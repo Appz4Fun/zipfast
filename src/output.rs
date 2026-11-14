@@ -141,10 +141,7 @@ struct SelectedStage {
 #[cfg(unix)]
 impl SelectedStage {
     fn owns_name(&self) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        self.path.as_ref().is_some_and(|path| {
-            fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && (meta.dev(), meta.ino()) == self.identity)
-        })
+        self.path.as_ref().is_some_and(|path| owns_stage_name(path, self.identity).unwrap_or(false))
     }
 }
 
@@ -507,5 +504,175 @@ mod tests {
         } if path == &target && source.raw_os_error().is_some()));
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"original");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+/// Retryable private stage. Unlike legacy WriteFile, failed publication retains ownership.
+/// Name removal is guarded; it is not a defense against a concurrent same-UID attacker.
+pub(crate) struct OwnedStage {
+    file: Option<File>,
+    path: TempPath,
+    identity: (u64, u64),
+    removed: bool,
+}
+impl OwnedStage {
+    pub(crate) fn create(parent: &Path) -> io::Result<Self> {
+        // tempfile's default mode is 0600, unlike legacy extraction temporary().
+        let temporary = tempfile::Builder::new().prefix(".zipfast-progressive-").tempfile_in(parent)?;
+        let identity = stage_identity(&temporary.as_file().metadata()?)?;
+        let (file, mut path) = temporary.into_parts();
+        path.disable_cleanup(true);
+        Ok(Self { file: Some(file), path, identity, removed: false })
+    }
+    pub(crate) fn file(&self) -> &File {
+        self.file.as_ref().expect("live owned stage")
+    }
+    fn owns_name(&self) -> io::Result<bool> {
+        owns_stage_name(&self.path, self.identity)
+    }
+    pub(crate) fn check(&self, len: u64) -> io::Result<()> {
+        if self.removed || !self.owns_name()? {
+            return Err(io::Error::other("output stage name changed"));
+        }
+        let metadata = self.file().metadata()?;
+        if !metadata.is_file() || stage_identity(&metadata)? != self.identity || metadata.len() != len {
+            return Err(io::Error::other("output stage descriptor changed"));
+        }
+        Ok(())
+    }
+    pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file().read_at(buf, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, buf);
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+    pub(crate) fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        let buf = match owned_stage_fault(OwnedOperation::Write)? {
+            Some(n) => &buf[..n.min(buf.len())],
+            None => buf,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file().write_at(buf, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, buf);
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+    pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
+        self.file().set_len(len)
+    }
+    pub(crate) fn discard(&mut self) -> io::Result<()> {
+        if self.removed {
+            return Ok(());
+        }
+        if !self.owns_name()? {
+            return Err(io::Error::other("output stage name changed; cleanup unconfirmed"));
+        }
+        #[cfg(test)]
+        owned_stage_fault(OwnedOperation::Remove)?;
+        fs::remove_file(&self.path)?;
+        self.removed = true;
+        self.file.take();
+        Ok(())
+    }
+    /// Returns an optional cleanup error only AFTER successful no-clobber publication.
+    /// Errors returned directly are prepublication and leave the stage owned.
+    #[allow(dead_code)]
+    pub(crate) fn publish(&mut self, target: &Path, replace: bool) -> io::Result<Option<io::Error>> {
+        self.publish_observed(target, replace, |_| {})
+    }
+    /// The callback receives the original descriptor only after atomic publication.
+    pub(crate) fn publish_observed(
+        &mut self,
+        target: &Path,
+        replace: bool,
+        published: impl FnOnce(&File),
+    ) -> io::Result<Option<io::Error>> {
+        if self.removed || !self.owns_name()? {
+            return Err(io::Error::other("output stage name changed"));
+        }
+        match fs::symlink_metadata(target) {
+            Ok(m) if m.file_type().is_symlink() => return Err(io::ErrorKind::AlreadyExists.into()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        #[cfg(test)]
+        owned_stage_fault(OwnedOperation::Publish)?;
+        if replace {
+            fs::rename(&self.path, target)?;
+            published(self.file());
+            self.removed = true;
+            self.file.take();
+            Ok(None)
+        } else {
+            // hard_link is an atomic no-clobber publication on this same filesystem.
+            fs::hard_link(&self.path, target)?;
+            published(self.file());
+            let cleanup = self.discard().err();
+            Ok(cleanup)
+        }
+    }
+}
+fn stage_identity(meta: &fs::Metadata) -> io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+impl Drop for OwnedStage {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = self.discard();
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum OwnedOperation {
+    Write,
+    Publish,
+    Remove,
+}
+#[cfg(test)]
+type OwnedFault = (OwnedOperation, Result<Option<usize>, i32>);
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OWNED_STAGE_FAULT: std::cell::RefCell<Option<OwnedFault>> = const {std::cell::RefCell::new(None)};
+}
+#[cfg(test)]
+fn owned_stage_fault(operation: OwnedOperation) -> io::Result<Option<usize>> {
+    OWNED_STAGE_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(op, _)| *op == operation) {
+            slot.take().expect("injected native fault").1.map_err(io::Error::from_raw_os_error)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+fn owns_stage_name(path: &Path, identity: (u64, u64)) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_file() && stage_identity(&meta)? == identity),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }

@@ -348,8 +348,16 @@ const SHA256_K: [u32; 64] = [
 const SHA256_IV: [u32; 8] =
     [0x6a09_e667, 0xbb67_ae85, 0x3c6e_f372, 0xa54f_f53a, 0x510e_527f, 0x9b05_688c, 0x1f83_d9ab, 0x5be0_cd19];
 
+#[cfg(test)]
+thread_local! {
+    static SHA256_COMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[inline]
 fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    #[cfg(test)]
+    SHA256_COMPRESSIONS.set(SHA256_COMPRESSIONS.get() + 1);
+
     let mut w = [0u32; 64];
     for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
         w[i] = u32::from_be_bytes(*chunk);
@@ -667,24 +675,112 @@ pub(crate) struct Rar5Keys {
     pub(crate) evidence: crate::error::RarPasswordEvidence,
 }
 
+/// A derivation calls this before every bounded group of SHA compression blocks.
+pub(crate) trait KdfControl {
+    fn charge(&mut self, blocks: u64) -> std::result::Result<(), KdfControlError>;
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code, reason = "private progressive control producer")]
+pub(crate) enum KdfControlError {
+    Canceled,
+    Limit { resource: crate::progressive::Resource, limit: u64, attempted: u64 },
+}
+#[derive(Debug)]
+pub(crate) enum ControlledKdfError {
+    Crypt(Rar5CryptError),
+    Control(KdfControlError),
+}
+
+struct UnrestrictedKdf;
+impl KdfControl for UnrestrictedKdf {
+    fn charge(&mut self, _: u64) -> std::result::Result<(), KdfControlError> {
+        Ok(())
+    }
+}
+
 pub(crate) fn derive_rar5_keys(
     password: &str,
     kdf_count: u8,
     salt: &[u8; 16],
     check: Option<([u8; 8], [u8; 4])>,
 ) -> std::result::Result<Rar5Keys, Rar5CryptError> {
+    derive_rar5_keys_impl(password, kdf_count, salt, check, &mut UnrestrictedKdf).map_err(|error| match error {
+        ControlledKdfError::Crypt(error) => error,
+        ControlledKdfError::Control(_) => unreachable!("unrestricted legacy derivation"),
+    })
+}
+
+#[allow(dead_code, reason = "private progressive producer; legacy wrapper uses the same derivation core")]
+pub(crate) fn derive_rar5_keys_controlled(
+    password: &str,
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+    control: &mut dyn KdfControl,
+) -> std::result::Result<Rar5Keys, ControlledKdfError> {
+    use crate::progressive::Resource;
+    for (resource, attempted, limit) in [
+        (Resource::KdfExponent, u64::from(kdf_count), 20),
+        (Resource::PasswordUtf8Bytes, password.len() as u64, 4096),
+        // RAR5 uses the supplied UTF-8 bytes directly.
+        (Resource::PasswordEncodedBytes, password.len() as u64, 8192),
+    ] {
+        if attempted > limit {
+            return Err(ControlledKdfError::Control(KdfControlError::Limit { resource, limit, attempted }));
+        }
+    }
+    struct Derivation<'a> {
+        control: &'a mut dyn KdfControl,
+        blocks: u64,
+    }
+    impl KdfControl for Derivation<'_> {
+        fn charge(&mut self, blocks: u64) -> std::result::Result<(), KdfControlError> {
+            let attempted = self.blocks.checked_add(blocks).ok_or(crate::crypto::KdfControlError::Limit {
+                resource: crate::progressive::Resource::KdfDerivationBlocks,
+                limit: 1 << 22,
+                attempted: u64::MAX,
+            })?;
+            if attempted > 1 << 22 {
+                return Err(KdfControlError::Limit {
+                    resource: Resource::KdfDerivationBlocks,
+                    limit: 1 << 22,
+                    attempted,
+                });
+            }
+            self.control.charge(blocks)?;
+            self.blocks = attempted;
+            Ok(())
+        }
+    }
+    derive_rar5_keys_impl(password, kdf_count, salt, check, &mut Derivation { control, blocks: 0 })
+}
+
+fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
+    password: &str,
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+    control: &mut C,
+) -> std::result::Result<Rar5Keys, ControlledKdfError> {
     use crate::error::{RarPasswordEvidence, RarVerifierUnavailable};
     if kdf_count > 24 {
-        return Err(Rar5CryptError::KdfLimit(kdf_count));
+        return Err(ControlledKdfError::Crypt(Rar5CryptError::KdfLimit(kdf_count)));
     }
+    // Normalizing a long HMAC key hashes ceil((bytes + 9) / 64) blocks.
+    // Setup always hashes the two ipad/opad blocks. No password buffer is allocated.
+    let normalization = if password.len() > 64 { (password.len() as u64 + 9).div_ceil(64) } else { 0 };
+    control.charge(normalization + 2).map_err(ControlledKdfError::Control)?;
     let keyed = HmacSha256Key::new(password.as_bytes());
     let mut salt_block = [0u8; 20];
     salt_block[..16].copy_from_slice(salt);
     salt_block[16..20].copy_from_slice(&1u32.to_be_bytes());
+    control.charge(2).map_err(ControlledKdfError::Control)?;
     let mut u = keyed.mac_slice(&salt_block);
     let mut fn_acc = u;
     let iterations = 1u32 << kdf_count;
     for _ in 1..iterations {
+        control.charge(2).map_err(ControlledKdfError::Control)?;
         u = keyed.mac_32(&u);
         for (slot, b) in fn_acc.iter_mut().zip(u) {
             *slot ^= b;
@@ -692,15 +788,20 @@ pub(crate) fn derive_rar5_keys(
     }
     let key = fn_acc;
     for _ in 0..16 {
+        control.charge(2).map_err(ControlledKdfError::Control)?;
         u = keyed.mac_32(&u);
         for (slot, b) in fn_acc.iter_mut().zip(u) {
             *slot ^= b;
         }
     }
     let hash_key = fn_acc;
+    if check.is_some() {
+        control.charge(1).map_err(ControlledKdfError::Control)?;
+    }
     let evidence = match check {
         Some((chk, csum)) if sha256(&chk)[..4] == csum => {
             for _ in 0..16 {
+                control.charge(2).map_err(ControlledKdfError::Control)?;
                 u = keyed.mac_32(&u);
                 for (slot, b) in fn_acc.iter_mut().zip(u) {
                     *slot ^= b;
@@ -711,7 +812,7 @@ pub(crate) fn derive_rar5_keys(
                 folded[i % 8] ^= *b;
             }
             if folded != chk {
-                return Err(Rar5CryptError::WrongPassword);
+                return Err(ControlledKdfError::Crypt(Rar5CryptError::WrongPassword));
             }
             RarPasswordEvidence::VerifierMatched
         }
@@ -776,6 +877,8 @@ pub fn decrypt_rar5_header(data: &[u8], pos: usize, key: &[u8; 32]) -> Option<(V
 // Pure-Rust SHA-1 + RAR 4.x (`SetKey30`) key/IV derivation & header decryption
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! { static SHA1_COMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 #[derive(Clone)]
 struct Sha1 {
     state: [u32; 5],
@@ -795,6 +898,8 @@ impl Sha1 {
     }
 
     fn compress(state: &mut [u32; 5], chunk: &[u8; 64]) {
+        #[cfg(test)]
+        SHA1_COMPRESSIONS.set(SHA1_COMPRESSIONS.get() + 1);
         let mut w = [0u32; 80];
         for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes(*word);
@@ -824,7 +929,14 @@ impl Sha1 {
         state[4] = state[4].wrapping_add(e);
     }
 
-    fn update(&mut self, mut data: &[u8]) {
+    fn update(&mut self, data: &[u8]) {
+        self.update_controlled(data, &mut UnrestrictedKdf).expect("unrestricted SHA1");
+    }
+    fn update_controlled<C: KdfControl + ?Sized>(
+        &mut self,
+        mut data: &[u8],
+        control: &mut C,
+    ) -> std::result::Result<(), KdfControlError> {
         self.total_len += data.len() as u64;
         if self.buf_len > 0 {
             let take = (64 - self.buf_len).min(data.len());
@@ -832,21 +944,30 @@ impl Sha1 {
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len == 64 {
+                control.charge(1)?;
                 Self::compress(&mut self.state, &self.buf);
                 self.buf_len = 0;
             }
         }
         let (blocks, rem) = data.as_chunks::<64>();
         for b in blocks {
+            control.charge(1)?;
             Self::compress(&mut self.state, b);
         }
         if !rem.is_empty() {
             self.buf[..rem.len()].copy_from_slice(rem);
             self.buf_len = rem.len();
         }
+        Ok(())
     }
 
     fn finalize_words(&self) -> [u32; 5] {
+        self.finalize_controlled(&mut UnrestrictedKdf).expect("unrestricted SHA1")
+    }
+    fn finalize_controlled<C: KdfControl + ?Sized>(
+        &self,
+        control: &mut C,
+    ) -> std::result::Result<[u32; 5], KdfControlError> {
         let mut state = self.state;
         let bit_len = self.total_len * 8;
         let mut tail = [0u8; 128];
@@ -854,13 +975,16 @@ impl Sha1 {
         tail[self.buf_len] = 0x80;
         if self.buf_len < 56 {
             tail[56..64].copy_from_slice(&bit_len.to_be_bytes());
+            control.charge(1)?;
             Self::compress(&mut state, tail[..64].try_into().unwrap());
         } else {
             tail[120..128].copy_from_slice(&bit_len.to_be_bytes());
+            control.charge(1)?;
             Self::compress(&mut state, tail[..64].try_into().unwrap());
+            control.charge(1)?;
             Self::compress(&mut state, tail[64..128].try_into().unwrap());
         }
-        state
+        Ok(state)
     }
 
     fn finalize_bytes(&self) -> [u8; 20] {
@@ -875,6 +999,50 @@ impl Sha1 {
 
 /// Derives the RAR4 (`SetKey30`) 16-byte AES-128 key and 16-byte IV from `password` and `salt`.
 pub fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
+    derive_rar4_key_iv_impl(password, salt, &mut UnrestrictedKdf).expect("unrestricted RAR4 derivation")
+}
+
+pub(crate) fn derive_rar4_key_iv_controlled(
+    password: &str,
+    salt: &[u8; 8],
+    control: &mut dyn KdfControl,
+) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
+    use crate::progressive::Resource;
+    for (resource, attempted, limit) in [
+        (Resource::PasswordUtf8Bytes, password.len() as u64, 4096),
+        (Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2, 8192),
+    ] {
+        if attempted > limit {
+            return Err(KdfControlError::Limit { resource, limit, attempted });
+        }
+    }
+    struct Derivation<'a> {
+        control: &'a mut dyn KdfControl,
+        blocks: u64,
+    }
+    impl KdfControl for Derivation<'_> {
+        fn charge(&mut self, blocks: u64) -> std::result::Result<(), KdfControlError> {
+            let attempted = self.blocks.saturating_add(blocks);
+            if attempted > 1 << 22 {
+                return Err(KdfControlError::Limit {
+                    resource: Resource::KdfDerivationBlocks,
+                    limit: 1 << 22,
+                    attempted,
+                });
+            }
+            self.control.charge(blocks)?;
+            self.blocks = attempted;
+            Ok(())
+        }
+    }
+    derive_rar4_key_iv_impl(password, salt, &mut Derivation { control, blocks: 0 })
+}
+
+fn derive_rar4_key_iv_impl<C: KdfControl + ?Sized>(
+    password: &str,
+    salt: &[u8; 8],
+    control: &mut C,
+) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
     let mut raw = Vec::with_capacity(password.len() * 2 + 8);
     for ch in password.encode_utf16() {
         raw.extend_from_slice(&ch.to_le_bytes());
@@ -885,23 +1053,23 @@ pub fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]
     let mut sha = Sha1::new();
     let mut iv = [0u8; 16];
     for i in 0..ROUNDS {
-        sha.update(&raw);
+        sha.update_controlled(&raw, control)?;
         let idx = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
-        sha.update(&idx);
+        sha.update_controlled(&idx, control)?;
         if i % (ROUNDS / 16) == 0 {
-            let words = sha.finalize_words();
+            let words = sha.finalize_controlled(control)?;
             let pos = (i / (ROUNDS / 16)) as usize;
             if let Some(slot) = iv.get_mut(pos) {
                 *slot = (words[4] & 0xff) as u8;
             }
         }
     }
-    let words = sha.finalize_words();
+    let words = sha.finalize_controlled(control)?;
     let mut key = [0u8; 16];
     for (i, &w) in words.iter().take(4).enumerate() {
         key[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
     }
-    (key, iv)
+    Ok((key, iv))
 }
 
 /// Decrypts an encrypted RAR4 block header at `pos` (starts with 8-byte salt followed by AES-128-CBC blocks).
@@ -1464,6 +1632,183 @@ pub fn aes_extra_info(extra: &[u8]) -> Option<(u8, u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct KdfMeter {
+        blocks: u64,
+        limit: u64,
+        cancel_at: Option<u64>,
+    }
+    impl KdfControl for KdfMeter {
+        fn charge(&mut self, blocks: u64) -> std::result::Result<(), KdfControlError> {
+            if self.cancel_at.is_some_and(|at| self.blocks >= at) {
+                return Err(KdfControlError::Canceled);
+            }
+            let attempted = self.blocks + blocks;
+            if attempted > self.limit {
+                return Err(KdfControlError::Limit {
+                    resource: crate::progressive::Resource::KdfDerivationBlocks,
+                    limit: self.limit,
+                    attempted,
+                });
+            }
+            self.blocks = attempted;
+            Ok(())
+        }
+    }
+    fn kdf_meter(limit: u64) -> KdfMeter {
+        KdfMeter { blocks: 0, limit, cancel_at: None }
+    }
+
+    #[test]
+    fn controlled_rar4_counts_primitives_including_clone_padding_and_stops_before_work() {
+        for password in ["", "pw", "é界😀", "abcdefghijklmnopqrstuvw", "abcdefghijklmnopqrstuvwx"] {
+            SHA1_COMPRESSIONS.set(0);
+            let mut meter = kdf_meter(u64::MAX);
+            let actual = derive_rar4_key_iv_controlled(password, &[1; 8], &mut meter).unwrap();
+            assert_eq!(meter.blocks, SHA1_COMPRESSIONS.get());
+            let raw = password.encode_utf16().count() as u64 * 2 + 11;
+            let expected = 0x40000 * raw / 64
+                + (0..16).map(|i| 1 + u64::from(((i * 0x4000 + 1) * raw) % 64 >= 56)).sum::<u64>()
+                + 1;
+            assert_eq!(meter.blocks, expected);
+            assert_eq!(actual, derive_rar4_key_iv(password, &[1; 8]));
+            let known = match password {
+                "pw" => Some(("77005689078b689864882b7665ede966", "510faeafff2ac0c52af181d88b5db8e3")),
+                "é界😀" => Some(("ee60c1ea894c83b3b370f29a6b7b7327", "d2e24a2a07863d9fd52616cbc45dc09e")),
+                _ => None,
+            };
+            if let Some((key, iv)) = known {
+                let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                assert_eq!(hex(&actual.0), key);
+                assert_eq!(hex(&actual.1), iv);
+            }
+        }
+        for n in [55, 56, 63, 64] {
+            let mut sha = Sha1::new();
+            let mut meter = kdf_meter(u64::MAX);
+            SHA1_COMPRESSIONS.set(0);
+            sha.update_controlled(&vec![0; n], &mut meter).unwrap();
+            sha.finalize_controlled(&mut meter).unwrap();
+            assert_eq!(meter.blocks, (n as u64 + 9).div_ceil(64));
+            assert_eq!(meter.blocks, SHA1_COMPRESSIONS.get());
+        }
+        for cancel in [false, true] {
+            let mut meter = kdf_meter(if cancel { u64::MAX } else { 1024 });
+            meter.cancel_at = cancel.then_some(1024);
+            SHA1_COMPRESSIONS.set(0);
+            let err = derive_rar4_key_iv_controlled("pw", &[1; 8], &mut meter).unwrap_err();
+            assert_eq!(SHA1_COMPRESSIONS.get(), 1024);
+            assert_eq!(meter.blocks, 1024);
+            assert!(matches!(
+                (cancel, err),
+                (true, KdfControlError::Canceled) | (false, KdfControlError::Limit { attempted: 1025, .. })
+            ));
+        }
+        SHA1_COMPRESSIONS.set(0);
+        let mut meter = kdf_meter(u64::MAX);
+        assert!(matches!(
+            derive_rar4_key_iv_controlled(&"x".repeat(4097), &[0; 8], &mut meter),
+            Err(KdfControlError::Limit { resource: crate::progressive::Resource::PasswordUtf8Bytes, .. })
+        ));
+        assert_eq!(SHA1_COMPRESSIONS.get(), 0);
+        assert_eq!(meter.blocks, 0);
+    }
+
+    #[test]
+    fn controlled_rar4_hard_derivation_ceiling_charges_actual_attempts_without_refund() {
+        let mut meter = kdf_meter(u64::MAX);
+        SHA1_COMPRESSIONS.set(0);
+        assert!(matches!(
+            derive_rar4_key_iv_controlled(&"x".repeat(4096), &[0; 8], &mut meter),
+            Err(KdfControlError::Limit {
+                resource: crate::progressive::Resource::KdfDerivationBlocks,
+                limit: 4194304,
+                attempted: 4194305
+            })
+        ));
+        assert_eq!(meter.blocks, 1 << 22);
+        assert_eq!(SHA1_COMPRESSIONS.get(), 1 << 22);
+    }
+
+    #[test]
+    fn controlled_rar5_stops_mid_derivation_and_hash_key_work() {
+        let mut cancel = kdf_meter(u64::MAX);
+        cancel.cancel_at = Some(1024);
+        SHA256_COMPRESSIONS.set(0);
+        assert!(matches!(
+            derive_rar5_keys_controlled("secret", 12, &[0; 16], None, &mut cancel),
+            Err(ControlledKdfError::Control(KdfControlError::Canceled))
+        ));
+        assert!(cancel.blocks >= 1024 && cancel.blocks <= 2048);
+        assert_eq!(cancel.blocks, SHA256_COMPRESSIONS.get());
+        let mut limited = kdf_meter(2 + 2 * (1 << 3) + 10);
+        assert!(matches!(
+            derive_rar5_keys_controlled("secret", 3, &[0; 16], None, &mut limited),
+            Err(ControlledKdfError::Control(KdfControlError::Limit { .. }))
+        ));
+        assert_eq!(limited.blocks, limited.limit);
+    }
+
+    #[test]
+    fn controlled_rar5_charges_actual_compressions_and_preserves_keys() {
+        for n in [0, 64, 65, 119, 120, 4096] {
+            let password = "x".repeat(n);
+            let legacy = derive_rar5_keys(&password, 3, &[7; 16], None).unwrap();
+            let mut meter = kdf_meter(u64::MAX);
+            SHA256_COMPRESSIONS.set(0);
+            let got = derive_rar5_keys_controlled(&password, 3, &[7; 16], None, &mut meter).unwrap();
+            assert_eq!(meter.blocks, SHA256_COMPRESSIONS.get(), "password length {n}");
+            assert_eq!(got.key, legacy.key);
+            assert_eq!(got.hash_key, legacy.hash_key);
+            assert_eq!(got.evidence, legacy.evidence);
+        }
+    }
+
+    #[test]
+    fn controlled_rar5_rejects_password_and_exponent_before_hashing() {
+        for (password, exponent, resource) in [
+            ("x".repeat(4097), 0, crate::progressive::Resource::PasswordUtf8Bytes),
+            ("x".to_owned(), 21, crate::progressive::Resource::KdfExponent),
+        ] {
+            let mut meter = kdf_meter(u64::MAX);
+            SHA256_COMPRESSIONS.set(0);
+            assert!(matches!(derive_rar5_keys_controlled(&password, exponent, &[0;16], None, &mut meter),
+                Err(ControlledKdfError::Control(KdfControlError::Limit { resource: actual, .. })) if actual == resource));
+            assert_eq!(meter.blocks, 0);
+            assert_eq!(SHA256_COMPRESSIONS.get(), 0);
+        }
+    }
+
+    #[test]
+    fn controlled_rar5_verifier_work_is_charged_and_corruption_is_not_wrong_password() {
+        // Independent Python hashlib/hmac known answer for secret, salt [7;16], exponent3.
+        let check = [0x3c, 0xb4, 0xa6, 0x01, 0x77, 0xb4, 0x1a, 0xe5];
+        let sum = [0x16, 0xc9, 0x41, 0x3b];
+        let mut meter = kdf_meter(u64::MAX);
+        SHA256_COMPRESSIONS.set(0);
+        let got = derive_rar5_keys_controlled("secret", 3, &[7; 16], Some((check, sum)), &mut meter).unwrap();
+        assert_eq!(got.evidence, crate::error::RarPasswordEvidence::VerifierMatched);
+        assert_eq!(meter.blocks, 2 + 2 * 8 + 32 + 1 + 32);
+        assert_eq!(meter.blocks, SHA256_COMPRESSIONS.get());
+        let mut limited = kdf_meter(2 + 2 * 8 + 32 + 1 + 10);
+        assert!(matches!(
+            derive_rar5_keys_controlled("secret", 3, &[7; 16], Some((check, sum)), &mut limited),
+            Err(ControlledKdfError::Control(KdfControlError::Limit { .. }))
+        ));
+        assert_eq!(limited.blocks, limited.limit);
+        assert!(matches!(
+            derive_rar5_keys_controlled("wrong", 3, &[7; 16], Some((check, sum)), &mut kdf_meter(u64::MAX)),
+            Err(ControlledKdfError::Crypt(Rar5CryptError::WrongPassword))
+        ));
+        let bad =
+            derive_rar5_keys_controlled("wrong", 3, &[7; 16], Some((check, [0; 4])), &mut kdf_meter(u64::MAX)).unwrap();
+        assert_eq!(
+            bad.evidence,
+            crate::error::RarPasswordEvidence::VerifierUnavailable(
+                crate::error::RarVerifierUnavailable::CheckChecksumMismatch
+            )
+        );
+    }
 
     // The AES-128 fixture comes from Prybar d3b8aa32a7c7214919b9c973588a9aa97a6a0e88.
     // Python hashlib and hmac and OpenSSL AES-ECB generated the fixtures independently.

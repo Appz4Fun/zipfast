@@ -109,15 +109,15 @@ impl<O: RarExtractObserver + ?Sized> SelectedDriver for Driver<'_, O> {
     fn identity(&mut self, session: &RarSession, index: usize) -> Result<RarEntryIdentity, SelectedStop> {
         self.control.native_charge(
             RarResource::ExtractControlWork,
-            add_capacity(session.members[index].header.name.len() as u64, 1)?,
+            add_capacity(session.model.members[index].header.name.len() as u64, 1)?,
         )?;
         let mut name = String::new();
-        let len = session.members[index].header.name.len();
+        let len = session.model.members[index].header.name.len();
         self.control.check_capacity(add_capacity(self.retained, len as u64)?)?;
         name.try_reserve_exact(len).map_err(RarExtractControlError::Allocation)?;
         self.event_bytes = name.capacity() as u64;
         self.control.capacity(add_capacity(self.retained, self.event_bytes)?)?;
-        name.push_str(&session.members[index].header.name);
+        name.push_str(&session.model.members[index].header.name);
         Ok(RarEntryIdentity { index: Some(index as u64), order: index as u64, name })
     }
     fn member(

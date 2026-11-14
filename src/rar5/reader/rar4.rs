@@ -17,120 +17,113 @@
 //! RAR4 framing from the documented fixed fields and independent fixtures.
 
 use super::*;
+use crate::error::RarUnsupported;
+use crate::rar5::session::{ScanBudget, allocation};
 
-impl Volume {
-    pub(super) fn next_rar4(&mut self, mut budget: Option<&mut ScanBudget<'_>>) -> RarResult<Option<ParsedBlock>> {
-        loop {
-            if self.next >= self.len {
-                return Ok(None);
-            }
-            let start = self.next;
-            if let Some(budget) = budget.as_deref_mut() {
-                budget.block()?;
-            } else {
-                self.src.seek(start);
-            }
-            let mut at = start;
-            let mut prefix = [0; 7];
-            self.read_header_exact(&mut budget, &mut at, &mut prefix)?;
-            let kind = prefix[2];
-            let flags = u16::from_le_bytes([prefix[3], prefix[4]]);
-            let size = usize::from(u16::from_le_bytes([prefix[5], prefix[6]]));
-            if size < 7 || start.checked_add(size as u64).is_none_or(|end| end > self.len) {
-                return Err(self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")));
-            }
-            if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
-                return Err(self.rar4_unsupported("embedded comment"));
-            }
-            // Runs must reference the bounded legacy prefix. Literal units consume
-            // encoded bytes, so decoded UTF-16 cannot exceed the whole name length.
-            // Reserve room for the header, raw name, units and growing UTF-8 output.
-            if let Some(budget) = budget.as_deref() {
-                budget.temporary(size as u64 * 12)?;
-            }
-            let mut header = header_buffer(size)?;
-            header[..7].copy_from_slice(&prefix);
-            self.read_header_exact(&mut budget, &mut at, &mut header[7..])?;
-            if crate::crc32::hash(&header[2..]) as u16 != u16::from_le_bytes([prefix[0], prefix[1]]) {
-                return Err(self.header_fault(
-                    RarIntegrityReason::HeaderCrc,
-                    Error::BadChecksum("RAR4 header CRC".into()),
-                    true,
-                ));
-            }
-            let mut cursor = Fields::new(&header, 7);
-            let packed =
-                if flags & 0x8000 != 0 { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
-            self.next = start
-                .checked_add(size as u64)
-                .and_then(|end| end.checked_add(packed))
-                .ok_or_else(|| self.framing("RAR4 data size", Error::Corrupt("RAR4 data size")))?;
-            if self.next > self.len {
-                return Err(self.header_fault(RarIntegrityReason::TruncatedData, Error::Truncated, false));
-            }
-            match kind {
-                0x73 => {
-                    if self.rar4_main_seen {
-                        return Err(
-                            self.framing("duplicate RAR4 main header", Error::Corrupt("duplicate RAR4 main header"))
-                        );
-                    }
-                    self.rar4_main_seen = true;
-                    if size != 13 && !(size == 14 && flags & 0x200 != 0) {
-                        return Err(self.framing("RAR4 main header size", Error::Corrupt("RAR4 main header size")));
-                    }
-                    if flags & 0x80 != 0 {
-                        return Err(self.rar4_unsupported("encrypted headers"));
-                    }
-                    let mut normalized = 0;
-                    if flags & 1 != 0 {
-                        normalized |= MHFL_VOLUME;
-                    }
-                    if flags & 8 != 0 {
-                        normalized |= MHFL_SOLID;
-                    }
-                    return Ok(Some((Block::Main(MainHeader { flags: normalized, volume_number: 0 }), None, None)));
-                }
-                0x74 | 0x7a => {
-                    if flags & 0x8000 == 0 {
-                        return Err(self.framing("RAR4 file data flag", Error::Corrupt("RAR4 file data flag")));
-                    }
-                    if let Some(budget) = budget.as_deref()
-                        && let Some(size) = header.get(26..28)
-                    {
-                        budget.names(u64::from(u16::from_le_bytes([size[0], size[1]])))?;
-                    }
-                    let (file, wire) =
-                        self.rar4_file(&header, flags, packed, start + size as u64, budget.as_deref())?;
-                    self.next = file
-                        .data_at
-                        .checked_add(file.packed_size)
-                        .ok_or_else(|| self.framing("RAR4 data size", Error::Corrupt("RAR4 data size")))?;
-                    if self.next > self.len {
-                        return Err(self.header_fault(RarIntegrityReason::TruncatedData, Error::Truncated, false));
-                    }
-                    let block = if kind == 0x74 { Block::File(file) } else { Block::Service(file) };
-                    return Ok(Some((block, None, Some(wire))));
-                }
-                0x7b => {
-                    let expected = 7
-                        + usize::from(flags & 2 != 0) * 4
-                        + usize::from(flags & 4 != 0) * 7
-                        + usize::from(flags & 8 != 0) * 2;
-                    if size != expected {
-                        return Err(self.framing("RAR4 end header fields", Error::Corrupt("RAR4 end header fields")));
-                    }
-                    self.next = self.len;
-                    return Ok(Some((Block::End { more_volumes: flags & 1 != 0 }, None, None)));
-                }
-                0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block")),
-                _ if flags & 0x4000 != 0 => {}
-                _ => return Err(self.rar4_unsupported("header type")),
-            }
+impl HeaderParser {
+    pub(super) fn parse_rar4(
+        &mut self,
+        budget: Option<&ScanBudget<'_>>,
+    ) -> std::result::Result<PhysicalFrame, FramingError> {
+        let header =
+            if matches!(self.phase, Phase::LegacyBody) { &self.buffer[8..8 + self.size] } else { &self.buffer[..] };
+        let kind = header[2];
+        let flags = u16::from_le_bytes([header[3], header[4]]);
+        let size = header.len();
+        if crate::crc32::hash(&header[2..]) as u16 != u16::from_le_bytes([header[0], header[1]]) {
+            return Err(self
+                .fault(RarIntegrityReason::HeaderCrc, Error::BadChecksum("RAR4 header CRC".into()), true)
+                .into());
         }
+        if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
+            return Err(self.rar4_unsupported("embedded comment").into());
+        }
+        let mut cursor = Fields::new(header, 7);
+        let packed = if flags & 0x8000 != 0 { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
+        let data_at = self
+            .at
+            .checked_add(self.need as u64)
+            .ok_or_else(|| self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")))?;
+        let data_end = data_at
+            .checked_add(packed)
+            .ok_or_else(|| self.framing("RAR4 data size", Error::Corrupt("RAR4 data size")))?;
+        let mut frame = PhysicalFrame {
+            block: Block::Unknown,
+            crypt: None,
+            wire: None,
+            extent: self.at..data_at,
+            data_end,
+            header_crypt: None,
+        };
+        frame.block = match kind {
+            0x73 => {
+                if self.rar4_main.is_some() {
+                    return Err(self
+                        .framing("duplicate RAR4 main header", Error::Corrupt("duplicate RAR4 main header"))
+                        .into());
+                }
+                if size != 13 && !(size == 14 && flags & 0x200 != 0) {
+                    return Err(self.framing("RAR4 main header size", Error::Corrupt("RAR4 main header size")).into());
+                }
+                if flags & 0x80 != 0 {
+                    if self.usage.is_none() {
+                        return Err(self.rar4_unsupported("encrypted headers").into());
+                    }
+                    if flags & 0x200 != 0 {
+                        return Err(self.rar4_unsupported("header encryption version").into());
+                    }
+                    self.legacy_headers = true;
+                }
+                let mut normalized = 0;
+                if flags & 1 != 0 {
+                    normalized |= MHFL_VOLUME;
+                }
+                if flags & 8 != 0 {
+                    normalized |= MHFL_SOLID;
+                }
+                let main = MainHeader { flags: normalized, volume_number: 0 };
+                self.rar4_main = Some(main.clone());
+                Block::Main(main)
+            }
+            0x74 | 0x7a => {
+                if flags & 0x8000 == 0 {
+                    return Err(self.framing("RAR4 file data flag", Error::Corrupt("RAR4 file data flag")).into());
+                }
+                if let Some(budget) = budget
+                    && let Some(size) = header.get(26..28)
+                {
+                    budget.names(u64::from(u16::from_le_bytes([size[0], size[1]])))?;
+                }
+                let (file, wire) = self.rar4_file(header, flags, packed, data_at, budget)?;
+                frame.data_end = file
+                    .data_at
+                    .checked_add(file.packed_size)
+                    .ok_or_else(|| self.framing("RAR4 data size", Error::Corrupt("RAR4 data size")))?;
+                frame.wire = Some(wire);
+                if kind == 0x74 { Block::File(file) } else { Block::Service(file) }
+            }
+            0x7b => {
+                let expected = 7
+                    + usize::from(flags & 2 != 0) * 4
+                    + usize::from(flags & 4 != 0) * 7
+                    + usize::from(flags & 8 != 0) * 2;
+                if size != expected {
+                    return Err(self
+                        .framing("RAR4 end header fields", Error::Corrupt("RAR4 end header fields"))
+                        .into());
+                }
+                Block::End { more_volumes: flags & 1 != 0 }
+            }
+            0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
+            _ if flags & 0x4000 != 0 => Block::Unknown,
+            _ => return Err(self.rar4_unsupported("header type").into()),
+        };
+        if self.complete_len.is_some_and(|len| frame.data_end > len) {
+            return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+        }
+        Ok(frame)
     }
-
-    fn rar4_unsupported(&self, feature: &'static str) -> RarFault {
+    pub(super) fn rar4_unsupported(&self, feature: &'static str) -> RarFault {
         RarFault::new(
             RarFailure::Unsupported(RarUnsupported::Rar4Feature(feature)),
             Error::Unsupported(format!("RAR4 {feature}")),
@@ -144,7 +137,7 @@ impl Volume {
         mut packed: u64,
         data_at: u64,
         budget: Option<&ScanBudget<'_>>,
-    ) -> RarResult<(FileHeader, FileWire)> {
+    ) -> std::result::Result<(FileHeader, FileWire), FramingError> {
         let result: std::result::Result<_, FileParseError> = (|| {
             let mut fields = Fields::new(bytes, 11);
             let mut unpacked = u64::from(fields.u32()?);
@@ -160,13 +153,11 @@ impl Volume {
                 unpacked |= u64::from(fields.u32()?) << 32;
             }
             let encoded = fields.take(name_len)?;
-            let name = decode_name(encoded, flags & 0x200 != 0)?;
+            let name = decode_name(encoded, flags & 0x200 != 0, self.usage.as_ref())?;
             if name.is_empty() || name.contains('\0') {
                 return Err(Error::Corrupt("RAR4 member name").into());
             }
-            if flags & 0x400 != 0 {
-                fields.take(8)?;
-            }
+            let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
             let mut mtime = dos_timestamp(dos);
             let mut nanos = 0;
             if flags & 0x1000 != 0 {
@@ -224,23 +215,51 @@ impl Volume {
                 host_os: normalized_host,
                 name,
                 encrypted: flags & 4 != 0,
-                solid: flags & 0x10 != 0 || self.main.is_solid(),
+                solid: flags & 0x10 != 0 || self.rar4_main.as_ref().is_some_and(MainHeader::is_solid),
                 ..FileHeader::default()
             };
-            Ok((header, encoded))
+            Ok((header, encoded, salt))
         })();
-        let (header, encoded) = result.map_err(|error| match error {
-            FileParseError::Allocation => allocation(),
-            FileParseError::Format(Error::Unsupported(_)) => self.rar4_unsupported("header extension or name encoding"),
-            FileParseError::Format(error) => self.parse_fault(error),
+        let (header, encoded, salt) = result.map_err(|error| match error {
+            FileParseError::Allocation => allocation().into(),
+            FileParseError::Progressive(error) => FramingError::Progressive(error),
+            FileParseError::Format(Error::Unsupported(_)) => {
+                self.rar4_unsupported("header extension or name encoding").into()
+            }
+            FileParseError::Format(error) => self.parse_fault(error).into(),
         })?;
         if let Some(budget) = budget {
             budget.names((encoded.len() + header.name.len()) as u64)?;
         }
+        if let Some(usage) = &self.usage {
+            usage.charge(crate::progressive::Resource::NameBytes, encoded.len() as u64)?;
+            usage.charge(crate::progressive::Resource::MetadataBytes, (encoded.len() + RAW_NAME_OWNER_BYTES) as u64)?;
+        }
         let mut name = Vec::new();
         name.try_reserve_exact(encoded.len()).map_err(|_| allocation())?;
+        if let Some(usage) = &self.usage {
+            usage.charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - encoded.len()) as u64)?;
+        }
         name.extend_from_slice(encoded);
-        Ok((header, FileWire { name, compression: 0 }))
+        let legacy = LegacyWire {
+            salt,
+            flags,
+            version: header.rar4.unwrap().unpack_version,
+            method: header.rar4.unwrap().method,
+            dictionary: header.dictionary,
+            packed_size: header.packed_size,
+            unpacked_size: header.unpacked_size,
+            crypt: header.encrypted.then_some(LegacyCrypt { version: header.rar4.unwrap().unpack_version, salt }),
+        };
+        Ok((
+            header,
+            FileWire {
+                legacy: Some(legacy),
+                name: std::sync::Arc::new(name),
+                compression: 0,
+                extent: self.at..data_at,
+            },
+        ))
     }
 }
 
@@ -271,11 +290,21 @@ impl<'a> Fields<'a> {
 }
 
 /// Decode the flag-directed RAR4 Unicode stream with bounded legacy references.
-fn decode_name(encoded: &[u8], unicode: bool) -> std::result::Result<String, FileParseError> {
+fn decode_name(
+    encoded: &[u8],
+    unicode: bool,
+    usage: Option<&crate::progressive::Usage>,
+) -> std::result::Result<String, FileParseError> {
     if !unicode || !encoded.contains(&0) {
         let value = std::str::from_utf8(encoded).map_err(|_| Error::Unsupported("RAR4 legacy name encoding".into()))?;
+        admit_name(usage, value.len())?;
         let mut name = String::new();
         name.try_reserve_exact(value.len()).map_err(|_| FileParseError::Allocation)?;
+        if let Some(usage) = usage {
+            usage
+                .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
+                .map_err(FileParseError::Progressive)?;
+        }
         name.push_str(value);
         return Ok(name);
     }
@@ -314,8 +343,14 @@ fn decode_name(encoded: &[u8], unicode: bool) -> std::result::Result<String, Fil
         let scalar = scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?;
         length.checked_add(scalar.len_utf8()).ok_or(FileParseError::Allocation)
     })?;
+    admit_name(usage, length)?;
     let mut name = String::new();
     name.try_reserve_exact(length).map_err(|_| FileParseError::Allocation)?;
+    if let Some(usage) = usage {
+        usage
+            .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - length) as u64)
+            .map_err(FileParseError::Progressive)?;
+    }
     for scalar in char::decode_utf16(units) {
         name.push(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?);
     }
@@ -344,4 +379,12 @@ fn dos_timestamp(bits: u32) -> Option<i64> {
         return None;
     }
     crate::zip::dos_time(bits as u16, date)
+}
+
+fn admit_name(usage: Option<&crate::progressive::Usage>, len: usize) -> std::result::Result<(), FileParseError> {
+    if let Some(usage) = usage {
+        usage.charge(crate::progressive::Resource::NameBytes, len as u64).map_err(FileParseError::Progressive)?;
+        usage.charge(crate::progressive::Resource::MetadataBytes, len as u64).map_err(FileParseError::Progressive)?;
+    }
+    Ok(())
 }

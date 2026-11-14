@@ -16,8 +16,6 @@
 
 //! Walks one RAR 5.0 volume block by block.
 
-mod rar4;
-
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -324,8 +322,8 @@ pub struct Volume {
     pub main: MainHeader,
     password: Option<String>,
     header_key: Option<crate::crypto::Rar5Keys>,
+    parser: Option<super::framing::HeaderParser>,
     format: RarFormat,
-    rar4_main_seen: bool,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
@@ -341,16 +339,7 @@ pub(crate) fn signature_end(head: &[u8]) -> Result<u64> {
 }
 
 fn signature_location(head: &[u8]) -> Result<(u64, RarFormat)> {
-    for at in 0..head.len().min(MAX_SFX as usize + 1) {
-        let tail = &head[at..];
-        if tail.starts_with(SIGNATURE) {
-            return Ok(((at + SIGNATURE.len()) as u64, RarFormat::Rar5));
-        }
-        if tail.starts_with(SIGNATURE_V4) {
-            return Ok(((at + SIGNATURE_V4.len()) as u64, RarFormat::Rar4));
-        }
-    }
-    Err(Error::NotAnArchive)
+    super::framing::SignatureParser::default().advance(head).1.ok_or(Error::NotAnArchive)
 }
 
 #[cfg(all(test, unix))]
@@ -466,8 +455,8 @@ impl Volume {
             main: MainHeader::default(),
             password: password.filter(|s| !s.is_empty()).map(str::to_owned),
             header_key: None,
+            parser: None,
             format,
-            rar4_main_seen: false,
         };
         match vol.next_block_impl(detailed, budget, true)? {
             Some((Block::Main(m), _, _)) => vol.main = m,
@@ -556,173 +545,57 @@ impl Volume {
         self.header_fault(RarIntegrityReason::HeaderFraming(reason), legacy, true)
     }
 
-    fn parse_fault(&self, e: Error) -> RarFault {
-        match e {
-            Error::Truncated => self.header_fault(RarIntegrityReason::TruncatedHeader, e, true),
-            Error::Corrupt(reason) => self.framing(reason, e),
-            _ => RarFault::new(RarFailure::Internal(RarInternal::Invariant("unexpected RAR header error")), e),
-        }
-    }
-
     fn next_block_impl(
         &mut self,
         detailed: bool,
         mut budget: Option<&mut ScanBudget<'_>>,
         catalogue_main: bool,
     ) -> RarResult<Option<ParsedBlock>> {
-        if self.format == RarFormat::Rar4 {
-            return self.next_rar4(budget);
-        }
-        loop {
-            if self.next >= self.len {
-                return Ok(None);
-            }
-            let start = self.next;
-            if let Some(budget) = budget.as_deref_mut() {
-                budget.block()?;
-            } else {
-                self.src.seek(start);
-            }
-            let mut at = start;
-            let (body, header_end) = if let Some(key) = self.header_key.as_ref().map(|keys| keys.key) {
-                if start.checked_add(32).is_none_or(|e| e > self.len) {
-                    return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
+        use super::framing::{HeaderParser, ParserStep};
+        let mut parser = self.parser.take().unwrap_or_else(|| {
+            let mut parser = HeaderParser::new(self.path.clone(), self.next, Some(self.len), budget.is_some());
+            parser.set_format(self.format);
+            parser
+        });
+        let result = (|| {
+            loop {
+                if self.next >= self.len {
+                    return Ok(None);
                 }
-                let mut iv = [0u8; 16];
-                let mut first_ct = [0u8; 16];
-                self.read_header_exact(&mut budget, &mut at, &mut iv)?;
-                self.read_header_exact(&mut budget, &mut at, &mut first_ct)?;
-                let cipher = crate::crypto::AesKey::new(&key)
-                    .ok_or_else(|| self.framing("encrypted header block", Error::Encrypted))?;
-                let mut first_dec = first_ct;
-                cipher.decrypt_cbc_in_place(&mut iv, &mut first_dec);
-                let mut size = 0u64;
-                let mut size_len = 0usize;
-                for i in 0..3 {
-                    let b = first_dec[4 + i];
-                    size |= u64::from(b & 0x7f) << (7 * i);
-                    size_len = i + 1;
-                    if b & 0x80 == 0 {
-                        break;
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.block()?;
+                } else {
+                    self.src.seek(self.next);
+                }
+                let (_, mut step) =
+                    parser.advance_core_budget(&[], budget.as_deref()).map_err(super::framing::FramingError::legacy)?;
+                let frame = loop {
+                    match step {
+                        ParserStep::LegacyKeyRequired { .. } => {
+                            return Err(RarFault::new(
+                                RarFailure::Unsupported(crate::error::RarUnsupported::Rar4Feature("encrypted headers")),
+                                Error::Encrypted,
+                            ));
+                        }
+                        ParserStep::End => return Ok(None),
+                        ParserStep::Frame(frame) => break frame,
+                        ParserStep::Need { offset, len } => {
+                            if let Some(budget) = &budget {
+                                budget.check_read(len)?;
+                            }
+                            let mut bytes = header_buffer(len)?;
+                            let mut at = offset;
+                            self.read_header_exact(&mut budget, &mut at, &mut bytes)?;
+                            let (used, next) = parser
+                                .advance_core_budget(&bytes, budget.as_deref())
+                                .map_err(super::framing::FramingError::legacy)?;
+                            debug_assert_eq!(used, bytes.len());
+                            step = next;
+                        }
                     }
-                    if i == 2 {
-                        return Err(self.framing("encrypted header size", Error::Encrypted));
-                    }
-                }
-                if size == 0 || size > MAX_HEADER {
-                    return Err(self.framing("encrypted header size", Error::Encrypted));
-                }
-                let plain_need = 4 + size_len + size as usize;
-                let padded_len = plain_need
-                    .checked_next_multiple_of(16)
-                    .ok_or_else(|| self.framing("encrypted header size", Error::Encrypted))?;
-                let header_end = start
-                    .checked_add(16 + padded_len as u64)
-                    .ok_or_else(|| self.framing("header size", Error::Corrupt("header size")))?;
-                if header_end > self.len {
-                    return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, true));
-                }
-                if let Some(budget) = &budget {
-                    budget.check_read(padded_len - 16)?;
-                }
-                let mut body = header_buffer(padded_len)?;
-                body[..16].copy_from_slice(&first_dec);
-                if padded_len > 16 {
-                    self.read_header_exact(&mut budget, &mut at, &mut body[16..])?;
-                    cipher.decrypt_cbc_in_place(&mut iv, &mut body[16..]);
-                }
-                let stored_crc = u32::from_le_bytes(body[..4].try_into().unwrap());
-                if crate::crc32::hash(&body[4..plain_need]) != stored_crc {
-                    return Err(self.header_fault(RarIntegrityReason::HeaderCrc, Error::Encrypted, true));
-                }
-                body.copy_within(4 + size_len..plain_need, 0);
-                body.truncate(size as usize);
-                (body, header_end)
-            } else {
-                let mut crc_bytes = [0u8; 4];
-                self.read_header_exact(&mut budget, &mut at, &mut crc_bytes)?;
-                let stored_crc = u32::from_le_bytes(crc_bytes);
-                // the size field is a vint of at most 3 bytes
-                let mut size_field = Vec::with_capacity(3);
-                let mut size = 0u64;
-                for i in 0..3 {
-                    let mut b = [0u8; 1];
-                    self.read_header_exact(&mut budget, &mut at, &mut b)?;
-                    size_field.push(b[0]);
-                    size |= u64::from(b[0] & 0x7f) << (7 * i);
-                    if b[0] & 0x80 == 0 {
-                        break;
-                    }
-                    if i == 2 {
-                        return Err(
-                            self.framing("header size field too long", Error::Corrupt("header size field too long"))
-                        );
-                    }
-                }
-                if size == 0 || size > MAX_HEADER {
-                    return Err(self.framing("header size", Error::Corrupt("header size")));
-                }
-                let header_end = start + 4 + size_field.len() as u64 + size;
-                if header_end > self.len {
-                    return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
-                }
-                if let Some(budget) = &budget {
-                    budget.check_read(size as usize)?;
-                }
-                let mut body = header_buffer(size as usize)?;
-                self.read_header_exact(&mut budget, &mut at, &mut body)?;
-                let mut hasher = crate::crc32::Hasher::new();
-                hasher.update(&size_field);
-                hasher.update(&body);
-                if hasher.finalize() != stored_crc {
-                    return Err(self.header_fault(
-                        RarIntegrityReason::HeaderCrc,
-                        Error::Corrupt("header checksum mismatch"),
-                        false,
-                    ));
-                }
-                (body, header_end)
-            };
-
-            let mut c = Cursor::new(&body);
-            let kind = c.vint().map_err(|e| self.parse_fault(e))?;
-            let flags = c.vint().map_err(|e| self.parse_fault(e))?;
-            let extra_size = if flags & HFL_EXTRA != 0 { c.vsize().map_err(|e| self.parse_fault(e))? } else { 0 };
-            let data_size = if flags & HFL_DATA != 0 { c.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
-            let fields_end = body.len().checked_sub(extra_size).filter(|&e| e >= c.pos());
-            let Some(fields_end) = fields_end else {
-                return Err(self.framing("extra area size", Error::Corrupt("extra area size")));
-            };
-            let fields = &body[c.pos()..fields_end];
-            let extra = &body[fields_end..];
-            let data_end = header_end
-                .checked_add(data_size)
-                .ok_or_else(|| self.framing("data size", Error::Corrupt("data size")))?;
-            // checked here, not only when the data is read, since skipped blocks are never read
-            if data_end > self.len {
-                return Err(self.header_fault(RarIntegrityReason::TruncatedData, Error::Truncated, false));
-            }
-            self.next = data_end;
-            let head = BlockHead { kind, flags, data_size, data_at: header_end };
-
-            match kind {
-                HEAD_MAIN => {
-                    let mut f = Cursor::new(fields);
-                    let flags = f.vint().map_err(|e| self.parse_fault(e))?;
-                    let volume_number =
-                        if flags & MHFL_VOLNUMBER != 0 { f.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
-                    return Ok(Some((Block::Main(MainHeader { flags, volume_number }), None, None)));
-                }
-                HEAD_FILE | HEAD_SERVICE => {
-                    let (h, crypt, wire) =
-                        parse_file_impl(&head, fields, extra, budget.is_some()).map_err(|error| match error {
-                            FileParseError::Format(error) => self.parse_fault(error),
-                            FileParseError::Allocation => allocation(),
-                        })?;
-                    let block = if kind == HEAD_FILE { Block::File(h) } else { Block::Service(h) };
-                    return Ok(Some((block, crypt, wire)));
-                }
-                HEAD_CRYPT => {
+                };
+                self.next = frame.data_end;
+                if matches!(frame.block, Block::Crypt) {
                     if budget.is_some() && (!catalogue_main || self.header_key.is_some()) {
                         return Err(self.framing("unexpected RAR header encryption block", Error::Encrypted));
                     }
@@ -730,30 +603,28 @@ impl Volume {
                         return Ok(Some((Block::Crypt, None, None)));
                     }
                     let crypt_fault = |e| RarFault::new(RarFailure::crypt(e, self.scope()), Error::Encrypted);
-                    let params = crate::crypto::parse_rar5_crypt(fields, crate::crypto::Rar5CryptLayout::Header)
-                        .map_err(crypt_fault)?;
+                    let params = frame.header_crypt.expect("encryption frame has its record").map_err(crypt_fault)?;
                     let pw = self.password.as_deref().ok_or_else(|| self.password_required())?;
                     if let Some(budget) = budget.as_deref_mut() {
                         budget.check()?;
                     }
                     let keys = crate::crypto::derive_rar5_keys(pw, params.kdf_count, &params.salt, params.check)
                         .map_err(crypt_fault)?;
+                    parser.set_encryption(&keys);
                     self.header_key = Some(keys);
                     continue;
                 }
-                HEAD_END => {
-                    let mut f = Cursor::new(fields);
-                    let flags = if budget.is_some() {
-                        f.vint().map_err(|e| self.parse_fault(e))?
-                    } else {
-                        f.vint().unwrap_or(0)
-                    };
+                if matches!(frame.block, Block::End { .. }) {
                     self.next = self.len;
-                    return Ok(Some((Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }, None, None)));
                 }
-                _ => return Ok(Some((Block::Unknown, None, None))),
+                if self.format == RarFormat::Rar4 && matches!(frame.block, Block::Unknown) {
+                    continue;
+                }
+                return Ok(Some((frame.block, frame.crypt, frame.wire)));
             }
-        }
+        })();
+        self.parser = Some(parser);
+        result
     }
 
     /// The open volume, for reads by position.
@@ -898,8 +769,8 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            parser: None,
             format: RarFormat::Rar5,
-            rar4_main_seen: false,
         };
         let (send, recv) = sync_channel(1);
         let (spare, _) = channel();
@@ -934,8 +805,8 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            parser: None,
             format: RarFormat::Rar5,
-            rar4_main_seen: false,
         };
         let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
         else {

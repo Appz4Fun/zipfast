@@ -30,6 +30,7 @@ pub mod error;
 pub mod extract;
 mod output;
 pub mod path;
+pub mod progressive;
 pub mod rar5;
 pub mod stream;
 pub mod tar;

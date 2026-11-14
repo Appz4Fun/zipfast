@@ -70,7 +70,7 @@ impl RarSession {
     pub fn select(&self, mut include: impl FnMut(RarMember<'_>) -> bool) -> Result<RarSelection, RarRunError> {
         let result = (|| {
             check_cancel(&self.options.cancel)?;
-            let words = self.members.len().div_ceil(64);
+            let words = self.model.members.len().div_ceil(64);
             let capacity = self.options.limits.capacity;
             let check_capacity = |words| {
                 limit(add(self.usage.capacity, vector_bytes::<u64>(words)?)?, capacity, RarResource::CatalogueCapacity)
@@ -156,7 +156,7 @@ impl RarSession {
                     entry: None,
                     cause,
                 })?;
-                let method = self.members[index].header.method;
+                let method = self.model.members[index].header.method;
                 let (outcome, terminal) = match driver.member(&mut run, self, index, &entry) {
                     Ok(outcome) => (outcome, None),
                     Err(SelectedStop::Native(failure)) => (RarOutcome::Failed(Arc::clone(&failure)), Some(failure)),
@@ -250,7 +250,7 @@ trait SelectedDriver {
         Ok(RarEntryIdentity {
             index: Some(index as u64),
             order: index as u64,
-            name: session.members[index].header.name.clone(),
+            name: session.model.members[index].header.name.clone(),
         })
     }
     fn member(
@@ -345,7 +345,7 @@ impl SelectedRun {
         output: Option<DecodedOutput<'_>>,
     ) -> Result<RarOutcome, Arc<RarFailure>> {
         check_cancel(&session.options.cancel).map_err(|fault| Arc::from(fault.failure))?;
-        let member = &session.members[index];
+        let member = &session.model.members[index];
         if member.header.is_dir() || member.header.redirection.is_some() {
             let outcome = match (member.issue, &member.header.redirection) {
                 (Some(issue), _) => RarOutcome::Failed(Arc::new(copy_catalogue_issue(&session.issues[issue]))),
@@ -363,7 +363,7 @@ impl SelectedRun {
                 (None, None) => RarOutcome::Directory,
             };
             let mut volumes = [0; VOLUME_WORDS];
-            mark_volumes(&mut volumes, &session.parts[member.parts.clone()]);
+            mark_volumes(&mut volumes, &session.model.parts[member.parts.clone()]);
             check_volumes(session, &volumes)?;
             return Ok(outcome);
         }
@@ -382,7 +382,7 @@ impl SelectedRun {
                 return Ok(RarOutcome::Failed(history_failure(Some(failed))));
             }
             for predecessor in self.next..index {
-                if session.members[predecessor].chain != Some(chain) {
+                if session.model.members[predecessor].chain != Some(chain) {
                     continue;
                 }
                 if let Err(failure) = self.decode(session, predecessor, true, None) {
@@ -417,9 +417,9 @@ impl SelectedRun {
         output: Option<DecodedOutput<'_>>,
     ) -> Result<(u64, RarVerification), Arc<RarFailure>> {
         check_cancel(&session.options.cancel).map_err(|fault| Arc::from(fault.failure))?;
-        let member = &session.members[index];
+        let member = &session.model.members[index];
         let mut used_volumes = if compressed { self.history_volumes } else { [0; VOLUME_WORDS] };
-        mark_volumes(&mut used_volumes, &session.parts[member.parts.clone()]);
+        mark_volumes(&mut used_volumes, &session.model.parts[member.parts.clone()]);
         check_volumes(session, &used_volumes)?;
         let result = self.decode_bound(session, index, output).map_err(Arc::new);
         if result
@@ -451,7 +451,7 @@ impl SelectedRun {
         index: usize,
         mut output: Option<DecodedOutput<'_>>,
     ) -> Result<(u64, RarVerification), RarFailure> {
-        let member = &session.members[index];
+        let member = &session.model.members[index];
         if let Some(issue) = member.issue {
             return Err(copy_catalogue_issue(&session.issues[issue]));
         }
@@ -462,7 +462,7 @@ impl SelectedRun {
             charge(self.decoded, size, self.limits.decoded_bytes, RarResource::SelectedDecodedBytes)?;
         }
         let header = &member.header;
-        let parts = &session.parts[member.parts.clone()];
+        let parts = &session.model.parts[member.parts.clone()];
         let context = EntryContext {
             entry: RarEntryIdentity { index: Some(index as u64), order: index as u64, name: String::new() },
             method: header.method,
@@ -633,7 +633,7 @@ impl SelectedRun {
             decoder.next_file(member.unpacked_size);
             return Ok(());
         }
-        let first = &session.parts[member.parts.start];
+        let first = &session.model.parts[member.parts.start];
         let solid = member.has_successor || session.volumes[first.volume].metadata.main.is_solid();
         let window = window_for_detailed(header.dictionary, member.unpacked_size, solid)
             .map_err(|error| *error.detailed(context.scope()).failure)?;
@@ -741,22 +741,7 @@ fn verify_part(
     crc: crate::crc32::Hasher,
     blake: Option<Blake2sp>,
 ) -> Result<(), RarFailure> {
-    let key = pending.hash_key(checks.keyed);
-    let crc_bad = checks.crc32.is_some_and(|want| {
-        let actual = crc.finalize();
-        key.map_or(actual, |key| crate::crypto::rar5_tweak_crc32(actual, key)) != want
-    });
-    let blake_bad = checks.blake2sp.zip(blake).is_some_and(|(want, actual)| {
-        let actual = actual.finish();
-        key.map_or(actual, |key| crate::crypto::rar5_tweak_blake2sp(&actual, key)) != want
-    });
-    if crc_bad || blake_bad {
-        let keyed = key.is_some();
-        return Err(pending
-            .context()
-            .integrity(RarIntegrityReason::PackedPiece { crc32: crc_bad, blake2sp: blake_bad, keyed }, keyed));
-    }
-    Ok(())
+    super::super::member::verify_packed(pending.context(), checks, crc, blake, pending.hash_key(checks.keyed))
 }
 
 struct SelectedSink<'a, 'out> {
