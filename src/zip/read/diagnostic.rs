@@ -608,6 +608,15 @@ impl<'a> BoundScope<'a> {
         };
         result.and(relative.finish(&self.context.ledger).map_err(DiagnosticBoundaryFault::Admission))
     }
+    fn inspect_current_protected_paths(&mut self) {
+        let sinks = self.state.sinks;
+        for path in &self.options.protected_paths {
+            if let Err(fault) = self.inspect_path(path, &sinks, true) {
+                self.boundary(fault);
+                break;
+            }
+        }
+    }
     #[allow(clippy::result_large_err)] // The prepare-only CWD carrier has two fixed owned cleanup slots.
     fn capture_cwd(&mut self) -> Result<policy::OwnedMetadata<u8>, policy::cwd::CwdFailure> {
         let ledger = self.context.ledger.view();
@@ -742,6 +751,9 @@ impl<'a> BoundScope<'a> {
                 self.boundary(f);
             }
         }
+        if self.evidence.boundary.is_none() && prepared.is_some_and(|d| !d.safe) {
+            self.inspect_current_protected_paths();
+        }
         let retired_safe_only =
             matches!(&self.source,SourceParts::Retired(retired)if retired.safe_only||!retired.confirmed_close);
         if self.evidence.boundary.is_some() || (self.evidence.source.is_some() || retired_safe_only) && !safe {
@@ -794,6 +806,9 @@ impl<'a> BoundScope<'a> {
             if let Err(f) = self.inspect_entry(ordinal, true, &sinks) {
                 self.boundary(f);
             }
+        }
+        if prepared.is_some_and(|d| !d.safe) {
+            self.inspect_current_protected_paths();
         }
         if self.evidence.failed() {
             // A render has occurred. Its provisional output and post-render
@@ -904,4 +919,15 @@ pub(super) fn direct_control_layout() -> [usize; 9] {
 #[cfg(test)]
 pub(super) fn direct_writer_control_layout() -> [usize; 2] {
     writer::control_layout()
+}
+
+#[cfg(test)]
+pub(super) fn protected_completion_control_layout() -> [usize; 5] {
+    [
+        std::mem::size_of::<[Option<Descriptor>; 2]>(),
+        std::mem::size_of::<std::collections::hash_set::Iter<'_, std::path::PathBuf>>(),
+        std::mem::size_of::<RetiredSource>(),
+        std::mem::size_of::<Evidence>(),
+        std::mem::size_of::<policy::OwnedMetadata<u8>>(),
+    ]
 }

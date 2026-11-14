@@ -694,7 +694,7 @@ fn relative_protected_cwd_is_once_charged_only_for_regular_sinks() {
         .run_with_context(&options, Some("pw"), &Cancellation::default(), &mut context, Regular(&mut out))
         .unwrap();
     assert_eq!(report.diagnostic_usage().cwd_metadata_attempts, if cfg!(target_os = "macos") { 3 } else { 1 });
-    assert_eq!(report.diagnostic_usage().target_metadata_attempts, 1);
+    assert_eq!(report.diagnostic_usage().target_metadata_attempts, 5); // Admission plus pre/post observations for two emitted events.
     assert_eq!(report.run_usage().path_steps, 1);
     assert_eq!(context.policy_metadata_usage().caller.live_capacity, 0);
     let (_file, mut session, mut options, mut context) = super::run::setup(&[Member::stored(b"a", b"a")]);
@@ -1757,4 +1757,244 @@ fn direct_foreign_context_refusal_preserves_the_other_live_capability() {
     let proof = ca.ledger.mint_reservation().unwrap();
     drop(ca);
     assert_eq!(proof.with_state(|s| s.policy_metadata.caller.live_capacity), 0);
+}
+
+#[test]
+fn r1_protected_name_budget_formula_and_attempts_are_explicit() {
+    for retries in [0, 16] {
+        for (protected, operations, metadata) in [(0, 20, 44), (1, 28, 52), (2, 36, 60)] {
+            let (_file, mut session, _options, old) = direct_setup();
+            drop(old);
+            let overrides = EncryptedReadOverrides { interrupted_retries: Some(retries), ..Default::default() };
+            let context = EncryptedReadContext::for_projected(
+                &mut session,
+                ProjectedReadScope::Entry(0),
+                Some(64),
+                ZipReadOutput::Callback,
+                None,
+                &overrides,
+                &Cancellation::default(),
+            )
+            .unwrap();
+            let before = context.options.limits.io_attempts;
+            let bound = context.ledger.with_state(|s| s.bind_direct_diagnostics(protected, false, u128::MAX)).unwrap();
+            assert_eq!(bound, before + metadata * (u128::from(retries) + 1));
+            context
+                .ledger
+                .with_state(|s| s.charge_category(RunCategory::DiagnosticAdmissionOperations, operations))
+                .unwrap();
+            assert!(
+                matches!(context.ledger.with_state(|s|s.charge_category(RunCategory::DiagnosticAdmissionOperations,1)),Err(ReadFault::Limit{resource:ReadResource::Run(RunCategory::DiagnosticAdmissionOperations),limit,attempted})if limit==operations&&attempted==operations+1)
+            );
+        }
+    }
+}
+#[test]
+#[allow(clippy::result_large_err)]
+fn r1_protected_name_exact_and_one_under_admission_boundaries_preserve_effects() {
+    for limit in [3, 5, 6] {
+        let (_file, mut session, mut options, mut context) = direct_setup();
+        let cancel = Cancellation::default();
+        let protected = tempfile::NamedTempFile::new().unwrap();
+        options.protected_paths.insert(protected.path().to_path_buf());
+        let mut log = tempfile::tempfile().unwrap();
+        let token =
+            session.prepare_diagnostics(0, &options, &cancel, &mut context, ZipDiagnosticSink::Stderr, &log).unwrap();
+        assert_eq!(context.run_usage().diagnostic_admission_operations, 2);
+        context.ledger.with_state(|s| s.test_limit_category(RunCategory::DiagnosticAdmissionOperations, limit));
+        let operation = session.read_at_with_context(0, None, 64, &cancel, &mut context, |_| Ok(())).map(|()| true);
+        let mut renders = 0;
+        let (value, error, usage) = session
+            .emit_diagnostic(token, &mut context, operation, &mut log, |_, _, w| {
+                renders += 1;
+                w.write_fmt(format_args!("completion\n"))
+            })
+            .into_parts();
+        assert_eq!(value, Some(true));
+        assert_eq!(renders, usize::from(limit != 3));
+        assert_eq!(usage.accepted_bytes, if limit == 3 { 0 } else { 11 });
+        if limit == 6 {
+            assert!(error.is_none());
+            assert_eq!(usage.target_metadata_attempts, 3);
+        } else {
+            assert!(
+                matches!(error.unwrap().diagnostic_boundary_fault(),Some(DiagnosticBoundaryFault::Admission(ReadFault::Limit{resource:ReadResource::Run(RunCategory::DiagnosticAdmissionOperations),limit:actual,attempted}))if *actual==limit&&*attempted==limit+1)
+            );
+        }
+        assert_eq!(context.run_usage().diagnostic_admission_operations, limit);
+    }
+}
+
+#[test]
+#[allow(clippy::result_large_err)]
+fn r1_run_ended_keeps_original_protected_cwd_for_borrowed_and_retired_sources() {
+    const FLAG: &str = "ZIPFAST_R1_PROTECTED_RUN_END_CHILD";
+    if std::env::var_os(FLAG).is_none() {
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","zip::read::tests::diagnostic::r1_run_ended_keeps_original_protected_cwd_for_borrowed_and_retired_sources","--test-threads=1","--nocapture"]).env(FLAG,"1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    struct End {
+        log: File,
+        log_path: std::path::PathBuf,
+        protected: std::path::PathBuf,
+        cwd: std::path::PathBuf,
+        replace: bool,
+    }
+    impl ZipRunObserver for End {
+        fn prepare(&mut self, s: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            s.admit_sinks(None, Some(&self.log))?;
+            Ok(())
+        }
+        fn observe(&mut self, e: ZipRunEvent<'_>, s: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            if matches!(e, ZipRunEvent::RunEnded { .. }) {
+                if self.replace {
+                    std::fs::remove_file(&self.protected).unwrap();
+                    std::fs::hard_link(&self.log_path, &self.protected).unwrap();
+                }
+                std::env::set_current_dir(&self.cwd).unwrap();
+                s.emit(ZipDiagnosticSink::Stderr, &mut self.log, |_, w| w.write_fmt(format_args!("ended\n")))?;
+            }
+            Ok(())
+        }
+    }
+    let original_cwd = std::env::current_dir().unwrap();
+    for extract in [false, true] {
+        for owned in [false, true] {
+            for replace in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let other = tempfile::tempdir().unwrap();
+                std::env::set_current_dir(root.path()).unwrap();
+                let (_file, mut session, mut options, old) = direct_setup();
+                drop(old);
+                let cancel = Cancellation::default();
+                options.mode = if extract { crate::extract::Mode::Extract } else { crate::extract::Mode::Test };
+                options.dest = "out".into();
+                options.protected_paths.insert("protected".into());
+                let protected = root.path().join("protected");
+                let log_path = root.path().join("log");
+                std::fs::write(&protected, b"protected").unwrap();
+                std::fs::write(&log_path, b"prior").unwrap();
+                if replace {
+                    std::fs::write(other.path().join("protected"), b"unrelated").unwrap();
+                } else {
+                    std::fs::hard_link(&log_path, other.path().join("protected")).unwrap();
+                }
+                let log = std::fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+                let observer =
+                    End { log, log_path: log_path.clone(), protected, cwd: other.path().to_path_buf(), replace };
+                let result = if owned {
+                    super::super::run::with_opened_policy(
+                        session,
+                        &options,
+                        None,
+                        &cancel,
+                        &Default::default(),
+                        observer,
+                    )
+                } else {
+                    let output = if extract {
+                        ZipReadOutput::StagedFiles { destination: &options.dest }
+                    } else {
+                        ZipReadOutput::Discard
+                    };
+                    let mut context = EncryptedReadContext::for_projected(
+                        &mut session,
+                        ProjectedReadScope::AllRegular,
+                        None,
+                        output,
+                        None,
+                        &Default::default(),
+                        &cancel,
+                    )
+                    .unwrap();
+                    let result = session.run_with_context(&options, None, &cancel, &mut context, observer);
+                    assert_eq!(context.policy_metadata_usage().caller.live_capacity, 0);
+                    result
+                };
+                std::env::set_current_dir(&original_cwd).unwrap();
+                if replace {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error.diagnostic_boundary_fault(), Some(DiagnosticBoundaryFault::Refused { .. })));
+                    assert_eq!(error.partial_run().unwrap().files(), 1);
+                    assert_eq!(std::fs::read(&log_path).unwrap(), b"prior");
+                } else {
+                    assert_eq!(result.unwrap().files(), 1);
+                    assert_eq!(std::fs::read(&log_path).unwrap(), b"priorended\n");
+                }
+                if extract {
+                    assert_eq!(std::fs::read(root.path().join("out/entry")).unwrap(), b"payload");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn r1_final_policy_and_cwd_retire_once_after_each_observer_failure() {
+    struct Fail {
+        log: File,
+        phase: u8,
+    }
+    impl ZipRunObserver for Fail {
+        fn prepare(&mut self, scope: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            scope.admit_sinks(None, Some(&self.log))?;
+            if self.phase == 0 {
+                return Err(ZipSinkFault::StageChanged.into());
+            }
+            Ok(())
+        }
+        fn observe(&mut self, event: ZipRunEvent<'_>, _: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            let ended = matches!(event, ZipRunEvent::RunEnded { .. });
+            if ended == (self.phase == 2) { Err(ZipSinkFault::StageChanged.into()) } else { Ok(()) }
+        }
+    }
+    for extract in [false, true] {
+        for owned in [false, true] {
+            for phase in 0..3 {
+                let (_file, mut session, mut options, old) = direct_setup();
+                drop(old);
+                let dest = tempfile::tempdir().unwrap();
+                options.dest = dest.path().to_path_buf();
+                options.mode = if extract { crate::extract::Mode::Extract } else { crate::extract::Mode::Test };
+                options.protected_paths.insert(".".into());
+                let cancel = Cancellation::default();
+                let output = if extract {
+                    ZipReadOutput::StagedFiles { destination: &options.dest }
+                } else {
+                    ZipReadOutput::Discard
+                };
+                let mut context = EncryptedReadContext::for_projected(
+                    &mut session,
+                    ProjectedReadScope::AllRegular,
+                    None,
+                    output,
+                    None,
+                    &Default::default(),
+                    &cancel,
+                )
+                .unwrap();
+                let observer = Fail { log: tempfile::tempfile().unwrap(), phase };
+                let error = if owned {
+                    super::super::run::with_opened_context(session, &options, None, &cancel, &mut context, observer)
+                } else {
+                    session.run_with_context(&options, None, &cancel, &mut context, observer)
+                }
+                .unwrap_err();
+                assert!(error.diagnostic_fault().is_some());
+                assert_eq!(context.policy_metadata_usage().caller.live_allocations, 0);
+                assert_eq!(context.policy_metadata_usage().caller.live_capacity, 0);
+                assert!(context.action.as_ref().unwrap().policy.is_none());
+                assert_eq!(error.partial_run().unwrap().files(), u64::from(phase != 0));
+                if extract {
+                    assert_eq!(dest.path().join("entry").exists(), phase != 0);
+                }
+            }
+        }
+    }
 }

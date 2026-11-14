@@ -104,7 +104,15 @@ the completion renderer cannot then write into that same payload file. Pipes,
 sockets, TTYs and the exact native null device may be shared. The classifier
 recognizes only macOS character device 3:2 and Linux 1:3 as null, using its
 existing descriptor observation; other non-TTY character devices remain refused.
-Descriptor/source/target observations are repeated at final rendering. No
+Descriptor/source/target observations are repeated at final rendering. Regular
+sinks also recheck every current protected name before and after emission,
+following symlinks and using the original frozen CWD for relative names in both
+Test and Extract modes. Stable substitutions before emission refuse rendering;
+a substitution observed after writing retains the actual accepted-byte receipt.
+These bounded observations do not make namespace changes inside an unobservable
+syscall or write interval atomic. The checked diagnostic allowance includes two
+additional path operations per protected name per possible emission, together
+with their metadata and retry attempts. No
 unchecked fallback is permitted after an admission, formatting or write refusal.
 
 Bootstrap/factory failures before a prepared context keep the terminal-only

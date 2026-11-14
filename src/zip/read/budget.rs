@@ -717,10 +717,18 @@ impl LedgerState {
         }
         let events = checked_sum(records, 2)?;
         let groups = checked_sum(2, product(2, events)?)?;
-        let operations =
-            [4, product(4, events)?, product(2, candidates)?, product(2, protected)?, product(2, records)?]
-                .into_iter()
-                .try_fold(0, checked_sum)?;
+        // Admission may lstat+stat each protected name. Each possible
+        // emission then performs one following stat before and after writing.
+        let operations = [
+            4,
+            product(4, events)?,
+            product(2, candidates)?,
+            product(2, protected)?,
+            product(2, records)?,
+            product(product(2, protected)?, events)?,
+        ]
+        .into_iter()
+        .try_fold(0, checked_sum)?;
         let metadata = checked_sum(checked_sum(product(3, groups)?, operations)?, if cwd { 5 } else { 0 })?;
         if cwd {
             plan.bounds.path_steps = checked_sum(plan.bounds.path_steps, 1)?;

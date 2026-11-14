@@ -1017,3 +1017,246 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
         assert_eq!(std::fs::read(source.path()).unwrap(), bytes);
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod protected_name_completion {
+    use super::fixture;
+    use std::io::Read;
+    use zipfast::extract::{Cancellation, Mode, Options, Overwrite, SelectedEntry};
+    use zipfast::zip::{
+        EncryptedReadContext, ProjectedReadScope, ProjectedReadSession, ReadSession, ZipDiagnosticSink, ZipReadOutput,
+        ZipReadStage,
+    };
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn current_protected_name_substitution_is_checked_for_all_owners_before_and_after_completion() {
+        for owner in 0..3 {
+            for extract in [false, true] {
+                for symlink in [false, true] {
+                    for post in [false, true] {
+                        let root = tempfile::tempdir().unwrap();
+                        let source = root.path().join("source.zip");
+                        let bytes =
+                            fixture::build(&[fixture::Member::stored(b"entry", b"payload")], &[0], b"", b"", false)
+                                .bytes;
+                        std::fs::write(&source, &bytes).unwrap();
+                        let dest = root.path().join("out");
+                        std::fs::create_dir(&dest).unwrap();
+                        std::fs::write(dest.join("entry"), b"prior target").unwrap();
+                        let protected = root.path().join("protected");
+                        let log_path = root.path().join("log");
+                        std::fs::write(&protected, b"protected").unwrap();
+                        std::fs::write(&log_path, b"prior").unwrap();
+                        let mut log = std::fs::OpenOptions::new().read(true).append(true).open(&log_path).unwrap();
+                        let cancel = Cancellation::default();
+                        let options = Options {
+                            mode: if extract { Mode::Extract } else { Mode::Test },
+                            dest: dest.clone(),
+                            overwrite: Overwrite::Skip,
+                            flatten: false,
+                            threads: Some(1),
+                            protected_paths: [protected.clone()].into_iter().collect(),
+                            parallel_min: None,
+                        };
+                        let output = || {
+                            if extract {
+                                ZipReadOutput::StagedFiles { destination: &options.dest }
+                            } else {
+                                ZipReadOutput::Callback
+                            }
+                        };
+                        let replace = || {
+                            std::fs::remove_file(&protected).unwrap();
+                            if symlink {
+                                std::os::unix::fs::symlink(&log_path, &protected).unwrap();
+                            } else {
+                                std::fs::hard_link(&log_path, &protected).unwrap();
+                            }
+                        };
+                        let mut rendered = false;
+                        macro_rules! emit {
+                            ($session:ident,$context:ident,$token:expr,$operation:expr,$method:ident) => {{
+                                let token = $token;
+                                let operation = $operation;
+                                assert_eq!(operation.as_ref().ok(), Some(&!extract));
+                                if !post {
+                                    replace();
+                                }
+                                $session.$method(token, &mut $context, operation, &mut log, |_, _, writer| {
+                                    rendered = true;
+                                    writer.write_fmt(format_args!("completion\n"))?;
+                                    if post {
+                                        replace();
+                                    }
+                                    Ok(())
+                                })
+                            }};
+                        }
+                        let completion = match owner {
+                            0 => {
+                                let mut session = ProjectedReadSession::open(&source, &cancel).unwrap();
+                                let mut context = EncryptedReadContext::for_projected(
+                                    &mut session,
+                                    ProjectedReadScope::Entry(0),
+                                    Some(64),
+                                    output(),
+                                    None,
+                                    &Default::default(),
+                                    &cancel,
+                                )
+                                .unwrap();
+                                emit!(
+                                    session,
+                                    context,
+                                    session
+                                        .prepare_diagnostics(
+                                            0,
+                                            &options,
+                                            &cancel,
+                                            &mut context,
+                                            ZipDiagnosticSink::Stderr,
+                                            &log
+                                        )
+                                        .unwrap(),
+                                    if extract {
+                                        ZipReadStage::prepare_file(
+                                            session.stage_entry(0).unwrap(),
+                                            std::path::Path::new("entry"),
+                                            &options,
+                                            &cancel,
+                                            &mut context,
+                                        )
+                                        .map(|stage| {
+                                            assert!(stage.is_none());
+                                            false
+                                        })
+                                    } else {
+                                        session
+                                            .read_at_with_context(0, None, 64, &cancel, &mut context, |_| Ok(()))
+                                            .map(|()| true)
+                                    },
+                                    emit_diagnostic
+                                )
+                            }
+                            1 => {
+                                let mut session = ReadSession::open(&source).unwrap();
+                                let id = session.metadata().entry_id(0).unwrap();
+                                let mut context = EncryptedReadContext::for_session(
+                                    &mut session,
+                                    &id,
+                                    Some(64),
+                                    output(),
+                                    None,
+                                    &Default::default(),
+                                    &cancel,
+                                )
+                                .unwrap();
+                                emit!(
+                                    session,
+                                    context,
+                                    session
+                                        .prepare_diagnostics(
+                                            &id,
+                                            &options,
+                                            &cancel,
+                                            &mut context,
+                                            ZipDiagnosticSink::Stderr,
+                                            &log
+                                        )
+                                        .unwrap(),
+                                    if extract {
+                                        let mut selected = session.select(&id, 64, cancel.clone()).unwrap();
+                                        ZipReadStage::prepare_file(
+                                            selected.stage_entry().unwrap(),
+                                            std::path::Path::new("entry"),
+                                            &options,
+                                            &cancel,
+                                            &mut context,
+                                        )
+                                        .map(|stage| {
+                                            assert!(stage.is_none());
+                                            false
+                                        })
+                                    } else {
+                                        session
+                                            .select(&id, 64, cancel.clone())
+                                            .unwrap()
+                                            .read_with_context(None, &mut context, |_| Ok(()))
+                                            .map(|()| true)
+                                    },
+                                    emit_diagnostic
+                                )
+                            }
+                            _ => {
+                                let mut session = SelectedEntry::open_cancelable_with_zip_limit(
+                                    &source,
+                                    0,
+                                    None,
+                                    64,
+                                    None,
+                                    cancel.clone(),
+                                )
+                                .unwrap();
+                                let mut context =
+                                    session.zip_read_context(None, output(), &Default::default()).unwrap().unwrap();
+                                emit!(
+                                    session,
+                                    context,
+                                    session
+                                        .prepare_zip_diagnostics(
+                                            &options,
+                                            &mut context,
+                                            ZipDiagnosticSink::Stderr,
+                                            &log
+                                        )
+                                        .unwrap()
+                                        .unwrap(),
+                                    if extract {
+                                        ZipReadStage::prepare_file(
+                                            session.zip_stage_entry().unwrap().unwrap(),
+                                            std::path::Path::new("entry"),
+                                            &options,
+                                            &cancel,
+                                            &mut context,
+                                        )
+                                        .map(|stage| {
+                                            assert!(stage.is_none());
+                                            false
+                                        })
+                                    } else {
+                                        session.read_with_zip_context(None, &mut context, |_| Ok(())).map(|()| true)
+                                    },
+                                    emit_zip_diagnostic
+                                )
+                            }
+                        };
+                        let (value, error, usage) = completion.into_parts();
+                        assert_eq!(value, Some(!extract));
+                        assert!(
+                            error.is_some(),
+                            "owner={owner} extract={extract} symlink={symlink} post={post} rendered={rendered} accepted={}",
+                            usage.accepted_bytes
+                        );
+                        assert!(
+                            error.unwrap().diagnostic_boundary_fault().is_some(),
+                            "owner={owner} extract={extract} symlink={symlink} post={post}"
+                        );
+                        assert_eq!(rendered, post);
+                        assert_eq!(usage.accepted_bytes, if post { 11 } else { 0 });
+                        let expected = if post { b"priorcompletion\n".as_slice() } else { b"prior".as_slice() };
+                        assert_eq!(std::fs::read(&log_path).unwrap(), expected);
+                        assert_eq!(std::fs::read(&protected).unwrap(), expected);
+                        assert_eq!(std::fs::read(dest.join("entry")).unwrap(), b"prior target");
+                        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+                        let mut held = Vec::new();
+                        use std::io::{Seek, SeekFrom};
+                        log.seek(SeekFrom::Start(0)).unwrap();
+                        log.read_to_end(&mut held).unwrap();
+                        assert_eq!(held, expected);
+                    }
+                }
+            }
+        }
+    }
+}

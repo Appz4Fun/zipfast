@@ -2682,8 +2682,19 @@ fn direct_completion_prepare_and_render_have_separate_bounded_control_phases() {
     let persistent = d[2] + d[3];
     let prepare =
         2 * e + 2 * r + persistent + d[8] + d[5] + d[4] + builder + scratch + backend.max(3 * stat + 1024 + 44) + 512;
-    let render =
-        2 * e.max(d[6]) + 2 * r + persistent + d[8] + d[5] + d[4] + w.iter().sum::<usize>() + 3 * stat + scratch + 512;
+    let protected = diagnostic::protected_completion_control_layout();
+    let render = protected[0]
+        + protected[1]
+        + 2 * e.max(d[6])
+        + 2 * r
+        + persistent
+        + d[8]
+        + d[5]
+        + d[4]
+        + w.iter().sum::<usize>()
+        + 3 * stat
+        + scratch
+        + 512;
     eprintln!(
         "ACTUAL direct writer/Stream={w:?} metadata_builder_fields={builder} scratch_control={scratch} prepare={prepare} render={render} component={} diagnostic_component={}",
         shared::SHARED_LEDGER_CAPACITY + 4096 + 3 * 65536 + 16384,
@@ -2695,5 +2706,46 @@ fn direct_completion_prepare_and_render_have_separate_bounded_control_phases() {
     }
     const {
         assert!(shared::SHARED_LEDGER_CAPACITY + 4096 + 65536 + 16384 <= 256 << 10);
+    }
+}
+
+#[test]
+fn r1_final_run_render_and_retirement_have_bounded_full_control_inventories() {
+    let d = diagnostic::direct_control_layout();
+    let w = diagnostic::direct_writer_control_layout();
+    let p = diagnostic::protected_completion_control_layout();
+    let run = super::super::run::final_completion_control_layout();
+    let error = std::mem::size_of::<ZipReadError>();
+    let cleanup = std::mem::size_of::<ObjectCleanupReport>();
+    let stat = std::mem::size_of::<libc::stat>();
+    let scratch = std::mem::size_of::<policy::PolicyScratch<'_>>();
+    // Run Completion already includes its terminal error and partial report.
+    // During rendering, the moving second error is not assembled yet. Count
+    // the FULL reserved action auxiliary and original frozen policy alongside
+    // the retired source, full diagnostic state, scope, writer and helper frame.
+    let render = run[0]
+        + 2 * cleanup
+        + d[2]
+        + d[8]
+        + d[5]
+        + d[4]
+        + run[1]
+        + p[2]
+        + w.iter().sum::<usize>()
+        + p[0]
+        + p[1]
+        + 3 * stat
+        + scratch
+        + 512;
+    // The scope/writer/helper are gone before evidence is merged and owned
+    // metadata is retired. Count the moving error, evidence, CWD metadata and
+    // both the original policy slot and its moving cleanup value in this phase.
+    let retirement = run[0] + error + 2 * cleanup + d[2] + d[8] + p[2] + p[3] + p[4] + 2 * run[1] + 512;
+    eprintln!(
+        "ACTUAL R1 sinks/iterator/retired/evidence/cwd={p:?} run_completion/frozen_policy={run:?} final_render={render} final_retirement={retirement}"
+    );
+    assert!(render <= 16384 && retirement <= 16384);
+    const {
+        assert!(shared::SHARED_LEDGER_CAPACITY + 4096 + 3 * 65536 + 16384 <= 256 << 10);
     }
 }
