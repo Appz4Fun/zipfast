@@ -170,7 +170,6 @@ pub struct ProgressiveSession {
     history: Option<crate::rar5::unpack::Unpacker>,
     history_failure: Option<u64>,
     rar4_independent: Option<rar4::Independent>,
-    header_witness: crate::blake2sp::Blake2sp,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -276,7 +275,6 @@ impl ProgressiveSession {
             history: None,
             history_failure: None,
             rar4_independent: None,
-            header_witness: crate::blake2sp::Blake2sp::new(),
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -448,7 +446,8 @@ impl ProgressiveSession {
                             self.volume,
                             self.driver.observed_info(self.volume),
                             &self.model,
-                            self.header_witness.clone().finish(),
+                            &self.witnesses,
+                            &self.usage,
                         )?;
                         self.machine.as_ref().expect("machine").check_rar4_binding(bound.binding())?;
                     }
@@ -529,7 +528,6 @@ impl ProgressiveSession {
                         Poll::Ready(Ok(SourceStep::Filled { offset, count })) => {
                             self.cursor = offset + count as u64;
                             work += count as u64;
-                            self.header_witness.update(&self.buffer[..count]);
                             recovery::record_header(
                                 &mut self.witnesses,
                                 self.volume,
@@ -899,6 +897,7 @@ impl ProgressiveSession {
                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?;
             let core = rar4::core_frame(member, &header)?;
             self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<rar4::Independent>() as u64)?;
+            let witness = recovery::WireSnapshot::capture_current(&self.witnesses, self.volume, &self.usage)?;
             let (machine, binding) = MemberMachine::new_rar4(
                 &header,
                 context,
@@ -907,15 +906,8 @@ impl ProgressiveSession {
                 &self.usage,
                 &self.control,
             )?;
-            self.rar4_independent = Some(rar4::Independent::new(
-                member,
-                self.volume,
-                source,
-                binding,
-                &header,
-                &wire,
-                self.header_witness.clone().finish(),
-            ));
+            self.rar4_independent =
+                Some(rar4::Independent::new(member, self.volume, source, binding, &header, &wire, witness));
             Some(machine)
         } else if decode {
             let decoder = if header.method != 0 {
@@ -1108,7 +1100,8 @@ impl ProgressiveSession {
                 self.volume,
                 self.driver.observed_info(self.volume),
                 &self.model,
-                self.header_witness.clone().finish(),
+                &self.witnesses,
+                &self.usage,
             )?;
         }
         if let Some(size) = physical.unpacked_size

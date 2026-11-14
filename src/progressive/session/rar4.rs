@@ -62,7 +62,7 @@ pub(super) struct Independent {
     extent: std::ops::Range<u64>,
     data_at: u64,
     crc: Option<u32>,
-    witness: [u8; 32],
+    witness: recovery::WireSnapshot,
 }
 impl Independent {
     #[allow(clippy::too_many_arguments)]
@@ -73,20 +73,22 @@ impl Independent {
         core: CoreBinding,
         h: &FileHeader,
         wire: &FileWire,
-        witness: [u8; 32],
+        witness: recovery::WireSnapshot,
     ) -> Self {
         Self { member, volume, source, core, extent: wire.extent.clone(), data_at: h.data_at, crc: h.crc32, witness }
     }
     pub(super) fn binding(&self) -> CoreBinding {
         self.core
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn validate(
         &self,
         member: Option<MemberId>,
         volume: u32,
         source: Option<SourceInfo>,
         model: &PhysicalModel,
-        witness: [u8; 32],
+        witnesses: &[recovery::WireVolume],
+        usage: &Usage,
     ) -> ProgressiveResult<()> {
         let current = source.ok_or_else(invalid)?;
         if current.id != self.source.id
@@ -116,7 +118,7 @@ impl Independent {
             || h.final_checks != Some(p.checks)
             || p.checks.keyed
             || p.checks.blake2sp.is_some()
-            || witness != self.witness
+            || !self.witness.matches_current(witnesses, volume, usage)?
         {
             return Err(invalid());
         }
@@ -177,6 +179,38 @@ mod tests {
     }
 
     #[test]
+    fn c1_existing_witness_snapshot_is_bounded_and_owner_specific() {
+        let producer = Usage::new(ProgressiveLimits::default());
+        let mut volumes = Vec::new();
+        recovery::record_header(&mut volumes, 0, 7, b"header", &producer).unwrap();
+        let bytes = std::mem::size_of::<recovery::WireSnapshot>() as u64;
+        for (metadata_bytes, source_bookkeeping, resource) in
+            [(bytes - 1, 1, Resource::MetadataBytes), (bytes, 0, Resource::SourceBookkeeping)]
+        {
+            let usage = Usage::new(ProgressiveLimits { metadata_bytes, source_bookkeeping, ..Default::default() });
+            let error = recovery::WireSnapshot::capture_current(&volumes, 0, &usage).err().unwrap();
+            assert!(matches!(error.kind, FailureKind::Limit { resource: got, .. } if got == resource));
+        }
+        let usage =
+            Usage::new(ProgressiveLimits { metadata_bytes: bytes, source_bookkeeping: 2, ..Default::default() });
+        let snapshot = recovery::WireSnapshot::capture_current(&volumes, 0, &usage).unwrap();
+        assert!(snapshot.matches_current(&volumes, 0, &usage).unwrap());
+        assert!(matches!(
+            snapshot.matches_current(&volumes, 0, &usage).unwrap_err().kind,
+            FailureKind::Limit { resource: Resource::SourceBookkeeping, .. }
+        ));
+        assert!(matches!(
+            usage.charge(Resource::MetadataBytes, 1).unwrap_err().kind,
+            FailureKind::Limit { resource: Resource::MetadataBytes, .. }
+        ));
+        let mut foreign = Vec::new();
+        recovery::record_header(&mut foreign, 0, 7, b"header", &producer).unwrap();
+        assert!(!snapshot.matches_current(&foreign, 0, &producer).unwrap());
+        assert!(!snapshot.matches_current(&volumes, 1, &producer).unwrap());
+        recovery::record_header(&mut volumes, 0, 13, b"later", &producer).unwrap();
+        assert!(!snapshot.matches_current(&volumes, 0, &producer).unwrap());
+    }
+    #[test]
     fn c1_native_short_write_and_failed_write_keep_output_authority() {
         for fail in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -236,7 +270,7 @@ mod tests {
     }
     #[test]
     fn c1_witness_and_foreign_codec_binding_cannot_publish() {
-        for witness in [false, true] {
+        for mutation in 0..3 {
             let dir = tempfile::tempdir().unwrap();
             let bytes = archive(&[member(
                 b"one",
@@ -259,10 +293,15 @@ mod tests {
                     break;
                 }
             }
-            if witness {
-                s.header_witness.update(b"foreign header");
-            } else {
-                s.rar4_independent.as_mut().unwrap().core.member_seq += 1;
+            match mutation {
+                0 => s.rar4_independent.as_mut().unwrap().core.member_seq += 1,
+                1 => recovery::record_header(&mut s.witnesses, s.volume, 999, b"new header", &s.usage).unwrap(),
+                _ => {
+                    let mut foreign = Vec::new();
+                    recovery::record_header(&mut foreign, s.volume, 0, b"foreign header", &s.usage).unwrap();
+                    s.rar4_independent.as_mut().unwrap().witness =
+                        recovery::WireSnapshot::capture_current(&foreign, s.volume, &s.usage).unwrap();
+                }
             }
             let mut refused = false;
             for _ in 0..1000 {
