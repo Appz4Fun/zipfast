@@ -1,4 +1,4 @@
-# Progressive RAR5 sessions
+# Progressive RAR sessions
 
 `zipfast::progressive::ProgressiveSession` owns a `VolumeSource` and
 `ProgressiveOptions`. Call `poll_event` with your current task context until it
@@ -121,8 +121,31 @@ without a safe boundary and existing independent-member integrity failures remai
 terminal. No byte scanning invents a reset point.
 
 All redirection kinds remain typed `RarUnsupported::Redirection { kind }`, as in
-the complete extractor; this entrypoint creates no links. RAR4 codecs and other formats remain outside this entrypoint's supported scope.
-Stored RAR5 recovery is described below. Full original compatibility remains open.
+the complete extractor; this entrypoint creates no links. Stored recovery is
+available for the admitted RAR4 and RAR5 subsets below. Full original
+compatibility remains open.
+
+## RAR4 capability boundary
+
+| Progressive RAR4 case | Current admission |
+| --- | --- |
+| Plain Stored, unpack version 20 or 29 | Supported with declared size and CRC32 checks. |
+| Plain split Stored | Supported with exact raw-name/method/version/dictionary continuity, nonfinal packed-part CRC32 and final whole-inner CRC32. |
+| Plain Stored holes and patching | Shared sparse/zero holes, bounded patching and whole-inner read-back verification; wrong patches and failed declared checks stay failed. |
+| Encrypted payload or headers | Typed unsupported; legacy AES admission remains separate work. |
+| Compressed, solid, RAR1.5/2, PPM and VM | Typed unsupported through this entrypoint; original engines and qualified continuation remain required work. |
+| Ambiguous/unknown RAR4 unpacked size, old revisions, special file types | Typed unsupported. |
+
+Plain RAR4 framing uses the same incremental producer for `Volume`, catalogue
+and progressive reads. Header waits retain exact parser state and raw encoded
+names; a header hole stops with `HeaderHole`. A set cannot switch archive format
+between volumes. The complete-file API retains its existing payload admission
+policy, including its split/encryption refusals; this table describes progressive
+admission only. No codec state is exposed as a verified restart point.
+
+Stored support is an increment, not completion of RAR4 or the full archive
+request. The 500,000,000-byte, ten-volume article-loss acceptance remains required
+separate correctness qualification.
 
 ## Stored holes and repair
 

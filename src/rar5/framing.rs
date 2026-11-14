@@ -21,6 +21,9 @@ use crate::error::{RarFailure, RarFault, RarIntegrityReason, RarInternal, RarPas
 use crate::progressive::{FailureKind, ProgressiveFailure, ProgressiveResult};
 use std::{ops::Range, path::PathBuf};
 
+#[path = "reader/rar4.rs"]
+mod rar4;
+
 #[derive(Debug)]
 pub(crate) enum FramingError {
     Rar(RarFault),
@@ -82,6 +85,8 @@ enum Phase {
     Body,
     EncryptedFirst,
     EncryptedBody,
+    Rar4Prefix,
+    Rar4Body,
 }
 
 pub(crate) struct HeaderParser {
@@ -105,6 +110,8 @@ pub(crate) struct HeaderParser {
     failed: bool,
     signature: Option<SignatureParser>,
     fault_path_admitted: bool,
+    format: RarFormat,
+    rar4_main: Option<MainHeader>,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -129,7 +136,16 @@ impl HeaderParser {
             failed: false,
             signature: None,
             fault_path_admitted: false,
+            format: RarFormat::Rar5,
+            rar4_main: None,
         }
+    }
+    pub(crate) fn format(&self) -> RarFormat {
+        self.format
+    }
+    pub(crate) fn set_format(&mut self, format: RarFormat) {
+        self.format = format;
+        self.reset();
     }
     pub(crate) fn progressive(path: PathBuf, at: u64, usage: crate::progressive::Usage) -> Self {
         let mut parser = Self::new(path, at, None, true);
@@ -165,8 +181,20 @@ impl HeaderParser {
         self.size = 0;
         self.size_len = 0;
         self.counted = false;
-        self.phase = if self.encrypted() { Phase::EncryptedFirst } else { Phase::Prefix };
-        self.need = if self.encrypted() { 32 } else { 4 };
+        self.phase = if self.format == RarFormat::Rar4 {
+            Phase::Rar4Prefix
+        } else if self.encrypted() {
+            Phase::EncryptedFirst
+        } else {
+            Phase::Prefix
+        };
+        self.need = if self.format == RarFormat::Rar4 {
+            7
+        } else if self.encrypted() {
+            32
+        } else {
+            4
+        };
     }
     pub(crate) fn advance(&mut self, bytes: &[u8]) -> ProgressiveResult<(usize, ParserStep)> {
         self.advance_core(bytes).map_err(|error| {
@@ -216,6 +244,13 @@ impl HeaderParser {
     }
     /// Canonical core; the complete adapter retains its exact RarFault without conversion.
     pub(crate) fn advance_core(&mut self, bytes: &[u8]) -> std::result::Result<(usize, ParserStep), FramingError> {
+        self.advance_core_budget(bytes, None)
+    }
+    pub(super) fn advance_core_budget(
+        &mut self,
+        bytes: &[u8],
+        budget: Option<&super::session::ScanBudget<'_>>,
+    ) -> std::result::Result<(usize, ParserStep), FramingError> {
         if self.failed {
             if self.usage.is_some() {
                 return Err(FramingError::Progressive(ProgressiveFailure::new(FailureKind::Malformed(
@@ -226,13 +261,17 @@ impl HeaderParser {
                 .framing("parser stopped after failure", Error::Corrupt("parser stopped after failure"))
                 .into());
         }
-        let result = self.advance_core_impl(bytes);
+        let result = self.advance_core_impl(bytes, budget);
         if result.is_err() {
             self.failed = true;
         }
         result
     }
-    fn advance_core_impl(&mut self, bytes: &[u8]) -> std::result::Result<(usize, ParserStep), FramingError> {
+    fn advance_core_impl(
+        &mut self,
+        bytes: &[u8],
+        budget: Option<&super::session::ScanBudget<'_>>,
+    ) -> std::result::Result<(usize, ParserStep), FramingError> {
         if let Some(usage) = &self.usage
             && !self.fault_path_admitted
         {
@@ -243,12 +282,10 @@ impl HeaderParser {
         if let Some(signature) = &mut self.signature {
             let (used, found) = signature.advance(bytes);
             if let Some((at, format)) = found {
-                if format != RarFormat::Rar5 {
-                    return Err(FramingError::Progressive(ProgressiveFailure::new(FailureKind::UnsupportedMethod)));
-                }
+                self.set_format(format);
                 self.signature = None;
                 self.at = at;
-                let (n, step) = self.advance_core(&bytes[used..])?;
+                let (n, step) = self.advance_core_budget(&bytes[used..], budget)?;
                 return Ok((used + n, step));
             }
             if signature.offset >= MAX_SFX + SIGNATURE.len() as u64 {
@@ -290,6 +327,37 @@ impl HeaderParser {
                 return Ok((used, ParserStep::Need { offset, len: self.need - self.buffer.len() }));
             }
             match self.phase {
+                Phase::Rar4Prefix => {
+                    let kind = self.buffer[2];
+                    let flags = u16::from_le_bytes([self.buffer[3], self.buffer[4]]);
+                    let size = usize::from(u16::from_le_bytes([self.buffer[5], self.buffer[6]]));
+                    if size < 7
+                        || self
+                            .at
+                            .checked_add(size as u64)
+                            .is_none_or(|end| self.complete_len.is_some_and(|len| end > len))
+                    {
+                        return Err(self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")).into());
+                    }
+                    if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
+                        return Err(self.rar4_unsupported("embedded comment").into());
+                    }
+                    if let Some(budget) = budget {
+                        budget.temporary(size as u64 * 12)?;
+                    }
+                    if let Some(usage) = &self.usage {
+                        usage.check(crate::progressive::Resource::HeaderAllocation, size as u64 * 12)?;
+                    }
+                    self.phase = Phase::Rar4Body;
+                    self.resized_need(size)?;
+                }
+                Phase::Rar4Body => {
+                    let frame = self.parse_rar4(budget)?;
+                    self.ended = matches!(frame.block, Block::End { .. });
+                    self.at = frame.data_end;
+                    self.reset();
+                    return Ok((used, ParserStep::Frame(frame)));
+                }
                 Phase::Prefix => {
                     self.phase = Phase::Size;
                     self.resized_need(5)?;

@@ -725,7 +725,11 @@ impl MemberMachine {
         decoder: Option<Unpacker>,
     ) -> crate::progressive::ProgressiveResult<Self> {
         use crate::progressive::{FailureKind, ProgressiveFailure, Resource};
-        if header.format != super::RarFormat::Rar5 || header.algorithm != 0 || header.method > 5 {
+        if header.format == super::RarFormat::Rar4 {
+            if let Some(reason) = header.rar4_progressive_unsupported() {
+                return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(reason)))));
+            }
+        } else if header.algorithm != 0 || header.method > 5 {
             return Err(ProgressiveFailure::new(FailureKind::UnsupportedMethod));
         }
         let size = (!header.size_unknown()).then_some(header.unpacked_size);

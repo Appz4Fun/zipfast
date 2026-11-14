@@ -52,7 +52,13 @@ pub(crate) struct PhysicalMember {
 
 /// The same continuation encoding and size checks serve catalogue and progressive adapters.
 pub(crate) fn continuation_issue(initial: &PhysicalMember, header: &FileHeader) -> Option<RarIntegrityReason> {
-    if (header.method == 0) != (initial.header.method == 0)
+    if header.format != initial.header.format
+        || (header.format == super::RarFormat::Rar4
+            && (header.method != initial.header.method
+                || header.dictionary != initial.header.dictionary
+                || header.rar4.map(|m| (m.method, m.unpack_version))
+                    != initial.header.rar4.map(|m| (m.method, m.unpack_version))))
+        || (header.method == 0) != (initial.header.method == 0)
         || header.algorithm != initial.header.algorithm
         || header.encrypted != initial.header.encrypted
         || header.is_dir() != initial.header.is_dir()

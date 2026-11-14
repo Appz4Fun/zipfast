@@ -16,8 +16,6 @@
 
 //! Walks one RAR 5.0 volume block by block.
 
-mod rar4;
-
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -326,7 +324,6 @@ pub struct Volume {
     header_key: Option<crate::crypto::Rar5Keys>,
     parser: Option<super::framing::HeaderParser>,
     format: RarFormat,
-    rar4_main_seen: bool,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
@@ -419,7 +416,6 @@ impl Volume {
             header_key: None,
             parser: None,
             format,
-            rar4_main_seen: false,
         };
         match vol.next_block_impl(detailed, budget, true)? {
             Some((Block::Main(m), _, _)) => vol.main = m,
@@ -508,28 +504,18 @@ impl Volume {
         self.header_fault(RarIntegrityReason::HeaderFraming(reason), legacy, true)
     }
 
-    fn parse_fault(&self, e: Error) -> RarFault {
-        match e {
-            Error::Truncated => self.header_fault(RarIntegrityReason::TruncatedHeader, e, true),
-            Error::Corrupt(reason) => self.framing(reason, e),
-            _ => RarFault::new(RarFailure::Internal(RarInternal::Invariant("unexpected RAR header error")), e),
-        }
-    }
-
     fn next_block_impl(
         &mut self,
         detailed: bool,
         mut budget: Option<&mut ScanBudget<'_>>,
         catalogue_main: bool,
     ) -> RarResult<Option<ParsedBlock>> {
-        if self.format == RarFormat::Rar4 {
-            return self.next_rar4(budget);
-        }
         use super::framing::{HeaderParser, ParserStep};
-        let mut parser = self
-            .parser
-            .take()
-            .unwrap_or_else(|| HeaderParser::new(self.path.clone(), self.next, Some(self.len), budget.is_some()));
+        let mut parser = self.parser.take().unwrap_or_else(|| {
+            let mut parser = HeaderParser::new(self.path.clone(), self.next, Some(self.len), budget.is_some());
+            parser.set_format(self.format);
+            parser
+        });
         let result = (|| {
             loop {
                 if self.next >= self.len {
@@ -540,7 +526,8 @@ impl Volume {
                 } else {
                     self.src.seek(self.next);
                 }
-                let (_, mut step) = parser.advance_core(&[]).map_err(super::framing::FramingError::legacy)?;
+                let (_, mut step) =
+                    parser.advance_core_budget(&[], budget.as_deref()).map_err(super::framing::FramingError::legacy)?;
                 let frame = loop {
                     match step {
                         ParserStep::End => return Ok(None),
@@ -552,8 +539,9 @@ impl Volume {
                             let mut bytes = header_buffer(len)?;
                             let mut at = offset;
                             self.read_header_exact(&mut budget, &mut at, &mut bytes)?;
-                            let (used, next) =
-                                parser.advance_core(&bytes).map_err(super::framing::FramingError::legacy)?;
+                            let (used, next) = parser
+                                .advance_core_budget(&bytes, budget.as_deref())
+                                .map_err(super::framing::FramingError::legacy)?;
                             debug_assert_eq!(used, bytes.len());
                             step = next;
                         }
@@ -581,6 +569,9 @@ impl Volume {
                 }
                 if matches!(frame.block, Block::End { .. }) {
                     self.next = self.len;
+                }
+                if self.format == RarFormat::Rar4 && matches!(frame.block, Block::Unknown) {
+                    continue;
                 }
                 return Ok(Some((frame.block, frame.crypt, frame.wire)));
             }
@@ -733,7 +724,6 @@ mod tests {
             header_key: None,
             parser: None,
             format: RarFormat::Rar5,
-            rar4_main_seen: false,
         };
         let (send, recv) = sync_channel(1);
         let (spare, _) = channel();
@@ -770,7 +760,6 @@ mod tests {
             header_key: None,
             parser: None,
             format: RarFormat::Rar5,
-            rar4_main_seen: false,
         };
         let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
         else {

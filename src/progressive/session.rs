@@ -169,6 +169,7 @@ pub struct ProgressiveSession {
     history: Option<crate::rar5::unpack::Unpacker>,
     history_failure: Option<u64>,
     solid_archive: Option<bool>,
+    archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
     start_event: Option<ProgressiveEvent>,
     finalizer: Option<MemberMachine>,
@@ -272,6 +273,7 @@ impl ProgressiveSession {
             history: None,
             history_failure: None,
             solid_archive: None,
+            archive_format: None,
             disposition: Disposition::Write,
             start_event: None,
             finalizer: None,
@@ -660,6 +662,11 @@ impl ProgressiveSession {
                 self.parser.enable_encryption(password, params, &self.usage, &self.control)?;
             }
             Block::Main(main) => {
+                let format = self.parser.format();
+                if self.archive_format.is_some_and(|prior| prior != format) {
+                    return Err(ProgressiveFailure::new(FailureKind::Malformed("volume archive format changed")));
+                }
+                self.archive_format = Some(format);
                 let encrypted = self.parser.encrypted();
                 if self.header_encryption.is_some_and(|initial| initial != encrypted) {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("volume header encryption changed")));
@@ -680,6 +687,11 @@ impl ProgressiveSession {
                 self.main_seen = true;
             }
             Block::File(header) => {
+                if let Some(reason) = header.rar4_progressive_unsupported() {
+                    return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                        crate::error::RarFailure::Unsupported(reason),
+                    ))));
+                }
                 if !self.main_seen {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("member before main")));
                 }
@@ -751,6 +763,11 @@ impl ProgressiveSession {
     }
     fn start(&mut self, frame: PhysicalFrame) -> ProgressiveResult<ProgressiveEvent> {
         let Block::File(header) = frame.block else { unreachable!() };
+        if let Some(reason) = header.rar4_progressive_unsupported() {
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
+                reason,
+            )))));
+        }
         if header.split_before() {
             return Err(ProgressiveFailure::new(FailureKind::Malformed("orphan continuation")));
         }

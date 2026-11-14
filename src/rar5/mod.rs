@@ -252,19 +252,35 @@ pub struct FileHeader {
 impl FileHeader {
     pub(crate) fn rar4_unsupported(&self) -> Option<crate::error::RarUnsupported> {
         let raw = self.rar4?;
-        raw.unsupported(self.attributes).or_else(|| {
-            if self.solid {
-                Some(crate::error::RarUnsupported::Rar4Feature("solid payload"))
-            } else if self.is_dir()
-                && (self.packed_size != 0 || self.unpacked_size != 0 || self.crc32.is_some_and(|crc| crc != 0))
-            {
-                Some(crate::error::RarUnsupported::Rar4Feature("directory payload"))
+        raw.unsupported(self.attributes).or_else(|| self.rar4_common_unsupported())
+    }
+
+    fn rar4_common_unsupported(&self) -> Option<crate::error::RarUnsupported> {
+        if self.solid {
+            Some(crate::error::RarUnsupported::Rar4Feature("solid payload"))
+        } else if self.is_dir()
+            && (self.packed_size != 0 || self.unpacked_size != 0 || self.crc32.is_some_and(|crc| crc != 0))
+        {
+            Some(crate::error::RarUnsupported::Rar4Feature("directory payload"))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn rar4_progressive_unsupported(&self) -> Option<crate::error::RarUnsupported> {
+        let raw = self.rar4?;
+        if raw.method != 0x30 {
+            return Some(crate::error::RarUnsupported::Rar4Feature("compressed progressive payload"));
+        }
+        let independent = Rar4Metadata { flags: raw.flags & !3, ..raw };
+        independent.unsupported(self.attributes).or_else(|| self.rar4_common_unsupported()).or_else(|| {
+            if self.unpacked_size == u64::MAX || self.unpacked_size == u64::from(u32::MAX) {
+                Some(crate::error::RarUnsupported::Rar4Feature("unknown unpacked size"))
             } else {
                 None
             }
         })
     }
-
     pub fn is_dir(&self) -> bool {
         self.file_flags & FHFL_DIRECTORY != 0
     }
