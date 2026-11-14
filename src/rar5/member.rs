@@ -330,6 +330,11 @@ impl MemberMachine {
         if data.is_none() && self.cipher.as_ref().is_some_and(|c| c.stored_padding.is_none()) {
             return Err(ProgressiveFailure::new(FailureKind::DataHole));
         }
+        // Extraction admits the bounded scratch before entering this producer.
+        // A feed can complete up to one retained CBC block in addition to len.
+        if self.cipher.is_some() && len.checked_add(16).is_none_or(|n| n > self.scratch.capacity()) {
+            return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
+        }
         let result = (|| -> Result<()> {
             if let Some(bytes) = data {
                 self.packed(bytes)?;
@@ -347,6 +352,11 @@ impl MemberMachine {
                     known: true,
                     previous_known: true,
                 });
+                self.scratch.clear();
+                let mut hole = 0;
+                // Trimming follows processed blocks; evidence/delivered follow
+                // successful sink flushes, which may fail after a partial write.
+                let mut processed = self.delivered;
                 let mut at = 0;
                 let result = (|| -> Result<()> {
                     while at < len {
@@ -373,26 +383,34 @@ impl MemberMachine {
                         state.previous_known = state.known;
                         state.used = 0;
                         state.known = true;
-                        let bytes = cipher.trim_stored(&plain, self.delivered)?;
+                        let bytes = cipher.trim_stored(&plain, processed)?;
+                        processed =
+                            processed.checked_add(bytes.len() as u64).ok_or(Error::Corrupt("inner size overflow"))?;
                         if !bytes.is_empty() {
                             if valid {
-                                sink.put(bytes)?;
-                                checks.hasher.update(bytes);
-                                if let Some(b) = &mut checks.blake {
-                                    b.update(bytes);
+                                if hole != 0 || self.scratch.capacity() - self.scratch.len() < bytes.len() {
+                                    flush_stored_run(&mut self.scratch, &mut hole, checks, &mut self.delivered, sink)?;
                                 }
+                                // Capacity was admitted before processing; never
+                                // let extend allocate in the block loop.
+                                if self.scratch.capacity() - self.scratch.len() < bytes.len() {
+                                    return Err(Error::Corrupt("unadmitted Stored scratch"));
+                                }
+                                self.scratch.extend_from_slice(bytes);
                             } else {
-                                sink.hole(bytes.len() as u64)?;
+                                if !self.scratch.is_empty() {
+                                    flush_stored_run(&mut self.scratch, &mut hole, checks, &mut self.delivered, sink)?;
+                                }
+                                hole = hole
+                                    .checked_add(bytes.len() as u64)
+                                    .ok_or(Error::Corrupt("inner size overflow"))?;
                             }
-                            checks.bytes = checks
-                                .bytes
-                                .checked_add(bytes.len() as u64)
-                                .ok_or(Error::Corrupt("inner size overflow"))?;
-                            self.delivered = checks.bytes;
                         }
                     }
-                    Ok(())
+                    // No output run survives this feed or a source/poll boundary.
+                    flush_stored_run(&mut self.scratch, &mut hole, checks, &mut self.delivered, sink)
                 })();
+                self.scratch.clear();
                 cipher.recovery = Some(state);
                 result?;
             } else {
@@ -541,6 +559,36 @@ impl MemberMachine {
     pub(crate) fn into_part_hashes(self) -> (crate::crc32::Hasher, Option<crate::blake2sp::Blake2sp>) {
         (self.part_crc, self.part_blake)
     }
+}
+/// Only successful whole sink runs contribute checks. A sink can commit a
+/// shorter native prefix before failing; its Stage owns that prefix and the
+/// failed member can never finish verification.
+fn flush_stored_run(
+    bytes: &mut Vec<u8>,
+    hole: &mut u64,
+    checks: &mut InnerChecks,
+    delivered: &mut u64,
+    sink: &mut dyn RecoverySink,
+) -> Result<()> {
+    let len = if *hole != 0 { *hole } else { bytes.len() as u64 };
+    if len == 0 {
+        return Ok(());
+    }
+    let end = checks.bytes.checked_add(len).ok_or(Error::Corrupt("inner size overflow"))?;
+    if *hole != 0 {
+        sink.hole(*hole)?;
+        *hole = 0;
+    } else {
+        sink.put(bytes)?;
+        checks.hasher.update(bytes);
+        if let Some(blake) = &mut checks.blake {
+            blake.update(bytes);
+        }
+        bytes.clear();
+    }
+    checks.bytes = end;
+    *delivered = end;
+    Ok(())
 }
 struct CheckingSink<'a> {
     checks: &'a mut InnerChecks,
@@ -836,6 +884,326 @@ mod tests {
             entry: crate::extract::RarEntryIdentity { index: Some(0), order: 0, name: String::new() },
             method: 0,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
+        }
+    }
+    fn recovery_fixture(size: usize) -> (super::super::FileHeader, Vec<u8>, Vec<u8>) {
+        let params = crate::crypto::Rar5CryptParams {
+            kdf_count: 1,
+            salt: [7; 16],
+            iv: [9; 16],
+            check: None,
+            tweaked_crc: false,
+        };
+        let plain: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let mut padded = plain.clone();
+        padded.resize(size.next_multiple_of(16), 0);
+        let keys = crate::crypto::derive_rar5_keys("secret", 1, &params.salt, None).unwrap();
+        let ciphertext = crate::crypto::encrypt_cbc(&keys.key, &params.iv, &padded).unwrap();
+        let header = super::super::FileHeader {
+            name: "f".into(),
+            unpacked_size: size as u64,
+            encrypted: true,
+            crypt: Some(params),
+            packed_size: ciphertext.len() as u64,
+            crc32: Some(crate::crc32::hash(&plain)),
+            ..Default::default()
+        };
+        (header, ciphertext, plain)
+    }
+    #[derive(Default)]
+    struct RecoveryRecorder {
+        output: Vec<Option<u8>>,
+        puts: usize,
+        holes: usize,
+    }
+    impl Sink for RecoveryRecorder {
+        fn put(&mut self, bytes: &[u8]) -> Result<()> {
+            self.puts += 1;
+            self.output.extend(bytes.iter().copied().map(Some));
+            Ok(())
+        }
+    }
+    impl RecoverySink for RecoveryRecorder {
+        fn hole(&mut self, len: u64) -> Result<()> {
+            self.holes += 1;
+            self.output.resize(self.output.len() + len as usize, None);
+            Ok(())
+        }
+    }
+    #[test]
+    fn stored_recovery_coalesces_actual_sink_calls() {
+        let (header, ciphertext, plain) = recovery_fixture(65_536);
+        let usage = Usage::new(ProgressiveLimits::default());
+        let mut machine =
+            MemberMachine::new(&header, context(), Some("secret"), &usage, &SessionControl::default()).unwrap();
+        let mut sink = RecoveryRecorder::default();
+        for (data, len) in [(Some(&ciphertext[..16]), 16), (None, 16), (Some(&ciphertext[32..]), 65_504)] {
+            machine.reserve_progressive_scratch(len, &usage).unwrap();
+            machine.feed_stored(data, len, &mut sink).unwrap();
+        }
+        assert_eq!(sink.output.len(), 65_536);
+        for (at, byte) in sink.output.iter().enumerate() {
+            assert_eq!(*byte, if (16..48).contains(&at) { None } else { Some(plain[at]) });
+        }
+        eprintln!("actual recovery sink calls: puts={} holes={}", sink.puts, sink.holes);
+        assert!(sink.puts <= 2 && sink.holes <= 2, "bounded runs, not cipher-block IO");
+    }
+    #[test]
+    fn stored_recovery_scratch_exact_budget_and_one_under() {
+        let (header, ciphertext, plain) = recovery_fixture(64);
+        for (budget, missing) in [(95, false), (96, false), (95, true), (96, true)] {
+            let usage = Usage::new(ProgressiveLimits { metadata_bytes: budget, ..ProgressiveLimits::default() });
+            let mut machine =
+                MemberMachine::new(&header, context(), Some("secret"), &usage, &SessionControl::default()).unwrap();
+            let mut sink = RecoveryRecorder::default();
+            let admission = machine.reserve_progressive_scratch(64, &usage);
+            if budget == 95 {
+                assert!(matches!(
+                    admission.unwrap_err().kind,
+                    FailureKind::Limit { resource: Resource::MetadataBytes, limit: 95, attempted: 96 }
+                ));
+                assert_eq!(machine.delivered, 0);
+                assert_eq!(machine.part_bytes, 0);
+                assert!(sink.output.is_empty());
+            } else {
+                admission.unwrap();
+                machine.feed_stored((!missing).then_some(ciphertext.as_slice()), 64, &mut sink).unwrap();
+                let expected = if missing { vec![None; 64] } else { plain.iter().copied().map(Some).collect() };
+                assert_eq!(sink.output, expected);
+                assert_eq!(machine.scratch.capacity(), 80);
+                assert_eq!(machine.cipher.as_ref().unwrap().rem.capacity(), 16);
+            }
+        }
+        let mut plain_header = header;
+        plain_header.encrypted = false;
+        plain_header.crypt = None;
+        let usage = Usage::new(ProgressiveLimits { metadata_bytes: 0, ..ProgressiveLimits::default() });
+        let mut machine =
+            MemberMachine::new(&plain_header, context(), None, &usage, &SessionControl::default()).unwrap();
+        machine.reserve_progressive_scratch(64, &usage).unwrap();
+        let mut sink = RecoveryRecorder::default();
+        machine.feed_stored(Some(&plain), 64, &mut sink).unwrap();
+        assert_eq!(machine.scratch.capacity(), 0);
+        assert_eq!(sink.output, plain.iter().copied().map(Some).collect::<Vec<_>>());
+    }
+    #[test]
+    fn stored_recovery_requires_admitted_scratch_before_processing() {
+        let (header, ciphertext, _) = recovery_fixture(64);
+        let usage = Usage::new(ProgressiveLimits::default());
+        for missing in [false, true] {
+            let mut machine =
+                MemberMachine::new(&header, context(), Some("secret"), &usage, &SessionControl::default()).unwrap();
+            let mut sink = RecoveryRecorder::default();
+            assert!(matches!(
+                machine.feed_stored((!missing).then_some(ciphertext.as_slice()), 64, &mut sink).unwrap_err().kind,
+                FailureKind::InvalidCapability
+            ));
+            assert_eq!(machine.part_bytes, 0);
+            assert_eq!(machine.delivered, 0);
+            assert!(sink.output.is_empty());
+            assert!(machine.cipher.as_ref().unwrap().recovery.is_none());
+        }
+    }
+    #[test]
+    fn stored_recovery_runs_preserve_taint_across_every_short_part_split() {
+        for (missing, expected) in
+            [(17..18, 16..48), (16..32, 16..48), (0..1, 0..32), (63..65, 48..79), (79..80, 64..79)]
+        {
+            for split in 0..=80 {
+                let (mut header, ciphertext, plain) = recovery_fixture(79);
+                header.block_flags = super::super::HFL_SPLIT_AFTER;
+                header.packed_size = split as u64;
+                header.crc32 = Some(crate::crc32::hash(&ciphertext[..split]));
+                let wire =
+                    super::super::FileWire { name: std::sync::Arc::new(b"f".to_vec()), compression: 0, extent: 0..0 };
+                let part = PhysicalPart::new(0, &header, header.crypt.map(Ok), &wire);
+                let mut member = PhysicalMember::new(header.clone(), wire, 0, &part).unwrap();
+                let usage = Usage::new(ProgressiveLimits::default());
+                let mut machine =
+                    MemberMachine::new(&header, context(), Some("secret"), &usage, &SessionControl::default()).unwrap();
+                let mut sink = RecoveryRecorder::default();
+                for (volume, range) in [(0, 0..split), (1, split..80)] {
+                    let part = if volume == 0 {
+                        PhysicalPart::new(0, &header, header.crypt.map(Ok), &member.wire)
+                    } else {
+                        header.block_flags = super::super::HFL_SPLIT_BEFORE;
+                        header.packed_size = (80 - split) as u64;
+                        header.crc32 = Some(crate::crc32::hash(&plain));
+                        header.crypt.as_mut().unwrap().iv = [55; 16];
+                        let part = PhysicalPart::new(1, &header, header.crypt.map(Ok), &member.wire);
+                        member.append(&header, &part).unwrap();
+                        part
+                    };
+                    machine.begin_part(&part);
+                    let mut at = range.start;
+                    while at < range.end {
+                        let absent = missing.contains(&at);
+                        let end = range.end.min(if absent {
+                            missing.end
+                        } else if at < missing.start {
+                            missing.start
+                        } else {
+                            range.end
+                        });
+                        machine.reserve_progressive_scratch(end - at, &usage).unwrap();
+                        machine.feed_stored((!absent).then_some(&ciphertext[at..end]), end - at, &mut sink).unwrap();
+                        assert_eq!(machine.delivered as usize, sink.output.len(), "each feed flushes");
+                        at = end;
+                    }
+                    machine.finish_part(&part).unwrap();
+                }
+                machine.finish_decode(&mut sink).unwrap();
+                machine.finish_member(&member).unwrap();
+                assert_eq!(sink.output.len(), 79);
+                for (at, byte) in sink.output.iter().enumerate() {
+                    assert_eq!(
+                        *byte,
+                        if expected.contains(&at) { None } else { Some(plain[at]) },
+                        "split={split} missing={missing:?}"
+                    );
+                }
+                assert!(sink.puts + sink.holes <= 8);
+            }
+        }
+    }
+    #[test]
+    fn stored_recovery_unknown_geometry_and_failed_flush_are_closed() {
+        let (mut header, ciphertext, plain) = recovery_fixture(64);
+        header.file_flags |= super::super::FHFL_UNPUNKNOWN;
+        let usage = Usage::new(ProgressiveLimits::default());
+        let mut machine =
+            MemberMachine::new(&header, context(), Some("secret"), &usage, &SessionControl::default()).unwrap();
+        machine.reserve_progressive_scratch(64, &usage).unwrap();
+        let mut sink = RecoveryRecorder::default();
+        machine.feed_stored(Some(&ciphertext), 64, &mut sink).unwrap();
+        assert_eq!(sink.puts, 1);
+        assert_eq!(sink.output, plain.iter().copied().map(Some).collect::<Vec<_>>());
+        assert!(matches!(machine.feed_stored(None, 16, &mut sink).unwrap_err().kind, FailureKind::DataHole));
+        assert_eq!(sink.output.len(), 64);
+
+        struct FailsAfterPrefix(Vec<u8>);
+        impl Sink for FailsAfterPrefix {
+            fn put(&mut self, bytes: &[u8]) -> Result<()> {
+                self.0.extend_from_slice(&bytes[..3]);
+                Err(Error::Corrupt("sink committed a prefix then failed"))
+            }
+        }
+        impl RecoverySink for FailsAfterPrefix {
+            fn hole(&mut self, _: u64) -> Result<()> {
+                panic!("no holes")
+            }
+        }
+        let mut failed =
+            MemberMachine::new(&header, context(), Some("secret"), &usage, &SessionControl::default()).unwrap();
+        failed.reserve_progressive_scratch(64, &usage).unwrap();
+        let mut sink = FailsAfterPrefix(Vec::new());
+        assert!(failed.feed_stored(Some(&ciphertext), 64, &mut sink).is_err());
+        assert_eq!(sink.0, &plain[..3]);
+        assert_eq!(failed.delivered, 0);
+        assert_eq!(failed.inner.as_ref().unwrap().bytes, 0);
+        assert_eq!(failed.inner.as_ref().unwrap().hasher.clone().finalize(), crate::crc32::hash(&[]));
+        assert!(failed.failed);
+        assert!(failed.scratch.is_empty());
+        assert!(failed.feed_stored(Some(&ciphertext), 64, &mut sink).is_err());
+        assert_eq!(sink.0.len(), 3);
+    }
+    #[test]
+    fn stored_recovery_native_short_write_then_limit_keeps_committed_prefix() {
+        use crate::progressive::*;
+        use std::task::{Context, Poll, Waker};
+        fn block(body: &[u8], data: &[u8]) -> Vec<u8> {
+            assert!(body.len() < 128);
+            let mut sized = vec![body.len() as u8];
+            sized.extend(body);
+            let mut bytes = crate::crc32::hash(&sized).to_le_bytes().to_vec();
+            bytes.extend(sized);
+            bytes.extend(data);
+            bytes
+        }
+        let (header, ciphertext, plain) = recovery_fixture(96);
+        let params = header.crypt.unwrap();
+        let mut extra = vec![36, 1, 0, 0, 1];
+        extra.extend(params.salt);
+        extra.extend(params.iv);
+        let mut body = vec![2, 3, 37, 96, 4, 96, 0];
+        body.extend(crate::crc32::hash(&plain).to_le_bytes());
+        body.extend([0, 0, 5]);
+        body.extend(b"inner");
+        body.extend(extra);
+        let mut data = b"Rar!\x1a\x07\x01\x00".to_vec();
+        data.extend(block(&[1, 0, 0], &[]));
+        data.extend(block(&body, &ciphertext));
+        data.extend(block(&[5, 0, 0], &[]));
+        for short in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = ProgressiveOptions::new(
+                crate::extract::Options {
+                    mode: crate::extract::Mode::Extract,
+                    dest: dir.path().into(),
+                    overwrite: crate::extract::Overwrite::Always,
+                    flatten: false,
+                    threads: Some(1),
+                    protected_paths: Default::default(),
+                    parallel_min: None,
+                },
+                "a.rar".into(),
+            );
+            opts.set_password(Some("secret".into())).unwrap();
+            opts.hole_policy = HolePolicy::PartialStored { fill: HoleFill::Sparse };
+            opts.artifact_aftermath = ArtifactAftermath::RetainProvisional;
+            opts.limits.output_write_bytes = 100;
+            let mut session =
+                ProgressiveSession::from_sealed_memory(vec![("a.rar".into(), data.clone().into_boxed_slice())], opts)
+                    .unwrap();
+            crate::output::OWNED_STAGE_FAULT.with(|slot| {
+                *slot.borrow_mut() =
+                    Some((crate::output::OwnedOperation::Write, if short { Ok(Some(3)) } else { Err(libc::ENOSPC) }))
+            });
+            let mut terminated = false;
+            for _ in 0..100 {
+                match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                    Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated {
+                        failure,
+                        artifact,
+                        cleanup_failure,
+                    }))) => {
+                        let committed = if short { 3 } else { 0 };
+                        assert_eq!(failure.context.inner_offset, Some(committed));
+                        if short {
+                            assert!(matches!(
+                                failure.kind,
+                                FailureKind::Limit { resource: Resource::OutputWriteBytes, limit: 100, attempted: 189 }
+                            ));
+                        } else {
+                            assert!(matches!(
+                                failure.kind,
+                                FailureKind::Output { operation: OutputOperation::Write, .. }
+                            ));
+                            let range = failure.context.output_range.unwrap();
+                            assert_eq!(range.completed, 0);
+                        }
+                        assert!(cleanup_failure.is_none());
+                        let mut artifact = artifact.unwrap();
+                        assert_eq!(artifact.produced_extent(), committed);
+                        assert_eq!(artifact.evidence(), ArtifactEvidence::Provisional);
+                        let mut got = [0; 96];
+                        if short {
+                            assert_eq!(artifact.read_at(0, &mut got).unwrap(), ArtifactRead::Filled { count: 3 });
+                            assert_eq!(&got[..3], &plain[..3]);
+                        }
+                        assert_eq!(artifact.read_at(committed, &mut got).unwrap(), ArtifactRead::End);
+                        assert!(!dir.path().join("inner").exists());
+                        artifact.discard().unwrap();
+                        terminated = true;
+                        break;
+                    }
+                    Poll::Ready(Err(e)) => panic!("{e}"),
+                    Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => panic!("failed write published"),
+                    _ => {}
+                }
+            }
+            assert!(terminated);
+            assert!(crate::output::OWNED_STAGE_FAULT.with(|slot| slot.borrow().is_none()));
         }
     }
     #[test]

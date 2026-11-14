@@ -263,6 +263,149 @@ fn encrypted(plain: &[u8]) -> (Vec<u8>, u64) {
     let start = bytes.windows(ciphertext.len()).position(|b| b == ciphertext).unwrap() as u64;
     (bytes, start)
 }
+fn small_bookkeeping_budget_case(cipher: bool) {
+    let plain: Vec<u8> = (0..65_536).map(|i| (i % 251) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let (data, start) = if cipher {
+        encrypted(&plain)
+    } else {
+        let data = archive(&[FileSpec::new("inner", &plain)]);
+        let start = data.windows(plain.len()).position(|b| b == plain).unwrap() as u64;
+        (data, start)
+    };
+    let mut opts = options(dir.path());
+    opts.limits.read_chunk = 4096;
+    opts.limits.packed_work_per_poll = 4096;
+    opts.limits.source_bookkeeping = 8192;
+    if cipher {
+        opts.set_password(Some("pw".into())).unwrap();
+    }
+    let mut session =
+        ProgressiveSession::new(Box::new(Provider(Some(Bytes { data, holes: one(start + 16..start + 32) }))), opts)
+            .unwrap();
+    let mut valid = 0;
+    for _ in 0..1000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { valid_bytes, .. }))) => valid += valid_bytes,
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                outcome: MemberOutcome::Partial(mut artifact),
+                ..
+            }))) => {
+                let end = if cipher { 48 } else { 32 };
+                assert_eq!(artifact.size(), Some(65_536));
+                assert_eq!(artifact.holes(), &[OutputHole { offset: 16, len: end - 16 }]);
+                assert_eq!(valid, 65_536 - (end - 16));
+                let mut got = [0; 4096];
+                for (start, end) in [(0, 16), (end, 65_536)] {
+                    let mut at = start;
+                    while at < end {
+                        let ArtifactRead::Filled { count } =
+                            artifact.read_at(at, &mut got[..((end - at) as usize).min(4096)]).unwrap()
+                        else {
+                            panic!("readable extent became a hole");
+                        };
+                        assert!(count > 0);
+                        assert_eq!(&got[..count], &plain[at as usize..at as usize + count]);
+                        at += count as u64;
+                    }
+                }
+                assert!(!dir.path().join("inner").exists());
+                return;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) | Poll::Ready(Err(failure)) => {
+                panic!("{failure:?}")
+            }
+            Poll::Ready(Ok(None)) => panic!("no Partial artifact"),
+            _ => {}
+        }
+    }
+    panic!("did not finish");
+}
+#[test]
+fn encrypted_stored_runs_fit_small_bookkeeping_budget() {
+    small_bookkeeping_budget_case(true);
+}
+#[test]
+fn plain_stored_runs_fit_small_bookkeeping_budget() {
+    small_bookkeeping_budget_case(false);
+}
+#[test]
+fn encrypted_stored_cancel_while_data_waits_does_not_flush_or_retry() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Paused {
+        bytes: Bytes,
+        start: u64,
+        attempts: Arc<AtomicUsize>,
+    }
+    impl RangeSource for Paused {
+        fn info(&self) -> SourceInfo {
+            self.bytes.info()
+        }
+        fn backing_files(&self) -> &[File] {
+            &[]
+        }
+        fn read_at(&mut self, at: u64, buf: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            if at >= self.start {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                return Ok(RangeRead::NotYet);
+            }
+            let n = buf.len().min((self.start - at) as usize);
+            self.bytes.read_at(at, &mut buf[..n], cx)
+        }
+    }
+    struct PausedProvider(Option<Paused>);
+    impl VolumeSource for PausedProvider {
+        fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+            Ok(VolumeAnswer::Ready(Box::new(self.0.take().unwrap())))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (data, start) = encrypted(&[42; 4096]);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut opts = options(dir.path());
+    opts.set_password(Some("pw".into())).unwrap();
+    opts.artifact_aftermath = ArtifactAftermath::RetainProvisional;
+    let mut session = ProgressiveSession::new(
+        Box::new(PausedProvider(Some(Paused {
+            bytes: Bytes { data, holes: vec![] },
+            start,
+            attempts: attempts.clone(),
+        }))),
+        opts,
+    )
+    .unwrap();
+    for _ in 0..100 {
+        let event = session.poll_event(&mut Context::from_waker(Waker::noop()));
+        if attempts.load(Ordering::SeqCst) == 1 {
+            assert!(event.is_pending());
+            break;
+        }
+        assert!(!matches!(event, Poll::Ready(Err(_))));
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    for _ in 0..3 {
+        assert!(session.poll_event(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    session.control().cancel();
+    let Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, artifact, cleanup_failure }))) =
+        session.poll_event(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("cancel must terminate parked extraction")
+    };
+    assert!(matches!(failure.kind, FailureKind::Canceled));
+    assert_eq!(failure.context.inner_offset, Some(0));
+    assert!(cleanup_failure.is_none());
+    let mut artifact = artifact.unwrap();
+    assert_eq!(artifact.produced_extent(), 0);
+    assert_eq!(artifact.read_at(0, &mut [0; 1]).unwrap(), ArtifactRead::End);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(!dir.path().join("inner").exists());
+    artifact.discard().unwrap();
+}
 #[test]
 fn cbc_one_byte_and_full_block_taint_same_following_block_and_replay() {
     let plain: Vec<u8> = (0..79).collect();

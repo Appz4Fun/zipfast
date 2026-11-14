@@ -577,6 +577,10 @@ impl ProgressiveSession {
                             if recover {
                                 self.remaining -= len;
                                 work += len;
+                                self.machine
+                                    .as_mut()
+                                    .expect("machine")
+                                    .reserve_progressive_scratch(len as usize, &self.usage)?;
                                 let mut sink = StageSink {
                                     stage: self.stage.as_mut(),
                                     usage: &self.usage,
@@ -627,6 +631,7 @@ impl ProgressiveSession {
                                     && self.model.members.last().is_some_and(|m| m.header.method == 0)
                                     && sink.stage.is_some()
                                 {
+                                    machine.reserve_progressive_scratch(count, &self.usage)?;
                                     machine.feed_stored(Some(&self.buffer[..count]), count, &mut sink)
                                 } else {
                                     machine.feed(&self.buffer[..count], &mut sink)
