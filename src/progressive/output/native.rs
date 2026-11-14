@@ -74,6 +74,9 @@ pub(crate) struct NativeProtection {
     immutable: Vec<ImmutableBinding>,
 }
 impl NativeProtection {
+    pub(crate) fn handle_count(&self) -> usize {
+        self.held.len() + self.bindings.iter().filter(|b| b.handle.is_some()).count()
+    }
     pub(crate) fn new(usage: &Usage) -> ProgressiveResult<Self> {
         // Reserve bounded native-path workspace before the standard filesystem helper.
         // This is cumulative metadata accounting, not a process-allocation guarantee.

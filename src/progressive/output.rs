@@ -118,6 +118,14 @@ pub enum ArtifactRead {
     Hole { len: u64 },
     End,
 }
+/// Actual publication receipt, distinct from content verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ArtifactPublication {
+    Unpublished,
+    Strict,
+    RecoveredInner,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactEvidence {
     Provisional,
@@ -126,7 +134,7 @@ pub enum ArtifactEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EvidenceOrigin {
     Archive,
-    Caller { label: Box<str> },
+    Caller { label: Arc<str> },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackedEvidence {
@@ -158,7 +166,9 @@ pub enum CheckVerdict {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Verification {
     pub(crate) inner_size: u64,
-    pub(crate) checksum: ChecksumValue,
+    pub(crate) checksum: Option<ChecksumValue>,
+    pub(crate) replacement_revision: Option<u64>,
+    pub(crate) caller: Option<Arc<ExpectedInner>>,
     pub(crate) size: CheckVerdict,
     pub(crate) crc32: CheckVerdict,
     pub(crate) blake2sp: CheckVerdict,
@@ -171,8 +181,16 @@ impl Verification {
     pub fn inner_size(&self) -> u64 {
         self.inner_size
     }
-    pub fn checksum(&self) -> &ChecksumValue {
-        &self.checksum
+    pub fn checksum(&self) -> Option<&ChecksumValue> {
+        self.checksum.as_ref()
+    }
+    /// Explicit replacement generation that supplied packed evidence, if any.
+    pub fn replacement_revision(&self) -> Option<u64> {
+        self.replacement_revision
+    }
+    /// A caller digest checked in addition to every declared archive check.
+    pub fn caller_expected(&self) -> Option<&ExpectedInner> {
+        self.caller.as_deref()
     }
     pub fn origin(&self) -> &EvidenceOrigin {
         &self.origin
@@ -339,14 +357,16 @@ impl OutputContext {
             member,
             size,
             produced: 0,
+            valid: 0,
             length: 0,
             reserved: 0,
             generation: 0,
             published: false,
-            evidence: None,
+            assessment: Default::default(),
             target_created: false,
             metadata: None,
             holes: Vec::new(),
+            zero_pending: None,
             usage: self.usage.clone(),
             lease: Some(lease),
             authority: Arc::downgrade(&self.authority),
@@ -371,25 +391,27 @@ impl Root {
     }
 }
 pub(crate) struct Stage {
-    native: OwnedStage,
+    pub(super) native: OwnedStage,
     root: Arc<Root>,
-    member: MemberId,
-    size: Option<u64>,
-    produced: u64,
-    length: u64,
+    pub(super) member: MemberId,
+    pub(super) size: Option<u64>,
+    pub(super) produced: u64,
+    pub(super) valid: u64,
+    pub(super) length: u64,
     reserved: u64,
-    generation: u64,
-    published: bool,
-    evidence: Option<Verification>,
+    pub(super) generation: u64,
+    pub(super) published: bool,
+    pub(super) assessment: std::cell::RefCell<super::session::recovery::Assessment>,
     target_created: bool,
     metadata: Option<crate::extract::Meta>,
-    holes: Vec<OutputHole>,
-    usage: Usage,
+    pub(super) holes: Vec<OutputHole>,
+    zero_pending: Option<(u64, u64)>,
+    pub(super) usage: Usage,
     lease: Option<Lease>,
     authority: Weak<Authority>,
 }
 impl Stage {
-    fn mutation(&self) -> ProgressiveResult<()> {
+    pub(super) fn mutation(&self) -> ProgressiveResult<()> {
         if self.published {
             return Err(invalid());
         }
@@ -436,8 +458,9 @@ impl Stage {
                 0,
             ));
         }
-        self.evidence = None;
+        self.assessment.get_mut().evidence = None;
         self.produced = offset + count as u64;
+        self.valid += count as u64;
         self.length = self.length.max(self.produced);
         self.generation = next_generation;
         Ok(count)
@@ -451,7 +474,7 @@ impl Stage {
         let next_generation = self.generation.checked_add(1).ok_or_else(invalid)?;
         self.extent(length)?;
         self.native.set_len(length).map_err(|e| out(OutputOperation::Write, e, self.length))?;
-        self.evidence = None;
+        self.assessment.get_mut().evidence = None;
         self.length = length;
         self.generation = next_generation;
         Ok(())
@@ -489,29 +512,34 @@ impl Stage {
         }
         self.produced = end;
         if fill == HoleFill::Zero {
-            let zero = [0; 8192];
-            let mut at = offset;
-            while at < end {
-                self.mutation()?;
-                let n = (end - at).min(zero.len() as u64) as usize;
-                self.usage.charge(Resource::OutputWriteBytes, n as u64)?;
-                let written = self
-                    .native
-                    .write_at(at, &zero[..n])
-                    .map_err(|e| out_range(OutputOperation::Write, e, at, n as u64, 0))?;
-                if written == 0 {
-                    return Err(out_range(
-                        OutputOperation::Write,
-                        std::io::ErrorKind::WriteZero.into(),
-                        at,
-                        n as u64,
-                        0,
-                    ));
-                }
-                at += written as u64;
-            }
+            self.zero_pending = Some(match self.zero_pending {
+                Some((start, previous)) if previous == offset => (start, end),
+                None => (offset, end),
+                _ => return Err(invalid()),
+            });
         }
         Ok(())
+    }
+    /// One bounded zero-fill attempt. Invalidity was already recorded by hole().
+    pub(crate) fn fill_step(&mut self, maximum: usize) -> ProgressiveResult<usize> {
+        let Some((at, end)) = self.zero_pending else { return Ok(0) };
+        self.mutation()?;
+        let n = (end - at).min(maximum as u64).min(8192) as usize;
+        if n == 0 {
+            return Err(invalid());
+        }
+        self.usage.charge(Resource::OutputWriteBytes, n as u64)?;
+        self.generation = self.generation.checked_add(1).ok_or_else(invalid)?;
+        self.assessment.get_mut().evidence = None;
+        let written = self
+            .native
+            .write_at(at, &[0; 8192][..n])
+            .map_err(|e| out_range(OutputOperation::Write, e, at, n as u64, 0))?;
+        if written == 0 {
+            return Err(out_range(OutputOperation::Write, std::io::ErrorKind::WriteZero.into(), at, n as u64, 0));
+        }
+        self.zero_pending = (at + (written as u64) < end).then_some((at + written as u64, end));
+        Ok(written)
     }
     #[cfg(test)]
     pub(crate) fn target(&mut self, name: &str, windows_names: bool) -> ProgressiveResult<Target> {
@@ -537,18 +565,14 @@ impl Stage {
     /// resizes the file or changes an earlier known size declaration.
     pub(crate) fn reconcile_final_size(&mut self, size: u64) -> ProgressiveResult<()> {
         self.mutation()?;
-        if self.size.is_some_and(|known| known != size)
-            || self.produced != size
-            || self.length != size
-            || !self.holes.is_empty()
-        {
+        if self.size.is_some_and(|known| known != size) || self.produced != size || self.length != size {
             return Err(ProgressiveFailure::new(FailureKind::IncompleteOutput));
         }
         if self.size.is_none() {
             let generation = self.generation.checked_add(1).ok_or_else(invalid)?;
             self.size = Some(size);
             self.generation = generation;
-            self.evidence = None;
+            self.assessment.get_mut().evidence = None;
         }
         Ok(())
     }
@@ -566,7 +590,11 @@ impl Stage {
             self.native.file().metadata().map_err(|e| out(OutputOperation::Metadata, e, 0))?,
         )
         .map_err(|e| out(OutputOperation::Metadata, e, 0))?;
-        self.evidence = Some(verification.clone());
+        if verification.level == VerificationLevel::Unverified || verification.checksum.is_none() {
+            return Err(invalid());
+        }
+        self.assessment.get_mut().evidence = Some(verification.clone());
+        self.assessment.get_mut().stamp = Some(stamp);
         Ok(VerifiedStage { member: self.member, generation: self.generation, stamp, verification })
     }
     pub(crate) fn publish(
@@ -574,6 +602,15 @@ impl Stage {
         target: &mut Target,
         verified: &VerifiedStage,
         source: &mut super::source::SourceDriver,
+    ) -> ProgressiveResult<Publication> {
+        self.publish_policy(target, verified, source, false)
+    }
+    pub(super) fn publish_policy(
+        &mut self,
+        target: &mut Target,
+        verified: &VerifiedStage,
+        source: &mut super::source::SourceDriver,
+        recovered: bool,
     ) -> ProgressiveResult<Publication> {
         self.mutation()?;
         if target.member != self.member
@@ -584,9 +621,14 @@ impl Stage {
         }
         if verified.member != self.member
             || verified.generation != self.generation
-            || verified.verification.level != VerificationLevel::Strict
+            || verified.verification.level
+                != if recovered { VerificationLevel::InnerOnly } else { VerificationLevel::Strict }
             || verified.verification.size != CheckVerdict::Passed
-            || verified.verification.packed != PackedEvidence::Passed
+            || if recovered {
+                verified.verification.packed == PackedEvidence::Failed
+            } else {
+                verified.verification.packed != PackedEvidence::Passed
+            }
             || verified.verification.authentication == AuthenticationEvidence::Incomplete
         {
             return Err(invalid());
@@ -608,6 +650,16 @@ impl Stage {
         target.check_parent()?;
         policy.parents(&target.path)?;
         if target_stamp(&target.path, target.directory)? != target.initial {
+            return Err(invalid());
+        }
+        // Provider authorization can run caller code; the checked stage stamp must
+        // still match after every such callback and immediately before publication.
+        self.mutation()?;
+        let current = SourceStamp::from_metadata(
+            self.native.file().metadata().map_err(|e| out(OutputOperation::Metadata, e, 0))?,
+        )
+        .map_err(|e| out(OutputOperation::Metadata, e, 0))?;
+        if current != verified.stamp {
             return Err(invalid());
         }
         let replace = matches!(self.root.overwrite, crate::extract::Overwrite::Always);
@@ -632,8 +684,7 @@ impl Stage {
     }
     pub(crate) fn into_artifact(mut self) -> Artifact {
         self.lease.as_mut().expect("slot").deliver();
-        let evidence = self.evidence.clone().map_or(ArtifactEvidence::Provisional, ArtifactEvidence::Verified);
-        Artifact { stage: Some(self), evidence }
+        Artifact { stage: Some(self), recovery: None, receipt: None }
     }
     pub(crate) fn discard(&mut self) -> ProgressiveResult<()> {
         self.native.discard().map_err(|e| out(OutputOperation::Remove, e, 0))?;
@@ -643,8 +694,9 @@ impl Stage {
 }
 /// A single owned provisional output. No pathname or writable descriptor is exposed.
 pub struct Artifact {
-    stage: Option<Stage>,
-    evidence: ArtifactEvidence,
+    pub(super) stage: Option<Stage>,
+    pub(super) recovery: Option<super::session::recovery::Record>,
+    pub(super) receipt: Option<(ArtifactPublication, Verification)>,
 }
 impl Artifact {
     pub fn member(&self) -> Option<MemberId> {
@@ -659,10 +711,32 @@ impl Artifact {
     pub fn holes(&self) -> &[OutputHole] {
         self.stage.as_ref().map_or(&[], |s| s.holes.as_slice())
     }
-    pub fn evidence(&self) -> &ArtifactEvidence {
-        &self.evidence
+    pub fn evidence(&self) -> ArtifactEvidence {
+        let v = self.receipt.as_ref().map(|(_, v)| v.clone()).or_else(|| {
+            self.stage.as_ref().and_then(|s| {
+                if self.recovery.as_ref().is_some_and(|r| !r.evidence_current(s)) {
+                    None
+                } else {
+                    s.assessment.borrow().evidence.clone()
+                }
+            })
+        });
+        match v {
+            Some(v) if v.level != VerificationLevel::Unverified => ArtifactEvidence::Verified(v),
+            _ => ArtifactEvidence::Provisional,
+        }
+    }
+    /// All volume indices needed for strict encrypted stored replacement replay.
+    pub fn required_verification_volumes(&self) -> impl Iterator<Item = u32> + '_ {
+        self.recovery.iter().flat_map(|r| r.required_volumes())
+    }
+    pub fn publication(&self) -> ArtifactPublication {
+        self.receipt.as_ref().map_or(ArtifactPublication::Unpublished, |(p, _)| *p)
     }
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> ProgressiveResult<ArtifactRead> {
+        if self.receipt.is_some() {
+            return Err(invalid());
+        }
         let stage = self.stage.as_mut().ok_or_else(invalid)?;
         let member = stage.member;
         read_stage(stage, offset, buf).map_err(|mut failure| {
@@ -678,6 +752,7 @@ impl Artifact {
             failure
         })?;
         self.stage.take();
+        self.recovery.take();
         Ok(())
     }
 }
@@ -699,7 +774,6 @@ fn read_stage(stage: &mut Stage, offset: u64, buf: &mut [u8]) -> ProgressiveResu
         stage.usage.charge(Resource::SourceBookkeeping, 1)?;
         if hole.offset <= offset && offset < hole.offset + hole.len {
             let len = (hole.offset + hole.len - offset).min(buf.len() as u64);
-            stage.usage.charge(Resource::VerifyBytes, len)?;
             return Ok(ArtifactRead::Hole { len });
         }
         if hole.offset > offset {
@@ -719,7 +793,7 @@ fn read_stage(stage: &mut Stage, offset: u64, buf: &mut [u8]) -> ProgressiveResu
 fn invalid() -> ProgressiveFailure {
     ProgressiveFailure::new(FailureKind::InvalidCapability)
 }
-fn out(operation: OutputOperation, cause: std::io::Error, offset: u64) -> ProgressiveFailure {
+pub(super) fn out(operation: OutputOperation, cause: std::io::Error, offset: u64) -> ProgressiveFailure {
     let mut e = ProgressiveFailure::new(FailureKind::Output { operation, cause });
     e.context.inner_offset = Some(offset);
     e
@@ -770,7 +844,7 @@ fn target_stamp(path: &Path, directory: bool) -> ProgressiveResult<Option<Target
     }
 }
 
-fn out_range(
+pub(super) fn out_range(
     operation: OutputOperation,
     cause: std::io::Error,
     offset: u64,

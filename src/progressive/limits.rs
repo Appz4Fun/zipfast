@@ -49,6 +49,7 @@ pub enum Resource {
     ProtectionPaths,
     ProtectionPathBytes,
     OutputWriteBytes,
+    VerifyWorkBytes,
 }
 /// Adjustable budgets; descriptor and protection-inventory safety ceilings remain fixed.
 /// Counts are cumulative unless a consumer explicitly establishes a smaller scope
@@ -78,6 +79,8 @@ pub struct ProgressiveLimits {
     /// Cumulative attempted output writes, including zero fill, patches and retries.
     pub output_write_bytes: u64,
     pub verify_bytes: u64,
+    /// Byte-span processing passes during verification; not physical IO or CPU time.
+    pub verify_work_bytes: u64,
     pub decoder_window: u64,
     pub packed_work_per_poll: u64,
     pub kdf_exponent: u64,
@@ -112,6 +115,7 @@ impl Default for ProgressiveLimits {
             temp_bytes: 68719476736,
             output_write_bytes: 68719476736,
             verify_bytes: 68719476736,
+            verify_work_bytes: 68719476736,
             decoder_window: 268435456,
             packed_work_per_poll: 1048576,
             kdf_exponent: 20,
@@ -148,6 +152,7 @@ impl ProgressiveLimits {
             Resource::TempBytes => self.temp_bytes,
             Resource::OutputWriteBytes => self.output_write_bytes,
             Resource::VerifyBytes => self.verify_bytes,
+            Resource::VerifyWorkBytes => self.verify_work_bytes,
             Resource::DecoderWindow => self.decoder_window,
             Resource::PackedWorkPerPoll => self.packed_work_per_poll,
             Resource::KdfExponent => self.kdf_exponent,
@@ -168,11 +173,11 @@ impl ProgressiveLimits {
 }
 struct UsageState {
     limits: ProgressiveLimits,
-    used: [u64; 30],
+    used: [u64; 31],
 }
 impl UsageState {
     pub(crate) fn new(limits: ProgressiveLimits) -> Self {
-        Self { limits, used: [0; 30] }
+        Self { limits, used: [0; 31] }
     }
     pub(crate) fn check(&self, resource: Resource, attempted: u64) -> ProgressiveResult<()> {
         let limit = self.limits.limit(resource);

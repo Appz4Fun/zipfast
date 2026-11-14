@@ -1050,7 +1050,7 @@ fn synchronized_wake_boundary_gates_read_and_volume_retry() {
                 assert!(poll(&mut d, &w, &mut [0; 4]).is_pending());
             }
             let before = calls.load(Ordering::SeqCst);
-            let gate = d.control.wake.clone();
+            let gate = d.wake.clone();
             // Force the wake AFTER the consumption snapshot but DURING budget
             // admission. This is exactly the old drain/readiness split boundary;
             // a scoped provider thread is joined, so no lucky scheduling is used.

@@ -121,9 +121,147 @@ without a safe boundary and existing independent-member integrity failures remai
 terminal. No byte scanning invents a reset point.
 
 All redirection kinds remain typed `RarUnsupported::Redirection { kind }`, as in
-the complete extractor; this entrypoint creates no links. RAR4 codecs, repair,
-hole filling, patching, recovered publication and other formats remain outside
-this entrypoint's supported scope. Full original compatibility remains open.
+the complete extractor; this entrypoint creates no links. RAR4 codecs and other formats remain outside this entrypoint's supported scope.
+Stored RAR5 recovery is described below. Full original compatibility remains open.
+
+## Stored holes and repair
+
+Opt in with `HolePolicy::PartialStored { fill: HoleFill::Sparse }` or `Zero`.
+The default remains `Fail`. A permanent source hole in a stored member advances
+its logical output position, keeps the range invalid, and continues. `Partial`
+owns the private artifact; no final target is published. `holes()` returns the
+sorted, disjoint, adjacent-coalesced inner-file intervals, and `produced_extent()`
+is the logical extent, including holes. `BytesWritten.valid_bytes` counts only
+actual valid output. Sparse and zero filling have identical validity and exact
+final size; zero writes proceed in bounded, cancelable poll steps.
+
+Plain store maps packed holes directly to inner offsets. CBC loss rounds to
+cipher blocks and also invalidates the following plaintext block in that same
+chain. Losing ciphertext `[17,18)` or `[16,32)` invalidates inner `[16,48)`.
+The first available block after a loss supplies only the next block's IV.
+RAR5 volume boundaries never reset the chain. Taint is clipped to declared inner
+size and genuine new-member IV boundaries. Losing a ciphertext byte corresponding
+to padding still taints the last affected plaintext block. After plaintext repair,
+missing ciphertext evidence remains missing. RAR5 stored padding is less than one
+block; a whole extra padding block is malformed, not a recoverable padding-only
+extent. A nonaligned final ciphertext extent fails its framing check.
+
+If encrypted stored plaintext size is unknown when a hole arrives, recovery
+stops with `DataHole` at the committed prefix. It does not guess padding geometry.
+Plain store may reconcile an initially unknown size with a real final declaration.
+Header holes are `HeaderHole`. Compressed holes remain stopped prefixes with
+invalidated dependent solid history; they are not patchable stored artifacts.
+
+`session.patch(&mut artifact, offset, bytes)` accepts one nonempty range wholly
+inside a current coalesced hole, within the declared inner size and read-chunk
+limit (at most 1 MiB). It rejects valid-byte overwrite, foreign/closed/published
+artifacts, overflow, changed staging identity, and canceled/dropped sessions.
+It reserves interval-split capacity before writing. The entire call is one
+validity commit: short writes may be retried, but a final error leaves the whole
+attempted range invalid, even if some bytes physically changed. Error context
+reports the attempted range and completed physical byte count. Retry only the
+still-invalid range. A successful wrong patch is validly written data whose
+checksum can fail; this API does not grant arbitrary overwrite afterward.
+
+```rust,ignore
+for hole in artifact.holes().to_vec() {
+    // Fetch the corresponding trusted donor bytes, then use bounded chunks.
+    for (offset, bytes) in donor_chunks(hole.offset, hole.len) {
+        session.patch(&mut artifact, offset, &bytes)?;
+    }
+}
+// Poll with the caller's current Context until Ready, respecting Pending/wakes.
+let verdict = poll_until_ready(|cx| session.poll_verify(&mut artifact, cx))?;
+```
+
+## Full verification and publication policy
+
+`poll_verify` scans the whole private stage in bounded chunks, including exact
+size, every declared CRC32/BLAKE2sp check and private keyed RAR checks. Nonempty
+holes return `IncompleteOutput`. Plain stored packed checks are recomputed for
+every corresponding part during that same stage scan. Encrypted plaintext repair
+cannot reconstruct original ciphertext or padding evidence: it yields `InnerOnly`
+and `PackedEvidence::Missing`, with `CbcChecksOnly` authentication evidence.
+A declared failed check is never downgraded to Missing and cannot be overridden
+by a caller digest. A member with no whole-inner digest yields `Unverified`,
+`checksum() == None` and provisional artifact evidence; absence of a checksum
+never proves a password.
+
+A caller can provide `ExpectedInner::Crc32 { digest, label }` or `Blake2sp` using
+`set_expected_inner(&artifact, expected)`. Labels are limited to 1024 UTF-8 bytes.
+Caller digests compare raw plaintext; archive keyed checks remain separate.
+`caller_expected()` retains every successfully checked caller digest and label,
+including when archive evidence remains the primary verdict origin. When caller
+evidence supplies the missing whole-inner digest, the verdict records
+`EvidenceOrigin::Caller` with its label, never Archive. Updating expectations
+invalidates previous evidence. `Artifact::evidence()` returns an owned snapshot;
+old snapshots are observations and cannot authorize publication.
+
+Output changes, expectations and supplied-source generations invalidate current
+verification jobs/permits. Each new attempt rescans the stage. Jobs are bound to
+the originating session/member/output, exact descriptor stamp/extent, output and
+expectation generation, and replacement revision. Only one verification job runs
+per session. While it runs or is parked, conflicting event polling or verification
+of another artifact returns `InvalidCapability` without consuming the original
+job. Cancellation wakes the registered caller. Patching or changing expectations
+for that artifact, or supplying a new replacement generation, abandons its job;
+retained sources keep their identities and permanent-hole history, and old request
+wakers cannot authorize a later request.
+
+With `RecoveryPublication::VerifiedInner`, call `publish_recovered(&mut artifact)`
+explicitly after a current InnerOnly success. It still requires original
+whole-source-set publication authority and safe source/target bindings. Missing
+packed evidence is permitted; Failed evidence is not. The published receipt keeps
+InnerOnly, its provenance, Missing packed evidence and CbcChecksOnly. Without
+publication authority the method returns `PublicationAuthorityRequired` and keeps
+the owned artifact. The default Strict policy does not permit this transition.
+
+A successful Strict `poll_verify` may publish through the same checked publisher.
+Successful content verification can still leave an authority-less artifact
+unpublished. Check `artifact.publication()` for the actual `Unpublished`, `Strict`
+or `RecoveredInner` receipt. Successful publication retires the staging descriptor
+and releases capacity; the receipt/evidence remain readable, while `read_at`,
+patch and reverify return `InvalidCapability`. They never reopen the final path.
+A post-publication staging-name cleanup error returns typed `Output(Remove)` with
+an already-published receipt. The artifact then owns only leftover-stage cleanup;
+`discard`/drop cannot remove the final target. That error closes further session
+mutation. Metadata is applied through the original descriptor only after actual
+publication, preserving provisional mode 0600.
+
+## Strict encrypted replacement evidence
+
+For strict verification of repaired encrypted store, supply explicit new sources
+with `supply_verification_source(volume_index, source)`. The indices returned by
+`artifact.required_verification_volumes()` are all member-part volumes whose
+original framing must be proved, including otherwise undamaged parts. The engine
+does not retain/reacquire all original download providers or mutate their hole
+generations. Replacement identity/generation/declared length are frozen within
+this separate verification generation; available bytes remain immutable under the
+provider contract. Missing replacements leave InnerOnly evidence.
+
+The same checked source machinery handles NotYet, wakes, identity, ranges,
+cancellation and finite budgets in independent verification lanes. Replacement
+framing is checked against retained bounded wire witnesses, including signatures,
+encrypted header IV/ciphertext and unknown fields, then reparsed with the canonical
+header parser. The canonical member machine rechecks all packed parts, complete
+cipher/padding geometry, final checks, and compares all replacement plaintext with
+the repaired stage. It does not extract a second output or decode unrelated earlier
+members. `Verification::replacement_revision()` identifies the explicit generation
+that established Passed packed evidence; the missing original ciphertext has not
+silently become available.
+
+Publication still requires the original whole-set authority and protection of
+**every** supplied replacement input. Initial replacement publication supports
+actual `ImmutableFileSource` native adapters, with retained path/descriptor/stamp
+checks and alias protection. Custom opaque or claimed native/non-file replacement
+providers can establish cooperative content evidence but remain unpublished,
+including if recovered publication is later requested. No replacement can remove
+original immutable bindings or reserved future-volume paths. Library-owned sealed
+replacement memory is not provided by this initial API.
+
+This RAR recovery path does not enable WinZip AES holes. Future ZIP integration
+must require complete global authentication before plaintext access; CBC format
+checks are not authenticated encryption.
 
 ## Limits
 
@@ -134,8 +272,14 @@ solid decoding charge decoded bytes to cumulative `LogicalOutputBytes`, but do
 not charge nonexistent temporary extent, output writes or physical verification
 reads. Extracted stages continue to charge logical extent and temporary bytes
 together. Test permits zero output/artifact/temp/write capacities. Optional
-physical artifact reads still charge `VerifyBytes`; hashing bytes already flowing
-through the decoder is not a second physical read.
+artifact reads still charge `VerifyBytes`; reporting a Hole does not. Verification
+charges attempted stage/replacement read spans, including failed attempts and
+provider retries. In-memory hashing is not a physical read. `VerifyWorkBytes`
+(default 64 GiB) separately bounds byte-span processing passes, not exact CPU
+instructions or time. Combined fixed hash/decrypt/compare work may charge a span
+once; distinct rescans/replays charge again. SourceBytes counts source spans
+(including reported holes), SourceRequests counts callbacks, and these counters
+are not a sum claiming measured disk traffic.
 
 Directory queue capacity/path storage and sorting work use existing finite
 metadata/name/bookkeeping budgets; no descriptor is retained per directory.

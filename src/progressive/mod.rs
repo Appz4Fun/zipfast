@@ -24,9 +24,9 @@ mod source;
 pub use error::*;
 pub use limits::*;
 pub use output::{
-    Artifact, ArtifactAftermath, ArtifactEvidence, ArtifactRead, AuthenticationEvidence, CheckVerdict, EvidenceOrigin,
-    HoleFill, HolePolicy, OutputHole, PackedEvidence, ProgressiveOptions, RecoveryPublication, Verification,
-    VerificationLevel,
+    Artifact, ArtifactAftermath, ArtifactEvidence, ArtifactPublication, ArtifactRead, AuthenticationEvidence,
+    CheckVerdict, EvidenceOrigin, HoleFill, HolePolicy, OutputHole, PackedEvidence, ProgressiveOptions,
+    RecoveryPublication, Verification, VerificationLevel,
 };
 pub use session::*;
 pub use source::*;

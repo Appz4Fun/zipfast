@@ -16,6 +16,8 @@
 
 //! Pull-driven RAR5 extraction over the single production source driver.
 pub(crate) mod memory;
+#[path = "recovery.rs"]
+pub(crate) mod recovery;
 use super::{
     output::{Capacity, OutputContext, Publication, Stage, Target},
     source::{SourceDriver, SourceStep},
@@ -27,6 +29,7 @@ use crate::rar5::{
     physical::{PhysicalMember, PhysicalModel, PhysicalPart, continuation_issue},
     reader::Block,
 };
+pub use recovery::ExpectedInner;
 use std::{
     ffi::OsString,
     num::NonZeroU64,
@@ -176,6 +179,12 @@ pub struct ProgressiveSession {
     remaining: u64,
     had_stage: bool,
     buffer: Vec<u8>,
+    verify_job: Option<recovery::VerifyJob>,
+    replacement_revision: u64,
+    witnesses: Vec<recovery::WireVolume>,
+    replacement_epoch: Arc<AtomicU64>,
+    recovery_closed: bool,
+    part_evidence: Vec<PackedEvidence>,
 }
 enum Disposition {
     Write,
@@ -272,12 +281,21 @@ impl ProgressiveSession {
             remaining: 0,
             had_stage: false,
             buffer,
+            verify_job: None,
+            replacement_revision: 0,
+            witnesses: Vec::new(),
+            replacement_epoch: Arc::new(AtomicU64::new(0)),
+            recovery_closed: false,
+            part_evidence: Vec::new(),
         })
     }
     pub fn control(&self) -> SessionControl {
         self.control.clone()
     }
     pub fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<ProgressiveResult<Option<ProgressiveEvent>>> {
+        if self.verify_job.is_some() {
+            return Poll::Ready(Err(ProgressiveFailure::new(FailureKind::InvalidCapability)));
+        }
         if matches!(self.phase, Phase::Done) {
             return Poll::Ready(Ok(None));
         }
@@ -300,6 +318,7 @@ impl ProgressiveSession {
             failure.context.expected = Some(std::mem::take(&mut self.expected));
         }
         self.phase = Phase::Done;
+        self.recovery_closed = true;
         self.machine.take();
         self.finalizer.take();
         self.target.take();
@@ -344,6 +363,15 @@ impl ProgressiveSession {
             if work >= self.options.limits.packed_work_per_poll.min(1 << 20) {
                 cx.waker().wake_by_ref();
                 return Ok(Poll::Pending);
+            }
+            if let Some(stage) = &mut self.stage {
+                let n = stage.fill_step(
+                    self.buffer.len().min((self.options.limits.packed_work_per_poll.min(1 << 20) - work) as usize),
+                )?;
+                if n > 0 {
+                    work += n as u64;
+                    continue;
+                }
             }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
@@ -399,6 +427,10 @@ impl ProgressiveSession {
                         produced: &mut self.produced,
                         chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
                         failure: None,
+                        fill: match self.options.hole_policy {
+                            HolePolicy::PartialStored { fill } => fill,
+                            _ => HoleFill::Sparse,
+                        },
                     };
                     let result = machine.finish_decode(&mut sink);
                     if let Some(e) = sink.failure {
@@ -449,6 +481,13 @@ impl ProgressiveSession {
                         Poll::Ready(Ok(SourceStep::Filled { offset, count })) => {
                             self.cursor = offset + count as u64;
                             work += count as u64;
+                            recovery::record_header(
+                                &mut self.witnesses,
+                                self.volume,
+                                offset,
+                                &self.buffer[..count],
+                                &self.usage,
+                            )?;
                             let (used, step) = self.parser.advance(&self.buffer[..count])?;
                             if used != count {
                                 return Err(ProgressiveFailure::new(FailureKind::SourceContract));
@@ -465,6 +504,16 @@ impl ProgressiveSession {
                         let part = self.model.parts.last().expect("active part");
                         if let Some(machine) = &mut self.machine {
                             machine.finish_part(part)?;
+                            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<PackedEvidence>() as u64)?;
+                            self.usage.charge(Resource::SourceBookkeeping, self.part_evidence.len() as u64)?;
+                            self.part_evidence
+                                .try_reserve_exact(1)
+                                .map_err(|_| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+                            self.part_evidence.push(if machine.part_missing() {
+                                PackedEvidence::Missing
+                            } else {
+                                PackedEvidence::Passed
+                            });
                         }
                         self.phase = if part.final_part {
                             if self.machine.is_some() { Phase::Finish } else { Phase::Verdict }
@@ -489,6 +538,35 @@ impl ProgressiveSession {
                         }
                         Poll::Ready(Ok(SourceStep::Hole { offset, len })) => {
                             self.cursor = offset + len;
+                            let recover = self.stage.is_some()
+                                && matches!(self.options.hole_policy, HolePolicy::PartialStored { .. })
+                                && self.model.members.last().is_some_and(|m| {
+                                    m.header.method == 0 && (!m.header.encrypted || m.unpacked_size.is_some())
+                                });
+                            if recover {
+                                self.remaining -= len;
+                                work += len;
+                                let mut sink = StageSink {
+                                    stage: self.stage.as_mut(),
+                                    usage: &self.usage,
+                                    control: &self.control,
+                                    produced: &mut self.produced,
+                                    chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
+                                    failure: None,
+                                    fill: match self.options.hole_policy {
+                                        HolePolicy::PartialStored { fill } => fill,
+                                        _ => unreachable!(),
+                                    },
+                                };
+                                let result =
+                                    self.machine.as_mut().expect("machine").feed_stored(None, len as usize, &mut sink);
+                                if let Some(e) = sink.failure {
+                                    return Err(e);
+                                }
+                                result?;
+                                self.driver.validate_current()?;
+                                continue;
+                            }
                             let mut failure = ProgressiveFailure::new(FailureKind::DataHole);
                             failure.context.packed_offset = Some(offset);
                             if self.model.parts.last().expect("part").final_part {
@@ -500,7 +578,7 @@ impl ProgressiveSession {
                             self.cursor = offset + count as u64;
                             self.remaining -= count as u64;
                             work += count as u64;
-                            let before = self.produced;
+                            let before = self.stage.as_ref().map_or(self.produced, |s| s.valid);
                             let mut sink = StageSink {
                                 stage: self.stage.as_mut(),
                                 usage: &self.usage,
@@ -508,9 +586,20 @@ impl ProgressiveSession {
                                 produced: &mut self.produced,
                                 chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
                                 failure: None,
+                                fill: match self.options.hole_policy {
+                                    HolePolicy::PartialStored { fill } => fill,
+                                    _ => HoleFill::Sparse,
+                                },
                             };
                             let result = if let Some(machine) = &mut self.machine {
-                                machine.feed(&self.buffer[..count], &mut sink)
+                                if matches!(self.options.hole_policy, HolePolicy::PartialStored { .. })
+                                    && self.model.members.last().is_some_and(|m| m.header.method == 0)
+                                    && sink.stage.is_some()
+                                {
+                                    machine.feed_stored(Some(&self.buffer[..count]), count, &mut sink)
+                                } else {
+                                    machine.feed(&self.buffer[..count], &mut sink)
+                                }
                             } else {
                                 Ok(())
                             };
@@ -521,10 +610,10 @@ impl ProgressiveSession {
                                 return self.member_error(error).map(|e| Poll::Ready(Ok(Some(e))));
                             }
                             self.driver.validate_current()?;
-                            if self.stage.is_some() && self.produced > before {
+                            if self.stage.as_ref().is_some_and(|s| s.valid > before) {
                                 return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
                                     member: self.member.expect("member"),
-                                    valid_bytes: self.produced - before,
+                                    valid_bytes: self.stage.as_ref().unwrap().valid - before,
                                     logical_end: self.produced,
                                 }))));
                             }
@@ -666,6 +755,7 @@ impl ProgressiveSession {
             self.ordinal.checked_add(1).ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
         self.member = Some(member);
         self.produced = 0;
+        self.part_evidence.clear();
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
         if self.options.extract.mode == crate::extract::Mode::Test || header.is_dir() {
             self.usage.charge(Resource::MetadataBytes, (header.name.len() as u64).saturating_mul(3))?;
@@ -906,6 +996,16 @@ impl ProgressiveSession {
         {
             stage.reconcile_final_size(size)?;
         }
+        if machine.missing && self.stage.is_some() {
+            let record = self.recovery_record(&machine)?;
+            let mut artifact = self.stage.take().expect("stage").into_artifact();
+            artifact.recovery = Some(record);
+            self.phase = Phase::Header;
+            return Ok(ProgressiveEvent::MemberFinished {
+                member: self.member.take().unwrap(),
+                outcome: MemberOutcome::Partial(artifact),
+            });
+        }
         let checks = physical.final_checks.expect("final member checks");
         let checksum = checks
             .blake2sp
@@ -914,7 +1014,9 @@ impl ProgressiveSession {
         let verification = if let (Some(checksum), Some(_)) = (checksum, physical.unpacked_size) {
             Some(Verification {
                 inner_size: self.produced,
-                checksum,
+                checksum: Some(checksum),
+                replacement_revision: None,
+                caller: None,
                 size: CheckVerdict::Passed,
                 crc32: if checks.crc32.is_some() { CheckVerdict::Passed } else { CheckVerdict::Missing },
                 blake2sp: if checks.blake2sp.is_some() { CheckVerdict::Passed } else { CheckVerdict::Missing },
@@ -960,7 +1062,7 @@ impl ProgressiveSession {
         if let Disposition::Skip(reason) = self.disposition {
             return self.finish_skip(reason);
         }
-        let outcome = if let Some(v) = verification {
+        let mut outcome = if let Some(v) = verification {
             let stage = self.stage.as_mut().unwrap();
             let permit = stage.bind_verification(v.clone())?;
             match stage.publish(self.target.as_mut().expect("target"), &permit, &mut self.driver)? {
@@ -974,6 +1076,7 @@ impl ProgressiveSession {
                     self.target.take();
                     self.history.take();
                     self.phase = Phase::Done;
+                    self.recovery_closed = true;
                     return Ok(ProgressiveEvent::MemberFinished {
                         member: self.member.take().expect("member"),
                         outcome: MemberOutcome::PublishedWithFailure {
@@ -988,6 +1091,10 @@ impl ProgressiveSession {
         } else {
             MemberOutcome::Provisional(self.stage.take().unwrap().into_artifact())
         };
+        if let MemberOutcome::Provisional(artifact) = &mut outcome {
+            artifact.recovery = Some(self.recovery_record(&machine)?);
+            artifact.stage.as_mut().unwrap().assessment.get_mut().evidence_epoch = self.replacement_revision;
+        }
         self.target.take();
         self.phase = Phase::Header;
         Ok(ProgressiveEvent::MemberFinished { member: self.member.take().unwrap(), outcome })
@@ -1005,6 +1112,7 @@ struct StageSink<'a> {
     produced: &'a mut u64,
     chunk: usize,
     failure: Option<ProgressiveFailure>,
+    fill: HoleFill,
 }
 impl crate::rar5::unpack::Sink for StageSink<'_> {
     fn put(&mut self, mut bytes: &[u8]) -> crate::error::Result<()> {
@@ -1029,6 +1137,28 @@ impl crate::rar5::unpack::Sink for StageSink<'_> {
             }
         }
         Ok(())
+    }
+}
+
+impl crate::rar5::member::RecoverySink for StageSink<'_> {
+    fn hole(&mut self, len: u64) -> crate::error::Result<()> {
+        let result = if self.control.is_canceled() {
+            Err(ProgressiveFailure::new(FailureKind::Canceled))
+        } else if let Some(stage) = &mut self.stage {
+            stage.hole(*self.produced, len, self.fill)
+        } else {
+            Err(ProgressiveFailure::new(FailureKind::DataHole))
+        };
+        match result {
+            Ok(()) => {
+                *self.produced += len;
+                Ok(())
+            }
+            Err(e) => {
+                self.failure = Some(e);
+                Err(crate::Error::Corrupt("progressive hole sink stopped"))
+            }
+        }
     }
 }
 

@@ -27,8 +27,19 @@ pub(crate) struct PendingCipher {
     pub(crate) hash_key: [u8; 32],
     pub(crate) stored_padding: Option<StoredCipherPadding>,
     pub(crate) blocks: Option<CipherBlocks>,
+    recovery: Option<CbcAvailability>,
 }
 
+/// Availability belongs to cipher blocks, not physical volumes.
+struct CbcAvailability {
+    block: [u8; 16],
+    used: usize,
+    known: bool,
+    previous_known: bool,
+}
+pub(crate) trait RecoverySink: Sink {
+    fn hole(&mut self, len: u64) -> Result<()>;
+}
 pub(crate) struct StoredCipherPadding {
     pub(crate) size: u64,
     pub(crate) skipped: usize,
@@ -103,7 +114,7 @@ impl PendingCipher {
     }
 
     pub(crate) fn finish_selected(&self, context: &EntryContext) -> std::result::Result<(), RarFailure> {
-        if !self.rem.is_empty() {
+        if !self.rem.is_empty() || self.recovery.as_ref().is_some_and(|r| r.used != 0) {
             return Err(context.integrity(RarIntegrityReason::IncompleteCipherBlock, false));
         }
         self.blocks
@@ -194,6 +205,8 @@ pub(crate) struct MemberMachine {
     context: EntryContext,
     decoded_finished: bool,
     failed: bool,
+    pub(crate) missing: bool,
+    part_missing: bool,
 }
 impl MemberMachine {
     pub(crate) fn from_state(
@@ -216,13 +229,50 @@ impl MemberMachine {
             context,
             decoded_finished: false,
             failed: false,
+            missing: false,
+            part_missing: false,
         }
+    }
+    pub(crate) fn part_missing(&self) -> bool {
+        self.part_missing
+    }
+    pub(crate) fn reserve_progressive_scratch(
+        &mut self,
+        count: usize,
+        usage: &crate::progressive::Usage,
+    ) -> crate::progressive::ProgressiveResult<()> {
+        use crate::progressive::{FailureKind, ProgressiveFailure, Resource};
+        if let Some(cipher) = &mut self.cipher {
+            let wanted =
+                count.checked_add(16).ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+            if self.scratch.capacity() < wanted {
+                let old = self.scratch.capacity();
+                usage.charge(Resource::MetadataBytes, (wanted - old) as u64)?;
+                self.scratch
+                    .try_reserve_exact(wanted - self.scratch.len())
+                    .map_err(|_| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+                usage.charge(Resource::MetadataBytes, self.scratch.capacity().saturating_sub(wanted) as u64)?;
+            }
+            if cipher.rem.capacity() < 16 {
+                usage.charge(Resource::MetadataBytes, (16 - cipher.rem.capacity()) as u64)?;
+                cipher
+                    .rem
+                    .try_reserve_exact(16 - cipher.rem.len())
+                    .map_err(|_| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+                usage.charge(Resource::MetadataBytes, cipher.rem.capacity().saturating_sub(16) as u64)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn recovery_context(&self) -> EntryContext {
+        self.context.clone()
     }
     pub(crate) fn begin_part(&mut self, part: &super::physical::PhysicalPart) {
         self.part_crc = crate::crc32::Hasher::new();
         self.part_blake = (!part.final_part && part.checks.blake2sp.is_some()).then(crate::blake2sp::Blake2sp::new);
         self.part_bytes = 0;
         self.part_checks = !part.final_part;
+        self.part_missing = false;
     }
     fn packed(&mut self, bytes: &[u8]) -> Result<()> {
         self.part_bytes =
@@ -264,6 +314,108 @@ impl MemberMachine {
                 None => sink.put(bytes),
             }
         }
+    }
+    /// Stored input with explicit availability. The ordinary cipher and packed-check
+    /// state remain authoritative; only unavailable blocks suppress inner checks.
+    pub(crate) fn feed_stored(
+        &mut self,
+        data: Option<&[u8]>,
+        len: usize,
+        sink: &mut dyn RecoverySink,
+    ) -> crate::progressive::ProgressiveResult<()> {
+        use crate::progressive::{FailureKind, ProgressiveFailure};
+        if self.failed || self.decoder.is_some() || data.is_some_and(|d| d.len() != len) {
+            return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
+        }
+        if data.is_none() && self.cipher.as_ref().is_some_and(|c| c.stored_padding.is_none()) {
+            return Err(ProgressiveFailure::new(FailureKind::DataHole));
+        }
+        let result = (|| -> Result<()> {
+            if let Some(bytes) = data {
+                self.packed(bytes)?;
+            } else {
+                self.part_bytes =
+                    self.part_bytes.checked_add(len as u64).ok_or(Error::Corrupt("packed size overflow"))?;
+                self.part_missing = true;
+                self.missing = true;
+            }
+            let checks = self.inner.as_mut().ok_or(Error::Corrupt("missing inner checks"))?;
+            if let Some(cipher) = &mut self.cipher {
+                let mut state = cipher.recovery.take().unwrap_or(CbcAvailability {
+                    block: [0; 16],
+                    used: 0,
+                    known: true,
+                    previous_known: true,
+                });
+                let mut at = 0;
+                let result = (|| -> Result<()> {
+                    while at < len {
+                        let n = (16 - state.used).min(len - at);
+                        if let Some(bytes) = data {
+                            state.block[state.used..state.used + n].copy_from_slice(&bytes[at..at + n]);
+                        } else {
+                            state.known = false;
+                        }
+                        state.used += n;
+                        at += n;
+                        if state.used != 16 {
+                            continue;
+                        }
+                        let valid = state.known && state.previous_known;
+                        let mut plain = state.block;
+                        if state.known {
+                            if state.previous_known {
+                                cipher.aes.decrypt_cbc_in_place(&mut cipher.iv, &mut plain);
+                            } else {
+                                cipher.iv = state.block;
+                            }
+                        }
+                        state.previous_known = state.known;
+                        state.used = 0;
+                        state.known = true;
+                        let bytes = cipher.trim_stored(&plain, self.delivered)?;
+                        if !bytes.is_empty() {
+                            if valid {
+                                sink.put(bytes)?;
+                                checks.hasher.update(bytes);
+                                if let Some(b) = &mut checks.blake {
+                                    b.update(bytes);
+                                }
+                            } else {
+                                sink.hole(bytes.len() as u64)?;
+                            }
+                            checks.bytes = checks
+                                .bytes
+                                .checked_add(bytes.len() as u64)
+                                .ok_or(Error::Corrupt("inner size overflow"))?;
+                            self.delivered = checks.bytes;
+                        }
+                    }
+                    Ok(())
+                })();
+                cipher.recovery = Some(state);
+                result?;
+            } else {
+                if let Some(bytes) = data {
+                    sink.put(bytes)?;
+                    checks.hasher.update(bytes);
+                    if let Some(b) = &mut checks.blake {
+                        b.update(bytes);
+                    }
+                } else {
+                    sink.hole(len as u64)?;
+                }
+                checks.bytes = checks.bytes.checked_add(len as u64).ok_or(Error::Corrupt("inner size overflow"))?;
+                self.delivered = checks.bytes;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result.map_err(|e| {
+            super::framing::progressive_fault(batch::decoder_failure(e, self.context.scope(), self.context.password))
+        })
     }
     pub(crate) fn feed_shared_core(
         &mut self,
@@ -319,7 +471,7 @@ impl MemberMachine {
         if self.part_bytes != part.packed_size {
             return Err(self.context.integrity(RarIntegrityReason::TruncatedData, false));
         }
-        if part.final_part {
+        if part.final_part || self.part_missing {
             return Ok(());
         }
         let key = self.cipher.as_ref().filter(|_| part.checks.keyed).map(|c| &c.hash_key);
@@ -344,6 +496,15 @@ impl MemberMachine {
             crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::IncompleteOutput)
         })?;
         let key = self.cipher.as_ref().filter(|_| checks.keyed).map(|c| &c.hash_key);
+        if self.missing {
+            let actual = self.inner.as_ref().map_or(0, |c| c.bytes);
+            if member.unpacked_size.is_some_and(|n| n != actual) {
+                return Err(crate::progressive::ProgressiveFailure::new(
+                    crate::progressive::FailureKind::IncompleteOutput,
+                ));
+            }
+            return Ok(());
+        }
         self.inner
             .as_mut()
             .ok_or_else(|| {
@@ -511,6 +672,7 @@ impl PendingCipher {
             hash_key: keys.hash_key,
             stored_padding: if compressed { None } else { size.map(|size| StoredCipherPadding { size, skipped: 0 }) },
             blocks: compressed.then(CipherBlocks::default),
+            recovery: None,
         }
     }
 }

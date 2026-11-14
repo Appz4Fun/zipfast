@@ -48,7 +48,7 @@ fn partial_output_is_not_final() {
     assert_eq!(&bytes[..3], b"abc");
     assert_eq!(a.read_at(3, &mut bytes).unwrap(), ArtifactRead::End);
     assert_eq!(a.produced_extent(), 3);
-    assert_eq!(a.evidence(), &ArtifactEvidence::Provisional);
+    assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
     assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1);
     a.discard().unwrap();
     assert_eq!(fs::read_dir(d.path()).unwrap().count(), 0);
@@ -143,7 +143,9 @@ fn complete(paths: Vec<ProtectedPath>) -> ProtectionDeclaration {
 fn verify(s: &mut Stage) -> VerifiedStage {
     s.bind_verification(Verification {
         inner_size: s.produced,
-        checksum: ChecksumValue::Crc32([0; 4]),
+        checksum: Some(ChecksumValue::Crc32([0; 4])),
+        replacement_revision: None,
+        caller: None,
         origin: EvidenceOrigin::Archive,
         size: CheckVerdict::Passed,
         crc32: CheckVerdict::Passed,
@@ -452,8 +454,9 @@ fn write_budget_charges_failures_and_zero_fill() {
     let mut c = setup(d.path());
     c.usage = Usage::new(ProgressiveLimits { output_write_bytes: 3, ..Default::default() });
     let mut s = c.create(member(1), Some(4)).unwrap();
+    s.hole(0, 4, HoleFill::Zero).unwrap();
     assert!(matches!(
-        s.hole(0, 4, HoleFill::Zero).unwrap_err().kind,
+        s.fill_step(4).unwrap_err().kind,
         FailureKind::Limit { resource: Resource::OutputWriteBytes, .. }
     ));
     let mut a = s.into_artifact();
@@ -691,7 +694,7 @@ fn verification_is_bound_to_member_stage_and_generation() {
     let mut provider = driver(native_complete(d.path()));
     assert!(matches!(s.publish(&mut target, &v, &mut provider).unwrap_err().kind, FailureKind::InvalidCapability));
     let artifact = s.into_artifact();
-    assert_eq!(artifact.evidence(), &ArtifactEvidence::Provisional);
+    assert_eq!(artifact.evidence(), ArtifactEvidence::Provisional);
     assert!(!target.path.exists());
 }
 #[test]
@@ -914,7 +917,8 @@ fn zero_fill_write_zero_reports_exact_range_and_keeps_hole_invalid() {
     let mut s = c.create(member(0), Some(5)).unwrap();
     s.write_at(0, b"ab").unwrap();
     fault(crate::output::OwnedOperation::Write, Ok(Some(0)));
-    let e = s.hole(2, 3, HoleFill::Zero).unwrap_err();
+    s.hole(2, 3, HoleFill::Zero).unwrap();
+    let e = s.fill_step(3).unwrap_err();
     assert!(matches!(e.kind, FailureKind::Output { operation: OutputOperation::Write, ref cause }
         if cause.kind() == std::io::ErrorKind::WriteZero));
     assert_eq!(e.context.output_range.as_deref(), Some(&OutputRange { offset: 2, attempted: 3, completed: 0 }));
@@ -938,7 +942,7 @@ fn final_size_reconciliation_never_resizes_or_replaces_a_known_declaration() {
     }
     stage.reconcile_final_size(3).unwrap();
     assert_eq!((stage.size, stage.produced, stage.length, stage.generation), (Some(3), 3, 3, generation + 1));
-    assert!(stage.evidence.is_none());
+    assert!(stage.assessment.borrow().evidence.is_none());
     stage.reconcile_final_size(3).unwrap();
     assert_eq!(stage.generation, generation + 1);
     stage.discard().unwrap();
@@ -1146,4 +1150,60 @@ fn task4b_r1_finalization_parent_rebind() {
 #[test]
 fn task4b_r1_finalization_safe_control() {
     check_finalization_ancestor(None);
+}
+
+#[test]
+fn recovery_exact_default_interval_limit_preserves_last_valid_extent() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = setup(d.path());
+    let mut s = c.create(member(0), Some(131_074)).unwrap();
+    for i in 0..65_536u64 {
+        s.hole(i * 2, 1, HoleFill::Sparse).unwrap();
+        s.write_at(i * 2 + 1, b"v").unwrap();
+    }
+    assert_eq!(s.holes.len(), 65_536);
+    assert_eq!(s.valid, 65_536);
+    assert_eq!(s.produced, 131_072);
+    let error = s.hole(131_072, 1, HoleFill::Sparse).unwrap_err();
+    assert!(matches!(
+        error.kind,
+        FailureKind::Limit { resource: Resource::HoleIntervals, limit: 65_536, attempted: 65_537 }
+    ));
+    assert_eq!(s.length, 131_072);
+    assert_eq!(s.native.file().metadata().unwrap().len(), 131_072);
+}
+
+#[test]
+fn recovery_publication_rechecks_stage_stamp_after_authorization_callback() {
+    struct Mutating {
+        file: Option<fs::File>,
+        declaration: ProtectionDeclaration,
+    }
+    impl VolumeSource for Mutating {
+        fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+            Ok(VolumeAnswer::Missing)
+        }
+        fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+            if let Some(file) = self.file.take() {
+                use std::os::unix::fs::FileExt;
+                file.write_at(b"bad", 0).unwrap();
+            }
+            Ok(self.declaration.clone())
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let mut c = setup(d.path());
+    let mut s = c.create(member(0), Some(3)).unwrap();
+    s.write_at(0, b"abc").unwrap();
+    let permit = verify(&mut s);
+    let mut target = s.target("final", false).unwrap();
+    let mut driver = super::super::source::SourceDriver::new(
+        Box::new(Mutating { file: Some(s.native.file().try_clone().unwrap()), declaration: native_complete(d.path()) }),
+        "input.rar".into(),
+        ProgressiveLimits::default(),
+        SessionControl::default(),
+    )
+    .unwrap();
+    assert!(matches!(s.publish(&mut target, &permit, &mut driver).unwrap_err().kind, FailureKind::InvalidCapability));
+    assert!(!d.path().join("final").exists());
 }

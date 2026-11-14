@@ -362,7 +362,7 @@ fn real_encrypted_wait_and_notyet_match_both_golds() {
                         assert_eq!(evidence.inner_size(), expected.len() as u64);
                         assert_eq!(evidence.authentication(), AuthenticationEvidence::CbcChecksOnly);
                         assert_eq!(evidence.size_verdict(), CheckVerdict::Passed);
-                        assert_eq!(evidence.checksum(), Some(v.checksum()));
+                        assert_eq!(evidence.checksum(), v.checksum());
                         tested += 1;
                     }
                     Poll::Ready(Ok(Some(
@@ -498,7 +498,7 @@ fn sealed_memory_publishes_but_no_checksum_stays_provisional() {
             Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
                 outcome: MemberOutcome::Provisional(a), ..
             }))) => {
-                assert_eq!(a.evidence(), &ArtifactEvidence::Provisional);
+                assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
                 provisional += 1
             }
             Poll::Ready(Ok(None)) => break,
@@ -548,7 +548,7 @@ fn final_checksum_failure_retires_machine() {
         match poll(&mut s) {
             Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { artifact: Some(mut a), .. }))) => {
                 assert_eq!(read_all(&mut a), b"wrong digest");
-                assert_eq!(a.evidence(), &ArtifactEvidence::Provisional);
+                assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
                 break;
             }
             Poll::Ready(Ok(Some(_))) => {}
@@ -1349,7 +1349,7 @@ fn size_transition_mismatches_preserve_targets_and_terminal_artifacts() {
                     drop(s);
                     if let Some(a) = &mut retained {
                         assert_eq!(a.size(), initial);
-                        assert_eq!(a.evidence(), &ArtifactEvidence::Provisional);
+                        assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
                         assert_eq!(
                             read_all(a),
                             if initial.is_some() { &data[..data.len() / 2] } else { data.as_slice() }
@@ -1378,7 +1378,7 @@ fn size_transition_always_unknown_stays_provisional_and_runs_successor() {
                     if completions == 0 {
                         let MemberOutcome::Provisional(mut a) = outcome else { panic!("unknown size is provisional") };
                         assert_eq!(a.size(), None);
-                        assert_eq!(a.evidence(), &ArtifactEvidence::Provisional);
+                        assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
                         assert_eq!(read_all(&mut a), data);
                         first_artifact = Some(a);
                     } else {
