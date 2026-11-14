@@ -141,24 +141,35 @@ struct WakeState {
 pub(crate) struct WakeGate(Mutex<WakeState>);
 impl WakeGate {
     fn register(&self, waker: &Waker) {
-        self.0.lock().unwrap().task = Some(waker.clone());
+        // RawWaker clone/drop hooks may call back into cancellation. Only
+        // ownership transfer belongs under the mutex, never caller code.
+        let incoming = waker.clone();
+        let previous = {
+            let mut state = self.0.lock().unwrap();
+            state.task.replace(incoming)
+        };
+        drop(previous);
     }
     fn arm(&self) {
         let mut s = self.0.lock().unwrap();
         s.armed = true;
         s.ready = false;
     }
-    fn is_ready(&self) -> bool {
-        self.0.lock().unwrap().ready
-    }
     fn disarm(&self) {
         let mut s = self.0.lock().unwrap();
         s.armed = false;
         s.ready = false;
     }
-    fn take_wakes(&self) -> u64 {
-        let mut s = self.0.lock().unwrap();
-        std::mem::take(&mut s.wakes)
+    /// Snapshot retry authority and its exact wake count in one transition.
+    /// Admission runs outside the lock, before the caller may use readiness.
+    /// Later wakes stay latched/countable for the next consumption.
+    fn consume_ready(&self, admit: impl FnOnce(u64) -> ProgressiveResult<()>) -> ProgressiveResult<bool> {
+        let (ready, wakes) = {
+            let mut state = self.0.lock().unwrap();
+            (std::mem::take(&mut state.ready), std::mem::take(&mut state.wakes))
+        };
+        admit(wakes)?;
+        Ok(ready)
     }
     fn notify(&self, provider: bool) {
         let task = {
@@ -169,7 +180,7 @@ impl WakeGate {
             if s.armed {
                 s.ready = true;
             }
-            s.task.clone()
+            s.task.take()
         };
         if let Some(task) = task {
             task.wake();
@@ -311,8 +322,8 @@ impl SourceDriver {
         if buf.is_empty() {
             return Ok(Poll::Ready(Ok(SourceStep::Filled { offset: self.cursor.offset(), count: 0 })));
         }
-        self.usage.charge(Resource::ProviderWakes, self.control.wake.take_wakes())?;
-        if self.parked && !self.control.wake.is_ready() {
+        let ready = self.control.wake.consume_ready(|wakes| self.usage.charge(Resource::ProviderWakes, wakes))?;
+        if self.parked && !ready {
             return Ok(Poll::Pending);
         }
         self.parked = false;

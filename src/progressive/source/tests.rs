@@ -909,3 +909,171 @@ fn fallible_metadata_sort_orders_adversarial_input_and_bounds_work() {
     ));
     assert_eq!(items, [2, 1]);
 }
+
+/// Isolate lock regressions so even a deadlock/recursive callback is bounded.
+/// Only the parent owns the child process; deadline failure kills AND reaps it.
+fn in_bounded_wake_child(test: &str, marker: &str) -> bool {
+    if std::env::var_os(marker).is_some() {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(marker, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            child.wait().unwrap();
+            panic!("wake regression exceeded bounded child deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+#[test]
+fn reentrant_task_waker_drop_replacement_is_bounded() {
+    if !in_bounded_wake_child(
+        "progressive::source::tests::reentrant_task_waker_drop_replacement_is_bounded",
+        "ZIPFAST_PROGRESSIVE_REENTRANT_DROP_CHILD",
+    ) {
+        return;
+    }
+    struct CancelOnDrop(SessionControl);
+    impl Wake for CancelOnDrop {
+        fn wake(self: Arc<Self>) {
+            self.0.cancel();
+        }
+    }
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    for replace in [true, false] {
+        let control = SessionControl::default();
+        let state = State::new(&[Answer::Wait(false)]);
+        let mut d = SourceDriver::new(
+            Box::new(Provider(state.clone())),
+            "a.rar".into(),
+            ProgressiveLimits::default(),
+            control.clone(),
+        )
+        .unwrap();
+        let old = Waker::from(Arc::new(CancelOnDrop(control.clone())));
+        opened(&mut d, &old);
+        assert!(poll(&mut d, &old, &mut [0; 4]).is_pending());
+        drop(old); // The gate now owns the last caller-task reference.
+        let replacement = Waker::from(Arc::new(Signal::default()));
+        if !replace {
+            // notify must take the registration, then wake/drop it outside the
+            // mutex. The final Arc destructor reenters cancellation here too.
+            state.wake();
+            assert!(control.is_canceled());
+        }
+        assert!(matches!(
+            poll(&mut d, &replacement, &mut [0; 4]),
+            Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::Canceled, .. }))
+        ));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+struct BoundaryVolumes {
+    calls: Arc<AtomicUsize>,
+    pending: Arc<Mutex<Option<Waker>>>,
+    waits: usize,
+}
+impl VolumeSource for BoundaryVolumes {
+    fn volume(&mut self, _: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call < self.waits {
+            *self.pending.lock().unwrap() = Some(cx.waker().clone());
+            Ok(VolumeAnswer::Wait)
+        } else {
+            Ok(VolumeAnswer::Ready(Box::new(State::new(&[]))))
+        }
+    }
+}
+#[test]
+fn synchronized_wake_boundary_gates_read_and_volume_retry() {
+    if !in_bounded_wake_child(
+        "progressive::source::tests::synchronized_wake_boundary_gates_read_and_volume_retry",
+        "ZIPFAST_PROGRESSIVE_WAKE_BOUNDARY_CHILD",
+    ) {
+        return;
+    }
+    for volume in [false, true] {
+        for exhausted in [false, true] {
+            let limit = u64::from(exhausted);
+            let limits = ProgressiveLimits { provider_wakes: limit, ..ProgressiveLimits::default() };
+            let (mut d, calls, pending) = if volume {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let pending = Arc::new(Mutex::new(None));
+                let d = SourceDriver::new(
+                    Box::new(BoundaryVolumes {
+                        calls: calls.clone(),
+                        pending: pending.clone(),
+                        waits: 1 + usize::from(exhausted),
+                    }),
+                    "a.rar".into(),
+                    limits,
+                    SessionControl::default(),
+                )
+                .unwrap();
+                (d, calls, pending)
+            } else {
+                let state = State::new(&[Answer::Wait(false), Answer::Wait(false), Answer::Fill(1)]);
+                let calls = state.calls.clone();
+                let pending = state.pending.clone();
+                (driver(state, limits), calls, pending)
+            };
+            let w = Waker::from(Arc::new(Signal::default()));
+            if !volume {
+                opened(&mut d, &w);
+            }
+            assert!(poll(&mut d, &w, &mut [0; 4]).is_pending());
+            if exhausted {
+                pending.lock().unwrap().as_ref().unwrap().wake_by_ref();
+                assert!(poll(&mut d, &w, &mut [0; 4]).is_pending());
+            }
+            let before = calls.load(Ordering::SeqCst);
+            let gate = d.control.wake.clone();
+            // Force the wake AFTER the consumption snapshot but DURING budget
+            // admission. This is exactly the old drain/readiness split boundary;
+            // a scoped provider thread is joined, so no lucky scheduling is used.
+            let ready = gate
+                .consume_ready(|wakes| {
+                    assert_eq!(wakes, 0);
+                    std::thread::scope(|scope| {
+                        scope.spawn(|| pending.lock().unwrap().as_ref().unwrap().wake_by_ref()).join().unwrap()
+                    });
+                    d.usage.charge(Resource::ProviderWakes, wakes)
+                })
+                .unwrap();
+            assert!(!ready, "a wake after the snapshot must not authorize this retry");
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+            assert!(
+                matches!(poll(&mut d,&w,&mut [0;4]),Poll::Ready(Err(ProgressiveFailure {kind:FailureKind::Limit {resource:Resource::ProviderWakes,limit:l,attempted},..})) if l==limit && attempted==limit+1)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+            assert_eq!(d.cursor.offset(), 0);
+            if volume {
+                assert!(d.source.is_none());
+                assert!(d.admitted.is_empty());
+            }
+        }
+    }
+}
