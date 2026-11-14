@@ -923,3 +923,42 @@ fn zero_fill_write_zero_reports_exact_range_and_keeps_hole_invalid() {
     assert_eq!(a.read_at(2, &mut b).unwrap(), ArtifactRead::Hole { len: 3 });
     assert_eq!(b, [77; 3]);
 }
+
+#[test]
+fn final_size_reconciliation_never_resizes_or_replaces_a_known_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut context = setup(dir.path());
+    let mut stage = context.create(member(0), None).unwrap();
+    stage.write_at(0, b"abc").unwrap();
+    let generation = stage.generation;
+    for size in [2, 4] {
+        assert!(matches!(stage.reconcile_final_size(size).unwrap_err().kind, FailureKind::IncompleteOutput));
+        assert_eq!((stage.size, stage.produced, stage.length, stage.generation), (None, 3, 3, generation));
+        assert_eq!(stage.native.file().metadata().unwrap().len(), 3);
+    }
+    stage.reconcile_final_size(3).unwrap();
+    assert_eq!((stage.size, stage.produced, stage.length, stage.generation), (Some(3), 3, 3, generation + 1));
+    assert!(stage.evidence.is_none());
+    stage.reconcile_final_size(3).unwrap();
+    assert_eq!(stage.generation, generation + 1);
+    stage.discard().unwrap();
+    let mut known = context.create(member(1), Some(4)).unwrap();
+    known.write_at(0, b"abc").unwrap();
+    assert!(matches!(known.reconcile_final_size(3).unwrap_err().kind, FailureKind::IncompleteOutput));
+    assert_eq!((known.size, known.produced, known.length), (Some(4), 3, 3));
+    assert_eq!(known.native.file().metadata().unwrap().len(), 3);
+}
+#[test]
+fn final_size_reconciliation_checks_physical_length_before_promotion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut context = setup(dir.path());
+    let mut stage = context.create(member(0), None).unwrap();
+    stage.write_at(0, b"abc").unwrap();
+    stage.native.file().set_len(4).unwrap();
+    assert!(matches!(
+        stage.reconcile_final_size(3).unwrap_err().kind,
+        FailureKind::Output { operation: OutputOperation::Metadata, .. }
+    ));
+    assert_eq!((stage.size, stage.produced, stage.length), (None, 3, 3));
+    assert_eq!(stage.native.file().metadata().unwrap().len(), 4);
+}

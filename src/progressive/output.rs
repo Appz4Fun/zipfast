@@ -626,6 +626,25 @@ impl Stage {
         }
         Ok(())
     }
+    /// Reconcile authoritative geometry after member finalization. This never
+    /// resizes the file or changes an earlier known size declaration.
+    pub(crate) fn reconcile_final_size(&mut self, size: u64) -> ProgressiveResult<()> {
+        self.mutation()?;
+        if self.size.is_some_and(|known| known != size)
+            || self.produced != size
+            || self.length != size
+            || !self.holes.is_empty()
+        {
+            return Err(ProgressiveFailure::new(FailureKind::IncompleteOutput));
+        }
+        if self.size.is_none() {
+            let generation = self.generation.checked_add(1).ok_or_else(invalid)?;
+            self.size = Some(size);
+            self.generation = generation;
+            self.evidence = None;
+        }
+        Ok(())
+    }
     /// Called only by an engine after its complete content/evidence verification pass.
     pub(crate) fn bind_verification(&mut self, verification: Verification) -> ProgressiveResult<VerifiedStage> {
         self.mutation()?;

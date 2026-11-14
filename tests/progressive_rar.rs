@@ -1181,3 +1181,223 @@ fn changed_volume_header_encryption_is_rejected() {
         }
     }
 }
+
+fn size_transition_volumes(data: &[u8], initial_size: Option<u64>, final_size: Option<u64>) -> Vec<Vec<u8>> {
+    let split = data.len() / 2;
+    let mut spec = FileSpec::new("transition", data);
+    spec.size_unknown = initial_size.is_none();
+    spec.size = initial_size;
+    let mut first = common::SIG.to_vec();
+    first.extend(common::main_block(true, Some(0)));
+    first.extend(common::file_block(&spec, &data[..split], crc32fast::hash(&data[..split]), false, true));
+    first.extend(common::end_block(true));
+    spec.size_unknown = final_size.is_none();
+    spec.size = final_size;
+    let mut second = common::SIG.to_vec();
+    second.extend(common::main_block(true, Some(1)));
+    second.extend(common::file_block(&spec, &data[split..], crc32fast::hash(data), true, false));
+    let successor = FileSpec::new("successor", b"independent successor");
+    second.extend(common::file_block(&successor, successor.data, crc32fast::hash(successor.data), false, false));
+    second.extend(common::end_block(false));
+    vec![first, second]
+}
+fn size_transition_session(bytes: Vec<Vec<u8>>, options: ProgressiveOptions, sealed: bool) -> ProgressiveSession {
+    if sealed {
+        ProgressiveSession::from_sealed_memory(
+            bytes
+                .into_iter()
+                .enumerate()
+                .map(|(i, b)| (format!("a.part{:02}.rar", i + 1).into(), b.into_boxed_slice()))
+                .collect(),
+            options,
+        )
+        .unwrap()
+    } else {
+        session(bytes, options, false, false, 3).0
+    }
+}
+#[test]
+fn size_transition_unknown_first_known_final_completes_and_runs_successor() {
+    for size in [0, 1, 7, 16, 17] {
+        let data = vec![b'x'; size];
+        for sealed in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut s = size_transition_session(
+                size_transition_volumes(&data, None, Some(size as u64)),
+                options(tmp.path()),
+                sealed,
+            );
+            let mut started = Vec::new();
+            let mut finished = Vec::new();
+            let mut opened = Vec::new();
+            let mut artifacts = Vec::new();
+            loop {
+                match poll(&mut s) {
+                    Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index, .. }))) => opened.push(index),
+                    Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { member, size: declared, .. }))) => {
+                        if started.is_empty() {
+                            assert_eq!(declared, None);
+                        }
+                        started.push(member);
+                    }
+                    Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { member, outcome }))) => {
+                        let expected = if finished.is_empty() { data.as_slice() } else { b"independent successor" };
+                        match outcome {
+                            MemberOutcome::Verified(v) if sealed => {
+                                assert_eq!(v.level(), VerificationLevel::Strict);
+                                assert_eq!(v.size_verdict(), CheckVerdict::Passed);
+                                assert_eq!(v.inner_size(), expected.len() as u64);
+                            }
+                            MemberOutcome::Provisional(mut a) if !sealed => {
+                                assert_eq!(a.size(), Some(expected.len() as u64));
+                                assert_eq!(a.produced_extent(), expected.len() as u64);
+                                assert!(
+                                    matches!(a.evidence(), ArtifactEvidence::Verified(v) if v.level()==VerificationLevel::Strict && v.size_verdict()==CheckVerdict::Passed)
+                                );
+                                assert_eq!(read_all(&mut a), expected);
+                                artifacts.push(a);
+                            }
+                            _ => panic!("size promotion completion outcome"),
+                        }
+                        finished.push(member);
+                    }
+                    Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) => {}
+                    Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
+                        panic!("valid size promotion terminated: {failure:?}")
+                    }
+                    Poll::Ready(Err(failure)) => panic!("valid size promotion failed: {failure:?}"),
+                    Poll::Ready(Ok(None)) => break,
+                    _ => panic!("size promotion poll"),
+                }
+            }
+            assert_eq!(opened, [0, 1]);
+            assert_eq!(started.len(), 2);
+            assert_eq!(finished, started);
+            for _ in 0..3 {
+                assert!(matches!(poll(&mut s), Poll::Ready(Ok(None))));
+            }
+            drop(s);
+            if sealed {
+                assert_eq!(std::fs::read(tmp.path().join("transition")).unwrap(), data);
+                assert_eq!(std::fs::read(tmp.path().join("successor")).unwrap(), b"independent successor");
+            } else {
+                assert!(!tmp.path().join("transition").exists());
+                assert!(!tmp.path().join("successor").exists());
+                assert_eq!(read_all(&mut artifacts[0]), data);
+                for a in &mut artifacts {
+                    a.discard().unwrap();
+                }
+                assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+            }
+        }
+    }
+}
+#[test]
+fn size_transition_mismatches_preserve_targets_and_terminal_artifacts() {
+    let data = b"payload";
+    for initial in [None, Some(data.len() as u64)] {
+        for final_size in [data.len() as u64 - 1, data.len() as u64 + 1] {
+            for sealed in [false, true] {
+                for aftermath in [ArtifactAftermath::Remove, ArtifactAftermath::RetainProvisional] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    std::fs::write(tmp.path().join("transition"), b"prior target").unwrap();
+                    std::fs::write(tmp.path().join("successor"), b"prior successor").unwrap();
+                    let mut o = options(tmp.path());
+                    o.artifact_aftermath = aftermath;
+                    let mut s =
+                        size_transition_session(size_transition_volumes(data, initial, Some(final_size)), o, sealed);
+                    let mut started = 0;
+                    let mut retained = loop {
+                        match poll(&mut s) {
+                            Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { .. }))) => started += 1,
+                            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated {
+                                failure,
+                                artifact,
+                                cleanup_failure,
+                            }))) => {
+                                assert!(cleanup_failure.is_none());
+                                assert!(matches!(failure.kind, FailureKind::Rar(_) | FailureKind::Malformed(_)));
+                                assert_eq!(artifact.is_some(), aftermath == ArtifactAftermath::RetainProvisional);
+                                break artifact;
+                            }
+                            Poll::Ready(Ok(Some(
+                                ProgressiveEvent::VolumeOpened { .. } | ProgressiveEvent::BytesWritten { .. },
+                            ))) => {}
+                            _ => panic!("size mismatch must terminate once before a completion/successor"),
+                        }
+                    };
+                    assert_eq!(started, 1);
+                    for _ in 0..3 {
+                        assert!(matches!(poll(&mut s), Poll::Ready(Ok(None))));
+                    }
+                    drop(s);
+                    if let Some(a) = &mut retained {
+                        assert_eq!(a.size(), initial);
+                        assert_eq!(a.evidence(), &ArtifactEvidence::Provisional);
+                        assert_eq!(
+                            read_all(a),
+                            if initial.is_some() { &data[..data.len() / 2] } else { data.as_slice() }
+                        );
+                        a.discard().unwrap();
+                    }
+                    assert_eq!(std::fs::read(tmp.path().join("transition")).unwrap(), b"prior target");
+                    assert_eq!(std::fs::read(tmp.path().join("successor")).unwrap(), b"prior successor");
+                    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn size_transition_always_unknown_stays_provisional_and_runs_successor() {
+    let data = b"unknown geometry";
+    for sealed in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = size_transition_session(size_transition_volumes(data, None, None), options(tmp.path()), sealed);
+        let mut completions = 0;
+        let mut first_artifact = None;
+        loop {
+            match poll(&mut s) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => {
+                    if completions == 0 {
+                        let MemberOutcome::Provisional(mut a) = outcome else { panic!("unknown size is provisional") };
+                        assert_eq!(a.size(), None);
+                        assert_eq!(a.evidence(), &ArtifactEvidence::Provisional);
+                        assert_eq!(read_all(&mut a), data);
+                        first_artifact = Some(a);
+                    } else {
+                        match outcome {
+                            MemberOutcome::Verified(v) if sealed => assert_eq!(v.level(), VerificationLevel::Strict),
+                            MemberOutcome::Provisional(mut a) if !sealed => {
+                                assert!(
+                                    matches!(a.evidence(), ArtifactEvidence::Verified(v) if v.level()==VerificationLevel::Strict)
+                                );
+                                assert_eq!(read_all(&mut a), b"independent successor");
+                                a.discard().unwrap();
+                            }
+                            _ => panic!("independent successor"),
+                        }
+                    }
+                    completions += 1;
+                }
+                Poll::Ready(Ok(Some(
+                    ProgressiveEvent::VolumeOpened { .. }
+                    | ProgressiveEvent::MemberStarted { .. }
+                    | ProgressiveEvent::BytesWritten { .. },
+                ))) => {}
+                Poll::Ready(Ok(None)) => break,
+                _ => panic!("unknown size continuation"),
+            }
+        }
+        assert_eq!(completions, 2);
+        for _ in 0..3 {
+            assert!(matches!(poll(&mut s), Poll::Ready(Ok(None))));
+        }
+        drop(s);
+        let mut a = first_artifact.unwrap();
+        assert_eq!(read_all(&mut a), data);
+        a.discard().unwrap();
+        assert!(!tmp.path().join("transition").exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), usize::from(sealed));
+    }
+}

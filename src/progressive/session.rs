@@ -610,6 +610,9 @@ impl ProgressiveSession {
         let physical = self.model.members.last().expect("member");
         machine.finish_member(physical)?;
         self.driver.validate_current()?;
+        if let Some(size) = physical.unpacked_size {
+            self.stage.as_mut().expect("stage").reconcile_final_size(size)?;
+        }
         let checks = physical.final_checks.expect("final member checks");
         let checksum = checks
             .blake2sp
