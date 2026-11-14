@@ -1014,8 +1014,12 @@ mod tests {
                 header.block_flags = super::super::HFL_SPLIT_AFTER;
                 header.packed_size = split as u64;
                 header.crc32 = Some(crate::crc32::hash(&ciphertext[..split]));
-                let wire =
-                    super::super::FileWire { name: std::sync::Arc::new(b"f".to_vec()), compression: 0, extent: 0..0 };
+                let wire = super::super::FileWire {
+                    legacy: None,
+                    name: std::sync::Arc::new(b"f".to_vec()),
+                    compression: 0,
+                    extent: 0..0,
+                };
                 let part = PhysicalPart::new(0, &header, header.crypt.map(Ok), &wire);
                 let mut member = PhysicalMember::new(header.clone(), wire, 0, &part).unwrap();
                 let usage = Usage::new(ProgressiveLimits::default());
