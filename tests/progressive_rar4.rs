@@ -360,7 +360,7 @@ fn volume_set_format_cannot_change_after_a_complete_member() {
 #[test]
 fn unsupported_rar4_features_do_not_enter_rar5_decoder() {
     for (flags, version, method) in
-        [(0, 29, 0x33), (0, 15, 0x30), (0, 20, 0x31), (4, 29, 0x30), (0x10, 29, 0x30), (0x800, 20, 0x30)]
+        [(0, 29, 0x36), (0, 15, 0x30), (0, 20, 0x31), (4, 29, 0x30), (0x10, 29, 0x30), (0x800, 20, 0x30)]
     {
         let dir = tempfile::tempdir().unwrap();
         let mut file = member(b"one", b"payload", flags, method);
