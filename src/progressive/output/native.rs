@@ -94,7 +94,12 @@ impl NativeProtection {
         })
     }
 
-    pub(crate) fn refresh(&mut self, declaration: &ProtectionDeclaration, usage: &mut Usage) -> ProgressiveResult<()> {
+    pub(crate) fn refresh(
+        &mut self,
+        declaration: &ProtectionDeclaration,
+        usage: &mut Usage,
+        external_handles: usize,
+    ) -> ProgressiveResult<()> {
         self.check_immutable(usage)?;
         let ProtectionDeclaration::Complete { inventory, .. } = declaration else { return Ok(()) };
         usage.charge(
@@ -109,6 +114,18 @@ impl NativeProtection {
                 VolumeBacking::NonFile => &[],
             })
             .chain(inventory.auxiliary_paths.iter());
+        // Check the combined live inventory before retaining any newly declared
+        // handle, including an Opaque -> Complete upgrade or newly resolved path.
+        let added = if self.complete {
+            self.bindings
+                .iter()
+                .zip(paths.clone())
+                .filter(|(b, p)| b.identity.is_none() && b.handle.is_none() && p.file.is_some())
+                .count()
+        } else {
+            paths.clone().filter(|p| p.file.is_some()).count()
+        };
+        usage.check(Resource::VolumeHandles, (external_handles + self.handle_count() + added) as u64)?;
         if !self.complete {
             let mut count = inventory.auxiliary_paths.len();
             // Structural NonFile declarations carry no library-owned memory authority.
@@ -154,10 +171,7 @@ impl NativeProtection {
                 }
             }
         }
-        usage.check(
-            Resource::VolumeHandles,
-            (self.held.len() + self.bindings.iter().filter(|b| b.handle.is_some()).count()) as u64,
-        )?;
+        usage.check(Resource::VolumeHandles, (external_handles + self.handle_count()) as u64)?;
         // Every prior native source must be covered by its declared indexed volume,
         // including sources admitted before an Opaque -> Complete upgrade.
         for &(index, identity) in &self.admitted {
@@ -197,11 +211,13 @@ impl NativeProtection {
         files: &[File],
         declaration: &ProtectionDeclaration,
         usage: &mut Usage,
+        external_handles: usize,
     ) -> ProgressiveResult<()> {
         usage.charge(Resource::SourceBookkeeping, (self.bindings.len() + self.admitted.len() + files.len()) as u64)?;
         usage.check(
             Resource::VolumeHandles,
-            (self.held.len()
+            (external_handles
+                + self.held.len()
                 + self.bindings.iter().filter(|b| b.handle.is_some()).count()
                 + files.len() * if self.complete { 1 } else { 2 }) as u64,
         )?;

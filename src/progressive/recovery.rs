@@ -300,17 +300,19 @@ impl ProgressiveSession {
         artifact: &mut Artifact,
         cx: &mut Context<'_>,
     ) -> Poll<ProgressiveResult<Verification>> {
-        if self.verify_job.as_ref().is_some_and(|j| artifact.member() != Some(j.member)) {
+        if self.extraction_active || self.verify_job.as_ref().is_some_and(|j| artifact.member() != Some(j.member)) {
             return Poll::Ready(Err(invalid()));
         }
         self.control.register(cx.waker());
         let result = self.verify_inner(artifact, cx);
         if let Err(e) = &result {
-            if matches!(e.kind, FailureKind::Rar(_) | FailureKind::ChecksumMismatch { .. })
-                && let Some(stage) = artifact.stage.as_mut()
+            if artifact.receipt.is_none()
+                && let Some(stage) = artifact.stage.as_mut().filter(|s| s.member.session == self.nonce)
             {
-                stage.assessment.get_mut().failed = true;
-                stage.assessment.get_mut().evidence = None;
+                let assessment = stage.assessment.get_mut();
+                assessment.failed |= matches!(e.kind, FailureKind::Rar(_) | FailureKind::ChecksumMismatch { .. });
+                assessment.evidence = None;
+                assessment.stamp = None;
             }
             self.verify_job = None;
             let _ = self.driver.abort_replacement_reads();
@@ -331,6 +333,9 @@ impl ProgressiveSession {
         let stage = self.recovery_stage(artifact)?;
         if self.verify_job.as_ref().is_some_and(|j| j.member != stage.member) {
             return Ok(Poll::Ready(Err(invalid())));
+        }
+        if !self.driver.replacement_retry_ready(cx)? {
+            return Ok(Poll::Pending);
         }
         self.driver.validate_current()?;
         if !stage.holes.is_empty() || stage.size != Some(stage.produced) || stage.length != stage.produced {
@@ -410,7 +415,7 @@ impl ProgressiveSession {
             stage.assessment.get_mut().stamp = Some(job.stamp);
             stage.assessment.get_mut().evidence_epoch = self.replacement_revision;
             if v.level == VerificationLevel::Strict {
-                self.publish_artifact(artifact, &v, false)?;
+                self.publish_artifact(artifact, &v, false, job.generation, job.stamp)?;
             }
             return Ok(Poll::Ready(Ok(v)));
         }
@@ -558,6 +563,9 @@ impl ProgressiveSession {
             },
         };
         self.driver.validate_current()?;
+        if job.generation != stage.generation || job.stamp != stamp(stage)? {
+            return Err(invalid());
+        }
         stage.assessment.get_mut().evidence = Some(v.clone());
         stage.assessment.get_mut().stamp = Some(job.stamp);
         stage.assessment.get_mut().evidence_epoch = self.replacement_revision;
@@ -578,7 +586,7 @@ impl ProgressiveSession {
             return Ok(Poll::Pending);
         }
         if v.level == VerificationLevel::Strict {
-            self.publish_artifact(artifact, &v, false)?;
+            self.publish_artifact(artifact, &v, false, job.generation, job.stamp)?;
         }
         Ok(Poll::Ready(Ok(v)))
     }
@@ -587,9 +595,11 @@ impl ProgressiveSession {
         artifact: &mut Artifact,
         v: &Verification,
         recovered: bool,
+        generation: u64,
+        verified_stamp: SourceStamp,
     ) -> ProgressiveResult<bool> {
         let stage = artifact.stage.as_mut().ok_or_else(invalid)?;
-        let permit = stage.bind_verification(v.clone())?;
+        let permit = stage.bind_verification_at(v.clone(), generation, verified_stamp)?;
         let record = artifact.recovery.as_mut().ok_or_else(invalid)?;
         match stage.publish_policy(&mut record.target, &permit, &mut self.driver, recovered)? {
             Publication::Provisional => Ok(false),
@@ -610,6 +620,9 @@ impl ProgressiveSession {
         }
     }
     pub fn publish_recovered(&mut self, artifact: &mut Artifact) -> ProgressiveResult<Verification> {
+        if self.extraction_active {
+            return Err(invalid());
+        }
         let stage = self.recovery_stage(artifact)?;
         if self.verify_job.is_some() || self.options.recovery_publication != RecoveryPublication::VerifiedInner {
             return Err(invalid());
@@ -628,7 +641,8 @@ impl ProgressiveSession {
         {
             return Err(invalid());
         }
-        if !self.publish_artifact(artifact, &v, true)? {
+        let generation = stage.generation;
+        if !self.publish_artifact(artifact, &v, true, generation, cached_stamp.ok_or_else(invalid)?)? {
             return Err(ProgressiveFailure::new(FailureKind::PublicationAuthorityRequired));
         }
         Ok(v)
@@ -968,14 +982,30 @@ mod tests {
         archive
     }
 
-    use std::{fs::File, task::Waker};
+    use std::{fs::File, sync::Mutex, task::Waker};
     struct Missing {
         bytes: Vec<u8>,
         start: u64,
         file: File,
+        attack: Arc<Mutex<Option<(usize, File)>>>,
+        pause: Option<Arc<Mutex<TestPause>>>,
+    }
+    struct TestPause {
+        offset: u64,
+        ready: bool,
+        waker: Option<Waker>,
     }
     impl RangeSource for Missing {
         fn info(&self) -> SourceInfo {
+            let mut attack = self.attack.lock().unwrap();
+            if let Some((remaining, file)) = &mut *attack {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    use std::os::unix::fs::FileExt;
+                    file.write_all_at(b"XXXXXXXXXX", 0).unwrap();
+                    *attack = None;
+                }
+            }
             SourceInfo {
                 id: SourceId(1),
                 generation: 0,
@@ -986,7 +1016,19 @@ mod tests {
         fn backing_files(&self) -> &[File] {
             std::slice::from_ref(&self.file)
         }
-        fn read_at(&mut self, at: u64, b: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        fn read_at(&mut self, at: u64, b: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            let mut available = b.len();
+            if let Some(pause) = &self.pause {
+                let mut pause = pause.lock().unwrap();
+                if !pause.ready {
+                    if at >= pause.offset {
+                        pause.waker = Some(cx.waker().clone());
+                        return Ok(RangeRead::NotYet);
+                    }
+                    available = available.min((pause.offset - at) as usize);
+                }
+            }
+            let b = &mut b[..available];
             if at >= self.start && at < self.start + 4 {
                 return Ok(RangeRead::Hole { len: (self.start + 4 - at).min(b.len() as u64) });
             }
@@ -1017,7 +1059,26 @@ mod tests {
         write_budget: u64,
         overwrite: crate::extract::Overwrite,
     ) -> (ProgressiveSession, Artifact) {
-        let bytes = test_archive();
+        setup_attack(dir, write_budget, overwrite, true, Arc::new(Mutex::new(None)))
+    }
+    fn setup_attack(
+        dir: &std::path::Path,
+        write_budget: u64,
+        overwrite: crate::extract::Overwrite,
+        authorized: bool,
+        attack: Arc<Mutex<Option<(usize, File)>>>,
+    ) -> (ProgressiveSession, Artifact) {
+        setup_case(dir, write_budget, overwrite, authorized, attack, test_archive(), None)
+    }
+    fn setup_case(
+        dir: &std::path::Path,
+        write_budget: u64,
+        overwrite: crate::extract::Overwrite,
+        authorized: bool,
+        attack: Arc<Mutex<Option<(usize, File)>>>,
+        bytes: Vec<u8>,
+        pause: Option<(Arc<Mutex<TestPause>>, ArtifactAftermath)>,
+    ) -> (ProgressiveSession, Artifact) {
         let start = bytes.windows(10).position(|w| w == b"0123456789").unwrap() as u64 + 3;
         let path = dir.join("source.rar");
         std::fs::write(&path, &bytes).unwrap();
@@ -1050,8 +1111,15 @@ mod tests {
         );
         opts.hole_policy = HolePolicy::PartialStored { fill: HoleFill::Sparse };
         opts.limits.output_write_bytes = write_budget;
+        if let Some((_, aftermath)) = &pause {
+            opts.artifact_aftermath = *aftermath;
+        }
+        let pause = pause.map(|(p, _)| p);
         let mut session = ProgressiveSession::new(
-            Box::new(Provider { source: Some(Missing { bytes, start, file }), declaration }),
+            Box::new(Provider {
+                source: Some(Missing { bytes, start, file, attack, pause }),
+                declaration: if authorized { declaration } else { ProtectionDeclaration::Opaque },
+            }),
             opts,
         )
         .unwrap();
@@ -1075,6 +1143,148 @@ mod tests {
     }
     fn fault(operation: crate::output::OwnedOperation, result: Result<Option<usize>, i32>) {
         crate::output::OWNED_STAGE_FAULT.with(|slot| *slot.borrow_mut() = Some((operation, result)));
+    }
+    #[test]
+    fn r1_verification_conflict_preserves_parked_extraction_and_cleanup() {
+        for aftermath in [ArtifactAftermath::RetainProvisional, ArtifactAftermath::Remove] {
+            for finish_second in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut bytes = test_archive();
+                bytes.truncate(bytes.len() - 8); // retain first member, replace archive end
+                let mut second = test_archive();
+                let name = second.windows(5).position(|w| w == b"inner").unwrap();
+                // Rebuild the CRC-covered file header with a distinct target name.
+                second[name..name + 5].copy_from_slice(b"other");
+                let header_end = second.windows(10).position(|w| w == b"0123456789").unwrap();
+                let crc = crate::crc32::hash(&second[20..header_end]);
+                second[16..20].copy_from_slice(&crc.to_le_bytes());
+                let pause_at = (bytes.len() + header_end - 16 + 2) as u64;
+                bytes.extend_from_slice(&second[16..]);
+                let pause = Arc::new(Mutex::new(TestPause { offset: pause_at, ready: false, waker: None }));
+                let (mut s, mut a) = setup_case(
+                    dir.path(),
+                    100,
+                    crate::extract::Overwrite::Skip,
+                    true,
+                    Arc::new(Mutex::new(None)),
+                    bytes,
+                    Some((pause.clone(), aftermath)),
+                );
+                s.patch(&mut a, 3, b"3456").unwrap();
+                let mut cx = Context::from_waker(Waker::noop());
+                for _ in 0..100 {
+                    assert!(!matches!(s.poll_event(&mut cx), Poll::Ready(Err(_))));
+                    if pause.lock().unwrap().waker.is_some() {
+                        break;
+                    }
+                }
+                assert!(pause.lock().unwrap().waker.is_some());
+                let second_member = s.stage.as_ref().unwrap().member;
+                assert_eq!(s.stage.as_ref().unwrap().produced, 2);
+                fault(crate::output::OwnedOperation::Remove, Err(libc::EACCES));
+                assert!(matches!(
+                    s.poll_verify(&mut a, &mut cx),
+                    Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::InvalidCapability, .. }))
+                ));
+                assert!(s.verify_job.is_none());
+                assert_eq!(s.stage.as_ref().unwrap().member, second_member);
+                assert_eq!(a.publication(), ArtifactPublication::Unpublished);
+                assert!(s.poll_event(&mut cx).is_pending());
+                // The rejected publication never consumed the fault or B's wait.
+                crate::output::OWNED_STAGE_FAULT.with(|slot| assert!(slot.borrow_mut().take().is_some()));
+                if !finish_second {
+                    s.control().cancel();
+                    let Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated {
+                        failure,
+                        artifact,
+                        cleanup_failure,
+                    }))) = s.poll_event(&mut cx)
+                    else {
+                        panic!("B must receive terminal aftermath");
+                    };
+                    assert!(matches!(failure.kind, FailureKind::Canceled));
+                    assert!(cleanup_failure.is_none());
+                    match (aftermath, artifact) {
+                        (ArtifactAftermath::RetainProvisional, Some(mut b)) => {
+                            assert_eq!(b.member(), Some(second_member));
+                            assert_eq!(b.produced_extent(), 2);
+                            let mut prefix = [0; 2];
+                            assert_eq!(b.read_at(0, &mut prefix).unwrap(), ArtifactRead::Filled { count: 2 });
+                            assert_eq!(&prefix, b"01");
+                            b.discard().unwrap();
+                        }
+                        (ArtifactAftermath::Remove, None) => {}
+                        _ => panic!("wrong B aftermath"),
+                    }
+                    assert_eq!(a.publication(), ArtifactPublication::Unpublished);
+                    assert!(!dir.path().join("out/other").exists());
+                    a.discard().unwrap();
+                    continue;
+                }
+                let wake = {
+                    let mut pause = pause.lock().unwrap();
+                    pause.ready = true;
+                    pause.waker.take().unwrap()
+                };
+                wake.wake();
+                loop {
+                    match s.poll_event(&mut cx) {
+                        Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                            member,
+                            outcome: MemberOutcome::Verified(_),
+                        }))) => {
+                            assert_eq!(member, second_member);
+                            break;
+                        }
+                        Poll::Ready(Err(e)) => panic!("{e}"),
+                        _ => {}
+                    }
+                }
+                assert_eq!(std::fs::read(dir.path().join("out/other")).unwrap(), b"0123456789");
+                fault(crate::output::OwnedOperation::Remove, Err(libc::EACCES));
+                assert!(matches!(
+                    verify(&mut s, &mut a).unwrap_err().kind,
+                    FailureKind::Output { operation: OutputOperation::Remove, .. }
+                ));
+                assert_eq!(a.publication(), ArtifactPublication::Strict);
+                a.discard().unwrap();
+                assert_eq!(std::fs::read(dir.path().join("out/inner")).unwrap(), b"0123456789");
+                assert!(matches!(s.poll_event(&mut cx), Poll::Ready(Ok(None))));
+            }
+        }
+    }
+    fn final_info_mutation(authorized: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let attack = Arc::new(Mutex::new(None));
+        let (mut s, mut a) =
+            setup_attack(dir.path(), 100, crate::extract::Overwrite::Always, authorized, attack.clone());
+        s.patch(&mut a, 3, b"3456").unwrap();
+        if !authorized {
+            verify(&mut s, &mut a).unwrap();
+            assert!(matches!(a.evidence(), ArtifactEvidence::Verified(_)));
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        while !s.verify_job.as_ref().is_some_and(|job| job.offset == 10 && job.part == 1) {
+            assert!(s.poll_verify(&mut a, &mut cx).is_pending());
+        }
+        // One start-of-poll info check, then the final validation callback.
+        *attack.lock().unwrap() = Some((2, a.stage.as_ref().unwrap().native.file().try_clone().unwrap()));
+        assert!(matches!(
+            s.poll_verify(&mut a, &mut cx),
+            Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::InvalidCapability, .. }))
+        ));
+        assert!(attack.lock().unwrap().is_none(), "the final info callback ran");
+        assert_eq!(a.publication(), ArtifactPublication::Unpublished);
+        assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
+        assert!(!dir.path().join("out/inner").exists());
+    }
+    #[test]
+    fn r1_final_info_mutation_cannot_publish_old_digest() {
+        final_info_mutation(true);
+    }
+    #[test]
+    fn r1_final_info_mutation_cannot_return_provisional_verified_digest() {
+        final_info_mutation(false);
     }
     #[test]
     fn failed_short_patch_retains_whole_hole_and_invalidates_generation() {

@@ -1047,3 +1047,153 @@ fn excessive_full_padding_block_is_malformed_even_with_missing_data() {
     }
     assert!(!dir.path().join("inner").exists());
 }
+
+#[test]
+fn r1_parked_verification_has_no_callbacks_or_request_debits_until_wake() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    type Counts = Arc<Mutex<[usize; 5]>>;
+    struct Counted {
+        source: Box<dyn RangeSource>,
+        counts: Counts,
+    }
+    impl RangeSource for Counted {
+        fn info(&self) -> SourceInfo {
+            self.counts.lock().unwrap()[0] += 1;
+            self.source.info()
+        }
+        fn backing_files(&self) -> &[File] {
+            self.counts.lock().unwrap()[1] += 1;
+            self.source.backing_files()
+        }
+        fn read_at(&mut self, at: u64, b: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            self.counts.lock().unwrap()[2] += 1;
+            self.source.read_at(at, b, cx)
+        }
+    }
+    struct CountedProvider {
+        source: Option<Counted>,
+        counts: Counts,
+    }
+    impl VolumeSource for CountedProvider {
+        fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+            self.counts.lock().unwrap()[3] += 1;
+            Ok(VolumeAnswer::Ready(Box::new(self.source.take().unwrap())))
+        }
+        fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+            self.counts.lock().unwrap()[4] += 1;
+            Ok(ProtectionDeclaration::Opaque)
+        }
+    }
+    #[derive(Default)]
+    struct Task(AtomicUsize);
+    impl std::task::Wake for Task {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let plain: Vec<u8> = (0..79).collect();
+    let (data, start) = encrypted(&plain);
+    let original = Arc::new(Mutex::new([0; 5]));
+    let replacement = Arc::new(Mutex::new([0; 5]));
+    let mut opts = options(dir.path());
+    opts.set_password(Some("pw".into())).unwrap();
+    opts.limits.source_requests = 2000;
+    let mut s = ProgressiveSession::new(
+        Box::new(CountedProvider {
+            source: Some(Counted {
+                source: Box::new(Bytes { data: data.clone(), holes: one(start + 17..start + 18) }),
+                counts: original.clone(),
+            }),
+            counts: original.clone(),
+        }),
+        opts,
+    )
+    .unwrap();
+    let mut a = artifact(&mut s);
+    s.patch(&mut a, 16, &plain[16..48]).unwrap();
+    let gate = Arc::new(Mutex::new(Gate::default()));
+    s.supply_verification_source(
+        0,
+        Box::new(Counted {
+            source: Box::new(Waiting { bytes: Bytes { data, holes: vec![] }, gate: gate.clone() }),
+            counts: replacement.clone(),
+        }),
+    )
+    .unwrap();
+    for _ in 0..100 {
+        assert!(s.poll_verify(&mut a, &mut Context::from_waker(Waker::noop())).is_pending());
+        if gate.lock().unwrap().waker.is_some() {
+            break;
+        }
+    }
+    assert!(gate.lock().unwrap().waker.is_some());
+    let original_before = *original.lock().unwrap();
+    let replacement_before = *replacement.lock().unwrap();
+    let old = Arc::new(Task::default());
+    let latest = Arc::new(Task::default());
+    let old_waker = Waker::from(old.clone());
+    let latest_waker = Waker::from(latest.clone());
+    // More no-wake polls than the entire request budget: no source debit is allowed.
+    for _ in 0..2500 {
+        assert!(s.poll_verify(&mut a, &mut Context::from_waker(&old_waker)).is_pending());
+        assert_eq!(*original.lock().unwrap(), original_before);
+        assert_eq!(*replacement.lock().unwrap(), replacement_before);
+    }
+    assert!(s.poll_verify(&mut a, &mut Context::from_waker(&latest_waker)).is_pending());
+    let wake = {
+        let mut gate = gate.lock().unwrap();
+        gate.allow = true;
+        gate.waker.take().unwrap()
+    };
+    wake.wake();
+    assert_eq!(old.0.load(Ordering::SeqCst), 0);
+    assert!(latest.0.load(Ordering::SeqCst) > 0);
+    assert!(s.poll_verify(&mut a, &mut Context::from_waker(&latest_waker)).is_pending());
+    assert!(original.lock().unwrap()[0] > original_before[0], "admitted work revalidates original");
+    assert!(replacement.lock().unwrap()[2] > replacement_before[2], "provider resumed after wake");
+    for _ in 0..100 {
+        assert!(s.poll_verify(&mut a, &mut Context::from_waker(&latest_waker)).is_pending());
+        if gate.lock().unwrap().waker.is_some() {
+            break;
+        }
+    }
+    let original_before = *original.lock().unwrap();
+    let replacement_before = *replacement.lock().unwrap();
+    let wakes = latest.0.load(Ordering::SeqCst);
+    s.control().cancel();
+    assert!(latest.0.load(Ordering::SeqCst) > wakes);
+    assert!(matches!(
+        s.poll_verify(&mut a, &mut Context::from_waker(&latest_waker)),
+        Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::Canceled, .. }))
+    ));
+    assert_eq!(*original.lock().unwrap(), original_before);
+    assert_eq!(*replacement.lock().unwrap(), replacement_before);
+}
+
+#[test]
+fn r1_caller_checksum_mismatch_permanently_blocks_expectation_correction() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = archive(&[FileSpec::new("inner", b"correct")]);
+    let mut s =
+        ProgressiveSession::new(Box::new(Provider(Some(Bytes { data, holes: vec![] }))), options(dir.path())).unwrap();
+    let mut a = artifact(&mut s);
+    s.set_expected_inner(&a, ExpectedInner::Crc32 { digest: 0, label: "mistaken metadata".into() }).unwrap();
+    assert!(matches!(verify(&mut s, &mut a).unwrap_err().kind, FailureKind::ChecksumMismatch { .. }));
+    assert!(matches!(
+        s.set_expected_inner(
+            &a,
+            ExpectedInner::Crc32 { digest: crc32fast::hash(b"correct"), label: "corrected metadata".into() }
+        )
+        .unwrap_err()
+        .kind,
+        FailureKind::IncompleteOutput
+    ));
+    assert!(matches!(verify(&mut s, &mut a).unwrap_err().kind, FailureKind::IncompleteOutput));
+    assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
+    assert_eq!(a.publication(), ArtifactPublication::Unpublished);
+    assert!(!dir.path().join("inner").exists());
+}

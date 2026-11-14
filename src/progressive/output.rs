@@ -579,6 +579,23 @@ impl Stage {
     /// Called only by an engine after its complete content/evidence verification pass.
     pub(crate) fn bind_verification(&mut self, verification: Verification) -> ProgressiveResult<VerifiedStage> {
         self.mutation()?;
+        let stamp = SourceStamp::from_metadata(
+            self.native.file().metadata().map_err(|e| out(OutputOperation::Metadata, e, 0))?,
+        )
+        .map_err(|e| out(OutputOperation::Metadata, e, 0))?;
+        self.bind_verification_at(verification, self.generation, stamp)
+    }
+    /// Recovery carries the stamp under which its whole-inner digest was scanned.
+    pub(crate) fn bind_verification_at(
+        &mut self,
+        verification: Verification,
+        generation: u64,
+        expected_stamp: SourceStamp,
+    ) -> ProgressiveResult<VerifiedStage> {
+        self.mutation()?;
+        if self.generation != generation {
+            return Err(invalid());
+        }
         if !self.holes.is_empty()
             || self.produced != self.length
             || self.size != Some(self.produced)
@@ -590,7 +607,10 @@ impl Stage {
             self.native.file().metadata().map_err(|e| out(OutputOperation::Metadata, e, 0))?,
         )
         .map_err(|e| out(OutputOperation::Metadata, e, 0))?;
-        if verification.level == VerificationLevel::Unverified || verification.checksum.is_none() {
+        if stamp != expected_stamp
+            || verification.level == VerificationLevel::Unverified
+            || verification.checksum.is_none()
+        {
             return Err(invalid());
         }
         self.assessment.get_mut().evidence = Some(verification.clone());
@@ -641,10 +661,18 @@ impl Stage {
             return Err(invalid());
         }
         let policy = Policy { root: &self.root, usage: &self.usage };
-        if !policy.check_target(target, source)? {
+        let authorized = policy.check_target(target, source)?;
+        self.mutation()?;
+        let current = SourceStamp::from_metadata(
+            self.native.file().metadata().map_err(|e| out(OutputOperation::Metadata, e, 0))?,
+        )
+        .map_err(|e| out(OutputOperation::Metadata, e, 0))?;
+        if current != verified.stamp {
+            return Err(invalid());
+        }
+        if !authorized {
             return Ok(Publication::Provisional);
         }
-        self.mutation()?;
         target.check_parent()?;
         policy.prepare_parents(target, source)?;
         target.check_parent()?;
@@ -684,7 +712,12 @@ impl Stage {
     }
     pub(crate) fn into_artifact(mut self) -> Artifact {
         self.lease.as_mut().expect("slot").deliver();
-        Artifact { stage: Some(self), recovery: None, receipt: None }
+        let receipt = if self.published {
+            Some((ArtifactPublication::Strict, self.assessment.get_mut().evidence.clone().expect("published verdict")))
+        } else {
+            None
+        };
+        Artifact { stage: Some(self), recovery: None, receipt }
     }
     pub(crate) fn discard(&mut self) -> ProgressiveResult<()> {
         self.native.discard().map_err(|e| out(OutputOperation::Remove, e, 0))?;

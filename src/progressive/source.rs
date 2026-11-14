@@ -315,7 +315,8 @@ impl SourceDriver {
         if self.info.is_some() {
             self.check_info()?;
         }
-        self.native.refresh(&self.protection, &mut self.usage)?;
+        let external = self.other_lane_handles()? + self.backing_count;
+        self.native.refresh(&self.protection, &mut self.usage, external)?;
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
@@ -524,13 +525,11 @@ impl SourceDriver {
         }
         self.usage.charge(Resource::SourceRequests, 1)?;
         let backing = source.backing_files();
-        self.usage.check(Resource::VolumeHandles, backing.len() as u64)?;
-        if self.external_handles > 0 {
-            self.usage.check(Resource::VolumeHandles, (self.external_handles + backing.len() * 2) as u64)?;
-        }
+        let external = self.other_lane_handles()?;
+        self.usage.check(Resource::VolumeHandles, (external + self.native.handle_count() + backing.len()) as u64)?;
+        self.native.refresh(&self.protection, &mut self.usage, external + backing.len())?;
+        self.native.admit(self.request.index, backing, &self.protection, &mut self.usage, external)?;
         self.backing_count = backing.len();
-        self.native.refresh(&self.protection, &mut self.usage)?;
-        self.native.admit(self.request.index, backing, &self.protection, &mut self.usage)?;
         // Only the concrete library adapter carries its original immutable stamp.
         // Custom providers retain the cooperative progressive identity contract.
         if let Some(immutable) = (&*source as &dyn std::any::Any).downcast_ref::<ImmutableFileSource>() {
@@ -545,6 +544,11 @@ impl SourceDriver {
         self.source = Some(source);
         self.info = Some(info);
         Ok(info)
+    }
+    fn other_lane_handles(&self) -> ProgressiveResult<usize> {
+        self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64)?;
+        Ok(self.external_handles
+            + self.replacements.iter().map(|(_, lane)| lane.native.handle_count() + lane.backing_count).sum::<usize>())
     }
     pub(crate) fn observed_info(&self, index: u32) -> Option<SourceInfo> {
         self.admitted.iter().find(|(i, _, _, _)| *i == index).map(|(_, _, _, v)| *v)
@@ -596,6 +600,23 @@ impl SourceDriver {
     pub(crate) fn has_replacement(&self, index: u32) -> ProgressiveResult<bool> {
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64)?;
         Ok(self.replacements.iter().any(|(i, _)| *i == index))
+    }
+    /// Admit a whole verification retry before any caller callback. Readiness
+    /// consumption and wake accounting use the same latch as range reads.
+    pub(crate) fn replacement_retry_ready(&mut self, cx: &mut Context<'_>) -> ProgressiveResult<bool> {
+        for (_, lane) in &mut self.replacements {
+            if lane.parked {
+                lane.wake.register(cx.waker());
+                if self.control.is_canceled() {
+                    return Err(ProgressiveFailure::new(FailureKind::Canceled));
+                }
+                if !lane.wake.consume_ready(|wakes| self.usage.charge(Resource::ProviderWakes, wakes))? {
+                    return Ok(false);
+                }
+                lane.parked = false;
+            }
+        }
+        Ok(true)
     }
     pub(crate) fn poll_replacement(
         &mut self,
@@ -740,7 +761,8 @@ impl SourceDriver {
             _ => {}
         }
         self.check_inventory_admitted(&next)?;
-        self.native.refresh(&next, &mut self.usage)?;
+        let external = self.other_lane_handles()? + self.backing_count;
+        self.native.refresh(&next, &mut self.usage, external)?;
         self.protection = next;
         Ok(())
     }

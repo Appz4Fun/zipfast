@@ -407,13 +407,13 @@ fn native_binding_survives_growth_and_rejects_rebinding() {
     let declaration = complete(vec![ProtectedPath { path: path.clone(), file: Some(held) }]);
     let mut native = native::NativeProtection::new(&Usage::new(ProgressiveLimits::default())).unwrap();
     let mut usage = Usage::new(ProgressiveLimits::default());
-    native.refresh(&declaration, &mut usage).unwrap();
+    native.refresh(&declaration, &mut usage, 0).unwrap();
     use std::io::Write;
     fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"more").unwrap();
-    native.refresh(&declaration, &mut usage).unwrap();
+    native.refresh(&declaration, &mut usage, 0).unwrap();
     fs::rename(&path, d.path().join("old")).unwrap();
     fs::write(&path, b"new").unwrap();
-    assert!(matches!(native.refresh(&declaration, &mut usage).unwrap_err().kind, FailureKind::SourceChanged));
+    assert!(matches!(native.refresh(&declaration, &mut usage, 0).unwrap_err().kind, FailureKind::SourceChanged));
 }
 #[test]
 fn opaque_native_retention_is_finite_and_checks_upgrade() {
@@ -424,18 +424,18 @@ fn opaque_native_retention_is_finite_and_checks_upgrade() {
     let mut guard = native::NativeProtection::new(&usage).unwrap();
     let file = fs::File::open(&path).unwrap();
     assert!(matches!(
-        guard.admit(0, std::slice::from_ref(&file), &ProtectionDeclaration::Opaque, &mut usage).unwrap_err().kind,
+        guard.admit(0, std::slice::from_ref(&file), &ProtectionDeclaration::Opaque, &mut usage, 0).unwrap_err().kind,
         FailureKind::Limit { resource: Resource::VolumeHandles, .. }
     ));
     let mut usage = Usage::new(ProgressiveLimits::default());
     let mut guard = native::NativeProtection::new(&usage).unwrap();
-    guard.admit(0, std::slice::from_ref(&file), &ProtectionDeclaration::Opaque, &mut usage).unwrap();
+    guard.admit(0, std::slice::from_ref(&file), &ProtectionDeclaration::Opaque, &mut usage, 0).unwrap();
     drop(file);
     fs::rename(&path, d.path().join("old")).unwrap();
     fs::write(&path, b"new").unwrap();
     let declaration =
         complete(vec![ProtectedPath { path: path.clone(), file: Some(Arc::new(fs::File::open(path).unwrap())) }]);
-    assert!(matches!(guard.refresh(&declaration, &mut usage).unwrap_err().kind, FailureKind::SourceContract));
+    assert!(matches!(guard.refresh(&declaration, &mut usage, 0).unwrap_err().kind, FailureKind::SourceContract));
 }
 #[test]
 fn write_budget_charges_failures_and_zero_fill() {
@@ -705,7 +705,7 @@ fn complete_absent_binding_can_appear_but_cannot_rebind() {
     let mut usage = Usage::new(ProgressiveLimits::default());
     let mut guard = native::NativeProtection::new(&usage).unwrap();
     let mut declaration = complete(vec![ProtectedPath { path: future.clone(), file: None }]);
-    guard.refresh(&declaration, &mut usage).unwrap();
+    guard.refresh(&declaration, &mut usage, 0).unwrap();
     assert!(!guard.resolved_for_publication(&usage).unwrap());
     guard.check_target(&target, None, &mut usage).unwrap();
     fs::write(&future, b"source").unwrap();
@@ -714,11 +714,11 @@ fn complete_absent_binding_can_appear_but_cannot_rebind() {
     {
         paths[0].file = Some(Arc::new(fs::File::open(&future).unwrap()));
     }
-    guard.refresh(&declaration, &mut usage).unwrap();
+    guard.refresh(&declaration, &mut usage, 0).unwrap();
     assert!(guard.resolved_for_publication(&usage).unwrap());
     fs::rename(&future, d.path().join("old")).unwrap();
     fs::write(&future, b"foreign").unwrap();
-    assert!(matches!(guard.refresh(&declaration, &mut usage).unwrap_err().kind, FailureKind::SourceChanged));
+    assert!(matches!(guard.refresh(&declaration, &mut usage, 0).unwrap_err().kind, FailureKind::SourceChanged));
 }
 
 #[test]

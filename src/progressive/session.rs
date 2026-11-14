@@ -184,6 +184,7 @@ pub struct ProgressiveSession {
     witnesses: Vec<recovery::WireVolume>,
     replacement_epoch: Arc<AtomicU64>,
     recovery_closed: bool,
+    extraction_active: bool,
     part_evidence: Vec<PackedEvidence>,
 }
 enum Disposition {
@@ -286,6 +287,7 @@ impl ProgressiveSession {
             witnesses: Vec::new(),
             replacement_epoch: Arc::new(AtomicU64::new(0)),
             recovery_closed: false,
+            extraction_active: false,
             part_evidence: Vec::new(),
         })
     }
@@ -300,10 +302,22 @@ impl ProgressiveSession {
             return Poll::Ready(Ok(None));
         }
         self.control.register(cx.waker());
-        match self.poll_inner(cx) {
+        self.extraction_active = true;
+        let result = match self.poll_inner(cx) {
             Ok(p) => p,
             Err(e) => Poll::Ready(self.terminate(e)),
+        };
+        if matches!(
+            &result,
+            Poll::Ready(
+                Err(_)
+                    | Ok(None
+                        | Some(ProgressiveEvent::MemberFinished { .. } | ProgressiveEvent::SessionTerminated { .. }))
+            )
+        ) {
+            self.extraction_active = false;
         }
+        result
     }
     fn scope(&self, mut failure: ProgressiveFailure) -> ProgressiveFailure {
         failure.context.member = failure.context.member.or(self.member);
@@ -1220,10 +1234,15 @@ mod tests {
             session.poll_event(&mut Context::from_waker(std::task::Waker::noop())),
             Poll::Ready(Ok(None))
         ));
+        assert_eq!(artifact.publication(), ArtifactPublication::Strict);
+        assert!(matches!(artifact.evidence(), ArtifactEvidence::Verified(v) if v.level() == VerificationLevel::Strict));
+        assert!(matches!(artifact.read_at(0, &mut [0; 3]).unwrap_err().kind, FailureKind::InvalidCapability));
+        assert!(matches!(session.patch(&mut artifact, 0, b"bad").unwrap_err().kind, FailureKind::InvalidCapability));
+        assert!(matches!(
+            session.poll_verify(&mut artifact, &mut Context::from_waker(std::task::Waker::noop())),
+            Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::InvalidCapability, .. }))
+        ));
         drop(session);
-        let mut buffer = [0; 3];
-        assert_eq!(artifact.read_at(0, &mut buffer).unwrap(), ArtifactRead::Filled { count: 3 });
-        assert_eq!(&buffer, b"new");
         artifact.discard().unwrap();
         assert_eq!(std::fs::read(temp.path().join("target")).unwrap(), b"new");
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);

@@ -187,6 +187,12 @@ by a caller digest. A member with no whole-inner digest yields `Unverified`,
 `checksum() == None` and provisional artifact evidence; absence of a checksum
 never proves a password.
 
+An actual declared checksum mismatch permanently marks this artifact Failed,
+including a mistaken caller expectation. Correcting expectation metadata cannot
+rehabilitate that artifact; the caller must restart recovery with a new artifact.
+Separating caller-metadata correction from sticky archive failures is a future
+compatibility extension, not supported by this initial policy.
+
 A caller can provide `ExpectedInner::Crc32 { digest, label }` or `Blake2sp` using
 `set_expected_inner(&artifact, expected)`. Labels are limited to 1024 UTF-8 bytes.
 Caller digests compare raw plaintext; archive keyed checks remain separate.
@@ -203,7 +209,12 @@ the originating session/member/output, exact descriptor stamp/extent, output and
 expectation generation, and replacement revision. Only one verification job runs
 per session. While it runs or is parked, conflicting event polling or verification
 of another artifact returns `InvalidCapability` without consuming the original
-job. Cancellation wakes the registered caller. Patching or changing expectations
+job. Verification and explicit recovered publication also reject an active or
+parked extraction operation until its current member reaches a terminal event;
+that conflict preserves both the extraction state and the retained artifact.
+A parked verification poll invokes no provider callbacks or source-request debits
+without readiness, while updating the task waker and checking cancellation.
+Cancellation wakes the registered caller. Patching or changing expectations
 for that artifact, or supplying a new replacement generation, abandons its job;
 retained sources keep their identities and permanent-hole history, and old request
 wakers cannot authorize a later request.

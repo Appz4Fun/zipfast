@@ -1077,3 +1077,98 @@ fn synchronized_wake_boundary_gates_read_and_volume_retry() {
         }
     }
 }
+
+#[test]
+fn r1_later_original_admission_counts_retained_replacement_handles() {
+    struct NativeVolumes(Vec<std::path::PathBuf>);
+    impl VolumeSource for NativeVolumes {
+        fn volume(&mut self, request: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+            Ok(VolumeAnswer::Ready(Box::new(ImmutableFileSource::open(&self.0[request.index as usize])?)))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<_> = ["first", "next", "replacement"].map(|name| dir.path().join(name)).into();
+    for path in &paths {
+        std::fs::write(path, b"12345678").unwrap();
+    }
+    let mut d = SourceDriver::new(
+        Box::new(NativeVolumes(paths[..2].to_vec())),
+        "a.part1.rar".into(),
+        ProgressiveLimits { volume_handles: 4, ..Default::default() },
+        SessionControl::default(),
+    )
+    .unwrap();
+    opened(&mut d, Waker::noop());
+    d.supply_replacement(0, Box::new(ImmutableFileSource::open(&paths[2]).unwrap())).unwrap();
+    assert_eq!(
+        d.native.handle_count()
+            + d.backing_count
+            + d.replacements[0].1.native.handle_count()
+            + d.replacements[0].1.backing_count,
+        4
+    );
+    d.select_volume(VolumeRequest { index: 1, expected: "a.part2.rar".into() }).unwrap();
+    assert!(matches!(
+        poll(&mut d, Waker::noop(), &mut [0; 8]),
+        Poll::Ready(Err(ProgressiveFailure {
+            kind: FailureKind::Limit { resource: Resource::VolumeHandles, limit: 4, attempted: 5 },
+            ..
+        }))
+    ));
+    assert_eq!(d.native.handle_count(), 1, "no new guard cloned before rejection");
+    assert!(d.source.is_none());
+}
+
+#[test]
+fn r1_protection_upgrade_counts_replacements_before_retaining_bindings() {
+    use crate::progressive::{ProtectedPath, ProtectedVolume, ProtectionInventory, VolumeBacking};
+    struct Upgrade {
+        path: std::path::PathBuf,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl VolumeSource for Upgrade {
+        fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+            Ok(VolumeAnswer::Ready(Box::new(ImmutableFileSource::open(&self.path)?)))
+        }
+        fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+            if !self.ready.load(Ordering::SeqCst) {
+                return Ok(ProtectionDeclaration::Opaque);
+            }
+            Ok(ProtectionDeclaration::Complete {
+                epoch: 1,
+                inventory: ProtectionInventory {
+                    volumes: vec![ProtectedVolume {
+                        index: 0,
+                        name: "a.rar".into(),
+                        backing: VolumeBacking::Native(vec![ProtectedPath {
+                            path: self.path.clone(),
+                            file: Some(Arc::new(std::fs::File::open(&self.path).unwrap())),
+                        }]),
+                    }],
+                    auxiliary_paths: vec![],
+                },
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original");
+    let replacement = dir.path().join("replacement");
+    std::fs::write(&original, b"12345678").unwrap();
+    std::fs::write(&replacement, b"12345678").unwrap();
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut d = SourceDriver::new(
+        Box::new(Upgrade { path: original, ready: ready.clone() }),
+        "a.rar".into(),
+        ProgressiveLimits { volume_handles: 4, ..Default::default() },
+        SessionControl::default(),
+    )
+    .unwrap();
+    opened(&mut d, Waker::noop());
+    d.supply_replacement(0, Box::new(ImmutableFileSource::open(&replacement).unwrap())).unwrap();
+    ready.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        d.refresh_protection().unwrap_err().kind,
+        FailureKind::Limit { resource: Resource::VolumeHandles, limit: 4, attempted: 5 }
+    ));
+    assert_eq!(d.native.handle_count(), 1, "upgrade rejected before retaining new bindings");
+}
