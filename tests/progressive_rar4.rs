@@ -408,10 +408,16 @@ fn malformed_continuations_and_checks_cannot_complete() {
 }
 #[test]
 fn source_change_and_cancel_are_checked_while_rar4_is_parked() {
-    for cancel in [false, true] {
+    for (cancel, encrypted) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
-        let data = archive(&[member(b"one", b"payload", 0, 0x30)]);
-        let (mut s, g) = custom(vec![data], vec![vec![]], options(dir.path()), true, 1);
+        let data = if encrypted {
+            aes_stored(b"payload", true, &[16]).remove(0)
+        } else {
+            archive(&[member(b"one", b"payload", 0, 0x30)])
+        };
+        let mut opts = options(dir.path());
+        opts.set_password(Some("pw".into())).unwrap();
+        let (mut s, g) = custom(vec![data], vec![vec![]], opts, true, 1);
         for _ in 0..1000 {
             match step(&mut s) {
                 Poll::Pending => wake(&mut s, &g),
@@ -560,4 +566,299 @@ fn directory_crc_cannot_bypass_rar4_verification() {
     let error = fails(vec![archive(&[file])], options(dir.path()));
     assert!(matches!(error.kind, FailureKind::Rar(_)), "{error:?}");
     assert!(!dir.path().join("directory").exists());
+}
+
+// First-party fixture follows the independently observed modern Stored geometry.
+fn aes_stored(gold: &[u8], headers: bool, cuts: &[usize]) -> Vec<Vec<u8>> {
+    aes_stored_mode(gold, headers, true, cuts)
+}
+fn aes_stored_mode(gold: &[u8], headers: bool, data_encrypted: bool, cuts: &[usize]) -> Vec<Vec<u8>> {
+    let salt = [1, 2, 3, 4, 5, 6, 7, 8];
+    let (key, iv) = zipfast::crypto::derive_rar4_key_iv("pw", &salt);
+    let mut padded = gold.to_vec();
+    padded.resize(gold.len().next_multiple_of(16), 0xa5);
+    let cipher = if data_encrypted { zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap() } else { gold.to_vec() };
+    let enc_header = |mut bytes: Vec<u8>| {
+        if !headers {
+            return bytes;
+        }
+        bytes.resize(bytes.len().next_multiple_of(16), 0x5a);
+        let mut wire = salt.to_vec();
+        wire.extend(zipfast::crypto::encrypt_cbc(&key, &iv, &bytes).unwrap());
+        wire
+    };
+    let mut at = 0;
+    cuts.iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            let payload = &cipher[at..at + len];
+            at += len;
+            let flags = 0x8000
+                | if data_encrypted { 0x404 } else { 0 }
+                | u16::from(i > 0)
+                | (u16::from(i + 1 < cuts.len()) * 2);
+            let mut body = Vec::new();
+            body.extend((len as u32).to_le_bytes());
+            body.extend((gold.len() as u32).to_le_bytes());
+            body.push(3);
+            body.extend(hash(if i + 1 == cuts.len() { gold } else { payload }).to_le_bytes());
+            body.extend(0x50221884u32.to_le_bytes());
+            body.extend([29, 0x30]);
+            body.extend(3u16.to_le_bytes());
+            body.extend(0o100644u32.to_le_bytes());
+            body.extend(b"one");
+            if data_encrypted {
+                body.extend(salt);
+            }
+            let mut wire = b"Rar!\x1a\x07\0".to_vec();
+            wire.extend(block(0x73, 1 | if headers { 0x80 } else { 0 }, &[0; 6]));
+            wire.extend(enc_header(block(0x74, flags, &body)));
+            wire.extend(payload);
+            wire.extend(enc_header(block(0x7b, 0x4000 | u16::from(i + 1 < cuts.len()), &[])));
+            wire
+        })
+        .collect()
+}
+
+#[test]
+fn aes_stored_continuous_split_and_independent_headers() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    for headers in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.set_password(Some("pw".into())).unwrap();
+        opts.first_name = "a.part01.rar".into();
+        let bytes = aes_stored(gold, headers, &[29, 31, 20]);
+        let (mut session, gate) = custom(bytes, vec![vec![]; 3], opts, true, 7);
+        let (mut artifacts, volumes) = collect(&mut session, &gate).unwrap();
+        assert_eq!(volumes, [0, 1, 2]);
+        assert_eq!(read_all(&mut artifacts[0]), gold);
+    }
+}
+
+#[test]
+fn aes_stored_password_damage_salt_and_cipher_tail_boundaries() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    for headers in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let wire = aes_stored(gold, headers, &[80]);
+        let error = fails(wire.clone(), options(dir.path()));
+        assert!(matches!(error.kind, FailureKind::PasswordRequired), "{error:?}");
+        let mut opts = options(dir.path());
+        opts.set_password(Some("wrong password".into())).unwrap();
+        let error = fails(wire.clone(), opts);
+        assert!(
+            matches!(error.kind, FailureKind::Rar(ref r) if matches!(**r, zipfast::error::RarFailure::EncryptedIntegrity { .. })),
+            "{error:?}"
+        );
+        for header_damage in [false, true] {
+            let mut damaged = wire.clone();
+            let at = if header_damage {
+                30
+            } else if headers {
+                100
+            } else {
+                70
+            };
+            damaged[0][at] ^= 1;
+            let mut opts = options(dir.path());
+            opts.set_password(Some("pw".into())).unwrap();
+            assert!(!matches!(fails(damaged, opts).kind, FailureKind::PasswordRequired));
+        }
+    }
+    // A changed per-part salt is not a CBC reset signal in the admitted family.
+    let mut wire = aes_stored(gold, false, &[29, 31, 20]);
+    wire[1][20 + 35] ^= 1;
+    fix_crc(&mut wire[1], 20);
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    opts.first_name = "a.part01.rar".into();
+    opts.set_password(Some("pw".into())).unwrap();
+    let error = fails(wire, opts);
+    assert!(
+        matches!(error.kind, FailureKind::Rar(ref r) if matches!(**r, zipfast::error::RarFailure::Unsupported(_))),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn aes_stored_hole_taint_crosses_parts_and_replacement_replays_headers() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    for headers in [false, true] {
+        for fill in [HoleFill::Sparse, HoleFill::Zero] {
+            let wire = aes_stored(gold, headers, &[29, 31, 20]);
+            let data_at = if headers { 76 } else { 63 };
+            let dir = tempfile::tempdir().unwrap();
+            let mut opts = options(dir.path());
+            opts.set_password(Some("pw".into())).unwrap();
+            opts.first_name = "a.part01.rar".into();
+            opts.hole_policy = HolePolicy::PartialStored { fill };
+            let (mut session, gate) =
+                custom(wire.clone(), vec![vec![data_at + 28..data_at + 29], vec![], vec![]], opts, true, 11);
+            let (mut artifacts, _) = collect(&mut session, &gate).unwrap();
+            let a = &mut artifacts[0];
+            assert_eq!(a.holes(), &[OutputHole { offset: 16, len: 32 }]);
+            session.patch(a, 16, &gold[16..48]).unwrap();
+            let v = verify(&mut session, a).unwrap();
+            assert_eq!(v.level(), VerificationLevel::InnerOnly);
+            for (i, bytes) in wire.into_iter().enumerate() {
+                session
+                    .supply_verification_source(
+                        i as u32,
+                        Box::new(Bytes {
+                            data: bytes,
+                            holes: vec![],
+                            id: 100 + i as u128,
+                            chunk: 7,
+                            wait: false,
+                            gate: Arc::new(Mutex::new(Gate::default())),
+                        }),
+                    )
+                    .unwrap();
+            }
+            let v = verify(&mut session, a).unwrap();
+            assert_eq!(v.level(), VerificationLevel::Strict);
+            assert_eq!(v.authentication(), AuthenticationEvidence::CbcChecksOnly);
+            assert_eq!(read_all(a), gold);
+            assert_eq!(a.publication(), ArtifactPublication::Unpublished);
+        }
+    }
+}
+
+#[test]
+fn encrypted_headers_allow_plain_stored_and_new_members_reset_data_cipher() {
+    for data_encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let gold = b"new member CBC IV";
+        let len = if data_encrypted { gold.len().next_multiple_of(16) } else { gold.len() };
+        let mut wire = aes_stored_mode(gold, true, data_encrypted, &[len]).remove(0);
+        // Remove independent encrypted end, append a second member and its end.
+        wire.truncate(wire.len() - 24);
+        let second = aes_stored_mode(gold, true, data_encrypted, &[len]).remove(0);
+        wire.extend_from_slice(&second[20..]);
+        let mut opts = options(dir.path());
+        opts.set_password(Some("pw".into())).unwrap();
+        let (mut s, g) = custom(vec![wire], vec![vec![]], opts, true, 1);
+        let (mut artifacts, _) = collect(&mut s, &g).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        for artifact in &mut artifacts {
+            assert_eq!(read_all(artifact), gold);
+        }
+    }
+}
+
+#[test]
+fn aes_stored_header_holes_and_kdf_limits_are_typed() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let wire = aes_stored(gold, true, &[80]);
+    for hole in [20..21, 27..28, 28..29, 75..76] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.set_password(Some("pw".into())).unwrap();
+        opts.hole_policy = HolePolicy::PartialStored { fill: HoleFill::Sparse };
+        let (mut session, gate) = custom(wire.clone(), vec![vec![hole]], opts, false, 7);
+        let err = collect(&mut session, &gate).err().unwrap();
+        assert!(matches!(err.kind, FailureKind::HeaderHole), "{err:?}");
+    }
+    for (encoded, session_limit) in [(3, 1 << 26), (8192, 100)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.set_password(Some("pw".into())).unwrap();
+        opts.limits.password_encoded_bytes = encoded;
+        opts.limits.kdf_session_blocks = session_limit;
+        let err = fails(wire.clone(), opts);
+        assert!(
+            matches!(
+                err.kind,
+                FailureKind::Limit { resource: Resource::PasswordEncodedBytes | Resource::KdfSessionBlocks, .. }
+            ),
+            "{err:?}"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut unknown = b"Rar!\x1a\x07\0".to_vec();
+    unknown.extend(block(0x73, 0x280, &[0; 7]));
+    let err = fails(vec![unknown], options(dir.path()));
+    assert!(matches!(err.kind, FailureKind::Rar(ref r) if matches!(**r, zipfast::error::RarFailure::Unsupported(_))));
+}
+
+#[test]
+#[ignore = "private native fixture; explicit final-source replay only"]
+fn private_native_aes_stored_matches_recorded_gold() {
+    let root = std::path::PathBuf::from(std::env::var_os("ZIPFAST_RAR4_AES_NATIVE").expect("private fixture root"));
+    let parts = (1..=3)
+        .map(|i| std::fs::read(root.join(format!("generated/split-aes-store.part{i}.rar"))).unwrap())
+        .collect::<Vec<_>>();
+    let gold = std::fs::read(root.join("native/split.bin")).unwrap();
+    assert_eq!(gold.len(), 155000);
+    for chunk in [1, 17, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.first_name = "split-aes-store.part1.rar".into();
+        opts.set_password(Some("zipfast-test-only".into())).unwrap();
+        let (mut session, gate) = custom(parts.clone(), vec![vec![]; 3], opts, true, chunk);
+        let (mut artifacts, volumes) = collect(&mut session, &gate).unwrap();
+        assert_eq!(volumes, [0, 1, 2]);
+        assert_eq!(read_all(&mut artifacts[0]), gold);
+        let ArtifactEvidence::Verified(v) = artifacts[0].evidence() else { panic!("no native gold verification") };
+        assert_eq!(v.level(), VerificationLevel::Strict);
+        assert_eq!(v.authentication(), AuthenticationEvidence::CbcChecksOnly);
+    }
+}
+
+#[test]
+fn aes_stored_tail_padding_and_total_alignment_are_checked() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    for mutation in 0..4 {
+        let mut wire = aes_stored(gold, false, &[80]).remove(0);
+        match mutation {
+            0 => {
+                // Short total cipher, with coherent physical packed length.
+                wire.remove(63 + 79);
+                wire[27..31].copy_from_slice(&79u32.to_le_bytes());
+            }
+            1 => {
+                // More than 15 trailing plaintext bytes cannot be padding.
+                wire[31..35].copy_from_slice(&60u32.to_le_bytes());
+            }
+            2 => {
+                // Declared output exceeds available decrypted bytes.
+                wire[31..35].copy_from_slice(&81u32.to_le_bytes());
+            }
+            _ => {
+                wire.truncate(63 + 60);
+            }
+        }
+        fix_crc(&mut wire, 20);
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.set_password(Some("pw".into())).unwrap();
+        let _ = fails(vec![wire], opts);
+        assert!(!dir.path().join("one").exists());
+    }
+}
+
+#[test]
+fn aes_stored_wrong_patch_keeps_failed_checks_sticky() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let dir = tempfile::tempdir().unwrap();
+    let wire = aes_stored(gold, true, &[80]);
+    let mut opts = options(dir.path());
+    opts.set_password(Some("pw".into())).unwrap();
+    opts.hole_policy = HolePolicy::PartialStored { fill: HoleFill::Sparse };
+    let (mut s, g) = custom(wire, vec![vec![76..77]], opts, true, 7);
+    let (mut artifacts, _) = collect(&mut s, &g).unwrap();
+    let a = &mut artifacts[0];
+    assert_eq!(a.holes(), &[OutputHole { offset: 0, len: 32 }]);
+    s.patch(a, 0, &[b'x'; 32]).unwrap();
+    assert!(verify(&mut s, a).is_err());
+    assert!(s.patch(a, 0, &gold[..32]).is_err());
+    assert!(
+        s.set_expected_inner(
+            a,
+            ExpectedInner::Crc32 { digest: hash(gold), label: "cannot erase failed archive check".into() }
+        )
+        .is_err()
+    );
+    assert_eq!(a.publication(), ArtifactPublication::Unpublished);
 }

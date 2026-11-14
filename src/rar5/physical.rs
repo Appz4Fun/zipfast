@@ -26,6 +26,7 @@ pub(crate) struct PhysicalPart {
     pub(crate) packed_size: u64,
     pub(crate) checks: RarChecks,
     pub(crate) crypt: MemberCrypt,
+    pub(crate) legacy: Option<super::LegacyWire>,
     pub(crate) final_part: bool,
     #[allow(dead_code, reason = "retained physical geometry consumed by subsequent map and recovery tasks")]
     pub(crate) wire_extent: Range<u64>,
@@ -92,6 +93,7 @@ impl PhysicalPart {
                 keyed: header.crypt.is_some_and(|c| c.tweaked_crc),
             },
             crypt,
+            legacy: wire.legacy,
             final_part: !header.split_after(),
             wire_extent: wire.extent.clone(),
             raw_flags: header.block_flags,

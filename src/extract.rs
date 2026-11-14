@@ -853,7 +853,7 @@ impl Pending {
     }
 
     pub(crate) fn hash_key(&self, keyed: bool) -> Option<&[u8; 32]> {
-        self.cipher.as_ref().filter(|_| keyed).map(|cipher| &cipher.hash_key)
+        self.cipher.as_ref().filter(|_| keyed).and_then(crate::rar5::member::PendingCipher::checksum_key)
     }
 
     /// Decoded bytes, to the checksums and the output file.
@@ -967,7 +967,7 @@ impl Pending {
         blake2sp: Option<[u8; 32]>,
         keyed: bool,
     ) -> std::result::Result<(), RarFailure> {
-        let key = self.cipher.as_ref().filter(|_| keyed).map(|cipher| &cipher.hash_key);
+        let key = self.cipher.as_ref().filter(|_| keyed).and_then(crate::rar5::member::PendingCipher::checksum_key);
         self.checks.verify(&self.context, size, crc32, blake2sp, key)
     }
 }

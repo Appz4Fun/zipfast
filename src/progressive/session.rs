@@ -470,8 +470,23 @@ impl ProgressiveSession {
                 Phase::Header => {
                     let (_, step) = self.parser.advance(&[])?;
                     let (offset, len) = match step {
+                        ParserStep::LegacyKeyRequired { salt } => {
+                            let password = self
+                                .options
+                                .password()
+                                .filter(|p| !p.is_empty())
+                                .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+                            let (key, iv) = crate::rar5::member::controlled_legacy_keys(
+                                password,
+                                &salt,
+                                &self.usage,
+                                &self.control,
+                            )?;
+                            self.parser.set_legacy_keys(&key, iv)?;
+                            continue;
+                        }
                         ParserStep::Need { offset, len } => (offset, len),
-                        ParserStep::End => return Err(ProgressiveFailure::new(FailureKind::Truncated)),
+                        ParserStep::End => return Err(self.parser.truncated()),
                         ParserStep::Frame(_) => unreachable!("frames require input"),
                     };
                     if offset != self.cursor {
@@ -489,7 +504,7 @@ impl ProgressiveSession {
                             return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index, id }))));
                         }
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
-                            return Err(ProgressiveFailure::new(FailureKind::Truncated));
+                            return Err(self.parser.truncated());
                         }
                         Poll::Ready(Ok(SourceStep::Hole { .. })) => {
                             return Err(ProgressiveFailure::new(FailureKind::HeaderHole));
@@ -712,6 +727,13 @@ impl ProgressiveSession {
                         .wire
                         .as_ref()
                         .ok_or_else(|| ProgressiveFailure::new(FailureKind::Malformed("missing wire identity")))?;
+                    if member.wire.legacy.and_then(|w| w.crypt) != wire.legacy.and_then(|w| w.crypt) {
+                        return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                            crate::error::RarFailure::Unsupported(crate::error::RarUnsupported::Rar4Feature(
+                                "changed split encryption salt or scheme",
+                            )),
+                        ))));
+                    }
                     if member.complete
                         || !member.matches_continuation(header, wire)
                         || continuation_issue(member, header).is_some()
@@ -883,6 +905,7 @@ impl ProgressiveSession {
                     &self.usage,
                     &self.control,
                     decoder,
+                    wire.legacy.and_then(|w| w.crypt),
                 )?)
             }
         } else {

@@ -272,7 +272,8 @@ impl FileHeader {
         if raw.method != 0x30 {
             return Some(crate::error::RarUnsupported::Rar4Feature("compressed progressive payload"));
         }
-        let independent = Rar4Metadata { flags: raw.flags & !3, ..raw };
+        let independent =
+            Rar4Metadata { flags: raw.flags & !(3 | if raw.unpack_version == 29 { 4 } else { 0 }), ..raw };
         independent.unsupported(self.attributes).or_else(|| self.rar4_common_unsupported()).or_else(|| {
             if self.unpacked_size == u64::MAX || self.unpacked_size == u64::from(u32::MAX) {
                 Some(crate::error::RarUnsupported::Rar4Feature("unknown unpacked size"))
@@ -333,7 +334,25 @@ impl From<Error> for FileParseError {
 
 pub(crate) const RAW_NAME_OWNER_BYTES: usize = std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>();
 
+// Raw legacy transport never contains derived keys or passwords.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyCrypt {
+    pub(crate) version: u8,
+    pub(crate) salt: Option<[u8; 8]>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyWire {
+    pub(crate) salt: Option<[u8; 8]>,
+    pub(crate) flags: u16,
+    pub(crate) version: u8,
+    pub(crate) method: u8,
+    pub(crate) dictionary: u64,
+    pub(crate) packed_size: u64,
+    pub(crate) unpacked_size: u64,
+    pub(crate) crypt: Option<LegacyCrypt>,
+}
 pub(super) struct FileWire {
+    pub(super) legacy: Option<LegacyWire>,
     pub(super) name: std::sync::Arc<Vec<u8>>,
     pub(super) compression: u64,
     pub(super) extent: std::ops::Range<u64>,
@@ -405,7 +424,12 @@ fn parse_file_impl(
                 .charge(crate::progressive::Resource::MetadataBytes, RAW_NAME_OWNER_BYTES as u64)
                 .map_err(FileParseError::Progressive)?;
         }
-        Some(FileWire { name: std::sync::Arc::new(encoded), compression: info, extent: head.data_at..head.data_at })
+        Some(FileWire {
+            legacy: None,
+            name: std::sync::Arc::new(encoded),
+            compression: info,
+            extent: head.data_at..head.data_at,
+        })
     } else {
         None
     };

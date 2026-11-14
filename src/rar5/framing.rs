@@ -75,6 +75,7 @@ pub(crate) struct PhysicalFrame {
 )]
 pub(crate) enum ParserStep {
     Need { offset: u64, len: usize },
+    LegacyKeyRequired { salt: [u8; 8] },
     Frame(PhysicalFrame),
     End,
 }
@@ -87,6 +88,10 @@ enum Phase {
     EncryptedBody,
     Rar4Prefix,
     Rar4Body,
+    LegacySalt,
+    LegacyKey,
+    LegacyFirst,
+    LegacyBody,
 }
 
 pub(crate) struct HeaderParser {
@@ -112,6 +117,7 @@ pub(crate) struct HeaderParser {
     fault_path_admitted: bool,
     format: RarFormat,
     rar4_main: Option<MainHeader>,
+    legacy_headers: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -138,6 +144,7 @@ impl HeaderParser {
             fault_path_admitted: false,
             format: RarFormat::Rar5,
             rar4_main: None,
+            legacy_headers: false,
         }
     }
     pub(crate) fn format(&self) -> RarFormat {
@@ -173,22 +180,44 @@ impl HeaderParser {
         self.evidence = keys.evidence;
         self.reset();
     }
+    pub(crate) fn set_legacy_keys(&mut self, key: &[u8; 16], iv: [u8; 16]) -> ProgressiveResult<()> {
+        if !matches!(self.phase, Phase::LegacyKey) {
+            return Err(ProgressiveFailure::new(FailureKind::Malformed("unexpected legacy key")));
+        }
+        self.cipher = crate::crypto::AesKey::new(key);
+        self.iv = iv;
+        self.evidence = RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);
+        self.phase = Phase::LegacyFirst;
+        self.resized_need(24).map_err(FramingError::progressive)
+    }
     pub(crate) fn encrypted(&self) -> bool {
-        self.cipher.is_some()
+        self.legacy_headers || self.cipher.is_some()
+    }
+    pub(crate) fn truncated(&self) -> ProgressiveFailure {
+        if self.legacy_headers {
+            progressive_fault(self.fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, true))
+        } else {
+            ProgressiveFailure::new(FailureKind::Truncated)
+        }
     }
     fn reset(&mut self) {
         self.buffer.clear();
         self.size = 0;
         self.size_len = 0;
         self.counted = false;
-        self.phase = if self.format == RarFormat::Rar4 {
+        self.phase = if self.legacy_headers {
+            self.cipher = None;
+            Phase::LegacySalt
+        } else if self.format == RarFormat::Rar4 {
             Phase::Rar4Prefix
         } else if self.encrypted() {
             Phase::EncryptedFirst
         } else {
             Phase::Prefix
         };
-        self.need = if self.format == RarFormat::Rar4 {
+        self.need = if self.legacy_headers {
+            8
+        } else if self.format == RarFormat::Rar4 {
             7
         } else if self.encrypted() {
             32
@@ -327,6 +356,30 @@ impl HeaderParser {
                 return Ok((used, ParserStep::Need { offset, len: self.need - self.buffer.len() }));
             }
             match self.phase {
+                Phase::LegacySalt | Phase::LegacyKey => {
+                    self.phase = Phase::LegacyKey;
+                    return Ok((used, ParserStep::LegacyKeyRequired { salt: self.buffer[..8].try_into().unwrap() }));
+                }
+                Phase::LegacyFirst => {
+                    self.cipher.as_ref().unwrap().decrypt_cbc_in_place(&mut self.iv, &mut self.buffer[8..24]);
+                    self.size = usize::from(u16::from_le_bytes([self.buffer[13], self.buffer[14]]));
+                    if self.size < 7 {
+                        return Err(self.framing("RAR4 encrypted header size", Error::Encrypted).into());
+                    }
+                    if let Some(usage) = &self.usage {
+                        usage.check(crate::progressive::Resource::HeaderAllocation, self.size as u64 * 12)?;
+                    }
+                    self.phase = Phase::LegacyBody;
+                    self.resized_need(8 + self.size.next_multiple_of(16))?;
+                }
+                Phase::LegacyBody => {
+                    self.cipher.as_ref().unwrap().decrypt_cbc_in_place(&mut self.iv, &mut self.buffer[24..]);
+                    let frame = self.parse_rar4(budget)?;
+                    self.ended = matches!(frame.block, Block::End { .. });
+                    self.at = frame.data_end;
+                    self.reset();
+                    return Ok((used, ParserStep::Frame(frame)));
+                }
                 Phase::Rar4Prefix => {
                     let kind = self.buffer[2];
                     let flags = u16::from_le_bytes([self.buffer[3], self.buffer[4]]);
@@ -613,6 +666,7 @@ mod tests {
                     assert_eq!(*frame.wire.unwrap().name, name);
                     assert_eq!(frame.extent, 8..8 + wire.len() as u64);
                 }
+                ParserStep::LegacyKeyRequired { .. } => panic!("unexpected legacy encryption"),
                 ParserStep::End => panic!("early end"),
             }
         }

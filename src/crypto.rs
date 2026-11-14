@@ -877,6 +877,8 @@ pub fn decrypt_rar5_header(data: &[u8], pos: usize, key: &[u8; 32]) -> Option<(V
 // Pure-Rust SHA-1 + RAR 4.x (`SetKey30`) key/IV derivation & header decryption
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! { static SHA1_COMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 #[derive(Clone)]
 struct Sha1 {
     state: [u32; 5],
@@ -896,6 +898,8 @@ impl Sha1 {
     }
 
     fn compress(state: &mut [u32; 5], chunk: &[u8; 64]) {
+        #[cfg(test)]
+        SHA1_COMPRESSIONS.set(SHA1_COMPRESSIONS.get() + 1);
         let mut w = [0u32; 80];
         for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes(*word);
@@ -925,7 +929,14 @@ impl Sha1 {
         state[4] = state[4].wrapping_add(e);
     }
 
-    fn update(&mut self, mut data: &[u8]) {
+    fn update(&mut self, data: &[u8]) {
+        self.update_controlled(data, &mut UnrestrictedKdf).expect("unrestricted SHA1");
+    }
+    fn update_controlled<C: KdfControl + ?Sized>(
+        &mut self,
+        mut data: &[u8],
+        control: &mut C,
+    ) -> std::result::Result<(), KdfControlError> {
         self.total_len += data.len() as u64;
         if self.buf_len > 0 {
             let take = (64 - self.buf_len).min(data.len());
@@ -933,21 +944,30 @@ impl Sha1 {
             self.buf_len += take;
             data = &data[take..];
             if self.buf_len == 64 {
+                control.charge(1)?;
                 Self::compress(&mut self.state, &self.buf);
                 self.buf_len = 0;
             }
         }
         let (blocks, rem) = data.as_chunks::<64>();
         for b in blocks {
+            control.charge(1)?;
             Self::compress(&mut self.state, b);
         }
         if !rem.is_empty() {
             self.buf[..rem.len()].copy_from_slice(rem);
             self.buf_len = rem.len();
         }
+        Ok(())
     }
 
     fn finalize_words(&self) -> [u32; 5] {
+        self.finalize_controlled(&mut UnrestrictedKdf).expect("unrestricted SHA1")
+    }
+    fn finalize_controlled<C: KdfControl + ?Sized>(
+        &self,
+        control: &mut C,
+    ) -> std::result::Result<[u32; 5], KdfControlError> {
         let mut state = self.state;
         let bit_len = self.total_len * 8;
         let mut tail = [0u8; 128];
@@ -955,13 +975,16 @@ impl Sha1 {
         tail[self.buf_len] = 0x80;
         if self.buf_len < 56 {
             tail[56..64].copy_from_slice(&bit_len.to_be_bytes());
+            control.charge(1)?;
             Self::compress(&mut state, tail[..64].try_into().unwrap());
         } else {
             tail[120..128].copy_from_slice(&bit_len.to_be_bytes());
+            control.charge(1)?;
             Self::compress(&mut state, tail[..64].try_into().unwrap());
+            control.charge(1)?;
             Self::compress(&mut state, tail[64..128].try_into().unwrap());
         }
-        state
+        Ok(state)
     }
 
     fn finalize_bytes(&self) -> [u8; 20] {
@@ -976,6 +999,50 @@ impl Sha1 {
 
 /// Derives the RAR4 (`SetKey30`) 16-byte AES-128 key and 16-byte IV from `password` and `salt`.
 pub fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
+    derive_rar4_key_iv_impl(password, salt, &mut UnrestrictedKdf).expect("unrestricted RAR4 derivation")
+}
+
+pub(crate) fn derive_rar4_key_iv_controlled(
+    password: &str,
+    salt: &[u8; 8],
+    control: &mut dyn KdfControl,
+) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
+    use crate::progressive::Resource;
+    for (resource, attempted, limit) in [
+        (Resource::PasswordUtf8Bytes, password.len() as u64, 4096),
+        (Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2, 8192),
+    ] {
+        if attempted > limit {
+            return Err(KdfControlError::Limit { resource, limit, attempted });
+        }
+    }
+    struct Derivation<'a> {
+        control: &'a mut dyn KdfControl,
+        blocks: u64,
+    }
+    impl KdfControl for Derivation<'_> {
+        fn charge(&mut self, blocks: u64) -> std::result::Result<(), KdfControlError> {
+            let attempted = self.blocks.saturating_add(blocks);
+            if attempted > 1 << 22 {
+                return Err(KdfControlError::Limit {
+                    resource: Resource::KdfDerivationBlocks,
+                    limit: 1 << 22,
+                    attempted,
+                });
+            }
+            self.control.charge(blocks)?;
+            self.blocks = attempted;
+            Ok(())
+        }
+    }
+    derive_rar4_key_iv_impl(password, salt, &mut Derivation { control, blocks: 0 })
+}
+
+fn derive_rar4_key_iv_impl<C: KdfControl + ?Sized>(
+    password: &str,
+    salt: &[u8; 8],
+    control: &mut C,
+) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
     let mut raw = Vec::with_capacity(password.len() * 2 + 8);
     for ch in password.encode_utf16() {
         raw.extend_from_slice(&ch.to_le_bytes());
@@ -986,23 +1053,23 @@ pub fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]
     let mut sha = Sha1::new();
     let mut iv = [0u8; 16];
     for i in 0..ROUNDS {
-        sha.update(&raw);
+        sha.update_controlled(&raw, control)?;
         let idx = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
-        sha.update(&idx);
+        sha.update_controlled(&idx, control)?;
         if i % (ROUNDS / 16) == 0 {
-            let words = sha.finalize_words();
+            let words = sha.finalize_controlled(control)?;
             let pos = (i / (ROUNDS / 16)) as usize;
             if let Some(slot) = iv.get_mut(pos) {
                 *slot = (words[4] & 0xff) as u8;
             }
         }
     }
-    let words = sha.finalize_words();
+    let words = sha.finalize_controlled(control)?;
     let mut key = [0u8; 16];
     for (i, &w) in words.iter().take(4).enumerate() {
         key[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
     }
-    (key, iv)
+    Ok((key, iv))
 }
 
 /// Decrypts an encrypted RAR4 block header at `pos` (starts with 8-byte salt followed by AES-128-CBC blocks).
@@ -1499,6 +1566,77 @@ mod tests {
     }
     fn kdf_meter(limit: u64) -> KdfMeter {
         KdfMeter { blocks: 0, limit, cancel_at: None }
+    }
+
+    #[test]
+    fn controlled_rar4_counts_primitives_including_clone_padding_and_stops_before_work() {
+        for password in ["", "pw", "é界😀", "abcdefghijklmnopqrstuvw", "abcdefghijklmnopqrstuvwx"] {
+            SHA1_COMPRESSIONS.set(0);
+            let mut meter = kdf_meter(u64::MAX);
+            let actual = derive_rar4_key_iv_controlled(password, &[1; 8], &mut meter).unwrap();
+            assert_eq!(meter.blocks, SHA1_COMPRESSIONS.get());
+            let raw = password.encode_utf16().count() as u64 * 2 + 11;
+            let expected = 0x40000 * raw / 64
+                + (0..16).map(|i| 1 + u64::from(((i * 0x4000 + 1) * raw) % 64 >= 56)).sum::<u64>()
+                + 1;
+            assert_eq!(meter.blocks, expected);
+            assert_eq!(actual, derive_rar4_key_iv(password, &[1; 8]));
+            let known = match password {
+                "pw" => Some(("77005689078b689864882b7665ede966", "510faeafff2ac0c52af181d88b5db8e3")),
+                "é界😀" => Some(("ee60c1ea894c83b3b370f29a6b7b7327", "d2e24a2a07863d9fd52616cbc45dc09e")),
+                _ => None,
+            };
+            if let Some((key, iv)) = known {
+                let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                assert_eq!(hex(&actual.0), key);
+                assert_eq!(hex(&actual.1), iv);
+            }
+        }
+        for n in [55, 56, 63, 64] {
+            let mut sha = Sha1::new();
+            let mut meter = kdf_meter(u64::MAX);
+            SHA1_COMPRESSIONS.set(0);
+            sha.update_controlled(&vec![0; n], &mut meter).unwrap();
+            sha.finalize_controlled(&mut meter).unwrap();
+            assert_eq!(meter.blocks, (n as u64 + 9).div_ceil(64));
+            assert_eq!(meter.blocks, SHA1_COMPRESSIONS.get());
+        }
+        for cancel in [false, true] {
+            let mut meter = kdf_meter(if cancel { u64::MAX } else { 1024 });
+            meter.cancel_at = cancel.then_some(1024);
+            SHA1_COMPRESSIONS.set(0);
+            let err = derive_rar4_key_iv_controlled("pw", &[1; 8], &mut meter).unwrap_err();
+            assert_eq!(SHA1_COMPRESSIONS.get(), 1024);
+            assert_eq!(meter.blocks, 1024);
+            assert!(matches!(
+                (cancel, err),
+                (true, KdfControlError::Canceled) | (false, KdfControlError::Limit { attempted: 1025, .. })
+            ));
+        }
+        SHA1_COMPRESSIONS.set(0);
+        let mut meter = kdf_meter(u64::MAX);
+        assert!(matches!(
+            derive_rar4_key_iv_controlled(&"x".repeat(4097), &[0; 8], &mut meter),
+            Err(KdfControlError::Limit { resource: crate::progressive::Resource::PasswordUtf8Bytes, .. })
+        ));
+        assert_eq!(SHA1_COMPRESSIONS.get(), 0);
+        assert_eq!(meter.blocks, 0);
+    }
+
+    #[test]
+    fn controlled_rar4_hard_derivation_ceiling_charges_actual_attempts_without_refund() {
+        let mut meter = kdf_meter(u64::MAX);
+        SHA1_COMPRESSIONS.set(0);
+        assert!(matches!(
+            derive_rar4_key_iv_controlled(&"x".repeat(4096), &[0; 8], &mut meter),
+            Err(KdfControlError::Limit {
+                resource: crate::progressive::Resource::KdfDerivationBlocks,
+                limit: 4194304,
+                attempted: 4194305
+            })
+        ));
+        assert_eq!(meter.blocks, 1 << 22);
+        assert_eq!(SHA1_COMPRESSIONS.get(), 1 << 22);
     }
 
     #[test]

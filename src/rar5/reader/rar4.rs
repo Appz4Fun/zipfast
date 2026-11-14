@@ -25,7 +25,8 @@ impl HeaderParser {
         &mut self,
         budget: Option<&ScanBudget<'_>>,
     ) -> std::result::Result<PhysicalFrame, FramingError> {
-        let header = &self.buffer;
+        let header =
+            if matches!(self.phase, Phase::LegacyBody) { &self.buffer[8..8 + self.size] } else { &self.buffer[..] };
         let kind = header[2];
         let flags = u16::from_le_bytes([header[3], header[4]]);
         let size = header.len();
@@ -34,11 +35,14 @@ impl HeaderParser {
                 .fault(RarIntegrityReason::HeaderCrc, Error::BadChecksum("RAR4 header CRC".into()), true)
                 .into());
         }
+        if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
+            return Err(self.rar4_unsupported("embedded comment").into());
+        }
         let mut cursor = Fields::new(header, 7);
         let packed = if flags & 0x8000 != 0 { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
         let data_at = self
             .at
-            .checked_add(size as u64)
+            .checked_add(self.need as u64)
             .ok_or_else(|| self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")))?;
         let data_end = data_at
             .checked_add(packed)
@@ -62,7 +66,13 @@ impl HeaderParser {
                     return Err(self.framing("RAR4 main header size", Error::Corrupt("RAR4 main header size")).into());
                 }
                 if flags & 0x80 != 0 {
-                    return Err(self.rar4_unsupported("encrypted headers").into());
+                    if self.usage.is_none() {
+                        return Err(self.rar4_unsupported("encrypted headers").into());
+                    }
+                    if flags & 0x200 != 0 {
+                        return Err(self.rar4_unsupported("header encryption version").into());
+                    }
+                    self.legacy_headers = true;
                 }
                 let mut normalized = 0;
                 if flags & 1 != 0 {
@@ -147,9 +157,7 @@ impl HeaderParser {
             if name.is_empty() || name.contains('\0') {
                 return Err(Error::Corrupt("RAR4 member name").into());
             }
-            if flags & 0x400 != 0 {
-                fields.take(8)?;
-            }
+            let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
             let mut mtime = dos_timestamp(dos);
             let mut nanos = 0;
             if flags & 0x1000 != 0 {
@@ -210,9 +218,9 @@ impl HeaderParser {
                 solid: flags & 0x10 != 0 || self.rar4_main.as_ref().is_some_and(MainHeader::is_solid),
                 ..FileHeader::default()
             };
-            Ok((header, encoded))
+            Ok((header, encoded, salt))
         })();
-        let (header, encoded) = result.map_err(|error| match error {
+        let (header, encoded, salt) = result.map_err(|error| match error {
             FileParseError::Allocation => allocation().into(),
             FileParseError::Progressive(error) => FramingError::Progressive(error),
             FileParseError::Format(Error::Unsupported(_)) => {
@@ -233,9 +241,24 @@ impl HeaderParser {
             usage.charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - encoded.len()) as u64)?;
         }
         name.extend_from_slice(encoded);
+        let legacy = LegacyWire {
+            salt,
+            flags,
+            version: header.rar4.unwrap().unpack_version,
+            method: header.rar4.unwrap().method,
+            dictionary: header.dictionary,
+            packed_size: header.packed_size,
+            unpacked_size: header.unpacked_size,
+            crypt: header.encrypted.then_some(LegacyCrypt { version: header.rar4.unwrap().unpack_version, salt }),
+        };
         Ok((
             header,
-            FileWire { name: std::sync::Arc::new(name), compression: 0, extent: data_at - bytes.len() as u64..data_at },
+            FileWire {
+                legacy: Some(legacy),
+                name: std::sync::Arc::new(name),
+                compression: 0,
+                extent: self.at..data_at,
+            },
         ))
     }
 }

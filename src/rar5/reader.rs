@@ -530,6 +530,12 @@ impl Volume {
                     parser.advance_core_budget(&[], budget.as_deref()).map_err(super::framing::FramingError::legacy)?;
                 let frame = loop {
                     match step {
+                        ParserStep::LegacyKeyRequired { .. } => {
+                            return Err(RarFault::new(
+                                RarFailure::Unsupported(crate::error::RarUnsupported::Rar4Feature("encrypted headers")),
+                                Error::Encrypted,
+                            ));
+                        }
                         ParserStep::End => return Ok(None),
                         ParserStep::Frame(frame) => break frame,
                         ParserStep::Need { offset, len } => {

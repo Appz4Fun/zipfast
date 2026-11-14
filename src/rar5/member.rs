@@ -24,7 +24,7 @@ pub(crate) struct PendingCipher {
     pub(crate) aes: crate::crypto::AesKey,
     pub(crate) iv: [u8; 16],
     pub(crate) rem: Vec<u8>,
-    pub(crate) hash_key: [u8; 32],
+    hash_key: Option<[u8; 32]>,
     pub(crate) stored_padding: Option<StoredCipherPadding>,
     pub(crate) blocks: Option<CipherBlocks>,
     recovery: Option<CbcAvailability>,
@@ -474,7 +474,7 @@ impl MemberMachine {
         if part.final_part || self.part_missing {
             return Ok(());
         }
-        let key = self.cipher.as_ref().filter(|_| part.checks.keyed).map(|c| &c.hash_key);
+        let key = self.cipher.as_ref().filter(|_| part.checks.keyed).and_then(PendingCipher::checksum_key);
         verify_packed(&self.context, part.checks, self.part_crc.clone(), self.part_blake.take(), key)
     }
     pub(crate) fn finish_member(
@@ -495,7 +495,7 @@ impl MemberMachine {
         let checks = member.final_checks.ok_or_else(|| {
             crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::IncompleteOutput)
         })?;
-        let key = self.cipher.as_ref().filter(|_| checks.keyed).map(|c| &c.hash_key);
+        let key = self.cipher.as_ref().filter(|_| checks.keyed).and_then(PendingCipher::checksum_key);
         if self.missing {
             let actual = self.inner.as_ref().map_or(0, |c| c.bytes);
             if member.unpacked_size.is_some_and(|n| n != actual) {
@@ -658,7 +658,44 @@ pub(crate) fn controlled_keys(
         }) => ProgressiveFailure::new(FailureKind::Limit { resource, limit, attempted }),
     })
 }
+pub(crate) fn controlled_legacy_keys(
+    password: &str,
+    salt: &[u8; 8],
+    usage: &crate::progressive::Usage,
+    control: &crate::progressive::SessionControl,
+) -> crate::progressive::ProgressiveResult<([u8; 16], [u8; 16])> {
+    use crate::progressive::{FailureKind, ProgressiveFailure, Resource};
+    if control.is_canceled() {
+        return Err(ProgressiveFailure::new(FailureKind::Canceled));
+    }
+    usage.check(Resource::PasswordUtf8Bytes, password.len() as u64)?;
+    usage.check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2)?;
+    crate::crypto::derive_rar4_key_iv_controlled(password, salt, &mut KdfMeter { usage, control, blocks: 0 }).map_err(
+        |error| {
+            ProgressiveFailure::new(match error {
+                crate::crypto::KdfControlError::Canceled => FailureKind::Canceled,
+                crate::crypto::KdfControlError::Limit { resource, limit, attempted } => {
+                    FailureKind::Limit { resource, limit, attempted }
+                }
+            })
+        },
+    )
+}
 impl PendingCipher {
+    pub(crate) fn checksum_key(&self) -> Option<&[u8; 32]> {
+        self.hash_key.as_ref()
+    }
+    fn from_legacy(key: [u8; 16], iv: [u8; 16], size: u64) -> Self {
+        Self {
+            aes: crate::crypto::AesKey::new(&key).expect("RAR4 AES128 key"),
+            iv,
+            rem: Vec::new(),
+            hash_key: None,
+            stored_padding: Some(StoredCipherPadding { size, skipped: 0 }),
+            blocks: None,
+            recovery: None,
+        }
+    }
     pub(crate) fn from_keys(
         params: crate::crypto::Rar5CryptParams,
         keys: crate::crypto::Rar5Keys,
@@ -669,7 +706,7 @@ impl PendingCipher {
             aes: crate::crypto::AesKey::new(&keys.key).expect("RAR5 key is AES256"),
             iv: params.iv,
             rem: Vec::new(),
-            hash_key: keys.hash_key,
+            hash_key: Some(keys.hash_key),
             stored_padding: if compressed { None } else { size.map(|size| StoredCipherPadding { size, skipped: 0 }) },
             blocks: compressed.then(CipherBlocks::default),
             recovery: None,
@@ -714,8 +751,9 @@ impl MemberMachine {
         usage: &crate::progressive::Usage,
         control: &crate::progressive::SessionControl,
     ) -> crate::progressive::ProgressiveResult<Self> {
-        Self::new_with_history(header, context, password, usage, control, None)
+        Self::new_with_history(header, context, password, usage, control, None, None)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_history(
         header: &super::FileHeader,
         mut context: EntryContext,
@@ -723,6 +761,7 @@ impl MemberMachine {
         usage: &crate::progressive::Usage,
         control: &crate::progressive::SessionControl,
         decoder: Option<Unpacker>,
+        legacy: Option<super::LegacyCrypt>,
     ) -> crate::progressive::ProgressiveResult<Self> {
         use crate::progressive::{FailureKind, ProgressiveFailure, Resource};
         if header.format == super::RarFormat::Rar4 {
@@ -734,15 +773,31 @@ impl MemberMachine {
         }
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
         let cipher = if header.encrypted {
-            let params = header
-                .crypt
-                .ok_or_else(|| ProgressiveFailure::new(FailureKind::Malformed("member encryption record")))?;
-            let password = password
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
-            let keys = controlled_keys(password, params, usage, control, context.scope())?;
-            context.password = keys.evidence;
-            Some(PendingCipher::from_keys(params, keys, header.method != 0, size))
+            if header.format == super::RarFormat::Rar4 {
+                let salt = legacy.filter(|c| c.version == 29).and_then(|c| c.salt).ok_or_else(|| {
+                    ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(
+                        crate::error::RarUnsupported::Rar4Feature("legacy encryption scheme or salt"),
+                    ))))
+                })?;
+                let password = password
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+                let (key, iv) = controlled_legacy_keys(password, &salt, usage, control)?;
+                context.password = crate::error::RarPasswordEvidence::VerifierUnavailable(
+                    crate::error::RarVerifierUnavailable::Absent,
+                );
+                Some(PendingCipher::from_legacy(key, iv, header.unpacked_size))
+            } else {
+                let params = header
+                    .crypt
+                    .ok_or_else(|| ProgressiveFailure::new(FailureKind::Malformed("member encryption record")))?;
+                let password = password
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+                let keys = controlled_keys(password, params, usage, control, context.scope())?;
+                context.password = keys.evidence;
+                Some(PendingCipher::from_keys(params, keys, header.method != 0, size))
+            }
         } else {
             None
         };
@@ -785,6 +840,26 @@ mod tests {
             password: crate::error::RarPasswordEvidence::NotEncrypted,
         }
     }
+    #[test]
+    fn legacy_kdf_session_budget_is_cumulative_and_meter_does_not_wrap() {
+        use crate::crypto::KdfControl;
+        let control = SessionControl::default();
+        let usage = Usage::new(ProgressiveLimits { kdf_session_blocks: 100, ..Default::default() });
+        for _ in 0..2 {
+            assert!(matches!(
+                controlled_legacy_keys("pw", &[1; 8], &usage, &control),
+                Err(crate::progressive::ProgressiveFailure {
+                    kind: FailureKind::Limit { resource: Resource::KdfSessionBlocks, limit: 100, attempted: 101 },
+                    ..
+                })
+            ));
+        }
+        let untouched = Usage::new(ProgressiveLimits { kdf_session_blocks: 1, ..Default::default() });
+        let mut meter = KdfMeter { usage: &untouched, control: &control, blocks: u64::MAX };
+        assert!(matches!(meter.charge(1), Err(crate::crypto::KdfControlError::Limit { attempted: u64::MAX, .. })));
+        untouched.charge(Resource::KdfSessionBlocks, 1).unwrap();
+    }
+
     #[test]
     fn production_kdf_meter_enforces_configured_fields_and_cumulative_session_work() {
         let params = crate::crypto::Rar5CryptParams {
@@ -849,8 +924,12 @@ mod tests {
                     block_flags: super::super::HFL_SPLIT_AFTER,
                     ..Default::default()
                 };
-                let wire =
-                    super::super::FileWire { name: std::sync::Arc::new(b"f".to_vec()), compression: 0, extent: 0..0 };
+                let wire = super::super::FileWire {
+                    legacy: None,
+                    name: std::sync::Arc::new(b"f".to_vec()),
+                    compression: 0,
+                    extent: 0..0,
+                };
                 let part1 = PhysicalPart::new(0, &first, Some(Ok(params)), &wire);
                 let mut member = PhysicalMember::new(first.clone(), wire, 0, &part1).unwrap();
                 let usage = Usage::new(ProgressiveLimits::default());
@@ -946,6 +1025,7 @@ mod tests {
                                 _ => {}
                             }
                         }
+                        ParserStep::LegacyKeyRequired { .. } => panic!("unexpected legacy encryption"),
                         ParserStep::End => break,
                     }
                 }

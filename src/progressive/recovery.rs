@@ -77,7 +77,7 @@ impl Record {
         Self {
             model,
             target,
-            key: machine.cipher.as_ref().map(|c| c.hash_key),
+            key: machine.cipher.as_ref().and_then(|c| c.checksum_key().copied()),
             context: machine.recovery_context(),
             missing: machine.missing,
             header_encrypted,
@@ -141,6 +141,9 @@ impl ProgressiveSession {
     pub fn supply_verification_source(&mut self, volume: u32, source: Box<dyn RangeSource>) -> ProgressiveResult<()> {
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
+        }
+        if self.recovery_closed {
+            return Err(invalid());
         }
         let next = self.replacement_revision.checked_add(1).ok_or_else(invalid)?;
         self.usage.charge(Resource::SourceBookkeeping, 1)?;
@@ -733,8 +736,15 @@ impl Replay {
             return Err(ProgressiveFailure::new(FailureKind::UnsupportedMethod));
         }
         usage.charge(Resource::MetadataBytes, std::mem::size_of::<Self>() as u64)?;
-        let machine =
-            MemberMachine::new_with_history(&member.header, record.context.clone(), password, usage, control, None)?;
+        let machine = MemberMachine::new_with_history(
+            &member.header,
+            record.context.clone(),
+            password,
+            usage,
+            control,
+            None,
+            member.wire.legacy.and_then(|w| w.crypt),
+        )?;
         Ok(Self {
             volume: 0,
             witness: 0,
@@ -767,6 +777,7 @@ impl Replay {
         }
         if self.compared < self.compare.len() {
             let n = (self.compare.len() - self.compared).min(buffer.len());
+            usage.charge(Resource::VerifyWorkBytes, n as u64)?;
             let ArtifactRead::Filled { count } = stage.read_at(self.inner_offset, &mut buffer[..n])? else {
                 return Err(incomplete());
             };
@@ -828,6 +839,13 @@ impl Replay {
             if used != count {
                 return Err(ProgressiveFailure::new(FailureKind::SourceChanged));
             }
+            if let ParserStep::LegacyKeyRequired { salt } = step {
+                let password = password
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+                let (key, iv) = crate::rar5::member::controlled_legacy_keys(password, &salt, usage, control)?;
+                parser.set_legacy_keys(&key, iv)?;
+            }
             if let ParserStep::Frame(frame) = step {
                 if self.witness_offset + count as u64 != witness.len {
                     return Err(ProgressiveFailure::new(FailureKind::SourceChanged));
@@ -854,6 +872,7 @@ impl Replay {
                     if part.packed_size != header.packed_size
                         || part.wire_extent != wire.extent
                         || part.crypt != frame.crypt
+                        || part.legacy != wire.legacy
                         || part.raw_flags != header.block_flags
                         || part.raw_compression != wire.compression
                         || wire.name != record.model.members[0].wire.name
@@ -1145,6 +1164,80 @@ mod tests {
         crate::output::OWNED_STAGE_FAULT.with(|slot| *slot.borrow_mut() = Some((operation, result)));
     }
     #[test]
+    fn replacement_comparison_work_is_precharged_separately() {
+        for limit in [2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut session, mut artifact) = setup(dir.path(), 100, crate::extract::Overwrite::Always);
+            let usage = Usage::new(ProgressiveLimits { verify_work_bytes: limit, ..Default::default() });
+            let record = artifact.recovery.as_ref().unwrap();
+            let mut replay = Replay::new(record, &usage, &session.control, None).unwrap();
+            replay.compare = b"012".to_vec();
+            let stage = artifact.stage.as_mut().unwrap();
+            let read_usage = Usage::new(ProgressiveLimits { verify_bytes: 3, ..Default::default() });
+            stage.usage = read_usage.clone();
+            let result = replay.poll(
+                record,
+                stage,
+                &mut session.driver,
+                &usage,
+                &session.control,
+                None,
+                &mut [0; 3],
+                &mut Context::from_waker(Waker::noop()),
+            );
+            if limit == 2 {
+                assert!(matches!(
+                    result,
+                    Err(ProgressiveFailure {
+                        kind: FailureKind::Limit { resource: Resource::VerifyWorkBytes, limit: 2, attempted: 3 },
+                        ..
+                    })
+                ));
+                read_usage.charge(Resource::VerifyBytes, 3).unwrap(); // No attempted stage read.
+                assert_eq!(replay.inner_offset, 0);
+            } else {
+                assert!(matches!(result, Ok(Poll::Pending)));
+                assert_eq!(replay.inner_offset, 3);
+                assert!(read_usage.charge(Resource::VerifyBytes, 1).is_err());
+                assert!(usage.charge(Resource::VerifyWorkBytes, 1).is_err());
+            }
+        }
+    }
+    struct NeverCalled;
+    impl RangeSource for NeverCalled {
+        fn info(&self) -> SourceInfo {
+            panic!("closed recovery called provider")
+        }
+        fn backing_files(&self) -> &[File] {
+            panic!("closed recovery called provider")
+        }
+        fn read_at(&mut self, _: u64, _: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            panic!("closed recovery read")
+        }
+    }
+    #[test]
+    fn closed_recovery_rejects_replacement_before_callbacks_and_cancel_has_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _a) = setup(dir.path(), 100, crate::extract::Overwrite::Always);
+        s.terminate(ProgressiveFailure::new(FailureKind::Malformed("test terminal failure"))).unwrap();
+        assert!(s.recovery_closed);
+        s.usage = Usage::new(ProgressiveLimits { source_bookkeeping: 0, ..Default::default() });
+        let revision = s.replacement_revision;
+        let epoch = s.replacement_epoch.load(Ordering::Acquire);
+        assert!(matches!(
+            s.supply_verification_source(0, Box::new(NeverCalled)),
+            Err(ProgressiveFailure { kind: FailureKind::InvalidCapability, .. })
+        ));
+        assert_eq!(s.replacement_revision, revision);
+        assert_eq!(s.replacement_epoch.load(Ordering::Acquire), epoch);
+        s.control.cancel();
+        assert!(matches!(
+            s.supply_verification_source(0, Box::new(NeverCalled)),
+            Err(ProgressiveFailure { kind: FailureKind::Canceled, .. })
+        ));
+    }
+
+    #[test]
     fn r1_verification_conflict_preserves_parked_extraction_and_cleanup() {
         for aftermath in [ArtifactAftermath::RetainProvisional, ArtifactAftermath::Remove] {
             for finish_second in [false, true] {
@@ -1329,6 +1422,12 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("out/inner")).unwrap(), b"0123456789");
         assert!(a.read_at(0, &mut [0]).is_err());
         assert!(s.patch(&mut a, 3, b"3456").is_err());
+        let revision = s.replacement_revision;
+        assert!(matches!(
+            s.supply_verification_source(0, Box::new(NeverCalled)),
+            Err(ProgressiveFailure { kind: FailureKind::InvalidCapability, .. })
+        ));
+        assert_eq!(s.replacement_revision, revision);
         a.discard().unwrap();
         drop(a);
         assert_eq!(std::fs::read(dir.path().join("out/inner")).unwrap(), b"0123456789");

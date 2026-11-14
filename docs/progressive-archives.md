@@ -132,11 +132,12 @@ compatibility remains open.
 | Plain Stored, unpack version 20 or 29 | Supported with declared size and CRC32 checks. |
 | Plain split Stored | Supported with exact raw-name/method/version/dictionary continuity, nonfinal packed-part CRC32 and final whole-inner CRC32. |
 | Plain Stored holes and patching | Shared sparse/zero holes, bounded patching and whole-inner read-back verification; wrong patches and failed declared checks stay failed. |
-| Encrypted payload or headers | Typed unsupported; legacy AES admission remains separate work. |
+| Modern version-29 AES Stored payload, including split parts | Admitted with explicit salt, known size, and unchanged data salt across parts; continuous CBC. |
+| Salt-prefixed AES encrypted headers | Admitted incrementally; each header derives its own IV. Explicit alternate header encryption versions remain unsupported. |
 | Compressed, solid, RAR1.5/2, PPM and VM | Typed unsupported through this entrypoint; original engines and qualified continuation remain required work. |
 | Ambiguous/unknown RAR4 unpacked size, old revisions, special file types | Typed unsupported. |
 
-Plain RAR4 framing uses the same incremental producer for `Volume`, catalogue
+RAR4 framing uses the same incremental producer for `Volume`, catalogue
 and progressive reads. Header waits retain exact parser state and raw encoded
 names; a header hole stops with `HeaderHole`. A set cannot switch archive format
 between volumes. The complete-file API retains its existing payload admission
@@ -321,3 +322,30 @@ Sealed memory charges retained bytes and inventory before acceptance. Source
 bookkeeping and provider requests remain separate cumulative budgets. KDF work
 uses the shared controlled meter and cumulative session budget. Limits bound
 engine work and retained allocation, not operating-system RSS or free disk space.
+
+
+Modern RAR4 Stored AES uses the same progressive session for visible and encrypted
+headers. The admitted encrypted payload family has unpack version 29, an explicit
+eight-byte salt, a known whole-member size, and the same data salt on all split
+parts. Cipher blocks and availability taint continue across physical part and
+volume boundaries, including boundaries inside a block. Each encrypted header
+instead starts its own salt-derived IV. Different split data salts and older
+crypto schemes are refused; they are not interpreted as IV reset instructions.
+Trailing AES padding is clipped by the declared size (at most 15 bytes), without
+requiring zero padding. Compressed/solid RAR4 and other legacy codec families
+remain outside this increment.
+
+RAR4 has no explicit password verifier. A missing password is reported separately;
+plaintext-dependent checksum or framing failure after decryption remains ambiguous
+between a wrong password and damaged ciphertext. Successful CBC checks are
+`CbcChecksOnly`, not authentication. Legacy data does not use RAR5 keyed checksum
+tweaks. Strict replacement replay binds the original salt and complete physical
+header extent, including encrypted header padding.
+
+Progressive RAR4 key derivation checks password bounds before allocating its UTF-16LE
+buffer (4096 UTF-8 bytes and 8192 encoded bytes, or configured stricter limits).
+It charges actual SHA-1 compressions, including all IV snapshot finalizations and
+final key padding, before the primitive. The independent ceilings are 2^22 blocks
+per derivation and a default 2^26 per session; a permitted long password can still
+reach a work limit. Such exhaustion is a resource failure, not a password verdict.
+The existing public unrestricted crypto helper retains its previous behavior.
