@@ -273,6 +273,9 @@ impl OutputContext {
         });
         Ok(created)
     }
+    pub(crate) fn skip_directories(&mut self) {
+        self.directories.clear();
+    }
     pub(crate) fn finish_directories(
         &mut self,
         source: &mut crate::progressive::source::SourceDriver,
@@ -311,9 +314,18 @@ impl OutputContext {
             if !policy.authorize(&dir.path, Some(dir.identity), source)? {
                 return Err(ProgressiveFailure::new(FailureKind::PublicationAuthorityRequired));
             }
+            // Authorization calls the provider. Recheck every binding it could
+            // have changed before following ancestors to the retained leaf.
+            policy.parents(&dir.path)?;
+            if target_stamp(&dir.path, true)? != Some(TargetStamp::Directory(dir.identity)) {
+                return Err(invalid());
+            }
             let file = open_directory(&dir.path)?;
             if native::Identity::file(&file).map_err(|e| out(OutputOperation::Metadata, e, 0))? != dir.identity {
                 return Err(invalid());
+            }
+            if self.authority.control.is_canceled() {
+                return Ok(());
             }
             crate::extract::finish_file(&file, &dir.meta);
         }

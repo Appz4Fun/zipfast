@@ -98,11 +98,17 @@ once. Pending directory metadata is skipped after this published failure.
 
 Directory metadata is queued with bounded paths and native identities, then
 restored deepest-first through newly opened nofollow descriptors checked against
-those identities. The last repeated directory header wins. Normal EOF and
+those identities. Root, parent and leaf bindings are rechecked after the provider
+authorization callback. The last repeated directory header wins. Normal EOF and
 noncancel termination attempt this once; unsafe replacement is never mutated.
 OS metadata errors are best effort, while binding/protection failures remain
-errors. Cancellation skips pending directory metadata; already-created
-directories keep their current metadata. Drop never performs another pass.
+errors. On termination, active-stage cleanup runs first. If removal fails, the
+primary failure, removal error and owned leftover artifact are returned; pending
+directory metadata is drained and skipped without callbacks or mutations. If
+stage cleanup succeeds (or the stage is retained without a cleanup error), the
+directory pass may run and its failure is returned as the cleanup error.
+Cancellation also skips pending directory metadata; already-created directories
+keep their current metadata. Drop never performs another pass.
 
 RAR5 solid streams reuse the complete extractor's serial decoder preparation
 primitives and the canonical `MemberMachine`/`Unpacker`. Clean decoded history

@@ -304,16 +304,24 @@ impl ProgressiveSession {
         self.finalizer.take();
         self.target.take();
         self.history.take();
-        let directory_failure =
-            self.output.as_mut().and_then(|output| output.finish_directories(&mut self.driver).err());
         if let Some(stage) = self.stage.take() {
-            let t = self.output.as_ref().expect("output").terminate(stage, failure);
+            let output = self.output.as_mut().expect("output");
+            let mut termination = output.terminate(stage, failure);
+            if termination.cleanup_failure.is_some() {
+                // Preserve the one actual cleanup failure; do not start a second
+                // fallible cleanup or allow its pending metadata to be retried.
+                output.skip_directories();
+            } else {
+                termination.cleanup_failure = output.finish_directories(&mut self.driver).err();
+            }
             return Ok(Some(ProgressiveEvent::SessionTerminated {
-                failure: t.failure,
-                artifact: t.artifact,
-                cleanup_failure: t.cleanup_failure.or(directory_failure),
+                failure: termination.failure,
+                artifact: termination.artifact,
+                cleanup_failure: termination.cleanup_failure,
             }));
         }
+        let directory_failure =
+            self.output.as_mut().and_then(|output| output.finish_directories(&mut self.driver).err());
         if self.had_stage || directory_failure.is_some() {
             Ok(Some(ProgressiveEvent::SessionTerminated {
                 failure,
@@ -1089,6 +1097,165 @@ mod tests {
         artifact.discard().unwrap();
         assert_eq!(std::fs::read(temp.path().join("target")).unwrap(), b"new");
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn task4b_r1_stage_cleanup_precedes_pending_directory_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicBool;
+        struct Provider {
+            path: std::path::PathBuf,
+            file: Arc<std::fs::File>,
+            armed: Arc<AtomicBool>,
+            cleanup_calls: Arc<AtomicU64>,
+        }
+        impl VolumeSource for Provider {
+            fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+                Ok(VolumeAnswer::Ready(Box::new(ImmutableFileSource::open(&self.path)?)))
+            }
+            fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+                if self.armed.load(Ordering::SeqCst) {
+                    self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                    return Err(ProgressiveFailure::new(FailureKind::SourceContract));
+                }
+                Ok(ProtectionDeclaration::Complete {
+                    epoch: 1,
+                    inventory: ProtectionInventory {
+                        volumes: vec![ProtectedVolume {
+                            index: 0,
+                            name: "a.rar".into(),
+                            backing: VolumeBacking::Native(vec![ProtectedPath {
+                                path: self.path.clone(),
+                                file: Some(self.file.clone()),
+                            }]),
+                        }],
+                        auxiliary_paths: vec![],
+                    },
+                })
+            }
+        }
+        fn block(body: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut sized = vec![u8::try_from(body.len()).unwrap()];
+            sized.extend(body);
+            let mut bytes = crate::crc32::hash(&sized).to_le_bytes().to_vec();
+            bytes.extend(sized);
+            bytes.extend(data);
+            bytes
+        }
+        // The same pending callback fails in the successful-removal control, and
+        // must never run when removal has already produced the sole cleanup error.
+        for (remove_failure, directory_failure, retain) in [
+            (true, true, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+            (false, true, true),
+            (false, false, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let dest = temp.path().join("out");
+            std::fs::create_dir(&dest).unwrap();
+            let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+            bytes.extend(block(&[1, 0, 0], &[]));
+            // Directory: flag1, size0, Unix mode0500 as vint, stored, Unix host.
+            bytes.extend(block(&[2, 0, 1, 0, 0xc0, 2, 0, 1, 3, b'd', b'i', b'r'], &[]));
+            let mut header = vec![2, 2, 3, 4, 3, 0];
+            header.extend(crate::crc32::hash(b"old").to_le_bytes());
+            header.extend([0, 0, 6]);
+            header.extend(b"target");
+            bytes.extend(block(&header, b"new"));
+            bytes.extend(block(&[5, 0, 0], &[]));
+            let path = temp.path().join("a.rar");
+            std::fs::write(&path, bytes).unwrap();
+            let armed = Arc::new(AtomicBool::new(false));
+            let cleanup_calls = Arc::new(AtomicU64::new(0));
+            let mut options = ProgressiveOptions::new(
+                crate::extract::Options {
+                    mode: crate::extract::Mode::Extract,
+                    dest: dest.clone(),
+                    overwrite: crate::extract::Overwrite::Always,
+                    flatten: false,
+                    threads: Some(1),
+                    protected_paths: Default::default(),
+                    parallel_min: None,
+                },
+                "a.rar".into(),
+            );
+            if retain {
+                options.artifact_aftermath = ArtifactAftermath::RetainProvisional;
+            }
+            let mut session = ProgressiveSession::new(
+                Box::new(Provider {
+                    file: Arc::new(std::fs::File::open(&path).unwrap()),
+                    path,
+                    armed: armed.clone(),
+                    cleanup_calls: cleanup_calls.clone(),
+                }),
+                options,
+            )
+            .unwrap();
+            let mut started = false;
+            let (failure, cleanup, mut artifact) = loop {
+                match session.poll_event(&mut Context::from_waker(std::task::Waker::noop())) {
+                    Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { name, .. })))
+                        if name.as_slice() == b"target" =>
+                    {
+                        started = true;
+                        std::fs::set_permissions(dest.join("dir"), std::fs::Permissions::from_mode(0o700)).unwrap();
+                        armed.store(directory_failure, Ordering::SeqCst);
+                        if remove_failure {
+                            crate::output::OWNED_STAGE_FAULT.with(|slot| {
+                                *slot.borrow_mut() = Some((crate::output::OwnedOperation::Remove, Err(libc::EACCES)))
+                            });
+                        }
+                    }
+                    Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated {
+                        failure,
+                        cleanup_failure,
+                        artifact,
+                    }))) => break (failure, cleanup_failure, artifact),
+                    Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+                    Poll::Ready(Err(e)) => panic!("terminal checksum event required: {e:?}"),
+                    _ => panic!("unexpected end"),
+                }
+            };
+            assert!(started);
+            assert!(
+                matches!(failure.kind, FailureKind::Rar(ref error) if matches!(error.as_ref(), crate::error::RarFailure::Integrity { reason: crate::error::RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false }, .. })),
+                "{failure:?}"
+            );
+            assert_eq!(cleanup_calls.load(Ordering::SeqCst), u64::from(directory_failure && !remove_failure));
+            if remove_failure {
+                assert!(
+                    matches!(cleanup.unwrap().kind, FailureKind::Output { operation: OutputOperation::Remove, cause } if cause.raw_os_error() == Some(libc::EACCES))
+                );
+            } else if directory_failure {
+                assert!(matches!(cleanup.unwrap().kind, FailureKind::SourceContract));
+            } else {
+                assert!(cleanup.is_none());
+            }
+            assert_eq!(artifact.is_some(), remove_failure || retain);
+            assert_eq!(failure.context.inner_offset, Some(3));
+            assert_eq!(
+                std::fs::metadata(dest.join("dir")).unwrap().permissions().mode() & 0o777,
+                if directory_failure || remove_failure { 0o700 } else { 0o500 }
+            );
+            assert!(!dest.join("target").exists());
+            assert!(matches!(
+                session.poll_event(&mut Context::from_waker(std::task::Waker::noop())),
+                Poll::Ready(Ok(None))
+            ));
+            // Even an explicit internal cleanup call cannot retry the drained queue.
+            session.output.as_mut().unwrap().finish_directories(&mut session.driver).unwrap();
+            assert_eq!(cleanup_calls.load(Ordering::SeqCst), u64::from(directory_failure && !remove_failure));
+            drop(session);
+            if let Some(ref mut artifact) = artifact {
+                let mut buffer = [0; 3];
+                assert_eq!(artifact.read_at(0, &mut buffer).unwrap(), ArtifactRead::Filled { count: 3 });
+                assert_eq!(&buffer, b"new");
+                artifact.discard().unwrap();
+            }
+            assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+        }
     }
     #[test]
     fn nonce_exhaustion_never_wraps_or_reuses_identity() {

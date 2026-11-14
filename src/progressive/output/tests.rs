@@ -1058,3 +1058,92 @@ fn task4b_directory_finalization_budget_is_finite_and_one_shot() {
     output.finish_directories(&mut source).unwrap();
     assert_eq!(fs::metadata(dir.path().join("directory")).unwrap().permissions().mode() & 0o777, 0o700);
 }
+
+fn check_finalization_ancestor(attack: Option<&str>) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Rebind {
+        armed: Arc<AtomicBool>,
+        from: PathBuf,
+        saved: PathBuf,
+        declaration: ProtectionDeclaration,
+    }
+    impl VolumeSource for Rebind {
+        fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+            Ok(VolumeAnswer::Missing)
+        }
+        fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                fs::rename(&self.from, &self.saved).unwrap();
+                symlink(&self.saved, &self.from).unwrap();
+            }
+            Ok(self.declaration.clone())
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("out");
+    fs::create_dir_all(root.join("parent/directory")).unwrap();
+    let leaf = root.join("parent/directory");
+    fs::set_permissions(&leaf, fs::Permissions::from_mode(0o700)).unwrap();
+    let file = fs::File::open(&leaf).unwrap();
+    file.set_times(
+        fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)),
+    )
+    .unwrap();
+    let before = file.metadata().unwrap();
+    let from = if attack == Some("parent") { root.join("parent") } else { root.clone() };
+    let saved = temp.path().join("saved");
+    let armed = Arc::new(AtomicBool::new(false));
+    let mut source = crate::progressive::source::SourceDriver::new(
+        Box::new(Rebind {
+            armed: armed.clone(),
+            from: from.clone(),
+            saved: saved.clone(),
+            declaration: native_complete(temp.path()),
+        }),
+        "input.rar".into(),
+        ProgressiveLimits::default(),
+        SessionControl::default(),
+    )
+    .unwrap();
+    let mut output = setup(&root);
+    let header = crate::rar5::FileHeader {
+        name: "parent/directory".into(),
+        host_os: 1,
+        attributes: 0o500,
+        mtime: Some(1_700_000_000),
+        ..Default::default()
+    };
+    assert!(!output.directory(member(0), &header, &mut source).unwrap());
+    armed.store(attack.is_some(), Ordering::SeqCst);
+    let result = output.finish_directories(&mut source);
+    let after = file.metadata().unwrap();
+    if attack.is_some() {
+        assert!(saved.is_dir(), "callback must move the ancestor");
+        assert!(fs::symlink_metadata(&from).unwrap().is_symlink());
+        assert_eq!(
+            (after.mode(), after.mtime(), after.mtime_nsec()),
+            (before.mode(), before.mtime(), before.mtime_nsec()),
+            "revoked ancestor must prevent metadata restoration: {attack:?}"
+        );
+        assert!(result.is_err());
+    } else {
+        result.unwrap();
+        assert_eq!(after.mode() & 0o777, 0o500);
+        assert_eq!(after.mtime(), 1_700_000_000);
+    }
+    output.finish_directories(&mut source).unwrap();
+}
+
+#[test]
+fn task4b_r1_finalization_root_rebind() {
+    check_finalization_ancestor(Some("root"));
+}
+#[test]
+fn task4b_r1_finalization_parent_rebind() {
+    check_finalization_ancestor(Some("parent"));
+}
+#[test]
+fn task4b_r1_finalization_safe_control() {
+    check_finalization_ancestor(None);
+}
