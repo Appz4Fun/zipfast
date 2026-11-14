@@ -235,6 +235,8 @@ pub(crate) struct SourceDriver {
     control: SessionControl,
     usage: Usage,
     parked: bool,
+    // Readiness admitted by verification, but its source callback has not run.
+    retry_admitted: bool,
     failed: bool,
     admitted: Vec<(u32, SourceId, OsString, SourceInfo)>,
     protection: ProtectionDeclaration,
@@ -274,6 +276,7 @@ impl SourceDriver {
             control,
             usage,
             parked: false,
+            retry_admitted: false,
             failed: false,
             admitted: Vec::new(),
             protection: ProtectionDeclaration::Opaque,
@@ -467,6 +470,7 @@ impl SourceDriver {
         if verify {
             self.usage.charge(Resource::VerifyBytes, count)?;
         }
+        self.retry_admitted = false;
         let answer = self.source.as_mut().unwrap().read_at(offset, &mut buf[..count as usize], &mut cx)?;
         self.check_info()?;
         if self.control.is_canceled() {
@@ -604,7 +608,13 @@ impl SourceDriver {
     /// Admit a whole verification retry before any caller callback. Readiness
     /// consumption and wake accounting use the same latch as range reads.
     pub(crate) fn replacement_retry_ready(&mut self, cx: &mut Context<'_>) -> ProgressiveResult<bool> {
+        if self.control.is_canceled() {
+            return Err(ProgressiveFailure::new(FailureKind::Canceled));
+        }
         for (_, lane) in &mut self.replacements {
+            if lane.failed {
+                return Err(contract());
+            }
             if lane.parked {
                 lane.wake.register(cx.waker());
                 if self.control.is_canceled() {
@@ -614,6 +624,7 @@ impl SourceDriver {
                     return Ok(false);
                 }
                 lane.parked = false;
+                lane.retry_admitted = true;
             }
         }
         Ok(true)
@@ -644,15 +655,27 @@ impl SourceDriver {
     /// permanent-hole ledger and native guards; old request wakers cannot authorize
     /// a later job because the new lane owns a fresh latch.
     pub(crate) fn abort_replacement_reads(&mut self) -> ProgressiveResult<()> {
-        self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64)?;
-        let count = self.replacements.iter().filter(|(_, lane)| lane.parked).count();
-        self.usage.charge(
-            Resource::MetadataBytes,
-            (count * (std::mem::size_of::<WakeGate>() + 2 * std::mem::size_of::<usize>())) as u64,
-        )?;
+        let admitted = self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64).and_then(|_| {
+            let count = self.replacements.iter().filter(|(_, lane)| lane.parked || lane.retry_admitted).count();
+            self.usage.charge(
+                Resource::MetadataBytes,
+                (count * (std::mem::size_of::<WakeGate>() + 2 * std::mem::size_of::<usize>())) as u64,
+            )
+        });
+        if let Err(error) = admitted {
+            // A failed retirement cannot leave its old request usable by a later
+            // job. Close only those lanes; no unbudgeted latch is allocated.
+            for (_, lane) in &mut self.replacements {
+                if lane.parked || lane.retry_admitted {
+                    lane.failed = true;
+                }
+            }
+            return Err(error);
+        }
         for (_, lane) in &mut self.replacements {
-            if lane.parked {
+            if lane.parked || lane.retry_admitted {
                 lane.parked = false;
+                lane.retry_admitted = false;
                 lane.wake = Arc::new(WakeGate::default());
             }
         }

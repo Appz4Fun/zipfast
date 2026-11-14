@@ -1172,3 +1172,26 @@ fn r1_protection_upgrade_counts_replacements_before_retaining_bindings() {
     ));
     assert_eq!(d.native.handle_count(), 1, "upgrade rejected before retaining new bindings");
 }
+
+#[test]
+fn r2_failed_retry_gate_retirement_cannot_admit_another_request() {
+    let original = State::new(&[]);
+    let mut replacement = State::new(&[Answer::Wait(false), Answer::Fill(1)]);
+    replacement.info.id = SourceId(2);
+    let mut d = driver(original, ProgressiveLimits::default());
+    opened(&mut d, Waker::noop());
+    d.supply_replacement(0, Box::new(replacement.clone())).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(d.poll_replacement(0, 0, &mut cx, &mut [0; 1]).is_pending());
+    replacement.wake();
+    assert!(d.replacement_retry_ready(&mut cx).unwrap());
+    // Exhaust the abort's existing new-latch allocation budget before its effect.
+    d.usage = Usage::new(ProgressiveLimits { metadata_bytes: 0, ..Default::default() });
+    assert!(matches!(
+        d.abort_replacement_reads().unwrap_err().kind,
+        FailureKind::Limit { resource: Resource::MetadataBytes, .. }
+    ));
+    replacement.wake();
+    assert!(matches!(d.replacement_retry_ready(&mut cx).unwrap_err().kind, FailureKind::SourceContract));
+    assert_eq!(replacement.calls.load(Ordering::SeqCst), 1);
+}

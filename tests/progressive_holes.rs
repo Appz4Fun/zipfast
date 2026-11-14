@@ -1050,6 +1050,13 @@ fn excessive_full_padding_block_is_malformed_even_with_missing_data() {
 
 #[test]
 fn r1_parked_verification_has_no_callbacks_or_request_debits_until_wake() {
+    counted_parked_verification(false);
+}
+#[test]
+fn r2_aborted_admitted_retry_retires_old_request_waker() {
+    counted_parked_verification(true);
+}
+fn counted_parked_verification(abort_admitted: bool) {
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -1102,6 +1109,7 @@ fn r1_parked_verification_has_no_callbacks_or_request_debits_until_wake() {
     let mut opts = options(dir.path());
     opts.set_password(Some("pw".into())).unwrap();
     opts.limits.source_requests = 2000;
+    opts.limits.provider_wakes = if abort_admitted { 2 } else { 1 };
     let mut s = ProgressiveSession::new(
         Box::new(CountedProvider {
             source: Some(Counted {
@@ -1131,12 +1139,46 @@ fn r1_parked_verification_has_no_callbacks_or_request_debits_until_wake() {
         }
     }
     assert!(gate.lock().unwrap().waker.is_some());
+    let stale_request = if abort_admitted {
+        let old_request = gate.lock().unwrap().waker.take().unwrap();
+        let reads_before = replacement.lock().unwrap()[2];
+        // Change only the real stage's full stamp; correct plaintext stays identical.
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(entries.len(), 1);
+        let file = std::fs::OpenOptions::new().write(true).open(&entries[0]).unwrap();
+        let before = file.metadata().unwrap().modified().unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(before + std::time::Duration::from_secs(2))).unwrap();
+        assert_ne!(file.metadata().unwrap().modified().unwrap(), before);
+        assert_eq!(std::fs::read(&entries[0]).unwrap(), plain);
+        old_request.wake_by_ref();
+        assert!(matches!(
+            s.poll_verify(&mut a, &mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::InvalidCapability, .. }))
+        ));
+        assert_eq!(replacement.lock().unwrap()[2], reads_before, "stamp rejection precedes the admitted read");
+        assert_eq!(a.evidence(), ArtifactEvidence::Provisional);
+        for _ in 0..100 {
+            assert!(s.poll_verify(&mut a, &mut Context::from_waker(Waker::noop())).is_pending());
+            if gate.lock().unwrap().waker.is_some() {
+                break;
+            }
+        }
+        assert!(gate.lock().unwrap().waker.is_some(), "fresh attempt registered its own NotYet request");
+        assert_eq!(replacement.lock().unwrap()[2], reads_before + 1);
+        Some(old_request)
+    } else {
+        None
+    };
     let original_before = *original.lock().unwrap();
     let replacement_before = *replacement.lock().unwrap();
     let old = Arc::new(Task::default());
     let latest = Arc::new(Task::default());
     let old_waker = Waker::from(old.clone());
     let latest_waker = Waker::from(latest.clone());
+    // An aborted request's notification cannot authorize this new request.
+    if let Some(stale) = &stale_request {
+        stale.wake_by_ref();
+    }
     // More no-wake polls than the entire request budget: no source debit is allowed.
     for _ in 0..2500 {
         assert!(s.poll_verify(&mut a, &mut Context::from_waker(&old_waker)).is_pending());
