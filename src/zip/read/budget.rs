@@ -717,10 +717,18 @@ impl LedgerState {
         }
         let events = checked_sum(records, 2)?;
         let groups = checked_sum(2, product(2, events)?)?;
-        let operations =
-            [4, product(4, events)?, product(2, candidates)?, product(2, protected)?, product(2, records)?]
-                .into_iter()
-                .try_fold(0, checked_sum)?;
+        // Admission may lstat+stat each protected name. Each possible
+        // emission then performs one following stat before and after writing.
+        let operations = [
+            4,
+            product(4, events)?,
+            product(2, candidates)?,
+            product(2, protected)?,
+            product(2, records)?,
+            product(product(2, protected)?, events)?,
+        ]
+        .into_iter()
+        .try_fold(0, checked_sum)?;
         let metadata = checked_sum(checked_sum(product(3, groups)?, operations)?, if cwd { 5 } else { 0 })?;
         if cwd {
             plan.bounds.path_steps = checked_sum(plan.bounds.path_steps, 1)?;
@@ -736,6 +744,17 @@ impl LedgerState {
             plan.bounds.diagnostic_admission_operations = operations;
         }
         Ok(())
+    }
+    pub(super) fn bind_direct_diagnostics(
+        &mut self,
+        protected: u128,
+        cwd: bool,
+        ceiling: u128,
+    ) -> Result<u128, ReadFault> {
+        self.bind_diagnostics(1, 1, protected, cwd)?;
+        let bound = self.run.plan.as_ref().ok_or(ReadFault::InvalidPlan)?.attempt_bound().min(ceiling);
+        self.encrypted.limits.io_attempts = bound;
+        Ok(bound)
     }
     pub(super) fn bind_policy_geometry(&mut self, policy: PolicyGeometry) -> Result<u128, ReadFault> {
         if self.poisoned {

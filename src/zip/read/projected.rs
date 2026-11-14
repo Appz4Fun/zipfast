@@ -97,7 +97,34 @@ pub(super) struct Action {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) policy: Option<policy::FrozenPolicy>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(super) directories: Option<policy::OwnedMetadata<(usize, usize)>>,
+    pub(super) auxiliary: ActionAuxiliary,
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::large_enum_variant)] // Reuse phase-exclusive inline storage, with no new allocation or owner role.
+pub(super) enum ActionAuxiliary {
+    Empty,
+    Directories(policy::OwnedMetadata<(usize, usize)>),
+    DirectDiagnostics(super::diagnostic::DirectDiagnosticState),
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl ActionAuxiliary {
+    pub(super) fn directories_mut(&mut self) -> Result<Option<&mut policy::OwnedMetadata<(usize, usize)>>, ReadFault> {
+        match self {
+            Self::Empty => Ok(None),
+            Self::Directories(index) => Ok(Some(index)),
+            Self::DirectDiagnostics(_) => Err(ReadFault::InvalidPlan),
+        }
+    }
+    pub(super) fn take_directories(&mut self) -> Result<Option<policy::OwnedMetadata<(usize, usize)>>, ReadFault> {
+        if matches!(self, Self::DirectDiagnostics(_)) {
+            return Err(ReadFault::InvalidPlan);
+        }
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => Ok(None),
+            Self::Directories(index) => Ok(Some(index)),
+            Self::DirectDiagnostics(_) => unreachable!(),
+        }
+    }
 }
 /// A checked owner of one original projected parse. No mutable catalogue is exposed.
 /// Handle/path identity, length, mtime and ctime checks are optimistic observations:
@@ -874,7 +901,7 @@ pub(super) fn factory<'a>(
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             policy: None,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            directories: None,
+            auxiliary: ActionAuxiliary::Empty,
         });
         Ok(())
     })();

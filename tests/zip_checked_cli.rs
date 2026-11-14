@@ -410,14 +410,17 @@ fn actual_binary_safe_socket_tty_fifo_and_nonterminal_character() {
         .unwrap();
     assert_eq!(result.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&line(&mut reader)).contains("wrong password"));
-    let null = OpenOptions::new().write(true).open("/dev/null").unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_zipfast"))
-        .args(["t", "-q", "-pwrong"])
-        .arg(&input)
-        .stderr(null)
-        .output()
-        .unwrap();
-    assert_eq!(result.status.code(), Some(2));
+    for (path, status) in [("/dev/null", 1), ("/dev/zero", 2), ("/dev/random", 2)] {
+        let device = OpenOptions::new().write(true).open(path).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_zipfast"))
+            .args(["t", "-q", "-pwrong"])
+            .arg(&input)
+            .stderr(device)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(status), "{path}");
+        assert!(result.stdout.is_empty(), "{path}");
+    }
     assert_eq!(fs::read(input).unwrap(), bytes);
 }
 #[test]

@@ -32,7 +32,96 @@ session.check_source(&mut context)?;
 
 `ProjectedReadSession` retains one original projection, file and source binding. `ReadSession` retains canonical metadata and stable `EntryId`s; use `EncryptedReadContext::for_session` before selecting its original ID and calling `SelectedZipEntry::read_with_context`. The generic `SelectedEntry::open_cancelable_with_zip_limit`, `zip_read_context` and `read_with_zip_context` use the same checked engine for ZIP. The original source stays held through final checks. A foreign ID, different owner, consumed action or altered source invalidates the attempt. Create a fresh action context for every retry; failed attempts spend cumulative work and I/O allowances.
 
+For generic archive discovery on macOS and Linux, use
+`extract::inspect_projected_cancelable(path, password, &cancel)`. Match the
+non-exhaustive `extract::ProjectedInspection`: `Zip(session)` supplies the same
+projected session used above, while `Other(entries)` supplies the incumbent
+non-ZIP listing. Handle future variants when matching outside the crate. The
+ZIP case moves one original source/catalogue and includes actual dispatch bytes
+in the cumulative 129 MiB dispatch/parser allowance; it does not reopen ZIP or
+create retained metadata first. ZIP/TAR head signatures win, then bounded RAR
+recognition precedes a ZIP attempt. A recognized format's errors are terminal,
+including RAR initializer, password, member and later-volume failures.
+
+The inspection password decrypts RAR headers; ZIP reads receive their payload
+password separately. TAR listing keeps its pathname reopen after checked source
+retirement, and later non-ZIP selection keeps its existing reopen/legacy scope.
+The successful returned ZIP session keeps its ordinary file-drop lifecycle;
+inspection adds no explicit successful-close receipt or close-error API.
+Constructor failures and TAR retirement retain existing checked cleanup
+evidence. This entry point is not exposed on other platforms.
+
 Callbacks are provisional until the full read returns success. AES authentication alone does not prove codec completion, decoded length, CRC where required, source stability or publication. A caller that publishes callback bytes directly accepts those later failure outcomes. Raw callback writes, caller allocations, arbitrary external operations and native codec allocations are outside Rust reader capacity accounting. Use controlled output for publication requirements.
+
+## One final selected-operation diagnostic
+
+On macOS/Linux, prepare one checked completion sink immediately after the
+original action-context factory, before payload FD admission, source checks,
+staging or decoding. Use `ProjectedReadSession::prepare_diagnostics(ordinal, ...)`,
+`ReadSession::prepare_diagnostics(&original_id, ...)`, or
+`SelectedEntry::prepare_zip_diagnostics(...)`. The generic selection returns
+`None` for its incumbent non-ZIP scope. Keep the same owner, context, immutable
+options and actual output handle through its matching `emit_diagnostic` or
+`emit_zip_diagnostic` call. `Mode::Test` options accompany callback/discard/stdout
+actions; staged-file actions require their original `Mode::Extract` options and
+destination. A prepared token cannot be cloned or emitted twice.
+
+For example, with the original projected session and a fresh callback context:
+
+```rust
+let token = session.prepare_diagnostics(
+    ordinal, &options, &cancel, &mut context,
+    zipfast::zip::ZipDiagnosticSink::Stderr, &stderr,
+)?;
+let operation = session.read_at_with_context(
+    ordinal, password, u64::MAX, &cancel, &mut context,
+    |bytes| { /* consume provisional bytes */ Ok(()) },
+).and_then(|()| session.check_source(&mut context)).map(|()| true);
+let (value, error, diagnostic_usage) = session.emit_diagnostic(
+    token, &mut context, operation, &mut stderr,
+    |operation, status, writer| writer.write_fmt(format_args!(
+        "ZIP completion: {}\n",
+        if status.is_fatal() { "source unavailable" }
+        else { match operation { Ok(true) => "complete", Ok(false) => "skipped", Err(_) => "failed" } },
+    )),
+).into_parts();
+// Inspect BOTH value and error before choosing the application's final status.
+```
+
+`Some(value)` is the actual successful operation/publication or legitimate skip
+receipt, even if `error` is also `Some` because final diagnostics failed. Record
+that completed operation before reporting the diagnostic failure; it cannot be
+rolled back. `None` plus an error retains the original failed operation with
+new checked evidence merged. The carrier never returns `None, None`. Successful
+operation values move without cloning; there is only one inline error slot.
+A diagnostic-only error after success has `Unknown` publication disposition;
+the preserved operation value holds its actual publication/accepted-byte result.
+
+Admission checks regular log files against the held source, selected output and
+protected targets. Actual payload stdout FD admission also refuses a prepared
+regular diagnostic alias and latches that refusal before staging or copying;
+the completion renderer cannot then write into that same payload file. Pipes,
+sockets, TTYs and the exact native null device may be shared. The classifier
+recognizes only macOS character device 3:2 and Linux 1:3 as null, using its
+existing descriptor observation; other non-TTY character devices remain refused.
+Descriptor/source/target observations are repeated at final rendering. Regular
+sinks also recheck every current protected name before and after emission,
+following symlinks and using the original frozen CWD for relative names in both
+Test and Extract modes. Stable substitutions before emission refuse rendering;
+a substitution observed after writing retains the actual accepted-byte receipt.
+These bounded observations do not make namespace changes inside an unobservable
+syscall or write interval atomic. The checked diagnostic allowance includes two
+additional path operations per protected name per possible emission, together
+with their metadata and retry attempts. No
+unchecked fallback is permitted after an admission, formatting or write refusal.
+
+Bootstrap/factory failures before a prepared context keep the terminal-only
+diagnostic boundary: safe streams/exact null are supported, unbound regular logs
+are refused. This API does not add a source reopen, metadata copy or regular-log
+proof for those earlier failures. Its compact state shares phase-exclusive action
+storage with the existing run directory index. Actual control inventories retain
+the 16 KiB phase and 256 KiB reader-component bounds; they are capacity inventories,
+not process RSS limits or measurements of the operating system stack.
 
 ## Policy and limits
 

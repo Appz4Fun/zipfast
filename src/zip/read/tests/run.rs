@@ -388,6 +388,10 @@ fn directory_index_allocation_is_before_output_effects() {
     assert!(matches!(result.unwrap_err().operation(), Some(ReadFault::Allocation { capacity: 48 })));
     assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
     assert_eq!(context.run_usage().records, 0);
+    // FrozenPolicy was bound before the directory-index allocation refused.
+    assert!(context.action.as_ref().unwrap().policy.is_none());
+    assert_eq!(context.policy_metadata_usage().caller.live_allocations, 0);
+    assert_eq!(context.policy_metadata_usage().caller.live_capacity, 0);
 }
 
 #[test]

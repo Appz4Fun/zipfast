@@ -58,7 +58,43 @@ fn snapshot(report: &mut ZipRunReport, context: &EncryptedReadContext, diagnosti
     report.run_usage = context.run_usage();
     report.diagnostic_usage = diagnostics.usage;
 }
+fn retire_diagnostic_policy(
+    owner: u64,
+    context: &mut EncryptedReadContext,
+    diagnostics: &mut DiagnosticState,
+    terminal: &mut Option<ZipReadError>,
+) {
+    if let Some(cwd) = diagnostics.cwd.take()
+        && let Err((_, fault)) = cwd.finish(&context.ledger)
+    {
+        *terminal = Some(match terminal.take() {
+            Some(error) => error.merge_cleanup_only(
+                ZipReadError::from(fault).owned_boundary_error(OwnedObject::PolicyPath, ReadIoOperation::Stat),
+            ),
+            None => fault.into(),
+        });
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(policy) = context
+        .action
+        .as_mut()
+        .filter(|a| a.identity == owner && a.scope == ProjectedReadScope::AllRegular)
+        .and_then(|a| a.policy.take())
+        && let Err(fault) = policy.finish(&context.ledger)
+    {
+        *terminal = Some(match terminal.take() {
+            Some(prior) => prior.merge_source_boundary(fault.into()),
+            None => fault.into(),
+        });
+    }
+}
 impl Completion {
+    fn fail(&mut self, error: ZipReadError) {
+        self.terminal = Some(match self.terminal.take() {
+            Some(prior) => prior.merge_source_boundary(error),
+            None => error,
+        });
+    }
     fn merge(&mut self, evidence: Evidence) {
         if evidence.failed() {
             self.terminal = Some(evidence.merge(self.terminal.take().unwrap_or_else(|| ReadFault::InvalidPlan.into())));
@@ -133,10 +169,17 @@ impl ProjectedReadSession {
         mut observe: impl ZipRunObserver,
     ) -> ZipReadResult<ZipRunReport> {
         let mut diagnostics = DiagnosticState::default();
-        let mut completion = self.run_steps(options, password, cancel, context, &mut diagnostics, &mut observe)?;
+        let mut completion = match self.run_steps(options, password, cancel, context, &mut diagnostics, &mut observe) {
+            Ok(completion) => completion,
+            Err(error) => {
+                let mut terminal = Some(error);
+                retire_diagnostic_policy(self.owner.identity, context, &mut diagnostics, &mut terminal);
+                return Err(terminal.unwrap());
+            }
+        };
         if !completion.observer_failed {
             let projected::ProjectedOwner { file, source, entries, .. } = &mut self.owner;
-            let mut scope = ZipDiagnosticScope::from_parts(
+            match ZipDiagnosticScope::from_parts(
                 file,
                 source,
                 entries,
@@ -145,14 +188,18 @@ impl ProjectedReadSession {
                 &mut diagnostics,
                 cancel,
                 None,
-            )?;
-            let result = observe.observe(
-                ZipRunEvent::RunEnded { report: &completion.report, error: completion.terminal.as_ref() },
-                &mut scope,
-            );
-            let evidence = scope.finish(result);
-            completion.merge(evidence);
+            ) {
+                Ok(mut scope) => {
+                    let result = observe.observe(
+                        ZipRunEvent::RunEnded { report: &completion.report, error: completion.terminal.as_ref() },
+                        &mut scope,
+                    );
+                    completion.merge(scope.finish(result));
+                }
+                Err(fault) => completion.fail(fault.into()),
+            }
         }
+        retire_diagnostic_policy(self.owner.identity, context, &mut diagnostics, &mut completion.terminal);
         completion.finish(context, &diagnostics)
     }
     #[allow(clippy::too_many_arguments)]
@@ -218,7 +265,9 @@ impl ProjectedReadSession {
                         break;
                     }
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
-                    if let Some(index) = context.action.as_mut().and_then(|a| a.directories.as_mut()) {
+                    if let Some(index) =
+                        context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.directories_mut()?
+                    {
                         let entry = &self.owner.entries[ordinal];
                         let depth = entry
                             .name
@@ -290,7 +339,7 @@ impl ProjectedReadSession {
             }
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(mut index) = context.action.as_mut().and_then(|a| a.directories.take()) {
+        if let Some(mut index) = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.take_directories()? {
             if !cancel.is_canceled() && !context.ledger.with_state(|s| s.poisoned) {
                 index.sort_unstable_by_key(|&(ordinal, depth)| (std::cmp::Reverse(depth), ordinal));
                 #[cfg(test)]
@@ -326,25 +375,6 @@ impl ProjectedReadSession {
             action.active_ordinal = None;
             action.active_record_charged = false;
         }
-        if let Some(cwd) = diagnostics.cwd.take()
-            && let Err((_, fault)) = cwd.finish(&context.ledger)
-        {
-            terminal = Some(match terminal.take() {
-                Some(error) => error.merge_cleanup_only(
-                    ZipReadError::from(fault).owned_boundary_error(OwnedObject::PolicyPath, ReadIoOperation::Stat),
-                ),
-                None => fault.into(),
-            });
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(policy) = context.action.as_mut().and_then(|a| a.policy.take())
-            && let Err(fault) = policy.finish(&context.ledger)
-        {
-            terminal = Some(match terminal.take() {
-                Some(prior) => prior.merge_source_boundary(fault.into()),
-                None => fault.into(),
-            });
-        }
         if let Err(boundary) = self.check_source(context) {
             terminal = Some(match terminal.take() {
                 Some(error) => error.merge_source_boundary(boundary),
@@ -368,7 +398,11 @@ impl ProjectedReadSession {
         let mut diagnostics = DiagnosticState::default();
         let mut completion = match self.run_steps(options, password, cancel, context, &mut diagnostics, &mut observe) {
             Ok(c) => c,
-            Err(error) => return Err(self.owner.reject(error)),
+            Err(error) => {
+                let mut terminal = Some(error);
+                retire_diagnostic_policy(self.owner.identity, context, &mut diagnostics, &mut terminal);
+                return Err(self.owner.reject(terminal.unwrap()));
+            }
         };
         #[cfg(test)]
         owned_hook(0, self.owner.source.as_ref().ok().map(|s| s.path.as_path()));
@@ -381,6 +415,8 @@ impl ProjectedReadSession {
             });
         }
         if !context.ledger.with_state(|s| s.source_registered()) {
+            retire_diagnostic_policy(self.owner.identity, context, &mut diagnostics, &mut completion.terminal);
+            snapshot(&mut completion.report, context, &diagnostics);
             return Err(self
                 .owner
                 .reject(completion.terminal.unwrap_or_else(|| ReadFault::InvalidPlan.into()))
@@ -405,20 +441,25 @@ impl ProjectedReadSession {
         owned_hook(1, retired.binding.as_ref().ok().map(|s| s.path.as_path()));
         snapshot(&mut completion.report, context, &diagnostics);
         if !completion.observer_failed {
-            let mut scope = ZipDiagnosticScope::retired(
+            match ZipDiagnosticScope::retired(
                 &mut retired,
                 &self.owner.entries,
                 options,
                 context,
                 &mut diagnostics,
                 cancel,
-            )?;
-            let result = observe.observe(
-                ZipRunEvent::RunEnded { report: &completion.report, error: completion.terminal.as_ref() },
-                &mut scope,
-            );
-            completion.merge(scope.finish(result));
+            ) {
+                Ok(mut scope) => {
+                    let result = observe.observe(
+                        ZipRunEvent::RunEnded { report: &completion.report, error: completion.terminal.as_ref() },
+                        &mut scope,
+                    );
+                    completion.merge(scope.finish(result));
+                }
+                Err(fault) => completion.fail(fault.into()),
+            }
         }
+        retire_diagnostic_policy(self.owner.identity, context, &mut diagnostics, &mut completion.terminal);
         completion.finish(context, &diagnostics)
     }
     fn bind_run(
@@ -449,10 +490,17 @@ impl ProjectedReadSession {
         if options.mode == Mode::Extract && !options.flatten {
             let count = self.owner.entries.iter().filter(|e| e.is_dir()).count();
             if count != 0 {
-                context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.directories = Some(
-                    policy::MetadataLease::new(context.ledger.view(), budget::PolicyComponent::Caller, count)?
-                        .into_owned(),
-                );
+                if !matches!(
+                    context.action.as_ref().ok_or(ReadFault::InvalidPlan)?.auxiliary,
+                    projected::ActionAuxiliary::Empty
+                ) {
+                    return Err(ReadFault::InvalidPlan.into());
+                }
+                context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary =
+                    projected::ActionAuxiliary::Directories(
+                        policy::MetadataLease::new(context.ledger.view(), budget::PolicyComponent::Caller, count)?
+                            .into_owned(),
+                    );
             }
         }
         context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.run_bound = true;
@@ -843,4 +891,9 @@ pub(crate) fn with_opened_context(
         return Err(session.owner.reject(error));
     }
     session.run_owned(options, password, cancel, context, observe)
+}
+
+#[cfg(test)]
+pub(super) fn final_completion_control_layout() -> [usize; 2] {
+    [std::mem::size_of::<Completion>(), std::mem::size_of::<policy::FrozenPolicy>()]
 }
