@@ -48,6 +48,7 @@ pub enum Resource {
     PasswordEncodedBytes,
     ProtectionPaths,
     ProtectionPathBytes,
+    OutputWriteBytes,
 }
 /// Adjustable budgets; descriptor and protection-inventory safety ceilings remain fixed.
 /// Counts are cumulative unless a consumer explicitly establishes a smaller scope
@@ -74,6 +75,8 @@ pub struct ProgressiveLimits {
     pub source_bytes: u64,
     pub logical_output_bytes: u64,
     pub temp_bytes: u64,
+    /// Cumulative attempted output writes, including zero fill, patches and retries.
+    pub output_write_bytes: u64,
     pub verify_bytes: u64,
     pub decoder_window: u64,
     pub packed_work_per_poll: u64,
@@ -107,6 +110,7 @@ impl Default for ProgressiveLimits {
             source_bytes: 68719476736,
             logical_output_bytes: 68719476736,
             temp_bytes: 68719476736,
+            output_write_bytes: 68719476736,
             verify_bytes: 68719476736,
             decoder_window: 268435456,
             packed_work_per_poll: 1048576,
@@ -142,6 +146,7 @@ impl ProgressiveLimits {
             Resource::SourceBytes => self.source_bytes,
             Resource::LogicalOutputBytes => self.logical_output_bytes,
             Resource::TempBytes => self.temp_bytes,
+            Resource::OutputWriteBytes => self.output_write_bytes,
             Resource::VerifyBytes => self.verify_bytes,
             Resource::DecoderWindow => self.decoder_window,
             Resource::PackedWorkPerPoll => self.packed_work_per_poll,
@@ -161,13 +166,13 @@ impl ProgressiveLimits {
         }
     }
 }
-pub(crate) struct Usage {
+struct UsageState {
     limits: ProgressiveLimits,
-    used: [u64; 29],
+    used: [u64; 30],
 }
-impl Usage {
+impl UsageState {
     pub(crate) fn new(limits: ProgressiveLimits) -> Self {
-        Self { limits, used: [0; 29] }
+        Self { limits, used: [0; 30] }
     }
     pub(crate) fn check(&self, resource: Resource, attempted: u64) -> ProgressiveResult<()> {
         let limit = self.limits.limit(resource);
@@ -188,5 +193,36 @@ impl Usage {
         self.check(resource, attempted)?;
         self.used[i] = attempted;
         Ok(())
+    }
+}
+
+/// Shared cumulative accounting only. Callers never hold this mutex across IO or callbacks.
+#[derive(Clone)]
+pub(crate) struct Usage(std::sync::Arc<std::sync::Mutex<UsageState>>);
+impl Usage {
+    pub(crate) fn new(limits: ProgressiveLimits) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(UsageState::new(limits))))
+    }
+    pub(crate) fn check(&self, resource: Resource, attempted: u64) -> ProgressiveResult<()> {
+        self.0.lock().unwrap().check(resource, attempted)
+    }
+    pub(crate) fn output_extent(&self, amount: u64) -> ProgressiveResult<()> {
+        let mut state = self.0.lock().unwrap();
+        for resource in [Resource::TempBytes, Resource::LogicalOutputBytes] {
+            let total = state.used[resource as usize].checked_add(amount).ok_or_else(|| {
+                ProgressiveFailure::new(FailureKind::Limit {
+                    resource,
+                    limit: state.limits.limit(resource),
+                    attempted: u64::MAX,
+                })
+            })?;
+            state.check(resource, total)?;
+        }
+        state.charge(Resource::TempBytes, amount)?;
+        state.charge(Resource::LogicalOutputBytes, amount)
+    }
+
+    pub(crate) fn charge(&self, resource: Resource, amount: u64) -> ProgressiveResult<()> {
+        self.0.lock().unwrap().charge(resource, amount)
     }
 }

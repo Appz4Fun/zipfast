@@ -529,7 +529,7 @@ fn usage_overflow_and_hard_ceilings() {
         source_bytes: u64::MAX,
         ..ProgressiveLimits::default()
     };
-    let mut usage = Usage::new(limits);
+    let usage = Usage::new(limits);
     for (resource, cap) in [
         (Resource::VolumeHandles, 4096),
         (Resource::ProtectionPaths, 4096),
@@ -799,7 +799,7 @@ fn source_bookkeeping_exact_under_and_overflow() {
             assert_eq!(d.cursor.offset(), 4);
         }
     }
-    let mut usage = Usage::new(ProgressiveLimits { source_bookkeeping: u64::MAX, ..ProgressiveLimits::default() });
+    let usage = Usage::new(ProgressiveLimits { source_bookkeeping: u64::MAX, ..ProgressiveLimits::default() });
     usage.charge(Resource::SourceBookkeeping, u64::MAX).unwrap();
     assert!(matches!(
         usage.charge(Resource::SourceBookkeeping, 1).unwrap_err().kind,

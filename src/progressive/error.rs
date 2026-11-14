@@ -27,11 +27,19 @@ pub struct MemberId {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FailureContext {
+    pub output_range: Option<Box<OutputRange>>,
     pub member: Option<MemberId>,
     pub volume_index: Option<u32>,
     pub expected: Option<OsString>,
     pub packed_offset: Option<u64>,
     pub inner_offset: Option<u64>,
+}
+/// Positioned output attempt. Completed bytes are committed only when explicitly reported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputRange {
+    pub offset: u64,
+    pub attempted: u64,
+    pub completed: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputOperation {

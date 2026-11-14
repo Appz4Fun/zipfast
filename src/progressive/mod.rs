@@ -18,7 +18,12 @@
 
 mod error;
 mod limits;
+mod output;
 mod source;
 pub use error::*;
 pub use limits::*;
+pub use output::{
+    Artifact, ArtifactAftermath, ArtifactEvidence, ArtifactRead, AuthenticationEvidence, EvidenceOrigin, HoleFill,
+    HolePolicy, OutputHole, PackedEvidence, ProgressiveOptions, RecoveryPublication, Verification,
+};
 pub use source::*;

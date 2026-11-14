@@ -19,6 +19,7 @@
 
 pub mod reader;
 pub mod session;
+pub(crate) mod source;
 #[doc(hidden)]
 pub mod testenc;
 pub mod unpack;

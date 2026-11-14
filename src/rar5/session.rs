@@ -18,7 +18,7 @@
 //! files used for its catalogue. Member metadata describes the headers,
 //! including any known issue that would prevent reading a payload.
 
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::mem::size_of;
 use std::ops::Range;
@@ -34,6 +34,7 @@ use crate::extract::{Cancellation, RarRunError, RarRunSummary};
 use crate::volume::next_volume;
 
 use super::reader::{Block, Volume, read_failure};
+use super::source::SourceStamp;
 use super::{FileHeader, FileWire, MHFL_VOLNUMBER, MainHeader, MemberCrypt, Redirection};
 
 mod selection;
@@ -889,75 +890,6 @@ thread_local! {
     static OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BEFORE_FINAL_BINDING_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct SourceStamp {
-    len: u64,
-    device: u64,
-    inode: u64,
-    mtime: (i64, i64),
-    ctime: (i64, i64),
-}
-
-impl SourceStamp {
-    fn capture(file: &File, path: &Path) -> RarResult<Self> {
-        Self::capture_for_output(file, path, None)
-    }
-
-    fn capture_for_output(file: &File, path: &Path, _output_identity: Option<(u64, u64)>) -> RarResult<Self> {
-        let metadata_error = |error| RarFault::input(IoOperation::Metadata, Some(path.to_path_buf()), None, error);
-        let metadata = file.metadata().map_err(metadata_error)?;
-        // Reject aliases before a binding or framing error could be reported
-        // through that same descriptor. This performs no extra metadata read.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if _output_identity == Some((metadata.dev(), metadata.ino())) {
-                return Err(RarFault::new(RarFailure::OutputAliasesInput, Error::Corrupt("RAR output aliases input")));
-            }
-        }
-        let before = Self::from_metadata(metadata).map_err(metadata_error)?;
-        let bound = Self::from_metadata(fs::metadata(path).map_err(metadata_error)?).map_err(metadata_error)?;
-        let after = Self::from_metadata(file.metadata().map_err(metadata_error)?).map_err(metadata_error)?;
-        if before != bound || before != after {
-            return Err(Self::changed(path));
-        }
-        Ok(before)
-    }
-
-    fn check(self, file: &File, path: &Path) -> RarResult<()> {
-        let current = Self::capture(file, path);
-        if matches!(&current, Ok(stamp) if *stamp != self) {
-            return Err(Self::changed(path));
-        }
-        current.map(|_| ())
-    }
-
-    fn changed(path: &Path) -> RarFault {
-        RarFault::new(RarFailure::SourceChanged { path: path.to_path_buf() }, Error::Corrupt("RAR source changed"))
-    }
-
-    #[cfg(unix)]
-    fn from_metadata(metadata: Metadata) -> io::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-
-        if !metadata.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "RAR source is not a regular file"));
-        }
-        Ok(Self {
-            len: metadata.len(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            mtime: (metadata.mtime(), metadata.mtime_nsec()),
-            ctime: (metadata.ctime(), metadata.ctime_nsec()),
-        })
-    }
-
-    #[cfg(not(unix))]
-    fn from_metadata(_: Metadata) -> io::Result<Self> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "RAR session source identity unavailable"))
-    }
 }
 
 #[cfg(all(test, unix))]

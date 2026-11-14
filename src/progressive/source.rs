@@ -81,7 +81,7 @@ pub trait VolumeSource: Send + 'static {
 /// The caller owns availability and immutability leases. After NotYet, wake the
 /// supplied waker when another read attempt is warranted; extra task polls do
 /// not retry a parked provider. Empty reads are resolved without a callback.
-pub trait RangeSource: Send + 'static {
+pub trait RangeSource: Send + std::any::Any + 'static {
     fn info(&self) -> SourceInfo;
     fn read_at(&mut self, offset: u64, buf: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead>;
     fn backing_files(&self) -> &[File];
@@ -125,6 +125,9 @@ impl SessionControl {
     pub fn cancel(&self) {
         self.token.cancel();
         self.wake.notify(false);
+    }
+    pub(crate) fn register(&self, waker: &Waker) {
+        self.wake.register(waker);
     }
     pub fn is_canceled(&self) -> bool {
         self.token.is_canceled()
@@ -238,6 +241,7 @@ pub(crate) struct SourceDriver {
     failed: bool,
     admitted: Vec<(u32, SourceId, OsString)>,
     protection: ProtectionDeclaration,
+    native: super::output::native::NativeProtection,
     holes: Vec<(u64, u64)>,
 }
 #[allow(dead_code)]
@@ -248,9 +252,10 @@ impl SourceDriver {
         limits: ProgressiveLimits,
         control: SessionControl,
     ) -> ProgressiveResult<Self> {
-        let mut usage = Usage::new(limits);
+        let usage = Usage::new(limits);
         usage.charge(Resource::NameBytes, first.capacity() as u64)?;
         usage.charge(Resource::MetadataBytes, first.capacity() as u64)?;
+        let native = super::output::native::NativeProtection::new(&usage)?;
         Ok(Self {
             provider,
             request: VolumeRequest { index: 0, expected: first },
@@ -263,8 +268,34 @@ impl SourceDriver {
             failed: false,
             admitted: Vec::new(),
             protection: ProtectionDeclaration::Opaque,
+            native,
             holes: Vec::new(),
         })
+    }
+    pub(crate) fn shared_usage(&self) -> Usage {
+        self.usage.clone()
+    }
+    pub(crate) fn publication_check(
+        &mut self,
+        target: &std::path::Path,
+        identity: Option<super::output::native::Identity>,
+    ) -> ProgressiveResult<bool> {
+        if self.failed {
+            return Err(contract());
+        }
+        if self.control.is_canceled() {
+            return Err(ProgressiveFailure::new(FailureKind::Canceled));
+        }
+        let result = (|| {
+            self.refresh_protection()?;
+            self.native.check_target(target, identity, &mut self.usage)?;
+            Ok(matches!(self.protection, ProtectionDeclaration::Complete { .. })
+                && self.native.resolved_for_publication(&self.usage)?)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
     pub(crate) fn cancel(&self) {
         self.control.cancel();
@@ -359,7 +390,20 @@ impl SourceDriver {
                         return Err(contract());
                     }
                     self.usage.charge(Resource::SourceRequests, 1)?;
-                    self.usage.check(Resource::VolumeHandles, source.backing_files().len() as u64)?;
+                    let backing = source.backing_files();
+                    self.usage.check(Resource::VolumeHandles, backing.len() as u64)?;
+                    self.native.refresh(&self.protection, &mut self.usage)?;
+                    self.native.admit(self.request.index, backing, &self.protection, &mut self.usage)?;
+                    // Only the concrete library adapter carries its original immutable stamp.
+                    // Custom providers retain the cooperative progressive identity contract.
+                    if let Some(immutable) = (&*source as &dyn std::any::Any).downcast_ref::<ImmutableFileSource>() {
+                        self.native.remember_immutable(
+                            &immutable.file,
+                            &immutable.path,
+                            immutable.stamp,
+                            &self.usage,
+                        )?;
+                    }
                     self.usage.charge(Resource::MetadataBytes, self.request.expected.capacity() as u64)?;
                     self.usage.charge(Resource::NameBytes, self.request.expected.capacity() as u64)?;
                     self.usage.charge(Resource::SourceBookkeeping, (self.admitted.len() - position) as u64)?;
@@ -517,6 +561,7 @@ impl SourceDriver {
             _ => {}
         }
         self.check_inventory_admitted(&next)?;
+        self.native.refresh(&next, &mut self.usage)?;
         self.protection = next;
         Ok(())
     }
@@ -767,3 +812,76 @@ fn validate_inventory(i: &ProtectionInventory, usage: &mut Usage) -> Progressive
 }
 #[cfg(test)]
 mod tests;
+
+/// A complete, immutable native file. Growth and metadata/content replacement are changes.
+pub struct ImmutableFileSource {
+    file: File,
+    path: PathBuf,
+    stamp: crate::rar5::source::SourceStamp,
+    info: SourceInfo,
+}
+impl ImmutableFileSource {
+    pub fn open(path: &std::path::Path) -> ProgressiveResult<Self> {
+        use super::InputOperation;
+        let path = std::path::absolute(path)
+            .map_err(|cause| ProgressiveFailure::new(FailureKind::Input { operation: InputOperation::Open, cause }))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|cause| ProgressiveFailure::new(FailureKind::Input { operation: InputOperation::Open, cause }))?;
+        let stamp = crate::rar5::source::SourceStamp::capture(&file, &path).map_err(immutable_error)?;
+        let info = SourceInfo {
+            id: SourceId(((stamp.device as u128) << 64) | stamp.inode as u128),
+            generation: 0,
+            extent: stamp.len,
+            length: SourceLength::Final(stamp.len),
+        };
+        Ok(Self { file, path, stamp, info })
+    }
+}
+impl RangeSource for ImmutableFileSource {
+    fn info(&self) -> SourceInfo {
+        self.info
+    }
+    fn backing_files(&self) -> &[File] {
+        std::slice::from_ref(&self.file)
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8], _cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        self.stamp.check(&self.file, &self.path).map_err(immutable_error)?;
+        if offset > self.stamp.len {
+            return Err(contract());
+        }
+        let n = (self.stamp.len - offset).min(buf.len() as u64) as usize;
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(&mut buf[..n], offset)
+        };
+        #[cfg(not(unix))]
+        let result: std::io::Result<usize> = Err(std::io::ErrorKind::Unsupported.into());
+        let count = result.map_err(|cause| {
+            let mut e = ProgressiveFailure::new(FailureKind::Input { operation: super::InputOperation::Read, cause });
+            e.context.packed_offset = Some(offset);
+            e
+        })?;
+        self.stamp.check(&self.file, &self.path).map_err(immutable_error)?;
+        if count == 0 && n != 0 {
+            return Err(ProgressiveFailure::new(FailureKind::Truncated));
+        }
+        Ok(RangeRead::Filled { count })
+    }
+}
+pub(super) fn immutable_error(fault: crate::error::RarFault) -> ProgressiveFailure {
+    match *fault.failure {
+        crate::error::RarFailure::Input { source, .. } => {
+            ProgressiveFailure::new(FailureKind::Input { operation: super::InputOperation::Metadata, cause: source })
+        }
+        _ => changed(),
+    }
+}
