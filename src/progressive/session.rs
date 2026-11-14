@@ -37,6 +37,7 @@ use std::{
     task::{Context, Poll},
 };
 
+#[non_exhaustive]
 pub enum ProgressiveEvent {
     VolumeOpened {
         index: u32,
@@ -65,12 +66,66 @@ pub enum ProgressiveEvent {
         cleanup_failure: Option<ProgressiveFailure>,
     },
 }
+/// A tested member has no publication capability; optional absent checks remain missing.
+#[derive(Clone, Debug)]
+pub struct TestEvidence {
+    inner_size: u64,
+    checksum: Option<ChecksumValue>,
+    size: CheckVerdict,
+    crc32: CheckVerdict,
+    blake2sp: CheckVerdict,
+    packed: PackedEvidence,
+    authentication: AuthenticationEvidence,
+}
+impl TestEvidence {
+    pub fn inner_size(&self) -> u64 {
+        self.inner_size
+    }
+    pub fn checksum(&self) -> Option<&ChecksumValue> {
+        self.checksum.as_ref()
+    }
+    pub fn size_verdict(&self) -> CheckVerdict {
+        self.size
+    }
+    pub fn crc32_verdict(&self) -> CheckVerdict {
+        self.crc32
+    }
+    pub fn blake2sp_verdict(&self) -> CheckVerdict {
+        self.blake2sp
+    }
+    pub fn packed(&self) -> PackedEvidence {
+        self.packed
+    }
+    pub fn authentication(&self) -> AuthenticationEvidence {
+        self.authentication
+    }
+}
+#[non_exhaustive]
 pub enum MemberOutcome {
+    Tested(TestEvidence),
+    Skipped(crate::extract::RarSkipReason),
+    /// Policy completed. False also includes Test and flattened directory entries.
+    Directory {
+        created: bool,
+    },
     Verified(Verification),
+    /// Publication succeeded; a subsequent failure stopped the session. An artifact,
+    /// when present, owns only a leftover staging name, never the final target.
+    PublishedWithFailure {
+        verification: Verification,
+        failure: ProgressiveFailure,
+        cleanup_failure: Option<ProgressiveFailure>,
+        artifact: Option<Artifact>,
+    },
     RecoveredInner(Verification),
     Provisional(Artifact),
     Partial(Artifact),
-    Stopped { inner_offset: u64, restart: RestartAvailability, failure: ProgressiveFailure, artifact: Option<Artifact> },
+    Stopped {
+        inner_offset: u64,
+        restart: RestartAvailability,
+        failure: ProgressiveFailure,
+        artifact: Option<Artifact>,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestartAvailability {
@@ -82,6 +137,7 @@ pub enum RestartAvailability {
 enum Phase {
     Header,
     Start(Box<PhysicalFrame>),
+    Stage,
     Part,
     Finish,
     Verdict,
@@ -91,7 +147,7 @@ enum Phase {
 /// A serialized, caller-driven extraction session. Delivered artifacts outlive it.
 pub struct ProgressiveSession {
     driver: SourceDriver,
-    output: OutputContext,
+    output: Option<OutputContext>,
     options: ProgressiveOptions,
     control: SessionControl,
     usage: Usage,
@@ -107,6 +163,11 @@ pub struct ProgressiveSession {
     header_encryption: Option<bool>,
     model: PhysicalModel,
     machine: Option<MemberMachine>,
+    history: Option<crate::rar5::unpack::Unpacker>,
+    history_failure: Option<u64>,
+    solid_archive: Option<bool>,
+    disposition: Disposition,
+    start_event: Option<ProgressiveEvent>,
     finalizer: Option<MemberMachine>,
     stage: Option<Stage>,
     target: Option<Target>,
@@ -115,6 +176,12 @@ pub struct ProgressiveSession {
     remaining: u64,
     had_stage: bool,
     buffer: Vec<u8>,
+}
+enum Disposition {
+    Write,
+    Test,
+    Skip(crate::extract::RarSkipReason),
+    Directory,
 }
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 fn nonce() -> ProgressiveResult<NonZeroU64> {
@@ -145,19 +212,20 @@ impl ProgressiveSession {
         Self::assemble(driver, control, options)
     }
     fn validate_options(options: &ProgressiveOptions) -> ProgressiveResult<()> {
-        if options.extract.mode != crate::extract::Mode::Extract {
-            return Err(ProgressiveFailure::new(FailureKind::UnsupportedMethod));
-        }
         let usage = Usage::new(options.limits.clone());
-        usage.check(Resource::ActiveOutputs, 1)?;
-        usage.check(Resource::RetainedArtifacts, 1)?;
+        if options.extract.mode == crate::extract::Mode::Extract {
+            usage.check(Resource::ActiveOutputs, 1)?;
+            usage.check(Resource::RetainedArtifacts, 1)?;
+        }
         usage.check(Resource::MetadataBytes, options.first_name.capacity() as u64)?;
         usage.check(Resource::NameBytes, options.first_name.capacity() as u64)?;
         Ok(())
     }
     fn assemble(driver: SourceDriver, control: SessionControl, options: ProgressiveOptions) -> ProgressiveResult<Self> {
         let usage = driver.shared_usage();
-        let output = OutputContext::new(&options, usage.clone(), control.clone())?;
+        let output = (options.extract.mode == crate::extract::Mode::Extract)
+            .then(|| OutputContext::new(&options, usage.clone(), control.clone()))
+            .transpose()?;
         let nonce = nonce()?;
         let chunk = options.limits.read_chunk.min(options.limits.packed_work_per_poll).min(1 << 20);
         usage.check(Resource::ReadChunk, 1)?;
@@ -191,6 +259,11 @@ impl ProgressiveSession {
             header_encryption: None,
             model: PhysicalModel::default(),
             machine: None,
+            history: None,
+            history_failure: None,
+            solid_archive: None,
+            disposition: Disposition::Write,
+            start_event: None,
             finalizer: None,
             stage: None,
             target: None,
@@ -230,16 +303,23 @@ impl ProgressiveSession {
         self.machine.take();
         self.finalizer.take();
         self.target.take();
+        self.history.take();
+        let directory_failure =
+            self.output.as_mut().and_then(|output| output.finish_directories(&mut self.driver).err());
         if let Some(stage) = self.stage.take() {
-            let t = self.output.terminate(stage, failure);
+            let t = self.output.as_ref().expect("output").terminate(stage, failure);
             return Ok(Some(ProgressiveEvent::SessionTerminated {
                 failure: t.failure,
                 artifact: t.artifact,
-                cleanup_failure: t.cleanup_failure,
+                cleanup_failure: t.cleanup_failure.or(directory_failure),
             }));
         }
-        if self.had_stage {
-            Ok(Some(ProgressiveEvent::SessionTerminated { failure, artifact: None, cleanup_failure: None }))
+        if self.had_stage || directory_failure.is_some() {
+            Ok(Some(ProgressiveEvent::SessionTerminated {
+                failure,
+                artifact: None,
+                cleanup_failure: directory_failure,
+            }))
         } else {
             Err(failure)
         }
@@ -274,22 +354,40 @@ impl ProgressiveSession {
                     self.phase = Phase::Header;
                 }
                 Phase::Start(_) => {
-                    match self.output.poll_capacity(cx)? {
+                    let Phase::Start(frame) = std::mem::replace(&mut self.phase, Phase::Part) else { unreachable!() };
+                    let event = self.start(*frame)?;
+                    if matches!(self.disposition, Disposition::Write) {
+                        self.start_event = Some(event);
+                        self.phase = Phase::Stage;
+                    } else {
+                        return Ok(Poll::Ready(Ok(Some(event))));
+                    }
+                }
+                Phase::Stage => {
+                    let output = self.output.as_mut().expect("extract output");
+                    match output.poll_capacity(cx)? {
                         Capacity::Needed { retained } => {
                             return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::CapacityNeeded { retained }))));
                         }
                         Capacity::Pending => return Ok(Poll::Pending),
                         Capacity::Ready => {}
                     }
-                    let Phase::Start(frame) = std::mem::replace(&mut self.phase, Phase::Part) else { unreachable!() };
-                    let event = self.start(*frame)?;
-                    return Ok(Poll::Ready(Ok(Some(event))));
+                    let member = self.model.members.last().expect("member");
+                    let mut stage = output.create(self.member.expect("member"), member.unpacked_size)?;
+                    self.had_stage = true;
+                    stage.bind_target(self.target.as_mut().expect("target"))?;
+                    stage.set_metadata(crate::extract::Meta::from(&member.header));
+                    self.stage = Some(stage);
+                    self.phase = Phase::Part;
+                    return Ok(Poll::Ready(Ok(self.start_event.take())));
                 }
                 Phase::Finish => {
                     let before = self.produced;
                     let mut machine = self.machine.take().expect("active decoder");
                     let mut sink = StageSink {
-                        stage: self.stage.as_mut().expect("stage"),
+                        stage: self.stage.as_mut(),
+                        usage: &self.usage,
+                        control: &self.control,
                         produced: &mut self.produced,
                         chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
                         failure: None,
@@ -298,11 +396,13 @@ impl ProgressiveSession {
                     if let Some(e) = sink.failure {
                         return Err(e);
                     }
-                    result?;
+                    if let Err(error) = result {
+                        return self.member_error(error).map(|e| Poll::Ready(Ok(Some(e))));
+                    }
                     self.driver.validate_current()?;
                     self.finalizer = Some(machine);
                     self.phase = Phase::Verdict;
-                    if self.produced > before {
+                    if self.stage.is_some() && self.produced > before {
                         return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
                             member: self.member.expect("member"),
                             valid_bytes: self.produced - before,
@@ -355,8 +455,14 @@ impl ProgressiveSession {
                 Phase::Part => {
                     if self.remaining == 0 {
                         let part = self.model.parts.last().expect("active part");
-                        self.machine.as_mut().expect("active decoder").finish_part(part)?;
-                        self.phase = if part.final_part { Phase::Finish } else { Phase::Header };
+                        if let Some(machine) = &mut self.machine {
+                            machine.finish_part(part)?;
+                        }
+                        self.phase = if part.final_part {
+                            if self.machine.is_some() { Phase::Finish } else { Phase::Verdict }
+                        } else {
+                            Phase::Header
+                        };
                         continue;
                     }
                     let n = self
@@ -388,18 +494,26 @@ impl ProgressiveSession {
                             work += count as u64;
                             let before = self.produced;
                             let mut sink = StageSink {
-                                stage: self.stage.as_mut().expect("stage"),
+                                stage: self.stage.as_mut(),
+                                usage: &self.usage,
+                                control: &self.control,
                                 produced: &mut self.produced,
                                 chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
                                 failure: None,
                             };
-                            let result = self.machine.as_mut().expect("decoder").feed(&self.buffer[..count], &mut sink);
+                            let result = if let Some(machine) = &mut self.machine {
+                                machine.feed(&self.buffer[..count], &mut sink)
+                            } else {
+                                Ok(())
+                            };
                             if let Some(e) = sink.failure {
                                 return Err(e);
                             }
-                            result?;
+                            if let Err(error) = result {
+                                return self.member_error(error).map(|e| Poll::Ready(Ok(Some(e))));
+                            }
                             self.driver.validate_current()?;
-                            if self.produced > before {
+                            if self.stage.is_some() && self.produced > before {
                                 return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
                                     member: self.member.expect("member"),
                                     valid_bytes: self.produced - before,
@@ -447,6 +561,10 @@ impl ProgressiveSession {
                 {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("volume main identity/order")));
                 }
+                if self.solid_archive.is_some_and(|solid| solid != main.is_solid()) {
+                    return Err(ProgressiveFailure::new(FailureKind::Malformed("volume solid flag changed")));
+                }
+                self.solid_archive = Some(main.is_solid());
                 self.volume_set = Some(main.is_volume());
                 self.main_seen = true;
             }
@@ -465,7 +583,7 @@ impl ProgressiveSession {
                         crate::Error::Encrypted,
                     )));
                 }
-                if let Some(machine) = &mut self.machine {
+                if self.member.is_some() {
                     let member = self.model.members.last_mut().expect("member");
                     let wire = frame
                         .wire
@@ -482,7 +600,9 @@ impl ProgressiveSession {
                     self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<PhysicalPart>() as u64)?;
                     let part = PhysicalPart::new(self.volume as usize, header, frame.crypt, wire);
                     member.append(header, &part).map_err(progressive_fault)?;
-                    machine.begin_part(&part);
+                    if let Some(machine) = &mut self.machine {
+                        machine.begin_part(&part);
+                    }
                     self.remaining = part.packed_size;
                     self.model
                         .parts
@@ -501,9 +621,12 @@ impl ProgressiveSession {
                 }
                 if *more_volumes {
                     self.phase = Phase::NextVolume;
-                } else if self.machine.is_some() {
+                } else if self.member.is_some() {
                     return Err(ProgressiveFailure::new(FailureKind::Truncated));
                 } else {
+                    if let Some(output) = &mut self.output {
+                        output.finish_directories(&mut self.driver)?;
+                    }
                     self.phase = Phase::Done;
                 }
             }
@@ -536,13 +659,44 @@ impl ProgressiveSession {
         self.member = Some(member);
         self.produced = 0;
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
-        self.stage = Some(self.output.create(member, size)?);
-        self.had_stage = true;
-        let stage = self.stage.as_mut().unwrap();
-        self.target = Some(stage.target(&header.name, !header.is_unix())?);
-        if header.is_dir() || header.redirection.is_some() {
-            return Err(ProgressiveFailure::new(FailureKind::UnsupportedMethod));
+        if self.options.extract.mode == crate::extract::Mode::Test || header.is_dir() {
+            self.usage.charge(Resource::MetadataBytes, (header.name.len() as u64).saturating_mul(3))?;
+            self.usage.charge(Resource::SourceBookkeeping, (header.name.len() as u64).saturating_mul(8))?;
+            crate::path::sanitize_fallible(&header.name, !header.is_unix())
+                .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
         }
+        if let Some(redirection) = &header.redirection {
+            let kind = match redirection {
+                crate::rar5::Redirection::UnixSymlink(_) => 1,
+                crate::rar5::Redirection::WindowsSymlink(_) => 2,
+                crate::rar5::Redirection::Junction(_) => 3,
+                crate::rar5::Redirection::HardLink(_) => 4,
+                crate::rar5::Redirection::FileCopy(_) => 5,
+                crate::rar5::Redirection::Unknown(kind) => *kind,
+            };
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
+                crate::error::RarUnsupported::Redirection { kind },
+            )))));
+        }
+        self.disposition = if header.is_dir() {
+            if header.split_after() || header.packed_size != 0 || header.size_unknown() || header.unpacked_size != 0 {
+                return Err(ProgressiveFailure::new(FailureKind::Malformed("directory payload or continuation")));
+            }
+            Disposition::Directory
+        } else if self.options.extract.mode == crate::extract::Mode::Test {
+            Disposition::Test
+        } else if let Some(version) = header.version {
+            Disposition::Skip(crate::extract::RarSkipReason::OlderVersion(version))
+        } else {
+            let output = self.output.as_ref().expect("output");
+            let target = output.prepare_target(member, &header.name, !header.is_unix())?;
+            let skip = self.options.extract.overwrite == crate::extract::Overwrite::Skip && target.exists();
+            if skip {
+                output.check_target(&target, &mut self.driver)?;
+            }
+            self.target = Some(target);
+            if skip { Disposition::Skip(crate::extract::RarSkipReason::ExistingTarget) } else { Disposition::Write }
+        };
         let context = crate::extract::EntryContext {
             entry: crate::extract::RarEntryIdentity {
                 index: Some(member.ordinal),
@@ -552,9 +706,63 @@ impl ProgressiveSession {
             method: header.method,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
         };
-        let mut machine = MemberMachine::new(&header, context, self.options.password(), &self.usage, &self.control)?;
+        let decode = matches!(self.disposition, Disposition::Write | Disposition::Test)
+            || (matches!(self.disposition, Disposition::Skip(_))
+                && self.solid_archive == Some(true)
+                && header.method != 0);
+        let mut machine = if decode {
+            let decoder = if header.method != 0 {
+                if header.solid {
+                    if !crate::rar5::member::continue_decoder(&mut self.history, header.dictionary, size) {
+                        self.history.take();
+                        None
+                    } else {
+                        self.usage.check(Resource::DecoderWindow, self.history.as_ref().unwrap().window_size())?;
+                        self.history.take()
+                    }
+                } else {
+                    let window = crate::rar5::unpack::window_for_detailed(
+                        header.dictionary,
+                        size,
+                        self.solid_archive == Some(true),
+                    )
+                    .map_err(|e| progressive_fault(e.detailed(context.scope())))?;
+                    self.usage.check(Resource::DecoderWindow, window.size)?;
+                    crate::rar5::member::reset_decoder(
+                        &mut self.history,
+                        window,
+                        size,
+                        self.options.extract.threads,
+                        self.options.extract.parallel_min,
+                    )
+                    .map_err(|e| progressive_fault(e.detailed(context.scope())))?;
+                    self.usage.check(Resource::DecoderWindow, self.history.as_ref().unwrap().window_size())?;
+                    self.history_failure = None;
+                    self.history.take()
+                }
+            } else {
+                None
+            };
+            // A missing dependency is handled after recording the physical boundary below.
+            if header.method != 0 && header.solid && decoder.is_none() {
+                None
+            } else {
+                Some(MemberMachine::new_with_history(
+                    &header,
+                    context,
+                    self.options.password(),
+                    &self.usage,
+                    &self.control,
+                    decoder,
+                )?)
+            }
+        } else {
+            None
+        };
         let part = PhysicalPart::new(self.volume as usize, &header, frame.crypt, &wire);
-        machine.begin_part(&part);
+        if let Some(machine) = &mut machine {
+            machine.begin_part(&part);
+        }
         self.remaining = part.packed_size;
         self.model.members.clear();
         self.model.parts.clear();
@@ -568,7 +776,10 @@ impl ProgressiveSession {
             .map_err(|_| ProgressiveFailure::new(FailureKind::Malformed("part allocation")))?;
         self.model.members.push(PhysicalMember::new(header, wire, 0, &part).map_err(progressive_fault)?);
         self.model.parts.push(part);
-        self.machine = Some(machine);
+        self.machine = machine;
+        if matches!(self.disposition, Disposition::Directory) {
+            self.phase = Phase::Verdict;
+        }
         Ok(ProgressiveEvent::MemberStarted { member, name, size })
     }
     fn stop(&mut self, failure: ProgressiveFailure) -> ProgressiveResult<ProgressiveEvent> {
@@ -579,12 +790,21 @@ impl ProgressiveSession {
             failure.context.expected = Some(self.expected.clone());
         }
         self.machine.take();
+        self.finalizer.take();
         self.target.take();
+        if self.model.members.last().is_some_and(|m| m.header.method != 0) {
+            self.history.take();
+            self.history_failure = self.member.map(|m| m.ordinal);
+        }
         let part = self.model.parts.last().expect("part");
         self.driver.seek(part.data_offset + part.packed_size)?;
         self.cursor = part.data_offset + part.packed_size;
         self.phase = Phase::Header;
-        let t = self.output.terminate(self.stage.take().expect("stage"), failure);
+        let t = if let Some(stage) = self.stage.take() {
+            self.output.as_ref().expect("output").terminate(stage, failure)
+        } else {
+            super::output::Termination { failure, artifact: None, cleanup_failure: None }
+        };
         if t.cleanup_failure.is_some() {
             self.phase = Phase::Done;
             return Ok(ProgressiveEvent::SessionTerminated {
@@ -603,15 +823,80 @@ impl ProgressiveSession {
             },
         })
     }
+    fn member_error(&mut self, failure: ProgressiveFailure) -> ProgressiveResult<ProgressiveEvent> {
+        if matches!(failure.kind, FailureKind::Rar(_) | FailureKind::UnsupportedMethod)
+            && self.solid_archive == Some(true)
+            && self.model.members.last().is_some_and(|member| member.header.method != 0)
+            && self.model.parts.last().is_some_and(|part| part.final_part)
+        {
+            self.stop(failure)
+        } else {
+            Err(failure)
+        }
+    }
+    fn finish_skip(&mut self, reason: crate::extract::RarSkipReason) -> ProgressiveResult<ProgressiveEvent> {
+        self.driver.validate_current()?;
+        if let Some(target) = &self.target {
+            self.output.as_ref().expect("output").check_target(target, &mut self.driver)?;
+        }
+        self.target.take();
+        self.phase = Phase::Header;
+        Ok(ProgressiveEvent::MemberFinished {
+            member: self.member.take().unwrap(),
+            outcome: MemberOutcome::Skipped(reason),
+        })
+    }
     fn finish(&mut self) -> ProgressiveResult<ProgressiveEvent> {
+        if matches!(self.disposition, Disposition::Directory) {
+            let header = &self.model.members.last().expect("member").header;
+            let created = if self.options.extract.mode == crate::extract::Mode::Test || self.options.extract.flatten {
+                false
+            } else {
+                match self.output.as_mut().expect("output").directory(
+                    self.member.expect("member"),
+                    header,
+                    &mut self.driver,
+                ) {
+                    Ok(created) => created,
+                    Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
+                    Err(e) => return Err(e),
+                }
+            };
+            self.phase = Phase::Header;
+            return Ok(ProgressiveEvent::MemberFinished {
+                member: self.member.take().unwrap(),
+                outcome: MemberOutcome::Directory { created },
+            });
+        }
+        if self.finalizer.is_none() {
+            let physical = self.model.members.last().expect("member");
+            let needs_history = physical.header.method != 0
+                && physical.header.solid
+                && (self.solid_archive == Some(true) || !matches!(self.disposition, Disposition::Skip(_)));
+            if needs_history {
+                return self.stop(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                    crate::error::RarFailure::SolidHistoryUnavailable {
+                        predecessor: self.history_failure,
+                        cause: None,
+                    },
+                ))));
+            }
+            if let Disposition::Skip(reason) = self.disposition {
+                return self.finish_skip(reason);
+            }
+        }
         // The successfully decoded machine lives in a non-feedable slot.
         // Take before the verdict and drop on every result, including failure.
         let mut machine = self.finalizer.take().expect("decoded machine");
         let physical = self.model.members.last().expect("member");
-        machine.finish_member(physical)?;
+        if let Err(error) = machine.finish_member(physical) {
+            return self.member_error(error);
+        }
         self.driver.validate_current()?;
-        if let Some(size) = physical.unpacked_size {
-            self.stage.as_mut().expect("stage").reconcile_final_size(size)?;
+        if let Some(size) = physical.unpacked_size
+            && let Some(stage) = &mut self.stage
+        {
+            stage.reconcile_final_size(size)?;
         }
         let checks = physical.final_checks.expect("final member checks");
         let checksum = checks
@@ -637,6 +922,36 @@ impl ProgressiveSession {
         } else {
             None
         };
+        if physical.header.method != 0 {
+            self.history = machine.decoder.take();
+            self.history_failure = None;
+        }
+        if matches!(self.disposition, Disposition::Test) {
+            let evidence = TestEvidence {
+                inner_size: self.produced,
+                checksum: checks
+                    .blake2sp
+                    .map(ChecksumValue::Blake2sp)
+                    .or_else(|| checks.crc32.map(|c| ChecksumValue::Crc32(c.to_le_bytes()))),
+                size: if physical.unpacked_size.is_some() { CheckVerdict::Passed } else { CheckVerdict::Missing },
+                crc32: if checks.crc32.is_some() { CheckVerdict::Passed } else { CheckVerdict::Missing },
+                blake2sp: if checks.blake2sp.is_some() { CheckVerdict::Passed } else { CheckVerdict::Missing },
+                packed: PackedEvidence::Passed,
+                authentication: if physical.header.encrypted || self.parser.encrypted() {
+                    AuthenticationEvidence::CbcChecksOnly
+                } else {
+                    AuthenticationEvidence::NotApplicable
+                },
+            };
+            self.phase = Phase::Header;
+            return Ok(ProgressiveEvent::MemberFinished {
+                member: self.member.take().unwrap(),
+                outcome: MemberOutcome::Tested(evidence),
+            });
+        }
+        if let Disposition::Skip(reason) = self.disposition {
+            return self.finish_skip(reason);
+        }
         let outcome = if let Some(v) = verification {
             let stage = self.stage.as_mut().unwrap();
             let permit = stage.bind_verification(v.clone())?;
@@ -646,7 +961,21 @@ impl ProgressiveSession {
                     self.stage.take();
                     MemberOutcome::Verified(v)
                 }
-                Publication::Published { cleanup_failure: Some(e) } => return Err(e),
+                Publication::Published { cleanup_failure: Some(failure) } => {
+                    let artifact = Some(self.stage.take().expect("published leftover").into_artifact());
+                    self.target.take();
+                    self.history.take();
+                    self.phase = Phase::Done;
+                    return Ok(ProgressiveEvent::MemberFinished {
+                        member: self.member.take().expect("member"),
+                        outcome: MemberOutcome::PublishedWithFailure {
+                            verification: v,
+                            failure,
+                            cleanup_failure: None,
+                            artifact,
+                        },
+                    });
+                }
             }
         } else {
             MemberOutcome::Provisional(self.stage.take().unwrap().into_artifact())
@@ -662,7 +991,9 @@ impl Drop for ProgressiveSession {
     }
 }
 struct StageSink<'a> {
-    stage: &'a mut Stage,
+    stage: Option<&'a mut Stage>,
+    usage: &'a Usage,
+    control: &'a SessionControl,
     produced: &'a mut u64,
     chunk: usize,
     failure: Option<ProgressiveFailure>,
@@ -671,7 +1002,14 @@ impl crate::rar5::unpack::Sink for StageSink<'_> {
     fn put(&mut self, mut bytes: &[u8]) -> crate::error::Result<()> {
         while !bytes.is_empty() {
             let n = bytes.len().min(self.chunk);
-            match self.stage.write_at(*self.produced, &bytes[..n]) {
+            let result = if self.control.is_canceled() {
+                Err(ProgressiveFailure::new(FailureKind::Canceled))
+            } else if let Some(stage) = &mut self.stage {
+                stage.write_at(*self.produced, &bytes[..n])
+            } else {
+                self.usage.charge(Resource::LogicalOutputBytes, n as u64).map(|()| n)
+            };
+            match result {
                 Ok(count) => {
                     *self.produced += count as u64;
                     bytes = &bytes[count..];
@@ -689,6 +1027,69 @@ impl crate::rar5::unpack::Sink for StageSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn published_cleanup_failure_has_public_outcome_and_owned_afterlife() {
+        fn block(body: &[u8], data: &[u8]) -> Vec<u8> {
+            assert!(body.len() < 128);
+            let mut sized = vec![body.len() as u8];
+            sized.extend(body);
+            let mut bytes = crate::crc32::hash(&sized).to_le_bytes().to_vec();
+            bytes.extend(sized);
+            bytes.extend(data);
+            bytes
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+        bytes.extend(block(&[1, 0, 0], &[]));
+        let mut header = vec![2, 2, 3, 4, 3, 0]; // file, data-size, packed-size, CRC flag, size, attributes
+        header.extend(crate::crc32::hash(b"new").to_le_bytes());
+        header.extend([0, 0, 6]); // stored, DOS host, name length
+        header.extend(b"target");
+        bytes.extend(block(&header, b"new"));
+        bytes.extend(block(&[5, 0, 0], &[]));
+        let options = ProgressiveOptions::new(
+            crate::extract::Options {
+                mode: crate::extract::Mode::Extract,
+                dest: temp.path().into(),
+                overwrite: crate::extract::Overwrite::Skip,
+                flatten: false,
+                threads: Some(1),
+                protected_paths: Default::default(),
+                parallel_min: None,
+            },
+            "a.rar".into(),
+        );
+        let mut session =
+            ProgressiveSession::from_sealed_memory(vec![("a.rar".into(), bytes.into_boxed_slice())], options).unwrap();
+        crate::output::OWNED_STAGE_FAULT
+            .with(|slot| *slot.borrow_mut() = Some((crate::output::OwnedOperation::Remove, Err(libc::EACCES))));
+        let mut artifact = loop {
+            match session.poll_event(&mut Context::from_waker(std::task::Waker::noop())) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::PublishedWithFailure { verification, failure, cleanup_failure, artifact },
+                    ..
+                }))) => {
+                    assert_eq!(verification.inner_size(), 3);
+                    assert!(matches!(failure.kind, FailureKind::Output { operation: OutputOperation::Remove, .. }));
+                    assert!(cleanup_failure.is_none());
+                    break artifact.expect("owned leftover");
+                }
+                Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+                _ => panic!("published outcome required"),
+            }
+        };
+        assert!(matches!(
+            session.poll_event(&mut Context::from_waker(std::task::Waker::noop())),
+            Poll::Ready(Ok(None))
+        ));
+        drop(session);
+        let mut buffer = [0; 3];
+        assert_eq!(artifact.read_at(0, &mut buffer).unwrap(), ArtifactRead::Filled { count: 3 });
+        assert_eq!(&buffer, b"new");
+        artifact.discard().unwrap();
+        assert_eq!(std::fs::read(temp.path().join("target")).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
     #[test]
     fn nonce_exhaustion_never_wraps_or_reuses_identity() {
         let counter = AtomicU64::new(u64::MAX - 1);

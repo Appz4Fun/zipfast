@@ -514,16 +514,56 @@ impl PendingCipher {
         }
     }
 }
+/// Serial stream preparation shared by complete and progressive extraction.
+pub(crate) fn continue_decoder(stream: &mut Option<Unpacker>, dictionary: u64, size: Option<u64>) -> bool {
+    if let Some(decoder) = stream.as_mut().filter(|u| dictionary <= u.reach()) {
+        decoder.next_file(size);
+        true
+    } else {
+        false
+    }
+}
+pub(crate) fn reset_decoder(
+    stream: &mut Option<Unpacker>,
+    window: super::unpack::Window,
+    size: Option<u64>,
+    threads: Option<usize>,
+    parallel_min: Option<u64>,
+) -> std::result::Result<(), super::unpack::WindowError> {
+    if let Some(decoder) = stream.as_mut().filter(|u| u.fits(window)) {
+        decoder.restart(window, size);
+    } else {
+        let mut decoder = Unpacker::new_detailed(window)?;
+        if threads.is_some() || parallel_min.is_some() {
+            let workers = threads.map_or_else(|| decoder.threads(), |n| n.saturating_sub(1));
+            decoder.set_threads(workers, parallel_min.unwrap_or(decoder.parallel_min()));
+        }
+        decoder.reset(size);
+        *stream = Some(decoder);
+    }
+    Ok(())
+}
 impl MemberMachine {
+    #[cfg(test)]
     pub(crate) fn new(
+        header: &super::FileHeader,
+        context: EntryContext,
+        password: Option<&str>,
+        usage: &crate::progressive::Usage,
+        control: &crate::progressive::SessionControl,
+    ) -> crate::progressive::ProgressiveResult<Self> {
+        Self::new_with_history(header, context, password, usage, control, None)
+    }
+    pub(crate) fn new_with_history(
         header: &super::FileHeader,
         mut context: EntryContext,
         password: Option<&str>,
         usage: &crate::progressive::Usage,
         control: &crate::progressive::SessionControl,
+        decoder: Option<Unpacker>,
     ) -> crate::progressive::ProgressiveResult<Self> {
         use crate::progressive::{FailureKind, ProgressiveFailure, Resource};
-        if header.format != super::RarFormat::Rar5 || header.algorithm != 0 || header.method > 5 || header.solid {
+        if header.format != super::RarFormat::Rar5 || header.algorithm != 0 || header.method > 5 {
             return Err(ProgressiveFailure::new(FailureKind::UnsupportedMethod));
         }
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
@@ -540,7 +580,13 @@ impl MemberMachine {
         } else {
             None
         };
-        let decoder = if header.method != 0 {
+        let decoder = if header.method != 0 && decoder.is_none() {
+            if header.solid {
+                return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::SolidHistoryUnavailable {
+                    predecessor: None,
+                    cause: None,
+                }))));
+            }
             let window = super::unpack::window_for_detailed(header.dictionary, size, false)
                 .map_err(|e| super::framing::progressive_fault(e.detailed(context.scope())))?;
             usage.check(Resource::DecoderWindow, window.size)?;
@@ -549,7 +595,7 @@ impl MemberMachine {
             decoder.next_file(size);
             Some(decoder)
         } else {
-            None
+            decoder
         };
         let mut machine = Self::from_state(header, context, cipher, decoder, 0);
         machine.inner = Some(InnerChecks::new(header));

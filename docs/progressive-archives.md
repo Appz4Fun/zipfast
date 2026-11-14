@@ -57,30 +57,83 @@ both the artifact and the separate cleanup error. Delivered artifacts are never
 reclaimed by cancellation or session drop. A stopped member carries its retained
 prefix under the same aftermath policy. Cleanup failure makes that stop terminal.
 
-## Current scope and limits
+## Test, Skip, metadata and solid policy
 
-This entrypoint supports RAR5 complete-byte extraction and real availability
-waits, including encrypted headers/data and split members. It consumes the same
-framing, physical model, crypto, and decoder producers as complete extraction.
-It rejects unsupported codecs, solid-member lifecycle, RAR4, and other formats;
-it does not implement directory/redirection creation, archive timestamp/mode
-restoration, repair, hole filling, patching, or recovered publication. Published
-regular files retain the staging file metadata.
-A data hole ends the active member or session; it never produces valid missing
-bytes. Later independent members can follow a stopped final part.
+`extract::Mode::Test` uses the same framing, cipher, decoder and declared
+integrity checks without constructing an output context or touching the
+destination. `Tested(TestEvidence)` reports actual bytes and individual size,
+CRC32, BLAKE2sp, packed and authentication verdicts; absent optional checks remain
+`Missing`, and the checksum accessor returns `None` when no checksum was
+provided. Tested is never a publication result. Discarded/tested bytes produce
+no `BytesWritten` event.
 
-`extract::Mode::Test` is currently rejected at construction as
-`UnsupportedMethod`, before providers or output are touched. Use the existing
-complete-file test API. With `Overwrite::Skip`, an existing target remains
-untouched but this new entrypoint currently reports a typed `AlreadyExists`
-output failure instead of a legacy skip outcome. These policy-integration gaps
-remain open; legacy complete-file behavior is unchanged.
+`Overwrite::Skip` reports `Skipped(ExistingTarget)` after checking the bound
+safe target and source identities; existing bytes, timestamps and permissions
+are preserved. Independent skipped payloads are traversed without decoding or
+checksum claims. Compressed skipped predecessors in a solid archive are decoded
+and checked to retain required history. Older archive versions follow the
+complete extractor's skip policy. Skip avoids temporary files and artifact
+capacity parking; Extract construction still requires nonzero output/artifact
+capacity. A changed target, protected input alias or symlink fails closed.
+
+Basic zero-payload, nonsplit directories produce `Directory { created }`.
+`created: false` includes existing directories and Test/flatten entries; it
+claims neither checksum verification nor successful metadata restoration.
+Directory mutation requires whole-source-set authority. An otherwise valid
+opaque-provider directory reports a member-local `Stopped` with
+`PublicationAuthorityRequired`; independent successors can continue. Existing
+regular files and symlinks are never removed to make directories.
+
+Regular-file metadata is applied best effort through the original staging
+descriptor **after** atomic publication and before that descriptor closes.
+The brief final-name-at-0600 interval is intentional: provisional artifacts and
+failed publication stages remain 0600. The existing complete-path metadata
+helper restores ordinary timestamps and modes masked to 0777, including zero
+mode; it does not restore ownership, set-id or sticky bits. There is no atomic
+metadata/durability guarantee. A published file whose staging-name cleanup fails
+reports `PublishedWithFailure`, explicitly carrying its verification and the
+primary failure. An optional artifact owns only the leftover staging name;
+discarding it cannot remove the final target. That event is terminal and emitted
+once. Pending directory metadata is skipped after this published failure.
+
+Directory metadata is queued with bounded paths and native identities, then
+restored deepest-first through newly opened nofollow descriptors checked against
+those identities. The last repeated directory header wins. Normal EOF and
+noncancel termination attempt this once; unsafe replacement is never mutated.
+OS metadata errors are best effort, while binding/protection failures remain
+errors. Cancellation skips pending directory metadata; already-created
+directories keep their current metadata. Drop never performs another pass.
+
+RAR5 solid streams reuse the complete extractor's serial decoder preparation
+primitives and the canonical `MemberMachine`/`Unpacker`. Clean decoded history
+survives stored/directory interleaving and test/skip predecessors. All declared
+checks must pass; missing optional checks do not poison history, and successors
+retain their own independent evidence. Actual decode/check/hole failure invalidates
+history. A final-part compressed failure in a solid archive can stop that member,
+refuse dependent members and resume a proven independent reset. Split failures
+without a safe boundary and existing independent-member integrity failures remain
+terminal. No byte scanning invents a reset point.
+
+All redirection kinds remain typed `RarUnsupported::Redirection { kind }`, as in
+the complete extractor; this entrypoint creates no links. RAR4 codecs, repair,
+hole filling, patching, recovered publication and other formats remain outside
+this entrypoint's supported scope. Full original compatibility remains open.
+
+## Limits
 
 Limits retain the documented finite defaults in `ProgressiveLimits`, including
-1 MiB read/packed-work chunks, 16 retained artifacts, 128 MiB metadata, and 64 GiB
-source/output/verification budgets. Sealed memory charges its retained bytes and
-inventory against metadata before acceptance. Source bookkeeping and provider
-requests are separate cumulative budgets. Zero artifact/output capacity fails
-as a typed limit instead of creating an unwakeable park. KDF work uses the shared
-controlled meter and configurable cumulative session budget. Limits bound engine
-work and retained allocation, not operating-system RSS or free disk space.
+1 MiB read/packed-work chunks, 16 retained artifacts, 128 MiB metadata, 256 MiB
+decoder windows and 64 GiB source/output/verification budgets. Test and passive
+solid decoding charge decoded bytes to cumulative `LogicalOutputBytes`, but do
+not charge nonexistent temporary extent, output writes or physical verification
+reads. Extracted stages continue to charge logical extent and temporary bytes
+together. Test permits zero output/artifact/temp/write capacities. Optional
+physical artifact reads still charge `VerifyBytes`; hashing bytes already flowing
+through the decoder is not a second physical read.
+
+Directory queue capacity/path storage and sorting work use existing finite
+metadata/name/bookkeeping budgets; no descriptor is retained per directory.
+Sealed memory charges retained bytes and inventory before acceptance. Source
+bookkeeping and provider requests remain separate cumulative budgets. KDF work
+uses the shared controlled meter and cumulative session budget. Limits bound
+engine work and retained allocation, not operating-system RSS or free disk space.

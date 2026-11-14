@@ -99,6 +99,7 @@ pub enum ChecksumScope {
     Volume,
 }
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FailureKind {
     Malformed(&'static str),
     Rar(Box<crate::error::RarFailure>),
@@ -133,6 +134,7 @@ pub enum FailureKind {
         attempted: u64,
     },
     IncompleteOutput,
+    PublicationAuthorityRequired,
     InvalidCapability,
 }
 #[derive(Debug)]

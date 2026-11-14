@@ -962,3 +962,99 @@ fn final_size_reconciliation_checks_physical_length_before_promotion() {
     assert_eq!((stage.size, stage.produced, stage.length), (None, 3, 3));
     assert_eq!(stage.native.file().metadata().unwrap().len(), 4);
 }
+
+#[test]
+fn task4b_metadata_waits_for_publication_and_cleanup_failure_keeps_published_fact() {
+    use std::os::unix::fs::PermissionsExt;
+    for cleanup_failure in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = setup(d.path());
+        Arc::get_mut(&mut c.root).unwrap().overwrite = crate::extract::Overwrite::Skip;
+        let mut stage = c.create(member(0), Some(3)).unwrap();
+        stage.write_at(0, b"new").unwrap();
+        stage.set_metadata(crate::extract::Meta { mtime: Some(1_700_000_000), nanos: 0, mode: Some(0o4751) });
+        let permit = verify(&mut stage);
+        let mut target = stage.target("target", false).unwrap();
+        let mut source = driver(native_complete(d.path()));
+        fault(crate::output::OwnedOperation::Publish, Err(libc::EACCES));
+        assert!(stage.publish(&mut target, &permit, &mut source).is_err());
+        assert_eq!(stage.native.file().metadata().unwrap().permissions().mode() & 0o7777, 0o600);
+        assert!(!target.path.exists());
+        if cleanup_failure {
+            fault(crate::output::OwnedOperation::Remove, Err(libc::EACCES));
+        }
+        let Publication::Published { cleanup_failure: actual } =
+            stage.publish(&mut target, &permit, &mut source).unwrap()
+        else {
+            panic!("published")
+        };
+        assert_eq!(actual.is_some(), cleanup_failure);
+        assert!(stage.published);
+        assert_eq!(fs::metadata(&target.path).unwrap().permissions().mode() & 0o7777, 0o751);
+        assert_eq!(fs::read(&target.path).unwrap(), b"new");
+        if cleanup_failure {
+            stage.discard().unwrap();
+        }
+    }
+}
+
+#[test]
+fn task4b_directory_rebound_during_authority_refresh_is_not_adopted() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Rebind {
+        calls: usize,
+        root: PathBuf,
+        declaration: ProtectionDeclaration,
+    }
+    impl VolumeSource for Rebind {
+        fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+            Ok(VolumeAnswer::Missing)
+        }
+        fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+            self.calls += 1;
+            if self.calls == 2 {
+                fs::rename(self.root.join("directory"), self.root.join("original")).unwrap();
+                fs::create_dir(self.root.join("directory")).unwrap();
+                fs::set_permissions(self.root.join("directory"), fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Ok(self.declaration.clone())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("directory")).unwrap();
+    let declaration = native_complete(dir.path());
+    let mut source = crate::progressive::source::SourceDriver::new(
+        Box::new(Rebind { calls: 0, root: dir.path().into(), declaration }),
+        "input.rar".into(),
+        ProgressiveLimits::default(),
+        SessionControl::default(),
+    )
+    .unwrap();
+    let mut output = setup(dir.path());
+    let header =
+        crate::rar5::FileHeader { name: "directory".into(), host_os: 1, attributes: 0o500, ..Default::default() };
+    let admitted = output.directory(member(0), &header, &mut source);
+    assert!(dir.path().join("original").exists(), "the provider replacement must actually run");
+    assert!(admitted.is_err());
+    output.finish_directories(&mut source).unwrap();
+    assert_eq!(fs::metadata(dir.path().join("directory")).unwrap().permissions().mode() & 0o777, 0o700);
+}
+
+#[test]
+fn task4b_directory_finalization_budget_is_finite_and_one_shot() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = driver(native_complete(dir.path()));
+    let mut output = setup(dir.path());
+    let header =
+        crate::rar5::FileHeader { name: "directory".into(), host_os: 1, attributes: 0o500, ..Default::default() };
+    assert!(output.directory(member(0), &header, &mut source).unwrap());
+    fs::set_permissions(dir.path().join("directory"), fs::Permissions::from_mode(0o700)).unwrap();
+    output.usage = Usage::new(ProgressiveLimits { source_bookkeeping: 0, ..Default::default() });
+    assert!(matches!(
+        output.finish_directories(&mut source).unwrap_err().kind,
+        FailureKind::Limit { resource: Resource::SourceBookkeeping, .. }
+    ));
+    output.finish_directories(&mut source).unwrap();
+    assert_eq!(fs::metadata(dir.path().join("directory")).unwrap().permissions().mode() & 0o777, 0o700);
+}

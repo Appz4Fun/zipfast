@@ -590,6 +590,15 @@ impl OwnedStage {
     /// Errors returned directly are prepublication and leave the stage owned.
     #[allow(dead_code)]
     pub(crate) fn publish(&mut self, target: &Path, replace: bool) -> io::Result<Option<io::Error>> {
+        self.publish_observed(target, replace, |_| {})
+    }
+    /// The callback receives the original descriptor only after atomic publication.
+    pub(crate) fn publish_observed(
+        &mut self,
+        target: &Path,
+        replace: bool,
+        published: impl FnOnce(&File),
+    ) -> io::Result<Option<io::Error>> {
         if self.removed || !self.owns_name()? {
             return Err(io::Error::other("output stage name changed"));
         }
@@ -603,12 +612,14 @@ impl OwnedStage {
         owned_stage_fault(OwnedOperation::Publish)?;
         if replace {
             fs::rename(&self.path, target)?;
+            published(self.file());
             self.removed = true;
             self.file.take();
             Ok(None)
         } else {
             // hard_link is an atomic no-clobber publication on this same filesystem.
             fs::hard_link(&self.path, target)?;
+            published(self.file());
             let cleanup = self.discard().err();
             Ok(cleanup)
         }

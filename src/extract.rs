@@ -1895,20 +1895,16 @@ impl Run<'_, '_, '_> {
         if h.format == RarFormat::Rar5 && h.method != 0 {
             let solid_archive = vol.main.is_solid();
             let ready = if h.solid {
-                match self.stream.as_mut() {
-                    Some(u) if h.dictionary <= u.reach() => {
-                        u.next_file(size);
-                        Ok(())
+                if crate::rar5::member::continue_decoder(&mut self.stream, h.dictionary, size) {
+                    Ok(())
+                } else {
+                    let failure = self.dependency_failure();
+                    p.discard();
+                    self.stream = None;
+                    if !p.passive {
+                        self.fail_in_order(&p.context, failure, NEEDS_EARLIER)?;
                     }
-                    _ => {
-                        let failure = self.dependency_failure();
-                        p.discard();
-                        self.stream = None;
-                        if !p.passive {
-                            self.fail_in_order(&p.context, failure, NEEDS_EARLIER)?;
-                        }
-                        return self.continue_file(vol, h, p, None);
-                    }
+                    return self.continue_file(vol, h, p, None);
                 }
             } else {
                 self.unavailable = None;
@@ -1920,20 +1916,13 @@ impl Run<'_, '_, '_> {
                         )
                         .into());
                     }
-                    Ok(window) => match self.stream.as_mut().filter(|u| u.fits(window)) {
-                        Some(u) => {
-                            u.restart(window, size);
-                            Ok(())
-                        }
-                        None => Unpacker::new_detailed(window).map(|mut u| {
-                            if self.opts.threads.is_some() || self.opts.parallel_min.is_some() {
-                                let workers = self.opts.threads.map_or_else(|| u.threads(), |n| n.saturating_sub(1));
-                                u.set_threads(workers, self.opts.parallel_min.unwrap_or(u.parallel_min()));
-                            }
-                            u.reset(size);
-                            self.stream = Some(u);
-                        }),
-                    },
+                    Ok(window) => crate::rar5::member::reset_decoder(
+                        &mut self.stream,
+                        window,
+                        size,
+                        self.opts.threads,
+                        self.opts.parallel_min,
+                    ),
                     Err(e) => Err(e),
                 }
             };

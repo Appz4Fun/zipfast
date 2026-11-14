@@ -27,7 +27,9 @@ use std::{
     task::Context,
 };
 pub(crate) mod native;
+mod policy;
 mod quota;
+use policy::Policy;
 pub(crate) use quota::Capacity;
 use quota::{Lease, Quota};
 
@@ -207,13 +209,14 @@ pub(crate) enum Publication {
 }
 pub(crate) struct Target {
     path: PathBuf,
-    initial: Option<SourceStamp>,
+    initial: Option<TargetStamp>,
+    directory: bool,
     parent_path: PathBuf,
     parent: fs::File,
     parent_identity: native::Identity,
     parent_unbound: bool,
     member: MemberId,
-    stage_identity: native::Identity,
+    stage_identity: Option<native::Identity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,6 +238,7 @@ pub(crate) struct OutputContext {
     quota: Quota,
     authority: Arc<Authority>,
     aftermath: ArtifactAftermath,
+    directories: Vec<policy::Directory>,
 }
 struct Root {
     path: PathBuf,
@@ -290,6 +294,7 @@ impl OutputContext {
             quota: Quota::new(options.limits.retained_artifacts, options.limits.active_outputs),
             authority: Arc::new(Authority { control }),
             aftermath: options.artifact_aftermath,
+            directories: Vec::new(),
         })
     }
     pub(crate) fn terminate(&self, mut stage: Stage, failure: ProgressiveFailure) -> Termination {
@@ -340,6 +345,7 @@ impl OutputContext {
             published: false,
             evidence: None,
             target_created: false,
+            metadata: None,
             holes: Vec::new(),
             usage: self.usage.clone(),
             lease: Some(lease),
@@ -376,6 +382,7 @@ pub(crate) struct Stage {
     published: bool,
     evidence: Option<Verification>,
     target_created: bool,
+    metadata: Option<crate::extract::Meta>,
     holes: Vec<OutputHole>,
     usage: Usage,
     lease: Option<Lease>,
@@ -506,125 +513,25 @@ impl Stage {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn target(&mut self, name: &str, windows_names: bool) -> ProgressiveResult<Target> {
         self.mutation()?;
-        self.usage.charge(Resource::SourceBookkeeping, (name.len() as u64).saturating_mul(8))?;
-        self.usage.charge(Resource::NameBytes, name.len() as u64)?;
-        self.usage
-            .charge(Resource::MetadataBytes, (name.len() * 3 + self.root.path.as_os_str().len() * 2 + 4) as u64)?;
-        let relative = crate::path::sanitize_fallible(name, windows_names)
-            .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
-        let relative =
-            if self.root.flatten { Path::new(relative.file_name().ok_or_else(invalid)?) } else { relative.as_path() };
-        let path = self.root.path.join(relative);
-        self.parents(&path)?;
-        let initial = target_stamp(&path)?;
-        if self.target_created {
+        let mut target = Policy { root: &self.root, usage: &self.usage }.target(self.member, name, windows_names)?;
+        self.bind_target(&mut target)?;
+        Ok(target)
+    }
+    pub(crate) fn bind_target(&mut self, target: &mut Target) -> ProgressiveResult<()> {
+        self.mutation()?;
+        if self.target_created || target.member != self.member || target.stage_identity.is_some() {
             return Err(invalid());
         }
-        let mut parent_path = path.parent().ok_or_else(invalid)?.to_path_buf();
-        loop {
-            self.usage.charge(Resource::SourceBookkeeping, 1 + parent_path.as_os_str().len() as u64)?;
-            match fs::symlink_metadata(&parent_path) {
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if !parent_path.pop() {
-                        return Err(invalid());
-                    }
-                }
-                Err(e) => return Err(out(OutputOperation::Metadata, e, 0)),
-            }
-        }
-        let parent = open_directory(&parent_path)?;
-        let parent_identity = native::Identity::file(&parent).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
-        let stage_identity =
-            native::Identity::file(self.native.file()).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
+        target.stage_identity =
+            Some(native::Identity::file(self.native.file()).map_err(|e| out(OutputOperation::Metadata, e, 0))?);
         self.target_created = true;
-        Ok(Target {
-            path,
-            initial,
-            parent_path,
-            parent,
-            parent_identity,
-            parent_unbound: false,
-            member: self.member,
-            stage_identity,
-        })
-    }
-    fn parents(&self, path: &Path) -> ProgressiveResult<()> {
-        self.root.check()?;
-        let relative = path.parent().ok_or_else(invalid)?.strip_prefix(&self.root.path).map_err(|_| invalid())?;
-        self.usage.charge(Resource::MetadataBytes, (path.as_os_str().len() as u64).saturating_mul(2))?;
-        let mut at = self.root.path.clone();
-        for component in relative.components() {
-            self.usage.charge(Resource::SourceBookkeeping, 1 + at.as_os_str().len() as u64)?;
-            at.push(component);
-            let meta = match fs::symlink_metadata(&at) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(e) => return Err(out(OutputOperation::Metadata, e, 0)),
-            };
-            if !meta.is_dir() || meta.file_type().is_symlink() {
-                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
-            }
-        }
         Ok(())
     }
-    fn prepare_parents(&self, target: &mut Target, source: &mut super::source::SourceDriver) -> ProgressiveResult<()> {
-        target.check_parent()?;
-        let relative =
-            target.path.parent().ok_or_else(invalid)?.strip_prefix(&target.parent_path).map_err(|_| invalid())?;
-        self.usage.charge(Resource::MetadataBytes, (target.path.as_os_str().len() as u64).saturating_mul(2))?;
-        let mut at = target.parent_path.clone();
-        for component in relative.components() {
-            self.root.check()?;
-            target.check_parent()?;
-            at.push(component);
-            self.usage.charge(Resource::SourceBookkeeping, 8 + at.as_os_str().len() as u64)?;
-            self.usage.charge(Resource::MetadataBytes, at.as_os_str().len() as u64)?;
-            let bound_path = at.clone();
-            self.usage
-                .charge(Resource::MetadataBytes, bound_path.capacity().saturating_sub(at.as_os_str().len()) as u64)?;
-            match fs::symlink_metadata(&at) {
-                Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-                Ok(_) => return Err(ProgressiveFailure::new(FailureKind::UnsafePath)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    for (protected, _) in &self.root.protected {
-                        self.usage.charge(
-                            Resource::SourceBookkeeping,
-                            1 + (protected.as_os_str().len() + at.as_os_str().len()) as u64,
-                        )?;
-                        if protected == &at {
-                            return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
-                        }
-                    }
-                    if !source.publication_check(&at, None)? {
-                        return Err(ProgressiveFailure::new(FailureKind::SourceContract));
-                    }
-                    // If creation/open/check cannot finish, a retry must never adopt
-                    // an unbound directory left by this attempt or its replacement.
-                    target.parent_unbound = true;
-                    fs::create_dir(&at).map_err(|e| out(OutputOperation::Create, e, 0))?;
-                }
-                Err(e) => return Err(out(OutputOperation::Metadata, e, 0)),
-            }
-            target.parent_unbound = true;
-            let parent = open_directory(&at)?;
-            let identity = native::Identity::file(&parent).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
-            let meta = fs::symlink_metadata(&at).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
-            if !meta.is_dir()
-                || native::Identity::metadata(&meta).map_err(|e| out(OutputOperation::Metadata, e, 0))? != identity
-            {
-                return Err(invalid());
-            }
-            // One retained parent descriptor, plus the transient replacement above.
-            // Each successfully prepared prefix survives errors in later components.
-            target.parent_path = bound_path;
-            target.parent = parent;
-            target.parent_identity = identity;
-            target.parent_unbound = false;
-        }
-        Ok(())
+    pub(crate) fn set_metadata(&mut self, meta: crate::extract::Meta) {
+        self.metadata = Some(meta);
     }
     /// Reconcile authoritative geometry after member finalization. This never
     /// resizes the file or changes an earlier known size declaration.
@@ -670,7 +577,7 @@ impl Stage {
     ) -> ProgressiveResult<Publication> {
         self.mutation()?;
         if target.member != self.member
-            || native::Identity::file(self.native.file()).map_err(|e| out(OutputOperation::Metadata, e, 0))?
+            || Some(native::Identity::file(self.native.file()).map_err(|e| out(OutputOperation::Metadata, e, 0))?)
                 != target.stage_identity
         {
             return Err(invalid());
@@ -691,46 +598,26 @@ impl Stage {
         if stamp != verified.stamp {
             return Err(invalid());
         }
-        self.parents(&target.path)?;
-        target.check_parent()?;
-        if target_stamp(&target.path)? != target.initial {
-            return Err(invalid());
-        }
-        let identity = target.initial.map(|s| native::Identity(s.device, s.inode));
-        let mut unresolved_protected = false;
-        for (path, old) in &self.root.protected {
-            self.usage.charge(
-                Resource::SourceBookkeeping,
-                1 + (path.as_os_str().len() + target.path.as_os_str().len()) as u64,
-            )?;
-            let now = match fs::metadata(path) {
-                Ok(m) => Some(native::Identity::metadata(&m).map_err(|e| out(OutputOperation::Metadata, e, 0))?),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(out(OutputOperation::Metadata, e, 0)),
-            };
-            unresolved_protected |= old.is_none() || now.is_none();
-            if old.is_some() && old != &now {
-                return Err(ProgressiveFailure::new(FailureKind::SourceChanged));
-            }
-            if path == &target.path || (identity.is_some() && (identity == *old || identity == now)) {
-                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
-            }
-        }
-        if !source.publication_check(&target.path, identity)? || unresolved_protected {
+        let policy = Policy { root: &self.root, usage: &self.usage };
+        if !policy.check_target(target, source)? {
             return Ok(Publication::Provisional);
         }
         self.mutation()?;
         target.check_parent()?;
-        self.prepare_parents(target, source)?;
+        policy.prepare_parents(target, source)?;
         target.check_parent()?;
-        self.parents(&target.path)?;
-        if target_stamp(&target.path)? != target.initial {
+        policy.parents(&target.path)?;
+        if target_stamp(&target.path, target.directory)? != target.initial {
             return Err(invalid());
         }
         let replace = matches!(self.root.overwrite, crate::extract::Overwrite::Always);
         let cleanup_failure = self
             .native
-            .publish(&target.path, replace)
+            .publish_observed(&target.path, replace, |file| {
+                if let Some(meta) = &self.metadata {
+                    crate::extract::finish_file(file, meta);
+                }
+            })
             .map_err(|e| out_range(OutputOperation::Publish, e, 0, self.produced, 0))?
             .map(|e| out(OutputOperation::Remove, e, 0));
         self.published = true;
@@ -850,16 +737,37 @@ fn open_directory(path: &Path) -> ProgressiveResult<fs::File> {
 #[cfg(all(test, unix))]
 mod tests;
 
-fn target_stamp(path: &Path) -> ProgressiveResult<Option<SourceStamp>> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TargetStamp {
+    Regular(SourceStamp),
+    Directory(native::Identity),
+}
+impl TargetStamp {
+    fn identity(self) -> native::Identity {
+        match self {
+            Self::Regular(s) => native::Identity(s.device, s.inode),
+            Self::Directory(id) => id,
+        }
+    }
+}
+fn target_stamp(path: &Path, directory: bool) -> ProgressiveResult<Option<TargetStamp>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(out(OutputOperation::Metadata, e, 0)),
     };
-    if !meta.is_file() || meta.file_type().is_symlink() {
+    if meta.file_type().is_symlink() || (directory && !meta.is_dir()) || (!directory && !meta.is_file()) {
         return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
     }
-    SourceStamp::from_metadata(meta).map(Some).map_err(|e| out(OutputOperation::Metadata, e, 0))
+    if directory {
+        native::Identity::metadata(&meta)
+            .map(|id| Some(TargetStamp::Directory(id)))
+            .map_err(|e| out(OutputOperation::Metadata, e, 0))
+    } else {
+        SourceStamp::from_metadata(meta)
+            .map(|s| Some(TargetStamp::Regular(s)))
+            .map_err(|e| out(OutputOperation::Metadata, e, 0))
+    }
 }
 
 fn out_range(

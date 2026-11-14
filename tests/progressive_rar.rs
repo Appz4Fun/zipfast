@@ -341,6 +341,39 @@ fn real_encrypted_wait_and_notyet_match_both_golds() {
             assert_eq!(v.authentication(), AuthenticationEvidence::CbcChecksOnly);
             assert_eq!(v.packed(), PackedEvidence::Passed);
             assert_eq!(v.size_verdict(), CheckVerdict::Passed);
+            let mut test_options = options(&tmp.path().join("test-absent"));
+            test_options.extract.mode = zipfast::extract::Mode::Test;
+            test_options.first_name = format!("testfile5{set}.part01.rar").into();
+            test_options.set_password(Some("123".into())).unwrap();
+            let (mut test, gate) = session(data.clone(), test_options, true, true, chunk);
+            let mut tested = 0;
+            loop {
+                match poll(&mut test) {
+                    Poll::Pending => {
+                        let calls = gate.lock().unwrap().calls;
+                        assert!(poll(&mut test).is_pending());
+                        assert_eq!(gate.lock().unwrap().calls, calls);
+                        resume(&gate);
+                    }
+                    Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                        outcome: MemberOutcome::Tested(evidence),
+                        ..
+                    }))) => {
+                        assert_eq!(evidence.inner_size(), expected.len() as u64);
+                        assert_eq!(evidence.authentication(), AuthenticationEvidence::CbcChecksOnly);
+                        assert_eq!(evidence.size_verdict(), CheckVerdict::Passed);
+                        assert_eq!(evidence.checksum(), Some(v.checksum()));
+                        tested += 1;
+                    }
+                    Poll::Ready(Ok(Some(
+                        ProgressiveEvent::VolumeOpened { .. } | ProgressiveEvent::MemberStarted { .. },
+                    ))) => {}
+                    Poll::Ready(Ok(None)) => break,
+                    _ => panic!("private Test mode outcome"),
+                }
+            }
+            assert_eq!(tested, 1);
+            assert!(!tmp.path().join("test-absent").exists());
         }
     }
 }
@@ -727,21 +760,6 @@ fn bytes_events_include_decoder_finish_output() {
 }
 
 #[test]
-fn test_mode_rejected_before_provider_or_output_effects() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut o = options(&tmp.path().join("not-created"));
-    o.extract.mode = zipfast::extract::Mode::Test;
-    struct NoCallbacks;
-    impl VolumeSource for NoCallbacks {
-        fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
-            panic!("provider not allowed")
-        }
-    }
-    let Err(e) = ProgressiveSession::new(Box::new(NoCallbacks), o) else { panic!("test mode unsupported") };
-    assert!(matches!(e.kind, FailureKind::UnsupportedMethod));
-    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
-}
-#[test]
 fn overwrite_skip_collision_preserves_target_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("one"), b"keep").unwrap();
@@ -754,12 +772,10 @@ fn overwrite_skip_collision_preserves_target_bytes() {
     .unwrap();
     loop {
         match poll(&mut s) {
-            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
-                assert!(
-                    matches!(failure.kind,FailureKind::Output {cause,..} if cause.kind()==std::io::ErrorKind::AlreadyExists)
-                );
-                break;
-            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                outcome: MemberOutcome::Skipped(zipfast::extract::RarSkipReason::ExistingTarget),
+                ..
+            }))) => break,
             Poll::Ready(Ok(Some(_))) => {}
             _ => panic!("collision"),
         }
@@ -1400,4 +1416,530 @@ fn size_transition_always_unknown_stays_provisional_and_runs_successor() {
         assert!(!tmp.path().join("transition").exists());
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), usize::from(sealed));
     }
+}
+
+fn policy_run(bytes: Vec<u8>, options: ProgressiveOptions) -> Vec<MemberOutcome> {
+    let mut session =
+        ProgressiveSession::from_sealed_memory(vec![("a.part01.rar".into(), bytes.into_boxed_slice())], options)
+            .unwrap();
+    let mut outcomes = Vec::new();
+    for _ in 0..100_000 {
+        match poll(&mut session) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(outcome),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            Poll::Ready(Ok(None)) => return outcomes,
+            Poll::Ready(Err(error)) => panic!("{error:?}"),
+            _ => {}
+        }
+    }
+    panic!("session did not finish")
+}
+#[test]
+fn task4b_policy_test_has_no_output_effects_or_output_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let destination = tmp.path().join("absent");
+    let mut o = options(&destination);
+    o.extract.mode = zipfast::extract::Mode::Test;
+    o.limits.active_outputs = 0;
+    o.limits.retained_artifacts = 0;
+    o.limits.temp_bytes = 0;
+    o.limits.output_write_bytes = 0;
+    assert_eq!(policy_run(archive(&[FileSpec::new("one", b"test")]), o).len(), 1);
+    assert!(!destination.exists());
+}
+#[test]
+fn task4b_policy_skip_finishes_without_staging_or_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("one"), b"keep").unwrap();
+    let mut o = options(tmp.path());
+    o.extract.overwrite = zipfast::extract::Overwrite::Skip;
+    o.limits.temp_bytes = 0;
+    o.limits.output_write_bytes = 0;
+    assert_eq!(policy_run(archive(&[FileSpec::new("one", b"replace")]), o).len(), 1);
+    assert_eq!(std::fs::read(tmp.path().join("one")).unwrap(), b"keep");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+}
+#[cfg(unix)]
+#[test]
+fn task4b_policy_directory_and_file_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let specs = [
+        FileSpec { dir: true, unix_mode: Some(0o500), ..FileSpec::new("dir", b"") },
+        FileSpec { unix_mode: Some(0o4751), ..FileSpec::new("dir/file", b"payload") },
+    ];
+    assert_eq!(policy_run(archive(&specs), options(tmp.path())).len(), 2);
+    assert_eq!(std::fs::read(tmp.path().join("dir/file")).unwrap(), b"payload");
+    let file = std::fs::metadata(tmp.path().join("dir/file")).unwrap();
+    assert_eq!(file.permissions().mode() & 0o7777, 0o751);
+    assert_eq!(file.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), 1_700_000_000);
+    assert_eq!(std::fs::metadata(tmp.path().join("dir")).unwrap().permissions().mode() & 0o777, 0o500);
+    std::fs::set_permissions(tmp.path().join("dir"), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+#[test]
+fn task4b_policy_solid_history_survives_skipped_predecessor() {
+    use zipfast::rar5::testenc::{self, Op};
+    let tmp = tempfile::tempdir().unwrap();
+    let first_ops = b"solid history".iter().copied().map(Op::Lit).collect::<Vec<_>>();
+    let first = testenc::block(&first_ops, true, true);
+    let second = testenc::block(&[Op::Match(13, 13)], false, true);
+    let specs = [
+        (FileSpec { method: 3, size: Some(13), ..FileSpec::new("one", &first) }, crc32fast::hash(b"solid history")),
+        (
+            FileSpec { method: 3, solid: true, size: Some(13), ..FileSpec::new("two", &second) },
+            crc32fast::hash(b"solid history"),
+        ),
+    ];
+    std::fs::write(tmp.path().join("one"), b"keep").unwrap();
+    let mut o = options(tmp.path());
+    o.extract.overwrite = zipfast::extract::Overwrite::Skip;
+    assert_eq!(policy_run(common::archive_with(&specs, true), o).len(), 2);
+    assert_eq!(std::fs::read(tmp.path().join("one")).unwrap(), b"keep");
+    assert_eq!(std::fs::read(tmp.path().join("two")).unwrap(), b"solid history");
+}
+
+#[test]
+fn task4b_test_evidence_and_logical_budget_are_truthful() {
+    let tmp = tempfile::tempdir().unwrap();
+    for missing in [false, true] {
+        let mut o = options(&tmp.path().join("absent"));
+        o.extract.mode = zipfast::extract::Mode::Test;
+        o.limits.logical_output_bytes = 4;
+        o.limits.verify_bytes = 0; // Hashing decoded bytes is not a physical verification read.
+        let spec = FileSpec { no_crc: missing, ..FileSpec::new("one", b"test") };
+        let outcomes = policy_run(archive(&[spec]), o);
+        let MemberOutcome::Tested(v) = &outcomes[0] else { panic!("test outcome") };
+        assert_eq!(v.inner_size(), 4);
+        assert_eq!(v.size_verdict(), CheckVerdict::Passed);
+        assert_eq!(v.crc32_verdict(), if missing { CheckVerdict::Missing } else { CheckVerdict::Passed });
+        assert_eq!(v.checksum().is_none(), missing);
+    }
+    let mut o = options(&tmp.path().join("absent"));
+    o.extract.mode = zipfast::extract::Mode::Test;
+    o.limits.logical_output_bytes = 3;
+    let (mut s, _) = session(vec![archive(&[FileSpec::new("one", b"test")])], o, false, false, 1);
+    loop {
+        match poll(&mut s) {
+            Poll::Ready(Err(e)) => {
+                assert!(matches!(e.kind, FailureKind::Limit { resource: Resource::LogicalOutputBytes, .. }));
+                break;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. } | ProgressiveEvent::MemberFinished { .. }))) => {
+                panic!("untruthful event")
+            }
+            Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+            _ => panic!("expected budget failure"),
+        }
+    }
+    assert!(!tmp.path().join("absent").exists());
+}
+#[test]
+fn task4b_test_waits_and_cancellation_do_not_touch_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut o = options(&tmp.path().join("absent"));
+    o.extract.mode = zipfast::extract::Mode::Test;
+    let (mut s, gate) = session(volumes(&FileSpec::new("one", b"test across volumes"), 3), o, true, true, 1);
+    let mut finished = 0;
+    for _ in 0..100_000 {
+        match poll(&mut s) {
+            Poll::Pending => {
+                let calls = gate.lock().unwrap().calls;
+                assert!(poll(&mut s).is_pending());
+                assert_eq!(gate.lock().unwrap().calls, calls);
+                resume(&gate);
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome: MemberOutcome::Tested(v), .. }))) => {
+                assert_eq!(v.inner_size(), 19);
+                finished += 1;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) => panic!("test did not write bytes"),
+            Poll::Ready(Ok(Some(_))) => {}
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+        }
+    }
+    assert_eq!(finished, 1);
+    assert!(!tmp.path().join("absent").exists());
+    let mut o = options(&tmp.path().join("absent"));
+    o.extract.mode = zipfast::extract::Mode::Test;
+    let (mut s, gate) = session(vec![archive(&[])], o, true, false, 1);
+    assert!(poll(&mut s).is_pending());
+    let calls = gate.lock().unwrap().calls;
+    s.control().cancel();
+    assert!(matches!(poll(&mut s), Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::Canceled, .. }))));
+    assert_eq!(gate.lock().unwrap().calls, calls);
+}
+
+fn policy_solid(missing: bool, bad: bool) -> Vec<u8> {
+    use zipfast::rar5::testenc::{self, Op};
+    let first = testenc::block(&b"solid history".iter().copied().map(Op::Lit).collect::<Vec<_>>(), true, true);
+    let second = testenc::block(&[Op::Match(13, 13)], false, true);
+    let reset = testenc::block(&[Op::Lit(b'R')], true, true);
+    common::archive_with(
+        &[
+            (
+                FileSpec { no_crc: missing, method: 3, size: Some(13), ..FileSpec::new("one", &first) },
+                if bad { 0 } else { crc32fast::hash(b"solid history") },
+            ),
+            (FileSpec::new("stored", b"S"), crc32fast::hash(b"S")),
+            (FileSpec { dir: true, ..FileSpec::new("directory", b"") }, 0),
+            (
+                FileSpec { method: 3, solid: true, size: Some(13), ..FileSpec::new("two", &second) },
+                crc32fast::hash(b"solid history"),
+            ),
+            (FileSpec { method: 3, size: Some(1), ..FileSpec::new("reset", &reset) }, crc32fast::hash(b"R")),
+        ],
+        true,
+    )
+}
+#[test]
+fn task4b_solid_missing_check_is_not_failed_history_and_reset_recovers_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (missing, bad) in [(true, false), (false, true)] {
+        let dir = tmp.path().join(format!("{missing}-{bad}"));
+        let outcomes = policy_run(policy_solid(missing, bad), options(&dir));
+        assert_eq!(outcomes.len(), 5);
+        if bad {
+            assert!(matches!(outcomes[0], MemberOutcome::Stopped { .. }));
+            assert!(
+                matches!(&outcomes[3], MemberOutcome::Stopped { failure: ProgressiveFailure { kind: FailureKind::Rar(f), .. }, .. } if matches!(**f, zipfast::error::RarFailure::SolidHistoryUnavailable { .. }))
+            );
+            assert!(!dir.join("one").exists());
+            assert!(!dir.join("two").exists());
+        } else {
+            assert!(matches!(outcomes[0], MemberOutcome::Provisional(_)));
+            assert!(matches!(outcomes[3], MemberOutcome::Verified(_)));
+            assert_eq!(std::fs::read(dir.join("two")).unwrap(), b"solid history");
+        }
+        assert!(matches!(outcomes[4], MemberOutcome::Verified(_)));
+        assert_eq!(std::fs::read(dir.join("reset")).unwrap(), b"R");
+    }
+    let mut o = options(&tmp.path().join("test-absent"));
+    o.extract.mode = zipfast::extract::Mode::Test;
+    let outcomes = policy_run(policy_solid(true, false), o);
+    assert!(matches!(&outcomes[0], MemberOutcome::Tested(v) if v.crc32_verdict() == CheckVerdict::Missing));
+    assert!(matches!(&outcomes[3], MemberOutcome::Tested(v) if v.crc32_verdict() == CheckVerdict::Passed));
+}
+#[test]
+fn task4b_opaque_directory_is_typed_and_regular_successor_survives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = archive(&[FileSpec { dir: true, ..FileSpec::new("directory", b"") }, FileSpec::new("one", b"payload")]);
+    let (mut s, _) = session(vec![bytes], options(tmp.path()), false, false, 4);
+    let mut outcomes = Vec::new();
+    loop {
+        match poll(&mut s) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(outcome),
+            Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+        }
+    }
+    assert!(matches!(
+        outcomes[0],
+        MemberOutcome::Stopped {
+            failure: ProgressiveFailure { kind: FailureKind::PublicationAuthorityRequired, .. },
+            artifact: None,
+            ..
+        }
+    ));
+    assert!(matches!(outcomes[1], MemberOutcome::Provisional(_)));
+    assert!(!tmp.path().join("directory").exists());
+}
+#[cfg(unix)]
+#[test]
+fn task4b_private_artifact_permissions_never_follow_archive_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    for missing in [false, true] {
+        let spec = FileSpec { no_crc: missing, unix_mode: Some(0o7777), ..FileSpec::new("one", b"private") };
+        let (mut s, _) = session(vec![archive(&[spec])], options(tmp.path()), false, false, 5);
+        let mut artifact = loop {
+            match poll(&mut s) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::Provisional(a),
+                    ..
+                }))) => break a,
+                Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+                _ => panic!("artifact expected"),
+            }
+        };
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            assert_eq!(entry.unwrap().metadata().unwrap().permissions().mode() & 0o7777, 0o600);
+        }
+        artifact.discard().unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn task4b_directory_replacement_cancellation_and_duplicate_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    for cancel in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = archive(&[FileSpec { dir: true, unix_mode: Some(0o500), ..FileSpec::new("dir", b"") }]);
+        let mut s = ProgressiveSession::from_sealed_memory(
+            vec![("a.part01.rar".into(), bytes.into_boxed_slice())],
+            options(tmp.path()),
+        )
+        .unwrap();
+        loop {
+            if let Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                outcome: MemberOutcome::Directory { created: true },
+                ..
+            }))) = poll(&mut s)
+            {
+                break;
+            }
+        }
+        if cancel {
+            s.control().cancel();
+        } else {
+            std::fs::rename(tmp.path().join("dir"), tmp.path().join("saved")).unwrap();
+            std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        }
+        std::fs::set_permissions(tmp.path().join("dir"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            poll(&mut s),
+            Poll::Ready(Err(_)) | Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { .. })))
+        ));
+        assert!(matches!(poll(&mut s), Poll::Ready(Ok(None))));
+        drop(s);
+        assert_eq!(std::fs::metadata(tmp.path().join("dir")).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let specs = [
+        FileSpec { dir: true, unix_mode: Some(0), ..FileSpec::new("same", b"") },
+        FileSpec { dir: true, unix_mode: Some(0o750), ..FileSpec::new("same", b"") },
+    ];
+    let outcomes = policy_run(archive(&specs), options(tmp.path()));
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(std::fs::metadata(tmp.path().join("same")).unwrap().permissions().mode() & 0o777, 0o750);
+}
+#[test]
+fn task4b_directory_flatten_test_and_obstruction_policies() {
+    for test in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut o = options(tmp.path());
+        if test {
+            o.extract.mode = zipfast::extract::Mode::Test;
+        } else {
+            o.extract.flatten = true;
+        }
+        let outcomes = policy_run(archive(&[FileSpec { dir: true, ..FileSpec::new("dir", b"") }]), o);
+        assert!(matches!(outcomes[0], MemberOutcome::Directory { created: false }));
+        assert!(!tmp.path().join("dir").exists());
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("dir"), b"preserve").unwrap();
+    let bytes = archive(&[FileSpec { dir: true, ..FileSpec::new("dir", b"") }]);
+    let mut s = ProgressiveSession::from_sealed_memory(
+        vec![("a.part01.rar".into(), bytes.into_boxed_slice())],
+        options(tmp.path()),
+    )
+    .unwrap();
+    loop {
+        match poll(&mut s) {
+            Poll::Ready(Err(e)) => {
+                assert!(matches!(e.kind, FailureKind::UnsafePath));
+                break;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => panic!("obstruction not directory"),
+            Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+            _ => panic!("missing refusal"),
+        }
+    }
+    assert_eq!(std::fs::read(tmp.path().join("dir")).unwrap(), b"preserve");
+}
+#[test]
+fn task4b_every_redirection_is_typed_and_creates_nothing() {
+    for kind in [1, 2, 3, 4, 5, 99] {
+        let tmp = tempfile::tempdir().unwrap();
+        // Existing RAR5 redirection extra: type, kind, flags, UTF-8 target length/bytes.
+        let mut record = vec![5, kind, 0, 6];
+        record.extend(b"target");
+        let mut extra = vec![record.len() as u8];
+        extra.extend(record);
+        let bytes = archive(&[FileSpec { extra, ..FileSpec::new("link", b"") }]);
+        let mut s = ProgressiveSession::from_sealed_memory(
+            vec![("a.part01.rar".into(), bytes.into_boxed_slice())],
+            options(tmp.path()),
+        )
+        .unwrap();
+        loop {
+            match poll(&mut s) {
+                Poll::Ready(Err(e)) => {
+                    assert!(
+                        matches!(e.kind, FailureKind::Rar(f) if matches!(*f, zipfast::error::RarFailure::Unsupported(zipfast::error::RarUnsupported::Redirection { kind: actual }) if actual == u64::from(kind)))
+                    );
+                    break;
+                }
+                Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+                _ => panic!("redirection refusal"),
+            }
+        }
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+}
+#[cfg(unix)]
+#[test]
+fn task4b_skip_replacement_while_parked_and_protected_alias_fail_closed() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("one");
+    std::fs::write(&target, b"keep").unwrap();
+    let mut o = options(tmp.path());
+    o.extract.overwrite = zipfast::extract::Overwrite::Skip;
+    let (mut s, gate) = session(vec![archive(&[FileSpec::new("one", b"replacement")])], o, false, true, 1);
+    loop {
+        match poll(&mut s) {
+            Poll::Pending => resume(&gate),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { .. }))) => break,
+            Poll::Ready(Ok(Some(_))) => {}
+            _ => panic!("start"),
+        }
+    }
+    assert!(poll(&mut s).is_pending());
+    std::fs::rename(&target, tmp.path().join("saved")).unwrap();
+    std::fs::write(&target, b"foreign").unwrap();
+    let foreign = std::fs::metadata(&target).unwrap().ino();
+    loop {
+        match poll(&mut s) {
+            Poll::Pending => resume(&gate),
+            Poll::Ready(Err(_)) => break,
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => panic!("cannot skip rebound target"),
+            Poll::Ready(Ok(Some(_))) => {}
+            _ => panic!("rebound failure"),
+        }
+    }
+    assert_eq!(std::fs::metadata(&target).unwrap().ino(), foreign);
+    assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+    let mut o = options(tmp.path());
+    o.extract.overwrite = zipfast::extract::Overwrite::Skip;
+    o.extract.protected_paths.insert(target.clone());
+    let bytes = archive(&[FileSpec::new("one", b"replacement")]);
+    let mut s =
+        ProgressiveSession::from_sealed_memory(vec![("a.part01.rar".into(), bytes.into_boxed_slice())], o).unwrap();
+    loop {
+        match poll(&mut s) {
+            Poll::Ready(Err(e)) => {
+                assert!(matches!(e.kind, FailureKind::UnsafePath));
+                break;
+            }
+            Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+            _ => panic!("protected skip"),
+        }
+    }
+}
+
+#[test]
+fn task4b_test_encrypted_integrity_and_kdf_limits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let salt = [3; 16];
+    let iv = [9; 16];
+    let (key, _) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &salt, None).unwrap();
+    let mut padded = b"plain".to_vec();
+    padded.resize(16, 0);
+    let ciphertext = zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap();
+    for (bad, limited) in [(false, false), (true, false), (false, true)] {
+        let mut spec = FileSpec::new("one", &ciphertext);
+        spec.size = Some(5);
+        spec.extra = vec![36, 1, 0, 0, 1];
+        spec.extra.extend(salt);
+        spec.extra.extend(iv);
+        let bytes = common::archive_with(&[(spec, if bad { 0 } else { crc32fast::hash(b"plain") })], false);
+        let mut o = options(&tmp.path().join("absent"));
+        o.extract.mode = zipfast::extract::Mode::Test;
+        o.set_password(Some("pw".into())).unwrap();
+        if limited {
+            o.limits.kdf_session_blocks = 0;
+        }
+        let (mut s, gate) = session(vec![bytes], o, false, true, 1);
+        loop {
+            match poll(&mut s) {
+                Poll::Pending => resume(&gate),
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::Tested(v), ..
+                }))) => {
+                    assert!(!bad && !limited);
+                    assert_eq!(v.inner_size(), 5);
+                    assert_eq!(v.authentication(), AuthenticationEvidence::CbcChecksOnly);
+                    break;
+                }
+                Poll::Ready(Err(e)) => {
+                    if limited {
+                        assert!(matches!(e.kind, FailureKind::Limit { resource: Resource::KdfSessionBlocks, .. }));
+                    } else {
+                        assert!(bad && matches!(e.kind, FailureKind::Rar(_)));
+                    }
+                    break;
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) => panic!("test never writes"),
+                Poll::Ready(Ok(Some(_))) => {}
+                _ => panic!("expected tested or typed failure"),
+            }
+        }
+        assert!(!tmp.path().join("absent").exists());
+    }
+}
+
+#[test]
+fn task4b_solid_window_budget_and_complete_path_bytes_agree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = policy_solid(false, false);
+    let path = tmp.path().join("source.rar");
+    std::fs::write(&path, &bytes).unwrap();
+    let complete = tmp.path().join("complete");
+    let opts = options(&complete).extract;
+    let summary = zipfast::extract::run(&path, &opts, |_| {}).unwrap();
+    assert!(summary.errors.is_empty());
+    let progressive = tmp.path().join("progressive");
+    let mut o = options(&progressive);
+    o.limits.decoder_window = 262_144; // Full 128 KiB history plus canonical window room.
+    let outcomes = policy_run(bytes.clone(), o);
+    assert_eq!(outcomes.len(), 5);
+    for name in ["one", "stored", "two", "reset"] {
+        assert_eq!(std::fs::read(complete.join(name)).unwrap(), std::fs::read(progressive.join(name)).unwrap());
+        assert_eq!(
+            std::fs::metadata(complete.join(name)).unwrap().modified().unwrap(),
+            std::fs::metadata(progressive.join(name)).unwrap().modified().unwrap()
+        );
+    }
+    let mut o = options(&tmp.path().join("limited"));
+    o.limits.decoder_window = 262_143;
+    let mut s =
+        ProgressiveSession::from_sealed_memory(vec![("a.part01.rar".into(), bytes.into_boxed_slice())], o).unwrap();
+    loop {
+        match poll(&mut s) {
+            Poll::Ready(Err(e)) => {
+                assert!(matches!(
+                    e.kind,
+                    FailureKind::Limit { resource: Resource::DecoderWindow, limit: 262_143, attempted: 262_144 }
+                ));
+                break;
+            }
+            Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
+            _ => panic!("window admission failure"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn task4b_late_directory_and_zero_file_mode_match_complete_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = archive(&[
+        FileSpec::new("late/file", b"payload"),
+        FileSpec { unix_mode: Some(0o100000), ..FileSpec::new("zero", b"") },
+        FileSpec { dir: true, unix_mode: Some(0o510), ..FileSpec::new("late", b"") },
+    ]);
+    let outcomes = policy_run(bytes, options(tmp.path()));
+    assert_eq!(outcomes.len(), 3);
+    assert!(matches!(outcomes[2], MemberOutcome::Directory { created: false }));
+    assert_eq!(std::fs::metadata(tmp.path().join("zero")).unwrap().permissions().mode() & 0o7777, 0);
+    let directory = std::fs::metadata(tmp.path().join("late")).unwrap();
+    assert_eq!(directory.permissions().mode() & 0o777, 0o510);
+    assert_eq!(directory.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), 1_700_000_000);
+    std::fs::set_permissions(tmp.path().join("zero"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(tmp.path().join("late"), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
