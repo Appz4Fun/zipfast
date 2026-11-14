@@ -1689,7 +1689,7 @@ fn direct_frozen_cwd_and_replaced_target_are_checked_before_skip_completion() {
 
 #[test]
 #[allow(clippy::result_large_err)]
-fn direct_early_emission_refusal_explicitly_retires_matching_context_cwd_metadata() {
+fn direct_policy_usage_early_emission_refusal_explicitly_retires_matching_context_cwd_metadata() {
     for poisoned in [false, true] {
         let (_file, mut session, mut options, mut context) = direct_setup_output(ZipReadOutput::VerifiedStdout);
         let cancel = Cancellation::default();
@@ -1710,7 +1710,9 @@ fn direct_early_emission_refusal_explicitly_retires_matching_context_cwd_metadat
                 .emit_diagnostic(token, &mut context, Ok(()), &mut log, |_, _, _| panic!("foreign owner cannot render"))
         };
         let (_, error, usage) = completion.into_parts();
-        assert!(error.is_some());
+        let error = error.unwrap();
+        assert_eq!(error.policy_metadata_usage(), context.policy_metadata_usage());
+        assert!(error.policy_metadata_usage().caller.peak_capacity > baseline);
         assert_eq!(usage.accepted_bytes, 0);
         assert_eq!(
             context.policy_metadata_usage().caller.live_capacity,
@@ -1722,12 +1724,13 @@ fn direct_early_emission_refusal_explicitly_retires_matching_context_cwd_metadat
 
 #[test]
 #[allow(clippy::result_large_err)]
-fn direct_foreign_context_refusal_preserves_the_other_live_capability() {
+fn direct_policy_usage_foreign_context_refusal_preserves_the_other_live_capability() {
     let (_fa, mut a, mut options_a, mut ca) = direct_setup();
     let (_fb, mut b, mut options_b, mut cb) = direct_setup();
     let cancel = Cancellation::default();
     options_a.protected_paths.insert(".".into());
     options_b.protected_paths.insert(".".into());
+    options_b.protected_paths.insert("src/zip/read/diagnostic/direct.rs".into());
     let log_a = tempfile::tempfile().unwrap();
     let mut log_b = tempfile::tempfile().unwrap();
     let ta = a.prepare_diagnostics(0, &options_a, &cancel, &mut ca, ZipDiagnosticSink::Stderr, &log_a).unwrap();
@@ -1735,8 +1738,13 @@ fn direct_foreign_context_refusal_preserves_the_other_live_capability() {
     let before = cb.policy_metadata_usage().caller.live_capacity;
     let original =
         a.read_at_with_context(0, None, 64, &cancel, &mut ca, |_| Err(ZipSinkFault::StageChanged)).unwrap_err();
+    // Preserve the caller's actual CA policy snapshot on its real failed read.
+    let original = original.with_policy_usage(ca.policy_metadata_usage());
     let original_usage = original.usage();
     let original_run = original.run_usage();
+    let original_policy = original.policy_metadata_usage();
+    assert_ne!(original_policy, PolicyMetadataUsage::default());
+    assert_ne!(original_policy, cb.policy_metadata_usage());
     let (value, error, _) = a
         .emit_diagnostic(ta, &mut cb, Err::<(), _>(original), &mut log_b, |_, _, _| {
             panic!("foreign context cannot render")
@@ -1746,6 +1754,7 @@ fn direct_foreign_context_refusal_preserves_the_other_live_capability() {
     let error = error.unwrap();
     assert_eq!(error.usage(), original_usage);
     assert_eq!(error.run_usage(), original_run);
+    assert_eq!(error.policy_metadata_usage(), original_policy);
     assert_eq!(cb.policy_metadata_usage().caller.live_capacity, before);
     let (value, error, usage) = b
         .emit_diagnostic(tb, &mut cb, Ok(false), &mut log_b, |_, _, w| w.write_fmt(format_args!("skip\n")))
@@ -1996,5 +2005,115 @@ fn r1_final_policy_and_cwd_retire_once_after_each_observer_failure() {
                 }
             }
         }
+    }
+}
+
+#[test]
+#[allow(clippy::result_large_err)]
+fn direct_policy_usage_receipt_matches_after_write_failure() {
+    direct_policy_usage_receipt(false, false);
+}
+#[test]
+#[allow(clippy::result_large_err)]
+fn direct_policy_usage_receipt_matches_after_prepare_refusal() {
+    for staged in [false, true] {
+        direct_policy_usage_receipt(true, staged);
+    }
+}
+#[allow(clippy::result_large_err)]
+fn direct_policy_usage_receipt(refusal: bool, staged: bool) {
+    let (_file, mut session, mut options, mut context) = direct_setup();
+    let dest = tempfile::tempdir().unwrap();
+    if staged {
+        options.mode = crate::extract::Mode::Extract;
+        options.dest = dest.path().to_path_buf();
+        context = EncryptedReadContext::for_projected(
+            &mut session,
+            ProjectedReadScope::Entry(0),
+            Some(64),
+            ZipReadOutput::StagedFiles { destination: &options.dest },
+            None,
+            &Default::default(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+    }
+    options.protected_paths.insert(".".into());
+    let cancel = Cancellation::default();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    // A genuine File descriptor is admitted, then its actual read-only
+    // write fails. Refusal instead aliases an expressly protected name.
+    let mut out = File::open(log.path()).unwrap();
+    if refusal {
+        options.protected_paths.insert(log.path().to_path_buf());
+    }
+    let prepared = session.prepare_diagnostics(0, &options, &cancel, &mut context, ZipDiagnosticSink::Stderr, &out);
+    let error = if refusal {
+        prepared.err().unwrap()
+    } else {
+        let token = prepared.unwrap();
+        let operation = session.read_at_with_context(0, None, 64, &cancel, &mut context, |_| Ok(())).map(|()| true);
+        let (value, error, usage) = session
+            .emit_diagnostic(token, &mut context, operation, &mut out, |_, _, w| {
+                w.write_fmt(format_args!("completion\n"))
+            })
+            .into_parts();
+        assert_eq!(value, Some(true));
+        assert_eq!(usage.accepted_bytes, 0);
+        error.unwrap()
+    };
+    if refusal {
+        assert!(error.diagnostic_boundary_fault().is_some());
+    } else {
+        assert!(error.diagnostic_fault().is_some());
+        assert!(error.operation().is_none());
+    }
+    let usage = context.policy_metadata_usage();
+    assert!(usage.caller.allocated_bytes > 0 && usage.caller.peak_capacity > 0);
+    if staged {
+        // The already-bound file policy belongs to the action, beyond a
+        // refused preparation; its live capacity must also be reported.
+        assert!(usage.caller.live_capacity > 0);
+        assert!(context.action.as_ref().unwrap().policy.is_some());
+    } else {
+        assert_eq!(usage.caller.live_allocations, 0);
+        assert_eq!(usage.caller.live_capacity, 0);
+    }
+    assert_eq!(error.policy_metadata_usage(), usage);
+}
+
+#[test]
+fn direct_policy_usage_error_assembly_has_a_separate_bounded_control_phase() {
+    let d = diagnostic::direct_control_layout();
+    let p = diagnostic::protected_completion_control_layout();
+    let error = std::mem::size_of::<ZipReadError>();
+    let cleanup = std::mem::size_of::<ObjectCleanupReport>();
+    let policy = std::mem::size_of::<PolicyMetadataUsage>();
+    let encrypted = std::mem::size_of::<EncryptedReadUsage>();
+    let run = std::mem::size_of::<RunUsage>();
+    let frozen = std::mem::size_of::<policy::FrozenPolicy>();
+    // Scope/writer/native scratch are gone before snapshotting the receipt.
+    // Count both moving error capacities, full persistent aux/token/state,
+    // cleanup evidence/CWD metadata, retained file policy, all counter values
+    // and scalar controls.
+    let receipt = 2 * error.max(d[6])
+        + 2 * cleanup
+        + d[2]
+        + d[3]
+        + d[8]
+        + d[4]
+        + p[3]
+        + p[4]
+        + policy
+        + encrypted
+        + run
+        + frozen
+        + 512;
+    eprintln!(
+        "ACTUAL M1 policy/encrypted/run snapshot={policy}/{encrypted}/{run} retained_policy={frozen} full_error_assembly={receipt}"
+    );
+    assert!(receipt <= 16384);
+    const {
+        assert!(shared::SHARED_LEDGER_CAPACITY + 4096 + 3 * 65536 + 16384 <= 256 << 10);
     }
 }

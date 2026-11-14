@@ -84,7 +84,11 @@ impl<T> ZipDiagnosticCompletion<T> {
         };
         let mut completed = Self::complete(operation, Evidence::default(), error, usage);
         if same_context && let Some(error) = completed.error.take() {
-            completed.error = Some(error.with_usage(context.usage(), context.run_usage()));
+            completed.error = Some(
+                error
+                    .with_usage(context.usage(), context.run_usage())
+                    .with_policy_usage(context.policy_metadata_usage()),
+            );
         }
         completed
     }
@@ -196,8 +200,33 @@ fn finish_cwd(
         }
     }
 }
+#[allow(clippy::result_large_err)]
+fn matching_usage(error: ZipReadError, identity: u64, context: &EncryptedReadContext) -> ZipReadError {
+    if context.action.as_ref().is_some_and(|action| action.identity == identity) {
+        error.with_usage(context.usage(), context.run_usage()).with_policy_usage(context.policy_metadata_usage())
+    } else {
+        error
+    }
+}
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn prepare<'o>(
+    source: SourceParts<'_>,
+    entries: DiagnosticEntries<'_>,
+    identity: u64,
+    ordinal: usize,
+    options: &'o Options,
+    cancel: &Cancellation,
+    context: &mut EncryptedReadContext,
+    which: ZipDiagnosticSink,
+    sink: &dyn AsFd,
+) -> ZipReadResult<ZipDirectDiagnostics<'o>> {
+    // Preparation's owned scope/state cleanup completes before any receipt
+    // snapshot, including early policy/admission/packing errors.
+    prepare_inner(source, entries, identity, ordinal, options, cancel, context, which, sink)
+        .map_err(|error| matching_usage(error, identity, context))
+}
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+fn prepare_inner<'o>(
     source: SourceParts<'_>,
     entries: DiagnosticEntries<'_>,
     identity: u64,
@@ -252,9 +281,7 @@ fn prepare<'o>(
     let evidence = prepared.finish(admitted.map_err(ZipObserverFault::from));
     if evidence.failed() {
         let error = evidence.merge(ZipReadError::diagnostic_only());
-        return Err(finish_state(&mut state, context, Some(error))
-            .unwrap()
-            .with_usage(context.usage(), context.run_usage()));
+        return Err(finish_state(&mut state, context, Some(error)).unwrap());
     }
     let compact = match DirectDiagnosticState::pack(&mut state, which) {
         Ok(compact) => compact,
@@ -297,7 +324,9 @@ where
     let cleanup = finish_state(&mut state, context, None);
     let mut completed = ZipDiagnosticCompletion::complete(operation, evidence, cleanup, state.usage);
     if let Some(error) = completed.error.take() {
-        completed.error = Some(error.with_usage(context.usage(), context.run_usage()));
+        completed.error = Some(
+            error.with_usage(context.usage(), context.run_usage()).with_policy_usage(context.policy_metadata_usage()),
+        );
     }
     completed
 }
@@ -402,7 +431,10 @@ impl crate::zip::ReadSession {
         which: ZipDiagnosticSink,
         sink: &dyn AsFd,
     ) -> ZipReadResult<ZipDirectDiagnostics<'o>> {
-        let ordinal = self.metadata.ordinal(id).map_err(|_| ReadFault::InvalidPlan)?;
+        let ordinal = self
+            .metadata
+            .ordinal(id)
+            .map_err(|_| matching_usage(ReadFault::InvalidPlan.into(), self.checked_identity, context))?;
         prepare(
             SourceParts::Retained { file: &self.file, binding: &mut self.source },
             DiagnosticEntries::Retained(&self.metadata),
