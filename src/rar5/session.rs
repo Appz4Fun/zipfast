@@ -21,7 +21,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::mem::size_of;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +32,7 @@ use crate::error::{
 use crate::extract::{Cancellation, RarRunError, RarRunSummary};
 use crate::volume::next_volume;
 
+use super::physical::{PhysicalMember as Member, PhysicalModel, PhysicalPart as Part, continuation_issue};
 use super::reader::{Block, Volume, read_failure};
 use super::source::SourceStamp;
 use super::{FileHeader, FileWire, MHFL_VOLNUMBER, MainHeader, MemberCrypt, Redirection};
@@ -170,14 +170,6 @@ impl RarPart<'_> {
     }
 }
 
-struct Part {
-    volume: usize,
-    data_offset: u64,
-    packed_size: u64,
-    checks: RarChecks,
-    crypt: MemberCrypt,
-}
-
 /// Borrowed metadata for one logical member, in archive order.
 #[derive(Clone, Copy)]
 pub struct RarMember<'a> {
@@ -293,18 +285,6 @@ impl<'a> RarMember<'a> {
     }
 }
 
-struct Member {
-    header: FileHeader,
-    wire: FileWire,
-    parts: Range<usize>,
-    packed_size: u64,
-    unpacked_size: Option<u64>,
-    complete: bool,
-    issue: Option<usize>,
-    chain: Option<usize>,
-    has_successor: bool,
-}
-
 struct HeldVolume {
     metadata: RarVolumeMetadata,
     file: File,
@@ -316,8 +296,7 @@ struct HeldVolume {
 pub struct RarSession {
     archive: RarArchiveMetadata,
     volumes: Vec<HeldVolume>,
-    members: Vec<Member>,
-    parts: Vec<Part>,
+    model: PhysicalModel,
     issues: Vec<RarFailure>,
     usage: RarCatalogueUsage,
     password: String,
@@ -364,8 +343,7 @@ impl RarSession {
             session: Self {
                 archive: RarArchiveMetadata::default(),
                 volumes: Vec::new(),
-                members: Vec::new(),
-                parts: Vec::new(),
+                model: PhysicalModel::default(),
                 issues: Vec::new(),
                 usage: RarCatalogueUsage::default(),
                 password: String::new(),
@@ -424,10 +402,10 @@ impl RarSession {
     }
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = RarMember<'_>> {
-        self.members.iter().enumerate().map(|(index, member)| RarMember {
+        self.model.members.iter().enumerate().map(|(index, member)| RarMember {
             ordinal: index as u64,
             member,
-            parts: &self.parts[member.parts.clone()],
+            parts: &self.model.parts[member.parts.clone()],
             issue: member.issue.map(|index| &self.issues[index]),
         })
     }
@@ -562,8 +540,7 @@ impl Catalogue {
         limit(parts, self.options.limits.parts, RarResource::CatalogueParts)?;
         self.session.usage.parts = parts;
         let associated = self.pending
-            && header.split_before()
-            && self.session.members.last().is_some_and(|member| member.wire.name == wire.name);
+            && self.session.model.members.last().is_some_and(|member| member.matches_continuation(&header, &wire));
         if !associated {
             self.end_incomplete()?;
             if header.split_before() {
@@ -573,34 +550,15 @@ impl Catalogue {
             }
         }
         let final_part = !header.split_after();
-        let part = Part {
-            volume,
-            data_offset: header.data_at,
-            packed_size: header.packed_size,
-            checks: RarChecks {
-                crc32: header.crc32,
-                blake2sp: header.blake2sp,
-                keyed: header.crypt.as_ref().is_some_and(|params| params.tweaked_crc),
-            },
-            crypt,
-        };
-        let ordinal = if associated { self.session.members.len() - 1 } else { self.session.members.len() } as u64;
-        let size = (!header.size_unknown()).then_some(header.unpacked_size);
+        let part = Part::new(volume, &header, crypt, &wire);
+        let ordinal =
+            if associated { self.session.model.members.len() - 1 } else { self.session.model.members.len() } as u64;
         let issue = if associated {
-            let initial = self.session.members.last().unwrap();
+            let initial = self.session.model.members.last().unwrap();
             if initial.issue.is_some() {
                 None
-            } else if (header.method == 0) != (initial.header.method == 0)
-                || header.algorithm != initial.header.algorithm
-                || header.encrypted != initial.header.encrypted
-                || header.is_dir() != initial.header.is_dir()
-                || header.redirection != initial.header.redirection
-            {
-                Some(member_integrity(ordinal, RarIntegrityReason::ChangedContinuationEncoding))
-            } else if let (Some(expected), Some(actual)) = (initial.unpacked_size, size)
-                && expected != actual
-            {
-                Some(member_integrity(ordinal, RarIntegrityReason::SplitSizeMismatch { expected, actual }))
+            } else if let Some(reason) = continuation_issue(initial, &header) {
+                Some(member_integrity(ordinal, reason))
             } else {
                 payload_issue(&header, crypt, ordinal).or_else(|| {
                     (final_part && header.blake2sp.is_some() && initial.header.blake2sp.is_none())
@@ -612,16 +570,13 @@ impl Catalogue {
         };
         let issue_minimum = u64::from(issue.is_some() && self.session.issues.len() == self.session.issues.capacity())
             * size_of::<RarFailure>() as u64;
-        let part_index = self.session.parts.len();
+        let part_index = self.session.model.parts.len();
         if associated {
-            let base = add(self.capacity_without::<Part>(self.session.parts.capacity())?, issue_minimum)?;
-            reserve_one(&mut self.session.parts, base, self.options.limits.capacity)?;
+            let base = add(self.capacity_without::<Part>(self.session.model.parts.capacity())?, issue_minimum)?;
+            reserve_one(&mut self.session.model.parts, base, self.options.limits.capacity)?;
             let issue = self.retain_issue(issue)?;
-            let member = self.session.members.last_mut().unwrap();
-            member.parts.end += 1;
-            member.packed_size = add(member.packed_size, header.packed_size)?;
-            member.unpacked_size = member.unpacked_size.or(size);
-            member.complete = final_part;
+            let member = self.session.model.members.last_mut().unwrap();
+            member.append(&header, &part)?;
             if issue.is_some() {
                 member.issue = issue;
             }
@@ -637,23 +592,25 @@ impl Catalogue {
                 add(header.name.capacity() as u64, wire.name.capacity() as u64)?,
                 target.map_or(0, |t| t.capacity() as u64),
             )?;
-            let part_minimum =
-                u64::from(self.session.parts.len() == self.session.parts.capacity()) * size_of::<Part>() as u64;
+            let part_minimum = u64::from(self.session.model.parts.len() == self.session.model.parts.capacity())
+                * size_of::<Part>() as u64;
             let base = add(
-                self.capacity_without::<Member>(self.session.members.capacity())?,
+                self.capacity_without::<Member>(self.session.model.members.capacity())?,
                 add(add(allocation, part_minimum)?, issue_minimum)?,
             )?;
-            reserve_one(&mut self.session.members, base, self.options.limits.capacity)?;
-            let base =
-                add(self.capacity_without::<Part>(self.session.parts.capacity())?, add(allocation, issue_minimum)?)?;
-            reserve_one(&mut self.session.parts, base, self.options.limits.capacity)?;
+            reserve_one(&mut self.session.model.members, base, self.options.limits.capacity)?;
+            let base = add(
+                self.capacity_without::<Part>(self.session.model.parts.capacity())?,
+                add(allocation, issue_minimum)?,
+            )?;
+            reserve_one(&mut self.session.model.parts, base, self.options.limits.capacity)?;
             self.owned_capacity = add(self.owned_capacity, allocation)?;
             let issue = self.retain_issue(issue)?;
             self.session.usage.entries = entries;
             self.session.usage.name_bytes = names;
             let compressed = header.method != 0 && !header.is_dir() && header.redirection.is_none();
             let chain = if compressed {
-                let index = self.session.members.len();
+                let index = self.session.model.members.len();
                 if !header.solid {
                     self.chain = Some(index);
                 } else if self.history_barrier {
@@ -661,7 +618,7 @@ impl Catalogue {
                 } else if let Some(previous) = self.last_compressed
                     && self.chain.is_some()
                 {
-                    self.session.members[previous].has_successor = true;
+                    self.session.model.members[previous].has_successor = true;
                 }
                 self.history_barrier = false;
                 self.last_compressed = Some(index);
@@ -669,29 +626,22 @@ impl Catalogue {
             } else {
                 None
             };
-            self.session.members.push(Member {
-                header,
-                wire,
-                parts: part_index..part_index + 1,
-                packed_size: part.packed_size,
-                unpacked_size: size,
-                complete: final_part,
-                issue,
-                chain,
-                has_successor: false,
-            });
+            let mut member = Member::new(header, wire, part_index, &part)?;
+            member.issue = issue;
+            member.chain = chain;
+            self.session.model.members.push(member);
         }
-        self.session.parts.push(part);
+        self.session.model.parts.push(part);
         self.pending = !final_part;
         self.update_capacity()
     }
 
     fn end_incomplete(&mut self) -> RarResult<()> {
         if std::mem::take(&mut self.pending) {
-            let index = self.session.members.len() - 1;
-            if self.session.members[index].issue.is_none() {
+            let index = self.session.model.members.len() - 1;
+            if self.session.model.members[index].issue.is_none() {
                 let issue = member_integrity(index as u64, RarIntegrityReason::MissingSplitContinuation);
-                self.session.members[index].issue = self.retain_issue(Some(issue))?;
+                self.session.model.members[index].issue = self.retain_issue(Some(issue))?;
                 self.update_capacity()?;
             }
         }
@@ -722,8 +672,8 @@ impl Catalogue {
                 )?,
             )?,
             add(
-                vector_bytes::<Member>(self.session.members.capacity())?,
-                vector_bytes::<Part>(self.session.parts.capacity())?,
+                vector_bytes::<Member>(self.session.model.members.capacity())?,
+                vector_bytes::<Part>(self.session.model.parts.capacity())?,
             )?,
         )
     }
@@ -1119,10 +1069,15 @@ mod tests {
         assert_eq!(session.entries().len(), 9);
         assert_eq!(session.issues.len(), 9);
         let variable = session.volumes[0].path.capacity()
-            + session.members.iter().map(|row| row.header.name.capacity() + row.wire.name.capacity()).sum::<usize>();
+            + session
+                .model
+                .members
+                .iter()
+                .map(|row| row.header.name.capacity() + row.wire.name.capacity())
+                .sum::<usize>();
         let actual = variable
-            + session.members.capacity() * size_of::<Member>()
-            + session.parts.capacity() * size_of::<Part>()
+            + session.model.members.capacity() * size_of::<Member>()
+            + session.model.parts.capacity() * size_of::<Part>()
             + session.issues.capacity() * size_of::<RarFailure>()
             + session.volumes.capacity() * size_of::<HeldVolume>();
         assert_eq!(session.usage().capacity, actual as u64);

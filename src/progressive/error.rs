@@ -100,6 +100,8 @@ pub enum ChecksumScope {
 }
 #[derive(Debug)]
 pub enum FailureKind {
+    Malformed(&'static str),
+    Rar(Box<crate::error::RarFailure>),
     PasswordRequired,
     WrongPassword,
     ChecksumMismatch {
@@ -153,6 +155,7 @@ impl std::error::Error for ProgressiveFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
             FailureKind::Input { cause, .. } | FailureKind::Output { cause, .. } => Some(cause),
+            FailureKind::Rar(failure) => Some(failure.as_ref()),
             _ => None,
         }
     }

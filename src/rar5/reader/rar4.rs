@@ -231,6 +231,7 @@ impl Volume {
         })();
         let (header, encoded) = result.map_err(|error| match error {
             FileParseError::Allocation => allocation(),
+            FileParseError::Progressive(_) => unreachable!("RAR4 catalogue uses ScanBudget"),
             FileParseError::Format(Error::Unsupported(_)) => self.rar4_unsupported("header extension or name encoding"),
             FileParseError::Format(error) => self.parse_fault(error),
         })?;
@@ -240,7 +241,7 @@ impl Volume {
         let mut name = Vec::new();
         name.try_reserve_exact(encoded.len()).map_err(|_| allocation())?;
         name.extend_from_slice(encoded);
-        Ok((header, FileWire { name, compression: 0 }))
+        Ok((header, FileWire { name, compression: 0, extent: data_at - bytes.len() as u64..data_at }))
     }
 }
 

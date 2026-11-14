@@ -382,10 +382,10 @@ impl Guard {
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let header = &session.members[index].header;
+                let header = &session.model.members[index].header;
                 // Precharge a conservative bound for UTF-8 validation,
                 // component splitting, normalization, copying and final parsing.
-                let name_work = checked(header.name.len() as u64, session.members[index].wire.name.len() as u64)?
+                let name_work = checked(header.name.len() as u64, session.model.members[index].wire.name.len() as u64)?
                     .checked_mul(8)
                     .and_then(|n| n.checked_add(2))
                     .ok_or(RarDiagnosticFailure::CounterOverflow)?;
@@ -397,7 +397,9 @@ impl Guard {
                 if targets > c.limits.diagnostics.targets {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Targets));
                 }
-                if header.name.contains('\u{fffe}') || std::str::from_utf8(&session.members[index].wire.name).is_err() {
+                if header.name.contains('\u{fffe}')
+                    || std::str::from_utf8(&session.model.members[index].wire.name).is_err()
+                {
                     return Err(RarDiagnosticFailure::ProjectionUnavailable { ordinal: index as u64 });
                 }
                 // Temporary projection capacity is charged while live, then released.

@@ -115,13 +115,13 @@ impl RarSession {
                 match result {
                     RarOutcome::Verified { bytes, checks, .. } => {
                         spool.prepare_copy(bytes, &mut attempts).map_err(Arc::new)?;
-                        let member = &session.members[index];
+                        let member = &session.model.members[index];
                         let mut volumes = if member.header.format == RarFormat::Rar5 && member.header.method != 0 {
                             run.history_volumes
                         } else {
                             [0; VOLUME_WORDS]
                         };
-                        mark_volumes(&mut volumes, &session.parts[member.parts.clone()]);
+                        mark_volumes(&mut volumes, &session.model.parts[member.parts.clone()]);
                         check_volumes(session, &volumes)?;
                         spool.copy_to(output, &mut accepted, &mut run.buffer, &mut attempts).map_err(Arc::new)?;
                         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Printed })

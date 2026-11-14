@@ -17,6 +17,12 @@
 //! RAR 5.0 archive blocks, read from the published archive layout: the signature, the main header, file and service
 //! headers with their extra records, and the end of archive header.
 
+#[allow(dead_code, reason = "private progressive producers are wired by the next session task")]
+pub(crate) mod framing;
+#[allow(dead_code, reason = "private progressive producers are wired by the next session task")]
+pub(crate) mod member;
+#[allow(dead_code, reason = "private progressive producers are wired by the next session task")]
+pub(crate) mod physical;
 pub mod reader;
 pub mod session;
 pub(crate) mod source;
@@ -292,14 +298,16 @@ pub(crate) type MemberCrypt =
     Option<std::result::Result<crate::crypto::Rar5CryptParams, crate::crypto::Rar5CryptError>>;
 
 pub(crate) fn parse_file_detailed(head: &BlockHead, body: &[u8], extra: &[u8]) -> Result<(FileHeader, MemberCrypt)> {
-    match parse_file_impl(head, body, extra, false) {
+    match parse_file_impl(head, body, extra, false, None) {
         Ok((file, crypt, _)) => Ok((file, crypt)),
         Err(FileParseError::Format(error)) => Err(error),
         Err(FileParseError::Allocation) => unreachable!("legacy names use the legacy allocation path"),
+        Err(FileParseError::Progressive(_)) => unreachable!("legacy names have no progressive admission"),
     }
 }
 
 enum FileParseError {
+    Progressive(crate::progressive::ProgressiveFailure),
     Format(Error),
     Allocation,
 }
@@ -313,6 +321,7 @@ impl From<Error> for FileParseError {
 pub(super) struct FileWire {
     pub(super) name: Vec<u8>,
     pub(super) compression: u64,
+    pub(super) extent: std::ops::Range<u64>,
 }
 
 fn parse_file_impl(
@@ -320,6 +329,7 @@ fn parse_file_impl(
     body: &[u8],
     extra: &[u8],
     catalogue: bool,
+    usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<(FileHeader, MemberCrypt, Option<FileWire>), FileParseError> {
     let mut c = Cursor::new(body);
     let mut f = FileHeader {
@@ -356,20 +366,37 @@ fn parse_file_impl(
     f.host_os = c.vint()?;
     let name_len = c.vsize()?;
     let name = c.bytes(name_len)?;
-    f.name = display_name(name, catalogue)?;
-    let crypt = parse_file_extra(&mut f, extra, catalogue)?;
+    f.name = display_name_admitted(name, catalogue, usage)?;
+    let crypt = parse_file_extra(&mut f, extra, catalogue, usage)?;
     let wire = if catalogue && !f.service {
+        if let Some(usage) = usage {
+            usage
+                .charge(crate::progressive::Resource::NameBytes, name.len() as u64)
+                .map_err(FileParseError::Progressive)?;
+            usage
+                .charge(crate::progressive::Resource::MetadataBytes, name.len() as u64)
+                .map_err(FileParseError::Progressive)?;
+        }
         let mut encoded = Vec::new();
         encoded.try_reserve_exact(name.len()).map_err(|_| FileParseError::Allocation)?;
+        if let Some(usage) = usage {
+            usage
+                .charge(crate::progressive::Resource::MetadataBytes, (encoded.capacity() - name.len()) as u64)
+                .map_err(FileParseError::Progressive)?;
+        }
         encoded.extend_from_slice(name);
-        Some(FileWire { name: encoded, compression: info })
+        Some(FileWire { name: encoded, compression: info, extent: head.data_at..head.data_at })
     } else {
         None
     };
     Ok((f, crypt, wire))
 }
 
-fn display_name(bytes: &[u8], catalogue: bool) -> std::result::Result<String, FileParseError> {
+fn display_name_admitted(
+    bytes: &[u8],
+    catalogue: bool,
+    usage: Option<&crate::progressive::Usage>,
+) -> std::result::Result<String, FileParseError> {
     if !catalogue {
         return Ok(String::from_utf8_lossy(bytes).into_owned());
     }
@@ -383,8 +410,17 @@ fn display_name(bytes: &[u8], catalogue: bool) -> std::result::Result<String, Fi
             })
         })
         .ok_or(FileParseError::Allocation)?;
+    if let Some(usage) = usage {
+        usage.charge(crate::progressive::Resource::NameBytes, len as u64).map_err(FileParseError::Progressive)?;
+        usage.charge(crate::progressive::Resource::MetadataBytes, len as u64).map_err(FileParseError::Progressive)?;
+    }
     let mut text = String::new();
     text.try_reserve_exact(len).map_err(|_| FileParseError::Allocation)?;
+    if let Some(usage) = usage {
+        usage
+            .charge(crate::progressive::Resource::MetadataBytes, (text.capacity() - len) as u64)
+            .map_err(FileParseError::Progressive)?;
+    }
     for chunk in bytes.utf8_chunks() {
         text.push_str(chunk.valid());
         if !chunk.invalid().is_empty() {
@@ -398,6 +434,7 @@ fn parse_file_extra(
     f: &mut FileHeader,
     extra: &[u8],
     catalogue: bool,
+    usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<MemberCrypt, FileParseError> {
     let mut crypt = None;
     let mut c = Cursor::new(extra);
@@ -433,7 +470,7 @@ fn parse_file_extra(
                     f.redirection = Some(Redirection::Unknown(kind));
                     continue;
                 }
-                let target = display_name(target, catalogue)?;
+                let target = display_name_admitted(target, catalogue, usage)?;
                 f.redirection = Some(match kind {
                     1 => Redirection::UnixSymlink(target),
                     2 => Redirection::WindowsSymlink(target),

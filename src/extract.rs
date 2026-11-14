@@ -30,6 +30,7 @@ use crate::blake2sp::Blake2sp;
 use crate::error::{Error, RarPasswordEvidence, RarScope, Result};
 use crate::output::{Output, temporary};
 use crate::path::sanitize;
+use crate::rar5::member::{CipherBlocks, MemberMachine, PendingCipher};
 use crate::rar5::reader::{Block, ReadDataError, SIGNATURE_PROBE_BYTES, Volume, signature_end};
 use crate::rar5::unpack::rar4::{Rar4DecodeError, Rar4Decoder};
 use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
@@ -785,81 +786,11 @@ fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-pub(crate) struct PendingCipher {
-    aes: crate::crypto::AesKey,
-    iv: [u8; 16],
-    rem: Vec<u8>,
-    hash_key: [u8; 32],
-    stored_padding: Option<StoredCipherPadding>,
-    blocks: Option<CipherBlocks>,
-}
-
-struct StoredCipherPadding {
-    size: u64,
-    skipped: usize,
-}
-
-#[derive(Default)]
-pub(crate) struct CipherBlocks {
-    header: Vec<u8>,
-    left: usize,
-    last: bool,
-    ended: bool,
-    padding: usize,
-}
-
-impl CipherBlocks {
-    pub(crate) fn feed(&mut self, mut data: &[u8], decoder: &mut Unpacker, sink: &mut dyn Sink) -> Result<()> {
-        while !data.is_empty() {
-            if self.ended {
-                if data.len() > 15 - self.padding {
-                    return Err(Error::Corrupt("excess encrypted RAR5 padding"));
-                }
-                self.padding += data.len();
-                return Ok(());
-            }
-            if self.left > 0 {
-                let count = self.left.min(data.len());
-                decoder.feed(&data[..count], sink)?;
-                data = &data[count..];
-                self.left -= count;
-                self.ended = self.last && self.left == 0;
-                continue;
-            }
-            self.header.push(data[0]);
-            data = &data[1..];
-            if let Some((_, payload, flags)) = crate::rar5::unpack::block_header(&self.header)? {
-                decoder.feed(&self.header, sink)?;
-                self.header.clear();
-                self.left = payload;
-                self.last = flags & 0x40 != 0;
-                self.ended = self.last && self.left == 0;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn finish(&self) -> Result<()> {
-        if !self.ended || self.left != 0 || !self.header.is_empty() {
-            return Err(Error::Truncated);
-        }
-        Ok(())
-    }
-}
-
 /// A file being read, whose data may run on into later volumes.
 pub(crate) struct Pending {
     context: EntryContext,
     out: Option<Output>,
-    hasher: crate::crc32::Hasher,
-    /// the decoder works out the CRC32 instead, and hands it over as `crc`: it does so for every compressed file
-    /// whose bytes aren't gathered for a worker
-    decoder_crc: bool,
-    crc: Option<u32>,
-    /// kept only when the archive stores a BLAKE2sp hash for this file
-    blake: Option<Blake2sp>,
-    /// unpacked bytes so far
-    bytes: u64,
+    checks: crate::rar5::member::InnerChecks,
     /// something already went wrong: read past the rest of it
     failed: bool,
     /// decoded only to keep a solid stream going: not counted, not written
@@ -876,16 +807,24 @@ pub(crate) struct Pending {
     mem: Option<Vec<u8>>,
 }
 
+impl std::ops::Deref for Pending {
+    type Target = crate::rar5::member::InnerChecks;
+    fn deref(&self) -> &Self::Target {
+        &self.checks
+    }
+}
+impl std::ops::DerefMut for Pending {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.checks
+    }
+}
+
 impl Pending {
     pub(crate) fn new(h: &FileHeader, context: EntryContext) -> Self {
         Pending {
             context,
             out: None,
-            hasher: crate::crc32::Hasher::new(),
-            decoder_crc: h.format == RarFormat::Rar5 && h.method != 0 && !h.encrypted,
-            crc: None,
-            blake: h.blake2sp.map(|_| Blake2sp::new()),
-            bytes: 0,
+            checks: crate::rar5::member::InnerChecks::new(h),
             failed: false,
             passive: false,
             compressed: h.method != 0,
@@ -931,18 +870,10 @@ impl Pending {
         mut chunk: &[u8],
         admit: impl FnOnce(&[u8]) -> crate::error::RarResult<()>,
     ) -> crate::error::RarResult<()> {
-        if let Some(padding) = self.cipher.as_mut().and_then(|c| c.stored_padding.as_mut()) {
-            let count = padding.size.saturating_sub(self.bytes).min(chunk.len() as u64) as usize;
-            let skipped = chunk.len() - count;
-            if skipped > 15 - padding.skipped {
-                return Err(batch::decoder_failure(
-                    Error::Corrupt("excess encrypted RAR5 padding"),
-                    self.context.scope(),
-                    self.context.password,
-                ));
-            }
-            padding.skipped += skipped;
-            chunk = &chunk[..count];
+        if let Some(cipher) = self.cipher.as_mut().filter(|cipher| cipher.stored_padding.is_some()) {
+            chunk = cipher
+                .trim_stored(chunk, self.checks.bytes)
+                .map_err(|error| batch::decoder_failure(error, self.context.scope(), self.context.password))?;
             if chunk.is_empty() {
                 return Ok(());
             }
@@ -1001,16 +932,7 @@ impl Pending {
         let keys = crate::crypto::derive_rar5_keys(password, params.kdf_count, &params.salt, params.check)
             .map_err(|error| RarFailure::crypt(error, context.scope()))?;
         context.password = keys.evidence;
-        let aes = crate::crypto::AesKey::new(&keys.key)
-            .ok_or(RarFailure::Internal(RarInternal::Invariant("invalid encryption key")))?;
-        Ok(PendingCipher {
-            aes,
-            iv: params.iv,
-            rem: Vec::new(),
-            hash_key: keys.hash_key,
-            stored_padding: if compressed { None } else { size.map(|size| StoredCipherPadding { size, skipped: 0 }) },
-            blocks: compressed.then(CipherBlocks::default),
-        })
+        Ok(PendingCipher::from_keys(params, keys, compressed, size))
     }
 
     pub(crate) fn start_selected_cipher(
@@ -1045,66 +967,8 @@ impl Pending {
         blake2sp: Option<[u8; 32]>,
         keyed: bool,
     ) -> std::result::Result<(), RarFailure> {
-        let raw_crc = if self.decoder_crc { self.crc } else { Some(self.hasher.clone().finalize()) };
-        let blake = self.blake.take();
-        let hash_key = self.hash_key(keyed);
-        let got_crc = match hash_key {
-            Some(key) => raw_crc.map(|crc| crate::crypto::rar5_tweak_crc32(crc, key)),
-            None => raw_crc,
-        };
-        let crc_bad = crc32.is_some_and(|want| got_crc != Some(want));
-        let blake_bad = match (blake2sp, blake) {
-            (Some(want), Some(got)) => {
-                let digest = got.finish();
-                hash_key.map_or(digest, |key| crate::crypto::rar5_tweak_blake2sp(&digest, key)) != want
-            }
-            (Some(_), None) => return Err(self.context.integrity(RarIntegrityReason::DeclaredHashUnavailable, false)),
-            _ => false,
-        };
-        if crc_bad || blake_bad {
-            return Err(self
-                .context
-                .integrity(RarIntegrityReason::FinalChecks { crc32: crc_bad, blake2sp: blake_bad }, true));
-        }
-        if let Some(size) = size
-            && self.bytes != size
-        {
-            return Err(self
-                .context
-                .integrity(RarIntegrityReason::DecodedSize { expected: size, actual: self.bytes }, true));
-        }
-        Ok(())
-    }
-}
-
-impl PendingCipher {
-    pub(crate) fn decrypt_selected(&mut self, chunk: &[u8], scratch: &mut Vec<u8>) {
-        scratch.clear();
-        scratch.extend_from_slice(&self.rem);
-        scratch.extend_from_slice(chunk);
-        let aligned = scratch.len() & !15;
-        self.rem.clear();
-        self.rem.extend_from_slice(&scratch[aligned..]);
-        scratch.truncate(aligned);
-        self.aes.decrypt_cbc_in_place(&mut self.iv, scratch);
-    }
-
-    pub(crate) fn take_blocks(&mut self) -> Option<CipherBlocks> {
-        self.blocks.take()
-    }
-
-    pub(crate) fn put_blocks(&mut self, blocks: Option<CipherBlocks>) {
-        self.blocks = blocks;
-    }
-
-    pub(crate) fn finish_selected(&self, context: &EntryContext) -> std::result::Result<(), RarFailure> {
-        if !self.rem.is_empty() {
-            return Err(context.integrity(RarIntegrityReason::IncompleteCipherBlock, false));
-        }
-        self.blocks
-            .as_ref()
-            .map_or(Ok(()), CipherBlocks::finish)
-            .map_err(|error| *batch::decoder_failure(error, context.scope(), context.password).failure)
+        let key = self.cipher.as_ref().filter(|_| keyed).map(|cipher| &cipher.hash_key);
+        self.checks.verify(&self.context, size, crc32, blake2sp, key)
     }
 }
 
@@ -1295,7 +1159,7 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
                 packed,
                 method: 0,
                 dictionary: 0,
-                size: c.size.unwrap_or(p.bytes),
+                size: c.size.unwrap_or(p.checks.bytes),
                 size_checked: c.size.is_some(),
                 crc32: c.crc32,
                 blake2sp: c.blake2sp,
@@ -2346,8 +2210,7 @@ impl Run<'_, '_, '_> {
         };
         // stored data is only checked (and copied) as it comes; compressed data goes to the decoder
         vol.read_fast(self.threads > 1 && !p.compressed && p.cipher.is_none());
-        // The decoder needs the pending member as a sink while the framing state is borrowed.
-        let mut blocks = p.cipher.as_mut().and_then(|cipher| cipher.blocks.take());
+        let mut machine = MemberMachine::from_state(h, p.context.clone(), p.cipher.take(), stream.take(), p.bytes);
         let read = if let Some(error) = rar4_error {
             Err(ReadDataError::Sink(MemberDecodeError::Rar4(error)))
         } else {
@@ -2355,48 +2218,26 @@ impl Run<'_, '_, '_> {
                 if let Some(selection) = &self.selection {
                     selection.cancel.check_io().map_err(|e| MemberDecodeError::Decoder(e.into()))?;
                 }
-                let chunk = &piece.bytes()[range.clone()];
-                if split_after {
-                    part.update(chunk);
-                    if let Some(b) = part_blake.as_mut() {
-                        b.update(chunk);
-                    }
-                }
-                if let Some(PendingCipher { aes, iv, rem, .. }) = p.cipher.as_mut() {
-                    let mut dec_buf;
-                    let to_feed: &[u8] = if !rem.is_empty() || !chunk.len().is_multiple_of(16) {
-                        rem.extend_from_slice(chunk);
-                        let aligned = rem.len() & !15;
-                        if aligned == 0 {
-                            return Ok(());
+                if let Some(decoder) = rar4.as_mut() {
+                    let chunk = &piece.bytes()[range];
+                    if split_after {
+                        part.update(chunk);
+                        if let Some(b) = &mut part_blake {
+                            b.update(chunk);
                         }
-                        dec_buf = rem.drain(..aligned).collect::<Vec<u8>>();
-                        aes.decrypt_cbc_in_place(iv, &mut dec_buf);
-                        &dec_buf
-                    } else {
-                        dec_buf = chunk.to_vec();
-                        aes.decrypt_cbc_in_place(iv, &mut dec_buf);
-                        &dec_buf
-                    };
-                    with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
-                        Some(decoder) => blocks
-                            .as_mut()
-                            .ok_or(Error::Corrupt("missing encrypted block state"))?
-                            .feed(to_feed, decoder, sink),
-                        None => sink.put(to_feed),
-                    })
-                } else if let Some(decoder) = rar4.as_mut() {
+                    }
                     with_rar4_member_sink(&mut p, self.selection.as_mut(), |sink| decoder.feed(chunk, sink).map(|_| ()))
                 } else {
-                    with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
-                        Some(u) => u.feed_shared(piece, range, sink),
-                        None => sink.put(chunk),
+                    with_member_sink(&mut p, self.selection.as_mut(), |sink| {
+                        machine.feed_shared_core(piece, range, sink)
                     })
                 }
             })
         };
-        if let Some(cipher) = p.cipher.as_mut() {
-            cipher.blocks = blocks;
+        p.cipher = machine.cipher.take();
+        stream = machine.decoder.take();
+        if h.format == RarFormat::Rar5 {
+            (part, part_blake) = machine.into_part_hashes();
         }
         let decoder_fault = |e: Error, p: &Pending, size| {
             batch::decoder_failure_with_size(e, p.context.scope(), p.context.password, size)
@@ -2490,18 +2331,10 @@ impl Run<'_, '_, '_> {
         if split_after {
             // The hash mode belongs to this part, even though CBC and its derived key span the member.
             let hash_key = p.hash_key(h.crypt.as_ref().is_some_and(|crypt| crypt.tweaked_crc));
-            let crc_bad = h.crc32.is_some_and(|want| {
-                let crc = part.finalize();
-                hash_key.map_or(crc, |key| crate::crypto::rar5_tweak_crc32(crc, key)) != want
-            });
-            let blake_bad = h.blake2sp.zip(part_blake).is_some_and(|(want, got)| {
-                let digest = got.finish();
-                hash_key.map_or(digest, |key| crate::crypto::rar5_tweak_blake2sp(&digest, key)) != want
-            });
-            if crc_bad || blake_bad {
-                let keyed = hash_key.is_some();
-                let reason = RarIntegrityReason::PackedPiece { crc32: crc_bad, blake2sp: blake_bad, keyed };
-                let failure = Arc::new(p.context.integrity(reason, keyed));
+            let checks =
+                crate::rar5::session::RarChecks { crc32: h.crc32, blake2sp: h.blake2sp, keyed: hash_key.is_some() };
+            if let Err(failure) = crate::rar5::member::verify_packed(&p.context, checks, part, part_blake, hash_key) {
+                let failure = Arc::new(failure);
                 if !p.passive {
                     self.reports.failed(&p.context, Arc::clone(&failure), "checksum error in a volume's part")?;
                 }

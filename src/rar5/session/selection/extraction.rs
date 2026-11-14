@@ -101,7 +101,7 @@ impl<'a> Extraction<'a> {
         hooks: &mut impl ExtractionHooks,
     ) -> Result<RarOutcome, SelectedStop> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
-        let member = &session.members[index];
+        let member = &session.model.members[index];
         let header = &member.header;
         if let Some(version) = header.version {
             return Ok(RarOutcome::Skipped(RarSkipReason::OlderVersion(version)));
@@ -125,8 +125,8 @@ impl<'a> Extraction<'a> {
                     &path,
                     path.capacity(),
                     &self.options.dest,
-                    &session.members[index].header,
-                    &session.members[index].wire.name,
+                    &session.model.members[index].header,
+                    &session.model.members[index].wire.name,
                 )?;
                 hooks.before_directories();
                 self.ensure_root().map_err(own_fault)?;
@@ -189,13 +189,14 @@ impl<'a> Extraction<'a> {
         event(Event::BeforePublish, &target).map_err(|source| output_fault(IoOperation::Publish, &target, source))?;
 
         check_cancel(&session.options.cancel).map_err(own_fault)?;
-        let mut sources =
-            if session.members[index].header.format == RarFormat::Rar5 && session.members[index].header.method != 0 {
-                run.history_volumes
-            } else {
-                [0; VOLUME_WORDS]
-            };
-        mark_volumes(&mut sources, &session.parts[session.members[index].parts.clone()]);
+        let mut sources = if session.model.members[index].header.format == RarFormat::Rar5
+            && session.model.members[index].header.method != 0
+        {
+            run.history_volumes
+        } else {
+            [0; VOLUME_WORDS]
+        };
+        mark_volumes(&mut sources, &session.model.parts[session.model.members[index].parts.clone()]);
         check_volumes(session, &sources)?;
         hooks.recheck(session, &target, initial)?;
         if self.inspect_target(session, &target)? != initial {
