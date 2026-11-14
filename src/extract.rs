@@ -580,6 +580,52 @@ impl SelectedEntry {
         }
     }
 
+    /// Prepares one final ZIP diagnostic before payload work; non-ZIP keeps its incumbent scope.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(clippy::result_large_err)]
+    pub fn prepare_zip_diagnostics<'o>(
+        &mut self,
+        options: &'o Options,
+        context: &mut crate::zip::EncryptedReadContext,
+        which: crate::zip::ZipDiagnosticSink,
+        sink: &dyn std::os::fd::AsFd,
+    ) -> crate::zip::ZipReadResult<Option<crate::zip::ZipDirectDiagnostics<'o>>> {
+        match &mut self.source {
+            SelectedSource::Zip(owner) => {
+                owner.prepare_diagnostics(self.index, options, &self.cancel, context, which, sink).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    /// Consumes the original prepared capability and preserves the operation receipt.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn emit_zip_diagnostic<T, W: std::io::Write + std::os::fd::AsFd, F>(
+        &mut self,
+        token: crate::zip::ZipDirectDiagnostics<'_>,
+        context: &mut crate::zip::EncryptedReadContext,
+        operation: crate::zip::ZipReadResult<T>,
+        out: &mut W,
+        render: F,
+    ) -> crate::zip::ZipDiagnosticCompletion<T>
+    where
+        F: FnOnce(
+            &crate::zip::ZipReadResult<T>,
+            crate::zip::ZipDiagnosticStatus<'_>,
+            &mut crate::zip::ZipDiagnosticWriter<'_, W>,
+        ) -> crate::zip::ZipDiagnosticResult<()>,
+    {
+        match &mut self.source {
+            SelectedSource::Zip(owner) => {
+                owner.emit_diagnostic(Some(self.index), token, context, operation, out, render)
+            }
+            _ => crate::zip::ZipDiagnosticCompletion::refused(
+                token,
+                context,
+                operation,
+                crate::zip::ReadFault::UnsupportedCheckedFormat.into(),
+            ),
+        }
+    }
     /// Borrows the original ZIP record; other formats have no ZIP stage proof.
     #[allow(clippy::result_large_err)]
     pub fn zip_stage_entry(&mut self) -> crate::zip::ZipReadResult<Option<crate::zip::ZipStageEntry<'_>>> {
@@ -876,6 +922,66 @@ fn rar_selected_header_from_volume(
         Ok(false)
     })?;
     header.ok_or_else(|| Error::Unsupported("entry index is out of range".into()))
+}
+
+/// Format-specific metadata returned by checked projected inspection.
+///
+/// Available on macOS and Linux. ZIP retains its original projected catalogue
+/// and source; non-ZIP listings keep their incumbent ownership/reopen scope.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[non_exhaustive]
+#[allow(clippy::large_enum_variant)] // Move the original ZIP owner inline without another allocation.
+pub enum ProjectedInspection {
+    /// The original checked ZIP source and its single projected catalogue.
+    Zip(crate::zip::ProjectedReadSession),
+    /// The existing listing for TAR, compressed streams, or RAR.
+    Other(Vec<Entry>),
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+thread_local! {
+    pub(crate) static PROJECTED_INSPECTION_LEGACY_COMPLETED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Inspects an archive with one checked dispatch and cooperative cancellation.
+///
+/// Available on macOS and Linux. ZIP and TAR/codec head signatures take
+/// precedence; an unknown head searches the bounded RAR signature window before
+/// trying ZIP. Recognized format errors are terminal, including RAR initializer,
+/// password, member and later-volume errors. `password` decrypts RAR headers;
+/// supply ZIP payload passwords separately to checked reads.
+///
+/// ZIP moves the held source, original projected catalogue and cumulative
+/// dispatch/parser budget into the returned session. Successful sessions retain
+/// the existing ordinary file-drop lifecycle. TAR retires the checked source
+/// before its incumbent pathname listing; other non-ZIP listings retain their
+/// existing ownership scope. Cancellation is checked before acquisition and
+/// after successful legacy listing; a legacy failure keeps its original error.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)] // Preserve inline checked operation/source/cleanup evidence.
+pub fn inspect_projected_cancelable(
+    first: &Path,
+    password: Option<&str>,
+    cancel: &Cancellation,
+) -> crate::zip::ZipReadResult<ProjectedInspection> {
+    use crate::zip::ReadFault;
+    match checked_route(first, cancel)? {
+        CheckedRoute::Zip(opened) => opened.into_zip_projected(cancel).map(ProjectedInspection::Zip),
+        CheckedRoute::Legacy(route) => {
+            let entries = route.list(first, password).map_err(ReadFault::Legacy)?;
+            #[cfg(test)]
+            {
+                let completed = PROJECTED_INSPECTION_LEGACY_COMPLETED.with(|s| s.borrow_mut().take());
+                if let Some(completed) = completed {
+                    completed();
+                }
+            }
+            if cancel.is_canceled() {
+                return Err(ReadFault::Cancelled.into());
+            }
+            Ok(ProjectedInspection::Other(entries))
+        }
+    }
 }
 
 /// Format-specific metadata returned by archive inspection.

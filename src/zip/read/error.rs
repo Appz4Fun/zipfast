@@ -303,6 +303,10 @@ impl ZipReadError {
             policy_metadata: PolicyMetadataUsage::default(),
         }
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn diagnostic_only() -> Self {
+        Self::empty(ZipReadErrorKind::Diagnostic)
+    }
     pub fn parser_usage(&self) -> Option<crate::zip::Usage> {
         self.parser_usage
     }

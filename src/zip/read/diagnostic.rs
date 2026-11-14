@@ -21,6 +21,8 @@ use crate::extract::Options;
 use crate::zip::{ZipEntry, session::SourceBinding};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
+mod direct;
+pub use direct::{ZipDiagnosticCompletion, ZipDirectDiagnostics};
 mod listing;
 mod terminal;
 mod writer;
@@ -138,6 +140,42 @@ pub(super) struct DiagnosticState {
     pub(super) attempted: bool,
     pub(super) cwd: Option<policy::OwnedMetadata<u8>>,
 }
+// Only this one-sink state persists across a direct selected payload phase.
+pub(super) struct DirectDiagnosticState {
+    descriptor: Descriptor,
+    which: ZipDiagnosticSink,
+    pub(super) usage: ZipDiagnosticUsage,
+    attempted: bool,
+    pub(super) cwd: Option<policy::OwnedMetadata<u8>>,
+}
+impl DirectDiagnosticState {
+    fn pack(state: &mut DiagnosticState, which: ZipDiagnosticSink) -> Result<Self, ReadFault> {
+        let index = which.index();
+        if !state.prepared || state.sinks[1 - index].is_some() {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let descriptor = state.sinks[index].ok_or(ReadFault::InvalidPlan)?;
+        Ok(Self {
+            descriptor,
+            which,
+            usage: std::mem::take(&mut state.usage),
+            attempted: state.attempted,
+            cwd: state.cwd.take(),
+        })
+    }
+    fn expand(self) -> DiagnosticState {
+        let mut sinks = [None, None];
+        sinks[self.which.index()] = Some(self.descriptor);
+        DiagnosticState {
+            sinks,
+            serial: 1,
+            prepared: true,
+            usage: self.usage,
+            attempted: self.attempted,
+            cwd: self.cwd,
+        }
+    }
+}
 #[derive(Default)]
 pub(crate) struct Evidence {
     // Callback disposition is independent of source/boundary/write priority.
@@ -218,7 +256,7 @@ impl<'a> ZipDiagnosticScope<'a> {
         Ok(Self {
             inner: ScopeInner::Bound(BoundScope {
                 source: SourceParts::Retired(retired),
-                entries,
+                entries: DiagnosticEntries::Projected(entries),
                 options,
                 context,
                 state,
@@ -287,11 +325,34 @@ pub(super) struct RetiredSource {
 }
 enum SourceParts<'a> {
     Held { file: &'a File, binding: &'a mut Result<SourceBinding, io::SourceCheckError> },
+    Retained { file: &'a File, binding: &'a mut SourceBinding },
     Retired(&'a mut RetiredSource),
+}
+#[derive(Clone, Copy)]
+enum DiagnosticEntries<'a> {
+    Projected(&'a [ZipEntry]),
+    Retained(&'a crate::zip::Metadata),
+}
+impl DiagnosticEntries<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Projected(entries) => entries.len(),
+            Self::Retained(metadata) => metadata.len(),
+        }
+    }
+    fn name_host(&self, ordinal: usize) -> (&str, u8) {
+        match self {
+            Self::Projected(entries) => (&entries[ordinal].name, entries[ordinal].host),
+            Self::Retained(metadata) => {
+                let entry = metadata.view(ordinal);
+                (entry.name(), entry.creator_host())
+            }
+        }
+    }
 }
 struct BoundScope<'a> {
     source: SourceParts<'a>,
-    entries: &'a [ZipEntry],
+    entries: DiagnosticEntries<'a>,
     options: &'a Options,
     context: &'a mut EncryptedReadContext,
     state: &'a mut DiagnosticState,
@@ -316,7 +377,7 @@ impl<'a> BoundScope<'a> {
         let token = Token { action: Some(context.ledger.identity()), serial: state.serial };
         Ok(Self {
             source: SourceParts::Held { file, binding: source },
-            entries,
+            entries: DiagnosticEntries::Projected(entries),
             options,
             context,
             state,
@@ -343,7 +404,7 @@ impl<'a> BoundScope<'a> {
         let token = Token { action: Some(context.ledger.identity()), serial: state.serial };
         Ok(Self {
             source: SourceParts::Held { file, binding: source },
-            entries,
+            entries: DiagnosticEntries::Projected(entries),
             options,
             context,
             state,
@@ -362,39 +423,39 @@ impl<'a> BoundScope<'a> {
         if self.evidence.source.is_some() {
             return;
         }
-        let file = match &self.source {
-            SourceParts::Held { file, .. } => Some(*file),
-            SourceParts::Retired(_) => None,
+        fn adapt(
+            binding: &mut Result<SourceBinding, io::SourceCheckError>,
+        ) -> Result<&mut SourceBinding, io::SourceCheckError> {
+            match binding {
+                Ok(binding) => Ok(binding),
+                Err(io::SourceCheckError::Source(f)) => {
+                    let (code, raw_os_error) = f.invalidation();
+                    Err(io::SourceCheckError::Source(CheckedSourceFault::PreviouslyInvalidated { code, raw_os_error }))
+                }
+                Err(io::SourceCheckError::Admission(_)) => Err(io::SourceCheckError::Admission(ReadFault::InvalidPlan)),
+            }
+        }
+        let (file, binding) = match &mut self.source {
+            SourceParts::Held { file, binding } => (Some(*file), adapt(binding)),
+            SourceParts::Retained { file, binding } => (Some(*file), Ok(&mut **binding)),
+            SourceParts::Retired(retired) => (None, adapt(&mut retired.binding)),
         };
-        let binding = match &mut self.source {
-            SourceParts::Held { binding, .. } => &mut **binding,
-            SourceParts::Retired(retired) => &mut retired.binding,
-        };
-        let result = match binding {
-            Ok(binding) => self
-                .context
+        let result = binding.and_then(|binding| {
+            self.context
                 .ledger
                 .with_state(|s| s.charge_category(RunCategory::DiagnosticSourceGroups, 1))
-                .map_err(io::SourceCheckError::Admission)
-                .and_then(|()| {
-                    let mut observe =
-                        |stage, call: &mut dyn FnMut() -> std::io::Result<crate::zip::session::SourceStamp>| {
-                            self.context.source_stat(stage, || {
-                                self.state.usage.metadata(0)?;
-                                call()
-                            })
-                        };
-                    match file {
-                        Some(file) => binding.verify_with(file, &mut observe),
-                        None => binding.verify_retired_path(&mut observe),
-                    }
-                }),
-            Err(io::SourceCheckError::Source(f)) => {
-                let (code, raw_os_error) = f.invalidation();
-                Err(io::SourceCheckError::Source(CheckedSourceFault::PreviouslyInvalidated { code, raw_os_error }))
+                .map_err(io::SourceCheckError::Admission)?;
+            let mut observe = |stage, call: &mut dyn FnMut() -> std::io::Result<crate::zip::session::SourceStamp>| {
+                self.context.source_stat(stage, || {
+                    self.state.usage.metadata(0)?;
+                    call()
+                })
+            };
+            match file {
+                Some(file) => binding.verify_with(file, &mut observe),
+                None => binding.verify_retired_path(&mut observe),
             }
-            Err(io::SourceCheckError::Admission(_)) => Err(io::SourceCheckError::Admission(ReadFault::InvalidPlan)),
-        };
+        });
         if let Err(error) = result {
             self.evidence.source = Some(error);
         }
@@ -422,10 +483,11 @@ impl<'a> BoundScope<'a> {
     }
     fn aliases_source(&self, d: Descriptor) -> bool {
         let binding = match &self.source {
-            SourceParts::Held { binding, .. } => &**binding,
-            SourceParts::Retired(retired) => &retired.binding,
+            SourceParts::Held { binding, .. } => binding.as_ref().ok(),
+            SourceParts::Retained { binding, .. } => Some(&**binding),
+            SourceParts::Retired(retired) => retired.binding.as_ref().ok(),
         };
-        binding.as_ref().is_ok_and(|s| s.stamp.dev == d.dev && s.stamp.ino == d.ino)
+        binding.is_some_and(|s| s.stamp.dev == d.dev && s.stamp.ino == d.ino)
     }
     fn inspect_path(
         &mut self,
@@ -523,8 +585,8 @@ impl<'a> BoundScope<'a> {
         current: bool,
         sinks: &[Option<Descriptor>; 2],
     ) -> Result<(), DiagnosticBoundaryFault> {
-        let e = &self.entries[ordinal];
-        let relative = match policy::PolicyPath::normalized(&self.context.ledger, &e.name, e.host != 3, self.cancel) {
+        let (name, host) = self.entries.name_host(ordinal);
+        let relative = match policy::PolicyPath::normalized(&self.context.ledger, name, host != 3, self.cancel) {
             Ok(p) => p,
             Err(policy::PathFailure::Unsafe) => return Ok(()),
             Err(policy::PathFailure::Fault(f)) => return Err(DiagnosticBoundaryFault::Admission(f)),
@@ -609,7 +671,8 @@ impl<'a> BoundScope<'a> {
                 && self.evidence.boundary.is_none()
                 && self.evidence.cwd.is_none()
             {
-                for (ordinal, _entry) in self.entries.iter().enumerate() {
+                let range = self.ordinal.map_or(0..self.entries.len(), |i| i..i + 1);
+                for ordinal in range {
                     if self.cancel.is_canceled() {
                         self.boundary(DiagnosticBoundaryFault::Admission(ReadFault::Cancelled));
                         break;
@@ -783,6 +846,7 @@ fn classify(
     let safe = match kind {
         libc::S_IFIFO | libc::S_IFSOCK => true,
         libc::S_IFREG => false,
+        libc::S_IFCHR if exact_null_device(stat.st_rdev) => true,
         libc::S_IFCHR => {
             operation(ReadIoOperation::DescriptorMode, &mut || {
                 let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -807,4 +871,37 @@ fn classify(
 #[cfg(test)]
 pub(super) fn protocol_test_token(action: LedgerIdentity, serial: u64) -> ZipDiagnosticStop {
     ZipDiagnosticStop { token: Token { action: Some(action), serial } }
+}
+
+// Exact native device ABI, proved independently from the already observed fstat.
+// Apple cdevsw major 3 / mmrw minor 2; Linux devices.txt character 1:3.
+fn exact_null_device(device: libc::dev_t) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        libc::major(device) == 3 && libc::minor(device) == 2
+    }
+    #[cfg(target_os = "linux")]
+    {
+        libc::major(device) == 1 && libc::minor(device) == 3
+    }
+}
+
+#[cfg(test)]
+pub(super) fn direct_control_layout() -> [usize; 9] {
+    [
+        std::mem::size_of::<EncryptedReadContext>(),
+        std::mem::size_of::<projected::Action>(),
+        std::mem::size_of::<projected::ActionAuxiliary>(),
+        std::mem::size_of::<ZipDirectDiagnostics<'_>>(),
+        std::mem::size_of::<DiagnosticEntries<'_>>(),
+        std::mem::size_of::<ZipDiagnosticScope<'_>>(),
+        std::mem::size_of::<ZipDiagnosticCompletion<()>>(),
+        std::mem::size_of::<DirectDiagnosticState>(),
+        std::mem::size_of::<DiagnosticState>(),
+    ]
+}
+
+#[cfg(test)]
+pub(super) fn direct_writer_control_layout() -> [usize; 2] {
+    writer::control_layout()
 }

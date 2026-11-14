@@ -23,8 +23,9 @@ pub(crate) mod diagnostic;
 mod error;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use diagnostic::{
-    ZipDiagnosticResult, ZipDiagnosticScope, ZipDiagnosticSink, ZipDiagnosticStatus, ZipDiagnosticStop,
-    ZipDiagnosticUsage, ZipDiagnosticWriter, ZipObserverFault, ZipObserverResult, ZipRunObserver,
+    ZipDiagnosticCompletion, ZipDiagnosticResult, ZipDiagnosticScope, ZipDiagnosticSink, ZipDiagnosticStatus,
+    ZipDiagnosticStop, ZipDiagnosticUsage, ZipDiagnosticWriter, ZipDirectDiagnostics, ZipObserverFault,
+    ZipObserverResult, ZipRunObserver,
 };
 mod output;
 #[cfg(unix)]
@@ -154,10 +155,22 @@ impl Drop for EncryptedReadContext {
                 self.ledger.with_state(|s| s.poisoned = true);
             }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            if let Some(index) = action.directories
-                && index.finish(&self.ledger).is_err()
             {
-                self.ledger.with_state(|s| s.poisoned = true);
+                let owned = match action.auxiliary {
+                    projected::ActionAuxiliary::Empty => None,
+                    projected::ActionAuxiliary::Directories(index) => {
+                        if index.finish(&self.ledger).is_err() {
+                            self.ledger.with_state(|s| s.poisoned = true);
+                        }
+                        None
+                    }
+                    projected::ActionAuxiliary::DirectDiagnostics(mut state) => state.cwd.take(),
+                };
+                if let Some(cwd) = owned
+                    && cwd.finish(&self.ledger).is_err()
+                {
+                    self.ledger.with_state(|s| s.poisoned = true);
+                }
             }
             drop(action.destination);
         }
@@ -194,6 +207,9 @@ impl EncryptedReadContext {
         fd: std::os::fd::BorrowedFd<'_>,
     ) -> ZipReadResult<()> {
         use std::os::fd::AsRawFd;
+        if self.ledger.with_state(|s| s.poisoned) {
+            return Err(ReadFault::InvalidPlan.into());
+        }
         self.verify_identity(owner)?;
         self.ledger.with_state(|s| s.verify_source(source))?;
         let stat = io::operation(
@@ -207,6 +223,20 @@ impl EncryptedReadContext {
         )?;
         if source.dev == stat.st_dev as u64 && source.ino == stat.st_ino as u64 {
             return Err(ReadFault::CheckedFormat { reason: "output aliases ZIP source" }.into());
+        }
+        let conflicts = self.ledger.with_state(|s| {
+            let conflicts = stat.st_mode & libc::S_IFMT == libc::S_IFREG
+                && s.diagnostic_identities
+                    .iter()
+                    .flatten()
+                    .any(|&(dev, ino)| dev == stat.st_dev as u64 && ino == stat.st_ino as u64);
+            if conflicts {
+                s.poisoned = true;
+            }
+            conflicts
+        });
+        if conflicts {
+            return Err(ReadFault::InvalidPlan.into());
         }
         let descriptor = (fd.as_raw_fd() as usize, stat.st_dev as u64, stat.st_ino as u64, stat.st_mode as u32);
         let action = self.action.as_mut().ok_or(ReadFault::InvalidPlan)?;

@@ -451,3 +451,569 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
         }
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod projected_inspection {
+    use super::{common, fixture};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsFd;
+    use std::path::Path;
+    use zipfast::extract::{self, Cancellation, ProjectedInspection};
+    use zipfast::zip::{EncryptedReadContext, ProjectedReadScope, ReadFault, ZipReadOutput, ZipReadStage};
+
+    fn zip_bytes(prefix: &[u8]) -> Vec<u8> {
+        fixture::build(&[fixture::Member::stored(b"original", b"payload")], &[0], prefix, b"", false).bytes
+    }
+    #[allow(clippy::result_large_err)] // Preserve the public inline checked evidence in this test helper.
+    fn inspect(path: &Path, password: Option<&str>) -> zipfast::zip::ZipReadResult<ProjectedInspection> {
+        extract::inspect_projected_cancelable(path, password, &Cancellation::default())
+    }
+    fn other(path: &Path, password: Option<&str>) -> Vec<extract::Entry> {
+        match inspect(path, password).unwrap() {
+            ProjectedInspection::Other(entries) => entries,
+            _ => panic!("incumbent non-ZIP listing required"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // The final source-check closure returns fixed inline checked evidence.
+    fn original_projected_zip_supports_verified_stdout_after_generic_dispatch() {
+        for prefix in [b"".as_slice(), b"launcher".as_slice()] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let bytes = zip_bytes(prefix);
+            std::fs::write(file.path(), &bytes).unwrap();
+            let ProjectedInspection::Zip(mut session) = inspect(file.path(), None).unwrap() else {
+                panic!("original projected ZIP required")
+            };
+            assert_eq!(session.entries().len(), 1);
+            let id = session.entry_id(0).unwrap();
+            assert_eq!(session.entry(&id).unwrap().name, "original");
+            assert_eq!(session.dispatch_bytes(), bytes.len() as u64 * if prefix.is_empty() { 1 } else { 2 });
+            assert_eq!(session.bootstrap_usage().opens(), 1);
+            assert_eq!(
+                session.bootstrap_usage().bytes(),
+                session.dispatch_bytes() + session.parser_usage().fetched_bytes
+            );
+            assert!(session.bootstrap_usage().bytes() <= 129 << 20);
+            let cancel = Cancellation::default();
+            let mut context = EncryptedReadContext::for_projected(
+                &mut session,
+                ProjectedReadScope::Entry(0),
+                Some(7),
+                ZipReadOutput::VerifiedStdout,
+                None,
+                &Default::default(),
+                &cancel,
+            )
+            .unwrap();
+            assert!(ZipReadStage::prepare_stdout(session.stage_entry(0).unwrap(), &cancel, &mut context).is_err());
+            let mut out = tempfile::tempfile().unwrap();
+            session.admit_output_fd(out.as_fd(), &mut context).unwrap();
+            let mut stage =
+                ZipReadStage::prepare_stdout(session.stage_entry(0).unwrap(), &cancel, &mut context).unwrap();
+            session.read_at_with_context(0, None, 7, &cancel, &mut context, |b| stage.write_all(b, &cancel)).unwrap();
+            assert_eq!(stage.copy_verified(&mut out, &cancel, &mut context, |c| session.check_source(c)).unwrap(), 7);
+            out.seek(SeekFrom::Start(0)).unwrap();
+            let mut actual = Vec::new();
+            out.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, b"payload");
+        }
+    }
+
+    fn tar_bytes() -> Vec<u8> {
+        let mut bytes = vec![0; 2048];
+        bytes[..9].copy_from_slice(b"tar-entry");
+        bytes[100..108].copy_from_slice(b"0000644\0");
+        bytes[124..136].copy_from_slice(b"00000000003\0");
+        bytes[148..156].fill(b' ');
+        bytes[156] = b'0';
+        bytes[257..263].copy_from_slice(b"ustar\0");
+        bytes[512..515].copy_from_slice(b"tar");
+        let sum: u64 = bytes[..512].iter().map(|&b| u64::from(b)).sum();
+        bytes[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        bytes
+    }
+    #[test]
+    fn tar_and_compressed_tar_keep_head_priority_and_legacy_terminal_errors() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let tar = tar_bytes();
+        for bytes in [tar.clone(), zip_bytes(&tar)] {
+            std::fs::write(file.path(), bytes).unwrap();
+            assert_eq!(other(file.path(), None)[0].name, "tar-entry");
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar).unwrap();
+        let gzip = encoder.finish().unwrap();
+        std::fs::write(file.path(), &gzip).unwrap();
+        assert_eq!(other(file.path(), None)[0].name, "tar-entry");
+        std::fs::write(file.path(), zip_bytes(&gzip)).unwrap();
+        assert!(matches!(inspect(file.path(), None).err().unwrap().operation(), Some(ReadFault::Legacy(_))));
+    }
+
+    // Same published-layout first-party RAR4 fixture used by rar4_stored.rs.
+    fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, kind];
+        bytes.extend(flags.to_le_bytes());
+        bytes.extend(((body.len() + 7) as u16).to_le_bytes());
+        bytes.extend(body);
+        let crc = zipfast::crc32::hash(&bytes[2..]) as u16;
+        bytes[..2].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+    fn rar4() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(3u32.to_le_bytes());
+        body.extend(3u32.to_le_bytes());
+        body.push(3);
+        body.extend(zipfast::crc32::hash(b"rar").to_le_bytes());
+        body.extend(0x50221884u32.to_le_bytes());
+        body.extend([20, 0x30]);
+        body.extend(9u16.to_le_bytes());
+        body.extend(0o100644u32.to_le_bytes());
+        body.extend(b"rar-entry");
+        let mut bytes = b"Rar!\x1a\x07\0".to_vec();
+        bytes.extend(rar4_block(0x73, 0, &[0; 6]));
+        bytes.extend(rar4_block(0x74, 0x8000, &body));
+        bytes.extend(b"rar");
+        bytes.extend(rar4_block(0x7b, 0x4000, &[]));
+        bytes
+    }
+    #[test]
+    fn genuine_rar4_and_rar5_sfx_win_over_zip_tail_and_keep_header_failures_terminal() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for rar in [rar4(), common::archive(&[common::FileSpec::new("rar-entry", b"rar")])] {
+            for launcher in [b"".as_slice(), b"launcher".as_slice()] {
+                let mut prefix = launcher.to_vec();
+                prefix.extend(&rar);
+                std::fs::write(file.path(), zip_bytes(&prefix)).unwrap();
+                assert_eq!(other(file.path(), None)[0].name, "rar-entry");
+                // Corrupt the initializer CRC after genuine recognition.
+                prefix[launcher.len() + if rar[6] == 0 { 7 } else { 8 }] ^= 1;
+                std::fs::write(file.path(), zip_bytes(&prefix)).unwrap();
+                let error = inspect(file.path(), None).err().unwrap();
+                if rar[6] == 0 {
+                    assert!(matches!(error.operation(), Some(ReadFault::Legacy(zipfast::Error::BadChecksum(_)))));
+                } else {
+                    assert!(matches!(error.operation(), Some(ReadFault::Legacy(zipfast::Error::Corrupt(_)))));
+                }
+            }
+        }
+        let mut rar = common::archive(&[common::FileSpec::new("rar-entry", b"rar")]);
+        rar[common::SIG.len() + common::main_block(false, None).len()] ^= 1;
+        std::fs::write(file.path(), zip_bytes(&rar)).unwrap();
+        assert!(matches!(
+            inspect(file.path(), None).err().unwrap().operation(),
+            Some(ReadFault::Legacy(zipfast::Error::Corrupt(_)))
+        ));
+    }
+    #[test]
+    fn recognized_rar_later_volume_not_an_archive_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("multi.part1.rar");
+        let mut prefix = b"launcher".to_vec();
+        prefix.extend(common::SIG);
+        prefix.extend(common::main_block(true, None));
+        prefix.extend(common::end_block(true));
+        std::fs::write(&first, zip_bytes(&prefix)).unwrap();
+        assert!(matches!(
+            inspect(&first, None).err().unwrap().operation(),
+            Some(ReadFault::Legacy(zipfast::Error::MissingVolume(_)))
+        ));
+        std::fs::write(dir.path().join("multi.part2.rar"), b"not a rar").unwrap();
+        assert!(matches!(
+            inspect(&first, None).err().unwrap().operation(),
+            Some(ReadFault::Legacy(zipfast::Error::NotAnArchive))
+        ));
+    }
+    #[test]
+    fn sfx_rar_password_errors_are_terminal_and_correct_password_lists() {
+        use zipfast::crypto::{derive_rar5_key, encrypt_cbc};
+        const PASSWORD: &str = "inspection test";
+        let salt = [7; 16];
+        let key = derive_rar5_key(PASSWORD, 3, &salt, None).unwrap();
+        let mut fields = vec![0, 0, 3];
+        fields.extend(salt);
+        let mut prefix = b"launcher".to_vec();
+        prefix.extend(common::SIG);
+        prefix.extend(common::block(4, 0, &fields, &[], &[], false));
+        for (i, mut header) in [common::main_block(false, None), common::end_block(false)].into_iter().enumerate() {
+            let iv = [i as u8; 16];
+            header.resize(header.len().next_multiple_of(16), 0);
+            prefix.extend(iv);
+            prefix.extend(encrypt_cbc(&key, &iv, &header).unwrap());
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), zip_bytes(&prefix)).unwrap();
+        for password in [None, Some("wrong")] {
+            assert!(matches!(
+                inspect(file.path(), password).err().unwrap().operation(),
+                Some(ReadFault::Legacy(zipfast::Error::Encrypted))
+            ));
+        }
+        assert!(other(file.path(), Some(PASSWORD)).is_empty());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod direct_completion {
+    use super::fixture;
+    use std::io::{Read, Seek, SeekFrom};
+    use zipfast::extract::{Cancellation, Mode, Options, Overwrite, SelectedEntry};
+    use zipfast::zip::{
+        EncryptedReadContext, ProjectedReadScope, ProjectedReadSession, ReadFault, ReadSession, ZipDiagnosticSink,
+        ZipReadOutput,
+    };
+    fn options(dest: std::path::PathBuf) -> Options {
+        Options {
+            mode: Mode::Test,
+            dest,
+            overwrite: Overwrite::Skip,
+            flatten: false,
+            threads: Some(1),
+            protected_paths: Default::default(),
+            parallel_min: None,
+        }
+    }
+    #[test]
+    #[allow(clippy::result_large_err)] // Actual operations and renderer preserve fixed inline checked faults.
+    fn all_original_owners_log_actual_success_skip_and_failure_to_safe_regular_file() {
+        for owner in 0..3 {
+            for outcome in 0..3 {
+                let mut member = fixture::Member::stored(b"entry", b"payload");
+                if outcome == 2 {
+                    member.crc = Some(0);
+                }
+                let bytes = fixture::build(&[member], &[0], b"", b"", false).bytes;
+                let source = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(source.path(), &bytes).unwrap();
+                let mut log = tempfile::tempfile().unwrap();
+                let cancel = Cancellation::default();
+                let opts = options(source.path().parent().unwrap().join("out"));
+                macro_rules! run_completion {
+                    ($session:ident, $context:ident, $prepared:expr, $read:expr, $emit:ident) => {{
+                        let token = $prepared;
+                        let result = if outcome == 1 { Ok(false) } else { $read.map(|()| true) };
+                        let completion =
+                            $session.$emit(token, &mut $context, result, &mut log, |operation, _, writer| {
+                                writer.write_fmt(format_args!(
+                                    "{}\n",
+                                    match operation {
+                                        Ok(true) => "success",
+                                        Ok(false) => "skip",
+                                        Err(_) => "failure",
+                                    }
+                                ))
+                            });
+                        let (value, error, usage) = completion.into_parts();
+                        if outcome == 2 {
+                            assert!(value.is_none());
+                            assert!(matches!(error.unwrap().operation(), Some(ReadFault::Integrity { .. })));
+                        } else {
+                            assert_eq!(value, Some(outcome == 0));
+                            assert!(error.is_none());
+                        }
+                        assert!(usage.accepted_bytes > 0);
+                    }};
+                }
+                match owner {
+                    0 => {
+                        let mut session = ProjectedReadSession::open(source.path(), &cancel).unwrap();
+                        let mut context = EncryptedReadContext::for_projected(
+                            &mut session,
+                            ProjectedReadScope::Entry(0),
+                            Some(64),
+                            ZipReadOutput::Callback,
+                            None,
+                            &Default::default(),
+                            &cancel,
+                        )
+                        .unwrap();
+                        run_completion!(
+                            session,
+                            context,
+                            session
+                                .prepare_diagnostics(0, &opts, &cancel, &mut context, ZipDiagnosticSink::Stderr, &log)
+                                .unwrap(),
+                            session.read_at_with_context(0, None, 64, &cancel, &mut context, |_| Ok(())),
+                            emit_diagnostic
+                        );
+                    }
+                    1 => {
+                        let mut session = ReadSession::open(source.path()).unwrap();
+                        let id = session.metadata().entry_id(0).unwrap();
+                        let mut context = EncryptedReadContext::for_session(
+                            &mut session,
+                            &id,
+                            Some(64),
+                            ZipReadOutput::Callback,
+                            None,
+                            &Default::default(),
+                            &cancel,
+                        )
+                        .unwrap();
+                        run_completion!(
+                            session,
+                            context,
+                            session
+                                .prepare_diagnostics(&id, &opts, &cancel, &mut context, ZipDiagnosticSink::Stderr, &log)
+                                .unwrap(),
+                            session.select(&id, 64, cancel.clone()).unwrap().read_with_context(
+                                None,
+                                &mut context,
+                                |_| Ok(())
+                            ),
+                            emit_diagnostic
+                        );
+                    }
+                    _ => {
+                        let mut session = SelectedEntry::open_cancelable_with_zip_limit(
+                            source.path(),
+                            0,
+                            None,
+                            64,
+                            None,
+                            cancel.clone(),
+                        )
+                        .unwrap();
+                        let mut context = session
+                            .zip_read_context(None, ZipReadOutput::Callback, &Default::default())
+                            .unwrap()
+                            .unwrap();
+                        run_completion!(
+                            session,
+                            context,
+                            session
+                                .prepare_zip_diagnostics(&opts, &mut context, ZipDiagnosticSink::Stderr, &log)
+                                .unwrap()
+                                .unwrap(),
+                            session.read_with_zip_context(None, &mut context, |_| Ok(())),
+                            emit_zip_diagnostic
+                        );
+                    }
+                }
+                log.seek(SeekFrom::Start(0)).unwrap();
+                let mut actual = String::new();
+                log.read_to_string(&mut actual).unwrap();
+                assert_eq!(actual, ["success\n", "skip\n", "failure\n"][outcome]);
+                assert_eq!(std::fs::read(source.path()).unwrap(), bytes);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod direct_aliases {
+    use super::fixture;
+    use zipfast::extract::{Cancellation, Mode, Options, Overwrite, SelectedEntry};
+    use zipfast::zip::{
+        EncryptedReadContext, ProjectedReadScope, ProjectedReadSession, ReadSession, ZipDiagnosticSink, ZipReadOutput,
+    };
+    #[test]
+    fn all_three_owners_refuse_source_hardlink_destination_and_protected_aliases_before_payload() {
+        for owner in 0..3 {
+            for alias in 0..4 {
+                let root = tempfile::tempdir().unwrap();
+                let source = root.path().join("source.zip");
+                let bytes =
+                    fixture::build(&[fixture::Member::stored(b"entry", b"payload")], &[0], b"", b"", false).bytes;
+                std::fs::write(&source, &bytes).unwrap();
+                let dest = root.path().join("dest");
+                std::fs::create_dir(&dest).unwrap();
+                let mut opts = Options {
+                    mode: if alias == 2 { Mode::Extract } else { Mode::Test },
+                    dest: dest.clone(),
+                    overwrite: Overwrite::Always,
+                    flatten: false,
+                    threads: Some(1),
+                    protected_paths: Default::default(),
+                    parallel_min: None,
+                };
+                let log_path = match alias {
+                    0 => source.clone(),
+                    1 => {
+                        let path = root.path().join("hardlink");
+                        std::fs::hard_link(&source, &path).unwrap();
+                        path
+                    }
+                    2 => {
+                        let path = dest.join("entry");
+                        std::fs::write(&path, b"prior").unwrap();
+                        path
+                    }
+                    _ => {
+                        let path = root.path().join("protected");
+                        std::fs::write(&path, b"protected").unwrap();
+                        opts.protected_paths.insert(path.clone());
+                        path
+                    }
+                };
+                let log = std::fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+                let cancel = Cancellation::default();
+                let output = || {
+                    if alias == 2 {
+                        ZipReadOutput::StagedFiles { destination: &opts.dest }
+                    } else {
+                        ZipReadOutput::Callback
+                    }
+                };
+                let error = match owner {
+                    0 => {
+                        let mut session = ProjectedReadSession::open(&source, &cancel).unwrap();
+                        let mut context = EncryptedReadContext::for_projected(
+                            &mut session,
+                            ProjectedReadScope::Entry(0),
+                            Some(64),
+                            output(),
+                            None,
+                            &Default::default(),
+                            &cancel,
+                        )
+                        .unwrap();
+                        session
+                            .prepare_diagnostics(0, &opts, &cancel, &mut context, ZipDiagnosticSink::Stderr, &log)
+                            .err()
+                            .unwrap()
+                    }
+                    1 => {
+                        let mut session = ReadSession::open(&source).unwrap();
+                        let id = session.metadata().entry_id(0).unwrap();
+                        let mut context = EncryptedReadContext::for_session(
+                            &mut session,
+                            &id,
+                            Some(64),
+                            output(),
+                            None,
+                            &Default::default(),
+                            &cancel,
+                        )
+                        .unwrap();
+                        session
+                            .prepare_diagnostics(&id, &opts, &cancel, &mut context, ZipDiagnosticSink::Stderr, &log)
+                            .err()
+                            .unwrap()
+                    }
+                    _ => {
+                        let mut session =
+                            SelectedEntry::open_cancelable_with_zip_limit(&source, 0, None, 64, None, cancel).unwrap();
+                        let mut context =
+                            session.zip_read_context(None, output(), &Default::default()).unwrap().unwrap();
+                        session
+                            .prepare_zip_diagnostics(&opts, &mut context, ZipDiagnosticSink::Stderr, &log)
+                            .err()
+                            .unwrap()
+                    }
+                };
+                assert!(error.diagnostic_boundary_fault().is_some(), "owner={owner} alias={alias}: {error:?}");
+                assert_eq!(std::fs::read(&source).unwrap(), bytes);
+                if alias == 2 {
+                    assert_eq!(std::fs::read(dest.join("entry")).unwrap(), b"prior");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
+    use std::os::fd::AsFd;
+    use zipfast::extract::{Mode, Options, Overwrite, SelectedEntry};
+    use zipfast::zip::{ReadSession, ZipDiagnosticSink};
+    for owner in 0..3 {
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let bytes = fixture::build(&[fixture::Member::stored(b"entry", b"payload")], &[0], b"", b"", false).bytes;
+        std::fs::write(source.path(), &bytes).unwrap();
+        let mut out = tempfile::tempfile().unwrap();
+        let cancel = Cancellation::default();
+        let options = Options {
+            mode: Mode::Test,
+            dest: source.path().parent().unwrap().join("out"),
+            overwrite: Overwrite::Skip,
+            flatten: false,
+            threads: Some(1),
+            protected_paths: Default::default(),
+            parallel_min: None,
+        };
+        macro_rules! refuse_completion {
+            ($session:ident,$context:ident,$token:expr,$admit:expr,$emit:ident) => {{
+                let token = $token;
+                let operation = $admit;
+                assert!(operation.is_err(), "owner={owner} must refuse before staging");
+                $session.$emit(token, &mut $context, operation, &mut out, |_, _, _| {
+                    panic!("latched alias refusal must not render into payload output")
+                })
+            }};
+        }
+        let completion = match owner {
+            0 => {
+                let mut session = ProjectedReadSession::open(source.path(), &cancel).unwrap();
+                let mut context = EncryptedReadContext::for_projected(
+                    &mut session,
+                    ProjectedReadScope::Entry(0),
+                    Some(64),
+                    ZipReadOutput::VerifiedStdout,
+                    None,
+                    &Default::default(),
+                    &cancel,
+                )
+                .unwrap();
+                refuse_completion!(
+                    session,
+                    context,
+                    session
+                        .prepare_diagnostics(0, &options, &cancel, &mut context, ZipDiagnosticSink::Stderr, &out)
+                        .unwrap(),
+                    session.admit_output_fd(out.as_fd(), &mut context).map(|()| true),
+                    emit_diagnostic
+                )
+            }
+            1 => {
+                let mut session = ReadSession::open(source.path()).unwrap();
+                let id = session.metadata().entry_id(0).unwrap();
+                let mut context = EncryptedReadContext::for_session(
+                    &mut session,
+                    &id,
+                    Some(64),
+                    ZipReadOutput::VerifiedStdout,
+                    None,
+                    &Default::default(),
+                    &cancel,
+                )
+                .unwrap();
+                refuse_completion!(
+                    session,
+                    context,
+                    session
+                        .prepare_diagnostics(&id, &options, &cancel, &mut context, ZipDiagnosticSink::Stderr, &out)
+                        .unwrap(),
+                    session.admit_output_fd(out.as_fd(), &mut context).map(|()| true),
+                    emit_diagnostic
+                )
+            }
+            _ => {
+                let mut session =
+                    SelectedEntry::open_cancelable_with_zip_limit(source.path(), 0, None, 64, None, cancel).unwrap();
+                let mut context = session
+                    .zip_read_context(None, ZipReadOutput::VerifiedStdout, &Default::default())
+                    .unwrap()
+                    .unwrap();
+                refuse_completion!(
+                    session,
+                    context,
+                    session
+                        .prepare_zip_diagnostics(&options, &mut context, ZipDiagnosticSink::Stderr, &out)
+                        .unwrap()
+                        .unwrap(),
+                    session.admit_zip_output_fd(out.as_fd(), &mut context),
+                    emit_zip_diagnostic
+                )
+            }
+        };
+        let (value, error, usage) = completion.into_parts();
+        assert!(value.is_none());
+        assert!(error.is_some());
+        assert_eq!(usage.accepted_bytes, 0);
+        assert_eq!(out.metadata().unwrap().len(), 0);
+        assert_eq!(std::fs::read(source.path()).unwrap(), bytes);
+    }
+}

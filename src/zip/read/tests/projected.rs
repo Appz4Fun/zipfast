@@ -1800,3 +1800,164 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         super::super::run::OWNED_CLOSE_CALLS.with(|s| assert_eq!(s.get(), 1));
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn projected_inspection_keeps_one_original_catalogue_and_dispatch_budget() {
+    use crate::extract::{ProjectedInspection, inspect_projected_cancelable};
+    for prefix in [b"".as_slice(), b"launcher".as_slice()] {
+        let bytes =
+            build(&[Member::stored(b"same", b"one"), Member::stored(b"same", b"two")], &[1, 0], prefix, b"", false)
+                .bytes;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        OBSERVATIONS.with(|s| s.set(Default::default()));
+        let cancel = Cancellation::default();
+        let ProjectedInspection::Zip(mut session) = inspect_projected_cancelable(file.path(), None, &cancel).unwrap()
+        else {
+            panic!("ZIP")
+        };
+        let pointer = session.entries().next().unwrap().name.as_ptr();
+        let id = session.entry_id(0).unwrap();
+        assert_eq!(session.entry(&id).unwrap().name.as_ptr(), pointer);
+        let dispatch = bytes.len() as u64 * if prefix.is_empty() { 1 } else { 2 };
+        assert_eq!(session.dispatch_bytes(), dispatch);
+        assert_eq!(session.bootstrap_usage().bytes(), dispatch + session.parser_usage().fetched_bytes);
+        assert!(session.bootstrap_usage().bytes() <= 129 << 20);
+        let mut c = context(&mut session, Some(64), &Default::default());
+        let mut output = Vec::new();
+        session
+            .read_at_with_context(0, Some("pw"), 64, &cancel, &mut c, |b| {
+                output.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
+        session.check_source(&mut c).unwrap();
+        assert_eq!(output, b"two");
+        assert_eq!(session.entries().next().unwrap().name.as_ptr(), pointer);
+        let seen = OBSERVATIONS.with(|s| s.get());
+        assert_eq!((seen.opens, seen.parses, seen.records, seen.names, seen.headers), (1, 1, 2, 2, 1));
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn projected_inspection_preserves_constructor_faults_and_checked_retirement() {
+    use crate::extract::inspect_projected_cancelable;
+    let bytes = build(&[Member::stored(b"entry", b"one")], &[0], b"launcher", b"", false).bytes;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &bytes).unwrap();
+    for case in 0..8 {
+        let cancel = Cancellation::default();
+        match case {
+            0 => crate::test_alloc::DENY_LAYOUT.with(|s| s.set(Some((1024, 1)))),
+            1 => crate::test_alloc::DENY_LAYOUT
+                .with(|s| s.set(Some((crate::rar5::reader::SIGNATURE_PROBE_BYTES as usize, 1)))),
+            2 | 3 => {
+                inject_bootstrap(None, ReadIoOperation::Read, 1, libc::EIO, false);
+                if case == 3 {
+                    CLOSE_FAULT.with(|s| s.set(Some(libc::EINTR)));
+                }
+            }
+            4 => cancel.cancel(),
+            5 | 6 => {
+                let held = cancel.clone();
+                OPEN_HOOK.with(|s| {
+                    *s.borrow_mut() = Some(Box::new(move |event| {
+                        if event == if case == 5 { 0 } else { 6 } {
+                            held.cancel();
+                        }
+                    }))
+                });
+            }
+            7 => {
+                let path = file.path().to_path_buf();
+                OPEN_HOOK.with(|s| {
+                    *s.borrow_mut() = Some(Box::new(move |event| {
+                        if event == 1 {
+                            std::fs::remove_file(&path).unwrap();
+                        }
+                    }))
+                });
+            }
+            _ => unreachable!(),
+        }
+        let error = inspect_projected_cancelable(file.path(), None, &cancel).err().unwrap();
+        OPEN_HOOK.with(|s| *s.borrow_mut() = None);
+        crate::test_alloc::DENY_LAYOUT.with(|s| assert!(s.get().is_none()));
+        let boot = error.bootstrap_usage().unwrap();
+        match case {
+            0 | 1 => assert!(matches!(error.operation(), Some(ReadFault::Allocation { .. }))),
+            2 | 3 => assert!(matches!(error.operation(), Some(ReadFault::Io { operation: ReadIoOperation::Read, .. }))),
+            4..=6 => assert!(matches!(error.operation(), Some(ReadFault::Cancelled))),
+            7 => assert!(error.is_source_changed()),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            boot.source_retirement(),
+            match case {
+                3 => Some(CloseDisposition::Unresolved),
+                4 => None,
+                _ => Some(CloseDisposition::Closed),
+            }
+        );
+        assert_eq!(error.cleanup_errors().len(), usize::from(case == 3));
+        if case == 4 {
+            assert_eq!(boot.attempts(), 0);
+        }
+        if case == 6 || case == 7 {
+            assert!(error.parser_usage().is_some());
+        }
+    }
+    // A malformed central parse is terminal, with parse usage and retired owner.
+    let mut malformed = [0; 100];
+    malformed[..4].copy_from_slice(b"PK\x03\x04");
+    std::fs::write(file.path(), malformed).unwrap();
+    let error = inspect_projected_cancelable(file.path(), None, &Cancellation::default()).err().unwrap();
+    assert!(matches!(error.operation(), Some(ReadFault::CheckedFormat { reason: "not a ZIP archive" })));
+    assert!(error.parser_usage().is_some());
+    assert_eq!(error.bootstrap_usage().unwrap().source_retirement(), Some(CloseDisposition::Closed));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn projected_inspection_legacy_success_cancellation_and_failure_priority() {
+    use crate::extract::{PROJECTED_INSPECTION_LEGACY_COMPLETED, inspect_projected_cancelable};
+    let file = tempfile::NamedTempFile::new().unwrap();
+    // Empty tar is identified by a valid ustar header, then incumbent listing succeeds.
+    let mut tar = vec![0; 2048];
+    tar[..5].copy_from_slice(b"empty");
+    tar[100..108].copy_from_slice(b"0000644\0");
+    tar[124..136].copy_from_slice(b"00000000000\0");
+    tar[148..156].fill(b' ');
+    tar[156] = b'0';
+    tar[257..263].copy_from_slice(b"ustar\0");
+    let sum: u64 = tar[..512].iter().map(|&b| u64::from(b)).sum();
+    tar[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    std::fs::write(file.path(), &tar).unwrap();
+    let cancel = Cancellation::default();
+    let held = cancel.clone();
+    PROJECTED_INSPECTION_LEGACY_COMPLETED.with(|s| {
+        *s.borrow_mut() = Some(Box::new(move || {
+            // Reentry into the cell must not encounter a held mutable borrow.
+            PROJECTED_INSPECTION_LEGACY_COMPLETED.with(|s| assert!(s.borrow().is_none()));
+            held.cancel();
+        }))
+    });
+    let error = inspect_projected_cancelable(file.path(), None, &cancel).err().unwrap();
+    assert!(matches!(error.operation(), Some(ReadFault::Cancelled)));
+    assert!(cancel.is_canceled());
+    // The only checked TAR close is attempted before pathname listing begins.
+    CLOSE_FAULT.with(|s| s.set(Some(libc::EINTR)));
+    let error = inspect_projected_cancelable(file.path(), None, &Cancellation::default()).err().unwrap();
+    assert_eq!(error.bootstrap_usage().unwrap().source_retirement(), Some(CloseDisposition::Unresolved));
+    assert_eq!(error.cleanup_errors().len(), 1);
+    std::fs::write(file.path(), b"Rar!\x1a\x07\x01\0bad initializer").unwrap();
+    PROJECTED_INSPECTION_LEGACY_COMPLETED
+        .with(|s| *s.borrow_mut() = Some(Box::new(|| panic!("failed listing must not call success hook"))));
+    crate::rar5::reader::VOLUME_OPENS.with(|s| s.set(0));
+    let error = inspect_projected_cancelable(file.path(), None, &Cancellation::default()).err().unwrap();
+    assert!(matches!(error.operation(), Some(ReadFault::Legacy(_))));
+    crate::rar5::reader::VOLUME_OPENS.with(|s| assert_eq!(s.get(), 0));
+    PROJECTED_INSPECTION_LEGACY_COMPLETED.with(|s| assert!(s.borrow_mut().take().is_some()));
+}

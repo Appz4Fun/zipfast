@@ -194,3 +194,8 @@ impl<W: Write> fmt::Write for Stream<'_, '_, W> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(super) fn control_layout() -> [usize; 2] {
+    [std::mem::size_of::<ZipDiagnosticWriter<'_, File>>(), std::mem::size_of::<Stream<'_, '_, File>>()]
+}

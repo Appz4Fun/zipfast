@@ -737,6 +737,17 @@ impl LedgerState {
         }
         Ok(())
     }
+    pub(super) fn bind_direct_diagnostics(
+        &mut self,
+        protected: u128,
+        cwd: bool,
+        ceiling: u128,
+    ) -> Result<u128, ReadFault> {
+        self.bind_diagnostics(1, 1, protected, cwd)?;
+        let bound = self.run.plan.as_ref().ok_or(ReadFault::InvalidPlan)?.attempt_bound().min(ceiling);
+        self.encrypted.limits.io_attempts = bound;
+        Ok(bound)
+    }
     pub(super) fn bind_policy_geometry(&mut self, policy: PolicyGeometry) -> Result<u128, ReadFault> {
         if self.poisoned {
             return Err(ReadFault::InvalidPlan);

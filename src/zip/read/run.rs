@@ -218,7 +218,9 @@ impl ProjectedReadSession {
                         break;
                     }
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
-                    if let Some(index) = context.action.as_mut().and_then(|a| a.directories.as_mut()) {
+                    if let Some(index) =
+                        context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.directories_mut()?
+                    {
                         let entry = &self.owner.entries[ordinal];
                         let depth = entry
                             .name
@@ -290,7 +292,7 @@ impl ProjectedReadSession {
             }
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(mut index) = context.action.as_mut().and_then(|a| a.directories.take()) {
+        if let Some(mut index) = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.take_directories()? {
             if !cancel.is_canceled() && !context.ledger.with_state(|s| s.poisoned) {
                 index.sort_unstable_by_key(|&(ordinal, depth)| (std::cmp::Reverse(depth), ordinal));
                 #[cfg(test)]
@@ -449,10 +451,17 @@ impl ProjectedReadSession {
         if options.mode == Mode::Extract && !options.flatten {
             let count = self.owner.entries.iter().filter(|e| e.is_dir()).count();
             if count != 0 {
-                context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.directories = Some(
-                    policy::MetadataLease::new(context.ledger.view(), budget::PolicyComponent::Caller, count)?
-                        .into_owned(),
-                );
+                if !matches!(
+                    context.action.as_ref().ok_or(ReadFault::InvalidPlan)?.auxiliary,
+                    projected::ActionAuxiliary::Empty
+                ) {
+                    return Err(ReadFault::InvalidPlan.into());
+                }
+                context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary =
+                    projected::ActionAuxiliary::Directories(
+                        policy::MetadataLease::new(context.ledger.view(), budget::PolicyComponent::Caller, count)?
+                            .into_owned(),
+                    );
             }
         }
         context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.run_bound = true;

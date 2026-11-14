@@ -2632,3 +2632,68 @@ fn public_stdout_preparation_parent_stage_finalization_exact_and_one_under() {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn direct_completion_persistent_storage_fits_existing_named_stage_phase() {
+    let d = diagnostic::direct_control_layout();
+    let s = output::control_layout();
+    let c = codecs::control_layout();
+    let e = std::mem::size_of::<ZipReadError>();
+    let r = std::mem::size_of::<ObjectCleanupReport>();
+    let native_stat = std::mem::size_of::<libc::stat>();
+    let backend = std::mem::size_of::<libc::statfs>();
+    let faults = 2 * e + 2 * r;
+    let bases = [
+        faults + c[..6].iter().sum::<usize>() + s[0] + 22 + 512,
+        faults + c[2] + c[3] + c[4] + s[0] + backend.max(1024 + 44) + 512,
+        2 * e.max(s[10]).max(s[11])
+            + 2 * r
+            + s[2]
+            + s[3]
+            + s[4]
+            + s[9]
+            + backend.max(3 * native_stat + 1024 + 44)
+            + 512,
+        faults + s[0] + s[8] + s[9] + 3 * native_stat + 512,
+    ];
+    // Count the FULL still-reserved auxiliary capacity, never just its delta.
+    let persistent = d[2] + d[3];
+    let peaks = bases.map(|base| base + persistent);
+    eprintln!(
+        "ACTUAL direct context/action/aux/token/entries/scope/completion/compact/full_state={d:?} base_payload_phases={bases:?} persistent={persistent} full_payload_phases={peaks:?}"
+    );
+    assert!(peaks.iter().all(|&peak| peak <= 16384));
+    assert_eq!(d[2], d[7]);
+}
+
+#[test]
+fn direct_completion_prepare_and_render_have_separate_bounded_control_phases() {
+    let d = diagnostic::direct_control_layout();
+    let w = diagnostic::direct_writer_control_layout();
+    let e = std::mem::size_of::<ZipReadError>();
+    let r = std::mem::size_of::<ObjectCleanupReport>();
+    let stat = std::mem::size_of::<libc::stat>();
+    let backend = std::mem::size_of::<libc::statfs>();
+    let scratch = std::mem::size_of::<policy::PolicyScratch<'_>>();
+    // FrozenPolicy Builder owns exactly one borrowed ledger view and five
+    // optional MetadataLease values. Vec-based leases have identical field
+    // layouts for every non-ZST element type; count every owning field here.
+    let builder = shared::role_sizes().2 + 5 * std::mem::size_of::<Option<policy::MetadataLease<'_, u8>>>();
+    let persistent = d[2] + d[3];
+    let prepare =
+        2 * e + 2 * r + persistent + d[8] + d[5] + d[4] + builder + scratch + backend.max(3 * stat + 1024 + 44) + 512;
+    let render =
+        2 * e.max(d[6]) + 2 * r + persistent + d[8] + d[5] + d[4] + w.iter().sum::<usize>() + 3 * stat + scratch + 512;
+    eprintln!(
+        "ACTUAL direct writer/Stream={w:?} metadata_builder_fields={builder} scratch_control={scratch} prepare={prepare} render={render} component={} diagnostic_component={}",
+        shared::SHARED_LEDGER_CAPACITY + 4096 + 3 * 65536 + 16384,
+        shared::SHARED_LEDGER_CAPACITY + 4096 + 65536 + 16384
+    );
+    assert!(prepare <= 16384 && render <= 16384);
+    const {
+        assert!(shared::SHARED_LEDGER_CAPACITY + 4096 + 3 * 65536 + 16384 <= 256 << 10);
+    }
+    const {
+        assert!(shared::SHARED_LEDGER_CAPACITY + 4096 + 65536 + 16384 <= 256 << 10);
+    }
+}
