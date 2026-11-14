@@ -172,8 +172,8 @@ fn stage_never_aliases_source_or_diagnostic() {
         let mut s = c.create(member(0), Some(3)).unwrap();
         s.write_at(0, b"new").unwrap();
         let v = verify(&mut s);
-        let target = s.target(name, false).unwrap();
-        assert!(matches!(s.publish(&target, &v, &mut source).unwrap_err().kind, FailureKind::UnsafePath));
+        let mut target = s.target(name, false).unwrap();
+        assert!(matches!(s.publish(&mut target, &v, &mut source).unwrap_err().kind, FailureKind::UnsafePath));
     }
     assert_eq!(fs::read(source).unwrap(), b"input");
     assert_eq!(fs::read(alias).unwrap(), b"input");
@@ -188,8 +188,8 @@ fn early_member_cannot_replace_unopened_volume() {
     let mut s = c.create(member(0), Some(3)).unwrap();
     s.write_at(0, b"new").unwrap();
     let v = verify(&mut s);
-    let target = s.target("input.part2.rar", false).unwrap();
-    assert!(matches!(s.publish(&target, &v, &mut source).unwrap_err().kind, FailureKind::UnsafePath));
+    let mut target = s.target("input.part2.rar", false).unwrap();
+    assert!(matches!(s.publish(&mut target, &v, &mut source).unwrap_err().kind, FailureKind::UnsafePath));
     assert!(!future.exists());
 }
 #[test]
@@ -205,8 +205,8 @@ fn opaque_and_incomplete_inventory_never_publish() {
         let mut s = c.create(member(0), Some(3)).unwrap();
         s.write_at(0, b"new").unwrap();
         let v = verify(&mut s);
-        let target = s.target("target", false).unwrap();
-        let result = s.publish(&target, &v, &mut source);
+        let mut target = s.target("target", false).unwrap();
+        let result = s.publish(&mut target, &v, &mut source);
         assert!(!matches!(result, Ok(Publication::Published { .. })));
         assert_eq!(fs::read(d.path().join("target")).unwrap(), b"old");
     }
@@ -218,12 +218,12 @@ fn stage_replaced_before_publish() {
     let mut s = c.create(member(0), Some(3)).unwrap();
     s.write_at(0, b"new").unwrap();
     let v = verify(&mut s);
-    let target = s.target("target", false).unwrap();
+    let mut target = s.target("target", false).unwrap();
     let stage = fs::read_dir(d.path()).unwrap().next().unwrap().unwrap().path();
     fs::rename(&stage, d.path().join("original-stage")).unwrap();
     fs::write(&stage, b"foreign").unwrap();
     let mut source = driver(ProtectionDeclaration::Opaque);
-    assert!(s.publish(&target, &v, &mut source).is_err());
+    assert!(s.publish(&mut target, &v, &mut source).is_err());
     drop(s);
     assert_eq!(fs::read(stage).unwrap(), b"foreign");
     assert!(!d.path().join("target").exists());
@@ -276,13 +276,16 @@ fn rename_failure_preserves_target_and_retry_ownership() {
     let mut s = c.create(member(0), Some(3)).unwrap();
     s.write_at(0, b"new").unwrap();
     let v = verify(&mut s);
-    let target = s.target("target", false).unwrap();
-    let mut source = driver(non_file_complete());
+    let mut target = s.target("target", false).unwrap();
+    let mut source = driver(native_complete(d.path()));
     fault(crate::output::OwnedOperation::Publish, Err(libc::EACCES));
-    let e = s.publish(&target, &v, &mut source).unwrap_err();
+    let e = s.publish(&mut target, &v, &mut source).unwrap_err();
     assert!(matches!(e.kind, FailureKind::Output { operation: OutputOperation::Publish, .. }));
     assert_eq!(fs::read(&target.path).unwrap(), b"old");
-    assert!(matches!(s.publish(&target, &v, &mut source).unwrap(), Publication::Published { cleanup_failure: None }));
+    assert!(matches!(
+        s.publish(&mut target, &v, &mut source).unwrap(),
+        Publication::Published { cleanup_failure: None }
+    ));
     assert_eq!(fs::read(&target.path).unwrap(), b"new");
 }
 #[test]
@@ -336,28 +339,28 @@ fn cleanup_failure_keeps_artifact_and_quota_for_retry() {
 }
 #[test]
 fn changed_inventory_revokes_authority() {
-    struct Changes(u8);
+    struct Changes(u8, ProtectionDeclaration);
     impl VolumeSource for Changes {
         fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
             Ok(VolumeAnswer::Missing)
         }
         fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
             self.0 += 1;
-            let mut d = non_file_complete();
+            let mut d = self.1.clone();
             if let ProtectionDeclaration::Complete { epoch, .. } = &mut d {
                 *epoch = u64::from(self.0);
             }
             Ok(d)
         }
     }
+    let d = tempfile::tempdir().unwrap();
     let mut source = super::super::source::SourceDriver::new(
-        Box::new(Changes(0)),
+        Box::new(Changes(0, native_complete(d.path()))),
         "input.rar".into(),
         ProgressiveLimits::default(),
         SessionControl::default(),
     )
     .unwrap();
-    let d = tempfile::tempdir().unwrap();
     let target = d.path().join("target");
     assert!(source.publication_check(&target, None).unwrap());
     assert!(matches!(source.publication_check(&target, None).unwrap_err().kind, FailureKind::SourceChanged));
@@ -372,11 +375,11 @@ fn publication_cleanup_failure_reports_published_without_rollback() {
     let mut s = c.create(member(0), Some(3)).unwrap();
     s.write_at(0, b"new").unwrap();
     let v = verify(&mut s);
-    let target = s.target("target", false).unwrap();
-    let mut source = driver(non_file_complete());
+    let mut target = s.target("target", false).unwrap();
+    let mut source = driver(native_complete(d.path()));
     fault(crate::output::OwnedOperation::Remove, Err(libc::EACCES));
     assert!(matches!(
-        s.publish(&target, &v, &mut source).unwrap(),
+        s.publish(&mut target, &v, &mut source).unwrap(),
         Publication::Published {
             cleanup_failure: Some(ProgressiveFailure {
                 kind: FailureKind::Output { operation: OutputOperation::Remove, .. },
@@ -472,13 +475,13 @@ fn missing_nested_parent_is_created_only_for_verified_authorized_output() {
     let mut s = c.create(member(0), Some(3)).unwrap();
     s.write_at(0, b"new").unwrap();
     let v = verify(&mut s);
-    let t = s.target("nested/deep/file", false).unwrap();
+    let mut t = s.target("nested/deep/file", false).unwrap();
     assert!(!d.path().join("nested").exists());
     let mut opaque = driver(ProtectionDeclaration::Opaque);
-    assert!(matches!(s.publish(&t, &v, &mut opaque).unwrap(), Publication::Provisional));
+    assert!(matches!(s.publish(&mut t, &v, &mut opaque).unwrap(), Publication::Provisional));
     assert!(!d.path().join("nested").exists());
-    let mut complete = driver(non_file_complete());
-    assert!(matches!(s.publish(&t, &v, &mut complete).unwrap(), Publication::Published { cleanup_failure: None }));
+    let mut complete = driver(native_complete(d.path()));
+    assert!(matches!(s.publish(&mut t, &v, &mut complete).unwrap(), Publication::Published { cleanup_failure: None }));
     assert_eq!(fs::read(d.path().join("nested/deep/file")).unwrap(), b"new");
 }
 
@@ -576,11 +579,11 @@ fn root_and_target_parent_rebinding_preserve_foreign_names() {
     let mut s = c.create(member(0), Some(3)).unwrap();
     s.write_at(0, b"new").unwrap();
     let v = verify(&mut s);
-    let t = s.target("nested/file", false).unwrap();
+    let mut t = s.target("nested/file", false).unwrap();
     fs::rename(root.join("nested"), root.join("old-nested")).unwrap();
     fs::create_dir(root.join("nested")).unwrap();
-    let mut source = driver(non_file_complete());
-    assert!(s.publish(&t, &v, &mut source).is_err());
+    let mut source = driver(native_complete(d.path()));
+    assert!(s.publish(&mut t, &v, &mut source).is_err());
     assert!(!root.join("nested/file").exists());
     fs::rename(&root, d.path().join("old-root")).unwrap();
     fs::create_dir(&root).unwrap();
@@ -616,14 +619,17 @@ fn cwd_is_pinned_in_bounded_child() {
         let mut s = c.create(member(0), Some(3)).unwrap();
         s.write_at(0, b"new").unwrap();
         let v = verify(&mut s);
-        let t = s.target("target", false).unwrap();
+        let mut t = s.target("target", false).unwrap();
         let other = tempfile::tempdir().unwrap();
         std::env::set_current_dir(other.path()).unwrap();
         let mut b = [0; 3];
         source.read_at(0, &mut b, &mut Context::from_waker(Waker::noop())).unwrap();
         assert_eq!(&b, b"abc");
-        let mut provider = driver(non_file_complete());
-        assert!(matches!(s.publish(&t, &v, &mut provider).unwrap(), Publication::Published { cleanup_failure: None }));
+        let mut provider = driver(native_complete(d.path()));
+        assert!(matches!(
+            s.publish(&mut t, &v, &mut provider).unwrap(),
+            Publication::Published { cleanup_failure: None }
+        ));
         assert_eq!(fs::read(d.path().join("out/target")).unwrap(), b"new");
         assert!(!other.path().join("out").exists());
         return;
@@ -676,10 +682,10 @@ fn verification_is_bound_to_member_stage_and_generation() {
     let mut s = c.create(member(0), Some(3)).unwrap();
     s.write_at(0, b"new").unwrap();
     let v = verify(&mut s);
-    let target = s.target("target", false).unwrap();
+    let mut target = s.target("target", false).unwrap();
     s.set_len(3).unwrap();
-    let mut provider = driver(non_file_complete());
-    assert!(matches!(s.publish(&target, &v, &mut provider).unwrap_err().kind, FailureKind::InvalidCapability));
+    let mut provider = driver(native_complete(d.path()));
+    assert!(matches!(s.publish(&mut target, &v, &mut provider).unwrap_err().kind, FailureKind::InvalidCapability));
     let artifact = s.into_artifact();
     assert_eq!(artifact.evidence(), &ArtifactEvidence::Provisional);
     assert!(!target.path.exists());
@@ -805,12 +811,111 @@ fn immutable_growth_after_last_read_and_volume_switch_blocks_publication() {
         let mut stage = c.create(member(0), Some(3)).unwrap();
         stage.write_at(0, b"new").unwrap();
         let verdict = verify(&mut stage);
-        let target = stage.target("target", false).unwrap();
+        let mut target = stage.target("target", false).unwrap();
         fs::OpenOptions::new().append(true).open(&paths[0]).unwrap().write_all(b"growth").unwrap();
         assert!(matches!(
-            stage.publish(&target, &verdict, &mut provider).unwrap_err().kind,
+            stage.publish(&mut target, &verdict, &mut provider).unwrap_err().kind,
             FailureKind::SourceChanged
         ));
         assert_eq!(fs::read(d.path().join("target")).unwrap(), b"old");
     }
+}
+
+fn native_complete(root: &Path) -> ProtectionDeclaration {
+    let path = root.join("protected-input.rar");
+    fs::write(&path, b"source").unwrap();
+    let file = Some(Arc::new(fs::File::open(&path).unwrap()));
+    complete(vec![ProtectedPath { path, file }])
+}
+
+fn assert_custom_non_file_cannot_publish(kind: u8) {
+    let d = tempfile::tempdir().unwrap();
+    let native = native_complete(d.path());
+    let mut declaration = non_file_complete();
+    if let ProtectionDeclaration::Complete { inventory, .. } = &mut declaration
+        && let ProtectionDeclaration::Complete { inventory: native_inventory, .. } = native
+        && let VolumeBacking::Native(paths) = native_inventory.volumes[0].backing.clone()
+    {
+        if kind == 1 {
+            inventory.auxiliary_paths = paths;
+        } else if kind == 2 {
+            inventory.volumes.push(ProtectedVolume {
+                index: 1,
+                name: "input.part2.rar".into(),
+                backing: VolumeBacking::Native(paths),
+            });
+        }
+    }
+    fs::write(d.path().join("target"), b"old").unwrap();
+    let mut c = setup(d.path());
+    let mut s = c.create(member(0), Some(3)).unwrap();
+    s.write_at(0, b"new").unwrap();
+    let v = verify(&mut s);
+    let mut t = s.target("target", false).unwrap();
+    let mut source = driver(declaration);
+    assert!(matches!(s.publish(&mut t, &v, &mut source).unwrap(), Publication::Provisional), "kind {kind}");
+    assert_eq!(fs::read(&t.path).unwrap(), b"old");
+}
+#[test]
+fn custom_non_file_declaration_cannot_publish() {
+    assert_custom_non_file_cannot_publish(0);
+}
+#[test]
+fn custom_non_file_with_native_auxiliary_cannot_publish() {
+    assert_custom_non_file_cannot_publish(1);
+}
+#[test]
+fn custom_mixed_native_and_non_file_cannot_publish() {
+    assert_custom_non_file_cannot_publish(2);
+}
+
+#[test]
+fn created_parent_rebinding_after_publish_failure_is_rejected() {
+    for rebind in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let mut source = driver(native_complete(d.path()));
+        let mut c = setup(d.path());
+        let mut s = c.create(member(0), Some(3)).unwrap();
+        s.write_at(0, b"new").unwrap();
+        let v = verify(&mut s);
+        let mut t = s.target("nested/deep/file", false).unwrap();
+        fault(crate::output::OwnedOperation::Publish, Err(libc::EACCES));
+        assert!(matches!(
+            s.publish(&mut t, &v, &mut source).unwrap_err().kind,
+            FailureKind::Output { operation: OutputOperation::Publish, .. }
+        ));
+        assert!(d.path().join("nested/deep").is_dir());
+        if !rebind {
+            assert!(matches!(
+                s.publish(&mut t, &v, &mut source).unwrap(),
+                Publication::Published { cleanup_failure: None }
+            ));
+            assert_eq!(fs::read(&t.path).unwrap(), b"new");
+            continue;
+        }
+        fs::rename(d.path().join("nested"), d.path().join("original")).unwrap();
+        fs::create_dir_all(d.path().join("nested/deep")).unwrap();
+        fs::write(d.path().join("nested/deep/foreign"), b"keep").unwrap();
+        assert!(s.publish(&mut t, &v, &mut source).is_err());
+        assert!(!t.path.exists());
+        assert!(!d.path().join("original/deep/file").exists());
+        assert_eq!(fs::read(d.path().join("nested/deep/foreign")).unwrap(), b"keep");
+    }
+}
+
+#[test]
+fn zero_fill_write_zero_reports_exact_range_and_keeps_hole_invalid() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = setup(d.path());
+    let mut s = c.create(member(0), Some(5)).unwrap();
+    s.write_at(0, b"ab").unwrap();
+    fault(crate::output::OwnedOperation::Write, Ok(Some(0)));
+    let e = s.hole(2, 3, HoleFill::Zero).unwrap_err();
+    assert!(matches!(e.kind, FailureKind::Output { operation: OutputOperation::Write, ref cause }
+        if cause.kind() == std::io::ErrorKind::WriteZero));
+    assert_eq!(e.context.output_range.as_deref(), Some(&OutputRange { offset: 2, attempted: 3, completed: 0 }));
+    let mut a = s.into_artifact();
+    let mut b = [77; 3];
+    assert_eq!(a.read_at(2, &mut b).unwrap(), ArtifactRead::Hole { len: 3 });
+    assert_eq!(b, [77; 3]);
 }

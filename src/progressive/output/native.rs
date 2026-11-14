@@ -68,6 +68,7 @@ pub(crate) struct NativeProtection {
     bindings: Vec<Binding>,
     admitted: Vec<(u32, Identity)>,
     complete: bool,
+    native_only: bool,
     cwd: PathBuf,
     held: Vec<File>,
     immutable: Vec<ImmutableBinding>,
@@ -83,6 +84,7 @@ impl NativeProtection {
             bindings: Vec::new(),
             admitted: Vec::new(),
             complete: false,
+            native_only: false,
             cwd,
             held: Vec::new(),
             immutable: Vec::new(),
@@ -106,9 +108,13 @@ impl NativeProtection {
             .chain(inventory.auxiliary_paths.iter());
         if !self.complete {
             let mut count = inventory.auxiliary_paths.len();
+            // Structural NonFile declarations carry no library-owned memory authority.
+            // Auxiliary native paths cannot supply the missing volume provenance.
+            let mut native_only = !inventory.volumes.is_empty();
             for volume in &inventory.volumes {
-                if let VolumeBacking::Native(paths) = &volume.backing {
-                    count += paths.len();
+                match &volume.backing {
+                    VolumeBacking::Native(paths) if !paths.is_empty() => count += paths.len(),
+                    _ => native_only = false,
                 }
             }
             usage.charge(Resource::SourceBookkeeping, count as u64)?;
@@ -130,6 +136,7 @@ impl NativeProtection {
                 let identity = observe(&path, p.file.as_deref())?;
                 self.bindings.push(Binding { path, identity, handle: p.file.clone() });
             }
+            self.native_only = native_only;
             self.complete = true;
         } else {
             for (binding, path) in self.bindings.iter_mut().zip(paths) {
@@ -272,7 +279,7 @@ impl NativeProtection {
         usage.charge(Resource::SourceBookkeeping, self.bindings.len() as u64)?;
         // An unbound name may alias a differently spelled target on a case-folding
         // filesystem. Until it binds, keep the output provisional on every platform.
-        Ok(self.complete && self.bindings.iter().all(|binding| binding.identity.is_some()))
+        Ok(self.complete && self.native_only && self.bindings.iter().all(|binding| binding.identity.is_some()))
     }
     pub(crate) fn check_target(
         &self,

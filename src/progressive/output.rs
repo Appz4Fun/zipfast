@@ -181,6 +181,7 @@ pub(crate) struct Target {
     parent_path: PathBuf,
     parent: fs::File,
     parent_identity: native::Identity,
+    parent_unbound: bool,
     member: MemberId,
     stage_identity: native::Identity,
 }
@@ -465,7 +466,13 @@ impl Stage {
                     .write_at(at, &zero[..n])
                     .map_err(|e| out_range(OutputOperation::Write, e, at, n as u64, 0))?;
                 if written == 0 {
-                    return Err(out(OutputOperation::Write, std::io::ErrorKind::WriteZero.into(), at));
+                    return Err(out_range(
+                        OutputOperation::Write,
+                        std::io::ErrorKind::WriteZero.into(),
+                        at,
+                        n as u64,
+                        0,
+                    ));
                 }
                 at += written as u64;
             }
@@ -506,7 +513,16 @@ impl Stage {
         let stage_identity =
             native::Identity::file(self.native.file()).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
         self.target_created = true;
-        Ok(Target { path, initial, parent_path, parent, parent_identity, member: self.member, stage_identity })
+        Ok(Target {
+            path,
+            initial,
+            parent_path,
+            parent,
+            parent_identity,
+            parent_unbound: false,
+            member: self.member,
+            stage_identity,
+        })
     }
     fn parents(&self, path: &Path) -> ProgressiveResult<()> {
         self.root.check()?;
@@ -527,14 +543,21 @@ impl Stage {
         }
         Ok(())
     }
-    fn prepare_parents(&self, path: &Path, source: &mut super::source::SourceDriver) -> ProgressiveResult<()> {
-        let relative = path.parent().ok_or_else(invalid)?.strip_prefix(&self.root.path).map_err(|_| invalid())?;
-        self.usage.charge(Resource::MetadataBytes, (path.as_os_str().len() as u64).saturating_mul(2))?;
-        let mut at = self.root.path.clone();
+    fn prepare_parents(&self, target: &mut Target, source: &mut super::source::SourceDriver) -> ProgressiveResult<()> {
+        target.check_parent()?;
+        let relative =
+            target.path.parent().ok_or_else(invalid)?.strip_prefix(&target.parent_path).map_err(|_| invalid())?;
+        self.usage.charge(Resource::MetadataBytes, (target.path.as_os_str().len() as u64).saturating_mul(2))?;
+        let mut at = target.parent_path.clone();
         for component in relative.components() {
             self.root.check()?;
+            target.check_parent()?;
             at.push(component);
-            self.usage.charge(Resource::SourceBookkeeping, 1 + at.as_os_str().len() as u64)?;
+            self.usage.charge(Resource::SourceBookkeeping, 8 + at.as_os_str().len() as u64)?;
+            self.usage.charge(Resource::MetadataBytes, at.as_os_str().len() as u64)?;
+            let bound_path = at.clone();
+            self.usage
+                .charge(Resource::MetadataBytes, bound_path.capacity().saturating_sub(at.as_os_str().len()) as u64)?;
             match fs::symlink_metadata(&at) {
                 Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
                 Ok(_) => return Err(ProgressiveFailure::new(FailureKind::UnsafePath)),
@@ -551,10 +574,28 @@ impl Stage {
                     if !source.publication_check(&at, None)? {
                         return Err(ProgressiveFailure::new(FailureKind::SourceContract));
                     }
+                    // If creation/open/check cannot finish, a retry must never adopt
+                    // an unbound directory left by this attempt or its replacement.
+                    target.parent_unbound = true;
                     fs::create_dir(&at).map_err(|e| out(OutputOperation::Create, e, 0))?;
                 }
                 Err(e) => return Err(out(OutputOperation::Metadata, e, 0)),
             }
+            target.parent_unbound = true;
+            let parent = open_directory(&at)?;
+            let identity = native::Identity::file(&parent).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
+            let meta = fs::symlink_metadata(&at).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
+            if !meta.is_dir()
+                || native::Identity::metadata(&meta).map_err(|e| out(OutputOperation::Metadata, e, 0))? != identity
+            {
+                return Err(invalid());
+            }
+            // One retained parent descriptor, plus the transient replacement above.
+            // Each successfully prepared prefix survives errors in later components.
+            target.parent_path = bound_path;
+            target.parent = parent;
+            target.parent_identity = identity;
+            target.parent_unbound = false;
         }
         Ok(())
     }
@@ -577,7 +618,7 @@ impl Stage {
     }
     pub(crate) fn publish(
         &mut self,
-        target: &Target,
+        target: &mut Target,
         verified: &VerifiedStage,
         source: &mut super::source::SourceDriver,
     ) -> ProgressiveResult<Publication> {
@@ -632,7 +673,8 @@ impl Stage {
         }
         self.mutation()?;
         target.check_parent()?;
-        self.prepare_parents(&target.path, source)?;
+        self.prepare_parents(target, source)?;
+        target.check_parent()?;
         self.parents(&target.path)?;
         if target_stamp(&target.path)? != target.initial {
             return Err(invalid());
@@ -785,6 +827,9 @@ fn out_range(
 
 impl Target {
     fn check_parent(&self) -> ProgressiveResult<()> {
+        if self.parent_unbound {
+            return Err(invalid());
+        }
         let bound = fs::symlink_metadata(&self.parent_path).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
         if !bound.is_dir()
             || native::Identity::metadata(&bound).map_err(|e| out(OutputOperation::Metadata, e, 0))?
