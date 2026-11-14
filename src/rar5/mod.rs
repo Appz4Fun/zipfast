@@ -267,10 +267,22 @@ impl FileHeader {
         }
     }
 
-    pub(crate) fn rar4_progressive_unsupported(&self) -> Option<crate::error::RarUnsupported> {
+    pub(crate) fn rar4_progressive_unsupported(
+        &self,
+        legacy: Option<LegacyCrypt>,
+    ) -> Option<crate::error::RarUnsupported> {
         let raw = self.rar4?;
         if raw.method != 0x30 {
             return Some(crate::error::RarUnsupported::Rar4Feature("compressed progressive payload"));
+        }
+        // Admission precedes every disposition, including directory creation and skip.
+        if self.encrypted {
+            if self.is_dir() {
+                return Some(crate::error::RarUnsupported::Rar4Feature("encrypted directory"));
+            }
+            if let Err(reason) = LegacyCrypt::stored_salt(legacy) {
+                return Some(reason);
+            }
         }
         let independent =
             Rar4Metadata { flags: raw.flags & !(3 | if raw.unpack_version == 29 { 4 } else { 0 }), ..raw };
@@ -339,6 +351,14 @@ pub(crate) const RAW_NAME_OWNER_BYTES: usize = std::mem::size_of::<Vec<u8>>() + 
 pub(crate) struct LegacyCrypt {
     pub(crate) version: u8,
     pub(crate) salt: Option<[u8; 8]>,
+}
+impl LegacyCrypt {
+    pub(crate) fn stored_salt(crypt: Option<Self>) -> std::result::Result<[u8; 8], crate::error::RarUnsupported> {
+        crypt
+            .filter(|c| c.version == 29)
+            .and_then(|c| c.salt)
+            .ok_or(crate::error::RarUnsupported::Rar4Feature("legacy encryption scheme or salt"))
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LegacyWire {

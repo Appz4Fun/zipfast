@@ -862,3 +862,129 @@ fn aes_stored_wrong_patch_keeps_failed_checks_sticky() {
     );
     assert_eq!(a.publication(), ArtifactPublication::Unpublished);
 }
+
+fn r1_metadata_record(directory: bool, encrypted: bool, salted: bool, version: u8) -> Vec<u8> {
+    let flags = if directory { 0xe0 } else { 0 } | if encrypted { 4 } else { 0 } | if salted { 0x400 } else { 0 };
+    let mut file = member(b"entry", b"", flags, 0x30);
+    file[24] = version;
+    if directory {
+        file[28..32].copy_from_slice(&0o040755u32.to_le_bytes());
+    }
+    if salted {
+        file.extend([1; 8]);
+        let size = file.len() as u16;
+        file[5..7].copy_from_slice(&size.to_le_bytes());
+    }
+    fix_crc(&mut file, 0);
+    archive(&[file])
+}
+
+fn r1_observe(bytes: Vec<u8>, opts: ProgressiveOptions) -> (Vec<MemberOutcome>, Option<ProgressiveFailure>) {
+    let mut session =
+        ProgressiveSession::from_sealed_memory(vec![("a.rar".into(), bytes.into_boxed_slice())], opts).unwrap();
+    let mut outcomes = Vec::new();
+    for _ in 0..1000 {
+        match step(&mut session) {
+            Poll::Ready(Err(e)) => return (outcomes, Some(e)),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
+                return (outcomes, Some(failure));
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                outcome: MemberOutcome::Stopped { failure, .. },
+                ..
+            }))) => return (outcomes, Some(failure)),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(outcome),
+            Poll::Ready(Ok(None)) => return (outcomes, None),
+            _ => {}
+        }
+    }
+    panic!("finite metadata admission poll bound")
+}
+
+#[test]
+fn r1_unsupported_crypto_is_refused_before_directory_and_skip_dispositions() {
+    let mut bypasses = Vec::new();
+    for mode in [zipfast::extract::Mode::Extract, zipfast::extract::Mode::Test] {
+        for password in [None, Some("pw".to_owned())] {
+            for (directory, salted, version) in
+                [(true, false, 29), (true, true, 29), (false, false, 29), (false, true, 20)]
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let target = dir.path().join("entry");
+                if !directory {
+                    std::fs::write(&target, b"keep existing target").unwrap();
+                }
+                let mut opts = options(dir.path());
+                opts.extract.mode = mode;
+                opts.extract.overwrite = zipfast::extract::Overwrite::Skip;
+                opts.limits.kdf_session_blocks = 0;
+                opts.set_password(password.clone()).unwrap();
+                let (outcomes, failure) = r1_observe(r1_metadata_record(directory, true, salted, version), opts);
+                let refused = failure.as_ref().is_some_and(|e| matches!(&e.kind, FailureKind::Rar(r) if matches!(**r, zipfast::error::RarFailure::Unsupported(_))));
+                let untouched = if directory {
+                    !target.exists()
+                } else {
+                    std::fs::read(&target).unwrap() == b"keep existing target"
+                };
+                if !refused || !outcomes.is_empty() || !untouched {
+                    let outcomes = outcomes
+                        .iter()
+                        .map(|o| match o {
+                            MemberOutcome::Directory { created } => format!("Directory(created={created})"),
+                            MemberOutcome::Skipped(_) => "Skipped".to_owned(),
+                            _ => "other outcome".to_owned(),
+                        })
+                        .collect::<Vec<_>>();
+                    bypasses.push(format!("mode={mode:?} password={} directory={directory} salted={salted} version={version}: outcomes={outcomes:?}, failure={failure:?}, target_exists={}", password.is_some(), target.exists()));
+                } else {
+                    let failure = failure.unwrap();
+                    assert_eq!(failure.context.volume_index, Some(0));
+                    assert_eq!(failure.context.expected.as_deref(), Some(std::ffi::OsStr::new("a.rar")));
+                    assert!(failure.context.packed_offset.is_some());
+                }
+            }
+        }
+    }
+    assert!(bypasses.is_empty(), "admission bypasses:\n{}", bypasses.join("\n"));
+}
+
+#[test]
+fn r1_plain_directories_and_admitted_regular_aes_keep_existing_dispositions() {
+    for mode in [zipfast::extract::Mode::Extract, zipfast::extract::Mode::Test] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.extract.mode = mode;
+        let (outcomes, failure) = r1_observe(r1_metadata_record(true, false, false, 29), opts);
+        assert!(failure.is_none(), "{failure:?}");
+        let extract = mode == zipfast::extract::Mode::Extract;
+        assert!(matches!(outcomes.as_slice(), [MemberOutcome::Directory { created }] if *created == extract));
+        assert_eq!(dir.path().join("entry").is_dir(), extract);
+        let mut opts = options(dir.path());
+        opts.extract.mode = mode;
+        opts.set_password(Some("pw".into())).unwrap();
+        let (outcomes, failure) = r1_observe(aes_stored(b"admitted", false, &[16]).remove(0), opts);
+        assert!(failure.is_none(), "{failure:?}");
+        assert!(if extract {
+            matches!(outcomes.as_slice(), [MemberOutcome::Verified(_)])
+        } else {
+            matches!(outcomes.as_slice(), [MemberOutcome::Tested(_)])
+        });
+        if extract {
+            assert_eq!(std::fs::read(dir.path().join("one")).unwrap(), b"admitted");
+        } else {
+            assert!(!dir.path().join("one").exists());
+        }
+    }
+    for password in [None, Some("pw".to_owned())] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("entry"), b"keep existing target").unwrap();
+        let mut opts = options(dir.path());
+        opts.extract.overwrite = zipfast::extract::Overwrite::Skip;
+        opts.limits.kdf_session_blocks = 0;
+        opts.set_password(password).unwrap();
+        let (outcomes, failure) = r1_observe(r1_metadata_record(false, true, true, 29), opts);
+        assert!(failure.is_none(), "{failure:?}");
+        assert!(matches!(outcomes.as_slice(), [MemberOutcome::Skipped(_)]));
+        assert_eq!(std::fs::read(dir.path().join("entry")).unwrap(), b"keep existing target");
+    }
+}

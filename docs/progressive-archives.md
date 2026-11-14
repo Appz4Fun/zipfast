@@ -132,6 +132,7 @@ compatibility remains open.
 | Plain Stored, unpack version 20 or 29 | Supported with declared size and CRC32 checks. |
 | Plain split Stored | Supported with exact raw-name/method/version/dictionary continuity, nonfinal packed-part CRC32 and final whole-inner CRC32. |
 | Plain Stored holes and patching | Shared sparse/zero holes, bounded patching and whole-inner read-back verification; wrong patches and failed declared checks stay failed. |
+| Directory records carrying the payload-encryption flag | Typed unsupported, including salt-present records; checked before every disposition. |
 | Modern version-29 AES Stored payload, including split parts | Admitted with explicit salt, known size, and unchanged data salt across parts; continuous CBC. |
 | Salt-prefixed AES encrypted headers | Admitted incrementally; each header derives its own IV. Explicit alternate header encryption versions remain unsupported. |
 | Compressed, solid, RAR1.5/2, PPM and VM | Typed unsupported through this entrypoint; original engines and qualified continuation remain required work. |

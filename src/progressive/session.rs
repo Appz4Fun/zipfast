@@ -702,7 +702,9 @@ impl ProgressiveSession {
                 self.main_seen = true;
             }
             Block::File(header) => {
-                if let Some(reason) = header.rar4_progressive_unsupported() {
+                if let Some(reason) = header
+                    .rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
+                {
                     return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
                         crate::error::RarFailure::Unsupported(reason),
                     ))));
@@ -785,7 +787,9 @@ impl ProgressiveSession {
     }
     fn start(&mut self, frame: PhysicalFrame) -> ProgressiveResult<ProgressiveEvent> {
         let Block::File(header) = frame.block else { unreachable!() };
-        if let Some(reason) = header.rar4_progressive_unsupported() {
+        if let Some(reason) =
+            header.rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
+        {
             return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
                 reason,
             )))));

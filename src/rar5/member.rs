@@ -765,7 +765,7 @@ impl MemberMachine {
     ) -> crate::progressive::ProgressiveResult<Self> {
         use crate::progressive::{FailureKind, ProgressiveFailure, Resource};
         if header.format == super::RarFormat::Rar4 {
-            if let Some(reason) = header.rar4_progressive_unsupported() {
+            if let Some(reason) = header.rar4_progressive_unsupported(legacy) {
                 return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(reason)))));
             }
         } else if header.algorithm != 0 || header.method > 5 {
@@ -774,10 +774,8 @@ impl MemberMachine {
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
         let cipher = if header.encrypted {
             if header.format == super::RarFormat::Rar4 {
-                let salt = legacy.filter(|c| c.version == 29).and_then(|c| c.salt).ok_or_else(|| {
-                    ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(
-                        crate::error::RarUnsupported::Rar4Feature("legacy encryption scheme or salt"),
-                    ))))
+                let salt = super::LegacyCrypt::stored_salt(legacy).map_err(|reason| {
+                    ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(reason))))
                 })?;
                 let password = password
                     .filter(|p| !p.is_empty())
