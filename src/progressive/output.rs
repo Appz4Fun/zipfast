@@ -79,6 +79,9 @@ impl ProgressiveOptions {
             password: None,
         }
     }
+    pub(crate) fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
     pub fn set_password(&mut self, password: Option<String>) -> ProgressiveResult<()> {
         if let Some(p) = &password {
             let limit = self.limits.password_utf8_bytes.min(4096);
@@ -118,28 +121,46 @@ pub enum ArtifactEvidence {
     Provisional,
     Verified(Verification),
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EvidenceOrigin {
     Archive,
-    Caller,
+    Caller { label: Box<str> },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackedEvidence {
-    Complete,
+    Passed,
     Missing,
+    Failed,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthenticationEvidence {
-    NotEncrypted,
-    RarChecks,
-    WinZipAuthenticated,
-    Missing,
+    NotApplicable,
+    CbcChecksOnly,
+    Authenticated,
+    Incomplete,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationLevel {
+    Strict,
+    InnerOnly,
+    Unverified,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckVerdict {
+    Passed,
+    Missing,
+    Failed,
+}
+
 /// Engine-produced evidence; public callers cannot construct a verification permit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Verification {
     pub(crate) inner_size: u64,
     pub(crate) checksum: ChecksumValue,
+    pub(crate) size: CheckVerdict,
+    pub(crate) crc32: CheckVerdict,
+    pub(crate) blake2sp: CheckVerdict,
+    pub(crate) level: VerificationLevel,
     pub(crate) origin: EvidenceOrigin,
     pub(crate) packed: PackedEvidence,
     pub(crate) authentication: AuthenticationEvidence,
@@ -151,8 +172,20 @@ impl Verification {
     pub fn checksum(&self) -> &ChecksumValue {
         &self.checksum
     }
-    pub fn origin(&self) -> EvidenceOrigin {
-        self.origin
+    pub fn origin(&self) -> &EvidenceOrigin {
+        &self.origin
+    }
+    pub fn size_verdict(&self) -> CheckVerdict {
+        self.size
+    }
+    pub fn crc32_verdict(&self) -> CheckVerdict {
+        self.crc32
+    }
+    pub fn blake2sp_verdict(&self) -> CheckVerdict {
+        self.blake2sp
+    }
+    pub fn level(&self) -> VerificationLevel {
+        self.level
     }
     pub fn packed(&self) -> PackedEvidence {
         self.packed
@@ -161,20 +194,17 @@ impl Verification {
         self.authentication
     }
 }
-#[allow(dead_code)]
 pub(crate) struct VerifiedStage {
     member: MemberId,
     generation: u64,
     stamp: SourceStamp,
     verification: Verification,
 }
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum Publication {
     Provisional,
     Published { cleanup_failure: Option<ProgressiveFailure> },
 }
-#[allow(dead_code)]
 pub(crate) struct Target {
     path: PathBuf,
     initial: Option<SourceStamp>,
@@ -194,13 +224,11 @@ pub struct OutputHole {
 struct Authority {
     control: SessionControl,
 }
-#[allow(dead_code)]
 pub(crate) struct Termination {
     pub(crate) failure: ProgressiveFailure,
     pub(crate) artifact: Option<Artifact>,
     pub(crate) cleanup_failure: Option<ProgressiveFailure>,
 }
-#[allow(dead_code)]
 pub(crate) struct OutputContext {
     root: Arc<Root>,
     usage: Usage,
@@ -216,7 +244,6 @@ struct Root {
     overwrite: crate::extract::Overwrite,
     protected: Vec<(PathBuf, Option<native::Identity>)>,
 }
-#[allow(dead_code)]
 impl OutputContext {
     pub(crate) fn new(options: &ProgressiveOptions, usage: Usage, control: SessionControl) -> ProgressiveResult<Self> {
         let root_reservation = options.extract.dest.as_os_str().len().checked_add(4096).ok_or_else(invalid)?;
@@ -337,7 +364,6 @@ impl Root {
         Ok(())
     }
 }
-#[allow(dead_code)]
 pub(crate) struct Stage {
     native: OwnedStage,
     root: Arc<Root>,
@@ -355,7 +381,6 @@ pub(crate) struct Stage {
     lease: Option<Lease>,
     authority: Weak<Authority>,
 }
-#[allow(dead_code)]
 impl Stage {
     fn mutation(&self) -> ProgressiveResult<()> {
         if self.published {
@@ -410,6 +435,7 @@ impl Stage {
         self.generation = next_generation;
         Ok(count)
     }
+    #[allow(dead_code, reason = "recovery stage operations are consumed by Task5")]
     pub(crate) fn set_len(&mut self, length: u64) -> ProgressiveResult<()> {
         self.mutation()?;
         if length < self.length {
@@ -423,6 +449,7 @@ impl Stage {
         self.generation = next_generation;
         Ok(())
     }
+    #[allow(dead_code, reason = "recovery stage operations are consumed by Task5")]
     pub(crate) fn hole(&mut self, offset: u64, len: u64, fill: HoleFill) -> ProgressiveResult<()> {
         self.mutation()?;
         if offset != self.produced || len == 0 {
@@ -631,8 +658,10 @@ impl Stage {
         }
         if verified.member != self.member
             || verified.generation != self.generation
-            || verified.verification.packed != PackedEvidence::Complete
-            || verified.verification.authentication == AuthenticationEvidence::Missing
+            || verified.verification.level != VerificationLevel::Strict
+            || verified.verification.size != CheckVerdict::Passed
+            || verified.verification.packed != PackedEvidence::Passed
+            || verified.verification.authentication == AuthenticationEvidence::Incomplete
         {
             return Err(invalid());
         }
@@ -691,6 +720,7 @@ impl Stage {
         }
         Ok(Publication::Published { cleanup_failure })
     }
+    #[allow(dead_code, reason = "recovery stage operations are consumed by Task5")]
     pub(crate) fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> ProgressiveResult<ArtifactRead> {
         read_stage(self, offset, buf)
     }

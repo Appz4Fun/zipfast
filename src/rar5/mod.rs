@@ -17,11 +17,8 @@
 //! RAR 5.0 archive blocks, read from the published archive layout: the signature, the main header, file and service
 //! headers with their extra records, and the end of archive header.
 
-#[allow(dead_code, reason = "private progressive producers are wired by the next session task")]
 pub(crate) mod framing;
-#[allow(dead_code, reason = "private progressive producers are wired by the next session task")]
 pub(crate) mod member;
-#[allow(dead_code, reason = "private progressive producers are wired by the next session task")]
 pub(crate) mod physical;
 pub mod reader;
 pub mod session;
@@ -318,8 +315,10 @@ impl From<Error> for FileParseError {
     }
 }
 
+pub(crate) const RAW_NAME_OWNER_BYTES: usize = std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>();
+
 pub(super) struct FileWire {
-    pub(super) name: Vec<u8>,
+    pub(super) name: std::sync::Arc<Vec<u8>>,
     pub(super) compression: u64,
     pub(super) extent: std::ops::Range<u64>,
 }
@@ -385,7 +384,12 @@ fn parse_file_impl(
                 .map_err(FileParseError::Progressive)?;
         }
         encoded.extend_from_slice(name);
-        Some(FileWire { name: encoded, compression: info, extent: head.data_at..head.data_at })
+        if let Some(usage) = usage {
+            usage
+                .charge(crate::progressive::Resource::MetadataBytes, RAW_NAME_OWNER_BYTES as u64)
+                .map_err(FileParseError::Progressive)?;
+        }
+        Some(FileWire { name: std::sync::Arc::new(encoded), compression: info, extent: head.data_at..head.data_at })
     } else {
         None
     };

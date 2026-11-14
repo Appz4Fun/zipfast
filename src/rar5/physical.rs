@@ -27,9 +27,13 @@ pub(crate) struct PhysicalPart {
     pub(crate) checks: RarChecks,
     pub(crate) crypt: MemberCrypt,
     pub(crate) final_part: bool,
+    #[allow(dead_code, reason = "retained physical geometry consumed by subsequent map and recovery tasks")]
     pub(crate) wire_extent: Range<u64>,
+    #[allow(dead_code, reason = "retained physical geometry consumed by subsequent map and recovery tasks")]
     pub(crate) raw_flags: u64,
+    #[allow(dead_code, reason = "retained physical geometry consumed by subsequent map and recovery tasks")]
     pub(crate) raw_compression: u64,
+    #[allow(dead_code, reason = "retained physical geometry consumed by subsequent map and recovery tasks")]
     pub(crate) plain_extent: Option<Range<u64>>,
 }
 

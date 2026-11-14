@@ -145,8 +145,12 @@ fn verify(s: &mut Stage) -> VerifiedStage {
         inner_size: s.produced,
         checksum: ChecksumValue::Crc32([0; 4]),
         origin: EvidenceOrigin::Archive,
-        packed: PackedEvidence::Complete,
-        authentication: AuthenticationEvidence::NotEncrypted,
+        size: CheckVerdict::Passed,
+        crc32: CheckVerdict::Passed,
+        blake2sp: CheckVerdict::Missing,
+        level: VerificationLevel::Strict,
+        packed: PackedEvidence::Passed,
+        authentication: AuthenticationEvidence::NotApplicable,
     })
     .unwrap()
 }

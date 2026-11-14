@@ -542,7 +542,7 @@ mod tests {
                 }
                 ParserStep::Frame(frame) => {
                     assert_eq!(i + 1, wire.len());
-                    assert_eq!(frame.wire.unwrap().name, name);
+                    assert_eq!(*frame.wire.unwrap().name, name);
                     assert_eq!(frame.extent, 8..8 + wire.len() as u64);
                 }
                 ParserStep::End => panic!("early end"),

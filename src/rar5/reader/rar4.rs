@@ -241,7 +241,10 @@ impl Volume {
         let mut name = Vec::new();
         name.try_reserve_exact(encoded.len()).map_err(|_| allocation())?;
         name.extend_from_slice(encoded);
-        Ok((header, FileWire { name, compression: 0, extent: data_at - bytes.len() as u64..data_at }))
+        Ok((
+            header,
+            FileWire { name: std::sync::Arc::new(name), compression: 0, extent: data_at - bytes.len() as u64..data_at },
+        ))
     }
 }
 

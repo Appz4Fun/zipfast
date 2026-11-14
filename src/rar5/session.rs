@@ -590,7 +590,7 @@ impl Catalogue {
             limit(names, self.options.limits.name_bytes, RarResource::CatalogueNameBytes)?;
             let allocation = add(
                 add(header.name.capacity() as u64, wire.name.capacity() as u64)?,
-                target.map_or(0, |t| t.capacity() as u64),
+                add(target.map_or(0, |t| t.capacity() as u64), crate::rar5::RAW_NAME_OWNER_BYTES as u64)?,
             )?;
             let part_minimum = u64::from(self.session.model.parts.len() == self.session.model.parts.capacity())
                 * size_of::<Part>() as u64;
@@ -1073,7 +1073,7 @@ mod tests {
                 .model
                 .members
                 .iter()
-                .map(|row| row.header.name.capacity() + row.wire.name.capacity())
+                .map(|row| row.header.name.capacity() + row.wire.name.capacity() + crate::rar5::RAW_NAME_OWNER_BYTES)
                 .sum::<usize>();
         let actual = variable
             + session.model.members.capacity() * size_of::<Member>()

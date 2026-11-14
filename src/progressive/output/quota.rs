@@ -50,7 +50,6 @@ impl Quota {
             active_limit: active_limit.min(1),
         }
     }
-    #[allow(dead_code, reason = "called by OutputContext Drop; Task4 supplies its production constructor consumer")]
     pub(super) fn clear_registration(&self) {
         let previous = { self.state.lock().unwrap().task.take() };
         // A task's final destructor may reenter cancellation or release artifacts.

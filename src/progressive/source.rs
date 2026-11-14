@@ -226,9 +226,6 @@ fn changed() -> ProgressiveFailure {
     ProgressiveFailure::new(FailureKind::SourceChanged)
 }
 
-// Task 4 consumes this production driver. Keep temporary allowances on the
-// unconsumed items, never on the module or public provider contract.
-#[allow(dead_code)]
 pub(crate) struct SourceDriver {
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
@@ -243,8 +240,8 @@ pub(crate) struct SourceDriver {
     protection: ProtectionDeclaration,
     native: super::output::native::NativeProtection,
     holes: Vec<(u64, u64)>,
+    sealed_memory: bool,
 }
-#[allow(dead_code)]
 impl SourceDriver {
     pub(crate) fn new(
         provider: Box<dyn VolumeSource>,
@@ -270,7 +267,42 @@ impl SourceDriver {
             protection: ProtectionDeclaration::Opaque,
             native,
             holes: Vec::new(),
+            sealed_memory: false,
         })
+    }
+    // This constructor consumes the private owning backend; no caller-supplied
+    // trait object or completeness declaration can mint memory authority.
+    pub(crate) fn sealed_memory(
+        provider: super::session::memory::SealedMemory,
+        first: OsString,
+        limits: ProgressiveLimits,
+        control: SessionControl,
+    ) -> ProgressiveResult<Self> {
+        let metadata = provider.metadata_bytes;
+        let names = provider.name_bytes;
+        let input = provider.source_bytes;
+        let mut driver = Self::new(Box::new(provider), first, limits, control)?;
+        driver.usage.charge(Resource::MetadataBytes, metadata)?;
+        driver.usage.charge(Resource::NameBytes, names)?;
+        driver.usage.check(Resource::SourceBytes, input)?;
+        driver.sealed_memory = true;
+        Ok(driver)
+    }
+    pub(crate) fn validate_current(&mut self) -> ProgressiveResult<()> {
+        if self.control.is_canceled() {
+            return Err(ProgressiveFailure::new(FailureKind::Canceled));
+        }
+        if self.failed {
+            return Err(contract());
+        }
+        if self.info.is_some() {
+            self.check_info()?;
+        }
+        self.native.refresh(&self.protection, &mut self.usage)?;
+        if self.control.is_canceled() {
+            return Err(ProgressiveFailure::new(FailureKind::Canceled));
+        }
+        Ok(())
     }
     pub(crate) fn shared_usage(&self) -> Usage {
         self.usage.clone()
@@ -287,10 +319,13 @@ impl SourceDriver {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
         let result = (|| {
+            self.validate_current()?;
             self.refresh_protection()?;
+            self.validate_current()?;
             self.native.check_target(target, identity, &mut self.usage)?;
-            Ok(matches!(self.protection, ProtectionDeclaration::Complete { .. })
-                && self.native.resolved_for_publication(&self.usage)?)
+            Ok(self.sealed_memory
+                || (matches!(self.protection, ProtectionDeclaration::Complete { .. })
+                    && self.native.resolved_for_publication(&self.usage)?))
         })();
         if result.is_err() {
             self.failed = true;
@@ -547,7 +582,13 @@ impl SourceDriver {
     }
     fn refresh_protection(&mut self) -> ProgressiveResult<()> {
         self.usage.charge(Resource::SourceRequests, 1)?;
+        if self.control.is_canceled() {
+            return Err(ProgressiveFailure::new(FailureKind::Canceled));
+        }
         let mut next = self.provider.protection()?;
+        if self.control.is_canceled() {
+            return Err(ProgressiveFailure::new(FailureKind::Canceled));
+        }
         if let ProtectionDeclaration::Complete { inventory, .. } = &mut next {
             validate_inventory(inventory, &mut self.usage)?;
             canonicalize_inventory(inventory, &mut self.usage)?;

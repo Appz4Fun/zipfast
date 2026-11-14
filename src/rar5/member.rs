@@ -637,7 +637,8 @@ mod tests {
                     block_flags: super::super::HFL_SPLIT_AFTER,
                     ..Default::default()
                 };
-                let wire = super::super::FileWire { name: b"f".to_vec(), compression: 0, extent: 0..0 };
+                let wire =
+                    super::super::FileWire { name: std::sync::Arc::new(b"f".to_vec()), compression: 0, extent: 0..0 };
                 let part1 = PhysicalPart::new(0, &first, Some(Ok(params)), &wire);
                 let mut member = PhysicalMember::new(first.clone(), wire, 0, &part1).unwrap();
                 let usage = Usage::new(ProgressiveLimits::default());
