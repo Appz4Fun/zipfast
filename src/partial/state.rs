@@ -554,8 +554,10 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             validity.range(&p.range)?;
         }
     }
-    // Trailing cause section; states written before it decode every hole as Missing.
-    for h in &snapshot.holes {
+    // Trailing cause section, written only when some hole is not Missing so that states without declared
+    // damage stay readable by builds that predate it. States without it decode every hole as Missing.
+    let causes = snapshot.holes.iter().any(|h| h.cause != HoleCause::Missing);
+    for h in snapshot.holes.iter().filter(|_| causes) {
         validity.u8(match h.cause {
             HoleCause::Missing => 0,
             HoleCause::DeclaredBad => 1,

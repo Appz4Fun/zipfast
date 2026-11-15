@@ -615,4 +615,14 @@ fn declared_damage_persists_cause_and_legacy_pages_decode_as_missing() {
         .collect();
     let decoded = state::decode_pages(op.snapshot.head.clone(), legacy, &file.core.budget, &[]).unwrap();
     assert!(matches!(decoded.holes[..], [HoleReport { cause: HoleCause::Missing, .. }]));
+    // States whose holes are all Missing carry no cause section, so older builds can still read them.
+    let mut missing_only = file.core.clone_snapshot(&op.snapshot).unwrap();
+    missing_only.holes[0].cause = HoleCause::Missing;
+    let validity = |pages: Vec<(PageKind, Vec<u8>)>| {
+        let (kind, bytes) = pages.into_iter().find(|(kind, _)| *kind == PageKind::Validity).unwrap();
+        state::page_payload(kind, &bytes).unwrap().len()
+    };
+    let with_causes = validity(state::encode_pages(&op.snapshot, &file.core.budget).unwrap());
+    let without = validity(state::encode_pages(&missing_only, &file.core.budget).unwrap());
+    assert_eq!(with_causes - without, op.snapshot.holes.len());
 }

@@ -1055,7 +1055,11 @@ impl SourceDriver {
             return Ok(Overlay::Limit(len));
         }
         let end = offset.saturating_add(len as u64).min(length);
-        for (_, range) in self.declared.iter().filter(|(v, _)| *v == volume) {
+        // Ranges are sorted and disjoint and reads only move forward, so ranges behind the cursor are dropped
+        // and only the first remaining one can matter.
+        let stale = self.declared.iter().take_while(|(v, r)| *v < volume || (*v == volume && r.end <= offset)).count();
+        self.declared.drain(..stale);
+        if let Some((_, range)) = self.declared.first().filter(|(v, _)| *v == volume) {
             self.usage.charge(Resource::SourceBookkeeping, 1)?;
             if range.start <= offset && offset < range.end {
                 let hole = range.end.min(end) - offset;
