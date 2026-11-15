@@ -618,6 +618,17 @@ fn evidence_extension_is_anchored_and_survives_reopen() {
     .unwrap();
     assert!(core.write_original(8, b"ijklmnop").is_err());
     assert_eq!(fs::read(f.output()).unwrap(), vec![0; 16]);
+    let start = f.evidence.parts[0].packed.range.start;
+    core.record_hole(HoleReport {
+        id: 1,
+        revision: 1,
+        member: f.member.clone(),
+        name: Arc::from(b"member.bin".as_slice()),
+        out: 0..8,
+        packed: vec![PackedSpan { volume: 0, range: start..start + 8 }],
+        cause: HoleCause::Missing,
+    })
+    .unwrap();
     core.extend_evidence(update).unwrap();
     let state = core.state().unwrap();
     drop(core);
@@ -674,7 +685,8 @@ fn plain_fill_uses_the_same_transaction_and_returns_its_state() {
     assert_eq!(result.revision, 2);
     assert_eq!(result.applied, vec![0..4]);
     assert!(result.needs_verification);
-    assert!(result.part_checks.is_empty());
+    assert_eq!(result.part_checks.len(), 1);
+    assert_eq!(result.part_checks[0].crc32, CheckResult::Pending);
     assert_eq!(result.state.anchor(), file.state().unwrap().anchor());
     drop(file);
     assert_eq!(f.open(result.state).unwrap().remaining().unwrap(), vec![4..16]);
@@ -693,8 +705,8 @@ fn reopened_extents_rebuild_actual_hashers() {
 }
 
 thread_local! {
-    static WRITE_FAULT:std::cell::Cell<Option<usize>>=const {std::cell::Cell::new(None)};
-    static SYNC_FAULT:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};
+    pub(super) static WRITE_FAULT:std::cell::Cell<Option<usize>>=const {std::cell::Cell::new(None)};
+    pub(super) static SYNC_FAULT:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};
     static STAMP_FAULT:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};
 }
 pub(crate) fn fault_write(file: &fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<usize> {
@@ -750,6 +762,18 @@ fn partial_write_and_sync_failures_keep_the_entire_intent_unknown() {
 fn alternative_provenance_survives_canonical_reopen() {
     let f = Fixture::new();
     let file = f.create().unwrap();
+    let start = f.evidence.parts[0].packed.range.start;
+    file.core
+        .record_hole(HoleReport {
+            id: 1,
+            revision: 1,
+            member: f.member.clone(),
+            name: Arc::from(b"member.bin".as_slice()),
+            out: 0..4,
+            packed: vec![PackedSpan { volume: 0, range: start..start + 4 }],
+            cause: HoleCause::Missing,
+        })
+        .unwrap();
     let result = file.core.fill_plain(0, b"abcd").unwrap();
     drop(file);
     let reopened = f.open(result.state).unwrap();

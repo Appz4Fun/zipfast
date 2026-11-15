@@ -17,10 +17,12 @@
 //! Independently owned anchored persistent output.
 mod anchor;
 mod journal;
+mod ledger;
 mod limits;
 mod native;
 mod state;
 mod types;
+mod verify;
 use crate::progressive::{OutputOperation, Resource, SessionControl};
 use crate::rar5::source::SourceStamp;
 use anchor::AnchorBinding;
@@ -61,16 +63,20 @@ struct CoreData {
     stamp: SourceStamp,
     uncertain: Option<Uncertain>,
     pending_compaction: Option<journal::PreparedCompaction>,
+    verification: Option<verify::Verification>,
+    reopened: bool,
 }
 struct Transaction {
     intent: PartialState,
     commit: PartialState,
     valid: Snapshot,
+    commit_known: Vec<state::KnownLeaf>,
 }
 struct Uncertain {
     expected: PartialState,
     intent: PartialState,
     commit: Option<PartialState>,
+    candidate_known: Option<Vec<state::KnownLeaf>>,
 }
 struct Operation<'a> {
     core: &'a PartialCore,
@@ -279,7 +285,16 @@ impl PartialCore {
             native.check(spec.size)?;
             canceled(&options.control)?;
             let stamp = stamp(&native)?;
-            Ok(CoreData { bundle, snapshot, state, stamp, uncertain: None, pending_compaction: None })
+            Ok(CoreData {
+                bundle,
+                snapshot,
+                state,
+                stamp,
+                uncertain: None,
+                pending_compaction: None,
+                verification: None,
+                reopened: false,
+            })
         })()
         .map_err(|mut error: PartialError| {
             error.committed = committed;
@@ -314,7 +329,12 @@ impl PartialCore {
                 };
                 self.budget.metadata(candidate.wire.len() as u64)?;
                 let candidate = candidate.clone();
-                let mut snapshot = data.bundle.snapshot_reusing(&candidate, &data.snapshot.known)?;
+                let reusable = if ack.matches(uncertain.expected.anchor()) {
+                    &data.snapshot.known
+                } else {
+                    uncertain.candidate_known.as_ref().unwrap_or(&data.snapshot.known)
+                };
+                let mut snapshot = data.bundle.snapshot_reusing(&candidate, reusable)?;
                 rehash_known(&self.native, &self.budget, &self.control, self.read_chunk, &mut snapshot).map_err(
                     |mut e| {
                         e.committed = Some(ack.anchor().clone());
@@ -381,33 +401,71 @@ impl PartialCore {
         self.check(&op)?;
         self.reconcile(&mut op)?;
         self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
-        let mut applied = self.budget.vector(1)?;
-        let changed = self.write_data(&mut op, offset, bytes, true)?;
-        if changed {
-            applied.push(offset..offset + bytes.len() as u64);
+        let mut part_checks = self.budget.vector(op.snapshot.evidence.parts.len())?;
+        let applied = self.write_data(&mut op, offset, bytes, true)?;
+        if op.verification.as_ref().is_none_or(|v| v.revision != op.snapshot.head.revision) {
+            op.verification = None;
+            op.verification = Some(verify::Verification::new(&op.snapshot, &self.budget).map_err(|mut e| {
+                e.committed = Some(op.state.anchor.clone());
+                e
+            })?);
         }
+        let verification = op.verification.as_ref().unwrap();
+        part_checks.extend_from_slice(&verification.parts);
+        let needs_verification = verification.needs_verification();
         Ok(FillResult {
             revision: op.snapshot.head.revision,
             applied,
             state: op.state.clone(),
-            part_checks: Vec::new(),
-            needs_verification: true,
+            part_checks,
+            needs_verification,
         })
     }
-    fn write_data(&self, op: &mut CoreData, offset: u64, bytes: &[u8], alternate: bool) -> PartialResult<bool> {
-        if bytes.is_empty() {
-            return Ok(false);
-        }
+    fn write_data(
+        &self,
+        op: &mut CoreData,
+        offset: u64,
+        bytes: &[u8],
+        alternate: bool,
+    ) -> PartialResult<Vec<Range<u64>>> {
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
         if end > op.snapshot.head.size || self.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
         if op.snapshot.evidence.parts.last().is_none_or(|part| end > part.out.end) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
         }
+        if !alternate && offset > op.snapshot.head.produced {
+            return Err(err(PartialErrorKind::IncompleteOutput));
+        }
+        if alternate && end > op.snapshot.head.produced {
+            return Err(err(PartialErrorKind::IncompleteOutput));
+        }
         let range = offset..end;
-        let mut covered = 0u64;
+        let plan = ledger::Ledger { known: &mut op.snapshot.known, size: op.snapshot.head.size, budget: &self.budget }
+            .plan_fill(range.clone())?;
+        if alternate {
+            for range in &plan.unknown {
+                let mut at = range.start;
+                while at < range.end {
+                    let mut next = at;
+                    for report in &op.snapshot.holes {
+                        self.budget.usage.charge(Resource::SourceBookkeeping, 1)?;
+                        if report.out.start <= at && report.out.end > next {
+                            next = report.out.end;
+                        }
+                    }
+                    if next == at {
+                        return Err(err(PartialErrorKind::IncompleteOutput));
+                    }
+                    at = next.min(range.end);
+                }
+            }
+        }
         let mut compare = self.budget.vector(bytes.len().min(self.read_chunk))?;
         compare.resize(bytes.len().min(self.read_chunk), 0);
         for leaf in &op.snapshot.known {
@@ -421,6 +479,7 @@ impl PartialCore {
                 canceled(&self.control)?;
                 let n = (stop - at).min(compare.len() as u64) as usize;
                 self.budget.usage.charge(Resource::VerifyBytes, n as u64)?;
+                self.budget.usage.charge(Resource::VerifyWorkBytes, n as u64)?;
                 let count = crate::output::range::read_at(&self.native.output.file, at, &mut compare[..n])
                     .map_err(|e| io_error(OutputOperation::Read, e))?;
                 if count == 0 || compare[..count] != bytes[(at - offset) as usize..(at - offset) as usize + count] {
@@ -428,61 +487,85 @@ impl PartialCore {
                 }
                 at += count as u64;
             }
-            covered += stop - start;
         }
         self.check(op)?;
-        if covered == bytes.len() as u64 {
-            return Ok(false);
+        if plan.unknown.is_empty() {
+            return Ok(Vec::new());
         }
-        // Task 1 admits append-only original extents. Task 2 extends this same ledger.
-        if covered != 0 || (!alternate && offset < op.snapshot.head.produced) {
+        if !alternate && offset < op.snapshot.head.produced {
             return Err(err(PartialErrorKind::OverlapMismatch { range }));
         }
-        self.budget.usage.charge(Resource::OutputWriteBytes, bytes.len() as u64)?;
-        let count = bytes.len().div_ceil(65_536);
+        let total: u64 = plan.unknown.iter().map(|r| r.end - r.start).sum();
+        self.budget.usage.charge(Resource::OutputWriteBytes, total)?;
+        let mut count = 0usize;
+        for range in &plan.unknown {
+            let mut at = range.start;
+            while at < range.end {
+                let boundary =
+                    op.snapshot.evidence.parts.iter().find(|p| p.out.end > at).ok_or_else(malformed)?.out.end;
+                at = range.end.min(boundary).min(at.saturating_add(65_536 - at % 65_536));
+                count += 1;
+            }
+        }
         self.budget.limits.check(
             PartialResource::CrcLeaves,
             op.snapshot.known.len().checked_add(count).ok_or_else(malformed)? as u64,
         )?;
-        let mut intent = self.clone_snapshot(&op.snapshot)?;
-        intent.head.sequence = intent.head.sequence.checked_add(1).ok_or_else(malformed)?;
-        intent.head.revision = intent.head.revision.checked_add(1).ok_or_else(malformed)?;
-        let mut commit = self.clone_snapshot(&intent)?;
-        commit.head.sequence = commit.head.sequence.checked_add(1).ok_or_else(malformed)?;
-        commit.head.produced = commit.head.produced.max(end);
-        self.budget.metadata((count * std::mem::size_of::<state::KnownLeaf>()) as u64)?;
-        commit.known.try_reserve_exact(count).map_err(|_| malformed())?;
-        for (index, chunk) in bytes.chunks(65_536).enumerate() {
-            let start = offset + (index * 65_536) as u64;
-            let mut hasher = crate::crc32::Hasher::new();
-            hasher.update(chunk);
-            commit.known.push(state::KnownLeaf {
-                range: start..start + chunk.len() as u64,
-                crc: hasher.clone().finalize(),
-                hasher,
-                provenance: if alternate { state::Provenance::Alt } else { state::Provenance::Original },
-                _lease: Arc::new(self.budget.reserve(PartialResource::CrcLeaves, 1)?),
-            });
+        let mut leaves = self.budget.vector(count)?;
+        for range in &plan.unknown {
+            let mut at = range.start;
+            while at < range.end {
+                let boundary =
+                    op.snapshot.evidence.parts.iter().find(|p| p.out.end > at).ok_or_else(malformed)?.out.end;
+                let stop = range.end.min(boundary).min(at.saturating_add(65_536 - at % 65_536));
+                self.budget.usage.charge(Resource::VerifyWorkBytes, stop - at)?;
+                let mut hasher = crate::crc32::Hasher::new();
+                hasher.update(&bytes[(at - offset) as usize..(stop - offset) as usize]);
+                leaves.push(state::KnownLeaf {
+                    range: at..stop,
+                    crc: hasher.clone().finalize(),
+                    hasher,
+                    provenance: if alternate { state::Provenance::Alt } else { state::Provenance::Original },
+                    _lease: Arc::new(self.budget.reserve(PartialResource::CrcLeaves, 1)?),
+                });
+                at = stop;
+            }
         }
-        commit.known.sort_by_key(|leaf| leaf.range.start);
-        if alternate {
-            commit.holes.retain(|hole| hole.out.end <= offset || hole.out.start >= end);
+        let (intent, mut commit) = self.next_snapshots(op)?;
+        if !alternate {
+            commit.head.produced = commit.head.produced.max(end);
         }
-        let transaction = self.begin_transaction(op, intent, commit, vec![range])?;
+        ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }
+            .commit_fill(&plan, &leaves)?;
+        ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }.remaining()?;
+        // Retain only still-unknown observed spans, including exact packed mappings.
+        commit.holes = self.remaining_reports(&mut commit)?;
+        self.budget.metadata((plan.unknown.len() * std::mem::size_of::<Range<u64>>()) as u64)?;
+        op.verification = None;
+        let verification = verify::Verification::new(&commit, &self.budget)?;
+        let transaction = self.begin_transaction(op, intent, commit, plan.unknown.clone())?;
         let mut completed = 0usize;
         let write = (|| {
-            while completed < bytes.len() {
-                canceled(&self.control)?;
-                self.native.check(op.snapshot.head.size)?;
-                let end = (completed + self.read_chunk).min(bytes.len());
-                let n = write_output(&self.native.output.file, offset + completed as u64, &bytes[completed..end])
+            for range in &plan.unknown {
+                let mut at = range.start;
+                while at < range.end {
+                    canceled(&self.control)?;
+                    self.native.check(op.snapshot.head.size)?;
+                    let stop = range.end.min(at + self.read_chunk as u64);
+                    let n = write_output(
+                        &self.native.output.file,
+                        at,
+                        &bytes[(at - offset) as usize..(stop - offset) as usize],
+                    )
                     .map_err(|e| io_error(OutputOperation::Write, e))?;
-                if n == 0 {
-                    return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
+                    if n == 0 {
+                        return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
+                    }
+                    completed += n;
+                    at += n as u64;
+                    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                    tests::state::checkpoint("write");
                 }
-                completed += n;
-                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-                tests::state::checkpoint("write");
             }
             Ok(())
         })();
@@ -495,15 +578,13 @@ impl PartialCore {
         // A secondary stamp failure must not replace the write failure or its progress.
         if let Err(mut error) = write.and(refresh) {
             error.committed = Some(transaction.intent.anchor.clone());
-            error.output = Some(crate::progressive::OutputRange {
-                offset,
-                attempted: bytes.len() as u64,
-                completed: completed as u64,
-            });
+            error.output =
+                Some(crate::progressive::OutputRange { offset, attempted: total, completed: completed as u64 });
             return Err(error);
         }
         self.finish_transaction(op, transaction)?;
-        Ok(true)
+        op.verification = Some(verification);
+        Ok(plan.unknown)
     }
     fn begin_transaction(
         &self,
@@ -514,6 +595,10 @@ impl PartialCore {
     ) -> PartialResult<Transaction> {
         self.budget.metadata(data.state.wire.len() as u64)?;
         let expected = data.state.clone();
+        let mut intent_known = self.budget.vector(intent.known.len())?;
+        intent_known.extend_from_slice(&intent.known);
+        let mut commit_known = self.budget.vector(valid.known.len())?;
+        commit_known.extend_from_slice(&valid.known);
         let (intent_state, commit_state, files) =
             data.bundle.prepare_mutation(expected.anchor(), &mut intent, &mut valid)?;
         data.bundle.write_pages(&files)?;
@@ -527,7 +612,12 @@ impl PartialCore {
         let anchor = data.bundle.append_intent(&record)?;
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         tests::state::checkpoint("intent-sync");
-        data.uncertain = Some(Uncertain { expected: expected.clone(), intent: intent_state.clone(), commit: None });
+        data.uncertain = Some(Uncertain {
+            expected: expected.clone(),
+            intent: intent_state.clone(),
+            commit: None,
+            candidate_known: Some(intent_known),
+        });
         let ack = self.anchors.advance(Some(expected.anchor()), &anchor).map_err(|mut e| {
             e.committed = Some(expected.anchor.clone());
             e
@@ -542,7 +632,7 @@ impl PartialCore {
             e.committed = Some(anchor);
             e
         })?;
-        Ok(Transaction { intent: intent_state, commit: commit_state, valid })
+        Ok(Transaction { intent: intent_state, commit: commit_state, valid, commit_known })
     }
     fn finish_transaction(&self, data: &mut CoreData, transaction: Transaction) -> PartialResult<()> {
         let intent_anchor = transaction.intent.anchor.clone();
@@ -565,6 +655,7 @@ impl PartialCore {
                 expected: transaction.intent.clone(),
                 intent: transaction.intent,
                 commit: Some(transaction.commit.clone()),
+                candidate_known: Some(transaction.commit_known),
             });
             let ack = self.anchors.advance(Some(&intent_anchor), &final_anchor)?;
             data.bundle.acknowledge(&final_anchor, &ack)?;
@@ -632,14 +723,31 @@ impl PartialCore {
             return Err(malformed());
         }
         let (mut intent, mut valid) = self.next_snapshots(&data)?;
-        intent.known.retain(|leaf| leaf.range.end <= report.out.start || leaf.range.start >= report.out.end);
+        if report.out.start > data.snapshot.head.produced
+            || (report.out.end > data.snapshot.head.produced && report.out.start != data.snapshot.head.produced)
+        {
+            return Err(err(PartialErrorKind::IncompleteOutput));
+        }
+        intent.known = self.invalidate(&data.snapshot, &report.out)?;
+        self.budget.metadata((intent.known.len() * std::mem::size_of::<state::KnownLeaf>()) as u64)?;
         valid.known = intent.known.clone();
+        valid.head.produced = valid.head.produced.max(report.out.end);
+        intent.head.produced = valid.head.produced;
+        ledger::Ledger { known: &mut intent.known, size: intent.head.size, budget: &self.budget }.remaining()?;
         self.budget.metadata(
             (std::mem::size_of::<HoleReport>() + report.packed.len() * std::mem::size_of::<PackedSpan>()) as u64,
         )?;
         valid.holes.try_reserve_exact(1).map_err(|_| malformed())?;
         let affected = report.out.clone();
         valid.holes.push(report);
+        self.budget.metadata(
+            valid
+                .holes
+                .iter()
+                .map(|h| std::mem::size_of::<HoleReport>() + h.packed.len() * std::mem::size_of::<PackedSpan>())
+                .sum::<usize>() as u64,
+        )?;
+        intent.holes = valid.holes.clone();
         let transaction = self.begin_transaction(&mut data, intent, valid, vec![affected])?;
         self.finish_transaction(&mut data, transaction)
     }
@@ -719,7 +827,8 @@ impl PartialCore {
         let prepared = op.bundle.prepare_compaction(&snapshot.head)?;
         let next = prepared.state.clone();
         let previous = op.state.clone();
-        op.uncertain = Some(Uncertain { expected: previous.clone(), intent: next.clone(), commit: None });
+        op.uncertain =
+            Some(Uncertain { expected: previous.clone(), intent: next.clone(), commit: None, candidate_known: None });
         op.pending_compaction = Some(prepared);
         let ack = self.anchors.advance(Some(previous.anchor()), next.anchor()).map_err(|mut e| {
             e.committed = Some(previous.anchor.clone());
@@ -745,21 +854,10 @@ impl PartialCore {
         Ok(op.state.clone())
     }
     fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
-        let op = self.operation()?;
+        let mut op = self.operation()?;
         self.check(&op)?;
-        let mut holes = self.budget.vector(op.snapshot.known.len().saturating_add(1))?;
-        let mut at = 0;
-        for leaf in &op.snapshot.known {
-            if at < leaf.range.start {
-                holes.push(at..leaf.range.start);
-            }
-            at = leaf.range.end;
-        }
-        if at < op.snapshot.head.size {
-            holes.push(at..op.snapshot.head.size);
-        }
-        self.budget.usage.check(Resource::HoleIntervals, holes.len() as u64)?;
-        Ok(holes)
+        let size = op.snapshot.head.size;
+        ledger::Ledger { known: &mut op.snapshot.known, size, budget: &self.budget }.remaining()
     }
 }
 impl PartialFile {
@@ -828,10 +926,16 @@ impl PartialFile {
                     stamp: before,
                     uncertain: None,
                     pending_compaction: None,
+                    verification: None,
+                    reopened: true,
                 })),
                 _lease: lease,
             }),
         })
+    }
+    /// Fills observed holes after comparing every known overlap. Matching known bytes are unchanged.
+    pub fn fill(&mut self, offset: u64, bytes: &[u8]) -> PartialResult<FillResult> {
+        self.core.fill_plain(offset, bytes)
     }
     pub fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         self.core.remaining()
@@ -845,9 +949,11 @@ impl PartialFile {
 }
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    mod ledger;
     mod native;
     #[path = "../../../tests/common/mod.rs"]
     mod rar_fixture;
     mod serde;
     pub(super) mod state;
+    mod verify;
 }

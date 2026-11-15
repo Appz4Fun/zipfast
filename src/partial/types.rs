@@ -301,3 +301,32 @@ pub struct FillResult {
     pub part_checks: Vec<PartCheck>,
     pub needs_verification: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum VerifyPath {
+    ExtentCombine,
+    TargetedReadback,
+    WholeReadback,
+    ReopenRehash,
+}
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AttributeResult {
+    Applied,
+    NotRequested,
+    Failed(io::Error),
+}
+#[derive(Debug)]
+pub struct MetadataResult {
+    pub modified: AttributeResult,
+    pub permissions: AttributeResult,
+}
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Verdict {
+    Ok { revision: u64, parts: Vec<PartCheck>, path: VerifyPath, metadata: MetadataResult },
+    PartBad { revision: u64, volume: u32, part: u64, which: crate::progressive::ChecksumAlgorithm },
+    Bad { revision: u64, which: crate::progressive::ChecksumAlgorithm },
+    Incomplete { revision: u64, holes: Vec<Range<u64>>, parts: Vec<PartCheck>, missing_checks: bool },
+}
