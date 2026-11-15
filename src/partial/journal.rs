@@ -31,6 +31,8 @@ struct Stored {
     size: u64,
     _bytes: Reservation,
     _count: Reservation,
+    // Its name and slot, released when compaction retires the file.
+    _metadata: Lease,
 }
 pub(crate) struct Bundle {
     directory: Directory,
@@ -41,6 +43,7 @@ pub(crate) struct Bundle {
 pub(crate) struct PreparedCompaction {
     pub(super) state: PartialState,
     retire: Vec<String>,
+    _retire: Lease,
 }
 impl Bundle {
     pub(crate) fn create(spec: &CreateSpec, budget: &PartialBudget) -> PartialResult<Self> {
@@ -87,9 +90,16 @@ impl Bundle {
                 if is_page { PartialResource::LedgerBytes } else { PartialResource::JournalBytes },
                 meta.len(),
             )?;
-            budget.metadata(std::mem::size_of::<Stored>() as u64 + name.len() as u64)?;
+            let metadata = budget.metadata_lease(std::mem::size_of::<Stored>() as u64 + name.len() as u64)?;
             files.try_reserve_exact(1).map_err(|_| malformed())?;
-            files.push(Stored { name, written: true, size: meta.len(), _bytes: bytes, _count: count });
+            files.push(Stored {
+                name,
+                written: true,
+                size: meta.len(),
+                _bytes: bytes,
+                _count: count,
+                _metadata: metadata,
+            });
         }
         directory.check()?;
         Ok(Self { directory, budget: budget.clone(), files, acknowledged: None })
@@ -145,7 +155,7 @@ impl Bundle {
         self.budget.exclusions.bind(&self.directory.path.join(name), &file.file)?;
         let mut at = 0;
         if exists {
-            let prior = state::read_bounded(&file.file, bytes.len(), &self.budget)?;
+            let (prior, _prior) = state::read_bounded_leased(&file.file, bytes.len(), &self.budget)?;
             if prior != bytes {
                 if !bytes.starts_with(&prior) || prior.len() >= bytes.len() {
                     return Err(err(PartialErrorKind::JournalCorrupt));
@@ -246,7 +256,7 @@ impl Bundle {
         state::decode_pages(head, pages, &self.budget, reusable)
     }
     pub(super) fn reserve_files(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
-        let mut added = self.budget.vector(files.len())?;
+        let (mut added, _added) = self.budget.leased_vector(files.len())?;
         for (name, bytes, page) in files {
             if self.files.iter().any(|f| &f.name == name) || added.iter().any(|f: &Stored| &f.name == name) {
                 continue;
@@ -259,16 +269,16 @@ impl Bundle {
                 bytes.len() as u64,
             )?;
             Self::exclude(&self.directory, &self.budget, name, None)?;
-            self.budget.metadata(name.len() as u64)?;
+            let metadata = self.budget.metadata_lease((name.len() + std::mem::size_of::<Stored>()) as u64)?;
             added.push(Stored {
                 name: name.clone(),
                 written: false,
                 size: bytes.len() as u64,
                 _bytes: space,
                 _count: count,
+                _metadata: metadata,
             });
         }
-        self.budget.metadata((added.len() * std::mem::size_of::<Stored>()) as u64)?;
         self.files.try_reserve_exact(added.len()).map_err(|_| malformed())?;
         self.files.extend(added);
         Ok(())
@@ -278,11 +288,16 @@ impl Bundle {
         parent: &StateAnchor,
         intent: &mut Snapshot,
         commit: &mut Snapshot,
-    ) -> PartialResult<(PartialState, PartialState, PreparedFiles)> {
+    ) -> PartialResult<(PartialState, PartialState, PreparedFiles, Lease)> {
         let mut files = Vec::new();
+        // The encoded pages live in `files` until they are written.
+        let mut lease = Lease::empty(&self.budget.usage, Resource::MetadataBytes);
         for snapshot in [&mut *intent, &mut *commit] {
-            let pages = state::encode_pages(snapshot, &self.budget)?;
-            let mut refs = self.budget.vector(pages.len())?;
+            let (pages, encoded) = state::encode_pages(snapshot, &self.budget)?;
+            lease.absorb(encoded);
+            // The refs replace the copy's page list; the copy is transaction-scoped.
+            let (mut refs, list) = self.budget.leased_vector(pages.len())?;
+            lease.absorb(list);
             for (kind, bytes) in pages {
                 let digest = crate::crypto::sha256(&bytes);
                 refs.push(PageRef { kind, digest, len: bytes.len() as u32 });
@@ -301,7 +316,7 @@ impl Bundle {
         )?;
         files.push((format!("r-{}", hex(intent_state.anchor().digest())), intent_state.wire.clone(), false));
         files.push((format!("r-{}", hex(commit_state.anchor().digest())), commit_state.wire.clone(), false));
-        Ok((intent_state, commit_state, files))
+        Ok((intent_state, commit_state, files, lease))
     }
     /// Maintenance is useful only when it can reclaim the pressured storage
     /// and leave room for this already-validated transaction. Include one
@@ -317,7 +332,8 @@ impl Bundle {
             .checked_mul(files.len().checked_add(head.pages.len()).ok_or_else(malformed)?)
             .ok_or_else(malformed)?;
         self.budget.usage.charge(Resource::SourceBookkeeping, visits as u64)?;
-        self.budget.metadata(
+        // Scratch for this check only.
+        let _scratch = self.budget.metadata_lease(
             (std::mem::size_of::<CommittedState>()
                 + head.relative_output.as_os_str().len()
                 + head.pages.len() * (std::mem::size_of::<PageRef>() + 66)) as u64,
@@ -409,15 +425,15 @@ impl Bundle {
     pub(crate) fn prepare_compaction(&mut self, head: &CommittedState) -> PartialResult<PreparedCompaction> {
         let state = self.compaction_state(head)?;
         let name = format!("r-{}", hex(state.anchor().digest()));
-        let mut retire = self.budget.vector(self.files.len())?;
+        let (mut retire, mut lease) = self.budget.leased_vector(self.files.len())?;
         for f in &self.files {
             if f.written && f.name != name && !head.pages.iter().any(|p| f.name == format!("p-{}", hex(&p.digest))) {
-                self.budget.metadata(f.name.len() as u64)?;
+                lease.absorb(self.budget.metadata_lease(f.name.len() as u64)?);
                 retire.push(f.name.clone());
             }
         }
         self.put(&name, &state.wire, false)?;
-        Ok(PreparedCompaction { state, retire })
+        Ok(PreparedCompaction { state, retire, _retire: lease })
     }
     pub(crate) fn complete_compaction(&mut self, prepared: PreparedCompaction, ack: &AnchorAck) -> PartialResult<()> {
         if !ack.matches(prepared.state.anchor()) {

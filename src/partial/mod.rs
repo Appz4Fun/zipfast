@@ -26,7 +26,7 @@ mod native;
 mod state;
 mod types;
 mod verify;
-use crate::progressive::{OutputOperation, Resource, SessionControl};
+use crate::progressive::{Lease, OutputOperation, Resource, SessionControl};
 use crate::rar5::source::SourceStamp;
 use anchor::AnchorBinding;
 pub(crate) use cipher::MemberKeys;
@@ -94,6 +94,9 @@ struct CoreData {
     uncertain: Option<Uncertain>,
     pending_compaction: Option<journal::PreparedCompaction>,
     verification: Option<verify::Verification>,
+    // Part CRC results still valid for the known leaves of the given revision,
+    // kept across transactions that do not change known leaves.
+    part_results: Option<(u64, Vec<PartCheck>, Lease)>,
     reopened: bool,
 }
 struct Transaction {
@@ -101,6 +104,8 @@ struct Transaction {
     commit: PartialState,
     valid: Snapshot,
     commit_known: Vec<state::KnownLeaf>,
+    // Transaction-scoped copies (state, known vectors, encoded pages).
+    _lease: Lease,
 }
 struct Uncertain {
     expected: PartialState,
@@ -276,7 +281,9 @@ impl PartialCore {
             crypt,
             cipher: Vec::new(),
         };
-        let pages = state::encode_pages(&initial, &budget)?;
+        // The genesis pages stay with the prepared core until it is created.
+        let (pages, encoded) = state::encode_pages(&initial, &budget)?;
+        encoded.keep();
         initial.head.pages = pages
             .iter()
             .map(|(kind, bytes)| state::PageRef {
@@ -372,7 +379,10 @@ impl PartialCore {
             error
         })
     }
-    fn clone_snapshot(&self, snapshot: &Snapshot) -> PartialResult<Snapshot> {
+    /// A working copy of `snapshot`. Its charge lasts as long as the returned
+    /// lease: a copy either replaces the retained snapshot or is dropped, and
+    /// retained growth (known leaves, holes, evidence) is charged where it is made.
+    fn clone_snapshot(&self, snapshot: &Snapshot) -> PartialResult<(Snapshot, Lease)> {
         let bytes = std::mem::size_of::<Snapshot>()
             + snapshot.name.len()
             + snapshot.head.relative_output.as_os_str().len()
@@ -397,8 +407,8 @@ impl PartialCore {
                 .iter()
                 .map(|h| std::mem::size_of::<HoleReport>() + h.packed.len() * std::mem::size_of::<PackedSpan>())
                 .sum::<usize>();
-        self.budget.metadata(bytes as u64)?;
-        Ok(snapshot.clone())
+        let lease = self.budget.metadata_lease(bytes as u64)?;
+        Ok((snapshot.clone(), lease))
     }
     pub(crate) fn validate_current(&self) -> PartialResult<()> {
         let data = self.operation()?;
@@ -608,7 +618,7 @@ impl PartialCore {
     }
     /// Durably keeps ciphertext blocks a remaining hole needs to decrypt later archive bytes.
     fn keep_cipher(&self, op: &mut CoreData, blocks: &[state::CipherBlock]) -> PartialResult<()> {
-        let (mut intent, mut valid) = self.next_snapshots(op)?;
+        let (mut intent, mut valid, _snapshots) = self.next_snapshots(op)?;
         cipher::merge(&self.budget, &mut valid.cipher, blocks)?;
         cipher::prune(&self.budget, &mut valid)?;
         if valid.cipher == op.snapshot.cipher {
@@ -699,12 +709,14 @@ impl PartialCore {
     fn fill_result(&self, op: &mut CoreData, applied: Vec<Range<u64>>) -> PartialResult<FillResult> {
         let mut part_checks = self.budget.vector(op.snapshot.evidence.parts.len())?;
         if op.verification.as_ref().is_none_or(|v| v.revision != op.snapshot.head.revision) {
-            op.verification = None;
+            let previous = self.part_results(op);
             op.verification =
-                Some(verify::Verification::new(&op.snapshot, &self.budget, self.hash_key()).map_err(|mut e| {
-                    e.committed = Some(op.state.anchor.clone());
-                    e
-                })?);
+                Some(verify::Verification::after(previous, &[], &op.snapshot, &self.budget, self.hash_key()).map_err(
+                    |mut e| {
+                        e.committed = Some(op.state.anchor.clone());
+                        e
+                    },
+                )?);
         }
         let verification = op.verification.as_ref().unwrap();
         part_checks.extend_from_slice(&verification.parts);
@@ -744,7 +756,7 @@ impl PartialCore {
         let (corrected, confirmed) = self.compare_known(op, offset, bytes, mode)?;
         let mut base = Vec::new();
         if !corrected.is_empty() {
-            let mut scratch = self.clone_snapshot(&op.snapshot)?;
+            let (mut scratch, _scratch) = self.clone_snapshot(&op.snapshot)?;
             for bad in &corrected {
                 scratch.known = self.invalidate(&scratch, bad)?;
             }
@@ -822,7 +834,7 @@ impl PartialCore {
                 at = stop;
             }
         }
-        let (mut intent, mut commit) = self.next_snapshots(op)?;
+        let (mut intent, mut commit, _snapshots) = self.next_snapshots(op)?;
         if !alternate {
             commit.head.produced = commit.head.produced.max(end);
         }
@@ -862,8 +874,13 @@ impl PartialCore {
             cipher::prune(&self.budget, &mut commit)?;
         }
         self.budget.metadata((plan.unknown.len() * std::mem::size_of::<Range<u64>>()) as u64)?;
-        op.verification = None;
-        let verification = verify::Verification::new(&commit, &self.budget, self.hash_key())?;
+        // Only the written and corrected ranges changed bytes; confirmation and
+        // hole bookkeeping leave every leaf CRC as it was.
+        let previous = self.part_results(op);
+        let (mut changed, changed_lease) = self.budget.leased_vector(plan.unknown.len() + corrected.len())?;
+        changed.extend(plan.unknown.iter().chain(&corrected).cloned());
+        let verification = verify::Verification::after(previous, &changed, &commit, &self.budget, self.hash_key())?;
+        drop((changed, changed_lease));
         // Once the intent is durable: the differing alt ranges are holes now, written or not. Report them on
         // failure so the caller still learns that alt was wrong.
         let progress = |op: &CoreData, mut error: PartialError| {
@@ -946,7 +963,8 @@ impl PartialCore {
         let end = offset + bytes.len() as u64;
         let mut corrected: Vec<Range<u64>> = Vec::new();
         let mut confirmed: Vec<Range<u64>> = Vec::new();
-        let mut compare = self.budget.vector(bytes.len().min(self.read_chunk))?;
+        // Scratch freed on return; read_chunk already caps its size.
+        let (mut compare, _compare) = self.budget.leased_vector(bytes.len().min(self.read_chunk))?;
         compare.resize(bytes.len().min(self.read_chunk), 0);
         for leaf in &op.snapshot.known {
             let start = offset.max(leaf.range.start);
@@ -1020,22 +1038,27 @@ impl PartialCore {
     ) -> PartialResult<Transaction> {
         let prior_sequence = data.state.anchor().sequence();
         let result = (|| {
-            self.budget.metadata(data.state.wire.len() as u64)?;
+            // These copies live until the transaction finishes (or, on failure,
+            // until the uncertain record is resolved); charge them that long.
+            let mut lease = self.budget.metadata_lease(data.state.wire.len() as u64)?;
             let mut expected = data.state.clone();
-            let mut intent_known = self.budget.vector(intent.known.len())?;
+            let (mut intent_known, known) = self.budget.leased_vector(intent.known.len())?;
+            lease.absorb(known);
             intent_known.extend_from_slice(&intent.known);
-            let mut commit_known = self.budget.vector(valid.known.len())?;
+            let (mut commit_known, known) = self.budget.leased_vector(valid.known.len())?;
+            lease.absorb(known);
             commit_known.extend_from_slice(&valid.known);
-            let (mut intent_state, mut commit_state, mut files) =
+            let (mut intent_state, mut commit_state, mut files, mut pages) =
                 data.bundle.prepare_mutation(expected.anchor(), &mut intent, &mut valid)?;
             if data.bundle.needs_compaction(&data.snapshot.head, &files)? {
                 self.compact_locked(data)?;
                 expected = data.state.clone();
                 intent.head.sequence = data.snapshot.head.sequence.checked_add(1).ok_or_else(malformed)?;
                 valid.head.sequence = intent.head.sequence.checked_add(1).ok_or_else(malformed)?;
-                (intent_state, commit_state, files) =
+                (intent_state, commit_state, files, pages) =
                     data.bundle.prepare_mutation(expected.anchor(), &mut intent, &mut valid)?;
             }
+            lease.absorb(pages);
             data.bundle.reserve_files(&files)?;
             data.bundle.write_pages(&files)?;
             self.check(data)?;
@@ -1068,7 +1091,7 @@ impl PartialCore {
                 e.committed = Some(anchor);
                 e
             })?;
-            Ok(Transaction { intent: intent_state, commit: commit_state, valid, commit_known })
+            Ok(Transaction { intent: intent_state, commit: commit_state, valid, commit_known, _lease: lease })
         })();
         result.map_err(|mut error: PartialError| {
             if error.committed.is_none() && data.state.anchor().sequence() != prior_sequence {
@@ -1119,13 +1142,15 @@ impl PartialCore {
             e
         })
     }
-    fn next_snapshots(&self, data: &CoreData) -> PartialResult<(Snapshot, Snapshot)> {
-        let mut intent = self.clone_snapshot(&data.snapshot)?;
+    /// Intent and commit copies for one transaction; keep the lease until it finishes.
+    fn next_snapshots(&self, data: &CoreData) -> PartialResult<(Snapshot, Snapshot, Lease)> {
+        let (mut intent, mut lease) = self.clone_snapshot(&data.snapshot)?;
         intent.head.sequence = intent.head.sequence.checked_add(1).ok_or_else(malformed)?;
         intent.head.revision = intent.head.revision.checked_add(1).ok_or_else(malformed)?;
-        let mut valid = self.clone_snapshot(&intent)?;
+        let (mut valid, copy) = self.clone_snapshot(&intent)?;
+        lease.absorb(copy);
         valid.head.sequence = valid.head.sequence.checked_add(1).ok_or_else(malformed)?;
-        Ok((intent, valid))
+        Ok((intent, valid, lease))
     }
     pub(crate) fn hash_key(&self) -> Option<&[u8; 32]> {
         self.keys.as_ref().map(|keys| &keys.hash)
@@ -1176,7 +1201,7 @@ impl PartialCore {
         {
             return Err(malformed());
         }
-        let (mut intent, mut valid) = self.next_snapshots(&data)?;
+        let (mut intent, mut valid, _snapshots) = self.next_snapshots(&data)?;
         if report.out.start > data.snapshot.head.produced
             || (report.out.end > data.snapshot.head.produced && report.out.start != data.snapshot.head.produced)
         {
@@ -1313,7 +1338,7 @@ impl PartialCore {
         let mut op = self.operation()?;
         self.check(&op)?;
         self.reconcile(&mut op)?;
-        let (mut intent, mut valid) = self.next_snapshots(&op)?;
+        let (mut intent, mut valid, _snapshots) = self.next_snapshots(&op)?;
         if !cipher::forget(&self.budget, &mut valid.cipher, damaged)? {
             return Ok(());
         }
@@ -1341,16 +1366,18 @@ impl PartialCore {
         {
             return Err(err(PartialErrorKind::IncompleteOutput));
         }
-        let (intent, mut valid) = self.next_snapshots(&data)?;
+        let (intent, mut valid, _snapshots) = self.next_snapshots(&data)?;
         valid.head.member_finished = true;
+        let carried = self.part_results(&mut data);
         let transaction = self.begin_transaction(&mut data, intent, valid, Vec::new())?;
-        self.finish_transaction(&mut data, transaction)
+        self.finish_transaction(&mut data, transaction)?;
+        self.keep_part_results(&mut data, carried)
     }
     pub(crate) fn extend_evidence(&self, update: EvidenceUpdate) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;
         self.reconcile(&mut data)?;
-        let (intent, mut valid) = self.next_snapshots(&data)?;
+        let (intent, mut valid, _snapshots) = self.next_snapshots(&data)?;
         for part in update.parts {
             if let Some(old) = valid.evidence.parts.iter().find(|old| old.ordinal == part.ordinal) {
                 if old != &part {
@@ -1412,8 +1439,27 @@ impl PartialCore {
         if state::validate_evidence(&valid.name, valid.head.size, &valid.evidence, &self.budget)? != valid.crypt {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
         }
+        // Evidence only appends parts and witnesses: every known leaf, and so
+        // every existing part's CRC result, is unchanged by this transaction.
+        let carried = self.part_results(&mut data);
         let transaction = self.begin_transaction(&mut data, intent, valid, Vec::new())?;
-        self.finish_transaction(&mut data, transaction)
+        self.finish_transaction(&mut data, transaction)?;
+        self.keep_part_results(&mut data, carried)
+    }
+    /// Keeps part results across a committed transaction that left every known leaf as it was.
+    fn keep_part_results(&self, data: &mut CoreData, parts: Vec<PartCheck>) -> PartialResult<()> {
+        let lease = self.budget.metadata_lease((parts.capacity() * std::mem::size_of::<PartCheck>()) as u64)?;
+        data.part_results = Some((data.snapshot.head.revision, parts, lease));
+        Ok(())
+    }
+    /// Part CRC results valid for the current known leaves, if any are kept.
+    fn part_results(&self, data: &mut CoreData) -> Vec<PartCheck> {
+        let revision = data.snapshot.head.revision;
+        let carried = data.part_results.take().filter(|(at, ..)| *at == revision).map(|(_, parts, _)| parts);
+        match data.verification.take() {
+            Some(v) if v.revision == revision => v.parts,
+            _ => carried.unwrap_or_default(),
+        }
     }
     pub(crate) fn compact(&self) -> PartialResult<()> {
         let mut op = self.operation()?;
@@ -1422,7 +1468,7 @@ impl PartialCore {
         self.compact_locked(&mut op)
     }
     fn compact_locked(&self, op: &mut CoreData) -> PartialResult<()> {
-        let mut snapshot = self.clone_snapshot(&op.snapshot)?;
+        let (mut snapshot, _snapshot) = self.clone_snapshot(&op.snapshot)?;
         snapshot.head.sequence = snapshot.head.sequence.checked_add(1).ok_or_else(malformed)?;
         let prepared = op.bundle.prepare_compaction(&snapshot.head)?;
         let next = prepared.state.clone();
@@ -1533,6 +1579,7 @@ impl PartialFile {
                     uncertain: None,
                     pending_compaction: None,
                     verification: None,
+                    part_results: None,
                     reopened: true,
                 })),
                 keys,
@@ -1759,6 +1806,7 @@ impl PreparedCreate {
                 uncertain: None,
                 pending_compaction: None,
                 verification: None,
+                part_results: None,
                 reopened: false,
             })
         })()

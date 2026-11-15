@@ -18,7 +18,8 @@
 use super::limits::{PartialBudget, Reservation};
 use super::*;
 use crate::progressive::{
-    FailureKind, OutputOperation, ProgressiveFailure, ProgressiveResult, ProtectionDeclaration, Resource, Usage, guard,
+    FailureKind, Lease, OutputOperation, ProgressiveFailure, ProgressiveResult, ProtectionDeclaration, Resource, Usage,
+    guard,
     native::{Identity, NativeProtection},
 };
 use std::{
@@ -53,6 +54,9 @@ impl Clone for PartialProtectedPath {
 }
 pub(crate) struct PartialExclusions {
     entries: Mutex<Vec<Arc<PartialProtectedPath>>>,
+    // Charges of entries made outside genesis, released when `retire` removes
+    // the entry (journal files dropped by compaction). Locked after `entries`.
+    leases: Mutex<Vec<(PathBuf, [Lease; 3])>>,
     revision: std::sync::atomic::AtomicU64,
     usage: Usage,
     pub(super) counters: Arc<Mutex<[u64; 10]>>,
@@ -61,6 +65,7 @@ impl PartialExclusions {
     pub(crate) fn new(usage: Usage) -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
+            leases: Mutex::new(Vec::new()),
             revision: std::sync::atomic::AtomicU64::new(0),
             usage,
             counters: Arc::new(Mutex::new([0; 10])),
@@ -84,18 +89,28 @@ impl PartialExclusions {
             }
             return Ok(());
         }
-        let charge = |resource, amount| match budget {
-            Some(budget) => budget.creation_charge(resource, amount),
-            None => self.usage.charge(resource, amount).map_err(Into::into),
-        };
-        charge(Resource::ProtectionPaths, 1)?;
         let bytes = path.path.as_os_str().len()
             + path.root.as_os_str().len()
             + path.parent.as_os_str().len()
             + std::mem::size_of::<PartialProtectedPath>()
             + 3 * std::mem::size_of::<usize>();
-        charge(Resource::MetadataBytes, bytes as u64)?;
-        charge(Resource::ProtectionPathBytes, bytes as u64)?;
+        let mut leases = self.leases.lock().unwrap();
+        match budget {
+            Some(budget) => {
+                budget.creation_charge(Resource::ProtectionPaths, 1)?;
+                budget.creation_charge(Resource::MetadataBytes, bytes as u64)?;
+                budget.creation_charge(Resource::ProtectionPathBytes, bytes as u64)?;
+            }
+            None => {
+                let held = [
+                    self.usage.lease(Resource::ProtectionPaths, 1)?,
+                    self.usage.lease(Resource::MetadataBytes, (bytes + path.path.as_os_str().len()) as u64)?,
+                    self.usage.lease(Resource::ProtectionPathBytes, bytes as u64)?,
+                ];
+                leases.try_reserve(1).map_err(|_| malformed())?;
+                leases.push((path.path.clone(), held));
+            }
+        }
         list.try_reserve_exact(1).map_err(|_| malformed())?;
         let next = self.revision.load(Ordering::Relaxed).checked_add(1).ok_or_else(malformed)?;
         list.push(Arc::new(path.clone()));
@@ -111,6 +126,7 @@ impl PartialExclusions {
             if let Some(next) = self.revision.load(Ordering::Relaxed).checked_add(1) {
                 list.retain(|entry| entry.path != path);
                 self.revision.store(next, Ordering::Release);
+                self.leases.lock().unwrap().retain(|(held, _)| held != path);
             }
         }
     }
@@ -190,13 +206,14 @@ impl PartialExclusions {
     pub(crate) fn check_input_revision(&self, paths: &[PathBuf], files: &[File]) -> ProgressiveResult<Option<u64>> {
         // Keep path facts alive without repeatedly allocating three paths per
         // live state file on every source callback. IO remains outside the lock.
-        let (revision, entries) = {
+        // The cloned list is freed on return; charge it only while it is held.
+        let (revision, entries, _entries) = {
             let list = self.entries.lock().unwrap();
-            self.usage.charge(
+            let lease = self.usage.lease(
                 Resource::MetadataBytes,
                 (list.len() * std::mem::size_of::<Arc<PartialProtectedPath>>()) as u64,
             )?;
-            (self.revision.load(Ordering::Relaxed), list.clone())
+            (self.revision.load(Ordering::Relaxed), list.clone(), lease)
         };
         let unsafe_path = || ProgressiveFailure::new(FailureKind::UnsafePath);
         for entry in entries {

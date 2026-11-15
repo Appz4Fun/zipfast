@@ -487,7 +487,7 @@ fn fill_leaf_and_work_caps_precede_effects() {
             match resource {
                 0 => limits.fill_bytes = if exact { 33 } else { 32 },
                 1 => limits.crc_leaves = if exact { 2 } else { 1 },
-                _ => progressive.verify_work_bytes = if exact { 116 } else { 115 },
+                _ => progressive.verify_work_bytes = if exact { 83 } else { 82 },
             }
             let mut file = f.create_with(limits, progressive).unwrap();
             f.hole(&file, 0..33);
@@ -607,7 +607,7 @@ fn declared_damage_persists_cause_and_legacy_pages_decode_as_missing() {
     assert_eq!(mapped, vec![damaged.clone()]);
     assert_eq!(file.remaining().unwrap(), vec![part.out.start + 2..part.out.start + 5]);
     let op = file.core.operation().unwrap();
-    let pages = state::encode_pages(&op.snapshot, &file.core.budget).unwrap();
+    let (pages, _pages) = state::encode_pages(&op.snapshot, &file.core.budget).unwrap();
     let decoded = state::decode_pages(op.snapshot.head.clone(), pages.clone(), &file.core.budget, &[]).unwrap();
     assert!(matches!(decoded.holes[..], [HoleReport { cause: HoleCause::DeclaredBad, .. }]));
     let legacy = pages
@@ -623,13 +623,13 @@ fn declared_damage_persists_cause_and_legacy_pages_decode_as_missing() {
     let decoded = state::decode_pages(op.snapshot.head.clone(), legacy, &file.core.budget, &[]).unwrap();
     assert!(matches!(decoded.holes[..], [HoleReport { cause: HoleCause::Missing, .. }]));
     // States whose holes are all Missing carry no cause section, so older builds can still read them.
-    let mut missing_only = file.core.clone_snapshot(&op.snapshot).unwrap();
+    let (mut missing_only, _copy) = file.core.clone_snapshot(&op.snapshot).unwrap();
     missing_only.holes[0].cause = HoleCause::Missing;
     let validity = |pages: Vec<(PageKind, Vec<u8>)>| {
         let (kind, bytes) = pages.into_iter().find(|(kind, _)| *kind == PageKind::Validity).unwrap();
         state::page_payload(kind, &bytes).unwrap().len()
     };
-    let with_causes = validity(state::encode_pages(&op.snapshot, &file.core.budget).unwrap());
-    let without = validity(state::encode_pages(&missing_only, &file.core.budget).unwrap());
+    let with_causes = validity(state::encode_pages(&op.snapshot, &file.core.budget).unwrap().0);
+    let without = validity(state::encode_pages(&missing_only, &file.core.budget).unwrap().0);
     assert_eq!(with_causes - without, op.snapshot.holes.len());
 }
