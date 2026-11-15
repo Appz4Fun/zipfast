@@ -662,10 +662,34 @@ pub(crate) struct WireVolume {
     volume: u32,
     witnesses: Arc<std::sync::Mutex<Vec<WireWitness>>>,
 }
-struct WireSnapshot {
+pub(super) struct WireSnapshot {
     volume: u32,
     witnesses: Arc<std::sync::Mutex<Vec<WireWitness>>>,
     count: usize,
+}
+impl WireSnapshot {
+    /// Binds the existing witness owner and admitted prefix. This is private
+    /// framing bookkeeping, not integrity evidence or restart authority.
+    pub(super) fn capture_current(volumes: &[WireVolume], volume: u32, usage: &Usage) -> ProgressiveResult<Self> {
+        usage.charge(Resource::MetadataBytes, std::mem::size_of::<Self>() as u64)?;
+        usage.charge(Resource::SourceBookkeeping, 1)?;
+        let current = volumes.last().filter(|v| v.volume == volume).ok_or_else(invalid)?;
+        let count = current.witnesses.lock().unwrap().len();
+        Ok(Self { volume, witnesses: current.witnesses.clone(), count })
+    }
+    pub(super) fn matches_current(
+        &self,
+        volumes: &[WireVolume],
+        volume: u32,
+        usage: &Usage,
+    ) -> ProgressiveResult<bool> {
+        usage.charge(Resource::SourceBookkeeping, 1)?;
+        let Some(current) = volumes.last() else { return Ok(false) };
+        Ok(self.volume == volume
+            && current.volume == volume
+            && Arc::ptr_eq(&self.witnesses, &current.witnesses)
+            && current.witnesses.lock().unwrap().len() == self.count)
+    }
 }
 pub(super) fn record_header(
     volumes: &mut Vec<WireVolume>,

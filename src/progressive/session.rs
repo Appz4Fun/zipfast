@@ -16,6 +16,7 @@
 
 //! Pull-driven RAR5 extraction over the single production source driver.
 pub(crate) mod memory;
+mod rar4;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
 use super::{
@@ -168,6 +169,7 @@ pub struct ProgressiveSession {
     machine: Option<MemberMachine>,
     history: Option<crate::rar5::unpack::Unpacker>,
     history_failure: Option<u64>,
+    rar4_independent: Option<rar4::Independent>,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -272,6 +274,7 @@ impl ProgressiveSession {
             machine: None,
             history: None,
             history_failure: None,
+            rar4_independent: None,
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -337,6 +340,7 @@ impl ProgressiveSession {
         self.recovery_closed = true;
         self.machine.take();
         self.finalizer.take();
+        self.rar4_independent.take();
         self.target.take();
         self.history.take();
         if let Some(stage) = self.stage.take() {
@@ -435,6 +439,18 @@ impl ProgressiveSession {
                 }
                 Phase::Finish => {
                     let before = self.produced;
+                    if let Some(bound) = &self.rar4_independent {
+                        self.driver.validate_current()?;
+                        bound.validate(
+                            self.member,
+                            self.volume,
+                            self.driver.observed_info(self.volume),
+                            &self.model,
+                            &self.witnesses,
+                            &self.usage,
+                        )?;
+                        self.machine.as_ref().expect("machine").check_rar4_binding(bound.binding())?;
+                    }
                     let mut machine = self.machine.take().expect("active decoder");
                     let mut sink = StageSink {
                         stage: self.stage.as_mut(),
@@ -707,6 +723,7 @@ impl ProgressiveSession {
                 self.main_seen = true;
             }
             Block::File(header) => {
+                rar4::admit_header_context(header, self.parser.encrypted(), self.solid_archive == Some(true))?;
                 if let Some(reason) = header
                     .rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
                 {
@@ -792,6 +809,7 @@ impl ProgressiveSession {
     }
     fn start(&mut self, frame: PhysicalFrame) -> ProgressiveResult<ProgressiveEvent> {
         let Block::File(header) = frame.block else { unreachable!() };
+        rar4::admit_header_context(&header, self.parser.encrypted(), self.solid_archive == Some(true))?;
         if let Some(reason) =
             header.rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
         {
@@ -870,7 +888,28 @@ impl ProgressiveSession {
             || (matches!(self.disposition, Disposition::Skip(_))
                 && self.solid_archive == Some(true)
                 && header.method != 0);
-        let mut machine = if decode {
+        self.rar4_independent = None;
+        let mut machine = if decode && header.format == crate::rar5::RarFormat::Rar4 && header.method != 0 {
+            self.history.take();
+            let source = self
+                .driver
+                .observed_info(self.volume)
+                .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?;
+            let core = rar4::core_frame(member, &header)?;
+            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<rar4::Independent>() as u64)?;
+            let witness = recovery::WireSnapshot::capture_current(&self.witnesses, self.volume, &self.usage)?;
+            let (machine, binding) = MemberMachine::new_rar4(
+                &header,
+                context,
+                core,
+                self.options.limits.decoder_window,
+                &self.usage,
+                &self.control,
+            )?;
+            self.rar4_independent =
+                Some(rar4::Independent::new(member, self.volume, source, binding, &header, &wire, witness));
+            Some(machine)
+        } else if decode {
             let decoder = if header.method != 0 {
                 if header.solid {
                     if !crate::rar5::member::continue_decoder(&mut self.history, header.dictionary, size) {
@@ -952,6 +991,7 @@ impl ProgressiveSession {
         }
         self.machine.take();
         self.finalizer.take();
+        self.rar4_independent.take();
         self.target.take();
         if self.model.members.last().is_some_and(|m| m.header.method != 0) {
             self.history.take();
@@ -1054,6 +1094,16 @@ impl ProgressiveSession {
             return self.member_error(error);
         }
         self.driver.validate_current()?;
+        if let Some(bound) = self.rar4_independent.take() {
+            bound.validate(
+                self.member,
+                self.volume,
+                self.driver.observed_info(self.volume),
+                &self.model,
+                &self.witnesses,
+                &self.usage,
+            )?;
+        }
         if let Some(size) = physical.unpacked_size
             && let Some(stage) = &mut self.stage
         {
@@ -1095,8 +1145,9 @@ impl ProgressiveSession {
         } else {
             None
         };
-        if physical.header.method != 0 {
-            self.history = machine.decoder.take();
+        if physical.header.method != 0 && physical.header.format == crate::rar5::RarFormat::Rar5 {
+            self.history =
+                machine.take_rar5_decoder().map_err(|_| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
             self.history_failure = None;
         }
         if matches!(self.disposition, Disposition::Test) {

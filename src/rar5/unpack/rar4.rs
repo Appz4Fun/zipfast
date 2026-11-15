@@ -14,12 +14,16 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Bounded, serial RAR4 version-29 non-solid LZ decoding.
+//! Bounded, serial RAR4 version-29 LZ core; production solid admission stays disabled.
 //! Original implementation from the SDD factual worksheet and independent vectors.
 //! No external decoder implementation was copied or translated.
 
 use super::Sink;
 use crate::extract::Cancellation;
+
+pub(crate) mod lifecycle;
+use lifecycle::Lifecycle;
+pub(crate) use lifecycle::{CoreBinding, CoreFrame};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Rar4FeedState {
@@ -43,6 +47,8 @@ pub(crate) enum Rar4DecodeError {
     CounterOverflow,
     Canceled,
     Sink(crate::error::Error),
+    State,
+    Binding,
 }
 
 const CHUNK: usize = 65536;
@@ -72,6 +78,10 @@ impl Rar4DecodeError {
                 };
                 (RarFailure::Unsupported(RarUnsupported::Rar4Feature(label)), legacy)
             }
+            Self::State | Self::Binding => (
+                RarFailure::Internal(crate::error::RarInternal::Invariant("RAR4 completion/source binding")),
+                Error::Corrupt("RAR4 completion/source binding"),
+            ),
             Self::Malformed(reason) => (integrity(RarIntegrityReason::Decoder(reason)), Error::Corrupt(reason)),
             Self::DecodedSize { expected, actual } => {
                 (integrity(RarIntegrityReason::DecodedSize { expected, actual }), Error::Corrupt("RAR4 decoded size"))
@@ -267,6 +277,11 @@ pub(crate) struct Rar4Decoder {
     produced: u64,
     bits: Bits,
     phase: Phase,
+    saved_phase: Phase,
+    chain_base: u64,
+    fetched: u64,
+    binding: CoreBinding,
+    lifecycle: Lifecycle,
     poisoned: bool,
     finished: bool,
     old: [u8; 404],
@@ -282,6 +297,8 @@ pub(crate) struct Rar4Decoder {
     output: [u8; OUTPUT],
     filled: usize,
     table_builds: u64,
+    #[cfg(test)]
+    first_cross: Option<(u64, u64, u64)>,
     #[cfg(test)]
     trace: Option<tests::BoundaryTrace>,
     #[cfg(test)]
@@ -334,6 +351,8 @@ impl Rar4Decoder {
             history.resize(next, 0);
             work.tick(work_bytes as u64)?;
         }
+        let binding =
+            CoreBinding::new(CoreFrame { ordinal: 0, packed, unpacked, unpack_version: 29, method: 0x33, dictionary })?;
         let mut decoder = Self {
             work,
             dictionary: history,
@@ -343,6 +362,11 @@ impl Rar4Decoder {
             produced: 0,
             bits: Bits::default(),
             phase: if unpacked == 0 { Phase::Complete } else { Phase::Align },
+            saved_phase: Phase::Align,
+            chain_base: 0,
+            fetched: 0,
+            binding,
+            lifecycle: Lifecycle::Active,
             poisoned: false,
             finished: false,
             old: [0; 404],
@@ -359,6 +383,8 @@ impl Rar4Decoder {
             filled: 0,
             table_builds: 0,
             #[cfg(test)]
+            first_cross: None,
+            #[cfg(test)]
             trace: None,
             #[cfg(test)]
             successor_trace: None,
@@ -371,6 +397,9 @@ impl Rar4Decoder {
         if self.poisoned || self.finished {
             return Err(Rar4DecodeError::Malformed("decoder is no longer usable"));
         }
+        if self.lifecycle != Lifecycle::Active {
+            return Err(Rar4DecodeError::State);
+        }
         let result = (|| {
             self.work.check()?;
             self.fed = self.fed.checked_add(bytes.len() as u64).ok_or(Rar4DecodeError::CounterOverflow)?;
@@ -378,7 +407,7 @@ impl Rar4Decoder {
                 return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
             }
             let mut input = bytes;
-            while self.step(&mut input, sink)? {}
+            while self.step_counted(&mut input, sink)? {}
             self.work.check()?;
             Ok(if matches!(self.phase, Phase::Complete) { Rar4FeedState::Complete } else { Rar4FeedState::NeedInput })
         })();
@@ -391,21 +420,22 @@ impl Rar4Decoder {
         if self.poisoned || self.finished {
             return Err(Rar4DecodeError::Malformed("decoder is no longer usable"));
         }
-        let result = (|| {
-            self.work.check()?;
-            if self.fed != self.packed {
-                return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
-            }
-            if !matches!(self.phase, Phase::Complete) {
-                return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: self.produced });
-            }
-            self.flush(sink)?;
-            self.finished = true;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.poisoned = true;
-        }
+        self.finish_logical(sink)?;
+        self.lifecycle = Lifecycle::Closed;
+        self.finished = true;
+        Ok(())
+    }
+    fn step_counted(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
+        // Even a partly assembled field owns the bytes fetched into Bits.
+        // Check the prospective cursor before any parser mutation.
+        self.fetched
+            .checked_add(input.len() as u64)
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(Rar4DecodeError::CounterOverflow)?;
+        let before = input.len();
+        let result = self.step(input, sink);
+        self.fetched =
+            self.fetched.checked_add((before - input.len()) as u64).ok_or(Rar4DecodeError::CounterOverflow)?;
         result
     }
     fn flush(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
@@ -421,7 +451,9 @@ impl Rar4Decoder {
         if next > self.expected {
             return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: next });
         }
-        let index = (self.produced & (self.dictionary.len() as u64 - 1)) as usize;
+        let cursor = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+        cursor.checked_add(1).ok_or(Rar4DecodeError::CounterOverflow)?;
+        let index = (cursor & (self.dictionary.len() as u64 - 1)) as usize;
         self.dictionary[index] = byte;
         self.produced = next;
         self.output[self.filled] = byte;
@@ -457,7 +489,8 @@ impl Rar4Decoder {
         self.recent[0] = distance;
     }
     fn start_copy(&mut self, length: u64, distance: u64) -> DecodeResult<()> {
-        if distance == 0 || distance > self.dictionary.len() as u64 || distance > self.produced {
+        let history = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+        if distance == 0 || distance > self.binding.frame.dictionary || distance > history {
             return Err(Rar4DecodeError::Malformed("match distance outside initialized history"));
         }
         let end = self.produced.checked_add(length).ok_or(Rar4DecodeError::CounterOverflow)?;
@@ -465,7 +498,12 @@ impl Rar4Decoder {
             return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: end });
         }
         #[cfg(test)]
-        self.observe_successor_match(length, distance);
+        {
+            if self.chain_base != 0 && distance > self.produced && self.first_cross.is_none() {
+                self.first_cross = Some((self.produced, distance, length));
+            }
+            self.observe_successor_match(length, distance);
+        }
         self.last_length = length;
         self.phase = Phase::Copy { distance, left: length };
         Ok(())
@@ -619,8 +657,12 @@ impl Rar4Decoder {
                     271..=298 => Phase::Length { index: (token - 271) as usize, recent: None },
                     _ => return Err(Rar4DecodeError::Malformed("literal alphabet")),
                 };
-                if self.produced == self.expected {
+                if self.produced == self.expected
+                    && matches!(self.phase, Phase::Token)
+                    && self.lifecycle == Lifecycle::Active
+                {
                     self.flush(sink)?;
+                    self.saved_phase = self.phase;
                     self.phase = Phase::Complete;
                 }
             }
@@ -633,6 +675,11 @@ impl Rar4Decoder {
                 let _hint = take!(1);
                 #[cfg(test)]
                 self.observe(tests::TraceKind::EndHint { read_tables_next: _hint != 0 });
+                if self.lifecycle == Lifecycle::Deferred {
+                    self.lifecycle = Lifecycle::BoundaryReady;
+                    self.saved_phase = if _hint == 0 { Phase::Token } else { Phase::Align };
+                    return Ok(false);
+                }
                 return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: self.produced });
             }
             Phase::Length { index, recent } => {
@@ -706,11 +753,14 @@ impl Rar4Decoder {
                 self.start_copy(2, distance)?;
             }
             Phase::Copy { distance, left } => {
-                let index = ((self.produced - distance) & (self.dictionary.len() as u64 - 1)) as usize;
+                let cursor = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+                let index = (cursor.checked_sub(distance).ok_or(Rar4DecodeError::CounterOverflow)?
+                    & (self.dictionary.len() as u64 - 1)) as usize;
                 self.emit(self.dictionary[index], sink)?;
                 self.phase = if left == 1 { Phase::Token } else { Phase::Copy { distance, left: left - 1 } };
-                if self.produced == self.expected {
+                if self.produced == self.expected && left == 1 && self.lifecycle == Lifecycle::Active {
                     self.flush(sink)?;
+                    self.saved_phase = self.phase;
                     self.phase = Phase::Complete;
                 }
             }
@@ -756,3 +806,7 @@ pub(crate) fn fixed_fixture() -> Vec<u8> {
     ]
     .concat()
 }
+
+#[cfg(test)]
+#[path = "rar4/deferred_tests.rs"]
+mod deferred_tests;

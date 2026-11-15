@@ -135,7 +135,9 @@ compatibility remains open.
 | Directory records carrying the payload-encryption flag | Typed unsupported, including salt-present records; checked before every disposition. |
 | Modern version-29 AES Stored payload, including split parts | Admitted with explicit salt, known size, and unchanged data salt across parts; continuous CBC. |
 | Salt-prefixed AES encrypted headers | Admitted incrementally; each header derives its own IV. Explicit alternate header encryption versions remain unsupported. |
-| Compressed, solid, RAR1.5/2, PPM and VM | Typed unsupported through this entrypoint; original engines and qualified continuation remain required work. |
+| Plain version-29 independent LZ, raw methods 0x31..0x35 | Supported with known size, one physical part, and a 64 KiB–4 MiB dictionary. Independent members may occur in a forward volume set. |
+| Split or solid compressed payload, compressed AES, compressed payload under encrypted headers | Typed unsupported before dispositions/output; separately qualified geometry and continuation remain required. |
+| RAR1.5/2 compressed payload, PPM and VM | Typed unsupported; original engines and independent positive fixtures remain required work. |
 | Ambiguous/unknown RAR4 unpacked size, old revisions, special file types | Typed unsupported. |
 
 RAR4 framing uses the same incremental producer for `Volume`, catalogue
@@ -145,8 +147,15 @@ between volumes. The complete-file API retains its existing payload admission
 policy, including its split/encryption refusals; this table describes progressive
 admission only. No codec state is exposed as a verified restart point.
 
-Stored support is an increment, not completion of RAR4 or the full archive
-request. The 500,000,000-byte, ten-volume article-loss acceptance remains required
+Stored and independent LZ support are increments, not completion of RAR4 or the full archive
+request. Independent LZ owns an exact canonical frame and checks all packed bytes,
+output size, declared CRC and source state before success. Its logical codec finish
+proves no solid boundary and grants no reusable history or restart capability.
+Compressed holes stop with the actual decoded prefix and no restart; they never
+enter Stored sparse recovery. The core observes the session cancellation token
+within decoding; dictionary and output limits remain finite.
+
+The 500,000,000-byte, ten-volume article-loss acceptance remains required
 separate correctness qualification.
 
 ## Stored holes and repair
@@ -333,8 +342,8 @@ volume boundaries, including boundaries inside a block. Each encrypted header
 instead starts its own salt-derived IV. Different split data salts and older
 crypto schemes are refused; they are not interpreted as IV reset instructions.
 Trailing AES padding is clipped by the declared size (at most 15 bytes), without
-requiring zero padding. Compressed/solid RAR4 and other legacy codec families
-remain outside this increment.
+requiring zero padding. Compressed AES/solid RAR4 and other legacy codec families
+remain outside this encrypted increment.
 
 RAR4 has no explicit password verifier. A missing password is reported separately;
 plaintext-dependent checksum or framing failure after decryption remains ambiguous

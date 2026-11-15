@@ -1,0 +1,301 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+//! Codec-only continuation. These capabilities prove no CRC, source or publication.
+//! The future history adapter must validate the full FrameKey/Pending/source
+//! envelope immediately before obtaining DeferGuard, with no callback in between.
+
+use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+
+fn mint_owner(counter: &AtomicU64) -> DecodeResult<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).filter(|_| current != 0).ok_or(Rar4DecodeError::CounterOverflow)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(owner) => return Ok(owner),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CoreFrame {
+    pub(crate) ordinal: u64,
+    pub(crate) packed: u64,
+    pub(crate) unpacked: u64,
+    pub(crate) unpack_version: u8,
+    pub(crate) method: u8,
+    pub(crate) dictionary: u64,
+}
+impl CoreFrame {
+    fn validate(self, retained: u64) -> DecodeResult<()> {
+        if self.unpack_version != 29 || !(0x31..=0x35).contains(&self.method) {
+            return Err(Rar4DecodeError::Binding);
+        }
+        if !(65536..=4194304).contains(&self.dictionary) || !self.dictionary.is_power_of_two() {
+            return Err(Rar4DecodeError::InvalidDictionary { requested: self.dictionary });
+        }
+        if self.dictionary > retained {
+            return Err(Rar4DecodeError::Binding);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CoreBinding {
+    pub(crate) owner: u64,
+    pub(crate) epoch: u64,
+    pub(crate) member_seq: u64,
+    pub(crate) frame: CoreFrame,
+}
+impl CoreBinding {
+    pub(super) fn new(frame: CoreFrame) -> DecodeResult<Self> {
+        Ok(Self { owner: mint_owner(&NEXT_OWNER)?, epoch: 1, member_seq: 1, frame })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Lifecycle {
+    Active,
+    LogicalDone,
+    Deferred,
+    BoundaryReady,
+    Unavailable,
+    Closed,
+}
+
+#[derive(Debug)]
+pub(crate) struct Completion {
+    binding: CoreBinding,
+}
+impl Completion {
+    // Used by the next adapter to match its external full frame envelope.
+    #[allow(dead_code)]
+    pub(crate) fn binding(&self) -> CoreBinding {
+        self.binding
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Boundary {
+    binding: CoreBinding,
+}
+#[derive(Debug)]
+pub(crate) enum BoundaryState {
+    NeedInput,
+    // The next private history consumer reads this single-use capability.
+    Ready(#[allow(dead_code)] Boundary),
+}
+
+pub(crate) struct DeferGuard<'a> {
+    decoder: &'a mut Rar4Decoder,
+}
+impl DeferGuard<'_> {
+    #[allow(dead_code)]
+    pub(crate) fn commit(self) {
+        self.decoder.phase = self.decoder.saved_phase;
+        self.decoder.lifecycle = Lifecycle::Deferred;
+    }
+}
+
+impl Rar4Decoder {
+    /// Exact parsed metadata constructor required by the future history adapter.
+    /// Legacy constructors' synthetic frame is compatibility bookkeeping only.
+    #[allow(dead_code)]
+    pub(crate) fn new_frame(frame: CoreFrame, window_limit: u64, cancel: Option<Cancellation>) -> DecodeResult<Self> {
+        frame.validate(4194304)?;
+        let mut d = Self::new_with_cancel(frame.dictionary, frame.packed, frame.unpacked, window_limit, cancel)?;
+        d.binding.frame = frame;
+        Ok(d)
+    }
+    /// Capture at member start for the future Pending/full-frame envelope.
+    #[allow(dead_code)]
+    pub(crate) fn active_binding(&self) -> DecodeResult<CoreBinding> {
+        self.require(Lifecycle::Active)?;
+        Ok(self.binding)
+    }
+    fn require(&self, state: Lifecycle) -> DecodeResult<()> {
+        if self.poisoned || self.finished || self.lifecycle != state { Err(Rar4DecodeError::State) } else { Ok(()) }
+    }
+    pub(crate) fn finish_logical(&mut self, sink: &mut dyn Sink) -> DecodeResult<Completion> {
+        self.require(Lifecycle::Active)?;
+        let result = (|| {
+            self.work.check()?;
+            if self.fed != self.packed {
+                return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
+            }
+            if self.produced != self.expected || !matches!(self.phase, Phase::Complete) {
+                return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: self.produced });
+            }
+            self.consumed_bits()?;
+            self.flush(sink)?;
+            self.lifecycle = Lifecycle::LogicalDone;
+            Ok(Completion { binding: self.binding })
+        })();
+        self.poison_on_error(result)
+    }
+    /// Validates ONLY codec identity/lifecycle. Caller must first validate its
+    /// full source/Pending envelope; this is never a verification substitute.
+    #[allow(dead_code)]
+    pub(crate) fn validate_defer(&mut self, completion: Completion) -> DecodeResult<DeferGuard<'_>> {
+        self.require(Lifecycle::LogicalDone)?;
+        if completion.binding != self.binding {
+            return Err(Rar4DecodeError::Binding);
+        }
+        self.check_transition()?;
+        Ok(DeferGuard { decoder: self })
+    }
+    #[allow(dead_code)]
+    pub(crate) fn abort(&mut self, completion: Completion) -> DecodeResult<()> {
+        self.require(Lifecycle::LogicalDone)?;
+        if completion.binding != self.binding {
+            return Err(Rar4DecodeError::Binding);
+        }
+        self.lifecycle = Lifecycle::Unavailable;
+        Ok(())
+    }
+    pub(crate) fn consumed_bits(&self) -> DecodeResult<u64> {
+        self.fetched
+            .checked_mul(8)
+            .and_then(|n| n.checked_sub(u64::from(self.bits.count)))
+            .ok_or(Rar4DecodeError::CounterOverflow)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn fetched(&self) -> u64 {
+        self.fetched
+    }
+
+    /// Input must start at data_at + fetched(), after exhausting the saved
+    /// accumulator with an empty call. No source or I/O accounting is performed.
+    #[allow(dead_code)]
+    pub(crate) fn resume_boundary(&mut self, bytes: &[u8]) -> DecodeResult<BoundaryState> {
+        self.require(Lifecycle::Deferred)?;
+        let remaining = self.packed.checked_sub(self.fetched).ok_or(Rar4DecodeError::CounterOverflow);
+        let remaining = self.poison_on_error(remaining)?;
+        if bytes.len() as u64 > remaining {
+            return Err(Rar4DecodeError::Binding);
+        }
+        let result = (|| {
+            self.work.check()?;
+            let mut input = bytes;
+            let mut no_output = |_: &[u8]| Err(crate::error::Error::Corrupt("RAR4 boundary output"));
+            while self.step_counted(&mut input, &mut no_output)? {}
+            self.work.check()?;
+            if self.lifecycle == Lifecycle::BoundaryReady {
+                Ok(BoundaryState::Ready(Boundary { binding: self.binding }))
+            } else if self.fetched == self.packed {
+                Err(Rar4DecodeError::Malformed("RAR4 missing real boundary bits"))
+            } else {
+                Ok(BoundaryState::NeedInput)
+            }
+        })();
+        self.poison_on_error(result)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn begin_next(&mut self, boundary: Boundary, frame: CoreFrame) -> DecodeResult<()> {
+        self.require(Lifecycle::BoundaryReady)?;
+        if boundary.binding != self.binding {
+            return Err(Rar4DecodeError::Binding);
+        }
+        frame.validate(self.dictionary.len() as u64)?;
+        let counters = (|| {
+            Ok((
+                self.binding.member_seq.checked_add(1).ok_or(Rar4DecodeError::CounterOverflow)?,
+                self.chain_base
+                    .checked_add(self.produced)
+                    .filter(|base| base.checked_add(frame.unpacked).is_some())
+                    .ok_or(Rar4DecodeError::CounterOverflow)?,
+            ))
+        })();
+        let (sequence, base) = self.poison_on_error(counters)?;
+        self.check_transition()?;
+        self.binding.member_seq = sequence;
+        self.binding.frame = frame;
+        self.chain_base = base;
+        self.start_frame(frame);
+        Ok(())
+    }
+    #[allow(dead_code)]
+    pub(crate) fn reset_independent(&mut self, frame: CoreFrame) -> DecodeResult<()> {
+        // A poisoned instance is never revived, even by reset.
+        if self.poisoned {
+            return Err(Rar4DecodeError::State);
+        }
+        frame.validate(self.dictionary.len() as u64)?;
+        let epoch = self.binding.epoch.checked_add(1).ok_or(Rar4DecodeError::CounterOverflow);
+        let epoch = self.poison_on_error(epoch)?;
+        self.check_transition()?;
+        self.binding.epoch = epoch;
+        self.binding.member_seq = 1;
+        self.binding.frame = frame;
+        self.chain_base = 0;
+        self.old = [0; 404];
+        self.lengths = [0; 404];
+        self.bc_lengths = [0; 20];
+        self.tables = std::array::from_fn(|_| Huff::empty());
+        self.recent = [0; 4];
+        self.last_length = 0;
+        self.low = 0;
+        self.low_repeats = 0;
+        self.saved_phase = Phase::Align;
+        self.start_frame(frame);
+        Ok(())
+    }
+    fn start_frame(&mut self, frame: CoreFrame) {
+        self.packed = frame.packed;
+        self.expected = frame.unpacked;
+        self.fed = 0;
+        self.fetched = 0;
+        self.produced = 0;
+        self.bits = Bits::default();
+        self.prefix = 0;
+        self.depth = 0;
+        self.filled = 0;
+        self.phase = if frame.unpacked == 0 { Phase::Complete } else { self.saved_phase };
+        self.finished = false;
+        self.lifecycle = Lifecycle::Active;
+        #[cfg(test)]
+        {
+            self.first_cross = None;
+        }
+    }
+    fn check_transition(&mut self) -> DecodeResult<()> {
+        let result = self.work.check();
+        self.poison_on_error(result)
+    }
+    fn poison_on_error<T>(&mut self, result: DecodeResult<T>) -> DecodeResult<T> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn exhausted_owner_counter_never_wraps_or_reuses() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(mint_owner(&counter).unwrap(), u64::MAX - 1);
+        assert!(matches!(mint_owner(&counter), Err(Rar4DecodeError::CounterOverflow)));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+}

@@ -122,6 +122,9 @@ pub struct SessionControl {
     wake: Arc<WakeGate>,
 }
 impl SessionControl {
+    pub(crate) fn cancellation_token(&self) -> Cancellation {
+        self.token.clone()
+    }
     pub fn cancel(&self) {
         self.token.cancel();
         self.wake.notify(false);

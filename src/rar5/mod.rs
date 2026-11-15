@@ -273,7 +273,16 @@ impl FileHeader {
     ) -> Option<crate::error::RarUnsupported> {
         let raw = self.rar4?;
         if raw.method != 0x30 {
-            return Some(crate::error::RarUnsupported::Rar4Feature("compressed progressive payload"));
+            // Independent modern LZ only. Reject unsupported geometry before every disposition.
+            return raw.unsupported(self.attributes).or_else(|| self.rar4_common_unsupported()).or_else(|| {
+                if self.is_dir() {
+                    Some(crate::error::RarUnsupported::Rar4Feature("compressed directory"))
+                } else if self.unpacked_size == u64::MAX || self.unpacked_size == u64::from(u32::MAX) {
+                    Some(crate::error::RarUnsupported::Rar4Feature("unknown unpacked size"))
+                } else {
+                    None
+                }
+            });
         }
         // Admission precedes every disposition, including directory creation and skip.
         if self.encrypted {

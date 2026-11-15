@@ -2668,7 +2668,7 @@ impl Run<'_, '_, '_> {
             })
         };
         p.cipher = machine.cipher.take();
-        stream = machine.decoder.take();
+        stream = machine.take_rar5_decoder()?;
         if h.format == RarFormat::Rar5 {
             (part, part_blake) = machine.into_part_hashes();
         }

@@ -15,10 +15,12 @@
 // rights and limitations under the RPL.
 
 //! Source-independent member cipher and decoder state, shared with complete extraction.
+mod decoder;
 use super::unpack::{Sink, Unpacker};
 use crate::batch;
 use crate::error::{Error, RarFailure, RarIntegrityReason, Result};
 use crate::extract::EntryContext;
+pub(crate) use decoder::MemberDecoder;
 
 pub(crate) struct PendingCipher {
     pub(crate) aes: crate::crypto::AesKey,
@@ -194,7 +196,7 @@ impl PendingCipher {
 /// decoder window and checks in this object. A part boundary never resets CBC.
 pub(crate) struct MemberMachine {
     pub(crate) cipher: Option<PendingCipher>,
-    pub(crate) decoder: Option<Unpacker>,
+    pub(crate) decoder: Option<MemberDecoder>,
     pub(crate) inner: Option<InnerChecks>,
     scratch: Vec<u8>,
     delivered: u64,
@@ -218,7 +220,7 @@ impl MemberMachine {
     ) -> Self {
         Self {
             cipher,
-            decoder,
+            decoder: decoder.map(MemberDecoder::Rar5),
             inner: None,
             scratch: Vec::new(),
             delivered,
@@ -292,7 +294,7 @@ impl MemberMachine {
             match &mut self.decoder {
                 Some(decoder) => cipher.blocks.as_mut().ok_or(Error::Corrupt("missing encrypted block state"))?.feed(
                     &self.scratch,
-                    decoder,
+                    decoder.rar5_mut()?,
                     sink,
                 ),
                 None => {
@@ -310,7 +312,7 @@ impl MemberMachine {
             }
         } else {
             match &mut self.decoder {
-                Some(decoder) => decoder.feed(bytes, sink),
+                Some(decoder) => decoder.rar5_mut()?.feed(bytes, sink),
                 None => sink.put(bytes),
             }
         }
@@ -446,7 +448,7 @@ impl MemberMachine {
         }
         self.packed(&piece.bytes()[range.clone()])?;
         match &mut self.decoder {
-            Some(decoder) => decoder.feed_shared(piece, range, sink),
+            Some(decoder) => decoder.rar5_mut()?.feed_shared(piece, range, sink),
             None => sink.put(&piece.bytes()[range]),
         }
     }
@@ -458,14 +460,36 @@ impl MemberMachine {
         let mut checks = self.inner.take().ok_or_else(|| {
             crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::IncompleteOutput)
         })?;
-        let result = self.feed_core(bytes, &mut CheckingSink { checks: &mut checks, sink });
+        let result = if matches!(self.decoder, Some(MemberDecoder::Rar4(_))) {
+            self.packed(bytes)
+                .map_err(|e| {
+                    super::framing::progressive_fault(batch::decoder_failure(
+                        e,
+                        self.context.scope(),
+                        self.context.password,
+                    ))
+                })
+                .and_then(|()| {
+                    let Some(MemberDecoder::Rar4(decoder)) = &mut self.decoder else { unreachable!() };
+                    decoder
+                        .feed(bytes, &mut CheckingSink { checks: &mut checks, sink })
+                        .map(|_| ())
+                        .map_err(|e| super::framing::progressive_fault(e.detailed(self.context.scope())))
+                })
+        } else {
+            self.feed_core(bytes, &mut CheckingSink { checks: &mut checks, sink }).map_err(|e| {
+                super::framing::progressive_fault(batch::decoder_failure(
+                    e,
+                    self.context.scope(),
+                    self.context.password,
+                ))
+            })
+        };
         self.inner = Some(checks);
         if result.is_err() {
             self.failed = true;
         }
-        result.map_err(|e| {
-            super::framing::progressive_fault(batch::decoder_failure(e, self.context.scope(), self.context.password))
-        })
+        result
     }
     pub(crate) fn finish_part(
         &mut self,
@@ -538,20 +562,22 @@ impl MemberMachine {
             })?;
         }
         if let Some(decoder) = &mut self.decoder {
-            decoder
-                .finish(&mut CheckingSink {
-                    checks: self.inner.as_mut().ok_or_else(|| {
-                        crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::IncompleteOutput)
-                    })?,
-                    sink,
-                })
-                .map_err(|e| {
-                    super::framing::progressive_fault(batch::decoder_failure(
-                        e,
-                        self.context.scope(),
-                        self.context.password,
-                    ))
-                })?;
+            let mut sink = CheckingSink {
+                checks: self.inner.as_mut().ok_or_else(|| {
+                    crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::IncompleteOutput)
+                })?,
+                sink,
+            };
+            let result = match decoder {
+                MemberDecoder::Rar5(d) => d
+                    .finish(&mut sink)
+                    .map_err(|e| batch::decoder_failure(e, self.context.scope(), self.context.password)),
+                MemberDecoder::Rar4(d) => d.finish(&mut sink).map_err(|e| e.detailed(self.context.scope())),
+            };
+            if result.is_err() {
+                self.failed = true;
+            }
+            result.map_err(super::framing::progressive_fault)?;
         }
         self.decoded_finished = true;
         Ok(())
@@ -818,6 +844,10 @@ impl MemberMachine {
             }
         } else if header.algorithm != 0 || header.method > 5 {
             return Err(ProgressiveFailure::new(FailureKind::UnsupportedMethod));
+        }
+        if header.format == super::RarFormat::Rar4 && header.method != 0 {
+            // RAR4 compressed construction requires its source-bound exact CoreFrame.
+            return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
         }
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
         let cipher = if header.encrypted {
