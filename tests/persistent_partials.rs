@@ -2842,7 +2842,8 @@ fn encrypted_damage_declared_on_bytes_still_in_the_cipher_state_becomes_holes() 
         let fed = fixture.starts[1] + (at + len as u64 - fixture.payloads[1].start);
         assert_ne!(fed % 16, 0, "the fixture must leave a partial block");
         let block = (fed & !15) - if previous { 16 } else { 0 };
-        let packed = fixture.payloads[1].start + (block + 6 - fixture.starts[1]);
+        // Damage the first byte of the block: the partial block holds only `fed % 16` bytes.
+        let packed = fixture.payloads[1].start + (block - fixture.starts[1]);
         let receipt = session.declare_hole(1, packed..packed + 1).unwrap();
         assert!(receipt.unmapped.is_empty() && receipt.pending.is_empty());
         let (holes, more) = run_to_end(&mut session);
