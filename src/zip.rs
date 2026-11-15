@@ -337,10 +337,13 @@ impl Archive {
     }
 }
 
-fn projected_parser(len: u64, limits: Limits) -> std::result::Result<DirectoryParser<ZipEntry>, DirectoryError> {
+pub(crate) fn projected_parser(
+    len: u64,
+    limits: Limits,
+) -> std::result::Result<DirectoryParser<ZipEntry>, DirectoryError> {
     DirectoryParser::with_projection_and_name_crc32(len, Profile::Zipfast, limits, crate::crc32::hash, project_record)
 }
-fn relocate_projected(
+pub(crate) fn relocate_projected(
     entries: &mut [ZipEntry],
     shift: u64,
     len: u64,
