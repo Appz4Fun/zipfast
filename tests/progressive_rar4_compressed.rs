@@ -437,13 +437,22 @@ fn source_generation_change_and_cancel_after_start_cannot_verify() {
     for cancel in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let (mut s, g) = custom(vec![fixed()], vec![vec![]], options(dir.path()), false, 1);
-        loop {
+        let mut started = false;
+        for _ in 0..1000 {
             match poll(&mut s) {
-                Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { .. }))) => break,
-                Poll::Ready(Err(e)) => panic!("{e:?}"),
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { .. }))) => {
+                    started = true;
+                    break;
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
+                    panic!("terminated before MemberStarted: {failure:?}")
+                }
+                Poll::Ready(Err(e)) => panic!("failed before MemberStarted: {e:?}"),
+                Poll::Ready(Ok(None)) => panic!("EOF before MemberStarted"),
                 _ => {}
             }
         }
+        assert!(started, "MemberStarted not observed within 1000 setup polls");
         if cancel {
             s.control().cancel();
         } else {

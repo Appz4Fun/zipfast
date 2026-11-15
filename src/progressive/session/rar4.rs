@@ -285,14 +285,22 @@ mod tests {
                 options(dir.path()),
             )
             .unwrap();
-            loop {
-                if matches!(
-                    s.poll_event(&mut Context::from_waker(std::task::Waker::noop())),
-                    Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { .. })))
-                ) {
-                    break;
+            let mut started = false;
+            for _ in 0..1000 {
+                match s.poll_event(&mut Context::from_waker(std::task::Waker::noop())) {
+                    Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { .. }))) => {
+                        started = true;
+                        break;
+                    }
+                    Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
+                        panic!("terminated before MemberStarted: {failure:?}")
+                    }
+                    Poll::Ready(Err(e)) => panic!("failed before MemberStarted: {e:?}"),
+                    Poll::Ready(Ok(None)) => panic!("EOF before MemberStarted"),
+                    _ => {}
                 }
             }
+            assert!(started, "MemberStarted not observed within 1000 setup polls");
             match mutation {
                 0 => s.rar4_independent.as_mut().unwrap().core.member_seq += 1,
                 1 => recovery::record_header(&mut s.witnesses, s.volume, 999, b"new header", &s.usage).unwrap(),
