@@ -57,15 +57,8 @@ pub(crate) struct Record {
     wires: Vec<WireSnapshot>,
     epoch: Arc<AtomicU64>,
     part_evidence: Vec<PackedEvidence>,
-    /// The stage stamp after the library's own last write (extraction end, then each patch). Verify combines the
-    /// CRCs of proven parts instead of reading them back only while the stage still carries this stamp; any other
-    /// writer changes it and forces a full readback.
-    trusted: Option<SourceStamp>,
 }
 impl Record {
-    pub(crate) fn trust(&mut self, stage: &Stage) {
-        self.trusted = stamp(stage).ok();
-    }
     pub(crate) fn required_volumes(&self) -> impl Iterator<Item = u32> + '_ {
         self.wires.iter().filter(|_| self.model.members[0].header.encrypted && self.missing).map(|w| w.volume)
     }
@@ -91,7 +84,6 @@ impl Record {
             wires,
             epoch,
             part_evidence,
-            trusted: None,
         }
     }
 }
@@ -255,8 +247,6 @@ impl ProgressiveSession {
         let split = offset > hole.offset && end < hole_end;
         self.usage.check(Resource::HoleIntervals, stage.holes.len() as u64 + u64::from(split))?;
         self.usage.charge(Resource::SourceBookkeeping, (stage.holes.len() - index) as u64)?;
-        let trusted = artifact.recovery.as_ref().unwrap().trusted.is_some_and(|t| stamp(stage).is_ok_and(|s| s == t));
-        artifact.recovery.as_mut().unwrap().trusted = None;
         self.verify_job = None;
         self.driver.abort_replacement_reads()?;
         let stage = artifact.stage.as_mut().unwrap();
@@ -271,6 +261,7 @@ impl ProgressiveSession {
         }
         stage.generation = stage.generation.checked_add(1).ok_or_else(invalid)?;
         stage.assessment.get_mut().evidence = None;
+        let held = stage.untrust_for_write();
         let mut completed = 0;
         while completed < bytes.len() {
             let scope = |mut e: ProgressiveFailure| {
@@ -307,9 +298,7 @@ impl ProgressiveSession {
             stage.holes[index].len = offset - hole.offset;
         }
         stage.valid = stage.valid.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
-        if trusted {
-            artifact.recovery.as_mut().unwrap().trust(artifact.stage.as_ref().unwrap());
-        }
+        artifact.stage.as_mut().unwrap().trust_written(held);
         Ok(())
     }
     /// Rescan the complete private stage. A strict pass may publish through the
@@ -449,7 +438,7 @@ impl ProgressiveSession {
         // instead of read back, unless a BLAKE2sp must be computed over the whole member.
         if plain_store
             && job.blake.is_none()
-            && record.trusted == Some(job.stamp)
+            && stage.trusted == Some(job.stamp)
             && record.part_evidence.len() == record.model.parts.len()
         {
             while job.part_offset == 0

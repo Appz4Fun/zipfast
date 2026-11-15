@@ -1428,7 +1428,7 @@ fn patch_verify_reads_back_only_damaged_and_final_parts() {
 #[test]
 fn outside_write_to_a_proven_part_forces_a_full_readback() {
     let plain: Vec<u8> = (0..101u32).map(|i| (i * 7 + 3) as u8).collect();
-    for after_patch in [false, true] {
+    for when in ["extracting", "before patch", "after patch"] {
         let dir = tempfile::tempdir().unwrap();
         let spec = FileSpec::new("inner", &plain);
         let data = common::volumes(&spec, 23);
@@ -1444,23 +1444,46 @@ fn outside_write_to_a_proven_part_forces_a_full_readback() {
         let mut opts = options(dir.path());
         opts.first_name = "a.part01.rar".into();
         let mut s = ProgressiveSession::new(Box::new(Multi(inputs)), opts).unwrap();
-        let mut a = artifact(&mut s);
-        let stage = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".zipfast-progressive"))
-            .expect("stage file");
-        let tamper = || {
+        let stage = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".zipfast-progressive"))
+                .expect("stage file")
+        };
+        let tamper = |dir: &std::path::Path| {
             use std::os::unix::fs::FileExt;
             std::thread::sleep(std::time::Duration::from_millis(5));
-            std::fs::OpenOptions::new().write(true).open(&stage).unwrap().write_at(&[0xff], 2).unwrap();
+            std::fs::OpenOptions::new().write(true).open(stage(dir)).unwrap().write_at(&[0xff], 2).unwrap();
         };
-        if !after_patch {
-            tamper();
+        let mut a = None;
+        let mut tampered = false;
+        for _ in 0..100000 {
+            match s.poll_event(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) if when == "extracting" && !tampered => {
+                    tamper(dir.path());
+                    tampered = true;
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::Partial(artifact),
+                    ..
+                }))) => {
+                    a = Some(artifact);
+                    break;
+                }
+                Poll::Ready(Err(e)) => panic!("{e}"),
+                Poll::Ready(Ok(None)) => panic!("no artifact"),
+                _ => {}
+            }
+        }
+        let mut a = a.expect("partial artifact");
+        assert!(when != "extracting" || tampered);
+        if when == "before patch" {
+            tamper(dir.path());
         }
         s.patch(&mut a, 51, &plain[51..61]).unwrap();
-        if after_patch {
-            tamper();
+        if when == "after patch" {
+            tamper(dir.path());
         }
         assert!(verify(&mut s, &mut a).is_err(), "a changed proven part must fail verification");
     }

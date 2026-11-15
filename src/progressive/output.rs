@@ -377,6 +377,11 @@ impl OutputContext {
             usage: self.usage.clone(),
             lease: Some(lease),
             authority: Arc::downgrade(&self.authority),
+            trusted: None,
+        })
+        .map(|mut stage| {
+            stage.trusted = stage.current_stamp();
+            stage
         })
     }
 }
@@ -406,11 +411,29 @@ pub(crate) struct Stage {
     metadata: Option<crate::extract::Meta>,
     pub(super) holes: Vec<OutputHole>,
     zero_pending: Option<(u64, u64)>,
+    /// The stamp after the library's own last write, kept only while every write since creation found the stamp
+    /// it left. Any other writer breaks the chain for good, so verify must then read everything back.
+    pub(super) trusted: Option<crate::rar5::source::SourceStamp>,
     pub(super) usage: Usage,
     lease: Option<Lease>,
     authority: Weak<Authority>,
 }
 impl Stage {
+    pub(super) fn current_stamp(&self) -> Option<crate::rar5::source::SourceStamp> {
+        crate::rar5::source::SourceStamp::from_metadata(self.native.file().metadata().ok()?).ok()
+    }
+    /// Call before each library write: keeps the chain only if nobody else wrote since the last one. Returns
+    /// whether the chain held; the stamp stays cleared until `trust_written` restores it after a full write.
+    pub(super) fn untrust_for_write(&mut self) -> bool {
+        let held = self.trusted.is_some_and(|t| self.current_stamp() == Some(t));
+        self.trusted = None;
+        held
+    }
+    pub(super) fn trust_written(&mut self, held: bool) {
+        if held {
+            self.trusted = self.current_stamp();
+        }
+    }
     pub(super) fn mutation(&self) -> ProgressiveResult<()> {
         if self.published {
             return Err(invalid());
@@ -445,10 +468,12 @@ impl Stage {
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
         self.extent(end)?;
         self.usage.charge(Resource::OutputWriteBytes, bytes.len() as u64)?;
+        let held = self.untrust_for_write();
         let count = self
             .native
             .write_at(offset, bytes)
             .map_err(|e| out_range(OutputOperation::Write, e, offset, bytes.len() as u64, 0))?;
+        self.trust_written(held);
         if count == 0 {
             return Err(out_range(
                 OutputOperation::Write,
@@ -473,7 +498,9 @@ impl Stage {
         }
         let next_generation = self.generation.checked_add(1).ok_or_else(invalid)?;
         self.extent(length)?;
+        let held = self.untrust_for_write();
         self.native.set_len(length).map_err(|e| out(OutputOperation::Write, e, self.length))?;
+        self.trust_written(held);
         self.assessment.get_mut().evidence = None;
         self.length = length;
         self.generation = next_generation;
@@ -531,10 +558,12 @@ impl Stage {
         self.usage.charge(Resource::OutputWriteBytes, n as u64)?;
         self.generation = self.generation.checked_add(1).ok_or_else(invalid)?;
         self.assessment.get_mut().evidence = None;
+        let held = self.untrust_for_write();
         let written = self
             .native
             .write_at(at, &[0; 8192][..n])
             .map_err(|e| out_range(OutputOperation::Write, e, at, n as u64, 0))?;
+        self.trust_written(held);
         if written == 0 {
             return Err(out_range(OutputOperation::Write, std::io::ErrorKind::WriteZero.into(), at, n as u64, 0));
         }
