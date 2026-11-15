@@ -2320,6 +2320,7 @@ fn many_streamed_fills_do_not_exhaust_the_metadata_budget() {
         a.fill_from(0, 7000, &mut input).unwrap();
     }
     assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+}
 
 // ---- Encrypted (AES-256-CBC) RAR5 stored members ----
 
