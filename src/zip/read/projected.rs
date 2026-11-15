@@ -135,6 +135,8 @@ pub struct ProjectedReadSession {
 }
 pub(crate) struct ProjectedOwner {
     pub(super) file: File,
+    // Only legacy opens with failed optional proof need a separate source label.
+    fallback_path: Option<PathBuf>,
     pub(super) entries: Vec<ZipEntry>,
     pub(super) source: Result<SourceBinding, io::SourceCheckError>,
     pub(super) identity: u64,
@@ -197,6 +199,16 @@ impl ProjectedReadSession {
 }
 #[allow(clippy::result_large_err)]
 impl ProjectedOwner {
+    pub(crate) fn source_path(&mut self) -> ZipReadResult<&Path> {
+        if self.fallback_path.is_some() {
+            return self.fallback_path.as_deref().ok_or_else(|| ReadFault::InvalidPlan.into());
+        }
+        // Preserve the original typed failure if a binding was already lost.
+        // This does not recapture or bless source identity for a label.
+        self.proof()?;
+        self.source.as_ref().map(|source| source.path.as_path()).map_err(|_| ReadFault::InvalidPlan.into())
+    }
+
     pub(crate) fn open_checked(path: &Path, cancel: &Cancellation) -> ZipReadResult<Self> {
         if !cfg!(unix) {
             return Err(ReadFault::UnsupportedIdentity.into());
@@ -260,7 +272,16 @@ impl ProjectedOwner {
         match result {
             Ok((file, entries, source, identity, parser_usage)) => {
                 let len = source.stamp.len;
-                Ok(Self { file, entries, source: Ok(source), identity, len, opening: bootstrap, parser_usage })
+                Ok(Self {
+                    fallback_path: None,
+                    file,
+                    entries,
+                    source: Ok(source),
+                    identity,
+                    len,
+                    opening: bootstrap,
+                    parser_usage,
+                })
             }
             Err(error) => Err(error.with_bootstrap(bootstrap.usage())),
         }
@@ -285,7 +306,8 @@ impl ProjectedOwner {
         });
         let (entries, parser_usage) = zip::read_projected_legacy(&mut file, len, Some(cancel))?;
         let identity = identity().map_err(|_| crate::Error::Corrupt("ZIP identity counter exhausted"))?;
-        Ok(Self { file, entries, source, identity, len, opening: bootstrap, parser_usage })
+        let fallback_path = source.is_err().then(|| path.to_path_buf());
+        Ok(Self { fallback_path, file, entries, source, identity, len, opening: bootstrap, parser_usage })
     }
     fn proof(&mut self) -> ZipReadResult<()> {
         if !cfg!(unix) {
@@ -1455,6 +1477,7 @@ impl CheckedOpen {
             }
         };
         Ok(ProjectedOwner {
+            fallback_path: None,
             file: self.file,
             entries,
             source: Ok(source),

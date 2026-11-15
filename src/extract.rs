@@ -278,8 +278,13 @@ pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::
 }
 
 /// One entry for a listing.
+///
+/// `mode` is additive in this unpublished 0.1 API; downstream struct literals
+/// must supply it (`None` when Unix metadata is unavailable).
 #[derive(Clone, Debug)]
 pub struct Entry {
+    /// Unix mode bits as stored by the archive, when available.
+    pub mode: Option<u32>,
     pub name: String,
     pub size: u64,
     pub packed: u64,
@@ -322,14 +327,26 @@ fn walk(
 }
 
 fn walk_until(
-    mut vol: Volume,
+    vol: Volume,
     password: Option<&str>,
     cancel: Option<&Cancellation>,
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<bool>,
 ) -> Result<u64> {
+    let mut observer = SelectedReadObserver::default();
+    walk_until_observed(vol, password, cancel, &mut observer, |vol, block, _, _| on_block(vol, block))
+}
+
+fn walk_until_observed(
+    mut vol: Volume,
+    password: Option<&str>,
+    cancel: Option<&Cancellation>,
+    observer: &mut SelectedReadObserver<'_>,
+    mut on_block: impl FnMut(&mut Volume, Block, u32, &mut SelectedReadObserver<'_>) -> Result<bool>,
+) -> Result<u64> {
     let format = vol.format();
     let mut volumes = 0;
     loop {
+        let index = observer.volume_index(volumes)?;
         volumes += 1;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
@@ -337,6 +354,7 @@ fn walk_until(
             if let Some(cancel) = cancel {
                 cancel.check_io()?;
             }
+            observer.notify(index, &vol.path, SelectedReadRole::Header, cancel)?;
             let Some(block) = vol.next_block()? else { break };
             match block {
                 Block::End { more_volumes } => {
@@ -346,7 +364,7 @@ fn walk_until(
                 }
                 Block::Crypt => return Err(Error::Encrypted),
                 b => {
-                    if on_block(&mut vol, b)? {
+                    if on_block(&mut vol, b, index, observer)? {
                         return Ok(volumes);
                     }
                 }
@@ -372,6 +390,7 @@ fn walk_until(
             }
             return Ok(volumes);
         }
+        observer.notify(observer.volume_index(volumes)?, &next, SelectedReadRole::Header, cancel)?;
         vol = Volume::open_with_password(&next, password)?;
         if vol.format() != format {
             return Err(Error::Corrupt("RAR volume format changed"));
@@ -549,6 +568,70 @@ impl Cancellation {
         if self.is_canceled() {
             return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "operation canceled"));
         }
+        Ok(())
+    }
+}
+
+/// Why a selected read is about to use an archive source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SelectedReadRole {
+    /// Archive signature, main headers, or member headers are being scanned.
+    Header,
+    /// A solid predecessor is being decoded to establish the selected history.
+    Prerequisite,
+    /// The selected member's payload is about to be read or decoded.
+    Selected,
+}
+
+/// A source-purpose transition during [`SelectedEntry::read_observed`].
+///
+/// The path labels the source opened by this operation (ZIP may retain a
+/// resolved path), not its current filesystem identity or location after a rename. Copy it inside the callback
+/// if it must be retained. A notice does not certify any payload bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectedReadNotice<'a> {
+    /// Zero-based read order, starting at the supplied first volume.
+    pub volume_index: u32,
+    pub path: &'a Path,
+    pub role: SelectedReadRole,
+}
+
+type SelectedReadCallback<'a> = &'a mut dyn FnMut(SelectedReadNotice<'_>) -> Result<()>;
+
+#[derive(Default)]
+struct SelectedReadObserver<'a> {
+    callback: Option<SelectedReadCallback<'a>>,
+    last: Option<(u32, SelectedReadRole)>,
+}
+
+impl SelectedReadObserver<'_> {
+    fn volume_index(&self, index: u64) -> Result<u32> {
+        if self.callback.is_none() {
+            return Ok(0);
+        }
+        u32::try_from(index).map_err(|_| Error::Unsupported("selected read volume index exceeds u32".into()))
+    }
+
+    fn notify(
+        &mut self,
+        volume_index: u32,
+        path: &Path,
+        role: SelectedReadRole,
+        cancel: Option<&Cancellation>,
+    ) -> Result<()> {
+        let Some(callback) = &mut self.callback else { return Ok(()) };
+        if self.last == Some((volume_index, role)) {
+            return Ok(());
+        }
+        if let Some(cancel) = cancel {
+            cancel.check_io()?;
+        }
+        let result = callback(SelectedReadNotice { volume_index, path, role });
+        let after = cancel.map(Cancellation::check_io).transpose();
+        result?;
+        after?;
+        self.last = Some((volume_index, role));
         Ok(())
     }
 }
@@ -861,7 +944,36 @@ impl SelectedEntry {
 
     /// Decodes the selected file into the sink. Data is provisional until
     /// all available integrity checks pass and this function returns success.
-    pub fn read(self, password: Option<&str>, mut sink: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    pub fn read(self, password: Option<&str>, sink: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.read_inner(password, sink, &mut SelectedReadObserver::default())
+    }
+
+    /// Decodes the selection with borrowed source-purpose notices during this read.
+    ///
+    /// RAR reports header scans and required solid payload work in the existing
+    /// traversal. ZIP and TAR report their single source as `Selected`, at index
+    /// zero, before the existing read. Consecutive identical volume/role notices
+    /// are suppressed; notices are not emitted for individual chunks. Readers
+    /// may buffer or read ahead; roles describe logical work, not byte ranges.
+    /// Source inspection already performed by `open` is not replayed. A callback
+    /// error stops the read unchanged, and cancellation is checked immediately
+    /// before and after each callback. Bytes remain provisional until all
+    /// integrity checks pass and this method returns success, just as for `read`.
+    pub fn read_observed(
+        self,
+        password: Option<&str>,
+        sink: impl FnMut(&[u8]) -> Result<()>,
+        mut notice: impl FnMut(SelectedReadNotice<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.read_inner(password, sink, &mut SelectedReadObserver { callback: Some(&mut notice), last: None })
+    }
+
+    fn read_inner(
+        self,
+        password: Option<&str>,
+        mut sink: impl FnMut(&[u8]) -> Result<()>,
+        observer: &mut SelectedReadObserver<'_>,
+    ) -> Result<()> {
         self.cancel.check_io()?;
         let mut checked_sink = |chunk: &[u8]| {
             self.cancel.check_io()?;
@@ -869,9 +981,16 @@ impl SelectedEntry {
         };
         match self.source {
             SelectedSource::Zip(mut archive) => {
+                if observer.callback.is_some() {
+                    let path = archive.source_path().map_err(|error| Error::Io(std::io::Error::other(error)))?;
+                    observer.notify(0, path, SelectedReadRole::Selected, Some(&self.cancel))?;
+                }
                 archive.legacy_read(self.index, password, self.limit, &self.cancel, &mut checked_sink)
             }
-            SelectedSource::Tar(selected) => selected.read(&mut checked_sink),
+            SelectedSource::Tar(selected) => {
+                observer.notify(0, selected.source_path(), SelectedReadRole::Selected, Some(&self.cancel))?;
+                selected.read(&mut checked_sink)
+            }
             SelectedSource::Rar { path, chain_start, name } => {
                 let selection = RarSelection {
                     sink: &mut checked_sink,
@@ -880,7 +999,7 @@ impl SelectedEntry {
                     decoded_left: self.limit,
                     cancel: &self.cancel,
                 };
-                rar_read_at(&path, chain_start, self.index, &name, password, selection)
+                rar_read_at(&path, chain_start, self.index, &name, password, selection, observer)
             }
         }?;
         self.cancel.check_io()?;
@@ -1203,7 +1322,9 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
         budget.record(&h.name)?;
         let crc32 = if h.split_after() { None } else { h.crc32 };
         let dir = h.is_dir();
+        let mode = Meta::from(&h).mode;
         out.push(Entry {
+            mode,
             name: h.name,
             size: h.unpacked_size,
             packed: h.packed_size,
@@ -1889,6 +2010,7 @@ fn rar_read_at(
     name: &str,
     password: Option<&str>,
     selection: RarSelection<'_>,
+    observer: &mut SelectedReadObserver<'_>,
 ) -> Result<()> {
     let opts = Options {
         mode: Mode::Test,
@@ -1908,8 +2030,9 @@ fn rar_read_at(
     let mut selected = false;
     let mut prerequisite = false;
     let mut complete = false;
+    observer.notify(0, first, SelectedReadRole::Header, Some(cancel))?;
     let volume = Volume::open_with_password(first, run.password)?;
-    walk_until(volume, run.password, Some(cancel), |volume, block| {
+    walk_until_observed(volume, run.password, Some(cancel), observer, |volume, block, volume_index, observer| {
         let Block::File(header) = block else { return Ok(false) };
         if !header.split_before() {
             if run.pending.is_some() {
@@ -1934,6 +2057,12 @@ fn rar_read_at(
         if let Some(selection) = &mut run.selection {
             selection.emit = selected;
         }
+        observer.notify(
+            volume_index,
+            &volume.path,
+            if selected { SelectedReadRole::Selected } else { SelectedReadRole::Prerequisite },
+            Some(cancel),
+        )?;
         let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
         let before = summary.files;
         let crypt = header.crypt.map(Ok);
