@@ -780,7 +780,9 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
             let dir = e.is_dir();
             let encrypted = e.encrypted();
             let link = e.is_link().then(|| Redirection::UnixSymlink(String::new()));
+            let mode = e.unix_mode();
             Entry {
+                mode,
                 name: e.name,
                 size: e.size,
                 packed: e.packed,

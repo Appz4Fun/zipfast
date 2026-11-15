@@ -293,6 +293,7 @@ impl Member {
         };
         let data = self.kind == Kind::File;
         Entry {
+            mode: Some(self.mode),
             name: self.name,
             size: if data { self.size } else { 0 },
             packed: if data { self.size } else { 0 },
@@ -606,6 +607,7 @@ impl Reader {
 
 pub(crate) struct Selected {
     reader: Reader,
+    path: PathBuf,
     pub name: String,
     size: Option<u64>,
     pub meta: Meta,
@@ -617,7 +619,13 @@ impl Selected {
         if matches!(reader.content, Content::Single) {
             let codec = reader.src.codec().ok_or(Error::NotAnArchive)?;
             if index == 0 {
-                return Ok(Self { name: single_name(codec, path), reader, size: None, meta: Meta::default() });
+                return Ok(Self {
+                    name: single_name(codec, path),
+                    reader,
+                    path: path.to_path_buf(),
+                    size: None,
+                    meta: Meta::default(),
+                });
             }
         } else {
             let mut current = 0;
@@ -633,12 +641,22 @@ impl Selected {
                         return Err(Error::Unsupported("the selected member exceeds the byte limit".into()));
                     }
                     let meta = member.meta();
-                    return Ok(Self { reader, name: member.name, size: Some(member.size), meta });
+                    return Ok(Self {
+                        reader,
+                        path: path.to_path_buf(),
+                        name: member.name,
+                        size: Some(member.size),
+                        meta,
+                    });
                 }
                 current += 1;
             }
         }
         Err(Error::Unsupported("entry index is out of range".into()))
+    }
+
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.path
     }
 
     pub(crate) fn read(mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
@@ -699,6 +717,7 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         let mut buf = vec![0u8; BUF];
         let size = reader.read_single(&mut buf, &mut |_| Ok(()))?;
         return Ok(vec![Entry {
+            mode: None,
             name: single_name(codec, path),
             size,
             packed,
