@@ -705,8 +705,7 @@ impl PartialCore {
         self.budget.metadata((plan.unknown.len() * std::mem::size_of::<Range<u64>>()) as u64)?;
         op.verification = None;
         let verification = verify::Verification::new(&commit, &self.budget)?;
-        let transaction = self.begin_transaction(op, intent, commit, plan.unknown.clone())?;
-        // From here the intent is durable: the differing alt ranges are holes now, written or not. Report them on
+        // Once the intent is durable: the differing alt ranges are holes now, written or not. Report them on
         // failure so the caller still learns that alt was wrong.
         let progress = |op: &CoreData, mut error: PartialError| {
             if !corrected.is_empty() && error.packed_progress.is_none() {
@@ -721,6 +720,15 @@ impl PartialCore {
                 }));
             }
             error
+        };
+        let intent_revision = intent.head.revision;
+        let transaction = match self.begin_transaction(op, intent, commit, plan.unknown.clone()) {
+            Ok(transaction) => transaction,
+            // The intent was acknowledged (or its CAS is uncertain) before the error: the alt ranges may be holes.
+            Err(error) if op.snapshot.head.revision == intent_revision || op.uncertain.is_some() => {
+                return Err(progress(op, error));
+            }
+            Err(error) => return Err(error),
         };
         let mut completed = 0usize;
         let write = (|| {
