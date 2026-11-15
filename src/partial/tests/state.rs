@@ -1218,6 +1218,7 @@ fn failed_packed_rewrite_of_alt_bytes_leaves_a_fillable_declared_hole() {
     WRITE_FAULT.set(None);
     let error = result.unwrap_err();
     assert!(matches!(error.kind, PartialErrorKind::Io { .. }), "{error:?}");
+    assert_eq!(error.packed_progress.as_ref().expect("wrong alt reported").corrected, vec![0..4]);
     assert_eq!(file.remaining().unwrap(), vec![0..16]);
     let state = file.close().unwrap();
     let mut opened = f.open(state).unwrap();

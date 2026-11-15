@@ -454,6 +454,9 @@ impl PartialCore {
                     corrected.extend(written.corrected);
                 }
                 Err(mut error) => {
+                    if let Some(step) = error.packed_progress.take() {
+                        corrected.extend(step.corrected);
+                    }
                     if !applied.is_empty() || !corrected.is_empty() {
                         error.packed_progress = Some(Box::new(PackedFillResult {
                             revision: op.snapshot.head.revision,
@@ -469,7 +472,23 @@ impl PartialCore {
                 }
             }
         }
-        let fill = self.fill_result(&mut op, applied)?;
+        let fill = match self.fill_result(&mut op, applied.clone()) {
+            Ok(fill) => fill,
+            Err(mut error) => {
+                if !applied.is_empty() || !corrected.is_empty() {
+                    error.packed_progress = Some(Box::new(PackedFillResult {
+                        revision: op.snapshot.head.revision,
+                        applied,
+                        corrected,
+                        unmapped,
+                        state: op.state.clone(),
+                        part_checks: Vec::new(),
+                        needs_verification: true,
+                    }));
+                }
+                return Err(error);
+            }
+        };
         Ok(PackedFillResult {
             revision: fill.revision,
             applied: fill.applied,
@@ -667,8 +686,16 @@ impl PartialCore {
                 commit.holes.push(report);
             }
         }
-        for leaf in commit.known.iter_mut().filter(|leaf| confirmed.contains(&leaf.range)) {
-            leaf.provenance = state::Provenance::Original;
+        // Both lists are sorted by start; walk them together.
+        let mut next = confirmed.iter().peekable();
+        for leaf in commit.known.iter_mut() {
+            while next.peek().is_some_and(|c| c.start < leaf.range.start) {
+                next.next();
+            }
+            if next.peek().is_some_and(|c| **c == leaf.range) {
+                leaf.provenance = state::Provenance::Original;
+                next.next();
+            }
         }
         ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }
             .commit_fill(&plan, &leaves)?;
@@ -679,6 +706,22 @@ impl PartialCore {
         op.verification = None;
         let verification = verify::Verification::new(&commit, &self.budget)?;
         let transaction = self.begin_transaction(op, intent, commit, plan.unknown.clone())?;
+        // From here the intent is durable: the differing alt ranges are holes now, written or not. Report them on
+        // failure so the caller still learns that alt was wrong.
+        let progress = |op: &CoreData, mut error: PartialError| {
+            if !corrected.is_empty() && error.packed_progress.is_none() {
+                error.packed_progress = Some(Box::new(PackedFillResult {
+                    revision: op.snapshot.head.revision,
+                    applied: Vec::new(),
+                    corrected: corrected.clone(),
+                    unmapped: Vec::new(),
+                    state: op.state.clone(),
+                    part_checks: Vec::new(),
+                    needs_verification: true,
+                }));
+            }
+            error
+        };
         let mut completed = 0usize;
         let write = (|| {
             for range in &plan.unknown {
@@ -715,9 +758,11 @@ impl PartialCore {
             error.committed = Some(transaction.intent.anchor.clone());
             error.output =
                 Some(crate::progressive::OutputRange { offset, attempted: total, completed: completed as u64 });
-            return Err(error);
+            return Err(progress(op, error));
         }
-        self.finish_transaction(op, transaction)?;
+        if let Err(error) = self.finish_transaction(op, transaction) {
+            return Err(progress(op, error));
+        }
         op.verification = Some(verification);
         Ok(Written { applied: plan.unknown, corrected })
     }
