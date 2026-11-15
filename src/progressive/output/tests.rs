@@ -31,6 +31,7 @@ fn setup(dir: &Path) -> OutputContext {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         },
         "input.rar".into(),
     );

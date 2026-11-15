@@ -65,6 +65,7 @@ fn options(mode: Mode, dest: &Path) -> Options {
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 

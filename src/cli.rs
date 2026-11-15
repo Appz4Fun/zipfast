@@ -93,6 +93,7 @@ pub(crate) fn main() -> ExitCode {
                 threads,
                 protected_paths: Default::default(),
                 parallel_min: None,
+                select: None,
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }

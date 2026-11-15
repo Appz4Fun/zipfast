@@ -17,7 +17,7 @@
 //! Encrypted RAR5 integration tests using archives generated from the format.
 mod common;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use common::*;
 use zipfast::crypto::{derive_rar5_key_and_hash_key, encrypt_cbc, rar5_tweak_crc32};
@@ -67,6 +67,7 @@ fn options(dest: &Path, mode: Mode) -> Options {
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 
@@ -678,4 +679,45 @@ fn truncated_verifier_in_continuation_preserves_destination() {
     assert_eq!((seen, summary.failed, summary.files), (1, 1, 0));
     assert_eq!(fs::read(out.join("f")).unwrap(), b"original");
     assert_eq!(fs::read_dir(out).unwrap().count(), 1);
+}
+
+#[test]
+fn a_wrong_password_on_an_unselected_solid_member_is_the_cause_its_dependent_reports() {
+    use zipfast::error::RarFailure;
+    use zipfast::extract::{MemberFilter, RarOutcome, run_rar_with_outcomes};
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("solid.rar");
+    let first: Vec<_> = b"first member".iter().copied().map(Op::Lit).collect();
+    let second: Vec<_> = b"second".iter().copied().map(Op::Lit).collect();
+    let packed = zipfast::rar5::testenc::block(&first, true, true);
+    let encrypted = encrypted_data(&packed, 0);
+    let later = zipfast::rar5::testenc::block(&second, true, true);
+    let specs = [
+        (
+            FileSpec { method: 3, size: Some(12), extra: checked_record(CHECK), ..FileSpec::new("locked", &encrypted) },
+            crc32fast::hash(b"first member"),
+        ),
+        (
+            FileSpec { method: 3, size: Some(6), solid: true, ..FileSpec::new("after", &later) },
+            crc32fast::hash(b"second"),
+        ),
+    ];
+    fs::write(&archive, archive_with(&specs, true)).unwrap();
+    let options = Options { select: Some(MemberFilter::new(|m| m.name == "after")), ..options(dir.path(), Mode::Test) };
+    let mut failures = Vec::new();
+    let summary = run_rar_with_outcomes(&archive, &options, Some("not the password"), |entry| {
+        if let RarOutcome::Failed(failure) = &entry.outcome {
+            failures.push((entry.entry.index, Arc::clone(failure)));
+        }
+    })
+    .unwrap();
+    assert_eq!((summary.encountered, summary.matched, summary.failed), (2, 1, 1));
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, Some(1));
+    match failures[0].1.as_ref() {
+        RarFailure::SolidHistoryUnavailable { predecessor: Some(0), cause: Some(cause) } => {
+            assert!(!matches!(cause.as_ref(), RarFailure::SolidHistoryUnavailable { .. }), "{cause:?}")
+        }
+        other => panic!("{other:?}"),
+    }
 }

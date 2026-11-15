@@ -89,6 +89,7 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
             threads: Some(1),
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         };
         let error = extract::run_with_zip_policy(
             &first,
@@ -409,6 +410,7 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
                 threads: Some(1),
                 protected_paths: Default::default(),
                 parallel_min: None,
+                select: None,
             };
             let result = extract::run_with_zip_policy(
                 &path,
@@ -672,6 +674,7 @@ mod direct_completion {
             threads: Some(1),
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         }
     }
     #[test]
@@ -827,6 +830,7 @@ mod direct_aliases {
                     threads: Some(1),
                     protected_paths: Default::default(),
                     parallel_min: None,
+                    select: None,
                 };
                 let log_path = match alias {
                     0 => source.clone(),
@@ -933,6 +937,7 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
             threads: Some(1),
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         };
         macro_rules! refuse_completion {
             ($session:ident,$context:ident,$token:expr,$admit:expr,$emit:ident) => {{
@@ -1058,6 +1063,7 @@ mod protected_name_completion {
                             threads: Some(1),
                             protected_paths: [protected.clone()].into_iter().collect(),
                             parallel_min: None,
+                            select: None,
                         };
                         let output = || {
                             if extract {

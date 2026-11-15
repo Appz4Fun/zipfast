@@ -27,6 +27,7 @@ fn additive_context_keeps_legacy_options() {
         threads: None,
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     };
     let _ = EncryptedReadContext::new(EncryptedReadOptions::default()).unwrap();
 }

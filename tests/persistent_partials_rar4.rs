@@ -258,6 +258,7 @@ fn options(dest: &Path, first: OsString) -> ProgressiveOptions {
             threads: Some(1),
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         },
         first,
     );

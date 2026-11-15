@@ -57,6 +57,29 @@ For compressed TAR, extraction stages member payloads and archive-supplied direc
 stream passes verification. Pending payloads use temporary disk space. Members publish in archive order, so a
 publication failure can leave earlier verified members in place.
 
+### Library: choosing members
+
+`extract::Options::select` takes an optional `MemberFilter`, a shared predicate over a `MemberRef` (decoded name,
+stored name bytes when kept, `is_dir`, and the zero-based ordinal that `extract::list` gives the member). `None`
+keeps the old behaviour. `run`, `run_with_password`, `run_with_zip_policy`, `run_with_zip_context` and
+`run_rar_with_outcomes` apply the filter to ZIP, tar (plain or compressed), lone compressed files, and RAR4/RAR5,
+in both `Mode::Test` and `Mode::Extract`:
+
+```rust
+use zipfast::extract::{MemberFilter, Options};
+let opts = Options { select: Some(MemberFilter::new(|m| m.is_dir || m.name.ends_with(".mkv"))), ..opts };
+```
+
+An unselected member is not written, tested, counted or reported. Folder entries are offered with `is_dir` set. An
+unselected folder entry is not created, but the folders above a selected file still are. Path safety and overwrite
+checks apply to selected members as before. ZIP doesn't read unselected entries. In a solid RAR archive, unselected
+compressed members are still decoded for the dictionary history but not checked. `Summary::matched`,
+`ZipRunReport::matched()` and `RarRunSummary::matched` count the members the filter took. A run that matches
+nothing succeeds with zero matched, so the caller can choose its own exit status. Only these whole-archive runners
+apply the filter. `RarSession::extract_selected`/`extract_selected_controlled`, progressive and persistent-partial
+sessions, and `ZipReadStage::prepare_file` have their own member selection and refuse `select: Some(..)` with a typed
+error before doing anything.
+
 ## Builds tuned for a processor
 
 A plain `cargo build --release` runs on any x86-64 or Apple silicon processor, and picks AVX2 at run time where

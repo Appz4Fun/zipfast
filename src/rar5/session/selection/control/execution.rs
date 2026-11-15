@@ -32,6 +32,9 @@ impl RarSession {
     ) -> RarControlledExtractReport<'a> {
         let outcome = if control.usage.phase != RarExtractControlPhase::Ready {
             Err(RarExtractError::ControlNotReset { partial: self.summary(0) })
+        } else if options.select.is_some() {
+            // refused before the run starts: no source, output or diagnostic is touched
+            Err(RarExtractError::Native(member_filter_refused(self)))
         } else {
             control.usage.phase = RarExtractControlPhase::Extracting;
             if Arc::ptr_eq(&self.token, &selection.token) {
@@ -690,6 +693,7 @@ mod tests {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         }
     }
     struct Fault {
@@ -934,6 +938,7 @@ mod directory_fault_tests {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1005,6 +1010,7 @@ mod trailing_directory_tests {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

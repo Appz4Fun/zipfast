@@ -34,6 +34,7 @@ fn options(dest: &Path) -> Options {
         threads: None,
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 struct Observer {
@@ -2061,4 +2062,39 @@ fn trailing_directory_empty_destination_child() {
         .unwrap();
     assert!(report.finish().diagnostic_failure.is_none());
     assert_eq!(fs::read("log").unwrap(), b"done\n");
+}
+
+#[test]
+fn controlled_extraction_refuses_the_whole_archive_member_filter_before_anything() {
+    use zipfast::error::{RarFailure, RarUnsupported};
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("a.rar");
+    fs::write(&source, archive(&[FileSpec::new("item", b"new")])).unwrap();
+    let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let dest = dir.path().join("out");
+    let filtered = Options { select: Some(zipfast::extract::MemberFilter::new(|_| true)), ..options(&dest) };
+    let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+    let report =
+        session.extract_selected_controlled(&selected, &filtered, RarDecodeLimits::default(), &mut control, &mut Quiet);
+    match report.finish().outcome {
+        Err(RarExtractError::Native(error)) => {
+            assert!(matches!(*error.failure, RarFailure::Unsupported(RarUnsupported::MemberFilter)))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!dest.exists());
+    let refused = session.extract_selected(&selected, &filtered, RarDecodeLimits::default(), |_| {}).unwrap_err();
+    assert!(matches!(*refused.failure, RarFailure::Unsupported(RarUnsupported::MemberFilter)));
+    assert!(!dest.exists());
+    // nothing was started: after the usual reset the same control runs an unfiltered extraction
+    control.reset().unwrap();
+    let report = session.extract_selected_controlled(
+        &selected,
+        &options(&dest),
+        RarDecodeLimits::default(),
+        &mut control,
+        &mut Quiet,
+    );
+    assert_eq!(report.finish().outcome.unwrap().files, 1);
 }

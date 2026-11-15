@@ -201,6 +201,7 @@ fn options(dest: &Path) -> ProgressiveOptions {
             threads: Some(1),
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         },
         volume_name(0),
     );

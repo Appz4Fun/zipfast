@@ -662,6 +662,7 @@ fn session(f: &Fixture, fill: HoleFill) -> (ProgressiveSession, Shared) {
             threads: Some(1),
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         },
         "a.part01.rar".into(),
     );

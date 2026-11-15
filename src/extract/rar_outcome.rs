@@ -86,7 +86,9 @@ pub struct RarVerification {
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct RarRunSummary {
+    /// Members with an initial header, whether or not [`super::Options::select`] took them.
     pub encountered: u64,
+    /// Members [`super::Options::select`] took: all of `encountered` without a filter.
     pub matched: u64,
     pub files: u64,
     pub dirs: u64,
@@ -212,13 +214,32 @@ impl Reports<'_> {
             Self::Typed { summary, .. } if normal => {
                 let index = summary.encountered;
                 add(&mut summary.encountered, 1)?;
-                summary.matched = summary.encountered;
+                add(&mut summary.matched, 1)?;
                 summary.match_state = RarMatchState::Matched;
                 Some(index)
+            }
+            Self::Legacy { summary, .. } if normal => {
+                add(&mut summary.matched, 1)?;
+                None
             }
             _ => None,
         };
         let entry = RarEntryIdentity { index, order: position, name };
+        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted })
+    }
+
+    /// A member the run's filter didn't take: it keeps its listing index, so later members' indexes still match a
+    /// listing, but takes no reporting order and isn't matched.
+    pub(super) fn unselected(&mut self, order: u64, name: String, method: u8) -> RunResult<EntryContext> {
+        let index = match self {
+            Self::Typed { summary, .. } => {
+                let index = summary.encountered;
+                add(&mut summary.encountered, 1)?;
+                Some(index)
+            }
+            Self::Legacy { .. } => None,
+        };
+        let entry = RarEntryIdentity { index, order, name };
         Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted })
     }
 

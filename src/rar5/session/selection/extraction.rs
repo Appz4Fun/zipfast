@@ -40,6 +40,9 @@ impl RarSession {
         limits: RarDecodeLimits,
         on_entry: impl FnMut(&RarEntryOutcome),
     ) -> Result<RarRunSummary, RarRunError> {
+        if options.select.is_some() {
+            return Err(member_filter_refused(self));
+        }
         let mut extraction = Extraction::new(options);
         self.execute_selected(selection, limits, |run, session, index| extraction.member(run, session, index), on_entry)
     }
@@ -560,6 +563,7 @@ mod tests {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         }
     }
 

@@ -31,6 +31,7 @@ fn opts(dest: &Path) -> Options {
         threads: None,
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 
@@ -535,4 +536,128 @@ fn a_failed_batched_blake_check_preserves_existing_output() {
     assert_eq!(after.permissions(), before.permissions());
     assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
     fs::remove_dir_all(&dir).unwrap();
+}
+
+fn only(names: &[&'static str]) -> extract::MemberFilter {
+    let names = names.to_vec();
+    extract::MemberFilter::new(move |m| names.contains(&m.name))
+}
+
+#[test]
+fn a_member_filter_chooses_which_rar5_members_are_tested_and_extracted() {
+    use std::sync::{Arc, Mutex};
+    let dir = tmp("select");
+    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+    let files = [
+        (FileSpec::new("a.txt", b"hello"), crc32fast::hash(b"hello")),
+        (FileSpec { dir: true, unix_mode: Some(0o755), ..FileSpec::new("sub", b"") }, 0),
+        (FileSpec::new("sub/big.bin", &big), crc32fast::hash(&big)),
+        // a wrong checksum: only seen when selected
+        (FileSpec::new("bad", b"damaged"), 1),
+        (FileSpec::new("../evil", b"x"), crc32fast::hash(b"x")),
+    ];
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive_with(&files, false)).unwrap();
+    let picked = || Some(only(&["a.txt", "sub/big.bin"]));
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let o = Options {
+        mode: Mode::Test,
+        select: Some(extract::MemberFilter::new(move |m| {
+            record.lock().unwrap().push((m.ordinal, m.name.to_string(), m.is_dir));
+            m.name == "a.txt" || m.name == "sub/big.bin"
+        })),
+        ..opts(&dir)
+    };
+    let s = extract::run(&arc, &o, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (2, 2, 0, 0), "{:?}", s.errors);
+    let listed: Vec<_> =
+        extract::list(&arc).unwrap().into_iter().enumerate().map(|(i, e)| (i as u64, e.name, e.dir)).collect();
+    assert_eq!(*seen.lock().unwrap(), listed);
+
+    for threads in [1, 4] {
+        let out = dir.join(format!("out-{threads}"));
+        let s =
+            extract::run(&arc, &Options { threads: Some(threads), select: picked(), ..opts(&out) }, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (2, 2, 0, 0), "{:?}", s.errors);
+        assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"hello");
+        assert!(fs::read(out.join("sub/big.bin")).unwrap() == big);
+        assert!(!out.join("bad").exists());
+    }
+
+    let mut outcomes = Vec::new();
+    let summary = extract::run_rar_with_outcomes(
+        &arc,
+        &Options { mode: Mode::Test, select: picked(), ..opts(&dir) },
+        None,
+        |o| outcomes.push((o.entry.index, o.entry.name.clone())),
+    )
+    .unwrap();
+    assert_eq!((summary.encountered, summary.matched, summary.files, summary.dirs, summary.failed), (5, 2, 2, 0, 0));
+    assert_eq!(outcomes, [(Some(0), "a.txt".to_string()), (Some(2), "sub/big.bin".to_string())]);
+
+    // a selected folder entry, and path safety on a selected member
+    let out = dir.join("dirs");
+    let s = extract::run(&arc, &Options { select: Some(only(&["sub", "../evil"])), ..opts(&out) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (2, 0, 1, 1));
+    assert!(out.join("sub").is_dir() && !out.join("sub/big.bin").exists());
+    assert!(!dir.join("evil").exists());
+
+    let none = dir.join("none");
+    for mode in [Mode::Test, Mode::Extract] {
+        let s = extract::run(&arc, &Options { mode, select: Some(only(&[])), ..opts(&none) }, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (0, 0, 0, 0));
+    }
+    assert_eq!(fs::read_dir(&none).unwrap().count(), 0);
+
+    let s = extract::run(&arc, &Options { mode: Mode::Test, ..opts(&dir) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (5, 2, 1, 2));
+}
+
+#[test]
+fn an_unselected_member_split_across_volumes_is_passed_over_quietly() {
+    let dir = tmp("select-volumes");
+    let split: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+    let (first, second) = split.split_at(120_000);
+    let spec = FileSpec::new("split.bin", &split);
+    let mut one = SIG.to_vec();
+    one.extend(main_block(true, None));
+    one.extend(file_block(&FileSpec::new("a.txt", b"before"), b"before", crc32fast::hash(b"before"), false, false));
+    one.extend(file_block(&spec, first, crc32fast::hash(first), false, true));
+    one.extend(end_block(true));
+    let mut two = SIG.to_vec();
+    two.extend(main_block(true, Some(1)));
+    two.extend(file_block(&spec, second, crc32fast::hash(&split), true, false));
+    two.extend(file_block(&FileSpec::new("c.txt", b"after"), b"after", crc32fast::hash(b"after"), false, false));
+    two.extend(end_block(false));
+    fs::write(dir.join("set.part1.rar"), one).unwrap();
+    fs::write(dir.join("set.part2.rar"), two).unwrap();
+    let arc = dir.join("set.part1.rar");
+
+    let out = dir.join("ends");
+    let s = extract::run(&arc, &Options { select: Some(only(&["a.txt", "c.txt"])), ..opts(&out) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.volumes, s.errors.len()), (2, 2, 2, 0), "{:?}", s.errors);
+    assert!(out.join("a.txt").exists() && out.join("c.txt").exists() && !out.join("split.bin").exists());
+
+    let out = dir.join("middle");
+    let s = extract::run(&arc, &Options { select: Some(only(&["split.bin"])), ..opts(&out) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (1, 1, 0), "{:?}", s.errors);
+    assert!(fs::read(out.join("split.bin")).unwrap() == split);
+    assert!(!out.join("a.txt").exists() && !out.join("c.txt").exists());
+
+    // with the last volume gone, the missing continuation of an unselected member isn't reported
+    fs::remove_file(dir.join("set.part2.rar")).unwrap();
+    let mut one = fs::read(&arc).unwrap();
+    // the first volume no longer says more follow, so the set ends here rather than failing as missing
+    let end = end_block(true);
+    let at = one.len() - end.len();
+    one.truncate(at);
+    one.extend(end_block(false));
+    fs::write(&arc, one).unwrap();
+    let s = extract::run(&arc, &Options { mode: Mode::Test, select: Some(only(&["a.txt"])), ..opts(&dir) }, |_| {})
+        .unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (1, 1, 0), "{:?}", s.errors);
+    let s = extract::run(&arc, &Options { mode: Mode::Test, ..opts(&dir) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (2, 1, 1), "{:?}", s.errors);
 }

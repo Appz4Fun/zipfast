@@ -669,6 +669,7 @@ pub enum ZipRunEvent<'a> {
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ZipRunReport {
+    matched: u64,
     files: u64,
     dirs: u64,
     skipped: u64,
@@ -684,6 +685,7 @@ impl ZipRunReport {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn from_legacy(summary: &crate::extract::Summary) -> Self {
         Self {
+            matched: summary.matched,
             files: summary.files,
             dirs: summary.dirs,
             skipped: summary.skipped,
@@ -697,6 +699,11 @@ impl ZipRunReport {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn diagnostic_usage(&self) -> ZipDiagnosticUsage {
         self.diagnostic_usage
+    }
+    /// Members (files and folders) taken by [`crate::extract::Options::select`], whatever became of them: every
+    /// member when there is no filter. Zero means nothing matched.
+    pub fn matched(&self) -> u64 {
+        self.matched
     }
     pub fn files(&self) -> u64 {
         self.files

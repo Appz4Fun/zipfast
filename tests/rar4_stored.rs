@@ -66,6 +66,7 @@ fn options(path: &std::path::Path, mode: Mode) -> Options {
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 
@@ -452,4 +453,62 @@ fn a_volume_set_cannot_switch_between_rar4_and_rar5() {
     assert!(RarSession::open(&first, None, RarSessionOptions::default()).is_err());
     assert!(extract::list(&first).is_err());
     assert!(extract::run(&first, &options(dir.path(), Mode::Test), |_| {}).is_err());
+}
+
+fn only(names: &[&'static str]) -> extract::MemberFilter {
+    let names = names.to_vec();
+    extract::MemberFilter::new(move |m| names.contains(&m.name))
+}
+
+#[test]
+fn a_member_filter_chooses_which_rar4_members_are_tested_and_extracted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    let mut bad = member(b"bad", b"damaged", 0, 0x30);
+    let at = bad.len() - 1;
+    bad[at] ^= 1;
+    fs::write(&path, archive(&[member(b"one", b"first", 0, 0x30), bad, member(b"three", b"third", 0, 0x30)])).unwrap();
+    let with = |mode, out: &std::path::Path, select| Options { select, ..options(out, mode) };
+    let picked = || Some(only(&["one", "three"]));
+
+    let out = dir.path().join("out");
+    let s = extract::run(&path, &with(Mode::Extract, &out, picked()), |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (2, 2, 0), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("one")).unwrap(), b"first");
+    assert_eq!(fs::read(out.join("three")).unwrap(), b"third");
+    assert!(!out.join("bad").exists());
+    let s = extract::run(&path, &with(Mode::Test, &out, picked()), |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (2, 2, 0));
+
+    let mut outcomes = Vec::new();
+    let summary = extract::run_rar_with_outcomes(&path, &with(Mode::Test, &out, picked()), None, |o| {
+        outcomes.push((o.entry.index, o.entry.order, o.entry.name.clone()))
+    })
+    .unwrap();
+    assert_eq!((summary.encountered, summary.matched, summary.files, summary.failed), (3, 2, 2, 0));
+    assert_eq!(outcomes, [(Some(0), 0, "one".to_string()), (Some(2), 1, "three".to_string())]);
+
+    let none = dir.path().join("none");
+    let s = extract::run(&path, &with(Mode::Extract, &none, Some(only(&[]))), |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (0, 0, 0));
+    assert_eq!(fs::read_dir(&none).unwrap().count(), 0);
+    let summary =
+        extract::run_rar_with_outcomes(&path, &with(Mode::Test, &out, Some(only(&[]))), None, |_| {}).unwrap();
+    assert_eq!((summary.encountered, summary.matched, summary.match_state), (3, 0, extract::RarMatchState::NoMatch));
+
+    let s = extract::run(&path, &with(Mode::Test, &out, None), |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (3, 2, 1));
+}
+
+#[test]
+fn an_unselected_unsupported_rar4_member_keeps_its_listing_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    fs::write(&path, archive(&[member(b"bad", b"", 0, 0x36), member(b"good", b"fine", 0, 0x30)])).unwrap();
+    assert_eq!(extract::list(&path).unwrap()[1].name, "good");
+    let o = Options { select: Some(only(&["good"])), ..options(dir.path(), Mode::Test) };
+    let mut indexes = Vec::new();
+    let summary = extract::run_rar_with_outcomes(&path, &o, None, |e| indexes.push(e.entry.index)).unwrap();
+    assert_eq!((summary.encountered, summary.matched, summary.files, summary.failed), (2, 1, 1, 0));
+    assert_eq!(indexes, [Some(1)]);
 }

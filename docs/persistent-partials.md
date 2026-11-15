@@ -162,7 +162,7 @@ fn start(archive: Vec<u8>, workspace: &Path) -> PartialResult<(ProgressiveSessio
     let anchors = Arc::new(DurableAnchors::open(&workspace.join("trusted-anchors"))?);
     let extract = zipfast::extract::Options { mode: zipfast::extract::Mode::Extract,
         dest: workspace.join("output"), overwrite: zipfast::extract::Overwrite::Always,
-        flatten: false, threads: Some(1), protected_paths: Default::default(), parallel_min: None };
+        flatten: false, threads: Some(1), protected_paths: Default::default(), parallel_min: None, select: None };
     let session = ProgressiveSession::new_partial(
         Box::new(CompleteProvider { source: Some(MemorySource { bytes: archive }) }),
         ProgressiveOptions::new(extract, "example.rar".into()),

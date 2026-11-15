@@ -167,6 +167,7 @@ fn opts(mode: Mode, dest: &Path) -> Options {
         threads: None,
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 
@@ -850,4 +851,154 @@ fn r2_checked_dispatch_keeps_direct_tar_and_compressed_tar_parity() {
         }
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
+}
+
+fn only(names: &[&'static str]) -> extract::MemberFilter {
+    let names = names.to_vec();
+    extract::MemberFilter::new(move |m| names.contains(&m.name))
+}
+
+#[test]
+fn a_member_filter_chooses_which_tar_members_are_tested_and_extracted() {
+    use std::sync::{Arc, Mutex};
+    let big = data(1 << 20, 3);
+    let tar = Tar::default()
+        .dir("d/", 0o750)
+        .file("d/a.txt", b"first")
+        .file("big.bin", &big)
+        .dir("e/", 0o755)
+        .file("e/c.txt", b"third")
+        .file("../evil", b"x")
+        .raw(header(b"bytes-\xff.bin", b'0', 3, 0o644, 0, b"", true), b"raw")
+        .end();
+    for (label, bytes) in [("tar", tar.clone()), ("tar.gz", gzip(&tar)), ("tar.xz", xz(&tar))] {
+        let dir = tmp(&format!("select-{label}"));
+        let archive = dir.join(format!("a.{label}"));
+        fs::write(&archive, &bytes).unwrap();
+        let picked = || Some(only(&["d/a.txt", "e/c.txt"]));
+
+        // every member is offered once, at its listing position, folders and raw names included
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let o = Options {
+            select: Some(extract::MemberFilter::new(move |m| {
+                record.lock().unwrap().push((m.ordinal, m.name.to_string(), m.is_dir, m.raw_name.map(<[u8]>::to_vec)));
+                false
+            })),
+            ..opts(Mode::Test, &dir.join("unused"))
+        };
+        let s = extract::run(&archive, &o, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (0, 0, 0, 0), "{label}");
+        let listed: Vec<_> = extract::list(&archive)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let raw = e.name.contains('\u{FFFD}').then(|| b"bytes-\xff.bin".to_vec());
+                (i as u64, e.name, e.dir, raw)
+            })
+            .collect();
+        assert_eq!(*seen.lock().unwrap(), listed, "{label}");
+
+        let tested = extract::run(&archive, &Options { select: picked(), ..opts(Mode::Test, &dir) }, |_| {}).unwrap();
+        assert_eq!((tested.matched, tested.files, tested.dirs, tested.bytes, tested.errors.len()), (2, 2, 0, 10, 0));
+
+        let out = dir.join("out");
+        let s = extract::run(&archive, &Options { select: picked(), ..opts(Mode::Extract, &out) }, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (2, 2, 0, 0), "{label}: {:?}", s.errors);
+        assert_eq!(fs::read(out.join("d/a.txt")).unwrap(), b"first");
+        assert_eq!(fs::read(out.join("e/c.txt")).unwrap(), b"third");
+        assert!(!out.join("big.bin").exists());
+        let mut written: Vec<_> = fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name()).collect();
+        written.sort();
+        assert_eq!(written, ["d", "e"], "{label}");
+
+        // path safety still applies to a selected member
+        let unsafe_out = dir.join("unsafe");
+        let s = extract::run(
+            &archive,
+            &Options { select: Some(only(&["../evil"])), ..opts(Mode::Extract, &unsafe_out) },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!((s.matched, s.files, s.errors.len()), (1, 0, 1), "{label}");
+        assert!(!dir.join("evil").exists());
+
+        // nothing matched
+        let none = dir.join("none");
+        let s =
+            extract::run(&archive, &Options { select: Some(only(&[])), ..opts(Mode::Extract, &none) }, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.dirs, s.skipped, s.errors.len()), (0, 0, 0, 0, 0));
+        assert_eq!(fs::read_dir(&none).unwrap().count(), 0);
+
+        // no filter
+        let s = extract::run(&archive, &opts(Mode::Test, &dir), |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (7, 4, 2, 1), "{label}");
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let report = extract::run_with_zip_policy(
+                &archive,
+                &Options { select: picked(), ..opts(Mode::Test, &dir) },
+                None,
+                &extract::Cancellation::default(),
+                &Default::default(),
+                |_: zipfast::zip::ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            assert_eq!((report.matched(), report.files(), report.failed()), (2, 2, 0));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_member_filter_applies_to_a_lone_compressed_file() {
+    let dir = tmp("select-single");
+    let body = data(100_000, 9);
+    let archive = dir.join("movie.nfo.gz");
+    fs::write(&archive, gzip(&body)).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = std::sync::Arc::clone(&seen);
+    let filter = extract::MemberFilter::new(move |m| {
+        record.lock().unwrap().push((m.ordinal, m.name.to_string(), m.is_dir));
+        true
+    });
+    for mode in [Mode::Test, Mode::Extract] {
+        let out = dir.join(format!("{mode:?}"));
+        let s = extract::run(&archive, &Options { select: Some(filter.clone()), ..opts(mode, &out) }, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.bytes, s.errors.len()), (1, 1, body.len() as u64, 0));
+        let s =
+            extract::run(&archive, &Options { select: Some(only(&["other"])), ..opts(mode, &out) }, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.bytes, s.errors.len()), (0, 0, 0, 0));
+        // no filter: the file again, skipped in extraction since the selected run already wrote it
+        let s = extract::run(&archive, &opts(mode, &out), |_| {}).unwrap();
+        assert_eq!((s.matched, s.files + s.skipped, s.errors.len()), (1, 1, 0));
+    }
+    assert_eq!(*seen.lock().unwrap(), [(0, "movie.nfo".to_string(), false), (0, "movie.nfo".to_string(), false)]);
+    // the unselected run wrote nothing; the selected one did
+    assert!(fs::read(dir.join("Extract/movie.nfo")).unwrap() == body);
+    let none = dir.join("none");
+    extract::run(&archive, &Options { select: Some(only(&[])), ..opts(Mode::Extract, &none) }, |_| {}).unwrap();
+    assert_eq!(fs::read_dir(&none).unwrap().count(), 0);
+}
+
+#[test]
+fn a_volume_label_is_checked_without_a_filter_and_never_offered_to_one() {
+    let dir = tmp("select-label");
+    let archive = dir.join("a.tar");
+    let tar = Tar::default().raw(header(b"../label", b'V', 0, 0o644, 0, b"", true), b"").file("f", b"data").end();
+    fs::write(&archive, &tar).unwrap();
+    // no filter: as before, the label's unsafe name is reported
+    let s = extract::run(&archive, &opts(Mode::Test, &dir), |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (1, 1, 1), "{:?}", s.errors);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = std::sync::Arc::clone(&seen);
+    let filter = extract::MemberFilter::new(move |m| {
+        record.lock().unwrap().push((m.ordinal, m.name.to_string()));
+        true
+    });
+    let s = extract::run(&archive, &Options { select: Some(filter), ..opts(Mode::Test, &dir) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (1, 1, 0), "{:?}", s.errors);
+    assert_eq!(*seen.lock().unwrap(), [(0, "f".to_string())]);
 }

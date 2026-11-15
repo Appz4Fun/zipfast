@@ -286,6 +286,11 @@ where
     }
 }
 
+/// Selected runs choose members with their own selection, never with `Options::select`.
+fn member_filter_refused(session: &RarSession) -> RarRunError {
+    run_error(session.summary(0), None, Arc::new(RarFailure::Unsupported(RarUnsupported::MemberFilter)))
+}
+
 fn run_error(partial: RarRunSummary, entry: Option<RarEntryIdentity>, failure: Arc<RarFailure>) -> RarRunError {
     RarRunError { partial, entry, failure, partial_member_bytes: 0 }
 }

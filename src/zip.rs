@@ -843,7 +843,11 @@ pub fn run_with_password(
         report(&line);
         summary.errors.push(line);
     }
-    for e in &entries {
+    for (ordinal, e) in entries.iter().enumerate() {
+        if !opts.selects(&e.name, None, e.is_dir(), ordinal as u64) {
+            continue;
+        }
+        summary.matched += 1;
         let rel = match sanitize(&e.name, e.host != HOST_UNIX) {
             Ok(rel) => rel,
             Err(err) => {

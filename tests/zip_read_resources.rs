@@ -292,6 +292,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             threads: Some(1),
                             protected_paths: Default::default(),
                             parallel_min: None,
+                            select: None,
                         },
                         Some("password"),
                         |_| {},
