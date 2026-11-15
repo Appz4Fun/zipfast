@@ -29,8 +29,17 @@
 //! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given) and single-disk ZIP are
 //! mapped. Passwords and keys never appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
 //! See `docs/member-map.md`.
+//!
+//! [`MemberReader`] and [`extract_member_from`] stream a stored member's plaintext from any output offset, reading
+//! only the packed bytes that offset needs, for example to fill the rest of a partial output from another copy. See
+//! `docs/extract-member-from.md`.
 
+mod member_reader;
 mod zip;
+
+pub use member_reader::{
+    ExtractFromError, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
+};
 
 use crate::progressive::{
     FailureKind, ProgressiveFailure, ProgressiveLimits, RangeRead, RangeSource, Resource, SessionControl, VolumeAnswer,
@@ -543,7 +552,7 @@ impl MapError {
     }
 }
 
-/// Options for building a map.
+/// Options for building a map, or for reading a member with [`MemberReader`].
 #[derive(Clone)]
 pub struct MapOptions {
     /// Name of the first volume. It names the volumes asked of a [`VolumeSource`] and appears in failures.
