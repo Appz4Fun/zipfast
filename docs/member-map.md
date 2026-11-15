@@ -12,6 +12,12 @@ entries get output mappings). 7z is not mapped yet; the types are format-neutral
 
 ## Building a map
 
+Format detection: a first volume starting with a ZIP local or end header is ZIP, one starting with `Rar!` is RAR.
+Anything else (a self-extracting stub) is ZIP when its last 1,046 bytes hold a ZIP end-of-central-directory record,
+so a stored `.rar` inside a ZIP is not mistaken for the archive; otherwise the RAR scanner looks for a signature in
+the first MiB, reading 4 KiB at a time. Over a `VolumeSource` this tail check waits for the volume's last bytes.
+The ZIP central directory is parsed within the caller's `ProgressiveLimits` (header bytes, entries, names, metadata).
+
 - `MemberMap::from_memory(&[&vol0, &vol1, ...], "name.part1.rar", password)` reads volumes held in memory, in order.
   Later volumes may be absent and the last one may be cut short; the map then has `complete: false`.
 - `MapBuilder::new(volume_source, MapOptions::new("name.part1.rar"))` reads through a `progressive::VolumeSource`.
@@ -28,7 +34,7 @@ How a walk ends is `MemberMap::end`:
 |---|---|
 | `Complete` | the archive's last end header was read (`complete: true`) |
 | `MissingVolume { volume }` | the volume source answered `Missing`, or the memory slice ended, after volume 0 |
-| `Truncated { volume, offset }` | the volume ended at `offset` before its headers did; pieces already announced are listed even when their data lies past the end |
+| `Truncated { volume, offset }` | the volume ended before its headers did; `offset` is the start of the header being read; pieces already announced are listed even when their data lies past the end |
 
 Failures are `MapError`: `NotArchive`, `MissingFirstVolume`, `PasswordRequired`, `WrongPassword`,
 `HeaderHole { volume, offset }` (a `RangeRead::Hole` inside header bytes; holes in member data are never reached),
@@ -37,9 +43,10 @@ limit, attempted }`, `Source` (provider failure, contract breach, cancellation) 
 
 Encrypted headers: RAR 5.0 headers with a password check value report a wrong password as soon as the key is
 derived. Without a check value (and for RAR 4.x, which has none), a wrong password shows up on the first header it
-decrypts on a volume, as a header checksum or framing failure, or as a header size that runs past the end of the
+decrypts, as a header checksum or framing failure, or as a header size that runs past the end of the
 volume; all are `WrongPassword`. A volume genuinely cut inside its first encrypted header cannot be told apart and
-is also reported as `WrongPassword`. Derived header keys are cached per salt, so a RAR4 archive repeating the same
+is also reported as `WrongPassword`. Once any header has decrypted under the password, on any volume, later failures
+are damage (`Malformed`) and a later volume cut short is `Truncated`. Derived header keys are cached per salt, so a RAR4 archive repeating the same
 salt in every header costs one derivation.
 
 ## The map
@@ -62,9 +69,14 @@ encrypted members' checks are keyed with the password (`MapChecks::keyed`).
 
 - `Rar5 { kdf_count, salt, iv, check, keyed_checks }`: AES-256-CBC. `iv` is the data IV (None for header encryption,
   where each header carries its own). `check` is the 8-byte password check value and its 4-byte checksum.
-- `Rar4 { salt }`: AES-128-CBC with key and IV derived from the password and salt.
+- `Rar4 { salt }`: AES-128-CBC with key and IV derived from the password and salt (unpack version 29 with a salt,
+  as the extractor admits it).
+- `Rar4Legacy { unpack_version, salt }`: older RAR 4.x data encryption, or version 29 without a salt. Not mapped:
+  `mapping` is `None` and `packed_spans` returns None.
 - `ZipCrypto { check }`: the byte the 12-byte encryption header decrypts to last.
-- `WinZipAes { strength, vendor_version, salt, verifier }`: read from the first bytes of the entry's data.
+- `WinZipAes { strength, vendor_version, salt, verifier }`: read from the first bytes of the entry's data. An entry
+  is WinZip AES when its method is 99 or it has an AES extra field, as the extractor decides; one without a valid
+  extra field gets `cipher: None` and `mapping: None`.
 
 ## Output offsets and restart points
 
@@ -79,7 +91,8 @@ exact:
 | `Sequential { skip }` | ZipCrypto stored | stream byte `o + skip`, but decrypting needs every earlier byte | None |
 | `None` | compressed | no mapping | None |
 
-Encrypted RAR stored members are one CBC stream across all their parts: a volume boundary never resets CBC, so a
+Encrypted RAR stored members are one CBC stream across all their parts (a continuation part whose RAR 5.0
+encryption record names a different KDF count, salt or IV is `Malformed`): a volume boundary never resets CBC, so a
 stream offset `c` is output offset `c`, clipped at the unpacked size. This is the same geometry persistent partials
 use (`docs/persistent-partials.md`).
 

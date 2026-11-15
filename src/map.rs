@@ -104,8 +104,8 @@ pub enum OutputMapping {
     /// A stream cipher after a `skip`-byte prefix whose state depends on every earlier byte (ZipCrypto). Output
     /// byte `o` is stream byte `o + skip`, but producing it needs the stream from its start.
     Sequential { skip: u64 },
-    /// Compressed data: output offsets do not map to packed offsets. Restart points inside compressed data are
-    /// future work.
+    /// Compressed data, or a cipher this module does not map: output offsets do not map to packed offsets.
+    /// Restart points inside compressed data are future work.
     None,
 }
 
@@ -126,6 +126,9 @@ pub enum CipherParams {
     },
     /// RAR 4.x: AES-128-CBC, key and IV derived from the password and this salt (2^18 SHA-1 rounds).
     Rar4 { salt: [u8; 8] },
+    /// RAR 4.x data encryption other than AES (an older unpack version's cipher, or version 29 without a salt).
+    /// Not mapped: such members get [`OutputMapping::None`].
+    Rar4Legacy { unpack_version: u8, salt: Option<[u8; 8]> },
     /// Traditional PKWARE encryption. `check` is the byte the 12-byte encryption header must decrypt to last.
     ZipCrypto { check: u8 },
     /// WinZip AES in counter mode. `strength` is 1, 2 or 3 (AES-128, -192, -256).
@@ -514,9 +517,21 @@ pub(crate) fn read(
     Ok(got)
 }
 
+/// How far from the end a ZIP end record is looked for: the record and a comment of up to 1 KiB.
+const TAIL_WINDOW: u64 = 22 + 1024;
+
+/// Whether `tail`, the last bytes of a volume, ends with a ZIP end-of-central-directory record.
+fn has_zip_end(tail: &[u8]) -> bool {
+    (0..tail.len().saturating_sub(21)).rev().any(|at| {
+        tail[at..].starts_with(b"PK\x05\x06")
+            && usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]])) == tail.len() - at - 22
+    })
+}
+
 enum Engine {
     Start,
     Detect,
+    Tail,
     Rar(Box<crate::rar5::map::RarWalker>),
     Zip(Box<zip::ZipWalker>),
     Done,
@@ -529,12 +544,14 @@ struct Core {
     engine: Engine,
     parked: Option<usize>,
     magic: Vec<u8>,
+    tail: Vec<u8>,
+    tail_at: u64,
 }
 
 impl Core {
     fn new(options: MapOptions) -> Self {
         let usage = crate::progressive::Usage::new(options.limits.clone());
-        Self { options, usage, engine: Engine::Start, parked: None, magic: Vec::new() }
+        Self { options, usage, engine: Engine::Start, parked: None, magic: Vec::new(), tail: Vec::new(), tail_at: 0 }
     }
 
     fn poll(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
@@ -581,16 +598,52 @@ impl Core {
                             }
                             if self.magic == b"PK\x03\x04" || self.magic == b"PK\x05\x06" {
                                 MapFormat::Zip
-                            } else {
+                            } else if self.magic == b"Rar!" {
                                 MapFormat::Rar5
+                            } else {
+                                // A self-extracting stub: look for a ZIP end record before scanning for RAR.
+                                let len = input.len();
+                                self.tail_at = len.saturating_sub(TAIL_WINDOW);
+                                self.engine = Engine::Tail;
+                                continue;
                             }
                         }
                         Ok(Got::Eof) if self.magic.is_empty() => return Poll::Ready(Err(MapError::NotArchive)),
                         Ok(Got::Eof) => MapFormat::Rar5,
                     };
                     self.engine = match format {
-                        MapFormat::Zip => Engine::Zip(Box::new(zip::ZipWalker::new(self.usage.clone()))),
+                        MapFormat::Zip => {
+                            Engine::Zip(Box::new(zip::ZipWalker::new(self.usage.clone(), &self.options.limits)))
+                        }
                         _ => Engine::Rar(Box::new(crate::rar5::map::RarWalker::new(&self.options, self.usage.clone()))),
+                    };
+                }
+                Engine::Tail => {
+                    let mut buf = [0u8; 1024];
+                    let at = self.tail_at + self.tail.len() as u64;
+                    let want = (input.len().saturating_sub(at)).min(buf.len() as u64) as usize;
+                    let n = self.parked.take().unwrap_or(want);
+                    let zip = match read(input, &self.usage, at, &mut buf[..n], cx) {
+                        Err(e) => return Poll::Ready(Err(MapError::from_failure(0, e))),
+                        Ok(Got::NotYet) => {
+                            self.parked = Some(n);
+                            return Poll::Pending;
+                        }
+                        Ok(Got::Filled(count)) => {
+                            self.tail.extend_from_slice(&buf[..count]);
+                            if at + (count as u64) < input.len() {
+                                continue;
+                            }
+                            has_zip_end(&self.tail)
+                        }
+                        // The tail is not there to tell: the RAR scanner decides.
+                        Ok(Got::Hole | Got::Eof) => false,
+                    };
+                    self.tail = Vec::new();
+                    self.engine = if zip {
+                        Engine::Zip(Box::new(zip::ZipWalker::new(self.usage.clone(), &self.options.limits)))
+                    } else {
+                        Engine::Rar(Box::new(crate::rar5::map::RarWalker::new(&self.options, self.usage.clone())))
                     };
                 }
                 Engine::Rar(walker) => return walker.poll(input, cx),

@@ -20,7 +20,7 @@ use super::{
     CipherParams, Got, MapChecks, MapEnd, MapError, MapFormat, MapInput, MapMember, MapMethod, MapOptions, MapPiece,
     MemberMap, OutputMapping, read,
 };
-use crate::progressive::{FailureKind, ProgressiveFailure, Resource, Usage};
+use crate::progressive::{FailureKind, ProgressiveFailure, ProgressiveLimits, Resource, Usage};
 use crate::zip::ZipEntry;
 use std::task::{Context, Poll};
 use zip_container::{DirectoryError, DirectoryParser, LOCAL_HEADER_LEN, Limits, LocalHeader, local_layout};
@@ -39,6 +39,7 @@ enum Phase {
 
 pub(super) struct ZipWalker {
     usage: Usage,
+    limits: Limits,
     phase: Phase,
     len: u64,
     parked: Option<usize>,
@@ -50,18 +51,62 @@ pub(super) struct ZipWalker {
     members: Vec<MapMember>,
 }
 
+/// WinZip AES, decided as the extractor decides it.
+fn is_aes(entry: &ZipEntry) -> bool {
+    entry.method == METHOD_AES || entry.aes_info.is_some()
+}
+
 fn malformed(reason: &'static str) -> MapError {
     MapError::Malformed { volume: 0, failure: Box::new(ProgressiveFailure::new(FailureKind::Malformed(reason))) }
 }
 
-fn directory(error: DirectoryError) -> MapError {
+/// Directory parser limits within the caller's budgets.
+fn zip_limits(limits: &ProgressiveLimits) -> Limits {
+    let default = Limits::default();
+    Limits {
+        directory_bytes: default.directory_bytes.min(limits.header_bytes),
+        entries: default.entries.min(limits.entries),
+        fetched_bytes: default.fetched_bytes.min(limits.header_bytes),
+        name_bytes: default.name_bytes.min(limits.name_bytes),
+        extra_bytes: default.extra_bytes.min(limits.metadata_bytes),
+        comment_bytes: default.comment_bytes.min(limits.metadata_bytes),
+        ..default
+    }
+}
+
+fn directory(error: DirectoryError, limits: &Limits) -> MapError {
     match error {
+        DirectoryError::Limit(kind) => {
+            use zip_container::LimitKind;
+            let (resource, limit) = match kind {
+                LimitKind::Entries => (Resource::Entries, limits.entries),
+                LimitKind::NameBytes => (Resource::NameBytes, limits.name_bytes),
+                LimitKind::ExtraBytes => (Resource::MetadataBytes, limits.extra_bytes),
+                LimitKind::CommentBytes => (Resource::MetadataBytes, limits.comment_bytes),
+                LimitKind::FetchedBytes => (Resource::HeaderBytes, limits.fetched_bytes),
+                LimitKind::DirectoryBytes => (Resource::HeaderBytes, limits.directory_bytes),
+                LimitKind::RangeBytes => (Resource::ReadChunk, limits.range_bytes),
+                LimitKind::WorkUnits => (Resource::HeaderBytes, limits.work_units),
+                LimitKind::ScratchBytes => (Resource::HeaderAllocation, limits.directory_bytes),
+            };
+            // The directory parser reports the budget, not the amount it tried.
+            MapError::Limit { resource, limit, attempted: limit.saturating_add(1) }
+        }
+        DirectoryError::Ownership(zip_container::OwnershipError::LimitExceeded { kind, needed, limit }) => {
+            use zip_container::OwnershipKind;
+            let resource = match kind {
+                OwnershipKind::Entries => Resource::Entries,
+                OwnershipKind::NameBytes => Resource::NameBytes,
+                OwnershipKind::ExtraBytes | OwnershipKind::CommentBytes => Resource::MetadataBytes,
+            };
+            MapError::Limit { resource, limit: limit as u64, attempted: needed as u64 }
+        }
         DirectoryError::NotZip => MapError::NotArchive,
         DirectoryError::UnsupportedDisk => MapError::Unsupported {
             volume: 0,
             failure: Box::new(ProgressiveFailure::new(FailureKind::Malformed("split ZIP archive"))),
         },
-        DirectoryError::Limit(_) | DirectoryError::Ownership(_) | DirectoryError::Allocation => MapError::Unsupported {
+        DirectoryError::Ownership(_) | DirectoryError::Allocation => MapError::Unsupported {
             volume: 0,
             failure: Box::new(ProgressiveFailure::new(FailureKind::Malformed(
                 "ZIP directory exceeds the listing limit",
@@ -77,9 +122,10 @@ fn directory(error: DirectoryError) -> MapError {
 }
 
 impl ZipWalker {
-    pub(super) fn new(usage: Usage) -> Self {
+    pub(super) fn new(usage: Usage, limits: &ProgressiveLimits) -> Self {
         Self {
             usage,
+            limits: zip_limits(limits),
             phase: Phase::Start,
             len: 0,
             parked: None,
@@ -136,15 +182,17 @@ impl ZipWalker {
             match &mut self.phase {
                 Phase::Start => {
                     self.len = input.len();
-                    let parser = crate::zip::projected_parser(self.len, Limits::default()).map_err(directory)?;
+                    let parser =
+                        crate::zip::projected_parser(self.len, self.limits).map_err(|e| directory(e, &self.limits))?;
                     self.phase = Phase::Directory(Box::new(parser));
                 }
                 Phase::Directory(parser) => {
-                    let Some(range) = parser.next_read().map_err(directory)? else {
+                    let limits = self.limits;
+                    let Some(range) = parser.next_read().map_err(|e| directory(e, &limits))? else {
                         let Phase::Directory(parser) = std::mem::replace(&mut self.phase, Phase::Start) else {
                             unreachable!()
                         };
-                        let mut found = parser.finish().map_err(directory)?;
+                        let mut found = parser.finish().map_err(|e| directory(e, &limits))?;
                         crate::zip::relocate_projected(&mut found.entries, found.prefix_shift, self.len, None)
                             .map_err(|_| malformed("local header offset"))?;
                         self.usage
@@ -158,7 +206,7 @@ impl ZipWalker {
                     let Some(count) = self.fetch(input, cx, range.start, want)? else { return Ok(Poll::Pending) };
                     let Phase::Directory(parser) = &mut self.phase else { unreachable!() };
                     self.usage.charge(Resource::HeaderBytes, count as u64).map_err(|e| MapError::from_failure(0, e))?;
-                    parser.supply(range.start, &self.buffer[..count]).map_err(directory)?;
+                    parser.supply(range.start, &self.buffer[..count]).map_err(|e| directory(e, &limits))?;
                 }
                 Phase::Locals { entries, index } => {
                     let Some(entry) = entries.get(*index).cloned() else {
@@ -173,7 +221,7 @@ impl ZipWalker {
                         }));
                     };
                     let local_at = entry.local_at;
-                    let aes_prefix = (entry.method == METHOD_AES && entry.flags & FLAG_ENCRYPTED != 0)
+                    let aes_prefix = (is_aes(&entry) && entry.flags & FLAG_ENCRYPTED != 0)
                         .then_some(entry.aes_info)
                         .flatten()
                         .map(|(strength, _, _)| 4 + 4 * usize::from(strength) + 2);
@@ -224,23 +272,27 @@ impl ZipWalker {
             )
             .map_err(|e| MapError::from_failure(0, e))?;
         let encrypted = entry.flags & FLAG_ENCRYPTED != 0;
-        let method_id = match entry.aes_info {
-            Some((_, _, actual)) if entry.method == METHOD_AES => actual,
-            _ => entry.method,
-        };
+        let method_id = entry.effective_method();
         let stored = method_id == 0;
         let (cipher, mapping) = if !encrypted {
             (None, if stored { OutputMapping::Direct } else { OutputMapping::None })
         } else if entry.flags & FLAG_STRONG != 0 {
             (None, OutputMapping::None)
-        } else if let (Some((strength, vendor_version, _)), Some(prefix)) = (entry.aes_info, aes_prefix) {
-            let cipher = (self.scratch.len() == prefix).then(|| CipherParams::WinZipAes {
-                strength,
-                vendor_version,
-                salt: self.scratch[..prefix - 2].to_vec(),
-                verifier: [self.scratch[prefix - 2], self.scratch[prefix - 1]],
-            });
-            (cipher, if stored { OutputMapping::Counter { skip: prefix as u64 } } else { OutputMapping::None })
+        } else if is_aes(entry) {
+            // As the extractor decides: method 99 or an AES extra field. Without a valid extra field (or with data
+            // too short for the salt and verifier) nothing is mapped.
+            match (entry.aes_info, aes_prefix) {
+                (Some((strength, vendor_version, _)), Some(prefix)) if self.scratch.len() == prefix => (
+                    Some(CipherParams::WinZipAes {
+                        strength,
+                        vendor_version,
+                        salt: self.scratch[..prefix - 2].to_vec(),
+                        verifier: [self.scratch[prefix - 2], self.scratch[prefix - 1]],
+                    }),
+                    if stored { OutputMapping::Counter { skip: prefix as u64 } } else { OutputMapping::None },
+                ),
+                _ => (None, OutputMapping::None),
+            }
         } else {
             let check = if entry.flags & FLAG_DESCRIPTOR != 0 {
                 (local.mod_time >> 8) as u8
@@ -252,7 +304,7 @@ impl ZipWalker {
                 if stored { OutputMapping::Sequential { skip: 12 } } else { OutputMapping::None },
             )
         };
-        let crc_known = !matches!(entry.aes_info, Some((_, 2, _)) if entry.method == METHOD_AES);
+        let crc_known = !(encrypted && is_aes(entry) && matches!(entry.aes_info, Some((_, 2, _))));
         let checks = MapChecks { crc32: crc_known.then_some(entry.crc32), blake2sp: None, keyed: false };
         let size = Some(entry.size);
         let out = mapping.out_of(0..entry.packed, size);

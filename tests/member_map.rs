@@ -201,15 +201,19 @@ fn password_check(password: &str, kdf_count: u8) -> [u8; 8] {
 
 /// One encrypted stored member "e.bin" of `size` bytes, its ciphertext cut at the stream offsets `cuts`.
 fn encrypted_volumes(size: usize, cuts: &[usize]) -> (Vec<u8>, [u8; 8], Vec<Vec<u8>>) {
+    encrypted_volumes_iv(size, cuts, IV)
+}
+
+fn encrypted_volumes_iv(size: usize, cuts: &[usize], iv: [u8; 16]) -> (Vec<u8>, [u8; 8], Vec<Vec<u8>>) {
     let plain = data(size, 11);
     let (key, hash_key) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap();
     let mut padded = plain.clone();
     padded.resize(size.div_ceil(16) * 16, 0);
-    let cipher = zipfast::crypto::encrypt_cbc(&key, &IV, &padded).unwrap();
+    let cipher = zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap();
     let check = password_check("pw", 1);
     let mut extra = vec![48, 1, 0, 3, 1];
     extra.extend(SALT);
-    extra.extend(IV);
+    extra.extend(iv);
     extra.extend(check);
     extra.extend(&zipfast::crypto::sha256(&check)[..4]);
     let mut spec = FileSpec::new("e.bin", &cipher);
@@ -366,13 +370,17 @@ fn r4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
 }
 
 fn r4_member(name: &[u8], data: &[u8], flags: u16, method: u8, size: usize, crc: u32) -> Vec<u8> {
+    r4_member_version(name, data, flags, method, size, crc, 29)
+}
+
+fn r4_member_version(name: &[u8], data: &[u8], flags: u16, method: u8, size: usize, crc: u32, version: u8) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend((data.len() as u32).to_le_bytes());
     body.extend((size as u32).to_le_bytes());
     body.push(3);
     body.extend(crc.to_le_bytes());
     body.extend(0x50221884u32.to_le_bytes());
-    body.extend([29, method]);
+    body.extend([version, method]);
     body.extend((name.len() as u16).to_le_bytes());
     body.extend(0o100644u32.to_le_bytes());
     body.extend(name);
@@ -566,7 +574,6 @@ impl RangeSource for Bytes {
             return Ok(RangeRead::NotYet);
         }
         g.ready = false;
-        self.reads.lock().unwrap().push((self.index, at, buf.len()));
         let mut end = (at + buf.len().min(self.chunk) as u64).min(self.data.len() as u64);
         for h in &self.holes {
             if h.start <= at && at < h.end {
@@ -578,6 +585,7 @@ impl RangeSource for Bytes {
         }
         let n = (end - at) as usize;
         buf[..n].copy_from_slice(&self.data[at as usize..end as usize]);
+        self.reads.lock().unwrap().push((self.index, at, n));
         Ok(RangeRead::Filled { count: n })
     }
 }
@@ -863,4 +871,134 @@ fn zip_stored_and_encrypted_entries() {
 
     let (mut builder, gate, _) = waiting_builder(&volumes, &[], MapOptions::new("x.zip"));
     assert_eq!(drive(&mut builder, &gate).unwrap(), map);
+}
+
+// ---- Review regressions ----
+
+#[test]
+fn later_volume_cut_inside_its_first_encrypted_header_is_truncated_not_a_wrong_password() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let volumes = r4_aes(gold, true, &[29, 31, 20]);
+    for cut in 28..75 {
+        let mut cut_set = volumes.clone();
+        cut_set[2].truncate(cut);
+        let map = MemberMap::from_memory(&refs(&cut_set), "a.part01.rar", Some("pw"))
+            .unwrap_or_else(|e| panic!("cut {cut}: {e:?}"));
+        assert!(!map.complete, "cut {cut}");
+        assert!(matches!(map.end, MapEnd::Truncated { volume: 2, .. }), "cut {cut}: {:?}", map.end);
+        assert_eq!(map.members[0].pieces.len(), 2, "cut {cut}: volume 2's file header is never complete");
+    }
+    // Damage in a later volume's encrypted header is damage, not a wrong password.
+    let mut damaged = volumes.clone();
+    damaged[2][50] ^= 1;
+    let error = MemberMap::from_memory(&refs(&damaged), "a.part01.rar", Some("pw")).unwrap_err();
+    assert!(matches!(error, MapError::Malformed { volume: 2, .. }), "{error:?}");
+}
+
+#[test]
+fn rar4_non_aes_data_encryption_is_not_mapped_as_cbc() {
+    let data = b"old cipher payload";
+    for (version, flags) in [(20u8, 0x04u16), (29, 0x04)] {
+        let bytes = r4_archive(&[r4_member_version(b"old", data, flags, 0x30, data.len(), 0, version)]);
+        let map = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap();
+        let member = &map.members[0];
+        assert!(member.encrypted);
+        assert_eq!(member.cipher, Some(CipherParams::Rar4Legacy { unpack_version: version, salt: None }));
+        assert_eq!(member.mapping, OutputMapping::None);
+        assert_eq!(member.pieces[0].out, None);
+        assert_eq!(member.packed_spans(0..4), None);
+    }
+}
+
+#[test]
+fn zip_method_99_without_a_valid_aes_field_is_not_zipcrypto() {
+    let bad_extra = [&[0x01, 0x99, 7, 0][..], &2u16.to_le_bytes(), b"AE", &[9], &0u16.to_le_bytes()].concat();
+    let bytes = zip(&[ZipSpec {
+        name: "aes.bin",
+        payload: vec![0; 40],
+        method: 99,
+        flags: 1,
+        extra: bad_extra,
+        crc: 0,
+        size: 12,
+    }]);
+    let map = MemberMap::from_memory(&[&bytes], "x.zip", None).unwrap();
+    let member = &map.members[0];
+    assert!(member.encrypted);
+    assert_eq!(member.cipher, None);
+    assert_eq!(member.mapping, OutputMapping::None);
+    assert_eq!(member.packed_spans(0..4), None);
+}
+
+#[test]
+fn zip_with_a_stub_and_a_stored_rar_inside_maps_as_zip() {
+    let inner = archive(&[FileSpec::new("inner.bin", b"inside a zip")]);
+    let mut bytes = b"MZ".to_vec();
+    bytes.resize(3000, 0x90);
+    bytes.extend(zip(&[ZipSpec {
+        name: "inner.rar",
+        payload: inner.clone(),
+        method: 0,
+        flags: 0,
+        extra: vec![],
+        crc: crc32fast::hash(&inner),
+        size: inner.len() as u32,
+    }]));
+    let map = MemberMap::from_memory(&[&bytes], "sfx.exe", None).unwrap();
+    assert_eq!(map.format, MapFormat::Zip);
+    assert_eq!(map.members[0].name.as_deref(), Some("inner.rar"));
+    let piece = &map.members[0].pieces[0];
+    assert_eq!(&bytes[piece.packed.start as usize..piece.packed.end as usize], &inner[..]);
+}
+
+#[test]
+fn rar_behind_a_long_stub_is_scanned_in_chunks() {
+    let mut bytes = b"MZ".to_vec();
+    bytes.resize(300_000, 0x90);
+    bytes.extend(archive(&[FileSpec::new("a.bin", b"behind a stub")]));
+    let mut options = MapOptions::new("sfx.exe");
+    options.limits.source_requests = 1000;
+    let map = MemberMap::from_memory_with(&[&bytes], options).unwrap();
+    assert_eq!(map.format, MapFormat::Rar5);
+    assert_eq!(map.members[0].name.as_deref(), Some("a.bin"));
+    let piece = &map.members[0].pieces[0];
+    assert_eq!(&bytes[piece.packed.start as usize..piece.packed.end as usize], b"behind a stub");
+}
+
+#[test]
+fn rar5_split_part_with_a_different_iv_is_malformed() {
+    let (_, _, a) = encrypted_volumes_iv(3000, &[1000, 2000], IV);
+    let (_, _, b) = encrypted_volumes_iv(3000, &[1000, 2000], [0x42; 16]);
+    let mixed = vec![a[0].clone(), b[1].clone(), a[2].clone()];
+    let error = MemberMap::from_memory(&refs(&mixed), "e.part1.rar", None).unwrap_err();
+    assert!(matches!(error, MapError::Malformed { volume: 1, .. }), "{error:?}");
+}
+
+#[test]
+fn zip_directory_uses_the_callers_limits() {
+    let bytes = zip(&[ZipSpec {
+        name: "a-long-name.bin",
+        payload: b"x".to_vec(),
+        method: 0,
+        flags: 0,
+        extra: vec![],
+        crc: crc32fast::hash(b"x"),
+        size: 1,
+    }]);
+    let mut options = MapOptions::new("x.zip");
+    options.limits.name_bytes = 5;
+    let error = MemberMap::from_memory_with(&[&bytes], options).unwrap_err();
+    assert!(matches!(error, MapError::Limit { resource: zipfast::progressive::Resource::NameBytes, .. }), "{error:?}");
+}
+
+#[test]
+fn truncated_offset_is_the_start_of_the_header_being_read() {
+    let a = data(500, 3);
+    let bytes = archive(&[FileSpec::new("a.bin", &a), FileSpec::new("b.bin", b"later")]);
+    let full = MemberMap::from_memory(&[&bytes], "x.rar", None).unwrap();
+    let next = full.members[1].pieces[0].header.start;
+    for cut in [next + 1, next + 3, next + 9] {
+        let map = MemberMap::from_memory(&[&bytes[..cut as usize]], "x.rar", None).unwrap();
+        assert_eq!(map.end, MapEnd::Truncated { volume: 0, offset: next }, "cut {cut}");
+    }
 }

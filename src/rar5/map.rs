@@ -31,6 +31,7 @@ use std::{
 };
 
 const READ_CHUNK: u64 = 64 << 10;
+const SCAN_CHUNK: usize = 4 << 10;
 
 enum Phase {
     Open,
@@ -55,8 +56,10 @@ pub(crate) struct RarWalker {
     solid_archive: Option<bool>,
     /// Keys were supplied on this volume and no header has decrypted since.
     unproven: bool,
-    /// A header decrypted on this volume.
+    /// A header decrypted under the password, on any volume: later failures are damage, not a wrong password.
     proven: bool,
+    /// Offset of the header being read on the current volume.
+    header_start: Option<u64>,
     rar5_keys: Option<(u8, [u8; 16], crate::crypto::Rar5Keys)>,
     rar4_keys: Option<([u8; 8], [u8; 16], [u8; 16])>,
     members: Vec<MapMember>,
@@ -84,6 +87,7 @@ impl RarWalker {
             solid_archive: None,
             unproven: false,
             proven: false,
+            header_start: None,
             rar5_keys: None,
             rar4_keys: None,
             members: Vec::new(),
@@ -141,7 +145,7 @@ impl RarWalker {
                             self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone());
                             self.main_seen = false;
                             self.unproven = false;
-                            self.proven = false;
+                            self.header_start = None;
                             self.phase = Phase::Header;
                         }
                         Opened::Wait => return Ok(Poll::Pending),
@@ -162,7 +166,10 @@ impl RarWalker {
                         ParserStep::End => return Err(self.fail(self.parser.truncated())),
                         ParserStep::Frame(_) => unreachable!("frames require input"),
                     };
-                    let n = self.parked.take().unwrap_or_else(|| len.min(self.buffer.len()));
+                    let header_start = *self.header_start.get_or_insert(offset);
+                    // The signature scan asks for one byte at a time; read it in whole chunks instead.
+                    let want = if self.parser.scanning() { SCAN_CHUNK } else { len }.min(self.buffer.len());
+                    let n = self.parked.take().unwrap_or(want);
                     match read(input, &self.usage, offset, &mut self.buffer[..n], cx)
                         .map_err(|e| MapError::from_failure(self.volume, e))?
                     {
@@ -184,24 +191,52 @@ impl RarWalker {
                                     self.malformed("volume without a RAR signature")
                                 });
                             }
-                            return Ok(Poll::Ready(self.finish(MapEnd::Truncated { volume: self.volume, offset })));
+                            return Ok(Poll::Ready(
+                                self.finish(MapEnd::Truncated { volume: self.volume, offset: header_start }),
+                            ));
                         }
                         Got::Filled(count) => {
-                            let count = count.min(n);
-                            let (used, step) = self.parser.advance(&self.buffer[..count]).map_err(|e| self.fail(e))?;
-                            if used != count {
-                                return Err(MapError::Source(Box::new(ProgressiveFailure::new(
-                                    FailureKind::SourceContract,
-                                ))));
-                            }
-                            if let ParserStep::Frame(frame) = step
-                                && let Some(map) = self.frame(frame)?
-                            {
+                            if let Some(map) = self.feed(offset, count.min(n))? {
                                 return Ok(Poll::Ready(map));
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Feeds `count` buffered bytes read at `offset`. A chunk read during the signature scan can run past what
+    /// the parser needs next; the rest is fed on while the parser keeps asking for the very next byte, and dropped
+    /// once it skips ahead (over member data).
+    fn feed(&mut self, offset: u64, count: usize) -> Result<Option<MemberMap>, MapError> {
+        let mut at = 0;
+        loop {
+            let (used, step) = self.parser.advance(&self.buffer[at..count]).map_err(|e| self.fail(e))?;
+            at += used;
+            let progressed = used > 0 || matches!(step, ParserStep::Frame(_) | ParserStep::LegacyKeyRequired { .. });
+            match step {
+                ParserStep::Frame(frame) => {
+                    self.header_start = None;
+                    if let Some(map) = self.frame(frame)? {
+                        return Ok(Some(map));
+                    }
+                }
+                ParserStep::LegacyKeyRequired { salt } => self.legacy_keys(salt)?,
+                ParserStep::Need { .. } | ParserStep::End => {}
+            }
+            if at == count || !matches!(self.phase, Phase::Header) {
+                return Ok(None);
+            }
+            match self.parser.advance(&[]).map_err(|e| self.fail(e))?.1 {
+                ParserStep::Need { offset: next, .. } if next == offset + at as u64 => {
+                    self.header_start.get_or_insert(next);
+                }
+                ParserStep::LegacyKeyRequired { .. } => {}
+                _ => return Ok(None),
+            }
+            if !progressed {
+                return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceContract))));
             }
         }
     }
@@ -361,6 +396,20 @@ impl RarWalker {
         self.usage.charge(resource, amount).map_err(|e| MapError::from_failure(self.volume, e))
     }
 
+    /// Whether a continuation part's RAR5 encryption record names the same key and IV as the member's first
+    /// part: all parts are one CBC stream.
+    fn same_cipher(&self, params: Option<&crate::crypto::Rar5CryptParams>) -> bool {
+        let first = self.members.last().and_then(|m| m.cipher.as_ref());
+        match (params, first) {
+            (None, Some(CipherParams::Rar5 { .. })) => false,
+            (None, _) => true,
+            (Some(p), Some(CipherParams::Rar5 { kdf_count, salt, iv, .. })) => {
+                *kdf_count == p.kdf_count && *salt == p.salt && *iv == Some(p.iv)
+            }
+            (Some(_), _) => false,
+        }
+    }
+
     fn file(&mut self, header: FileHeader, crypt: MemberCrypt, wire: FileWire) -> Result<(), MapError> {
         let params = match crypt {
             Some(Err(error)) => return Err(self.crypt_error(error)),
@@ -379,6 +428,7 @@ impl RarWalker {
                 || continuation_issue(&open, &header).is_some()
                 || open.wire.compression != wire.compression
                 || open.wire.legacy.and_then(|w| w.crypt) != wire.legacy.and_then(|w| w.crypt)
+                || !self.same_cipher(params.as_ref())
             {
                 return Err(self.malformed("member continuation identity"));
             }
@@ -439,13 +489,19 @@ impl RarWalker {
                 keyed_checks: params.tweaked_crc,
             })
         } else {
-            wire.legacy.and_then(|w| w.crypt).and_then(|c| c.salt).map(|salt| CipherParams::Rar4 { salt })
+            // As the extractor admits it: only version 29 with a salt is AES-128-CBC.
+            wire.legacy.and_then(|w| w.crypt).map(|crypt| match super::LegacyCrypt::stored_salt(Some(crypt)) {
+                Ok(salt) => CipherParams::Rar4 { salt },
+                Err(_) => CipherParams::Rar4Legacy { unpack_version: crypt.version, salt: crypt.salt },
+            })
         };
         let encrypted = header.encrypted;
+        let cbc = matches!(cipher, Some(CipherParams::Rar5 { .. } | CipherParams::Rar4 { .. }));
         let mapping = match (stored, encrypted) {
             (false, _) => OutputMapping::None,
             (true, false) => OutputMapping::Direct,
-            (true, true) => OutputMapping::CbcBlocks,
+            (true, true) if cbc => OutputMapping::CbcBlocks,
+            (true, true) => OutputMapping::None,
         };
         let unpacked_size = (!header.size_unknown()).then_some(header.unpacked_size);
         let out = mapping.out_of(0..part.packed_size, unpacked_size);
