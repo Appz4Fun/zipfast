@@ -190,6 +190,10 @@ impl HeaderParser {
         self.phase = Phase::LegacyFirst;
         self.resized_need(24).map_err(FramingError::progressive)
     }
+    /// Where the header being parsed starts (after the signature scan, the end of the signature).
+    pub(crate) fn header_offset(&self) -> u64 {
+        self.at
+    }
     /// Whether the parser is still looking for the archive signature.
     pub(crate) fn scanning(&self) -> bool {
         self.signature.is_some()
@@ -524,7 +528,7 @@ impl HeaderParser {
                 let flags = f.vint().map_err(|e| self.parse_fault(e))?;
                 let volume_number =
                     if flags & MHFL_VOLNUMBER != 0 { f.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
-                Block::Main(MainHeader { flags, volume_number })
+                Block::Main(MainHeader { flags, volume_number, rar4_flags: None })
             }
             HEAD_FILE | HEAD_SERVICE => {
                 let (h, crypt, wire) = parse_file_impl(&head, fields, extra, self.catalogue, self.usage.as_ref())
@@ -549,7 +553,7 @@ impl HeaderParser {
                 let mut f = Cursor::new(fields);
                 let flags =
                     if self.catalogue { f.vint().map_err(|e| self.parse_fault(e))? } else { f.vint().unwrap_or(0) };
-                Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }
+                Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0, volume_number: None }
             }
             _ => Block::Unknown,
         };

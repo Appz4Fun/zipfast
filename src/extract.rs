@@ -465,7 +465,7 @@ fn walk_until_observed(
             observer.notify(index, &vol.path, SelectedReadRole::Header, cancel)?;
             let Some(block) = vol.next_block()? else { break };
             match block {
-                Block::End { more_volumes } => {
+                Block::End { more_volumes, .. } => {
                     more = more_volumes;
                     saw_end = true;
                     break;
@@ -514,7 +514,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
         let mut saw_end = false;
         while let Some((block, crypt)) = vol.next_block_detailed()? {
             match block {
-                Block::End { more_volumes } => {
+                Block::End { more_volumes, .. } => {
                     more = more_volumes;
                     saw_end = true;
                     break;

@@ -923,7 +923,7 @@ impl ProgressiveSession {
                     self.phase = Phase::Start(Box::new(frame));
                 }
             }
-            Block::End { more_volumes } => {
+            Block::End { more_volumes, .. } => {
                 if !self.main_seen {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("end before main")));
                 }

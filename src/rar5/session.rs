@@ -486,7 +486,7 @@ impl Catalogue {
                         let wire = wire.expect("catalogue file metadata includes the wire name");
                         self.add_part(volume_index, header, crypt, wire)?;
                     }
-                    Block::End { more_volumes } => {
+                    Block::End { more_volumes, .. } => {
                         next = more_volumes.then_some(true);
                         break;
                     }

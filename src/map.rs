@@ -23,6 +23,9 @@
 //! output range the piece carries. [`MapMember::packed_spans`] turns an output range of a stored member into the
 //! per-volume packed spans that must be fetched to produce it.
 //!
+//! A [`VolumeMap`] lists the headers of one RAR volume read on its own, at any position in its set and possibly cut
+//! short ([`MemberMap::from_volume`], [`VolumeMapBuilder`]).
+//!
 //! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given) and single-disk ZIP are
 //! mapped. Passwords and keys never appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
 //! See `docs/member-map.md`.
@@ -164,6 +167,95 @@ pub struct MapPiece {
     pub checks: MapChecks,
     /// Whether this is the member's last part.
     pub final_part: bool,
+}
+
+/// How a single-volume walk ([`MemberMap::from_volume`]) ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VolumeEnd {
+    /// The volume's end header was read.
+    Complete,
+    /// The bytes ended at `offset` before the volume's headers did; `offset` is the start of the header being read,
+    /// which lies past the end when the last member's data does. Members whose headers were read are listed.
+    Truncated { offset: u64 },
+    /// The headers from `offset` on are encrypted (RAR `-hp`) and no password was given. No members are listed.
+    /// For RAR 5.0 the main header is among them, so the volume facts are unknown; RAR 4.x keeps its main
+    /// header in the clear.
+    Locked { offset: u64 },
+}
+
+/// The headers of one RAR volume, read on their own: any volume of a set, or only its first bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct VolumeMap {
+    /// [`MapFormat::Rar4`] or [`MapFormat::Rar5`].
+    pub format: MapFormat,
+    /// Whether the main header was read. False only for [`VolumeEnd::Locked`] RAR 5.0 volumes and bytes that end
+    /// inside the main header; the volume facts below are then defaults.
+    pub main_read: bool,
+    /// Zero-based position in the set. RAR 5.0: the main header's volume number, 0 when it records none (only
+    /// the first volume omits it). RAR 4.x: the end header's volume number when it records one, else 0 for a
+    /// first volume and None otherwise. A non-volume archive is volume 0.
+    pub volume_number: Option<u32>,
+    /// Whether this is the first volume, or a single-volume archive. RAR 4.x: the main header's first-volume flag
+    /// (`MHD_FIRSTVOLUME`, written since RAR 3.0) or a volume number of 0.
+    pub first_volume: bool,
+    /// Whether the archive is a volume set (the main header's volume flag).
+    pub multi_volume: bool,
+    /// Whether the set is named `name.partNN.rar` rather than `name.rar`, `name.r00`, ... Always true for
+    /// RAR 5.0; RAR 4.x `MHD_NEWNUMBERING`.
+    pub new_naming: bool,
+    /// The end header's "not last volume" flag. False when the end header was not reached.
+    pub has_next_volume: bool,
+    /// Whether the archive is solid (the main header's flag).
+    pub solid: bool,
+    /// Whether the headers are encrypted (RAR `-hp`).
+    pub header_encrypted: bool,
+    /// Parameters of the header encryption, as far as they were read.
+    pub header_cipher: Option<CipherParams>,
+    pub end: VolumeEnd,
+    /// One entry per file header, in volume order. Service headers are not listed.
+    pub members: Vec<VolumeMember>,
+}
+
+/// One file header of a volume: one part of a member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct VolumeMember {
+    /// The name exactly as stored.
+    pub raw_name: Vec<u8>,
+    /// The name decoded by the format's rules, when it decodes.
+    pub name: Option<String>,
+    pub is_dir: bool,
+    /// The member's unpacked size (every part header records the whole member's), when known.
+    pub unpacked_size: Option<u64>,
+    /// Packed bytes of this part in this volume: `packed.end - packed.start`.
+    pub packed_size: u64,
+    /// This part's data offsets in this volume, as declared. They may run past the end of truncated bytes.
+    pub packed: Range<u64>,
+    /// The wire extent of the header, including the IV and padding of an encrypted header.
+    pub header: Range<u64>,
+    /// The member continues from the previous volume.
+    pub split_before: bool,
+    /// The member continues in the next volume.
+    pub split_after: bool,
+    pub method: MapMethod,
+    /// How the member's output offsets relate to its packed stream (see [`MapMember::mapping`]). Where this
+    /// part falls in that stream depends on earlier volumes' parts.
+    pub mapping: OutputMapping,
+    pub solid: bool,
+    pub encrypted: bool,
+    pub cipher: Option<CipherParams>,
+    /// Checks as stored in this header: of this part's packed bytes for a part with `split_after`, of the member's
+    /// output otherwise.
+    pub part_checks: MapChecks,
+    /// The member's final checks: `Some(part_checks)` exactly when this is the member's last part.
+    pub checks: Option<MapChecks>,
+    /// Modification time as seconds since 1970 and nanoseconds.
+    pub mtime: Option<(i64, u32)>,
+    /// Raw attributes as the host recorded them.
+    pub attributes: u64,
+    /// Unix permission and type bits, when the host was Unix.
+    pub unix_mode: Option<u32>,
 }
 
 /// A packed byte range in one volume, as returned by [`MapMember::packed_spans`].
@@ -479,26 +571,36 @@ impl MapInput for SourceInput {
     }
     fn read(&mut self, offset: u64, buf: &mut [u8], cx: &mut Context<'_>) -> Result<Got, ProgressiveFailure> {
         let source = self.current.as_mut().ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?;
-        let len = source.info().length.value();
-        if offset >= len {
-            return Ok(Got::Eof);
-        }
-        let n = buf.len().min(usize::try_from(len - offset).unwrap_or(usize::MAX));
-        if n == 0 {
-            return Ok(Got::Filled(0));
-        }
-        Ok(match source.read_at(offset, &mut buf[..n], cx)? {
-            RangeRead::Filled { count } if count > 0 && count <= n => Got::Filled(count),
-            RangeRead::Filled { .. } | RangeRead::Hole { len: 0 } => {
-                return Err(ProgressiveFailure::new(FailureKind::SourceContract));
-            }
-            RangeRead::NotYet => Got::NotYet,
-            RangeRead::Hole { .. } => Got::Hole,
-        })
+        read_range(source.as_mut(), offset, buf, cx)
     }
     fn len(&self) -> u64 {
         self.current.as_ref().map_or(0, |s| s.info().length.value())
     }
+}
+
+/// One read of a range source, bounded by its current length.
+fn read_range(
+    source: &mut dyn RangeSource,
+    offset: u64,
+    buf: &mut [u8],
+    cx: &mut Context<'_>,
+) -> Result<Got, ProgressiveFailure> {
+    let len = source.info().length.value();
+    if offset >= len {
+        return Ok(Got::Eof);
+    }
+    let n = buf.len().min(usize::try_from(len - offset).unwrap_or(usize::MAX));
+    if n == 0 {
+        return Ok(Got::Filled(0));
+    }
+    Ok(match source.read_at(offset, &mut buf[..n], cx)? {
+        RangeRead::Filled { count } if count > 0 && count <= n => Got::Filled(count),
+        RangeRead::Filled { .. } | RangeRead::Hole { len: 0 } => {
+            return Err(ProgressiveFailure::new(FailureKind::SourceContract));
+        }
+        RangeRead::NotYet => Got::NotYet,
+        RangeRead::Hole { .. } => Got::Hole,
+    })
 }
 
 /// Reads through `input`, charging one source request per call and one provider wake per `NotYet`.
@@ -528,6 +630,12 @@ fn has_zip_end(tail: &[u8]) -> bool {
     })
 }
 
+/// What a walk produced: a whole-archive map or a single-volume map.
+pub(crate) enum Walked {
+    Map(MemberMap),
+    Volume(VolumeMap),
+}
+
 enum Engine {
     Start,
     Detect,
@@ -546,15 +654,44 @@ struct Core {
     magic: Vec<u8>,
     tail: Vec<u8>,
     tail_at: u64,
+    /// Map one RAR volume on its own ([`VolumeMap`]) instead of a whole archive.
+    single: bool,
 }
 
 impl Core {
-    fn new(options: MapOptions) -> Self {
+    fn new(options: MapOptions, single: bool) -> Self {
         let usage = crate::progressive::Usage::new(options.limits.clone());
-        Self { options, usage, engine: Engine::Start, parked: None, magic: Vec::new(), tail: Vec::new(), tail_at: 0 }
+        Self {
+            options,
+            usage,
+            engine: Engine::Start,
+            parked: None,
+            magic: Vec::new(),
+            tail: Vec::new(),
+            tail_at: 0,
+            single,
+        }
     }
 
-    fn poll(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
+    fn rar(&self) -> Engine {
+        Engine::Rar(Box::new(crate::rar5::map::RarWalker::new(&self.options, self.usage.clone(), self.single)))
+    }
+
+    fn poll_map(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
+        self.poll(input, cx).map_ok(|walked| match walked {
+            Walked::Map(map) => map,
+            Walked::Volume(_) => unreachable!("whole-archive walks produce member maps"),
+        })
+    }
+
+    fn poll_volume(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<VolumeMap, MapError>> {
+        self.poll(input, cx).map_ok(|walked| match walked {
+            Walked::Volume(map) => map,
+            Walked::Map(_) => unreachable!("single-volume walks produce volume maps"),
+        })
+    }
+
+    fn poll(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<Walked, MapError>> {
         let result = self.poll_inner(input, cx);
         if matches!(result, Poll::Ready(_)) {
             self.engine = Engine::Done;
@@ -562,7 +699,7 @@ impl Core {
         result
     }
 
-    fn poll_inner(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
+    fn poll_inner(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<Walked, MapError>> {
         loop {
             if self.options.control.is_canceled() {
                 return Poll::Ready(Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled)))));
@@ -597,8 +734,14 @@ impl Core {
                                 continue;
                             }
                             if self.magic == b"PK\x03\x04" || self.magic == b"PK\x05\x06" {
+                                if self.single {
+                                    return Poll::Ready(Err(MapError::NotArchive));
+                                }
                                 MapFormat::Zip
                             } else if self.magic == b"Rar!" {
+                                MapFormat::Rar5
+                            } else if self.single {
+                                // A self-extracting stub: only RAR volumes are mapped one by one.
                                 MapFormat::Rar5
                             } else {
                                 // A self-extracting stub: look for a ZIP end record before scanning for RAR.
@@ -615,7 +758,7 @@ impl Core {
                         MapFormat::Zip => {
                             Engine::Zip(Box::new(zip::ZipWalker::new(self.usage.clone(), &self.options.limits)))
                         }
-                        _ => Engine::Rar(Box::new(crate::rar5::map::RarWalker::new(&self.options, self.usage.clone()))),
+                        _ => self.rar(),
                     };
                 }
                 Engine::Tail => {
@@ -643,11 +786,11 @@ impl Core {
                     self.engine = if zip {
                         Engine::Zip(Box::new(zip::ZipWalker::new(self.usage.clone(), &self.options.limits)))
                     } else {
-                        Engine::Rar(Box::new(crate::rar5::map::RarWalker::new(&self.options, self.usage.clone())))
+                        self.rar()
                     };
                 }
                 Engine::Rar(walker) => return walker.poll(input, cx),
-                Engine::Zip(walker) => return walker.poll(input, cx, &self.options),
+                Engine::Zip(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
                 Engine::Done => return Poll::Ready(Err(MapError::AlreadyFinished)),
             }
         }
@@ -668,9 +811,29 @@ impl MemberMap {
     /// [`Self::from_memory`] with explicit options.
     pub fn from_memory_with(volumes: &[&[u8]], options: MapOptions) -> Result<MemberMap, MapError> {
         let mut input = MemoryInput { volumes, current: None };
-        let mut core = Core::new(options);
+        let mut core = Core::new(options, false);
         let mut cx = Context::from_waker(Waker::noop());
-        match core.poll(&mut input, &mut cx) {
+        match core.poll_map(&mut input, &mut cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => unreachable!("memory input never waits"),
+        }
+    }
+
+    /// Maps one RAR volume on its own: any volume of a set (a `.part07.rar`, or an obfuscated file that is
+    /// really volume 12), or only its first bytes (a single Usenet article).
+    ///
+    /// Volume 0 is not needed and the volume's position is not checked against anything: it is reported in
+    /// [`VolumeMap::volume_number`]. Bytes that end inside member data or inside a header give
+    /// [`VolumeEnd::Truncated`] with what was read. Encrypted headers (`-hp`) are decrypted with
+    /// [`MapOptions::password`]; without one the map ends [`VolumeEnd::Locked`] with no members, and a wrong
+    /// password is [`MapError::WrongPassword`] where it can be told. `options.first_name` names this volume in
+    /// failures; the volume in [`MapError`] variants is 0. ZIP is [`MapError::NotArchive`].
+    pub fn from_volume(bytes: &[u8], options: MapOptions) -> Result<VolumeMap, MapError> {
+        let volumes = [bytes];
+        let mut input = MemoryInput { volumes: &volumes, current: None };
+        let mut core = Core::new(options, true);
+        let mut cx = Context::from_waker(Waker::noop());
+        match core.poll_volume(&mut input, &mut cx) {
             Poll::Ready(result) => result,
             Poll::Pending => unreachable!("memory input never waits"),
         }
@@ -690,10 +853,49 @@ pub struct MapBuilder {
 
 impl MapBuilder {
     pub fn new(source: Box<dyn VolumeSource>, options: MapOptions) -> Self {
-        Self { input: SourceInput { source, current: None }, core: Core::new(options) }
+        Self { input: SourceInput { source, current: None }, core: Core::new(options, false) }
     }
 
     pub fn poll_map(&mut self, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
-        self.core.poll(&mut self.input, cx)
+        self.core.poll_map(&mut self.input, cx)
+    }
+}
+
+/// One volume behind a [`RangeSource`].
+struct RangeInput {
+    source: Box<dyn RangeSource>,
+}
+
+impl MapInput for RangeInput {
+    fn open(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> Result<Opened, ProgressiveFailure> {
+        Ok(Opened::Ready)
+    }
+    fn read(&mut self, offset: u64, buf: &mut [u8], cx: &mut Context<'_>) -> Result<Got, ProgressiveFailure> {
+        read_range(self.source.as_mut(), offset, buf, cx)
+    }
+    fn len(&self) -> u64 {
+        self.source.info().length.value()
+    }
+}
+
+/// Builds a [`VolumeMap`] of one RAR volume from a [`RangeSource`], reading only header bytes: the pollable form of
+/// [`MemberMap::from_volume`].
+///
+/// [`RangeRead::NotYet`] makes [`Self::poll_map`] return `Pending`; the provider wakes the task's waker when a retry
+/// is warranted, and the parked read is retried with the same length. A [`RangeRead::Hole`] inside header bytes is
+/// [`MapError::HeaderHole`]. The source's current length is where the volume ends: reads past it give
+/// [`VolumeEnd::Truncated`].
+pub struct VolumeMapBuilder {
+    input: RangeInput,
+    core: Core,
+}
+
+impl VolumeMapBuilder {
+    pub fn new(source: Box<dyn RangeSource>, options: MapOptions) -> Self {
+        Self { input: RangeInput { source }, core: Core::new(options, true) }
+    }
+
+    pub fn poll_map(&mut self, cx: &mut Context<'_>) -> Poll<Result<VolumeMap, MapError>> {
+        self.core.poll_volume(&mut self.input, cx)
     }
 }

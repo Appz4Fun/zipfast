@@ -1034,3 +1034,344 @@ fn zip_aes_entry_without_the_encryption_flag_is_still_encrypted() {
     assert!(matches!(member.cipher, Some(CipherParams::WinZipAes { .. })), "{:?}", member.cipher);
     assert_ne!(member.mapping, OutputMapping::Direct);
 }
+
+// ---- Single-volume maps ----
+
+fn vol(bytes: &[u8], name: &str, password: Option<&str>) -> Result<VolumeMap, MapError> {
+    MemberMap::from_volume(bytes, MapOptions::new(name).password(password))
+}
+
+fn packed_of<'a>(bytes: &'a [u8], member: &VolumeMember) -> &'a [u8] {
+    &bytes[member.packed.start as usize..member.packed.end as usize]
+}
+
+#[test]
+fn rar5_any_volume_maps_on_its_own() {
+    let (gold, volumes) = split_fixture();
+    // `.part03.rar` alone, under an obfuscated name.
+    let map = vol(&volumes[2], "3f9a1c0d", None).unwrap();
+    assert_eq!(map.format, MapFormat::Rar5);
+    assert!(map.main_read);
+    assert_eq!(map.volume_number, Some(2));
+    assert!(!map.first_volume && map.multi_volume && map.new_naming && map.has_next_volume);
+    assert!(!map.solid && !map.header_encrypted && map.header_cipher.is_none());
+    assert_eq!(map.end, VolumeEnd::Complete);
+    assert_eq!(map.members.len(), 1);
+    let member = &map.members[0];
+    assert_eq!(member.raw_name, b"big.bin");
+    assert_eq!(member.name.as_deref(), Some("big.bin"));
+    assert!(member.split_before && member.split_after);
+    assert_eq!(member.unpacked_size, Some(10_000));
+    assert_eq!(member.packed_size, 2600);
+    assert_eq!(member.method, MapMethod::Stored);
+    assert_eq!(member.mapping, OutputMapping::Direct);
+    assert_eq!(packed_of(&volumes[2], member), &gold[5200..7800]);
+    assert_eq!(member.header.end, member.packed.start);
+    assert_eq!(member.part_checks.crc32, Some(crc32fast::hash(&gold[5200..7800])));
+    assert_eq!(member.checks, None);
+    assert_eq!(member.mtime, Some((1_700_000_000, 0)));
+    assert_eq!(member.unix_mode, Some(0o644));
+
+    let first = vol(&volumes[0], "big.part1.rar", None).unwrap();
+    assert_eq!(first.volume_number, Some(0));
+    assert!(first.first_volume && first.has_next_volume);
+    assert!(!first.members[0].split_before && first.members[0].split_after);
+
+    let last = vol(&volumes[3], "big.part4.rar", None).unwrap();
+    assert_eq!(last.volume_number, Some(3));
+    assert!(!last.first_volume && !last.has_next_volume);
+    let member = &last.members[0];
+    assert!(member.split_before && !member.split_after);
+    assert_eq!(packed_of(&volumes[3], member), &gold[7800..]);
+    assert_eq!(member.checks, Some(member.part_checks));
+    assert_eq!(member.checks.unwrap().crc32, Some(crc32fast::hash(&gold)));
+
+    // A single-volume archive is volume 0 and has no next volume.
+    let single = vol(&archive(&[FileSpec::new("a.bin", b"alone")]), "a.rar", None).unwrap();
+    assert_eq!(single.volume_number, Some(0));
+    assert!(single.first_volume && !single.multi_volume && !single.has_next_volume);
+}
+
+#[test]
+fn rar5_volume_prefix_lists_what_was_read() {
+    let (gold, volumes) = split_fixture();
+    // The first 2 KiB of volume 1: the main header and the file header, its data running past the end.
+    let map = vol(&volumes[1][..2048], "big.part2.rar", None).unwrap();
+    assert!(map.main_read && map.multi_volume);
+    assert_eq!(map.volume_number, Some(1));
+    assert!(!map.has_next_volume, "the end header was not reached");
+    assert_eq!(map.members.len(), 1);
+    let member = &map.members[0];
+    assert!(member.split_before && member.split_after);
+    assert_eq!(member.packed_size, 2600);
+    assert!(member.packed.end > 2048);
+    assert_eq!(map.end, VolumeEnd::Truncated { offset: member.packed.end });
+    assert_eq!(
+        &volumes[1][member.packed.start as usize..2048],
+        &gold[2600..2600 + 2048 - member.packed.start as usize]
+    );
+
+    // Cut inside the file header: the main facts and no members.
+    let header_start = member.header.start;
+    let map = vol(&volumes[1][..header_start as usize + 5], "big.part2.rar", None).unwrap();
+    assert!(map.main_read);
+    assert_eq!(map.volume_number, Some(1));
+    assert!(map.members.is_empty());
+    assert_eq!(map.end, VolumeEnd::Truncated { offset: header_start });
+
+    // Cut inside the main header: nothing but the format.
+    let map = vol(&volumes[1][..SIG.len() + 3], "big.part2.rar", None).unwrap();
+    assert!(!map.main_read && map.members.is_empty());
+    assert_eq!(map.volume_number, None);
+    assert_eq!(map.end, VolumeEnd::Truncated { offset: SIG.len() as u64 });
+}
+
+#[test]
+fn volume_holding_the_end_of_one_member_and_the_start_of_the_next() {
+    let a = data(3000, 1);
+    let b = data(4000, 2);
+    let (a_spec, b_spec) = (FileSpec::new("a.bin", &a), FileSpec::new("b.bin", &b));
+    let mut bytes = SIG.to_vec();
+    bytes.extend(main_block(true, Some(1)));
+    bytes.extend(file_block(&a_spec, &a[1000..], crc32fast::hash(&a), true, false));
+    bytes.extend(file_block(&b_spec, &b[..1500], crc32fast::hash(&b[..1500]), false, true));
+    bytes.extend(end_block(true));
+    let map = vol(&bytes, "x.part2.rar", None).unwrap();
+    assert_eq!(map.volume_number, Some(1));
+    assert!(map.has_next_volume);
+    assert_eq!(map.end, VolumeEnd::Complete);
+    let [tail, head] = map.members.as_slice() else { panic!("{:?}", map.members) };
+    assert_eq!(tail.name.as_deref(), Some("a.bin"));
+    assert!(tail.split_before && !tail.split_after);
+    assert_eq!(packed_of(&bytes, tail), &a[1000..]);
+    assert_eq!(tail.checks.unwrap().crc32, Some(crc32fast::hash(&a)));
+    assert_eq!(head.name.as_deref(), Some("b.bin"));
+    assert!(!head.split_before && head.split_after);
+    assert_eq!(packed_of(&bytes, head), &b[..1500]);
+    assert_eq!(head.unpacked_size, Some(4000));
+    assert_eq!(head.checks, None);
+    assert_eq!(head.part_checks.crc32, Some(crc32fast::hash(&b[..1500])));
+    assert_eq!(head.header.start, tail.packed.end);
+}
+
+#[test]
+fn rar5_hp_volume_without_a_password_reports_its_facts() {
+    let payload = data(700, 5);
+    let bytes = hp_archive(&payload);
+    let map = vol(&bytes, "hp.rar", None).unwrap();
+    assert!(map.header_encrypted && !map.main_read);
+    assert!(map.members.is_empty());
+    assert_eq!(map.volume_number, None);
+    assert!(matches!(map.header_cipher, Some(CipherParams::Rar5 { kdf_count: 4, salt: HP_SALT, iv: None, .. })));
+    let VolumeEnd::Locked { offset } = map.end else { panic!("{:?}", map.end) };
+    assert_eq!(&bytes[offset as usize..offset as usize + 16], &[0x49; 16], "the first encrypted header's IV");
+
+    let map = vol(&bytes, "hp.rar", Some(HP_PASSWORD)).unwrap();
+    assert!(map.header_encrypted && map.main_read);
+    assert_eq!(map.end, VolumeEnd::Complete);
+    assert_eq!(map.volume_number, Some(0));
+    assert_eq!(map.members.len(), 1);
+    assert_eq!(map.members[0].name.as_deref(), Some("secret.bin"));
+    assert_eq!(packed_of(&bytes, &map.members[0]), &payload[..]);
+
+    assert!(matches!(vol(&bytes, "hp.rar", Some("wrong")), Err(MapError::WrongPassword)));
+}
+
+#[test]
+fn rar4_hp_volume_without_a_password_reports_its_facts() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let volumes = r4_aes(gold, true, &[29, 31, 20]);
+    let map = vol(&volumes[1], "a.part02.rar", None).unwrap();
+    assert_eq!(map.format, MapFormat::Rar4);
+    // RAR 4.x keeps its main header in the clear.
+    assert!(map.header_encrypted && map.main_read && map.multi_volume);
+    assert_eq!(map.header_cipher, Some(CipherParams::Rar4 { salt: R4_SALT }));
+    assert!(map.members.is_empty());
+    let main_end = 7 + 13;
+    assert_eq!(map.end, VolumeEnd::Locked { offset: main_end });
+
+    let map = vol(&volumes[1], "a.part02.rar", Some("pw")).unwrap();
+    assert_eq!(map.end, VolumeEnd::Complete);
+    assert!(map.has_next_volume);
+    let member = &map.members[0];
+    assert!(member.split_before && member.split_after && member.encrypted);
+    assert_eq!(member.cipher, Some(CipherParams::Rar4 { salt: R4_SALT }));
+    assert_eq!(member.packed_size, 31);
+    assert_eq!(member.header.start, main_end);
+
+    let wrong = vol(&volumes[1], "a.part02.rar", Some("wrong password"));
+    assert!(matches!(wrong, Err(MapError::WrongPassword)), "{wrong:?}");
+}
+
+/// A stored RAR4 member cut into volumes, named the old way (`.rar`, `.r00`, ...) or the new way, with or without
+/// the volume number in each end header.
+fn r4_volumes(gold: &[u8], chunk: usize, new_naming: bool, numbered: bool) -> Vec<Vec<u8>> {
+    let count = gold.len().div_ceil(chunk);
+    gold.chunks(chunk)
+        .enumerate()
+        .map(|(i, payload)| {
+            let flags = u16::from(i > 0) | (u16::from(i + 1 < count) * 2);
+            let crc = crc32fast::hash(if i + 1 == count { gold } else { payload });
+            let main = 0x01 | if new_naming { 0x10 } else { 0 } | if i == 0 { 0x100 } else { 0 };
+            let mut wire = b"Rar!\x1a\x07\0".to_vec();
+            wire.extend(r4_block(0x73, main, &[0; 6]));
+            wire.extend(r4_member(b"one", payload, flags, 0x30, gold.len(), crc));
+            let more = u16::from(i + 1 < count);
+            if numbered {
+                wire.extend(r4_block(0x7b, 0x4000 | 0x8 | more, &(i as u16).to_le_bytes()));
+            } else {
+                wire.extend(r4_block(0x7b, 0x4000 | more, &[]));
+            }
+            wire
+        })
+        .collect()
+}
+
+#[test]
+fn rar4_volume_naming_numbers_and_next_volume() {
+    let gold = data(130, 9);
+    // Old naming: `x.rar`, `x.r00`, `x.r01`, `x.r02`, numbered end headers.
+    let volumes = r4_volumes(&gold, 40, false, true);
+    for (i, bytes) in volumes.iter().enumerate() {
+        let map = vol(bytes, "x.r01", None).unwrap();
+        assert_eq!(map.format, MapFormat::Rar4);
+        assert!(!map.new_naming && map.multi_volume, "volume {i}");
+        assert_eq!(map.volume_number, Some(i as u32));
+        assert_eq!(map.first_volume, i == 0);
+        assert_eq!(map.has_next_volume, i < 3);
+        let member = &map.members[0];
+        assert_eq!((member.split_before, member.split_after), (i > 0, i < 3));
+        let start = i * 40;
+        assert_eq!(packed_of(bytes, member), &gold[start..(start + 40).min(130)]);
+    }
+    // A prefix of volume 2 does not reach the numbered end header.
+    let cut = vol(&volumes[2][..60], "x.r01", None).unwrap();
+    assert_eq!(cut.volume_number, None);
+    assert!(!cut.first_volume && !cut.has_next_volume);
+    assert!(matches!(cut.end, VolumeEnd::Truncated { .. }));
+    assert_eq!(cut.members.len(), 1);
+
+    // New naming, end headers without numbers: only the first volume knows its number.
+    let volumes = r4_volumes(&gold, 40, true, false);
+    let first = vol(&volumes[0], "x.part1.rar", None).unwrap();
+    assert!(first.new_naming && first.first_volume && first.has_next_volume);
+    assert_eq!(first.volume_number, Some(0));
+    let middle = vol(&volumes[1], "x.part2.rar", None).unwrap();
+    assert!(middle.new_naming && !middle.first_volume && middle.has_next_volume);
+    assert_eq!(middle.volume_number, None);
+    let last = vol(&volumes[3], "x.part4.rar", None).unwrap();
+    assert!(!last.has_next_volume);
+    assert_eq!(last.members[0].checks.unwrap().crc32, Some(crc32fast::hash(&gold)));
+    let numbered = r4_volumes(&gold, 40, true, true);
+    assert_eq!(vol(&numbered[2], "x.part3.rar", None).unwrap().volume_number, Some(2));
+}
+
+#[test]
+fn encrypted_data_members_list_their_cipher_params() {
+    let (plain, check, volumes) = encrypted_volumes(3000, &[1000, 2000]);
+    let map = vol(&volumes[1], "e.part2.rar", None).unwrap();
+    assert!(!map.header_encrypted);
+    let member = &map.members[0];
+    assert!(member.encrypted && member.split_before && member.split_after);
+    assert_eq!(member.mapping, OutputMapping::CbcBlocks);
+    let sum: [u8; 4] = zipfast::crypto::sha256(&check)[..4].try_into().unwrap();
+    assert_eq!(
+        member.cipher,
+        Some(CipherParams::Rar5 {
+            kdf_count: 1,
+            salt: SALT,
+            iv: Some(IV),
+            check: Some((check, sum)),
+            keyed_checks: true
+        })
+    );
+    assert!(member.part_checks.keyed);
+    assert_eq!(member.unpacked_size, Some(plain.len() as u64));
+    assert_eq!(member.packed_size, 1000);
+
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let volumes = r4_aes(gold, false, &[29, 31, 20]);
+    let map = vol(&volumes[2], "a.part03.rar", None).unwrap();
+    assert!(!map.header_encrypted && !map.has_next_volume);
+    let member = &map.members[0];
+    assert_eq!(member.cipher, Some(CipherParams::Rar4 { salt: R4_SALT }));
+    assert!(member.split_before && !member.split_after);
+}
+
+#[test]
+fn single_volume_maps_scan_stubs_reject_zip_and_respect_options() {
+    let (_, volumes) = split_fixture();
+    let mut stubbed = b"MZ".to_vec();
+    stubbed.resize(5000, 0x90);
+    stubbed.extend(&volumes[1]);
+    let map = vol(&stubbed, "sfx.exe", None).unwrap();
+    let plain = vol(&volumes[1], "big.part2.rar", None).unwrap();
+    assert_eq!(map.volume_number, Some(1));
+    assert_eq!(map.members[0].packed.start, plain.members[0].packed.start + 5000);
+
+    let zip = zip(&[ZipSpec {
+        name: "a",
+        payload: b"x".to_vec(),
+        method: 0,
+        flags: 0,
+        extra: vec![],
+        crc: crc32fast::hash(b"x"),
+        size: 1,
+    }]);
+    assert!(matches!(vol(&zip, "x.zip", None), Err(MapError::NotArchive)));
+    assert!(matches!(vol(b"not an archive at all", "x", None), Err(MapError::NotArchive)));
+    assert!(matches!(vol(b"", "x", None), Err(MapError::NotArchive)));
+
+    let mut options = MapOptions::new("big.part2.rar");
+    options.limits.header_bytes = 40;
+    let error = MemberMap::from_volume(&volumes[1], options).unwrap_err();
+    assert!(matches!(error, MapError::Limit { resource: zipfast::progressive::Resource::HeaderBytes, .. }));
+    let options = MapOptions::new("big.part2.rar");
+    options.control.cancel();
+    assert!(matches!(MemberMap::from_volume(&volumes[1], options), Err(MapError::Source(_))));
+}
+
+/// Maps `bytes` through a range source that answers `NotYet` before every read, releasing each wait.
+fn drive_volume(bytes: &[u8], hole: Option<Range<u64>>) -> (Result<VolumeMap, MapError>, usize) {
+    let gate = Arc::new(Mutex::new(Gate::default()));
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let source = Bytes {
+        index: 0,
+        data: bytes.to_vec(),
+        holes: hole.into_iter().collect(),
+        chunk: 7,
+        gate: gate.clone(),
+        reads,
+    };
+    let mut builder = VolumeMapBuilder::new(Box::new(source), MapOptions::new("big.part3.rar"));
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        match builder.poll_map(&mut cx) {
+            Poll::Ready(result) => {
+                assert!(matches!(builder.poll_map(&mut cx), Poll::Ready(Err(MapError::AlreadyFinished))));
+                return (result, gate.lock().unwrap().waits);
+            }
+            Poll::Pending => {
+                let waker = {
+                    let mut g = gate.lock().unwrap();
+                    g.ready = true;
+                    g.wake.take().expect("pending only after the source kept a waker")
+                };
+                waker.wake();
+            }
+        }
+    }
+}
+
+#[test]
+fn volume_builder_over_a_waiting_range_source_matches_memory() {
+    let (_, volumes) = split_fixture();
+    for bytes in [&volumes[2][..], &volumes[1][..2048]] {
+        let expected = vol(bytes, "big.part3.rar", None).unwrap();
+        let (map, waits) = drive_volume(bytes, None);
+        assert_eq!(map.unwrap(), expected);
+        assert!(waits > 5);
+    }
+    let (error, _) = drive_volume(&volumes[2], Some(9..12));
+    assert!(matches!(error, Err(MapError::HeaderHole { volume: 0, offset: 9 })), "{error:?}");
+}

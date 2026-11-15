@@ -141,6 +141,8 @@ pub struct BlockHead {
 pub struct MainHeader {
     pub flags: u64,
     pub volume_number: u64,
+    /// The RAR4 main header's own flags (`MHD_*`), before normalization into `flags`. None for RAR 5.0.
+    pub rar4_flags: Option<u16>,
 }
 
 impl MainHeader {
