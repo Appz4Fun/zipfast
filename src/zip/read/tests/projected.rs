@@ -1961,3 +1961,84 @@ fn projected_inspection_legacy_success_cancellation_and_failure_priority() {
     crate::rar5::reader::VOLUME_OPENS.with(|s| assert_eq!(s.get(), 0));
     PROJECTED_INSPECTION_LEGACY_COMPLETED.with(|s| assert!(s.borrow_mut().take().is_some()));
 }
+
+#[test]
+fn selected_notice_keeps_opened_path_when_optional_legacy_proof_fails() {
+    let mut file = tempfile::NamedTempFile::new_in(".").unwrap();
+    file.write_all(&build(&[Member::stored(b"entry", b"one")], &[0], b"", b"", false).bytes).unwrap();
+    let relative = std::path::Path::new(file.path().file_name().unwrap());
+    LEGACY_CWD_FAULT.with(|fault| fault.set(Some(libc::EIO)));
+    let entry = crate::extract::SelectedEntry::open(relative, 0, None, 3).unwrap();
+    assert!(LEGACY_CWD_FAULT.with(|fault| fault.get()).is_none());
+    let mut notices = 0;
+    let mut out = Vec::new();
+    entry
+        .read_observed(
+            None,
+            |chunk| {
+                out.extend_from_slice(chunk);
+                Ok(())
+            },
+            |notice| {
+                assert_eq!(notice.path, relative);
+                assert_eq!(notice.volume_index, 0);
+                assert_eq!(notice.role, crate::extract::SelectedReadRole::Selected);
+                notices += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(notices, 1);
+    assert_eq!(out, b"one");
+}
+
+#[test]
+fn selected_notice_label_adds_no_checked_factory_postparse_allocation() {
+    for generic in [false, true] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&build(&[Member::stored(b"entry", b"one")], &[0], b"", b"", false).bytes).unwrap();
+        let cancel = Cancellation::default();
+        OPEN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|event| {
+                if event == 6 {
+                    crate::test_alloc::ALLOC_REQUESTS.with(|count| count.set(0));
+                    crate::test_alloc::TRACK_ALLOC.with(|track| track.set(true));
+                }
+            }));
+        });
+        let opened = if generic {
+            CheckedOpen::open(file.path(), &cancel).unwrap().probe(1024, &cancel).unwrap().0.into_zip(&cancel)
+        } else {
+            ProjectedOwner::open_checked(file.path(), &cancel)
+        };
+        crate::test_alloc::TRACK_ALLOC.with(|track| track.set(false));
+        let allocations = crate::test_alloc::ALLOC_REQUESTS.with(|count| count.get());
+        OPEN_HOOK.with(|hook| *hook.borrow_mut() = None);
+        let _owner = opened.unwrap();
+        assert_eq!(allocations, 0, "generic={generic}");
+    }
+}
+
+#[test]
+fn selected_notice_label_does_not_recapture_a_lost_checked_binding() {
+    let (_file, mut session) = opened(&[Member::stored(b"entry", b"one")]);
+    session.owner.source = Err(io::SourceCheckError::Admission(ReadFault::Io {
+        stage: IoStage::SourcePath,
+        operation: ReadIoOperation::Directory,
+        offset: 0,
+        error: std::io::Error::from_raw_os_error(libc::EIO),
+    }));
+    let error = session.owner.source_path().unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::Io { error, .. }) if error.raw_os_error() == Some(libc::EIO)));
+    assert!(matches!(session.owner.source_path().unwrap_err().operation(), Some(ReadFault::InvalidPlan)));
+    // The incumbent legacy decoder remains independent of optional source proof.
+    let mut out = Vec::new();
+    session
+        .owner
+        .legacy_read(0, None, 3, &Cancellation::default(), |chunk| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(out, b"one");
+}
