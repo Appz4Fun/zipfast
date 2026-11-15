@@ -1021,3 +1021,16 @@ fn truncated_offset_is_the_start_of_the_header_being_read() {
         assert_eq!(map.end, MapEnd::Truncated { volume: 0, offset: next }, "cut {cut}");
     }
 }
+
+// Catches a WinZip AES entry whose general-purpose encryption bit is clear being mapped as plain data.
+#[test]
+fn zip_aes_entry_without_the_encryption_flag_is_still_encrypted() {
+    let extra = [&[0x01, 0x99, 7, 0][..], &2u16.to_le_bytes(), b"AE", &[3], &0u16.to_le_bytes()].concat();
+    let bytes =
+        zip(&[ZipSpec { name: "aes.bin", payload: vec![7; 40], method: 99, flags: 0, extra, crc: 0, size: 12 }]);
+    let map = MemberMap::from_memory(&[&bytes], "x.zip", None).unwrap();
+    let member = &map.members[0];
+    assert!(member.encrypted);
+    assert!(matches!(member.cipher, Some(CipherParams::WinZipAes { .. })), "{:?}", member.cipher);
+    assert_ne!(member.mapping, OutputMapping::Direct);
+}

@@ -221,7 +221,7 @@ impl ZipWalker {
                         }));
                     };
                     let local_at = entry.local_at;
-                    let aes_prefix = (is_aes(&entry) && entry.flags & FLAG_ENCRYPTED != 0)
+                    let aes_prefix = is_aes(&entry)
                         .then_some(entry.aes_info)
                         .flatten()
                         .map(|(strength, _, _)| 4 + 4 * usize::from(strength) + 2);
@@ -271,7 +271,8 @@ impl ZipWalker {
                 (std::mem::size_of::<MapMember>() + std::mem::size_of::<MapPiece>() + 2 * entry.name.len()) as u64,
             )
             .map_err(|e| MapError::from_failure(0, e))?;
-        let encrypted = entry.flags & FLAG_ENCRYPTED != 0;
+        // As the extractor decides (src/zip.rs): flag bit 0, method 99, or an AES extra field.
+        let encrypted = entry.flags & FLAG_ENCRYPTED != 0 || is_aes(entry);
         let method_id = entry.effective_method();
         let stored = method_id == 0;
         let (cipher, mapping) = if !encrypted {
