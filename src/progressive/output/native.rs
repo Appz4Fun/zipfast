@@ -540,7 +540,7 @@ fn observe(path: &Path, file: Option<&File>) -> ProgressiveResult<Option<Identit
 }
 
 #[cfg(feature = "persistent-partials")]
-fn future_path(path: &Path) -> ProgressiveResult<PathBuf> {
+pub(crate) fn future_path(path: &Path) -> ProgressiveResult<PathBuf> {
     let absolute = std::path::absolute(path).map_err(input)?;
     let mut ancestor = absolute.as_path();
     loop {

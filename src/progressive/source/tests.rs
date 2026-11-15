@@ -1195,3 +1195,53 @@ fn r2_failed_retry_gate_retirement_cannot_admit_another_request() {
     assert!(matches!(d.replacement_retry_ready(&mut cx).unwrap_err().kind, FailureKind::SourceContract));
     assert_eq!(replacement.calls.load(Ordering::SeqCst), 1);
 }
+
+/// Answers whatever declaration the test sets, and opts in to a growing one.
+#[cfg(feature = "persistent-partials")]
+struct Growable(Arc<Mutex<ProtectionDeclaration>>);
+#[cfg(feature = "persistent-partials")]
+impl VolumeSource for Growable {
+    fn volume(&mut self, _: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        Ok(VolumeAnswer::Wait)
+    }
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn extends_protection(&self) -> bool {
+        true
+    }
+}
+#[test]
+#[cfg(feature = "persistent-partials")]
+fn an_extension_that_fails_after_binding_its_paths_fails_the_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = dir.path().join("held");
+    std::fs::write(&held, b"a").unwrap();
+    let mut first = inventory();
+    first.auxiliary_paths =
+        vec![ProtectedPath { path: held.clone(), file: Some(Arc::new(std::fs::File::open(&held).unwrap())) }];
+    let declaration = Arc::new(Mutex::new(ProtectionDeclaration::Complete { epoch: 1, inventory: first.clone() }));
+    let mut d = SourceDriver::new_retained(
+        Box::new(Growable(declaration.clone())),
+        "a.rar".into(),
+        ProgressiveLimits::default(),
+        SessionControl::default(),
+    )
+    .unwrap();
+    d.require_partial_catalogue().unwrap();
+    d.install_partial_exclusions(Arc::new(crate::partial::PartialExclusions::new(d.shared_usage()))).unwrap();
+    // The held path is replaced on disk while an extension appends a new path: the appended path binds, then the
+    // refresh of the old bindings fails.
+    let aside = dir.path().join("aside");
+    std::fs::rename(&held, &aside).unwrap();
+    std::fs::write(&held, b"b").unwrap();
+    let mut grown = first.clone();
+    grown.auxiliary_paths.push(ProtectedPath { path: dir.path().join("later.par2"), file: None });
+    *declaration.lock().unwrap() = ProtectionDeclaration::Complete { epoch: 2, inventory: grown };
+    assert!(matches!(d.require_partial_catalogue(), Err(ProgressiveFailure { kind: FailureKind::SourceChanged, .. })));
+    // Even once the path and the first declaration are back, the half-extended driver stays failed.
+    std::fs::remove_file(&held).unwrap();
+    std::fs::rename(&aside, &held).unwrap();
+    *declaration.lock().unwrap() = ProtectionDeclaration::Complete { epoch: 1, inventory: first };
+    assert!(matches!(d.require_partial_catalogue(), Err(ProgressiveFailure { kind: FailureKind::SourceContract, .. })));
+}

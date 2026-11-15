@@ -78,14 +78,22 @@ pub trait VolumeSource: Send + 'static {
     fn volume(&mut self, request: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer>;
     /// A declaration of structure only; this does not grant publication authority.
     ///
-    /// Once Complete, a declaration is frozen: the same epoch and inventory for the session's life. A persistent
-    /// session (`ProgressiveSession::new_partial`, feature `persistent-partials`) also accepts a Complete
-    /// declaration with a higher epoch that only appends volumes and auxiliary paths, every earlier entry (index,
-    /// name and backing) unchanged. When such a session requests an index the current declaration does not name,
-    /// answer Wait and wake the request's waker once a larger declaration names it. A Ready answer for an
-    /// undeclared index is held unread until a later declaration names it; wake that request's waker then too.
+    /// Once Complete, a declaration is frozen: the same epoch and inventory for the session's life, unless
+    /// `extends_protection` opts in to growth.
     fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
         Ok(ProtectionDeclaration::Opaque)
+    }
+    /// Opts in to a growing Complete declaration; read once, when a persistent session starts. Ordinary sessions
+    /// ignore it.
+    ///
+    /// When true, a persistent session (`ProgressiveSession::new_partial`, feature `persistent-partials`) also
+    /// accepts a Complete declaration with a higher epoch that only appends volumes and auxiliary paths, every
+    /// earlier entry (index, name and backing) unchanged. When it requests an index the current declaration does
+    /// not name, answer Wait and wake the request's waker once a larger declaration names it. A Ready answer for
+    /// an undeclared index is held unread until a later declaration names it; wake that request's waker then too.
+    /// A provider that opts in and never declares the index leaves the session waiting.
+    fn extends_protection(&self) -> bool {
+        false
     }
 }
 /// The caller owns availability and immutability leases. After NotYet, wake the
@@ -553,6 +561,9 @@ fn accept_available(
 pub(crate) struct SourceDriver {
     #[cfg(feature = "persistent-partials")]
     partial_exclusions: Option<Arc<crate::partial::PartialExclusions>>,
+    /// Whether the provider opted in to a growing declaration (`VolumeSource::extends_protection`).
+    #[cfg(feature = "persistent-partials")]
+    extends: bool,
     #[cfg(feature = "persistent-partials")]
     pending_partial_read: Option<PendingPartialRead>,
     /// Caller-declared damage on archive bytes not yet read, sorted and disjoint per volume. Reads answer
@@ -607,6 +618,8 @@ impl SourceDriver {
         Ok(Self {
             #[cfg(feature = "persistent-partials")]
             partial_exclusions: None,
+            #[cfg(feature = "persistent-partials")]
+            extends: false,
             #[cfg(feature = "persistent-partials")]
             pending_partial_read: None,
             #[cfg(feature = "persistent-partials")]
@@ -692,6 +705,7 @@ impl SourceDriver {
         exclusions: Arc<crate::partial::PartialExclusions>,
     ) -> ProgressiveResult<()> {
         self.partial_exclusions = Some(exclusions);
+        self.extends = self.provider.extends_protection();
         self.check_partial_inputs()
     }
     #[cfg(feature = "persistent-partials")]
@@ -762,6 +776,13 @@ impl SourceDriver {
     pub(crate) fn check_partial_target(&mut self, path: &std::path::Path) -> ProgressiveResult<()> {
         self.require_partial_catalogue()?;
         self.native.check_partial_target(path, &mut self.usage)?;
+        self.validate_current()
+    }
+    /// Refuses a state bundle at `path` holding, or being, a path the current declaration names.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn check_partial_subtree(&mut self, path: &std::path::Path) -> ProgressiveResult<()> {
+        self.require_partial_catalogue()?;
+        self.native.check_partial_subtree(path, &mut self.usage)?;
         self.validate_current()
     }
     pub(crate) fn shared_usage(&self) -> Usage {
@@ -1368,8 +1389,24 @@ impl SourceDriver {
         self.check_inventory_admitted(&next)?;
         #[cfg(feature = "persistent-partials")]
         if extension {
-            // Appended paths must not name an output, bundle or lock created under an earlier epoch.
+            // Appended paths must not name an output, bundle or lock created under an earlier epoch, by any
+            // spelling: the check canonicalises, as member creation does.
             self.check_inventory_inputs(&next)?;
+            if let (Some(exclusions), ProtectionDeclaration::Complete { inventory, .. }) =
+                (&self.partial_exclusions, &next)
+            {
+                exclusions.check_declared(
+                    inventory
+                        .volumes
+                        .iter()
+                        .flat_map(|volume| match &volume.backing {
+                            VolumeBacking::Native(paths) => paths.as_slice(),
+                            VolumeBacking::NonFile => &[],
+                        })
+                        .chain(inventory.auxiliary_paths.iter())
+                        .map(|path| path.path.as_path()),
+                )?;
+            }
         }
         let external = self.other_lane_handles()? + self.backing_count();
         if extension
@@ -1379,6 +1416,19 @@ impl SourceDriver {
             ) = (&self.protection, &next)
         {
             self.native.extend(old, new, &mut self.usage, external)?;
+            // The bindings now hold the appended paths; anything failing before the declaration is committed
+            // leaves them disagreeing with it, so the driver is failed rather than left half extended.
+            let committed = (|| {
+                self.native.refresh(&next, &mut self.usage, external)?;
+                self.protection = next;
+                #[cfg(feature = "persistent-partials")]
+                self.check_partial_inputs()?;
+                Ok(())
+            })();
+            if committed.is_err() {
+                self.failed = true;
+            }
+            return committed;
         }
         self.native.refresh(&next, &mut self.usage, external)?;
         self.protection = next;
@@ -1386,12 +1436,20 @@ impl SourceDriver {
         self.check_partial_inputs()?;
         Ok(())
     }
+    /// The epoch of the current Complete declaration.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn protection_epoch(&self) -> Option<u64> {
+        match &self.protection {
+            ProtectionDeclaration::Complete { epoch, .. } => Some(*epoch),
+            _ => None,
+        }
+    }
     /// Whether a Complete declaration may grow: persistent sessions only, whose exclusions refuse any declared
-    /// path that names an output, bundle or lock.
+    /// path that names an output, bundle or lock, and only when the provider opted in.
     fn extendable(&self) -> bool {
         #[cfg(feature = "persistent-partials")]
         {
-            self.partial_exclusions.is_some()
+            self.partial_exclusions.is_some() && self.extends
         }
         #[cfg(not(feature = "persistent-partials"))]
         {

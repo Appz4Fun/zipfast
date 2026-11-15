@@ -35,7 +35,7 @@ pub(crate) use limits::PartialBudget;
 pub use limits::{PartialLimits, PartialResource};
 use limits::{Reservation, limit};
 use native::PersistentNative;
-pub(crate) use native::{PartialExclusions, PartialProtectedPath};
+pub(crate) use native::{GenesisPath, PartialExclusions, PartialProtectedPath};
 pub(crate) use state::CipherBlock;
 pub use state::PartialState;
 use state::{CommittedState, MutationCommit, MutationIntent, Snapshot};
@@ -1682,9 +1682,9 @@ impl PreparedCreate {
     }
     pub(crate) fn prepare_parents(
         &self,
-        check: impl FnMut(&std::path::Path) -> PartialResult<()>,
+        check: impl FnMut(native::GenesisPath<'_>) -> PartialResult<()>,
     ) -> PartialResult<native::PreparedParents> {
-        native::prepare_parents(&self.spec, &self.budget, &self.control, check)
+        native::prepare_parents(&self.spec, &self.budget, &self.control, self.native.paths(), check)
     }
     #[cfg(test)]
     pub(crate) fn complete(self) -> PartialResult<Arc<PartialCore>> {
