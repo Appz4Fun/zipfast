@@ -1944,3 +1944,99 @@ fn task4b_late_directory_and_zero_file_mode_match_complete_metadata() {
     std::fs::set_permissions(tmp.path().join("zero"), std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::set_permissions(tmp.path().join("late"), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+/// A Complete native set of `count` stored volumes named `a.part001.rar`...
+fn complete_native_set(dir: &std::path::Path, data: &[u8], per_volume: usize) -> Vec<std::path::PathBuf> {
+    let input = dir.join("in");
+    std::fs::create_dir_all(&input).unwrap();
+    volumes(&FileSpec::new("member.bin", data), per_volume)
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            let path = input.join(format!("a.part{:03}.rar", i + 1));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect()
+}
+fn complete_native_options(dest: &std::path::Path, volumes: usize) -> ProgressiveOptions {
+    let mut o = options(dest);
+    o.first_name = OsString::from("a.part001.rar");
+    o.limits.volume_handles = 2 * volumes as u64 + 16;
+    o
+}
+/// Drive to the end, calling `step` on every event; returns the terminal failure, if any.
+fn drive_complete(
+    s: &mut ProgressiveSession,
+    mut step: impl FnMut(&ProgressiveEvent),
+) -> Option<zipfast::progressive::ProgressiveFailure> {
+    loop {
+        match poll(s) {
+            Poll::Ready(Ok(None)) => return None,
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => return Some(failure),
+            Poll::Ready(Ok(Some(event))) => step(&event),
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Pending => panic!("pending"),
+        }
+    }
+}
+#[test]
+fn complete_native_bookkeeping_does_not_grow_with_inventory_times_steps() {
+    // Every header and data step used to recheck all V protected paths and
+    // re-cover every admitted volume, and every volume open re-sorted the whole
+    // inventory: about 2e8 units for this set. Steps now pay a bounded rotating
+    // slice, so the whole run fits a fraction of the default 64 MiB.
+    const VOLUMES: usize = 160;
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let data: Vec<u8> = (0..VOLUMES * 2048).map(|i| (i * 7 % 251) as u8).collect();
+    let paths = complete_native_set(tmp.path(), &data, 2048);
+    assert_eq!(paths.len(), VOLUMES);
+    let mut o = complete_native_options(&out, VOLUMES);
+    o.limits.source_bookkeeping = 32 << 20;
+    let mut s = ProgressiveSession::new(Box::new(NativeSet::new(paths.clone())), o).unwrap();
+    let mut opened = 0;
+    let failure = drive_complete(&mut s, |e| opened += matches!(e, ProgressiveEvent::VolumeOpened { .. }) as usize);
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(opened, VOLUMES);
+    assert_eq!(std::fs::read(out.join("member.bin")).unwrap(), data);
+
+    // The same run is still charged: a small ceiling stops it.
+    let out = tmp.path().join("small");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut o = complete_native_options(&out, VOLUMES);
+    o.limits.source_bookkeeping = 1 << 20;
+    let mut s = ProgressiveSession::new(Box::new(NativeSet::new(paths)), o).unwrap();
+    let failure = drive_complete(&mut s, |_| {}).expect("limit");
+    assert!(matches!(failure.kind, FailureKind::Limit { resource: Resource::SourceBookkeeping, .. }), "{failure:?}");
+    assert!(!out.join("member.bin").exists());
+}
+#[test]
+fn complete_native_replaced_volume_path_is_detected_before_publication() {
+    // Replace a protected volume path with a different file (new inode) while
+    // the session reads later volumes: an already-read volume, the volume being
+    // read, and a volume not yet opened. Each must stop the session as a source
+    // change before the member is published.
+    const VOLUMES: usize = 8;
+    for (victim, at) in [(0usize, 3u32), (3, 3), (6, 3)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let data: Vec<u8> = (0..VOLUMES * 4096).map(|i| (i * 13 % 251) as u8).collect();
+        let paths = complete_native_set(tmp.path(), &data, 4096);
+        let mut s =
+            ProgressiveSession::new(Box::new(NativeSet::new(paths.clone())), complete_native_options(&out, VOLUMES))
+                .unwrap();
+        let failure = drive_complete(&mut s, |e| {
+            if matches!(e, ProgressiveEvent::VolumeOpened { index, .. } if *index == at) {
+                let copy = paths[victim].with_extension("swap");
+                std::fs::copy(&paths[victim], &copy).unwrap();
+                std::fs::rename(&copy, &paths[victim]).unwrap();
+            }
+        })
+        .unwrap_or_else(|| panic!("victim {victim}: replacement was not detected"));
+        assert!(matches!(failure.kind, FailureKind::SourceChanged), "victim {victim}: {failure:?}");
+        assert!(!out.join("member.bin").exists(), "victim {victim}");
+    }
+}

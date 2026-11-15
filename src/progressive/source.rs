@@ -427,7 +427,7 @@ fn partial_read_stable(original: &mut OriginalSource, op: &mut RangeOperation<'_
             return Err(canceled());
         }
         if let Some((native, declaration, external)) = &mut op.native {
-            native.refresh(declaration, op.usage, *external)?;
+            native.refresh_step(declaration, op.usage, *external)?;
         }
         let stable = exclusions.check_input_revision(&[], files)?.is_some();
         original.observe_info(info)?;
@@ -666,7 +666,19 @@ impl SourceDriver {
         driver.sealed_memory = true;
         Ok(driver)
     }
+    /// Full validation for authority points: volume and member boundaries,
+    /// publication and replacement admission re-observe every protected path.
     pub(crate) fn validate_current(&mut self) -> ProgressiveResult<()> {
+        self.validate(false)
+    }
+    /// Per-step validation after a header or data step. It checks the same
+    /// source facts, but bounds the Complete protection recheck to a rotating
+    /// slice (see `NativeProtection::refresh_step`), so cumulative bookkeeping
+    /// grows with steps rather than with steps times the inventory size.
+    pub(crate) fn validate_step(&mut self) -> ProgressiveResult<()> {
+        self.validate(true)
+    }
+    fn validate(&mut self, step: bool) -> ProgressiveResult<()> {
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
@@ -681,7 +693,11 @@ impl SourceDriver {
             checked?;
         }
         let external = self.other_lane_handles()? + self.backing_count();
-        self.native.refresh(&self.protection, &mut self.usage, external)?;
+        if step {
+            self.native.refresh_step(&self.protection, &mut self.usage, external)?;
+        } else {
+            self.native.refresh(&self.protection, &mut self.usage, external)?;
+        }
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
@@ -1001,7 +1017,7 @@ impl SourceDriver {
         }
         if self.retained.is_some() {
             let external = self.other_lane_handles()? + self.backing_count();
-            self.native.refresh(&self.protection, &mut self.usage, external)?;
+            self.native.refresh_step(&self.protection, &mut self.usage, external)?;
             if self.control.is_canceled() {
                 return Err(canceled());
             }
@@ -1368,11 +1384,39 @@ impl SourceDriver {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
         let mut next = next?;
-        if let ProtectionDeclaration::Complete { inventory, .. } = &mut next {
-            validate_inventory(inventory, &mut self.usage)?;
-            canonicalize_inventory(inventory, &mut self.usage)?;
+        // A redeclaration that matches the current Complete inventory position by
+        // position is already canonical and duplicate-free, so only its shape and
+        // retained sizes are rechecked; the sorts run for a first or reordered one.
+        let mut known = false;
+        if let ProtectionDeclaration::Complete { epoch: b, inventory } = &mut next {
+            validate_inventory_shape(inventory, &mut self.usage)?;
+            if let ProtectionDeclaration::Complete { epoch: a, inventory: x } = &self.protection {
+                known = a == b && same_inventory(x, inventory, &mut self.usage)?;
+            }
+            if !known {
+                validate_inventory_unique(inventory, &mut self.usage)?;
+                canonicalize_inventory(inventory, &mut self.usage)?;
+            }
+        }
+        if let (
+            true,
+            ProtectionDeclaration::Complete { inventory: x, .. },
+            ProtectionDeclaration::Complete { inventory: y, .. },
+        ) = (known, &self.protection, &next)
+            && !adds_handles(x, y, &mut self.usage)?
+        {
+            // Nothing new was declared. The retained declaration already covers
+            // every admitted name, and every caller re-proves all bindings with a
+            // full refresh before it relies on them (admission after the provider
+            // callback, or the full validation around a publication check).
+            let external = self.other_lane_handles()? + self.backing_count();
+            self.native.refresh_step(&self.protection, &mut self.usage, external)?;
+            #[cfg(feature = "persistent-partials")]
+            self.check_partial_inputs()?;
+            return Ok(());
         }
         let extension = match (&self.protection, &next) {
+            (ProtectionDeclaration::Complete { .. }, ProtectionDeclaration::Complete { .. }) if known => false,
             (
                 ProtectionDeclaration::Complete { epoch: a, inventory: x },
                 ProtectionDeclaration::Complete { epoch: b, inventory: y },
@@ -1595,6 +1639,25 @@ fn same_path(a: &ProtectedPath, b: &ProtectedPath, usage: &mut Usage) -> Progres
         _ => false,
     })
 }
+/// Whether `b` declares a handle for a path that `a` declared without one.
+/// Both inventories must already compare equal position by position.
+fn adds_handles(a: &ProtectionInventory, b: &ProtectionInventory, usage: &mut Usage) -> ProgressiveResult<bool> {
+    usage.charge(Resource::SourceBookkeeping, (a.volumes.len() + a.auxiliary_paths.len()) as u64)?;
+    for (x, y) in a.auxiliary_paths.iter().zip(&b.auxiliary_paths) {
+        if x.file.is_none() && y.file.is_some() {
+            return Ok(true);
+        }
+    }
+    for (x, y) in a.volumes.iter().zip(&b.volumes) {
+        if let (VolumeBacking::Native(x), VolumeBacking::Native(y)) = (&x.backing, &y.backing) {
+            usage.charge(Resource::SourceBookkeeping, x.len() as u64)?;
+            if x.iter().zip(y).any(|(x, y)| x.file.is_none() && y.file.is_some()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
 fn same_inventory(a: &ProtectionInventory, b: &ProtectionInventory, usage: &mut Usage) -> ProgressiveResult<bool> {
     usage.charge(Resource::SourceBookkeeping, 2)?;
     if a.volumes.len() != b.volumes.len() || a.auxiliary_paths.len() != b.auxiliary_paths.len() {
@@ -1689,7 +1752,13 @@ fn extends_inventory(a: &ProtectionInventory, b: &ProtectionInventory, usage: &m
     }
     Ok(true)
 }
+#[cfg(test)]
 fn validate_inventory(i: &ProtectionInventory, usage: &mut Usage) -> ProgressiveResult<()> {
+    validate_inventory_shape(i, usage)?;
+    validate_inventory_unique(i, usage)
+}
+/// Linear checks and retained-size charges for one declared inventory.
+fn validate_inventory_shape(i: &ProtectionInventory, usage: &mut Usage) -> ProgressiveResult<()> {
     if i.volumes.is_empty() {
         return Err(contract());
     }
@@ -1744,11 +1813,23 @@ fn validate_inventory(i: &ProtectionInventory, usage: &mut Usage) -> Progressive
     usage.check(Resource::VolumeHandles, handles)?;
     usage.charge(Resource::NameBytes, names)?;
     metadata = metadata.checked_add(bytes).and_then(|n| n.checked_add(names)).ok_or_else(contract)?;
+    usage.charge(Resource::MetadataBytes, metadata)
+}
+/// Duplicate volume indexes and native paths, found by sorting borrowed keys.
+fn validate_inventory_unique(i: &ProtectionInventory, usage: &mut Usage) -> ProgressiveResult<()> {
+    let all = || {
+        i.auxiliary_paths.iter().chain(i.volumes.iter().flat_map(|v| match &v.backing {
+            VolumeBacking::Native(p) => p.as_slice(),
+            VolumeBacking::NonFile => &[],
+        }))
+    };
+    let paths = all().count() as u64;
     // Temporary borrowed-key indexes below also need reservation before allocation.
-    let scratch = size(i.volumes.len(), std::mem::size_of::<u32>())?
-        .checked_add(size(paths as usize, std::mem::size_of::<&std::path::Path>())?)
+    let scratch = (i.volumes.len() as u64)
+        .checked_mul(std::mem::size_of::<u32>() as u64)
+        .and_then(|n| n.checked_add(paths.checked_mul(std::mem::size_of::<&std::path::Path>() as u64)?))
         .ok_or_else(contract)?;
-    usage.charge(Resource::MetadataBytes, metadata.checked_add(scratch).ok_or_else(contract)?)?;
+    usage.charge(Resource::MetadataBytes, scratch)?;
     let mut indices = Vec::new();
     indices.try_reserve_exact(i.volumes.len()).map_err(|_| contract())?;
     usage.charge(Resource::SourceBookkeeping, i.volumes.len() as u64)?;

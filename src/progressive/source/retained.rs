@@ -464,7 +464,7 @@ impl SourceDriver {
             return Ok(Poll::Pending);
         }
         let external = self.other_lane_handles()? + self.backing_count();
-        self.native.refresh(&self.protection, &mut self.usage, external)?;
+        self.native.refresh_step(&self.protection, &mut self.usage, external)?;
         if self.control.is_canceled() {
             return Err(canceled());
         }
