@@ -2301,3 +2301,16 @@ fn fill_from_stops_on_short_input_with_committed_progress() {
     assert!(a.remaining().unwrap().is_empty());
     assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
 }
+
+// Catches each streamed fill permanently spending the session's shared metadata budget.
+#[test]
+fn many_streamed_fills_do_not_exhaust_the_metadata_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _session, mut files) = extracted_with(dir.path(), PartialLimits::default());
+    let mut a = files.remove(0);
+    for _ in 0..300 {
+        let mut input = &fixture.data[0][..];
+        a.fill_from(0, 7000, &mut input).unwrap();
+    }
+    assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+}

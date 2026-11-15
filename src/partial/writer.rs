@@ -44,12 +44,16 @@ impl<'a> FillWriter<'a> {
         if chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        let buffer = file.core.budget.vector(chunk)?;
+        // Not charged to the cumulative metadata budget: the buffer is freed with the writer, and `fill_bytes` is
+        // validated against its 1 MiB hard cap, the same bound as a caller slice passed to `fill`.
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(chunk).map_err(|_| err(PartialErrorKind::InvalidOptions))?;
         Ok(Self { file, at: offset, buffer, chunk, applied: Vec::new(), last: None, failed: None })
     }
-    /// The output offset the next written byte lands at.
+    /// The output offset the next written byte lands at. After an error it is the end of the committed bytes, the
+    /// point to resume from.
     pub fn position(&self) -> u64 {
-        self.at + self.buffer.len() as u64
+        if self.failed.is_some() { self.at } else { self.at + self.buffer.len() as u64 }
     }
     fn commit(&mut self) -> PartialResult<()> {
         if self.buffer.is_empty() {
@@ -111,6 +115,12 @@ impl io::Write for FillWriter<'_> {
     }
 }
 
+/// Sets how far a streamed fill got on an error that does not say already.
+fn progress(mut error: PartialError, offset: u64, attempted: u64, completed: u64) -> PartialError {
+    error.output.get_or_insert(crate::progressive::OutputRange { offset, attempted, completed });
+    error
+}
+
 impl PartialFile {
     /// A [`FillWriter`] that fills plaintext starting at output `offset`, for streaming a large range (for example
     /// `[offset_reached, end)` from an alt) without holding it in memory.
@@ -118,8 +128,8 @@ impl PartialFile {
         FillWriter::new(self, offset)
     }
     /// Fills exactly `len` plaintext bytes at output `offset` read from `reader`, in transactions of at most
-    /// `PartialLimits::fill_bytes`. A read error or an early end of input is [`PartialErrorKind::FillRead`]; ranges
-    /// committed before it stay filled, and the error's `output` says how far the fill got.
+    /// `PartialLimits::fill_bytes`. A read error or an early end of input is [`PartialErrorKind::FillRead`]. On any
+    /// error, ranges committed before it stay filled and the error's `output` says how far the fill got.
     pub fn fill_from<R: io::Read>(&mut self, offset: u64, len: u64, reader: &mut R) -> PartialResult<FillResult> {
         offset.checked_add(len).ok_or_else(|| err(PartialErrorKind::InvalidOptions))?;
         let mut writer = self.fill_writer(offset)?;
@@ -141,6 +151,10 @@ impl PartialFile {
                 Err(e) => Err(e),
             };
             let n = match n {
+                Ok(n) if n > room => Err(io::Error::new(io::ErrorKind::InvalidData, "reader returned more than asked")),
+                other => other,
+            };
+            let n = match n {
                 Ok(n) => n,
                 Err(cause) => {
                     writer.buffer.truncate(start);
@@ -153,9 +167,11 @@ impl PartialFile {
             writer.buffer.truncate(start + n);
             left -= n as u64;
             if writer.buffer.len() == writer.chunk {
-                writer.commit()?;
+                let done = writer.at - offset;
+                writer.commit().map_err(|e| progress(e, offset, len, done))?;
             }
         }
-        writer.finish()
+        let done = writer.at - offset;
+        writer.finish().map_err(|e| progress(e, offset, len, done))
     }
 }
