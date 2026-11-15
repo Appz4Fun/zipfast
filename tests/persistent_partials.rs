@@ -2501,6 +2501,15 @@ fn extract_encrypted(dir: &Path, fixture: &Encrypted, holes: &[Range<u64>]) -> E
 }
 #[allow(clippy::result_large_err, reason = "the public partial error type")]
 fn reopen(dir: &Path, run: EncryptedRun, password: Option<&str>) -> PartialResult<PartialFile> {
+    reopen_with(dir, run, password, ProgressiveLimits::default())
+}
+#[allow(clippy::result_large_err, reason = "the public partial error type")]
+fn reopen_with(
+    dir: &Path,
+    run: EncryptedRun,
+    password: Option<&str>,
+    progressive_limits: ProgressiveLimits,
+) -> PartialResult<PartialFile> {
     drop(run.session);
     let state = partial_state::roundtrip(&run.file.close().unwrap());
     let expected_anchor = run.anchors.current(&run.key).unwrap().unwrap();
@@ -2513,7 +2522,7 @@ fn reopen(dir: &Path, run: EncryptedRun, password: Option<&str>) -> PartialResul
             expected_anchor,
             protection: run.protection,
             limits: PartialLimits::default(),
-            progressive_limits: ProgressiveLimits::default(),
+            progressive_limits,
             anchors: run.anchors,
             control: SessionControl::default(),
             password: password.map(Into::into),
@@ -2858,4 +2867,150 @@ fn encrypted_damage_declared_on_bytes_still_in_the_cipher_state_becomes_holes() 
         assert!(matches!(verify(&mut files[0]), Verdict::Ok { .. }));
         assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
     }
+}
+
+#[test]
+fn encrypted_declared_damage_drops_the_kept_block_it_covers() {
+    // Byte 1475 is corrupt in the extraction's copy of volume 1, and 1500..1510 is missing. Extraction keeps
+    // block 1472, the block before the hole run, with the corrupt byte in it.
+    for via_session in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Encrypted::new(3000, &CUTS, true);
+        let mut bad = Encrypted::new(3000, &CUTS, true);
+        let corrupt = fixture.packed(1475..1476).remove(0);
+        assert_eq!(corrupt.0, 1);
+        bad.volumes[1][corrupt.1.start as usize] ^= 1;
+        let mut run = extract_encrypted(dir.path(), &bad, &hole(1500..1510));
+        assert_eq!(
+            joined(&run.holes),
+            vec![(1488..1520, HoleCause::Missing), (1520..1536, HoleCause::CipherNeighbour)]
+        );
+        let holes = if via_session {
+            run.session.declare_hole(1, corrupt.1.clone()).unwrap().holes
+        } else {
+            run.file.declare_hole(1, corrupt.1.clone()).unwrap()
+        };
+        assert_eq!(joined(&holes), vec![(1472..1488, HoleCause::DeclaredBad)]);
+        // Good twin bytes of the Missing report's spans: block 1488 needs block 1472, which is now untrusted.
+        for (volume, range) in fixture.packed(1488..1520) {
+            let bytes = &fixture.volumes[volume as usize][range.start as usize..range.end as usize];
+            let result = run.file.fill_packed(volume, range.start, bytes).unwrap();
+            assert_eq!(result.undecryptable, vec![1488..1504], "decrypted with the damaged kept block");
+            assert_eq!(result.applied, vec![1504..1536]);
+        }
+        // The DeclaredBad report's spans, plus one block before them, fill the rest.
+        let (volume, range) = fixture.packed(1456..1488).remove(0);
+        run.file
+            .fill_packed(
+                volume,
+                range.start,
+                &fixture.volumes[volume as usize][range.start as usize..range.end as usize],
+            )
+            .unwrap();
+        let (volume, range) = fixture.packed(1472..1504).remove(0);
+        run.file
+            .fill_packed(
+                volume,
+                range.start,
+                &fixture.volumes[volume as usize][range.start as usize..range.end as usize],
+            )
+            .unwrap();
+        assert!(run.file.remaining().unwrap().is_empty());
+        assert!(matches!(verify(&mut run.file), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+    }
+}
+
+#[test]
+fn encrypted_whole_volume_fill_over_known_output_costs_bookkeeping_per_run() {
+    // About 25,000 blocks of volume 1 are already known; the fill must not charge bookkeeping for each.
+    let size = 1 << 20;
+    let cuts = [300_001, 700_004];
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(size, &cuts, true);
+    let run = extract_encrypted(dir.path(), &fixture, &hole(500_000..500_010));
+    let mut limits = ProgressiveLimits::default();
+    limits.source_bookkeeping = 4_000;
+    let mut file = reopen_with(dir.path(), run, Some("pw"), limits).unwrap();
+    for _ in 0..3 {
+        let result = file.fill_packed(1, 0, &fixture.volumes[1]).unwrap();
+        assert!(result.undecryptable.is_empty());
+    }
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_packed_fill_without_a_check_value_needs_a_proven_password() {
+    let fixture = Encrypted::new(3000, &CUTS, false);
+    let bytes = |stream: Range<u64>| {
+        let (volume, range) = fixture.packed(stream).remove(0);
+        (volume, range.start, &fixture.volumes[volume as usize][range.start as usize..range.end as usize])
+    };
+    for password in ["wrong", "pw"] {
+        let dir = tempfile::tempdir().unwrap();
+        let run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+        assert_eq!(
+            joined(&run.holes),
+            vec![(1488..1520, HoleCause::Missing), (1520..1536, HoleCause::CipherNeighbour)]
+        );
+        let mut file = reopen(dir.path(), run, Some(password)).unwrap();
+        // The Missing report's exact spans decrypt only hole blocks (with the kept blocks 1472 and 1520): nothing
+        // shows the password is right.
+        let (volume, at, missing) = bytes(1488..1520);
+        let error = file.fill_packed(volume, at, missing).unwrap_err();
+        assert!(matches!(error.kind, PartialErrorKind::PasswordUnverified), "{error:?}");
+        assert_eq!(file.remaining().unwrap(), vec![1488..1536]);
+        // Block 1456 decrypts with 1440 to original output: it proves (or refutes) the password.
+        let (proof_volume, proof_at, proof) = bytes(1440..1472);
+        let result = file.fill_packed(proof_volume, proof_at, proof);
+        if password == "wrong" {
+            let error = result.unwrap_err();
+            assert!(matches!(error.kind, PartialErrorKind::WrongPassword), "{error:?}");
+            assert_eq!(file.remaining().unwrap(), vec![1488..1536]);
+            continue;
+        }
+        assert!(result.unwrap().applied.is_empty());
+        assert_eq!(file.fill_packed(volume, at, missing).unwrap().applied, vec![1488..1536]);
+        assert!(file.remaining().unwrap().is_empty());
+        assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+    }
+}
+
+#[test]
+fn encrypted_cipher_neighbour_hole_precedes_the_bytes_written_past_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let (provider, _) = fixture.provider(&hole(1500..1510));
+    let mut opts = options(&dir.path().join("out"));
+    opts.set_password(Some("pw".into())).unwrap();
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), opts, partial_options(&dir.path().join("state"))).unwrap();
+    // Holes and written bytes must arrive in output order.
+    let mut cursor = 0;
+    let mut neighbour = false;
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => {
+                assert_eq!(report.out.start, cursor, "{report:?}");
+                neighbour |= report.cause == HoleCause::CipherNeighbour;
+                cursor = report.out.end;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { valid_bytes, logical_end, .. }))) => {
+                assert_eq!(
+                    logical_end - valid_bytes,
+                    cursor,
+                    "a hole below logical_end {logical_end} is not delivered"
+                );
+                cursor = logical_end;
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    assert!(neighbour);
+    assert_eq!(cursor, 3000);
 }

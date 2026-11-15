@@ -33,6 +33,9 @@ pub(super) struct Persistent {
     pub(super) ready: Option<(ProgressiveEvent, PartialEventLease)>,
     /// Hole reports recorded but not yet delivered as events; one feed can record several.
     pub(super) holes: VecDeque<HoleReport>,
+    /// A `BytesWritten` event held back until the holes the same feed recorded are delivered, so no event
+    /// reports a `logical_end` past a hole not yet delivered.
+    pub(super) written: Option<ProgressiveEvent>,
     /// Ciphertext stream bytes of the active member fed so far (the output offset for a plain member).
     stream: u64,
     /// Recently unavailable stream ranges of the active member, and whether the caller declared them damaged.
@@ -109,6 +112,7 @@ impl ProgressiveSession {
             witness: None,
             ready: None,
             holes: VecDeque::new(),
+            written: None,
             stream: 0,
             unavailable: Vec::new(),
         });

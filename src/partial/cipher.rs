@@ -198,6 +198,23 @@ pub(super) fn merge(
     }
     Ok(())
 }
+/// Drops kept blocks whose ciphertext overlaps a `damaged` stream range: declared damage makes that ciphertext
+/// untrusted, and decrypting a neighbour with it would write wrong output with archive authority. Returns whether
+/// any block was dropped.
+pub(super) fn forget(
+    budget: &PartialBudget,
+    cipher: &mut Vec<CipherBlock>,
+    damaged: &[Range<u64>],
+) -> PartialResult<bool> {
+    let before = cipher.len();
+    for range in damaged {
+        budget.usage.charge(Resource::SourceBookkeeping, 1)?;
+        let first = cipher.partition_point(|block| block.offset.saturating_add(16) <= range.start);
+        let last = first + cipher[first..].partition_point(|block| block.offset < range.end);
+        cipher.drain(first..last);
+    }
+    Ok(cipher.len() != before)
+}
 fn join(old: &CipherBlock, new: &CipherBlock) -> CipherBlock {
     if new.whole() || new.have.end < old.have.start || old.have.end < new.have.start {
         return new.clone();
@@ -255,7 +272,9 @@ pub(super) fn decrypt(
     let first = floor_block(at);
     let last = ceil_block(end).saturating_add(16).min(ceil_block(limit));
     budget.usage.charge(Resource::VerifyWorkBytes, last - first)?;
-    budget.usage.charge(Resource::SourceBookkeeping, (last - first) / 16)?;
+    // Bookkeeping follows the runs and intervals produced, not the blocks visited: a fill over mostly known output
+    // costs what a plain fill does.
+    budget.usage.charge(Resource::SourceBookkeeping, 1)?;
     result.plain = budget.vector((last.min(size) - first.min(size)) as usize)?;
     let mut run: Option<(u64, usize)> = None;
     let mut previous = if first == 0 {
@@ -279,7 +298,10 @@ pub(super) fn decrypt(
         };
         match decrypted {
             Some(bytes) if !out.is_empty() => {
-                run.get_or_insert((out.start, result.plain.len()));
+                if run.is_none() {
+                    budget.usage.charge(Resource::SourceBookkeeping, 1)?;
+                    run = Some((out.start, result.plain.len()));
+                }
                 result.plain.extend_from_slice(&bytes[..(out.end - out.start) as usize]);
             }
             _ => {
@@ -291,6 +313,7 @@ pub(super) fn decrypt(
                         Some(last) if last.end == out.start => last.end = out.end,
                         _ => {
                             budget.usage.check(Resource::HoleIntervals, result.undecryptable.len() as u64 + 1)?;
+                            budget.usage.charge(Resource::SourceBookkeeping, 1)?;
                             result.undecryptable.push(out.clone());
                         }
                     }
@@ -320,13 +343,15 @@ pub(super) fn keep(
     }
     let supply = &supply[..(end - at) as usize];
     let mut offset = floor_block(at);
-    budget.usage.charge(Resource::SourceBookkeeping, (ceil_block(end) - offset) / 16)?;
+    // Charged per block kept, like `merge`, not per block visited.
+    budget.usage.charge(Resource::SourceBookkeeping, 1)?;
     while offset < end {
         if useful(snapshot, offset)
             && let Some(block) = assemble(&snapshot.cipher, offset, at, supply)
             && snapshot.cipher.binary_search_by_key(&offset, |b| b.offset).map_or(true, |i| snapshot.cipher[i] != block)
         {
             budget.usage.check(Resource::HoleIntervals, blocks.len() as u64 + 1)?;
+            budget.usage.charge(Resource::SourceBookkeeping, 1)?;
             budget.metadata(std::mem::size_of::<CipherBlock>() as u64)?;
             blocks.try_reserve(1).map_err(|_| malformed())?;
             blocks.push(block);

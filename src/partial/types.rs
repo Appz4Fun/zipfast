@@ -202,8 +202,14 @@ pub enum PartialErrorKind {
     /// bytes in `fill_packed`, or evaluating member checks that RAR5 keys with the password. Reopen with
     /// [`PartialOpenContext::password`].
     PasswordRequired,
-    /// The supplied password does not match the member's password check value.
+    /// The supplied password does not match the member's password check value, or, for a member without one,
+    /// `fill_packed` decrypted a block of original output to different bytes.
     WrongPassword,
+    /// The member has no password check value, and this `fill_packed` would write with a password that has not
+    /// yet decrypted any block of original output correctly. Include at least one block (16 bytes, plus the block
+    /// before it) whose output the original extraction wrote, for example with `refill_from_packed`, or fill
+    /// plaintext with `fill`.
+    PasswordUnverified,
     Limit {
         resource: PartialResource,
         limit: u64,

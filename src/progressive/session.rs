@@ -451,6 +451,10 @@ impl ProgressiveSession {
             if let Some(report) = self.partial.as_mut().and_then(|p| p.holes.pop_front()) {
                 return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))));
             }
+            #[cfg(feature = "persistent-partials")]
+            if let Some(event) = self.partial.as_mut().and_then(|p| p.written.take()) {
+                return Ok(Poll::Ready(Ok(Some(event))));
+            }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
                 Phase::NextVolume => {
@@ -729,11 +733,19 @@ impl ProgressiveSession {
                                 if written == 0 {
                                     continue;
                                 }
-                                return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
+                                let event = ProgressiveEvent::BytesWritten {
                                     member: self.member.unwrap(),
                                     valid_bytes: written,
                                     logical_end: self.produced,
-                                }))));
+                                };
+                                // A data feed of an encrypted member can record a CipherNeighbour hole below
+                                // `logical_end`: deliver it first.
+                                let persistent = self.partial.as_mut().unwrap();
+                                if persistent.holes.is_empty() {
+                                    return Ok(Poll::Ready(Ok(Some(event))));
+                                }
+                                persistent.written = Some(event);
+                                continue;
                             }
                             let before = self.stage.as_ref().map_or(self.produced, |s| s.valid);
                             let mut sink = StageSink {
