@@ -149,6 +149,42 @@ impl PartialExclusions {
     pub(crate) fn check_input(&self, paths: &[PathBuf], files: &[File]) -> ProgressiveResult<()> {
         self.check_input_revision(paths, files).map(|_| ())
     }
+    /// Refuses a declared path naming an output, lock or state bundle (or a path inside a bundle) by any
+    /// spelling: both sides are canonicalised as member creation canonicalises, so a symlinked-directory alias
+    /// is caught too. Path IO runs outside the registry lock.
+    pub(crate) fn check_declared<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> ProgressiveResult<()> {
+        let entries = {
+            let list = self.entries.lock().unwrap();
+            self.usage.charge(
+                Resource::MetadataBytes,
+                (list.len() * std::mem::size_of::<Arc<PartialProtectedPath>>()) as u64,
+            )?;
+            list.clone()
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut declared = Vec::new();
+        for path in paths {
+            self.usage.charge(Resource::SourceBookkeeping, 1 + path.as_os_str().len() as u64)?;
+            let canonical = crate::progressive::native::future_path(path)?;
+            self.usage.charge(
+                Resource::MetadataBytes,
+                (std::mem::size_of::<PathBuf>() + canonical.as_os_str().len()) as u64,
+            )?;
+            declared.try_reserve(1).map_err(|_| ProgressiveFailure::new(FailureKind::SourceContract))?;
+            declared.push(canonical);
+        }
+        for entry in entries {
+            self.usage
+                .charge(Resource::SourceBookkeeping, 1 + entry.path.as_os_str().len() as u64 + declared.len() as u64)?;
+            let excluded = crate::progressive::native::future_path(&entry.path)?;
+            if declared.iter().any(|path| *path == excluded || (entry.directory && path.starts_with(&excluded))) {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
+        }
+        Ok(())
+    }
     /// None requests a bounded retry: the examined snapshot was retired while
     /// path IO ran. No filesystem or caller callback runs under the registry lock.
     pub(crate) fn check_input_revision(&self, paths: &[PathBuf], files: &[File]) -> ProgressiveResult<Option<u64>> {
@@ -194,6 +230,9 @@ pub(super) struct PreparedNative {
     protection: NativeProtection,
 }
 impl PreparedNative {
+    pub(super) fn paths(&self) -> (&Path, &Path) {
+        (&self.output, &self.bundle)
+    }
     pub(super) fn new(spec: &CreateSpec, budget: &PartialBudget) -> PartialResult<Self> {
         Self::layout(
             &spec.output_root,
@@ -637,6 +676,13 @@ impl PersistentNative {
     }
 }
 
+/// What a genesis asks the session to check before creating any name: each parent directory, then the output
+/// file and the state bundle, after every parent's check.
+pub(crate) enum GenesisPath<'a> {
+    Parent(&'a Path),
+    Output(&'a Path),
+    Bundle(&'a Path),
+}
 /// Holds every observed ancestor through the independent Core binding.
 pub(crate) struct PreparedParents {
     held: Vec<Directory>,
@@ -653,7 +699,8 @@ pub(super) fn prepare_parents(
     spec: &CreateSpec,
     genesis: &PartialBudget,
     control: &SessionControl,
-    mut check: impl FnMut(&Path) -> PartialResult<()>,
+    targets: (&Path, &Path),
+    mut check: impl FnMut(GenesisPath<'_>) -> PartialResult<()>,
 ) -> PartialResult<PreparedParents> {
     // Separate transient reservations cannot consume the prepared Core's credits.
     let budget = PartialBudget::new(genesis.limits.clone(), genesis.usage.clone(), genesis.exclusions.clone())?;
@@ -692,7 +739,7 @@ pub(super) fn prepare_parents(
     // All existing ancestors are held, all missing names reserved, and every
     // provider callback has returned before the first mkdirat.
     for path in paths {
-        check(&path)?;
+        check(GenesisPath::Parent(&path))?;
         for directory in &held {
             directory.check()?;
         }
@@ -718,6 +765,13 @@ pub(super) fn prepare_parents(
             }
             Err(e) => return Err(io_error(OutputOperation::Metadata, e)),
         }
+    }
+    // The parent checks read the declaration again, so it may have grown since the output and bundle were
+    // checked against it; their exclusions do not exist until the genesis, so an extension cannot see them.
+    check(GenesisPath::Output(targets.0))?;
+    check(GenesisPath::Bundle(targets.1))?;
+    for directory in &held {
+        directory.check()?;
     }
     // The remaining native rechecks and exclusion-table visits are predictable
     // now: provider callbacks and provisional parent reservations have finished.

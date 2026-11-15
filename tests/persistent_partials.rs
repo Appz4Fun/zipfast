@@ -3024,3 +3024,601 @@ fn encrypted_refill_without_a_check_value_proves_the_password_from_an_earlier_bl
         assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
     }
 }
+
+/// How a growing provider answers a request for a volume its declaration does not name yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Grow {
+    /// Declares the whole set while answering, then answers Ready.
+    OnRequest,
+    /// Answers Wait; the test extends the declaration and wakes the request.
+    Wait,
+    /// Answers Ready before declaring; the test extends the declaration and wakes the request.
+    ReadyFirst,
+}
+/// What a growing provider declares: the first `count` volumes at `epoch`, plus any auxiliary paths.
+struct Declared {
+    epoch: u64,
+    count: u32,
+    names: Vec<OsString>,
+    /// A native backing path per volume; None declares the volume NonFile.
+    native: Vec<Option<ProtectedPath>>,
+    auxiliary: Vec<ProtectedPath>,
+}
+impl Declared {
+    fn declaration(&self) -> ProtectionDeclaration {
+        ProtectionDeclaration::Complete {
+            epoch: self.epoch,
+            inventory: ProtectionInventory {
+                volumes: (0..self.count)
+                    .map(|index| ProtectedVolume {
+                        index,
+                        name: self.names[index as usize].clone(),
+                        backing: match &self.native[index as usize] {
+                            Some(path) => VolumeBacking::Native(vec![path.clone()]),
+                            None => VolumeBacking::NonFile,
+                        },
+                    })
+                    .collect(),
+                auxiliary_paths: self.auxiliary.clone(),
+            },
+        }
+    }
+}
+/// A change a growing provider applies to its declaration.
+type Extension = Box<dyn FnOnce(&mut Declared) + Send>;
+/// RustyGet's case: the set's size is known but not every final name, so volumes are declared as they become
+/// known, each time with a higher epoch.
+struct GrowingProvider {
+    inner: Provider,
+    declared: Arc<Mutex<Declared>>,
+    grow: Grow,
+    /// The extension `OnRequest` applies: the whole set at the next epoch, unless the test replaced it.
+    extension: Option<Extension>,
+    waker: Arc<Mutex<Option<Waker>>>,
+    requests: Arc<Mutex<Vec<u32>>>,
+    /// Whether it opts in to a growing declaration.
+    extends: bool,
+}
+impl VolumeSource for GrowingProvider {
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        Ok(self.declared.lock().unwrap().declaration())
+    }
+    fn extends_protection(&self) -> bool {
+        self.extends
+    }
+    fn volume(&mut self, request: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        self.requests.lock().unwrap().push(request.index);
+        let declared = self.declared.lock().unwrap().count > request.index;
+        if !declared {
+            match self.grow {
+                Grow::OnRequest => {
+                    let extend = self.extension.take().expect("one extension");
+                    extend(&mut self.declared.lock().unwrap());
+                }
+                Grow::Wait => {
+                    *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                    return Ok(VolumeAnswer::Wait);
+                }
+                Grow::ReadyFirst => *self.waker.lock().unwrap() = Some(cx.waker().clone()),
+            }
+        }
+        self.inner.volume(request, cx)
+    }
+}
+struct Growing {
+    fixture: Fixture,
+    declared: Arc<Mutex<Declared>>,
+    waker: Arc<Mutex<Option<Waker>>>,
+    requests: Arc<Mutex<Vec<u32>>>,
+}
+impl Growing {
+    fn new() -> Self {
+        let declared = Declared {
+            epoch: 1,
+            count: 5,
+            names: (0..10).map(volume_name).collect(),
+            native: vec![None; 10],
+            auxiliary: Vec::new(),
+        };
+        Self {
+            fixture: Fixture::new(),
+            declared: Arc::new(Mutex::new(declared)),
+            waker: Arc::default(),
+            requests: Arc::default(),
+        }
+    }
+    fn provider(&mut self, grow: Grow) -> GrowingProvider {
+        self.provider_with(grow, |declared| {
+            declared.epoch += 1;
+            declared.count = 10;
+        })
+    }
+    fn provider_with(&mut self, grow: Grow, extend: impl FnOnce(&mut Declared) + Send + 'static) -> GrowingProvider {
+        GrowingProvider {
+            inner: self.fixture.provider(),
+            declared: self.declared.clone(),
+            grow,
+            extension: Some(Box::new(extend)),
+            waker: self.waker.clone(),
+            requests: self.requests.clone(),
+            extends: true,
+        }
+    }
+    /// The whole set at epoch 2, as the extension declares it.
+    fn extended(&self) -> ProtectionDeclaration {
+        let declared = self.declared.lock().unwrap();
+        Declared {
+            epoch: 2,
+            count: 10,
+            names: declared.names.clone(),
+            native: declared.native.clone(),
+            auxiliary: declared.auxiliary.clone(),
+        }
+        .declaration()
+    }
+}
+/// Polls up to `polls` times, collecting handles and holes. Returns the session's end, or None if still running.
+fn drive(
+    session: &mut ProgressiveSession,
+    files: &mut Vec<(MemberKey, PartialFile)>,
+    polls: usize,
+) -> Option<Result<(), ProgressiveFailure>> {
+    for _ in 0..polls {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                let file = session.partial_file(&member).unwrap();
+                files.push((member, file));
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => return Some(Err(failure)),
+            Poll::Ready(Ok(None)) => return Some(Ok(())),
+            Poll::Ready(Err(e)) => return Some(Err(e)),
+            _ => {}
+        }
+    }
+    None
+}
+/// Fills both fixture members' missing articles and checks each verifies Ok with the expected bytes.
+fn fill_and_verify(fixture: &Fixture, dest: &Path, files: &mut [(MemberKey, PartialFile)]) {
+    assert_eq!(files.len(), 2);
+    for ((_, file), (member, hole, name)) in
+        files.iter_mut().zip([(0, 1300..2000u64, "a.bin"), (1, 3500..4200, "b.bin")])
+    {
+        assert_eq!(file.remaining().unwrap(), vec![hole.clone()]);
+        file.fill(hole.start, &fixture.data[member][hole.start as usize..hole.end as usize]).unwrap();
+        assert!(matches!(verify(file), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dest.join(name)).unwrap(), fixture.data[member]);
+    }
+}
+
+#[test]
+fn persistent_session_declares_later_volumes_with_a_higher_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let mut growing = Growing::new();
+    let provider = growing.provider(Grow::OnRequest);
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial_options(&dir.path().join("state")))
+            .unwrap();
+    let mut files = Vec::new();
+    assert!(matches!(drive(&mut session, &mut files, 100_000), Some(Ok(()))));
+    // Volume 5 was requested once, under the five-volume declaration, which it then extended.
+    assert_eq!(*growing.requests.lock().unwrap(), (0..10).collect::<Vec<_>>());
+    assert_eq!(growing.declared.lock().unwrap().epoch, 2);
+    fill_and_verify(&growing.fixture, &dest, &mut files);
+}
+
+#[test]
+fn a_request_for_an_undeclared_volume_waits_until_the_declaration_names_it() {
+    for grow in [Grow::Wait, Grow::ReadyFirst] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let mut growing = Growing::new();
+        let provider = growing.provider(grow);
+        let mut session = ProgressiveSession::new_partial(
+            Box::new(provider),
+            options(&dest),
+            partial_options(&dir.path().join("state")),
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        // The session reaches volume 5 and waits there without failing, however often it is polled.
+        assert!(drive(&mut session, &mut files, 20_000).is_none(), "the session must wait, not end");
+        assert_eq!(growing.requests.lock().unwrap().last(), Some(&5));
+        let requests = growing.requests.lock().unwrap().len();
+        assert!(drive(&mut session, &mut files, 1000).is_none());
+        assert_eq!(growing.requests.lock().unwrap().len(), requests, "a parked request is not asked again unwoken");
+        assert_eq!(files.len(), 1, "only a.bin, on volumes 0-4, has started");
+        // A wake without a larger declaration keeps it waiting.
+        growing.waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
+        assert!(drive(&mut session, &mut files, 1000).is_none());
+        if grow == Grow::Wait {
+            assert_eq!(growing.requests.lock().unwrap().len(), requests + 1, "the woken request is asked again");
+        } else {
+            assert_eq!(growing.requests.lock().unwrap().len(), requests, "the held source is not asked for again");
+        }
+        {
+            let mut declared = growing.declared.lock().unwrap();
+            declared.epoch = 2;
+            declared.count = 10;
+        }
+        growing.waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
+        assert!(matches!(drive(&mut session, &mut files, 100_000), Some(Ok(()))));
+        fill_and_verify(&growing.fixture, &dest, &mut files);
+    }
+}
+
+#[test]
+fn an_extension_that_changes_or_shrinks_the_declaration_is_refused() {
+    type Change = fn(&mut Declared);
+    let changes: [(&str, Change); 4] = [
+        ("renamed volume", |d| {
+            d.epoch += 1;
+            d.count = 10;
+            d.names[2] = "renamed.part03.rar".into();
+        }),
+        ("same epoch", |d| d.count = 10),
+        ("lower epoch", |d| {
+            d.epoch -= 1;
+            d.count = 10;
+        }),
+        ("shrunk", |d| {
+            d.epoch += 1;
+            d.count = 4;
+        }),
+    ];
+    for (what, change) in changes {
+        let dir = tempfile::tempdir().unwrap();
+        let mut growing = Growing::new();
+        let provider = growing.provider_with(Grow::OnRequest, change);
+        let mut session = ProgressiveSession::new_partial(
+            Box::new(provider),
+            options(&dir.path().join("out")),
+            partial_options(&dir.path().join("state")),
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        let Some(Err(failure)) = drive(&mut session, &mut files, 100_000) else { panic!("{what}: must be refused") };
+        assert!(matches!(failure.kind, FailureKind::SourceChanged), "{what}: {failure:?}");
+        // The member created under the first declaration keeps working.
+        let (_, a) = &mut files[0];
+        a.fill(1300, &growing.fixture.data[0][1300..2000]).unwrap();
+        assert!(matches!(verify(a), Verdict::Ok { .. }), "{what}");
+    }
+}
+
+#[test]
+fn an_extension_may_not_declare_an_existing_partial_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let output = std::path::absolute(dest.join("a.bin")).unwrap();
+    let mut growing = Growing::new();
+    let provider = growing.provider_with(Grow::OnRequest, move |d| {
+        d.epoch += 1;
+        d.count = 10;
+        d.auxiliary.push(ProtectedPath { path: output, file: None });
+    });
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial_options(&dir.path().join("state")))
+            .unwrap();
+    let mut files = Vec::new();
+    let Some(Err(failure)) = drive(&mut session, &mut files, 100_000) else {
+        panic!("an output alias must be refused")
+    };
+    assert!(matches!(failure.kind, FailureKind::UnsafePath), "{failure:?}");
+    assert_eq!(files.len(), 1);
+}
+
+#[test]
+fn members_reopen_and_repair_under_the_extended_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let state_root = dir.path().join("state");
+    let mut growing = Growing::new();
+    let volumes = volume_bytes(&growing.fixture);
+    let anchors = Arc::new(Anchors::default());
+    let mut partial = partial_options(&state_root);
+    partial.anchors = anchors.clone();
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(growing.provider(Grow::OnRequest)), options(&dest), partial).unwrap();
+    let mut files = Vec::new();
+    assert!(matches!(drive(&mut session, &mut files, 100_000), Some(Ok(()))));
+    // a.bin was created under the five-volume declaration, b.bin under the extended one; both stay live in the
+    // session after the extension.
+    let p6 = growing.fixture.payloads[6].start;
+    let receipt = session.declare_hole(6, p6..p6 + 100).unwrap();
+    assert_eq!(receipt.holes.len(), 1);
+    drop(session);
+    let extended = growing.extended();
+    let mut reopened = Vec::new();
+    for (key, file) in files {
+        let state = partial_state::roundtrip(&file.close().unwrap());
+        let expected_anchor = anchors.current(&key).unwrap().unwrap();
+        let file = PartialFile::open(
+            state,
+            PartialOpenContext {
+                output_root: dest.clone(),
+                state_root: state_root.clone(),
+                expected_member: key.clone(),
+                expected_anchor,
+                protection: extended.clone(),
+                limits: PartialLimits::default(),
+                progressive_limits: ProgressiveLimits::default(),
+                anchors: anchors.clone(),
+                control: SessionControl::default(),
+                password: None,
+            },
+        )
+        .unwrap();
+        reopened.push((key, file));
+    }
+    let (_, b) = &mut reopened[1];
+    assert_eq!(b.remaining().unwrap(), vec![1400..1500, 3500..4200]);
+    // b.bin's declared damage on volume 6 comes back from archive bytes; its missing article from plaintext.
+    let packed = b.fill_packed(6, 0, &volumes[6]).unwrap();
+    assert_eq!(packed.applied, vec![1400..1500]);
+    fill_and_verify(&growing.fixture, &dest, &mut reopened);
+}
+
+#[test]
+fn a_frozen_declaration_is_unchanged_outside_persistent_sessions() {
+    // An ordinary session keeps today's contract: a Complete declaration never grows, and a volume it does not
+    // name is a contract failure.
+    let dir = tempfile::tempdir().unwrap();
+    let mut growing = Growing::new();
+    let mut session =
+        ProgressiveSession::new(Box::new(growing.provider(Grow::OnRequest)), options(&dir.path().join("out"))).unwrap();
+    let failure = loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) | Poll::Ready(Err(failure)) => {
+                break failure;
+            }
+            Poll::Ready(Ok(None)) => panic!("an undeclared volume must not be admitted"),
+            _ => {}
+        }
+    };
+    assert!(matches!(failure.kind, FailureKind::SourceContract), "{failure:?}");
+    assert_eq!(growing.requests.lock().unwrap().last(), Some(&5));
+}
+
+#[test]
+fn appended_native_paths_bind_beside_the_old_ones_and_protect_later_outputs() {
+    // Old bindings keep their identities when appended paths sort before them: the set completes.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let inputs = std::path::absolute(dir.path().join("inputs")).unwrap();
+    fs::create_dir(&inputs).unwrap();
+    // Existing native paths are declared with their open handles.
+    let held = |name: &str| {
+        let path = inputs.join(name);
+        fs::write(&path, name).unwrap();
+        ProtectedPath { file: Some(Arc::new(File::open(&path).unwrap())), path }
+    };
+    let mut growing = Growing::new();
+    growing.declared.lock().unwrap().auxiliary.push(held("m-aux"));
+    let first = held("a-aux");
+    let volumes: Vec<_> = (5..10).map(|index| held(&format!("v{index}"))).collect();
+    let provider = growing.provider_with(Grow::OnRequest, move |d| {
+        d.epoch += 1;
+        d.count = 10;
+        d.auxiliary.insert(0, first);
+        for (index, path) in (5..10).zip(volumes) {
+            d.native[index] = Some(path);
+        }
+    });
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial_options(&dir.path().join("state")))
+            .unwrap();
+    let mut files = Vec::new();
+    assert!(matches!(drive(&mut session, &mut files, 100_000), Some(Ok(()))));
+    fill_and_verify(&growing.fixture, &dest, &mut files);
+
+    // An appended native path is protected like a first-epoch one: b.bin may not be created over it.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let target = std::path::absolute(dest.join("b.bin")).unwrap();
+    let mut growing = Growing::new();
+    let provider = growing.provider_with(Grow::OnRequest, move |d| {
+        d.epoch += 1;
+        d.count = 10;
+        d.native[6] = Some(ProtectedPath { path: target, file: None });
+    });
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial_options(&dir.path().join("state")))
+            .unwrap();
+    let mut files = Vec::new();
+    let Some(Err(failure)) = drive(&mut session, &mut files, 100_000) else { panic!("b.bin must be refused") };
+    // Refused while preparing b.bin's genesis, so the guard's failure arrives inside the partial error.
+    assert!(
+        matches!(&failure.kind, FailureKind::Partial(e)
+            if matches!(&e.kind, PartialErrorKind::Progressive(e) if matches!(e.kind, FailureKind::UnsafePath))),
+        "{failure:?}"
+    );
+    assert_eq!(files.len(), 1);
+    assert!(!dest.join("b.bin").exists());
+}
+
+#[test]
+fn a_persistent_provider_that_does_not_opt_in_keeps_a_frozen_declaration() {
+    // Without `extends_protection`, a persistent session keeps the frozen contract exactly: an undeclared volume
+    // answered Ready fails at once instead of being held, and an extension is not accepted.
+    for grow in [Grow::OnRequest, Grow::ReadyFirst] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut growing = Growing::new();
+        let mut provider = growing.provider(grow);
+        provider.extends = false;
+        let mut session = ProgressiveSession::new_partial(
+            Box::new(provider),
+            options(&dir.path().join("out")),
+            partial_options(&dir.path().join("state")),
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        let Some(Err(failure)) = drive(&mut session, &mut files, 100_000) else {
+            panic!("{grow:?}: an undeclared volume must fail, not wait")
+        };
+        assert!(matches!(failure.kind, FailureKind::SourceContract), "{grow:?}: {failure:?}");
+        assert_eq!(growing.requests.lock().unwrap().last(), Some(&5));
+        assert_eq!(files.len(), 1);
+    }
+}
+
+/// Declares every volume at epoch 1. Once volume 5 is requested, the `at`th declaration read after it grows to
+/// epoch 2 and declares `auxiliary`.
+struct LateAuxiliary {
+    inner: Provider,
+    declared: Declared,
+    auxiliary: Option<ProtectedPath>,
+    at: usize,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    armed: bool,
+}
+impl VolumeSource for LateAuxiliary {
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        if self.armed && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.at {
+            self.declared.epoch = 2;
+            self.declared.auxiliary.push(self.auxiliary.take().unwrap());
+        }
+        Ok(self.declared.declaration())
+    }
+    fn extends_protection(&self) -> bool {
+        true
+    }
+    fn volume(&mut self, request: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        self.armed |= request.index == 5;
+        self.inner.volume(request, cx)
+    }
+}
+
+#[test]
+fn an_extension_while_a_member_is_created_cannot_declare_its_output() {
+    // Whichever declaration read the extension lands on, b.bin is never handed out live at a path a declaration
+    // already named when it was created: either its creation is refused, or the extension comes after it and is
+    // refused itself.
+    let mut refused_creation = false;
+    for at in 1.. {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let mut fixture = Fixture::new();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = LateAuxiliary {
+            inner: fixture.provider(),
+            declared: Declared {
+                epoch: 1,
+                count: 10,
+                names: (0..10).map(volume_name).collect(),
+                native: vec![None; 10],
+                auxiliary: Vec::new(),
+            },
+            auxiliary: Some(ProtectedPath { path: std::path::absolute(dest.join("b.bin")).unwrap(), file: None }),
+            at,
+            reads: reads.clone(),
+            armed: false,
+        };
+        let mut session = ProgressiveSession::new_partial(
+            Box::new(provider),
+            options(&dest),
+            partial_options(&dir.path().join("state")),
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        let mut ready_at = None;
+        let failure = loop {
+            match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                    if !files.is_empty() {
+                        ready_at = Some(reads.load(std::sync::atomic::Ordering::SeqCst));
+                    }
+                    files.push((member.clone(), session.partial_file(&member).unwrap()));
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. })))
+                | Poll::Ready(Err(failure)) => break Some(failure),
+                Poll::Ready(Ok(None)) => break None,
+                _ => {}
+            }
+        };
+        let Some(failure) = failure else {
+            // Fewer than `at` reads followed volume 5's request, so the extension never landed: every read is done.
+            assert!(reads.load(std::sync::atomic::Ordering::SeqCst) < at, "at {at}: the extension must be refused");
+            assert!(at > 1);
+            break;
+        };
+        let unsafe_path = matches!(&failure.kind, FailureKind::UnsafePath)
+            || matches!(&failure.kind, FailureKind::Partial(e)
+                if matches!(&e.kind, PartialErrorKind::Progressive(e) if matches!(e.kind, FailureKind::UnsafePath)));
+        match ready_at {
+            Some(reads) => assert!(reads < at, "at {at}: b.bin was handed out after read {at} declared it"),
+            None => {
+                refused_creation = true;
+                assert_eq!(files.len(), 1, "at {at}");
+            }
+        }
+        assert!(unsafe_path, "at {at}: {failure:?}");
+    }
+    assert!(refused_creation, "some read must land while b.bin is being created");
+}
+
+#[test]
+fn an_extension_may_not_declare_a_state_bundle_through_a_symlinked_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&state, &alias).unwrap();
+    let mut growing = Growing::new();
+    let state_dir = state.clone();
+    let provider = growing.provider_with(Grow::OnRequest, move |d| {
+        // a.bin's bundle exists by now; name a file inside it through the alias.
+        let bundle = fs::read_dir(&state_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| entry.file_type().unwrap().is_dir())
+            .expect("a.bin's state bundle")
+            .file_name();
+        d.epoch += 1;
+        d.count = 10;
+        d.auxiliary
+            .push(ProtectedPath { path: std::path::absolute(alias.join(bundle).join("journal")).unwrap(), file: None });
+    });
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), options(&dir.path().join("out")), partial_options(&state))
+            .unwrap();
+    let mut files = Vec::new();
+    let Some(Err(failure)) = drive(&mut session, &mut files, 100_000) else { panic!("a bundle alias must be refused") };
+    assert!(matches!(failure.kind, FailureKind::UnsafePath), "{failure:?}");
+    assert_eq!(files.len(), 1);
+}
+
+#[test]
+fn an_unrelated_extension_while_a_member_is_created_is_accepted() {
+    // Creation prepares again under the grown declaration instead of failing, wherever the extension lands.
+    for at in 1..=12 {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let mut fixture = Fixture::new();
+        let provider = LateAuxiliary {
+            inner: fixture.provider(),
+            declared: Declared {
+                epoch: 1,
+                count: 10,
+                names: (0..10).map(volume_name).collect(),
+                native: vec![None; 10],
+                auxiliary: Vec::new(),
+            },
+            auxiliary: Some(ProtectedPath {
+                path: std::path::absolute(dir.path().join("elsewhere.par2")).unwrap(),
+                file: None,
+            }),
+            at,
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            armed: false,
+        };
+        let mut session = ProgressiveSession::new_partial(
+            Box::new(provider),
+            options(&dest),
+            partial_options(&dir.path().join("state")),
+        )
+        .unwrap();
+        let mut files = Vec::new();
+        assert!(matches!(drive(&mut session, &mut files, 100_000), Some(Ok(()))), "at {at}");
+        fill_and_verify(&fixture, &dest, &mut files);
+    }
+}

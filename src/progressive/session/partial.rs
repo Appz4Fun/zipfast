@@ -316,14 +316,14 @@ impl ProgressiveSession {
                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?,
             expected: self.expected.clone(),
         };
-        let spec = CreateSpec {
+        let mut spec = CreateSpec {
             member: key.clone(),
             name: Arc::from(header.name.as_bytes()),
             output_root: self.options.extract.dest.clone(),
             state_root: persistent.options.state_dir.clone(),
             relative_output: relative,
             size: header.unpacked_size,
-            protection: self.driver.partial_catalogue()?,
+            protection: crate::progressive::ProtectionDeclaration::Opaque,
             evidence: InitialEvidence {
                 format,
                 metadata: crate::extract::Meta::from(header),
@@ -334,27 +334,56 @@ impl ProgressiveSession {
         };
         self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<(MemberKey, Arc<PartialCore>)>() as u64)?;
         persistent.cores.try_reserve_exact(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
-        let mut prepared = PartialCore::prepare_create(
-            spec,
-            checks,
-            CoreOptions {
-                limits: persistent.options.limits.clone(),
-                usage: self.usage.clone(),
-                read_chunk: self.options.limits.read_chunk,
-                anchors: persistent.options.anchors.clone(),
-                control: persistent.options.control.clone(),
-                exclusions: persistent.exclusions.clone(),
-            },
-        )
-        .map_err(failure)?;
-        if let Some(keys) = keys {
-            prepared.set_keys(keys);
-        }
-        prepared.reserve_ready_state().map_err(failure)?;
-        let parents = prepared
-            .prepare_parents(|path| self.driver.check_partial_target(path).map_err(Into::into))
+        // The output and bundle are checked against a snapshot of the declaration, but the parent checks read it
+        // again and an extension may land meanwhile. Their exclusions are registered only by the genesis, so the
+        // extension's own check cannot see them: after the parents, and before any name is created, both are
+        // checked against the current declaration, and creation is prepared again if it grew.
+        let mut attempts = 0;
+        let (prepared, _parents) = loop {
+            spec.protection = self.driver.partial_catalogue()?;
+            let epoch = self.driver.protection_epoch();
+            let mut prepared = PartialCore::prepare_create(
+                spec.clone(),
+                checks.clone(),
+                CoreOptions {
+                    limits: persistent.options.limits.clone(),
+                    usage: self.usage.clone(),
+                    read_chunk: self.options.limits.read_chunk,
+                    anchors: persistent.options.anchors.clone(),
+                    control: persistent.options.control.clone(),
+                    exclusions: persistent.exclusions.clone(),
+                },
+            )
             .map_err(failure)?;
-        parents.check().map_err(failure)?;
+            if let Some(keys) = &keys {
+                prepared.set_keys(keys.clone());
+            }
+            prepared.reserve_ready_state().map_err(failure)?;
+            let mut grew = false;
+            let driver = &mut self.driver;
+            let parents = prepared.prepare_parents(|path| {
+                match path {
+                    GenesisPath::Parent(path) | GenesisPath::Output(path) => driver.check_partial_target(path)?,
+                    GenesisPath::Bundle(path) => {
+                        driver.check_partial_subtree(path)?;
+                        // The last provider callback before the genesis creates a name.
+                        if driver.protection_epoch() != epoch {
+                            grew = true;
+                            return Err(ProgressiveFailure::new(FailureKind::SourceChanged).into());
+                        }
+                    }
+                }
+                Ok(())
+            });
+            match parents {
+                Ok(parents) => {
+                    parents.check().map_err(failure)?;
+                    break (prepared, parents);
+                }
+                Err(_) if grew && attempts < 3 => attempts += 1,
+                Err(e) => return Err(failure(e)),
+            }
+        };
         let (core, state, event_lease) = prepared.complete_ready().map_err(failure)?;
         persistent.current = Some(persistent.cores.len());
         persistent.cores.push((key.clone(), core));

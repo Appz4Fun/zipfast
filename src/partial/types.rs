@@ -303,6 +303,7 @@ pub(crate) struct InitialEvidence {
     pub admissions: Vec<SourceAdmission>,
     pub headers: Vec<HeaderWitness>,
 }
+#[derive(Clone)]
 pub(crate) struct CreateSpec {
     pub member: MemberKey,
     pub name: Arc<[u8]>,
