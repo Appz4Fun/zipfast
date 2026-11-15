@@ -10,6 +10,14 @@
 
 **Spec:** [Persistent Stored holes design](../specs/2026-11-14-persistent-stored-holes-design.md). This H2 plan makes its plain-Store increment concrete; all later requirements remain required.
 
+## Execution status — 2026-11-15T04:51:14.508174+00:00
+
+Task 1 (H2-A) is privately reviewed and closed at `8106d3ff065dfcdc8298fd5588904c1cac6998dd`: original review's three Important findings fixed in round 1 and SAME scoped review three addressed/zero open. Final focused feature tests42/42, default output45/45 and integration2/2, fmt pass. Exact reviewed core was cleanly integrated with qualified public PR104 main `042aea4f8643419193f59a05b14cadd3d8650454` at merge `5ef870948c10a0d9b2dd60c6654132667e7eefb9`; joint feature42/42 passes without warnings. Source/receipt paths are in the SDD Task1 report and root final receipt. No full H2/public/platform claim follows.
+
+Task 2 is next; its finite lease records the final implementation BASE (including this documentation-only status update). Initial H2 Task1 BASE was725471a, while later task BASEs contain the reviewed preceding implementation. Public algorithm baseline0030 below remains historical; API additions are now qualified at042. The frozen contracts and future all-nine/R1/full-compatibility scope remain unchanged.
+
+Deferred Minor for final whole-branch review: whether predictable `SourceBookkeeping` work in exclusion reservation also needs genesis pre-admission. This is visible followup, not an unresolved blocker in the reviewed three-resource fix. Do not silently discard it or broaden the closed Task1 fix round. Tasks2/3 and final feature/default/platform gates remain required.
+
 ## Global Constraints
 
 - Rust 1.100.0; private offline Cargo/target directories; jobs 3; no global cache mutation.
