@@ -36,6 +36,7 @@ mod output;
 #[cfg(feature = "persistent-partials")]
 pub mod partial;
 pub mod path;
+pub mod probe;
 pub mod progressive;
 pub mod rar5;
 pub mod stream;

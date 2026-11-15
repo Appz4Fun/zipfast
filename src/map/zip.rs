@@ -61,7 +61,7 @@ fn malformed(reason: &'static str) -> MapError {
 }
 
 /// Directory parser limits within the caller's budgets.
-fn zip_limits(limits: &ProgressiveLimits) -> Limits {
+pub(crate) fn zip_limits(limits: &ProgressiveLimits) -> Limits {
     let default = Limits::default();
     Limits {
         directory_bytes: default.directory_bytes.min(limits.header_bytes),

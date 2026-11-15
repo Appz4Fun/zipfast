@@ -35,6 +35,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   RAR 5.0 and RAR 4.x AES and WinZip AES members stream their plaintext suffix from the packed bytes that offset
   needs, checking the parts they cover, for example to finish a partial output from another copy; see
   [extract-member-from](docs/extract-member-from.md).
+- Probing (`zipfast::probe`): from a file's first bytes (one Usenet article) and optionally its last, tells bare
+  media (mkv, webm, mp4, mov, avi, MPEG-TS, M2TS, ASF, MPEG-PS) from RAR4, RAR 5.0 and ZIP, picks the first media
+  member, says whether it is stored, compressed, data-encrypted or behind encrypted headers, and whether its bytes
+  can be borrowed; see [probing](docs/probe.md).
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 

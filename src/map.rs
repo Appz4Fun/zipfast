@@ -35,7 +35,7 @@
 //! `docs/extract-member-from.md`.
 
 mod member_reader;
-mod zip;
+pub(crate) mod zip;
 
 pub use member_reader::{
     ExtractFromError, ExtractedFrom, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
