@@ -600,7 +600,7 @@ impl ProgressiveSession {
                         }
                         Poll::Ready(Err(e)) => return Err(e),
                         Poll::Ready(Ok(SourceStep::VolumeOpened { index, id })) => {
-                            self.driver.validate_current()?;
+                            self.driver.validate_step()?;
                             return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index, id }))));
                         }
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
@@ -627,7 +627,7 @@ impl ProgressiveSession {
                             if used != count {
                                 return Err(ProgressiveFailure::new(FailureKind::SourceContract));
                             }
-                            self.driver.validate_current()?;
+                            self.driver.validate_step()?;
                             if let ParserStep::Frame(frame) = step {
                                 #[cfg(feature = "persistent-partials")]
                                 if let Some(partial) = &mut self.partial {
@@ -717,7 +717,7 @@ impl ProgressiveSession {
                                     return Err(e);
                                 }
                                 result?;
-                                self.driver.validate_current()?;
+                                self.driver.validate_step()?;
                                 continue;
                             }
                             let mut failure = ProgressiveFailure::new(FailureKind::DataHole);
@@ -783,7 +783,7 @@ impl ProgressiveSession {
                             if let Err(error) = result {
                                 return self.member_error(error).map(|e| Poll::Ready(Ok(Some(e))));
                             }
-                            self.driver.validate_current()?;
+                            self.driver.validate_step()?;
                             if self.stage.as_ref().is_some_and(|s| s.valid > before) {
                                 return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
                                     member: self.member.expect("member"),

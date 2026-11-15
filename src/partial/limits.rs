@@ -15,7 +15,7 @@
 // rights and limitations under the RPL.
 
 use super::*;
-use crate::progressive::{Resource, Usage};
+use crate::progressive::{Lease, Resource, Usage};
 use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -276,6 +276,25 @@ impl PartialBudget {
     }
     pub(super) fn metadata(&self, bytes: u64) -> PartialResult<()> {
         self.creation_charge(Resource::MetadataBytes, bytes)
+    }
+    /// [`Self::metadata`] for memory freed when the returned lease drops.
+    /// Prepaid genesis credits are consumed first, exactly as there.
+    pub(super) fn metadata_lease(&self, bytes: u64) -> PartialResult<Lease> {
+        let mut remaining = bytes;
+        if let Some(credits) = self.genesis.lock().unwrap().as_mut().and_then(|g| g.remaining.as_mut()) {
+            let prepaid = credits[0].min(bytes);
+            credits[0] -= prepaid;
+            remaining -= prepaid;
+        }
+        Ok(self.usage.lease(Resource::MetadataBytes, remaining)?)
+    }
+    /// [`Self::vector`] whose charge lasts only as long as the returned lease.
+    pub(super) fn leased_vector<T>(&self, count: usize) -> PartialResult<(Vec<T>, Lease)> {
+        let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(malformed)?;
+        let lease = self.metadata_lease(bytes as u64)?;
+        let mut v = Vec::new();
+        v.try_reserve_exact(count).map_err(|_| malformed())?;
+        Ok((v, lease))
     }
     pub(super) fn vector<T>(&self, count: usize) -> PartialResult<Vec<T>> {
         let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(malformed)?;

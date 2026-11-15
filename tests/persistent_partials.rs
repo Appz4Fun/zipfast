@@ -3622,3 +3622,79 @@ fn an_unrelated_extension_while_a_member_is_created_is_accepted() {
         fill_and_verify(&fixture, &dest, &mut files);
     }
 }
+
+/// One stored member over `volumes` in-memory volumes, declared Complete NonFile.
+struct Spanning {
+    volumes: Vec<Option<Vec<u8>>>,
+}
+struct SpanningSource {
+    index: u32,
+    bytes: Vec<u8>,
+}
+impl RangeSource for SpanningSource {
+    fn info(&self) -> SourceInfo {
+        SourceInfo {
+            id: SourceId(self.index as u128 + 1),
+            generation: 0,
+            extent: self.bytes.len() as u64,
+            length: SourceLength::Final(self.bytes.len() as u64),
+        }
+    }
+    fn backing_files(&self) -> &[File] {
+        &[]
+    }
+    fn read_at(&mut self, at: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        let end = (at as usize + buf.len()).min(self.bytes.len());
+        buf[..end - at as usize].copy_from_slice(&self.bytes[at as usize..end]);
+        Ok(RangeRead::Filled { count: end - at as usize })
+    }
+}
+impl VolumeSource for Spanning {
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        Ok(ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory {
+                volumes: (0..self.volumes.len() as u32)
+                    .map(|index| ProtectedVolume { index, name: volume_name(index), backing: VolumeBacking::NonFile })
+                    .collect(),
+                auxiliary_paths: Vec::new(),
+            },
+        })
+    }
+    fn volume(&mut self, request: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        assert_eq!(request.expected, volume_name(request.index));
+        let bytes = self.volumes[request.index as usize].take().expect("each volume is opened once");
+        Ok(VolumeAnswer::Ready(Box::new(SpanningSource { index: request.index, bytes })))
+    }
+}
+#[test]
+fn long_persistent_extraction_fits_default_limits() {
+    // Every write commits a state transaction. Scratch copies of the state and
+    // ledger, the overlap compare buffer, journal file names and exclusions
+    // used to be charged for good, and each new part re-combined every earlier
+    // part's CRC, so MetadataBytes, ProtectionPathBytes (hard 1 MiB cap) and
+    // VerifyWorkBytes grew with commits until a long member failed. Small
+    // chunks make this run commit about 640 times, well past the old
+    // ProtectionPathBytes failure (about 450 commits), with default limits.
+    const CHUNK: usize = 4096;
+    let data: Vec<u8> = (0..5 << 19).map(|i: usize| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let volumes = common::volumes(&common::FileSpec::new("big.bin", &data), data.len() / 8);
+    assert_eq!(volumes.len(), 8);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let mut opts = options(&dest);
+    opts.limits.read_chunk = CHUNK as u64;
+    let mut partial = partial_options(&dir.path().join("state"));
+    partial.limits.fill_bytes = CHUNK as u32;
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(Spanning { volumes: volumes.into_iter().map(Some).collect() }),
+        opts,
+        partial,
+    )
+    .unwrap();
+    let (holes, mut files) = run_to_end(&mut session);
+    assert!(holes.is_empty());
+    assert_eq!(files.len(), 1);
+    assert!(matches!(verify(&mut files[0]), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dest.join("big.bin")).unwrap(), data);
+}

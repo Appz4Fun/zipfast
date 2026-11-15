@@ -188,13 +188,16 @@ fn part_snapshots_are_revision_bound_and_bounded() {
         );
         assert_eq!(std::mem::discriminant(&first), std::mem::discriminant(&second));
         for exact in [false, true] {
+            // Scratch charges are leased and released, so setup may peak above
+            // its net usage; tighten the budget only for the verification step.
             let f = Fixture::new(33, true, true, false);
-            let progressive =
-                ProgressiveLimits { metadata_bytes: after - u64::from(!exact), ..ProgressiveLimits::default() };
-            let mut file = f.create_with(PartialLimits::default(), progressive).unwrap();
+            let mut file = f.create_with(PartialLimits::default(), ProgressiveLimits::default()).unwrap();
             f.hole(&file, 0..33);
             f.finish_missing_member(&file);
             file.fill(0, if incomplete { &f.data[..17] } else { &f.data }).unwrap();
+            let start = used(&file.core.budget.usage, Resource::MetadataBytes, cap);
+            assert_eq!(start, before);
+            file.core.budget.usage.set_limit_for_test(Resource::MetadataBytes, after - u64::from(!exact));
             let waker = Waker::noop();
             let mut cx = Context::from_waker(waker);
             let Poll::Ready(result) = file.poll_verify(&mut cx) else { panic!("CRC is immediate") };
@@ -255,7 +258,8 @@ fn crc_combine_and_targeted_readback_report_actual_work() {
         assert_eq!(path, if targeted { VerifyPath::TargetedReadback } else { VerifyPath::ExtentCombine });
         assert_eq!(parts[1].blake2sp, CheckResult::Missing);
         let cap = ProgressiveLimits::default().verify_work_bytes;
-        assert_eq!(used(&file.core.budget.usage, Resource::VerifyWorkBytes, cap), 116 + if targeted { 17 } else { 0 });
+        // 33 hashed into leaves, 17 for part 0, 33 for the final part; the member CRC reuses the final part.
+        assert_eq!(used(&file.core.budget.usage, Resource::VerifyWorkBytes, cap), 83 + if targeted { 17 } else { 0 });
         if targeted {
             assert_eq!(
                 used(&file.core.budget.usage, Resource::VerifyBytes, ProgressiveLimits::default().verify_bytes),
@@ -314,4 +318,70 @@ fn retained_part_storage_counts_against_ledger_bytes() {
             ));
         }
     }
+}
+#[test]
+fn per_write_scratch_is_released_and_part_checks_are_reused() {
+    // Every original write commits a transaction. Its scratch (compare buffer,
+    // state and ledger copies, encoded pages, journal names and exclusions)
+    // must be released, and part CRCs combined once, or a long member runs out
+    // of MetadataBytes, ProtectionPathBytes or VerifyWorkBytes.
+    use crate::progressive::Resource;
+    const CHUNK: usize = 4096;
+    let f = Fixture::new(168 * CHUNK, true, true, false);
+    let file = f.create();
+    let usage = &file.core.budget.usage;
+    let defaults = ProgressiveLimits::default();
+    let snapshot = |usage: &crate::progressive::Usage| {
+        [
+            used(usage, Resource::MetadataBytes, defaults.metadata_bytes),
+            used(usage, Resource::ProtectionPathBytes, defaults.protection_path_bytes),
+            used(usage, Resource::VerifyWorkBytes, defaults.verify_work_bytes),
+        ]
+    };
+    let mut at = 0;
+    for _ in 0..8 {
+        file.core.write_original(at as u64, &f.data[at..at + CHUNK]).unwrap();
+        at += CHUNK;
+    }
+    let early = snapshot(usage);
+    while at < f.data.len() {
+        file.core.write_original(at as u64, &f.data[at..at + CHUNK]).unwrap();
+        at += CHUNK;
+    }
+    let late = snapshot(usage);
+    let writes = (f.data.len() / CHUNK - 8) as u64;
+    // What stays is the ledger (one leaf per 64 KiB) plus journal files and
+    // their exclusions until the next compaction: bounded, unlike the old
+    // charges of at least one compare buffer per write.
+    assert!(writes * CHUNK as u64 > 600 << 10);
+    assert!(late[0] - early[0] < 256 << 10, "MetadataBytes grew {} over {writes} writes", late[0] - early[0]);
+    // Journal files come and go with compaction; their exclusions go with them.
+    assert!(late[1] - early[1] < 128 << 10, "ProtectionPathBytes grew {}", late[1] - early[1]);
+    // Hash each byte into a leaf, combine part 0 once and the final part once.
+    assert!(late[2] <= 3 * f.data.len() as u64, "VerifyWorkBytes {}", late[2]);
+}
+
+// Catches the member CRC being taken from a final-part check that never ran (encrypted parts are not checked
+// on plaintext), which let corrupt output of an encrypted member without tweaked CRCs verify.
+#[test]
+fn encrypted_member_crc_is_not_taken_from_an_unrun_part_check() {
+    let f = Fixture::new(33, false, true, false);
+    let mut file = f.create();
+    f.hole(&file, 0..33);
+    f.finish_missing_member(&file);
+    let mut data = f.data.clone();
+    data[20] ^= 1;
+    file.fill(0, &data).unwrap();
+    let op = file.core.operation().unwrap();
+    let (mut snapshot, _lease) = file.core.clone_snapshot(&op.snapshot).unwrap();
+    drop(op);
+    snapshot.crypt = Some(crate::crypto::Rar5CryptParams {
+        kdf_count: 1,
+        salt: [0; 16],
+        iv: [0; 16],
+        check: None,
+        tweaked_crc: false,
+    });
+    let checks = crate::partial::verify::Verification::new(&snapshot, &file.core.budget, None).unwrap();
+    assert_eq!(checks.member_crc(), &CheckResult::Failed);
 }

@@ -30,6 +30,7 @@ pub(super) struct Verification {
     /// The member checks are keyed but this handle has no password.
     password_required: bool,
     _lease: Reservation,
+    _metadata: crate::progressive::Lease,
 }
 // BLAKE2sp holds eight fixed lanes and a 512-byte round. Reserve a conservative
 // 4096 bytes for those internal allocations before constructing the existing hasher.
@@ -84,10 +85,28 @@ fn crc(
     Ok(if crc == expected { CheckResult::Passed } else { CheckResult::Failed })
 }
 impl Verification {
+    /// Fresh checks, reusing nothing.
+    #[cfg(test)]
+    pub fn new(snapshot: &Snapshot, budget: &PartialBudget, hash_key: Option<&[u8; 32]>) -> PartialResult<Self> {
+        Self::after(Vec::new(), &[], snapshot, budget, hash_key)
+    }
+    /// The checks of `snapshot`, after a write that changed only output `changed`
+    /// (empty when `previous` already matches these known leaves). A part
+    /// CRC result in `previous` (computed for the known leaves before the
+    /// write) whose range lies outside every changed range still holds: it
+    /// depends only on the known leaves inside its range. Each write then
+    /// re-combines only the parts it touched, instead of every part.
+    ///
     /// Encrypted parts carry checks over their ciphertext, keyed with the password: they never check plaintext
     /// output, so they report `Missing`. Keyed member checks need `hash_key`; without it they stay unevaluated and
     /// verification reports [`PartialErrorKind::PasswordRequired`] once nothing else is missing.
-    pub fn new(snapshot: &Snapshot, budget: &PartialBudget, hash_key: Option<&[u8; 32]>) -> PartialResult<Self> {
+    pub fn after(
+        previous: Vec<PartCheck>,
+        changed: &[Range<u64>],
+        snapshot: &Snapshot,
+        budget: &PartialBudget,
+        hash_key: Option<&[u8; 32]>,
+    ) -> PartialResult<Self> {
         let keyed = snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc);
         let password_required = keyed
             && hash_key.is_none()
@@ -101,14 +120,32 @@ impl Verification {
             )
             .ok_or_else(malformed)?;
         let lease = budget.reserve(PartialResource::LedgerBytes, bytes as u64)?;
-        budget.metadata(std::mem::size_of::<Self>() as u64)?;
-        let mut parts = budget.vector(snapshot.evidence.parts.len())?;
-        for part in &snapshot.evidence.parts {
+        // A verification is replaced after every write; charge it while it lives.
+        let mut metadata = budget.metadata_lease(std::mem::size_of::<Self>() as u64)?;
+        let (mut parts, vector) = budget.leased_vector(snapshot.evidence.parts.len())?;
+        metadata.absorb(vector);
+        for (i, part) in snapshot.evidence.parts.iter().enumerate() {
             let range = if part.final_part { 0..snapshot.head.size } else { part.out.clone() };
+            budget.usage.charge(Resource::SourceBookkeeping, 1 + changed.len() as u64)?;
+            let kept = previous
+                .get(i)
+                .filter(|old| {
+                    old.part == part.ordinal
+                        && old.volume == part.packed.volume
+                        && old.range == range
+                        && changed.iter().all(|c| c.end <= range.start || c.start >= range.end)
+                })
+                .map(|old| old.crc32.clone());
             parts.push(PartCheck {
                 volume: part.packed.volume,
                 part: part.ordinal,
-                crc32: if encrypted { CheckResult::Missing } else { crc(snapshot, &range, part.crc32, None, budget)? },
+                crc32: if encrypted {
+                    CheckResult::Missing
+                } else if let Some(kept) = kept {
+                    kept
+                } else {
+                    crc(snapshot, &range, part.crc32, None, budget)?
+                },
                 blake2sp: if part.blake2sp.is_some() && !encrypted {
                     CheckResult::Pending
                 } else {
@@ -117,10 +154,26 @@ impl Verification {
                 range,
             });
         }
+        // An unkeyed final part spanning the whole member with the member's
+        // expected CRC is the same check; reuse its result instead of combining
+        // every leaf a second time.
+        let whole = 0..snapshot.head.size;
+        // Only a part check that actually ran can stand in for the member check: encrypted parts are never
+        // checked on plaintext (their result is Missing), so they must not short-circuit the member CRC.
+        let same = parts.iter().zip(&snapshot.evidence.parts).find(|(check, part)| {
+            part.final_part
+                && key.is_none()
+                && snapshot.crypt.is_none()
+                && matches!(check.crc32, CheckResult::Passed | CheckResult::Failed)
+                && check.range == whole
+                && part.crc32 == snapshot.head.checks.crc32
+        });
         let member_crc = if password_required {
             CheckResult::Missing
+        } else if let Some((check, _)) = same {
+            check.crc32.clone()
         } else {
-            crc(snapshot, &(0..snapshot.head.size), snapshot.head.checks.crc32, key.as_ref(), budget)?
+            crc(snapshot, &whole, snapshot.head.checks.crc32, key.as_ref(), budget)?
         };
         Ok(Self {
             active: None,
@@ -136,7 +189,12 @@ impl Verification {
             key,
             password_required,
             _lease: lease,
+            _metadata: metadata,
         })
+    }
+    #[cfg(test)]
+    pub(super) fn member_crc(&self) -> &CheckResult {
+        &self.member_crc
     }
     pub fn needs_verification(&self) -> bool {
         self.password_required
@@ -244,8 +302,8 @@ impl PartialCore {
         self.check(&op)?;
         self.reconcile(&mut op)?;
         if op.verification.as_ref().is_none_or(|v| v.revision != op.snapshot.head.revision) {
-            op.verification = None;
-            op.verification = Some(Verification::new(&op.snapshot, &self.budget, self.hash_key())?);
+            let previous = self.part_results(&mut op);
+            op.verification = Some(Verification::after(previous, &[], &op.snapshot, &self.budget, self.hash_key())?);
         }
         if let Some(bad) = op.verification.as_ref().unwrap().bad(&op.snapshot) {
             return Ok(Poll::Ready(bad));

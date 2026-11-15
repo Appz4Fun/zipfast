@@ -88,6 +88,41 @@ struct Binding {
 struct ImmutableBinding {
     path: PathBuf,
     stamp: crate::rar5::source::SourceStamp,
+    // Bindings and held handles are append-only and never rebind once set,
+    // so the handle found for this identity stays the same open file.
+    slot: Option<Slot>,
+}
+#[derive(Clone, Copy)]
+enum Slot {
+    Binding(usize),
+    Held(usize),
+}
+/// How much of the protected state a refresh re-proves.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Sweep {
+    /// Every binding, immutable stamp and uncovered admission.
+    Full,
+    /// The newest immutable stamp plus one rotating binding and stamp.
+    Step,
+}
+/// Address and shape of the Complete declaration last fully refreshed.
+/// `SourceDriver` replaces its declaration only after a full refresh of the
+/// replacement, so a stale value only ever forces another full refresh.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Fingerprint {
+    epoch: u64,
+    volumes: (usize, usize),
+    auxiliary: (usize, usize),
+}
+impl Fingerprint {
+    fn of(declaration: &ProtectionDeclaration) -> Option<Self> {
+        let ProtectionDeclaration::Complete { epoch, inventory } = declaration else { return None };
+        Some(Self {
+            epoch: *epoch,
+            volumes: (inventory.volumes.as_ptr() as usize, inventory.volumes.len()),
+            auxiliary: (inventory.auxiliary_paths.as_ptr() as usize, inventory.auxiliary_paths.len()),
+        })
+    }
 }
 // Only a prepared persistent genesis has prepaid work. Legacy drivers and
 // normal later operations retain the original cumulative Usage accounting.
@@ -117,6 +152,15 @@ pub(crate) struct NativeProtection {
     cwd: PathBuf,
     held: Vec<File>,
     immutable: Vec<ImmutableBinding>,
+    // Prefix of `admitted` already proven covered by the Complete declaration.
+    // A covered pair stays covered: the declaration is fixed once Complete
+    // (only absent handles may be added) and descriptor identities never change.
+    covered: usize,
+    // Declaration whose bindings were all observed by the last full refresh.
+    fingerprint: Option<Fingerprint>,
+    // Rotating cursors for step refreshes.
+    next_binding: usize,
+    next_immutable: usize,
 }
 impl NativeProtection {
     #[cfg(feature = "persistent-partials")]
@@ -168,16 +212,23 @@ impl NativeProtection {
             cwd,
             held: Vec::new(),
             immutable: Vec::new(),
+            covered: 0,
+            fingerprint: None,
+            next_binding: 0,
+            next_immutable: 0,
         })
     }
 
+    /// Re-prove every protected fact: each binding's path identity, each
+    /// immutable stamp and coverage of every admission not yet covered.
     pub(crate) fn refresh(
         &mut self,
         declaration: &ProtectionDeclaration,
         usage: &mut Usage,
         external_handles: usize,
     ) -> ProgressiveResult<()> {
-        self.check_immutable(usage)?;
+        self.fingerprint = None;
+        self.check_immutable(usage, Sweep::Full)?;
         let ProtectionDeclaration::Complete { inventory, .. } = declaration else { return Ok(()) };
         bookkeeping!(
             self,
@@ -252,8 +303,50 @@ impl NativeProtection {
         usage.check(Resource::VolumeHandles, (external_handles + self.handle_count()) as u64)?;
         // Every prior native source must be covered by its declared indexed volume,
         // including sources admitted before an Opaque -> Complete upgrade.
-        for &(index, identity) in &self.admitted {
+        for &(index, identity) in &self.admitted[self.covered..] {
             self.covers(index, identity, declaration, usage)?;
+        }
+        self.covered = self.admitted.len();
+        self.fingerprint = Fingerprint::of(declaration);
+        Ok(())
+    }
+    /// Bounded per-step refresh for the declaration last fully refreshed.
+    ///
+    /// Each step re-checks the newest immutable stamp (the volume being read),
+    /// one more stamp and one binding in rotation, so every binding and stamp
+    /// is still re-observed every few steps at a cost independent of the set
+    /// size. Volume admission, publication and every other authority point use
+    /// [`Self::refresh`]; anything else, including a first or changed
+    /// declaration, falls back to it here.
+    pub(crate) fn refresh_step(
+        &mut self,
+        declaration: &ProtectionDeclaration,
+        usage: &mut Usage,
+        external_handles: usize,
+    ) -> ProgressiveResult<()> {
+        let fingerprint = Fingerprint::of(declaration);
+        if fingerprint.is_some() && (!self.complete || self.fingerprint != fingerprint) {
+            return self.refresh(declaration, usage, external_handles);
+        }
+        self.check_immutable(usage, Sweep::Step)?;
+        if fingerprint.is_none() {
+            return Ok(());
+        }
+        // A full refresh of this declaration bound every declared handle and
+        // covered every admission; admit keeps later admissions covered.
+        usage.check(Resource::VolumeHandles, (external_handles + self.handle_count()) as u64)?;
+        if self.covered != self.admitted.len() {
+            return self.refresh(declaration, usage, external_handles);
+        }
+        if self.bindings.is_empty() {
+            return Ok(());
+        }
+        let i = self.next_binding % self.bindings.len();
+        self.next_binding = (i + 1) % self.bindings.len();
+        let binding = &self.bindings[i];
+        bookkeeping!(self, usage, 1 + binding.path.as_os_str().len() as u64)?;
+        if observe(&binding.path, binding.handle.as_deref())? != binding.identity {
+            return Err(changed());
         }
         Ok(())
     }
@@ -267,6 +360,10 @@ impl NativeProtection {
         usage: &mut Usage,
         external_handles: usize,
     ) -> ProgressiveResult<()> {
+        // Extension rebuilds the bindings in canonical order, so cached binding positions may now name other files.
+        for immutable in &mut self.immutable {
+            immutable.slot = None;
+        }
         if !self.complete {
             // Nothing is bound yet; the refresh binds `new` whole.
             return Ok(());
@@ -390,7 +487,14 @@ impl NativeProtection {
                 })?;
                 self.held.push(retained);
             }
+            // Only a Complete declaration proves coverage; an Opaque admission
+            // is covered by the full refresh that upgrades to Complete.
+            let proven =
+                matches!(declaration, ProtectionDeclaration::Complete { .. }) && self.covered == self.admitted.len();
             self.admitted.push((index, id));
+            if proven {
+                self.covered = self.admitted.len();
+            }
         }
         Ok(())
     }
@@ -413,35 +517,66 @@ impl NativeProtection {
             Resource::MetadataBytes,
             (self.immutable.capacity().saturating_sub(old + 1) * std::mem::size_of::<ImmutableBinding>()) as u64,
         )?;
-        self.immutable.push(ImmutableBinding { path: path.to_path_buf(), stamp });
+        self.immutable.push(ImmutableBinding { path: path.to_path_buf(), stamp, slot: None });
         Ok(())
     }
-    fn check_immutable(&self, usage: &Usage) -> ProgressiveResult<()> {
-        for immutable in &self.immutable {
-            usage.charge(
-                Resource::SourceBookkeeping,
-                (self.bindings.len() + self.held.len() + 8 + immutable.path.as_os_str().len()) as u64,
-            )?;
-            let id = Identity(immutable.stamp.device, immutable.stamp.inode);
-            let mut file = self
-                .bindings
-                .iter()
-                .find(|binding| binding.identity == Some(id))
-                .and_then(|binding| binding.handle.as_deref());
-            if file.is_none() {
-                for held in &self.held {
-                    if Identity::file(held).map_err(input)? == id {
-                        file = Some(held);
-                        break;
-                    }
-                }
+    fn check_immutable(&mut self, usage: &Usage, sweep: Sweep) -> ProgressiveResult<()> {
+        let n = self.immutable.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if sweep == Sweep::Full {
+            for i in 0..n {
+                self.check_stamp(i, usage)?;
             }
-            immutable
-                .stamp
-                .check(file.ok_or_else(contract)?, &immutable.path)
-                .map_err(super::super::source::immutable_error)?;
+            return Ok(());
+        }
+        // The newest stamp belongs to the volume being read; rotate the rest.
+        self.check_stamp(n - 1, usage)?;
+        if n > 1 {
+            let i = self.next_immutable % (n - 1);
+            self.next_immutable = (i + 1) % (n - 1);
+            self.check_stamp(i, usage)?;
         }
         Ok(())
+    }
+    fn check_stamp(&mut self, i: usize, usage: &Usage) -> ProgressiveResult<()> {
+        let immutable = &self.immutable[i];
+        let slot = match immutable.slot {
+            Some(slot) => {
+                usage.charge(Resource::SourceBookkeeping, 8 + immutable.path.as_os_str().len() as u64)?;
+                slot
+            }
+            None => {
+                usage.charge(
+                    Resource::SourceBookkeeping,
+                    (self.bindings.len() + self.held.len() + 8 + immutable.path.as_os_str().len()) as u64,
+                )?;
+                let id = Identity(immutable.stamp.device, immutable.stamp.inode);
+                let mut slot = self
+                    .bindings
+                    .iter()
+                    .position(|binding| binding.identity == Some(id) && binding.handle.is_some())
+                    .map(Slot::Binding);
+                if slot.is_none() {
+                    for (h, held) in self.held.iter().enumerate() {
+                        if Identity::file(held).map_err(input)? == id {
+                            slot = Some(Slot::Held(h));
+                            break;
+                        }
+                    }
+                }
+                let slot = slot.ok_or_else(contract)?;
+                self.immutable[i].slot = Some(slot);
+                slot
+            }
+        };
+        let file = match slot {
+            Slot::Binding(b) => self.bindings[b].handle.as_deref().ok_or_else(contract)?,
+            Slot::Held(h) => &self.held[h],
+        };
+        let immutable = &self.immutable[i];
+        immutable.stamp.check(file, &immutable.path).map_err(super::super::source::immutable_error)
     }
     pub(crate) fn resolved_for_publication(&self, usage: &Usage) -> ProgressiveResult<bool> {
         usage.charge(Resource::SourceBookkeeping, self.bindings.len() as u64)?;

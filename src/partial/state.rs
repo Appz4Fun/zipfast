@@ -171,11 +171,32 @@ impl PartialState {
     }
 }
 pub(super) fn read_bounded(file: &std::fs::File, max: usize, budget: &PartialBudget) -> PartialResult<Vec<u8>> {
+    read_bounded_with(file, max, |len| budget.vector(len))
+}
+/// [`read_bounded`] for a transient copy, charged until the returned lease drops.
+pub(super) fn read_bounded_leased(
+    file: &std::fs::File,
+    max: usize,
+    budget: &PartialBudget,
+) -> PartialResult<(Vec<u8>, Lease)> {
+    let mut lease = None;
+    let bytes = read_bounded_with(file, max, |len| {
+        let (bytes, charge) = budget.leased_vector(len)?;
+        lease = Some(charge);
+        Ok(bytes)
+    })?;
+    Ok((bytes, lease.unwrap_or_else(|| Lease::empty(&budget.usage, crate::progressive::Resource::MetadataBytes))))
+}
+fn read_bounded_with(
+    file: &std::fs::File,
+    max: usize,
+    allocate: impl FnOnce(usize) -> PartialResult<Vec<u8>>,
+) -> PartialResult<Vec<u8>> {
     let len = file.metadata().map_err(|e| io_error(crate::progressive::OutputOperation::Metadata, e))?.len();
     if len > max as u64 {
         return Err(limit(PartialResource::StateWire, max as u64, len));
     }
-    let mut bytes = budget.vector(len as usize)?;
+    let mut bytes = allocate(len as usize)?;
     bytes.resize(len as usize, 0);
     let mut at = 0;
     while at < bytes.len() {
@@ -194,14 +215,32 @@ pub(super) fn read_bounded(file: &std::fs::File, max: usize, budget: &PartialBud
 struct Encoder {
     bytes: Vec<u8>,
     max: usize,
-    usage: Option<crate::progressive::Usage>,
+    // The buffer is scratch: its bytes are copied into pages and it is dropped
+    // with the encoder, so its capacity is leased rather than charged for good.
+    usage: Option<(crate::progressive::Usage, Lease)>,
 }
 impl Encoder {
     fn new(max: usize) -> Self {
         Self { bytes: Vec::new(), max, usage: None }
     }
     fn budgeted(max: usize, budget: &PartialBudget) -> Self {
-        Self { bytes: Vec::new(), max, usage: Some(budget.usage.clone()) }
+        let lease = Lease::empty(&budget.usage, crate::progressive::Resource::MetadataBytes);
+        Self { bytes: Vec::new(), max, usage: Some((budget.usage.clone(), lease)) }
+    }
+    /// Reserves room for `n` bytes up front, so encoding a known size moves nothing.
+    fn reserve(&mut self, n: usize) -> PartialResult<()> {
+        let n = n.min(self.max);
+        if self.bytes.capacity() < n {
+            self.grow_to(n)?;
+        }
+        Ok(())
+    }
+    fn grow_to(&mut self, capacity: usize) -> PartialResult<()> {
+        if let Some((usage, lease)) = &mut self.usage {
+            lease.grow((capacity - self.bytes.capacity()) as u64)?;
+            usage.charge(crate::progressive::Resource::SourceBookkeeping, self.bytes.len() as u64)?;
+        }
+        self.bytes.try_reserve_exact(capacity - self.bytes.len()).map_err(|_| malformed())
     }
     fn raw(&mut self, b: &[u8]) -> PartialResult<()> {
         let n = self.bytes.len().checked_add(b.len()).ok_or_else(malformed)?;
@@ -209,12 +248,7 @@ impl Encoder {
             return Err(limit(PartialResource::StateWire, self.max as u64, n as u64));
         }
         if self.bytes.capacity() < n {
-            let capacity = self.bytes.capacity().saturating_mul(2).max(n).min(self.max);
-            if let Some(usage) = &self.usage {
-                usage.charge(crate::progressive::Resource::MetadataBytes, (capacity - self.bytes.capacity()) as u64)?;
-                usage.charge(crate::progressive::Resource::SourceBookkeeping, self.bytes.len() as u64)?;
-            }
-            self.bytes.try_reserve_exact(capacity - self.bytes.len()).map_err(|_| malformed())?;
+            self.grow_to(self.bytes.capacity().saturating_mul(2).max(n).min(self.max))?;
         }
         self.bytes.extend_from_slice(b);
         Ok(())
@@ -500,8 +534,18 @@ pub(super) fn page_payload(kind: PageKind, bytes: &[u8]) -> PartialResult<&[u8]>
     d.end()?;
     Ok(b)
 }
-pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> PartialResult<Vec<(PageKind, Vec<u8>)>> {
+pub(super) type EncodedPages = Vec<(PageKind, Vec<u8>)>;
+/// Encodes the snapshot's ledger pages. The returned lease covers the page
+/// bytes; callers keep it while they hold the pages.
+pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> PartialResult<(EncodedPages, Lease)> {
+    // Every encoder is sized up front from the snapshot (an upper bound of the
+    // fields written below), so encoding moves no bytes as it grows.
     let mut geometry = Encoder::budgeted(budget.limits.ledger_bytes as usize, budget);
+    geometry.reserve(
+        12 + snapshot.name.len()
+            + 83 * snapshot.evidence.parts.len()
+            + snapshot.evidence.admissions.iter().map(|a| 49 + os_bytes(&a.expected).len()).sum::<usize>(),
+    )?;
     geometry.blob(&snapshot.name)?;
     geometry.u32(snapshot.evidence.parts.len().try_into().map_err(|_| malformed())?)?;
     for p in &snapshot.evidence.parts {
@@ -542,6 +586,12 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         extent_count.checked_mul(21).and_then(|n| n.checked_add(8)).ok_or_else(malformed)?,
     )?;
     let mut validity = Encoder::budgeted(budget.limits.ledger_bytes as usize, budget);
+    validity.reserve(
+        (extent_count.saturating_mul(21) as usize)
+            .saturating_add(13)
+            .saturating_add(snapshot.holes.iter().map(|h| 37 + 20 * h.packed.len()).sum::<usize>())
+            .saturating_add(snapshot.cipher.iter().map(|b| 10 + b.bytes.len()).sum::<usize>()),
+    )?;
     validity.u32(extent_count.try_into().map_err(|_| malformed())?)?;
     let mut end = 0;
     for leaf in &snapshot.known {
@@ -599,6 +649,7 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         }
     }
     let mut headers = Encoder::budgeted(budget.limits.ledger_bytes as usize, budget);
+    headers.reserve(5 + snapshot.evidence.headers.iter().map(|h| 28 + h.bytes.len()).sum::<usize>())?;
     headers.u32(snapshot.evidence.headers.len().try_into().map_err(|_| malformed())?)?;
     for h in &snapshot.evidence.headers {
         headers.u32(h.volume)?;
@@ -617,7 +668,7 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         .and_then(|n| n.checked_add(headers.bytes.len()))
         .ok_or_else(malformed)?;
     budget.limits.check(PartialResource::LedgerBytes, total as u64)?;
-    budget.metadata(total as u64)?;
+    let lease = budget.metadata_lease(total as u64)?;
     let mut out = Vec::new();
     for (kind, bytes) in [
         (PageKind::Geometry, geometry.bytes),
@@ -629,7 +680,7 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             out.push((kind, page_bytes(kind, chunk)?));
         }
     }
-    Ok(out)
+    Ok((out, lease))
 }
 pub(super) fn decode_pages(
     head: CommittedState,

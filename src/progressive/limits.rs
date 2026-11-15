@@ -54,6 +54,8 @@ pub enum Resource {
 /// Adjustable budgets; descriptor and protection-inventory safety ceilings remain fixed.
 /// Counts are cumulative unless a consumer explicitly establishes a smaller scope
 /// (single allocation, volume, derivation, member, or poll).
+/// Scratch memory that an operation frees again (persistent-partial transaction
+/// copies, encodings, compare buffers) is charged only while it is live.
 #[derive(Clone, Debug)]
 pub struct ProgressiveLimits {
     pub volume_handles: u64,
@@ -229,5 +231,69 @@ impl Usage {
 
     pub(crate) fn charge(&self, resource: Resource, amount: u64) -> ProgressiveResult<()> {
         self.0.lock().unwrap().charge(resource, amount)
+    }
+    /// Tightens one budget mid-session, so a test can bound a single step.
+    #[cfg_attr(
+        not(feature = "persistent-partials"),
+        allow(dead_code, reason = "persistent partial files lease scratch")
+    )]
+    #[cfg(test)]
+    pub(crate) fn set_limit_for_test(&self, resource: Resource, limit: u64) {
+        let mut state = self.0.lock().unwrap();
+        match resource {
+            Resource::MetadataBytes => state.limits.metadata_bytes = limit,
+            _ => unimplemented!("only MetadataBytes is tightened by tests"),
+        }
+    }
+    /// Charge `amount` until the returned lease drops. For memory that is
+    /// freed again when its owner goes away (scratch buffers, encodings,
+    /// transaction copies): the budget then bounds what is live at once, not
+    /// what was ever allocated.
+    #[cfg_attr(
+        not(feature = "persistent-partials"),
+        allow(dead_code, reason = "persistent partial files lease scratch")
+    )]
+    pub(crate) fn lease(&self, resource: Resource, amount: u64) -> ProgressiveResult<Lease> {
+        let mut lease = Lease::empty(self, resource);
+        lease.grow(amount)?;
+        Ok(lease)
+    }
+}
+
+/// A scoped [`Usage`] charge, released when dropped.
+#[cfg_attr(not(feature = "persistent-partials"), allow(dead_code, reason = "persistent partial files lease scratch"))]
+#[must_use = "a lease releases its charge when dropped"]
+pub(crate) struct Lease {
+    usage: Usage,
+    resource: Resource,
+    amount: u64,
+}
+#[cfg_attr(not(feature = "persistent-partials"), allow(dead_code, reason = "persistent partial files lease scratch"))]
+impl Lease {
+    pub(crate) fn empty(usage: &Usage, resource: Resource) -> Self {
+        Self { usage: usage.clone(), resource, amount: 0 }
+    }
+    pub(crate) fn grow(&mut self, amount: u64) -> ProgressiveResult<()> {
+        self.usage.charge(self.resource, amount)?;
+        self.amount += amount;
+        Ok(())
+    }
+    /// Turns the lease into an ordinary cumulative charge.
+    pub(crate) fn keep(mut self) {
+        self.amount = 0;
+    }
+    /// Takes over `other`'s charge, which then lasts as long as this lease.
+    pub(crate) fn absorb(&mut self, mut other: Lease) {
+        debug_assert!(other.resource == self.resource);
+        self.amount += std::mem::take(&mut other.amount);
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if self.amount != 0 {
+            let mut state = self.usage.0.lock().unwrap_or_else(|e| e.into_inner());
+            let used = &mut state.used[self.resource as usize];
+            *used = used.saturating_sub(self.amount);
+        }
     }
 }
