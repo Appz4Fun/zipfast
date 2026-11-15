@@ -57,7 +57,8 @@ salt in every header costs one derivation.
 `name` (decoded, when it decodes), `is_dir`,
 `unpacked_size`, `packed_size` (over the pieces seen), `method` (`Stored` or `Compressed { id }` with the format's
 method number), `mapping`, `solid`, `encrypted`, `cipher`, final `checks` (once the final piece is seen), `mtime`,
-`attributes`, `unix_mode` and `complete`, and its `pieces`.
+`dos_time` (RAR 4.x: the header's DOS date and time as stored, also when it is not a valid date and `mtime` is None;
+None for other formats), `attributes`, `unix_mode` and `complete`, and its `pieces`.
 
 `MapPiece` is one part header: `volume`, `packed` (data bytes in that volume), `header` (the header's wire extent,
 including the IV and padding of an encrypted header, or a ZIP local header with its name and extra field),
@@ -131,8 +132,25 @@ member's), `packed_size` and `packed` (this part's data bytes in this volume), `
 `split_before` (continues from the previous volume), `split_after` (continues in the next), `method`, `mapping`,
 `solid`, `encrypted`, `cipher`, `part_checks` (as stored in this header: of this part's packed bytes when it has
 `split_after`, of the member's output otherwise), `checks` (the member's final checks: `Some(part_checks)` exactly
-on its last part), `mtime`, `attributes` and `unix_mode`. Where a continuation part falls in the member's packed
+on its last part), `mtime`, `dos_time` (as for `MapMember`), `attributes` and `unix_mode`. Where a continuation part falls in the member's packed
 stream depends on earlier volumes; a whole-archive map gives that as `MapPiece::stream_offset`.
+
+## RAR 4.x leniency
+
+Map walks (`MemberMap::from_memory`, `MapBuilder` and single-volume `from_volume` / `VolumeMapBuilder`) accept three
+things in old RAR 4.x archives that `RarSession`, `extract::list` and extraction still refuse as unsupported:
+
+- A legacy name that is not UTF-8 (no Unicode flag, OEM/CP437 bytes such as `caf\x82.mkv`): the member is listed
+  with `raw_name` holding the stored bytes and `name: None`. A whole-archive map matches split parts by those bytes.
+  An empty name or one holding a NUL byte is still `Malformed`.
+- Legacy service blocks 0x75..=0x79 (old comment, AV, old subblock, old recovery record, sign): skipped by their
+  declared header size, plus the data that follows when LONG_BLOCK declares an `ADD_SIZE`. The old subblock (0x77)
+  and old recovery record (0x78) always carry that data size, as unrar reads them. Their header bytes count against
+  the header budgets like any other header. A header size below 7 or one too short for its data size is
+  `Malformed`; a header or data size running past the volume ends the walk `Truncated` there.
+- Bytes left over inside a file or service header's declared size, after the fields its flags call for: ignored.
+
+Embedded comments in the main header (`MHD_COMMENT` in RAR 2.x) or a file header (`LHD_COMMENT`) remain `Unsupported`.
 
 ## Output offsets and restart points
 

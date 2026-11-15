@@ -39,7 +39,10 @@ impl HeaderParser {
             return Err(self.rar4_unsupported("embedded comment").into());
         }
         let mut cursor = Fields::new(header, 7);
-        let packed = if flags & 0x8000 != 0 { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
+        // The old subblock (0x77) and old recovery record (0x78) carry their data size whether or not they set
+        // LONG_BLOCK, as unrar reads them; only lenient map walks admit those blocks at all.
+        let sized = flags & 0x8000 != 0 || (self.map_lenient && matches!(kind, 0x77 | 0x78));
+        let packed = if sized { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
         let data_at = self
             .at
             .checked_add(self.need as u64)
@@ -118,6 +121,9 @@ impl HeaderParser {
                     (flags & 8 != 0).then(|| u64::from(u16::from_le_bytes([header[at], header[at + 1]])));
                 Block::End { more_volumes: flags & 1 != 0, volume_number }
             }
+            // Old comment, AV, old subblock, old recovery record and sign blocks hold no members. A map walk skips
+            // them by their declared sizes, already bounded above, like unknown blocks marked skippable.
+            0x75..=0x79 if self.map_lenient => Block::Unknown,
             0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
             _ if flags & 0x4000 != 0 => Block::Unknown,
             _ => return Err(self.rar4_unsupported("header type").into()),
@@ -157,10 +163,22 @@ impl HeaderParser {
                 unpacked |= u64::from(fields.u32()?) << 32;
             }
             let encoded = fields.take(name_len)?;
-            let name = decode_name(encoded, flags & 0x200 != 0, self.usage.as_ref())?;
-            if name.is_empty() || name.contains('\0') {
-                return Err(Error::Corrupt("RAR4 member name").into());
-            }
+            let name = match decode_name(encoded, flags & 0x200 != 0, self.usage.as_ref()) {
+                // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
+                // name, which no decoded name can be (see below).
+                Err(FileParseError::Format(Error::Unsupported(_)))
+                    if self.map_lenient && !encoded.is_empty() && !encoded.contains(&0) =>
+                {
+                    String::new()
+                }
+                result => {
+                    let name = result?;
+                    if name.is_empty() || name.contains('\0') {
+                        return Err(Error::Corrupt("RAR4 member name").into());
+                    }
+                    name
+                }
+            };
             let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
             let mut mtime = dos_timestamp(dos);
             let mut nanos = 0;
@@ -191,7 +209,7 @@ impl HeaderParser {
                     }
                 }
             }
-            if fields.at != bytes.len() {
+            if fields.at != bytes.len() && !self.map_lenient {
                 return Err(Error::Unsupported("RAR4 trailing header fields".into()).into());
             }
             let directory = flags & 0xe0 == 0xe0;

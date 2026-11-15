@@ -99,7 +99,7 @@ impl RarWalker {
     pub(crate) fn new(options: &MapOptions, usage: Usage, single: bool) -> Self {
         let chunk = options.limits.read_chunk.clamp(1, READ_CHUNK) as usize;
         Self {
-            parser: HeaderParser::from_start(options.first_name.clone().into(), usage.clone()),
+            parser: HeaderParser::from_start(options.first_name.clone().into(), usage.clone()).lenient_map(),
             usage,
             control: options.control.clone(),
             password: options.password.clone(),
@@ -205,7 +205,8 @@ impl RarWalker {
                     let request = VolumeRequest { index: self.volume, expected: self.expected.clone() };
                     match input.open(&request, cx).map_err(|e| MapError::from_failure(self.volume, e))? {
                         Opened::Ready => {
-                            self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone());
+                            self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone())
+                                .lenient_map();
                             self.main_seen = false;
                             self.unproven = false;
                             self.header_start = None;
@@ -537,7 +538,9 @@ impl RarWalker {
     ) -> Result<Described, MapError> {
         let name = match header.format {
             RarFormat::Rar5 => String::from_utf8(wire.name.to_vec()).ok(),
-            RarFormat::Rar4 => Some(header.name.clone()),
+            // The lenient map parser leaves a legacy name that is not UTF-8 undecoded (empty); a decoded RAR 4.x
+            // name is never empty.
+            RarFormat::Rar4 => Some(header.name.clone()).filter(|name| !name.is_empty()),
         };
         self.charge(Resource::MetadataBytes, (owner + wire.name.len() + name.as_ref().map_or(0, String::len)) as u64)?;
         let stored = header.method == 0;
@@ -641,6 +644,7 @@ impl RarWalker {
             part_checks,
             checks: part.final_part.then_some(part_checks),
             mtime: header.mtime.map(|s| (s, header.mtime_nanos)),
+            dos_time: header.rar4.map(|r| r.dos_time),
             attributes: header.attributes,
             unix_mode,
         };
@@ -726,6 +730,7 @@ impl RarWalker {
             cipher,
             checks: part.final_part.then_some(checks),
             mtime: header.mtime.map(|s| (s, header.mtime_nanos)),
+            dos_time: header.rar4.map(|r| r.dos_time),
             attributes: header.attributes,
             unix_mode,
             complete: part.final_part,

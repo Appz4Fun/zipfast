@@ -252,6 +252,9 @@ pub struct VolumeMember {
     pub checks: Option<MapChecks>,
     /// Modification time as seconds since 1970 and nanoseconds.
     pub mtime: Option<(i64, u32)>,
+    /// RAR 4.x: the header's DOS date and time exactly as stored (time in the low 16 bits, date in the high), even
+    /// when it is not a valid date and `mtime` is None. None for other formats.
+    pub dos_time: Option<u32>,
     /// Raw attributes as the host recorded them.
     pub attributes: u64,
     /// Unix permission and type bits, when the host was Unix.
@@ -290,6 +293,9 @@ pub struct MapMember {
     pub checks: Option<MapChecks>,
     /// Modification time as seconds since 1970 and nanoseconds.
     pub mtime: Option<(i64, u32)>,
+    /// RAR 4.x: the header's DOS date and time exactly as stored (time in the low 16 bits, date in the high), even
+    /// when it is not a valid date and `mtime` is None. None for other formats.
+    pub dos_time: Option<u32>,
     /// Raw attributes as the host recorded them.
     pub attributes: u64,
     /// Unix permission and type bits, when the host was Unix.
