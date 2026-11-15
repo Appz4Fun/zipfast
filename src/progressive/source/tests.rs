@@ -912,7 +912,7 @@ fn fallible_metadata_sort_orders_adversarial_input_and_bounds_work() {
 
 /// Isolate lock regressions so even a deadlock/recursive callback is bounded.
 /// Only the parent owns the child process; deadline failure kills AND reaps it.
-fn in_bounded_wake_child(test: &str, marker: &str) -> bool {
+pub(super) fn in_bounded_wake_child(test: &str, marker: &str) -> bool {
     if std::env::var_os(marker).is_some() {
         return true;
     }

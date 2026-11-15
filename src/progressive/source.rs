@@ -23,7 +23,10 @@ use std::{
     ffi::OsString,
     fs::File,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Wake, Waker},
 };
 
@@ -119,7 +122,7 @@ pub enum ProtectionDeclaration {
 #[derive(Clone, Default)]
 pub struct SessionControl {
     token: Cancellation,
-    wake: Arc<WakeGate>,
+    wake: Arc<ControlWake>,
 }
 impl SessionControl {
     pub(crate) fn cancellation_token(&self) -> Cancellation {
@@ -127,14 +130,139 @@ impl SessionControl {
     }
     pub fn cancel(&self) {
         self.token.cancel();
-        self.wake.notify(false);
+        if let Some(hub) = self.wake.retained.get() {
+            hub.cancel();
+        }
+        self.wake.legacy.notify(false);
     }
     pub(crate) fn register(&self, waker: &Waker) {
-        self.wake.register(waker);
+        self.wake.legacy.register(waker);
     }
     pub fn is_canceled(&self) -> bool {
         self.token.is_canceled()
     }
+}
+#[derive(Default)]
+struct ControlWake {
+    legacy: WakeGate,
+    retained: OnceLock<Arc<CancelFanout>>,
+}
+struct CancelFanout {
+    canceled: AtomicBool,
+    slots: Mutex<Vec<Weak<CancelSlot>>>,
+}
+struct CancelOwner {
+    identity: Arc<()>,
+    max_operations: u64,
+}
+struct CancelSlot {
+    owner: Arc<()>,
+    gate: Weak<WakeGate>,
+    retired: AtomicBool,
+}
+struct CancelRegistration(Arc<CancelSlot>);
+impl CancelRegistration {
+    fn retire(&mut self) {
+        self.0.retired.store(true, Ordering::Release);
+    }
+}
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+impl CancelFanout {
+    fn cancel(&self) {
+        let slots = {
+            let mut slots = self.slots.lock().unwrap();
+            if self.canceled.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            std::mem::take(&mut *slots)
+        };
+        // The detached precharged list is bounded. No callback runs under its mutex.
+        for slot in slots {
+            if let Some(slot) = slot.upgrade()
+                && !slot.retired.load(Ordering::Acquire)
+                && let Some(gate) = slot.gate.upgrade()
+            {
+                gate.notify_canceled();
+            }
+        }
+    }
+}
+impl SessionControl {
+    fn enable_retained_cancel(&self, usage: &mut Usage) -> ProgressiveResult<()> {
+        if self.wake.retained.get().is_none() {
+            usage.charge(
+                Resource::MetadataBytes,
+                (std::mem::size_of::<CancelFanout>() + 2 * std::mem::size_of::<usize>()) as u64,
+            )?;
+            let _ = self.wake.retained.set(Arc::new(CancelFanout {
+                canceled: AtomicBool::new(self.is_canceled()),
+                slots: Mutex::new(Vec::new()),
+            }));
+        }
+        // Covers installation racing cancellation before OnceLock became visible.
+        if self.is_canceled() {
+            self.wake.retained.get().unwrap().cancel();
+        }
+        Ok(())
+    }
+    fn register_retained_cancel(
+        &self,
+        owner: &CancelOwner,
+        gate: &Arc<WakeGate>,
+        usage: &mut Usage,
+    ) -> ProgressiveResult<CancelRegistration> {
+        let hub = self.wake.retained.get().ok_or_else(invalid_capability)?;
+        let mut slots = hub.slots.lock().unwrap();
+        if self.is_canceled() || hub.canceled.load(Ordering::Acquire) {
+            drop(slots);
+            gate.notify_canceled();
+            return Err(canceled());
+        }
+        // One bounded scan, compaction movement and one future cancellation visit.
+        usage.charge(Resource::SourceBookkeeping, (slots.len() * 3 + 1) as u64)?;
+        slots.retain(|row| row.upgrade().is_some_and(|slot| !slot.retired.load(Ordering::Acquire)));
+        let own = slots
+            .iter()
+            .filter(|row| row.upgrade().is_some_and(|slot| Arc::ptr_eq(&slot.owner, &owner.identity)))
+            .count() as u64;
+        let (limit, attempted) =
+            if own >= owner.max_operations { (owner.max_operations, own + 1) } else { (4096, slots.len() as u64 + 1) };
+        if attempted > limit {
+            return Err(ProgressiveFailure::new(FailureKind::Limit {
+                resource: Resource::VolumeHandles,
+                limit,
+                attempted,
+            }));
+        }
+        usage.charge(
+            Resource::MetadataBytes,
+            (std::mem::size_of::<CancelSlot>() + 2 * std::mem::size_of::<usize>()) as u64,
+        )?;
+        reserve_records(&mut slots, usage)?;
+        let slot = Arc::new(CancelSlot {
+            owner: owner.identity.clone(),
+            gate: Arc::downgrade(gate),
+            retired: AtomicBool::new(false),
+        });
+        slots.push(Arc::downgrade(&slot));
+        drop(slots);
+        // Cancellation may have drained and notified before registration returned.
+        if self.is_canceled() {
+            gate.notify_canceled();
+            return Err(canceled());
+        }
+        Ok(CancelRegistration(slot))
+    }
+}
+fn canceled() -> ProgressiveFailure {
+    ProgressiveFailure::new(FailureKind::Canceled)
+}
+fn invalid_capability() -> ProgressiveFailure {
+    ProgressiveFailure::new(FailureKind::InvalidCapability)
 }
 #[derive(Default)]
 struct WakeState {
@@ -155,6 +283,12 @@ impl WakeGate {
             state.task.replace(incoming)
         };
         drop(previous);
+    }
+    fn notify_canceled(&self) {
+        let task = self.0.lock().unwrap().task.take();
+        if let Some(task) = task {
+            task.wake();
+        }
     }
     fn arm(&self) {
         let mut s = self.0.lock().unwrap();
@@ -230,8 +364,92 @@ fn changed() -> ProgressiveFailure {
 }
 
 mod retained;
+#[allow(unused_imports, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+pub(crate) use retained::{OriginalRead, OriginalReadPurpose};
 use retained::{OriginalSource, RetainedOriginals};
 
+struct RangeOperation<'a> {
+    cursor: &'a mut CheckedCursor,
+    gate: &'a Arc<WakeGate>,
+    parked: &'a mut bool,
+    retry_admitted: &'a mut bool,
+    control: &'a SessionControl,
+    usage: &'a mut Usage,
+    verify: bool,
+}
+fn poll_available(
+    original: &mut OriginalSource,
+    op: RangeOperation<'_>,
+    buf: &mut [u8],
+) -> ProgressiveResult<Poll<SourceStep>> {
+    let offset = op.cursor.offset();
+    let length = original.live.length.value();
+    if offset == length {
+        return Ok(Poll::Ready(SourceStep::EndOfVolume));
+    }
+    let checked = original.check_info(op.usage);
+    if op.control.is_canceled() {
+        return Err(canceled());
+    }
+    checked?;
+    let count = (length - offset).min(buf.len() as u64);
+    op.usage.check(Resource::ReadChunk, count)?;
+    op.usage.charge(Resource::SourceRequests, 1)?;
+    op.gate.arm();
+    let w = Waker::from(op.gate.clone());
+    let mut cx = Context::from_waker(&w);
+    if op.verify {
+        op.usage.charge(Resource::VerifyBytes, count)?;
+    }
+    *op.retry_admitted = false;
+    let answer = original.source.read_at(offset, &mut buf[..count as usize], &mut cx);
+    if op.control.is_canceled() {
+        return Err(canceled());
+    }
+    let answer = answer?;
+    let checked = original.check_info(op.usage);
+    if op.control.is_canceled() {
+        return Err(canceled());
+    }
+    checked?;
+    let step = match answer {
+        RangeRead::NotYet => {
+            *op.parked = true;
+            return Ok(Poll::Pending);
+        }
+        RangeRead::Filled { count: n } => {
+            if n == 0 || n as u64 > count {
+                return Err(contract());
+            }
+            let end = offset.checked_add(n as u64).ok_or_else(contract)?;
+            if end > original.live.extent {
+                return Err(contract());
+            }
+            let next = original.hole_bound(offset, false, op.usage)?;
+            if let Some(&(start, _)) = original.holes.get(next) {
+                op.usage.charge(Resource::SourceBookkeeping, 1)?;
+                if start < end {
+                    return Err(changed());
+                }
+            }
+            op.usage.charge(Resource::SourceBytes, n as u64)?;
+            op.cursor.advance(n as u64)?;
+            SourceStep::Filled { offset, count: n }
+        }
+        RangeRead::Hole { len } => {
+            if len == 0 || len > count {
+                return Err(contract());
+            }
+            let end = offset.checked_add(len).ok_or_else(contract)?;
+            op.usage.charge(Resource::SourceBytes, len)?;
+            original.remember_hole(offset, end, op.usage)?;
+            op.cursor.advance(len)?;
+            SourceStep::Hole { offset, len }
+        }
+    };
+    op.gate.disarm();
+    Ok(Poll::Ready(step))
+}
 pub(crate) struct SourceDriver {
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
@@ -411,9 +629,36 @@ impl SourceDriver {
         buf: &mut [u8],
         verify: bool,
     ) -> Poll<ProgressiveResult<SourceStep>> {
-        self.control.register(cx.waker());
-        self.wake.register(cx.waker());
-        let result = self.poll_inner(buf, verify);
+        if self.retained.is_some() && self.control.is_canceled() {
+            self.finish_selected_request();
+            return Poll::Ready(Err(canceled()));
+        }
+        if self.retained.is_some() && self.original.as_mut().is_some_and(|s| s.leased()) {
+            return Poll::Ready(Err(invalid_capability()));
+        }
+        if let Some(retained) = &self.retained {
+            if self.parked && retained.selected_len != Some(buf.len()) {
+                return Poll::Ready(Err(invalid_capability()));
+            }
+            if !self.failed && buf.is_empty() {
+                return Poll::Ready(Ok(SourceStep::Filled { offset: self.cursor.offset(), count: 0 }));
+            }
+        }
+        let result = (|| {
+            if self.retained.is_some() && self.failed {
+                return Err(contract());
+            }
+            if self.retained.is_some() {
+                self.prepare_selected(cx, buf.len())?;
+            } else {
+                self.control.register(cx.waker());
+                self.wake.register(cx.waker());
+            }
+            self.poll_inner(buf, verify)
+        })();
+        if self.retained.is_some() && !matches!(result, Ok(Poll::Pending)) {
+            self.finish_selected_request();
+        }
         match result {
             Err(mut e) => {
                 self.failed = true;
@@ -452,11 +697,11 @@ impl SourceDriver {
             self.wake.arm();
             let w = Waker::from(self.wake.clone());
             let mut cx = Context::from_waker(&w);
-            let answer = self.provider.volume(&self.request, &mut cx)?;
+            let answer = self.provider.volume(&self.request, &mut cx);
             if self.control.is_canceled() {
                 return Err(ProgressiveFailure::new(FailureKind::Canceled));
             }
-            match answer {
+            match answer? {
                 VolumeAnswer::Wait => {
                     self.parked = true;
                     return Ok(Poll::Pending);
@@ -483,68 +728,35 @@ impl SourceDriver {
                 id: self.original.as_ref().unwrap().live.id,
             })));
         }
-        let offset = self.cursor.offset();
-        let length = self.original.as_ref().unwrap().live.length.value();
-        if offset == length {
-            return Ok(Poll::Ready(Ok(SourceStep::EndOfVolume)));
-        }
-        self.check_info()?;
-        let count = (length - offset).min(buf.len() as u64);
-        self.usage.check(Resource::ReadChunk, count)?;
-        self.usage.charge(Resource::SourceRequests, 1)?;
-        self.wake.arm();
-        let w = Waker::from(self.wake.clone());
-        let mut cx = Context::from_waker(&w);
-        if verify {
-            self.usage.charge(Resource::VerifyBytes, count)?;
-        }
-        self.retry_admitted = false;
-        let answer = self.original.as_mut().unwrap().source.read_at(offset, &mut buf[..count as usize], &mut cx)?;
-        self.check_info()?;
-        if self.control.is_canceled() {
-            return Err(ProgressiveFailure::new(FailureKind::Canceled));
-        }
-        let step = match answer {
-            RangeRead::NotYet => {
-                self.parked = true;
-                return Ok(Poll::Pending);
+        if self.retained.is_some() {
+            let external = self.other_lane_handles()? + self.backing_count();
+            self.native.refresh(&self.protection, &mut self.usage, external)?;
+            if self.control.is_canceled() {
+                return Err(canceled());
             }
-            RangeRead::Filled { count: n } => {
-                if n == 0 || n as u64 > count {
-                    return Err(contract());
-                }
-                let end = offset.checked_add(n as u64).ok_or_else(contract)?;
-                if end > self.original.as_ref().unwrap().live.extent {
-                    return Err(contract());
-                }
-                let next = self.hole_bound(offset, false)?;
-                if let Some(&(start, _)) = self.original.as_ref().unwrap().holes.get(next) {
-                    self.usage.charge(Resource::SourceBookkeeping, 1)?;
-                    if start < end {
-                        return Err(changed());
-                    }
-                }
-                self.usage.charge(Resource::SourceBytes, n as u64)?;
-                self.cursor.advance(n as u64)?;
-                SourceStep::Filled { offset, count: n }
-            }
-            RangeRead::Hole { len } => {
-                if len == 0 || len > count {
-                    return Err(contract());
-                }
-                let end = offset.checked_add(len).ok_or_else(contract)?;
-                self.usage.charge(Resource::SourceBytes, len)?;
-                self.remember_hole(offset, end)?;
-                self.cursor.advance(len)?;
-                SourceStep::Hole { offset, len }
-            }
-        };
-        self.wake.disarm();
-        Ok(Poll::Ready(Ok(step)))
+        }
+        poll_available(
+            self.original.as_mut().unwrap(),
+            RangeOperation {
+                cursor: &mut self.cursor,
+                gate: &self.wake,
+                parked: &mut self.parked,
+                retry_admitted: &mut self.retry_admitted,
+                control: &self.control,
+                usage: &mut self.usage,
+                verify,
+            },
+            buf,
+        )
+        .map(|p| p.map(Ok))
     }
+
     fn admit_source(&mut self, source: Box<dyn RangeSource>) -> ProgressiveResult<SourceInfo> {
         self.usage.charge(Resource::SourceRequests, 1)?;
         let info = source.info();
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
         if info.extent > info.length.value() {
             return Err(contract());
         }
@@ -557,6 +769,9 @@ impl SourceDriver {
         }
         self.usage.charge(Resource::SourceRequests, 1)?;
         let backing = source.backing_files();
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
         let external = self.other_lane_handles()?;
         self.usage.check(Resource::VolumeHandles, (external + self.native.handle_count() + backing.len()) as u64)?;
         self.native.refresh(&self.protection, &mut self.usage, external + backing.len())?;
@@ -579,6 +794,7 @@ impl SourceDriver {
             live: info,
             holes: std::mem::take(&mut self.legacy_holes),
             backing_count,
+            lease: None,
         });
         if let Some(retained) = &mut self.retained {
             retained.high_water = Some(self.request.index);
@@ -749,12 +965,6 @@ impl SourceDriver {
         }
         Ok((low, false))
     }
-    fn hole_bound(&mut self, offset: u64, touching: bool) -> ProgressiveResult<usize> {
-        self.original.as_ref().unwrap().hole_bound(offset, touching, &mut self.usage)
-    }
-    fn remember_hole(&mut self, offset: u64, end: u64) -> ProgressiveResult<()> {
-        self.original.as_mut().unwrap().remember_hole(offset, end, &mut self.usage)
-    }
     fn check_info(&mut self) -> ProgressiveResult<()> {
         self.original.as_mut().unwrap().check_info(&mut self.usage)
     }
@@ -763,10 +973,11 @@ impl SourceDriver {
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
-        let mut next = self.provider.protection()?;
+        let next = self.provider.protection();
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
+        let mut next = next?;
         if let ProtectionDeclaration::Complete { inventory, .. } = &mut next {
             validate_inventory(inventory, &mut self.usage)?;
             canonicalize_inventory(inventory, &mut self.usage)?;

@@ -22,13 +22,17 @@ pub(super) struct OriginalSource {
     pub(super) live: SourceInfo,
     pub(super) holes: Vec<(u64, u64)>,
     pub(super) backing_count: usize,
+    pub(super) lease: Option<Weak<LeaseEpoch>>,
 }
 pub(super) struct RetainedOriginals {
     pub(super) slots: Vec<OriginalSource>,
     pub(super) high_water: Option<u32>,
     // The allocation identity is stable when SourceDriver moves. Task 2 binds leases to it.
-    _identity: Arc<()>,
-    _lease_counter: u64,
+    pub(super) owner: CancelOwner,
+    pub(super) lease_counter: u64,
+    pub(super) selected_cancel: Option<CancelRegistration>,
+    pub(super) selected_fresh: bool,
+    pub(super) selected_len: Option<usize>,
 }
 impl OriginalSource {
     /// First interval whose end is >= offset (coalescing) or > offset (fill).
@@ -96,17 +100,26 @@ impl OriginalSource {
 }
 impl SourceDriver {
     // H2 will call this internal entrypoint; legacy construction remains unchanged.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
     pub(crate) fn new_retained(
         provider: Box<dyn VolumeSource>,
         first: OsString,
         limits: ProgressiveLimits,
         control: SessionControl,
     ) -> ProgressiveResult<Self> {
+        let max_operations = limits.volume_handles.min(4096);
         let mut driver = Self::new(provider, first, limits, control)?;
+        driver.control.enable_retained_cancel(&mut driver.usage)?;
         driver.usage.charge(Resource::MetadataBytes, (2 * std::mem::size_of::<usize>()) as u64)?;
-        driver.retained =
-            Some(RetainedOriginals { slots: Vec::new(), high_water: None, _identity: Arc::new(()), _lease_counter: 0 });
+        driver.retained = Some(RetainedOriginals {
+            slots: Vec::new(),
+            high_water: None,
+            owner: CancelOwner { identity: Arc::new(()), max_operations },
+            lease_counter: 0,
+            selected_cancel: None,
+            selected_fresh: false,
+            selected_len: None,
+        });
         Ok(driver)
     }
     pub(super) fn backing_count(&self) -> usize {
@@ -129,6 +142,12 @@ impl SourceDriver {
         Ok(())
     }
     pub(super) fn select_retained(&mut self, request: VolumeRequest) -> ProgressiveResult<()> {
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
+        if self.original.as_mut().is_some_and(|s| s.leased()) {
+            return Err(invalid_capability());
+        }
         if self.parked || self.failed || self.original.is_none() {
             return Err(contract());
         }
@@ -164,11 +183,303 @@ impl SourceDriver {
             .position(|source| source.index == request.index)
             .map(|position| retained.slots.remove(position));
         self.reopened = self.original.is_some();
+        retained.selected_cancel = None;
+        retained.selected_fresh = false;
+        retained.selected_len = None;
         self.wake.disarm();
         self.wake = wake;
         self.retry_admitted = false;
         self.request = request;
         self.cursor = CheckedCursor::new(0);
         Ok(())
+    }
+}
+
+pub(super) struct LeaseEpoch {
+    retired: AtomicBool,
+    number: u64,
+}
+#[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+#[derive(Clone, Copy)]
+pub(crate) enum OriginalReadPurpose {
+    Discovery,
+    Refill,
+}
+#[derive(Clone, Copy)]
+enum ReadState {
+    Active,
+    Parked { offset: u64, requested_len: usize },
+    Retired,
+    Failed,
+    Canceled,
+}
+#[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+pub(crate) struct OriginalRead {
+    owner: Arc<()>,
+    volume: u32,
+    identity: SourceInfo,
+    epoch: Arc<LeaseEpoch>,
+    pub(super) cursor: CheckedCursor,
+    gate: Arc<WakeGate>,
+    registration: Option<CancelRegistration>,
+    state: ReadState,
+    purpose: OriginalReadPurpose,
+    fresh: bool,
+}
+impl OriginalRead {
+    fn close(&mut self, state: ReadState) {
+        self.state = state;
+        self.epoch.retired.store(true, Ordering::Release);
+        self.gate.disarm();
+        self.registration = None;
+    }
+}
+impl Drop for OriginalRead {
+    fn drop(&mut self) {
+        self.close(ReadState::Retired);
+    }
+}
+impl OriginalSource {
+    pub(super) fn leased(&mut self) -> bool {
+        if self.lease.as_ref().and_then(Weak::upgrade).is_some_and(|epoch| !epoch.retired.load(Ordering::Acquire)) {
+            true
+        } else {
+            self.lease = None;
+            false
+        }
+    }
+}
+fn new_gate(usage: &mut Usage) -> ProgressiveResult<Arc<WakeGate>> {
+    usage
+        .charge(Resource::MetadataBytes, (std::mem::size_of::<WakeGate>() + 2 * std::mem::size_of::<usize>()) as u64)?;
+    Ok(Arc::new(WakeGate::default()))
+}
+impl SourceDriver {
+    pub(super) fn prepare_selected(&mut self, cx: &mut Context<'_>, len: usize) -> ProgressiveResult<()> {
+        let retained = self.retained.as_mut().unwrap();
+        if retained.selected_fresh {
+            let gate = new_gate(&mut self.usage)?;
+            self.wake.disarm();
+            self.wake = gate;
+            retained.selected_fresh = false;
+        }
+        self.wake.register(cx.waker());
+        if self.control.is_canceled() {
+            self.wake.notify_canceled();
+            return Err(canceled());
+        }
+        if retained.selected_cancel.is_none() {
+            retained.selected_cancel =
+                Some(self.control.register_retained_cancel(&retained.owner, &self.wake, &mut self.usage)?);
+        }
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
+        retained.selected_len = Some(len);
+        Ok(())
+    }
+    pub(super) fn finish_selected_request(&mut self) {
+        let retained = self.retained.as_mut().unwrap();
+        retained.selected_cancel = None;
+        retained.selected_fresh = true;
+        retained.selected_len = None;
+        self.wake.disarm();
+    }
+    fn original_mut(&mut self, volume: u32) -> ProgressiveResult<&mut OriginalSource> {
+        if self.original.as_ref().is_some_and(|s| s.index == volume) {
+            return Ok(self.original.as_mut().unwrap());
+        }
+        let retained = self.retained.as_mut().ok_or_else(invalid_capability)?;
+        self.usage.charge(Resource::SourceBookkeeping, retained.slots.len() as u64)?;
+        retained.slots.iter_mut().find(|s| s.index == volume).ok_or_else(invalid_capability)
+    }
+    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+    pub(crate) fn begin_original_read(
+        &mut self,
+        volume: u32,
+        offset: u64,
+        purpose: OriginalReadPurpose,
+    ) -> ProgressiveResult<OriginalRead> {
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
+        if self.failed {
+            return Err(contract());
+        }
+        let retained = self.retained.as_ref().ok_or_else(invalid_capability)?;
+        let owner = retained.owner.identity.clone();
+        // A parked selected request already owns this lane.
+        if self.request.index == volume && (self.parked || retained.selected_cancel.is_some()) {
+            return Err(invalid_capability());
+        }
+        let number = retained.lease_counter.checked_add(1).ok_or_else(invalid_capability)?;
+        let mut usage = self.usage.clone();
+        let source = self.original_mut(volume)?;
+        if source.leased() {
+            return Err(invalid_capability());
+        }
+        if offset > source.live.length.value() {
+            return Err(contract());
+        }
+        let identity = source.live;
+        usage.charge(
+            Resource::MetadataBytes,
+            (std::mem::size_of::<LeaseEpoch>() + 2 * std::mem::size_of::<usize>()) as u64,
+        )?;
+        let gate = new_gate(&mut usage)?;
+        let epoch = Arc::new(LeaseEpoch { retired: AtomicBool::new(false), number });
+        source.lease = Some(Arc::downgrade(&epoch));
+        self.retained.as_mut().unwrap().lease_counter = number;
+        Ok(OriginalRead {
+            owner,
+            volume,
+            identity,
+            epoch,
+            cursor: CheckedCursor::new(offset),
+            gate,
+            registration: None,
+            state: ReadState::Active,
+            purpose,
+            fresh: false,
+        })
+    }
+    fn check_read(&mut self, read: &OriginalRead) -> ProgressiveResult<()> {
+        let retained = self.retained.as_ref().ok_or_else(invalid_capability)?;
+        if !Arc::ptr_eq(&retained.owner.identity, &read.owner) || read.epoch.retired.load(Ordering::Acquire) {
+            return Err(invalid_capability());
+        }
+        let source = self.original_mut(read.volume)?;
+        let epoch = source.lease.as_ref().and_then(Weak::upgrade).ok_or_else(invalid_capability)?;
+        if !Arc::ptr_eq(&epoch, &read.epoch)
+            || epoch.number != read.epoch.number
+            || source.live.id != read.identity.id
+            || source.live.generation != read.identity.generation
+        {
+            return Err(invalid_capability());
+        }
+        Ok(())
+    }
+    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+    pub(crate) fn retire_original_read(&mut self, read: &mut OriginalRead) -> ProgressiveResult<()> {
+        // Retirement stays terminal even when cancellation is already latched.
+        if !self.retained.as_ref().is_some_and(|retained| Arc::ptr_eq(&retained.owner.identity, &read.owner)) {
+            return Err(if self.control.is_canceled() { canceled() } else { invalid_capability() });
+        }
+        let result = self.check_read(read);
+        read.close(ReadState::Retired);
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
+        result
+    }
+    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+    pub(crate) fn poll_original_read(
+        &mut self,
+        read: &mut OriginalRead,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<ProgressiveResult<SourceStep>> {
+        if self.control.is_canceled() {
+            if self.retained.as_ref().is_some_and(|retained| Arc::ptr_eq(&retained.owner.identity, &read.owner)) {
+                read.close(ReadState::Canceled);
+            }
+            return Poll::Ready(Err(canceled()));
+        }
+        if let Err(e) = self.check_read(read) {
+            if !matches!(e.kind, FailureKind::InvalidCapability) {
+                self.failed = true;
+                self.finish_selected_request();
+                read.close(ReadState::Failed);
+            }
+            return Poll::Ready(Err(e));
+        }
+        if self.failed {
+            read.close(ReadState::Failed);
+            return Poll::Ready(Err(contract()));
+        }
+        if let ReadState::Parked { offset, requested_len } = read.state
+            && (offset != read.cursor.offset() || requested_len != buf.len())
+        {
+            return Poll::Ready(Err(invalid_capability()));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(SourceStep::Filled { offset: read.cursor.offset(), count: 0 }));
+        }
+        let result = self.poll_original_inner(read, cx, buf);
+        match result {
+            Ok(Poll::Pending) => {
+                read.state = ReadState::Parked { offset: read.cursor.offset(), requested_len: buf.len() };
+                Poll::Pending
+            }
+            Ok(Poll::Ready(step)) => {
+                read.state = ReadState::Active;
+                read.registration = None;
+                read.gate.disarm();
+                read.fresh = true;
+                Poll::Ready(Ok(step))
+            }
+            Err(e) => {
+                self.failed = true;
+                self.wake.disarm();
+                self.finish_selected_request();
+                read.close(if self.control.is_canceled() { ReadState::Canceled } else { ReadState::Failed });
+                Poll::Ready(Err(e))
+            }
+        }
+    }
+    fn poll_original_inner(
+        &mut self,
+        read: &mut OriginalRead,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> ProgressiveResult<Poll<SourceStep>> {
+        if read.fresh {
+            let gate = new_gate(&mut self.usage)?;
+            read.gate.disarm();
+            read.gate = gate;
+            read.fresh = false;
+        }
+        read.gate.register(cx.waker());
+        if self.control.is_canceled() {
+            read.gate.notify_canceled();
+            return Err(canceled());
+        }
+        if read.registration.is_none() {
+            read.registration = Some(self.control.register_retained_cancel(
+                &self.retained.as_ref().unwrap().owner,
+                &read.gate,
+                &mut self.usage,
+            )?);
+        }
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
+        let ready = read.gate.consume_ready(|wakes| self.usage.charge(Resource::ProviderWakes, wakes))?;
+        if matches!(read.state, ReadState::Parked { .. }) && !ready {
+            return Ok(Poll::Pending);
+        }
+        let external = self.other_lane_handles()? + self.backing_count();
+        self.native.refresh(&self.protection, &mut self.usage, external)?;
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
+        let mut usage = self.usage.clone();
+        let control = self.control.clone();
+        let source = self.original_mut(read.volume)?;
+        let mut parked = false;
+        let mut retry_admitted = false;
+        poll_available(
+            source,
+            RangeOperation {
+                cursor: &mut read.cursor,
+                gate: &read.gate,
+                parked: &mut parked,
+                retry_admitted: &mut retry_admitted,
+                control: &control,
+                usage: &mut usage,
+                verify: matches!(read.purpose, OriginalReadPurpose::Refill),
+            },
+            buf,
+        )
     }
 }
