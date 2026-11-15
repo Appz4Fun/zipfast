@@ -2929,8 +2929,7 @@ fn encrypted_whole_volume_fill_over_known_output_costs_bookkeeping_per_run() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = Encrypted::new(size, &cuts, true);
     let run = extract_encrypted(dir.path(), &fixture, &hole(500_000..500_010));
-    let mut limits = ProgressiveLimits::default();
-    limits.source_bookkeeping = 4_000;
+    let limits = ProgressiveLimits { source_bookkeeping: 4_000, ..ProgressiveLimits::default() };
     let mut file = reopen_with(dir.path(), run, Some("pw"), limits).unwrap();
     for _ in 0..3 {
         let result = file.fill_packed(1, 0, &fixture.volumes[1]).unwrap();
