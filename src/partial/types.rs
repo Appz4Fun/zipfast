@@ -174,18 +174,31 @@ pub enum PartialErrorKind {
     BindingMismatch(BindingField),
     StateVersion,
     StateMalformed,
-    StateStale { latest: StateAnchor },
+    StateStale {
+        latest: StateAnchor,
+    },
     StateUnavailable,
     JournalCorrupt,
     AnchorConflict,
     AnchorCommitUncertain,
     Busy,
     Canceled,
-    OverlapMismatch { range: Range<u64> },
+    OverlapMismatch {
+        range: Range<u64>,
+    },
     IncompleteOutput,
     OutputChanged,
-    Limit { resource: PartialResource, limit: u64, attempted: u64 },
-    Io { operation: OutputOperation, cause: io::Error },
+    /// Reading the caller's archive volume failed in `refill_from_packed`; `volume` and `packed_offset` say where.
+    PackedRead(io::Error),
+    Limit {
+        resource: PartialResource,
+        limit: u64,
+        attempted: u64,
+    },
+    Io {
+        operation: OutputOperation,
+        cause: io::Error,
+    },
 }
 #[derive(Debug)]
 pub struct PartialError {
@@ -195,11 +208,24 @@ pub struct PartialError {
     pub output: Option<OutputRange>,
     pub committed: Option<StateAnchor>,
     pub location: Option<PartialLocation>,
+    /// Set when `fill_packed` or `refill_from_packed` fails after some work became durable: output already applied,
+    /// and alt ranges found wrong. A corrected range whose rewrite did not finish may be a `DeclaredBad` hole now
+    /// (check `remaining`); if so, a retry fills it but reports it as `applied`, not `corrected`, so keep this list.
+    pub packed_progress: Option<Box<PackedFillResult>>,
     pub kind: PartialErrorKind,
 }
 impl PartialError {
     pub fn new(kind: PartialErrorKind) -> Self {
-        Self { member: None, volume: None, packed_offset: None, output: None, committed: None, location: None, kind }
+        Self {
+            member: None,
+            volume: None,
+            packed_offset: None,
+            output: None,
+            committed: None,
+            location: None,
+            packed_progress: None,
+            kind,
+        }
     }
 }
 impl std::fmt::Display for PartialError {
@@ -210,7 +236,7 @@ impl std::fmt::Display for PartialError {
 impl std::error::Error for PartialError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
-            PartialErrorKind::Io { cause, .. } => Some(cause),
+            PartialErrorKind::Io { cause, .. } | PartialErrorKind::PackedRead(cause) => Some(cause),
             PartialErrorKind::Progressive(cause) => Some(cause.as_ref()),
             _ => None,
         }
@@ -309,6 +335,23 @@ pub struct PartCheck {
 pub struct FillResult {
     pub revision: u64,
     pub applied: Vec<Range<u64>>,
+    pub state: PartialState,
+    pub part_checks: Vec<PartCheck>,
+    pub needs_verification: bool,
+}
+/// What [`PartialFile::fill_packed`](super::PartialFile::fill_packed) or
+/// [`refill_from_packed`](super::PartialFile::refill_from_packed) did.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct PackedFillResult {
+    pub revision: u64,
+    /// Output ranges written: former holes plus corrected alt bytes.
+    pub applied: Vec<Range<u64>>,
+    /// Output ranges that had been filled from an alt with different bytes. The archive bytes replaced them.
+    pub corrected: Vec<Range<u64>>,
+    /// Supplied packed bytes that map to no produced output of this member (headers, padding, other members, or
+    /// output the extraction has not reached yet). They were not used.
+    pub unmapped: Vec<PackedSpan>,
     pub state: PartialState,
     pub part_checks: Vec<PartCheck>,
     pub needs_verification: bool,

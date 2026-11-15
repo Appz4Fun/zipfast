@@ -1194,3 +1194,133 @@ fn journal_recovery_never_repairs_conflicting_or_current_anchored_bytes() {
         assert_eq!(fs::read(target).unwrap(), saved);
     }
 }
+
+// Catches a failed archive-authority rewrite leaving wrong alt bytes known, or leaving the range unfillable.
+#[test]
+fn failed_packed_rewrite_of_alt_bytes_leaves_a_fillable_declared_hole() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    let start = f.evidence.parts[0].packed.range.start;
+    file.core
+        .record_hole(HoleReport {
+            id: 1,
+            revision: 1,
+            member: f.member.clone(),
+            name: Arc::from(b"member.bin".as_slice()),
+            out: 0..4,
+            packed: vec![PackedSpan { volume: 0, range: start..start + 4 }],
+            cause: HoleCause::Missing,
+        })
+        .unwrap();
+    file.core.fill_plain(0, b"wxyz").unwrap();
+    WRITE_FAULT.set(Some(2));
+    let result = file.core.fill_packed(0, start, b"abcd");
+    WRITE_FAULT.set(None);
+    let error = result.unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::Io { .. }), "{error:?}");
+    assert_eq!(error.packed_progress.as_ref().expect("wrong alt reported").corrected, vec![0..4]);
+    assert_eq!(file.remaining().unwrap(), vec![0..16]);
+    let state = file.close().unwrap();
+    let mut opened = f.open(state).unwrap();
+    assert_eq!(opened.remaining().unwrap(), vec![0..16]);
+    let op = opened.core.operation().unwrap();
+    assert!(op.snapshot.holes.iter().any(|h| h.out == (0..4) && h.cause == HoleCause::DeclaredBad));
+    drop(op);
+    opened.fill(0, b"abcd").unwrap();
+    assert_eq!(&fs::read(f.output()).unwrap()[..4], b"abcd");
+}
+
+fn hole(f: &Fixture, file: &PartialFile, revision: u64, out: Range<u64>) {
+    let start = f.evidence.parts[0].packed.range.start;
+    file.core
+        .record_hole(HoleReport {
+            id: revision,
+            revision,
+            member: f.member.clone(),
+            name: Arc::from(b"member.bin".as_slice()),
+            packed: vec![PackedSpan { volume: 0, range: start + out.start..start + out.end }],
+            out,
+            cause: HoleCause::Missing,
+        })
+        .unwrap();
+}
+
+// Catches an intent snapshot whose rewrite holes exceed the reopen limit, which would strand the member.
+#[test]
+fn packed_rewrite_holes_respect_the_reopen_limit() {
+    let f = Fixture::new();
+    let progressive = ProgressiveLimits { hole_intervals: 1, ..ProgressiveLimits::default() };
+    let file = f.create_with(PartialLimits::default(), progressive, SessionControl::default()).unwrap();
+    let start = f.evidence.parts[0].packed.range.start;
+    hole(&f, &file, 1, 0..4);
+    file.core.fill_plain(0, b"wxyz").unwrap();
+    hole(&f, &file, 3, 4..8);
+    let error = file.core.fill_packed(0, start, b"abcd").unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::Progressive(_)), "{error:?}");
+    assert_eq!(&fs::read(f.output()).unwrap()[..4], b"wxyz");
+    let state = file.close().unwrap();
+    f.open(state).unwrap();
+}
+
+struct FailAfter {
+    bytes: Vec<u8>,
+    at: u64,
+    reads: usize,
+}
+impl std::io::Read for FailAfter {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        if self.reads > 1 {
+            return Err(std::io::Error::other("volume went away"));
+        }
+        let n = buf.len().min(self.bytes.len() - self.at as usize);
+        buf[..n].copy_from_slice(&self.bytes[self.at as usize..self.at as usize + n]);
+        self.at += n as u64;
+        Ok(n)
+    }
+}
+impl std::io::Seek for FailAfter {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let std::io::SeekFrom::Start(at) = pos else { unreachable!() };
+        self.at = at;
+        Ok(at)
+    }
+}
+
+// Catches losing which alt bytes were corrected when a later refill chunk fails.
+#[test]
+fn refill_failure_reports_corrections_already_committed() {
+    let f = Fixture::new();
+    let limits = PartialLimits { fill_bytes: 4, ..PartialLimits::default() };
+    let mut file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    let start = f.evidence.parts[0].packed.range.start;
+    hole(&f, &file, 1, 0..8);
+    file.core.fill_plain(0, b"wxyz").unwrap();
+    file.core.fill_plain(4, b"wxyz").unwrap();
+    let mut volume = vec![0u8; start as usize + 16];
+    volume[start as usize..start as usize + 8].copy_from_slice(b"abcdefgh");
+    let mut reader = FailAfter { bytes: volume, at: 0, reads: 0 };
+    let error = file.refill_from_packed(0, start..start + 8, &mut reader).unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::PackedRead(_)), "{error:?}");
+    assert_eq!((error.volume, error.packed_offset), (Some(0), Some(start + 4)));
+    let progress = error.packed_progress.expect("committed progress");
+    assert_eq!(progress.corrected, vec![0..4]);
+    assert_eq!(&fs::read(f.output()).unwrap()[..8], b"abcdwxyz");
+}
+
+// Catches confirmed alt bytes staying Alt, which makes every later refill re-read them.
+#[test]
+fn alt_bytes_confirmed_by_archive_bytes_are_not_refilled_again() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    let start = f.evidence.parts[0].packed.range.start;
+    hole(&f, &file, 1, 0..4);
+    file.core.fill_plain(0, b"abcd").unwrap();
+    assert_eq!(file.core.refill_targets(0, &(start..start + 4)).unwrap(), vec![start..start + 4]);
+    let result = file.core.fill_packed(0, start, b"abcd").unwrap();
+    assert!(result.applied.is_empty() && result.corrected.is_empty());
+    assert!(file.core.refill_targets(0, &(start..start + 4)).unwrap().is_empty());
+    let state = file.close().unwrap();
+    let reopened = f.open(state).unwrap();
+    assert!(reopened.core.refill_targets(0, &(start..start + 4)).unwrap().is_empty());
+}

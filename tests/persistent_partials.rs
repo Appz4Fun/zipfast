@@ -2112,3 +2112,122 @@ fn declare_hole_ignores_members_without_parts_on_the_volume() {
     );
     assert_eq!(files[1].remaining().unwrap(), vec![10..11, 3500..4200]);
 }
+
+fn volume_bytes(fixture: &Fixture) -> Vec<Vec<u8>> {
+    fixture.volumes.iter().map(|v| v.as_ref().unwrap().bytes.clone()).collect()
+}
+fn extracted(dir: &Path) -> (Fixture, Vec<Vec<u8>>, ProgressiveSession, Vec<PartialFile>) {
+    let dest = dir.join("out");
+    let mut fixture = Fixture::new();
+    let volumes = volume_bytes(&fixture);
+    let provider = fixture.provider();
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial_options(&dir.join("state")))
+            .unwrap();
+    let (_, files) = run_to_end(&mut session);
+    (fixture, volumes, session, files)
+}
+struct CountingReader {
+    inner: std::io::Cursor<Vec<u8>>,
+    read: u64,
+}
+impl std::io::Read for CountingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+impl std::io::Seek for CountingReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn fill_packed_with_whole_volumes_fills_only_the_holes_and_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, volumes, _session, mut files) = extracted(dir.path());
+    let mut a = files.remove(0);
+    let mut b = files.remove(0);
+    // a.bin's hole 1300..2000 spans volume 0 (out 0..1400) and volume 1 (out 1400..2800). Whole volume files act
+    // like oversized par2 blocks: headers and good bytes are covered too.
+    let (p0, p1) = (fixture.payloads[0].clone(), fixture.payloads[1].clone());
+    let first = a.fill_packed(0, 0, &volumes[0]).unwrap();
+    assert_eq!(first.applied, vec![1300..1400]);
+    assert!(first.corrected.is_empty());
+    let unmapped: Vec<_> = first.unmapped.iter().map(|s| (s.volume, s.range.clone())).collect();
+    assert_eq!(unmapped, vec![(0, 0..p0.start), (0, p0.end..volumes[0].len() as u64)]);
+    assert_eq!(a.remaining().unwrap(), vec![1400..2000]);
+    let second = a.fill_packed(1, 0, &volumes[1]).unwrap();
+    assert_eq!(second.applied, vec![1400..2000]);
+    assert_eq!(second.unmapped.len(), 2);
+    assert!(a.remaining().unwrap().is_empty());
+    assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/a.bin")).unwrap(), fixture.data[0]);
+    // Packed bytes of another member's volume map to nothing here.
+    let other = b.fill_packed(1, p1.start, &volumes[1][p1.start as usize..p1.end as usize]).unwrap();
+    assert!(other.applied.is_empty());
+    assert_eq!(other.unmapped.len(), 1);
+}
+
+#[test]
+fn packed_bytes_win_over_wrong_alt_bytes_and_flag_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, volumes, _session, mut files) = extracted(dir.path());
+    let mut a = files.remove(0);
+    let wrong: Vec<u8> = fixture.data[0][1300..2000].iter().map(|b| b ^ 0x5a).collect();
+    a.fill(1300, &wrong).unwrap();
+    assert!(!matches!(verify(&mut a), Verdict::Ok { .. }));
+    // A right alt fill of the same range would have been refused; packed bytes replace the wrong ones.
+    let p1 = fixture.payloads[1].clone();
+    let fixed = a.fill_packed(1, p1.start - 20, &volumes[1][p1.start as usize - 20..p1.start as usize + 1000]).unwrap();
+    assert_eq!(fixed.corrected, vec![1400..2000]);
+    assert_eq!(fixed.applied, vec![1400..2000]);
+    let fixed = a.fill_packed(0, 0, &volumes[0]).unwrap();
+    assert_eq!(fixed.corrected, vec![1300..1400]);
+    assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/a.bin")).unwrap(), fixture.data[0]);
+    // Once corrected, the same packed bytes are a no-op.
+    let again = a.fill_packed(0, 0, &volumes[0]).unwrap();
+    assert!(again.applied.is_empty() && again.corrected.is_empty());
+}
+
+#[test]
+fn packed_bytes_that_disagree_with_original_output_are_refused_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, mut volumes, _session, mut files) = extracted(dir.path());
+    let mut a = files.remove(0);
+    let p0 = fixture.payloads[0].clone();
+    volumes[0][p0.start as usize + 10] ^= 1;
+    let error = a.fill_packed(0, 0, &volumes[0]).unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::OverlapMismatch { .. }), "{error:?}");
+    assert_eq!(a.remaining().unwrap(), vec![1300..2000]);
+    let out = fs::read(dir.path().join("out/a.bin")).unwrap();
+    assert_eq!(out[..1300], fixture.data[0][..1300]);
+}
+
+#[test]
+fn refill_from_packed_reads_only_the_damaged_bytes_of_a_repaired_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, volumes, _session, mut files) = extracted(dir.path());
+    let mut a = files.remove(0);
+    // The alt for 1300..1400 was wrong; 1400..2000 is still a hole. Volume 0 and 1 are now repaired on disk.
+    let wrong: Vec<u8> = fixture.data[0][1300..1400].iter().map(|b| b.wrapping_add(1)).collect();
+    a.fill(1300, &wrong).unwrap();
+    let mut reader = CountingReader { inner: std::io::Cursor::new(volumes[0].clone()), read: 0 };
+    let first = a.refill_from_packed(0, 0..volumes[0].len() as u64, &mut reader).unwrap();
+    assert_eq!(reader.read, 100);
+    assert_eq!(first.corrected, vec![1300..1400]);
+    let mut reader = CountingReader { inner: std::io::Cursor::new(volumes[1].clone()), read: 0 };
+    let second = a.refill_from_packed(1, 0..volumes[1].len() as u64, &mut reader).unwrap();
+    assert_eq!(reader.read, 600);
+    assert_eq!(second.applied, vec![1400..2000]);
+    assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/a.bin")).unwrap(), fixture.data[0]);
+    // Nothing left to change: a further refill reads nothing.
+    let mut reader = CountingReader { inner: std::io::Cursor::new(volumes[1].clone()), read: 0 };
+    let none = a.refill_from_packed(1, 0..volumes[1].len() as u64, &mut reader).unwrap();
+    assert_eq!(reader.read, 0);
+    assert!(none.applied.is_empty());
+}
