@@ -801,21 +801,7 @@ fn known_unsupported_members_and_invalid_options_refuse_before_effects() {
         s.extra.extend(record);
     });
     assert!(matches!(failure_before_output(redirection, |_, _, _| {}), PartialErrorKind::UnsupportedMethod));
-    let mut rar4 = Fixture::new();
-    let block = |kind: u8, flags: u16, body: &[u8]| {
-        let mut bytes = vec![0, 0, kind];
-        bytes.extend(flags.to_le_bytes());
-        bytes.extend(((body.len() + 7) as u16).to_le_bytes());
-        bytes.extend(body);
-        let crc = crc32fast::hash(&bytes[2..]) as u16;
-        bytes[..2].copy_from_slice(&crc.to_le_bytes());
-        bytes
-    };
-    let mut bytes = b"Rar!\x1a\x07\0".to_vec();
-    bytes.extend(block(0x73, 0, &[0; 6]));
-    bytes.extend(block(0x7b, 0x4000, &[]));
-    rar4.volumes[0].as_mut().unwrap().bytes = bytes;
-    assert!(matches!(failure_before_output(rar4, |_, _, _| {}), PartialErrorKind::UnsupportedFormat));
+    // RAR4 stored members are admitted; tests/persistent_partials_rar4.rs covers the RAR4 refusals.
     let mut aes = Fixture::new();
     let mut params = Vec::new();
     common::vint(0, &mut params);

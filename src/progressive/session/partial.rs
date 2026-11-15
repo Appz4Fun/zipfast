@@ -257,14 +257,14 @@ impl ProgressiveSession {
         Ok(fed)
     }
     pub(super) fn partial_header(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<()> {
-        if header.format != crate::rar5::RarFormat::Rar5 {
-            return Err(error(PartialErrorKind::UnsupportedFormat));
-        }
-        // Encrypted stored members are admitted; their password must be in the session options.
-        if header.method != 0 || header.is_dir() || header.redirection.is_some() {
+        // Encrypted RAR5 stored members are admitted; their password must be in the session options. RAR4 stored
+        // members are admitted plain only.
+        let rar4 = header.format == crate::rar5::RarFormat::Rar4;
+        if header.method != 0 || header.is_dir() || header.redirection.is_some() || (rar4 && header.encrypted) {
             return Err(error(PartialErrorKind::UnsupportedMethod));
         }
-        if header.size_unknown() {
+        // RAR4 has no unknown-size flag: the progressive RAR4 path reads an all-ones size as unknown.
+        if header.size_unknown() || (rar4 && matches!(header.unpacked_size, u64::MAX | 0xffff_ffff)) {
             return Err(error(PartialErrorKind::UnknownMemberSize));
         }
         Ok(())
@@ -276,7 +276,12 @@ impl ProgressiveSession {
         let header = &physical.header;
         let witness = persistent.witness.take().ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
         self.usage.charge(Resource::MetadataBytes, (witness.bytes.len() + header.name.len() + 32) as u64)?;
-        let mut identity = b"zipfast/plain-stored/member/v1\0".to_vec();
+        // Each format has its own identity domain, so a RAR4 and a RAR5 member never share a key or a bundle.
+        let format = header.format;
+        let mut identity = match format {
+            crate::rar5::RarFormat::Rar5 => b"zipfast/plain-stored/member/v1\0".to_vec(),
+            crate::rar5::RarFormat::Rar4 => b"zipfast/rar4-stored/member/v1\0".to_vec(),
+        };
         identity.extend_from_slice(&witness.bytes);
         let key = MemberKey::new(
             persistent.options.binding.clone(),
@@ -320,6 +325,7 @@ impl ProgressiveSession {
             size: header.unpacked_size,
             protection: self.driver.partial_catalogue()?,
             evidence: InitialEvidence {
+                format,
                 metadata: crate::extract::Meta::from(header),
                 parts: vec![plain],
                 admissions: vec![admission],

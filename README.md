@@ -120,3 +120,11 @@ old embedded comments and legacy service layouts stop catalogue construction.
 The existing catalogue, selected decode and spool limits apply to RAR4.
 Catalogue opening reserves a conservative temporary capacity allowance of
 12 times each header length before allocating header and name scratch.
+
+With the `persistent-partials` feature, plain RAR4 Stored members, unsplit or
+split across volumes, can be extracted to persistent partial files. Holes are
+skipped and reported exactly, filled later from plaintext or archive bytes, and
+verified with each non-final part's header CRC, which pins a bad fill to its
+volume, and with the member CRC. Encrypted RAR4 members, RAR4 header
+encryption and compressed RAR4 members are refused with typed errors before any
+output. See [docs/persistent-partials.md](docs/persistent-partials.md).
