@@ -430,11 +430,14 @@ impl PartialCore {
     ) -> PartialResult<Vec<Range<u64>>> {
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
-        if end > op.snapshot.head.size || self.read_chunk == 0 {
+        if end > op.snapshot.head.size {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
         if bytes.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.read_chunk == 0 {
+            return Err(err(PartialErrorKind::InvalidOptions));
         }
         if op.snapshot.evidence.parts.last().is_none_or(|part| end > part.out.end) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));

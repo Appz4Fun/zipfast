@@ -492,3 +492,28 @@ fn filled_hole_reports_release_interval_capacity() {
     file.fill(17, &f.data[17..]).unwrap();
     assert!(file.remaining().unwrap().is_empty());
 }
+
+// Empty operations need no read capacity, even after a legitimate zero-chunk reopen.
+#[test]
+fn reopened_unknown_empty_fills_allow_zero_read_chunk() {
+    let f = Fixture::new(33, true, true, false);
+    let file = f.create();
+    f.hole(&file, 0..33);
+    let state = file.close().unwrap();
+    let anchor = state.anchor().clone();
+    let calls = f.store.calls.load(Ordering::SeqCst);
+    let output = fs::read(f.output()).unwrap();
+    let mut context = f.context();
+    context.progressive_limits.read_chunk = 0;
+    let mut file = PartialFile::open(state, context).unwrap();
+    for offset in [0, 33] {
+        let result = file.fill(offset, &[]).expect("valid empty fill needs no read chunk");
+        assert!(result.applied.is_empty());
+        assert_eq!(result.state.anchor(), &anchor);
+    }
+    assert!(matches!(file.fill(34, &[]).unwrap_err().kind, PartialErrorKind::InvalidOptions));
+    assert!(matches!(file.fill(0, &f.data[..17]).unwrap_err().kind, PartialErrorKind::InvalidOptions));
+    assert_eq!(file.state().unwrap().anchor(), &anchor);
+    assert_eq!(f.store.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(fs::read(f.output()).unwrap(), output);
+}
