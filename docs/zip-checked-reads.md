@@ -2,7 +2,7 @@
 
 The additive checked reader streams Stored, Deflate, Bzip2, ZIP LZMA, XZ and Zstandard members. It supports ZipCrypto and WinZip AES-128/192/256, AE-1 and AE-2. AES verifies the complete ciphertext authentication tag in an owned snapshot before constructing the decoder, decrypting or invoking a plaintext callback. ZipCrypto's password header is weak evidence; it does not authenticate the payload. AE-1 requires the ZIP CRC; AE-2 uses its authentication tag and ignores the wire CRC. Every supported codec must finish exactly at the declared packed and decoded boundaries under its format's permitted termination rules.
 
-Existing `Archive::read_at`, consuming selected reads, `run` and `run_with_password` preserve the 128 MiB packed encrypted-member ceiling. Their signatures and `extract::Options` literals remain compatible. The ordinary command uses the checked policy path. Applications opt into checked reads with `EncryptedReadContext` and the methods below.
+Existing `Archive::read_at`, consuming selected reads, `run` and `run_with_password` preserve the 128 MiB packed encrypted-member ceiling. Their signatures remain compatible. `extract::Options` literals must now also set `select` (`None` keeps every member). The checked run honours the member filter and does not read unselected entries. The ordinary command uses the checked policy path. Applications opt into checked reads with `EncryptedReadContext` and the methods below.
 
 ## Required output and temporary storage
 

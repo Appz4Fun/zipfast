@@ -1222,6 +1222,7 @@ mod tests {
                     threads: Some(1),
                     protected_paths: Default::default(),
                     parallel_min: None,
+                    select: None,
                 },
                 "a.rar".into(),
             );
@@ -1490,6 +1491,7 @@ mod tests {
                 threads: Some(1),
                 protected_paths: Default::default(),
                 parallel_min: None,
+                select: None,
             };
             let run = crate::extract::run_with_password(
                 &fixtures.join(format!("testfile5{set}.part01.rar")),

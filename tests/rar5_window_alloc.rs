@@ -98,6 +98,7 @@ fn check_archive(archive: &Path, refuse: bool) {
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     };
     let mut seen = 0;
     REFUSE_WINDOW.store(refuse, Ordering::Relaxed);

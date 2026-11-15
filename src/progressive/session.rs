@@ -1458,6 +1458,7 @@ mod tests {
                 threads: Some(1),
                 protected_paths: Default::default(),
                 parallel_min: None,
+                select: None,
             },
             "a.rar".into(),
         );
@@ -1576,6 +1577,7 @@ mod tests {
                     threads: Some(1),
                     protected_paths: Default::default(),
                     parallel_min: None,
+                    select: None,
                 },
                 "a.rar".into(),
             );

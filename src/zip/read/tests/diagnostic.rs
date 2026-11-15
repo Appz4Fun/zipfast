@@ -1177,6 +1177,7 @@ fn direct_setup_output(
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     };
     (file, session, options, context)
 }

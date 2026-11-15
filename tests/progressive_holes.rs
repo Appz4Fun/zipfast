@@ -74,6 +74,7 @@ fn options(dest: &std::path::Path) -> ProgressiveOptions {
             threads: Some(1),
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         },
         OsString::from("a.rar"),
     );

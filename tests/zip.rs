@@ -170,6 +170,7 @@ fn opts(dest: &Path) -> Options {
         threads: None,
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 
@@ -755,4 +756,132 @@ fn selected_zip_cancellation_before_open_and_during_decode() {
         .unwrap_err();
     assert!(matches!(error, zipfast::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionAborted));
     assert!((1..plain.len()).contains(&received));
+}
+
+fn only(names: &[&'static str]) -> extract::MemberFilter {
+    let names = names.to_vec();
+    extract::MemberFilter::new(move |m| names.contains(&m.name))
+}
+
+#[test]
+fn a_member_filter_chooses_which_zip_entries_are_tested_and_extracted() {
+    use std::sync::{Arc, Mutex};
+    let dir = tmp("member-filter");
+    let arc = dir.join("a.zip");
+    let text = b"selected text ".repeat(1000);
+    fs::write(
+        &arc,
+        zip(&[
+            Z { mode: Some(0o40755), ..Z::new("d/", b"") },
+            Z { deflate: true, ..Z::new("d/a.txt", &text) },
+            Z::new("b.bin", b"bee"),
+            Z { mode: Some(0o40755), ..Z::new("e/", b"") },
+            // would fail if read: an unselected entry is not read or decompressed
+            Z { crc: Some(1), deflate: true, ..Z::new("e/bad.txt", b"bad bad bad") },
+            Z::new("../evil", b"x"),
+        ]),
+    )
+    .unwrap();
+
+    // the filter sees every entry once, folders included, at its listing position
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let o = Options {
+        select: Some(extract::MemberFilter::new(move |m| {
+            record.lock().unwrap().push((m.ordinal, m.name.to_string(), m.is_dir));
+            m.name == "d/a.txt" || m.name == "b.bin"
+        })),
+        ..test_opts(&dir)
+    };
+    let s = extract::run(&arc, &o, |_| {}).unwrap();
+    let listed: Vec<_> =
+        extract::list(&arc).unwrap().into_iter().enumerate().map(|(i, e)| (i as u64, e.name, e.dir)).collect();
+    assert_eq!(*seen.lock().unwrap(), listed);
+    assert_eq!((s.matched, s.files, s.dirs, s.bytes, s.errors.len()), (2, 2, 0, text.len() as u64 + 3, 0));
+
+    // extraction writes only the selected files; the folder above one is made, the unselected folder entry is not
+    let out = dir.join("out");
+    let s = extract::run(&arc, &Options { select: Some(only(&["d/a.txt", "b.bin"])), ..opts(&out) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (2, 2, 0, 0), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("d/a.txt")).unwrap(), text);
+    assert_eq!(fs::read(out.join("b.bin")).unwrap(), b"bee");
+    assert!(!out.join("e").exists());
+    assert!(!dir.join("evil").exists());
+
+    // a selected folder entry is counted and made
+    let s = extract::run(&arc, &Options { select: Some(only(&["e/"])), ..opts(&dir.join("dirs")) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (1, 0, 1, 0));
+    assert!(dir.join("dirs/e").is_dir() && !dir.join("dirs/e/bad.txt").exists());
+
+    // path safety still applies to a selected entry
+    let s = extract::run(&arc, &Options { select: Some(only(&["../evil"])), ..opts(&dir.join("evil-out")) }, |_| {})
+        .unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (1, 0, 1));
+    assert!(!dir.join("evil").exists());
+
+    // nothing matched: success with nothing counted or written
+    let none = dir.join("none");
+    for o in
+        [Options { select: Some(only(&[])), ..opts(&none) }, Options { select: Some(only(&[])), ..test_opts(&none) }]
+    {
+        let s = extract::run(&arc, &o, |_| {}).unwrap();
+        assert_eq!((s.matched, s.files, s.dirs, s.skipped, s.errors.len()), (0, 0, 0, 0, 0));
+    }
+    assert_eq!(fs::read_dir(&none).unwrap().count(), 0);
+
+    // no filter: every entry, as before
+    let s = extract::run(&arc, &test_opts(&dir), |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.dirs, s.errors.len()), (6, 2, 2, 2));
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use zipfast::zip::{EncryptedReadContext, ZipRunEvent};
+        let checked = |o: &Options| {
+            let mut events = Vec::new();
+            let policy = extract::run_with_zip_policy(
+                &arc,
+                o,
+                None,
+                &extract::Cancellation::default(),
+                &Default::default(),
+                |event: ZipRunEvent<'_>| {
+                    match event {
+                        ZipRunEvent::MemberSucceeded { ordinal, .. } => events.push(("ok", ordinal)),
+                        ZipRunEvent::MemberFailed { ordinal, .. } => events.push(("failed", ordinal)),
+                        ZipRunEvent::MemberSkipped { ordinal, .. } => events.push(("skipped", ordinal)),
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+            let contextual = extract::run_with_zip_context(
+                &arc,
+                o,
+                None,
+                &extract::Cancellation::default(),
+                &mut context,
+                |_: ZipRunEvent<'_>| Ok(()),
+            );
+            (policy, contextual, events)
+        };
+        let report = |r: zipfast::zip::ZipRunReport| (r.matched(), r.files(), r.dirs(), r.failed());
+        let picked = Some(only(&["d/a.txt", "b.bin"]));
+        let (policy, contextual, events) = checked(&Options { select: picked.clone(), ..test_opts(&dir) });
+        assert_eq!(report(policy), (2, 2, 0, 0));
+        assert_eq!(events, [("ok", 1), ("ok", 2)]);
+        assert_eq!(report(contextual.unwrap()), (2, 2, 0, 0));
+        let out = dir.join("checked");
+        let (policy, _, _) = checked(&Options { select: picked, ..opts(&out) });
+        assert_eq!(report(policy), (2, 2, 0, 0));
+        assert_eq!(fs::read(out.join("d/a.txt")).unwrap(), text);
+        assert!(out.join("b.bin").exists() && !out.join("e").exists());
+        let (policy, contextual, events) = checked(&Options { select: Some(only(&[])), ..test_opts(&dir) });
+        assert_eq!(report(policy), (0, 0, 0, 0));
+        assert!(events.is_empty());
+        assert_eq!(report(contextual.unwrap()), (0, 0, 0, 0));
+        let (policy, _, _) = checked(&Options { select: Some(only(&["../evil"])), ..test_opts(&dir) });
+        assert_eq!(report(policy), (1, 0, 0, 1));
+    }
 }

@@ -690,6 +690,7 @@ mod tests {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         }
     }
     struct Fault {
@@ -934,6 +935,7 @@ mod directory_fault_tests {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1005,6 +1007,7 @@ mod trailing_directory_tests {
             threads: None,
             protected_paths: Default::default(),
             parallel_min: None,
+            select: None,
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

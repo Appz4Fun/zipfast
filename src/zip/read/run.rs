@@ -255,6 +255,12 @@ impl ProjectedReadSession {
                     terminal = Some(ReadFault::Cancelled.into());
                     break;
                 }
+                let entry = &self.owner.entries[ordinal];
+                // an unselected member is not read, checked, charged or reported
+                if !options.selects(&entry.name, None, entry.is_dir(), ordinal as u64) {
+                    continue;
+                }
+                add(&mut report.matched)?;
                 if self.owner.entries[ordinal].is_dir() {
                     if let Err(fault) = context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1)) {
                         terminal = Some(fault.into());

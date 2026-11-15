@@ -33,6 +33,7 @@ pub(super) fn setup(
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     };
     let context = EncryptedReadContext::for_projected(
         &mut s,

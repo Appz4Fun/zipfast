@@ -34,6 +34,7 @@ fn opts(dest: &Path, threads: usize) -> Options {
         threads: Some(threads),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 
@@ -374,5 +375,79 @@ fn refused_solid_predecessor_cannot_leave_stale_history() {
             assert!(!typed_out.join("dependent").exists());
             assert_eq!(fs::read(typed_out.join("restart")).unwrap(), b"AAA");
         }
+    }
+}
+
+fn picking(wanted: Vec<String>) -> extract::MemberFilter {
+    extract::MemberFilter::new(move |m| wanted.iter().any(|w| w == m.name))
+}
+
+#[test]
+fn unselected_files_of_a_solid_archive_are_decoded_for_history_but_not_written_or_counted() {
+    let dir = tmp("select");
+    let files = named(solid_stream(12, true));
+    let arc = dir.join("s.rar");
+    fs::write(&arc, archive(&files)).unwrap();
+    // the second file alone, then a few that copy from files before them
+    for wanted in [vec![1], vec![2, 7, 11]] {
+        let names: Vec<String> = wanted.iter().map(|&i| files[i].0.clone()).collect();
+        for threads in [1, 4] {
+            let out = dir.join(format!("out-{threads}-{}", wanted.len()));
+            let o = Options { select: Some(picking(names.clone())), ..opts(&out, threads) };
+            let (s, lines) = run(&arc, &o);
+            assert!(s.errors.is_empty() && lines.is_empty(), "{threads}: {:?} {lines:?}", s.errors);
+            assert_eq!((s.matched, s.files), (wanted.len() as u64, wanted.len() as u64));
+            for (i, (n, _, plain, _)) in files.iter().enumerate() {
+                match fs::read(out.join(n)) {
+                    Ok(got) => assert!(wanted.contains(&i) && got == *plain, "{threads}: {n}"),
+                    Err(_) => assert!(!wanted.contains(&i), "{threads}: {n} missing"),
+                }
+            }
+            let (t, _) = run(&arc, &Options { mode: Mode::Test, ..o.clone() });
+            assert!(t.errors.is_empty(), "{:?}", t.errors);
+            assert_eq!((t.matched, t.files), (wanted.len() as u64, wanted.len() as u64));
+
+            let mut indexes = Vec::new();
+            let summary = extract::run_rar_with_outcomes(&arc, &Options { mode: Mode::Test, ..o }, None, |e| {
+                indexes.push(e.entry.index.unwrap())
+            })
+            .unwrap();
+            assert_eq!(
+                (summary.encountered, summary.matched, summary.files),
+                (12, wanted.len() as u64, wanted.len() as u64)
+            );
+            assert_eq!(indexes, wanted.iter().map(|&i| i as u64).collect::<Vec<_>>());
+        }
+    }
+
+    // nothing matched, and no filter
+    let (s, lines) = run(&arc, &Options { select: Some(picking(Vec::new())), ..opts(&dir.join("none"), 4) });
+    assert_eq!((s.matched, s.files, s.errors.len(), lines.len()), (0, 0, 0, 0));
+    assert_eq!(fs::read_dir(dir.join("none")).unwrap().count(), 0);
+    let (s, _) = run(&arc, &Options { mode: Mode::Test, ..opts(&dir.join("all"), 4) });
+    assert_eq!((s.matched, s.files, s.errors.len()), (12, 12, 0));
+}
+
+#[test]
+fn a_damaged_unselected_file_of_a_solid_archive_fails_only_the_selected_ones_after_it() {
+    let dir = tmp("select-damaged");
+    let mut files = named(solid_stream(10, false));
+    let n = files[3].1.len();
+    files[3].1[n / 2] ^= 0xff;
+    files[3].1[n / 2 + 1] ^= 0xff;
+    // and a wrong checksum, which an unselected file is never checked against
+    files[2].3 ^= 1;
+    let arc = dir.join("s.rar");
+    fs::write(&arc, archive(&files)).unwrap();
+    let names = vec![files[1].0.clone(), files[6].0.clone()];
+    for threads in [1, 4] {
+        let out = dir.join(format!("out-{threads}"));
+        let (s, lines) = run(&arc, &Options { select: Some(picking(names.clone())), ..opts(&out, threads) });
+        assert_eq!((s.matched, s.files), (2, 1), "{threads}");
+        assert_eq!(s.errors.len(), 1, "{threads}: {:?}", s.errors);
+        assert!(s.errors[0].starts_with(&files[6].0), "{threads}: {:?}", s.errors);
+        assert_eq!(lines, s.errors);
+        assert!(fs::read(out.join(&files[1].0)).unwrap() == files[1].2);
+        assert!(!out.join(&files[6].0).exists());
     }
 }

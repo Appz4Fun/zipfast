@@ -83,7 +83,8 @@ APIs and the same Deflate backend. Full WinZip AES reads verify the payload
 tag, while header password checks and prefix previews remain provisional.
 Zipfast retains its default command, root package, and skip-existing
 extraction default. Callers constructing `zipfast::extract::Options` must
-initialize the new `protected_paths` field, which accepts an empty set.
+initialize the new `protected_paths` field, which accepts an empty set, and
+the later `select` member filter, which takes `None` for every member.
 The engine supplies its own archive and volume protections. See
 [engine behavior and limits](engine-baseline.md#safety-behavior).
 

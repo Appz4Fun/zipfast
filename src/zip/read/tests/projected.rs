@@ -1673,6 +1673,7 @@ fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     };
     for case in 0..6 {
         let cancel = Cancellation::default();
@@ -1772,6 +1773,7 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     };
     for supplied_context in [false, true] {
         OBSERVATIONS.with(|s| s.set(Default::default()));

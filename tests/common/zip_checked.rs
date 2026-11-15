@@ -64,6 +64,7 @@ pub fn options(dest: &Path, extract: bool) -> zipfast::extract::Options {
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     }
 }
 

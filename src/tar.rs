@@ -272,6 +272,8 @@ enum Kind {
 #[derive(Clone, Debug)]
 struct Member {
     name: String,
+    /// the stored name's bytes, kept only when they aren't UTF-8 and `name` had to replace some
+    raw_name: Option<Vec<u8>>,
     link: String,
     size: u64,
     kind: Kind,
@@ -477,7 +479,7 @@ impl Reader {
             let n = std::mem::take(&mut self.unread);
             self.src.skip(n, &mut self.scratch)?;
         }
-        let mut long_name: Option<String> = None;
+        let mut long_name: Option<Vec<u8>> = None;
         let mut long_link: Option<String> = None;
         let mut pax = Pax::default();
         loop {
@@ -487,7 +489,7 @@ impl Reader {
             let Some(size) = size else { return Err(Error::Corrupt("a tar header's size is unreadable")) };
             match kind {
                 b'L' => {
-                    long_name = Some(name_of(text(&self.ext_data(size)?)));
+                    long_name = Some(text(&self.ext_data(size)?).to_vec());
                     continue;
                 }
                 b'K' => {
@@ -519,7 +521,14 @@ impl Reader {
                     name = [prefix, b"/", &name].concat();
                 }
             }
-            let name = p.path.clone().or(long_name).unwrap_or_else(|| name_of(&name));
+            let (name, raw_name) = match p.path.clone() {
+                Some(path) => (path, None),
+                None => {
+                    let stored = long_name.unwrap_or(name);
+                    let decoded = name_of(&stored);
+                    (decoded, std::str::from_utf8(&stored).is_err().then_some(stored))
+                }
+            };
             let link = p.linkpath.clone().or(long_link).unwrap_or_else(|| name_of(text(&h[157..257])));
             let size = p.size.unwrap_or(size);
             // the size with its padding has to be a number too
@@ -557,7 +566,16 @@ impl Reader {
             // links and folders carry no data, whatever the size field says, except GNU's dump folders
             let has_data = !matches!(kind, Kind::HardLink | Kind::Symlink) && !(kind == Kind::Dir && h[156] == b'5');
             self.unread = if has_data { size + padding(size) } else { 0 };
-            return Ok(Some(Member { name, link, size: if has_data { size } else { 0 }, kind, mtime, nanos, mode }));
+            return Ok(Some(Member {
+                name,
+                raw_name,
+                link,
+                size: if has_data { size } else { 0 },
+                kind,
+                mtime,
+                nanos,
+                mode,
+            }));
         }
     }
 
@@ -911,6 +929,10 @@ fn run_single(
     report: &mut impl FnMut(&str),
 ) -> Result<()> {
     let name = single_name(reader.src.codec().unwrap_or(Codec::Gzip), path);
+    if !opts.selects(&name, None, false, 0) {
+        return Ok(());
+    }
+    summary.matched += 1;
     let mut out = None;
     if opts.mode == Mode::Extract {
         let rel = PathBuf::from(&name);
@@ -942,6 +964,8 @@ fn run_tar(
     report: &mut impl FnMut(&str),
 ) -> Result<()> {
     let mut staged = (opts.mode == Mode::Extract && reader.src.codec().is_some()).then(StagedTar::default);
+    // the next member's position in a listing, which leaves out volume labels
+    let mut ordinal = 0u64;
     loop {
         let m = match reader.next() {
             Ok(Some(m)) => m,
@@ -969,10 +993,20 @@ fn run_tar(
                 return Ok(());
             }
         };
+        if m.kind == Kind::Other(b'V') {
+            continue;
+        }
+        let position = ordinal;
+        ordinal += 1;
         // "./" stands for the destination itself
         if m.kind == Kind::Dir && m.name.split('/').all(|p| p.is_empty() || p == ".") {
             continue;
         }
+        // an unselected member's data is passed over by the next call to `next`
+        if !opts.selects(&m.name, m.raw_name.as_deref(), m.kind == Kind::Dir, position) {
+            continue;
+        }
+        summary.matched += 1;
         let rel = match sanitize(&m.name, false) {
             Ok(rel) => rel,
             Err(e) => {

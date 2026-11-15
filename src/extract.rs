@@ -80,9 +80,105 @@ pub struct Options {
     /// the smallest file decoded on several threads; None for the decoder's default
     #[doc(hidden)]
     pub parallel_min: Option<u64>,
+    /// Which members to test or extract. `None` takes every member.
+    ///
+    /// The filter is asked once per member, in archive order, before anything about that member is checked, written
+    /// or counted. See [`MemberFilter`] for what an unselected member means for each format.
+    pub select: Option<MemberFilter>,
+}
+
+/// One member as a [`MemberFilter`] sees it.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct MemberRef<'a> {
+    /// The member's name as [`list`] reports it: decoded to text, before any output path policy.
+    pub name: &'a str,
+    /// The name's bytes exactly as stored, when they differ from `name` and the reader kept them. `None` means `name`
+    /// is all the reader keeps. Today only tar sets it, for a ustar or GNU long name that isn't UTF-8.
+    pub raw_name: Option<&'a [u8]>,
+    /// The member is a folder.
+    pub is_dir: bool,
+    /// Zero-based position of the member in what [`list`] returns for the same archive.
+    pub ordinal: u64,
+}
+
+impl MemberRef<'_> {
+    /// The stored name's bytes: `raw_name` when kept, else the decoded name's UTF-8.
+    pub fn name_bytes(&self) -> &[u8] {
+        self.raw_name.unwrap_or(self.name.as_bytes())
+    }
+}
+
+/// A predicate choosing which members a whole-archive run tests or extracts.
+///
+/// Every format applies it the same way:
+///
+/// - An unselected member is neither written nor tested, and it is left out of every count, message and outcome.
+///   [`Summary::matched`], [`RarRunSummary::matched`] and [`crate::zip::ZipRunReport::matched`] count the members the
+///   filter took, so a caller can tell a run that matched nothing from one that failed. A run that matches nothing
+///   succeeds with zero files.
+/// - Folder entries are offered too, with `is_dir` set. An unselected folder entry is not created and its times and
+///   permissions are not restored, but the folders above a selected file are still made so the file can be written.
+/// - Path safety, overwrite and protected-path checks apply to selected members exactly as without a filter. An
+///   unselected member is never written, not even as an empty file.
+/// - ZIP does not read or decompress an unselected member. Plain tar seeks past it. Compressed tar decodes through
+///   it, since the stream can only be read in order.
+/// - In a solid RAR archive an unselected compressed member that a later member may depend on is still decoded, to
+///   keep the dictionary history, but it is not checked against its checksums, counted or reported. Its failure to
+///   decode is reported on the next selected member that needed it, as with a member skipped because its target
+///   exists.
+/// - A RAR continuation part whose first part isn't in the set has no listing position, so the filter is not asked
+///   about it. It is handled as before (reported as [`RarSkipReason::MissingStart`], or taken as a member of its own
+///   after a different member that was missing its next part) only when there is no filter; with one, it is passed
+///   over.
+///
+/// ```
+/// use zipfast::extract::{MemberFilter, Mode, Options, Overwrite};
+///
+/// let opts = Options {
+///     mode: Mode::Test,
+///     dest: "out".into(),
+///     overwrite: Overwrite::Skip,
+///     flatten: false,
+///     threads: None,
+///     protected_paths: Default::default(),
+///     parallel_min: None,
+///     select: Some(MemberFilter::new(|m| m.is_dir || m.name.ends_with(".txt"))),
+/// };
+/// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
+/// ```
+#[derive(Clone)]
+pub struct MemberFilter(Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>);
+
+impl MemberFilter {
+    pub fn new(filter: impl Fn(&MemberRef<'_>) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(filter))
+    }
+
+    /// Whether the filter takes `member`.
+    pub fn selects(&self, member: &MemberRef<'_>) -> bool {
+        (self.0)(member)
+    }
+}
+
+impl From<Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>> for MemberFilter {
+    fn from(filter: Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>) -> Self {
+        Self(filter)
+    }
+}
+
+impl std::fmt::Debug for MemberFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemberFilter(..)")
+    }
 }
 
 impl Options {
+    /// Whether a run takes this member: always without a filter.
+    pub(crate) fn selects(&self, name: &str, raw_name: Option<&[u8]>, is_dir: bool, ordinal: u64) -> bool {
+        self.select.as_ref().is_none_or(|filter| filter.selects(&MemberRef { name, raw_name, is_dir, ordinal }))
+    }
+
     pub(crate) fn protecting(&self, input: &Path) -> Result<Cow<'_, Self>> {
         self.protecting_detailed(input).map_err(RarFault::into_legacy)
     }
@@ -111,6 +207,9 @@ pub struct Summary {
     pub dirs: u64,
     pub bytes: u64,
     pub skipped: u64,
+    /// Members (files and folders) taken by [`Options::select`], whatever became of them: every member when there is
+    /// no filter. Zero means nothing matched.
+    pub matched: u64,
     /// one line per file that failed
     pub errors: Vec<String>,
     pub volumes: u64,
@@ -1351,6 +1450,8 @@ pub(crate) struct Pending {
     failed: bool,
     /// decoded only to keep a solid stream going: not counted, not written
     passive: bool,
+    /// not taken by the run's member filter: never reported, even when its parts go missing
+    hidden: bool,
     compressed: bool,
     encrypted: bool,
     /// AES-256-CBC state for an encrypted RAR5 file
@@ -1383,6 +1484,7 @@ impl Pending {
             checks: crate::rar5::member::InnerChecks::new(h),
             failed: false,
             passive: false,
+            hidden: false,
             compressed: h.method != 0,
             encrypted: h.encrypted,
             cipher: None,
@@ -1878,6 +1980,8 @@ struct Run<'a, 'r, 'c> {
     /// folders under the destination made (or found) so far
     dirs: Dirs,
     selection: Option<RarSelection<'a>>,
+    /// members with a first header seen so far: the next one's listing position
+    members: u64,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -1908,9 +2012,11 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, mut report: imp
 /// The synchronous callback runs on the calling thread, in archive reporting order. Workers may
 /// publish files independently. A callback panic unwinds without rolling back completed outputs.
 ///
-/// A successful traversal can include failed or skipped members. Every normal member counts as a
-/// match, including directories and existing-target skips. An empty archive or a volume containing
-/// only orphan continuations can complete with no matches. A terminal error contains partial
+/// A successful traversal can include failed or skipped members. Every normal member that
+/// [`Options::select`] takes (every one without a filter) counts as a match, including directories
+/// and existing-target skips. Unselected members produce no outcome and keep their listing index.
+/// An empty archive, a volume containing only orphan continuations, or a filter that takes nothing
+/// can complete with no matches. A terminal error contains partial
 /// counts for the completions reported before return.
 #[allow(clippy::result_large_err, reason = "the public error carries partial counts and an optional entry identity")]
 pub fn run_rar_with_outcomes(
@@ -1991,7 +2097,7 @@ fn rar_run_shared_open<'a>(
     let result = if let Some(mut p) = run.pending.take() {
         let already_reported = p.failed || p.passive;
         p.discard();
-        if walked.is_ok() && (!run.reports.typed() || !already_reported) {
+        if walked.is_ok() && !p.hidden && (!run.reports.typed() || !already_reported) {
             let failure = p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false);
             run.reports.failed(&p.context, Arc::new(failure), "archive ends before this file does")
         } else {
@@ -2021,6 +2127,7 @@ fn rar_read_at(
         threads: Some(1),
         protected_paths: Default::default(),
         parallel_min: None,
+        select: None,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -2100,6 +2207,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             queued_paths: HashSet::new(),
             dirs: Dirs::default(),
             selection: None,
+            members: 0,
         }
     }
 }
@@ -2219,6 +2327,17 @@ impl Run<'_, '_, '_> {
             return self.continue_file(vol, &h, p, crypt);
         }
         let name = std::mem::take(&mut h.name);
+        let selected = if continuation {
+            // an orphan continuation has no listing position to filter on
+            self.opts.select.is_none()
+        } else {
+            let ordinal = self.members;
+            self.members = ordinal.checked_add(1).ok_or_else(RarFault::counter_limit)?;
+            self.opts.selects(&name, None, h.is_dir(), ordinal)
+        };
+        if !selected {
+            return self.unselected_block(vol, h, name, continuation);
+        }
         let ctx = self.reports.encounter(!continuation, &mut self.order, name, h.method)?;
         if let Some(reason) = h.rar4_unsupported() {
             self.fail_in_order(&ctx, RarFailure::Unsupported(reason), "unsupported RAR4 payload feature")?;
@@ -2227,25 +2346,68 @@ impl Run<'_, '_, '_> {
         if !self.goes_to_batch(vol, &h) && !self.queueable(vol, &h) && !self.beside_batch(vol, &h) {
             self.drain_batch()?;
         }
-        if let Some(mut p) = self.pending.take() {
-            if !self.reports.typed() || (!p.failed && !p.passive) {
-                let failure = Arc::new(p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false));
-                self.reports.failed(&p.context, Arc::clone(&failure), "next part is missing")?;
-                if p.compressed {
-                    self.lost_history(&p.context, Some(failure));
-                }
-            } else if p.compressed && self.stream.is_some() {
-                self.lost_history(&p.context, None);
-            }
-            p.discard();
-            self.stream = None;
-        } else if continuation {
+        // a continuation of some other member, after one that wants its next part, is taken as a member of its own
+        if !self.end_pending()? && continuation {
             if self.reports.typed() {
                 self.drain()?;
             }
             return self.reports.skipped(&ctx, RarSkipReason::MissingStart);
         }
         self.start_file(vol, &h, ctx, crypt)
+    }
+
+    /// A new member starts while the one before still waits for a part: that part is missing. Whether one waited.
+    fn end_pending(&mut self) -> RunResult<bool> {
+        let Some(mut p) = self.pending.take() else { return Ok(false) };
+        if !p.hidden && (!self.reports.typed() || (!p.failed && !p.passive)) {
+            let failure = Arc::new(p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false));
+            self.reports.failed(&p.context, Arc::clone(&failure), "next part is missing")?;
+            if p.compressed {
+                self.lost_history(&p.context, Some(failure));
+            }
+        } else if p.compressed && self.stream.is_some() {
+            self.lost_history(&p.context, None);
+        }
+        p.discard();
+        self.stream = None;
+        Ok(true)
+    }
+
+    /// A member the run's filter didn't take. It is not reported or counted, but in a solid archive a compressed one
+    /// is still decoded when a later member may need its history.
+    fn unselected_block(&mut self, vol: &mut Volume, h: FileHeader, name: String, continuation: bool) -> RunResult<()> {
+        if self.pending.is_some() {
+            // the member before is reported missing a part, after everything ahead of it
+            self.drain_batch()?;
+        }
+        self.end_pending()?;
+        if continuation || h.rar4_unsupported().is_some() {
+            return Ok(());
+        }
+        let mut ctx = self.reports.unselected(self.order, name, h.method)?;
+        if !(vol.main.is_solid() && h.method != 0 && !h.is_dir()) {
+            if h.split_after() {
+                // its later parts are passed over too
+                let mut p = Pending::new(&h, ctx);
+                p.failed = true;
+                p.hidden = true;
+                self.pending = Some(p);
+            }
+            return Ok(());
+        }
+        let cipher = match (h.crypt, self.password) {
+            (Some(params), Some(password)) => {
+                let size = (!h.size_unknown()).then_some(h.unpacked_size);
+                Pending::start_cipher(&mut ctx, true, params, password, size).ok()
+            }
+            _ => None,
+        };
+        self.pass_over(vol, &h, ctx, cipher, None)?;
+        // a member split over volumes waits here for its next part: it is this unselected one
+        if let Some(p) = self.pending.as_mut() {
+            p.hidden = true;
+        }
+        Ok(())
     }
 
     /// Decodes usable passive history in a solid archive.
