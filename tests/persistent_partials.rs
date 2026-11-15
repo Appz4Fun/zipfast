@@ -2089,3 +2089,26 @@ fn declare_hole_releases_a_read_parked_on_the_declared_bytes() {
     assert!(holes.iter().any(|h| h.out == (4200..5600) && matches!(h.cause, HoleCause::DeclaredBad)));
     assert_eq!(files[1].remaining().unwrap(), vec![3500..5600]);
 }
+
+#[test]
+fn declare_hole_ignores_members_without_parts_on_the_volume() {
+    // a.bin has no bytes on volume 5; its output being moved away must not fail damage declared for b.bin.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let mut fixture = Fixture::new();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(fixture.provider()),
+        options(&dest),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    let (_, files) = run_to_end(&mut session);
+    fs::rename(dest.join("a.bin"), dir.path().join("moved.bin")).unwrap();
+    let p5 = fixture.payloads[5].start;
+    let receipt = session.declare_hole(5, p5 + 10..p5 + 11).unwrap();
+    assert_eq!(
+        receipt.holes.iter().map(|h| (h.member.ordinal(), h.out.clone())).collect::<Vec<_>>(),
+        vec![(1, 10..11)]
+    );
+    assert_eq!(files[1].remaining().unwrap(), vec![10..11, 3500..4200]);
+}

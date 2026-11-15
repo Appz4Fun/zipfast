@@ -130,15 +130,21 @@ impl ProgressiveSession {
         };
         let read = range.start..split;
         let future = split..range.end;
-        if !future.is_empty() {
-            self.driver.declare_future(volume, future.clone())?;
-        }
         let mut holes = Vec::new();
         let mut mapped = Vec::new();
         if !read.is_empty() {
             let persistent = self.partial.as_ref().unwrap();
             let active = persistent.current.map(|index| persistent.cores[index].0.clone());
-            for (key, core) in &persistent.cores {
+            // The active member first: its machine must learn of streamed damage even if another member fails.
+            let order = active
+                .as_ref()
+                .and_then(|key| persistent.cores.iter().find(|(k, _)| k == key))
+                .into_iter()
+                .chain(persistent.cores.iter().filter(|(k, _)| Some(k) != active.as_ref()));
+            for (key, core) in order {
+                if !core.touches(volume, &read) {
+                    continue;
+                }
                 let (reports, ranges) = core.declare_damage(volume, &read).map_err(failure)?;
                 if active.as_ref() == Some(key) && !reports.is_empty() {
                     // The member machine checked those bytes as they streamed; it must not judge the member or
@@ -159,6 +165,9 @@ impl ProgressiveSession {
                 holes.extend(reports);
                 mapped.extend(ranges);
             }
+        }
+        if !future.is_empty() {
+            self.driver.declare_future(volume, future.clone())?;
         }
         mapped.sort_by_key(|r: &Range<u64>| r.start);
         let mut unmapped = Vec::new();

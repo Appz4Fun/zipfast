@@ -1087,6 +1087,7 @@ impl SourceDriver {
                 crate::partial::PartialErrorKind::Busy,
             )))));
         }
+        let declared_start = range.start;
         let mut merged = range;
         let mut kept = Vec::new();
         kept.try_reserve_exact(self.declared.len() + 1).map_err(|_| contract())?;
@@ -1101,7 +1102,13 @@ impl SourceDriver {
         kept.push((volume, merged));
         kept.sort_by_key(|(v, r)| (*v, r.start));
         self.declared = kept;
-        if self.parked && self.original.is_some() && volume == index {
+        let parked_end =
+            self.retained.as_ref().and_then(|r| r.selected_len).map(|len| cursor.saturating_add(len as u64));
+        if self.parked
+            && self.original.is_some()
+            && volume == index
+            && parked_end.is_none_or(|end| declared_start < end)
+        {
             // A read parked on the provider may be waiting for exactly these bytes; let it retry through the
             // overlay instead of waiting for a provider wake that may never come.
             self.wake.notify(false);

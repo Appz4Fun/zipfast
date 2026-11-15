@@ -761,6 +761,18 @@ impl PartialCore {
         let transaction = self.begin_transaction(&mut data, intent, valid, vec![affected])?;
         self.finish_transaction(&mut data, transaction)
     }
+    /// Whether any proven part of this member lies in `range` of `volume`. Checked without taking the
+    /// operation or touching the output, so unrelated members never fail a declaration; a member busy in another
+    /// operation answers true and is then tried for real.
+    pub(crate) fn touches(&self, volume: u32, range: &Range<u64>) -> bool {
+        self.data.lock().unwrap().as_ref().is_none_or(|data| {
+            data.snapshot.evidence.parts.iter().any(|part| {
+                part.packed.volume == volume
+                    && part.packed.range.start < range.end
+                    && range.start < part.packed.range.end
+            })
+        })
+    }
     /// Maps damage declared on archive bytes of `volume` to this member's already written output. Each run of
     /// output that was still known becomes a durable `DeclaredBad` hole. Also returns the packed sub-ranges whose
     /// output this member has produced, known or not, so callers can tell mapped from unmapped damage.
