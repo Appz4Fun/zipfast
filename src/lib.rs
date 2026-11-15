@@ -19,6 +19,9 @@
 //! RAR 5.0, ZIP, tar and gzip/xz/zstd/bzip2 streams are read from their published layouts. Each format lives in its own module and
 //! hands the extractor a stream of entries; the extractor owns paths, overwrite rules and checksums.
 
+#[cfg(all(test, feature = "persistent-partials"))]
+extern crate self as zipfast;
+
 #[cfg(test)]
 mod test_alloc;
 
@@ -29,6 +32,8 @@ pub mod crypto;
 pub mod error;
 pub mod extract;
 mod output;
+#[cfg(feature = "persistent-partials")]
+pub mod partial;
 pub mod path;
 pub mod progressive;
 pub mod rar5;

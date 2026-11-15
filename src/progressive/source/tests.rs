@@ -516,7 +516,7 @@ fn adjacent_holes_use_one_interval() {
     for offset in [0, 1] {
         assert!(matches!(poll(&mut d,&w,&mut [0;4]),Poll::Ready(Ok(SourceStep::Hole {offset:o,len:1})) if o==offset));
     }
-    assert_eq!(d.holes, [(0, 2)]);
+    assert_eq!(d.original.as_ref().unwrap().holes, [(0, 2)]);
 }
 
 #[test]
@@ -785,7 +785,7 @@ fn source_bookkeeping_exact_under_and_overflow() {
         let result = poll(&mut d, &w, &mut [0; 4]);
         if pass {
             assert!(matches!(result, Poll::Ready(Ok(SourceStep::Hole { offset: 4, len: 1 }))));
-            assert_eq!(d.holes, [(4, 5), (6, 7)]);
+            assert_eq!(d.original.as_ref().unwrap().holes, [(4, 5), (6, 7)]);
             assert_eq!(d.cursor.offset(), 5);
         } else {
             assert!(matches!(
@@ -795,7 +795,7 @@ fn source_bookkeeping_exact_under_and_overflow() {
                     ..
                 }))
             ));
-            assert_eq!(d.holes, [(6, 7)]);
+            assert_eq!(d.original.as_ref().unwrap().holes, [(6, 7)]);
             assert_eq!(d.cursor.offset(), 4);
         }
     }
@@ -833,7 +833,7 @@ fn source_history_has_no_hidden_per_volume_member_quota() {
         d.seek(2 * n).unwrap();
         assert!(matches!(poll(&mut d,&w,&mut [0;1]),Poll::Ready(Ok(SourceStep::Hole {offset,len:1})) if offset==2*n));
     }
-    assert_eq!(d.holes.len(), 65_537);
+    assert_eq!(d.original.as_ref().unwrap().holes.len(), 65_537);
 }
 
 #[test]
@@ -867,7 +867,7 @@ fn id_and_coverage_bookkeeping_exact_under_preserves_state() {
             ));
             assert_eq!(d.admitted.len(), 1);
             assert_eq!(d.admitted[0].1, SourceId(1));
-            assert!(d.source.is_none());
+            assert!(d.original.is_none());
         }
         assert_eq!(d.cursor.offset(), 0);
     }
@@ -912,7 +912,7 @@ fn fallible_metadata_sort_orders_adversarial_input_and_bounds_work() {
 
 /// Isolate lock regressions so even a deadlock/recursive callback is bounded.
 /// Only the parent owns the child process; deadline failure kills AND reaps it.
-fn in_bounded_wake_child(test: &str, marker: &str) -> bool {
+pub(super) fn in_bounded_wake_child(test: &str, marker: &str) -> bool {
     if std::env::var_os(marker).is_some() {
         return true;
     }
@@ -1071,7 +1071,7 @@ fn synchronized_wake_boundary_gates_read_and_volume_retry() {
             assert_eq!(calls.load(Ordering::SeqCst), before);
             assert_eq!(d.cursor.offset(), 0);
             if volume {
-                assert!(d.source.is_none());
+                assert!(d.original.is_none());
                 assert!(d.admitted.is_empty());
             }
         }
@@ -1102,9 +1102,9 @@ fn r1_later_original_admission_counts_retained_replacement_handles() {
     d.supply_replacement(0, Box::new(ImmutableFileSource::open(&paths[2]).unwrap())).unwrap();
     assert_eq!(
         d.native.handle_count()
-            + d.backing_count
+            + d.backing_count()
             + d.replacements[0].1.native.handle_count()
-            + d.replacements[0].1.backing_count,
+            + d.replacements[0].1.backing_count(),
         4
     );
     d.select_volume(VolumeRequest { index: 1, expected: "a.part2.rar".into() }).unwrap();
@@ -1116,7 +1116,7 @@ fn r1_later_original_admission_counts_retained_replacement_handles() {
         }))
     ));
     assert_eq!(d.native.handle_count(), 1, "no new guard cloned before rejection");
-    assert!(d.source.is_none());
+    assert!(d.original.is_none());
 }
 
 #[test]

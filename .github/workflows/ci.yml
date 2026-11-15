@@ -52,6 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features persistent-partials -- -D warnings
       - name: Qualify ZIP creation on native ext-family
         if: runner.os == 'Linux'
         shell: bash
@@ -67,7 +68,9 @@ jobs:
           cargo test --locked --lib native_filesystem_qualification -- --nocapture
           cargo test --locked --test zip_create -- --nocapture
       - run: cargo test --workspace --all-targets --locked
+      - run: cargo test --workspace --all-targets --locked --features persistent-partials
       - run: cargo test --workspace --doc --locked
+      - run: cargo test --workspace --doc --locked --features persistent-partials
 
   zipview-msrv:
     name: Zipview on Rust 1.100.0

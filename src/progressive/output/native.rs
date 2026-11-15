@@ -64,7 +64,27 @@ struct ImmutableBinding {
     path: PathBuf,
     stamp: crate::rar5::source::SourceStamp,
 }
+// Only a prepared persistent genesis has prepaid work. Legacy drivers and
+// normal later operations retain the original cumulative Usage accounting.
+macro_rules! bookkeeping {
+    ($native:expr, $usage:expr, $amount:expr) => {{
+        #[cfg(feature = "persistent-partials")]
+        {
+            if let Some(budget) = &$native.partial_genesis {
+                budget.bookkeeping($amount)
+            } else {
+                $usage.charge(Resource::SourceBookkeeping, $amount)
+            }
+        }
+        #[cfg(not(feature = "persistent-partials"))]
+        {
+            $usage.charge(Resource::SourceBookkeeping, $amount)
+        }
+    }};
+}
 pub(crate) struct NativeProtection {
+    #[cfg(feature = "persistent-partials")]
+    partial_genesis: Option<crate::partial::PartialBudget>,
     bindings: Vec<Binding>,
     admitted: Vec<(u32, Identity)>,
     complete: bool,
@@ -74,6 +94,36 @@ pub(crate) struct NativeProtection {
     immutable: Vec<ImmutableBinding>,
 }
 impl NativeProtection {
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn prepare_partial_genesis(
+        &mut self,
+        output: &Path,
+        bundle: &Path,
+        declaration: &ProtectionDeclaration,
+        budget: &crate::partial::PartialBudget,
+    ) -> ProgressiveResult<()> {
+        let ProtectionDeclaration::Complete { inventory, .. } = declaration else {
+            return Err(contract());
+        };
+        let partial_output = future_path(output)?;
+        let partial_bundle = future_path(bundle)?;
+        let mut work = (inventory.volumes.len() + inventory.auxiliary_paths.len() + self.bindings.len()) as u64;
+        for binding in &self.bindings {
+            let base = 1 + binding.path.as_os_str().len() as u64;
+            let out = base + output.as_os_str().len() as u64;
+            let bundle = base + bundle.as_os_str().len() as u64;
+            let partial_out = base + partial_output.as_os_str().len() as u64;
+            let partial_bundle = base + partial_bundle.as_os_str().len() as u64;
+            // refresh, three initial target checks, then four native checks
+            // (create, intent acknowledgement, output sync, commit acknowledgement).
+            work = work
+                .checked_add(base + 2 * out + bundle + 4 * (base + partial_out + 2 * partial_bundle + out))
+                .ok_or_else(contract)?;
+        }
+        budget.prepare_native_bookkeeping(work);
+        self.partial_genesis = Some(budget.clone());
+        Ok(())
+    }
     pub(crate) fn handle_count(&self) -> usize {
         self.held.len() + self.bindings.iter().filter(|b| b.handle.is_some()).count()
     }
@@ -84,6 +134,8 @@ impl NativeProtection {
         let cwd = std::env::current_dir().map_err(input)?;
         usage.charge(Resource::MetadataBytes, cwd.capacity().saturating_sub(4096) as u64)?;
         Ok(Self {
+            #[cfg(feature = "persistent-partials")]
+            partial_genesis: None,
             bindings: Vec::new(),
             admitted: Vec::new(),
             complete: false,
@@ -102,9 +154,10 @@ impl NativeProtection {
     ) -> ProgressiveResult<()> {
         self.check_immutable(usage)?;
         let ProtectionDeclaration::Complete { inventory, .. } = declaration else { return Ok(()) };
-        usage.charge(
-            Resource::SourceBookkeeping,
-            (inventory.volumes.len() + inventory.auxiliary_paths.len() + self.bindings.len()) as u64,
+        bookkeeping!(
+            self,
+            usage,
+            (inventory.volumes.len() + inventory.auxiliary_paths.len() + self.bindings.len()) as u64
         )?;
         let paths = inventory
             .volumes
@@ -160,7 +213,7 @@ impl NativeProtection {
             self.complete = true;
         } else {
             for (binding, path) in self.bindings.iter_mut().zip(paths) {
-                usage.charge(Resource::SourceBookkeeping, 1 + binding.path.as_os_str().len() as u64)?;
+                bookkeeping!(self, usage, 1 + binding.path.as_os_str().len() as u64)?;
                 let now = observe(&binding.path, path.file.as_deref())?;
                 if binding.identity.is_some() && binding.identity != now {
                     return Err(changed());
@@ -300,6 +353,47 @@ impl NativeProtection {
         // filesystem. Until it binds, keep the output provisional on every platform.
         Ok(self.complete && self.native_only && self.bindings.iter().all(|binding| binding.identity.is_some()))
     }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn check_partial_bindings(&self, usage: &Usage) -> ProgressiveResult<()> {
+        for binding in &self.bindings {
+            bookkeeping!(self, usage, 1 + binding.path.as_os_str().len() as u64)?;
+            if binding.identity.is_some() && observe(&binding.path, binding.handle.as_deref())? != binding.identity {
+                return Err(changed());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn check_partial_subtree(&self, path: &Path, usage: &mut Usage) -> ProgressiveResult<()> {
+        let path = future_path(path)?;
+        for binding in &self.bindings {
+            bookkeeping!(self, usage, 1 + (path.as_os_str().len() + binding.path.as_os_str().len()) as u64)?;
+            if future_path(&binding.path)?.starts_with(&path) {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
+        }
+        self.check_partial_target(&path, usage)
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn check_partial_target(&self, path: &Path, usage: &mut Usage) -> ProgressiveResult<()> {
+        let path = future_path(path)?;
+        for binding in &self.bindings {
+            bookkeeping!(self, usage, 1 + (path.as_os_str().len() + binding.path.as_os_str().len()) as u64)?;
+            let source = future_path(&binding.path)?;
+            if path == source {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
+        }
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            let identity = Identity::metadata(&meta).map_err(input)?;
+            if self.bindings.iter().any(|b| b.identity == Some(identity))
+                || self.admitted.iter().any(|(_, id)| *id == identity)
+            {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn check_target(
         &self,
         path: &Path,
@@ -307,10 +401,7 @@ impl NativeProtection {
         usage: &mut Usage,
     ) -> ProgressiveResult<()> {
         for binding in &self.bindings {
-            usage.charge(
-                Resource::SourceBookkeeping,
-                1 + (path.as_os_str().len() + binding.path.as_os_str().len()) as u64,
-            )?;
+            bookkeeping!(self, usage, 1 + (path.as_os_str().len() + binding.path.as_os_str().len()) as u64)?;
             if path == binding.path || (identity.is_some() && identity == binding.identity) {
                 return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
             }
@@ -323,7 +414,7 @@ impl NativeProtection {
                 }
             }
         }
-        usage.charge(Resource::SourceBookkeeping, self.admitted.len() as u64)?;
+        bookkeeping!(self, usage, self.admitted.len() as u64)?;
         if identity.is_some_and(|id| self.admitted.iter().any(|(_, old)| *old == id)) {
             return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
         }
@@ -350,4 +441,25 @@ fn observe(path: &Path, file: Option<&File>) -> ProgressiveResult<Option<Identit
         return Err(changed());
     }
     Ok(Some(identity))
+}
+
+#[cfg(feature = "persistent-partials")]
+fn future_path(path: &Path) -> ProgressiveResult<PathBuf> {
+    let absolute = std::path::absolute(path).map_err(input)?;
+    let mut ancestor = absolute.as_path();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                let suffix = absolute.strip_prefix(ancestor).map_err(|_| contract())?;
+                // Pushing an empty suffix appends a separator, changing the
+                // charged path length when the previously absent name appears.
+                if !suffix.as_os_str().is_empty() {
+                    canonical.push(suffix);
+                }
+                return Ok(canonical);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ancestor = ancestor.parent().ok_or_else(contract)?,
+            Err(e) => return Err(input(e)),
+        }
+    }
 }

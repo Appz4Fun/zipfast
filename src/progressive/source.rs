@@ -23,7 +23,10 @@ use std::{
     ffi::OsString,
     fs::File,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Wake, Waker},
 };
 
@@ -119,7 +122,7 @@ pub enum ProtectionDeclaration {
 #[derive(Clone, Default)]
 pub struct SessionControl {
     token: Cancellation,
-    wake: Arc<WakeGate>,
+    wake: Arc<ControlWake>,
 }
 impl SessionControl {
     pub(crate) fn cancellation_token(&self) -> Cancellation {
@@ -127,14 +130,139 @@ impl SessionControl {
     }
     pub fn cancel(&self) {
         self.token.cancel();
-        self.wake.notify(false);
+        if let Some(hub) = self.wake.retained.get() {
+            hub.cancel();
+        }
+        self.wake.legacy.notify(false);
     }
     pub(crate) fn register(&self, waker: &Waker) {
-        self.wake.register(waker);
+        self.wake.legacy.register(waker);
     }
     pub fn is_canceled(&self) -> bool {
         self.token.is_canceled()
     }
+}
+#[derive(Default)]
+struct ControlWake {
+    legacy: WakeGate,
+    retained: OnceLock<Arc<CancelFanout>>,
+}
+struct CancelFanout {
+    canceled: AtomicBool,
+    slots: Mutex<Vec<Weak<CancelSlot>>>,
+}
+struct CancelOwner {
+    identity: Arc<()>,
+    max_operations: u64,
+}
+struct CancelSlot {
+    owner: Arc<()>,
+    gate: Weak<WakeGate>,
+    retired: AtomicBool,
+}
+struct CancelRegistration(Arc<CancelSlot>);
+impl CancelRegistration {
+    fn retire(&mut self) {
+        self.0.retired.store(true, Ordering::Release);
+    }
+}
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+impl CancelFanout {
+    fn cancel(&self) {
+        let slots = {
+            let mut slots = self.slots.lock().unwrap();
+            if self.canceled.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            std::mem::take(&mut *slots)
+        };
+        // The detached precharged list is bounded. No callback runs under its mutex.
+        for slot in slots {
+            if let Some(slot) = slot.upgrade()
+                && !slot.retired.load(Ordering::Acquire)
+                && let Some(gate) = slot.gate.upgrade()
+            {
+                gate.notify_canceled();
+            }
+        }
+    }
+}
+impl SessionControl {
+    fn enable_retained_cancel(&self, usage: &mut Usage) -> ProgressiveResult<()> {
+        if self.wake.retained.get().is_none() {
+            usage.charge(
+                Resource::MetadataBytes,
+                (std::mem::size_of::<CancelFanout>() + 2 * std::mem::size_of::<usize>()) as u64,
+            )?;
+            let _ = self.wake.retained.set(Arc::new(CancelFanout {
+                canceled: AtomicBool::new(self.is_canceled()),
+                slots: Mutex::new(Vec::new()),
+            }));
+        }
+        // Covers installation racing cancellation before OnceLock became visible.
+        if self.is_canceled() {
+            self.wake.retained.get().unwrap().cancel();
+        }
+        Ok(())
+    }
+    fn register_retained_cancel(
+        &self,
+        owner: &CancelOwner,
+        gate: &Arc<WakeGate>,
+        usage: &mut Usage,
+    ) -> ProgressiveResult<CancelRegistration> {
+        let hub = self.wake.retained.get().ok_or_else(invalid_capability)?;
+        let mut slots = hub.slots.lock().unwrap();
+        if self.is_canceled() || hub.canceled.load(Ordering::Acquire) {
+            drop(slots);
+            gate.notify_canceled();
+            return Err(canceled());
+        }
+        // One bounded scan, compaction movement and one future cancellation visit.
+        usage.charge(Resource::SourceBookkeeping, (slots.len() * 3 + 1) as u64)?;
+        slots.retain(|row| row.upgrade().is_some_and(|slot| !slot.retired.load(Ordering::Acquire)));
+        let own = slots
+            .iter()
+            .filter(|row| row.upgrade().is_some_and(|slot| Arc::ptr_eq(&slot.owner, &owner.identity)))
+            .count() as u64;
+        let (limit, attempted) =
+            if own >= owner.max_operations { (owner.max_operations, own + 1) } else { (4096, slots.len() as u64 + 1) };
+        if attempted > limit {
+            return Err(ProgressiveFailure::new(FailureKind::Limit {
+                resource: Resource::VolumeHandles,
+                limit,
+                attempted,
+            }));
+        }
+        usage.charge(
+            Resource::MetadataBytes,
+            (std::mem::size_of::<CancelSlot>() + 2 * std::mem::size_of::<usize>()) as u64,
+        )?;
+        reserve_records(&mut slots, usage)?;
+        let slot = Arc::new(CancelSlot {
+            owner: owner.identity.clone(),
+            gate: Arc::downgrade(gate),
+            retired: AtomicBool::new(false),
+        });
+        slots.push(Arc::downgrade(&slot));
+        drop(slots);
+        // Cancellation may have drained and notified before registration returned.
+        if self.is_canceled() {
+            gate.notify_canceled();
+            return Err(canceled());
+        }
+        Ok(CancelRegistration(slot))
+    }
+}
+fn canceled() -> ProgressiveFailure {
+    ProgressiveFailure::new(FailureKind::Canceled)
+}
+fn invalid_capability() -> ProgressiveFailure {
+    ProgressiveFailure::new(FailureKind::InvalidCapability)
 }
 #[derive(Default)]
 struct WakeState {
@@ -155,6 +283,12 @@ impl WakeGate {
             state.task.replace(incoming)
         };
         drop(previous);
+    }
+    fn notify_canceled(&self) {
+        let task = self.0.lock().unwrap().task.take();
+        if let Some(task) = task {
+            task.wake();
+        }
     }
     fn arm(&self) {
         let mut s = self.0.lock().unwrap();
@@ -229,11 +363,193 @@ fn changed() -> ProgressiveFailure {
     ProgressiveFailure::new(FailureKind::SourceChanged)
 }
 
+mod retained;
+#[allow(unused_imports, reason = "H3/H4 consume retained discovery and refill entrypoints")]
+pub(crate) use retained::{OriginalRead, OriginalReadPurpose};
+use retained::{OriginalSource, RetainedOriginals};
+
+struct RangeOperation<'a> {
+    cursor: &'a mut CheckedCursor,
+    gate: &'a Arc<WakeGate>,
+    parked: &'a mut bool,
+    retry_admitted: &'a mut bool,
+    control: &'a SessionControl,
+    usage: &'a mut Usage,
+    verify: bool,
+    #[cfg(feature = "persistent-partials")]
+    exclusions: Option<&'a crate::partial::PartialExclusions>,
+    #[cfg(feature = "persistent-partials")]
+    pending: &'a mut Option<PendingPartialRead>,
+    #[cfg(feature = "persistent-partials")]
+    native: Option<(&'a mut super::output::native::NativeProtection, &'a ProtectionDeclaration, usize)>,
+}
+#[cfg(feature = "persistent-partials")]
+struct PendingPartialRead {
+    offset: u64,
+    requested: u64,
+    answer: RangeRead,
+    bytes: Vec<u8>,
+}
+#[cfg(feature = "persistent-partials")]
+fn partial_read_stable(original: &mut OriginalSource, op: &mut RangeOperation<'_>) -> ProgressiveResult<bool> {
+    let Some(exclusions) = op.exclusions else { return Ok(true) };
+    for _ in 0..2 {
+        op.usage.charge(Resource::SourceRequests, 1)?;
+        let files = original.source.backing_files();
+        if op.control.is_canceled() {
+            return Err(canceled());
+        }
+        // info is the final source callback. Validate native facts after it,
+        // then accept this identity before any answer/cursor/byte mutation.
+        op.usage.charge(Resource::SourceRequests, 1)?;
+        let info = original.source.info();
+        if op.control.is_canceled() {
+            return Err(canceled());
+        }
+        if let Some((native, declaration, external)) = &mut op.native {
+            native.refresh(declaration, op.usage, *external)?;
+        }
+        let stable = exclusions.check_input_revision(&[], files)?.is_some();
+        original.observe_info(info)?;
+        if stable {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn poll_available(
+    original: &mut OriginalSource,
+    op: RangeOperation<'_>,
+    buf: &mut [u8],
+) -> ProgressiveResult<Poll<SourceStep>> {
+    #[cfg(feature = "persistent-partials")]
+    let mut op = op;
+    let offset = op.cursor.offset();
+    #[cfg(feature = "persistent-partials")]
+    if let Some(pending) = op.pending.as_ref() {
+        if pending.offset != offset || pending.bytes.len() > buf.len() {
+            return Err(contract());
+        }
+        original.check_info(op.usage)?;
+        if op.control.is_canceled() {
+            return Err(canceled());
+        }
+        if !partial_read_stable(original, &mut op)? {
+            op.gate.notify(false);
+            return Ok(Poll::Pending);
+        }
+        let pending = op.pending.take().unwrap();
+        buf[..pending.bytes.len()].copy_from_slice(&pending.bytes);
+        return accept_available(original, op, pending.offset, pending.requested, pending.answer);
+    }
+    let length = original.live.length.value();
+    if offset == length {
+        return Ok(Poll::Ready(SourceStep::EndOfVolume));
+    }
+    let checked = original.check_info(op.usage);
+    if op.control.is_canceled() {
+        return Err(canceled());
+    }
+    checked?;
+    #[cfg(feature = "persistent-partials")]
+    if !partial_read_stable(original, &mut op)? {
+        op.gate.notify(false);
+        return Ok(Poll::Pending);
+    }
+    let count = (length - offset).min(buf.len() as u64);
+    op.usage.check(Resource::ReadChunk, count)?;
+    op.usage.charge(Resource::SourceRequests, 1)?;
+    op.gate.arm();
+    let w = Waker::from(op.gate.clone());
+    let mut cx = Context::from_waker(&w);
+    if op.verify {
+        op.usage.charge(Resource::VerifyBytes, count)?;
+    }
+    *op.retry_admitted = false;
+    let answer = original.source.read_at(offset, &mut buf[..count as usize], &mut cx);
+    if op.control.is_canceled() {
+        return Err(canceled());
+    }
+    let answer = answer?;
+    let checked = original.check_info(op.usage);
+    if op.control.is_canceled() {
+        return Err(canceled());
+    }
+    checked?;
+    #[cfg(feature = "persistent-partials")]
+    if !matches!(answer, RangeRead::NotYet) && !partial_read_stable(original, &mut op)? {
+        let n = match answer {
+            RangeRead::Filled { count: n } if n > 0 && n <= count as usize => n,
+            RangeRead::Hole { len } if len > 0 && len <= count => 0,
+            _ => return Err(contract()),
+        };
+        op.usage.charge(Resource::MetadataBytes, n as u64)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(n).map_err(|_| contract())?;
+        bytes.extend_from_slice(&buf[..n]);
+        *op.pending = Some(PendingPartialRead { offset, requested: count, answer, bytes });
+        op.gate.notify(false);
+        return Ok(Poll::Pending);
+    }
+    accept_available(original, op, offset, count, answer)
+}
+fn accept_available(
+    original: &mut OriginalSource,
+    op: RangeOperation<'_>,
+    offset: u64,
+    count: u64,
+    answer: RangeRead,
+) -> ProgressiveResult<Poll<SourceStep>> {
+    let step = match answer {
+        RangeRead::NotYet => {
+            *op.parked = true;
+            return Ok(Poll::Pending);
+        }
+        RangeRead::Filled { count: n } => {
+            if n == 0 || n as u64 > count {
+                return Err(contract());
+            }
+            let end = offset.checked_add(n as u64).ok_or_else(contract)?;
+            if end > original.live.extent {
+                return Err(contract());
+            }
+            let next = original.hole_bound(offset, false, op.usage)?;
+            if let Some(&(start, _)) = original.holes.get(next) {
+                op.usage.charge(Resource::SourceBookkeeping, 1)?;
+                if start < end {
+                    return Err(changed());
+                }
+            }
+            op.usage.charge(Resource::SourceBytes, n as u64)?;
+            op.cursor.advance(n as u64)?;
+            SourceStep::Filled { offset, count: n }
+        }
+        RangeRead::Hole { len } => {
+            if len == 0 || len > count {
+                return Err(contract());
+            }
+            let end = offset.checked_add(len).ok_or_else(contract)?;
+            op.usage.charge(Resource::SourceBytes, len)?;
+            original.remember_hole(offset, end, op.usage)?;
+            op.cursor.advance(len)?;
+            SourceStep::Hole { offset, len }
+        }
+    };
+    op.gate.disarm();
+    Ok(Poll::Ready(step))
+}
 pub(crate) struct SourceDriver {
+    #[cfg(feature = "persistent-partials")]
+    partial_exclusions: Option<Arc<crate::partial::PartialExclusions>>,
+    #[cfg(feature = "persistent-partials")]
+    pending_partial_read: Option<PendingPartialRead>,
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
-    source: Option<Box<dyn RangeSource>>,
-    info: Option<SourceInfo>,
+    original: Option<OriginalSource>,
+    retained: Option<RetainedOriginals>,
+    reopened: bool,
+    // Empty reusable interval capacity only; live source facts stay in OriginalSource.
+    legacy_holes: Vec<(u64, u64)>,
     cursor: CheckedCursor,
     control: SessionControl,
     usage: Usage,
@@ -244,12 +560,10 @@ pub(crate) struct SourceDriver {
     admitted: Vec<(u32, SourceId, OsString, SourceInfo)>,
     protection: ProtectionDeclaration,
     native: super::output::native::NativeProtection,
-    holes: Vec<(u64, u64)>,
     sealed_memory: bool,
     wake: Arc<WakeGate>,
     replacements: Vec<(u32, SourceDriver)>,
     replacement_native: bool,
-    backing_count: usize,
     external_handles: usize,
 }
 impl SourceDriver {
@@ -271,10 +585,16 @@ impl SourceDriver {
         usage.charge(Resource::MetadataBytes, first.capacity() as u64)?;
         let native = super::output::native::NativeProtection::new(&usage)?;
         Ok(Self {
+            #[cfg(feature = "persistent-partials")]
+            partial_exclusions: None,
+            #[cfg(feature = "persistent-partials")]
+            pending_partial_read: None,
             provider,
             request: VolumeRequest { index: 0, expected: first },
-            source: None,
-            info: None,
+            original: None,
+            retained: None,
+            reopened: false,
+            legacy_holes: Vec::new(),
             cursor: CheckedCursor::new(0),
             control,
             usage,
@@ -284,12 +604,10 @@ impl SourceDriver {
             admitted: Vec::new(),
             protection: ProtectionDeclaration::Opaque,
             native,
-            holes: Vec::new(),
             sealed_memory: false,
             wake: Arc::new(WakeGate::default()),
             replacements: Vec::new(),
             replacement_native: false,
-            backing_count: 0,
             external_handles: 0,
         })
     }
@@ -318,15 +636,102 @@ impl SourceDriver {
         if self.failed {
             return Err(contract());
         }
-        if self.info.is_some() {
-            self.check_info()?;
+        if self.original.is_some() {
+            let checked = self.check_info();
+            if self.control.is_canceled() {
+                return Err(canceled());
+            }
+            checked?;
         }
-        let external = self.other_lane_handles()? + self.backing_count;
+        let external = self.other_lane_handles()? + self.backing_count();
         self.native.refresh(&self.protection, &mut self.usage, external)?;
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
+        #[cfg(feature = "persistent-partials")]
+        self.check_partial_inputs()?;
         Ok(())
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn require_partial_catalogue(&mut self) -> ProgressiveResult<()> {
+        self.refresh_protection()?;
+        if !matches!(self.protection, ProtectionDeclaration::Complete { .. }) {
+            return Err(ProgressiveFailure::new(FailureKind::Partial(Box::new(crate::partial::PartialError::new(
+                crate::partial::PartialErrorKind::InvalidOptions,
+            )))));
+        }
+        self.validate_current()
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn install_partial_exclusions(
+        &mut self,
+        exclusions: Arc<crate::partial::PartialExclusions>,
+    ) -> ProgressiveResult<()> {
+        self.partial_exclusions = Some(exclusions);
+        self.check_partial_inputs()
+    }
+    #[cfg(feature = "persistent-partials")]
+    fn check_partial_inputs(&self) -> ProgressiveResult<()> {
+        let Some(exclusions) = &self.partial_exclusions else { return Ok(()) };
+        if let ProtectionDeclaration::Complete { inventory, .. } = &self.protection {
+            for path in inventory
+                .volumes
+                .iter()
+                .flat_map(|volume| match &volume.backing {
+                    VolumeBacking::Native(paths) => paths.as_slice(),
+                    VolumeBacking::NonFile => &[],
+                })
+                .chain(inventory.auxiliary_paths.iter())
+            {
+                exclusions.check_input(
+                    std::slice::from_ref(&path.path),
+                    path.file.as_ref().map_or(&[], |file| std::slice::from_ref(file.as_ref())),
+                )?;
+            }
+        }
+        if let Some(original) = &self.original {
+            self.usage.charge(Resource::SourceRequests, 1)?;
+            let files = original.source.backing_files();
+            if self.control.is_canceled() {
+                return Err(canceled());
+            }
+            exclusions.check_input(&[], files)?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn partial_catalogue(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        self.require_partial_catalogue()?;
+        if let ProtectionDeclaration::Complete { inventory, .. } = &self.protection {
+            let bytes = inventory
+                .volumes
+                .iter()
+                .map(|v| {
+                    std::mem::size_of::<ProtectedVolume>()
+                        + v.name.len()
+                        + match &v.backing {
+                            VolumeBacking::NonFile => 0,
+                            VolumeBacking::Native(p) => p
+                                .iter()
+                                .map(|p| std::mem::size_of::<ProtectedPath>() + p.path.as_os_str().len())
+                                .sum::<usize>(),
+                        }
+                })
+                .sum::<usize>()
+                + inventory
+                    .auxiliary_paths
+                    .iter()
+                    .map(|p| std::mem::size_of::<ProtectedPath>() + p.path.as_os_str().len())
+                    .sum::<usize>();
+            self.usage.charge(Resource::MetadataBytes, bytes as u64)?;
+        }
+        Ok(self.protection.clone())
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn check_partial_target(&mut self, path: &std::path::Path) -> ProgressiveResult<()> {
+        self.require_partial_catalogue()?;
+        self.native.check_partial_target(path, &mut self.usage)?;
+        self.validate_current()
     }
     pub(crate) fn shared_usage(&self) -> Usage {
         self.usage.clone()
@@ -367,16 +772,31 @@ impl SourceDriver {
         self.control.cancel();
     }
     pub(crate) fn seek(&mut self, offset: u64) -> ProgressiveResult<()> {
-        if self.parked || self.failed || self.info.is_none() || offset > self.info.unwrap().length.value() {
+        #[cfg(feature = "persistent-partials")]
+        if self.pending_partial_read.is_some() {
+            return Err(contract());
+        }
+        if self.parked
+            || self.failed
+            || self.original.is_none()
+            || offset > self.original.as_ref().unwrap().live.length.value()
+        {
             return Err(contract());
         }
         self.cursor = CheckedCursor::new(offset);
         Ok(())
     }
     pub(crate) fn select_volume(&mut self, request: VolumeRequest) -> ProgressiveResult<()> {
+        #[cfg(feature = "persistent-partials")]
+        if self.pending_partial_read.is_some() {
+            return Err(contract());
+        }
+        if self.retained.is_some() {
+            return self.select_retained(request);
+        }
         if self.parked
             || self.failed
-            || self.source.is_none()
+            || self.original.is_none()
             || self.request.index.checked_add(1) != Some(request.index)
         {
             return Err(contract());
@@ -384,11 +804,11 @@ impl SourceDriver {
         self.usage.charge(Resource::NameBytes, request.expected.as_encoded_bytes().len() as u64)?;
         self.usage.charge(Resource::MetadataBytes, request.expected.capacity() as u64)?;
         self.request = request;
-        self.source = None;
-        self.backing_count = 0;
-        self.info = None;
+        let mut original = self.original.take().unwrap();
+        self.legacy_holes = std::mem::take(&mut original.holes);
+        self.legacy_holes.clear();
+        drop(original);
         self.cursor = CheckedCursor::new(0);
-        self.holes.clear();
         Ok(())
     }
     pub(crate) fn poll_step(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<ProgressiveResult<SourceStep>> {
@@ -400,9 +820,36 @@ impl SourceDriver {
         buf: &mut [u8],
         verify: bool,
     ) -> Poll<ProgressiveResult<SourceStep>> {
-        self.control.register(cx.waker());
-        self.wake.register(cx.waker());
-        let result = self.poll_inner(buf, verify);
+        if self.retained.is_some() && self.control.is_canceled() {
+            self.finish_selected_request();
+            return Poll::Ready(Err(canceled()));
+        }
+        if self.retained.is_some() && self.original.as_mut().is_some_and(|s| s.leased()) {
+            return Poll::Ready(Err(invalid_capability()));
+        }
+        if let Some(retained) = &self.retained {
+            if self.parked && retained.selected_len != Some(buf.len()) {
+                return Poll::Ready(Err(invalid_capability()));
+            }
+            if !self.failed && buf.is_empty() {
+                return Poll::Ready(Ok(SourceStep::Filled { offset: self.cursor.offset(), count: 0 }));
+            }
+        }
+        let result = (|| {
+            if self.retained.is_some() && self.failed {
+                return Err(contract());
+            }
+            if self.retained.is_some() {
+                self.prepare_selected(cx, buf.len())?;
+            } else {
+                self.control.register(cx.waker());
+                self.wake.register(cx.waker());
+            }
+            self.poll_inner(buf, verify)
+        })();
+        if self.retained.is_some() && !matches!(result, Ok(Poll::Pending)) {
+            self.finish_selected_request();
+        }
         match result {
             Err(mut e) => {
                 self.failed = true;
@@ -434,17 +881,18 @@ impl SourceDriver {
             return Ok(Poll::Pending);
         }
         self.parked = false;
-        if self.source.is_none() {
+        if self.original.is_none() {
+            self.check_original_capacity()?;
             self.refresh_protection()?;
             self.usage.charge(Resource::SourceRequests, 1)?;
             self.wake.arm();
             let w = Waker::from(self.wake.clone());
             let mut cx = Context::from_waker(&w);
-            let answer = self.provider.volume(&self.request, &mut cx)?;
+            let answer = self.provider.volume(&self.request, &mut cx);
             if self.control.is_canceled() {
                 return Err(ProgressiveFailure::new(FailureKind::Canceled));
             }
-            match answer {
+            match answer? {
                 VolumeAnswer::Wait => {
                     self.parked = true;
                     return Ok(Poll::Pending);
@@ -458,68 +906,64 @@ impl SourceDriver {
                 }
             }
         }
-        let offset = self.cursor.offset();
-        let length = self.info.unwrap().length.value();
-        if offset == length {
-            return Ok(Poll::Ready(Ok(SourceStep::EndOfVolume)));
-        }
-        self.check_info()?;
-        let count = (length - offset).min(buf.len() as u64);
-        self.usage.check(Resource::ReadChunk, count)?;
-        self.usage.charge(Resource::SourceRequests, 1)?;
-        self.wake.arm();
-        let w = Waker::from(self.wake.clone());
-        let mut cx = Context::from_waker(&w);
-        if verify {
-            self.usage.charge(Resource::VerifyBytes, count)?;
-        }
-        self.retry_admitted = false;
-        let answer = self.source.as_mut().unwrap().read_at(offset, &mut buf[..count as usize], &mut cx)?;
-        self.check_info()?;
-        if self.control.is_canceled() {
-            return Err(ProgressiveFailure::new(FailureKind::Canceled));
-        }
-        let step = match answer {
-            RangeRead::NotYet => {
-                self.parked = true;
-                return Ok(Poll::Pending);
+        if self.reopened {
+            let checked = self.check_info();
+            if self.control.is_canceled() {
+                return Err(canceled());
             }
-            RangeRead::Filled { count: n } => {
-                if n == 0 || n as u64 > count {
-                    return Err(contract());
-                }
-                let end = offset.checked_add(n as u64).ok_or_else(contract)?;
-                if end > self.info.unwrap().extent {
-                    return Err(contract());
-                }
-                let next = self.hole_bound(offset, false)?;
-                if let Some(&(start, _)) = self.holes.get(next) {
-                    self.usage.charge(Resource::SourceBookkeeping, 1)?;
-                    if start < end {
-                        return Err(changed());
-                    }
-                }
-                self.usage.charge(Resource::SourceBytes, n as u64)?;
-                self.cursor.advance(n as u64)?;
-                SourceStep::Filled { offset, count: n }
+            checked?;
+            let external = self.other_lane_handles()? + self.backing_count();
+            self.native.refresh(&self.protection, &mut self.usage, external)?;
+            if self.control.is_canceled() {
+                return Err(ProgressiveFailure::new(FailureKind::Canceled));
             }
-            RangeRead::Hole { len } => {
-                if len == 0 || len > count {
-                    return Err(contract());
-                }
-                let end = offset.checked_add(len).ok_or_else(contract)?;
-                self.usage.charge(Resource::SourceBytes, len)?;
-                self.remember_hole(offset, end)?;
-                self.cursor.advance(len)?;
-                SourceStep::Hole { offset, len }
+            self.reopened = false;
+            return Ok(Poll::Ready(Ok(SourceStep::VolumeOpened {
+                index: self.request.index,
+                id: self.original.as_ref().unwrap().live.id,
+            })));
+        }
+        if self.retained.is_some() {
+            let external = self.other_lane_handles()? + self.backing_count();
+            self.native.refresh(&self.protection, &mut self.usage, external)?;
+            if self.control.is_canceled() {
+                return Err(canceled());
             }
-        };
-        self.wake.disarm();
-        Ok(Poll::Ready(Ok(step)))
+        }
+        #[cfg(feature = "persistent-partials")]
+        let partial_external =
+            if self.partial_exclusions.is_some() { self.other_lane_handles()? + self.backing_count() } else { 0 };
+        poll_available(
+            self.original.as_mut().unwrap(),
+            RangeOperation {
+                cursor: &mut self.cursor,
+                gate: &self.wake,
+                parked: &mut self.parked,
+                retry_admitted: &mut self.retry_admitted,
+                control: &self.control,
+                usage: &mut self.usage,
+                verify,
+                #[cfg(feature = "persistent-partials")]
+                exclusions: self.partial_exclusions.as_deref(),
+                #[cfg(feature = "persistent-partials")]
+                pending: &mut self.pending_partial_read,
+                #[cfg(feature = "persistent-partials")]
+                native: self
+                    .partial_exclusions
+                    .as_ref()
+                    .map(|_| (&mut self.native, &self.protection, partial_external)),
+            },
+            buf,
+        )
+        .map(|p| p.map(Ok))
     }
+
     fn admit_source(&mut self, source: Box<dyn RangeSource>) -> ProgressiveResult<SourceInfo> {
         self.usage.charge(Resource::SourceRequests, 1)?;
         let info = source.info();
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
         if info.extent > info.length.value() {
             return Err(contract());
         }
@@ -532,11 +976,18 @@ impl SourceDriver {
         }
         self.usage.charge(Resource::SourceRequests, 1)?;
         let backing = source.backing_files();
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
+        #[cfg(feature = "persistent-partials")]
+        if let Some(exclusions) = &self.partial_exclusions {
+            exclusions.check_input(&[], backing)?;
+        }
         let external = self.other_lane_handles()?;
         self.usage.check(Resource::VolumeHandles, (external + self.native.handle_count() + backing.len()) as u64)?;
         self.native.refresh(&self.protection, &mut self.usage, external + backing.len())?;
         self.native.admit(self.request.index, backing, &self.protection, &mut self.usage, external)?;
-        self.backing_count = backing.len();
+        let backing_count = backing.len();
         // Only the concrete library adapter carries its original immutable stamp.
         // Custom providers retain the cooperative progressive identity contract.
         if let Some(immutable) = (&*source as &dyn std::any::Any).downcast_ref::<ImmutableFileSource>() {
@@ -548,14 +999,28 @@ impl SourceDriver {
         reserve_records(&mut self.admitted, &mut self.usage)?;
         self.admitted.insert(position, (self.request.index, info.id, self.request.expected.clone(), info));
         self.replacement_native = (&*source as &dyn std::any::Any).is::<ImmutableFileSource>();
-        self.source = Some(source);
-        self.info = Some(info);
+        self.original = Some(OriginalSource {
+            source,
+            index: self.request.index,
+            live: info,
+            holes: std::mem::take(&mut self.legacy_holes),
+            backing_count,
+            lease: None,
+        });
+        if let Some(retained) = &mut self.retained {
+            retained.high_water = Some(self.request.index);
+        }
         Ok(info)
     }
     fn other_lane_handles(&self) -> ProgressiveResult<usize> {
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64)?;
         Ok(self.external_handles
-            + self.replacements.iter().map(|(_, lane)| lane.native.handle_count() + lane.backing_count).sum::<usize>())
+            + self.retained_backing_count()?
+            + self
+                .replacements
+                .iter()
+                .map(|(_, lane)| lane.native.handle_count() + lane.backing_count())
+                .sum::<usize>())
     }
     pub(crate) fn observed_info(&self, index: u32) -> Option<SourceInfo> {
         self.admitted.iter().find(|(i, _, _, _)| *i == index).map(|(_, _, _, v)| *v)
@@ -563,15 +1028,26 @@ impl SourceDriver {
     pub(crate) fn supply_replacement(&mut self, index: u32, source: Box<dyn RangeSource>) -> ProgressiveResult<()> {
         self.validate_current()?;
         self.usage.charge(Resource::SourceBookkeeping, self.admitted.len() as u64)?;
-        self.usage.check(Resource::VolumeHandles, self.replacements.len() as u64 + 2)?;
+        if self.retained.is_some() {
+            self.usage.check(Resource::VolumeHandles, (self.original_count() + self.replacements.len() + 1) as u64)?;
+        } else {
+            self.usage.check(Resource::VolumeHandles, self.replacements.len() as u64 + 2)?;
+        }
         let original = self.observed_info(index).ok_or_else(contract)?;
         self.usage.charge(Resource::SourceRequests, 1)?;
         let info = source.info();
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
         if info.length.value() != original.length.value() {
             return Err(changed());
         }
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64 + 1)?;
-        if self.replacements.iter().any(|(i, s)| *i != index && s.info.is_some_and(|v| v.id == info.id)) {
+        if self
+            .replacements
+            .iter()
+            .any(|(i, s)| *i != index && s.original.as_ref().is_some_and(|v| v.live.id == info.id))
+        {
             return Err(contract());
         }
         self.usage.charge(Resource::SourceBookkeeping, self.admitted.len() as u64)?;
@@ -580,10 +1056,14 @@ impl SourceDriver {
         let first = name.clone();
         let mut lane = Self::with_usage(Box::new(NoVolumes), first, self.usage.clone(), self.control.clone())?;
         lane.request.index = index;
+        #[cfg(feature = "persistent-partials")]
+        {
+            lane.partial_exclusions = self.partial_exclusions.clone();
+        }
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64 * 2)?;
-        let held = self.native.handle_count() + self.backing_count;
+        let held = self.native.handle_count() + self.backing_count() + self.retained_backing_count()?;
         let replacements =
-            self.replacements.iter().map(|(_, s)| s.native.handle_count() + s.backing_count).sum::<usize>();
+            self.replacements.iter().map(|(_, s)| s.native.handle_count() + s.backing_count()).sum::<usize>();
         lane.external_handles = held + replacements;
         let admitted = lane.admit_source(source)?;
         if admitted.id != info.id
@@ -703,77 +1183,19 @@ impl SourceDriver {
         }
         Ok((low, false))
     }
-    /// First interval whose end is >= offset (coalescing) or > offset (fill).
-    /// Search steps are charged individually before each comparison.
-    fn hole_bound(&mut self, offset: u64, touching: bool) -> ProgressiveResult<usize> {
-        let (mut low, mut high) = (0, self.holes.len());
-        while low < high {
-            self.usage.charge(Resource::SourceBookkeeping, 1)?;
-            let mid = low + (high - low) / 2;
-            let end = self.holes[mid].1;
-            if end < offset || (!touching && end == offset) {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        Ok(low)
-    }
-    fn remember_hole(&mut self, offset: u64, end: u64) -> ProgressiveResult<()> {
-        let start = self.hole_bound(offset, true)?;
-        let mut after = start;
-        let mut range = (offset, end);
-        while after < self.holes.len() {
-            self.usage.charge(Resource::SourceBookkeeping, 1)?;
-            let (a, b) = self.holes[after];
-            if a > range.1 {
-                break;
-            }
-            range.0 = range.0.min(a);
-            range.1 = range.1.max(b);
-            after += 1;
-        }
-        if start == after {
-            // Admit all bulk movement before allocating/mutating. Capacity grows
-            // geometrically; possible allocator copying is charged separately.
-            self.usage.charge(Resource::SourceBookkeeping, (self.holes.len() - start) as u64)?;
-            reserve_records(&mut self.holes, &mut self.usage)?;
-            self.holes.insert(start, range);
-        } else {
-            let removed = after - start;
-            // At most one shift of the tail, plus all replaced/removed slots.
-            self.usage.charge(Resource::SourceBookkeeping, (removed + self.holes.len() - after) as u64)?;
-            self.holes[start] = range;
-            self.holes.drain(start + 1..after);
-        }
-        Ok(())
-    }
     fn check_info(&mut self) -> ProgressiveResult<()> {
-        self.usage.charge(Resource::SourceRequests, 1)?;
-        let new = self.source.as_ref().unwrap().info();
-        let old = self.info.unwrap();
-        if new.id != old.id
-            || new.generation != old.generation
-            || new.length.value() != old.length.value()
-            || matches!((old.length, new.length), (SourceLength::Final(_), SourceLength::Advertised(_)))
-        {
-            return Err(changed());
-        }
-        if new.extent > new.length.value() || new.extent < old.extent {
-            return Err(contract());
-        }
-        self.info = Some(new);
-        Ok(())
+        self.original.as_mut().unwrap().check_info(&mut self.usage)
     }
     fn refresh_protection(&mut self) -> ProgressiveResult<()> {
         self.usage.charge(Resource::SourceRequests, 1)?;
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
-        let mut next = self.provider.protection()?;
+        let next = self.provider.protection();
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
+        let mut next = next?;
         if let ProtectionDeclaration::Complete { inventory, .. } = &mut next {
             validate_inventory(inventory, &mut self.usage)?;
             canonicalize_inventory(inventory, &mut self.usage)?;
@@ -787,9 +1209,11 @@ impl SourceDriver {
             _ => {}
         }
         self.check_inventory_admitted(&next)?;
-        let external = self.other_lane_handles()? + self.backing_count;
+        let external = self.other_lane_handles()? + self.backing_count();
         self.native.refresh(&next, &mut self.usage, external)?;
         self.protection = next;
+        #[cfg(feature = "persistent-partials")]
+        self.check_partial_inputs()?;
         Ok(())
     }
     fn check_inventory_admitted(&mut self, candidate: &ProtectionDeclaration) -> ProgressiveResult<()> {
@@ -1044,6 +1468,8 @@ fn validate_inventory(i: &ProtectionInventory, usage: &mut Usage) -> Progressive
     Ok(())
 }
 #[cfg(test)]
+mod retained_tests;
+#[cfg(test)]
 mod tests;
 
 /// A complete, immutable native file. Growth and metadata/content replacement are changes.
@@ -1116,5 +1542,94 @@ pub(super) fn immutable_error(fault: crate::error::RarFault) -> ProgressiveFailu
             ProgressiveFailure::new(FailureKind::Input { operation: super::InputOperation::Metadata, cause: source })
         }
         _ => changed(),
+    }
+}
+
+#[cfg(all(test, feature = "persistent-partials"))]
+mod partial_callback_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    struct ChangingSource {
+        generation: AtomicU64,
+        armed: AtomicBool,
+        reads: Arc<AtomicU64>,
+    }
+    impl RangeSource for ChangingSource {
+        fn info(&self) -> SourceInfo {
+            SourceInfo {
+                id: SourceId(1),
+                generation: self.generation.load(Ordering::SeqCst),
+                extent: 4,
+                length: SourceLength::Final(4),
+            }
+        }
+        fn backing_files(&self) -> &[File] {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.generation.fetch_add(1, Ordering::SeqCst);
+            }
+            &[]
+        }
+        fn read_at(&mut self, _: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            buf.copy_from_slice(b"data");
+            self.armed.store(true, Ordering::SeqCst);
+            Ok(RangeRead::Filled { count: 4 })
+        }
+    }
+    fn unchanged_acceptance(pending_answer: bool) {
+        let mut usage = Usage::new(ProgressiveLimits { source_bytes: 4, ..Default::default() });
+        let exclusions = crate::partial::PartialExclusions::new(usage.clone());
+        let reads = Arc::new(AtomicU64::new(0));
+        let source = Box::new(ChangingSource {
+            generation: AtomicU64::new(0),
+            armed: AtomicBool::new(pending_answer),
+            reads: reads.clone(),
+        });
+        let mut original =
+            OriginalSource { live: source.info(), source, index: 0, holes: Vec::new(), backing_count: 0, lease: None };
+        let mut cursor = CheckedCursor::new(0);
+        let gate = Arc::new(WakeGate::default());
+        let mut parked = false;
+        let mut retry = false;
+        let control = SessionControl::default();
+        let mut pending = pending_answer.then(|| PendingPartialRead {
+            offset: 0,
+            requested: 4,
+            answer: RangeRead::Filled { count: 4 },
+            bytes: b"data".to_vec(),
+        });
+        let mut buf = [0; 4];
+        let result = poll_available(
+            &mut original,
+            RangeOperation {
+                cursor: &mut cursor,
+                gate: &gate,
+                parked: &mut parked,
+                retry_admitted: &mut retry,
+                control: &control,
+                usage: &mut usage,
+                verify: false,
+                exclusions: Some(&exclusions),
+                pending: &mut pending,
+                native: None,
+            },
+            &mut buf,
+        );
+        assert_eq!(cursor.offset(), 0, "changed source advanced accepted cursor");
+        usage.charge(Resource::SourceBytes, 4).expect("changed source charged accepted bytes");
+        assert!(matches!(result, Err(ProgressiveFailure { kind: FailureKind::SourceChanged, .. })));
+        assert_eq!(reads.load(Ordering::SeqCst), u64::from(!pending_answer));
+        if pending_answer {
+            assert!(pending.is_some());
+            assert_eq!(buf, [0; 4]);
+        }
+    }
+    #[test]
+    fn post_backing_change_does_not_accept_fresh_answer() {
+        unchanged_acceptance(false);
+    }
+    #[test]
+    fn post_backing_change_does_not_accept_retained_pending_answer() {
+        unchanged_acceptance(true);
     }
 }

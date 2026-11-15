@@ -16,6 +16,8 @@
 
 //! Pull-driven RAR5 extraction over the single production source driver.
 pub(crate) mod memory;
+#[cfg(feature = "persistent-partials")]
+mod partial;
 mod rar4;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
@@ -43,6 +45,18 @@ use std::{
 
 #[non_exhaustive]
 pub enum ProgressiveEvent {
+    #[cfg(feature = "persistent-partials")]
+    PartialReady {
+        member: crate::partial::MemberKey,
+        state: crate::partial::PartialState,
+    },
+    #[cfg(feature = "persistent-partials")]
+    Hole(crate::partial::HoleReport),
+    #[cfg(feature = "persistent-partials")]
+    PartVerified {
+        member: crate::partial::MemberKey,
+        check: crate::partial::PartCheck,
+    },
     VolumeOpened {
         index: u32,
         id: SourceId,
@@ -106,6 +120,18 @@ impl TestEvidence {
 }
 #[non_exhaustive]
 pub enum MemberOutcome {
+    #[cfg(feature = "persistent-partials")]
+    PersistentPartial {
+        member: crate::partial::MemberKey,
+        state: crate::partial::PartialState,
+        expected: crate::partial::MemberChecks,
+    },
+    #[cfg(feature = "persistent-partials")]
+    PersistentComplete {
+        member: crate::partial::MemberKey,
+        state: crate::partial::PartialState,
+        verdict: crate::partial::Verdict,
+    },
     Tested(TestEvidence),
     Skipped(crate::extract::RarSkipReason),
     /// Policy completed. False also includes Test and flattened directory entries.
@@ -150,6 +176,8 @@ enum Phase {
 }
 /// A serialized, caller-driven extraction session. Delivered artifacts outlive it.
 pub struct ProgressiveSession {
+    #[cfg(feature = "persistent-partials")]
+    partial: Option<partial::Persistent>,
     driver: SourceDriver,
     output: Option<OutputContext>,
     options: ProgressiveOptions,
@@ -182,6 +210,8 @@ pub struct ProgressiveSession {
     remaining: u64,
     had_stage: bool,
     buffer: Vec<u8>,
+    /// Length of a driver read that returned `Pending`; the resumed read must ask for the same length.
+    parked_read: Option<usize>,
     verify_job: Option<recovery::VerifyJob>,
     replacement_revision: u64,
     witnesses: Vec<recovery::WireVolume>,
@@ -239,6 +269,15 @@ impl ProgressiveSession {
         let output = (options.extract.mode == crate::extract::Mode::Extract)
             .then(|| OutputContext::new(&options, usage.clone(), control.clone()))
             .transpose()?;
+        Self::assemble_with_output(driver, control, options, output)
+    }
+    fn assemble_with_output(
+        driver: SourceDriver,
+        control: SessionControl,
+        options: ProgressiveOptions,
+        output: Option<OutputContext>,
+    ) -> ProgressiveResult<Self> {
+        let usage = driver.shared_usage();
         let nonce = nonce()?;
         let chunk = options.limits.read_chunk.min(options.limits.packed_work_per_poll).min(1 << 20);
         usage.check(Resource::ReadChunk, 1)?;
@@ -255,6 +294,8 @@ impl ProgressiveSession {
         usage.charge(Resource::MetadataBytes, buffer.capacity() as u64 - chunk)?;
         buffer.resize(chunk as usize, 0);
         Ok(Self {
+            #[cfg(feature = "persistent-partials")]
+            partial: None,
             driver,
             output,
             options,
@@ -287,6 +328,7 @@ impl ProgressiveSession {
             remaining: 0,
             had_stage: false,
             buffer,
+            parked_read: None,
             verify_job: None,
             replacement_revision: 0,
             witnesses: Vec::new(),
@@ -371,6 +413,14 @@ impl ProgressiveSession {
             Err(failure)
         }
     }
+    /// Bytes to request from the driver: a parked read resumes with exactly its earlier length (a retained
+    /// driver rejects any other), otherwise `full` bounded by the poll's remaining packed-work budget.
+    fn read_len(&mut self, full: usize, work: u64) -> usize {
+        match self.parked_read.take() {
+            Some(parked) if parked <= full => parked,
+            _ => full.min((self.options.limits.packed_work_per_poll.min(1 << 20) - work) as usize),
+        }
+    }
     fn poll_inner(
         &mut self,
         cx: &mut Context<'_>,
@@ -392,6 +442,10 @@ impl ProgressiveSession {
                     work += n as u64;
                     continue;
                 }
+            }
+            #[cfg(feature = "persistent-partials")]
+            if let Some(event) = self.partial.as_mut().and_then(|p| p.ready.take()).map(|(event, _lease)| event) {
+                return Ok(Poll::Ready(Ok(Some(event))));
             }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
@@ -420,6 +474,12 @@ impl ProgressiveSession {
                     }
                 }
                 Phase::Stage => {
+                    #[cfg(feature = "persistent-partials")]
+                    if self.partial.is_some() {
+                        self.partial_create()?;
+                        self.phase = Phase::Part;
+                        return Ok(Poll::Ready(Ok(self.start_event.take())));
+                    }
                     let output = self.output.as_mut().expect("extract output");
                     match output.poll_capacity(cx)? {
                         Capacity::Needed { retained } => {
@@ -438,6 +498,11 @@ impl ProgressiveSession {
                     return Ok(Poll::Ready(Ok(self.start_event.take())));
                 }
                 Phase::Finish => {
+                    #[cfg(feature = "persistent-partials")]
+                    if self.partial_active() {
+                        self.partial_finish_decode()?;
+                        continue;
+                    }
                     let before = self.produced;
                     if let Some(bound) = &self.rar4_independent {
                         self.driver.validate_current()?;
@@ -482,7 +547,13 @@ impl ProgressiveSession {
                         }))));
                     }
                 }
-                Phase::Verdict => return self.finish().map(|e| Poll::Ready(Ok(Some(e)))),
+                Phase::Verdict => {
+                    #[cfg(feature = "persistent-partials")]
+                    if self.partial_active() {
+                        return self.partial_finish(cx);
+                    }
+                    return self.finish().map(|e| Poll::Ready(Ok(Some(e))));
+                }
                 Phase::Header => {
                     let (_, step) = self.parser.advance(&[])?;
                     let (offset, len) = match step {
@@ -509,11 +580,12 @@ impl ProgressiveSession {
                         self.driver.seek(offset)?;
                         self.cursor = offset;
                     }
-                    let n = len
-                        .min(self.buffer.len())
-                        .min((self.options.limits.packed_work_per_poll.min(1 << 20) - work) as usize);
+                    let n = self.read_len(len.min(self.buffer.len()), work);
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
-                        Poll::Pending => return Ok(Poll::Pending),
+                        Poll::Pending => {
+                            self.parked_read = Some(n);
+                            return Ok(Poll::Pending);
+                        }
                         Poll::Ready(Err(e)) => return Err(e),
                         Poll::Ready(Ok(SourceStep::VolumeOpened { index, id })) => {
                             self.driver.validate_current()?;
@@ -535,12 +607,20 @@ impl ProgressiveSession {
                                 &self.buffer[..count],
                                 &self.usage,
                             )?;
+                            #[cfg(feature = "persistent-partials")]
+                            if let Some(partial) = &mut self.partial {
+                                partial.record_header(offset, &self.buffer[..count], &self.usage)?;
+                            }
                             let (used, step) = self.parser.advance(&self.buffer[..count])?;
                             if used != count {
                                 return Err(ProgressiveFailure::new(FailureKind::SourceContract));
                             }
                             self.driver.validate_current()?;
                             if let ParserStep::Frame(frame) = step {
+                                #[cfg(feature = "persistent-partials")]
+                                if let Some(partial) = &mut self.partial {
+                                    partial.frame_header(self.volume, &frame, &self.usage)?;
+                                }
                                 self.frame(frame)?;
                             }
                         }
@@ -567,15 +647,18 @@ impl ProgressiveSession {
                         } else {
                             Phase::Header
                         };
+                        #[cfg(feature = "persistent-partials")]
+                        if let Some(event) = self.partial_part_event()? {
+                            return Ok(Poll::Ready(Ok(Some(event))));
+                        }
                         continue;
                     }
-                    let n = self
-                        .remaining
-                        .min(self.buffer.len() as u64)
-                        .min(self.options.limits.packed_work_per_poll.min(1 << 20) - work)
-                        as usize;
+                    let n = self.read_len(self.remaining.min(self.buffer.len() as u64) as usize, work);
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
-                        Poll::Pending => return Ok(Poll::Pending),
+                        Poll::Pending => {
+                            self.parked_read = Some(n);
+                            return Ok(Poll::Pending);
+                        }
                         Poll::Ready(Err(e)) => return Err(e),
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
                             return Err(ProgressiveFailure::new(FailureKind::Truncated));
@@ -585,6 +668,13 @@ impl ProgressiveSession {
                         }
                         Poll::Ready(Ok(SourceStep::Hole { offset, len })) => {
                             self.cursor = offset + len;
+                            #[cfg(feature = "persistent-partials")]
+                            if self.partial_active() {
+                                self.remaining -= len;
+                                return self
+                                    .partial_feed(len as usize, Some(offset))
+                                    .map(|event| Poll::Ready(Ok(event)));
+                            }
                             let recover = self.stage.is_some()
                                 && matches!(self.options.hole_policy, HolePolicy::PartialStored { .. })
                                 && self.model.members.last().is_some_and(|m| {
@@ -629,6 +719,15 @@ impl ProgressiveSession {
                             self.cursor = offset + count as u64;
                             self.remaining -= count as u64;
                             work += count as u64;
+                            #[cfg(feature = "persistent-partials")]
+                            if self.partial_active() {
+                                self.partial_feed(count, None)?;
+                                return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
+                                    member: self.member.unwrap(),
+                                    valid_bytes: count as u64,
+                                    logical_end: self.produced,
+                                }))));
+                            }
                             let before = self.stage.as_ref().map_or(self.produced, |s| s.valid);
                             let mut sink = StageSink {
                                 stage: self.stage.as_mut(),
@@ -678,6 +777,10 @@ impl ProgressiveSession {
     fn frame(&mut self, frame: PhysicalFrame) -> ProgressiveResult<()> {
         match &frame.block {
             Block::Crypt => {
+                #[cfg(feature = "persistent-partials")]
+                if self.partial.is_some() {
+                    return Err(partial::error(crate::partial::PartialErrorKind::UnsupportedMethod));
+                }
                 if self.main_seen || self.parser.encrypted() {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("encryption header order")));
                 }
@@ -699,6 +802,10 @@ impl ProgressiveSession {
             }
             Block::Main(main) => {
                 let format = self.parser.format();
+                #[cfg(feature = "persistent-partials")]
+                if self.partial.is_some() && format != crate::rar5::RarFormat::Rar5 {
+                    return Err(partial::error(crate::partial::PartialErrorKind::UnsupportedFormat));
+                }
                 if self.archive_format.is_some_and(|prior| prior != format) {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("volume archive format changed")));
                 }
@@ -723,6 +830,10 @@ impl ProgressiveSession {
                 self.main_seen = true;
             }
             Block::File(header) => {
+                #[cfg(feature = "persistent-partials")]
+                if self.partial.is_some() {
+                    self.partial_header(header)?;
+                }
                 rar4::admit_header_context(header, self.parser.encrypted(), self.solid_archive == Some(true))?;
                 if let Some(reason) = header
                     .rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
@@ -778,6 +889,10 @@ impl ProgressiveSession {
                         .try_reserve_exact(1)
                         .map_err(|_| ProgressiveFailure::new(FailureKind::Malformed("part allocation")))?;
                     self.model.parts.push(part);
+                    #[cfg(feature = "persistent-partials")]
+                    if self.partial_active() {
+                        self.partial_extend()?;
+                    }
                     self.phase = Phase::Part;
                 } else {
                     self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<PhysicalFrame>() as u64)?;
@@ -866,14 +981,14 @@ impl ProgressiveSession {
         } else if let Some(version) = header.version {
             Disposition::Skip(crate::extract::RarSkipReason::OlderVersion(version))
         } else {
-            let output = self.output.as_ref().expect("output");
-            let target = output.prepare_target(member, &header.name, !header.is_unix())?;
-            let skip = self.options.extract.overwrite == crate::extract::Overwrite::Skip && target.exists();
-            if skip {
-                output.check_target(&target, &mut self.driver)?;
+            #[cfg(feature = "persistent-partials")]
+            if self.partial.is_some() {
+                Disposition::Write
+            } else {
+                self.prepare_legacy_target(member, &header)?
             }
-            self.target = Some(target);
-            if skip { Disposition::Skip(crate::extract::RarSkipReason::ExistingTarget) } else { Disposition::Write }
+            #[cfg(not(feature = "persistent-partials"))]
+            self.prepare_legacy_target(member, &header)?
         };
         let context = crate::extract::EntryContext {
             entry: crate::extract::RarEntryIdentity {
@@ -981,6 +1096,20 @@ impl ProgressiveSession {
             self.phase = Phase::Verdict;
         }
         Ok(ProgressiveEvent::MemberStarted { member, name, size })
+    }
+    fn prepare_legacy_target(
+        &mut self,
+        member: MemberId,
+        header: &crate::rar5::FileHeader,
+    ) -> ProgressiveResult<Disposition> {
+        let output = self.output.as_ref().expect("output");
+        let target = output.prepare_target(member, &header.name, !header.is_unix())?;
+        let skip = self.options.extract.overwrite == crate::extract::Overwrite::Skip && target.exists();
+        if skip {
+            output.check_target(&target, &mut self.driver)?;
+        }
+        self.target = Some(target);
+        Ok(if skip { Disposition::Skip(crate::extract::RarSkipReason::ExistingTarget) } else { Disposition::Write })
     }
     fn stop(&mut self, failure: ProgressiveFailure) -> ProgressiveResult<ProgressiveEvent> {
         let mut failure = self.scope(failure);

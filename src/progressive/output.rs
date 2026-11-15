@@ -380,14 +380,7 @@ impl Drop for OutputContext {
 }
 impl Root {
     fn check(&self) -> ProgressiveResult<()> {
-        let meta = fs::symlink_metadata(&self.path).map_err(|e| out(OutputOperation::Metadata, e, 0))?;
-        if !meta.is_dir()
-            || native::Identity::metadata(&meta).map_err(|e| out(OutputOperation::Metadata, e, 0))? != self.identity
-            || native::Identity::file(&self.file).map_err(|e| out(OutputOperation::Metadata, e, 0))? != self.identity
-        {
-            return Err(invalid());
-        }
-        Ok(())
+        guard::check_directory(&self.path, &self.file, self.identity)
     }
 }
 pub(crate) struct Stage {
@@ -831,16 +824,7 @@ pub(super) fn out(operation: OutputOperation, cause: std::io::Error, offset: u64
     e.context.inner_offset = Some(offset);
     e
 }
-fn open_directory(path: &Path) -> ProgressiveResult<fs::File> {
-    let mut o = fs::OpenOptions::new();
-    o.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    o.open(path).map_err(|e| out(OutputOperation::Create, e, 0))
-}
+use guard::open_directory;
 #[cfg(all(test, unix))]
 mod tests;
 
@@ -906,3 +890,5 @@ impl Target {
         Ok(())
     }
 }
+
+pub(crate) mod guard;
