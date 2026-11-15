@@ -135,7 +135,8 @@ impl PartialFile {
         let mut writer = self.fill_writer(offset)?;
         let mut left = len;
         while left > 0 {
-            canceled(&writer.file.core.control)?;
+            let done = writer.at - offset;
+            canceled(&writer.file.core.control).map_err(|e| progress(e, offset, len, done))?;
             let room = (writer.chunk - writer.buffer.len()).min(left.min(usize::MAX as u64) as usize);
             let start = writer.buffer.len();
             writer.buffer.resize(start + room, 0);
