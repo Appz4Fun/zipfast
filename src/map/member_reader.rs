@@ -56,9 +56,10 @@ pub enum UnsupportedRead {
 
 /// A typed failure to stream a member from an output offset.
 ///
-/// Errors that happen while streaming carry `out`, the output offset reached: every byte from the starting offset
+/// Errors that happen while streaming carry `out`, the offset to resume from: every byte from the starting offset
 /// up to `out` was returned (or written to the sink) and is correct as far as the reader could check. A caller
-/// switching to another copy resumes at `out`.
+/// switching to another copy resumes at `out`. The one exception is [`Self::PartBad`] with `released: true`, where
+/// bytes past `out` were returned too and must be discarded.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ExtractFromError {
@@ -77,7 +78,8 @@ pub enum ExtractFromError {
     /// password. RAR 4.x records none: a wrong password gives wrong plaintext, which only a check of the whole
     /// output (offset 0, or the caller's own verify) catches.
     WrongPassword,
-    /// The source reported a permanent hole at `packed` in volume `volume`.
+    /// The source reported a permanent hole at `packed` in volume `volume`. Inside a checked part, whose plaintext
+    /// is held back until its check passes, `out` is where that part's output starts.
     Hole { out: u64, volume: u32, packed: u64 },
     /// The volume source answered [`VolumeAnswer::Missing`](crate::progressive::VolumeAnswer::Missing) for
     /// `volume`.
@@ -88,9 +90,15 @@ pub enum ExtractFromError {
     /// [`MapMember::pieces`], `volume` its volume. RAR part checks cover packed bytes (ciphertext for encrypted
     /// members), so the bad bytes are in that volume. Plaintext of the part may already have been returned:
     /// `bad` is the output range it carries (for CBC, one more block, which decrypts with the part's last
-    /// ciphertext block), clipped to what this reader produces. Treat it as unverified. RAR 5.0 encrypted members'
-    /// checks are keyed with the password: without a password check value, a wrong password fails them too.
-    PartBad { out: u64, volume: u32, part: usize, which: ChecksumAlgorithm, bad: Range<u64> },
+    /// ciphertext block), clipped to what this reader produces. RAR 5.0 encrypted members' checks are keyed with
+    /// the password: without a password check value, a wrong password fails them too.
+    ///
+    /// A checked part's plaintext is held back until its check passes, so none of `bad` was returned
+    /// (`released: false`) and `out` is the offset reached. A part carrying more than
+    /// [`MapOptions::part_hold_bytes`] is streamed unchecked instead (`released: true`): its bytes up to the reader's
+    /// position were already returned, and `out` is `bad.start`, the offset the caller must rewind to and discard
+    /// everything written from.
+    PartBad { out: u64, released: bool, volume: u32, part: usize, which: ChecksumAlgorithm, bad: Range<u64> },
     /// Reading from offset 0 covered the whole member and its declared checksum does not match. Every byte was
     /// returned before the check.
     MemberBad { which: ChecksumAlgorithm },
@@ -197,6 +205,7 @@ impl Plan {
             }));
         }
         let size = member.unpacked_size.ok_or(ExtractFromError::Unsupported(UnsupportedRead::UnknownSize))?;
+        validate(member, mapping, size)?;
         if out_offset > size {
             return Err(ExtractFromError::OffsetPastEnd { offset: out_offset, size });
         }
@@ -254,6 +263,42 @@ impl Plan {
         };
         out.min(self.size)
     }
+}
+
+/// Checks that a map member (a public type the caller may have built or edited) describes a readable stream: pieces
+/// contiguous from stream offset 0 with ordered ranges, encryption consistent with the mapping and the cipher, and
+/// each piece's output range the one its stream range carries.
+fn validate(member: &MapMember, mapping: OutputMapping, size: u64) -> Result<(), ExtractFromError> {
+    use ExtractFromError::Malformed;
+    let encrypted_mapping = !matches!(mapping, OutputMapping::Direct);
+    if member.encrypted != encrypted_mapping {
+        return Err(Malformed("encryption flag does not match the output mapping"));
+    }
+    let cipher_fits = matches!(
+        (mapping, &member.cipher),
+        (OutputMapping::Direct, None)
+            | (OutputMapping::CbcBlocks, Some(CipherParams::Rar5 { iv: Some(_), .. } | CipherParams::Rar4 { .. }))
+            | (OutputMapping::Counter { .. }, Some(CipherParams::WinZipAes { .. }))
+            | (OutputMapping::Sequential { .. }, Some(CipherParams::ZipCrypto { .. }))
+    );
+    if !cipher_fits {
+        return Err(Malformed("cipher parameters do not match the output mapping"));
+    }
+    let mut next = 0u64;
+    for piece in &member.pieces {
+        if piece.packed.start > piece.packed.end {
+            return Err(Malformed("piece packed range is inverted"));
+        }
+        if piece.stream_offset != next {
+            return Err(Malformed("pieces are not contiguous from stream offset 0"));
+        }
+        let len = piece.packed.end - piece.packed.start;
+        next = next.checked_add(len).ok_or(Malformed("piece stream offsets overflow"))?;
+        if piece.out != mapping.out_of(piece.stream_offset..next, Some(size)) {
+            return Err(Malformed("piece output range does not match its stream range"));
+        }
+    }
+    Ok(())
 }
 
 enum Cipher {
@@ -347,7 +392,12 @@ struct Core {
     /// Output offset of the next plaintext byte to be produced.
     produced: u64,
     part: Option<PartHash>,
+    /// Plaintext of the part being checked, held back until its check passes.
+    held: Option<Vec<u8>>,
     member_hash: Option<PartHash>,
+    /// Whether the password is shown right: no encryption, a matching check value, or a passing check that
+    /// covers plaintext or is keyed with the password.
+    password_verified: bool,
 }
 
 impl Core {
@@ -388,8 +438,11 @@ impl Core {
             ready: Vec::new(),
             ready_pos: 0,
             part: None,
+            held: None,
             member_hash,
+            password_verified: false,
         };
+        core.password_verified = !core.member.encrypted;
         if core.plan.stream.is_empty() {
             core.phase = Phase::Done;
         } else {
@@ -401,11 +454,24 @@ impl Core {
     }
 
     /// Starts hashing the current piece when the read covers it from its first byte and it has its own checks.
+    /// Its plaintext is held back until the check passes when the part carries at most
+    /// [`MapOptions::part_hold_bytes`] of output.
     fn start_part(&mut self) {
         self.part = self.member.pieces.get(self.piece).and_then(|p| {
             let own = !p.final_part && (p.checks.crc32.is_some() || p.checks.blake2sp.is_some());
             (own && self.stream_pos == p.stream_offset).then(|| PartHash::new(p.checks.blake2sp.is_some()))
         });
+        self.held = None;
+        if self.part.is_some() {
+            let len = self.member.pieces[self.piece].packed.end - self.member.pieces[self.piece].packed.start;
+            if len <= self.options.part_hold_bytes {
+                // Plaintext from the previous part's last partial CBC block can land here too.
+                let mut held = Vec::new();
+                if held.try_reserve_exact(len as usize + 16).is_ok() {
+                    self.held = Some(held);
+                }
+            }
+        }
     }
 
     fn password(&self) -> Result<&str, ExtractFromError> {
@@ -435,6 +501,9 @@ impl Core {
                 )
                 .map_err(ExtractFromError::from_failure)?;
                 self.hash_key = Some(keys.hash_key);
+                if keys.evidence == crate::error::RarPasswordEvidence::VerifierMatched {
+                    self.password_verified = true;
+                }
                 let aes = crate::crypto::AesKey::new(&keys.key).expect("AES-256 key");
                 self.cbc(aes, member_iv)
             }
@@ -456,12 +525,27 @@ impl Core {
                 self.usage
                     .check(Resource::PasswordUtf8Bytes, self.password()?.len() as u64)
                     .map_err(ExtractFromError::from_failure)?;
+                // PBKDF2-HMAC-SHA1, 1,000 rounds per 20-byte output block, about four SHA-1 compressions a round.
+                let blocks = ((2 * key_len + 2).div_ceil(20) * 1000 * 4 + 4) as u64;
+                crate::crypto::KdfControl::charge(
+                    &mut crate::rar5::member::KdfMeter::new(&self.usage, &self.options.control),
+                    blocks,
+                )
+                .map_err(|e| match e {
+                    crate::crypto::KdfControlError::Canceled => {
+                        ExtractFromError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled)))
+                    }
+                    crate::crypto::KdfControlError::Limit { resource, limit, attempted } => {
+                        ExtractFromError::Limit { resource, limit, attempted }
+                    }
+                })?;
                 let derived = crate::crypto::aes_derive(self.password()?.as_bytes(), salt, key_len)
                     .ok_or(ExtractFromError::Malformed("WinZip AES key derivation"))?;
                 use subtle::ConstantTimeEq;
                 if !bool::from(derived[2 * key_len..2 * key_len + 2].ct_eq(verifier)) {
                     return Err(ExtractFromError::WrongPassword);
                 }
+                self.password_verified = true;
                 let aes = crate::crypto::AesKey::new(&derived[..key_len]).expect("WinZip AES key");
                 let hmac = plan.whole.then(|| crate::crypto::HmacSha1::new(&derived[key_len..2 * key_len]));
                 Cipher::Ctr { aes, skip, hmac, tag: Vec::new(), ct_end: skip + plan.size }
@@ -621,17 +705,25 @@ impl Core {
                 let part = self.part.take().expect("hashing this part");
                 let piece = &self.member.pieces[self.piece];
                 let key = self.hash_key.as_ref().filter(|_| piece.checks.keyed);
+                let held = self.held.take();
                 if let Some(which) = part.verify(&piece.checks, key) {
                     let out = piece.out.clone().unwrap_or(self.reached..self.reached);
                     let tail = if self.plan.mapping == OutputMapping::CbcBlocks { 16 } else { 0 };
                     let bad = out.start.max(self.plan.out_offset)..(out.end + tail).min(self.plan.size);
                     return Err(ExtractFromError::PartBad {
-                        out: self.reached,
+                        out: self.reached.min(bad.start),
+                        released: held.is_none(),
                         volume: piece.volume,
                         part: self.piece,
                         which,
                         bad,
                     });
+                }
+                if key.is_some() {
+                    self.password_verified = true;
+                }
+                if let Some(held) = held {
+                    self.ready.extend_from_slice(&held);
                 }
             }
         }
@@ -734,7 +826,10 @@ impl Core {
         if let Some(hash) = &mut self.member_hash {
             hash.update(bytes);
         }
-        self.ready.extend_from_slice(bytes);
+        match &mut self.held {
+            Some(held) => held.extend_from_slice(bytes),
+            None => self.ready.extend_from_slice(bytes),
+        }
     }
 
     /// Final checks once every stream byte was read.
@@ -749,6 +844,7 @@ impl Core {
                 if tag.len() as u64 != AES_TAG || !bool::from(hmac.finish()[..AES_TAG as usize].ct_eq(tag)) {
                     return Err(ExtractFromError::AuthenticationFailed);
                 }
+                self.password_verified = true;
             }
             _ => {}
         }
@@ -760,6 +856,8 @@ impl Core {
             if let Some(which) = hash.verify(&checks, key) {
                 return Err(ExtractFromError::MemberBad { which });
             }
+            // The checks cover the plaintext (or are keyed): a wrong password could not pass them.
+            self.password_verified = true;
         }
         Ok(())
     }
@@ -867,11 +965,22 @@ impl MemberReader {
     pub fn end(&self) -> u64 {
         self.core.plan.size
     }
+
+    /// Whether the password is known to be right: the member is not encrypted, or its password check value (RAR
+    /// 5.0) or verifier (WinZip AES, 16 bits) matched, or a check keyed with the password or covering the plaintext
+    /// passed (a RAR 5.0 keyed part check, or the member check or authentication code read from offset 0).
+    ///
+    /// False after a successful read means the plaintext is unverified: RAR 4.x AES from an offset other than 0, or
+    /// RAR 5.0 without a check value when the read covered no whole part, decrypts a wrong password to garbage
+    /// without any error. The caller's verify of the finished output (`PartialFile::poll_verify`) settles it.
+    pub fn password_verified(&self) -> bool {
+        self.core.password_verified
+    }
 }
 
 /// Writes the plaintext of member `member` of `map` from output offset `out_offset` to its end into `sink`, reading
 /// volumes held in memory (in order, starting with the first; a volume the read does not need may be empty).
-/// Returns the number of bytes written. See [`MemberReader`].
+/// See [`MemberReader`].
 pub fn extract_member_from(
     volumes: &[&[u8]],
     map: &MemberMap,
@@ -879,7 +988,7 @@ pub fn extract_member_from(
     out_offset: u64,
     password: Option<&str>,
     sink: &mut impl Write,
-) -> Result<u64, ExtractFromError> {
+) -> Result<ExtractedFrom, ExtractFromError> {
     extract_member_from_with(volumes, map, member, out_offset, MapOptions::new("").password(password), sink)
 }
 
@@ -891,12 +1000,24 @@ pub fn extract_member_from_with(
     out_offset: u64,
     options: MapOptions,
     sink: &mut dyn Write,
-) -> Result<u64, ExtractFromError> {
+) -> Result<ExtractedFrom, ExtractFromError> {
     let mut input = MemoryInput { volumes, current: None };
     let mut core = Core::new(map, member, out_offset, options)?;
     let mut cx = Context::from_waker(Waker::noop());
     match core.poll_write_to(&mut input, &mut cx, sink) {
-        Poll::Ready(result) => result,
+        Poll::Ready(result) => {
+            result.map(|written| ExtractedFrom { written, password_verified: core.password_verified })
+        }
         Poll::Pending => unreachable!("memory input never waits"),
     }
+}
+
+/// What [`extract_member_from`] wrote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ExtractedFrom {
+    /// Plaintext bytes written to the sink.
+    pub written: u64,
+    /// Whether the password is known to be right; see [`MemberReader::password_verified`].
+    pub password_verified: bool,
 }

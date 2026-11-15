@@ -12,9 +12,10 @@ store, possibly encrypted, or ZIP. The caller maps that copy with `MemberMap`, f
 ```rust,ignore
 let map = MemberMap::from_memory(&alt_volumes, "alt.part1.rar", None)?;
 let mut writer = partial.fill_writer(offset_reached)?;
-extract_member_from(&alt_volumes, &map, member, offset_reached, Some(password), &mut writer)?;
+let done = extract_member_from(&alt_volumes, &map, member, offset_reached, Some(password), &mut writer)?;
 writer.finish()?;
-// partial.poll_verify(..) checks the whole member, which a suffix read cannot.
+// partial.poll_verify(..) checks the whole member, which a suffix read cannot. Until it passes,
+// done.password_verified == false means the alt's password was never proven.
 ```
 
 ## API
@@ -23,20 +24,31 @@ writer.finish()?;
   MapOptions)` builds a pollable reader. `MapOptions` is the same type that builds maps. It holds the first
   volume's name (later volumes are asked for with names that `volume::next_volume_os` derives; providers usually
   key on `VolumeRequest::index`), the password, the `ProgressiveLimits` (source requests, source bytes, provider
-  wakes, KDF work, password sizes) and a `SessionControl` for cancellation. `new` refuses at once, before any read,
+  wakes, KDF work for RAR 5.0, RAR 4.x and WinZip AES, password sizes), a `SessionControl` for cancellation, and
+  `part_hold_bytes` (see [checks while streaming](#checks-while-streaming)). `new` refuses at once, before any read,
   when the member cannot be read from that offset.
   - `poll_read(cx, buf) -> Poll<Result<usize, ExtractFromError>>` returns plaintext. `Ok(0)` for a nonempty `buf`
     means the member's end, once every check that could run has passed.
   - `poll_write_to(cx, sink: &mut dyn Write) -> Poll<Result<u64, _>>` writes to the end and returns the byte
     count. It can be polled again after `Pending`. For example, the sink can be a `PartialFile::fill_writer`.
   - `position()` is the output offset of the next byte; `end()` is the member's size.
+  - `password_verified()` says whether the password is proven (see [passwords](#passwords)).
   - `RangeRead::NotYet` and `VolumeAnswer::Wait` give `Pending`. The provider wakes the task, and the parked read
     is retried with the same length.
   - Only the volumes holding needed bytes are opened, in order. A volume before the first needed piece is never
     asked for.
-- `extract_member_from(volumes: &[&[u8]], map, member, out_offset, password, sink: &mut impl Write) -> Result<u64,
-  _>` does the same over volumes in memory and returns the bytes written. A volume the read does not need may be
-  an empty slice. `extract_member_from_with` takes `MapOptions` instead of a password.
+- `extract_member_from(volumes: &[&[u8]], map, member, out_offset, password, sink: &mut impl Write) ->
+  Result<ExtractedFrom, _>` does the same over volumes in memory. `ExtractedFrom { written, password_verified }`
+  gives the bytes written and the password verdict. A volume the read does not need may be an empty slice.
+  `extract_member_from_with` takes `MapOptions` instead of a password.
+
+`MemberMap` is a public type, so a caller may build or edit one. The reader validates the member before reading:
+- pieces must be contiguous from stream offset 0, with ordered packed ranges and no offset overflow;
+- `encrypted` must agree with `mapping`, and `cipher` with `mapping` (a CBC member needs RAR 5.0 parameters with
+  an IV, or RAR 4.x parameters);
+- each `piece.out` must be the output range its stream range carries.
+
+Anything else is `Malformed`.
 
 ## Supported members
 
@@ -78,17 +90,31 @@ out }`. The last one means the map (one with `complete: false`) lists the member
   password).
 - ZipCrypto: the check byte gives `WrongPassword` (1 in 256).
 
+`MemberReader::password_verified()` (and `ExtractedFrom::password_verified`) is true when:
+- the member is not encrypted;
+- the RAR 5.0 check value or the WinZip AES verifier matched;
+- a RAR 5.0 keyed part check passed;
+- the member check or WinZip authentication code passed, from offset 0.
+
+A successful read with `password_verified() == false` produced unverified plaintext. This happens with RAR 4.x
+AES from an offset other than 0, or with RAR 5.0 without a check value when the read covered no whole part. A wrong
+password there gives garbage with no error, which only the caller's verify of the finished output catches.
+
 ## Checks while streaming
 
 - **Part checks.** A RAR part whose packed bytes the read covers from the first byte is checked when its last byte
-  is read, before that last chunk's plaintext is released. RAR 5.0 non-final part checks are CRC32 or BLAKE2sp of
+  is read. Its plaintext is held back in memory until the check passes, so a bad part's bytes never reach the
+  caller. The hold is capped by `MapOptions::part_hold_bytes` (default 256 MiB; a part's output is at most its
+  packed size). A larger part is streamed unchecked and still checked at its end. RAR 5.0 non-final part checks are CRC32 or BLAKE2sp of
   the packed bytes (ciphertext for encrypted members), keyed with the password when the member's checks are keyed.
   RAR 4.x non-final part CRCs cover the packed bytes. A failure is `PartBad { out, volume, part, which, bad }`:
   - `volume` names the volume holding the bad bytes, so the bad article is pinned.
   - `part` indexes `MapMember::pieces`.
   - `bad` is the output range that part carries, clipped to the read. For CBC it includes one more block, which
-    decrypts with the part's last ciphertext block. Earlier chunks of that part may already have been returned, so
-    treat `bad` as unverified.
+    decrypts with the part's last ciphertext block.
+  - `released: false` means the part was held back: nothing of `bad` was returned, and `out` is the offset reached.
+  - `released: true` means the part was larger than the cap: its bytes were returned unchecked. `out` is
+    `bad.start`, and the caller must rewind there and discard what it wrote from that offset on.
   - A part that the read enters in its middle cannot be checked.
 - **Member checks.** A final part's checks cover the whole output. From offset 0 the read covers the whole member,
   so it checks them at the end (`MemberBad { which }`); for WinZip AES it also checks the HMAC-SHA1 authentication
@@ -98,11 +124,13 @@ out }`. The last one means the map (one with `complete: false`) lists the member
 
 ## Errors while streaming
 
-Each carries `out`, the output offset reached: every byte from the starting offset up to `out` was returned or
-written. A caller switching copies again resumes there.
+Each carries `out`, the offset to resume from: every byte from the starting offset up to `out` was returned or
+written and is good as far as the reader could check. A caller switching copies again resumes there. The one
+exception is `PartBad { released: true }`, where bytes past `out` were also returned and must be discarded.
 
 - `Hole { out, volume, packed }`: the source answered `RangeRead::Hole` at `packed` in `volume`. For CBC, a hole in
-  the IV block before the start gives `out == out_offset`.
+  the IV block before the start gives `out == out_offset`. A hole inside a held-back part gives the part's output
+  start, because its earlier bytes were never checked.
 - `MissingVolume { out, volume }`: `VolumeAnswer::Missing`.
 - `Truncated { out, volume, packed }`: a volume ended inside the member's data.
 - `PartBad`, `MemberBad`, `AuthenticationFailed`: see above.

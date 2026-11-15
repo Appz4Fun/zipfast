@@ -38,7 +38,7 @@ mod member_reader;
 mod zip;
 
 pub use member_reader::{
-    ExtractFromError, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
+    ExtractFromError, ExtractedFrom, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
 };
 
 use crate::progressive::{
@@ -563,6 +563,10 @@ pub struct MapOptions {
     pub limits: ProgressiveLimits,
     /// Cancels a walk, including a key derivation in progress.
     pub control: SessionControl,
+    /// [`MemberReader`] only: the most output a checked part may carry for its plaintext to be held back in memory
+    /// until its check passes. A larger part is streamed unchecked and reported after the fact (see
+    /// [`ExtractFromError::PartBad`]). Default 256 MiB.
+    pub part_hold_bytes: u64,
 }
 
 impl MapOptions {
@@ -572,6 +576,7 @@ impl MapOptions {
             password: None,
             limits: ProgressiveLimits::default(),
             control: SessionControl::default(),
+            part_hold_bytes: 256 << 20,
         }
     }
 

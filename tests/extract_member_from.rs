@@ -41,9 +41,9 @@ fn data(len: usize, seed: usize) -> Vec<u8> {
 
 fn extract(volumes: &[Vec<u8>], map: &MemberMap, member: usize, at: u64, pw: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
-    let n = extract_member_from(&refs(volumes), map, member, at, pw, &mut out)
+    let done = extract_member_from(&refs(volumes), map, member, at, pw, &mut out)
         .unwrap_or_else(|e| panic!("offset {at}: {e:?}"));
-    assert_eq!(n, out.len() as u64);
+    assert_eq!(done.written, out.len() as u64);
     out
 }
 
@@ -458,12 +458,14 @@ fn corrupt_part_is_pinned_to_its_volume() {
     for at in [0, 3000, 5200] {
         let mut out = Vec::new();
         let error = extract_member_from(&refs(&bad), &map, 0, at, None, &mut out).unwrap_err();
-        let ExtractFromError::PartBad { volume, part, which, bad: range, out: reached } = error else {
+        let ExtractFromError::PartBad { volume, part, which, bad: range, out: reached, released } = error else {
             panic!("offset {at}: {error:?}")
         };
         assert_eq!((volume, part, which), (2, 2, ChecksumAlgorithm::Crc32));
         assert_eq!(range, at.max(5200)..7800);
-        // Bytes before the part are delivered and correct.
+        // Bytes before the part are delivered and correct; none of the bad part's.
+        assert!(!released);
+        assert_eq!(reached, at.max(5200));
         assert_eq!(out.len() as u64, reached - at);
         assert_eq!(out[..(5200 - at.min(5200)) as usize], gold[at as usize..5200]);
     }
@@ -762,15 +764,24 @@ fn hole_mid_stream_reports_the_output_reached() {
     let mut out = Vec::new();
     let error = drive(&mut reader, &gate, &mut out).unwrap_err();
     let ExtractFromError::Hole { out: reached, volume, packed } = error else { panic!("{error:?}") };
-    assert_eq!((reached, volume, packed), (6200, 2, hole.start));
-    assert_eq!(out, &gold[3000..6200]);
-    assert_eq!(reader.position(), 6200);
+    // Part 2 (output 5200..7800) is checked, so its bytes before the hole were held back, never returned.
+    assert_eq!((reached, volume, packed), (5200, 2, hole.start));
+    assert_eq!(out, &gold[3000..5200]);
+    assert_eq!(reader.position(), 5200);
     let mut cx = Context::from_waker(Waker::noop());
     assert!(matches!(reader.poll_read(&mut cx, &mut [0; 4]), Poll::Ready(Err(ExtractFromError::AlreadyFailed))));
     // Switching to another copy from the reported offset completes the member.
     let rest = extract(&volumes, &map, 0, reached, None);
     out.extend(rest);
     assert_eq!(out, &gold[3000..]);
+    // The last part has no check of its own, so it streams up to the hole.
+    let last = map.members[0].pieces[3].clone();
+    let hole = last.packed.start + 1000..last.packed.start + 1500;
+    let (mut reader, gate, _) = waiting_reader(&volumes, &[(3, hole)], &map, 3000, MapOptions::new("big.part1.rar"));
+    let mut out = Vec::new();
+    let error = drive(&mut reader, &gate, &mut out).unwrap_err();
+    assert!(matches!(error, ExtractFromError::Hole { out: 8800, volume: 3, .. }), "{error:?}");
+    assert_eq!(out, &gold[3000..8800]);
 
     // An encrypted member: the hole is in the block before the start, so nothing was produced yet.
     let gold = data(9_999, 11);
@@ -792,6 +803,162 @@ fn hole_mid_stream_reports_the_output_reached() {
     let error = drive(&mut reader, &gate, &mut out).unwrap_err();
     assert!(matches!(error, ExtractFromError::MissingVolume { out: 7800, volume: 3 }), "{error:?}");
     assert_eq!(out, &gold[7000..7800]);
+}
+
+// ---- Review regressions ----
+
+fn extract_with(
+    volumes: &[Vec<u8>],
+    map: &MemberMap,
+    at: u64,
+    options: MapOptions,
+) -> (Result<ExtractedFrom, ExtractFromError>, Vec<u8>) {
+    let mut out = Vec::new();
+    let result = extract_member_from_with(&refs(volumes), map, 0, at, options, &mut out);
+    (result, out)
+}
+
+// Catches a checked part's earlier chunks being released before its check fails.
+#[test]
+fn a_checked_part_is_held_back_until_its_check_passes() {
+    let gold = data(10_000, 7);
+    let volumes = rar5_split(&gold, 2600);
+    let map = MemberMap::from_memory(&refs(&volumes), "big.part1.rar", None).unwrap();
+    let piece = map.members[0].pieces[2].clone();
+    let mut bad = volumes.clone();
+    bad[2][piece.packed.start as usize + 100] ^= 0x40;
+    let mut options = MapOptions::new("big.part1.rar");
+    options.limits.read_chunk = 64;
+    let (result, out) = extract_with(&bad, &map, 3000, options.clone());
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ExtractFromError::PartBad { out: 5200, released: false, volume: 2, part: 2, ref bad, .. } if *bad == (5200..7800)),
+        "{error:?}"
+    );
+    assert_eq!(out, &gold[3000..5200], "nothing of the bad part reaches the sink");
+
+    // Over a waiting source with poll_read, too.
+    let (mut reader, gate, _) = waiting_reader(&bad, &[], &map, 3000, options.clone());
+    let mut got = Vec::new();
+    assert!(matches!(drive(&mut reader, &gate, &mut got), Err(ExtractFromError::PartBad { out: 5200, .. })));
+    assert_eq!(got, &gold[3000..5200]);
+
+    // A good part still streams in full with small reads.
+    let (result, out) = extract_with(&volumes, &map, 3000, options.clone());
+    assert_eq!(result.unwrap().written, 7000);
+    assert_eq!(out, &gold[3000..]);
+
+    // A part larger than the hold cap streams unchecked; the error then says so and points back to its start.
+    options.part_hold_bytes = 100;
+    let (result, out) = extract_with(&bad, &map, 3000, options);
+    let error = result.unwrap_err();
+    assert!(matches!(error, ExtractFromError::PartBad { out: 5200, released: true, .. }), "{error:?}");
+    assert!(out.len() > 2200, "the unchecked part was released");
+    assert_eq!(&out[..2200], &gold[3000..5200]);
+
+    // A wrong RAR 5.0 password without a check value releases nothing either.
+    let gold = data(3000, 2);
+    let volumes = rar5_encrypted(&gold, &[1000, 2000], false);
+    let map = MemberMap::from_memory(&refs(&volumes), "e.part1.rar", None).unwrap();
+    let mut options = MapOptions::new("e.part1.rar").password(Some("wrong"));
+    options.limits.read_chunk = 64;
+    let (result, out) = extract_with(&volumes, &map, 0, options);
+    assert!(matches!(result, Err(ExtractFromError::PartBad { out: 0, released: false, part: 0, .. })), "{result:?}");
+    assert!(out.is_empty());
+}
+
+// Catches an inconsistent public map panicking or reading header bytes as data.
+#[test]
+fn inconsistent_maps_are_malformed() {
+    let gold = data(10_000, 7);
+    let volumes = rar5_split(&gold, 2600);
+    let good = MemberMap::from_memory(&refs(&volumes), "big.part1.rar", None).unwrap();
+    let malformed = |edit: &dyn Fn(&mut MapMember)| {
+        let mut map = good.clone();
+        edit(&mut map.members[0]);
+        let error = extract_err(&volumes, &map, 0, 0, Some("pw"));
+        assert!(matches!(error, ExtractFromError::Malformed(_)), "{error:?}");
+    };
+    // A gap between pieces.
+    malformed(&|m| {
+        m.pieces[1].packed.start += 10;
+        m.pieces[1].stream_offset += 10;
+    });
+    // Pieces out of order.
+    malformed(&|m| m.pieces.swap(1, 2));
+    // An inverted packed range.
+    malformed(&|m| m.pieces[1].packed = m.pieces[1].packed.end..m.pieces[1].packed.start);
+    // Encrypted data mapped as plain.
+    malformed(&|m| m.encrypted = true);
+    // Plain mapping with cipher parameters, and CBC without them.
+    malformed(&|m| m.cipher = Some(CipherParams::Rar4 { salt: [0; 8] }));
+    malformed(&|m| {
+        m.encrypted = true;
+        m.mapping = OutputMapping::CbcBlocks;
+    });
+    // An output range that is not what the piece carries.
+    malformed(&|m| m.pieces[2].out = Some(0..10));
+    // An offset overflow.
+    malformed(&|m| m.pieces[3].packed = 0..u64::MAX);
+}
+
+// Catches a read with an unproven password being indistinguishable from a verified one.
+#[test]
+fn password_verification_is_reported() {
+    let gold = data(1000, 13);
+    let volumes = r4_aes(&gold, &[333, 400, 275]);
+    let map = MemberMap::from_memory(&refs(&volumes), "a.part01.rar", None).unwrap();
+    let run = |volumes: &[Vec<u8>], map: &MemberMap, at, pw| {
+        extract_member_from(&refs(volumes), map, 0, at, Some(pw), &mut Vec::new()).unwrap().password_verified
+    };
+    assert!(!run(&volumes, &map, 500, "pw"));
+    assert!(!run(&volumes, &map, 500, "wrong"), "a wrong RAR 4.x password is silent past offset 0");
+    assert!(run(&volumes, &map, 0, "pw"), "the member CRC proves it from offset 0");
+
+    let gold = data(3000, 2);
+    let checked = rar5_encrypted(&gold, &[1000], true);
+    let map = MemberMap::from_memory(&refs(&checked), "e.part1.rar", None).unwrap();
+    assert!(run(&checked, &map, 2500, "pw"), "the check value proves it");
+    let unchecked = rar5_encrypted(&gold, &[1000], false);
+    let map = MemberMap::from_memory(&refs(&unchecked), "e.part1.rar", None).unwrap();
+    assert!(!run(&unchecked, &map, 2500, "pw"), "no whole part is covered");
+    assert!(!run(&unchecked, &map, 2500, "wrong"));
+    assert!(run(&unchecked, &map, 0, "pw"), "a keyed part check proves it");
+
+    let plain = data(5000, 7);
+    let split = rar5_split(&plain, 2600);
+    let map = MemberMap::from_memory(&refs(&split), "big.part1.rar", None).unwrap();
+    assert!(run(&split, &map, 4000, "unused"));
+
+    use zipfast::zip::write::{AesStrength, AesVariant};
+    let zip = vec![winzip_aes(&plain, AesStrength::Aes256, AesVariant::Ae2)];
+    let map = MemberMap::from_memory(&refs(&zip), "x.zip", None).unwrap();
+    assert!(run(&zip, &map, 4000, "pw"));
+
+    // MemberReader reports it as well.
+    let map = MemberMap::from_memory(&refs(&unchecked), "e.part1.rar", None).unwrap();
+    let options = MapOptions::new("e.part1.rar").password(Some("pw"));
+    let (mut reader, gate, _) = waiting_reader(&unchecked, &[], &map, 2500, options);
+    drive(&mut reader, &gate, &mut Vec::new()).unwrap();
+    assert!(!reader.password_verified());
+}
+
+// Catches WinZip AES key derivation escaping the KDF budget.
+#[test]
+fn winzip_aes_key_derivation_is_charged() {
+    use zipfast::zip::write::{AesStrength, AesVariant};
+    let zip = vec![winzip_aes(&data(100, 1), AesStrength::Aes256, AesVariant::Ae1)];
+    let map = MemberMap::from_memory(&refs(&zip), "x.zip", None).unwrap();
+    let mut options = MapOptions::new("x.zip").password(Some("pw"));
+    options.limits.kdf_session_blocks = 1000;
+    let (result, _) = extract_with(&zip, &map, 10, options);
+    assert!(
+        matches!(
+            result,
+            Err(ExtractFromError::Limit { resource: zipfast::progressive::Resource::KdfSessionBlocks, .. })
+        ),
+        "{result:?}"
+    );
 }
 
 // ---- Alt takeover into a persistent partial ----
@@ -964,9 +1131,13 @@ mod takeover {
 
                 let map = MemberMap::from_memory(&refs(alt), first, None).unwrap();
                 let mut writer = a.fill_writer(cut).unwrap();
-                let written = extract_member_from(&refs(alt), &map, 0, cut, Some("pw"), &mut writer).unwrap();
+                let done = extract_member_from(&refs(alt), &map, 0, cut, Some("pw"), &mut writer).unwrap();
                 writer.finish().unwrap();
-                assert_eq!(written, 9_999 - cut);
+                assert_eq!(done.written, 9_999 - cut);
+                // RAR 4.x has no password check value: from an offset other than 0 only the partial's verify can
+                // tell a wrong password.
+                let rar4_suffix = std::ptr::eq(alt, &rar4) && cut != 0;
+                assert_eq!(done.password_verified, !rar4_suffix, "cut {cut}");
                 assert!(a.remaining().unwrap().is_empty());
                 assert!(matches!(verify(&mut a), Verdict::Ok { .. }), "cut {cut}");
                 assert_eq!(fs::read(dir.path().join("out/big.bin")).unwrap(), gold);
