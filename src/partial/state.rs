@@ -586,6 +586,7 @@ pub(super) fn decode_pages(
     head: CommittedState,
     pages: Vec<(PageKind, Vec<u8>)>,
     budget: &PartialBudget,
+    reusable: &[KnownLeaf],
 ) -> PartialResult<Snapshot> {
     let mut buffers: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut total = 0usize;
@@ -674,13 +675,17 @@ pub(super) fn decode_pages(
             budget.metadata(((capacity - known.capacity()) * std::mem::size_of::<KnownLeaf>()) as u64)?;
             known.try_reserve_exact(capacity - known.len()).map_err(|_| malformed())?;
         }
-        known.push(KnownLeaf {
-            range,
-            crc,
-            hasher: crate::crc32::Hasher::new(),
-            provenance,
-            _lease: Arc::new(budget.reserve(PartialResource::CrcLeaves, 1)?),
-        });
+        // Immutable matching records share one logical lease; old state stays intact on failure.
+        let existing = reusable
+            .binary_search_by_key(&range.start, |leaf| leaf.range.start)
+            .ok()
+            .map(|index| &reusable[index])
+            .filter(|leaf| leaf.range == range && leaf.crc == crc && leaf.provenance == provenance);
+        let lease = match existing {
+            Some(leaf) => leaf._lease.clone(),
+            None => Arc::new(budget.reserve(PartialResource::CrcLeaves, 1)?),
+        };
+        known.push(KnownLeaf { range, crc, hasher: crate::crc32::Hasher::new(), provenance, _lease: lease });
     }
     if end != head.size {
         return Err(malformed());

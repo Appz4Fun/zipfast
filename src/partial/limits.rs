@@ -111,6 +111,13 @@ pub(crate) struct PartialBudget {
     pub exclusions: Arc<PartialExclusions>,
     counters: Arc<Mutex<[u64; 10]>>,
     prepaid: Arc<Mutex<[Vec<Reservation>; 10]>>,
+    genesis: Arc<Mutex<Option<GenesisCredits>>>,
+}
+// Only the concrete genesis transaction uses these credits; future mutations cannot consume them.
+struct GenesisCredits {
+    pages: usize,
+    journal_metadata: u64,
+    remaining: Option<[u64; 3]>,
 }
 pub(super) struct Reservation {
     counters: Arc<Mutex<[u64; 10]>>,
@@ -132,6 +139,7 @@ impl PartialBudget {
             exclusions,
             counters,
             prepaid: Arc::new(Mutex::new(std::array::from_fn(|_| Vec::new()))),
+            genesis: Arc::new(Mutex::new(None)),
         })
     }
     pub(super) fn reserve(&self, resource: PartialResource, amount: u64) -> PartialResult<Reservation> {
@@ -166,8 +174,50 @@ impl PartialBudget {
         }
         Ok(())
     }
+    pub(super) fn prepare_genesis(&self, pages: usize, journal_metadata: u64) {
+        *self.genesis.lock().unwrap() = Some(GenesisCredits { pages, journal_metadata, remaining: None });
+    }
+    pub(super) fn genesis_pages(&self) -> PartialResult<usize> {
+        self.genesis.lock().unwrap().as_ref().map(|g| g.pages).ok_or_else(|| err(PartialErrorKind::InvalidOptions))
+    }
+    pub(super) fn admit_genesis(&self, exclusion_bytes: u64) -> PartialResult<()> {
+        let mut genesis = self.genesis.lock().unwrap();
+        let genesis = genesis.as_mut().ok_or_else(|| err(PartialErrorKind::InvalidOptions))?;
+        let paths = genesis.pages as u64 + 5;
+        let metadata = genesis.journal_metadata.checked_add(exclusion_bytes).ok_or_else(malformed)?;
+        self.usage.charge(Resource::ProtectionPaths, paths)?;
+        self.usage.charge(Resource::ProtectionPathBytes, exclusion_bytes)?;
+        self.usage.charge(Resource::MetadataBytes, metadata)?;
+        genesis.remaining = Some([metadata, paths, exclusion_bytes]);
+        Ok(())
+    }
+    pub(super) fn finish_genesis(&self) {
+        *self.genesis.lock().unwrap() = None;
+    }
+    pub(super) fn exclude(&self, path: &PartialProtectedPath) -> PartialResult<()> {
+        let active = self.genesis.lock().unwrap().as_ref().is_some_and(|g| g.remaining.is_some());
+        if active { self.exclusions.reserve_created(path, self) } else { self.exclusions.reserve(path) }
+    }
+    pub(super) fn creation_charge(&self, resource: Resource, amount: u64) -> PartialResult<()> {
+        let index = match resource {
+            Resource::MetadataBytes => 0,
+            Resource::ProtectionPaths => 1,
+            Resource::ProtectionPathBytes => 2,
+            _ => unreachable!("genesis credits only cover its three prepared charges"),
+        };
+        let mut remaining = amount;
+        if let Some(credits) = self.genesis.lock().unwrap().as_mut().and_then(|g| g.remaining.as_mut()) {
+            let prepaid = credits[index].min(amount);
+            credits[index] -= prepaid;
+            remaining -= prepaid;
+        }
+        if remaining != 0 {
+            self.usage.charge(resource, remaining)?;
+        }
+        Ok(())
+    }
     pub(super) fn metadata(&self, bytes: u64) -> PartialResult<()> {
-        self.usage.charge(Resource::MetadataBytes, bytes).map_err(Into::into)
+        self.creation_charge(Resource::MetadataBytes, bytes)
     }
     pub(super) fn vector<T>(&self, count: usize) -> PartialResult<Vec<T>> {
         let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or_else(malformed)?;

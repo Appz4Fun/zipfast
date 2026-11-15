@@ -61,6 +61,12 @@ impl PartialExclusions {
         Self { entries: Mutex::new(Vec::new()), usage, counters: Arc::new(Mutex::new([0; 10])) }
     }
     pub(crate) fn reserve(&self, path: &PartialProtectedPath) -> PartialResult<()> {
+        self.reserve_inner(path, None)
+    }
+    pub(super) fn reserve_created(&self, path: &PartialProtectedPath, budget: &PartialBudget) -> PartialResult<()> {
+        self.reserve_inner(path, Some(budget))
+    }
+    fn reserve_inner(&self, path: &PartialProtectedPath, budget: Option<&PartialBudget>) -> PartialResult<()> {
         let mut list = self.entries.lock().unwrap();
         self.usage.charge(Resource::SourceBookkeeping, list.len() as u64)?;
         if let Some(old) = list.iter().find(|p| p.path == path.path) {
@@ -69,13 +75,17 @@ impl PartialExclusions {
             }
             return Ok(());
         }
-        self.usage.charge(Resource::ProtectionPaths, 1)?;
+        let charge = |resource, amount| match budget {
+            Some(budget) => budget.creation_charge(resource, amount),
+            None => self.usage.charge(resource, amount).map_err(Into::into),
+        };
+        charge(Resource::ProtectionPaths, 1)?;
         let bytes = path.path.as_os_str().len()
             + path.root.as_os_str().len()
             + path.parent.as_os_str().len()
             + std::mem::size_of::<PartialProtectedPath>();
-        self.usage.charge(Resource::MetadataBytes, bytes as u64)?;
-        self.usage.charge(Resource::ProtectionPathBytes, bytes as u64)?;
+        charge(Resource::MetadataBytes, bytes as u64)?;
+        charge(Resource::ProtectionPathBytes, bytes as u64)?;
         list.try_reserve_exact(1).map_err(|_| malformed())?;
         list.push(path.clone());
         Ok(())
@@ -380,7 +390,30 @@ impl PersistentNative {
         protection.check_target(&output_path, None, &mut usage)?;
         let bundle_path = state_root.path.join(bundle_name(&spec.member));
         protection.check_target(&bundle_path, None, &mut usage)?;
-        budget.exclusions.reserve(&PartialProtectedPath {
+        if create {
+            // Digest names are fixed-width; native binding values are installed only after real creation.
+            let entry = std::mem::size_of::<PartialProtectedPath>();
+            let output_bytes =
+                output_path.as_os_str().len() + root.path.as_os_str().len() + parent.path.as_os_str().len() + entry;
+            let bundle_bytes = bundle_path.as_os_str().len() + 2 * state_root.path.as_os_str().len() + entry;
+            let lock_bytes = bundle_path.as_os_str().len()
+                + 5
+                + state_root.path.as_os_str().len()
+                + bundle_path.as_os_str().len()
+                + entry;
+            let immutable_bytes = 3 * bundle_path.as_os_str().len() + 67 + entry;
+            let bytes = output_bytes
+                .checked_add(bundle_bytes)
+                .and_then(|n| n.checked_add(lock_bytes))
+                .and_then(|n| {
+                    immutable_bytes
+                        .checked_mul(budget.genesis_pages().ok()?.checked_add(2)?)
+                        .and_then(|v| n.checked_add(v))
+                })
+                .ok_or_else(malformed)?;
+            budget.admit_genesis(bytes as u64)?;
+        }
+        budget.exclude(&PartialProtectedPath {
             path: output_path.clone(),
             identity: None,
             root: root.path.clone(),
@@ -389,7 +422,7 @@ impl PersistentNative {
             parent_identity: parent.identity,
             directory: false,
         })?;
-        budget.exclusions.reserve(&PartialProtectedPath {
+        budget.exclude(&PartialProtectedPath {
             path: bundle_path.clone(),
             identity: None,
             root: state_root.path.clone(),
@@ -414,7 +447,7 @@ impl PersistentNative {
             let parent = parents.last().unwrap_or(&root);
             let bundle = Directory::open(bundle_path, budget)?;
             let lock_path = bundle.path.join("lock");
-            budget.exclusions.reserve(&PartialProtectedPath {
+            budget.exclude(&PartialProtectedPath {
                 path: lock_path.clone(),
                 identity: None,
                 root: state_root.path.clone(),

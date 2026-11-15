@@ -20,7 +20,7 @@ use super::{
     anchor::AnchorAck,
     limits::{PartialBudget, Reservation},
     native::{Directory, bundle_name, hex, open_at},
-    state::{self, CommittedState, MutationCommit, MutationIntent, PageRef, Snapshot},
+    state::{self, CommittedState, MutationCommit, MutationIntent, PageKind, PageRef, Snapshot},
 };
 use crate::progressive::OutputOperation;
 use std::{ffi::OsStr, path::Path};
@@ -98,7 +98,7 @@ impl Bundle {
         name: &str,
         identity: Option<crate::progressive::native::Identity>,
     ) -> PartialResult<()> {
-        budget.exclusions.reserve(&PartialProtectedPath {
+        budget.exclude(&PartialProtectedPath {
             path: directory.path.join(name),
             identity,
             root: directory.path.clone(),
@@ -108,8 +108,20 @@ impl Bundle {
             directory: false,
         })
     }
-    pub(super) fn persist_pages(&mut self, snapshot: &mut Snapshot) -> PartialResult<()> {
-        let pages = state::encode_pages(snapshot, &self.budget)?;
+    // Each immutable file reserves one staging Stored and one retained Stored plus its 66-byte name.
+    pub(super) fn genesis_metadata(pages: usize) -> PartialResult<u64> {
+        let refs = pages.checked_mul(std::mem::size_of::<PageRef>()).ok_or_else(malformed)?;
+        let files = pages
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(2 * std::mem::size_of::<Stored>() + 66))
+            .ok_or_else(malformed)?;
+        Ok(refs.checked_add(files).ok_or_else(malformed)? as u64)
+    }
+    pub(super) fn persist_pages(
+        &mut self,
+        snapshot: &mut Snapshot,
+        pages: Vec<(PageKind, Vec<u8>)>,
+    ) -> PartialResult<()> {
         let mut refs = self.budget.vector(pages.len())?;
         for (kind, bytes) in pages {
             let digest = crate::crypto::sha256(&bytes);
@@ -172,6 +184,13 @@ impl Bundle {
         Ok(state.anchor)
     }
     pub(super) fn snapshot(&self, state: &PartialState) -> PartialResult<Snapshot> {
+        self.snapshot_reusing(state, &[])
+    }
+    pub(super) fn snapshot_reusing(
+        &self,
+        state: &PartialState,
+        reusable: &[state::KnownLeaf],
+    ) -> PartialResult<Snapshot> {
         let (_, _, _, head) = state::decode_record(&state.wire, &self.budget.limits)?;
         let mut pages = self.budget.vector(head.pages.len())?;
         for reference in &head.pages {
@@ -192,7 +211,7 @@ impl Bundle {
             pages.push((reference.kind, bytes));
         }
         self.directory.check()?;
-        state::decode_pages(head, pages, &self.budget)
+        state::decode_pages(head, pages, &self.budget, reusable)
     }
     fn reserve_files(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
         let mut added = self.budget.vector(files.len())?;

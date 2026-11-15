@@ -274,12 +274,12 @@ fn each_native_lock_independently_excludes_reopen() {
 #[test]
 fn creation_failure_reports_retained_bundle_location() {
     let f = Fixture::new();
-    let mut progressive = ProgressiveLimits::default();
-    progressive.protection_paths = 2;
-    let error = f.create_with(PartialLimits::default(), progressive, SessionControl::default()).err().unwrap();
+    f.fail_first_anchor();
+    let error = f.create().err().unwrap();
+    assert!(matches!(error.kind, PartialErrorKind::AnchorCommitUncertain));
     let location = error.location.expect("created bundle must be reported");
     assert!(location.state_bundle.is_dir());
     assert_eq!(location.output, f.output());
-    assert!(!f.output().exists());
-    assert_eq!(fs::read_dir(&location.state_bundle).unwrap().count(), 0);
+    assert_eq!(fs::metadata(f.output()).unwrap().len(), 0);
+    assert!(fs::read_dir(&location.state_bundle).unwrap().count() >= 5);
 }

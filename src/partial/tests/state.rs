@@ -222,6 +222,9 @@ impl Fixture {
             },
         )
     }
+    pub(super) fn fail_first_anchor(&self) {
+        *self.store.fail.lock().unwrap() = Some((1, false));
+    }
     pub(super) fn output(&self) -> std::path::PathBuf {
         self.dir.path().join("out/member.bin")
     }
@@ -692,6 +695,7 @@ fn reopened_extents_rebuild_actual_hashers() {
 thread_local! {
     static WRITE_FAULT:std::cell::Cell<Option<usize>>=const {std::cell::Cell::new(None)};
     static SYNC_FAULT:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};
+    static STAMP_FAULT:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};
 }
 pub(crate) fn fault_write(file: &fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<usize> {
     WRITE_FAULT.with(|fault| match fault.get() {
@@ -844,4 +848,152 @@ fn state_exclusion_capacity_precedes_mutation_effects() {
     assert_eq!(names(), before);
     assert_eq!(f.store.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(fs::read(f.output()).unwrap(), vec![0; 16]);
+}
+
+// Recovery must reuse the single logical leaf, including rollback from a read failure.
+#[test]
+fn ambiguous_compaction_recovers_at_exact_shared_leaf_cap() {
+    for persisted in [false, true] {
+        let f = Fixture::new();
+        let mut limits = PartialLimits::default();
+        limits.crc_leaves = 1;
+        let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+        file.core.write_original(0, b"abcd").unwrap();
+        let prior = file.state().unwrap();
+        let bundle = f.dir.path().join("state").join(crate::partial::native::bundle_name(&f.member));
+        let prior_record = bundle.join(format!("r-{}", crate::partial::native::hex(prior.anchor().digest())));
+        let before = fs::read(f.output()).unwrap();
+        *f.store.fail.lock().unwrap() = Some((5, persisted));
+        assert!(matches!(file.core.compact().unwrap_err().kind, PartialErrorKind::AnchorCommitUncertain));
+        let confirmed = f.store.current(&f.member).unwrap().unwrap();
+        // Any attempted output write during recovery must fail this assertion.
+        WRITE_FAULT.set(Some(0));
+        let recovery = file.core.write_original(0, b"abcd");
+        WRITE_FAULT.set(None);
+        recovery.unwrap();
+        assert_eq!(file.state().unwrap().anchor(), &confirmed);
+        assert_eq!(fs::read(f.output()).unwrap(), before);
+        assert_eq!(f.store.calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert_eq!(prior_record.exists(), !persisted);
+        assert_eq!(file.core.budget.exclusions.counters.lock().unwrap()[PartialResource::CrcLeaves as usize], 1);
+    }
+}
+#[test]
+fn confirmed_uncertainty_anchor_survives_reconstruction_failure() {
+    let f = Fixture::new();
+    let mut limits = PartialLimits::default();
+    limits.crc_leaves = 1;
+    let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    file.core.write_original(0, b"abcd").unwrap();
+    *f.store.fail.lock().unwrap() = Some((5, true));
+    file.core.compact().unwrap_err();
+    let confirmed = f.store.current(&f.member).unwrap().unwrap();
+    let bundle = f.dir.path().join("state").join(crate::partial::native::bundle_name(&f.member));
+    let (_, _, _, head) =
+        crate::partial::state::decode_record(&file.state().unwrap().wire, &PartialLimits::default()).unwrap();
+    let page = bundle.join(format!("p-{}", crate::partial::native::hex(&head.pages[0].digest)));
+    let hidden = f.dir.path().join("held-page");
+    fs::rename(&page, &hidden).unwrap();
+    let error = file.core.write_original(0, b"abcd").unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::StateUnavailable));
+    assert_eq!(error.committed.as_ref(), Some(&confirmed));
+    assert_eq!(file.core.budget.exclusions.counters.lock().unwrap()[PartialResource::CrcLeaves as usize], 1);
+    fs::rename(hidden, page).unwrap();
+    file.core.write_original(0, b"abcd").unwrap();
+    assert_eq!(file.core.budget.exclusions.counters.lock().unwrap()[PartialResource::CrcLeaves as usize], 1);
+}
+
+pub(crate) fn fault_post_write_stamp() -> std::io::Result<()> {
+    if STAMP_FAULT.replace(false) { Err(std::io::Error::other("injected post-write metadata failure")) } else { Ok(()) }
+}
+#[test]
+fn post_write_stamp_failure_preserves_intent_and_primary_error() {
+    for short in [false, true] {
+        let f = Fixture::new();
+        let file = f.create().unwrap();
+        STAMP_FAULT.set(true);
+        if short {
+            WRITE_FAULT.set(Some(2));
+        }
+        let error = file.core.write_original(0, b"abcd").unwrap_err();
+        WRITE_FAULT.set(None);
+        STAMP_FAULT.set(false);
+        let intent = f.store.current(&f.member).unwrap().unwrap();
+        assert_eq!(intent.sequence(), 2);
+        assert_eq!(error.committed.as_ref(), Some(&intent));
+        let output = error.output.as_ref().expect("acknowledged write progress");
+        assert_eq!((output.offset, output.attempted, output.completed), (0, 4, if short { 2 } else { 4 }));
+        match error.kind {
+            PartialErrorKind::Io { operation, cause } => {
+                assert_eq!(operation, if short { OutputOperation::Write } else { OutputOperation::Metadata });
+                assert_eq!(
+                    cause.to_string(),
+                    if short {
+                        "injected persistent short-write failure"
+                    } else {
+                        "injected post-write metadata failure"
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let state = PartialState::load(&f.dir.path().join("state"), &intent, &PartialLimits::default()).unwrap();
+        drop(file);
+        assert_eq!(f.open(state).unwrap().remaining().unwrap(), vec![0..16]);
+        let mut bytes = vec![0; 16];
+        let n = if short { 2 } else { 4 };
+        bytes[..n].copy_from_slice(&b"abcd"[..n]);
+        assert_eq!(fs::read(f.output()).unwrap(), bytes);
+    }
+}
+
+fn genesis_cap(resource: Resource, cap: u64) -> (Fixture, PartialResult<PartialFile>) {
+    let f = Fixture::new();
+    let mut progressive = ProgressiveLimits::default();
+    match resource {
+        Resource::ProtectionPaths => progressive.protection_paths = cap,
+        Resource::ProtectionPathBytes => progressive.protection_path_bytes = cap,
+        Resource::MetadataBytes => progressive.metadata_bytes = cap,
+        _ => unreachable!(),
+    }
+    let result = f.create_with(PartialLimits::default(), progressive, SessionControl::default());
+    (f, result)
+}
+fn assert_genesis_rejection(resource: Resource, cap: u64) {
+    let (f, result) = genesis_cap(resource, cap);
+    let error = result.err().expect("one-under admission must reject");
+    assert!(
+        matches!(error.kind,PartialErrorKind::Progressive(ref cause) if matches!(cause.kind,FailureKind::Limit {resource:r,..} if r==resource)),
+        "{error:?}"
+    );
+    assert!(!f.output().exists(), "known cap failure created output");
+    assert_eq!(fs::read_dir(f.dir.path().join("state")).unwrap().count(), 0, "known cap failure created a bundle");
+    assert_eq!(f.store.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+fn measured_genesis_boundary(resource: Resource, high: u64) {
+    let mut low = 0;
+    let mut high = high;
+    assert!(genesis_cap(resource, high).1.is_ok());
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if genesis_cap(resource, mid).1.is_ok() { high = mid } else { low = mid }
+    }
+    assert!(genesis_cap(resource, high).1.is_ok());
+    assert_genesis_rejection(resource, high - 1);
+    println!("genesis {resource:?}: exact={high}, one-under={}", high - 1);
+}
+#[test]
+fn genesis_exclusion_count_admits_exact_and_rejects_before_effects() {
+    assert!(genesis_cap(Resource::ProtectionPaths, 8).1.is_ok());
+    for cap in [2, 3, 7] {
+        assert_genesis_rejection(Resource::ProtectionPaths, cap);
+    }
+}
+#[test]
+fn genesis_path_bytes_admits_exact_and_rejects_before_effects() {
+    measured_genesis_boundary(Resource::ProtectionPathBytes, 1_048_576);
+}
+#[test]
+fn genesis_metadata_admits_exact_and_rejects_before_effects() {
+    measured_genesis_boundary(Resource::MetadataBytes, 1_048_576);
 }

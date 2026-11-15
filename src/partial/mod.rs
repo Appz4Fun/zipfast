@@ -239,6 +239,7 @@ impl PartialCore {
             requests.push((PartialResource::JournalBytes, size_probe.wire.len() as u64));
         }
         budget.prepay(&requests)?;
+        budget.prepare_genesis(pages.len(), Bundle::genesis_metadata(pages.len())?);
         let anchors = AnchorBinding::new(spec.member.clone(), options.anchors);
         if let Some(latest) = anchors.current()? {
             return Err(err(PartialErrorKind::StateStale { latest }));
@@ -249,28 +250,9 @@ impl PartialCore {
         let mut committed = None;
         let result = (|| {
             let mut bundle = Bundle::create(&spec, &budget)?;
-            let head = CommittedState {
-                member: spec.member.clone(),
-                sequence: 0,
-                revision: 0,
-                relative_output: spec.relative_output.clone(),
-                size: spec.size,
-                produced: 0,
-                member_finished: false,
-                checks,
-                binding: native.binding.clone(),
-                pages: Vec::new(),
-                metadata: spec.evidence.metadata,
-                cursor: None,
-            };
-            let mut snapshot = Snapshot {
-                head,
-                name: spec.name.clone(),
-                evidence: spec.evidence.clone(),
-                known: Vec::new(),
-                holes: Vec::new(),
-            };
-            bundle.persist_pages(&mut snapshot)?;
+            let mut snapshot = initial;
+            snapshot.head.binding = native.binding.clone();
+            bundle.persist_pages(&mut snapshot, pages)?;
             let intent = MutationIntent {
                 transaction: 0,
                 parent: None,
@@ -304,6 +286,7 @@ impl PartialCore {
             error.location = Some(location);
             error
         })?;
+        budget.finish_genesis();
         Ok(Arc::new(Self {
             native,
             budget,
@@ -317,42 +300,48 @@ impl PartialCore {
     }
     fn reconcile(&self, data: &mut CoreData) -> PartialResult<()> {
         let ack = self.anchors.current_ack()?.ok_or_else(|| err(PartialErrorKind::AnchorConflict))?;
-        self.check(data)?;
-        if let Some(uncertain) = &data.uncertain {
-            let candidate = if ack.matches(uncertain.expected.anchor()) {
-                &uncertain.expected
-            } else if ack.matches(uncertain.intent.anchor()) {
-                &uncertain.intent
-            } else if uncertain.commit.as_ref().is_some_and(|state| ack.matches(state.anchor())) {
-                uncertain.commit.as_ref().unwrap()
-            } else {
-                return Err(err(PartialErrorKind::StateStale { latest: ack.anchor().clone() }));
-            };
-            self.budget.metadata(candidate.wire.len() as u64)?;
-            let candidate = candidate.clone();
-            let mut snapshot = data.bundle.snapshot(&candidate)?;
-            rehash_known(&self.native, &self.budget, &self.control, self.read_chunk, &mut snapshot).map_err(
-                |mut e| {
-                    e.committed = Some(ack.anchor().clone());
-                    e
-                },
-            )?;
-            data.state = candidate;
-            data.snapshot = snapshot;
-            data.uncertain = None;
-            if let Some(prepared) = data.pending_compaction.take() {
-                if ack.matches(prepared.state.anchor()) {
-                    data.bundle.complete_compaction(prepared, &ack).map_err(|mut e| {
+        let result = (|| {
+            self.check(data)?;
+            if let Some(uncertain) = &data.uncertain {
+                let candidate = if ack.matches(uncertain.expected.anchor()) {
+                    &uncertain.expected
+                } else if ack.matches(uncertain.intent.anchor()) {
+                    &uncertain.intent
+                } else if uncertain.commit.as_ref().is_some_and(|state| ack.matches(state.anchor())) {
+                    uncertain.commit.as_ref().unwrap()
+                } else {
+                    return Err(err(PartialErrorKind::StateStale { latest: ack.anchor().clone() }));
+                };
+                self.budget.metadata(candidate.wire.len() as u64)?;
+                let candidate = candidate.clone();
+                let mut snapshot = data.bundle.snapshot_reusing(&candidate, &data.snapshot.known)?;
+                rehash_known(&self.native, &self.budget, &self.control, self.read_chunk, &mut snapshot).map_err(
+                    |mut e| {
                         e.committed = Some(ack.anchor().clone());
                         e
-                    })?;
+                    },
+                )?;
+                data.state = candidate;
+                data.snapshot = snapshot;
+                data.uncertain = None;
+                if let Some(prepared) = data.pending_compaction.take() {
+                    if ack.matches(prepared.state.anchor()) {
+                        data.bundle.complete_compaction(prepared, &ack).map_err(|mut e| {
+                            e.committed = Some(ack.anchor().clone());
+                            e
+                        })?;
+                    }
                 }
+            } else if !ack.matches(data.state.anchor()) {
+                return Err(err(PartialErrorKind::StateStale { latest: ack.anchor().clone() }));
             }
-        } else if !ack.matches(data.state.anchor()) {
-            return Err(err(PartialErrorKind::StateStale { latest: ack.anchor().clone() }));
-        }
-        data.bundle.acknowledge(data.state.anchor(), &ack)?;
-        Ok(())
+            data.bundle.acknowledge(data.state.anchor(), &ack)?;
+            Ok(())
+        })();
+        result.map_err(|mut error: PartialError| {
+            error.committed = Some(ack.anchor().clone());
+            error
+        })
     }
     fn clone_snapshot(&self, snapshot: &Snapshot) -> PartialResult<Snapshot> {
         let bytes = std::mem::size_of::<Snapshot>()
@@ -497,8 +486,14 @@ impl PartialCore {
             }
             Ok(())
         })();
-        op.stamp = stamp(&self.native)?;
-        if let Err(mut error) = write {
+        let refresh = (|| {
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::fault_post_write_stamp().map_err(|e| io_error(OutputOperation::Metadata, e))?;
+            op.stamp = stamp(&self.native)?;
+            Ok(())
+        })();
+        // A secondary stamp failure must not replace the write failure or its progress.
+        if let Err(mut error) = write.and(refresh) {
             error.committed = Some(transaction.intent.anchor.clone());
             error.output = Some(crate::progressive::OutputRange {
                 offset,
