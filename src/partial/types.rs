@@ -296,6 +296,8 @@ pub(crate) struct HeaderWitness {
 }
 #[derive(Clone)]
 pub(crate) struct InitialEvidence {
+    /// Archive format of the member's header witnesses; it selects how they are parsed again on every load.
+    pub format: crate::rar5::RarFormat,
     pub metadata: crate::extract::Meta,
     pub parts: Vec<PlainPart>,
     pub admissions: Vec<SourceAdmission>,

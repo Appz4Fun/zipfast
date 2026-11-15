@@ -151,7 +151,13 @@ impl Fixture {
             data,
             member: MemberKey::new(ArchiveBinding { job: [5; 16], archive: [6; 32] }, 0, [7; 32]),
             store: Arc::new(Store::default()),
-            evidence: InitialEvidence { metadata: metadata.unwrap(), parts, admissions, headers },
+            evidence: InitialEvidence {
+                format: crate::rar5::RarFormat::Rar5,
+                metadata: metadata.unwrap(),
+                parts,
+                admissions,
+                headers,
+            },
             checks,
         }
     }

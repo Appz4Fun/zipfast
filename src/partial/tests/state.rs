@@ -107,6 +107,7 @@ impl Fixture {
         };
         let Block::File(header) = frame.block else { panic!("file header required") };
         let evidence = InitialEvidence {
+            format: crate::rar5::RarFormat::Rar5,
             metadata: (&header).into(),
             parts: vec![PlainPart {
                 ordinal: 0,
@@ -584,6 +585,7 @@ fn split_fixture() -> (Fixture, EvidenceUpdate) {
         };
         let Block::File(header) = frame.block else { panic!("file header") };
         InitialEvidence {
+            format: crate::rar5::RarFormat::Rar5,
             metadata: (&header).into(),
             parts: vec![PlainPart {
                 ordinal: volume as u64,

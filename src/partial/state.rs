@@ -29,6 +29,8 @@ use std::{
 };
 const MAGIC: &[u8; 8] = b"ZFPART1\0";
 pub(super) const PAGE_MAX: usize = 1_048_576;
+/// Header witness page tag of a RAR4 member.
+const FORMAT_RAR4: u8 = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageKind {
     Geometry = 1,
@@ -603,6 +605,11 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         headers.range(&h.packed)?;
         headers.blob(&h.bytes)?;
     }
+    // Trailing format tag, written only for RAR4 members so that RAR5 states stay byte-identical and readable by
+    // builds that predate RAR4 support. States without it are RAR5.
+    if snapshot.evidence.format == crate::rar5::RarFormat::Rar4 {
+        headers.u8(FORMAT_RAR4)?;
+    }
     let total = geometry
         .bytes
         .len()
@@ -806,8 +813,15 @@ pub(super) fn decode_pages(
         }
         headers.push(HeaderWitness { volume, packed, bytes });
     }
+    let mut format = crate::rar5::RarFormat::Rar5;
+    if d.at < d.bytes.len() {
+        if d.u8()? != FORMAT_RAR4 {
+            return Err(err(PartialErrorKind::StateVersion));
+        }
+        format = crate::rar5::RarFormat::Rar4;
+    }
     d.end()?;
-    let evidence = InitialEvidence { metadata: head.metadata, parts, admissions, headers };
+    let evidence = InitialEvidence { format, metadata: head.metadata, parts, admissions, headers };
     let mut snapshot = Snapshot { head, name, evidence, known, holes, crypt: None, cipher };
     snapshot.crypt = validate_evidence(&snapshot.name, snapshot.head.size, &snapshot.evidence, budget)?;
     if !snapshot.cipher.is_empty() && snapshot.crypt.is_none() {
@@ -859,6 +873,9 @@ pub(super) fn validate_evidence(
         }
         let mut parser =
             HeaderParser::progressive(PathBuf::from(&admission.expected), witness.packed.start, budget.usage.clone());
+        if evidence.format == crate::rar5::RarFormat::Rar4 {
+            parser.set_format(crate::rar5::RarFormat::Rar4);
+        }
         let mut step = parser.advance(&[])?.1;
         let frame = loop {
             match step {
@@ -882,10 +899,16 @@ pub(super) fn validate_evidence(
                 return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
             }
         }
-        if header.format != crate::rar5::RarFormat::Rar5 {
+        if header.format != evidence.format {
             return Err(err(PartialErrorKind::UnsupportedFormat));
         }
         if header.method != 0 || header.is_dir() || header.redirection.is_some() {
+            return Err(err(PartialErrorKind::UnsupportedMethod));
+        }
+        // RAR4 is admitted plain only: its encryption, and any header the progressive RAR4 path refuses, stay out.
+        if header.format == crate::rar5::RarFormat::Rar4
+            && (header.encrypted || header.rar4_progressive_unsupported(None).is_some())
+        {
             return Err(err(PartialErrorKind::UnsupportedMethod));
         }
         let params = if header.encrypted {

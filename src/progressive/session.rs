@@ -821,9 +821,10 @@ impl ProgressiveSession {
             }
             Block::Main(main) => {
                 let format = self.parser.format();
+                // RAR4 header encryption (`-hp`) is refused like RAR5's, before the first encrypted header is read.
                 #[cfg(feature = "persistent-partials")]
-                if self.partial.is_some() && format != crate::rar5::RarFormat::Rar5 {
-                    return Err(partial::error(crate::partial::PartialErrorKind::UnsupportedFormat));
+                if self.partial.is_some() && format == crate::rar5::RarFormat::Rar4 && self.parser.encrypted() {
+                    return Err(partial::error(crate::partial::PartialErrorKind::UnsupportedMethod));
                 }
                 if self.archive_format.is_some_and(|prior| prior != format) {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("volume archive format changed")));
