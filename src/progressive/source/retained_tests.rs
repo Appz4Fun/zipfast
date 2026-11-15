@@ -1304,3 +1304,134 @@ fn retained_revisit_info_cancel_precedes_changed_info() {
     assert!(d.failed);
     assert_eq!(*requests.lock().unwrap(), [0, 1]);
 }
+
+// Catches current-original validation masking cancellation before replacement admission.
+#[test]
+fn retained_replacement_current_info_cancel_precedes_changed_info() {
+    struct CancelCurrent {
+        source: Probe,
+        armed: Arc<AtomicBool>,
+        control: SessionControl,
+    }
+    impl RangeSource for CancelCurrent {
+        fn info(&self) -> SourceInfo {
+            let mut info = self.source.info();
+            if self.armed.load(Ordering::SeqCst) {
+                self.control.cancel();
+                info.generation += 1;
+            }
+            info
+        }
+        fn backing_files(&self) -> &[File] {
+            self.source.backing_files()
+        }
+        fn read_at(&mut self, offset: u64, buf: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            self.source.read_at(offset, buf, cx)
+        }
+    }
+    let control = SessionControl::default();
+    let armed = Arc::new(AtomicBool::new(false));
+    let original = probe(280);
+    let original_drops = original.drops.clone();
+    let original_reads = original.offsets.clone();
+    let provider = Volumes {
+        sources: vec![Some(Box::new(CancelCurrent {
+            source: original,
+            armed: armed.clone(),
+            control: control.clone(),
+        }))],
+        requests: Arc::new(Mutex::new(vec![])),
+    };
+    let mut d =
+        SourceDriver::new_retained(Box::new(provider), "v0".into(), ProgressiveLimits::default(), control.clone())
+            .unwrap();
+    open(&mut d, 0);
+    let candidate = probe(281);
+    let candidate_drops = candidate.drops.clone();
+    armed.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        d.supply_replacement(0, Box::new(candidate)),
+        Err(ProgressiveFailure { kind: FailureKind::Canceled, .. })
+    ));
+    assert!(control.is_canceled());
+    assert!(d.replacements.is_empty());
+    assert_eq!(d.original.as_ref().unwrap().live.id, SourceId(280));
+    assert_eq!(d.original_count(), 1);
+    assert_eq!(d.cursor.offset(), 0);
+    assert!(original_reads.lock().unwrap().is_empty());
+    assert_eq!(original_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(candidate_drops.load(Ordering::SeqCst), 1);
+    drop(d);
+    assert_eq!(original_drops.load(Ordering::SeqCst), 1);
+}
+
+// Catches a second candidate info callback after cancellation, or changed-length masking it.
+#[test]
+fn retained_replacement_candidate_info_cancel_stops_admission() {
+    struct CancelCandidate {
+        control: SessionControl,
+        length: u64,
+        info_calls: Arc<AtomicUsize>,
+        backing_calls: Arc<AtomicUsize>,
+        read_calls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl RangeSource for CancelCandidate {
+        fn info(&self) -> SourceInfo {
+            self.info_calls.fetch_add(1, Ordering::SeqCst);
+            self.control.cancel();
+            SourceInfo { id: SourceId(283), generation: 0, extent: 8, length: SourceLength::Final(self.length) }
+        }
+        fn backing_files(&self) -> &[File] {
+            self.backing_calls.fetch_add(1, Ordering::SeqCst);
+            &[]
+        }
+        fn read_at(&mut self, _: u64, _: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RangeRead::Filled { count: 1 })
+        }
+    }
+    impl Drop for CancelCandidate {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    for length in [8, 9] {
+        let original = probe(282);
+        let original_drops = original.drops.clone();
+        let original_reads = original.offsets.clone();
+        let (mut d, requests) = setup(true, 64, vec![Box::new(original)]);
+        open(&mut d, 0);
+        let info_calls = Arc::new(AtomicUsize::new(0));
+        let backing_calls = Arc::new(AtomicUsize::new(0));
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let candidate = CancelCandidate {
+            control: d.control.clone(),
+            length,
+            info_calls: info_calls.clone(),
+            backing_calls: backing_calls.clone(),
+            read_calls: read_calls.clone(),
+            drops: drops.clone(),
+        };
+        let result = d.supply_replacement(0, Box::new(candidate));
+        // Check the valid-length duplicate-call failure independently of error priority.
+        assert_eq!(info_calls.load(Ordering::SeqCst), 1, "candidate length {length}");
+        assert!(
+            matches!(result, Err(ProgressiveFailure { kind: FailureKind::Canceled, .. })),
+            "candidate length {length}"
+        );
+        assert_eq!(backing_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(read_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(d.replacements.is_empty());
+        assert_eq!(d.original.as_ref().unwrap().live.id, SourceId(282));
+        assert_eq!(d.original_count(), 1);
+        assert_eq!(d.cursor.offset(), 0);
+        assert_eq!(*requests.lock().unwrap(), [0]);
+        assert!(original_reads.lock().unwrap().is_empty());
+        assert_eq!(original_drops.load(Ordering::SeqCst), 0);
+        drop(d);
+        assert_eq!(original_drops.load(Ordering::SeqCst), 1);
+    }
+}

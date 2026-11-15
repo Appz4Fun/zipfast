@@ -541,7 +541,11 @@ impl SourceDriver {
             return Err(contract());
         }
         if self.original.is_some() {
-            self.check_info()?;
+            let checked = self.check_info();
+            if self.control.is_canceled() {
+                return Err(canceled());
+            }
+            checked?;
         }
         let external = self.other_lane_handles()? + self.backing_count();
         self.native.refresh(&self.protection, &mut self.usage, external)?;
@@ -829,6 +833,9 @@ impl SourceDriver {
         let original = self.observed_info(index).ok_or_else(contract)?;
         self.usage.charge(Resource::SourceRequests, 1)?;
         let info = source.info();
+        if self.control.is_canceled() {
+            return Err(canceled());
+        }
         if info.length.value() != original.length.value() {
             return Err(changed());
         }
