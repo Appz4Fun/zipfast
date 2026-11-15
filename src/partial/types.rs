@@ -190,6 +190,9 @@ pub enum PartialErrorKind {
     OutputChanged,
     /// Reading the caller's archive volume failed in `refill_from_packed`; `volume` and `packed_offset` say where.
     PackedRead(io::Error),
+    /// Reading the caller's plaintext failed (or ended early) in `PartialFile::fill_from`; `output` says how far the
+    /// fill got.
+    FillRead(io::Error),
     Limit {
         resource: PartialResource,
         limit: u64,
@@ -236,7 +239,9 @@ impl std::fmt::Display for PartialError {
 impl std::error::Error for PartialError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
-            PartialErrorKind::Io { cause, .. } | PartialErrorKind::PackedRead(cause) => Some(cause),
+            PartialErrorKind::Io { cause, .. }
+            | PartialErrorKind::PackedRead(cause)
+            | PartialErrorKind::FillRead(cause) => Some(cause),
             PartialErrorKind::Progressive(cause) => Some(cause.as_ref()),
             _ => None,
         }

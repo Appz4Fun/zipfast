@@ -44,6 +44,8 @@ use std::{
     },
 };
 pub use types::*;
+mod writer;
+pub use writer::FillWriter;
 
 #[derive(Clone)]
 pub struct PartialFile {
