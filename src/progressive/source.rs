@@ -229,11 +229,17 @@ fn changed() -> ProgressiveFailure {
     ProgressiveFailure::new(FailureKind::SourceChanged)
 }
 
+mod retained;
+use retained::{OriginalSource, RetainedOriginals};
+
 pub(crate) struct SourceDriver {
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
-    source: Option<Box<dyn RangeSource>>,
-    info: Option<SourceInfo>,
+    original: Option<OriginalSource>,
+    retained: Option<RetainedOriginals>,
+    reopened: bool,
+    // Empty reusable interval capacity only; live source facts stay in OriginalSource.
+    legacy_holes: Vec<(u64, u64)>,
     cursor: CheckedCursor,
     control: SessionControl,
     usage: Usage,
@@ -244,12 +250,10 @@ pub(crate) struct SourceDriver {
     admitted: Vec<(u32, SourceId, OsString, SourceInfo)>,
     protection: ProtectionDeclaration,
     native: super::output::native::NativeProtection,
-    holes: Vec<(u64, u64)>,
     sealed_memory: bool,
     wake: Arc<WakeGate>,
     replacements: Vec<(u32, SourceDriver)>,
     replacement_native: bool,
-    backing_count: usize,
     external_handles: usize,
 }
 impl SourceDriver {
@@ -273,8 +277,10 @@ impl SourceDriver {
         Ok(Self {
             provider,
             request: VolumeRequest { index: 0, expected: first },
-            source: None,
-            info: None,
+            original: None,
+            retained: None,
+            reopened: false,
+            legacy_holes: Vec::new(),
             cursor: CheckedCursor::new(0),
             control,
             usage,
@@ -284,12 +290,10 @@ impl SourceDriver {
             admitted: Vec::new(),
             protection: ProtectionDeclaration::Opaque,
             native,
-            holes: Vec::new(),
             sealed_memory: false,
             wake: Arc::new(WakeGate::default()),
             replacements: Vec::new(),
             replacement_native: false,
-            backing_count: 0,
             external_handles: 0,
         })
     }
@@ -318,10 +322,10 @@ impl SourceDriver {
         if self.failed {
             return Err(contract());
         }
-        if self.info.is_some() {
+        if self.original.is_some() {
             self.check_info()?;
         }
-        let external = self.other_lane_handles()? + self.backing_count;
+        let external = self.other_lane_handles()? + self.backing_count();
         self.native.refresh(&self.protection, &mut self.usage, external)?;
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
@@ -367,16 +371,23 @@ impl SourceDriver {
         self.control.cancel();
     }
     pub(crate) fn seek(&mut self, offset: u64) -> ProgressiveResult<()> {
-        if self.parked || self.failed || self.info.is_none() || offset > self.info.unwrap().length.value() {
+        if self.parked
+            || self.failed
+            || self.original.is_none()
+            || offset > self.original.as_ref().unwrap().live.length.value()
+        {
             return Err(contract());
         }
         self.cursor = CheckedCursor::new(offset);
         Ok(())
     }
     pub(crate) fn select_volume(&mut self, request: VolumeRequest) -> ProgressiveResult<()> {
+        if self.retained.is_some() {
+            return self.select_retained(request);
+        }
         if self.parked
             || self.failed
-            || self.source.is_none()
+            || self.original.is_none()
             || self.request.index.checked_add(1) != Some(request.index)
         {
             return Err(contract());
@@ -384,11 +395,11 @@ impl SourceDriver {
         self.usage.charge(Resource::NameBytes, request.expected.as_encoded_bytes().len() as u64)?;
         self.usage.charge(Resource::MetadataBytes, request.expected.capacity() as u64)?;
         self.request = request;
-        self.source = None;
-        self.backing_count = 0;
-        self.info = None;
+        let mut original = self.original.take().unwrap();
+        self.legacy_holes = std::mem::take(&mut original.holes);
+        self.legacy_holes.clear();
+        drop(original);
         self.cursor = CheckedCursor::new(0);
-        self.holes.clear();
         Ok(())
     }
     pub(crate) fn poll_step(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<ProgressiveResult<SourceStep>> {
@@ -434,7 +445,8 @@ impl SourceDriver {
             return Ok(Poll::Pending);
         }
         self.parked = false;
-        if self.source.is_none() {
+        if self.original.is_none() {
+            self.check_original_capacity()?;
             self.refresh_protection()?;
             self.usage.charge(Resource::SourceRequests, 1)?;
             self.wake.arm();
@@ -458,8 +470,21 @@ impl SourceDriver {
                 }
             }
         }
+        if self.reopened {
+            self.check_info()?;
+            let external = self.other_lane_handles()? + self.backing_count();
+            self.native.refresh(&self.protection, &mut self.usage, external)?;
+            if self.control.is_canceled() {
+                return Err(ProgressiveFailure::new(FailureKind::Canceled));
+            }
+            self.reopened = false;
+            return Ok(Poll::Ready(Ok(SourceStep::VolumeOpened {
+                index: self.request.index,
+                id: self.original.as_ref().unwrap().live.id,
+            })));
+        }
         let offset = self.cursor.offset();
-        let length = self.info.unwrap().length.value();
+        let length = self.original.as_ref().unwrap().live.length.value();
         if offset == length {
             return Ok(Poll::Ready(Ok(SourceStep::EndOfVolume)));
         }
@@ -474,7 +499,7 @@ impl SourceDriver {
             self.usage.charge(Resource::VerifyBytes, count)?;
         }
         self.retry_admitted = false;
-        let answer = self.source.as_mut().unwrap().read_at(offset, &mut buf[..count as usize], &mut cx)?;
+        let answer = self.original.as_mut().unwrap().source.read_at(offset, &mut buf[..count as usize], &mut cx)?;
         self.check_info()?;
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
@@ -489,11 +514,11 @@ impl SourceDriver {
                     return Err(contract());
                 }
                 let end = offset.checked_add(n as u64).ok_or_else(contract)?;
-                if end > self.info.unwrap().extent {
+                if end > self.original.as_ref().unwrap().live.extent {
                     return Err(contract());
                 }
                 let next = self.hole_bound(offset, false)?;
-                if let Some(&(start, _)) = self.holes.get(next) {
+                if let Some(&(start, _)) = self.original.as_ref().unwrap().holes.get(next) {
                     self.usage.charge(Resource::SourceBookkeeping, 1)?;
                     if start < end {
                         return Err(changed());
@@ -536,7 +561,7 @@ impl SourceDriver {
         self.usage.check(Resource::VolumeHandles, (external + self.native.handle_count() + backing.len()) as u64)?;
         self.native.refresh(&self.protection, &mut self.usage, external + backing.len())?;
         self.native.admit(self.request.index, backing, &self.protection, &mut self.usage, external)?;
-        self.backing_count = backing.len();
+        let backing_count = backing.len();
         // Only the concrete library adapter carries its original immutable stamp.
         // Custom providers retain the cooperative progressive identity contract.
         if let Some(immutable) = (&*source as &dyn std::any::Any).downcast_ref::<ImmutableFileSource>() {
@@ -548,14 +573,27 @@ impl SourceDriver {
         reserve_records(&mut self.admitted, &mut self.usage)?;
         self.admitted.insert(position, (self.request.index, info.id, self.request.expected.clone(), info));
         self.replacement_native = (&*source as &dyn std::any::Any).is::<ImmutableFileSource>();
-        self.source = Some(source);
-        self.info = Some(info);
+        self.original = Some(OriginalSource {
+            source,
+            index: self.request.index,
+            live: info,
+            holes: std::mem::take(&mut self.legacy_holes),
+            backing_count,
+        });
+        if let Some(retained) = &mut self.retained {
+            retained.high_water = Some(self.request.index);
+        }
         Ok(info)
     }
     fn other_lane_handles(&self) -> ProgressiveResult<usize> {
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64)?;
         Ok(self.external_handles
-            + self.replacements.iter().map(|(_, lane)| lane.native.handle_count() + lane.backing_count).sum::<usize>())
+            + self.retained_backing_count()?
+            + self
+                .replacements
+                .iter()
+                .map(|(_, lane)| lane.native.handle_count() + lane.backing_count())
+                .sum::<usize>())
     }
     pub(crate) fn observed_info(&self, index: u32) -> Option<SourceInfo> {
         self.admitted.iter().find(|(i, _, _, _)| *i == index).map(|(_, _, _, v)| *v)
@@ -563,7 +601,11 @@ impl SourceDriver {
     pub(crate) fn supply_replacement(&mut self, index: u32, source: Box<dyn RangeSource>) -> ProgressiveResult<()> {
         self.validate_current()?;
         self.usage.charge(Resource::SourceBookkeeping, self.admitted.len() as u64)?;
-        self.usage.check(Resource::VolumeHandles, self.replacements.len() as u64 + 2)?;
+        if self.retained.is_some() {
+            self.usage.check(Resource::VolumeHandles, (self.original_count() + self.replacements.len() + 1) as u64)?;
+        } else {
+            self.usage.check(Resource::VolumeHandles, self.replacements.len() as u64 + 2)?;
+        }
         let original = self.observed_info(index).ok_or_else(contract)?;
         self.usage.charge(Resource::SourceRequests, 1)?;
         let info = source.info();
@@ -571,7 +613,11 @@ impl SourceDriver {
             return Err(changed());
         }
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64 + 1)?;
-        if self.replacements.iter().any(|(i, s)| *i != index && s.info.is_some_and(|v| v.id == info.id)) {
+        if self
+            .replacements
+            .iter()
+            .any(|(i, s)| *i != index && s.original.as_ref().is_some_and(|v| v.live.id == info.id))
+        {
             return Err(contract());
         }
         self.usage.charge(Resource::SourceBookkeeping, self.admitted.len() as u64)?;
@@ -581,9 +627,9 @@ impl SourceDriver {
         let mut lane = Self::with_usage(Box::new(NoVolumes), first, self.usage.clone(), self.control.clone())?;
         lane.request.index = index;
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64 * 2)?;
-        let held = self.native.handle_count() + self.backing_count;
+        let held = self.native.handle_count() + self.backing_count() + self.retained_backing_count()?;
         let replacements =
-            self.replacements.iter().map(|(_, s)| s.native.handle_count() + s.backing_count).sum::<usize>();
+            self.replacements.iter().map(|(_, s)| s.native.handle_count() + s.backing_count()).sum::<usize>();
         lane.external_handles = held + replacements;
         let admitted = lane.admit_source(source)?;
         if admitted.id != info.id
@@ -703,67 +749,14 @@ impl SourceDriver {
         }
         Ok((low, false))
     }
-    /// First interval whose end is >= offset (coalescing) or > offset (fill).
-    /// Search steps are charged individually before each comparison.
     fn hole_bound(&mut self, offset: u64, touching: bool) -> ProgressiveResult<usize> {
-        let (mut low, mut high) = (0, self.holes.len());
-        while low < high {
-            self.usage.charge(Resource::SourceBookkeeping, 1)?;
-            let mid = low + (high - low) / 2;
-            let end = self.holes[mid].1;
-            if end < offset || (!touching && end == offset) {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        Ok(low)
+        self.original.as_ref().unwrap().hole_bound(offset, touching, &mut self.usage)
     }
     fn remember_hole(&mut self, offset: u64, end: u64) -> ProgressiveResult<()> {
-        let start = self.hole_bound(offset, true)?;
-        let mut after = start;
-        let mut range = (offset, end);
-        while after < self.holes.len() {
-            self.usage.charge(Resource::SourceBookkeeping, 1)?;
-            let (a, b) = self.holes[after];
-            if a > range.1 {
-                break;
-            }
-            range.0 = range.0.min(a);
-            range.1 = range.1.max(b);
-            after += 1;
-        }
-        if start == after {
-            // Admit all bulk movement before allocating/mutating. Capacity grows
-            // geometrically; possible allocator copying is charged separately.
-            self.usage.charge(Resource::SourceBookkeeping, (self.holes.len() - start) as u64)?;
-            reserve_records(&mut self.holes, &mut self.usage)?;
-            self.holes.insert(start, range);
-        } else {
-            let removed = after - start;
-            // At most one shift of the tail, plus all replaced/removed slots.
-            self.usage.charge(Resource::SourceBookkeeping, (removed + self.holes.len() - after) as u64)?;
-            self.holes[start] = range;
-            self.holes.drain(start + 1..after);
-        }
-        Ok(())
+        self.original.as_mut().unwrap().remember_hole(offset, end, &mut self.usage)
     }
     fn check_info(&mut self) -> ProgressiveResult<()> {
-        self.usage.charge(Resource::SourceRequests, 1)?;
-        let new = self.source.as_ref().unwrap().info();
-        let old = self.info.unwrap();
-        if new.id != old.id
-            || new.generation != old.generation
-            || new.length.value() != old.length.value()
-            || matches!((old.length, new.length), (SourceLength::Final(_), SourceLength::Advertised(_)))
-        {
-            return Err(changed());
-        }
-        if new.extent > new.length.value() || new.extent < old.extent {
-            return Err(contract());
-        }
-        self.info = Some(new);
-        Ok(())
+        self.original.as_mut().unwrap().check_info(&mut self.usage)
     }
     fn refresh_protection(&mut self) -> ProgressiveResult<()> {
         self.usage.charge(Resource::SourceRequests, 1)?;
@@ -787,7 +780,7 @@ impl SourceDriver {
             _ => {}
         }
         self.check_inventory_admitted(&next)?;
-        let external = self.other_lane_handles()? + self.backing_count;
+        let external = self.other_lane_handles()? + self.backing_count();
         self.native.refresh(&next, &mut self.usage, external)?;
         self.protection = next;
         Ok(())
@@ -1043,6 +1036,8 @@ fn validate_inventory(i: &ProtectionInventory, usage: &mut Usage) -> Progressive
     }
     Ok(())
 }
+#[cfg(test)]
+mod retained_tests;
 #[cfg(test)]
 mod tests;
 
