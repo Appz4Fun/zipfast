@@ -209,8 +209,8 @@ pub struct PartialError {
     pub committed: Option<StateAnchor>,
     pub location: Option<PartialLocation>,
     /// Set when `fill_packed` or `refill_from_packed` fails after some work became durable: output already applied,
-    /// and alt ranges found wrong. A corrected range whose rewrite did not finish is a `DeclaredBad` hole now (see
-    /// `remaining`); a retry fills it but reports it as `applied`, not `corrected`, so keep this list.
+    /// and alt ranges found wrong. A corrected range whose rewrite did not finish may be a `DeclaredBad` hole now
+    /// (check `remaining`); if so, a retry fills it but reports it as `applied`, not `corrected`, so keep this list.
     pub packed_progress: Option<Box<PackedFillResult>>,
     pub kind: PartialErrorKind,
 }
