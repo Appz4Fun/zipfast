@@ -117,7 +117,9 @@ pub(crate) struct PartialBudget {
 struct GenesisCredits {
     pages: usize,
     journal_metadata: u64,
-    remaining: Option<[u64; 3]>,
+    remaining: Option<[u64; 4]>,
+    native_bookkeeping: u64,
+    bookkeeping_admitted: bool,
 }
 pub(super) struct Reservation {
     counters: Arc<Mutex<[u64; 10]>>,
@@ -175,7 +177,13 @@ impl PartialBudget {
         Ok(())
     }
     pub(super) fn prepare_genesis(&self, pages: usize, journal_metadata: u64) {
-        *self.genesis.lock().unwrap() = Some(GenesisCredits { pages, journal_metadata, remaining: None });
+        *self.genesis.lock().unwrap() = Some(GenesisCredits {
+            pages,
+            journal_metadata,
+            remaining: None,
+            native_bookkeeping: 0,
+            bookkeeping_admitted: false,
+        });
     }
     pub(super) fn genesis_pages(&self) -> PartialResult<usize> {
         self.genesis.lock().unwrap().as_ref().map(|g| g.pages).ok_or_else(|| err(PartialErrorKind::InvalidOptions))
@@ -188,7 +196,40 @@ impl PartialBudget {
         self.usage.charge(Resource::ProtectionPaths, paths)?;
         self.usage.charge(Resource::ProtectionPathBytes, exclusion_bytes)?;
         self.usage.charge(Resource::MetadataBytes, metadata)?;
-        genesis.remaining = Some([metadata, paths, exclusion_bytes]);
+        genesis.remaining = Some([metadata, paths, exclusion_bytes, 0]);
+        Ok(())
+    }
+    pub(crate) fn prepare_native_bookkeeping(&self, amount: u64) {
+        self.genesis.lock().unwrap().as_mut().expect("prepared genesis").native_bookkeeping = amount;
+    }
+    pub(super) fn admit_genesis_bookkeeping(&self) -> PartialResult<()> {
+        let entries = self.exclusions.entry_count() as u64;
+        let mut scope = self.genesis.lock().unwrap();
+        let scope = scope.as_mut().ok_or_else(malformed)?;
+        if scope.bookkeeping_admitted {
+            return Ok(());
+        }
+        let names = scope.pages as u64 + 5;
+        let visits = names
+            .checked_mul(entries)
+            .and_then(|n| n.checked_add(names * (names - 1) / 2))
+            .and_then(|n| n.checked_add(scope.native_bookkeeping))
+            .ok_or_else(malformed)?;
+        self.usage.charge(Resource::SourceBookkeeping, visits)?;
+        scope.remaining.as_mut().ok_or_else(malformed)?[3] = visits;
+        scope.bookkeeping_admitted = true;
+        Ok(())
+    }
+    pub(crate) fn bookkeeping(&self, amount: u64) -> crate::progressive::ProgressiveResult<()> {
+        let mut remaining = amount;
+        if let Some(credits) = self.genesis.lock().unwrap().as_mut().and_then(|g| g.remaining.as_mut()) {
+            let prepaid = credits[3].min(amount);
+            credits[3] -= prepaid;
+            remaining -= prepaid;
+        }
+        if remaining != 0 {
+            self.usage.charge(Resource::SourceBookkeeping, remaining)?;
+        }
         Ok(())
     }
     pub(super) fn finish_genesis(&self) {
@@ -225,5 +266,32 @@ impl PartialBudget {
         let mut v = Vec::new();
         v.try_reserve_exact(count).map_err(|_| malformed())?;
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn genesis_bookkeeping_credits_end_before_live_operations() {
+        let usage = Usage::new(crate::progressive::ProgressiveLimits { source_bookkeeping: 100, ..Default::default() });
+        let exclusions = Arc::new(PartialExclusions::new(usage.clone()));
+        let budget = PartialBudget::new(PartialLimits::default(), usage, exclusions).unwrap();
+        budget.prepare_genesis(0, 0);
+        budget.admit_genesis(0).unwrap();
+        budget.admit_genesis_bookkeeping().unwrap(); // five entries, ten comparisons
+        budget.bookkeeping(3).unwrap();
+        budget.finish_genesis(); // seven unused credits cannot escape this scope
+        let error = budget.bookkeeping(91).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            crate::progressive::FailureKind::Limit {
+                resource: Resource::SourceBookkeeping,
+                limit: 100,
+                attempted: 101
+            }
+        ));
+        budget.bookkeeping(90).unwrap();
+        assert!(budget.bookkeeping(1).is_err());
     }
 }

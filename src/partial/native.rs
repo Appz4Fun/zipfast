@@ -52,13 +52,19 @@ impl Clone for PartialProtectedPath {
     }
 }
 pub(crate) struct PartialExclusions {
-    entries: Mutex<Vec<PartialProtectedPath>>,
+    entries: Mutex<Vec<Arc<PartialProtectedPath>>>,
+    revision: std::sync::atomic::AtomicU64,
     usage: Usage,
     pub(super) counters: Arc<Mutex<[u64; 10]>>,
 }
 impl PartialExclusions {
     pub(crate) fn new(usage: Usage) -> Self {
-        Self { entries: Mutex::new(Vec::new()), usage, counters: Arc::new(Mutex::new([0; 10])) }
+        Self {
+            entries: Mutex::new(Vec::new()),
+            revision: std::sync::atomic::AtomicU64::new(0),
+            usage,
+            counters: Arc::new(Mutex::new([0; 10])),
+        }
     }
     pub(crate) fn reserve(&self, path: &PartialProtectedPath) -> PartialResult<()> {
         self.reserve_inner(path, None)
@@ -68,7 +74,10 @@ impl PartialExclusions {
     }
     fn reserve_inner(&self, path: &PartialProtectedPath, budget: Option<&PartialBudget>) -> PartialResult<()> {
         let mut list = self.entries.lock().unwrap();
-        self.usage.charge(Resource::SourceBookkeeping, list.len() as u64)?;
+        match budget {
+            Some(budget) => budget.bookkeeping(list.len() as u64)?,
+            None => self.usage.charge(Resource::SourceBookkeeping, list.len() as u64)?,
+        }
         if let Some(old) = list.iter().find(|p| p.path == path.path) {
             if path.identity.is_some() && old.identity.is_some() && path.identity != old.identity {
                 return Err(err(PartialErrorKind::OutputChanged));
@@ -83,16 +92,27 @@ impl PartialExclusions {
         let bytes = path.path.as_os_str().len()
             + path.root.as_os_str().len()
             + path.parent.as_os_str().len()
-            + std::mem::size_of::<PartialProtectedPath>();
+            + std::mem::size_of::<PartialProtectedPath>()
+            + 3 * std::mem::size_of::<usize>();
         charge(Resource::MetadataBytes, bytes as u64)?;
         charge(Resource::ProtectionPathBytes, bytes as u64)?;
         list.try_reserve_exact(1).map_err(|_| malformed())?;
-        list.push(path.clone());
+        let next = self.revision.load(Ordering::Relaxed).checked_add(1).ok_or_else(malformed)?;
+        list.push(Arc::new(path.clone()));
+        self.revision.store(next, Ordering::Release);
         Ok(())
     }
     // Called only after acknowledged retirement has actually removed the name.
     pub(super) fn retire(&self, path: &Path) {
-        self.entries.lock().unwrap().retain(|entry| entry.path != path);
+        let mut list = self.entries.lock().unwrap();
+        if list.iter().any(|entry| entry.path == path) {
+            // Exhaustion retains a conservative exclusion; it never wraps or
+            // silently makes an old snapshot current again.
+            if let Some(next) = self.revision.load(Ordering::Relaxed).checked_add(1) {
+                list.retain(|entry| entry.path != path);
+                self.revision.store(next, Ordering::Release);
+            }
+        }
     }
     pub(crate) fn bind(&self, path: &Path, file: &File) -> PartialResult<()> {
         let identity = Identity::file(file).map_err(|e| io_error(OutputOperation::Metadata, e))?;
@@ -101,24 +121,46 @@ impl PartialExclusions {
         if item.identity.is_some_and(|old| old != identity) {
             return Err(err(PartialErrorKind::OutputChanged));
         }
-        item.identity = Some(identity);
+        if item.identity.is_none() {
+            let next = self.revision.load(Ordering::Relaxed).checked_add(1).ok_or_else(malformed)?;
+            // A reader may still hold the immutable pre-bind facts while doing
+            // path IO. Copy only this changed entry, never the entire registry.
+            if Arc::strong_count(item) > 1 {
+                self.usage.charge(
+                    Resource::MetadataBytes,
+                    (std::mem::size_of::<PartialProtectedPath>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + item.path.as_os_str().len()
+                        + item.root.as_os_str().len()
+                        + item.parent.as_os_str().len()) as u64,
+                )?;
+            }
+            Arc::make_mut(item).identity = Some(identity);
+            self.revision.store(next, Ordering::Release);
+        }
         Ok(())
     }
+    pub(super) fn entry_count(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
     pub(crate) fn check_input(&self, paths: &[PathBuf], files: &[File]) -> ProgressiveResult<()> {
-        let entries = {
+        self.check_input_revision(paths, files).map(|_| ())
+    }
+    /// None requests a bounded retry: the examined snapshot was retired while
+    /// path IO ran. No filesystem or caller callback runs under the registry lock.
+    pub(crate) fn check_input_revision(&self, paths: &[PathBuf], files: &[File]) -> ProgressiveResult<Option<u64>> {
+        // Keep path facts alive without repeatedly allocating three paths per
+        // live state file on every source callback. IO remains outside the lock.
+        let (revision, entries) = {
             let list = self.entries.lock().unwrap();
             self.usage.charge(
                 Resource::MetadataBytes,
-                list.iter()
-                    .map(|p| {
-                        (std::mem::size_of::<PartialProtectedPath>()
-                            + p.path.as_os_str().len()
-                            + p.root.as_os_str().len()
-                            + p.parent.as_os_str().len()) as u64
-                    })
-                    .sum(),
+                (list.len() * std::mem::size_of::<Arc<PartialProtectedPath>>()) as u64,
             )?;
-            list.clone()
+            (self.revision.load(Ordering::Relaxed), list.clone())
         };
         let unsafe_path = || ProgressiveFailure::new(FailureKind::UnsafePath);
         for entry in entries {
@@ -139,7 +181,76 @@ impl PartialExclusions {
                 }
             }
         }
-        Ok(())
+        Ok((revision == self.revision()).then_some(revision))
+    }
+}
+
+pub(super) struct PreparedNative {
+    root: PathBuf,
+    state_root: PathBuf,
+    output: PathBuf,
+    bundle: PathBuf,
+    parents: Vec<Directory>,
+    protection: NativeProtection,
+}
+impl PreparedNative {
+    pub(super) fn new(spec: &CreateSpec, budget: &PartialBudget) -> PartialResult<Self> {
+        Self::layout(
+            &spec.output_root,
+            &spec.state_root,
+            &spec.relative_output,
+            &spec.member,
+            &spec.protection,
+            budget,
+            true,
+        )
+    }
+    fn layout(
+        output_root: &Path,
+        state_root: &Path,
+        relative: &Path,
+        member: &MemberKey,
+        declaration: &ProtectionDeclaration,
+        budget: &PartialBudget,
+        create: bool,
+    ) -> PartialResult<Self> {
+        budget.metadata(
+            (output_root.as_os_str().len() + state_root.as_os_str().len() + relative.as_os_str().len()) as u64 * 4
+                + 8192,
+        )?;
+        let root = std::path::absolute(output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+        let state_root = std::path::absolute(state_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+        let output = root.join(relative);
+        guard::check_parents(&root, &output, &budget.usage)?;
+        let bundle = state_root.join(bundle_name(member));
+        let parents = budget.vector(relative.components().count().saturating_sub(1))?;
+        let mut protection = NativeProtection::new(&budget.usage)?;
+        let mut usage = budget.usage.clone();
+        protection.refresh(declaration, &mut usage, 0)?;
+        if create {
+            protection.check_partial_target(&output, &mut usage)?;
+            protection.check_partial_subtree(&bundle, &mut usage)?;
+            let entry = std::mem::size_of::<PartialProtectedPath>() + 3 * std::mem::size_of::<usize>();
+            let output_bytes = output.as_os_str().len()
+                + root.as_os_str().len()
+                + output.parent().ok_or_else(malformed)?.as_os_str().len()
+                + entry;
+            let bundle_bytes = bundle.as_os_str().len() + 2 * state_root.as_os_str().len() + entry;
+            let lock_bytes = 2 * bundle.as_os_str().len() + 5 + state_root.as_os_str().len() + entry;
+            let immutable_bytes = 3 * bundle.as_os_str().len() + 67 + entry;
+            let bytes = output_bytes
+                .checked_add(bundle_bytes)
+                .and_then(|n| n.checked_add(lock_bytes))
+                .and_then(|n| {
+                    immutable_bytes
+                        .checked_mul(budget.genesis_pages().ok()?.checked_add(2)?)
+                        .and_then(|v| n.checked_add(v))
+                })
+                .ok_or_else(malformed)?;
+            budget.admit_genesis(bytes as u64)?;
+            protection.prepare_partial_genesis(&output, &bundle, declaration, budget)?;
+        }
+        Ok(Self { root, state_root, output, bundle, parents, protection })
     }
 }
 
@@ -316,7 +427,7 @@ struct NativeSpec<'a> {
     protection: &'a ProtectionDeclaration,
 }
 impl PersistentNative {
-    pub(crate) fn create(spec: &CreateSpec, budget: &PartialBudget) -> PartialResult<Self> {
+    pub(crate) fn create(spec: &CreateSpec, budget: &PartialBudget, prepared: PreparedNative) -> PartialResult<Self> {
         Self::bind(
             NativeSpec {
                 member: &spec.member,
@@ -329,6 +440,7 @@ impl PersistentNative {
             true,
             None,
             budget,
+            Some(prepared),
         )
     }
     pub(crate) fn reopen(spec: &ReopenSpec, budget: &PartialBudget) -> PartialResult<Self> {
@@ -345,6 +457,7 @@ impl PersistentNative {
             false,
             Some(&head.binding),
             budget,
+            None,
         )
     }
     fn bind(
@@ -352,30 +465,34 @@ impl PersistentNative {
         create: bool,
         expected: Option<&NativeBinding>,
         budget: &PartialBudget,
+        prepared: Option<PreparedNative>,
     ) -> PartialResult<Self> {
         platform()?;
-        validate_relative(&spec.relative_output)?;
+        validate_relative(spec.relative_output)?;
         if !matches!(spec.protection, ProtectionDeclaration::Complete { .. }) {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        budget.metadata(
-            (spec.output_root.as_os_str().len()
-                + spec.state_root.as_os_str().len()
-                + spec.relative_output.as_os_str().len()) as u64
-                * 4
-                + 8192,
-        )?;
-        let root = Directory::open(
-            std::path::absolute(&spec.output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?,
-            budget,
-        )?;
-        let state_root = Directory::open(
-            std::path::absolute(&spec.state_root).map_err(|e| io_error(OutputOperation::Metadata, e))?,
-            budget,
-        )?;
-        let output_path = root.path.join(&spec.relative_output);
-        guard::check_parents(&root.path, &output_path, &budget.usage)?;
-        let mut parents = budget.vector(spec.relative_output.components().count().saturating_sub(1))?;
+        let PreparedNative {
+            root: root_path,
+            state_root: state_path,
+            output: output_path,
+            bundle: bundle_path,
+            mut parents,
+            mut protection,
+        } = match prepared {
+            Some(prepared) => prepared,
+            None => PreparedNative::layout(
+                spec.output_root,
+                spec.state_root,
+                spec.relative_output,
+                spec.member,
+                spec.protection,
+                budget,
+                false,
+            )?,
+        };
+        let root = Directory::open(root_path, budget)?;
+        let state_root = Directory::open(state_path, budget)?;
         let mut at = root.path.clone();
         if let Some(relative) = spec.relative_output.parent() {
             for c in relative.components() {
@@ -384,35 +501,10 @@ impl PersistentNative {
             }
         }
         let parent = parents.last().unwrap_or(&root);
-        let mut protection = NativeProtection::new(&budget.usage)?;
         let mut usage = budget.usage.clone();
-        protection.refresh(&spec.protection, &mut usage, 0)?;
+        protection.refresh(spec.protection, &mut usage, 0)?;
         protection.check_target(&output_path, None, &mut usage)?;
-        let bundle_path = state_root.path.join(bundle_name(&spec.member));
         protection.check_target(&bundle_path, None, &mut usage)?;
-        if create {
-            // Digest names are fixed-width; native binding values are installed only after real creation.
-            let entry = std::mem::size_of::<PartialProtectedPath>();
-            let output_bytes =
-                output_path.as_os_str().len() + root.path.as_os_str().len() + parent.path.as_os_str().len() + entry;
-            let bundle_bytes = bundle_path.as_os_str().len() + 2 * state_root.path.as_os_str().len() + entry;
-            let lock_bytes = bundle_path.as_os_str().len()
-                + 5
-                + state_root.path.as_os_str().len()
-                + bundle_path.as_os_str().len()
-                + entry;
-            let immutable_bytes = 3 * bundle_path.as_os_str().len() + 67 + entry;
-            let bytes = output_bytes
-                .checked_add(bundle_bytes)
-                .and_then(|n| n.checked_add(lock_bytes))
-                .and_then(|n| {
-                    immutable_bytes
-                        .checked_mul(budget.genesis_pages().ok()?.checked_add(2)?)
-                        .and_then(|v| n.checked_add(v))
-                })
-                .ok_or_else(malformed)?;
-            budget.admit_genesis(bytes as u64)?;
-        }
         budget.exclude(&PartialProtectedPath {
             path: output_path.clone(),
             identity: None,
@@ -525,6 +617,9 @@ impl PersistentNative {
         if self.output.file.metadata().map_err(|e| io_error(OutputOperation::Metadata, e))?.len() != expected_len {
             return Err(err(PartialErrorKind::OutputChanged));
         }
+        self.protection.check_partial_bindings(&self.usage)?;
+        self.protection.check_partial_target(&self.output_path, &mut self.usage.clone())?;
+        self.protection.check_partial_subtree(&self.bundle.path, &mut self.usage.clone())?;
         self.protection.check_target(&self.output_path, Some(self.binding.output), &mut self.usage.clone())?;
         Ok(())
     }
@@ -540,4 +635,106 @@ impl PersistentNative {
         }
         Ok(())
     }
+}
+
+/// Holds every observed ancestor through the independent Core binding.
+pub(crate) struct PreparedParents {
+    held: Vec<Directory>,
+}
+impl PreparedParents {
+    pub(crate) fn check(&self) -> PartialResult<()> {
+        for directory in &self.held {
+            directory.check()?;
+        }
+        Ok(())
+    }
+}
+pub(super) fn prepare_parents(
+    spec: &CreateSpec,
+    genesis: &PartialBudget,
+    control: &SessionControl,
+    mut check: impl FnMut(&Path) -> PartialResult<()>,
+) -> PartialResult<PreparedParents> {
+    // Separate transient reservations cannot consume the prepared Core's credits.
+    let budget = PartialBudget::new(genesis.limits.clone(), genesis.usage.clone(), genesis.exclusions.clone())?;
+    let mut paths = Vec::<PathBuf>::new();
+    let output = std::path::absolute(&spec.output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+    let state = std::path::absolute(&spec.state_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+    for target in [&output, &state, &output.join(&spec.relative_output).parent().ok_or_else(malformed)?.to_path_buf()] {
+        let mut at = target.as_path();
+        loop {
+            canceled(control)?;
+            budget.usage.charge(Resource::SourceBookkeeping, paths.len() as u64 + 1)?;
+            if !paths.iter().any(|p| p == at) {
+                budget.metadata((std::mem::size_of::<PathBuf>() + at.as_os_str().len()) as u64)?;
+                paths.try_reserve_exact(1).map_err(|_| malformed())?;
+                paths.push(at.to_path_buf());
+            }
+            match fs::symlink_metadata(at) {
+                Ok(meta) => {
+                    if !meta.is_dir() {
+                        return Err(err(PartialErrorKind::UnsafePath));
+                    }
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => at = at.parent().ok_or_else(malformed)?,
+                Err(e) => return Err(io_error(OutputOperation::Metadata, e)),
+            }
+        }
+    }
+    paths.sort_by_key(|p| p.components().count());
+    let mut held = budget.vector::<Directory>(paths.len())?;
+    let mut missing = budget.vector::<PathBuf>(paths.len())?;
+    let reservations = budget.vector::<(PartialResource, u64)>(paths.len())?;
+    let mut reservations = reservations;
+    reservations.resize(paths.len(), (PartialResource::OpenFiles, 1));
+    budget.prepay(&reservations)?;
+    // All existing ancestors are held, all missing names reserved, and every
+    // provider callback has returned before the first mkdirat.
+    for path in paths {
+        check(&path)?;
+        for directory in &held {
+            directory.check()?;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return Err(err(PartialErrorKind::UnsafePath));
+                }
+                held.push(Directory::open(path, &budget)?);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let ancestor = held.iter().rev().find(|d| path.starts_with(&d.path)).ok_or_else(malformed)?;
+                budget.exclusions.reserve(&PartialProtectedPath {
+                    path: path.clone(),
+                    identity: None,
+                    root: ancestor.path.clone(),
+                    root_identity: ancestor.identity,
+                    parent: ancestor.path.clone(),
+                    parent_identity: ancestor.identity,
+                    directory: false,
+                })?;
+                missing.push(path);
+            }
+            Err(e) => return Err(io_error(OutputOperation::Metadata, e)),
+        }
+    }
+    // The remaining native rechecks and exclusion-table visits are predictable
+    // now: provider callbacks and provisional parent reservations have finished.
+    genesis.admit_genesis_bookkeeping()?;
+    for path in missing {
+        canceled(control)?;
+        for directory in &held {
+            directory.check()?;
+        }
+        let parent = held.iter().find(|d| Some(d.path.as_path()) == path.parent()).ok_or_else(malformed)?;
+        mkdir_at(&parent.held.file, path.file_name().ok_or_else(malformed)?)?;
+        parent.held.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))?;
+        let directory = Directory::open(path, &budget)?;
+        budget.exclusions.bind(&directory.path, &directory.held.file)?;
+        held.push(directory);
+    }
+    let prepared = PreparedParents { held };
+    prepared.check()?;
+    Ok(prepared)
 }

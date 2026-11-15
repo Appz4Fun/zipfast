@@ -170,16 +170,16 @@ impl Verification {
             let active = self.active.take().unwrap();
             let hash = active.hash.finish();
             for (checks, part) in self.parts.iter_mut().zip(&snapshot.evidence.parts) {
-                if checks.range == active.range {
-                    if let Some(expected) = part.blake2sp {
-                        checks.blake2sp = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
-                    }
+                if checks.range == active.range
+                    && let Some(expected) = part.blake2sp
+                {
+                    checks.blake2sp = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
                 }
             }
-            if active.range == (0..snapshot.head.size) {
-                if let Some(expected) = snapshot.head.checks.blake2sp {
-                    self.member_blake = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
-                }
+            if active.range == (0..snapshot.head.size)
+                && let Some(expected) = snapshot.head.checks.blake2sp
+            {
+                self.member_blake = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
             }
         }
         Ok(self.active.is_some()
@@ -244,6 +244,24 @@ impl PartialCore {
         if !holes.is_empty() || missing_checks || pending {
             Ok(Poll::Ready(Verdict::Incomplete { revision, holes, parts, missing_checks }))
         } else {
+            // The operation token excludes mutation; callbacks have completed and
+            // this stamp was checked for the same revision immediately above.
+            let result = crate::extract::finish_file_checked(&self.native.output.file, &op.snapshot.evidence.metadata);
+            let attribute = |result: Option<std::io::Result<()>>| match result {
+                None => AttributeResult::NotRequested,
+                Some(Ok(())) => AttributeResult::Applied,
+                Some(Err(error)) => AttributeResult::Failed(error),
+            };
+            let metadata =
+                MetadataResult { modified: attribute(result.modified), permissions: attribute(result.permissions) };
+            (|| {
+                op.stamp = stamp(&self.native)?;
+                self.check(&op)
+            })()
+            .map_err(|mut error| {
+                error.committed = Some(op.state.anchor().clone());
+                error
+            })?;
             Ok(Poll::Ready(Verdict::Ok {
                 revision,
                 parts,
@@ -252,10 +270,7 @@ impl PartialCore {
                 } else {
                     VerifyPath::ExtentCombine
                 }),
-                metadata: MetadataResult {
-                    modified: AttributeResult::NotRequested,
-                    permissions: AttributeResult::NotRequested,
-                },
+                metadata,
             }))
         }
     }

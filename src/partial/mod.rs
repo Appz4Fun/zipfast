@@ -15,6 +15,8 @@
 // rights and limitations under the RPL.
 
 //! Independently owned anchored persistent output.
+#![allow(clippy::result_large_err, reason = "typed public errors preserve contextual and committed-anchor receipts")]
+#![doc = include_str!("../../docs/persistent-partials.md")]
 mod anchor;
 mod journal;
 mod ledger;
@@ -27,8 +29,9 @@ use crate::progressive::{OutputOperation, Resource, SessionControl};
 use crate::rar5::source::SourceStamp;
 use anchor::AnchorBinding;
 use journal::Bundle;
-use limits::{PartialBudget, Reservation, limit};
+pub(crate) use limits::PartialBudget;
 pub use limits::{PartialLimits, PartialResource};
+use limits::{Reservation, limit};
 use native::PersistentNative;
 pub(crate) use native::{PartialExclusions, PartialProtectedPath};
 pub use state::PartialState;
@@ -55,6 +58,22 @@ pub(crate) struct PartialCore {
     busy: AtomicBool,
     data: Mutex<Option<CoreData>>,
     _lease: Reservation,
+}
+pub(crate) struct PreparedCreate {
+    spec: CreateSpec,
+    budget: PartialBudget,
+    lease: Reservation,
+    _event: Reservation,
+    anchors: AnchorBinding,
+    control: SessionControl,
+    read_chunk: u64,
+    initial: Snapshot,
+    pages: Vec<(state::PageKind, Vec<u8>)>,
+    native: native::PreparedNative,
+    ready_bytes: Option<usize>,
+}
+pub(crate) struct PartialEventLease {
+    _reservation: Reservation,
 }
 struct CoreData {
     bundle: Bundle,
@@ -175,7 +194,15 @@ impl PartialCore {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn create(spec: CreateSpec, checks: MemberChecks, options: CoreOptions) -> PartialResult<Arc<Self>> {
+        Self::prepare_create(spec, checks, options)?.complete()
+    }
+    pub(crate) fn prepare_create(
+        spec: CreateSpec,
+        checks: MemberChecks,
+        options: CoreOptions,
+    ) -> PartialResult<PreparedCreate> {
         native::platform()?;
         options.limits.validate()?;
         canceled(&options.control)?;
@@ -251,67 +278,20 @@ impl PartialCore {
             return Err(err(PartialErrorKind::StateStale { latest }));
         }
         canceled(&options.control)?;
-        let native = PersistentNative::create(&spec, &budget)?;
-        let location = PartialLocation { output: native.output_path.clone(), state_bundle: native.bundle.path.clone() };
-        let mut committed = None;
-        let result = (|| {
-            let mut bundle = Bundle::create(&spec, &budget)?;
-            let mut snapshot = initial;
-            snapshot.head.binding = native.binding.clone();
-            bundle.persist_pages(&mut snapshot, pages)?;
-            let intent = MutationIntent {
-                transaction: 0,
-                parent: None,
-                conservative: snapshot.head.clone(),
-                affected: vec![0..spec.size],
-            };
-            let intent_anchor = bundle.append_intent(&intent)?;
-            let ack = anchors.advance(None, &intent_anchor)?;
-            bundle.acknowledge(&intent_anchor, &ack)?;
-            committed = Some(intent_anchor.clone());
-            canceled(&options.control)?;
-            native.check(0)?;
-            native.output.file.set_len(spec.size).map_err(|e| io_error(OutputOperation::Write, e))?;
-            native.sync()?;
-            native.sync_parents()?;
-            native.check(spec.size)?;
-            snapshot.head.sequence = 1;
-            let commit = MutationCommit { transaction: 0, parent: intent_anchor.clone(), valid: snapshot.head.clone() };
-            let final_anchor = bundle.append_commit(&commit)?;
-            let ack = anchors.advance(Some(&intent_anchor), &final_anchor)?;
-            bundle.acknowledge(&final_anchor, &ack)?;
-            committed = Some(final_anchor.clone());
-            let state = state::encode_record(3, 0, Some(&intent_anchor), &snapshot.head, &budget.limits)?;
-            native.check(spec.size)?;
-            canceled(&options.control)?;
-            let stamp = stamp(&native)?;
-            Ok(CoreData {
-                bundle,
-                snapshot,
-                state,
-                stamp,
-                uncertain: None,
-                pending_compaction: None,
-                verification: None,
-                reopened: false,
-            })
-        })()
-        .map_err(|mut error: PartialError| {
-            error.committed = committed;
-            error.location = Some(location);
-            error
-        })?;
-        budget.finish_genesis();
-        Ok(Arc::new(Self {
-            native,
+        let native = native::PreparedNative::new(&spec, &budget)?;
+        Ok(PreparedCreate {
+            spec,
             budget,
+            lease,
+            _event,
             anchors,
             control: options.control,
-            read_chunk: options.read_chunk.min(1_048_576) as usize,
-            busy: AtomicBool::new(false),
-            data: Mutex::new(Some(result)),
-            _lease: lease,
-        }))
+            read_chunk: options.read_chunk,
+            initial,
+            pages,
+            native,
+            ready_bytes: None,
+        })
     }
     fn reconcile(&self, data: &mut CoreData) -> PartialResult<()> {
         let ack = self.anchors.current_ack()?.ok_or_else(|| err(PartialErrorKind::AnchorConflict))?;
@@ -344,13 +324,13 @@ impl PartialCore {
                 data.state = candidate;
                 data.snapshot = snapshot;
                 data.uncertain = None;
-                if let Some(prepared) = data.pending_compaction.take() {
-                    if ack.matches(prepared.state.anchor()) {
-                        data.bundle.complete_compaction(prepared, &ack).map_err(|mut e| {
-                            e.committed = Some(ack.anchor().clone());
-                            e
-                        })?;
-                    }
+                if let Some(prepared) = data.pending_compaction.take()
+                    && ack.matches(prepared.state.anchor())
+                {
+                    data.bundle.complete_compaction(prepared, &ack).map_err(|mut e| {
+                        e.committed = Some(ack.anchor().clone());
+                        e
+                    })?;
                 }
             } else if !ack.matches(data.state.anchor()) {
                 return Err(err(PartialErrorKind::StateStale { latest: ack.anchor().clone() }));
@@ -389,6 +369,15 @@ impl PartialCore {
                 .sum::<usize>();
         self.budget.metadata(bytes as u64)?;
         Ok(snapshot.clone())
+    }
+    pub(crate) fn validate_current(&self) -> PartialResult<()> {
+        let data = self.operation()?;
+        self.check(&data)
+    }
+    pub(crate) fn next_revision(&self) -> PartialResult<u64> {
+        let data = self.operation()?;
+        self.check(&data)?;
+        data.snapshot.head.revision.checked_add(1).ok_or_else(malformed)
     }
     pub(crate) fn write_original(&self, offset: u64, bytes: &[u8]) -> PartialResult<()> {
         let mut op = self.operation()?;
@@ -596,46 +585,64 @@ impl PartialCore {
         mut valid: Snapshot,
         affected: Vec<Range<u64>>,
     ) -> PartialResult<Transaction> {
-        self.budget.metadata(data.state.wire.len() as u64)?;
-        let expected = data.state.clone();
-        let mut intent_known = self.budget.vector(intent.known.len())?;
-        intent_known.extend_from_slice(&intent.known);
-        let mut commit_known = self.budget.vector(valid.known.len())?;
-        commit_known.extend_from_slice(&valid.known);
-        let (intent_state, commit_state, files) =
-            data.bundle.prepare_mutation(expected.anchor(), &mut intent, &mut valid)?;
-        data.bundle.write_pages(&files)?;
-        self.check(data)?;
-        let record = MutationIntent {
-            transaction: intent.head.revision,
-            parent: Some(expected.anchor.clone()),
-            conservative: intent.head.clone(),
-            affected,
-        };
-        let anchor = data.bundle.append_intent(&record)?;
-        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-        tests::state::checkpoint("intent-sync");
-        data.uncertain = Some(Uncertain {
-            expected: expected.clone(),
-            intent: intent_state.clone(),
-            commit: None,
-            candidate_known: Some(intent_known),
-        });
-        let ack = self.anchors.advance(Some(expected.anchor()), &anchor).map_err(|mut e| {
-            e.committed = Some(expected.anchor.clone());
-            e
-        })?;
-        data.bundle.acknowledge(&anchor, &ack)?;
-        data.state = intent_state.clone();
-        data.snapshot = intent;
-        data.uncertain = None;
-        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-        tests::state::checkpoint("intent-cas");
-        self.check(data).map_err(|mut e| {
-            e.committed = Some(anchor);
-            e
-        })?;
-        Ok(Transaction { intent: intent_state, commit: commit_state, valid, commit_known })
+        let prior_sequence = data.state.anchor().sequence();
+        let result = (|| {
+            self.budget.metadata(data.state.wire.len() as u64)?;
+            let mut expected = data.state.clone();
+            let mut intent_known = self.budget.vector(intent.known.len())?;
+            intent_known.extend_from_slice(&intent.known);
+            let mut commit_known = self.budget.vector(valid.known.len())?;
+            commit_known.extend_from_slice(&valid.known);
+            let (mut intent_state, mut commit_state, mut files) =
+                data.bundle.prepare_mutation(expected.anchor(), &mut intent, &mut valid)?;
+            if data.bundle.needs_compaction(&data.snapshot.head, &files)? {
+                self.compact_locked(data)?;
+                expected = data.state.clone();
+                intent.head.sequence = data.snapshot.head.sequence.checked_add(1).ok_or_else(malformed)?;
+                valid.head.sequence = intent.head.sequence.checked_add(1).ok_or_else(malformed)?;
+                (intent_state, commit_state, files) =
+                    data.bundle.prepare_mutation(expected.anchor(), &mut intent, &mut valid)?;
+            }
+            data.bundle.reserve_files(&files)?;
+            data.bundle.write_pages(&files)?;
+            self.check(data)?;
+            let record = MutationIntent {
+                transaction: intent.head.revision,
+                parent: Some(expected.anchor.clone()),
+                conservative: intent.head.clone(),
+                affected,
+            };
+            let anchor = data.bundle.append_intent(&record)?;
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::checkpoint("intent-sync");
+            data.uncertain = Some(Uncertain {
+                expected: expected.clone(),
+                intent: intent_state.clone(),
+                commit: None,
+                candidate_known: Some(intent_known),
+            });
+            let ack = self.anchors.advance(Some(expected.anchor()), &anchor).map_err(|mut e| {
+                e.committed = Some(expected.anchor.clone());
+                e
+            })?;
+            data.bundle.acknowledge(&anchor, &ack)?;
+            data.state = intent_state.clone();
+            data.snapshot = intent;
+            data.uncertain = None;
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::checkpoint("intent-cas");
+            self.check(data).map_err(|mut e| {
+                e.committed = Some(anchor);
+                e
+            })?;
+            Ok(Transaction { intent: intent_state, commit: commit_state, valid, commit_known })
+        })();
+        result.map_err(|mut error: PartialError| {
+            if error.committed.is_none() && data.state.anchor().sequence() != prior_sequence {
+                error.committed = Some(data.state.anchor().clone());
+            }
+            error
+        })
     }
     fn finish_transaction(&self, data: &mut CoreData, transaction: Transaction) -> PartialResult<()> {
         let intent_anchor = transaction.intent.anchor.clone();
@@ -825,6 +832,9 @@ impl PartialCore {
         let mut op = self.operation()?;
         self.check(&op)?;
         self.reconcile(&mut op)?;
+        self.compact_locked(&mut op)
+    }
+    fn compact_locked(&self, op: &mut CoreData) -> PartialResult<()> {
         let mut snapshot = self.clone_snapshot(&op.snapshot)?;
         snapshot.head.sequence = snapshot.head.sequence.checked_add(1).ok_or_else(malformed)?;
         let prepared = op.bundle.prepare_compaction(&snapshot.head)?;
@@ -840,7 +850,7 @@ impl PartialCore {
         op.state = next.clone();
         op.snapshot = snapshot;
         op.uncertain = None;
-        self.check(&op).map_err(|mut e| {
+        self.check(op).map_err(|mut e| {
             e.committed = Some(next.anchor.clone());
             e
         })?;
@@ -850,7 +860,7 @@ impl PartialCore {
             e
         })
     }
-    fn state(&self) -> PartialResult<PartialState> {
+    pub(crate) fn state(&self) -> PartialResult<PartialState> {
         let op = self.operation()?;
         self.check(&op)?;
         self.budget.metadata(op.state.wire.len() as u64)?;
@@ -959,4 +969,130 @@ mod tests {
     mod serde;
     pub(super) mod state;
     mod verify;
+}
+
+impl PartialOptions {
+    pub(crate) fn validate_session(&self) -> PartialResult<()> {
+        native::platform()?;
+        self.limits.validate()?;
+        canceled(&self.control)?;
+        if self.limits.events == 0 || self.state_dir.as_os_str().is_empty() {
+            return Err(err(PartialErrorKind::InvalidOptions));
+        }
+        Ok(())
+    }
+}
+
+impl PreparedCreate {
+    pub(crate) fn reserve_ready_state(&mut self) -> PartialResult<()> {
+        if self.ready_bytes.is_none() {
+            // Native identities and parent digests occupy fixed-width fields.
+            let bytes = state::encode_record(3, 0, None, &self.initial.head, &self.budget.limits)?.wire.len();
+            self.budget.usage.charge(Resource::MetadataBytes, bytes as u64)?;
+            self.ready_bytes = Some(bytes);
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_parents(
+        &self,
+        check: impl FnMut(&std::path::Path) -> PartialResult<()>,
+    ) -> PartialResult<native::PreparedParents> {
+        native::prepare_parents(&self.spec, &self.budget, &self.control, check)
+    }
+    #[cfg(test)]
+    pub(crate) fn complete(self) -> PartialResult<Arc<PartialCore>> {
+        self.complete_inner().map(|(core, _, _)| core)
+    }
+    pub(crate) fn complete_ready(self) -> PartialResult<(Arc<PartialCore>, PartialState, PartialEventLease)> {
+        if self.ready_bytes.is_none() {
+            return Err(err(PartialErrorKind::InvalidOptions));
+        }
+        let (core, state, lease) = self.complete_inner()?;
+        Ok((core, state.ok_or_else(malformed)?, lease))
+    }
+    fn complete_inner(self) -> PartialResult<(Arc<PartialCore>, Option<PartialState>, PartialEventLease)> {
+        let Self {
+            spec,
+            budget,
+            lease,
+            _event,
+            anchors,
+            control,
+            read_chunk,
+            initial,
+            pages,
+            native: prepared_native,
+            ready_bytes,
+        } = self;
+        budget.admit_genesis_bookkeeping()?;
+        let native = PersistentNative::create(&spec, &budget, prepared_native)?;
+        let location = PartialLocation { output: native.output_path.clone(), state_bundle: native.bundle.path.clone() };
+        let mut committed = None;
+        let result = (|| {
+            let mut bundle = Bundle::create(&spec, &budget)?;
+            let mut snapshot = initial;
+            snapshot.head.binding = native.binding.clone();
+            bundle.persist_pages(&mut snapshot, pages)?;
+            let intent = MutationIntent {
+                transaction: 0,
+                parent: None,
+                conservative: snapshot.head.clone(),
+                affected: std::iter::once(0..spec.size).collect(),
+            };
+            let intent_anchor = bundle.append_intent(&intent)?;
+            let ack = anchors.advance(None, &intent_anchor)?;
+            bundle.acknowledge(&intent_anchor, &ack)?;
+            committed = Some(intent_anchor.clone());
+            canceled(&control)?;
+            native.check(0)?;
+            native.output.file.set_len(spec.size).map_err(|e| io_error(OutputOperation::Write, e))?;
+            native.sync()?;
+            native.sync_parents()?;
+            native.check(spec.size)?;
+            snapshot.head.sequence = 1;
+            let commit = MutationCommit { transaction: 0, parent: intent_anchor.clone(), valid: snapshot.head.clone() };
+            let final_anchor = bundle.append_commit(&commit)?;
+            let ack = anchors.advance(Some(&intent_anchor), &final_anchor)?;
+            bundle.acknowledge(&final_anchor, &ack)?;
+            committed = Some(final_anchor.clone());
+            let state = state::encode_record(3, 0, Some(&intent_anchor), &snapshot.head, &budget.limits)?;
+            native.check(spec.size)?;
+            canceled(&control)?;
+            let stamp = stamp(&native)?;
+            Ok(CoreData {
+                bundle,
+                snapshot,
+                state,
+                stamp,
+                uncertain: None,
+                pending_compaction: None,
+                verification: None,
+                reopened: false,
+            })
+        })()
+        .map_err(|mut error: PartialError| {
+            error.committed = committed;
+            error.location = Some(location);
+            error
+        })?;
+        budget.finish_genesis();
+        let ready = ready_bytes.map(|bytes| {
+            debug_assert_eq!(bytes, result.state.wire.len());
+            result.state.clone()
+        });
+        Ok((
+            Arc::new(PartialCore {
+                native,
+                budget,
+                anchors,
+                control,
+                read_chunk: read_chunk.min(1_048_576) as usize,
+                busy: AtomicBool::new(false),
+                data: Mutex::new(Some(result)),
+                _lease: lease,
+            }),
+            ready,
+            PartialEventLease { _reservation: _event },
+        ))
+    }
 }

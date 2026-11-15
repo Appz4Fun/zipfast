@@ -24,9 +24,11 @@ use super::{
 };
 use crate::progressive::OutputOperation;
 use std::{ffi::OsStr, path::Path};
+type PreparedFiles = Vec<(String, Vec<u8>, bool)>;
 struct Stored {
     name: String,
     written: bool,
+    size: u64,
     _bytes: Reservation,
     _count: Reservation,
 }
@@ -87,7 +89,7 @@ impl Bundle {
             )?;
             budget.metadata(std::mem::size_of::<Stored>() as u64 + name.len() as u64)?;
             files.try_reserve_exact(1).map_err(|_| malformed())?;
-            files.push(Stored { name, written: true, _bytes: bytes, _count: count });
+            files.push(Stored { name, written: true, size: meta.len(), _bytes: bytes, _count: count });
         }
         directory.check()?;
         Ok(Self { directory, budget: budget.clone(), files, acknowledged: None })
@@ -213,7 +215,7 @@ impl Bundle {
         self.directory.check()?;
         state::decode_pages(head, pages, &self.budget, reusable)
     }
-    fn reserve_files(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
+    pub(super) fn reserve_files(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
         let mut added = self.budget.vector(files.len())?;
         for (name, bytes, page) in files {
             if self.files.iter().any(|f| &f.name == name) || added.iter().any(|f: &Stored| &f.name == name) {
@@ -228,7 +230,13 @@ impl Bundle {
             )?;
             Self::exclude(&self.directory, &self.budget, name, None)?;
             self.budget.metadata(name.len() as u64)?;
-            added.push(Stored { name: name.clone(), written: false, _bytes: space, _count: count });
+            added.push(Stored {
+                name: name.clone(),
+                written: false,
+                size: bytes.len() as u64,
+                _bytes: space,
+                _count: count,
+            });
         }
         self.budget.metadata((added.len() * std::mem::size_of::<Stored>()) as u64)?;
         self.files.try_reserve_exact(added.len()).map_err(|_| malformed())?;
@@ -240,7 +248,7 @@ impl Bundle {
         parent: &StateAnchor,
         intent: &mut Snapshot,
         commit: &mut Snapshot,
-    ) -> PartialResult<(PartialState, PartialState, Vec<(String, Vec<u8>, bool)>)> {
+    ) -> PartialResult<(PartialState, PartialState, PreparedFiles)> {
         let mut files = Vec::new();
         for snapshot in [&mut *intent, &mut *commit] {
             let pages = state::encode_pages(snapshot, &self.budget)?;
@@ -263,8 +271,88 @@ impl Bundle {
         )?;
         files.push((format!("r-{}", hex(intent_state.anchor().digest())), intent_state.wire.clone(), false));
         files.push((format!("r-{}", hex(commit_state.anchor().digest())), commit_state.wire.clone(), false));
-        self.reserve_files(&files)?;
         Ok((intent_state, commit_state, files))
+    }
+    /// Maintenance is useful only when it can reclaim the pressured storage
+    /// and leave room for this already-validated transaction. Include one
+    /// compaction record of headroom so a small journal does not become stuck.
+    pub(super) fn needs_compaction(
+        &self,
+        head: &CommittedState,
+        files: &[(String, Vec<u8>, bool)],
+    ) -> PartialResult<bool> {
+        let visits = self
+            .files
+            .len()
+            .checked_mul(files.len().checked_add(head.pages.len()).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?;
+        self.budget.usage.charge(Resource::SourceBookkeeping, visits as u64)?;
+        self.budget.metadata(
+            (std::mem::size_of::<CommittedState>()
+                + head.relative_output.as_os_str().len()
+                + head.pages.len() * (std::mem::size_of::<PageRef>() + 66)) as u64,
+        )?;
+        let live = head.pages.iter().map(|p| format!("p-{}", hex(&p.digest))).collect::<Vec<_>>();
+        let mut compact_head = head.clone();
+        compact_head.sequence = compact_head.sequence.checked_add(1).ok_or_else(malformed)?;
+        let compact = self.compaction_state(&compact_head)?;
+        let compact_name = format!("r-{}", hex(compact.anchor().digest()));
+        let retained_compact = self.files.iter().any(|f| f.name == compact_name);
+        let maintenance =
+            [0, 0, u64::from(!retained_compact), if retained_compact { 0 } else { compact.wire.len() as u64 }];
+        let mut needed = [0u64; 4];
+        let mut after_needed = [0u64; 4];
+        let mut reclaim = [0u64; 4];
+        let add = |totals: &mut [u64; 4], page: bool, size: u64| -> PartialResult<()> {
+            let i = if page { 0 } else { 2 };
+            totals[i] = totals[i].checked_add(1).ok_or_else(malformed)?;
+            totals[i + 1] = totals[i + 1].checked_add(size).ok_or_else(malformed)?;
+            Ok(())
+        };
+        for (i, (name, bytes, page)) in files.iter().enumerate() {
+            if files[..i].iter().any(|(prior, _, _)| prior == name) {
+                continue;
+            }
+            let existing = self.files.iter().find(|f| &f.name == name);
+            if existing.is_none() {
+                add(&mut needed, *page, bytes.len() as u64)?;
+            }
+            if !live.contains(name) && existing.is_none_or(|f| f.written) {
+                add(&mut after_needed, *page, bytes.len() as u64)?;
+            }
+        }
+        for file in &self.files {
+            if file.written && file.name != compact_name && !live.contains(&file.name) {
+                add(&mut reclaim, file.name.starts_with("p-"), file.size)?;
+            }
+        }
+        let counts = *self.budget.exclusions.counters.lock().unwrap();
+        let resources = [
+            PartialResource::StatePages,
+            PartialResource::LedgerBytes,
+            PartialResource::JournalRecords,
+            PartialResource::JournalBytes,
+        ];
+        let mut pressure = false;
+        for (i, resource) in resources.into_iter().enumerate() {
+            let used = counts[resource as usize];
+            let cap = self.budget.limits.value(resource);
+            let projected =
+                used.checked_add(needed[i]).and_then(|n| n.checked_add(maintenance[i])).ok_or_else(malformed)?;
+            pressure |= projected > cap;
+            // Do not acknowledge maintenance which cannot make this transaction fit.
+            if used.checked_add(maintenance[i]).ok_or_else(malformed)? > cap
+                || used
+                    .checked_sub(reclaim[i])
+                    .and_then(|n| n.checked_add(maintenance[i]))
+                    .and_then(|n| n.checked_add(after_needed[i]))
+                    .ok_or_else(malformed)?
+                    > cap
+            {
+                return Ok(false);
+            }
+        }
+        Ok(pressure && reclaim.iter().any(|n| *n > 0))
     }
     pub(super) fn write_pages(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
         for (name, bytes, page) in files {
@@ -281,12 +369,15 @@ impl Bundle {
         self.acknowledged = Some(state.clone());
         Ok(())
     }
-    pub(crate) fn prepare_compaction(&mut self, head: &CommittedState) -> PartialResult<PreparedCompaction> {
+    fn compaction_state(&self, head: &CommittedState) -> PartialResult<PartialState> {
         let parent = self.acknowledged.as_ref().ok_or_else(|| err(PartialErrorKind::AnchorConflict))?;
         if head.sequence != parent.sequence().checked_add(1).ok_or_else(malformed)? {
             return Err(malformed());
         }
-        let state = state::encode_record(4, head.revision, Some(parent), head, &self.budget.limits)?;
+        state::encode_record(4, head.revision, Some(parent), head, &self.budget.limits)
+    }
+    pub(crate) fn prepare_compaction(&mut self, head: &CommittedState) -> PartialResult<PreparedCompaction> {
+        let state = self.compaction_state(head)?;
         let name = format!("r-{}", hex(state.anchor().digest()));
         let mut retire = self.budget.vector(self.files.len())?;
         for f in &self.files {

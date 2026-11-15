@@ -101,6 +101,8 @@ pub enum ChecksumScope {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FailureKind {
+    #[cfg(feature = "persistent-partials")]
+    Partial(Box<crate::partial::PartialError>),
     Malformed(&'static str),
     Rar(Box<crate::error::RarFailure>),
     PasswordRequired,
@@ -158,6 +160,8 @@ impl std::error::Error for ProgressiveFailure {
         match &self.kind {
             FailureKind::Input { cause, .. } | FailureKind::Output { cause, .. } => Some(cause),
             FailureKind::Rar(failure) => Some(failure.as_ref()),
+            #[cfg(feature = "persistent-partials")]
+            FailureKind::Partial(failure) => Some(failure.as_ref()),
             _ => None,
         }
     }

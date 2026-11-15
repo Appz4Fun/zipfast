@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3021,15 +3022,52 @@ fn finish_dir_meta(dir_meta: &mut Vec<(PathBuf, Meta)>) {
     let _ = dirs;
 }
 
-/// Times and permissions, best effort: a file system that can't keep them still gets the data.
-pub(crate) fn finish_file(out: &File, h: &Meta) {
-    set_time(out, h);
+pub(crate) struct FileMetadataResult {
+    pub modified: Option<io::Result<()>>,
+    pub permissions: Option<io::Result<()>>,
+}
+/// Each requested attribute reports its own native result.
+pub(crate) fn finish_file_checked(out: &File, h: &Meta) -> FileMetadataResult {
+    finish_file_attributes(
+        h,
+        |at| out.set_modified(at),
+        |mode| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                out.set_permissions(fs::Permissions::from_mode(mode))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (out, mode);
+                Ok(())
+            }
+        },
+    )
+}
+fn finish_file_attributes(
+    h: &Meta,
+    modified: impl FnOnce(SystemTime) -> io::Result<()>,
+    permissions: impl FnOnce(u32) -> io::Result<()>,
+) -> FileMetadataResult {
+    let modified = h.mtime.map(|seconds| {
+        archive_time(seconds, h.nanos)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "archive timestamp out of range"))
+            .and_then(modified)
+    });
     #[cfg(unix)]
-    if let Some(mode) = h.mode {
-        use std::os::unix::fs::PermissionsExt;
-        // set-id and sticky bits are never restored from an archive; zero is a real mode, not a missing one
-        let _ = out.set_permissions(fs::Permissions::from_mode(mode & 0o777));
-    }
+    let permissions = h.mode.map(|mode| permissions(mode & 0o777));
+    #[cfg(not(unix))]
+    let permissions = {
+        let _ = permissions;
+        None
+    };
+    FileMetadataResult { modified, permissions }
+}
+/// Times and permissions, best effort: preserve the legacy swallowing policy.
+pub(crate) fn finish_file(out: &File, h: &Meta) {
+    let FileMetadataResult { modified, permissions } = finish_file_checked(out, h);
+    drop((modified, permissions));
 }
 
 fn set_time(out: &File, h: &Meta) {
@@ -3155,6 +3193,39 @@ pub(crate) fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn persistent_metadata_attributes_are_independent() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = tempfile::tempfile().unwrap();
+        let meta = Meta { mtime: Some(1_700_000_000), nanos: 123_000_000, mode: Some(0o7777) };
+        let result = finish_file_attributes(
+            &meta,
+            |at| file.set_modified(at),
+            |mode| {
+                assert_eq!(mode, 0o777);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            },
+        );
+        assert!(result.modified.unwrap().is_ok());
+        assert_eq!(result.permissions.unwrap().unwrap_err().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            file.metadata().unwrap().modified().unwrap(),
+            archive_time(meta.mtime.unwrap(), meta.nanos).unwrap()
+        );
+        let absent = finish_file_attributes(&Meta::default(), |_| panic!("absent time"), |_| panic!("absent mode"));
+        assert!(absent.modified.is_none() && absent.permissions.is_none());
+        let zero = finish_file_checked(&file, &Meta { mode: Some(0), ..Meta::default() });
+        assert!(zero.permissions.unwrap().is_ok());
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0);
+        let result = finish_file_attributes(
+            &meta,
+            |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+            |mode| file.set_permissions(fs::Permissions::from_mode(mode)),
+        );
+        assert_eq!(result.modified.unwrap().unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert!(result.permissions.unwrap().is_ok());
+    }
 
     #[cfg(unix)]
     #[test]

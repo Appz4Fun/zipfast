@@ -99,8 +99,11 @@ impl OriginalSource {
     }
 }
 impl SourceDriver {
-    // H2 will call this internal entrypoint; legacy construction remains unchanged.
-    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+    // The opt-in persistent session retains original sources; legacy construction remains unchanged.
+    #[cfg_attr(
+        not(feature = "persistent-partials"),
+        allow(dead_code, reason = "used by the opt-in persistent session")
+    )]
     pub(crate) fn new_retained(
         provider: Box<dyn VolumeSource>,
         first: OsString,
@@ -199,7 +202,7 @@ pub(super) struct LeaseEpoch {
     retired: AtomicBool,
     number: u64,
 }
-#[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+#[allow(dead_code, reason = "H3/H4 consume retained discovery and refill entrypoints")]
 #[derive(Clone, Copy)]
 pub(crate) enum OriginalReadPurpose {
     Discovery,
@@ -213,8 +216,10 @@ enum ReadState {
     Failed,
     Canceled,
 }
-#[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+#[allow(dead_code, reason = "H3/H4 consume retained discovery and refill entrypoints")]
 pub(crate) struct OriginalRead {
+    #[cfg(feature = "persistent-partials")]
+    pending_partial_read: Option<PendingPartialRead>,
     owner: Arc<()>,
     volume: u32,
     identity: SourceInfo,
@@ -286,14 +291,9 @@ impl SourceDriver {
         self.wake.disarm();
     }
     fn original_mut(&mut self, volume: u32) -> ProgressiveResult<&mut OriginalSource> {
-        if self.original.as_ref().is_some_and(|s| s.index == volume) {
-            return Ok(self.original.as_mut().unwrap());
-        }
-        let retained = self.retained.as_mut().ok_or_else(invalid_capability)?;
-        self.usage.charge(Resource::SourceBookkeeping, retained.slots.len() as u64)?;
-        retained.slots.iter_mut().find(|s| s.index == volume).ok_or_else(invalid_capability)
+        original_parts(&mut self.original, &mut self.retained, &mut self.usage, volume)
     }
-    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+    #[allow(dead_code, reason = "H3/H4 consume retained discovery and refill entrypoints")]
     pub(crate) fn begin_original_read(
         &mut self,
         volume: u32,
@@ -331,6 +331,8 @@ impl SourceDriver {
         source.lease = Some(Arc::downgrade(&epoch));
         self.retained.as_mut().unwrap().lease_counter = number;
         Ok(OriginalRead {
+            #[cfg(feature = "persistent-partials")]
+            pending_partial_read: None,
             owner,
             volume,
             identity,
@@ -359,7 +361,7 @@ impl SourceDriver {
         }
         Ok(())
     }
-    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+    #[allow(dead_code, reason = "H3/H4 consume retained discovery and refill entrypoints")]
     pub(crate) fn retire_original_read(&mut self, read: &mut OriginalRead) -> ProgressiveResult<()> {
         // Retirement stays terminal even when cancellation is already latched.
         if !self.retained.as_ref().is_some_and(|retained| Arc::ptr_eq(&retained.owner.identity, &read.owner)) {
@@ -372,7 +374,7 @@ impl SourceDriver {
         }
         result
     }
-    #[allow(dead_code, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+    #[allow(dead_code, reason = "H3/H4 consume retained discovery and refill entrypoints")]
     pub(crate) fn poll_original_read(
         &mut self,
         read: &mut OriginalRead,
@@ -465,7 +467,9 @@ impl SourceDriver {
         }
         let mut usage = self.usage.clone();
         let control = self.control.clone();
-        let source = self.original_mut(read.volume)?;
+        #[cfg(feature = "persistent-partials")]
+        let exclusions = self.partial_exclusions.clone();
+        let source = original_parts(&mut self.original, &mut self.retained, &mut self.usage, read.volume)?;
         let mut parked = false;
         let mut retry_admitted = false;
         poll_available(
@@ -478,8 +482,28 @@ impl SourceDriver {
                 control: &control,
                 usage: &mut usage,
                 verify: matches!(read.purpose, OriginalReadPurpose::Refill),
+                #[cfg(feature = "persistent-partials")]
+                exclusions: exclusions.as_deref(),
+                #[cfg(feature = "persistent-partials")]
+                pending: &mut read.pending_partial_read,
+                #[cfg(feature = "persistent-partials")]
+                native: exclusions.as_ref().map(|_| (&mut self.native, &self.protection, external)),
             },
             buf,
         )
     }
+}
+
+fn original_parts<'a>(
+    original: &'a mut Option<OriginalSource>,
+    retained: &'a mut Option<RetainedOriginals>,
+    usage: &mut Usage,
+    volume: u32,
+) -> ProgressiveResult<&'a mut OriginalSource> {
+    if original.as_ref().is_some_and(|s| s.index == volume) {
+        return Ok(original.as_mut().unwrap());
+    }
+    let retained = retained.as_mut().ok_or_else(invalid_capability)?;
+    usage.charge(Resource::SourceBookkeeping, retained.slots.len() as u64)?;
+    retained.slots.iter_mut().find(|s| s.index == volume).ok_or_else(invalid_capability)
 }

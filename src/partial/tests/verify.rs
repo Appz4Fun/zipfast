@@ -93,7 +93,7 @@ fn blake_verification_uses_readback() {
     let Verdict::Ok { path, parts, metadata, .. } = drive(&mut file) else { panic!("complete BLAKE must verify") };
     assert_eq!(path, VerifyPath::WholeReadback);
     assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
-    assert!(matches!(metadata.modified, AttributeResult::NotRequested));
+    assert!(matches!(metadata.modified, AttributeResult::Applied));
     assert!(file.core.budget.usage.charge(crate::progressive::Resource::VerifyBytes, 1).is_err());
 }
 fn deferred(reopen: bool) {

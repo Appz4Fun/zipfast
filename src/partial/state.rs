@@ -134,14 +134,14 @@ impl PartialState {
             if matches!(&failure.kind,crate::progressive::FailureKind::Output {cause,..} if cause.kind()==std::io::ErrorKind::NotFound) {err(PartialErrorKind::StateUnavailable)} else {failure.into()}
         })?;
         let f =
-            super::native::open_at(&dir, std::ffi::OsStr::new(&format!("r-{}", hex(anchor.digest()))), false, &budget)
+            super::native::open_at(&dir, std::ffi::OsStr::new(&format!("r-{}", hex(anchor.digest()))), false, budget)
                 .map_err(|e| match e.kind {
-                    PartialErrorKind::Io { ref cause, .. } if cause.kind() == std::io::ErrorKind::NotFound => {
-                        err(PartialErrorKind::StateUnavailable)
-                    }
-                    _ => e,
-                })?;
-        let bytes = read_bounded(&f.file, limits.state_wire_bytes as usize, &budget)?;
+                PartialErrorKind::Io { ref cause, .. } if cause.kind() == std::io::ErrorKind::NotFound => {
+                    err(PartialErrorKind::StateUnavailable)
+                }
+                _ => e,
+            })?;
+        let bytes = read_bounded(&f.file, limits.state_wire_bytes as usize, budget)?;
         let state = Self::parse(bytes, limits)?;
         if state.anchor() != anchor {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));

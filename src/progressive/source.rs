@@ -364,7 +364,7 @@ fn changed() -> ProgressiveFailure {
 }
 
 mod retained;
-#[allow(unused_imports, reason = "H1 private retained-source entrypoint consumed by H2 persistent output")]
+#[allow(unused_imports, reason = "H3/H4 consume retained discovery and refill entrypoints")]
 pub(crate) use retained::{OriginalRead, OriginalReadPurpose};
 use retained::{OriginalSource, RetainedOriginals};
 
@@ -376,13 +376,63 @@ struct RangeOperation<'a> {
     control: &'a SessionControl,
     usage: &'a mut Usage,
     verify: bool,
+    #[cfg(feature = "persistent-partials")]
+    exclusions: Option<&'a crate::partial::PartialExclusions>,
+    #[cfg(feature = "persistent-partials")]
+    pending: &'a mut Option<PendingPartialRead>,
+    #[cfg(feature = "persistent-partials")]
+    native: Option<(&'a mut super::output::native::NativeProtection, &'a ProtectionDeclaration, usize)>,
+}
+#[cfg(feature = "persistent-partials")]
+struct PendingPartialRead {
+    offset: u64,
+    requested: u64,
+    answer: RangeRead,
+    bytes: Vec<u8>,
+}
+#[cfg(feature = "persistent-partials")]
+fn partial_read_stable(original: &OriginalSource, op: &mut RangeOperation<'_>) -> ProgressiveResult<bool> {
+    let Some(exclusions) = op.exclusions else { return Ok(true) };
+    for _ in 0..2 {
+        op.usage.charge(Resource::SourceRequests, 1)?;
+        let files = original.source.backing_files();
+        if op.control.is_canceled() {
+            return Err(canceled());
+        }
+        if let Some((native, declaration, external)) = &mut op.native {
+            native.refresh(declaration, op.usage, *external)?;
+        }
+        if exclusions.check_input_revision(&[], files)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn poll_available(
     original: &mut OriginalSource,
     op: RangeOperation<'_>,
     buf: &mut [u8],
 ) -> ProgressiveResult<Poll<SourceStep>> {
+    #[cfg(feature = "persistent-partials")]
+    let mut op = op;
     let offset = op.cursor.offset();
+    #[cfg(feature = "persistent-partials")]
+    if let Some(pending) = op.pending.as_ref() {
+        if pending.offset != offset || pending.bytes.len() > buf.len() {
+            return Err(contract());
+        }
+        original.check_info(op.usage)?;
+        if op.control.is_canceled() {
+            return Err(canceled());
+        }
+        if !partial_read_stable(original, &mut op)? {
+            op.gate.notify(false);
+            return Ok(Poll::Pending);
+        }
+        let pending = op.pending.take().unwrap();
+        buf[..pending.bytes.len()].copy_from_slice(&pending.bytes);
+        return accept_available(original, op, pending.offset, pending.requested, pending.answer);
+    }
     let length = original.live.length.value();
     if offset == length {
         return Ok(Poll::Ready(SourceStep::EndOfVolume));
@@ -392,6 +442,11 @@ fn poll_available(
         return Err(canceled());
     }
     checked?;
+    #[cfg(feature = "persistent-partials")]
+    if !partial_read_stable(original, &mut op)? {
+        op.gate.notify(false);
+        return Ok(Poll::Pending);
+    }
     let count = (length - offset).min(buf.len() as u64);
     op.usage.check(Resource::ReadChunk, count)?;
     op.usage.charge(Resource::SourceRequests, 1)?;
@@ -412,6 +467,30 @@ fn poll_available(
         return Err(canceled());
     }
     checked?;
+    #[cfg(feature = "persistent-partials")]
+    if !matches!(answer, RangeRead::NotYet) && !partial_read_stable(original, &mut op)? {
+        let n = match answer {
+            RangeRead::Filled { count: n } if n > 0 && n <= count as usize => n,
+            RangeRead::Hole { len } if len > 0 && len <= count => 0,
+            _ => return Err(contract()),
+        };
+        op.usage.charge(Resource::MetadataBytes, n as u64)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(n).map_err(|_| contract())?;
+        bytes.extend_from_slice(&buf[..n]);
+        *op.pending = Some(PendingPartialRead { offset, requested: count, answer, bytes });
+        op.gate.notify(false);
+        return Ok(Poll::Pending);
+    }
+    accept_available(original, op, offset, count, answer)
+}
+fn accept_available(
+    original: &mut OriginalSource,
+    op: RangeOperation<'_>,
+    offset: u64,
+    count: u64,
+    answer: RangeRead,
+) -> ProgressiveResult<Poll<SourceStep>> {
     let step = match answer {
         RangeRead::NotYet => {
             *op.parked = true;
@@ -451,6 +530,10 @@ fn poll_available(
     Ok(Poll::Ready(step))
 }
 pub(crate) struct SourceDriver {
+    #[cfg(feature = "persistent-partials")]
+    partial_exclusions: Option<Arc<crate::partial::PartialExclusions>>,
+    #[cfg(feature = "persistent-partials")]
+    pending_partial_read: Option<PendingPartialRead>,
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
     original: Option<OriginalSource>,
@@ -493,6 +576,10 @@ impl SourceDriver {
         usage.charge(Resource::MetadataBytes, first.capacity() as u64)?;
         let native = super::output::native::NativeProtection::new(&usage)?;
         Ok(Self {
+            #[cfg(feature = "persistent-partials")]
+            partial_exclusions: None,
+            #[cfg(feature = "persistent-partials")]
+            pending_partial_read: None,
             provider,
             request: VolumeRequest { index: 0, expected: first },
             original: None,
@@ -552,7 +639,90 @@ impl SourceDriver {
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
+        #[cfg(feature = "persistent-partials")]
+        self.check_partial_inputs()?;
         Ok(())
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn require_partial_catalogue(&mut self) -> ProgressiveResult<()> {
+        self.refresh_protection()?;
+        if !matches!(self.protection, ProtectionDeclaration::Complete { .. }) {
+            return Err(ProgressiveFailure::new(FailureKind::Partial(Box::new(crate::partial::PartialError::new(
+                crate::partial::PartialErrorKind::InvalidOptions,
+            )))));
+        }
+        self.validate_current()
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn install_partial_exclusions(
+        &mut self,
+        exclusions: Arc<crate::partial::PartialExclusions>,
+    ) -> ProgressiveResult<()> {
+        self.partial_exclusions = Some(exclusions);
+        self.check_partial_inputs()
+    }
+    #[cfg(feature = "persistent-partials")]
+    fn check_partial_inputs(&self) -> ProgressiveResult<()> {
+        let Some(exclusions) = &self.partial_exclusions else { return Ok(()) };
+        if let ProtectionDeclaration::Complete { inventory, .. } = &self.protection {
+            for path in inventory
+                .volumes
+                .iter()
+                .flat_map(|volume| match &volume.backing {
+                    VolumeBacking::Native(paths) => paths.as_slice(),
+                    VolumeBacking::NonFile => &[],
+                })
+                .chain(inventory.auxiliary_paths.iter())
+            {
+                exclusions.check_input(
+                    std::slice::from_ref(&path.path),
+                    path.file.as_ref().map_or(&[], |file| std::slice::from_ref(file.as_ref())),
+                )?;
+            }
+        }
+        if let Some(original) = &self.original {
+            self.usage.charge(Resource::SourceRequests, 1)?;
+            let files = original.source.backing_files();
+            if self.control.is_canceled() {
+                return Err(canceled());
+            }
+            exclusions.check_input(&[], files)?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn partial_catalogue(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        self.require_partial_catalogue()?;
+        if let ProtectionDeclaration::Complete { inventory, .. } = &self.protection {
+            let bytes = inventory
+                .volumes
+                .iter()
+                .map(|v| {
+                    std::mem::size_of::<ProtectedVolume>()
+                        + v.name.len()
+                        + match &v.backing {
+                            VolumeBacking::NonFile => 0,
+                            VolumeBacking::Native(p) => p
+                                .iter()
+                                .map(|p| std::mem::size_of::<ProtectedPath>() + p.path.as_os_str().len())
+                                .sum::<usize>(),
+                        }
+                })
+                .sum::<usize>()
+                + inventory
+                    .auxiliary_paths
+                    .iter()
+                    .map(|p| std::mem::size_of::<ProtectedPath>() + p.path.as_os_str().len())
+                    .sum::<usize>();
+            self.usage.charge(Resource::MetadataBytes, bytes as u64)?;
+        }
+        Ok(self.protection.clone())
+    }
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn check_partial_target(&mut self, path: &std::path::Path) -> ProgressiveResult<()> {
+        self.require_partial_catalogue()?;
+        self.native.check_partial_target(path, &mut self.usage)?;
+        self.validate_current()
     }
     pub(crate) fn shared_usage(&self) -> Usage {
         self.usage.clone()
@@ -593,6 +763,10 @@ impl SourceDriver {
         self.control.cancel();
     }
     pub(crate) fn seek(&mut self, offset: u64) -> ProgressiveResult<()> {
+        #[cfg(feature = "persistent-partials")]
+        if self.pending_partial_read.is_some() {
+            return Err(contract());
+        }
         if self.parked
             || self.failed
             || self.original.is_none()
@@ -604,6 +778,10 @@ impl SourceDriver {
         Ok(())
     }
     pub(crate) fn select_volume(&mut self, request: VolumeRequest) -> ProgressiveResult<()> {
+        #[cfg(feature = "persistent-partials")]
+        if self.pending_partial_read.is_some() {
+            return Err(contract());
+        }
         if self.retained.is_some() {
             return self.select_retained(request);
         }
@@ -743,6 +921,9 @@ impl SourceDriver {
                 return Err(canceled());
             }
         }
+        #[cfg(feature = "persistent-partials")]
+        let partial_external =
+            if self.partial_exclusions.is_some() { self.other_lane_handles()? + self.backing_count() } else { 0 };
         poll_available(
             self.original.as_mut().unwrap(),
             RangeOperation {
@@ -753,6 +934,15 @@ impl SourceDriver {
                 control: &self.control,
                 usage: &mut self.usage,
                 verify,
+                #[cfg(feature = "persistent-partials")]
+                exclusions: self.partial_exclusions.as_deref(),
+                #[cfg(feature = "persistent-partials")]
+                pending: &mut self.pending_partial_read,
+                #[cfg(feature = "persistent-partials")]
+                native: self
+                    .partial_exclusions
+                    .as_ref()
+                    .map(|_| (&mut self.native, &self.protection, partial_external)),
             },
             buf,
         )
@@ -779,6 +969,10 @@ impl SourceDriver {
         let backing = source.backing_files();
         if self.control.is_canceled() {
             return Err(canceled());
+        }
+        #[cfg(feature = "persistent-partials")]
+        if let Some(exclusions) = &self.partial_exclusions {
+            exclusions.check_input(&[], backing)?;
         }
         let external = self.other_lane_handles()?;
         self.usage.check(Resource::VolumeHandles, (external + self.native.handle_count() + backing.len()) as u64)?;
@@ -853,6 +1047,10 @@ impl SourceDriver {
         let first = name.clone();
         let mut lane = Self::with_usage(Box::new(NoVolumes), first, self.usage.clone(), self.control.clone())?;
         lane.request.index = index;
+        #[cfg(feature = "persistent-partials")]
+        {
+            lane.partial_exclusions = self.partial_exclusions.clone();
+        }
         self.usage.charge(Resource::SourceBookkeeping, self.replacements.len() as u64 * 2)?;
         let held = self.native.handle_count() + self.backing_count() + self.retained_backing_count()?;
         let replacements =
@@ -1005,6 +1203,8 @@ impl SourceDriver {
         let external = self.other_lane_handles()? + self.backing_count();
         self.native.refresh(&next, &mut self.usage, external)?;
         self.protection = next;
+        #[cfg(feature = "persistent-partials")]
+        self.check_partial_inputs()?;
         Ok(())
     }
     fn check_inventory_admitted(&mut self, candidate: &ProtectionDeclaration) -> ProgressiveResult<()> {

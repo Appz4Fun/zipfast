@@ -37,7 +37,7 @@ pub(crate) fn check_directory(path: &Path, file: &fs::File, identity: native::Id
     Ok(())
 }
 pub(crate) fn check_parents(root: &Path, path: &Path, usage: &Usage) -> ProgressiveResult<()> {
-    let relative = path.parent().ok_or_else(invalid)?.strip_prefix(&root).map_err(|_| invalid())?;
+    let relative = path.parent().ok_or_else(invalid)?.strip_prefix(root).map_err(|_| invalid())?;
     usage.charge(Resource::MetadataBytes, (path.as_os_str().len() as u64).saturating_mul(2))?;
     let mut at = root.to_path_buf();
     for component in relative.components() {
