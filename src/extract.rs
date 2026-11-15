@@ -597,9 +597,11 @@ pub struct SelectedReadNotice<'a> {
     pub role: SelectedReadRole,
 }
 
+type SelectedReadCallback<'a> = &'a mut dyn FnMut(SelectedReadNotice<'_>) -> Result<()>;
+
 #[derive(Default)]
 struct SelectedReadObserver<'a> {
-    callback: Option<&'a mut dyn FnMut(SelectedReadNotice<'_>) -> Result<()>>,
+    callback: Option<SelectedReadCallback<'a>>,
     last: Option<(u32, SelectedReadRole)>,
 }
 
