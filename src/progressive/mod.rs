@@ -30,3 +30,6 @@ pub use output::{
 };
 pub use session::*;
 pub use source::*;
+
+#[cfg(feature = "persistent-partials")]
+pub(crate) use output::{guard, native};

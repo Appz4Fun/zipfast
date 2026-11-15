@@ -29,7 +29,11 @@ license = "RPL-1.5"
 description = "Fast universal archive extractor"
 publish = false
 
+[features]
+persistent-partials = ["dep:serde"]
+
 [dependencies]
+serde = { version = "=1.0.229", default-features = false, features = ["std"], optional = true }
 bzip2 = "0.6.1"
 crc32fast = "1.5"
 flate2 = "1"

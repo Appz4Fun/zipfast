@@ -79,22 +79,7 @@ impl Policy<'_> {
     }
     pub(super) fn parents(&self, path: &Path) -> ProgressiveResult<()> {
         self.root.check()?;
-        let relative = path.parent().ok_or_else(invalid)?.strip_prefix(&self.root.path).map_err(|_| invalid())?;
-        self.usage.charge(Resource::MetadataBytes, (path.as_os_str().len() as u64).saturating_mul(2))?;
-        let mut at = self.root.path.clone();
-        for component in relative.components() {
-            self.usage.charge(Resource::SourceBookkeeping, 1 + at.as_os_str().len() as u64)?;
-            at.push(component);
-            let meta = match fs::symlink_metadata(&at) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(e) => return Err(out(OutputOperation::Metadata, e, 0)),
-            };
-            if !meta.is_dir() || meta.file_type().is_symlink() {
-                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
-            }
-        }
-        Ok(())
+        guard::check_parents(&self.root.path, path, self.usage)
     }
     pub(super) fn prepare_parents(
         &self,

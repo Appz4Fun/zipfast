@@ -541,16 +541,7 @@ impl OwnedStage {
         Ok(())
     }
     pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file().read_at(buf, offset)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (offset, buf);
-            Err(io::ErrorKind::Unsupported.into())
-        }
+        range::read_at(self.file(), offset, buf)
     }
     pub(crate) fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<usize> {
         #[cfg(test)]
@@ -558,16 +549,7 @@ impl OwnedStage {
             Some(n) => &buf[..n.min(buf.len())],
             None => buf,
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file().write_at(buf, offset)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (offset, buf);
-            Err(io::ErrorKind::Unsupported.into())
-        }
+        range::write_at(self.file(), offset, buf)
     }
     pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
         self.file().set_len(len)
@@ -676,3 +658,5 @@ fn owns_stage_name(path: &Path, identity: (u64, u64)) -> io::Result<bool> {
         Err(e) => Err(e),
     }
 }
+
+pub(crate) mod range;
