@@ -57,8 +57,15 @@ pub(crate) struct Record {
     wires: Vec<WireSnapshot>,
     epoch: Arc<AtomicU64>,
     part_evidence: Vec<PackedEvidence>,
+    /// The stage stamp after the library's own last write (extraction end, then each patch). Verify combines the
+    /// CRCs of proven parts instead of reading them back only while the stage still carries this stamp; any other
+    /// writer changes it and forces a full readback.
+    trusted: Option<SourceStamp>,
 }
 impl Record {
+    pub(crate) fn trust(&mut self, stage: &Stage) {
+        self.trusted = stamp(stage).ok();
+    }
     pub(crate) fn required_volumes(&self) -> impl Iterator<Item = u32> + '_ {
         self.wires.iter().filter(|_| self.model.members[0].header.encrypted && self.missing).map(|w| w.volume)
     }
@@ -84,6 +91,7 @@ impl Record {
             wires,
             epoch,
             part_evidence,
+            trusted: None,
         }
     }
 }
@@ -247,6 +255,8 @@ impl ProgressiveSession {
         let split = offset > hole.offset && end < hole_end;
         self.usage.check(Resource::HoleIntervals, stage.holes.len() as u64 + u64::from(split))?;
         self.usage.charge(Resource::SourceBookkeeping, (stage.holes.len() - index) as u64)?;
+        let trusted = artifact.recovery.as_ref().unwrap().trusted.is_some_and(|t| stamp(stage).is_ok_and(|s| s == t));
+        artifact.recovery.as_mut().unwrap().trusted = None;
         self.verify_job = None;
         self.driver.abort_replacement_reads()?;
         let stage = artifact.stage.as_mut().unwrap();
@@ -297,6 +307,9 @@ impl ProgressiveSession {
             stage.holes[index].len = offset - hole.offset;
         }
         stage.valid = stage.valid.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
+        if trusted {
+            artifact.recovery.as_mut().unwrap().trust(artifact.stage.as_ref().unwrap());
+        }
         Ok(())
     }
     /// Rescan the complete private stage. A strict pass may publish through the
@@ -357,7 +370,7 @@ impl ProgressiveSession {
             let record = artifact.recovery.as_ref().unwrap();
             let blake_wanted = record.model.members[0].final_checks.is_none_or(|c| c.blake2sp.is_some())
                 || matches!(stage.assessment.borrow().expected, Some(ExpectedInner::Blake2sp { .. }));
-            let part_blake = |part: usize| record.model.parts.get(part).is_none_or(|p| p.checks.blake2sp.is_some());
+            let part_blake = |part: usize| record.model.parts.get(part).is_some_and(|p| p.checks.blake2sp.is_some());
             self.verify_job = Some(VerifyJob {
                 member: stage.member,
                 generation: stage.generation,
@@ -434,7 +447,11 @@ impl ProgressiveSession {
         // A non-final plain stored part that passed its declared part CRC during extraction holds exactly those
         // bytes: patches only ever write into holes, and holes make a part's evidence Missing. Its CRC is combined
         // instead of read back, unless a BLAKE2sp must be computed over the whole member.
-        if plain_store && job.blake.is_none() && record.part_evidence.len() == record.model.parts.len() {
+        if plain_store
+            && job.blake.is_none()
+            && record.trusted == Some(job.stamp)
+            && record.part_evidence.len() == record.model.parts.len()
+        {
             while job.part_offset == 0
                 && let Some(part) = record.model.parts.get(job.part)
                 && !part.final_part
@@ -451,7 +468,7 @@ impl ProgressiveSession {
                     .model
                     .parts
                     .get(job.part)
-                    .is_none_or(|p| p.checks.blake2sp.is_some())
+                    .is_some_and(|p| p.checks.blake2sp.is_some())
                     .then(crate::blake2sp::Blake2sp::new);
             }
         }
@@ -477,7 +494,7 @@ impl ProgressiveSession {
                 .model
                 .parts
                 .get(job.part)
-                .is_none_or(|p| p.checks.blake2sp.is_some())
+                .is_some_and(|p| p.checks.blake2sp.is_some())
                 .then(crate::blake2sp::Blake2sp::new);
             self.verify_job = Some(job);
             cx.waker().wake_by_ref();

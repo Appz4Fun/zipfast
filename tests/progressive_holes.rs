@@ -1424,3 +1424,44 @@ fn patch_verify_reads_back_only_damaged_and_final_parts() {
         assert_eq!(got, plain);
     }
 }
+// Catches combining part CRCs over a stage that something other than the library changed after extraction.
+#[test]
+fn outside_write_to_a_proven_part_forces_a_full_readback() {
+    let plain: Vec<u8> = (0..101u32).map(|i| (i * 7 + 3) as u8).collect();
+    for after_patch in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = FileSpec::new("inner", &plain);
+        let data = common::volumes(&spec, 23);
+        let mut inputs = Vec::new();
+        let mut logical = 0;
+        for (index, volume) in data.iter().enumerate() {
+            let part = &plain[logical..(logical + 23).min(plain.len())];
+            let start = volume.windows(part.len()).position(|b| b == part).unwrap() as u64;
+            let holes = if index == 2 { one(start + 5..start + 15) } else { vec![] };
+            inputs.push(Some(Bytes { data: volume.clone(), holes }));
+            logical += part.len();
+        }
+        let mut opts = options(dir.path());
+        opts.first_name = "a.part01.rar".into();
+        let mut s = ProgressiveSession::new(Box::new(Multi(inputs)), opts).unwrap();
+        let mut a = artifact(&mut s);
+        let stage = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".zipfast-progressive"))
+            .expect("stage file");
+        let tamper = || {
+            use std::os::unix::fs::FileExt;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::fs::OpenOptions::new().write(true).open(&stage).unwrap().write_at(&[0xff], 2).unwrap();
+        };
+        if !after_patch {
+            tamper();
+        }
+        s.patch(&mut a, 51, &plain[51..61]).unwrap();
+        if after_patch {
+            tamper();
+        }
+        assert!(verify(&mut s, &mut a).is_err(), "a changed proven part must fail verification");
+    }
+}

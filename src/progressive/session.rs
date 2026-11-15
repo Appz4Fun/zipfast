@@ -1241,6 +1241,8 @@ impl ProgressiveSession {
         if machine.missing && self.stage.is_some() {
             let record = self.recovery_record(&machine)?;
             let mut artifact = self.stage.take().expect("stage").into_artifact();
+            let mut record = record;
+            record.trust(artifact.stage.as_ref().expect("stage"));
             artifact.recovery = Some(record);
             self.phase = Phase::Header;
             return Ok(ProgressiveEvent::MemberFinished {
