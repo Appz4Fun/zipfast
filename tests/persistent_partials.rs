@@ -721,6 +721,7 @@ fn deferred_part_success_survives_session_drop_and_reopen() {
                     progressive_limits,
                     anchors,
                     control: SessionControl::default(),
+                    password: None,
                 },
             )
             .unwrap();
@@ -1149,6 +1150,7 @@ fn many_standalone_fills_reclaim_superseded_state() {
             progressive_limits: ProgressiveLimits::default(),
             anchors,
             control: SessionControl::default(),
+            password: None,
         },
     )
     .unwrap();
@@ -1261,6 +1263,7 @@ fn automatic_compaction_uncertainty_cancel_receipts_and_reopen() {
                         progressive_limits: ProgressiveLimits::default(),
                         anchors: anchors.clone(),
                         control: SessionControl::default(),
+                        password: None,
                     },
                 )
                 .unwrap();
@@ -1666,6 +1669,7 @@ fn durable_anchor_store_recovers_sync_before_compaction_retirement() {
                 progressive_limits: ProgressiveLimits::default(),
                 anchors,
                 control: SessionControl::default(),
+                password: None,
             },
         )
         .unwrap();
@@ -1759,6 +1763,7 @@ fn paused_member_cannot_verify_or_apply_metadata_before_canonical_finish() {
                     progressive_limits: ProgressiveLimits::default(),
                     anchors,
                     control: SessionControl::default(),
+                    password: None,
                 },
             )
             .unwrap();
@@ -1852,6 +1857,7 @@ fn canonical_finish_failure_never_commits_completion_or_metadata() {
                 progressive_limits: ProgressiveLimits::default(),
                 anchors,
                 control: SessionControl::default(),
+                password: None,
             },
         )
         .unwrap();
@@ -1937,6 +1943,7 @@ fn declare_hole_after_extraction_reopens_output_and_fill_verifies() {
                     progressive_limits: ProgressiveLimits::default(),
                     anchors: anchors.clone(),
                     control: SessionControl::default(),
+                    password: None,
                 },
             )
             .unwrap();
@@ -2313,4 +2320,541 @@ fn many_streamed_fills_do_not_exhaust_the_metadata_budget() {
         a.fill_from(0, 7000, &mut input).unwrap();
     }
     assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+
+// ---- Encrypted (AES-256-CBC) RAR5 stored members ----
+
+type Reads = Arc<Mutex<Vec<(u32, u64, usize)>>>;
+fn hole(range: Range<u64>) -> Vec<Range<u64>> {
+    std::iter::once(range).collect()
+}
+const SALT: [u8; 16] = [3; 16];
+const IV: [u8; 16] = [9; 16];
+fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut padded = [0u8; 64];
+    padded[..key.len()].copy_from_slice(key);
+    let mut inner: Vec<u8> = padded.iter().map(|b| b ^ 0x36).collect();
+    inner.extend_from_slice(message);
+    let mut outer: Vec<u8> = padded.iter().map(|b| b ^ 0x5c).collect();
+    outer.extend_from_slice(&zipfast::crypto::sha256(&inner));
+    zipfast::crypto::sha256(&outer)
+}
+/// The RAR5 password check value: PBKDF2-HMAC-SHA256 continued 32 rounds past the key, folded to 8 bytes.
+fn password_check(password: &str, kdf_count: u8) -> [u8; 8] {
+    let mut block = SALT.to_vec();
+    block.extend(1u32.to_be_bytes());
+    let mut u = hmac(password.as_bytes(), &block);
+    let mut sum = u;
+    for _ in 1..(1u32 << kdf_count) + 32 {
+        u = hmac(password.as_bytes(), &u);
+        sum.iter_mut().zip(u).for_each(|(s, b)| *s ^= b);
+    }
+    let mut folded = [0u8; 8];
+    sum.iter().enumerate().for_each(|(i, b)| folded[i % 8] ^= b);
+    folded
+}
+struct Encrypted {
+    plain: Vec<u8>,
+    cipher: Vec<u8>,
+    volumes: Vec<Vec<u8>>,
+    /// Ciphertext payload of each volume, and the ciphertext stream offset where it starts.
+    payloads: Vec<Range<u64>>,
+    starts: Vec<u64>,
+}
+impl Encrypted {
+    /// One encrypted stored member "e.bin" of `size` bytes, its ciphertext cut at the stream offsets `cuts`
+    /// (one part per volume), with keyed (tweaked) checks and, with `check`, a password check value.
+    fn new(size: usize, cuts: &[usize], check: bool) -> Self {
+        let plain: Vec<u8> = (0..size).map(|i| ((i * 7 + 3) % 253) as u8).collect();
+        let (key, hash_key) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap();
+        let mut padded = plain.clone();
+        padded.resize(size.div_ceil(16) * 16, 0);
+        let cipher = zipfast::crypto::encrypt_cbc(&key, &IV, &padded).unwrap();
+        let mut extra = vec![if check { 48 } else { 36 }, 1, 0, if check { 3 } else { 2 }, 1];
+        extra.extend(SALT);
+        extra.extend(IV);
+        if check {
+            let value = password_check("pw", 1);
+            extra.extend(value);
+            extra.extend(&zipfast::crypto::sha256(&value)[..4]);
+        }
+        let mut spec = common::FileSpec::new("e.bin", &cipher);
+        spec.size = Some(size as u64);
+        spec.extra = extra;
+        let bounds: Vec<usize> = std::iter::once(0).chain(cuts.iter().copied()).chain([cipher.len()]).collect();
+        let (mut volumes, mut payloads, mut starts) = (Vec::new(), Vec::new(), Vec::new());
+        for (index, pair) in bounds.windows(2).enumerate() {
+            let part = &cipher[pair[0]..pair[1]];
+            let last = pair[1] == cipher.len();
+            let crc = crc32fast::hash(if last { &plain } else { part });
+            let crc = zipfast::crypto::rar5_tweak_crc32(crc, &hash_key);
+            let mut bytes = common::SIG.to_vec();
+            bytes.extend(common::main_block(true, Some(index as u64)));
+            let file = common::file_block(&spec, part, crc, index > 0, !last);
+            let start = (bytes.len() + file.len() - part.len()) as u64;
+            bytes.extend(file);
+            bytes.extend(common::end_block(!last));
+            volumes.push(bytes);
+            payloads.push(start..start + part.len() as u64);
+            starts.push(pair[0] as u64);
+        }
+        Self { plain, cipher, volumes, payloads, starts }
+    }
+    /// Packed spans of ciphertext stream `range`, one per volume piece.
+    fn packed(&self, range: Range<u64>) -> Vec<(u32, Range<u64>)> {
+        let mut spans = Vec::new();
+        for (volume, payload) in self.payloads.iter().enumerate() {
+            let start = self.starts[volume];
+            let end = start + (payload.end - payload.start);
+            let (a, b) = (range.start.max(start), range.end.min(end));
+            if a < b {
+                spans.push((volume as u32, payload.start + (a - start)..payload.start + (b - start)));
+            }
+        }
+        spans
+    }
+    /// A provider whose sources answer the ciphertext stream ranges `holes` as holes.
+    fn provider(&self, holes: &[Range<u64>]) -> (Provider, Reads) {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let volumes = (0..self.volumes.len())
+            .map(|index| {
+                let holes = holes
+                    .iter()
+                    .flat_map(|hole| self.packed(hole.clone()))
+                    .filter(|(volume, _)| *volume == index as u32)
+                    .map(|(_, range)| range)
+                    .collect();
+                Some(Source {
+                    generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    backing_hook: Arc::new(Mutex::new(None)),
+                    index: index as u32,
+                    bytes: self.volumes[index].clone(),
+                    holes,
+                    reads: reads.clone(),
+                    backing: Vec::new(),
+                    hook: Arc::new(Mutex::new(None)),
+                    wait: None,
+                })
+            })
+            .collect();
+        let protection = ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory {
+                volumes: (0..self.volumes.len() as u32)
+                    .map(|index| ProtectedVolume { index, name: volume_name(index), backing: VolumeBacking::NonFile })
+                    .collect(),
+                auxiliary_paths: Vec::new(),
+            },
+        };
+        let provider = Provider {
+            volumes,
+            protection,
+            wait: None,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            protection_hook: None,
+        };
+        (provider, reads)
+    }
+}
+struct EncryptedRun {
+    holes: Vec<HoleReport>,
+    file: PartialFile,
+    key: MemberKey,
+    anchors: Arc<Anchors>,
+    protection: ProtectionDeclaration,
+    session: ProgressiveSession,
+}
+fn extract_encrypted(dir: &Path, fixture: &Encrypted, holes: &[Range<u64>]) -> EncryptedRun {
+    let (provider, _) = fixture.provider(holes);
+    let protection = provider.protection.clone();
+    let anchors = Arc::new(Anchors::default());
+    let mut partial = partial_options(&dir.join("state"));
+    partial.anchors = anchors.clone();
+    let mut opts = options(&dir.join("out"));
+    opts.set_password(Some("pw".into())).unwrap();
+    let mut session = ProgressiveSession::new_partial(Box::new(provider), opts, partial).unwrap();
+    let mut outcome = None;
+    let mut reports = Vec::new();
+    let mut files = Vec::new();
+    for _ in 0..100_000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push((member.clone(), session.partial_file(&member).unwrap()))
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => reports.push(report),
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartVerified { .. }))) => {
+                panic!("encrypted part checks cover ciphertext and have no plaintext mirror")
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome: o, .. }))) => outcome = Some(o),
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    let outcome = outcome.expect("member finished");
+    if holes.is_empty() {
+        assert!(matches!(outcome, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }));
+    } else {
+        assert!(matches!(outcome, MemberOutcome::PersistentPartial { .. }));
+    }
+    let (key, file) = files.pop().unwrap();
+    EncryptedRun { holes: reports, file, key, anchors, protection, session }
+}
+#[allow(clippy::result_large_err, reason = "the public partial error type")]
+fn reopen(dir: &Path, run: EncryptedRun, password: Option<&str>) -> PartialResult<PartialFile> {
+    drop(run.session);
+    let state = partial_state::roundtrip(&run.file.close().unwrap());
+    let expected_anchor = run.anchors.current(&run.key).unwrap().unwrap();
+    PartialFile::open(
+        state,
+        PartialOpenContext {
+            output_root: dir.join("out"),
+            state_root: dir.join("state"),
+            expected_member: run.key,
+            expected_anchor,
+            protection: run.protection,
+            limits: PartialLimits::default(),
+            progressive_limits: ProgressiveLimits::default(),
+            anchors: run.anchors,
+            control: SessionControl::default(),
+            password: password.map(Into::into),
+        },
+    )
+}
+#[allow(clippy::result_large_err, reason = "the public partial error type")]
+fn verify_result(file: &mut PartialFile) -> PartialResult<Verdict> {
+    for _ in 0..10000 {
+        if let Poll::Ready(result) = file.poll_verify(&mut Context::from_waker(Waker::noop())) {
+            return result;
+        }
+    }
+    panic!("local verification failed to complete")
+}
+/// (output, cause) of each report, with consecutive reports of one cause joined.
+fn joined(reports: &[HoleReport]) -> Vec<(Range<u64>, HoleCause)> {
+    let mut out: Vec<(Range<u64>, HoleCause)> = Vec::new();
+    for report in reports {
+        match out.last_mut() {
+            Some((range, cause)) if range.end == report.out.start && *cause == report.cause => {
+                range.end = report.out.end
+            }
+            _ => out.push((report.out.clone(), report.cause.clone())),
+        }
+    }
+    out
+}
+fn spans(report: &HoleReport) -> Vec<(u32, Range<u64>)> {
+    report.packed.iter().map(|s| (s.volume, s.range.clone())).collect()
+}
+fn fill_plain(file: &mut PartialFile, fixture: &Encrypted) {
+    for hole in file.remaining().unwrap() {
+        file.fill(hole.start, &fixture.plain[hole.start as usize..hole.end as usize]).unwrap();
+    }
+}
+const CUTS: [usize; 2] = [1001, 2004];
+
+#[test]
+fn encrypted_split_hole_reports_are_block_widened_with_a_cipher_neighbour_and_alt_fill_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    // One hole straddles the boundary of volumes 0 and 1, one lies inside volume 1.
+    let mut run = extract_encrypted(dir.path(), &fixture, &[990..1010, 1500..1510]);
+    assert_eq!(
+        joined(&run.holes),
+        vec![
+            (976..1024, HoleCause::Missing),
+            (1024..1040, HoleCause::CipherNeighbour),
+            (1488..1520, HoleCause::Missing),
+            (1520..1536, HoleCause::CipherNeighbour),
+        ]
+    );
+    // Every report's packed spans are exactly its whole ciphertext blocks, one span per volume piece.
+    for report in &run.holes {
+        assert_eq!(report.out.start % 16, 0);
+        assert_eq!(report.out.end % 16, 0);
+        assert_eq!(spans(report), fixture.packed(report.out.clone()), "{report:?}");
+    }
+    let straddling = run.holes.iter().find(|r| r.out.contains(&992)).unwrap();
+    assert_eq!(straddling.packed.len(), 2, "a block cut by a volume boundary has one span per volume");
+    let file = &mut run.file;
+    assert_eq!(file.remaining().unwrap(), vec![976..1040, 1488..1536]);
+    assert!(matches!(verify(file), Verdict::Incomplete { .. }));
+    fill_plain(file, &fixture);
+    let Verdict::Ok { parts, .. } = verify(file) else { panic!("alt plaintext must verify the keyed member CRC") };
+    assert!(parts.iter().all(|p| p.crc32 == CheckResult::Missing), "encrypted part checks are never plaintext checks");
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_member_without_holes_verifies_ok_during_extraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let run = extract_encrypted(dir.path(), &fixture, &[]);
+    assert!(run.holes.is_empty());
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_reopen_with_password_fills_from_an_alt_and_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let run = extract_encrypted(dir.path(), &fixture, &[990..1010, 1500..1510]);
+    let mut file = reopen(dir.path(), run, Some("pw")).unwrap();
+    assert_eq!(file.remaining().unwrap(), vec![976..1040, 1488..1536]);
+    fill_plain(&mut file, &fixture);
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_reopen_without_or_with_a_wrong_password() {
+    // With a password check value, a wrong password is refused at open.
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+    let error = reopen(dir.path(), run, Some("wrong")).err().expect("wrong password");
+    assert!(matches!(error.kind, PartialErrorKind::WrongPassword), "{error:?}");
+
+    // Without a password, plaintext fills work but the keyed member check and decryption need the password.
+    let dir = tempfile::tempdir().unwrap();
+    let run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+    let p1 = fixture.payloads[1].start;
+    let mut file = reopen(dir.path(), run, None).unwrap();
+    let error = file.fill_packed(1, 0, &fixture.volumes[1]).unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::PasswordRequired), "{error:?}");
+    assert!(matches!(verify_result(&mut file).unwrap(), Verdict::Incomplete { .. }), "holes come first");
+    fill_plain(&mut file, &fixture);
+    let error = verify_result(&mut file).unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::PasswordRequired), "{error:?}");
+    assert!(p1 > 0);
+
+    // Without a check value a wrong password cannot be refused at open; the keyed member CRC then fails.
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, false);
+    let run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+    let mut file = reopen(dir.path(), run, Some("wrong")).unwrap();
+    fill_plain(&mut file, &fixture);
+    assert!(matches!(verify_result(&mut file).unwrap(), Verdict::Bad { .. }));
+}
+
+#[test]
+fn encrypted_fill_packed_with_whole_volumes_decrypts_across_volume_boundaries_and_verifies() {
+    for reopened in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Encrypted::new(3000, &CUTS, true);
+        let run = extract_encrypted(dir.path(), &fixture, &[990..1010, 1500..1510]);
+        let mut file = if reopened { reopen(dir.path(), run, Some("pw")).unwrap() } else { run.file };
+        // Volume 0 ends inside block 992..1008: that block cannot be decrypted from volume 0 alone. Its first
+        // bytes are kept, so the next volume completes it.
+        let first = file.fill_packed(0, 0, &fixture.volumes[0]).unwrap();
+        assert_eq!(first.applied, vec![976..992]);
+        assert_eq!(first.undecryptable, vec![992..1008]);
+        let p0 = fixture.payloads[0].clone();
+        let unmapped: Vec<_> = first.unmapped.iter().map(|s| (s.volume, s.range.clone())).collect();
+        assert_eq!(unmapped, vec![(0, 0..p0.start), (0, p0.end..fixture.volumes[0].len() as u64)]);
+        assert_eq!(file.remaining().unwrap(), vec![992..1040, 1488..1536]);
+        let second = file.fill_packed(1, 0, &fixture.volumes[1]).unwrap();
+        assert_eq!(second.applied, vec![992..1040, 1488..1536]);
+        assert!(second.undecryptable.is_empty() && second.corrected.is_empty());
+        assert!(file.remaining().unwrap().is_empty());
+        assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+        // Volume 2 overlaps only original output: it must match and changes nothing.
+        let third = file.fill_packed(2, 0, &fixture.volumes[2]).unwrap();
+        assert!(third.applied.is_empty() && third.undecryptable.is_empty());
+    }
+}
+
+#[test]
+fn encrypted_fill_packed_reports_blocks_whose_previous_ciphertext_block_is_missing() {
+    for reopened in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Encrypted::new(3000, &CUTS, true);
+        let mut run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+        let block = |offset: u64| {
+            let (volume, range) = fixture.packed(offset..offset + 16).remove(0);
+            (volume, range.start, &fixture.cipher[offset as usize..offset as usize + 16])
+        };
+        // Block 1504's previous block 1488 is itself a hole: it cannot be decrypted. The kept neighbour block
+        // 1520 decrypts with 1504 as its previous block.
+        let (volume, at, bytes) = block(1504);
+        let result = run.file.fill_packed(volume, at, bytes).unwrap();
+        assert_eq!(result.undecryptable, vec![1504..1520]);
+        assert_eq!(result.applied, vec![1520..1536]);
+        assert_eq!(run.file.remaining().unwrap(), vec![1488..1520]);
+        // Kept ciphertext blocks are durable state: they survive a reopen.
+        let mut file = if reopened { reopen(dir.path(), run, Some("pw")).unwrap() } else { run.file };
+        // Block 1488 decrypts with the block kept from before the hole, and 1504, now kept, decrypts with it.
+        let (volume, at, bytes) = block(1488);
+        let result = file.fill_packed(volume, at, bytes).unwrap();
+        assert!(result.undecryptable.is_empty());
+        assert_eq!(result.applied, vec![1488..1520]);
+        assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+    }
+}
+
+#[test]
+fn encrypted_exact_report_spans_correct_wrong_alt_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let mut run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+    let wrong: Vec<u8> = fixture.plain[1488..1536].iter().map(|b| b ^ 0x5a).collect();
+    run.file.fill(1488, &wrong).unwrap();
+    // A twin post of exactly the reported packed spans: the kept block before the hole decrypts the first.
+    for report in run.holes.clone() {
+        for span in &report.packed {
+            let bytes = &fixture.volumes[span.volume as usize][span.range.start as usize..span.range.end as usize];
+            let result = run.file.fill_packed(span.volume, span.range.start, bytes).unwrap();
+            assert!(result.undecryptable.is_empty());
+        }
+    }
+    assert!(matches!(verify(&mut run.file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_corrupt_packed_bytes_over_original_output_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let mut run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+    let mut volume = fixture.volumes[1].clone();
+    volume[fixture.payloads[1].start as usize + 10] ^= 1;
+    let error = run.file.fill_packed(1, 0, &volume).unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::OverlapMismatch { .. }), "{error:?}");
+    assert_eq!(run.file.remaining().unwrap(), vec![1488..1536]);
+}
+
+#[test]
+fn encrypted_packed_bytes_correct_wrong_alt_bytes_and_refill_reads_whole_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let mut run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+    let file = &mut run.file;
+    let wrong: Vec<u8> = fixture.plain[1488..1536].iter().map(|b| b ^ 0x5a).collect();
+    file.fill(1488, &wrong).unwrap();
+    assert!(matches!(verify(file), Verdict::Bad { .. }));
+    // A repaired volume 1: the refill reads the alt blocks plus the block before them, nothing else.
+    let mut reader = CountingReader { inner: std::io::Cursor::new(fixture.volumes[1].clone()), read: 0 };
+    let result = file.refill_from_packed(1, 0..fixture.volumes[1].len() as u64, &mut reader).unwrap();
+    assert_eq!(reader.read, 16 + 48);
+    assert_eq!(result.corrected, vec![1488..1536]);
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_hole_at_stream_offset_zero_decrypts_with_the_header_iv() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let mut run = extract_encrypted(dir.path(), &fixture, &hole(0..5));
+    assert_eq!(joined(&run.holes), vec![(0..16, HoleCause::Missing), (16..32, HoleCause::CipherNeighbour)]);
+    let missing = &run.holes[0];
+    assert_eq!(spans(missing), fixture.packed(0..16));
+    let (volume, range) = (missing.packed[0].volume, missing.packed[0].range.clone());
+    let result = run.file.fill_packed(volume, range.start, &fixture.cipher[..16]).unwrap();
+    assert!(result.undecryptable.is_empty());
+    assert_eq!(result.applied, vec![0..32]);
+    assert!(matches!(verify(&mut run.file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_final_padding_hole_maps_to_no_output_past_the_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    // Only padding bytes are lost, but CBC loses the whole last block: its output ends at the size.
+    let mut run = extract_encrypted(dir.path(), &fixture, &hole(3002..3008));
+    assert_eq!(joined(&run.holes), vec![(2992..3000, HoleCause::Missing)]);
+    let report = &run.holes[0];
+    let last = fixture.payloads[2].clone();
+    assert_eq!(spans(report), vec![(2, last.end - 16..last.end)], "the packed span keeps the padding");
+    // The end-of-archive header after the padding maps to nothing.
+    let at = last.end - 16;
+    let result = run.file.fill_packed(2, at, &fixture.volumes[2][at as usize..]).unwrap();
+    assert_eq!(result.applied, vec![2992..3000]);
+    let unmapped: Vec<_> = result.unmapped.iter().map(|s| (s.volume, s.range.clone())).collect();
+    assert_eq!(unmapped, vec![(2, last.end..fixture.volumes[2].len() as u64)]);
+    assert!(matches!(verify(&mut run.file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+#[test]
+fn encrypted_declared_damage_widens_to_blocks_with_a_cipher_neighbour() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let mut run = extract_encrypted(dir.path(), &fixture, &[]);
+    let p0 = fixture.payloads[0].start;
+    let receipt = run.session.declare_hole(0, p0 + 100..p0 + 101).unwrap();
+    assert_eq!(joined(&receipt.holes), vec![(96..112, HoleCause::DeclaredBad), (112..128, HoleCause::CipherNeighbour)]);
+    assert!(receipt.unmapped.is_empty() && receipt.pending.is_empty());
+    assert_eq!(run.file.remaining().unwrap(), vec![96..128]);
+    fill_plain(&mut run.file, &fixture);
+    assert!(matches!(verify(&mut run.file), Verdict::Ok { .. }));
+}
+
+#[test]
+fn encrypted_damage_declared_before_it_is_read_is_a_declared_hole() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let (provider, _) = fixture.provider(&[]);
+    let mut opts = options(&dir.path().join("out"));
+    opts.set_password(Some("pw".into())).unwrap();
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(provider), opts, partial_options(&dir.path().join("state"))).unwrap();
+    let p1 = fixture.payloads[1].start;
+    // Stream 1500..1510 lies in volume 1.
+    let receipt = session.declare_hole(1, p1 + 499..p1 + 509).unwrap();
+    assert_eq!(receipt.pending.len(), 1);
+    let (holes, mut files) = run_to_end(&mut session);
+    assert_eq!(joined(&holes), vec![(1488..1520, HoleCause::DeclaredBad), (1520..1536, HoleCause::CipherNeighbour)]);
+    fill_plain(&mut files[0], &fixture);
+    assert!(matches!(verify(&mut files[0]), Verdict::Ok { .. }));
+}
+
+#[test]
+fn encrypted_damage_declared_on_bytes_still_in_the_cipher_state_becomes_holes() {
+    // Damage on the block still being assembled, then on the last complete block, which decrypts the next one.
+    for previous in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Encrypted::new(3000, &CUTS, true);
+        let (provider, reads) = fixture.provider(&[]);
+        let mut opts = options(&dir.path().join("out"));
+        opts.set_password(Some("pw".into())).unwrap();
+        let mut session =
+            ProgressiveSession::new_partial(Box::new(provider), opts, partial_options(&dir.path().join("state")))
+                .unwrap();
+        let mut files = Vec::new();
+        let mut in_volume_1 = false;
+        loop {
+            match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                    files.push(session.partial_file(&member).unwrap())
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index: 1, .. }))) => in_volume_1 = true,
+                Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) if in_volume_1 => break,
+                Poll::Ready(Err(e)) => panic!("{e:?}"),
+                _ => {}
+            }
+        }
+        // The last byte fed: its block is still being assembled, so no output holds it yet.
+        let (volume, at, len) = *reads.lock().unwrap().last().unwrap();
+        assert_eq!(volume, 1);
+        let fed = fixture.starts[1] + (at + len as u64 - fixture.payloads[1].start);
+        assert_ne!(fed % 16, 0, "the fixture must leave a partial block");
+        let block = (fed & !15) - if previous { 16 } else { 0 };
+        let packed = fixture.payloads[1].start + (block + 6 - fixture.starts[1]);
+        let receipt = session.declare_hole(1, packed..packed + 1).unwrap();
+        assert!(receipt.unmapped.is_empty() && receipt.pending.is_empty());
+        let (holes, more) = run_to_end(&mut session);
+        files.extend(more);
+        let mut all = receipt.holes.clone();
+        all.extend(holes);
+        assert_eq!(
+            joined(&all),
+            vec![(block..block + 16, HoleCause::DeclaredBad), (block + 16..block + 32, HoleCause::CipherNeighbour)]
+        );
+        fill_plain(&mut files[0], &fixture);
+        assert!(matches!(verify(&mut files[0]), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+    }
 }
