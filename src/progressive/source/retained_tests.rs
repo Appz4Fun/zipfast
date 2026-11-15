@@ -1252,3 +1252,55 @@ fn retained_provider_cancel_has_priority_over_callback_error() {
         assert_eq!(calls.load(Ordering::SeqCst), usize::from(!protection));
     }
 }
+
+// Catches a revisited source's changed-info error masking callback cancellation.
+#[test]
+fn retained_revisit_info_cancel_precedes_changed_info() {
+    struct CancelInfo {
+        source: LeaseProbe,
+        armed: Arc<AtomicBool>,
+        control: SessionControl,
+    }
+    impl RangeSource for CancelInfo {
+        fn info(&self) -> SourceInfo {
+            let mut info = self.source.info();
+            if self.armed.load(Ordering::SeqCst) {
+                self.control.cancel();
+                info.generation += 1;
+            }
+            info
+        }
+        fn backing_files(&self) -> &[File] {
+            self.source.backing_files()
+        }
+        fn read_at(&mut self, offset: u64, buf: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            self.source.read_at(offset, buf, cx)
+        }
+    }
+    let control = SessionControl::default();
+    let armed = Arc::new(AtomicBool::new(false));
+    let source = LeaseProbe::new(270, &[]);
+    let requests = Arc::new(Mutex::new(vec![]));
+    let provider = Volumes {
+        sources: vec![
+            Some(Box::new(CancelInfo { source: source.clone(), armed: armed.clone(), control: control.clone() })),
+            Some(Box::new(probe(271))),
+        ],
+        requests: requests.clone(),
+    };
+    let mut d =
+        SourceDriver::new_retained(Box::new(provider), "v0".into(), ProgressiveLimits::default(), control.clone())
+            .unwrap();
+    open(&mut d, 0);
+    select(&mut d, 1);
+    open(&mut d, 1);
+    select(&mut d, 0);
+    armed.store(true, Ordering::SeqCst);
+    assert!(matches!(poll(&mut d), Poll::Ready(Err(ProgressiveFailure { kind: FailureKind::Canceled, .. }))));
+    assert!(control.is_canceled());
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(d.cursor.offset(), 0);
+    assert!(d.reopened); // No successful VolumeOpened notice was emitted.
+    assert!(d.failed);
+    assert_eq!(*requests.lock().unwrap(), [0, 1]);
+}

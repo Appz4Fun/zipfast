@@ -716,7 +716,11 @@ impl SourceDriver {
             }
         }
         if self.reopened {
-            self.check_info()?;
+            let checked = self.check_info();
+            if self.control.is_canceled() {
+                return Err(canceled());
+            }
+            checked?;
             let external = self.other_lane_handles()? + self.backing_count();
             self.native.refresh(&self.protection, &mut self.usage, external)?;
             if self.control.is_canceled() {
