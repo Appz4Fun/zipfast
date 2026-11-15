@@ -166,6 +166,7 @@ pub enum CheckVerdict {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Verification {
     pub(crate) inner_size: u64,
+    pub(crate) read_back: u64,
     pub(crate) checksum: Option<ChecksumValue>,
     pub(crate) replacement_revision: Option<u64>,
     pub(crate) caller: Option<Arc<ExpectedInner>>,
@@ -180,6 +181,12 @@ pub struct Verification {
 impl Verification {
     pub fn inner_size(&self) -> u64 {
         self.inner_size
+    }
+    /// Output bytes this verification read back. Below `inner_size` when plain stored parts already proven by their
+    /// per-part CRC were combined (CRC-32 combine) instead of re-read; equal to it for a whole readback, which is
+    /// used whenever a BLAKE2sp has to be computed. Zero when the member was verified while it was extracted.
+    pub fn read_back(&self) -> u64 {
+        self.read_back
     }
     pub fn checksum(&self) -> Option<&ChecksumValue> {
         self.checksum.as_ref()

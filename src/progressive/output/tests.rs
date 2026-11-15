@@ -143,6 +143,7 @@ fn complete(paths: Vec<ProtectedPath>) -> ProtectionDeclaration {
 fn verify(s: &mut Stage) -> VerifiedStage {
     s.bind_verification(Verification {
         inner_size: s.produced,
+        read_back: 0,
         checksum: Some(ChecksumValue::Crc32([0; 4])),
         replacement_revision: None,
         caller: None,

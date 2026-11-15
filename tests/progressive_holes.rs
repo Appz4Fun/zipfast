@@ -1382,3 +1382,45 @@ fn r1_caller_checksum_mismatch_permanently_blocks_expectation_correction() {
     assert_eq!(a.publication(), ArtifactPublication::Unpublished);
     assert!(!dir.path().join("inner").exists());
 }
+// Catches verify re-reading the whole member after a patch: parts that passed their part CRC are combined.
+#[test]
+fn patch_verify_reads_back_only_damaged_and_final_parts() {
+    let plain: Vec<u8> = (0..101u32).map(|i| (i * 7 + 3) as u8).collect();
+    for wrong in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = FileSpec::new("inner", &plain);
+        let data = common::volumes(&spec, 23);
+        let mut inputs = Vec::new();
+        let mut logical = 0;
+        for (index, volume) in data.iter().enumerate() {
+            let part = &plain[logical..(logical + 23).min(plain.len())];
+            let start = volume.windows(part.len()).position(|b| b == part).unwrap() as u64;
+            // Only the third volume (output 46..69) loses bytes.
+            let holes = if index == 2 { one(start + 5..start + 15) } else { vec![] };
+            inputs.push(Some(Bytes { data: volume.clone(), holes }));
+            logical += part.len();
+        }
+        let mut opts = options(dir.path());
+        opts.first_name = "a.part01.rar".into();
+        let mut s = ProgressiveSession::new(Box::new(Multi(inputs)), opts).unwrap();
+        let mut a = artifact(&mut s);
+        assert_eq!(a.holes(), &[OutputHole { offset: 51, len: 10 }]);
+        let mut patch = plain[51..61].to_vec();
+        if wrong {
+            patch[3] ^= 1;
+        }
+        s.patch(&mut a, 51, &patch).unwrap();
+        if wrong {
+            assert!(verify(&mut s, &mut a).is_err());
+            continue;
+        }
+        let v = verify(&mut s, &mut a).unwrap();
+        assert_eq!(v.level(), VerificationLevel::Strict);
+        assert_eq!(v.packed(), PackedEvidence::Passed);
+        // Part 2 (23 bytes) holds the patch; the final part (9 bytes) has no part CRC of its own.
+        assert_eq!(v.read_back(), 23 + 9);
+        let mut got = vec![0; 101];
+        assert_eq!(a.read_at(0, &mut got).unwrap(), ArtifactRead::Filled { count: 101 });
+        assert_eq!(got, plain);
+    }
+}
