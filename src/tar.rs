@@ -993,20 +993,26 @@ fn run_tar(
                 return Ok(());
             }
         };
-        if m.kind == Kind::Other(b'V') {
-            continue;
-        }
+        // a volume label is no member: a listing leaves it out, and a filter never sees it, but without a filter its
+        // name is still checked as it always was
+        let label = m.kind == Kind::Other(b'V');
         let position = ordinal;
-        ordinal += 1;
+        if !label {
+            ordinal += 1;
+        }
         // "./" stands for the destination itself
         if m.kind == Kind::Dir && m.name.split('/').all(|p| p.is_empty() || p == ".") {
             continue;
         }
         // an unselected member's data is passed over by the next call to `next`
-        if !opts.selects(&m.name, m.raw_name.as_deref(), m.kind == Kind::Dir, position) {
+        if opts.select.is_some()
+            && (label || !opts.selects(&m.name, m.raw_name.as_deref(), m.kind == Kind::Dir, position))
+        {
             continue;
         }
-        summary.matched += 1;
+        if !label {
+            summary.matched += 1;
+        }
         let rel = match sanitize(&m.name, false) {
             Ok(rel) => rel,
             Err(e) => {

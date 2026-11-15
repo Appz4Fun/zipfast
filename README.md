@@ -75,7 +75,10 @@ unselected folder entry is not created, but the folders above a selected file st
 checks apply to selected members as before. ZIP doesn't read unselected entries. In a solid RAR archive, unselected
 compressed members are still decoded for the dictionary history but not checked. `Summary::matched`,
 `ZipRunReport::matched()` and `RarRunSummary::matched` count the members the filter took. A run that matches
-nothing succeeds with zero matched, so the caller can choose its own exit status.
+nothing succeeds with zero matched, so the caller can choose its own exit status. Only these whole-archive runners
+apply the filter. `RarSession::extract_selected`/`extract_selected_controlled`, progressive and persistent-partial
+sessions, and `ZipReadStage::prepare_file` have their own member selection and refuse `select: Some(..)` with a typed
+error before doing anything.
 
 ## Builds tuned for a processor
 

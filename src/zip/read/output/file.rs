@@ -461,6 +461,10 @@ impl ZipReadStage {
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
     ) -> ZipReadResult<Option<Self>> {
+        // one named entry: the whole-archive member filter has nothing to choose
+        if options.select.is_some() {
+            return Err(ReadFault::InvalidPlan.into());
+        }
         Self::prepare_file_inner(entry, relative, options, cancel, context, &mut None, false)
     }
     pub(in crate::zip::read) fn prepare_run_file(

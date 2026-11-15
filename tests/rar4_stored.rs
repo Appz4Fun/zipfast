@@ -499,3 +499,16 @@ fn a_member_filter_chooses_which_rar4_members_are_tested_and_extracted() {
     let s = extract::run(&path, &with(Mode::Test, &out, None), |_| {}).unwrap();
     assert_eq!((s.matched, s.files, s.errors.len()), (3, 2, 1));
 }
+
+#[test]
+fn an_unselected_unsupported_rar4_member_keeps_its_listing_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    fs::write(&path, archive(&[member(b"bad", b"", 0, 0x36), member(b"good", b"fine", 0, 0x30)])).unwrap();
+    assert_eq!(extract::list(&path).unwrap()[1].name, "good");
+    let o = Options { select: Some(only(&["good"])), ..options(dir.path(), Mode::Test) };
+    let mut indexes = Vec::new();
+    let summary = extract::run_rar_with_outcomes(&path, &o, None, |e| indexes.push(e.entry.index)).unwrap();
+    assert_eq!((summary.encountered, summary.matched, summary.files, summary.failed), (2, 1, 1, 0));
+    assert_eq!(indexes, [Some(1)]);
+}

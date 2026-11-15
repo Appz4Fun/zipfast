@@ -32,6 +32,9 @@ impl RarSession {
     ) -> RarControlledExtractReport<'a> {
         let outcome = if control.usage.phase != RarExtractControlPhase::Ready {
             Err(RarExtractError::ControlNotReset { partial: self.summary(0) })
+        } else if options.select.is_some() {
+            // refused before the run starts: no source, output or diagnostic is touched
+            Err(RarExtractError::Native(member_filter_refused(self)))
         } else {
             control.usage.phase = RarExtractControlPhase::Extracting;
             if Arc::ptr_eq(&self.token, &selection.token) {

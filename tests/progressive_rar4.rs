@@ -989,3 +989,14 @@ fn r1_plain_directories_and_admitted_regular_aes_keep_existing_dispositions() {
         assert_eq!(std::fs::read(dir.path().join("entry")).unwrap(), b"keep existing target");
     }
 }
+
+#[test]
+fn a_session_refuses_the_whole_archive_member_filter_before_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = archive(&[member(b"one", b"data", 0, 0x30)]);
+    let mut opts = options(dir.path());
+    opts.extract.select = Some(zipfast::extract::MemberFilter::new(|_| true));
+    let refused = ProgressiveSession::from_sealed_memory(vec![("a.rar".into(), bytes.into_boxed_slice())], opts);
+    assert!(matches!(refused.err().unwrap().kind, FailureKind::InvalidCapability));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}

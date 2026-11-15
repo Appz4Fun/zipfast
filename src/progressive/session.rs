@@ -255,6 +255,10 @@ impl ProgressiveSession {
         Self::assemble(driver, control, options)
     }
     fn validate_options(options: &ProgressiveOptions) -> ProgressiveResult<()> {
+        // a session chooses members by its own events; the whole-archive member filter doesn't apply here
+        if options.extract.select.is_some() {
+            return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
+        }
         let usage = Usage::new(options.limits.clone());
         if options.extract.mode == crate::extract::Mode::Extract {
             usage.check(Resource::ActiveOutputs, 1)?;

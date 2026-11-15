@@ -82,8 +82,15 @@ pub struct Options {
     pub parallel_min: Option<u64>,
     /// Which members to test or extract. `None` takes every member.
     ///
-    /// The filter is asked once per member, in archive order, before anything about that member is checked, written
-    /// or counted. See [`MemberFilter`] for what an unselected member means for each format.
+    /// Only the whole-archive runners apply it: [`run`], [`run_with_password`], [`run_with_zip_policy`],
+    /// [`run_with_zip_context`], [`run_rar_with_outcomes`] and the format runners they dispatch to (`zip::run*`,
+    /// `tar::run`). There the filter is asked once per member, in archive order, before anything about that member is
+    /// checked, written or counted; see [`MemberFilter`] for what an unselected member means for each format.
+    ///
+    /// Runs that choose members their own way refuse `Some` before doing anything:
+    /// `RarSession::extract_selected` and `extract_selected_controlled` fail with
+    /// `RarFailure::Unsupported(RarUnsupported::MemberFilter)`, progressive and persistent-partial sessions with
+    /// `FailureKind::InvalidCapability`, and `ZipReadStage::prepare_file` with `ReadFault::InvalidPlan`.
     pub select: Option<MemberFilter>,
 }
 
@@ -109,9 +116,10 @@ impl MemberRef<'_> {
     }
 }
 
-/// A predicate choosing which members a whole-archive run tests or extracts.
+/// A predicate choosing which members a whole-archive run tests or extracts. Runs with their own member selection
+/// refuse it; see [`Options::select`].
 ///
-/// Every format applies it the same way:
+/// Every format a whole-archive run reads applies it the same way:
 ///
 /// - An unselected member is neither written nor tested, and it is left out of every count, message and outcome.
 ///   [`Summary::matched`], [`RarRunSummary::matched`] and [`crate::zip::ZipRunReport::matched`] count the members the
@@ -2381,10 +2389,14 @@ impl Run<'_, '_, '_> {
             self.drain_batch()?;
         }
         self.end_pending()?;
-        if continuation || h.rar4_unsupported().is_some() {
+        if continuation {
             return Ok(());
         }
+        // every member with a first header takes its listing index, even one this reader can't decode
         let mut ctx = self.reports.unselected(self.order, name, h.method)?;
+        if h.rar4_unsupported().is_some() {
+            return Ok(());
+        }
         if !(vol.main.is_solid() && h.method != 0 && !h.is_dir()) {
             if h.split_after() {
                 // its later parts are passed over too
@@ -2395,14 +2407,18 @@ impl Run<'_, '_, '_> {
             }
             return Ok(());
         }
-        let cipher = match (h.crypt, self.password) {
+        let (cipher, failure) = match (h.crypt, self.password) {
             (Some(params), Some(password)) => {
                 let size = (!h.size_unknown()).then_some(h.unpacked_size);
-                Pending::start_cipher(&mut ctx, true, params, password, size).ok()
+                match Pending::start_cipher(&mut ctx, true, params, password, size) {
+                    Ok(cipher) => (Some(cipher), None),
+                    // a wrong password is why the members after it lose their history
+                    Err(failure) => (None, Some(Arc::new(failure))),
+                }
             }
-            _ => None,
+            _ => (None, None),
         };
-        self.pass_over(vol, &h, ctx, cipher, None)?;
+        self.pass_over(vol, &h, ctx, cipher, failure)?;
         // a member split over volumes waits here for its next part: it is this unselected one
         if let Some(p) = self.pending.as_mut() {
             p.hidden = true;

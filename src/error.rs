@@ -140,12 +140,20 @@ pub enum RarUnsupported {
     ArchiveVersion(u8),
     Rar4Feature(&'static str),
     SourceIdentity,
-    CompressionAlgorithm { algorithm: u8, method: u8 },
+    CompressionAlgorithm {
+        algorithm: u8,
+        method: u8,
+    },
     EncryptionVersion(u64),
-    Redirection { kind: u64 },
+    Redirection {
+        kind: u64,
+    },
     PrintDirectory,
     NameEncoding,
     Decoder(String),
+    /// [`crate::extract::Options::select`] was set on a run that chooses members its own way. Only the whole-archive
+    /// runners apply it.
+    MemberFilter,
 }
 
 #[derive(Clone, Debug)]

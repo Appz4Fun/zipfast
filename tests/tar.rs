@@ -982,3 +982,23 @@ fn a_member_filter_applies_to_a_lone_compressed_file() {
     extract::run(&archive, &Options { select: Some(only(&[])), ..opts(Mode::Extract, &none) }, |_| {}).unwrap();
     assert_eq!(fs::read_dir(&none).unwrap().count(), 0);
 }
+
+#[test]
+fn a_volume_label_is_checked_without_a_filter_and_never_offered_to_one() {
+    let dir = tmp("select-label");
+    let archive = dir.join("a.tar");
+    let tar = Tar::default().raw(header(b"../label", b'V', 0, 0o644, 0, b"", true), b"").file("f", b"data").end();
+    fs::write(&archive, &tar).unwrap();
+    // no filter: as before, the label's unsafe name is reported
+    let s = extract::run(&archive, &opts(Mode::Test, &dir), |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (1, 1, 1), "{:?}", s.errors);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = std::sync::Arc::clone(&seen);
+    let filter = extract::MemberFilter::new(move |m| {
+        record.lock().unwrap().push((m.ordinal, m.name.to_string()));
+        true
+    });
+    let s = extract::run(&archive, &Options { select: Some(filter), ..opts(Mode::Test, &dir) }, |_| {}).unwrap();
+    assert_eq!((s.matched, s.files, s.errors.len()), (1, 1, 0), "{:?}", s.errors);
+    assert_eq!(*seen.lock().unwrap(), [(0, "f".to_string())]);
+}
