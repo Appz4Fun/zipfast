@@ -2231,3 +2231,73 @@ fn refill_from_packed_reads_only_the_damaged_bytes_of_a_repaired_volume() {
     assert_eq!(reader.read, 0);
     assert!(none.applied.is_empty());
 }
+
+fn extracted_with(dir: &Path, limits: PartialLimits) -> (Fixture, ProgressiveSession, Vec<PartialFile>) {
+    let dest = dir.join("out");
+    let mut fixture = Fixture::new();
+    let provider = fixture.provider();
+    let mut partial = partial_options(&dir.join("state"));
+    partial.limits = limits;
+    let mut session = ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial).unwrap();
+    let (_, files) = run_to_end(&mut session);
+    (fixture, session, files)
+}
+
+// Catches streaming fills that need the whole range in memory or lose bytes at transaction boundaries.
+#[test]
+fn fill_writer_streams_an_alt_tail_through_bounded_transactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = PartialLimits { fill_bytes: 2048, ..PartialLimits::default() };
+    let (fixture, _session, mut files) = extracted_with(dir.path(), limits);
+    let mut a = files.remove(0);
+    // RustyGet's alt switch: everything from an offset to the end comes from the alt, known bytes included.
+    let mut writer = a.fill_writer(1000).unwrap();
+    for piece in fixture.data[0][1000..].chunks(100) {
+        std::io::Write::write_all(&mut writer, piece).unwrap();
+    }
+    assert_eq!(writer.position(), 7000);
+    let result = writer.finish().unwrap();
+    assert_eq!(result.applied, vec![1300..2000]);
+    assert!(a.remaining().unwrap().is_empty());
+    assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/a.bin")).unwrap(), fixture.data[0]);
+}
+
+#[test]
+fn fill_writer_reports_the_typed_error_and_accepts_nothing_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = PartialLimits { fill_bytes: 2048, ..PartialLimits::default() };
+    let (fixture, _session, mut files) = extracted_with(dir.path(), limits);
+    let mut a = files.remove(0);
+    let mut alt = fixture.data[0].clone();
+    alt[1100] ^= 1; // a known byte: the alt disagrees with the archive output
+    let mut writer = a.fill_writer(1000).unwrap();
+    let mut failed = false;
+    for piece in alt[1000..].chunks(100) {
+        if std::io::Write::write_all(&mut writer, piece).is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    assert!(std::io::Write::write(&mut writer, b"x").is_err());
+    let error = writer.finish().unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::OverlapMismatch { .. }), "{error:?}");
+    assert_eq!(a.remaining().unwrap(), vec![1300..2000]);
+}
+
+#[test]
+fn fill_from_stops_on_short_input_with_committed_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = PartialLimits { fill_bytes: 2048, ..PartialLimits::default() };
+    let (fixture, _session, mut files) = extracted_with(dir.path(), limits);
+    let mut a = files.remove(0);
+    // The alt stream for 0..7000 ends after 5000 bytes: two 2048-byte transactions (holding the hole) committed.
+    let mut input = &fixture.data[0][..5000];
+    let error = a.fill_from(0, 7000, &mut input).unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::FillRead(_)), "{error:?}");
+    let output = error.output.unwrap();
+    assert_eq!((output.offset, output.attempted, output.completed), (0, 7000, 4096));
+    assert!(a.remaining().unwrap().is_empty());
+    assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+}
