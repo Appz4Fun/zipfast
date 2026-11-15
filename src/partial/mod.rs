@@ -1064,6 +1064,10 @@ impl PreparedCreate {
                 affected: std::iter::once(0..spec.size).collect(),
             };
             let intent_anchor = bundle.append_intent(&intent)?;
+            // The bundle and output directory entries must be durable before the store can hold an anchor
+            // naming them; otherwise a crash leaves an anchor whose state can never be reopened or recreated.
+            native.sync()?;
+            native.sync_parents()?;
             let ack = anchors.advance(None, &intent_anchor)?;
             bundle.acknowledge(&intent_anchor, &ack)?;
             committed = Some(intent_anchor.clone());

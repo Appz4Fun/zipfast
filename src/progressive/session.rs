@@ -210,6 +210,8 @@ pub struct ProgressiveSession {
     remaining: u64,
     had_stage: bool,
     buffer: Vec<u8>,
+    /// Length of a driver read that returned `Pending`; the resumed read must ask for the same length.
+    parked_read: Option<usize>,
     verify_job: Option<recovery::VerifyJob>,
     replacement_revision: u64,
     witnesses: Vec<recovery::WireVolume>,
@@ -326,6 +328,7 @@ impl ProgressiveSession {
             remaining: 0,
             had_stage: false,
             buffer,
+            parked_read: None,
             verify_job: None,
             replacement_revision: 0,
             witnesses: Vec::new(),
@@ -408,6 +411,14 @@ impl ProgressiveSession {
             }))
         } else {
             Err(failure)
+        }
+    }
+    /// Bytes to request from the driver: a parked read resumes with exactly its earlier length (a retained
+    /// driver rejects any other), otherwise `full` bounded by the poll's remaining packed-work budget.
+    fn read_len(&mut self, full: usize, work: u64) -> usize {
+        match self.parked_read.take() {
+            Some(parked) if parked <= full => parked,
+            _ => full.min((self.options.limits.packed_work_per_poll.min(1 << 20) - work) as usize),
         }
     }
     fn poll_inner(
@@ -569,11 +580,12 @@ impl ProgressiveSession {
                         self.driver.seek(offset)?;
                         self.cursor = offset;
                     }
-                    let n = len
-                        .min(self.buffer.len())
-                        .min((self.options.limits.packed_work_per_poll.min(1 << 20) - work) as usize);
+                    let n = self.read_len(len.min(self.buffer.len()), work);
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
-                        Poll::Pending => return Ok(Poll::Pending),
+                        Poll::Pending => {
+                            self.parked_read = Some(n);
+                            return Ok(Poll::Pending);
+                        }
                         Poll::Ready(Err(e)) => return Err(e),
                         Poll::Ready(Ok(SourceStep::VolumeOpened { index, id })) => {
                             self.driver.validate_current()?;
@@ -641,13 +653,12 @@ impl ProgressiveSession {
                         }
                         continue;
                     }
-                    let n = self
-                        .remaining
-                        .min(self.buffer.len() as u64)
-                        .min(self.options.limits.packed_work_per_poll.min(1 << 20) - work)
-                        as usize;
+                    let n = self.read_len(self.remaining.min(self.buffer.len() as u64) as usize, work);
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
-                        Poll::Pending => return Ok(Poll::Pending),
+                        Poll::Pending => {
+                            self.parked_read = Some(n);
+                            return Ok(Poll::Pending);
+                        }
                         Poll::Ready(Err(e)) => return Err(e),
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
                             return Err(ProgressiveFailure::new(FailureKind::Truncated));

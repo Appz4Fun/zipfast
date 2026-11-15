@@ -196,4 +196,6 @@ fn reopen_latest(workspace: &Path, member: MemberKey, anchors: Arc<DurableAnchor
 
 Drive `poll_event` and `PartialFile::poll_verify` with your executor's context. Do not spin on provider waits. The source session and partial controls are independent; cancel the partial control only when you intend to stop its file operations. Ordinary filesystem reads are fine, but external writes, truncation, renaming, hardlink changes or replacing the roots invalidate ownership checks. Size, metadata, state, descriptor and event limits are enforced before their corresponding work; synchronous durable CAS and sync costs are intentional.
 
+A persistent session keeps every opened original volume source open so later refills can revisit it, and each one counts against `ProgressiveLimits::volume_handles` (default 64, ceiling 4096). Raise that limit for sets with more volumes; past it, opening the next volume fails with `Limit { resource: VolumeHandles, .. }` rather than closing earlier sources.
+
 Lost headers/volumes, compressed/AES/RAR4 recovery, the full 500 MB acceptance workload, and resume cursor restoration remain later stages. This API does not silently emulate them.

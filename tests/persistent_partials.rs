@@ -446,6 +446,36 @@ fn waits_are_not_damage_and_require_the_original_wake() {
         Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { valid_bytes: 1300, .. })))
     ));
 }
+#[test]
+fn continuation_part_resumes_after_wait_with_header_work_in_same_poll() {
+    // A continuation part's first payload read follows its headers in the same poll, so its length is
+    // reduced by that header work; the resumed read after the wake must still be accepted.
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new();
+    let read_gate = Arc::new(WaitGate::default());
+    fixture.volumes[1].as_mut().unwrap().wait = Some((fixture.payloads[1].start, read_gate.clone()));
+    let mut opts = options(&dir.path().join("out"));
+    opts.limits.packed_work_per_poll = 1024;
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(fixture.provider()), opts, partial_options(&dir.path().join("state")))
+            .unwrap();
+    let mut woke = false;
+    for _ in 0..100_000 {
+        if !woke && let Some(waker) = read_gate.0.lock().unwrap().take() {
+            waker.wake();
+            woke = true;
+        }
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(None)) => {
+                assert!(woke, "the continuation part never waited");
+                return;
+            }
+            Poll::Ready(Err(e)) => panic!("resumed continuation read failed: {e:?}"),
+            _ => {}
+        }
+    }
+    panic!("session did not finish");
+}
 fn next_partial(session: &mut ProgressiveSession) -> (MemberKey, PartialFile) {
     for _ in 0..10000 {
         match session.poll_event(&mut Context::from_waker(Waker::noop())) {
