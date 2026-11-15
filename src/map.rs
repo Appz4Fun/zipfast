@@ -825,8 +825,10 @@ impl MemberMap {
     /// Volume 0 is not needed and the volume's position is not checked against anything: it is reported in
     /// [`VolumeMap::volume_number`]. Bytes that end inside member data or inside a header give
     /// [`VolumeEnd::Truncated`] with what was read. Encrypted headers (`-hp`) are decrypted with
-    /// [`MapOptions::password`]; without one the map ends [`VolumeEnd::Locked`] with no members, and a wrong
-    /// password is [`MapError::WrongPassword`] where it can be told. `options.first_name` names this volume in
+    /// [`MapOptions::password`]; without one (or with an empty one) the map ends [`VolumeEnd::Locked`] with no
+    /// members. A wrong password is [`MapError::WrongPassword`] where it can be told; bytes ending inside the first
+    /// encrypted header are a cut ([`VolumeEnd::Truncated`]) unless its decrypted start is not a plausible header,
+    /// so without a password check value (always for RAR 4.x) a wrong password can go unnoticed in a short prefix. `options.first_name` names this volume in
     /// failures; the volume in [`MapError`] variants is 0. ZIP is [`MapError::NotArchive`].
     pub fn from_volume(bytes: &[u8], options: MapOptions) -> Result<VolumeMap, MapError> {
         let volumes = [bytes];

@@ -96,10 +96,10 @@ matched against that volume's part. RAR 4.x and RAR 5.0 volumes are read, behind
 
 | field | meaning |
 |---|---|
-| `format` | `Rar4` or `Rar5` |
+| `format` | `Rar4` or `Rar5`, from the signature when the main header was not read |
 | `main_read` | the main header was read; false for a `Locked` RAR 5.0 volume and bytes that end inside the main header, where the facts below are defaults |
 | `volume_number` | zero-based. RAR 5.0: the main header's volume number, 0 when it records none (only the first volume omits it). RAR 4.x: the end header's number (`EARC_VOLNUMBER`) when the end header is read and records one, else 0 for a first volume and None otherwise. A non-volume archive is volume 0 |
-| `first_volume` | the first volume, or a single-volume archive. RAR 4.x: `MHD_FIRSTVOLUME` (written since RAR 3.0) or an end-header number of 0 |
+| `first_volume` | the first volume, or a single-volume archive. RAR 4.x: `MHD_FIRSTVOLUME` (written since RAR 3.0) or an end-header number of 0. RAR 2.x first volumes lack `MHD_FIRSTVOLUME`, so a prefix of one that stops before the end header reports `first_volume: false` and `volume_number: None`. A main header claiming the first volume with an end header numbering it otherwise is `Malformed` |
 | `multi_volume` | the main header's volume flag |
 | `new_naming` | `.partNN.rar` naming: always true for RAR 5.0, RAR 4.x `MHD_NEWNUMBERING` (false means `.rar`, `.r00`, `.r01`, ...) |
 | `has_next_volume` | the end header's "not last volume" flag; false when the end header was not reached |
@@ -113,7 +113,14 @@ does. A member whose header was read is listed with its declared packed size and
 runs past the end.
 
 Encrypted headers (`-hp`): with a password, headers decrypt as for `from_memory`, and a wrong password is
-`WrongPassword` where it can be told (see above). Without a password the walk stops at the first encrypted header
+`WrongPassword` where it can be told. A single-volume map treats bytes that end inside the first encrypted header as
+a cut, not a wrong password, since prefixes are its normal input: it reports `Truncated` unless the header's first
+decrypted block is not a header that can stand there (RAR 4.x: a file, service or end header; RAR 5.0: a main,
+file, service or end header), which is `WrongPassword`. RAR 5.0 headers with a password check value are proven
+before any header is read. **Without a check value (always for RAR 4.x), a wrong password is missed** when the bytes
+end within the first 16 bytes of ciphertext of that header, or, about once in a hundred, when the noise passes for a
+header type; the map is then `Truncated` with no members. Any complete header that fails its checksum is
+`WrongPassword`. Without a password (`None` or empty) the walk stops at the first encrypted header
 with `Locked { offset }`, `header_encrypted: true`, the header cipher parameters and no members, instead of
 `PasswordRequired`. RAR 5.0 encrypts the main header too, so a locked RAR 5.0 volume has `main_read: false` and no
 volume facts; RAR 4.x keeps its main header in the clear, so its facts are known. Members whose data is encrypted

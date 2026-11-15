@@ -1375,3 +1375,86 @@ fn volume_builder_over_a_waiting_range_source_matches_memory() {
     let (error, _) = drive_volume(&volumes[2], Some(9..12));
     assert!(matches!(error, Err(MapError::HeaderHole { volume: 0, offset: 9 })), "{error:?}");
 }
+
+// ---- Single-volume review regressions ----
+
+#[test]
+fn rar4_volume_cut_inside_its_main_header_is_still_rar4() {
+    let volumes = r4_volumes(&data(130, 9), 40, true, true);
+    for cut in [7, 10, 19] {
+        let map = vol(&volumes[1][..cut], "x.part2.rar", None).unwrap();
+        assert_eq!(map.format, MapFormat::Rar4, "cut {cut}");
+        assert!(!map.main_read && map.members.is_empty(), "cut {cut}");
+        assert_eq!(map.end, VolumeEnd::Truncated { offset: 7 }, "cut {cut}");
+        let whole = MemberMap::from_memory(&[&volumes[1][..cut]], "x.part2.rar", None).unwrap();
+        assert_eq!(whole.format, MapFormat::Rar4, "cut {cut}");
+    }
+}
+
+#[test]
+fn an_empty_password_locks_hp_volumes_in_both_formats() {
+    let rar5 = hp_archive(&data(700, 5));
+    let map = vol(&rar5, "hp.rar", Some("")).unwrap();
+    assert!(matches!(map.end, VolumeEnd::Locked { .. }), "{:?}", map.end);
+    assert!(map.header_encrypted && map.members.is_empty());
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let rar4 = r4_aes(gold, true, &[29, 31, 20]);
+    let map = vol(&rar4[1], "a.part02.rar", Some("")).unwrap();
+    assert_eq!(map.end, VolumeEnd::Locked { offset: 20 });
+}
+
+#[test]
+fn hp_prefix_cut_inside_the_first_encrypted_header_is_truncated_with_the_right_password() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let volumes = r4_aes(gold, true, &[29, 31, 20]);
+    let full = vol(&volumes[1], "a.part02.rar", Some("pw")).unwrap();
+    let header = full.members[0].header.clone();
+    assert_eq!(header.start, 20);
+    for cut in header.start + 1..header.end {
+        let map =
+            vol(&volumes[1][..cut as usize], "a.part02.rar", Some("pw")).unwrap_or_else(|e| panic!("cut {cut}: {e:?}"));
+        assert_eq!(map.end, VolumeEnd::Truncated { offset: 20 }, "cut {cut}");
+        assert!(map.main_read && map.members.is_empty(), "cut {cut}");
+    }
+    // Once the first block decrypts, a wrong password shows in a prefix too; before that nothing can tell.
+    for cut in [30, header.start + 8 + 16, header.end - 1] {
+        let wrong = vol(&volumes[1][..cut as usize], "a.part02.rar", Some("wrong password"));
+        if cut >= header.start + 8 + 16 {
+            assert!(matches!(wrong, Err(MapError::WrongPassword)), "cut {cut}: {wrong:?}");
+        } else {
+            assert!(matches!(wrong, Ok(VolumeMap { end: VolumeEnd::Truncated { offset: 20 }, .. })), "{wrong:?}");
+        }
+    }
+    // RAR 5.0 with a check value: the password is proven before any header, so a cut is a cut.
+    let rar5 = hp_archive(&data(700, 5));
+    let locked = vol(&rar5, "hp.rar", None).unwrap();
+    let VolumeEnd::Locked { offset } = locked.end else { panic!() };
+    for cut in [offset + 1, offset + 16, offset + 31] {
+        let map = vol(&rar5[..cut as usize], "hp.rar", Some(HP_PASSWORD)).unwrap();
+        assert_eq!(map.end, VolumeEnd::Truncated { offset }, "cut {cut}");
+    }
+}
+
+#[test]
+fn rar4_first_volume_flag_and_end_header_number_must_agree() {
+    let gold = data(130, 9);
+    // MHD_FIRSTVOLUME with an end header numbering the volume 5.
+    let mut bytes = b"Rar!\x1a\x07\0".to_vec();
+    bytes.extend(r4_block(0x73, 0x111, &[0; 6]));
+    bytes.extend(r4_member(b"one", &gold[..40], 2, 0x30, gold.len(), crc32fast::hash(&gold[..40])));
+    bytes.extend(r4_block(0x7b, 0x4000 | 0x8 | 1, &5u16.to_le_bytes()));
+    let error = vol(&bytes, "x.part1.rar", None).unwrap_err();
+    assert!(matches!(error, MapError::Malformed { volume: 0, .. }), "{error:?}");
+    // A RAR 2.x first volume has no MHD_FIRSTVOLUME: its end header's 0 makes it first, and a prefix knows nothing.
+    let mut old = b"Rar!\x1a\x07\0".to_vec();
+    old.extend(r4_block(0x73, 0x01, &[0; 6]));
+    old.extend(r4_member(b"one", &gold[..40], 2, 0x30, gold.len(), crc32fast::hash(&gold[..40])));
+    let cut = old.len();
+    old.extend(r4_block(0x7b, 0x4000 | 0x8 | 1, &0u16.to_le_bytes()));
+    let map = vol(&old, "x.rar", None).unwrap();
+    assert!(map.first_volume);
+    assert_eq!(map.volume_number, Some(0));
+    let prefix = vol(&old[..cut], "x.rar", None).unwrap();
+    assert!(!prefix.first_volume);
+    assert_eq!(prefix.volume_number, None);
+}

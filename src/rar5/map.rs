@@ -139,6 +139,15 @@ impl RarWalker {
         MapError::from_failure(self.volume, failure)
     }
 
+    /// The archive format: the main header's, or the signature's when no main header was read. A walk finishes
+    /// only after the signature has been found.
+    fn map_format(&self) -> MapFormat {
+        match self.format.unwrap_or_else(|| self.parser.format()) {
+            RarFormat::Rar4 => MapFormat::Rar4,
+            RarFormat::Rar5 => MapFormat::Rar5,
+        }
+    }
+
     fn finish(&mut self, end: MapEnd) -> Walked {
         if self.single.is_some() {
             return self.finish_volume(match end {
@@ -147,7 +156,7 @@ impl RarWalker {
             });
         }
         Walked::Map(MemberMap {
-            format: if self.format == Some(RarFormat::Rar4) { MapFormat::Rar4 } else { MapFormat::Rar5 },
+            format: self.map_format(),
             header_encrypted: self.header_encrypted.unwrap_or(false),
             header_cipher: self.header_cipher.clone(),
             complete: end == MapEnd::Complete,
@@ -163,7 +172,7 @@ impl RarWalker {
     fn finish_volume(&mut self, end: VolumeEnd) -> Walked {
         let single = self.single.take().expect("single-volume mode");
         Walked::Volume(VolumeMap {
-            format: if self.format == Some(RarFormat::Rar4) { MapFormat::Rar4 } else { MapFormat::Rar5 },
+            format: self.map_format(),
             main_read: single.main_read,
             volume_number: single.volume_number,
             first_volume: single.first_volume,
@@ -235,9 +244,13 @@ impl RarWalker {
                         }
                         Got::Hole => return Err(MapError::HeaderHole { volume: self.volume, offset }),
                         Got::Eof => {
-                            if self.unproven {
-                                // A wrong key turns the first encrypted header's size into noise that usually runs
-                                // past the end; a volume cut inside that header cannot be told apart from it.
+                            // A wrong key turns the first encrypted header's size into noise that usually runs past
+                            // the end; a volume cut inside that header looks the same. Whole-archive walks call it a
+                            // wrong password. Single-volume walks, whose input is often a prefix, call it a cut
+                            // unless the decrypted start of the header is not a header a volume can hold there.
+                            if self.unproven
+                                && (self.single.is_none() || self.parser.encrypted_start_plausible() == Some(false))
+                            {
                                 return Err(MapError::WrongPassword);
                             }
                             if self.parser.scanning() {
@@ -381,7 +394,8 @@ impl RarWalker {
                         keyed_checks: params.tweaked_crc,
                     });
                 }
-                if self.single.is_some() && self.password.is_none() {
+                // An empty password is no password, as for RAR4.
+                if self.single.is_some() && self.password.as_deref().is_none_or(str::is_empty) {
                     self.header_encrypted = Some(true);
                     return Ok(Some(self.finish_volume(VolumeEnd::Locked { offset: frame.extent.end })));
                 }
@@ -438,8 +452,13 @@ impl RarWalker {
                     let single = self.single.as_mut().expect("single-volume mode");
                     single.has_next_volume = more_volumes;
                     if let Some(number) = number {
+                        // RAR 2.x first volumes lack MHD_FIRSTVOLUME: a number of 0 makes the volume first. A first
+                        // volume numbered otherwise contradicts itself.
+                        if single.first_volume && number != 0 {
+                            return Err(self.malformed("first volume with a nonzero volume number"));
+                        }
                         single.volume_number = Some(number);
-                        single.first_volume |= number == 0;
+                        single.first_volume = number == 0;
                     }
                     return Ok(Some(self.finish_volume(VolumeEnd::Complete)));
                 }
