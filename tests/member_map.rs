@@ -201,18 +201,26 @@ fn password_check(password: &str, kdf_count: u8) -> [u8; 8] {
 
 /// One encrypted stored member "e.bin" of `size` bytes, its ciphertext cut at the stream offsets `cuts`.
 fn encrypted_volumes(size: usize, cuts: &[usize]) -> (Vec<u8>, [u8; 8], Vec<Vec<u8>>) {
-    encrypted_volumes_iv(size, cuts, IV)
+    encrypted_volumes_with(size, cuts, IV, SALT, 1)
 }
 
-fn encrypted_volumes_iv(size: usize, cuts: &[usize], iv: [u8; 16]) -> (Vec<u8>, [u8; 8], Vec<Vec<u8>>) {
+/// The same member with its encryption record's IV, salt and KDF count chosen. The password check value always
+/// belongs to `SALT` and count 1; maps do not test it.
+fn encrypted_volumes_with(
+    size: usize,
+    cuts: &[usize],
+    iv: [u8; 16],
+    salt: [u8; 16],
+    kdf: u8,
+) -> (Vec<u8>, [u8; 8], Vec<Vec<u8>>) {
     let plain = data(size, 11);
     let (key, hash_key) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap();
     let mut padded = plain.clone();
     padded.resize(size.div_ceil(16) * 16, 0);
     let cipher = zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap();
     let check = password_check("pw", 1);
-    let mut extra = vec![48, 1, 0, 3, 1];
-    extra.extend(SALT);
+    let mut extra = vec![48, 1, 0, 3, kdf];
+    extra.extend(salt);
     extra.extend(iv);
     extra.extend(check);
     extra.extend(&zipfast::crypto::sha256(&check)[..4]);
@@ -966,12 +974,23 @@ fn rar_behind_a_long_stub_is_scanned_in_chunks() {
 }
 
 #[test]
-fn rar5_split_part_with_a_different_iv_is_malformed() {
-    let (_, _, a) = encrypted_volumes_iv(3000, &[1000, 2000], IV);
-    let (_, _, b) = encrypted_volumes_iv(3000, &[1000, 2000], [0x42; 16]);
-    let mixed = vec![a[0].clone(), b[1].clone(), a[2].clone()];
-    let error = MemberMap::from_memory(&refs(&mixed), "e.part1.rar", None).unwrap_err();
-    assert!(matches!(error, MapError::Malformed { volume: 1, .. }), "{error:?}");
+fn rar5_split_part_must_keep_the_key_but_may_restate_another_iv() {
+    let (_, _, a) = encrypted_volumes(3000, &[1000, 2000]);
+    let expected = MemberMap::from_memory(&refs(&a), "e.part1.rar", None).unwrap();
+    // One CBC stream: only the first part's IV is used, so a later part restating another IV is accepted.
+    let (_, _, other_iv) = encrypted_volumes_with(3000, &[1000, 2000], [0x42; 16], SALT, 1);
+    let mixed = vec![a[0].clone(), other_iv[1].clone(), a[2].clone()];
+    let map = MemberMap::from_memory(&refs(&mixed), "e.part1.rar", None).unwrap();
+    assert!(map.complete);
+    assert_eq!(map.members[0].cipher, expected.members[0].cipher);
+    assert_eq!(map.members[0].pieces.len(), 3);
+    // A different key (salt or KDF count) is a different stream.
+    for (salt, kdf) in [([0x44; 16], 1), (SALT, 2)] {
+        let (_, _, other) = encrypted_volumes_with(3000, &[1000, 2000], IV, salt, kdf);
+        let mixed = vec![a[0].clone(), other[1].clone(), a[2].clone()];
+        let error = MemberMap::from_memory(&refs(&mixed), "e.part1.rar", None).unwrap_err();
+        assert!(matches!(error, MapError::Malformed { volume: 1, .. }), "{error:?}");
+    }
 }
 
 #[test]

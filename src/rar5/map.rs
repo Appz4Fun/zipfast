@@ -396,16 +396,15 @@ impl RarWalker {
         self.usage.charge(resource, amount).map_err(|e| MapError::from_failure(self.volume, e))
     }
 
-    /// Whether a continuation part's RAR5 encryption record names the same key and IV as the member's first
-    /// part: all parts are one CBC stream.
+    /// Whether a continuation part's RAR5 encryption record names the same key (KDF count and salt) as the
+    /// member's first part. All parts are one CBC stream, so only the first part's IV is used and a later part
+    /// restating a different one is accepted.
     fn same_cipher(&self, params: Option<&crate::crypto::Rar5CryptParams>) -> bool {
         let first = self.members.last().and_then(|m| m.cipher.as_ref());
         match (params, first) {
             (None, Some(CipherParams::Rar5 { .. })) => false,
             (None, _) => true,
-            (Some(p), Some(CipherParams::Rar5 { kdf_count, salt, iv, .. })) => {
-                *kdf_count == p.kdf_count && *salt == p.salt && *iv == Some(p.iv)
-            }
+            (Some(p), Some(CipherParams::Rar5 { kdf_count, salt, .. })) => *kdf_count == p.kdf_count && *salt == p.salt,
             (Some(_), _) => false,
         }
     }

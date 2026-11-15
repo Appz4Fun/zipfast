@@ -92,7 +92,8 @@ exact:
 | `None` | compressed | no mapping | None |
 
 Encrypted RAR stored members are one CBC stream across all their parts (a continuation part whose RAR 5.0
-encryption record names a different KDF count, salt or IV is `Malformed`): a volume boundary never resets CBC, so a
+encryption record names a different KDF count or salt is `Malformed`; only the first part's IV is used, so a later
+part restating a different IV is accepted): a volume boundary never resets CBC, so a
 stream offset `c` is output offset `c`, clipped at the unpacked size. This is the same geometry persistent partials
 use (`docs/persistent-partials.md`).
 
