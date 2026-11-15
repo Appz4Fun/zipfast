@@ -135,31 +135,61 @@ impl Bundle {
     }
     fn put(&mut self, name: &str, bytes: &[u8], page: bool) -> PartialResult<()> {
         self.directory.check()?;
-        if self.files.iter().any(|f| f.name == name && f.written) {
-            let f = open_at(&self.directory.held.file, OsStr::new(name), false, &self.budget)?;
-            if state::read_bounded(&f.file, bytes.len(), &self.budget)? != bytes {
-                return Err(err(PartialErrorKind::JournalCorrupt));
-            }
-            return Ok(());
-        }
+        let exists = self.files.iter().any(|f| f.name == name && f.written);
         if !self.files.iter().any(|f| f.name == name) {
             self.reserve_files(&[(name.to_owned(), bytes.to_vec(), page)])?;
         }
-        let file = open_at(&self.directory.held.file, OsStr::new(name), true, &self.budget)?;
+        let file = open_at(&self.directory.held.file, OsStr::new(name), !exists, &self.budget)?;
+        // written records that the name exists, not that its contents are durable.
         self.files.iter_mut().find(|f| f.name == name).unwrap().written = true;
         self.budget.exclusions.bind(&self.directory.path.join(name), &file.file)?;
         let mut at = 0;
+        if exists {
+            let prior = state::read_bounded(&file.file, bytes.len(), &self.budget)?;
+            if prior != bytes {
+                if !bytes.starts_with(&prior) || prior.len() >= bytes.len() {
+                    return Err(err(PartialErrorKind::JournalCorrupt));
+                }
+                self.require_unanchored(name)?;
+                let stored = self.files.iter_mut().find(|f| f.name == name).unwrap();
+                stored._bytes.grow_to(bytes.len() as u64, &self.budget.limits)?;
+                stored.size = bytes.len() as u64;
+            }
+            at = prior.len();
+        }
         while at < bytes.len() {
-            let n = crate::output::range::write_at(&file.file, at as u64, &bytes[at..])
+            let n = write_journal(&file.file, name, at as u64, &bytes[at..])
                 .map_err(|e| io_error(OutputOperation::Write, e))?;
             if n == 0 {
                 return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
             }
             at += n;
         }
-        file.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))?;
-        self.directory.held.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))?;
+        // Equal visible bytes may be left by a failed file or directory sync.
+        // Every successful put must establish both durability boundaries.
+        sync_journal(&file.file, name, false).map_err(|e| io_error(OutputOperation::Flush, e))?;
+        sync_journal(&self.directory.held.file, name, true).map_err(|e| io_error(OutputOperation::Flush, e))?;
         self.directory.check()?;
+        Ok(())
+    }
+    fn require_unanchored(&self, name: &str) -> PartialResult<()> {
+        let anchor = self.acknowledged.as_ref().ok_or_else(|| err(PartialErrorKind::JournalCorrupt))?;
+        let record_name = format!("r-{}", hex(anchor.digest()));
+        if name == record_name {
+            return Err(err(PartialErrorKind::JournalCorrupt));
+        }
+        let record = open_at(&self.directory.held.file, OsStr::new(&record_name), false, &self.budget)?;
+        let wire = state::read_bounded(&record.file, self.budget.limits.state_wire_bytes as usize, &self.budget)?;
+        if crate::crypto::sha256(&wire) != *anchor.digest() {
+            return Err(err(PartialErrorKind::JournalCorrupt));
+        }
+        let (_, _, _, head) = state::decode_record(&wire, &self.budget.limits)?;
+        if head.member != *anchor.member()
+            || head.sequence != anchor.sequence()
+            || head.pages.iter().any(|page| name == format!("p-{}", hex(&page.digest)))
+        {
+            return Err(err(PartialErrorKind::JournalCorrupt));
+        }
         Ok(())
     }
     pub(crate) fn append_intent(&mut self, intent: &MutationIntent) -> PartialResult<StateAnchor> {
@@ -420,5 +450,28 @@ impl Bundle {
             self.files.retain(|f| f.name != name);
         }
         self.directory.held.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))
+    }
+}
+
+fn write_journal(file: &std::fs::File, name: &str, at: u64, bytes: &[u8]) -> std::io::Result<usize> {
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    {
+        super::tests::state::journal_write(file, name, at, bytes)
+    }
+    #[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
+    {
+        let _ = name;
+        crate::output::range::write_at(file, at, bytes)
+    }
+}
+fn sync_journal(file: &std::fs::File, name: &str, directory: bool) -> std::io::Result<()> {
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    {
+        super::tests::state::journal_sync(file, name, directory)
+    }
+    #[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
+    {
+        let _ = (name, directory);
+        file.sync_all()
     }
 }

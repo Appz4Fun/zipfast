@@ -375,6 +375,9 @@ fn process_kill_child() {
     );
     options.anchors = store;
     let core = PartialCore::create(f.spec(), f.checks.clone(), options).unwrap();
+    if std::env::var("ZIPFAST_PARTIAL_KILL_AT").ok().as_deref() == Some("journal-prefix") {
+        JOURNAL_FAULT.set(Some(JournalFault::Write { page: true, remaining: 2 }));
+    }
     core.write_original(0, b"abcdefghijklmnop").unwrap();
 }
 // Catches certification of an unanchored tail and incorrect crash ordering at real fsync/CAS boundaries.
@@ -382,6 +385,7 @@ fn process_kill_child() {
 fn crash_recovers_last_acknowledged_state() {
     use std::time::{Duration, Instant};
     for (phase, sequence, written) in [
+        ("journal-prefix", 1, 0),
         ("intent-sync", 1, 0),
         ("intent-cas", 2, 0),
         ("write", 2, 4),
@@ -442,6 +446,13 @@ fn crash_recovers_last_acknowledged_state() {
         let mut expected = vec![0; 16];
         expected[..written].copy_from_slice(&b"abcdefghijklmnop"[..written]);
         assert_eq!(fs::read(path.join("out/member.bin")).unwrap(), expected, "{phase}");
+        if phase == "journal-prefix" {
+            file.core
+                .write_original(0, b"abcdefghijklmnop")
+                .expect("restart must complete torn unanchored journal prefix");
+            assert!(file.remaining().unwrap().is_empty());
+            assert_eq!(fs::read(path.join("out/member.bin")).unwrap(), b"abcdefghijklmnop");
+        }
     }
 }
 
@@ -1020,4 +1031,164 @@ fn genesis_path_bytes_admits_exact_and_rejects_before_effects() {
 #[test]
 fn genesis_metadata_admits_exact_and_rejects_before_effects() {
     measured_genesis_boundary(Resource::MetadataBytes, 1_048_576);
+}
+
+#[derive(Clone, Copy)]
+enum JournalFault {
+    Write { page: bool, remaining: usize },
+    Sync { page: bool, directory: bool, remaining: usize },
+}
+thread_local! {
+    static JOURNAL_FAULT: std::cell::Cell<Option<JournalFault>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn journal_write(file: &fs::File, name: &str, at: u64, bytes: &[u8]) -> std::io::Result<usize> {
+    if let Some(JournalFault::Write { page, remaining }) = JOURNAL_FAULT.get()
+        && name.starts_with(if page { "p-" } else { "r-" })
+    {
+        if remaining == 0 {
+            JOURNAL_FAULT.set(None);
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        let n = crate::output::range::write_at(file, at, &bytes[..bytes.len().min(remaining)])?;
+        JOURNAL_FAULT.set(Some(JournalFault::Write { page, remaining: remaining - n }));
+        checkpoint("journal-prefix");
+        return Ok(n);
+    }
+    crate::output::range::write_at(file, at, bytes)
+}
+pub(crate) fn journal_sync(file: &fs::File, name: &str, directory: bool) -> std::io::Result<()> {
+    if let Some(JournalFault::Sync { page, directory: wanted, remaining }) = JOURNAL_FAULT.get()
+        && directory == wanted
+        && name.starts_with(if page { "p-" } else { "r-" })
+    {
+        if remaining > 0 {
+            JOURNAL_FAULT.set(Some(JournalFault::Sync { page, directory, remaining: remaining - 1 }));
+            return Err(std::io::Error::other("injected journal sync failure"));
+        }
+        JOURNAL_FAULT.set(None);
+    }
+    file.sync_all()
+}
+fn prepared_public_fill(f: &Fixture) -> PartialFile {
+    let file = f.create().unwrap();
+    let packed = f.evidence.parts[0].packed.clone();
+    file.core
+        .record_hole(HoleReport {
+            id: 1,
+            revision: 1,
+            member: f.member.clone(),
+            name: Arc::from(b"member.bin".as_slice()),
+            out: 0..16,
+            packed: vec![packed],
+            cause: HoleCause::Missing,
+        })
+        .unwrap();
+    file
+}
+#[test]
+fn journal_torn_unanchored_file_retries_live_and_after_reopen() {
+    for page in [false, true] {
+        for reopen in [false, true] {
+            let f = Fixture::new();
+            let mut file = prepared_public_fill(&f);
+            let before = file.state().unwrap();
+            let calls = f.store.calls.load(std::sync::atomic::Ordering::SeqCst);
+            JOURNAL_FAULT.set(Some(JournalFault::Write { page, remaining: 2 }));
+            let error = file.fill(0, b"abcdefghijklmnop").unwrap_err();
+            assert!(
+                matches!(error.kind, PartialErrorKind::Io {operation: OutputOperation::Write, ref cause} if cause.raw_os_error() == Some(libc::ENOSPC))
+            );
+            assert_eq!(f.store.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+            assert_eq!(file.state().unwrap().anchor(), before.anchor());
+            assert_eq!(fs::read(f.output()).unwrap(), vec![0; 16]);
+            if reopen {
+                drop(file);
+                file = f.open(before).unwrap();
+            }
+            file.fill(0, b"abcdefghijklmnop").expect("unanchored torn journal must be retryable");
+            let state = file.close().unwrap();
+            assert!(f.open(state).unwrap().remaining().unwrap().is_empty());
+            assert_eq!(fs::read(f.output()).unwrap(), b"abcdefghijklmnop");
+        }
+    }
+}
+#[test]
+fn journal_equal_retry_reestablishes_file_and_directory_durability_before_cas() {
+    for page in [false, true] {
+        for directory in [false, true] {
+            for reopen in [false, true] {
+                let f = Fixture::new();
+                let mut file = prepared_public_fill(&f);
+                let before = file.state().unwrap();
+                let calls = f.store.calls.load(std::sync::atomic::Ordering::SeqCst);
+                JOURNAL_FAULT.set(Some(JournalFault::Sync { page, directory, remaining: 2 }));
+                for attempt in 0..2 {
+                    if attempt == 1 && reopen {
+                        drop(file);
+                        file = f.open(before.clone()).unwrap();
+                    }
+                    let result = file.fill(0, b"abcdefghijklmnop");
+                    assert_eq!(
+                        f.store.calls.load(std::sync::atomic::Ordering::SeqCst),
+                        calls,
+                        "unsynced journal escaped into anchor CAS"
+                    );
+                    let error = result.unwrap_err();
+                    assert!(
+                        matches!(error.kind, PartialErrorKind::Io { operation: OutputOperation::Flush, ref cause } if cause.to_string() == "injected journal sync failure")
+                    );
+                    assert_eq!(file.state().unwrap().anchor(), before.anchor());
+                    assert_eq!(fs::read(f.output()).unwrap(), vec![0; 16]);
+                }
+                file.fill(0, b"abcdefghijklmnop").unwrap();
+                let state = file.close().unwrap();
+                assert!(f.open(state).unwrap().remaining().unwrap().is_empty());
+                assert_eq!(fs::read(f.output()).unwrap(), b"abcdefghijklmnop");
+            }
+        }
+    }
+}
+
+#[test]
+fn journal_recovery_never_repairs_conflicting_or_current_anchored_bytes() {
+    use std::io::{Seek, SeekFrom, Write};
+    for anchored in [false, true] {
+        let f = Fixture::new();
+        let mut file = prepared_public_fill(&f);
+        let before = file.state().unwrap();
+        let bundle = f.dir.path().join("state").join(super::super::native::bundle_name(&f.member));
+        let target = if anchored {
+            let op = file.core.operation().unwrap();
+            bundle.join(format!("p-{}", super::super::native::hex(&op.snapshot.head.pages[0].digest)))
+        } else {
+            let names = fs::read_dir(&bundle).unwrap().map(|e| e.unwrap().path()).collect::<Vec<_>>();
+            JOURNAL_FAULT.set(Some(JournalFault::Write { page: false, remaining: 2 }));
+            assert!(file.fill(0, b"abcdefghijklmnop").is_err());
+            fs::read_dir(&bundle)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| !names.contains(p) && p.file_name().unwrap().to_str().unwrap().starts_with("r-"))
+                .unwrap()
+        };
+        let mut damaged = fs::OpenOptions::new().write(true).open(&target).unwrap();
+        damaged.set_len(2).unwrap();
+        if !anchored {
+            damaged.seek(SeekFrom::Start(0)).unwrap();
+            damaged.write_all(b"XX").unwrap();
+        }
+        damaged.sync_all().unwrap();
+        let saved = fs::read(&target).unwrap();
+        let calls = f.store.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let error = file.fill(0, b"abcdefghijklmnop").unwrap_err();
+        assert!(matches!(error.kind, PartialErrorKind::JournalCorrupt));
+        assert_eq!(f.store.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        assert_eq!(file.state().unwrap().anchor(), before.anchor());
+        assert_eq!(fs::read(&target).unwrap(), saved);
+        assert_eq!(fs::read(f.output()).unwrap(), vec![0; 16]);
+        drop(file);
+        if anchored {
+            assert!(f.open(before).is_err());
+        }
+        assert_eq!(fs::read(target).unwrap(), saved);
+    }
 }

@@ -199,6 +199,72 @@ impl Fixture {
         };
         Ok(PartialFile::from_core(PartialCore::create(spec, self.checks.clone(), options)?))
     }
+    // Model an extraction whose real parsed parts were all reported missing.
+    // Run the canonical machine to completion before committing that fact.
+    pub fn finish_missing_member(&self, file: &PartialFile) {
+        use crate::rar5::{
+            framing::{HeaderParser, ParserStep},
+            member::{MemberMachine, RecoverySink},
+            physical::{PhysicalMember, PhysicalPart},
+            reader::Block,
+            unpack::Sink,
+        };
+        struct Missing;
+        impl Sink for Missing {
+            fn put(&mut self, bytes: &[u8]) -> crate::error::Result<()> {
+                assert!(bytes.is_empty());
+                Ok(())
+            }
+        }
+        impl RecoverySink for Missing {
+            fn hole(&mut self, _: u64) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        let usage = Usage::new(ProgressiveLimits::default());
+        let mut machine: Option<MemberMachine> = None;
+        let mut member: Option<PhysicalMember> = None;
+        for (index, witness) in self.evidence.headers.iter().enumerate() {
+            let mut parser = HeaderParser::progressive(
+                self.evidence.admissions[index].expected.clone().into(),
+                witness.packed.start,
+                usage.clone(),
+            );
+            let mut step = parser.advance(&[]).unwrap().1;
+            let frame = loop {
+                match step {
+                    ParserStep::Need { offset, len } => {
+                        let at = (offset - witness.packed.start) as usize;
+                        step = parser.advance(&witness.bytes[at..at + len]).unwrap().1;
+                    }
+                    ParserStep::Frame(frame) => break frame,
+                    _ => panic!("canonical file frame"),
+                }
+            };
+            let Block::File(header) = frame.block else { panic!("canonical file") };
+            let wire = frame.wire.unwrap();
+            let part = PhysicalPart::new(index, &header, frame.crypt, &wire);
+            if machine.is_none() {
+                let context = crate::extract::EntryContext {
+                    entry: crate::extract::RarEntryIdentity { index: Some(0), order: 0, name: header.name.clone() },
+                    method: header.method,
+                    password: crate::error::RarPasswordEvidence::NotEncrypted,
+                };
+                machine = Some(MemberMachine::new(&header, context, None, &usage, &SessionControl::default()).unwrap());
+                member = Some(PhysicalMember::new(header, wire, 0, &part).unwrap());
+            } else {
+                member.as_mut().unwrap().append(&header, &part).unwrap();
+            }
+            let machine = machine.as_mut().unwrap();
+            machine.begin_part(&part);
+            machine.feed_stored(None, part.packed_size as usize, &mut Missing).unwrap();
+            machine.finish_part(&part).unwrap();
+        }
+        let mut machine = machine.unwrap();
+        machine.finish_decode(&mut Missing).unwrap();
+        machine.finish_member(&member.unwrap()).unwrap();
+        file.core.finish_member().unwrap();
+    }
     pub fn context(&self) -> PartialOpenContext {
         PartialOpenContext {
             output_root: self.dir.path().join("out"),

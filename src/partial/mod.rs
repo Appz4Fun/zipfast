@@ -761,6 +761,30 @@ impl PartialCore {
         let transaction = self.begin_transaction(&mut data, intent, valid, vec![affected])?;
         self.finish_transaction(&mut data, transaction)
     }
+    // Called only after the canonical MemberMachine has successfully finished.
+    // The acknowledged commit, not complete output coverage, grants finalization.
+    pub(crate) fn finish_member(&self) -> PartialResult<()> {
+        let mut data = self.operation()?;
+        self.check(&data)?;
+        self.reconcile(&mut data)?;
+        if data.snapshot.head.member_finished {
+            return Ok(());
+        }
+        if data.snapshot.head.produced != data.snapshot.head.size
+            || data
+                .snapshot
+                .evidence
+                .parts
+                .last()
+                .is_none_or(|part| !part.final_part || part.out.end != data.snapshot.head.size)
+        {
+            return Err(err(PartialErrorKind::IncompleteOutput));
+        }
+        let (intent, mut valid) = self.next_snapshots(&data)?;
+        valid.head.member_finished = true;
+        let transaction = self.begin_transaction(&mut data, intent, valid, Vec::new())?;
+        self.finish_transaction(&mut data, transaction)
+    }
     pub(crate) fn extend_evidence(&self, update: EvidenceUpdate) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;

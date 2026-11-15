@@ -667,6 +667,12 @@ fn deferred_part_success_survives_session_drop_and_reopen() {
                 _ => {}
             }
         }
+        // The next poll finishes the canonical machine and durably commits
+        // completion, then yields before starting deferred BLAKE readback.
+        assert!(session.poll_event(&mut Context::from_waker(Waker::noop())).is_pending());
+        let before_readback = file.fill(0, &[]).unwrap();
+        assert!(before_readback.applied.is_empty());
+        assert!(before_readback.part_checks.iter().all(|part| part.blake2sp == CheckResult::Pending));
         let reads = fixture.reads.lock().unwrap().len();
         drop(session);
         if reopen {
@@ -1635,5 +1641,196 @@ fn durable_anchor_store_recovers_sync_before_compaction_retirement() {
         .unwrap();
         assert!(matches!(verify(&mut file), Verdict::Ok {revision: r, ..} if r == revision));
         assert_eq!(fs::read(dest.join("a.bin")).unwrap(), fixture.data[0]);
+    }
+}
+
+#[test]
+fn paused_member_cannot_verify_or_apply_metadata_before_canonical_finish() {
+    use std::os::unix::fs::PermissionsExt;
+    for empty in [false, true] {
+        for drop_before_finish in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("out");
+            let state_root = dir.path().join("state");
+            let bytes = if empty { &b""[..] } else { &b"canonical finish must precede final metadata"[..] };
+            let mut fixture = Fixture::new();
+            fixture.volumes.truncate(1);
+            let source = fixture.volumes[0].as_mut().unwrap();
+            source.bytes = common::archive(&[common::FileSpec::new("a.bin", bytes)]);
+            source.holes.clear();
+            let provider = fixture.provider();
+            let protection = provider.protection.clone();
+            let anchors = Arc::new(Anchors::default());
+            let mut partial = partial_options(&state_root);
+            partial.anchors = anchors.clone();
+            let mut session = ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial).unwrap();
+            let (key, mut file) = next_partial(&mut session);
+            if !empty {
+                loop {
+                    match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                        Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { logical_end, .. })))
+                            if logical_end == bytes.len() as u64 =>
+                        {
+                            break;
+                        }
+                        Poll::Ready(Err(error)) => panic!("{error:?}"),
+                        Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => {
+                            panic!("lost pause before canonical finalization")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(file.remaining().unwrap().is_empty());
+            let path = dest.join("a.bin");
+            let before = fs::metadata(&path).unwrap();
+            let verdict = verify(&mut file);
+            let after = fs::metadata(&path).unwrap();
+            assert_eq!(
+                after.modified().unwrap(),
+                before.modified().unwrap(),
+                "unfinished member applied archive mtime: {verdict:?}"
+            );
+            assert_eq!(
+                after.permissions().mode(),
+                before.permissions().mode(),
+                "unfinished member applied archive permissions"
+            );
+            assert!(matches!(verdict, Verdict::Incomplete { ref holes, .. } if holes.is_empty()));
+            if !drop_before_finish {
+                loop {
+                    match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                        Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                            outcome: MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. },
+                            ..
+                        }))) => break,
+                        Poll::Ready(Err(error)) => panic!("{error:?}"),
+                        Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => {
+                            panic!("canonical completion must verify")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+            }
+            drop(session);
+            let state = file.close().unwrap();
+            let latest = anchors.current(&key).unwrap().unwrap();
+            assert_eq!(state.anchor(), &latest);
+            let mut reopened = PartialFile::open(
+                state,
+                PartialOpenContext {
+                    output_root: dest.clone(),
+                    state_root,
+                    expected_member: key,
+                    expected_anchor: latest,
+                    protection,
+                    limits: PartialLimits::default(),
+                    progressive_limits: ProgressiveLimits::default(),
+                    anchors,
+                    control: SessionControl::default(),
+                },
+            )
+            .unwrap();
+            let verdict = verify(&mut reopened);
+            if drop_before_finish {
+                assert!(matches!(verdict, Verdict::Incomplete { ref holes, .. } if holes.is_empty()));
+                assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before.modified().unwrap());
+            } else {
+                assert!(matches!(verdict, Verdict::Ok { .. }));
+                assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+            }
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn canonical_finish_failure_never_commits_completion_or_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    for checksum_failure in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let state_root = dir.path().join("state");
+        let data = b"actual canonical checksum failure at member finish";
+        let mut fixture = Fixture::new();
+        fixture.volumes.truncate(1);
+        let source = fixture.volumes[0].as_mut().unwrap();
+        source.bytes = common::archive(&[common::FileSpec::new("a.bin", data)]);
+        source.holes.clear();
+        if checksum_failure {
+            let start = source.bytes.windows(data.len()).position(|part| part == data).unwrap();
+            source.bytes[start] ^= 1;
+        }
+        let generation = source.generation.clone();
+        let provider = fixture.provider();
+        let protection = provider.protection.clone();
+        let anchors = Arc::new(Anchors::default());
+        let mut partial = partial_options(&state_root);
+        partial.anchors = anchors.clone();
+        let mut session = ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial).unwrap();
+        let (key, mut file) = next_partial(&mut session);
+        loop {
+            match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { logical_end, .. })))
+                    if logical_end == data.len() as u64 =>
+                {
+                    break;
+                }
+                Poll::Ready(Err(error)) => panic!("{error:?}"),
+                _ => {}
+            }
+        }
+        let path = dest.join("a.bin");
+        let before = fs::metadata(&path).unwrap();
+        let anchor = anchors.current(&key).unwrap().unwrap();
+        let verdict = verify(&mut file);
+        if checksum_failure {
+            assert!(matches!(verdict, Verdict::Bad { which: ChecksumAlgorithm::Crc32, .. }));
+        } else {
+            assert!(matches!(verdict, Verdict::Incomplete {ref holes, ..} if holes.is_empty()));
+            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let Poll::Ready(Err(error)) = session.poll_event(&mut Context::from_waker(Waker::noop())) else {
+            panic!("finalization must fail");
+        };
+        if checksum_failure {
+            assert!(
+                matches!(error.kind, FailureKind::Rar(ref failure) if matches!(failure.as_ref(), zipfast::error::RarFailure::Integrity {reason:zipfast::error::RarIntegrityReason::FinalChecks {crc32:true, ..}, ..}))
+            );
+        } else {
+            assert!(matches!(error.kind, FailureKind::SourceChanged));
+        }
+        assert_eq!(
+            anchors.current(&key).unwrap(),
+            Some(anchor.clone()),
+            "failed finalization committed a completion transition"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before.modified().unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode(), before.permissions().mode());
+        drop(session);
+        let state = file.close().unwrap();
+        let mut file = PartialFile::open(
+            state,
+            PartialOpenContext {
+                output_root: dest,
+                state_root,
+                expected_member: key,
+                expected_anchor: anchor,
+                protection,
+                limits: PartialLimits::default(),
+                progressive_limits: ProgressiveLimits::default(),
+                anchors,
+                control: SessionControl::default(),
+            },
+        )
+        .unwrap();
+        let verdict = verify(&mut file);
+        if checksum_failure {
+            assert!(matches!(verdict, Verdict::Bad { .. }));
+        } else {
+            assert!(matches!(verdict, Verdict::Incomplete {ref holes, ..} if holes.is_empty()));
+        }
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), before.modified().unwrap());
     }
 }

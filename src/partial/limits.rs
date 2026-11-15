@@ -126,6 +126,23 @@ pub(super) struct Reservation {
     resource: PartialResource,
     amount: u64,
 }
+impl Reservation {
+    // Growing a recovered short journal file must admit the missing bytes
+    // before touching the file, without double-counting its retained prefix.
+    pub(super) fn grow_to(&mut self, amount: u64, limits: &PartialLimits) -> PartialResult<()> {
+        if amount <= self.amount {
+            return Ok(());
+        }
+        let mut counts = self.counters.lock().unwrap();
+        let next = counts[self.resource as usize]
+            .checked_add(amount - self.amount)
+            .ok_or_else(|| limit(self.resource, limits.value(self.resource), u64::MAX))?;
+        limits.check(self.resource, next)?;
+        counts[self.resource as usize] = next;
+        self.amount = amount;
+        Ok(())
+    }
+}
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.counters.lock().unwrap()[self.resource as usize] -= self.amount;
@@ -272,6 +289,27 @@ impl PartialBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovered_journal_reservation_growth_admits_before_mutation() {
+        let usage = Usage::new(crate::progressive::ProgressiveLimits::default());
+        let exclusions = Arc::new(PartialExclusions::new(usage.clone()));
+        let limits = PartialLimits { journal_bytes: 100, ..Default::default() };
+        let budget = PartialBudget::new(limits, usage, exclusions).unwrap();
+        let mut prefix = budget.reserve(PartialResource::JournalBytes, 2).unwrap();
+        let other = budget.reserve(PartialResource::JournalBytes, 95).unwrap();
+        let error = prefix.grow_to(6, &budget.limits).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            PartialErrorKind::Limit { resource: PartialResource::JournalBytes, limit: 100, attempted: 101 }
+        ));
+        assert_eq!(prefix.amount, 2);
+        assert_eq!(budget.counters.lock().unwrap()[PartialResource::JournalBytes as usize], 97);
+        prefix.grow_to(5, &budget.limits).unwrap();
+        assert_eq!(budget.counters.lock().unwrap()[PartialResource::JournalBytes as usize], 100);
+        drop(prefix);
+        drop(other);
+        assert_eq!(budget.counters.lock().unwrap()[PartialResource::JournalBytes as usize], 0);
+    }
     #[test]
     fn genesis_bookkeeping_credits_end_before_live_operations() {
         let usage = Usage::new(crate::progressive::ProgressiveLimits { source_bookkeeping: 100, ..Default::default() });

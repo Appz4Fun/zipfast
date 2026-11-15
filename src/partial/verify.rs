@@ -241,7 +241,7 @@ impl PartialCore {
         let size = op.snapshot.head.size;
         let holes = ledger::Ledger { known: &mut op.snapshot.known, size, budget: &self.budget }.remaining()?;
         self.check(&op)?;
-        if !holes.is_empty() || missing_checks || pending {
+        if !op.snapshot.head.member_finished || !holes.is_empty() || missing_checks || pending {
             Ok(Poll::Ready(Verdict::Incomplete { revision, holes, parts, missing_checks }))
         } else {
             // The operation token excludes mutation; callbacks have completed and

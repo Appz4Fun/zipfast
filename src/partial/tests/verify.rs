@@ -58,6 +58,7 @@ fn missing_hash_is_not_ok() {
     let f = Fixture::new(33, false, false, false);
     let mut file = f.create();
     f.hole(&file, 0..33);
+    f.finish_missing_member(&file);
     file.fill(0, &f.data).unwrap();
     assert!(matches!(drive(&mut file),Verdict::Incomplete {holes,missing_checks:true,..} if holes.is_empty()));
 }
@@ -67,6 +68,7 @@ fn crc_verdict_distinguishes_part_and_member_scope() {
         let f = Fixture::new(33, true, true, false);
         let mut file = f.create();
         f.hole(&file, 0..33);
+        f.finish_missing_member(&file);
         let mut data = f.data.clone();
         data[bad] ^= 1;
         let mut borrowed = file.clone();
@@ -89,6 +91,7 @@ fn blake_verification_uses_readback() {
     limits.verify_bytes = 65_554;
     let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
     f.hole(&file, 0..65_537);
+    f.finish_missing_member(&file);
     file.fill(0, &f.data).unwrap();
     let Verdict::Ok { path, parts, metadata, .. } = drive(&mut file) else { panic!("complete BLAKE must verify") };
     assert_eq!(path, VerifyPath::WholeReadback);
@@ -100,6 +103,7 @@ fn deferred(reopen: bool) {
     let f = Fixture::new(33, true, false, true);
     let file = f.create();
     f.hole(&file, 0..33);
+    f.finish_missing_member(&file);
     file.core.fill_plain(0, &f.data[..17]).unwrap();
     let mut handle = if reopen {
         let state = file.close().unwrap();
@@ -137,6 +141,7 @@ fn changed_revision_invalidates_verify() {
     limits.read_chunk = 3;
     let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
     f.hole(&file, 0..33);
+    f.finish_missing_member(&file);
     file.fill(0, &f.data[..17]).unwrap();
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
@@ -170,6 +175,7 @@ fn part_snapshots_are_revision_bound_and_bounded() {
         let f = Fixture::new(33, true, true, false);
         let mut file = f.create();
         f.hole(&file, 0..33);
+        f.finish_missing_member(&file);
         file.fill(0, if incomplete { &f.data[..17] } else { &f.data }).unwrap();
         let cap = ProgressiveLimits::default().metadata_bytes;
         let before = used(&file.core.budget.usage, Resource::MetadataBytes, cap);
@@ -190,6 +196,7 @@ fn part_snapshots_are_revision_bound_and_bounded() {
             progressive.metadata_bytes = after - u64::from(!exact);
             let mut file = f.create_with(PartialLimits::default(), progressive).unwrap();
             f.hole(&file, 0..33);
+            f.finish_missing_member(&file);
             file.fill(0, if incomplete { &f.data[..17] } else { &f.data }).unwrap();
             let waker = Waker::noop();
             let mut cx = Context::from_waker(waker);
@@ -213,6 +220,7 @@ fn blake_readback_cap_is_exact_and_chunk_bounded() {
         progressive.read_chunk = 7;
         let mut file = f.create_with(PartialLimits::default(), progressive).unwrap();
         f.hole(&file, 0..33);
+        f.finish_missing_member(&file);
         file.fill(0, &f.data).unwrap();
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
@@ -242,6 +250,7 @@ fn crc_combine_and_targeted_readback_report_actual_work() {
         let f = Fixture::with_hashes(33, true, true, targeted, true);
         let mut file = f.create();
         f.hole(&file, 0..33);
+        f.finish_missing_member(&file);
         file.fill(0, &f.data).unwrap();
         let Verdict::Ok { path, parts, .. } = drive(&mut file) else { panic!("verified") };
         assert_eq!(path, if targeted { VerifyPath::TargetedReadback } else { VerifyPath::ExtentCombine });
@@ -264,6 +273,7 @@ fn blake_verdict_preserves_part_and_member_identity() {
         let f = Fixture::new(33, true, false, true);
         let mut file = f.create();
         f.hole(&file, 0..33);
+        f.finish_missing_member(&file);
         let mut data = f.data.clone();
         data[bad] ^= 1;
         let mut borrowed = file.clone();

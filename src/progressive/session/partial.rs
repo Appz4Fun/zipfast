@@ -303,6 +303,11 @@ impl ProgressiveSession {
     ) -> ProgressiveResult<Poll<ProgressiveResult<Option<ProgressiveEvent>>>> {
         if let Some(mut machine) = self.finalizer.take() {
             machine.finish_member(self.model.members.last().unwrap())?;
+            self.partial.as_ref().unwrap().active().1.finish_member().map_err(failure)?;
+            // Expose a bounded poll boundary after durable canonical completion,
+            // before any deferred readback. Surviving handles can finish that work.
+            cx.waker().wake_by_ref();
+            return Ok(Poll::Pending);
         }
         let persistent = self.partial.as_mut().unwrap();
         let (key, core) = persistent.active();
