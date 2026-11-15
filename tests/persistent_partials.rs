@@ -32,7 +32,10 @@ use zipfast::progressive::*;
 type ReadHook = Arc<Mutex<Option<Box<dyn FnMut(u32, u64) -> Option<File> + Send>>>>;
 #[derive(Default)]
 struct WaitGate(Mutex<Option<Waker>>);
+type BackingHook = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
 struct Source {
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    backing_hook: BackingHook,
     index: u32,
     bytes: Vec<u8>,
     holes: Vec<Range<u64>>,
@@ -45,12 +48,15 @@ impl RangeSource for Source {
     fn info(&self) -> SourceInfo {
         SourceInfo {
             id: SourceId(self.index as u128 + 1),
-            generation: 0,
+            generation: self.generation.load(std::sync::atomic::Ordering::SeqCst),
             extent: self.bytes.len() as u64,
             length: SourceLength::Final(self.bytes.len() as u64),
         }
     }
     fn backing_files(&self) -> &[File] {
+        if let Some(hook) = self.backing_hook.lock().unwrap().as_mut() {
+            hook();
+        }
         &self.backing
     }
     fn read_at(&mut self, at: u64, buf: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
@@ -153,6 +159,8 @@ impl Fixture {
             };
             payloads.push(payload.clone());
             volumes.push(Some(Source {
+                generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                backing_hook: Arc::new(Mutex::new(None)),
                 index: index as u32,
                 bytes,
                 holes,
@@ -168,7 +176,7 @@ impl Fixture {
         let protection = ProtectionDeclaration::Complete {
             epoch: 1,
             inventory: ProtectionInventory {
-                volumes: (0..10)
+                volumes: (0..self.volumes.len() as u32)
                     .map(|index| ProtectedVolume { index, name: volume_name(index), backing: VolumeBacking::NonFile })
                     .collect(),
                 auxiliary_paths: Vec::new(),
@@ -1364,5 +1372,268 @@ fn genesis_bookkeeping_exact_and_one_under_precede_parent_names() {
         assert_eq!(creation_with_bookkeeping(high, native), (true, true));
         assert_eq!(creation_with_bookkeeping(low, native), (false, false));
         eprintln!("genesis SourceBookkeeping native={native} exact={high}, one-under={low}");
+    }
+}
+
+#[test]
+fn backing_callback_generation_change_precedes_public_payload_acceptance() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for hole in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let mut fixture = Fixture::new();
+        let payload = fixture.payloads[0].clone();
+        let source = fixture.volumes[0].as_mut().unwrap();
+        if hole {
+            source.holes = std::iter::once(payload.clone()).collect();
+        }
+        let generation = source.generation.clone();
+        let arm = Arc::new(AtomicBool::new(false));
+        let armed = arm.clone();
+        *source.hook.lock().unwrap() = Some(Box::new(move |_, at| {
+            if at == payload.start {
+                armed.store(true, Ordering::SeqCst);
+            }
+            None
+        }));
+        *source.backing_hook.lock().unwrap() = Some(Box::new(move || {
+            if arm.swap(false, Ordering::SeqCst) {
+                generation.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let anchors = Arc::new(Anchors::default());
+        let mut partial = partial_options(&dir.path().join("state"));
+        partial.anchors = anchors.clone();
+        let mut session =
+            ProgressiveSession::new_partial(Box::new(fixture.provider()), options(&dest), partial).unwrap();
+        let (key, file) = next_partial(&mut session);
+        let before = anchors.current(&key).unwrap();
+        let Poll::Ready(Err(error)) = session.poll_event(&mut Context::from_waker(Waker::noop())) else {
+            panic!("changed generation yielded a success event");
+        };
+        assert!(matches!(error.kind, FailureKind::SourceChanged));
+        assert_eq!(anchors.current(&key).unwrap(), before, "changed generation committed a payload transaction");
+        assert_eq!(file.remaining().unwrap(), vec![0..7000]);
+        assert!(fs::read(dest.join("a.bin")).unwrap().iter().all(|b| *b == 0));
+    }
+}
+
+fn versioned_skip_with_successor(empty: bool, split: bool) {
+    for persistent in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let state = dir.path().join("state");
+        let old = if empty { &b""[..] } else { &b"older contents"[..] };
+        let clean = b"clean successor";
+        let mut skipped = common::FileSpec::new("old.bin", old);
+        skipped.extra = vec![3, 4, 0, 1]; // record size, VERSION, flags, version
+        let successor = common::FileSpec::new("clean.bin", clean);
+        let archives = if split {
+            let middle = old.len() / 2;
+            let mut first = common::SIG.to_vec();
+            first.extend(common::main_block(true, Some(0)));
+            first.extend(common::file_block(&skipped, &old[..middle], crc32fast::hash(&old[..middle]), false, true));
+            first.extend(common::end_block(true));
+            let mut second = common::SIG.to_vec();
+            second.extend(common::main_block(true, Some(1)));
+            second.extend(common::file_block(&skipped, &old[middle..], crc32fast::hash(old), true, false));
+            second.extend(common::file_block(&successor, clean, crc32fast::hash(clean), false, false));
+            second.extend(common::end_block(false));
+            vec![first, second]
+        } else {
+            vec![common::archive(&[skipped, successor])]
+        };
+        let mut fixture = Fixture::new();
+        fixture.volumes.truncate(archives.len());
+        for (source, bytes) in fixture.volumes.iter_mut().zip(archives) {
+            let source = source.as_mut().unwrap();
+            source.bytes = bytes;
+            source.holes.clear();
+        }
+        let anchors = Arc::new(Anchors::default());
+        let mut partial = partial_options(&state);
+        partial.anchors = anchors.clone();
+        let provider = fixture.provider();
+        let mut session = if persistent {
+            ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial).unwrap()
+        } else {
+            ProgressiveSession::new(Box::new(provider), options(&dest)).unwrap()
+        };
+        let mut skipped_count = 0;
+        let mut completed = 0;
+        let mut ready = 0;
+        let mut terminal = false;
+        for _ in 0..1000 {
+            match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                    assert!(persistent);
+                    assert_eq!(member.ordinal(), 1);
+                    ready += 1;
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::Skipped(zipfast::extract::RarSkipReason::OlderVersion(1)),
+                    ..
+                }))) => {
+                    skipped_count += 1;
+                    assert!(!dest.join("old.bin").exists());
+                    assert!(!state.exists());
+                    assert!(anchors.0.lock().unwrap().is_empty());
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::PersistentComplete { member, verdict: Verdict::Ok { .. }, .. },
+                    ..
+                }))) => {
+                    assert!(persistent);
+                    assert_eq!(member.ordinal(), 1);
+                    let mut handle = session.partial_file(&member).unwrap();
+                    assert!(matches!(verify(&mut handle), Verdict::Ok { .. }));
+                    assert_eq!(fs::read(dest.join("clean.bin")).unwrap(), clean);
+                    completed += 1;
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::Provisional(mut artifact),
+                    ..
+                }))) => {
+                    assert!(!persistent);
+                    let mut bytes = vec![0; clean.len()];
+                    assert!(
+                        matches!(artifact.read_at(0, &mut bytes).unwrap(), ArtifactRead::Filled { count: n } if n == clean.len())
+                    );
+                    assert_eq!(bytes, clean);
+                    completed += 1;
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => panic!("unexpected member outcome"),
+                Poll::Ready(Err(error)) => panic!("{error:?}"),
+                Poll::Ready(Ok(None)) => {
+                    terminal = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(terminal);
+        assert_eq!((skipped_count, completed, ready), (1, 1, usize::from(persistent)));
+        assert_eq!(anchors.0.lock().unwrap().len(), usize::from(persistent));
+        assert!(!dest.join("old.bin").exists());
+    }
+}
+#[test]
+fn versioned_nonempty_skip_preserves_clean_successor() {
+    versioned_skip_with_successor(false, false);
+}
+#[test]
+fn versioned_empty_skip_preserves_clean_successor() {
+    versioned_skip_with_successor(true, false);
+}
+#[test]
+fn versioned_split_skip_preserves_clean_successor() {
+    versioned_skip_with_successor(false, true);
+}
+
+#[path = "../docs/persistent-anchor-store.rs"]
+mod anchor_store;
+
+#[test]
+fn durable_anchor_store_requires_preprovisioned_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("missing");
+    assert!(anchor_store::DurableAnchors::open(&root).is_err());
+    assert!(!root.exists());
+}
+
+#[test]
+fn durable_anchor_store_recovers_sync_before_compaction_retirement() {
+    let mut maintenance_at = None;
+    for inject in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let state_root = dir.path().join("state");
+        let trusted = dir.path().join("trusted");
+        // Caller provisioning: persist each newly created root's parent link.
+        fs::create_dir(&trusted).unwrap();
+        File::open(dir.path()).unwrap().sync_all().unwrap();
+        File::open(dir.path().parent().unwrap()).unwrap().sync_all().unwrap();
+        let anchors = Arc::new(anchor_store::DurableAnchors::open(&trusted).unwrap());
+        let mut fixture = Fixture::new();
+        let provider = fixture.provider();
+        let protection = provider.protection.clone();
+        let mut partial = partial_options(&state_root);
+        partial.anchors = anchors.clone();
+        let mut session = ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial).unwrap();
+        let (key, mut file) = next_partial(&mut session);
+        loop {
+            match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => break,
+                Poll::Ready(Err(error)) => panic!("{error:?}"),
+                _ => {}
+            }
+        }
+        drop(session);
+        let mut revision = match verify(&mut file) {
+            Verdict::Incomplete { revision, .. } => revision,
+            other => panic!("{other:?}"),
+        };
+        for at in (1300..2000).step_by(5) {
+            let before = anchors.current(&key).unwrap().unwrap();
+            if inject && Some(at) == maintenance_at {
+                let output_before = fs::read(dest.join("a.bin")).unwrap();
+                let bundle = fs::read_dir(&state_root).unwrap().next().unwrap().unwrap().path();
+                let digest: String = before.digest().iter().map(|b| format!("{b:02x}")).collect();
+                let old_record = bundle.join(format!("r-{digest}"));
+                assert!(old_record.exists());
+                anchors.fail_after_rename(2);
+                let first = file.fill(at as u64, &fixture.data[0][at..at + 5]).unwrap_err();
+                assert!(matches!(first.kind, PartialErrorKind::AnchorCommitUncertain));
+                assert_eq!(first.committed.as_ref(), Some(&before));
+                let visible = anchors.visible(&key).unwrap().unwrap();
+                assert_eq!(visible.sequence(), before.sequence() + 1);
+                assert!(old_record.exists());
+                let retry = file.fill(at as u64, &fixture.data[0][at..at + 5]);
+                assert!(old_record.exists(), "visible but unsynced candidate retired trusted old record");
+                let retry = retry.unwrap_err();
+                assert!(matches!(retry.kind, PartialErrorKind::Io { operation: OutputOperation::Flush, ref cause }
+                    if cause.to_string() == "injected anchor directory sync failure"));
+                assert_eq!(anchors.visible(&key).unwrap(), Some(visible.clone()), "failed current must not CAS");
+                assert_eq!(fs::read(dest.join("a.bin")).unwrap(), output_before);
+                // Only successful current directory sync can acknowledge the rename.
+                assert_eq!(anchors.current(&key).unwrap(), Some(visible));
+                let filled = file.fill(at as u64, &fixture.data[0][at..at + 5]).unwrap();
+                assert_eq!(filled.revision, revision + 1);
+                revision = filled.revision;
+                assert!(!old_record.exists(), "durability recovery must allow retirement");
+                continue;
+            }
+            let result = file.fill(at as u64, &fixture.data[0][at..at + 5]).unwrap();
+            assert_eq!(result.revision, revision + 1);
+            revision = result.revision;
+            if !inject && maintenance_at.is_none() && result.state.anchor().sequence() == before.sequence() + 3 {
+                maintenance_at = Some(at);
+            }
+        }
+        assert!(maintenance_at.is_some());
+        assert!(matches!(verify(&mut file), Verdict::Ok {revision: r, ..} if r == revision));
+        drop(file);
+        let latest = anchors.current(&key).unwrap().unwrap();
+        drop(anchors); // release the real process lock before reopen
+        let anchors = Arc::new(anchor_store::DurableAnchors::open(&trusted).unwrap());
+        assert_eq!(anchors.current(&key).unwrap(), Some(latest.clone()));
+        let state = PartialState::load(&state_root, &latest, &PartialLimits::default()).unwrap();
+        let mut file = PartialFile::open(
+            state,
+            PartialOpenContext {
+                output_root: dest.clone(),
+                state_root,
+                expected_member: key,
+                expected_anchor: latest,
+                protection,
+                limits: PartialLimits::default(),
+                progressive_limits: ProgressiveLimits::default(),
+                anchors,
+                control: SessionControl::default(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(verify(&mut file), Verdict::Ok {revision: r, ..} if r == revision));
+        assert_eq!(fs::read(dest.join("a.bin")).unwrap(), fixture.data[0]);
     }
 }

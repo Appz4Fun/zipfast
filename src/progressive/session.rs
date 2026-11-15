@@ -488,7 +488,7 @@ impl ProgressiveSession {
                 }
                 Phase::Finish => {
                     #[cfg(feature = "persistent-partials")]
-                    if self.partial.is_some() {
+                    if self.partial_active() {
                         self.partial_finish_decode()?;
                         continue;
                     }
@@ -538,7 +538,7 @@ impl ProgressiveSession {
                 }
                 Phase::Verdict => {
                     #[cfg(feature = "persistent-partials")]
-                    if self.partial.is_some() {
+                    if self.partial_active() {
                         return self.partial_finish(cx);
                     }
                     return self.finish().map(|e| Poll::Ready(Ok(Some(e))));
@@ -658,7 +658,7 @@ impl ProgressiveSession {
                         Poll::Ready(Ok(SourceStep::Hole { offset, len })) => {
                             self.cursor = offset + len;
                             #[cfg(feature = "persistent-partials")]
-                            if self.partial.is_some() {
+                            if self.partial_active() {
                                 self.remaining -= len;
                                 return self
                                     .partial_feed(len as usize, Some(offset))
@@ -709,7 +709,7 @@ impl ProgressiveSession {
                             self.remaining -= count as u64;
                             work += count as u64;
                             #[cfg(feature = "persistent-partials")]
-                            if self.partial.is_some() {
+                            if self.partial_active() {
                                 self.partial_feed(count, None)?;
                                 return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
                                     member: self.member.unwrap(),
@@ -879,7 +879,7 @@ impl ProgressiveSession {
                         .map_err(|_| ProgressiveFailure::new(FailureKind::Malformed("part allocation")))?;
                     self.model.parts.push(part);
                     #[cfg(feature = "persistent-partials")]
-                    if self.partial.is_some() {
+                    if self.partial_active() {
                         self.partial_extend()?;
                     }
                     self.phase = Phase::Part;

@@ -391,7 +391,7 @@ struct PendingPartialRead {
     bytes: Vec<u8>,
 }
 #[cfg(feature = "persistent-partials")]
-fn partial_read_stable(original: &OriginalSource, op: &mut RangeOperation<'_>) -> ProgressiveResult<bool> {
+fn partial_read_stable(original: &mut OriginalSource, op: &mut RangeOperation<'_>) -> ProgressiveResult<bool> {
     let Some(exclusions) = op.exclusions else { return Ok(true) };
     for _ in 0..2 {
         op.usage.charge(Resource::SourceRequests, 1)?;
@@ -399,10 +399,19 @@ fn partial_read_stable(original: &OriginalSource, op: &mut RangeOperation<'_>) -
         if op.control.is_canceled() {
             return Err(canceled());
         }
+        // info is the final source callback. Validate native facts after it,
+        // then accept this identity before any answer/cursor/byte mutation.
+        op.usage.charge(Resource::SourceRequests, 1)?;
+        let info = original.source.info();
+        if op.control.is_canceled() {
+            return Err(canceled());
+        }
         if let Some((native, declaration, external)) = &mut op.native {
             native.refresh(declaration, op.usage, *external)?;
         }
-        if exclusions.check_input_revision(&[], files)?.is_some() {
+        let stable = exclusions.check_input_revision(&[], files)?.is_some();
+        original.observe_info(info)?;
+        if stable {
             return Ok(true);
         }
     }
@@ -1533,5 +1542,94 @@ pub(super) fn immutable_error(fault: crate::error::RarFault) -> ProgressiveFailu
             ProgressiveFailure::new(FailureKind::Input { operation: super::InputOperation::Metadata, cause: source })
         }
         _ => changed(),
+    }
+}
+
+#[cfg(all(test, feature = "persistent-partials"))]
+mod partial_callback_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    struct ChangingSource {
+        generation: AtomicU64,
+        armed: AtomicBool,
+        reads: Arc<AtomicU64>,
+    }
+    impl RangeSource for ChangingSource {
+        fn info(&self) -> SourceInfo {
+            SourceInfo {
+                id: SourceId(1),
+                generation: self.generation.load(Ordering::SeqCst),
+                extent: 4,
+                length: SourceLength::Final(4),
+            }
+        }
+        fn backing_files(&self) -> &[File] {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.generation.fetch_add(1, Ordering::SeqCst);
+            }
+            &[]
+        }
+        fn read_at(&mut self, _: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            buf.copy_from_slice(b"data");
+            self.armed.store(true, Ordering::SeqCst);
+            Ok(RangeRead::Filled { count: 4 })
+        }
+    }
+    fn unchanged_acceptance(pending_answer: bool) {
+        let mut usage = Usage::new(ProgressiveLimits { source_bytes: 4, ..Default::default() });
+        let exclusions = crate::partial::PartialExclusions::new(usage.clone());
+        let reads = Arc::new(AtomicU64::new(0));
+        let source = Box::new(ChangingSource {
+            generation: AtomicU64::new(0),
+            armed: AtomicBool::new(pending_answer),
+            reads: reads.clone(),
+        });
+        let mut original =
+            OriginalSource { live: source.info(), source, index: 0, holes: Vec::new(), backing_count: 0, lease: None };
+        let mut cursor = CheckedCursor::new(0);
+        let gate = Arc::new(WakeGate::default());
+        let mut parked = false;
+        let mut retry = false;
+        let control = SessionControl::default();
+        let mut pending = pending_answer.then(|| PendingPartialRead {
+            offset: 0,
+            requested: 4,
+            answer: RangeRead::Filled { count: 4 },
+            bytes: b"data".to_vec(),
+        });
+        let mut buf = [0; 4];
+        let result = poll_available(
+            &mut original,
+            RangeOperation {
+                cursor: &mut cursor,
+                gate: &gate,
+                parked: &mut parked,
+                retry_admitted: &mut retry,
+                control: &control,
+                usage: &mut usage,
+                verify: false,
+                exclusions: Some(&exclusions),
+                pending: &mut pending,
+                native: None,
+            },
+            &mut buf,
+        );
+        assert_eq!(cursor.offset(), 0, "changed source advanced accepted cursor");
+        usage.charge(Resource::SourceBytes, 4).expect("changed source charged accepted bytes");
+        assert!(matches!(result, Err(ProgressiveFailure { kind: FailureKind::SourceChanged, .. })));
+        assert_eq!(reads.load(Ordering::SeqCst), u64::from(!pending_answer));
+        if pending_answer {
+            assert!(pending.is_some());
+            assert_eq!(buf, [0; 4]);
+        }
+    }
+    #[test]
+    fn post_backing_change_does_not_accept_fresh_answer() {
+        unchanged_acceptance(false);
+    }
+    #[test]
+    fn post_backing_change_does_not_accept_retained_pending_answer() {
+        unchanged_acceptance(true);
     }
 }

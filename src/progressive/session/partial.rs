@@ -69,6 +69,10 @@ impl Persistent {
     }
 }
 impl ProgressiveSession {
+    pub(super) fn partial_active(&self) -> bool {
+        self.partial.as_ref().is_some_and(|persistent| persistent.current.is_some())
+    }
+
     pub fn new_partial(
         provider: Box<dyn VolumeSource>,
         options: ProgressiveOptions,
@@ -256,7 +260,10 @@ impl ProgressiveSession {
         Ok(report.map(ProgressiveEvent::Hole))
     }
     pub(super) fn partial_part_event(&self) -> ProgressiveResult<Option<ProgressiveEvent>> {
-        let Some(persistent) = &self.partial else { return Ok(None) };
+        if !self.partial_active() {
+            return Ok(None);
+        }
+        let persistent = self.partial.as_ref().unwrap();
         let part = self.model.parts.last().unwrap();
         if part.final_part
             || self.machine.as_ref().unwrap().part_missing()

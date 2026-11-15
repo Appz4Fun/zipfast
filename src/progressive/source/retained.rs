@@ -83,6 +83,9 @@ impl OriginalSource {
     pub(super) fn check_info(&mut self, usage: &mut Usage) -> ProgressiveResult<()> {
         usage.charge(Resource::SourceRequests, 1)?;
         let new = self.source.info();
+        self.observe_info(new)
+    }
+    pub(super) fn observe_info(&mut self, new: SourceInfo) -> ProgressiveResult<()> {
         let old = self.live;
         if new.id != old.id
             || new.generation != old.generation

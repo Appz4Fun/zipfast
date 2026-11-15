@@ -8,66 +8,16 @@ This H2 path accepts plain RAR5 Stored members with known sizes and a Complete s
 
 Persist serialized `PartialState` only as an untrusted cache. Keep `StateAnchorStore` in independently trusted durable storage: each mutation first durably CASes an intent, writes/syncs output, then durably CASes its commit. On `AnchorCommitUncertain`, retain all files and the reported committed anchor. The caller may explicitly retry the same operation on the live handle. After closing every owner, load the latest trusted anchor and `PartialState::load`, then reopen with matching expected member/anchor. A cached older state returns `StateStale`; it never rolls the trusted store back. Reopen synchronously rehashes known output with bounded reads, costing O(known output), and does not call a source provider.
 
-The following Linux/macOS example uses a process-locked, atomically replaced anchor file with file and directory sync. Its directory must be trusted and exclusively managed by this store. The in-memory Complete provider illustrates source ownership; network providers implement the same wake/Wait/Hole contract. Choose stable job/archive bindings for your application. The example's byte-only serde adapter uses the public serde contract without another serialization dependency.
+The following Linux/macOS example uses a process-locked, atomically replaced anchor file with file and directory sync. The exact [DurableAnchors implementation](persistent-anchor-store.rs) is compiled into this example and exercised by the public fault regression; copy it into your `anchor_store` module. Its directory must already exist, be trusted and be exclusively managed by this store. Before `open`, the caller must durably provision the root and every newly created ancestor link by syncing their parents; `open` deliberately does not create missing roots. Under the serialization lock, `current` syncs the anchor directory before acknowledging a visible anchor, so a failed rename-sync remains uncertain until that durability recovery succeeds. The in-memory Complete provider illustrates source ownership; network providers implement the same wake/Wait/Hole contract. Choose stable job/archive bindings for your application. The example's byte-only serde adapter uses the public serde contract without another serialization dependency.
 
 ```no_run
-use std::{fs::{self, File, OpenOptions}, io::{Read, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex}};
+use std::{fs::File, path::Path, sync::Arc};
 use zipfast::partial::*;
 use zipfast::progressive::*;
 
-// This directory is caller-owned trusted storage, separate from output/state.
-// One process holds its OS lock; threads serialize each durable CAS.
-struct DurableAnchors { root: PathBuf, directory: File, _lock: File, serial: Mutex<u64> }
-impl DurableAnchors {
-    fn open(root: &Path) -> PartialResult<Self> {
-        fs::create_dir_all(root).map_err(store_io)?;
-        let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
-            .open(root.join("store.lock")).map_err(store_io)?;
-        lock.lock().map_err(store_io)?;
-        Ok(Self { root: root.into(), directory: File::open(root).map_err(store_io)?, _lock: lock, serial: Mutex::new(0) })
-    }
-    fn path(&self, member: &MemberKey) -> PathBuf {
-        fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
-        self.root.join(format!("{}-{}-{:016x}-{}", hex(&member.binding().job),
-            hex(&member.binding().archive), member.ordinal(), hex(member.identity())))
-    }
-    fn read(&self, member: &MemberKey) -> PartialResult<Option<StateAnchor>> {
-        let file = match File::open(self.path(member)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(store_io(e)),
-        };
-        let mut bytes = Vec::new();
-        file.take(41).read_to_end(&mut bytes).map_err(store_io)?;
-        if bytes.len() != 40 { return Err(PartialError::new(PartialErrorKind::StateUnavailable)); }
-        Ok(Some(StateAnchor::new(member.clone(), u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-            bytes[8..].try_into().unwrap())))
-    }
-}
-fn store_io(cause: std::io::Error) -> PartialError {
-    PartialError::new(PartialErrorKind::Io { operation: OutputOperation::Flush, cause })
-}
-impl StateAnchorStore for DurableAnchors {
-    fn current(&self, member: &MemberKey) -> PartialResult<Option<StateAnchor>> {
-        let _guard = self.serial.lock().unwrap();
-        self.read(member)
-    }
-    fn compare_exchange(&self, member: &MemberKey, expected: Option<&StateAnchor>, next: &StateAnchor) -> PartialResult<()> {
-        let mut serial = self.serial.lock().unwrap();
-        if next.member() != member || self.read(member)?.as_ref() != expected {
-            return Err(PartialError::new(PartialErrorKind::AnchorConflict));
-        }
-        *serial = serial.checked_add(1).ok_or_else(|| PartialError::new(PartialErrorKind::StateUnavailable))?;
-        let temporary = self.root.join(format!("new-{}-{}", std::process::id(), serial));
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(store_io)?;
-        file.write_all(&next.sequence().to_le_bytes()).map_err(store_io)?;
-        file.write_all(next.digest()).map_err(store_io)?;
-        file.sync_all().map_err(store_io)?;
-        fs::rename(&temporary, self.path(member)).map_err(store_io)?;
-        // A late error is uncertain: rename may have durably installed next.
-        self.directory.sync_all().map_err(store_io)
-    }
-}
+# mod anchor_store { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/persistent-anchor-store.rs")); }
+use anchor_store::DurableAnchors;
+
 struct MemorySource { bytes: Vec<u8> }
 impl RangeSource for MemorySource {
     fn info(&self) -> SourceInfo { SourceInfo { id: SourceId(1), generation: 0,
@@ -193,6 +143,7 @@ impl VolumeSource for CompleteProvider {
 use serde::{Serialize, Deserialize};
 use std::task::{Context, Poll};
 
+// Precondition: workspace/trusted-anchors and its ancestor links were durably provisioned.
 fn start(archive: Vec<u8>, workspace: &Path) -> PartialResult<(ProgressiveSession, Arc<DurableAnchors>)> {
     let anchors = Arc::new(DurableAnchors::open(&workspace.join("trusted-anchors"))?);
     let extract = zipfast::extract::Options { mode: zipfast::extract::Mode::Extract,
