@@ -1256,6 +1256,7 @@ impl ProgressiveSession {
         let verification = if let (Some(checksum), Some(_)) = (checksum, physical.unpacked_size) {
             Some(Verification {
                 inner_size: self.produced,
+                read_back: 0,
                 checksum: Some(checksum),
                 replacement_revision: None,
                 caller: None,

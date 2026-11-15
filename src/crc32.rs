@@ -45,6 +45,11 @@ impl Hasher {
         self.crc
     }
 
+    /// A hasher that has already taken in `len` bytes whose CRC is `crc`.
+    pub(crate) fn from_parts(crc: u32, len: u64) -> Self {
+        Self { crc, len }
+    }
+
     /// Takes in the bytes `other` was given, as if they had been given to this one after its own.
     pub fn combine(&mut self, other: &Hasher) {
         let mut a = crc32fast::Hasher::new_with_initial_len(self.crc, self.len);

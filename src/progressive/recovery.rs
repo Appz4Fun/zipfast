@@ -94,11 +94,14 @@ pub(crate) struct VerifyJob {
     stamp: SourceStamp,
     offset: u64,
     crc: crate::crc32::Hasher,
-    blake: crate::blake2sp::Blake2sp,
+    /// Only when a member BLAKE2sp is declared or expected; otherwise it is not computed.
+    blake: Option<crate::blake2sp::Blake2sp>,
     part: usize,
     part_offset: u64,
     part_crc: crate::crc32::Hasher,
-    part_blake: crate::blake2sp::Blake2sp,
+    part_blake: Option<crate::blake2sp::Blake2sp>,
+    /// Output bytes read back from the stage; parts already proven by their part CRC are combined, not read.
+    read_back: u64,
     replay: Option<Replay>,
     verdict: Option<Verification>,
     replacement_revision: u64,
@@ -258,6 +261,7 @@ impl ProgressiveSession {
         }
         stage.generation = stage.generation.checked_add(1).ok_or_else(invalid)?;
         stage.assessment.get_mut().evidence = None;
+        let held = stage.untrust_for_write();
         let mut completed = 0;
         while completed < bytes.len() {
             let scope = |mut e: ProgressiveFailure| {
@@ -294,6 +298,7 @@ impl ProgressiveSession {
             stage.holes[index].len = offset - hole.offset;
         }
         stage.valid = stage.valid.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
+        artifact.stage.as_mut().unwrap().trust_written(held);
         Ok(())
     }
     /// Rescan the complete private stage. A strict pass may publish through the
@@ -351,6 +356,10 @@ impl ProgressiveSession {
         if self.verify_job.is_none() {
             self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<VerifyJob>() as u64)?;
             self.usage.charge(Resource::SourceBookkeeping, 1)?;
+            let record = artifact.recovery.as_ref().unwrap();
+            let blake_wanted = record.model.members[0].final_checks.is_none_or(|c| c.blake2sp.is_some())
+                || matches!(stage.assessment.borrow().expected, Some(ExpectedInner::Blake2sp { .. }));
+            let part_blake = |part: usize| record.model.parts.get(part).is_some_and(|p| p.checks.blake2sp.is_some());
             self.verify_job = Some(VerifyJob {
                 member: stage.member,
                 generation: stage.generation,
@@ -358,11 +367,12 @@ impl ProgressiveSession {
                 stamp: stamp(stage)?,
                 offset: 0,
                 crc: crate::crc32::Hasher::new(),
-                blake: crate::blake2sp::Blake2sp::new(),
+                blake: blake_wanted.then(crate::blake2sp::Blake2sp::new),
                 part: 0,
                 part_offset: 0,
                 part_crc: crate::crc32::Hasher::new(),
-                part_blake: crate::blake2sp::Blake2sp::new(),
+                part_blake: part_blake(0).then(crate::blake2sp::Blake2sp::new),
+                read_back: 0,
                 replay: None,
                 verdict: None,
                 replacement_revision: self.replacement_revision,
@@ -423,6 +433,34 @@ impl ProgressiveSession {
             return Ok(Poll::Ready(Ok(v)));
         }
         let plain_store = !record.model.members[0].header.encrypted && record.model.members[0].header.method == 0;
+        // A non-final plain stored part that passed its declared part CRC during extraction holds exactly those
+        // bytes: patches only ever write into holes, and holes make a part's evidence Missing. Its CRC is combined
+        // instead of read back, unless a BLAKE2sp must be computed over the whole member.
+        if plain_store
+            && job.blake.is_none()
+            && stage.trusted == Some(job.stamp)
+            && record.part_evidence.len() == record.model.parts.len()
+        {
+            while job.part_offset == 0
+                && let Some(part) = record.model.parts.get(job.part)
+                && !part.final_part
+                && part.checks.blake2sp.is_none()
+                && let Some(crc) = part.checks.crc32
+                && record.part_evidence[job.part] == PackedEvidence::Passed
+                && job.offset.checked_add(part.packed_size).is_some_and(|end| end <= size)
+            {
+                self.usage.charge(Resource::SourceBookkeeping, 1)?;
+                job.crc.combine(&crate::crc32::Hasher::from_parts(crc, part.packed_size));
+                job.offset += part.packed_size;
+                job.part += 1;
+                job.part_blake = record
+                    .model
+                    .parts
+                    .get(job.part)
+                    .is_some_and(|p| p.checks.blake2sp.is_some())
+                    .then(crate::blake2sp::Blake2sp::new);
+            }
+        }
         if plain_store
             && let Some(part) = record.model.parts.get(job.part)
             && job.part_offset == part.packed_size
@@ -433,7 +471,7 @@ impl ProgressiveSession {
                     &record.context,
                     part.checks,
                     job.part_crc.clone(),
-                    Some(job.part_blake.clone()),
+                    job.part_blake.clone(),
                     None,
                 )
                 .map_err(|e| ProgressiveFailure::new(FailureKind::Rar(Box::new(e))))?;
@@ -441,7 +479,12 @@ impl ProgressiveSession {
             job.part += 1;
             job.part_offset = 0;
             job.part_crc = crate::crc32::Hasher::new();
-            job.part_blake = crate::blake2sp::Blake2sp::new();
+            job.part_blake = record
+                .model
+                .parts
+                .get(job.part)
+                .is_some_and(|p| p.checks.blake2sp.is_some())
+                .then(crate::blake2sp::Blake2sp::new);
             self.verify_job = Some(job);
             cx.waker().wake_by_ref();
             return Ok(Poll::Pending);
@@ -462,13 +505,18 @@ impl ProgressiveSession {
                 return Err(incomplete());
             };
             job.crc.update(&self.buffer[..count]);
-            job.blake.update(&self.buffer[..count]);
+            if let Some(blake) = &mut job.blake {
+                blake.update(&self.buffer[..count]);
+            }
             if plain_store {
                 job.part_crc.update(&self.buffer[..count]);
-                job.part_blake.update(&self.buffer[..count]);
+                if let Some(blake) = &mut job.part_blake {
+                    blake.update(&self.buffer[..count]);
+                }
                 job.part_offset += count as u64;
             }
             job.offset += count as u64;
+            job.read_back += count as u64;
             if self.control.is_canceled() {
                 return Err(ProgressiveFailure::new(FailureKind::Canceled));
             }
@@ -488,7 +536,7 @@ impl ProgressiveSession {
             hasher: job.crc.clone(),
             decoder_crc: false,
             crc: None,
-            blake: Some(job.blake.clone()),
+            blake: job.blake.clone(),
             bytes: size,
         };
         if let Err(e) = inner.verify(
@@ -507,7 +555,9 @@ impl ProgressiveSession {
         if let Some(expected) = &expected {
             let actual = match expected {
                 ExpectedInner::Crc32 { .. } => ChecksumValue::Crc32(job.crc.clone().finalize().to_le_bytes()),
-                ExpectedInner::Blake2sp { .. } => ChecksumValue::Blake2sp(job.blake.clone().finish()),
+                ExpectedInner::Blake2sp { .. } => {
+                    ChecksumValue::Blake2sp(job.blake.clone().ok_or_else(incomplete)?.finish())
+                }
             };
             if actual != expected.checksum() {
                 stage.assessment.get_mut().failed = true;
@@ -538,6 +588,7 @@ impl ProgressiveSession {
         }
         let v = Verification {
             inner_size: size,
+            read_back: job.read_back,
             checksum,
             replacement_revision: None,
             caller: expected.clone().map(Arc::new),
