@@ -1194,3 +1194,37 @@ fn journal_recovery_never_repairs_conflicting_or_current_anchored_bytes() {
         assert_eq!(fs::read(target).unwrap(), saved);
     }
 }
+
+// Catches a failed archive-authority rewrite leaving wrong alt bytes known, or leaving the range unfillable.
+#[test]
+fn failed_packed_rewrite_of_alt_bytes_leaves_a_fillable_declared_hole() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    let start = f.evidence.parts[0].packed.range.start;
+    file.core
+        .record_hole(HoleReport {
+            id: 1,
+            revision: 1,
+            member: f.member.clone(),
+            name: Arc::from(b"member.bin".as_slice()),
+            out: 0..4,
+            packed: vec![PackedSpan { volume: 0, range: start..start + 4 }],
+            cause: HoleCause::Missing,
+        })
+        .unwrap();
+    file.core.fill_plain(0, b"wxyz").unwrap();
+    WRITE_FAULT.set(Some(2));
+    let result = file.core.fill_packed(0, start, b"abcd");
+    WRITE_FAULT.set(None);
+    let error = result.unwrap_err();
+    assert!(matches!(error.kind, PartialErrorKind::Io { .. }), "{error:?}");
+    assert_eq!(file.remaining().unwrap(), vec![0..16]);
+    let state = file.close().unwrap();
+    let mut opened = f.open(state).unwrap();
+    assert_eq!(opened.remaining().unwrap(), vec![0..16]);
+    let op = opened.core.operation().unwrap();
+    assert!(op.snapshot.holes.iter().any(|h| h.out == (0..4) && h.cause == HoleCause::DeclaredBad));
+    drop(op);
+    opened.fill(0, b"abcd").unwrap();
+    assert_eq!(&fs::read(f.output()).unwrap()[..4], b"abcd");
+}

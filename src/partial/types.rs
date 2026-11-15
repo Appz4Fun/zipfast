@@ -313,6 +313,23 @@ pub struct FillResult {
     pub part_checks: Vec<PartCheck>,
     pub needs_verification: bool,
 }
+/// What [`PartialFile::fill_packed`](super::PartialFile::fill_packed) or
+/// [`refill_from_packed`](super::PartialFile::refill_from_packed) did.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct PackedFillResult {
+    pub revision: u64,
+    /// Output ranges written: former holes plus corrected alt bytes.
+    pub applied: Vec<Range<u64>>,
+    /// Output ranges that had been filled from an alt with different bytes. The archive bytes replaced them.
+    pub corrected: Vec<Range<u64>>,
+    /// Supplied packed bytes that map to no produced output of this member (headers, padding, other members, or
+    /// output the extraction has not reached yet). They were not used.
+    pub unmapped: Vec<PackedSpan>,
+    pub state: PartialState,
+    pub part_checks: Vec<PartCheck>,
+    pub needs_verification: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
