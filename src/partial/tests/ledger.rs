@@ -76,7 +76,7 @@ impl Fixture {
             assert!(size > 17);
             vec![0..17, 17..size]
         } else {
-            vec![0..size]
+            std::iter::once(0..size).collect::<Vec<_>>()
         };
         let mut parts = Vec::new();
         let mut admissions = Vec::new();
@@ -425,8 +425,7 @@ fn split_fragment_leases_survive_uncertain_cas_at_exact_cap() {
     for at in [1, 2] {
         for persisted in [false, true] {
             let f = Fixture::new(33, false, true, false);
-            let mut limits = PartialLimits::default();
-            limits.crc_leaves = 2;
+            let limits = PartialLimits { crc_leaves: 2, ..PartialLimits::default() };
             let file = f.create_with(limits, ProgressiveLimits::default()).unwrap();
             file.core.write_original(0, &f.data).unwrap();
             let call = f.store.calls.load(Ordering::SeqCst) + at;
@@ -435,7 +434,10 @@ fn split_fragment_leases_survive_uncertain_cas_at_exact_cap() {
             assert!(error.committed.is_some());
             *f.store.fail.lock().unwrap() = None;
             file.core.compact().expect("explicit recovery must reuse prepared fragment leases");
-            assert_eq!(file.remaining().unwrap(), if at == 1 && !persisted { vec![] } else { vec![10..20] });
+            assert_eq!(
+                file.remaining().unwrap(),
+                if at == 1 && !persisted { vec![] } else { std::iter::once(10..20).collect::<Vec<_>>() }
+            );
         }
     }
 }
@@ -501,8 +503,8 @@ fn fill_leaf_and_work_caps_precede_effects() {
 fn resulting_hole_intervals_are_admitted_before_fill() {
     for exact in [false, true] {
         let f = Fixture::new(33, true, true, false);
-        let mut progressive = ProgressiveLimits::default();
-        progressive.hole_intervals = if exact { 2 } else { 1 };
+        let progressive =
+            ProgressiveLimits { hole_intervals: if exact { 2 } else { 1 }, ..ProgressiveLimits::default() };
         let mut file = f.create_with(PartialLimits::default(), progressive).unwrap();
         f.hole(&file, 0..33);
         let calls = f.store.calls.load(Ordering::SeqCst);
@@ -549,8 +551,7 @@ fn producer_cannot_skip_unobserved_output() {
 #[test]
 fn filled_hole_reports_release_interval_capacity() {
     let f = Fixture::new(33, true, true, false);
-    let mut limits = ProgressiveLimits::default();
-    limits.hole_intervals = 1;
+    let limits = ProgressiveLimits { hole_intervals: 1, ..ProgressiveLimits::default() };
     let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
     f.hole(&file, 0..17);
     file.fill(0, &f.data[..17]).unwrap();

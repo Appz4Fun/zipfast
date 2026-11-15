@@ -86,9 +86,7 @@ fn crc_verdict_distinguishes_part_and_member_scope() {
 #[test]
 fn blake_verification_uses_readback() {
     let f = Fixture::new(65_537, true, false, true);
-    let mut limits = ProgressiveLimits::default();
-    limits.read_chunk = 4096;
-    limits.verify_bytes = 65_554;
+    let limits = ProgressiveLimits { read_chunk: 4096, verify_bytes: 65_554, ..ProgressiveLimits::default() };
     let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
     f.hole(&file, 0..65_537);
     f.finish_missing_member(&file);
@@ -137,8 +135,7 @@ fn reopened_incomplete_exposes_deferred_part_success() {
 #[test]
 fn changed_revision_invalidates_verify() {
     let f = Fixture::new(33, true, false, true);
-    let mut limits = ProgressiveLimits::default();
-    limits.read_chunk = 3;
+    let limits = ProgressiveLimits { read_chunk: 3, ..ProgressiveLimits::default() };
     let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
     f.hole(&file, 0..33);
     f.finish_missing_member(&file);
@@ -192,8 +189,8 @@ fn part_snapshots_are_revision_bound_and_bounded() {
         assert_eq!(std::mem::discriminant(&first), std::mem::discriminant(&second));
         for exact in [false, true] {
             let f = Fixture::new(33, true, true, false);
-            let mut progressive = ProgressiveLimits::default();
-            progressive.metadata_bytes = after - u64::from(!exact);
+            let progressive =
+                ProgressiveLimits { metadata_bytes: after - u64::from(!exact), ..ProgressiveLimits::default() };
             let mut file = f.create_with(PartialLimits::default(), progressive).unwrap();
             f.hole(&file, 0..33);
             f.finish_missing_member(&file);
@@ -215,9 +212,11 @@ fn part_snapshots_are_revision_bound_and_bounded() {
 fn blake_readback_cap_is_exact_and_chunk_bounded() {
     for exact in [false, true] {
         let f = Fixture::new(33, true, false, true);
-        let mut progressive = ProgressiveLimits::default();
-        progressive.verify_bytes = if exact { 50 } else { 49 };
-        progressive.read_chunk = 7;
+        let progressive = ProgressiveLimits {
+            verify_bytes: if exact { 50 } else { 49 },
+            read_chunk: 7,
+            ..ProgressiveLimits::default()
+        };
         let mut file = f.create_with(PartialLimits::default(), progressive).unwrap();
         f.hole(&file, 0..33);
         f.finish_missing_member(&file);
@@ -301,8 +300,7 @@ fn retained_part_storage_counts_against_ledger_bytes() {
         + 2 * std::mem::size_of::<PartCheck>() as u64;
     for exact in [false, true] {
         let f = Fixture::new(33, true, true, false);
-        let mut limits = PartialLimits::default();
-        limits.ledger_bytes = base + needed - u64::from(!exact);
+        let limits = PartialLimits { ledger_bytes: base + needed - u64::from(!exact), ..PartialLimits::default() };
         let file = f.create_with(limits, ProgressiveLimits::default()).unwrap();
         let op = file.core.operation().unwrap();
         let result = crate::partial::verify::Verification::new(&op.snapshot, &file.core.budget);

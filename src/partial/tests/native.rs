@@ -63,20 +63,15 @@ fn creation_fd_page_record_caps_are_reserved_before_effects() {
         (7, 3, 1, PartialResource::JournalRecords),
     ] {
         let f = Fixture::new();
-        let mut limits = PartialLimits::default();
-        limits.open_files = fd;
-        limits.state_pages = pages;
-        limits.journal_records = records;
+        let limits =
+            PartialLimits { open_files: fd, state_pages: pages, journal_records: records, ..PartialLimits::default() };
         let error = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).err().unwrap();
         assert!(matches!(error.kind,PartialErrorKind::Limit {resource:r,..} if r==resource), "{error:?}");
         assert!(!f.output().exists(), "budget failure must precede named output creation");
         assert_eq!(fs::read_dir(f.dir.path().join("state")).unwrap().count(), 0);
     }
     let f = Fixture::new();
-    let mut limits = PartialLimits::default();
-    limits.open_files = 7;
-    limits.state_pages = 3;
-    limits.journal_records = 2;
+    let limits = PartialLimits { open_files: 7, state_pages: 3, journal_records: 2, ..PartialLimits::default() };
     let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
     assert_eq!(file.remaining().unwrap(), vec![0..16]);
 }
@@ -209,8 +204,7 @@ fn exact_wire_ledger_and_journal_bytes_are_admitted() {
         .filter(|e| e.file_name().to_str().unwrap().starts_with("p-"))
         .map(|e| e.metadata().unwrap().len())
         .sum::<u64>();
-    let mut limits = PartialLimits::default();
-    limits.state_wire_bytes = wire as u32;
+    let mut limits = PartialLimits { state_wire_bytes: wire as u32, ..PartialLimits::default() };
     assert!(PartialState::load(&baseline.dir.path().join("state"), state.anchor(), &limits).is_ok());
     limits.state_wire_bytes -= 1;
     assert!(PartialState::load(&baseline.dir.path().join("state"), state.anchor(), &limits).is_err());

@@ -21,6 +21,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+type StoreHook = Arc<dyn Fn(usize) + Send + Sync>;
+
 #[derive(Default)]
 struct Store {
     value: Mutex<Option<StateAnchor>>,
@@ -28,7 +30,7 @@ struct Store {
     currents: std::sync::atomic::AtomicUsize,
     fail: Mutex<Option<(usize, bool)>>,
     observe: Mutex<Option<(usize, std::path::PathBuf, Vec<u8>)>>,
-    hook: Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
+    hook: Mutex<Option<StoreHook>>,
 }
 impl StateAnchorStore for Store {
     fn current(&self, _: &MemberKey) -> PartialResult<Option<StateAnchor>> {
@@ -37,10 +39,10 @@ impl StateAnchorStore for Store {
     }
     fn compare_exchange(&self, _: &MemberKey, expected: Option<&StateAnchor>, next: &StateAnchor) -> PartialResult<()> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        if let Some((at, path, expected)) = &*self.observe.lock().unwrap() {
-            if *at == call {
-                assert_eq!(&fs::read(path).unwrap(), expected, "output changed before intent acknowledgement");
-            }
+        if let Some((at, path, expected)) = &*self.observe.lock().unwrap()
+            && *at == call
+        {
+            assert_eq!(&fs::read(path).unwrap(), expected, "output changed before intent acknowledgement");
         }
         let callback = self.hook.lock().unwrap().clone();
         if let Some(callback) = callback {
@@ -442,7 +444,11 @@ fn crash_recovers_last_acknowledged_state() {
             },
         )
         .unwrap();
-        assert_eq!(file.remaining().unwrap(), if sequence == 3 { vec![] } else { vec![0..16] }, "{phase}");
+        assert_eq!(
+            file.remaining().unwrap(),
+            if sequence == 3 { vec![] } else { std::iter::once(0..16).collect::<Vec<_>>() },
+            "{phase}"
+        );
         let mut expected = vec![0; 16];
         expected[..written].copy_from_slice(&b"abcdefghijklmnop"[..written]);
         assert_eq!(fs::read(path.join("out/member.bin")).unwrap(), expected, "{phase}");
@@ -799,8 +805,7 @@ fn shared_crc_leaf_capacity_is_released_only_with_its_owner() {
     let second = Fixture::new();
     let usage = Usage::new(ProgressiveLimits::default());
     let exclusions = Arc::new(PartialExclusions::new(usage.clone()));
-    let mut limits = PartialLimits::default();
-    limits.crc_leaves = 1;
+    let limits = PartialLimits { crc_leaves: 1, ..PartialLimits::default() };
     let options = |f: &Fixture| CoreOptions {
         limits: limits.clone(),
         usage: usage.clone(),
@@ -866,8 +871,7 @@ fn state_file_aliases_are_excluded_until_acknowledged_retirement() {
 #[test]
 fn state_exclusion_capacity_precedes_mutation_effects() {
     let f = Fixture::new();
-    let mut progressive = ProgressiveLimits::default();
-    progressive.protection_paths = 8;
+    let progressive = ProgressiveLimits { protection_paths: 8, ..ProgressiveLimits::default() };
     let file = f.create_with(PartialLimits::default(), progressive, SessionControl::default()).unwrap();
     let bundle = f.dir.path().join("state").join(crate::partial::native::bundle_name(&f.member));
     let names = || {
@@ -890,8 +894,7 @@ fn state_exclusion_capacity_precedes_mutation_effects() {
 fn ambiguous_compaction_recovers_at_exact_shared_leaf_cap() {
     for persisted in [false, true] {
         let f = Fixture::new();
-        let mut limits = PartialLimits::default();
-        limits.crc_leaves = 1;
+        let limits = PartialLimits { crc_leaves: 1, ..PartialLimits::default() };
         let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
         file.core.write_original(0, b"abcd").unwrap();
         let prior = file.state().unwrap();
@@ -916,8 +919,7 @@ fn ambiguous_compaction_recovers_at_exact_shared_leaf_cap() {
 #[test]
 fn confirmed_uncertainty_anchor_survives_reconstruction_failure() {
     let f = Fixture::new();
-    let mut limits = PartialLimits::default();
-    limits.crc_leaves = 1;
+    let limits = PartialLimits { crc_leaves: 1, ..PartialLimits::default() };
     let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
     file.core.write_original(0, b"abcd").unwrap();
     *f.store.fail.lock().unwrap() = Some((5, true));
