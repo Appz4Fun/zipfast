@@ -81,7 +81,7 @@ impl HeaderParser {
                 if flags & 8 != 0 {
                     normalized |= MHFL_SOLID;
                 }
-                let main = MainHeader { flags: normalized, volume_number: 0 };
+                let main = MainHeader { flags: normalized, volume_number: 0, rar4_flags: Some(flags) };
                 self.rar4_main = Some(main.clone());
                 Block::Main(main)
             }
@@ -112,7 +112,11 @@ impl HeaderParser {
                         .framing("RAR4 end header fields", Error::Corrupt("RAR4 end header fields"))
                         .into());
                 }
-                Block::End { more_volumes: flags & 1 != 0 }
+                // EARC_VOLNUMBER: a 16-bit volume number after the optional data CRC.
+                let at = 7 + usize::from(flags & 2 != 0) * 4;
+                let volume_number =
+                    (flags & 8 != 0).then(|| u64::from(u16::from_le_bytes([header[at], header[at + 1]])));
+                Block::End { more_volumes: flags & 1 != 0, volume_number }
             }
             0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
             _ if flags & 0x4000 != 0 => Block::Unknown,

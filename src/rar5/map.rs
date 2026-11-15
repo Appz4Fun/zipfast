@@ -15,14 +15,15 @@
 // rights and limitations under the RPL.
 
 //! The RAR walker behind [`crate::map`]: drives the push parser over a map input and accumulates its own model,
-//! one [`MapMember`] per logical member and one [`MapPiece`] per part header.
+//! one [`MapMember`] per logical member and one [`MapPiece`] per part header. In single-volume mode it reads one
+//! volume of any position and lists its file headers as they are ([`VolumeMap`]).
 use super::framing::{HeaderParser, ParserStep, PhysicalFrame};
 use super::physical::{PhysicalMember, PhysicalPart, continuation_issue};
 use super::reader::Block;
 use super::{FileHeader, FileWire, MemberCrypt, RarFormat};
 use crate::map::{
     CipherParams, Got, MapChecks, MapEnd, MapError, MapFormat, MapInput, MapMember, MapMethod, MapOptions, MapPiece,
-    MemberMap, Opened, OutputMapping, read,
+    MemberMap, Opened, OutputMapping, VolumeEnd, VolumeMap, VolumeMember, Walked, read,
 };
 use crate::progressive::{FailureKind, ProgressiveFailure, Resource, SessionControl, Usage, VolumeRequest};
 use std::{
@@ -37,6 +38,32 @@ enum Phase {
     Open,
     Header,
 }
+
+/// What a single-volume walk has learned about its volume.
+#[derive(Default)]
+struct Single {
+    main_read: bool,
+    volume_number: Option<u32>,
+    first_volume: bool,
+    multi_volume: bool,
+    new_naming: bool,
+    has_next_volume: bool,
+    members: Vec<VolumeMember>,
+}
+
+/// What a member's header says, shared by both modes.
+struct Described {
+    name: Option<String>,
+    method: MapMethod,
+    cipher: Option<CipherParams>,
+    mapping: OutputMapping,
+    unpacked_size: Option<u64>,
+    unix_mode: Option<u32>,
+}
+
+/// RAR4 main header flags (`MHD_*`).
+const MHD_NEWNUMBERING: u16 = 0x0010;
+const MHD_FIRSTVOLUME: u16 = 0x0100;
 
 pub(crate) struct RarWalker {
     usage: Usage,
@@ -64,10 +91,12 @@ pub(crate) struct RarWalker {
     rar4_keys: Option<([u8; 8], [u8; 16], [u8; 16])>,
     members: Vec<MapMember>,
     open: Option<PhysicalMember>,
+    /// Single-volume mode: one volume, read without regard to its position.
+    single: Option<Box<Single>>,
 }
 
 impl RarWalker {
-    pub(crate) fn new(options: &MapOptions, usage: Usage) -> Self {
+    pub(crate) fn new(options: &MapOptions, usage: Usage, single: bool) -> Self {
         let chunk = options.limits.read_chunk.clamp(1, READ_CHUNK) as usize;
         Self {
             parser: HeaderParser::from_start(options.first_name.clone().into(), usage.clone()),
@@ -92,6 +121,7 @@ impl RarWalker {
             rar4_keys: None,
             members: Vec::new(),
             open: None,
+            single: single.then(Box::default),
         }
     }
 
@@ -109,9 +139,24 @@ impl RarWalker {
         MapError::from_failure(self.volume, failure)
     }
 
-    fn finish(&mut self, end: MapEnd) -> MemberMap {
-        MemberMap {
-            format: if self.format == Some(RarFormat::Rar4) { MapFormat::Rar4 } else { MapFormat::Rar5 },
+    /// The archive format: the main header's, or the signature's when no main header was read. A walk finishes
+    /// only after the signature has been found.
+    fn map_format(&self) -> MapFormat {
+        match self.format.unwrap_or_else(|| self.parser.format()) {
+            RarFormat::Rar4 => MapFormat::Rar4,
+            RarFormat::Rar5 => MapFormat::Rar5,
+        }
+    }
+
+    fn finish(&mut self, end: MapEnd) -> Walked {
+        if self.single.is_some() {
+            return self.finish_volume(match end {
+                MapEnd::Truncated { offset, .. } => VolumeEnd::Truncated { offset },
+                _ => VolumeEnd::Complete,
+            });
+        }
+        Walked::Map(MemberMap {
+            format: self.map_format(),
             header_encrypted: self.header_encrypted.unwrap_or(false),
             header_cipher: self.header_cipher.clone(),
             complete: end == MapEnd::Complete,
@@ -121,10 +166,28 @@ impl RarWalker {
                 _ => self.volume + 1,
             },
             members: std::mem::take(&mut self.members),
-        }
+        })
     }
 
-    pub(crate) fn poll(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
+    fn finish_volume(&mut self, end: VolumeEnd) -> Walked {
+        let single = self.single.take().expect("single-volume mode");
+        Walked::Volume(VolumeMap {
+            format: self.map_format(),
+            main_read: single.main_read,
+            volume_number: single.volume_number,
+            first_volume: single.first_volume,
+            multi_volume: single.multi_volume,
+            new_naming: single.new_naming,
+            has_next_volume: single.has_next_volume,
+            solid: self.solid_archive.unwrap_or(false),
+            header_encrypted: self.header_encrypted.unwrap_or(false),
+            header_cipher: self.header_cipher.clone(),
+            end,
+            members: single.members,
+        })
+    }
+
+    pub(crate) fn poll(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<Walked, MapError>> {
         match self.poll_inner(input, cx) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(map)) => Poll::Ready(Ok(map)),
@@ -132,7 +195,7 @@ impl RarWalker {
         }
     }
 
-    fn poll_inner(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Result<Poll<MemberMap>, MapError> {
+    fn poll_inner(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Result<Poll<Walked>, MapError> {
         loop {
             if self.control.is_canceled() {
                 return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
@@ -159,7 +222,9 @@ impl RarWalker {
                     let (_, step) = self.parser.advance(&[]).map_err(|e| self.fail(e))?;
                     let (offset, len) = match step {
                         ParserStep::LegacyKeyRequired { salt } => {
-                            self.legacy_keys(salt)?;
+                            if let Some(walked) = self.legacy_keys(salt)? {
+                                return Ok(Poll::Ready(walked));
+                            }
                             continue;
                         }
                         ParserStep::Need { offset, len } => (offset, len),
@@ -179,9 +244,13 @@ impl RarWalker {
                         }
                         Got::Hole => return Err(MapError::HeaderHole { volume: self.volume, offset }),
                         Got::Eof => {
-                            if self.unproven {
-                                // A wrong key turns the first encrypted header's size into noise that usually runs
-                                // past the end; a volume cut inside that header cannot be told apart from it.
+                            // A wrong key turns the first encrypted header's size into noise that usually runs past
+                            // the end; a volume cut inside that header looks the same. Whole-archive walks call it a
+                            // wrong password. Single-volume walks, whose input is often a prefix, call it a cut
+                            // unless the decrypted start of the header is not a header a volume can hold there.
+                            if self.unproven
+                                && (self.single.is_none() || self.parser.encrypted_start_plausible() == Some(false))
+                            {
                                 return Err(MapError::WrongPassword);
                             }
                             if self.parser.scanning() {
@@ -209,11 +278,16 @@ impl RarWalker {
     /// Feeds `count` buffered bytes read at `offset`. A chunk read during the signature scan can run past what
     /// the parser needs next; the rest is fed on while the parser keeps asking for the very next byte, and dropped
     /// once it skips ahead (over member data).
-    fn feed(&mut self, offset: u64, count: usize) -> Result<Option<MemberMap>, MapError> {
+    fn feed(&mut self, offset: u64, count: usize) -> Result<Option<Walked>, MapError> {
         let mut at = 0;
         loop {
+            let scanning = self.parser.scanning();
             let (used, step) = self.parser.advance(&self.buffer[at..count]).map_err(|e| self.fail(e))?;
             at += used;
+            if scanning && !self.parser.scanning() {
+                // The signature is behind us: the first header starts where it ends.
+                self.header_start = Some(self.parser.header_offset());
+            }
             let progressed = used > 0 || matches!(step, ParserStep::Frame(_) | ParserStep::LegacyKeyRequired { .. });
             match step {
                 ParserStep::Frame(frame) => {
@@ -222,7 +296,11 @@ impl RarWalker {
                         return Ok(Some(map));
                     }
                 }
-                ParserStep::LegacyKeyRequired { salt } => self.legacy_keys(salt)?,
+                ParserStep::LegacyKeyRequired { salt } => {
+                    if let Some(walked) = self.legacy_keys(salt)? {
+                        return Ok(Some(walked));
+                    }
+                }
                 ParserStep::Need { .. } | ParserStep::End => {}
             }
             if at == count || !matches!(self.phase, Phase::Header) {
@@ -241,23 +319,31 @@ impl RarWalker {
         }
     }
 
-    fn legacy_keys(&mut self, salt: [u8; 8]) -> Result<(), MapError> {
+    /// Supplies the RAR4 header key for `salt`. Returns the finished map when a single-volume walk has no password.
+    fn legacy_keys(&mut self, salt: [u8; 8]) -> Result<Option<Walked>, MapError> {
+        if self.header_cipher.is_none() {
+            self.header_cipher = Some(CipherParams::Rar4 { salt });
+        }
         let (key, iv) = match self.rar4_keys {
             Some((cached, key, iv)) if cached == salt => (key, iv),
             _ => {
-                let password = self.password.as_deref().filter(|p| !p.is_empty()).ok_or(MapError::PasswordRequired)?;
+                let Some(password) = self.password.as_deref().filter(|p| !p.is_empty()) else {
+                    if self.single.is_some() {
+                        // The salt that precedes the header has been read; the header starts at the salt.
+                        let offset = self.header_start.unwrap_or(0);
+                        return Ok(Some(self.finish_volume(VolumeEnd::Locked { offset })));
+                    }
+                    return Err(MapError::PasswordRequired);
+                };
                 let (key, iv) = super::member::controlled_legacy_keys(password, &salt, &self.usage, &self.control)
                     .map_err(|e| MapError::from_failure(self.volume, e))?;
                 self.rar4_keys = Some((salt, key, iv));
                 (key, iv)
             }
         };
-        if self.header_cipher.is_none() {
-            self.header_cipher = Some(CipherParams::Rar4 { salt });
-        }
         self.parser.set_legacy_keys(&key, iv).map_err(|e| self.fail(e))?;
         self.unproven = !self.proven;
-        Ok(())
+        Ok(None)
     }
 
     fn header_keys(&mut self, params: crate::crypto::Rar5CryptParams) -> Result<(), MapError> {
@@ -284,7 +370,7 @@ impl RarWalker {
     }
 
     /// Accounts one frame. Returns the finished map at the archive's last end header.
-    fn frame(&mut self, frame: PhysicalFrame) -> Result<Option<MemberMap>, MapError> {
+    fn frame(&mut self, frame: PhysicalFrame) -> Result<Option<Walked>, MapError> {
         // Keys are supplied after the frame that calls for them, so any frame seen while unproven decrypted.
         if self.unproven {
             self.unproven = false;
@@ -308,6 +394,11 @@ impl RarWalker {
                         keyed_checks: params.tweaked_crc,
                     });
                 }
+                // An empty password is no password, as for RAR4.
+                if self.single.is_some() && self.password.as_deref().is_none_or(str::is_empty) {
+                    self.header_encrypted = Some(true);
+                    return Ok(Some(self.finish_volume(VolumeEnd::Locked { offset: frame.extent.end })));
+                }
                 self.header_keys(params)?;
             }
             Block::Main(main) => {
@@ -321,7 +412,12 @@ impl RarWalker {
                     return Err(self.malformed("volume header encryption changed"));
                 }
                 self.header_encrypted = Some(encrypted);
-                if self.main_seen
+                if self.single.is_some() {
+                    if self.main_seen {
+                        return Err(self.malformed("duplicate main header"));
+                    }
+                    self.single_main(format, &main)?;
+                } else if self.main_seen
                     || (main.flags & super::MHFL_VOLNUMBER != 0 && main.volume_number != u64::from(self.volume))
                     || (self.volume > 0 && !main.is_volume())
                     || self.volume_set.is_some_and(|v| v != main.is_volume())
@@ -340,11 +436,32 @@ impl RarWalker {
                     return Err(self.malformed("member before main"));
                 }
                 let wire = frame.wire.ok_or_else(|| self.malformed("missing member wire identity"))?;
-                self.file(header, frame.crypt, wire)?;
+                if self.single.is_some() {
+                    self.volume_file(header, frame.crypt, wire)?;
+                } else {
+                    self.file(header, frame.crypt, wire)?;
+                }
             }
-            Block::End { more_volumes } => {
+            Block::End { more_volumes, volume_number } => {
                 if !self.main_seen {
                     return Err(self.malformed("end before main"));
+                }
+                if self.single.is_some() {
+                    let number =
+                        volume_number.map(u32::try_from).transpose().map_err(|_| self.malformed("volume number"))?;
+                    let single = self.single.as_mut().expect("single-volume mode");
+                    single.has_next_volume = more_volumes;
+                    // Only a volume of a set has a meaningful number; a stray one in a non-volume archive is ignored.
+                    if let Some(number) = number.filter(|_| single.multi_volume) {
+                        // RAR 2.x first volumes lack MHD_FIRSTVOLUME: a number of 0 makes the volume first. A first
+                        // volume numbered otherwise contradicts itself.
+                        if single.first_volume && number != 0 {
+                            return Err(self.malformed("first volume with a nonzero volume number"));
+                        }
+                        single.volume_number = Some(number);
+                        single.first_volume = number == 0;
+                    }
+                    return Ok(Some(self.finish_volume(VolumeEnd::Complete)));
                 }
                 if more_volumes {
                     self.volume = self.volume.checked_add(1).ok_or_else(|| {
@@ -409,6 +526,132 @@ impl RarWalker {
         }
     }
 
+    /// Name, method, cipher and output mapping of a member as its header states them. Charges `owner` bytes plus
+    /// the names as metadata.
+    fn describe(
+        &self,
+        header: &FileHeader,
+        wire: &FileWire,
+        params: Option<&crate::crypto::Rar5CryptParams>,
+        owner: usize,
+    ) -> Result<Described, MapError> {
+        let name = match header.format {
+            RarFormat::Rar5 => String::from_utf8(wire.name.to_vec()).ok(),
+            RarFormat::Rar4 => Some(header.name.clone()),
+        };
+        self.charge(Resource::MetadataBytes, (owner + wire.name.len() + name.as_ref().map_or(0, String::len)) as u64)?;
+        let stored = header.method == 0;
+        let method = if stored {
+            MapMethod::Stored
+        } else {
+            MapMethod::Compressed { id: header.rar4.map_or(u16::from(header.method), |r| u16::from(r.method)) }
+        };
+        let cipher = if let Some(params) = params {
+            Some(CipherParams::Rar5 {
+                kdf_count: params.kdf_count,
+                salt: params.salt,
+                iv: Some(params.iv),
+                check: params.check,
+                keyed_checks: params.tweaked_crc,
+            })
+        } else {
+            // As the extractor admits it: only version 29 with a salt is AES-128-CBC.
+            wire.legacy.and_then(|w| w.crypt).map(|crypt| match super::LegacyCrypt::stored_salt(Some(crypt)) {
+                Ok(salt) => CipherParams::Rar4 { salt },
+                Err(_) => CipherParams::Rar4Legacy { unpack_version: crypt.version, salt: crypt.salt },
+            })
+        };
+        let cbc = matches!(cipher, Some(CipherParams::Rar5 { .. } | CipherParams::Rar4 { .. }));
+        let mapping = match (stored, header.encrypted) {
+            (false, _) => OutputMapping::None,
+            (true, false) => OutputMapping::Direct,
+            (true, true) if cbc => OutputMapping::CbcBlocks,
+            (true, true) => OutputMapping::None,
+        };
+        Ok(Described {
+            name,
+            method,
+            cipher,
+            mapping,
+            unpacked_size: (!header.size_unknown()).then_some(header.unpacked_size),
+            unix_mode: header.is_unix().then_some((header.attributes & 0xffff_ffff) as u32),
+        })
+    }
+
+    /// Records a single-volume walk's main header facts. The volume's position is reported, never checked.
+    fn single_main(&mut self, format: RarFormat, main: &super::MainHeader) -> Result<(), MapError> {
+        let volume_number = match format {
+            RarFormat::Rar5 if main.flags & super::MHFL_VOLNUMBER != 0 => {
+                Some(u32::try_from(main.volume_number).map_err(|_| self.malformed("volume number"))?)
+            }
+            // Only the first volume leaves the number out.
+            RarFormat::Rar5 => Some(0),
+            RarFormat::Rar4 => None,
+        };
+        let rar4 = main.rar4_flags.unwrap_or(0);
+        let single = self.single.as_mut().expect("single-volume mode");
+        single.main_read = true;
+        single.multi_volume = main.is_volume();
+        match format {
+            RarFormat::Rar5 => {
+                single.volume_number = volume_number;
+                single.first_volume = volume_number == Some(0);
+                single.new_naming = true;
+            }
+            RarFormat::Rar4 => {
+                single.first_volume = !main.is_volume() || rar4 & MHD_FIRSTVOLUME != 0;
+                single.volume_number = single.first_volume.then_some(0);
+                single.new_naming = rar4 & MHD_NEWNUMBERING != 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists one file header of a single-volume walk as it is: no continuation is matched against anything.
+    fn volume_file(&mut self, header: FileHeader, crypt: MemberCrypt, wire: FileWire) -> Result<(), MapError> {
+        let params = match crypt {
+            Some(Err(error)) => return Err(self.crypt_error(error)),
+            Some(Ok(params)) => Some(params),
+            None => None,
+        };
+        let part = PhysicalPart::new(0, &header, crypt, &wire);
+        self.charge(Resource::Parts, 1)?;
+        self.charge(Resource::Entries, 1)?;
+        let Described { name, method, cipher, mapping, unpacked_size, unix_mode } =
+            self.describe(&header, &wire, params.as_ref(), std::mem::size_of::<VolumeMember>())?;
+        let part_checks =
+            MapChecks { crc32: part.checks.crc32, blake2sp: part.checks.blake2sp, keyed: part.checks.keyed };
+        let packed = part.data_offset
+            ..part.data_offset.checked_add(part.packed_size).ok_or_else(|| self.malformed("data size"))?;
+        let member = VolumeMember {
+            raw_name: wire.name.to_vec(),
+            name,
+            is_dir: header.is_dir(),
+            unpacked_size,
+            packed_size: part.packed_size,
+            packed,
+            header: wire.extent.clone(),
+            split_before: header.split_before(),
+            split_after: header.split_after(),
+            method,
+            mapping,
+            solid: header.solid,
+            encrypted: header.encrypted,
+            cipher,
+            part_checks,
+            checks: part.final_part.then_some(part_checks),
+            mtime: header.mtime.map(|s| (s, header.mtime_nanos)),
+            attributes: header.attributes,
+            unix_mode,
+        };
+        let members = &mut self.single.as_mut().expect("single-volume mode").members;
+        if members.try_reserve(1).is_err() {
+            return Err(self.malformed("member allocation"));
+        }
+        members.push(member);
+        Ok(())
+    }
+
     fn file(&mut self, header: FileHeader, crypt: MemberCrypt, wire: FileWire) -> Result<(), MapError> {
         let params = match crypt {
             Some(Err(error)) => return Err(self.crypt_error(error)),
@@ -465,46 +708,10 @@ impl RarWalker {
             return Err(self.malformed("orphan continuation"));
         }
         self.charge(Resource::Entries, 1)?;
-        let name = match header.format {
-            RarFormat::Rar5 => String::from_utf8(wire.name.to_vec()).ok(),
-            RarFormat::Rar4 => Some(header.name.clone()),
-        };
-        self.charge(
-            Resource::MetadataBytes,
-            (std::mem::size_of::<MapMember>() + wire.name.len() + name.as_ref().map_or(0, String::len)) as u64,
-        )?;
-        let stored = header.method == 0;
-        let method = if stored {
-            MapMethod::Stored
-        } else {
-            MapMethod::Compressed { id: header.rar4.map_or(u16::from(header.method), |r| u16::from(r.method)) }
-        };
-        let cipher = if let Some(params) = params {
-            Some(CipherParams::Rar5 {
-                kdf_count: params.kdf_count,
-                salt: params.salt,
-                iv: Some(params.iv),
-                check: params.check,
-                keyed_checks: params.tweaked_crc,
-            })
-        } else {
-            // As the extractor admits it: only version 29 with a salt is AES-128-CBC.
-            wire.legacy.and_then(|w| w.crypt).map(|crypt| match super::LegacyCrypt::stored_salt(Some(crypt)) {
-                Ok(salt) => CipherParams::Rar4 { salt },
-                Err(_) => CipherParams::Rar4Legacy { unpack_version: crypt.version, salt: crypt.salt },
-            })
-        };
+        let Described { name, method, cipher, mapping, unpacked_size, unix_mode } =
+            self.describe(&header, &wire, params.as_ref(), std::mem::size_of::<MapMember>())?;
         let encrypted = header.encrypted;
-        let cbc = matches!(cipher, Some(CipherParams::Rar5 { .. } | CipherParams::Rar4 { .. }));
-        let mapping = match (stored, encrypted) {
-            (false, _) => OutputMapping::None,
-            (true, false) => OutputMapping::Direct,
-            (true, true) if cbc => OutputMapping::CbcBlocks,
-            (true, true) => OutputMapping::None,
-        };
-        let unpacked_size = (!header.size_unknown()).then_some(header.unpacked_size);
         let out = mapping.out_of(0..part.packed_size, unpacked_size);
-        let unix_mode = header.is_unix().then_some((header.attributes & 0xffff_ffff) as u32);
         let member = MapMember {
             ordinal: self.members.len() as u64,
             raw_name: wire.name.to_vec(),

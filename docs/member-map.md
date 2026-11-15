@@ -34,7 +34,7 @@ How a walk ends is `MemberMap::end`:
 |---|---|
 | `Complete` | the archive's last end header was read (`complete: true`) |
 | `MissingVolume { volume }` | the volume source answered `Missing`, or the memory slice ended, after volume 0 |
-| `Truncated { volume, offset }` | the volume ended before its headers did; `offset` is the start of the header being read; pieces already announced are listed even when their data lies past the end |
+| `Truncated { volume, offset }` | the volume ended before its headers did; `offset` is the start of the header being read (the end of the signature when the bytes end inside the main header); pieces already announced are listed even when their data lies past the end |
 
 Failures are `MapError`: `NotArchive`, `MissingFirstVolume`, `PasswordRequired`, `WrongPassword`,
 `HeaderHole { volume, offset }` (a `RangeRead::Hole` inside header bytes; holes in member data are never reached),
@@ -77,6 +77,62 @@ encrypted members' checks are keyed with the password (`MapChecks::keyed`).
 - `WinZipAes { strength, vendor_version, salt, verifier }`: read from the first bytes of the entry's data. An entry
   is WinZip AES when its method is 99 or it has an AES extra field, as the extractor decides; one without a valid
   extra field gets `cipher: None` and `mapping: None`.
+
+## Single-volume maps
+
+`MemberMap::from_volume(bytes, MapOptions::new(name))` reads the headers of one RAR volume on its own: any volume of
+a set (a `.part07.rar`, or an obfuscated file that is really volume 12), or only its first bytes (a single Usenet
+article). `VolumeMapBuilder::new(range_source, options)` is the pollable form over one `progressive::RangeSource`:
+`poll_map(cx)` returns `Pending` on `RangeRead::NotYet` and retries the parked read with the same length; a hole in
+header bytes is `HeaderHole { volume: 0, .. }`; the source's current length is where the volume ends.
+
+Volume 0 is not needed. The volume's position is reported, never checked: the main header's volume number is not
+compared with anything, and a member that continues from an earlier volume is listed as it is instead of being
+matched against that volume's part. RAR 4.x and RAR 5.0 volumes are read, behind a self-extracting stub too; ZIP is
+`NotArchive`. `MapOptions` limits, budgets and cancellation apply as for whole-archive maps, and the volume in
+`MapError` variants is 0.
+
+`VolumeMap`:
+
+| field | meaning |
+|---|---|
+| `format` | `Rar4` or `Rar5`, from the signature when the main header was not read |
+| `main_read` | the main header was read; false for a `Locked` RAR 5.0 volume and bytes that end inside the main header, where the facts below are defaults |
+| `volume_number` | zero-based. RAR 5.0: the main header's volume number, 0 when it records none (only the first volume omits it). RAR 4.x: the end header's number (`EARC_VOLNUMBER`) when the end header is read and records one, else 0 for a first volume and None otherwise. A non-volume archive is volume 0 |
+| `first_volume` | the first volume, or a single-volume archive. RAR 4.x: `MHD_FIRSTVOLUME` (written since RAR 3.0) or an end-header number of 0. RAR 2.x first volumes lack `MHD_FIRSTVOLUME`, so a prefix of one that stops before the end header reports `first_volume: false` and `volume_number: None`. A main header claiming the first volume with an end header numbering it otherwise is `Malformed` |
+| `multi_volume` | the main header's volume flag |
+| `new_naming` | `.partNN.rar` naming: always true for RAR 5.0, RAR 4.x `MHD_NEWNUMBERING` (false means `.rar`, `.r00`, `.r01`, ...) |
+| `has_next_volume` | the end header's "not last volume" flag; false when the end header was not reached |
+| `solid`, `header_encrypted`, `header_cipher` | as the main header and encryption header state them |
+| `end` | `Complete` (the end header was read), `Truncated { offset }` or `Locked { offset }` |
+| `members` | one `VolumeMember` per file header, in volume order; service headers are not listed |
+
+Truncation is normal. Bytes that end inside member data or inside a header give `Truncated { offset }`, where
+`offset` is the start of the header being read; it lies past the end of the bytes when the last listed member's data
+does. A member whose header was read is listed with its declared packed size and data offsets even when its data
+runs past the end.
+
+Encrypted headers (`-hp`): with a password, headers decrypt as for `from_memory`, and a wrong password is
+`WrongPassword` where it can be told. A single-volume map treats bytes that end inside the first encrypted header as
+a cut, not a wrong password, since prefixes are its normal input: it reports `Truncated` unless the header's first
+decrypted block is not a header that can stand there (RAR 4.x: a file, service or end header; RAR 5.0: a main,
+file, service or end header), which is `WrongPassword`. RAR 5.0 headers with a password check value are proven
+before any header is read. **Without a check value (always for RAR 4.x), a wrong password is missed** when the bytes
+end within the first 16 bytes of ciphertext of that header, or, about once in a hundred, when the noise passes for a
+header type; the map is then `Truncated` with no members. Any complete header that fails its checksum is
+`WrongPassword`. Without a password (`None` or empty) the walk stops at the first encrypted header
+with `Locked { offset }`, `header_encrypted: true`, the header cipher parameters and no members, instead of
+`PasswordRequired`. RAR 5.0 encrypts the main header too, so a locked RAR 5.0 volume has `main_read: false` and no
+volume facts; RAR 4.x keeps its main header in the clear, so its facts are known. Members whose data is encrypted
+but whose headers are not are listed with their `cipher`.
+
+`VolumeMember` carries `raw_name` and `name`, `is_dir`, `unpacked_size` (every part header records the whole
+member's), `packed_size` and `packed` (this part's data bytes in this volume), `header` (the header's wire extent),
+`split_before` (continues from the previous volume), `split_after` (continues in the next), `method`, `mapping`,
+`solid`, `encrypted`, `cipher`, `part_checks` (as stored in this header: of this part's packed bytes when it has
+`split_after`, of the member's output otherwise), `checks` (the member's final checks: `Some(part_checks)` exactly
+on its last part), `mtime`, `attributes` and `unix_mode`. Where a continuation part falls in the member's packed
+stream depends on earlier volumes; a whole-archive map gives that as `MapPiece::stream_offset`.
 
 ## Output offsets and restart points
 

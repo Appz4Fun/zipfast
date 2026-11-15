@@ -37,6 +37,8 @@ pub enum Block {
     Service(FileHeader),
     End {
         more_volumes: bool,
+        /// The volume number a RAR4 end header records (`EARC_VOLNUMBER`). RAR 5.0 keeps it in the main header.
+        volume_number: Option<u64>,
     },
     /// Headers from here on are encrypted.
     Crypt,
