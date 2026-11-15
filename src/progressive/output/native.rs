@@ -360,6 +360,10 @@ impl NativeProtection {
         usage: &mut Usage,
         external_handles: usize,
     ) -> ProgressiveResult<()> {
+        // Extension rebuilds the bindings in canonical order, so cached binding positions may now name other files.
+        for immutable in &mut self.immutable {
+            immutable.slot = None;
+        }
         if !self.complete {
             // Nothing is bound yet; the refresh binds `new` whole.
             return Ok(());

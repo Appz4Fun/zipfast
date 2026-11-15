@@ -158,8 +158,15 @@ impl Verification {
         // expected CRC is the same check; reuse its result instead of combining
         // every leaf a second time.
         let whole = 0..snapshot.head.size;
+        // Only a part check that actually ran can stand in for the member check: encrypted parts are never
+        // checked on plaintext (their result is Missing), so they must not short-circuit the member CRC.
         let same = parts.iter().zip(&snapshot.evidence.parts).find(|(check, part)| {
-            part.final_part && key.is_none() && check.range == whole && part.crc32 == snapshot.head.checks.crc32
+            part.final_part
+                && key.is_none()
+                && snapshot.crypt.is_none()
+                && matches!(check.crc32, CheckResult::Passed | CheckResult::Failed)
+                && check.range == whole
+                && part.crc32 == snapshot.head.checks.crc32
         });
         let member_crc = if password_required {
             CheckResult::Missing
@@ -184,6 +191,10 @@ impl Verification {
             _lease: lease,
             _metadata: metadata,
         })
+    }
+    #[cfg(test)]
+    pub(super) fn member_crc(&self) -> &CheckResult {
+        &self.member_crc
     }
     pub fn needs_verification(&self) -> bool {
         self.password_required

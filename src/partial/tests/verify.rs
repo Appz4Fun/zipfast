@@ -360,3 +360,28 @@ fn per_write_scratch_is_released_and_part_checks_are_reused() {
     // Hash each byte into a leaf, combine part 0 once and the final part once.
     assert!(late[2] <= 3 * f.data.len() as u64, "VerifyWorkBytes {}", late[2]);
 }
+
+// Catches the member CRC being taken from a final-part check that never ran (encrypted parts are not checked
+// on plaintext), which let corrupt output of an encrypted member without tweaked CRCs verify.
+#[test]
+fn encrypted_member_crc_is_not_taken_from_an_unrun_part_check() {
+    let f = Fixture::new(33, false, true, false);
+    let mut file = f.create();
+    f.hole(&file, 0..33);
+    f.finish_missing_member(&file);
+    let mut data = f.data.clone();
+    data[20] ^= 1;
+    file.fill(0, &data).unwrap();
+    let op = file.core.operation().unwrap();
+    let (mut snapshot, _lease) = file.core.clone_snapshot(&op.snapshot).unwrap();
+    drop(op);
+    snapshot.crypt = Some(crate::crypto::Rar5CryptParams {
+        kdf_count: 1,
+        salt: [0; 16],
+        iv: [0; 16],
+        check: None,
+        tweaked_crc: false,
+    });
+    let checks = crate::partial::verify::Verification::new(&snapshot, &file.core.budget, None).unwrap();
+    assert_eq!(checks.member_crc(), &CheckResult::Failed);
+}

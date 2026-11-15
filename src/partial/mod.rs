@@ -1142,7 +1142,8 @@ impl PartialCore {
             e
         })
     }
-    /// Intent and commit copies for one transaction; keep the lease until it finishes.
+    /// Intent and commit copies for one transaction; keep the lease until it finishes. If the transaction fails, the
+    /// copies kept in `uncertain` for reconciliation are uncharged until it runs (one transaction's worth, bounded).
     fn next_snapshots(&self, data: &CoreData) -> PartialResult<(Snapshot, Snapshot, Lease)> {
         let (mut intent, mut lease) = self.clone_snapshot(&data.snapshot)?;
         intent.head.sequence = intent.head.sequence.checked_add(1).ok_or_else(malformed)?;
