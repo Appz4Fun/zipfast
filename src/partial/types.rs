@@ -126,6 +126,18 @@ pub struct HoleReport {
     pub packed: Vec<PackedSpan>,
     pub cause: HoleCause,
 }
+/// What a session made of damage declared with `ProgressiveSession::declare_hole`.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct DamageReceipt {
+    /// Output that was already written from the damaged bytes and is now a `DeclaredBad` hole, per member.
+    pub holes: Vec<HoleReport>,
+    /// Damaged bytes not read yet. They are answered as holes when reached and reported then as
+    /// `ProgressiveEvent::Hole` with cause `DeclaredBad`.
+    pub pending: Vec<PackedSpan>,
+    /// Damaged bytes already read that map to no persistent output, such as headers or padding.
+    pub unmapped: Vec<PackedSpan>,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberChecks {
     pub size: u64,

@@ -470,7 +470,7 @@ pub(super) fn page_bytes(kind: PageKind, payload: &[u8]) -> PartialResult<Vec<u8
     e.blob(payload)?;
     Ok(e.bytes)
 }
-fn page_payload(kind: PageKind, bytes: &[u8]) -> PartialResult<&[u8]> {
+pub(super) fn page_payload(kind: PageKind, bytes: &[u8]) -> PartialResult<&[u8]> {
     let mut d = Decoder::new(bytes);
     if d.take(8)? != MAGIC || d.u16()? != 1 || d.u8()? != kind as u8 {
         return Err(malformed());
@@ -553,6 +553,15 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             validity.u32(p.volume)?;
             validity.range(&p.range)?;
         }
+    }
+    // Trailing cause section; states written before it decode every hole as Missing.
+    for h in &snapshot.holes {
+        validity.u8(match h.cause {
+            HoleCause::Missing => 0,
+            HoleCause::DeclaredBad => 1,
+            HoleCause::CipherNeighbour => 2,
+            HoleCause::HeaderLost => 3,
+        })?;
     }
     let mut headers = Encoder::budgeted(budget.limits.ledger_bytes as usize, budget);
     headers.u32(snapshot.evidence.headers.len().try_into().map_err(|_| malformed())?)?;
@@ -714,6 +723,17 @@ pub(super) fn decode_pages(
             packed,
             cause: HoleCause::Missing,
         });
+    }
+    if d.at < d.bytes.len() {
+        for hole in &mut holes {
+            hole.cause = match d.u8()? {
+                0 => HoleCause::Missing,
+                1 => HoleCause::DeclaredBad,
+                2 => HoleCause::CipherNeighbour,
+                3 => HoleCause::HeaderLost,
+                _ => return Err(malformed()),
+            };
+        }
     }
     d.end()?;
     let mut d = Decoder::new(&buffers[2]);

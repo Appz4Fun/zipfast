@@ -584,3 +584,35 @@ fn reopened_unknown_empty_fills_allow_zero_read_chunk() {
     assert_eq!(f.store.calls.load(Ordering::SeqCst), calls);
     assert_eq!(fs::read(f.output()).unwrap(), output);
 }
+// Declared damage is recorded with its cause, and pages written before causes were stored decode as Missing.
+#[test]
+fn declared_damage_persists_cause_and_legacy_pages_decode_as_missing() {
+    use crate::partial::state::{self, PageKind};
+    let f = Fixture::new(65_537, true, true, false);
+    let file = f.create();
+    file.core.write_original(0, &f.data).unwrap();
+    let part = f.evidence.parts[1].clone();
+    let damaged = part.packed.range.start + 2..part.packed.range.start + 5;
+    let (reports, mapped) = file.core.declare_damage(part.packed.volume, &damaged).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].out, part.out.start + 2..part.out.start + 5);
+    assert!(matches!(reports[0].cause, HoleCause::DeclaredBad));
+    assert_eq!(mapped, vec![damaged.clone()]);
+    assert_eq!(file.remaining().unwrap(), vec![part.out.start + 2..part.out.start + 5]);
+    let op = file.core.operation().unwrap();
+    let pages = state::encode_pages(&op.snapshot, &file.core.budget).unwrap();
+    let decoded = state::decode_pages(op.snapshot.head.clone(), pages.clone(), &file.core.budget, &[]).unwrap();
+    assert!(matches!(decoded.holes[..], [HoleReport { cause: HoleCause::DeclaredBad, .. }]));
+    let legacy = pages
+        .into_iter()
+        .map(|(kind, bytes)| {
+            if kind != PageKind::Validity {
+                return (kind, bytes);
+            }
+            let payload = state::page_payload(kind, &bytes).unwrap();
+            (kind, state::page_bytes(kind, &payload[..payload.len() - op.snapshot.holes.len()]).unwrap())
+        })
+        .collect();
+    let decoded = state::decode_pages(op.snapshot.head.clone(), legacy, &file.core.budget, &[]).unwrap();
+    assert!(matches!(decoded.holes[..], [HoleReport { cause: HoleCause::Missing, .. }]));
+}

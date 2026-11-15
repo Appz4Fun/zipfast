@@ -19,6 +19,7 @@ use super::*;
 use crate::partial::*;
 use crate::rar5::member::RecoverySink;
 use crate::rar5::unpack::Sink;
+use std::ops::Range;
 
 pub(super) struct Persistent {
     options: PartialOptions,
@@ -109,6 +110,56 @@ impl ProgressiveSession {
             .and_then(|p| p.cores.iter().find(|(key, _)| key == member))
             .map(|(_, core)| PartialFile::from_core(core.clone()))
             .ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))
+    }
+    /// Declares archive bytes `range` of zero-based `volume` damaged, at any time, including bytes already
+    /// extracted (for example when an article's yEnc CRC turns out wrong after it was consumed).
+    ///
+    /// Output already written from those bytes becomes `DeclaredBad` holes in each affected member, returned in
+    /// the receipt; finished members stay fillable through their `PartialFile` and verify again once filled.
+    /// Bytes not read yet are answered as holes when the session reaches them. Damage on bytes the session
+    /// has not read yet must not cover a member header; lost-header recovery is not supported yet.
+    pub fn declare_hole(&mut self, volume: u32, range: Range<u64>) -> ProgressiveResult<DamageReceipt> {
+        if self.partial.is_none() || range.is_empty() {
+            return Err(error(PartialErrorKind::InvalidOptions));
+        }
+        let (index, cursor) = self.driver.position();
+        let split = match volume.cmp(&index) {
+            std::cmp::Ordering::Less => range.end,
+            std::cmp::Ordering::Equal => range.end.min(cursor).max(range.start),
+            std::cmp::Ordering::Greater => range.start,
+        };
+        let read = range.start..split;
+        let future = split..range.end;
+        if !future.is_empty() {
+            self.driver.declare_future(volume, future.clone())?;
+        }
+        let mut holes = Vec::new();
+        let mut mapped = Vec::new();
+        if !read.is_empty() {
+            for (_, core) in &self.partial.as_ref().unwrap().cores {
+                let (reports, ranges) = core.declare_damage(volume, &read).map_err(failure)?;
+                self.usage.charge(
+                    Resource::MetadataBytes,
+                    (reports.len() * std::mem::size_of::<HoleReport>() + ranges.len() * 16) as u64,
+                )?;
+                holes.extend(reports);
+                mapped.extend(ranges);
+            }
+        }
+        mapped.sort_by_key(|r: &Range<u64>| r.start);
+        let mut unmapped = Vec::new();
+        let mut at = read.start;
+        for r in mapped {
+            if r.start > at {
+                unmapped.push(PackedSpan { volume, range: at..r.start });
+            }
+            at = at.max(r.end);
+        }
+        if at < read.end {
+            unmapped.push(PackedSpan { volume, range: at..read.end });
+        }
+        let pending = if future.is_empty() { Vec::new() } else { vec![PackedSpan { volume, range: future }] };
+        Ok(DamageReceipt { holes, pending, unmapped })
     }
     pub(super) fn partial_header(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<()> {
         if header.format != crate::rar5::RarFormat::Rar5 {
@@ -243,7 +294,11 @@ impl ProgressiveSession {
                 name: Arc::from(self.model.members.last().unwrap().header.name.as_bytes()),
                 out: self.produced..self.produced + count as u64,
                 packed: vec![PackedSpan { volume: self.volume, range: packed..packed + count as u64 }],
-                cause: HoleCause::Missing,
+                cause: if self.driver.declared_covers(self.volume, &(packed..packed + count as u64)) {
+                    HoleCause::DeclaredBad
+                } else {
+                    HoleCause::Missing
+                },
             })
         } else {
             None

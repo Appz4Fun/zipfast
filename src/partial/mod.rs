@@ -700,7 +700,7 @@ impl PartialCore {
         self.reconcile(&mut data)?;
         if report.member != data.snapshot.head.member
             || report.name != data.snapshot.name
-            || !matches!(report.cause, HoleCause::Missing)
+            || !matches!(report.cause, HoleCause::Missing | HoleCause::DeclaredBad)
             || report.out.start >= report.out.end
             || report.out.end > data.snapshot.head.size
             || report.revision != data.snapshot.head.revision.checked_add(1).ok_or_else(malformed)?
@@ -760,6 +760,81 @@ impl PartialCore {
         intent.holes = valid.holes.clone();
         let transaction = self.begin_transaction(&mut data, intent, valid, vec![affected])?;
         self.finish_transaction(&mut data, transaction)
+    }
+    /// Maps damage declared on archive bytes of `volume` to this member's already written output. Each run of
+    /// output that was still known becomes a durable `DeclaredBad` hole. Also returns the packed sub-ranges whose
+    /// output this member has produced, known or not, so callers can tell mapped from unmapped damage.
+    pub(crate) fn declare_damage(
+        &self,
+        volume: u32,
+        range: &Range<u64>,
+    ) -> PartialResult<(Vec<HoleReport>, Vec<Range<u64>>)> {
+        if range.start >= range.end {
+            return Err(err(PartialErrorKind::InvalidOptions));
+        }
+        let (member, name, runs, mapped) = {
+            let mut data = self.operation()?;
+            self.check(&data)?;
+            self.reconcile(&mut data)?;
+            let snapshot = &data.snapshot;
+            let produced = snapshot.head.produced;
+            let mut runs: Vec<(Range<u64>, Range<u64>)> = self.budget.vector(snapshot.known.len())?;
+            let mut mapped = self.budget.vector(snapshot.evidence.parts.len())?;
+            for part in snapshot.evidence.parts.iter().filter(|part| part.packed.volume == volume) {
+                let start = range.start.max(part.packed.range.start);
+                let end = range.end.min(part.packed.range.end);
+                if start >= end {
+                    continue;
+                }
+                let out_start = part.out.start + (start - part.packed.range.start);
+                let out_end = (part.out.start + (end - part.packed.range.start)).min(produced);
+                if out_start >= out_end {
+                    continue;
+                }
+                mapped.push(start..start + (out_end - out_start));
+                for leaf in &snapshot.known {
+                    let a = leaf.range.start.max(out_start);
+                    let b = leaf.range.end.min(out_end);
+                    if a >= b {
+                        continue;
+                    }
+                    let packed = start + (a - out_start)..start + (b - out_start);
+                    match runs.last_mut() {
+                        Some((out, run)) if out.end == a && run.end == packed.start => {
+                            out.end = b;
+                            run.end = packed.end;
+                        }
+                        _ => {
+                            if runs.len() == runs.capacity() {
+                                return Err(err(PartialErrorKind::Limit {
+                                    resource: PartialResource::CrcLeaves,
+                                    limit: runs.capacity() as u64,
+                                    attempted: runs.len() as u64 + 1,
+                                }));
+                            }
+                            runs.push((a..b, packed));
+                        }
+                    }
+                }
+            }
+            (snapshot.head.member.clone(), snapshot.name.clone(), runs, mapped)
+        };
+        let mut reports = self.budget.vector(runs.len())?;
+        for (out, packed) in runs {
+            let revision = self.next_revision()?;
+            let report = HoleReport {
+                id: revision,
+                revision,
+                member: member.clone(),
+                name: name.clone(),
+                out,
+                packed: vec![PackedSpan { volume, range: packed }],
+                cause: HoleCause::DeclaredBad,
+            };
+            self.record_hole(report.clone())?;
+            reports.push(report);
+        }
+        Ok((reports, mapped))
     }
     // Called only after the canonical MemberMachine has successfully finished.
     // The acknowledged commit, not complete output coverage, grants finalization.
@@ -976,6 +1051,13 @@ impl PartialFile {
     }
     pub fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         self.core.remaining()
+    }
+    /// Declares archive bytes of `volume` bad after they were extracted, for example when an article's CRC
+    /// fails late. Output this member produced from those bytes becomes `DeclaredBad` holes again (returned,
+    /// one report per newly invalidated run) and must be filled before the member verifies. Bytes that map to
+    /// no output of this member, or that were already holes, are ignored.
+    pub fn declare_hole(&mut self, volume: u32, range: Range<u64>) -> PartialResult<Vec<HoleReport>> {
+        self.core.declare_damage(volume, &range).map(|(reports, _)| reports)
     }
     pub fn state(&self) -> PartialResult<PartialState> {
         self.core.state()

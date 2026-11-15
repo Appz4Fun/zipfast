@@ -1864,3 +1864,153 @@ fn canonical_finish_failure_never_commits_completion_or_metadata() {
         assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), before.modified().unwrap());
     }
 }
+
+/// Drives a session to its end, returning every hole report and the partial handle of each member.
+fn run_to_end(session: &mut ProgressiveSession) -> (Vec<HoleReport>, Vec<PartialFile>) {
+    let mut holes = Vec::new();
+    let mut files = Vec::new();
+    for _ in 0..100_000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => holes.push(report),
+            Poll::Ready(Ok(None)) => return (holes, files),
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    panic!("session did not finish")
+}
+
+#[test]
+fn declare_hole_after_extraction_reopens_output_and_fill_verifies() {
+    for reopen in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let state_root = dir.path().join("state");
+        let mut fixture = Fixture::new();
+        let anchors = Arc::new(Anchors::default());
+        let mut partial = partial_options(&state_root);
+        partial.anchors = anchors.clone();
+        let provider = fixture.provider();
+        let protection = provider.protection.clone();
+        let mut session = ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial).unwrap();
+        let (_, mut files) = run_to_end(&mut session);
+        let mut a = files.remove(0);
+        a.fill(1300, &fixture.data[0][1300..2000]).unwrap();
+        assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+
+        // Volume 3 carries a.bin 4200..5600. Ten header bytes before its payload map to no output.
+        let p3 = fixture.payloads[3].start;
+        let receipt = session.declare_hole(3, p3 - 10..p3 + 300).unwrap();
+        assert_eq!(receipt.holes.len(), 1);
+        let report = &receipt.holes[0];
+        assert_eq!(report.out, 4200..4500);
+        assert_eq!(report.packed.len(), 1);
+        assert_eq!((report.packed[0].volume, report.packed[0].range.clone()), (3, p3..p3 + 300));
+        assert!(matches!(report.cause, HoleCause::DeclaredBad));
+        assert_eq!(receipt.unmapped.len(), 1);
+        assert_eq!((receipt.unmapped[0].volume, receipt.unmapped[0].range.clone()), (3, p3 - 10..p3));
+        assert!(receipt.pending.is_empty());
+
+        // The handle held since extraction sees the new hole; the verified member is incomplete again.
+        assert_eq!(a.remaining().unwrap(), vec![4200..4500]);
+        let Verdict::Incomplete { holes, .. } = verify(&mut a) else {
+            panic!("declared damage must reopen the member")
+        };
+        assert_eq!(holes, vec![4200..4500]);
+        drop(session);
+        if reopen {
+            let key = report.member.clone();
+            let state = partial_state::roundtrip(&a.close().unwrap());
+            let expected_anchor = anchors.current(&key).unwrap().unwrap();
+            a = PartialFile::open(
+                state,
+                PartialOpenContext {
+                    output_root: dest.clone(),
+                    state_root: state_root.clone(),
+                    expected_member: key,
+                    expected_anchor,
+                    protection: protection.clone(),
+                    limits: PartialLimits::default(),
+                    progressive_limits: ProgressiveLimits::default(),
+                    anchors: anchors.clone(),
+                    control: SessionControl::default(),
+                },
+            )
+            .unwrap();
+            assert_eq!(a.remaining().unwrap(), vec![4200..4500]);
+        }
+        a.fill(4200, &fixture.data[0][4200..4500]).unwrap();
+        assert!(matches!(verify(&mut a), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dest.join("a.bin")).unwrap(), fixture.data[0]);
+    }
+}
+
+#[test]
+fn declare_hole_reports_only_output_that_was_still_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(fixture.provider()),
+        options(&dir.path().join("out")),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    let (_, mut files) = run_to_end(&mut session);
+    // a.bin 1300..1400 in volume 0 is already a Missing hole; only 1200..1300 is newly damaged.
+    let p0 = fixture.payloads[0].start;
+    let receipt = session.declare_hole(0, p0 + 1200..p0 + 1400).unwrap();
+    assert_eq!(receipt.holes.iter().map(|h| h.out.clone()).collect::<Vec<_>>(), vec![1200..1300]);
+    assert!(receipt.unmapped.is_empty());
+    assert_eq!(files[0].remaining().unwrap(), vec![1200..2000]);
+    // Declaring the same bytes again changes nothing.
+    assert!(session.declare_hole(0, p0 + 1200..p0 + 1400).unwrap().holes.is_empty());
+    // A PartialFile can declare damage on its own after the session is gone.
+    drop(session);
+    let reports = files[0].declare_hole(4, fixture.payloads[4].start..fixture.payloads[4].start + 1).unwrap();
+    assert_eq!(reports.iter().map(|h| h.out.clone()).collect::<Vec<_>>(), vec![5600..5601]);
+    files[0].fill(1200, &fixture.data[0][1200..2000]).unwrap();
+    files[0].fill(5600, &fixture.data[0][5600..5601]).unwrap();
+    assert!(matches!(verify(&mut files[0]), Verdict::Ok { .. }));
+}
+
+#[test]
+fn declare_hole_before_bytes_are_read_skips_them_without_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let mut fixture = Fixture::new();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(fixture.provider()),
+        options(&dest),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    // Volume 8 carries b.bin 4200..5600.
+    let p8 = fixture.payloads[8].start;
+    let receipt = session.declare_hole(8, p8 + 100..p8 + 300).unwrap();
+    assert!(receipt.holes.is_empty() && receipt.unmapped.is_empty());
+    assert_eq!(receipt.pending.len(), 1);
+    assert_eq!((receipt.pending[0].volume, receipt.pending[0].range.clone()), (8, p8 + 100..p8 + 300));
+    let (holes, mut files) = run_to_end(&mut session);
+    let declared = holes.iter().find(|h| matches!(h.cause, HoleCause::DeclaredBad)).expect("declared hole event");
+    assert_eq!(declared.member.ordinal(), 1);
+    assert_eq!(declared.out, 4300..4500);
+    assert_eq!((declared.packed[0].volume, declared.packed[0].range.clone()), (8, p8 + 100..p8 + 300));
+    assert!(
+        fixture
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|&(volume, at, len)| volume != 8 || at + len as u64 <= p8 + 100 || at >= p8 + 300),
+        "declared bytes must not be read from the provider"
+    );
+    let b = &mut files[1];
+    assert_eq!(b.remaining().unwrap(), vec![3500..4200, 4300..4500]);
+    b.fill(3500, &fixture.data[1][3500..4200]).unwrap();
+    b.fill(4300, &fixture.data[1][4300..4500]).unwrap();
+    assert!(matches!(verify(b), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dest.join("b.bin")).unwrap(), fixture.data[1]);
+}
