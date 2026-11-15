@@ -28,6 +28,9 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   `.tar.bz2` and so on): POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
   sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
   compresses. xz files written in blocks (`xz -T0`) decode on several cores.
+- Member maps (`zipfast::map`): a typed header listing of RAR4, RAR 5.0 (including `-hp` with a password) and
+  ZIP archives from memory or a range source, mapping each stored member's output offsets to per-volume packed
+  spans; see [member maps](docs/member-map.md).
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 

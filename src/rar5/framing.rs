@@ -190,6 +190,10 @@ impl HeaderParser {
         self.phase = Phase::LegacyFirst;
         self.resized_need(24).map_err(FramingError::progressive)
     }
+    /// Whether the parser is still looking for the archive signature.
+    pub(crate) fn scanning(&self) -> bool {
+        self.signature.is_some()
+    }
     pub(crate) fn encrypted(&self) -> bool {
         self.legacy_headers || self.cipher.is_some()
     }

@@ -18,6 +18,7 @@
 //! headers with their extra records, and the end of archive header.
 
 pub(crate) mod framing;
+pub(crate) mod map;
 pub(crate) mod member;
 pub(crate) mod physical;
 pub mod reader;
