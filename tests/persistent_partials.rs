@@ -3013,3 +3013,26 @@ fn encrypted_cipher_neighbour_hole_precedes_the_bytes_written_past_it() {
     assert!(neighbour);
     assert_eq!(cursor, 3000);
 }
+
+#[test]
+fn encrypted_refill_without_a_check_value_proves_the_password_from_an_earlier_block() {
+    let fixture = Encrypted::new(3000, &CUTS, false);
+    for password in ["wrong", "pw"] {
+        let dir = tempfile::tempdir().unwrap();
+        let run = extract_encrypted(dir.path(), &fixture, &hole(1500..1510));
+        let mut file = reopen(dir.path(), run, Some(password)).unwrap();
+        let mut reader = CountingReader { inner: std::io::Cursor::new(fixture.volumes[1].clone()), read: 0 };
+        let result = file.refill_from_packed(1, 0..fixture.volumes[1].len() as u64, &mut reader);
+        if password == "wrong" {
+            let error = result.unwrap_err();
+            assert!(matches!(error.kind, PartialErrorKind::WrongPassword), "{error:?}");
+            assert_eq!(file.remaining().unwrap(), vec![1488..1536]);
+            continue;
+        }
+        // Blocks 1456 and 1472 before the 48-byte hole: 1472 decrypts with 1456 to original output.
+        assert_eq!(result.unwrap().applied, vec![1488..1536]);
+        assert_eq!(reader.read, 32 + 48);
+        assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+    }
+}

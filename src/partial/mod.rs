@@ -554,13 +554,15 @@ impl PartialCore {
             needs_verification: fill.needs_verification,
         })
     }
-    /// Proves keys that passed no password check value before `fill_packed` writes with them: one decrypted block
-    /// whose whole output the original extraction wrote must match it. A wrong password decrypts to other bytes
+    /// Proves keys that passed no password check value before `fill_packed` writes with them: a decrypted block
+    /// whose whole output the original extraction wrote must match it (one block per original leaf is tried, so an
+    /// original block that is itself wrong does not refute the keys). A wrong password matches none
     /// (`WrongPassword`); a fill with no such block that would write unresolved output is `PasswordUnverified`.
     fn prove_keys(&self, op: &CoreData, decryptions: &[Option<cipher::Decrypted>]) -> PartialResult<()> {
         let snapshot = &op.snapshot;
         let size = snapshot.head.size;
         let mut writes = false;
+        let mut refuted = false;
         for decrypted in decryptions.iter().flatten() {
             for (out, plain) in &decrypted.runs {
                 let run = *out..*out + (plain.end - plain.start) as u64;
@@ -588,14 +590,21 @@ impl PartialCore {
                     let count = crate::output::range::read_at(&self.native.output.file, start, actual)
                         .map_err(|e| io_error(OutputOperation::Read, e))?;
                     if count != actual.len() || actual != expected {
-                        return Err(err(PartialErrorKind::WrongPassword));
+                        refuted = true;
+                        continue;
                     }
                     self.keys_proven.store(true, Ordering::Release);
                     return Ok(());
                 }
             }
         }
-        if writes { Err(err(PartialErrorKind::PasswordUnverified)) } else { Ok(()) }
+        if refuted {
+            Err(err(PartialErrorKind::WrongPassword))
+        } else if writes {
+            Err(err(PartialErrorKind::PasswordUnverified))
+        } else {
+            Ok(())
+        }
     }
     /// Durably keeps ciphertext blocks a remaining hole needs to decrypt later archive bytes.
     fn keep_cipher(&self, op: &mut CoreData, blocks: &[state::CipherBlock]) -> PartialResult<()> {
@@ -613,7 +622,9 @@ impl PartialCore {
     }
     /// Packed ranges of `volume` within `range` whose output is still unknown or came from an alt; output the
     /// original extraction wrote is skipped, so a refill reads only what it can change. For an encrypted member
-    /// each range covers whole ciphertext blocks plus the block before, which CBC needs to decrypt the first.
+    /// each range covers whole ciphertext blocks plus the block before, which CBC needs to decrypt the first. While
+    /// the keys are unproven it starts one block earlier still, so the block before decrypts to output the original
+    /// extraction wrote and proves them.
     pub(crate) fn refill_targets(&self, volume: u32, range: &Range<u64>) -> PartialResult<Vec<Range<u64>>> {
         let op = self.operation()?;
         self.check(&op)?;
@@ -623,6 +634,7 @@ impl PartialCore {
         if snapshot.crypt.is_some() {
             let runs = cipher::unresolved_runs(&self.budget, snapshot)?;
             let total = cipher::stream_total(snapshot);
+            let back = if self.keys.is_some() && !self.keys_proven.load(Ordering::Acquire) { 32 } else { 16 };
             for (part, stream) in cipher::parts_with_stream(snapshot).filter(|(p, _)| p.packed.volume == volume) {
                 let start = range.start.max(part.packed.range.start);
                 let stop = range.end.min(part.packed.range.end);
@@ -634,7 +646,7 @@ impl PartialCore {
                 for run in &runs {
                     self.budget.usage.charge(Resource::SourceBookkeeping, 1)?;
                     let need_end = if run.end >= snapshot.head.size { total } else { cipher::ceil_block(run.end) };
-                    let need = cipher::floor_block(run.start).saturating_sub(16).max(lo)..need_end.min(hi);
+                    let need = cipher::floor_block(run.start).saturating_sub(back).max(lo)..need_end.min(hi);
                     if need.start >= need.end {
                         continue;
                     }
