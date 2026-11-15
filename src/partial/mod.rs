@@ -18,6 +18,7 @@
 #![allow(clippy::result_large_err, reason = "typed public errors preserve contextual and committed-anchor receipts")]
 #![doc = include_str!("../../docs/persistent-partials.md")]
 mod anchor;
+mod cipher;
 mod journal;
 mod ledger;
 mod limits;
@@ -28,12 +29,14 @@ mod verify;
 use crate::progressive::{OutputOperation, Resource, SessionControl};
 use crate::rar5::source::SourceStamp;
 use anchor::AnchorBinding;
+pub(crate) use cipher::MemberKeys;
 use journal::Bundle;
 pub(crate) use limits::PartialBudget;
 pub use limits::{PartialLimits, PartialResource};
 use limits::{Reservation, limit};
 use native::PersistentNative;
 pub(crate) use native::{PartialExclusions, PartialProtectedPath};
+pub(crate) use state::CipherBlock;
 pub use state::PartialState;
 use state::{CommittedState, MutationCommit, MutationIntent, Snapshot};
 use std::{
@@ -59,6 +62,8 @@ pub(crate) struct PartialCore {
     read_chunk: usize,
     busy: AtomicBool,
     data: Mutex<Option<CoreData>>,
+    /// Keys of an encrypted member, in memory only.
+    keys: Option<MemberKeys>,
     _lease: Reservation,
 }
 pub(crate) struct PreparedCreate {
@@ -73,6 +78,7 @@ pub(crate) struct PreparedCreate {
     pages: Vec<(state::PageKind, Vec<u8>)>,
     native: native::PreparedNative,
     ready_bytes: Option<usize>,
+    keys: Option<MemberKeys>,
 }
 pub(crate) struct PartialEventLease {
     _reservation: Reservation,
@@ -231,7 +237,7 @@ impl PartialCore {
         let _event = budget.reserve(PartialResource::Events, 1)?;
         budget.usage.charge(Resource::NameBytes, spec.name.len() as u64)?;
         budget.usage.output_extent(spec.size)?;
-        state::validate_evidence(&spec.name, spec.size, &spec.evidence, &budget)?;
+        let crypt = state::validate_evidence(&spec.name, spec.size, &spec.evidence, &budget)?;
         native::validate_relative(&spec.relative_output)?;
         match std::fs::symlink_metadata(spec.output_root.join(&spec.relative_output)) {
             Ok(_) => return Err(err(PartialErrorKind::AlreadyExists)),
@@ -264,6 +270,8 @@ impl PartialCore {
             evidence: spec.evidence.clone(),
             known: Vec::new(),
             holes: Vec::new(),
+            crypt,
+            cipher: Vec::new(),
         };
         let pages = state::encode_pages(&initial, &budget)?;
         initial.head.pages = pages
@@ -308,6 +316,7 @@ impl PartialCore {
             pages,
             native,
             ready_bytes: None,
+            keys: None,
         })
     }
     fn reconcile(&self, data: &mut CoreData) -> PartialResult<()> {
@@ -379,6 +388,7 @@ impl PartialCore {
                 .map(|a| std::mem::size_of::<SourceAdmission>() + a.expected.len())
                 .sum::<usize>()
             + snapshot.head.pages.len() * std::mem::size_of::<state::PageRef>()
+            + snapshot.cipher.len() * std::mem::size_of::<state::CipherBlock>()
             + snapshot
                 .holes
                 .iter()
@@ -390,11 +400,6 @@ impl PartialCore {
     pub(crate) fn validate_current(&self) -> PartialResult<()> {
         let data = self.operation()?;
         self.check(&data)
-    }
-    pub(crate) fn next_revision(&self) -> PartialResult<u64> {
-        let data = self.operation()?;
-        self.check(&data)?;
-        data.snapshot.head.revision.checked_add(1).ok_or_else(malformed)
     }
     pub(crate) fn write_original(&self, offset: u64, bytes: &[u8]) -> PartialResult<()> {
         let mut op = self.operation()?;
@@ -413,6 +418,8 @@ impl PartialCore {
     /// Maps archive bytes of `volume` starting at `offset` to this member's produced output and writes them with
     /// archive authority: holes are filled, bytes from the original extraction must match, and alt bytes that
     /// differ are rewritten and reported. Packed bytes outside this member's produced output are returned unused.
+    /// An encrypted member's ciphertext is decrypted first; blocks whose previous ciphertext block is unknown are
+    /// reported in `undecryptable`, and ciphertext a remaining hole still needs is kept durably.
     pub(crate) fn fill_packed(&self, volume: u32, offset: u64, bytes: &[u8]) -> PartialResult<PackedFillResult> {
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
@@ -420,19 +427,25 @@ impl PartialCore {
         self.check(&op)?;
         self.reconcile(&mut op)?;
         self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
-        let produced = op.snapshot.head.produced;
+        let keys = match (&op.snapshot.crypt, &self.keys) {
+            (None, _) => None,
+            (Some(_), Some(keys)) => Some(keys),
+            (Some(_), None) => return Err(err(PartialErrorKind::PasswordRequired)),
+        };
+        let limit = cipher::stream_produced(&op.snapshot);
         let parts = op.snapshot.evidence.parts.len();
+        // (packed bytes, ciphertext stream offset); the stream is the output for a plain member.
         let mut segments: Vec<(Range<u64>, u64)> = self.budget.vector(parts)?;
-        for part in op.snapshot.evidence.parts.iter().filter(|p| p.packed.volume == volume) {
+        for (part, stream) in cipher::parts_with_stream(&op.snapshot).filter(|(p, _)| p.packed.volume == volume) {
             let start = offset.max(part.packed.range.start);
             let stop = end.min(part.packed.range.end);
             if start >= stop {
                 continue;
             }
-            let out = part.out.start + (start - part.packed.range.start);
-            let out_end = (out + (stop - start)).min(produced);
-            if out < out_end {
-                segments.push((start..start + (out_end - out), out));
+            let at = stream + (start - part.packed.range.start);
+            let at_end = (at + (stop - start)).min(limit);
+            if at < at_end {
+                segments.push((start..start + (at_end - at), at));
             }
         }
         let mut unmapped = self.budget.vector(segments.len() + 1)?;
@@ -448,67 +461,142 @@ impl PartialCore {
         }
         let mut applied = Vec::new();
         let mut corrected = Vec::new();
-        for (packed, out) in segments {
-            let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
-            match self.write_data(&mut op, out, slice, FillMode::Packed) {
-                Ok(written) => {
-                    applied.extend(written.applied);
-                    corrected.extend(written.corrected);
-                }
-                Err(mut error) => {
-                    if let Some(step) = error.packed_progress.take() {
-                        corrected.extend(step.corrected);
-                    }
-                    if !applied.is_empty() || !corrected.is_empty() {
-                        error.packed_progress = Some(Box::new(PackedFillResult {
-                            revision: op.snapshot.head.revision,
-                            applied,
-                            corrected,
-                            unmapped,
-                            state: op.state.clone(),
-                            part_checks: Vec::new(),
-                            needs_verification: true,
-                        }));
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        let fill = match self.fill_result(&mut op, applied.clone()) {
-            Ok(fill) => fill,
-            Err(mut error) => {
+        let mut undecryptable = Vec::new();
+        let mut kept = Vec::new();
+        let progress = |op: &CoreData,
+                        applied: Vec<Range<u64>>,
+                        corrected: Vec<Range<u64>>,
+                        undecryptable: Vec<Range<u64>>,
+                        unmapped: Vec<PackedSpan>,
+                        mut error: PartialError| {
+            if let Some(step) = error.packed_progress.take() {
+                let mut corrected = corrected;
+                corrected.extend(step.corrected);
                 if !applied.is_empty() || !corrected.is_empty() {
                     error.packed_progress = Some(Box::new(PackedFillResult {
                         revision: op.snapshot.head.revision,
                         applied,
                         corrected,
                         unmapped,
+                        undecryptable,
                         state: op.state.clone(),
                         part_checks: Vec::new(),
                         needs_verification: true,
                     }));
                 }
-                return Err(error);
+            } else if !applied.is_empty() || !corrected.is_empty() {
+                error.packed_progress = Some(Box::new(PackedFillResult {
+                    revision: op.snapshot.head.revision,
+                    applied,
+                    corrected,
+                    unmapped,
+                    undecryptable,
+                    state: op.state.clone(),
+                    part_checks: Vec::new(),
+                    needs_verification: true,
+                }));
             }
+            error
+        };
+        for (packed, stream) in segments {
+            let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
+            let decrypted = match keys {
+                Some(keys) => Some(cipher::decrypt(&self.budget, &op.snapshot, keys, stream, slice)?),
+                None => None,
+            };
+            let writes: Vec<(u64, &[u8])> = match &decrypted {
+                Some(d) => {
+                    undecryptable.extend(d.undecryptable.iter().cloned());
+                    d.runs.iter().map(|(out, range)| (*out, &d.plain[range.clone()])).collect()
+                }
+                None => vec![(stream, slice)],
+            };
+            for (out, plain) in writes {
+                match self.write_data(&mut op, out, plain, FillMode::Packed) {
+                    Ok(written) => {
+                        applied.extend(written.applied);
+                        corrected.extend(written.corrected);
+                    }
+                    Err(error) => return Err(progress(&op, applied, corrected, undecryptable, unmapped, error)),
+                }
+            }
+            if decrypted.is_some() {
+                kept.extend(cipher::keep(&self.budget, &op.snapshot, stream, slice)?);
+            }
+        }
+        if !kept.is_empty()
+            && let Err(error) = self.keep_cipher(&mut op, &kept)
+        {
+            return Err(progress(&op, applied, corrected, undecryptable, unmapped, error));
+        }
+        let fill = match self.fill_result(&mut op, applied.clone()) {
+            Ok(fill) => fill,
+            Err(error) => return Err(progress(&op, applied, corrected, undecryptable, unmapped, error)),
         };
         Ok(PackedFillResult {
             revision: fill.revision,
             applied: fill.applied,
             corrected,
             unmapped,
+            undecryptable,
             state: fill.state,
             part_checks: fill.part_checks,
             needs_verification: fill.needs_verification,
         })
     }
+    /// Durably keeps ciphertext blocks a remaining hole needs to decrypt later archive bytes.
+    fn keep_cipher(&self, op: &mut CoreData, blocks: &[state::CipherBlock]) -> PartialResult<()> {
+        let (mut intent, mut valid) = self.next_snapshots(op)?;
+        cipher::merge(&self.budget, &mut valid.cipher, blocks)?;
+        cipher::prune(&self.budget, &mut valid)?;
+        if valid.cipher == op.snapshot.cipher {
+            return Ok(());
+        }
+        self.budget.metadata((valid.cipher.len() * std::mem::size_of::<state::CipherBlock>()) as u64)?;
+        intent.cipher = valid.cipher.clone();
+        op.verification = None;
+        let transaction = self.begin_transaction(op, intent, valid, Vec::new())?;
+        self.finish_transaction(op, transaction)
+    }
     /// Packed ranges of `volume` within `range` whose output is still unknown or came from an alt; output the
-    /// original extraction wrote is skipped, so a refill reads only what it can change.
+    /// original extraction wrote is skipped, so a refill reads only what it can change. For an encrypted member
+    /// each range covers whole ciphertext blocks plus the block before, which CBC needs to decrypt the first.
     pub(crate) fn refill_targets(&self, volume: u32, range: &Range<u64>) -> PartialResult<Vec<Range<u64>>> {
         let op = self.operation()?;
         self.check(&op)?;
         let snapshot = &op.snapshot;
         let produced = snapshot.head.produced;
         let mut targets: Vec<Range<u64>> = Vec::new();
+        if snapshot.crypt.is_some() {
+            let runs = cipher::unresolved_runs(&self.budget, snapshot)?;
+            let total = cipher::stream_total(snapshot);
+            for (part, stream) in cipher::parts_with_stream(snapshot).filter(|(p, _)| p.packed.volume == volume) {
+                let start = range.start.max(part.packed.range.start);
+                let stop = range.end.min(part.packed.range.end);
+                if start >= stop {
+                    continue;
+                }
+                let lo = stream + (start - part.packed.range.start);
+                let hi = stream + (stop - part.packed.range.start);
+                for run in &runs {
+                    self.budget.usage.charge(Resource::SourceBookkeeping, 1)?;
+                    let need_end = if run.end >= snapshot.head.size { total } else { cipher::ceil_block(run.end) };
+                    let need = cipher::floor_block(run.start).saturating_sub(16).max(lo)..need_end.min(hi);
+                    if need.start >= need.end {
+                        continue;
+                    }
+                    let p = start + (need.start - lo)..start + (need.end - lo);
+                    match targets.last_mut() {
+                        Some(last) if last.end >= p.start => last.end = last.end.max(p.end),
+                        _ => {
+                            self.budget.usage.check(Resource::HoleIntervals, targets.len() as u64 + 1)?;
+                            targets.push(p);
+                        }
+                    }
+                }
+            }
+            return Ok(targets);
+        }
         for part in snapshot.evidence.parts.iter().filter(|p| p.packed.volume == volume) {
             let start = range.start.max(part.packed.range.start);
             let stop = range.end.min(part.packed.range.end);
@@ -547,10 +635,11 @@ impl PartialCore {
         let mut part_checks = self.budget.vector(op.snapshot.evidence.parts.len())?;
         if op.verification.as_ref().is_none_or(|v| v.revision != op.snapshot.head.revision) {
             op.verification = None;
-            op.verification = Some(verify::Verification::new(&op.snapshot, &self.budget).map_err(|mut e| {
-                e.committed = Some(op.state.anchor.clone());
-                e
-            })?);
+            op.verification =
+                Some(verify::Verification::new(&op.snapshot, &self.budget, self.hash_key()).map_err(|mut e| {
+                    e.committed = Some(op.state.anchor.clone());
+                    e
+                })?);
         }
         let verification = op.verification.as_ref().unwrap();
         part_checks.extend_from_slice(&verification.parts);
@@ -704,9 +793,12 @@ impl PartialCore {
         ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }.remaining()?;
         // Retain only still-unknown observed spans, including exact packed mappings.
         commit.holes = self.remaining_reports(&mut commit)?;
+        if commit.crypt.is_some() {
+            cipher::prune(&self.budget, &mut commit)?;
+        }
         self.budget.metadata((plan.unknown.len() * std::mem::size_of::<Range<u64>>()) as u64)?;
         op.verification = None;
-        let verification = verify::Verification::new(&commit, &self.budget)?;
+        let verification = verify::Verification::new(&commit, &self.budget, self.hash_key())?;
         // Once the intent is durable: the differing alt ranges are holes now, written or not. Report them on
         // failure so the caller still learns that alt was wrong.
         let progress = |op: &CoreData, mut error: PartialError| {
@@ -716,6 +808,7 @@ impl PartialCore {
                     applied: Vec::new(),
                     corrected: corrected.clone(),
                     unmapped: Vec::new(),
+                    undecryptable: Vec::new(),
                     state: op.state.clone(),
                     part_checks: Vec::new(),
                     needs_verification: true,
@@ -841,20 +934,8 @@ impl PartialCore {
         out: Range<u64>,
         cause: HoleCause,
     ) -> PartialResult<HoleReport> {
-        let mut packed = Vec::new();
-        for part in &snapshot.evidence.parts {
-            let start = out.start.max(part.out.start);
-            let end = out.end.min(part.out.end);
-            if start < end {
-                packed.push(PackedSpan {
-                    volume: part.packed.volume,
-                    range: part.packed.range.start + start - part.out.start
-                        ..part.packed.range.start + end - part.out.start,
-                });
-            }
-        }
-        self.budget
-            .metadata((std::mem::size_of::<HoleReport>() + packed.len() * std::mem::size_of::<PackedSpan>()) as u64)?;
+        let packed = cipher::packed_spans(&self.budget, snapshot, &out)?;
+        self.budget.metadata(std::mem::size_of::<HoleReport>() as u64)?;
         Ok(HoleReport {
             id: revision,
             revision,
@@ -981,13 +1062,29 @@ impl PartialCore {
         valid.head.sequence = valid.head.sequence.checked_add(1).ok_or_else(malformed)?;
         Ok((intent, valid))
     }
+    pub(crate) fn hash_key(&self) -> Option<&[u8; 32]> {
+        self.keys.as_ref().map(|keys| &keys.hash)
+    }
+    /// Builds the report of the next revision for observed output `out`, with its exact packed spans.
+    pub(crate) fn hole_report(&self, out: Range<u64>, cause: HoleCause) -> PartialResult<HoleReport> {
+        let data = self.operation()?;
+        self.check(&data)?;
+        let revision = data.snapshot.head.revision.checked_add(1).ok_or_else(malformed)?;
+        self.report_for(&data.snapshot, revision, out, cause)
+    }
     pub(crate) fn record_hole(&self, report: HoleReport) -> PartialResult<()> {
+        self.record_hole_with(report, &[])
+    }
+    /// Records a hole and keeps the ciphertext `blocks` next to it (encrypted members) in the same transaction.
+    pub(crate) fn record_hole_with(&self, report: HoleReport, blocks: &[state::CipherBlock]) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;
         self.reconcile(&mut data)?;
         if report.member != data.snapshot.head.member
             || report.name != data.snapshot.name
-            || !matches!(report.cause, HoleCause::Missing | HoleCause::DeclaredBad)
+            || !matches!(report.cause, HoleCause::Missing | HoleCause::DeclaredBad | HoleCause::CipherNeighbour)
+            || (report.cause == HoleCause::CipherNeighbour && data.snapshot.crypt.is_none())
+            || (!blocks.is_empty() && data.snapshot.crypt.is_none())
             || report.out.start >= report.out.end
             || report.out.end > data.snapshot.head.size
             || report.revision != data.snapshot.head.revision.checked_add(1).ok_or_else(malformed)?
@@ -997,26 +1094,10 @@ impl PartialCore {
         self.budget
             .usage
             .check(Resource::HoleIntervals, data.snapshot.holes.len().checked_add(1).ok_or_else(malformed)? as u64)?;
-        let mut covered = report.out.start;
-        for packed in &report.packed {
-            let part = data
-                .snapshot
-                .evidence
-                .parts
-                .iter()
-                .find(|part| {
-                    part.packed.volume == packed.volume
-                        && packed.range.start >= part.packed.range.start
-                        && packed.range.end <= part.packed.range.end
-                })
-                .ok_or_else(malformed)?;
-            let out = part.out.start + packed.range.start - part.packed.range.start;
-            if packed.range.start >= packed.range.end || out != covered {
-                return Err(malformed());
-            }
-            covered = covered.checked_add(packed.range.end - packed.range.start).ok_or_else(malformed)?;
-        }
-        if covered != report.out.end || data.snapshot.holes.iter().any(|h| h.id == report.id) {
+        // The packed spans must be exactly those of the output range (block-widened for encrypted members).
+        if report.packed != cipher::packed_spans(&self.budget, &data.snapshot, &report.out)?
+            || data.snapshot.holes.iter().any(|h| h.id == report.id)
+        {
             return Err(malformed());
         }
         let (mut intent, mut valid) = self.next_snapshots(&data)?;
@@ -1045,6 +1126,11 @@ impl PartialCore {
                 .sum::<usize>() as u64,
         )?;
         intent.holes = valid.holes.clone();
+        if !blocks.is_empty() {
+            cipher::merge(&self.budget, &mut valid.cipher, blocks)?;
+            self.budget.metadata((valid.cipher.len() * std::mem::size_of::<state::CipherBlock>()) as u64)?;
+            intent.cipher = valid.cipher.clone();
+        }
         let transaction = self.begin_transaction(&mut data, intent, valid, vec![affected])?;
         self.finish_transaction(&mut data, transaction)
     }
@@ -1062,7 +1148,9 @@ impl PartialCore {
     }
     /// Maps damage declared on archive bytes of `volume` to this member's already written output. Each run of
     /// output that was still known becomes a durable `DeclaredBad` hole. Also returns the packed sub-ranges whose
-    /// output this member has produced, known or not, so callers can tell mapped from unmapped damage.
+    /// output this member has produced, known or not, so callers can tell mapped from unmapped damage. For an
+    /// encrypted member the damaged ciphertext blocks are `DeclaredBad` and the block after them, which CBC
+    /// decrypts with the damaged block, becomes a `CipherNeighbour` hole.
     pub(crate) fn declare_damage(
         &self,
         volume: u32,
@@ -1071,65 +1159,59 @@ impl PartialCore {
         if range.start >= range.end {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        let (member, name, runs, mapped) = {
+        let (runs, mapped) = {
             let mut data = self.operation()?;
             self.check(&data)?;
             self.reconcile(&mut data)?;
             let snapshot = &data.snapshot;
             let produced = snapshot.head.produced;
-            let mut runs: Vec<(Range<u64>, Range<u64>)> = self.budget.vector(snapshot.known.len())?;
+            let limit = cipher::stream_produced(snapshot);
+            let encrypted = snapshot.crypt.is_some();
+            let mut runs: Vec<(Range<u64>, HoleCause)> = self.budget.vector(snapshot.known.len() + 2)?;
             let mut mapped = self.budget.vector(snapshot.evidence.parts.len())?;
-            for part in snapshot.evidence.parts.iter().filter(|part| part.packed.volume == volume) {
+            for (part, stream) in cipher::parts_with_stream(snapshot).filter(|(p, _)| p.packed.volume == volume) {
                 let start = range.start.max(part.packed.range.start);
                 let end = range.end.min(part.packed.range.end);
                 if start >= end {
                     continue;
                 }
-                let out_start = part.out.start + (start - part.packed.range.start);
-                let out_end = (part.out.start + (end - part.packed.range.start)).min(produced);
-                if out_start >= out_end {
+                let at = stream + (start - part.packed.range.start);
+                let at_end = stream + (end - part.packed.range.start);
+                if at >= at_end.min(limit) {
                     continue;
                 }
-                mapped.push(start..start + (out_end - out_start));
-                for leaf in &snapshot.known {
-                    let a = leaf.range.start.max(out_start);
-                    let b = leaf.range.end.min(out_end);
-                    if a >= b {
-                        continue;
-                    }
-                    let packed = start + (a - out_start)..start + (b - out_start);
-                    match runs.last_mut() {
-                        Some((out, run)) if out.end == a && run.end == packed.start => {
-                            out.end = b;
-                            run.end = packed.end;
+                mapped.push(start..start + (at_end.min(limit) - at));
+                let bad = if encrypted { cipher::floor_block(at)..cipher::ceil_block(at_end) } else { at..at_end };
+                let neighbour = if encrypted { bad.end..bad.end.saturating_add(16) } else { bad.end..bad.end };
+                for (out, cause) in [(bad, HoleCause::DeclaredBad), (neighbour, HoleCause::CipherNeighbour)] {
+                    let out = out.start.min(produced)..out.end.min(produced);
+                    for leaf in &snapshot.known {
+                        let a = leaf.range.start.max(out.start);
+                        let b = leaf.range.end.min(out.end);
+                        if a >= b {
+                            continue;
                         }
-                        _ => {
-                            if runs.len() == runs.capacity() {
-                                return Err(err(PartialErrorKind::Limit {
-                                    resource: PartialResource::CrcLeaves,
-                                    limit: runs.capacity() as u64,
-                                    attempted: runs.len() as u64 + 1,
-                                }));
+                        match runs.last_mut() {
+                            Some((run, kind)) if run.end == a && *kind == cause => run.end = b,
+                            _ => {
+                                if runs.len() == runs.capacity() {
+                                    return Err(err(PartialErrorKind::Limit {
+                                        resource: PartialResource::CrcLeaves,
+                                        limit: runs.capacity() as u64,
+                                        attempted: runs.len() as u64 + 1,
+                                    }));
+                                }
+                                runs.push((a..b, cause.clone()));
                             }
-                            runs.push((a..b, packed));
                         }
                     }
                 }
             }
-            (snapshot.head.member.clone(), snapshot.name.clone(), runs, mapped)
+            (runs, mapped)
         };
         let mut reports = self.budget.vector(runs.len())?;
-        for (out, packed) in runs {
-            let revision = self.next_revision()?;
-            let report = HoleReport {
-                id: revision,
-                revision,
-                member: member.clone(),
-                name: name.clone(),
-                out,
-                packed: vec![PackedSpan { volume, range: packed }],
-                cause: HoleCause::DeclaredBad,
-            };
+        for (out, cause) in runs {
+            let report = self.hole_report(out, cause)?;
             self.record_hole(report.clone())?;
             reports.push(report);
         }
@@ -1222,7 +1304,9 @@ impl PartialCore {
             }
             valid.head.checks = checks;
         }
-        state::validate_evidence(&valid.name, valid.head.size, &valid.evidence, &self.budget)?;
+        if state::validate_evidence(&valid.name, valid.head.size, &valid.evidence, &self.budget)? != valid.crypt {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+        }
         let transaction = self.begin_transaction(&mut data, intent, valid, Vec::new())?;
         self.finish_transaction(&mut data, transaction)
     }
@@ -1308,6 +1392,10 @@ impl PartialFile {
         }
         let mut bundle = Bundle::open(&spec, &current, &budget)?;
         let mut snapshot = bundle.snapshot(state)?;
+        let keys = match (&snapshot.crypt, &context.password) {
+            (Some(params), Some(password)) => Some(MemberKeys::derive(password, params, &budget, &context.control)?),
+            _ => None,
+        };
         let native = PersistentNative::reopen(&spec, &budget)?;
         let before = stamp(&native)?;
         rehash_known(&native, &budget, &context.control, read_chunk, &mut snapshot)?;
@@ -1340,6 +1428,7 @@ impl PartialFile {
                     verification: None,
                     reopened: true,
                 })),
+                keys,
                 _lease: lease,
             }),
         })
@@ -1470,6 +1559,10 @@ impl PartialOptions {
 }
 
 impl PreparedCreate {
+    /// Hands the extraction's member keys to the core, in memory only.
+    pub(crate) fn set_keys(&mut self, keys: MemberKeys) {
+        self.keys = Some(keys);
+    }
     pub(crate) fn reserve_ready_state(&mut self) -> PartialResult<()> {
         if self.ready_bytes.is_none() {
             // Native identities and parent digests occupy fixed-width fields.
@@ -1509,6 +1602,7 @@ impl PreparedCreate {
             pages,
             native: prepared_native,
             ready_bytes,
+            keys,
         } = self;
         budget.admit_genesis_bookkeeping()?;
         let native = PersistentNative::create(&spec, &budget, prepared_native)?;
@@ -1579,6 +1673,7 @@ impl PreparedCreate {
                 read_chunk: read_chunk.min(1_048_576) as usize,
                 busy: AtomicBool::new(false),
                 data: Mutex::new(Some(result)),
+                keys,
                 _lease: lease,
             }),
             ready,

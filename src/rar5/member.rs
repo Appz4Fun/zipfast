@@ -41,6 +41,12 @@ struct CbcAvailability {
 }
 pub(crate) trait RecoverySink: Sink {
     fn hole(&mut self, len: u64) -> Result<()>;
+    /// Ciphertext of the block at ciphertext stream offset `offset` that a later fill of an encrypted hole needs:
+    /// the block just before a run of unavailable blocks, or a `CipherNeighbour` block whose own ciphertext
+    /// arrived but whose previous block did not. Called before the hole run that needs it is flushed.
+    fn cipher_block(&mut self, _offset: u64, _block: &[u8; 16]) -> Result<()> {
+        Ok(())
+    }
 }
 pub(crate) struct StoredCipherPadding {
     pub(crate) size: u64,
@@ -245,6 +251,21 @@ impl MemberMachine {
             self.part_missing = true;
         }
     }
+    /// Late damage on ciphertext already fed to a stored encrypted member: `range` is in ciphertext stream
+    /// offsets. Output already produced is the caller's to invalidate; this taints the CBC state still pending, so
+    /// the block being assembled and the block after the last complete one come out as holes.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn declare_cipher_damage(&mut self, range: std::ops::Range<u64>) {
+        let start = self.delivered;
+        if let Some(state) = self.cipher.as_mut().and_then(|cipher| cipher.recovery.as_mut()) {
+            if start >= 16 && range.start < start && start - 16 < range.end {
+                state.previous_known = false;
+            }
+            if range.start < start + state.used as u64 && start < range.end {
+                state.known = false;
+            }
+        }
+    }
     pub(crate) fn part_missing(&self) -> bool {
         self.part_missing
     }
@@ -384,6 +405,12 @@ impl MemberMachine {
                             continue;
                         }
                         let valid = state.known && state.previous_known;
+                        // `processed` is the stream offset of this block: only the final block is trimmed.
+                        if !state.known && state.previous_known && processed >= 16 {
+                            sink.cipher_block(processed - 16, &cipher.iv)?;
+                        } else if state.known && !state.previous_known {
+                            sink.cipher_block(processed, &state.block)?;
+                        }
                         let mut plain = state.block;
                         if state.known {
                             if state.previous_known {
@@ -684,6 +711,12 @@ pub(crate) struct KdfMeter<'a> {
     pub(crate) usage: &'a crate::progressive::Usage,
     pub(crate) control: &'a crate::progressive::SessionControl,
     blocks: u64,
+}
+impl<'a> KdfMeter<'a> {
+    #[cfg_attr(not(feature = "persistent-partials"), allow(dead_code))]
+    pub(crate) fn new(usage: &'a crate::progressive::Usage, control: &'a crate::progressive::SessionControl) -> Self {
+        Self { usage, control, blocks: 0 }
+    }
 }
 impl crate::crypto::KdfControl for KdfMeter<'_> {
     fn charge(&mut self, blocks: u64) -> std::result::Result<(), crate::crypto::KdfControlError> {

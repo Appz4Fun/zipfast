@@ -205,6 +205,7 @@ impl Fixture {
             progressive_limits: ProgressiveLimits::default(),
             anchors: self.store.clone(),
             control: SessionControl::default(),
+            password: None,
         }
     }
     pub(super) fn open(&self, state: PartialState) -> PartialResult<PartialFile> {
@@ -221,6 +222,7 @@ impl Fixture {
                 progressive_limits: ProgressiveLimits::default(),
                 anchors: self.store.clone(),
                 control: SessionControl::default(),
+                password: None,
             },
         )
     }
@@ -441,6 +443,7 @@ fn crash_recovers_last_acknowledged_state() {
                 progressive_limits: ProgressiveLimits { read_chunk: 4, ..Default::default() },
                 anchors,
                 control: SessionControl::default(),
+                password: None,
             },
         )
         .unwrap();

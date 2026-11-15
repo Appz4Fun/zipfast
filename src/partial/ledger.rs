@@ -126,20 +126,7 @@ impl PartialCore {
             let plan = Ledger { known: &mut snapshot.known, size: snapshot.head.size, budget: &self.budget }
                 .plan_fill(report.out.clone())?;
             for out in plan.unknown {
-                let count =
-                    snapshot.evidence.parts.iter().filter(|p| p.out.start < out.end && p.out.end > out.start).count();
-                let mut packed = self.budget.vector(count)?;
-                for part in &snapshot.evidence.parts {
-                    let start = out.start.max(part.out.start);
-                    let end = out.end.min(part.out.end);
-                    if start < end {
-                        packed.push(PackedSpan {
-                            volume: part.packed.volume,
-                            range: part.packed.range.start + start - part.out.start
-                                ..part.packed.range.start + end - part.out.start,
-                        });
-                    }
-                }
+                let packed = super::cipher::packed_spans(&self.budget, snapshot, &out)?;
                 reports.push(HoleReport {
                     id: report.id,
                     revision: report.revision,

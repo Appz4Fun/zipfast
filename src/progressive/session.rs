@@ -447,6 +447,10 @@ impl ProgressiveSession {
             if let Some(event) = self.partial.as_mut().and_then(|p| p.ready.take()).map(|(event, _lease)| event) {
                 return Ok(Poll::Ready(Ok(Some(event))));
             }
+            #[cfg(feature = "persistent-partials")]
+            if let Some(report) = self.partial.as_mut().and_then(|p| p.holes.pop_front()) {
+                return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))));
+            }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
                 Phase::NextVolume => {
@@ -671,9 +675,9 @@ impl ProgressiveSession {
                             #[cfg(feature = "persistent-partials")]
                             if self.partial_active() {
                                 self.remaining -= len;
-                                return self
-                                    .partial_feed(len as usize, Some(offset))
-                                    .map(|event| Poll::Ready(Ok(event)));
+                                // Recorded holes are delivered from the queue before any further read.
+                                self.partial_feed(len as usize, Some(offset))?;
+                                continue;
                             }
                             let recover = self.stage.is_some()
                                 && matches!(self.options.hole_policy, HolePolicy::PartialStored { .. })
@@ -721,10 +725,13 @@ impl ProgressiveSession {
                             work += count as u64;
                             #[cfg(feature = "persistent-partials")]
                             if self.partial_active() {
-                                self.partial_feed(count, None)?;
+                                let written = self.partial_feed(count, None)?;
+                                if written == 0 {
+                                    continue;
+                                }
                                 return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten {
                                     member: self.member.unwrap(),
-                                    valid_bytes: count as u64,
+                                    valid_bytes: written,
                                     logical_end: self.produced,
                                 }))));
                             }
