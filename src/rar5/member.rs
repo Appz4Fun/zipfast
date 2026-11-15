@@ -235,6 +235,16 @@ impl MemberMachine {
             part_missing: false,
         }
     }
+    /// Treats bytes already fed as missing after the fact (caller-declared damage), exactly as a hole fed in
+    /// their place would be: the member's whole-content checks, and the current part's packed checks when the
+    /// damage falls in it, are no longer evaluated against those bytes.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn declare_missing(&mut self, current_part: bool) {
+        self.missing = true;
+        if current_part {
+            self.part_missing = true;
+        }
+    }
     pub(crate) fn part_missing(&self) -> bool {
         self.part_missing
     }

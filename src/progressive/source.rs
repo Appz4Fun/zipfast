@@ -384,6 +384,11 @@ struct RangeOperation<'a> {
     native: Option<(&'a mut super::output::native::NativeProtection, &'a ProtectionDeclaration, usize)>,
 }
 #[cfg(feature = "persistent-partials")]
+enum Overlay {
+    Hole(SourceStep),
+    Limit(usize),
+}
+#[cfg(feature = "persistent-partials")]
 struct PendingPartialRead {
     offset: u64,
     requested: u64,
@@ -543,6 +548,10 @@ pub(crate) struct SourceDriver {
     partial_exclusions: Option<Arc<crate::partial::PartialExclusions>>,
     #[cfg(feature = "persistent-partials")]
     pending_partial_read: Option<PendingPartialRead>,
+    /// Caller-declared damage on archive bytes not yet read, sorted and disjoint per volume. Reads answer
+    /// these ranges as holes without consulting the provider.
+    #[cfg(feature = "persistent-partials")]
+    declared: Vec<(u32, std::ops::Range<u64>)>,
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
     original: Option<OriginalSource>,
@@ -589,6 +598,8 @@ impl SourceDriver {
             partial_exclusions: None,
             #[cfg(feature = "persistent-partials")]
             pending_partial_read: None,
+            #[cfg(feature = "persistent-partials")]
+            declared: Vec::new(),
             provider,
             request: VolumeRequest { index: 0, expected: first },
             original: None,
@@ -931,6 +942,15 @@ impl SourceDriver {
             }
         }
         #[cfg(feature = "persistent-partials")]
+        let buf = if verify || self.pending_partial_read.is_some() {
+            buf
+        } else {
+            match self.declared_overlay(buf.len())? {
+                Overlay::Hole(step) => return Ok(Poll::Ready(Ok(step))),
+                Overlay::Limit(n) => &mut buf[..n],
+            }
+        };
+        #[cfg(feature = "persistent-partials")]
         let partial_external =
             if self.partial_exclusions.is_some() { self.other_lane_handles()? + self.backing_count() } else { 0 };
         poll_available(
@@ -1021,6 +1041,93 @@ impl SourceDriver {
                 .iter()
                 .map(|(_, lane)| lane.native.handle_count() + lane.backing_count())
                 .sum::<usize>())
+    }
+    /// Answers a read at the cursor that starts inside declared damage as a hole, or limits it to end where
+    /// declared damage begins.
+    #[cfg(feature = "persistent-partials")]
+    fn declared_overlay(&mut self, len: usize) -> ProgressiveResult<Overlay> {
+        let volume = self.request.index;
+        let offset = self.cursor.offset();
+        let original = self.original.as_mut().unwrap();
+        let length = original.live.length.value();
+        if offset >= length {
+            // End of volume (or a truncated one) is reported by the ordinary read path.
+            return Ok(Overlay::Limit(len));
+        }
+        let end = offset.saturating_add(len as u64).min(length);
+        // Ranges are sorted and disjoint and reads only move forward, so ranges behind the cursor are dropped
+        // and only the first remaining one can matter.
+        let stale = self.declared.iter().take_while(|(v, r)| *v < volume || (*v == volume && r.end <= offset)).count();
+        self.declared.drain(..stale);
+        if let Some((_, range)) = self.declared.first().filter(|(v, _)| *v == volume) {
+            self.usage.charge(Resource::SourceBookkeeping, 1)?;
+            if range.start <= offset && offset < range.end {
+                let hole = range.end.min(end) - offset;
+                self.usage.charge(Resource::SourceBytes, hole)?;
+                original.remember_hole(offset, offset + hole, &mut self.usage)?;
+                self.cursor.advance(hole)?;
+                self.wake.disarm();
+                return Ok(Overlay::Hole(SourceStep::Hole { offset, len: hole }));
+            }
+            if offset < range.start && range.start < end {
+                return Ok(Overlay::Limit((range.start - offset) as usize));
+            }
+        }
+        Ok(Overlay::Limit(len))
+    }
+    /// Records damage on bytes of `volume` the driver has not read yet. Ranges are merged and bounded by the
+    /// hole-interval limit.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn declare_future(&mut self, volume: u32, range: std::ops::Range<u64>) -> ProgressiveResult<()> {
+        let (index, cursor) = self.position();
+        if range.is_empty() || volume < index || (volume == index && range.start < cursor) {
+            return Err(contract());
+        }
+        if let Some(pending) = &self.pending_partial_read
+            && volume == index
+            && range.start < pending.offset.saturating_add(pending.requested)
+        {
+            return Err(ProgressiveFailure::new(FailureKind::Partial(Box::new(crate::partial::PartialError::new(
+                crate::partial::PartialErrorKind::Busy,
+            )))));
+        }
+        let declared_start = range.start;
+        let mut merged = range;
+        let mut kept = Vec::new();
+        kept.try_reserve_exact(self.declared.len() + 1).map_err(|_| contract())?;
+        for (v, r) in self.declared.drain(..) {
+            if v == volume && r.start <= merged.end && merged.start <= r.end {
+                merged = merged.start.min(r.start)..merged.end.max(r.end);
+            } else {
+                kept.push((v, r));
+            }
+        }
+        self.usage.check(Resource::HoleIntervals, kept.len() as u64 + 1)?;
+        kept.push((volume, merged));
+        kept.sort_by_key(|(v, r)| (*v, r.start));
+        self.declared = kept;
+        let parked_end =
+            self.retained.as_ref().and_then(|r| r.selected_len).map(|len| cursor.saturating_add(len as u64));
+        if self.parked
+            && self.original.is_some()
+            && volume == index
+            && parked_end.is_none_or(|end| declared_start < end)
+        {
+            // A read parked on the provider may be waiting for exactly these bytes; let it retry through the
+            // overlay instead of waiting for a provider wake that may never come.
+            self.wake.notify(false);
+        }
+        Ok(())
+    }
+    /// Whether every byte of `range` on `volume` is caller-declared damage.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn declared_covers(&self, volume: u32, range: &std::ops::Range<u64>) -> bool {
+        self.declared.iter().any(|(v, r)| *v == volume && r.start <= range.start && range.end <= r.end)
+    }
+    /// The volume being read (or about to be opened) and the packed offset of the next read within it.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn position(&self) -> (u32, u64) {
+        (self.request.index, if self.original.is_some() { self.cursor.offset() } else { 0 })
     }
     pub(crate) fn observed_info(&self, index: u32) -> Option<SourceInfo> {
         self.admitted.iter().find(|(i, _, _, _)| *i == index).map(|(_, _, _, v)| *v)
