@@ -2014,3 +2014,78 @@ fn declare_hole_before_bytes_are_read_skips_them_without_reading() {
     assert!(matches!(verify(b), Verdict::Ok { .. }));
     assert_eq!(fs::read(dest.join("b.bin")).unwrap(), fixture.data[1]);
 }
+
+#[test]
+fn declare_hole_on_bytes_just_streamed_skips_their_checks_and_member_still_finishes() {
+    // An article that turns out bad right after zipfast consumed it: the bytes really are corrupt, so the
+    // part CRC would fail unless the declared damage reaches the member machine.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let mut fixture = Fixture::new();
+    let p5 = fixture.payloads[5].start;
+    fixture.volumes[5].as_mut().unwrap().bytes[p5 as usize + 10] ^= 0x55;
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(fixture.provider()),
+        options(&dest),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    let mut files = Vec::new();
+    let mut in_volume_5 = false;
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index: 5, .. }))) => in_volume_5 = true,
+            Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) if in_volume_5 => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    let receipt = session.declare_hole(5, p5 + 10..p5 + 11).unwrap();
+    assert_eq!(receipt.holes.iter().map(|h| h.out.clone()).collect::<Vec<_>>(), vec![10..11]);
+    let (_, more) = run_to_end(&mut session);
+    files.extend(more);
+    let b = &mut files[1];
+    assert_eq!(b.remaining().unwrap(), vec![10..11, 3500..4200]);
+    b.fill(10, &fixture.data[1][10..11]).unwrap();
+    b.fill(3500, &fixture.data[1][3500..4200]).unwrap();
+    assert!(matches!(verify(b), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dest.join("b.bin")).unwrap(), fixture.data[1]);
+}
+
+#[test]
+fn declare_hole_releases_a_read_parked_on_the_declared_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new();
+    let p8 = fixture.payloads[8].start;
+    let gate = Arc::new(WaitGate::default());
+    fixture.volumes[8].as_mut().unwrap().wait = Some((p8, gate.clone()));
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(fixture.provider()),
+        options(&dir.path().join("out")),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    let mut files = Vec::new();
+    // Run until the provider parks on volume 8's payload; its gate is never woken.
+    while gate.0.lock().unwrap().is_none() {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    for _ in 0..5 {
+        assert!(session.poll_event(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+    let receipt = session.declare_hole(8, p8..p8 + 1400).unwrap();
+    assert_eq!(receipt.pending.len(), 1);
+    let (holes, more) = run_to_end(&mut session);
+    files.extend(more);
+    assert!(holes.iter().any(|h| h.out == (4200..5600) && matches!(h.cause, HoleCause::DeclaredBad)));
+    assert_eq!(files[1].remaining().unwrap(), vec![3500..5600]);
+}

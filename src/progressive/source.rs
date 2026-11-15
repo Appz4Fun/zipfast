@@ -1050,6 +1050,10 @@ impl SourceDriver {
         let offset = self.cursor.offset();
         let original = self.original.as_mut().unwrap();
         let length = original.live.length.value();
+        if offset >= length {
+            // End of volume (or a truncated one) is reported by the ordinary read path.
+            return Ok(Overlay::Limit(len));
+        }
         let end = offset.saturating_add(len as u64).min(length);
         for (_, range) in self.declared.iter().filter(|(v, _)| *v == volume) {
             self.usage.charge(Resource::SourceBookkeeping, 1)?;
@@ -1058,6 +1062,7 @@ impl SourceDriver {
                 self.usage.charge(Resource::SourceBytes, hole)?;
                 original.remember_hole(offset, offset + hole, &mut self.usage)?;
                 self.cursor.advance(hole)?;
+                self.wake.disarm();
                 return Ok(Overlay::Hole(SourceStep::Hole { offset, len: hole }));
             }
             if offset < range.start && range.start < end {
@@ -1096,6 +1101,11 @@ impl SourceDriver {
         kept.push((volume, merged));
         kept.sort_by_key(|(v, r)| (*v, r.start));
         self.declared = kept;
+        if self.parked && self.original.is_some() && volume == index {
+            // A read parked on the provider may be waiting for exactly these bytes; let it retry through the
+            // overlay instead of waiting for a provider wake that may never come.
+            self.wake.notify(false);
+        }
         Ok(())
     }
     /// Whether every byte of `range` on `volume` is caller-declared damage.

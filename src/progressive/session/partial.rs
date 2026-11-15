@@ -136,12 +136,26 @@ impl ProgressiveSession {
         let mut holes = Vec::new();
         let mut mapped = Vec::new();
         if !read.is_empty() {
-            for (_, core) in &self.partial.as_ref().unwrap().cores {
+            let persistent = self.partial.as_ref().unwrap();
+            let active = persistent.current.map(|index| persistent.cores[index].0.clone());
+            for (key, core) in &persistent.cores {
                 let (reports, ranges) = core.declare_damage(volume, &read).map_err(failure)?;
-                self.usage.charge(
-                    Resource::MetadataBytes,
-                    (reports.len() * std::mem::size_of::<HoleReport>() + ranges.len() * 16) as u64,
-                )?;
+                if active.as_ref() == Some(key) && !reports.is_empty() {
+                    // The member machine checked those bytes as they streamed; it must not judge the member or
+                    // the part still being read by them now.
+                    let current_part = self.model.parts.last().is_some_and(|part| {
+                        part.volume as u32 == volume
+                            && reports.iter().any(|r| {
+                                r.packed.iter().any(|p| {
+                                    p.range.start < part.data_offset.saturating_add(part.packed_size)
+                                        && part.data_offset < p.range.end
+                                })
+                            })
+                    });
+                    if let Some(machine) = self.machine.as_mut().or(self.finalizer.as_mut()) {
+                        machine.declare_missing(current_part);
+                    }
+                }
                 holes.extend(reports);
                 mapped.extend(ranges);
             }
