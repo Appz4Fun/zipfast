@@ -451,7 +451,8 @@ impl RarWalker {
                         volume_number.map(u32::try_from).transpose().map_err(|_| self.malformed("volume number"))?;
                     let single = self.single.as_mut().expect("single-volume mode");
                     single.has_next_volume = more_volumes;
-                    if let Some(number) = number {
+                    // Only a volume of a set has a meaningful number; a stray one in a non-volume archive is ignored.
+                    if let Some(number) = number.filter(|_| single.multi_volume) {
                         // RAR 2.x first volumes lack MHD_FIRSTVOLUME: a number of 0 makes the volume first. A first
                         // volume numbered otherwise contradicts itself.
                         if single.first_volume && number != 0 {

@@ -1457,4 +1457,13 @@ fn rar4_first_volume_flag_and_end_header_number_must_agree() {
     let prefix = vol(&old[..cut], "x.rar", None).unwrap();
     assert!(!prefix.first_volume);
     assert_eq!(prefix.volume_number, None);
+    // A non-volume archive whose end header carries a stray number is not a contradiction: it is volume 0.
+    let mut single = b"Rar!\x1a\x07\0".to_vec();
+    single.extend(r4_block(0x73, 0x00, &[0; 6]));
+    single.extend(r4_member(b"one", &gold, 0, 0x30, gold.len(), crc32fast::hash(&gold)));
+    single.extend(r4_block(0x7b, 0x4000 | 0x8, &5u16.to_le_bytes()));
+    let map = vol(&single, "x.rar", None).unwrap();
+    assert!(!map.multi_volume);
+    assert!(map.first_volume);
+    assert_eq!(map.volume_number, Some(0));
 }
