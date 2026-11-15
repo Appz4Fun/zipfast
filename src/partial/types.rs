@@ -174,18 +174,31 @@ pub enum PartialErrorKind {
     BindingMismatch(BindingField),
     StateVersion,
     StateMalformed,
-    StateStale { latest: StateAnchor },
+    StateStale {
+        latest: StateAnchor,
+    },
     StateUnavailable,
     JournalCorrupt,
     AnchorConflict,
     AnchorCommitUncertain,
     Busy,
     Canceled,
-    OverlapMismatch { range: Range<u64> },
+    OverlapMismatch {
+        range: Range<u64>,
+    },
     IncompleteOutput,
     OutputChanged,
-    Limit { resource: PartialResource, limit: u64, attempted: u64 },
-    Io { operation: OutputOperation, cause: io::Error },
+    /// Reading the caller's archive volume failed in `refill_from_packed`; `volume` and `packed_offset` say where.
+    PackedRead(io::Error),
+    Limit {
+        resource: PartialResource,
+        limit: u64,
+        attempted: u64,
+    },
+    Io {
+        operation: OutputOperation,
+        cause: io::Error,
+    },
 }
 #[derive(Debug)]
 pub struct PartialError {
@@ -195,11 +208,23 @@ pub struct PartialError {
     pub output: Option<OutputRange>,
     pub committed: Option<StateAnchor>,
     pub location: Option<PartialLocation>,
+    /// Set when `fill_packed` or `refill_from_packed` fails after earlier steps already committed: what those steps
+    /// applied and corrected. Corrected alt bytes are already overwritten and are not reported again on retry.
+    pub packed_progress: Option<Box<PackedFillResult>>,
     pub kind: PartialErrorKind,
 }
 impl PartialError {
     pub fn new(kind: PartialErrorKind) -> Self {
-        Self { member: None, volume: None, packed_offset: None, output: None, committed: None, location: None, kind }
+        Self {
+            member: None,
+            volume: None,
+            packed_offset: None,
+            output: None,
+            committed: None,
+            location: None,
+            packed_progress: None,
+            kind,
+        }
     }
 }
 impl std::fmt::Display for PartialError {
@@ -210,7 +235,7 @@ impl std::fmt::Display for PartialError {
 impl std::error::Error for PartialError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
-            PartialErrorKind::Io { cause, .. } => Some(cause),
+            PartialErrorKind::Io { cause, .. } | PartialErrorKind::PackedRead(cause) => Some(cause),
             PartialErrorKind::Progressive(cause) => Some(cause.as_ref()),
             _ => None,
         }

@@ -135,6 +135,7 @@ enum FillMode {
     /// Archive bytes supplied later (a twin post or a par2 repair); fill holes and replace differing alt bytes.
     Packed,
 }
+type Ranges = Vec<Range<u64>>;
 #[derive(Default)]
 struct Written {
     applied: Vec<Range<u64>>,
@@ -447,9 +448,26 @@ impl PartialCore {
         let mut corrected = Vec::new();
         for (packed, out) in segments {
             let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
-            let written = self.write_data(&mut op, out, slice, FillMode::Packed)?;
-            applied.extend(written.applied);
-            corrected.extend(written.corrected);
+            match self.write_data(&mut op, out, slice, FillMode::Packed) {
+                Ok(written) => {
+                    applied.extend(written.applied);
+                    corrected.extend(written.corrected);
+                }
+                Err(mut error) => {
+                    if !applied.is_empty() || !corrected.is_empty() {
+                        error.packed_progress = Some(Box::new(PackedFillResult {
+                            revision: op.snapshot.head.revision,
+                            applied,
+                            corrected,
+                            unmapped,
+                            state: op.state.clone(),
+                            part_checks: Vec::new(),
+                            needs_verification: true,
+                        }));
+                    }
+                    return Err(error);
+                }
+            }
         }
         let fill = self.fill_result(&mut op, applied)?;
         Ok(PackedFillResult {
@@ -548,7 +566,7 @@ impl PartialCore {
         }
         let range = offset..end;
         // Packed bytes carry archive authority: alt leaves that differ are collected here and rewritten below.
-        let corrected = self.compare_known(op, offset, bytes, mode)?;
+        let (corrected, confirmed) = self.compare_known(op, offset, bytes, mode)?;
         let mut base = Vec::new();
         if !corrected.is_empty() {
             let mut scratch = self.clone_snapshot(&op.snapshot)?;
@@ -583,7 +601,7 @@ impl PartialCore {
             }
         }
         self.check(op)?;
-        if plan.unknown.is_empty() {
+        if plan.unknown.is_empty() && confirmed.is_empty() {
             return Ok(Written { applied: Vec::new(), corrected });
         }
         if !alternate && offset < op.snapshot.head.produced {
@@ -638,11 +656,19 @@ impl PartialCore {
             intent.known = base.clone();
             commit.known = base;
             let revision = intent.head.revision;
+            // The intent is what a crash reopens, so its holes must fit the same limit reopening enforces.
+            self.budget.usage.check(
+                Resource::HoleIntervals,
+                intent.holes.len().checked_add(corrected.len()).ok_or_else(malformed)? as u64,
+            )?;
             for bad in &corrected {
                 let report = self.report_for(&intent, revision, bad.clone(), HoleCause::DeclaredBad)?;
                 intent.holes.push(report.clone());
                 commit.holes.push(report);
             }
+        }
+        for leaf in commit.known.iter_mut().filter(|leaf| confirmed.contains(&leaf.range)) {
+            leaf.provenance = state::Provenance::Original;
         }
         ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }
             .commit_fill(&plan, &leaves)?;
@@ -703,9 +729,10 @@ impl PartialCore {
         offset: u64,
         bytes: &[u8],
         mode: FillMode,
-    ) -> PartialResult<Vec<Range<u64>>> {
+    ) -> PartialResult<(Ranges, Ranges)> {
         let end = offset + bytes.len() as u64;
         let mut corrected: Vec<Range<u64>> = Vec::new();
+        let mut confirmed: Vec<Range<u64>> = Vec::new();
         let mut compare = self.budget.vector(bytes.len().min(self.read_chunk))?;
         compare.resize(bytes.len().min(self.read_chunk), 0);
         for leaf in &op.snapshot.known {
@@ -715,6 +742,7 @@ impl PartialCore {
                 continue;
             }
             let mut at = start;
+            let mut differs = false;
             while at < stop {
                 canceled(&self.control)?;
                 let n = (stop - at).min(compare.len() as u64) as usize;
@@ -725,16 +753,31 @@ impl PartialCore {
                 let i = (at - offset) as usize;
                 if count == 0 || compare[..count] != bytes[i..i + count] {
                     if mode == FillMode::Packed && leaf.provenance == state::Provenance::Alt && count != 0 {
-                        self.budget.usage.check(Resource::HoleIntervals, corrected.len() as u64 + 1)?;
-                        corrected.push(start..stop);
+                        match corrected.last_mut() {
+                            Some(last) if last.end == start => last.end = stop,
+                            _ => {
+                                self.budget.usage.check(Resource::HoleIntervals, corrected.len() as u64 + 1)?;
+                                corrected.push(start..stop);
+                            }
+                        }
+                        differs = true;
                         break;
                     }
                     return Err(err(PartialErrorKind::OverlapMismatch { range: start..stop }));
                 }
                 at += count as u64;
             }
+            // An alt leaf wholly confirmed by archive bytes is archive output from now on; refills skip it.
+            if mode == FillMode::Packed
+                && !differs
+                && leaf.provenance == state::Provenance::Alt
+                && start == leaf.range.start
+                && stop == leaf.range.end
+            {
+                confirmed.push(leaf.range.clone());
+            }
         }
-        Ok(corrected)
+        Ok((corrected, confirmed))
     }
     fn report_for(
         &self,
@@ -1280,28 +1323,49 @@ impl PartialFile {
         let targets = self.core.refill_targets(volume, &range)?;
         let mut buffer = self.core.budget.vector(chunk)?;
         let mut total: Option<PackedFillResult> = None;
+        fn merge(total: &mut Option<PackedFillResult>, step: PackedFillResult) {
+            *total = Some(match total.take() {
+                None => step,
+                Some(mut sum) => {
+                    sum.applied.extend(step.applied);
+                    sum.corrected.extend(step.corrected);
+                    sum.unmapped.extend(step.unmapped);
+                    sum.revision = step.revision;
+                    sum.state = step.state;
+                    sum.part_checks = step.part_checks;
+                    sum.needs_verification = step.needs_verification;
+                    sum
+                }
+            });
+        }
         for target in targets {
             let mut at = target.start;
             while at < target.end {
-                canceled(&self.core.control)?;
                 let n = (target.end - at).min(chunk as u64) as usize;
                 buffer.resize(n, 0);
-                reader.seek(std::io::SeekFrom::Start(at)).map_err(|e| io_error(OutputOperation::Read, e))?;
-                reader.read_exact(&mut buffer[..n]).map_err(|e| io_error(OutputOperation::Read, e))?;
-                let step = self.core.fill_packed(volume, at, &buffer[..n])?;
-                total = Some(match total.take() {
-                    None => step,
-                    Some(mut sum) => {
-                        sum.applied.extend(step.applied);
-                        sum.corrected.extend(step.corrected);
-                        sum.unmapped.extend(step.unmapped);
-                        sum.revision = step.revision;
-                        sum.state = step.state;
-                        sum.part_checks = step.part_checks;
-                        sum.needs_verification = step.needs_verification;
-                        sum
+                let step = canceled(&self.core.control)
+                    .and_then(|()| {
+                        reader
+                            .seek(std::io::SeekFrom::Start(at))
+                            .and_then(|_| reader.read_exact(&mut buffer[..n]))
+                            .map_err(|cause| {
+                                let mut error = err(PartialErrorKind::PackedRead(cause));
+                                error.volume = Some(volume);
+                                error.packed_offset = Some(at);
+                                error
+                            })
+                    })
+                    .and_then(|()| self.core.fill_packed(volume, at, &buffer[..n]));
+                match step {
+                    Ok(step) => merge(&mut total, step),
+                    Err(mut error) => {
+                        if let Some(progress) = error.packed_progress.take() {
+                            merge(&mut total, *progress);
+                        }
+                        error.packed_progress = total.map(Box::new);
+                        return Err(error);
                     }
-                });
+                }
                 at += n as u64;
             }
         }
