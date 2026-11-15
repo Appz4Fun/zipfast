@@ -276,6 +276,7 @@ impl Fixture {
             progressive_limits: ProgressiveLimits::default(),
             anchors: self.store.clone(),
             control: SessionControl::default(),
+            password: None,
         }
     }
     pub fn output(&self) -> std::path::PathBuf {

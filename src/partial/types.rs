@@ -102,6 +102,11 @@ pub struct PartialOpenContext {
     pub progressive_limits: ProgressiveLimits,
     pub anchors: Arc<dyn StateAnchorStore>,
     pub control: SessionControl,
+    /// Password of an encrypted member. It is never stored. Without it a reopened encrypted member still accepts
+    /// [`PartialFile::fill`](super::PartialFile::fill) (plaintext), but cannot decrypt archive bytes in `fill_packed`
+    /// or evaluate keyed member checks; both then fail with [`PartialErrorKind::PasswordRequired`]. Ignored for
+    /// unencrypted members.
+    pub password: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedSpan {
@@ -193,6 +198,18 @@ pub enum PartialErrorKind {
     /// Reading the caller's plaintext failed (or ended early) in `PartialFile::fill_from`; `output` says how far the
     /// fill got.
     FillRead(io::Error),
+    /// The member is encrypted and this handle has no password, but the operation needs one: decrypting archive
+    /// bytes in `fill_packed`, or evaluating member checks that RAR5 keys with the password. Reopen with
+    /// [`PartialOpenContext::password`].
+    PasswordRequired,
+    /// The supplied password does not match the member's password check value, or, for a member without one,
+    /// `fill_packed` decrypted every block of original output it tried to different bytes.
+    WrongPassword,
+    /// The member has no password check value, and this `fill_packed` would write with a password that has not
+    /// yet decrypted any block of original output correctly. Include at least one block (16 bytes, plus the block
+    /// before it) whose output the original extraction wrote, or fill plaintext with `fill`. `refill_from_packed`
+    /// does this by itself while the password is unproven.
+    PasswordUnverified,
     Limit {
         resource: PartialResource,
         limit: u64,
@@ -357,6 +374,11 @@ pub struct PackedFillResult {
     /// Supplied packed bytes that map to no produced output of this member (headers, padding, other members, or
     /// output the extraction has not reached yet). They were not used.
     pub unmapped: Vec<PackedSpan>,
+    /// Encrypted members only: output ranges the supplied bytes reach that are still holes or alt output but could
+    /// not be decrypted. CBC needs the previous ciphertext block: it was neither in the supplied bytes nor kept from
+    /// earlier (the extraction keeps the block before each hole and each `CipherNeighbour` block), or the supplied
+    /// bytes ended inside the block. Supply bytes that start one 16-byte block earlier, or the rest of the block.
+    pub undecryptable: Vec<Range<u64>>,
     pub state: PartialState,
     pub part_checks: Vec<PartCheck>,
     pub needs_verification: bool,

@@ -25,6 +25,10 @@ pub(super) struct Verification {
     member_blake: CheckResult,
     active: Option<Readback>,
     readback: Option<VerifyPath>,
+    /// Hash key for an encrypted member whose RAR5 checks are keyed (tweaked) with it.
+    key: Option<[u8; 32]>,
+    /// The member checks are keyed but this handle has no password.
+    password_required: bool,
     _lease: Reservation,
 }
 // BLAKE2sp holds eight fixed lanes and a 512-byte round. Reserve a conservative
@@ -57,6 +61,7 @@ fn crc(
     snapshot: &Snapshot,
     range: &Range<u64>,
     expected: Option<u32>,
+    key: Option<&[u8; 32]>,
     budget: &PartialBudget,
 ) -> PartialResult<CheckResult> {
     let Some(expected) = expected else { return Ok(CheckResult::Missing) };
@@ -74,10 +79,21 @@ fn crc(
         budget.usage.charge(Resource::VerifyWorkBytes, leaf.range.end - leaf.range.start)?;
         combined.combine(&leaf.hasher);
     }
-    Ok(if combined.finalize() == expected { CheckResult::Passed } else { CheckResult::Failed })
+    let raw = combined.finalize();
+    let crc = key.map_or(raw, |key| crate::crypto::rar5_tweak_crc32(raw, key));
+    Ok(if crc == expected { CheckResult::Passed } else { CheckResult::Failed })
 }
 impl Verification {
-    pub fn new(snapshot: &Snapshot, budget: &PartialBudget) -> PartialResult<Self> {
+    /// Encrypted parts carry checks over their ciphertext, keyed with the password: they never check plaintext
+    /// output, so they report `Missing`. Keyed member checks need `hash_key`; without it they stay unevaluated and
+    /// verification reports [`PartialErrorKind::PasswordRequired`] once nothing else is missing.
+    pub fn new(snapshot: &Snapshot, budget: &PartialBudget, hash_key: Option<&[u8; 32]>) -> PartialResult<Self> {
+        let keyed = snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc);
+        let password_required = keyed
+            && hash_key.is_none()
+            && (snapshot.head.checks.crc32.is_some() || snapshot.head.checks.blake2sp.is_some());
+        let key = hash_key.filter(|_| keyed).copied();
+        let encrypted = snapshot.crypt.is_some();
         budget.usage.check(Resource::Parts, snapshot.evidence.parts.len() as u64)?;
         let bytes = std::mem::size_of::<Self>()
             .checked_add(
@@ -92,28 +108,39 @@ impl Verification {
             parts.push(PartCheck {
                 volume: part.packed.volume,
                 part: part.ordinal,
-                crc32: crc(snapshot, &range, part.crc32, budget)?,
-                blake2sp: if part.blake2sp.is_some() { CheckResult::Pending } else { CheckResult::Missing },
+                crc32: if encrypted { CheckResult::Missing } else { crc(snapshot, &range, part.crc32, None, budget)? },
+                blake2sp: if part.blake2sp.is_some() && !encrypted {
+                    CheckResult::Pending
+                } else {
+                    CheckResult::Missing
+                },
                 range,
             });
         }
-        let member_crc = crc(snapshot, &(0..snapshot.head.size), snapshot.head.checks.crc32, budget)?;
+        let member_crc = if password_required {
+            CheckResult::Missing
+        } else {
+            crc(snapshot, &(0..snapshot.head.size), snapshot.head.checks.crc32, key.as_ref(), budget)?
+        };
         Ok(Self {
             active: None,
             readback: None,
             revision: snapshot.head.revision,
             parts,
             member_crc,
-            member_blake: if snapshot.head.checks.blake2sp.is_some() {
+            member_blake: if snapshot.head.checks.blake2sp.is_some() && !password_required {
                 CheckResult::Pending
             } else {
                 CheckResult::Missing
             },
+            key,
+            password_required,
             _lease: lease,
         })
     }
     pub fn needs_verification(&self) -> bool {
-        self.parts.iter().any(|p| p.crc32 == CheckResult::Pending || p.blake2sp == CheckResult::Pending)
+        self.password_required
+            || self.parts.iter().any(|p| p.crc32 == CheckResult::Pending || p.blake2sp == CheckResult::Pending)
             || self.member_crc == CheckResult::Pending
             || self.member_blake == CheckResult::Pending
     }
@@ -179,6 +206,7 @@ impl Verification {
             if active.range == (0..snapshot.head.size)
                 && let Some(expected) = snapshot.head.checks.blake2sp
             {
+                let hash = self.key.as_ref().map_or(hash, |key| crate::crypto::rar5_tweak_blake2sp(&hash, key));
                 self.member_blake = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
             }
         }
@@ -217,7 +245,7 @@ impl PartialCore {
         self.reconcile(&mut op)?;
         if op.verification.as_ref().is_none_or(|v| v.revision != op.snapshot.head.revision) {
             op.verification = None;
-            op.verification = Some(Verification::new(&op.snapshot, &self.budget)?);
+            op.verification = Some(Verification::new(&op.snapshot, &self.budget, self.hash_key())?);
         }
         if let Some(bad) = op.verification.as_ref().unwrap().bad(&op.snapshot) {
             return Ok(Poll::Ready(bad));
@@ -235,13 +263,17 @@ impl PartialCore {
         let mut parts = self.budget.vector(verification.parts.len())?;
         parts.extend_from_slice(&verification.parts);
         let missing_checks = op.snapshot.head.checks.crc32.is_none() && op.snapshot.head.checks.blake2sp.is_none();
-        let pending = verification.needs_verification();
+        let password_required = verification.password_required;
+        let pending = verification.needs_verification() && !password_required;
         let revision = verification.revision;
         let readback = verification.readback;
         let size = op.snapshot.head.size;
         let holes = ledger::Ledger { known: &mut op.snapshot.known, size, budget: &self.budget }.remaining()?;
         self.check(&op)?;
-        if !op.snapshot.head.member_finished || !holes.is_empty() || missing_checks || pending {
+        if password_required && op.snapshot.head.member_finished && holes.is_empty() && !pending {
+            return Err(err(PartialErrorKind::PasswordRequired));
+        }
+        if !op.snapshot.head.member_finished || !holes.is_empty() || missing_checks || pending || password_required {
             Ok(Poll::Ready(Verdict::Incomplete { revision, holes, parts, missing_checks }))
         } else {
             // The operation token excludes mutation; callbacks have completed and

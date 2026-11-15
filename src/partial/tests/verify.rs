@@ -303,7 +303,7 @@ fn retained_part_storage_counts_against_ledger_bytes() {
         let limits = PartialLimits { ledger_bytes: base + needed - u64::from(!exact), ..PartialLimits::default() };
         let file = f.create_with(limits, ProgressiveLimits::default()).unwrap();
         let op = file.core.operation().unwrap();
-        let result = crate::partial::verify::Verification::new(&op.snapshot, &file.core.budget);
+        let result = crate::partial::verify::Verification::new(&op.snapshot, &file.core.budget, None);
         if exact {
             let _held = result.unwrap();
             assert!(file.core.budget.reserve(PartialResource::LedgerBytes, 1).is_err());

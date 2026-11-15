@@ -19,6 +19,7 @@ use super::*;
 use crate::partial::*;
 use crate::rar5::member::RecoverySink;
 use crate::rar5::unpack::Sink;
+use std::collections::VecDeque;
 use std::ops::Range;
 
 pub(super) struct Persistent {
@@ -30,6 +31,16 @@ pub(super) struct Persistent {
     header: Vec<u8>,
     witness: Option<HeaderWitness>,
     pub(super) ready: Option<(ProgressiveEvent, PartialEventLease)>,
+    /// Hole reports recorded but not yet delivered as events; one feed can record several.
+    pub(super) holes: VecDeque<HoleReport>,
+    /// A `BytesWritten` event held back until the holes the same feed recorded are delivered, so no event
+    /// reports a `logical_end` past a hole not yet delivered.
+    pub(super) written: Option<ProgressiveEvent>,
+    /// Ciphertext stream bytes of the active member fed so far (the output offset for a plain member).
+    stream: u64,
+    /// Recently unavailable stream ranges of the active member, and whether the caller declared them damaged.
+    /// Kept until every block they touch is produced, to give each hole block its cause.
+    unavailable: Vec<(Range<u64>, bool)>,
 }
 impl Persistent {
     pub(super) fn record_header(&mut self, offset: u64, bytes: &[u8], usage: &Usage) -> ProgressiveResult<()> {
@@ -100,6 +111,10 @@ impl ProgressiveSession {
             header: Vec::new(),
             witness: None,
             ready: None,
+            holes: VecDeque::new(),
+            written: None,
+            stream: 0,
+            unavailable: Vec::new(),
         });
         Ok(session)
     }
@@ -141,11 +156,35 @@ impl ProgressiveSession {
                 .and_then(|key| persistent.cores.iter().find(|(k, _)| k == key))
                 .into_iter()
                 .chain(persistent.cores.iter().filter(|(k, _)| Some(k) != active.as_ref()));
+            let mut fed = Vec::new();
+            if active.is_some() {
+                fed = self.fed_damage(volume, &read)?;
+            }
             for (key, core) in order {
                 if !core.touches(volume, &read) {
                     continue;
                 }
                 let (reports, ranges) = core.declare_damage(volume, &read).map_err(failure)?;
+                if active.as_ref() == Some(key) && !fed.is_empty() {
+                    // Encrypted bytes the machine still holds in its CBC state: taint that state, so a block not
+                    // produced yet comes out as a DeclaredBad hole and the block after the damage as a
+                    // CipherNeighbour hole, and skip the checks those bytes fed.
+                    for (stream, packed) in &fed {
+                        mapped.push(packed.clone());
+                        if let Some(machine) = self.machine.as_mut() {
+                            machine.declare_cipher_damage(stream.clone());
+                        }
+                    }
+                    let current_part = self.model.parts.last().is_some_and(|part| {
+                        part.volume as u32 == volume
+                            && fed.iter().any(|(_, p)| {
+                                p.start < part.data_offset.saturating_add(part.packed_size) && part.data_offset < p.end
+                            })
+                    });
+                    if let Some(machine) = self.machine.as_mut() {
+                        machine.declare_missing(current_part);
+                    }
+                }
                 if active.as_ref() == Some(key) && !reports.is_empty() {
                     // The member machine checked those bytes as they streamed; it must not judge the member or
                     // the part still being read by them now.
@@ -164,6 +203,12 @@ impl ProgressiveSession {
                 }
                 holes.extend(reports);
                 mapped.extend(ranges);
+            }
+            let persistent = self.partial.as_mut().unwrap();
+            for (stream, _) in fed {
+                self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<(Range<u64>, bool)>() as u64)?;
+                persistent.unavailable.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+                persistent.unavailable.push((stream, true));
             }
         }
         if !future.is_empty() {
@@ -184,11 +229,39 @@ impl ProgressiveSession {
         let pending = if future.is_empty() { Vec::new() } else { vec![PackedSpan { volume, range: future }] };
         Ok(DamageReceipt { holes, pending, unmapped })
     }
+    /// Stream and packed ranges of `range` (on `volume`) that the machine of an active encrypted member still
+    /// holds in its CBC state: the block being assembled, and the last complete block, which decrypts the next.
+    fn fed_damage(&self, volume: u32, range: &Range<u64>) -> ProgressiveResult<Vec<(Range<u64>, Range<u64>)>> {
+        let persistent = self.partial.as_ref().unwrap();
+        let mut fed = Vec::new();
+        if !self.model.members.last().is_some_and(|m| m.header.encrypted) {
+            return Ok(fed);
+        }
+        let floor = (self.produced & !15).saturating_sub(16);
+        let mut stream = 0u64;
+        for part in &self.model.parts {
+            let start = range.start.max(part.data_offset);
+            let end = range.end.min(part.data_offset.saturating_add(part.packed_size));
+            if part.volume as u32 == volume && start < end {
+                let a = (stream + (start - part.data_offset)).max(floor);
+                let b = (stream + (end - part.data_offset)).min(persistent.stream);
+                if a < b {
+                    self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<[Range<u64>; 2]>() as u64)?;
+                    fed.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+                    let packed = part.data_offset + (a - stream);
+                    fed.push((a..b, packed..packed + (b - a)));
+                }
+            }
+            stream = stream.saturating_add(part.packed_size);
+        }
+        Ok(fed)
+    }
     pub(super) fn partial_header(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<()> {
         if header.format != crate::rar5::RarFormat::Rar5 {
             return Err(error(PartialErrorKind::UnsupportedFormat));
         }
-        if header.method != 0 || header.encrypted || header.is_dir() || header.redirection.is_some() {
+        // Encrypted stored members are admitted; their password must be in the session options.
+        if header.method != 0 || header.is_dir() || header.redirection.is_some() {
             return Err(error(PartialErrorKind::UnsupportedMethod));
         }
         if header.size_unknown() {
@@ -218,8 +291,17 @@ impl ProgressiveSession {
             relative.set_file_name(name);
         }
         let part = &mut self.model.parts[0];
-        part.plain_extent = Some(0..part.packed_size);
+        part.plain_extent = Some(extent(header, 0, part.packed_size)?);
         let plain = plain_part(part, 0)?;
+        // The extraction's machine holds the keys of an encrypted member; the core keeps them in memory only.
+        let keys = match self.machine.as_ref().and_then(|machine| machine.cipher.as_ref()) {
+            Some(cipher) => Some(MemberKeys::new(
+                cipher.aes,
+                *cipher.checksum_key().ok_or_else(|| error(PartialErrorKind::UnsupportedMethod))?,
+            )),
+            None if header.encrypted => return Err(error(PartialErrorKind::PasswordRequired)),
+            None => None,
+        };
         let checks = member_checks(physical);
         let admission = SourceAdmission {
             volume: self.volume,
@@ -259,6 +341,9 @@ impl ProgressiveSession {
             },
         )
         .map_err(failure)?;
+        if let Some(keys) = keys {
+            prepared.set_keys(keys);
+        }
         prepared.reserve_ready_state().map_err(failure)?;
         let parents = prepared
             .prepare_parents(|path| self.driver.check_partial_target(path).map_err(Into::into))
@@ -267,6 +352,8 @@ impl ProgressiveSession {
         let (core, state, event_lease) = prepared.complete_ready().map_err(failure)?;
         persistent.current = Some(persistent.cores.len());
         persistent.cores.push((key.clone(), core));
+        persistent.stream = 0;
+        persistent.unavailable.clear();
         persistent.ready = Some((ProgressiveEvent::PartialReady { member: key, state }, event_lease));
         Ok(())
     }
@@ -277,9 +364,9 @@ impl ProgressiveSession {
             .iter()
             .try_fold(0u64, |sum, p| sum.checked_add(p.packed_size))
             .ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
+        let header = &self.model.members.last().unwrap().header;
         let part = &mut self.model.parts[index];
-        let end = out.checked_add(part.packed_size).ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
-        part.plain_extent = Some(out..end);
+        part.plain_extent = Some(extent(header, out, part.packed_size)?);
         let plain = plain_part(part, index as u64)?;
         let witness = persistent.witness.take().ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
         let admission = SourceAdmission {
@@ -301,41 +388,47 @@ impl ProgressiveSession {
             })
             .map_err(failure)
     }
-    pub(super) fn partial_feed(
-        &mut self,
-        count: usize,
-        hole: Option<u64>,
-    ) -> ProgressiveResult<Option<ProgressiveEvent>> {
-        let persistent = self.partial.as_ref().unwrap();
-        let (key, core) = persistent.active();
-        let report = if let Some(packed) = hole {
-            let revision = core.next_revision().map_err(failure)?;
-            Some(HoleReport {
-                id: revision,
-                revision,
-                member: key.clone(),
-                name: Arc::from(self.model.members.last().unwrap().header.name.as_bytes()),
-                out: self.produced..self.produced + count as u64,
-                packed: vec![PackedSpan { volume: self.volume, range: packed..packed + count as u64 }],
-                cause: if self.driver.declared_covers(self.volume, &(packed..packed + count as u64)) {
-                    HoleCause::DeclaredBad
-                } else {
-                    HoleCause::Missing
-                },
-            })
-        } else {
-            None
+    /// Feeds `count` packed bytes (a hole when `hole` holds their packed offset) to the active member. Holes the
+    /// machine emits, including the `CipherNeighbour` block a data feed of an encrypted member can emit, are
+    /// recorded durably and queued as events. Returns the output bytes written.
+    pub(super) fn partial_feed(&mut self, count: usize, hole: Option<u64>) -> ProgressiveResult<u64> {
+        let encrypted = self.model.members.last().unwrap().header.encrypted;
+        let declared =
+            hole.is_some_and(|packed| self.driver.declared_covers(self.volume, &(packed..packed + count as u64)));
+        let persistent = self.partial.as_mut().unwrap();
+        let stream = persistent.stream;
+        persistent.stream = stream.checked_add(count as u64).ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
+        if hole.is_some() {
+            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<(Range<u64>, bool)>() as u64)?;
+            persistent.unavailable.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+            persistent.unavailable.push((stream..stream + count as u64, declared));
+        }
+        let Persistent { cores, current, holes, unavailable, .. } = persistent;
+        let core = &cores[current.expect("persistent member")].1;
+        let mut sink = PersistentSink {
+            core,
+            produced: &mut self.produced,
+            encrypted,
+            unavailable,
+            blocks: Vec::new(),
+            reports: holes,
+            usage: &self.usage,
+            written: 0,
+            failure: None,
         };
-        let mut sink = PersistentSink { core, produced: &mut self.produced, report: report.clone(), failure: None };
         let machine = self.machine.as_mut().unwrap();
         machine.reserve_progressive_scratch(count, &self.usage)?;
         let result = machine.feed_stored(hole.is_none().then_some(&self.buffer[..count]), count, &mut sink);
+        let written = sink.written;
         if let Some(error) = sink.failure {
             return Err(error);
         }
         result?;
+        // A range stays until every block it touches is produced.
+        let floor = if encrypted { self.produced & !15 } else { self.produced };
+        unavailable.retain(|(range, _)| range.end > floor);
         self.driver.validate_current()?;
-        Ok(report.map(ProgressiveEvent::Hole))
+        Ok(written)
     }
     pub(super) fn partial_part_event(&self) -> ProgressiveResult<Option<ProgressiveEvent>> {
         if !self.partial_active() {
@@ -343,7 +436,9 @@ impl ProgressiveSession {
         }
         let persistent = self.partial.as_ref().unwrap();
         let part = self.model.parts.last().unwrap();
+        // Encrypted part checks cover ciphertext, never plaintext output, so they have no plaintext mirror.
         if part.final_part
+            || self.model.members.last().unwrap().header.encrypted
             || self.machine.as_ref().unwrap().part_missing()
             || (part.checks.crc32.is_none() && part.checks.blake2sp.is_none())
         {
@@ -362,8 +457,20 @@ impl ProgressiveSession {
         }))
     }
     pub(super) fn partial_finish_decode(&mut self) -> ProgressiveResult<()> {
-        let core = self.partial.as_ref().unwrap().active().1;
-        let mut sink = PersistentSink { core, produced: &mut self.produced, report: None, failure: None };
+        let encrypted = self.model.members.last().unwrap().header.encrypted;
+        let Persistent { cores, current, holes, unavailable, .. } = self.partial.as_mut().unwrap();
+        let core = &cores[current.expect("persistent member")].1;
+        let mut sink = PersistentSink {
+            core,
+            produced: &mut self.produced,
+            encrypted,
+            unavailable,
+            blocks: Vec::new(),
+            reports: holes,
+            usage: &self.usage,
+            written: 0,
+            failure: None,
+        };
         let mut machine = self.machine.take().unwrap();
         let result = machine.finish_decode(&mut sink);
         if let Some(error) = sink.failure {
@@ -406,6 +513,7 @@ impl ProgressiveSession {
             MemberOutcome::PersistentComplete { member: key.clone(), state, verdict }
         };
         persistent.current = None;
+        persistent.unavailable.clear();
         self.phase = Phase::Header;
         Ok(Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { member: self.member.take().unwrap(), outcome }))))
     }
@@ -435,17 +543,68 @@ fn plain_part(part: &PhysicalPart, ordinal: u64) -> ProgressiveResult<PlainPart>
         blake2sp: part.checks.blake2sp,
     })
 }
+/// Output range of a part starting at stream offset `stream`: the stream itself for a plain member, clipped at the
+/// unpacked size for an encrypted one (the final padding maps to no output).
+fn extent(header: &crate::rar5::FileHeader, stream: u64, packed: u64) -> ProgressiveResult<Range<u64>> {
+    let end = stream.checked_add(packed).ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
+    Ok(if header.encrypted { stream.min(header.unpacked_size)..end.min(header.unpacked_size) } else { stream..end })
+}
 struct PersistentSink<'a> {
     core: &'a Arc<PartialCore>,
     produced: &'a mut u64,
-    report: Option<HoleReport>,
+    encrypted: bool,
+    unavailable: &'a [(Range<u64>, bool)],
+    /// Ciphertext blocks the machine handed over for the next hole run.
+    blocks: Vec<CipherBlock>,
+    reports: &'a mut VecDeque<HoleReport>,
+    usage: &'a Usage,
+    written: u64,
     failure: Option<ProgressiveFailure>,
+}
+impl PersistentSink<'_> {
+    /// Cause of a hole over stream `range`: the source said it was unavailable (declared by the caller or not),
+    /// or, for an encrypted member, only the previous ciphertext block was.
+    fn cause(&self, range: &Range<u64>) -> HoleCause {
+        let mut overlapping =
+            self.unavailable.iter().filter(|(r, _)| r.start < range.end && range.start < r.end).peekable();
+        if overlapping.peek().is_none() {
+            return if self.encrypted { HoleCause::CipherNeighbour } else { HoleCause::Missing };
+        }
+        if overlapping.all(|(_, declared)| *declared) { HoleCause::DeclaredBad } else { HoleCause::Missing }
+    }
+    #[allow(clippy::result_large_err, reason = "carries the typed partial receipt into the sink failure")]
+    fn record(&mut self, len: u64) -> PartialResult<()> {
+        let end = self.produced.checked_add(len).ok_or_else(|| PartialError::new(PartialErrorKind::StateMalformed))?;
+        while *self.produced < end {
+            let at = *self.produced;
+            let (cause, stop) = if self.encrypted {
+                // One cause per 16-byte block, judged on the block's ciphertext; runs of equal causes join.
+                let cause = self.cause(&(at & !15..(at & !15) + 16));
+                let mut stop = ((at & !15) + 16).min(end);
+                while stop < end && self.cause(&(stop..stop + 16)) == cause {
+                    stop = (stop + 16).min(end);
+                }
+                (cause, stop)
+            } else {
+                (self.cause(&(at..end)), end)
+            };
+            let report = self.core.hole_report(at..stop, cause)?;
+            let blocks = std::mem::take(&mut self.blocks);
+            self.core.record_hole_with(report.clone(), &blocks)?;
+            *self.produced = stop;
+            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<HoleReport>() as u64)?;
+            self.reports.try_reserve(1).map_err(|_| PartialError::new(PartialErrorKind::StateMalformed))?;
+            self.reports.push_back(report);
+        }
+        Ok(())
+    }
 }
 impl Sink for PersistentSink<'_> {
     fn put(&mut self, bytes: &[u8]) -> crate::error::Result<()> {
         match self.core.write_original(*self.produced, bytes) {
             Ok(()) => {
                 *self.produced += bytes.len() as u64;
+                self.written += bytes.len() as u64;
                 Ok(())
             }
             Err(error) => {
@@ -457,17 +616,22 @@ impl Sink for PersistentSink<'_> {
 }
 impl RecoverySink for PersistentSink<'_> {
     fn hole(&mut self, len: u64) -> crate::error::Result<()> {
-        let report = self.report.take().ok_or(crate::Error::Corrupt("unmapped hole"))?;
-        match self.core.record_hole(report) {
-            Ok(()) => {
-                *self.produced += len;
-                Ok(())
-            }
-            Err(error) => {
-                self.failure = Some(failure(error));
-                Err(crate::Error::Corrupt("persistent hole"))
-            }
+        self.record(len).map_err(|error| {
+            self.failure = Some(failure(error));
+            crate::Error::Corrupt("persistent hole")
+        })
+    }
+    fn cipher_block(&mut self, offset: u64, block: &[u8; 16]) -> crate::error::Result<()> {
+        let admitted =
+            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<CipherBlock>() as u64).and_then(|()| {
+                self.blocks.try_reserve(1).map_err(|_| ProgressiveFailure::new(FailureKind::InvalidCapability))
+            });
+        if let Err(error) = admitted {
+            self.failure = Some(error);
+            return Err(crate::Error::Corrupt("persistent cipher block"));
         }
+        self.blocks.push(CipherBlock { offset, have: 0..16, bytes: *block });
+        Ok(())
     }
 }
 pub(super) fn error(kind: PartialErrorKind) -> ProgressiveFailure {

@@ -76,6 +76,20 @@ pub(super) struct KnownLeaf {
     pub provenance: Provenance,
     pub _lease: Arc<super::limits::Reservation>,
 }
+/// Ciphertext of one 16-byte CBC block of an encrypted member, kept because a hole next to it needs it to decrypt
+/// later archive bytes. `offset` is the block's offset in the member's ciphertext stream (a multiple of 16) and
+/// `have` the bytes of the block that are known; a whole block has `0..16`. Never key material.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CipherBlock {
+    pub offset: u64,
+    pub have: Range<u8>,
+    pub bytes: [u8; 16],
+}
+impl CipherBlock {
+    pub fn whole(&self) -> bool {
+        self.have == (0..16)
+    }
+}
 #[derive(Clone)]
 pub(super) struct Snapshot {
     pub head: CommittedState,
@@ -83,6 +97,11 @@ pub(super) struct Snapshot {
     pub evidence: InitialEvidence,
     pub known: Vec<KnownLeaf>,
     pub holes: Vec<HoleReport>,
+    /// Encryption parameters parsed from the member's header witnesses; `None` for a plain member. Derived from the
+    /// evidence on every load, never encoded separately.
+    pub crypt: Option<crate::crypto::Rar5CryptParams>,
+    /// Ciphertext blocks next to holes of an encrypted member, sorted by offset.
+    pub cipher: Vec<CipherBlock>,
 }
 pub(crate) struct MutationIntent {
     pub transaction: u64,
@@ -555,8 +574,9 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         }
     }
     // Trailing cause section, written only when some hole is not Missing so that states without declared
-    // damage stay readable by builds that predate it. States without it decode every hole as Missing.
-    let causes = snapshot.holes.iter().any(|h| h.cause != HoleCause::Missing);
+    // damage stay readable by builds that predate it. States without it decode every hole as Missing. The
+    // ciphertext block section follows it, so it forces the cause section.
+    let causes = snapshot.holes.iter().any(|h| h.cause != HoleCause::Missing) || !snapshot.cipher.is_empty();
     for h in snapshot.holes.iter().filter(|_| causes) {
         validity.u8(match h.cause {
             HoleCause::Missing => 0,
@@ -564,6 +584,17 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             HoleCause::CipherNeighbour => 2,
             HoleCause::HeaderLost => 3,
         })?;
+    }
+    // Versioned ciphertext block section of encrypted members, written only when some block is kept.
+    if !snapshot.cipher.is_empty() {
+        validity.u8(1)?;
+        validity.u32(snapshot.cipher.len().try_into().map_err(|_| malformed())?)?;
+        for block in &snapshot.cipher {
+            validity.u64(block.offset)?;
+            validity.u8(block.have.start)?;
+            validity.u8(block.have.end)?;
+            validity.raw(&block.bytes)?;
+        }
     }
     let mut headers = Encoder::budgeted(budget.limits.ledger_bytes as usize, budget);
     headers.u32(snapshot.evidence.headers.len().try_into().map_err(|_| malformed())?)?;
@@ -737,6 +768,29 @@ pub(super) fn decode_pages(
             };
         }
     }
+    let mut cipher = Vec::new();
+    if d.at < d.bytes.len() {
+        if d.u8()? != 1 {
+            return Err(err(PartialErrorKind::StateVersion));
+        }
+        let count = d.count(budget.limits.journal_records as usize, 26)?;
+        budget.usage.check(crate::progressive::Resource::HoleIntervals, count as u64)?;
+        budget.metadata((count * std::mem::size_of::<CipherBlock>()) as u64)?;
+        cipher = budget.vector(count)?;
+        for _ in 0..count {
+            let offset = d.u64()?;
+            let have = d.u8()?..d.u8()?;
+            let bytes: [u8; 16] = d.take(16)?.try_into().unwrap();
+            if offset % 16 != 0
+                || have.start >= have.end
+                || have.end > 16
+                || cipher.last().is_some_and(|last: &CipherBlock| last.offset >= offset)
+            {
+                return Err(malformed());
+            }
+            cipher.push(CipherBlock { offset, have, bytes });
+        }
+    }
     d.end()?;
     let mut d = Decoder::new(&buffers[2]);
     let count = d.count(usize::MAX, 24)?;
@@ -754,16 +808,23 @@ pub(super) fn decode_pages(
     }
     d.end()?;
     let evidence = InitialEvidence { metadata: head.metadata, parts, admissions, headers };
-    let snapshot = Snapshot { head, name, evidence, known, holes };
-    validate_evidence(&snapshot.name, snapshot.head.size, &snapshot.evidence, budget)?;
+    let mut snapshot = Snapshot { head, name, evidence, known, holes, crypt: None, cipher };
+    snapshot.crypt = validate_evidence(&snapshot.name, snapshot.head.size, &snapshot.evidence, budget)?;
+    if !snapshot.cipher.is_empty() && snapshot.crypt.is_none() {
+        return Err(malformed());
+    }
     Ok(snapshot)
 }
+/// Checks every part against its header witness and returns the member's encryption parameters (`None` when the
+/// member is plain). Plain parts map packed bytes one to one onto output. Encrypted parts form one continuous CBC
+/// ciphertext stream: stream offset `c` is output offset `c`, clipped at the unpacked size, and the final padding
+/// maps to no output.
 pub(super) fn validate_evidence(
     name: &[u8],
     size: u64,
     evidence: &InitialEvidence,
     budget: &PartialBudget,
-) -> PartialResult<()> {
+) -> PartialResult<Option<crate::crypto::Rar5CryptParams>> {
     use crate::rar5::{
         framing::{HeaderParser, ParserStep},
         reader::Block,
@@ -773,12 +834,12 @@ pub(super) fn validate_evidence(
     }
     budget.usage.check(crate::progressive::Resource::Parts, evidence.parts.len() as u64)?;
     let mut end = 0;
+    let mut stream = 0u64;
+    let mut crypt = None;
     for (index, part) in evidence.parts.iter().enumerate() {
-        if part.ordinal != index as u64
-            || part.out.start != end
-            || part.out.end > size
-            || part.packed.range.end.checked_sub(part.packed.range.start) != part.out.end.checked_sub(part.out.start)
-        {
+        let packed = part.packed.range.end.checked_sub(part.packed.range.start).ok_or_else(malformed)?;
+        let stream_end = stream.checked_add(packed).ok_or_else(malformed)?;
+        if part.ordinal != index as u64 || part.out.start != end || part.out.end > size {
             return Err(malformed());
         }
         end = part.out.end;
@@ -824,9 +885,31 @@ pub(super) fn validate_evidence(
         if header.format != crate::rar5::RarFormat::Rar5 {
             return Err(err(PartialErrorKind::UnsupportedFormat));
         }
-        if header.method != 0 || header.encrypted || header.is_dir() || header.redirection.is_some() {
+        if header.method != 0 || header.is_dir() || header.redirection.is_some() {
             return Err(err(PartialErrorKind::UnsupportedMethod));
         }
+        let params = if header.encrypted {
+            Some(header.crypt.ok_or_else(|| err(PartialErrorKind::UnsupportedMethod))?)
+        } else {
+            None
+        };
+        if index == 0 {
+            crypt = params;
+        } else if params != crypt {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+        }
+        let padded = size.checked_next_multiple_of(16).ok_or_else(malformed)?;
+        let geometry = if crypt.is_some() {
+            part.out == (stream.min(size)..stream_end.min(size))
+                && stream_end <= padded
+                && (!part.final_part || stream_end == padded)
+        } else {
+            part.out == (stream..stream_end)
+        };
+        if !geometry {
+            return Err(malformed());
+        }
+        stream = stream_end;
         if header.name.as_bytes() != name
             || header.size_unknown()
             || header.unpacked_size != size
@@ -839,7 +922,7 @@ pub(super) fn validate_evidence(
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
         }
     }
-    Ok(())
+    Ok(crypt)
 }
 
 impl serde::Serialize for PartialState {
