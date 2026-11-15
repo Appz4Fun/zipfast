@@ -17,7 +17,8 @@
 //! Native identity binding; growth is deliberately not part of progressive identity.
 use super::super::limits::Usage;
 use super::super::{
-    FailureKind, InputOperation, ProgressiveFailure, ProgressiveResult, ProtectionDeclaration, Resource, VolumeBacking,
+    FailureKind, InputOperation, ProgressiveFailure, ProgressiveResult, ProtectedPath, ProtectionDeclaration,
+    ProtectionInventory, Resource, VolumeBacking,
 };
 use std::{
     fs::{self, File, Metadata},
@@ -45,6 +46,30 @@ impl Identity {
     pub(crate) fn file(file: &File) -> std::io::Result<Self> {
         Self::metadata(&file.metadata()?)
     }
+}
+/// Every declared path in binding order: volume backings by index, then auxiliary paths.
+fn inventory_paths(i: &ProtectionInventory) -> ProgressiveResult<Vec<&ProtectedPath>> {
+    let mut paths = Vec::new();
+    let count = i
+        .volumes
+        .iter()
+        .map(|v| match &v.backing {
+            VolumeBacking::Native(p) => p.len(),
+            VolumeBacking::NonFile => 0,
+        })
+        .sum::<usize>()
+        + i.auxiliary_paths.len();
+    paths.try_reserve_exact(count).map_err(|_| contract())?;
+    paths.extend(
+        i.volumes
+            .iter()
+            .flat_map(|v| match &v.backing {
+                VolumeBacking::Native(p) => p.as_slice(),
+                VolumeBacking::NonFile => &[],
+            })
+            .chain(i.auxiliary_paths.iter()),
+    );
+    Ok(paths)
 }
 fn input(e: std::io::Error) -> ProgressiveFailure {
     ProgressiveFailure::new(FailureKind::Input { operation: InputOperation::Metadata, cause: e })
@@ -230,6 +255,77 @@ impl NativeProtection {
         for &(index, identity) in &self.admitted {
             self.covers(index, identity, declaration, usage)?;
         }
+        Ok(())
+    }
+    /// Realigns the bindings of a bound Complete inventory `old` to `new`, which keeps every old path unchanged
+    /// and in order. Old bindings keep their observed identities; appended paths are observed and bound here.
+    /// The caller then refreshes against `new`, which checks every binding again.
+    pub(crate) fn extend(
+        &mut self,
+        old: &ProtectionInventory,
+        new: &ProtectionInventory,
+        usage: &mut Usage,
+        external_handles: usize,
+    ) -> ProgressiveResult<()> {
+        if !self.complete {
+            // Nothing is bound yet; the refresh binds `new` whole.
+            return Ok(());
+        }
+        bookkeeping!(self, usage, (old.volumes.len() + new.volumes.len() + 2 * self.bindings.len()) as u64)?;
+        let (old, new_paths) = (inventory_paths(old)?, inventory_paths(new)?);
+        if old.len() != self.bindings.len() || new_paths.len() < old.len() {
+            return Err(contract());
+        }
+        let added = new_paths.len() - old.len();
+        let added_handles = new_paths
+            .iter()
+            .filter(|p| p.file.is_some())
+            .count()
+            .saturating_sub(old.iter().filter(|p| p.file.is_some()).count());
+        usage.check(Resource::VolumeHandles, (external_handles + self.handle_count() + added_handles) as u64)?;
+        usage.charge(Resource::ProtectionPaths, added as u64)?;
+        // The new binding list, the appended bindings, the order and both borrowed path lists.
+        usage.charge(
+            Resource::MetadataBytes,
+            ((new_paths.len() + added) * std::mem::size_of::<Binding>()
+                + (old.len() + new_paths.len()) * std::mem::size_of::<usize>()
+                + new_paths.len()) as u64,
+        )?;
+        // Observe every appended path before changing anything, so a failure leaves the old bindings intact.
+        let mut fresh = Vec::new();
+        fresh.try_reserve_exact(added).map_err(|_| contract())?;
+        let mut keep = Vec::new();
+        keep.try_reserve_exact(new_paths.len()).map_err(|_| contract())?;
+        let mut at = 0;
+        for p in new_paths.iter().copied() {
+            usage.charge(Resource::SourceBookkeeping, 1 + p.path.as_os_str().len() as u64)?;
+            if old.get(at).is_some_and(|o| o.path == p.path) {
+                at += 1;
+                keep.push(true);
+                continue;
+            }
+            let capacity =
+                p.path.as_os_str().len() + if p.path.is_absolute() { 0 } else { self.cwd.as_os_str().len() + 1 };
+            usage.charge(Resource::MetadataBytes, capacity as u64)?;
+            let path = if p.path.is_absolute() { p.path.clone() } else { self.cwd.join(&p.path) };
+            usage.charge(Resource::MetadataBytes, path.capacity().saturating_sub(capacity) as u64)?;
+            usage.charge(Resource::ProtectionPathBytes, path.capacity() as u64)?;
+            let identity = observe(&path, p.file.as_deref())?;
+            fresh.push(Binding { path, identity, handle: p.file.clone() });
+            keep.push(false);
+        }
+        if at != old.len() {
+            return Err(changed());
+        }
+        let mut next = Vec::new();
+        next.try_reserve_exact(new_paths.len()).map_err(|_| contract())?;
+        let (mut kept, mut fresh) = (std::mem::take(&mut self.bindings).into_iter(), fresh.into_iter());
+        for keep in keep {
+            next.extend(if keep { kept.next() } else { fresh.next() });
+        }
+        self.bindings = next;
+        self.native_only = !new.volumes.is_empty()
+            && new.volumes.iter().all(|v| matches!(&v.backing, VolumeBacking::Native(p) if !p.is_empty()));
         Ok(())
     }
     fn covers(

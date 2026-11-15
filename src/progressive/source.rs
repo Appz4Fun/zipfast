@@ -77,6 +77,13 @@ pub enum RangeRead {
 pub trait VolumeSource: Send + 'static {
     fn volume(&mut self, request: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer>;
     /// A declaration of structure only; this does not grant publication authority.
+    ///
+    /// Once Complete, a declaration is frozen: the same epoch and inventory for the session's life. A persistent
+    /// session (`ProgressiveSession::new_partial`, feature `persistent-partials`) also accepts a Complete
+    /// declaration with a higher epoch that only appends volumes and auxiliary paths, every earlier entry (index,
+    /// name and backing) unchanged. When such a session requests an index the current declaration does not name,
+    /// answer Wait and wake the request's waker once a larger declaration names it. A Ready answer for an
+    /// undeclared index is held unread until a later declaration names it; wake that request's waker then too.
     fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
         Ok(ProtectionDeclaration::Opaque)
     }
@@ -552,6 +559,10 @@ pub(crate) struct SourceDriver {
     /// these ranges as holes without consulting the provider.
     #[cfg(feature = "persistent-partials")]
     declared: Vec<(u32, std::ops::Range<u64>)>,
+    /// A source the provider answered Ready for before its Complete declaration named the requested index.
+    /// It is held unread, and unadmitted, until a later declaration names it (persistent sessions only).
+    #[cfg(feature = "persistent-partials")]
+    undeclared: Option<Box<dyn RangeSource>>,
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
     original: Option<OriginalSource>,
@@ -600,6 +611,8 @@ impl SourceDriver {
             pending_partial_read: None,
             #[cfg(feature = "persistent-partials")]
             declared: Vec::new(),
+            #[cfg(feature = "persistent-partials")]
+            undeclared: None,
             provider,
             request: VolumeRequest { index: 0, expected: first },
             original: None,
@@ -684,7 +697,22 @@ impl SourceDriver {
     #[cfg(feature = "persistent-partials")]
     fn check_partial_inputs(&self) -> ProgressiveResult<()> {
         let Some(exclusions) = &self.partial_exclusions else { return Ok(()) };
-        if let ProtectionDeclaration::Complete { inventory, .. } = &self.protection {
+        self.check_inventory_inputs(&self.protection)?;
+        if let Some(original) = &self.original {
+            self.usage.charge(Resource::SourceRequests, 1)?;
+            let files = original.source.backing_files();
+            if self.control.is_canceled() {
+                return Err(canceled());
+            }
+            exclusions.check_input(&[], files)?;
+        }
+        Ok(())
+    }
+    /// Refuses a declaration naming a path or handle that is a persistent output, state bundle or lock.
+    #[cfg(feature = "persistent-partials")]
+    fn check_inventory_inputs(&self, declaration: &ProtectionDeclaration) -> ProgressiveResult<()> {
+        let Some(exclusions) = &self.partial_exclusions else { return Ok(()) };
+        if let ProtectionDeclaration::Complete { inventory, .. } = declaration {
             for path in inventory
                 .volumes
                 .iter()
@@ -699,14 +727,6 @@ impl SourceDriver {
                     path.file.as_ref().map_or(&[], |file| std::slice::from_ref(file.as_ref())),
                 )?;
             }
-        }
-        if let Some(original) = &self.original {
-            self.usage.charge(Resource::SourceRequests, 1)?;
-            let files = original.source.backing_files();
-            if self.control.is_canceled() {
-                return Err(canceled());
-            }
-            exclusions.check_input(&[], files)?;
         }
         Ok(())
     }
@@ -895,6 +915,18 @@ impl SourceDriver {
         if self.original.is_none() {
             self.check_original_capacity()?;
             self.refresh_protection()?;
+            #[cfg(feature = "persistent-partials")]
+            if let Some(source) = self.undeclared.take() {
+                // Woken after a Ready for a volume the declaration did not name yet: admit it once it does.
+                if self.awaits_declaration(self.request.index)? {
+                    self.undeclared = Some(source);
+                    self.parked = true;
+                    return Ok(Poll::Pending);
+                }
+                self.wake.disarm();
+                let info = self.admit_source(source)?;
+                return Ok(Poll::Ready(Ok(SourceStep::VolumeOpened { index: self.request.index, id: info.id })));
+            }
             self.usage.charge(Resource::SourceRequests, 1)?;
             self.wake.arm();
             let w = Waker::from(self.wake.clone());
@@ -911,6 +943,18 @@ impl SourceDriver {
                 VolumeAnswer::Missing => return Err(ProgressiveFailure::new(FailureKind::MissingVolume)),
                 VolumeAnswer::Abort => return Err(ProgressiveFailure::new(FailureKind::Canceled)),
                 VolumeAnswer::Ready(source) => {
+                    #[cfg(feature = "persistent-partials")]
+                    if self.awaits_declaration(self.request.index)? {
+                        // The provider may have declared the volume while answering.
+                        self.refresh_protection()?;
+                        if self.awaits_declaration(self.request.index)? {
+                            // Hold it unread and wait, still armed, for the provider to wake this request once
+                            // a larger declaration names it.
+                            self.undeclared = Some(source);
+                            self.parked = true;
+                            return Ok(Poll::Pending);
+                        }
+                    }
                     self.wake.disarm();
                     let info = self.admit_source(source)?;
                     return Ok(Poll::Ready(Ok(SourceStep::VolumeOpened { index: self.request.index, id: info.id })));
@@ -1307,21 +1351,62 @@ impl SourceDriver {
             validate_inventory(inventory, &mut self.usage)?;
             canonicalize_inventory(inventory, &mut self.usage)?;
         }
-        match (&self.protection, &next) {
+        let extension = match (&self.protection, &next) {
             (
                 ProtectionDeclaration::Complete { epoch: a, inventory: x },
                 ProtectionDeclaration::Complete { epoch: b, inventory: y },
-            ) if a == b && same_inventory(x, y, &mut self.usage)? => {}
+            ) if a == b && same_inventory(x, y, &mut self.usage)? => false,
+            // Only a persistent session checks every declared path against every output it creates, so only it
+            // may learn of volumes later. An extension needs a higher epoch and leaves every entry unchanged.
+            (
+                ProtectionDeclaration::Complete { epoch: a, inventory: x },
+                ProtectionDeclaration::Complete { epoch: b, inventory: y },
+            ) if self.extendable() && b > a && extends_inventory(x, y, &mut self.usage)? => true,
             (ProtectionDeclaration::Complete { .. }, _) => return Err(changed()),
-            _ => {}
-        }
+            _ => false,
+        };
         self.check_inventory_admitted(&next)?;
+        #[cfg(feature = "persistent-partials")]
+        if extension {
+            // Appended paths must not name an output, bundle or lock created under an earlier epoch.
+            self.check_inventory_inputs(&next)?;
+        }
         let external = self.other_lane_handles()? + self.backing_count();
+        if extension
+            && let (
+                ProtectionDeclaration::Complete { inventory: old, .. },
+                ProtectionDeclaration::Complete { inventory: new, .. },
+            ) = (&self.protection, &next)
+        {
+            self.native.extend(old, new, &mut self.usage, external)?;
+        }
         self.native.refresh(&next, &mut self.usage, external)?;
         self.protection = next;
         #[cfg(feature = "persistent-partials")]
         self.check_partial_inputs()?;
         Ok(())
+    }
+    /// Whether a Complete declaration may grow: persistent sessions only, whose exclusions refuse any declared
+    /// path that names an output, bundle or lock.
+    fn extendable(&self) -> bool {
+        #[cfg(feature = "persistent-partials")]
+        {
+            self.partial_exclusions.is_some()
+        }
+        #[cfg(not(feature = "persistent-partials"))]
+        {
+            false
+        }
+    }
+    /// Whether the current declaration leaves `index` undeclared, so a persistent session waits for a larger one.
+    #[cfg(feature = "persistent-partials")]
+    fn awaits_declaration(&mut self, index: u32) -> ProgressiveResult<bool> {
+        if !self.extendable() {
+            return Ok(false);
+        }
+        let ProtectionDeclaration::Complete { inventory, .. } = &self.protection else { return Ok(false) };
+        self.usage.charge(Resource::SourceBookkeeping, 1 + inventory.volumes.len().max(1).ilog2() as u64)?;
+        Ok(inventory.volumes.binary_search_by_key(&index, |v| v.index).is_err())
     }
     fn check_inventory_admitted(&mut self, candidate: &ProtectionDeclaration) -> ProgressiveResult<()> {
         if let ProtectionDeclaration::Complete { inventory, .. } = candidate {
@@ -1484,6 +1569,64 @@ fn same_inventory(a: &ProtectionInventory, b: &ProtectionInventory, usage: &mut 
                 }
             }
             _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+/// Whether canonical `b` keeps every volume of canonical `a` (index, name and backing) and every auxiliary path,
+/// adding only new indices and paths.
+fn extends_inventory(a: &ProtectionInventory, b: &ProtectionInventory, usage: &mut Usage) -> ProgressiveResult<bool> {
+    usage.charge(Resource::SourceBookkeeping, 2)?;
+    if a.volumes.len() > b.volumes.len() || a.auxiliary_paths.len() > b.auxiliary_paths.len() {
+        return Ok(false);
+    }
+    // Both are sorted by index; every old index must appear in order with the same entry.
+    let mut later = b.volumes.iter();
+    for x in &a.volumes {
+        let y = loop {
+            usage.charge(Resource::SourceBookkeeping, 1)?;
+            match later.next() {
+                Some(y) if y.index < x.index => continue,
+                Some(y) if y.index == x.index => break y,
+                _ => return Ok(false),
+            }
+        };
+        usage.charge(
+            Resource::SourceBookkeeping,
+            2 + x.name.as_encoded_bytes().len() as u64 + y.name.as_encoded_bytes().len() as u64,
+        )?;
+        if x.name != y.name {
+            return Ok(false);
+        }
+        match (&x.backing, &y.backing) {
+            (VolumeBacking::NonFile, VolumeBacking::NonFile) => {}
+            (VolumeBacking::Native(p), VolumeBacking::Native(q)) => {
+                usage.charge(Resource::SourceBookkeeping, 1)?;
+                if p.len() != q.len() {
+                    return Ok(false);
+                }
+                for (p, q) in p.iter().zip(q) {
+                    if !same_path(p, q, usage)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    // Auxiliary paths are sorted and unique; every old path must appear in order, unchanged.
+    let mut later = b.auxiliary_paths.iter();
+    for x in &a.auxiliary_paths {
+        let y = loop {
+            let Some(y) = later.next() else { return Ok(false) };
+            match path_compare(&y.path, &x.path, usage)? {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => break y,
+                std::cmp::Ordering::Greater => return Ok(false),
+            }
+        };
+        if !same_path(x, y, usage)? {
+            return Ok(false);
         }
     }
     Ok(true)
