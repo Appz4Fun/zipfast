@@ -211,6 +211,14 @@ impl<'a> RarMember<'a> {
         &self.member.wire.name
     }
 
+    /// The name UnRAR on Unix gives a RAR5 member, as raw `wchar_t` units; see [`super::unrar_name`]. It can differ
+    /// from [`Self::name`] when the stored bytes aren't valid UTF-8: UnRAR keeps overlong forms and encoded surrogates
+    /// and stops at the first malformed byte, where `name()` puts U+FFFD. [`super::unrar_name_to_string`] turns it
+    /// into text when every unit is a scalar value. None for RAR4 members, whose names UnRAR decodes another way.
+    pub fn unrar_name(&self) -> Option<Vec<u32>> {
+        (self.format() == super::RarFormat::Rar5).then(|| super::unrar_name(self.raw_name()))
+    }
+
     /// Raw RAR5 compression bits. Returns None for RAR4 members.
     pub fn rar5_compression_info(&self) -> Option<u64> {
         (self.format() == super::RarFormat::Rar5).then_some(self.member.wire.compression)

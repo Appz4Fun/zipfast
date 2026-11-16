@@ -502,7 +502,8 @@ pub struct MapMember {
     /// Zero-based position among the archive's members. 7z: among the members listed, which leaves out anti items,
     /// so it is not the raw file index of the 7z header.
     pub ordinal: u64,
-    /// The name exactly as stored. For ZIP, the UTF-8 bytes of the decoded name.
+    /// The name exactly as stored. For ZIP, the UTF-8 bytes of the decoded name. For RAR5,
+    /// [`crate::rar5::unrar_name`] gives the name UnRAR reads from them.
     pub raw_name: Vec<u8>,
     /// The name decoded by the format's rules, when it decodes.
     pub name: Option<String>,

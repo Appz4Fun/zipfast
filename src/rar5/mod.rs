@@ -27,6 +27,9 @@ pub(crate) mod source;
 #[doc(hidden)]
 pub mod testenc;
 pub mod unpack;
+mod unrar_name;
+
+pub use unrar_name::{unrar_name, unrar_name_to_string};
 
 use crate::error::{Error, Result};
 

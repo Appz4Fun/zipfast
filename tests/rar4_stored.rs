@@ -164,6 +164,7 @@ fn unicode_names_preserve_raw_fields_and_bounded_decoding() {
         assert_eq!(entry.attributes(), 0o100644);
         assert_eq!(entry.modified(), Some((1_577_934_248, 0)));
         assert_eq!(entry.rar5_compression_info(), None);
+        assert_eq!(entry.unrar_name(), None);
     }
 }
 
