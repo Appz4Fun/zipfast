@@ -17,3 +17,5 @@ license. The password of the encrypted ones is `password`.
 | `encrypted_files.7z` | Copy, LZMA, 7zAES+LZMA and 7zAES+Copy folders, plain header |
 | `multi_substreams_encrypted.7z` | a two-file LZMA folder and a 7zAES+LZMA folder |
 | `encrypted_headers.7z` | `7zFormat.txt` in a 7zAES+Copy folder, header encrypted (`-mhe`) |
+
+Copyright (c) 2010-2016 Hecks. Redistributed under the BSD-3-Clause license; the full notice and conditions are in [../LICENSE-rarinfo](../LICENSE-rarinfo).
