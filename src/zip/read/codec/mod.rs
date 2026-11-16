@@ -18,12 +18,14 @@
 use super::{EncryptedReadOptions, IntegrityReason};
 mod bzip2;
 mod deflate;
+mod deflate64;
 mod lzma;
 mod xz;
 mod zstd;
 enum State {
     Stored,
     Deflate(deflate::Decoder),
+    Deflate64(deflate64::Decoder),
     Bzip(bzip2::Decoder),
     Lzma(lzma::Decoder),
     Xz(xz::Decoder),
@@ -45,6 +47,7 @@ impl Engine {
             state: match method {
                 0 => State::Stored,
                 8 => State::Deflate(deflate::Decoder::new(options)?),
+                9 => State::Deflate64(deflate64::Decoder::new(options)?),
                 12 => State::Bzip(bzip2::Decoder::new(options)?),
                 14 => State::Lzma(lzma::Decoder::new(options)?),
                 95 => State::Xz(xz::Decoder::new(options)?),
@@ -62,6 +65,7 @@ impl Engine {
                 Progress { consumed: n, produced: n, fault: None, end: last && n == input.len() }
             }
             State::Deflate(z) => z.step(input, output, last),
+            State::Deflate64(z) => z.step(input, output, last),
             State::Bzip(z) => z.step(input, output, last),
             State::Lzma(z) => z.step(input, output, last),
             State::Xz(z) => z.step(input, output, last),

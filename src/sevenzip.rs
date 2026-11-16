@@ -109,7 +109,7 @@ pub enum SevenZipError {
     Canceled,
     /// The archive asks for more than [`SevenZipLimits`] allows.
     Limit { limit: SevenZipLimit, max: u64, attempted: u64 },
-    /// A coder this build does not decode (PPMd, Deflate64, RISC-V, or an unknown method id), found before anything
+    /// A coder this build does not decode (PPMd, RISC-V, or an unknown method id), found before anything
     /// is written. `id` is the method id as stored.
     UnsupportedCoder { id: u64 },
     /// A header feature this build does not handle.
