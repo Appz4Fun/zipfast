@@ -998,7 +998,9 @@ fn dictionaries_are_bounded_per_folder_in_total() {
         }
         _ => panic!("{result:?}"),
     }
-    assert_eq!(SevenZipLimits::default().dictionary_bytes, 1 << 30);
+    // the defaults open 7-Zip's largest dictionaries and solid folders of any size
+    assert_eq!(SevenZipLimits::default().dictionary_bytes, 4 << 30);
+    assert_eq!(SevenZipLimits::default().folder_bytes, u64::MAX);
 }
 
 #[test]

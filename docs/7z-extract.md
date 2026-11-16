@@ -145,13 +145,18 @@ The crate's legacy `Error` keeps its variants (a test pins them), so the typed `
 
 `SevenZipLimits` (defaults in brackets; `#[non_exhaustive]`, start from `Default` and set fields):
 
-- `folder_bytes` (16 GiB): the decoded size of a folder, and of every coder's output inside it, not only the last
-  (`FolderBytes`). The outputs of all a folder's coders together may total at most four times this, 64 GiB by
-  default (`FolderCoderBytes`). So a chain like Deflate over LZMA2 cannot expand a little packed data into an
-  unbounded inner stream.
-- `dictionary_bytes` (1 GiB): LZMA and LZMA2 dictionary bytes one folder allocates, summed over its LZMA coders
-  (a BCJ2 folder has three), each first shrunk to its coder's output size (`DictionaryBytes`). That opens
-  everything 7-Zip writes up to `-mx9 -md=1g`; raise it for larger dictionaries.
+- `folder_bytes` (no limit): the decoded size of a folder, and of every coder's output inside it, not only the last
+  (`FolderBytes`). The outputs of all a folder's coders together may total at most four times this
+  (`FolderCoderBytes`). It bounds work and output, not memory, since every coder streams and stops at its declared
+  size: a solid folder of a 4K remux is far past any fixed cap, so there is none by default. Lower it to keep a
+  chain like Deflate over LZMA2 from expanding a little packed data into a huge inner stream. Decoding checks for
+  cancellation at least once per MiB either way.
+- `dictionary_bytes` (4 GiB): the memory one folder's decoders allocate up front, LZMA and LZMA2 dictionaries,
+  summed over the folder's coders (a BCJ2 folder has three), each dictionary first shrunk to its
+  coder's output size (`DictionaryBytes`). This is the memory-bomb guard: a tiny archive declaring a huge
+  dictionary and output allocates at most this. 4 GiB is the largest LZMA dictionary and opens 7-Zip's largest
+  setting, `-md=1536m`; an allocation the system refuses is an `OutOfMemory` I/O error. Lower it where memory is
+  short.
 - `folders` (4096), `pack_streams` (4096), `coders` per folder (32), `coder_properties` bytes per coder (64) and
   `entries` (65536, counting anti items, checked while the header is read).
 

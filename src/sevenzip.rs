@@ -38,13 +38,18 @@ use crate::error::{Error, Result};
 use crate::extract::{Cancellation, Entry, MtimeOrigin, Options, Summary};
 use crate::map::{CoderKind, MapBuilder, MapEnd, MapError, MapFolder, MapFormat, MapOptions, MemberMap};
 
-/// Bounds on what a 7z archive may ask for. The defaults match what RustyGet enforced.
+/// Bounds on what a 7z archive may ask for. The defaults open every archive 7-Zip writes with its own settings,
+/// including solid folders of many gigabytes and 7-Zip's largest dictionaries; a caller that must bound a hostile
+/// archive's work or memory lowers them.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SevenZipLimits {
-    /// Decoded bytes per folder (a solid block, or one file): 16 GiB. It bounds every coder's output in the folder,
-    /// not only the last one, and the outputs of all a folder's coders together may total at most four times this
-    /// (64 GiB by default), so no stage of a coder chain can expand a little packed data without bound.
+    /// Decoded bytes per folder (a solid block, or one file): no limit by default (`u64::MAX`). It bounds every
+    /// coder's output in the folder, not only the last one, and the outputs of all a folder's coders together may
+    /// total at most four times this, so a lowered limit keeps any stage of a coder chain from expanding a little
+    /// packed data without bound. What it protects is work and output size, not memory: every coder streams, and
+    /// each stops at the size its folder declares. Decoding checks for cancellation at least once per MiB whatever
+    /// the limit.
     pub folder_bytes: u64,
     /// Folders in the archive: 4096.
     pub folders: u64,
@@ -56,22 +61,25 @@ pub struct SevenZipLimits {
     pub coder_properties: u64,
     /// Entries (files, folders, empty files and anti items): 65536.
     pub entries: u64,
-    /// LZMA and LZMA2 dictionary bytes one folder may allocate, summed over its LZMA coders (BCJ2 folders have
-    /// three), each dictionary first shrunk to its coder's output size: 1 GiB. 7-Zip's own default `-mmemuse` is
-    /// most of the machine's RAM; 1 GiB opens everything 7-Zip writes up to `-mx9 -md=1g`.
+    /// Memory one folder's decoders may allocate up front: LZMA and LZMA2 dictionaries, each first shrunk to its
+    /// coder's declared output size, summed over the folder's coders (a BCJ2 folder has three): 4 GiB, the largest
+    /// LZMA dictionary there is (7-Zip offers up to 1536 MiB, `-md=1536m`). This is the memory-bomb guard: a small
+    /// archive can declare a large dictionary and a large output, and this caps what that makes the decoder
+    /// allocate. An allocation the system refuses is an `OutOfMemory` I/O error, never an abort. Lower it on a
+    /// machine with less memory to spare.
     pub dictionary_bytes: u64,
 }
 
 impl Default for SevenZipLimits {
     fn default() -> Self {
         Self {
-            folder_bytes: 16 << 30,
+            folder_bytes: u64::MAX,
             folders: 4096,
             pack_streams: 4096,
             coders: 32,
             coder_properties: 64,
             entries: 65536,
-            dictionary_bytes: 1 << 30,
+            dictionary_bytes: 4 << 30,
         }
     }
 }
