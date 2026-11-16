@@ -575,6 +575,21 @@ impl OutputMapping {
 }
 
 impl MapMember {
+    /// Where byte `offset` of a plain stored member ([`OutputMapping::Direct`]) lies: `(volume, offset within that
+    /// volume)`. A thin convenience over [`Self::packed_spans`]: an offset on a piece boundary is the first byte of
+    /// the next piece, and pieces of zero length never hold one.
+    ///
+    /// None for an offset at or past the unpacked size, an offset whose piece is not in the map, and any other
+    /// mapping: an encrypted member's byte needs its whole 16-byte block and the block before it
+    /// ([`OutputMapping::CbcBlocks`]) or a skipped prefix, which [`Self::packed_spans`] describes.
+    pub fn locate(&self, offset: u64) -> Option<(u32, u64)> {
+        if self.mapping != OutputMapping::Direct {
+            return None;
+        }
+        let span = self.packed_spans(offset..offset.checked_add(1)?)?.into_iter().next()?;
+        (span.stream.start == offset).then_some((span.volume, span.packed.start))
+    }
+
     /// The per-volume packed spans needed to produce output range `out` of a stored member, in stream order.
     ///
     /// `out` is clipped to the unpacked size. Spans are cut at piece boundaries, and only pieces present in the map

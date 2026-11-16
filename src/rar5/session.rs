@@ -606,6 +606,30 @@ impl<'a> RarMember<'a> {
     pub fn parts(&self) -> impl ExactSizeIterator<Item = RarPart<'a>> {
         self.parts.iter().map(RarPart)
     }
+
+    /// Where byte `offset` of a stored, unencrypted member's data lies: `(volume, offset within that volume)`, the
+    /// volume as [`RarPart::volume`] counts it. The member's bytes are its parts' packed bytes in order, so this
+    /// walks [`Self::parts`]; parts of zero length are passed over, and an offset on a part boundary is the first
+    /// byte of the next part.
+    ///
+    /// None for an offset at or past the unpacked size, a directory, a compressed member, or an encrypted one:
+    /// its packed bytes are AES-CBC ciphertext, padded to whole 16-byte blocks, and decrypting byte `offset` needs
+    /// its whole block and the block before it as IV. [`crate::map::MapMember::packed_spans`] gives those spans.
+    pub fn locate(&self, offset: u64) -> Option<(usize, u64)> {
+        let header = &self.member.header;
+        if header.method != 0 || header.encrypted || header.is_dir() || offset >= header.unpacked_size {
+            return None;
+        }
+        let mut start = 0u64;
+        for part in self.parts {
+            let end = start.checked_add(part.packed_size)?;
+            if offset < end {
+                return Some((part.volume, part.data_offset.checked_add(offset - start)?));
+            }
+            start = end;
+        }
+        None
+    }
 }
 
 struct HeldVolume {
