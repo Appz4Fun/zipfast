@@ -59,6 +59,8 @@ const OUTPUT: usize = 32768;
 /// PPM input decoded only while this much is buffered, until the member's data is all in: one character never
 /// reads more (a model of order 64 escapes at most 64 times, each normalizing at most 4 bytes).
 const PPM_LOOKAHEAD: usize = 4096;
+/// The most memory a PPM block can ask for, 256 MiB, plus the VM's filter memory.
+const PPM_MEMORY_MAX: u64 = (256 << 20) + filters::VM_MEM as u64;
 
 impl Rar4DecodeError {
     pub(crate) fn detailed(self, scope: crate::error::RarScope) -> crate::error::RarFault {
@@ -387,6 +389,8 @@ pub(crate) struct Rar4Decoder {
     hold_start: u64,
     /// the member's unpack version, and the RAR 1.5 or 2.0 engine that decodes it
     version: u8,
+    /// memory beyond the window a PPM model and a held filter block may take
+    memory_limit: u64,
     legacy: Option<Box<legacy::Engine>>,
     /// the bit within the next buffered byte where the legacy engine reads on
     legacy_bit: u32,
@@ -489,6 +493,7 @@ impl Rar4Decoder {
             hold: Vec::new(),
             hold_start: 0,
             version: 29,
+            memory_limit: PPM_MEMORY_MAX,
             legacy: None,
             legacy_bit: 0,
             #[cfg(test)]
@@ -684,7 +689,18 @@ impl Rar4Decoder {
             } else {
                 Rar4DecodeError::Malformed(reason)
             }
-        })
+        })?;
+        // a block's bytes are held until it can be filtered
+        let held = self.filters.pending.back().map_or(0, |block| block.len as u64);
+        if held > self.memory_limit {
+            return Err(Rar4DecodeError::WindowLimit { requested: held, allowed: self.memory_limit });
+        }
+        Ok(())
+    }
+    /// Bounds what the decoder takes beyond its window: a PPM model and the block a filter holds back. At most
+    /// the 256 MiB a PPM block may ask for.
+    pub(crate) fn set_memory_limit(&mut self, limit: u64) {
+        self.memory_limit = limit.min(PPM_MEMORY_MAX);
     }
     /// Copies a match inside a PPM block, as far as the member's output goes.
     fn ppm_copy(&mut self, distance: u64, length: u64, sink: &mut dyn Sink) -> DecodeResult<()> {
@@ -812,6 +828,15 @@ impl Rar4Decoder {
         let then = match self.phase {
             Phase::PpmInit => {
                 drop(next);
+                // A block that starts a model says how much memory it takes, before the model takes any.
+                let flags = self.ppm_in.get(self.ppm_pos).copied().unwrap_or(0);
+                if flags & 0x20 != 0 {
+                    let megabytes = u64::from(self.ppm_in.get(self.ppm_pos + 1).copied().unwrap_or(0)) + 1;
+                    let requested = (megabytes << 20) + filters::VM_MEM as u64;
+                    if requested > self.memory_limit {
+                        return Err(Rar4DecodeError::WindowLimit { requested, allowed: self.memory_limit });
+                    }
+                }
                 if !model.init(&mut bits, &mut esc) {
                     return Err(Rar4DecodeError::Malformed("PPM block header"));
                 }

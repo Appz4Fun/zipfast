@@ -676,6 +676,7 @@ impl SelectedRun {
             session.options.cancel.clone(),
         )?;
         decoder.set_version(raw.unpack_version)?;
+        decoder.set_memory_limit(self.limits.window_bytes.min(WINDOW_MAX));
         if solid {
             decoder.track_boundary();
         }

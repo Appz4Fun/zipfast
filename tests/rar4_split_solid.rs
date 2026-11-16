@@ -790,6 +790,50 @@ fn a_filter_inside_a_ppm_block_runs() {
     assert_eq!(summary.files, 1);
 }
 
+/// A progressive session over complete volumes ends an archive older than RAR 2.9, which has no end-of-archive
+/// block, at a block boundary; a RAR 2.9+ archive cut at a block boundary is still truncated.
+#[test]
+fn only_archives_older_than_rar_2_9_may_end_without_an_end_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = |name: &str, bytes: Vec<u8>| {
+        let dest = tmp.path().join(name);
+        let case = Case { volumes: vec![PathBuf::from(name)], password: None, want: Manifest::new() };
+        let mut session = ProgressiveSession::from_sealed_memory(
+            vec![(OsString::from(name), bytes.into_boxed_slice())],
+            progressive_options(&case, &dest),
+        )
+        .unwrap();
+        drive(&mut session, || {})
+    };
+    // RAR 1.54 writes no end block
+    let old = fs::read(fixtures().join("rar4-legacy/readme_154_normal.rar")).unwrap();
+    assert!(run("old.rar", old).is_empty());
+    // a RAR 3.x archive without its end block
+    let mut modern = fs::read(fixtures().join("rar4/solid.rar")).unwrap();
+    assert_eq!(modern[modern.len() - 5], 0x7b, "ends with the end-of-archive block");
+    modern.truncate(modern.len() - 7);
+    let problems = run("modern.rar", modern);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("Truncated"), "{problems:?}");
+}
+
+/// A PPM block asks for its model's memory up front; a progressive session's decoder window bounds it, typed.
+#[test]
+fn a_ppm_model_larger_than_the_progressive_window_is_a_typed_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = fixtures().join("rar4/latest_winrar.rar");
+    let case = Case { volumes: vec![path.clone()], password: None, want: Manifest::new() };
+    let mut opts = progressive_options(&case, tmp.path());
+    // the LZ dictionary (1 MiB) fits; the PPM model and filter memory don't
+    opts.limits.decoder_window = 1 << 20;
+    let volume = fs::read(&path).unwrap().into_boxed_slice();
+    let mut session =
+        ProgressiveSession::from_sealed_memory(vec![(OsString::from("latest_winrar.rar"), volume)], opts).unwrap();
+    let problems = drive(&mut session, || {});
+    assert!(!problems.is_empty() && problems.iter().any(|p| p.contains("Limit")), "{problems:?}");
+    assert!(tree(tmp.path()).is_empty());
+}
+
 /// The whole Prybar reference corpus, when `ZIPFAST_RAR4_CORPUS` names it: every archive UnRAR extracts must
 /// extract identically, except the shapes listed as not yet supported.
 #[test]

@@ -162,7 +162,6 @@ impl Filters {
             self.old_lengths[pos]
         };
         let mut regs = [0u32; 7];
-        regs[4] = len;
         if first & 0x10 != 0 {
             let mask = bits.peek16() >> 9;
             bits.skip(7);
@@ -172,6 +171,8 @@ impl Filters {
                 }
             }
         }
+        // As UnRAR: the block length is register 4 whatever the record's own register values say.
+        regs[4] = len;
         if new {
             let size = vm_number(&mut bits) as usize;
             if size == 0 || size >= 0x10000 || bits.addr + size > code.len() {
@@ -407,5 +408,33 @@ fn set_bundle_bits(data: &mut [u8], value: u32, pos: usize, count: u32) {
         *b = (u32::from(*b) & and) as u8 | value as u8;
         and = (and >> 8) | 0xff00_0000;
         value >>= 8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Big-endian bits, as the VM reads its records.
+    fn pack(fields: &[(u32, u8)]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        for &(value, width) in fields {
+            for i in (0..width).rev() {
+                bits.push((value >> i) & 1 != 0);
+            }
+        }
+        bits.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |b, (i, &on)| b | (u8::from(on) << (7 - i)))).collect()
+    }
+
+    #[test]
+    fn the_block_length_is_register_4_whatever_the_register_mask_says() {
+        let mut filters = Filters::default();
+        filters.kinds.push(Kind::Delta);
+        filters.old_lengths.push(0);
+        // the last filter again (no number), its start 0, a length of 100, then register 4 given as 7
+        let code = pack(&[(0, 6), (0b01, 2), (100, 8), (1 << 4, 7), (7, 6)]);
+        filters.add(0x20 | 0x10, &code, 1000).unwrap();
+        let block = filters.pending.back().unwrap();
+        assert_eq!((block.start, block.len, block.regs[4]), (1000, 100, 100));
     }
 }

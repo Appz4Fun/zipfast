@@ -124,6 +124,8 @@ impl Rar4Decoder {
         frame.validate(4194304)?;
         let mut d = Self::new_with_cancel(frame.dictionary, frame.packed, frame.unpacked, window_limit, cancel)?;
         d.set_version(frame.unpack_version)?;
+        // a progressive session's decoder window also bounds a PPM model and held filter blocks
+        d.set_memory_limit(window_limit);
         d.binding.frame = frame;
         Ok(d)
     }
@@ -145,6 +147,8 @@ impl Rar4Decoder {
             }
             self.drain_input(sink)?;
             if !self.hold.is_empty() {
+                // UnRAR keeps a block waiting into the next solid member, but its bytes are this member's output,
+                // which must be complete and checked now; no archiver writes such a block.
                 return Err(Rar4DecodeError::Malformed("RAR4 filter block runs past the member"));
             }
             if self.in_tail && self.produced == self.expected {

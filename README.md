@@ -233,7 +233,9 @@ bits are required. Once the declared output is complete, remaining declared
 packed bytes are charged and drained without claiming canonical tail encoding.
 Empty compressed members use the same logical-completion policy and verify the
 empty CRC. PPM blocks decode with PPMd variant H (the model asks for its memory,
-up to 256 MiB, which is committed in 64 KiB pages as the model writes it) and
+up to 256 MiB, which is committed in 64 KiB pages as the model writes it; a
+progressive session's `decoder_window` and a selected session's window limit
+bound it, and a held filter block, with a typed limit failure) and
 are buffered 4 KiB ahead until the member's data is all in; LZ matches, filter
 records and the end-of-file escape inside them are honoured, and a solid member
 goes on from the model. Filter records are parsed and the six standard filters
@@ -245,8 +247,11 @@ success. Unpack versions 15 and 20/26 decode with RAR 1.5's and 2.0's own
 engines, solid streams included. Before version 20 a non-final part's CRC field
 holds no packed-data hash, so only the member CRC is checked. A progressive
 session over complete volumes ends an archive that has no end-of-archive block
-(older than RAR 2.9) at a block boundary, as UnRAR does; one following growing
-files waits for more.
+at a block boundary, as UnRAR does, when every member so far predates RAR 2.9
+(unpack version below 29, no extended-time record); a later archive cut there
+is still truncated, and a session following growing files waits for more. A
+filter block reaching into the next solid member, which UnRAR would keep
+waiting, is refused as corrupt: its bytes are the first member's output.
 RAR 1.5 and 2.0 encryption, symbolic
 links, special files, old file revisions, and unsupported host attributes retain
 explicit exclusions. Encrypted headers,
