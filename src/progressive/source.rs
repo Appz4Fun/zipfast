@@ -606,6 +606,9 @@ pub(crate) struct SourceDriver {
     failed: bool,
     admitted: Vec<(u32, SourceId, OsString, SourceInfo)>,
     protection: ProtectionDeclaration,
+    /// The epoch of a Complete declaration refused as a promotion from Opaque because a source admitted while
+    /// Opaque is not the file it now declares (see `refresh_protection`). The same epoch is not tried again.
+    declined_promotion: Option<u64>,
     native: super::output::native::NativeProtection,
     sealed_memory: bool,
     wake: Arc<WakeGate>,
@@ -666,6 +669,7 @@ impl SourceDriver {
             failed: false,
             admitted: Vec::new(),
             protection: ProtectionDeclaration::Opaque,
+            declined_promotion: None,
             native,
             sealed_memory: false,
             wake: Arc::new(WakeGate::default()),
@@ -1529,6 +1533,24 @@ impl SourceDriver {
             _ => false,
         };
         self.check_inventory_admitted(&next)?;
+        if matches!(self.protection, ProtectionDeclaration::Opaque)
+            && let ProtectionDeclaration::Complete { epoch, .. } = &next
+        {
+            // Promotion: the set became final and the provider now names every file. A source this session read
+            // while Opaque may since have been replaced on disk with a new inode (a par2 repair renamed over it,
+            // or the provider fell back to a backup copy). Its bytes were read from a file the declaration no
+            // longer names, so the declaration cannot vouch for them; but nothing the session read has changed
+            // under it either. Decline the promotion and stay Opaque (no Strict publication authority) instead
+            // of failing the whole session. A higher epoch is tried again.
+            let epoch = *epoch;
+            if self.declined_promotion == Some(epoch) {
+                return Ok(());
+            }
+            if !self.native.covers_admitted(&next, &mut self.usage)? {
+                self.declined_promotion = Some(epoch);
+                return Ok(());
+            }
+        }
         if self.ordinary_extension() && (extension || matches!(self.protection, ProtectionDeclaration::Opaque)) {
             // An ordinary session learns of volumes later only from a library-owned provider; nothing it declares
             // may be an output file this session created.

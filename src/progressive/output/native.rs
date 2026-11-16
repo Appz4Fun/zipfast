@@ -500,6 +500,20 @@ impl NativeProtection {
             && new.volumes.iter().all(|v| matches!(&v.backing, VolumeBacking::Native(p) if !p.is_empty()));
         Ok(())
     }
+    /// Whether every admission not yet covered is one of the files `declaration` names for its volume. `false` when
+    /// a declared native volume names other files only (a replaced inode); structural mismatches are still errors.
+    pub(crate) fn covers_admitted(
+        &self,
+        declaration: &ProtectionDeclaration,
+        usage: &mut Usage,
+    ) -> ProgressiveResult<bool> {
+        for &(index, identity) in &self.admitted[self.covered..] {
+            if !self.matches(index, identity, declaration, usage)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     fn covers(
         &self,
         index: u32,
@@ -507,7 +521,16 @@ impl NativeProtection {
         declaration: &ProtectionDeclaration,
         usage: &mut Usage,
     ) -> ProgressiveResult<()> {
-        let ProtectionDeclaration::Complete { inventory, .. } = declaration else { return Ok(()) };
+        if self.matches(index, identity, declaration, usage)? { Ok(()) } else { Err(contract()) }
+    }
+    fn matches(
+        &self,
+        index: u32,
+        identity: Identity,
+        declaration: &ProtectionDeclaration,
+        usage: &mut Usage,
+    ) -> ProgressiveResult<bool> {
+        let ProtectionDeclaration::Complete { inventory, .. } = declaration else { return Ok(true) };
         // A binary search of the canonical inventory.
         usage.charge(Resource::SourceBookkeeping, 1 + inventory.volumes.len().max(1).ilog2() as u64)?;
         let v = inventory
@@ -522,10 +545,10 @@ impl NativeProtection {
             if let Some(file) = &p.file
                 && Identity::file(file).map_err(input)? == identity
             {
-                return Ok(());
+                return Ok(true);
             }
         }
-        Err(contract())
+        Ok(false)
     }
     pub(crate) fn admit(
         &mut self,
