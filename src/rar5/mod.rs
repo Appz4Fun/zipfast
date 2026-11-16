@@ -155,6 +155,9 @@ pub struct MainHeader {
     pub original_name: Option<Vec<u8>>,
     /// RAR 5.0 only: the archive creation time stored by `-ams`.
     pub original_time: Option<RarTime>,
+    /// RAR 2.x only (`MHD_COMMENT`): the comment block embedded in the main header, from its `COMM_HEAD` on, as
+    /// stored. Kept by catalogues only.
+    pub embedded_comment: Option<Vec<u8>>,
 }
 
 /// A timestamp as a header stores it. `resolution_nanos` is the step the stored form can express: 2 s for an MS-DOS

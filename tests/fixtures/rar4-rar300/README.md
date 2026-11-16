@@ -18,5 +18,6 @@ RAR4 compatibility corpus carries the same files.
 | `ppmd_embedded_vm_filter.rar` | a filter record inside a PPMd block |
 | `solid_e8_filter_member_offset.rar` | `lead.txt` then `tiny_e8e9.exe` through an E8E9 filter, solid |
 | `generic_delta_padding_mutation.rar` | a VM program that is none of the standard filters (refused) |
+| `with_comment_rar300.rar` | stored `hello.txt` and a RAR 3.x archive comment (a compressed `CMT` service header) |
 
 `../rar4-unrar/` holds the SHA-256 of every file UnRAR 7.30 extracts from them.

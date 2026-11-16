@@ -751,46 +751,162 @@ impl RarSession {
         self.headers[range].iter().map(RarHeader)
     }
 
-    /// Read the archive comment of a volume: the data of its `CMT` service header, as stored (UTF-8 for RAR 5.0,
-    /// the archiver's code page for RAR 4.x). None when the volume has no comment header. Only a stored,
-    /// unencrypted comment of at most 1 MiB can be read; any other is refused as unsupported. The stored CRC-32 is
-    /// checked.
+    /// Read the archive comment of a volume, as stored: UTF-8 for RAR 5.0, the archiver's code page for RAR 4.x.
+    /// It is the data of the volume's `CMT` service header or, in a RAR 2.x archive, the comment embedded in the
+    /// main header (`MHD_COMMENT`). None when the volume has neither. Bytes are returned as stored, including a
+    /// trailing NUL RAR 5.0 writes; UnRAR prints up to the first NUL.
+    ///
+    /// A stored comment, or a RAR 4.x comment compressed by RAR 1.5 to 2.9 (unpack versions 15, 20, 26 and 29), is
+    /// decoded; an encrypted or split comment, or a compressed RAR 5.0 one, is refused as unsupported. Packed and
+    /// unpacked sizes are limited to 1 MiB, the decoder's dictionary to 4 MiB and its other memory to 16 MiB. The
+    /// stored CRC is checked: CRC-32 for a `CMT` header, its low 16 bits for a RAR 2.x comment.
     pub fn comment(&self, volume: usize) -> Result<Option<Vec<u8>>, Arc<RarFailure>> {
-        const MAX_COMMENT: u64 = 1 << 20;
         let Some(held) = self.volumes.get(volume) else { return Ok(None) };
-        let Some(index) = held.metadata.comment else { return Ok(None) };
-        let header = &self.headers[index].header;
-        if header.encrypted || header.method != 0 || header.split_before() || header.split_after() {
-            return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::Decoder(
-                "compressed, encrypted or split archive comment".into(),
-            ))));
+        if let Some(index) = held.metadata.comment {
+            return service_comment(held, &self.headers[index].header, &self.options.cancel).map(Some);
         }
-        if header.packed_size > MAX_COMMENT {
-            return Err(Arc::new(RarFailure::Limit {
-                resource: RarResource::CatalogueReadBytes,
-                requested: Some(header.packed_size),
-                allowed: Some(MAX_COMMENT),
-            }));
+        match &held.metadata.main.embedded_comment {
+            Some(block) => rar2_comment(held, block, &self.options.cancel).map(Some),
+            None => Ok(None),
         }
-        held.stamp.check(&held.file, &held.path).map_err(|fault| Arc::from(fault.failure))?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(header.packed_size as usize).map_err(|_| Arc::from(allocation().failure))?;
-        bytes.resize(header.packed_size as usize, 0);
-        read_at_detailed(&held.file, &mut bytes, header.data_at).map_err(|error| {
-            Arc::from(read_failure(error, Some(held.path.clone()), RarIntegrityReason::TruncatedData).failure)
-        })?;
-        if let Some(expected) = header.crc32
-            && crate::crc32::hash(&bytes) != expected
-        {
-            return Err(Arc::new(RarFailure::integrity(
-                RarScope::Header { volume: held.path.clone() },
-                RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false },
-                RarPasswordEvidence::NotEncrypted,
-                false,
-            )));
-        }
-        Ok(Some(bytes))
     }
+}
+
+const MAX_COMMENT: u64 = 1 << 20;
+const COMMENT_WINDOW: u64 = 4 << 20;
+const COMMENT_MEMORY: u64 = 16 << 20;
+
+fn comment_scope(held: &HeldVolume) -> RarScope {
+    RarScope::Header { volume: held.path.clone() }
+}
+
+fn comment_unsupported(what: &str) -> Arc<RarFailure> {
+    Arc::new(RarFailure::Unsupported(RarUnsupported::Decoder(format!("{what} archive comment"))))
+}
+
+fn comment_limit(requested: u64) -> Arc<RarFailure> {
+    Arc::new(RarFailure::Limit {
+        resource: RarResource::CatalogueReadBytes,
+        requested: Some(requested),
+        allowed: Some(MAX_COMMENT),
+    })
+}
+
+fn comment_integrity(held: &HeldVolume, reason: RarIntegrityReason) -> Arc<RarFailure> {
+    Arc::new(RarFailure::integrity(comment_scope(held), reason, RarPasswordEvidence::NotEncrypted, false))
+}
+
+fn read_comment(held: &HeldVolume, at: u64, len: u64) -> Result<Vec<u8>, Arc<RarFailure>> {
+    held.stamp.check(&held.file, &held.path).map_err(|fault| Arc::from(fault.failure))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len as usize).map_err(|_| Arc::from(allocation().failure))?;
+    bytes.resize(len as usize, 0);
+    read_at_detailed(&held.file, &mut bytes, at).map_err(|error| {
+        Arc::from(read_failure(error, Some(held.path.clone()), RarIntegrityReason::TruncatedData).failure)
+    })?;
+    Ok(bytes)
+}
+
+fn service_comment(held: &HeldVolume, header: &FileHeader, cancel: &Cancellation) -> Result<Vec<u8>, Arc<RarFailure>> {
+    if header.encrypted {
+        return Err(comment_unsupported("encrypted"));
+    }
+    if header.split_before() || header.split_after() {
+        return Err(comment_unsupported("split"));
+    }
+    if header.packed_size > MAX_COMMENT {
+        return Err(comment_limit(header.packed_size));
+    }
+    let packed = read_comment(held, header.data_at, header.packed_size)?;
+    let bytes = match (header.method, header.rar4) {
+        (0, _) => packed,
+        (_, Some(rar4)) => {
+            if header.size_unknown() {
+                return Err(comment_unsupported("unknown-size"));
+            }
+            if header.unpacked_size > MAX_COMMENT {
+                return Err(comment_limit(header.unpacked_size));
+            }
+            decode_rar4_comment(held, &packed, rar4.unpack_version, header.dictionary, header.unpacked_size, cancel)?
+        }
+        _ => return Err(comment_unsupported("compressed RAR 5.0")),
+    };
+    if let Some(expected) = header.crc32
+        && crate::crc32::hash(&bytes) != expected
+    {
+        return Err(comment_integrity(held, RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false }));
+    }
+    Ok(bytes)
+}
+
+/// A RAR 2.x comment embedded in the main header: a `COMM_HEAD` (CRC, type 0x75, flags, size, then unpacked size,
+/// unpack version, method and the comment's 16-bit CRC) followed by the packed comment, as UnRAR's `DoGetComment`
+/// reads it.
+fn rar2_comment(held: &HeldVolume, block: &[u8], cancel: &Cancellation) -> Result<Vec<u8>, Arc<RarFailure>> {
+    let framing = |reason| comment_integrity(held, RarIntegrityReason::HeaderFraming(reason));
+    let field = |at: usize| block.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let (Some(size), Some(unpacked), Some(&version), Some(&method), Some(crc)) =
+        (field(5), field(7), block.get(9), block.get(10), field(11))
+    else {
+        return Err(framing("RAR 2.x comment header"));
+    };
+    let size = usize::from(size);
+    if size < 13 {
+        return Err(framing("RAR 2.x comment header"));
+    }
+    let Some(packed) = block.get(13..size) else { return Err(framing("RAR 2.x comment size")) };
+    let bytes = if method == 0x30 {
+        let mut stored = Vec::new();
+        stored.try_reserve_exact(packed.len()).map_err(|_| Arc::from(allocation().failure))?;
+        stored.extend_from_slice(packed);
+        stored
+    } else if (0x31..=0x35).contains(&method) {
+        decode_rar4_comment(held, packed, version, 65_536, u64::from(unpacked), cancel)?
+    } else {
+        return Err(comment_unsupported("RAR 2.x method"));
+    };
+    if crate::crc32::hash(&bytes) as u16 != crc {
+        return Err(comment_integrity(held, RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false }));
+    }
+    Ok(bytes)
+}
+
+fn decode_rar4_comment(
+    held: &HeldVolume,
+    packed: &[u8],
+    version: u8,
+    dictionary: u64,
+    unpacked: u64,
+    cancel: &Cancellation,
+) -> Result<Vec<u8>, Arc<RarFailure>> {
+    use super::unpack::rar4::Rar4Decoder;
+    if !matches!(version, 15 | 20 | 26 | 29) {
+        return Err(comment_unsupported("RAR 4.x unpack version"));
+    }
+    let failed = |error: super::unpack::rar4::Rar4DecodeError| Arc::from(error.detailed(comment_scope(held)).failure);
+    let mut out = Vec::new();
+    out.try_reserve_exact(unpacked as usize).map_err(|_| Arc::from(allocation().failure))?;
+    let mut decoder =
+        Rar4Decoder::new_with_cancel(dictionary, packed.len() as u64, unpacked, COMMENT_WINDOW, Some(cancel.clone()))
+            .map_err(failed)?;
+    decoder.set_memory_limit(COMMENT_MEMORY);
+    decoder.set_version(version).map_err(failed)?;
+    let mut sink = |bytes: &[u8]| -> crate::error::Result<()> {
+        if (out.len() + bytes.len()) as u64 > unpacked {
+            return Err(Error::Corrupt("RAR comment longer than declared"));
+        }
+        out.extend_from_slice(bytes);
+        Ok(())
+    };
+    decoder.feed(packed, &mut sink).map_err(failed)?;
+    decoder.finish(&mut sink).map_err(failed)?;
+    if out.len() as u64 != unpacked {
+        return Err(comment_integrity(
+            held,
+            RarIntegrityReason::DecodedSize { expected: unpacked, actual: out.len() as u64 },
+        ));
+    }
+    Ok(out)
 }
 
 struct Catalogue {
@@ -885,7 +1001,10 @@ impl Catalogue {
                     Block::Unknown => {}
                 }
             }
-            let original = volume.main.original_name.as_ref().map_or(0, |name| name.capacity() as u64);
+            let original = add(
+                volume.main.original_name.as_ref().map_or(0, |name| name.capacity() as u64),
+                volume.main.embedded_comment.as_ref().map_or(0, |block| block.capacity() as u64),
+            )?;
             self.owned_capacity = add(self.owned_capacity, original)?;
             let metadata = RarVolumeMetadata {
                 format,

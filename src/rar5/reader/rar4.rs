@@ -75,7 +75,14 @@ impl HeaderParser {
                 // MHD_ENCRYPTVER (0x200) adds a byte: the version of the header encryption. A map walk also accepts
                 // a longer header (a RAR 2.x embedded comment, or fields it does not know) and ignores the rest.
                 let fixed = 13 + usize::from(flags & 0x200 != 0);
-                if (self.map_lenient && size < fixed) || (!self.map_lenient && size != 13 && size != fixed) {
+                // A catalogue keeps a RAR 2.x comment block (`COMM_HEAD`, 13 bytes and the comment) for
+                // `RarSession::comment`; it is decoded only when asked for.
+                let comment = self.catalogue_main_comment(flags);
+                if comment && size < 13 + 13 {
+                    return Err(self.framing("RAR4 comment header size", Error::Corrupt("RAR4 comment size")).into());
+                }
+                if (self.map_lenient && size < fixed) || (!self.map_lenient && !comment && size != 13 && size != fixed)
+                {
                     return Err(self.framing("RAR4 main header size", Error::Corrupt("RAR4 main header size")).into());
                 }
                 if flags & 0x80 != 0 {
@@ -96,7 +103,17 @@ impl HeaderParser {
                 if flags & 8 != 0 {
                     normalized |= MHFL_SOLID;
                 }
+                let embedded_comment = if comment {
+                    let block = &header[13..];
+                    let mut kept = Vec::new();
+                    kept.try_reserve_exact(block.len()).map_err(|_| allocation())?;
+                    kept.extend_from_slice(block);
+                    Some(kept)
+                } else {
+                    None
+                };
                 let main = MainHeader {
+                    embedded_comment,
                     flags: normalized,
                     volume_number: 0,
                     rar4_flags: Some(flags),
@@ -161,6 +178,10 @@ impl HeaderParser {
     /// wrong password.
     fn rar4_crc_end(&self, header: &[u8]) -> Option<usize> {
         let (kind, flags) = (header[2], u16::from_le_bytes([header[3], header[4]]));
+        if self.catalogue_main_comment(flags) && kind == 0x73 {
+            // As RAR 2.x writes it and UnRAR checks it, the CRC covers the fixed fields before the comment.
+            return Some(header.len().min(13));
+        }
         if !self.map_lenient || self.legacy_headers {
             return Some(header.len());
         }
@@ -184,7 +205,14 @@ impl HeaderParser {
     /// parser refuses. Map walks accept both: the main header's comment lies past its fixed fields, and a file
     /// header's after the name, where unrar leaves it unread too.
     pub(super) fn embedded_comment(&self, kind: u8, flags: u16) -> bool {
-        !self.map_lenient && ((kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0))
+        !self.map_lenient
+            && ((kind == 0x73 && flags & 2 != 0 && !self.catalogue_main_comment(flags))
+                || (kind == 0x74 && flags & 8 != 0))
+    }
+    /// A catalogue accepts a RAR 2.x comment embedded in a clear main header without `MHD_ENCRYPTVER`, which RAR
+    /// 2.x never writes with one.
+    fn catalogue_main_comment(&self, flags: u16) -> bool {
+        self.catalogue && !self.map_lenient && flags & 0x0002 != 0 && flags & 0x0280 == 0
     }
     pub(super) fn rar4_unsupported(&self, feature: &'static str) -> RarFault {
         RarFault::new(
