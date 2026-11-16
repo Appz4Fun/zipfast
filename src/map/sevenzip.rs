@@ -639,49 +639,24 @@ impl<'a> Reader<'a> {
 
 // ---- Decoding an encoded header ----
 
-/// LZMA2's dictionary size for property byte `b` (at most 40).
-fn lzma2_dict(b: u8) -> u64 {
-    if b >= 40 { u64::from(u32::MAX) } else { (2 | u64::from(b & 1)) << (b / 2 + 11) }
-}
-
 /// Decodes LZMA or LZMA2 data into exactly `size` bytes. Ok(None) means the data does not decode. The dictionary
 /// is shrunk to what `size` bytes can use, so a stated dictionary never allocates more than the output.
 fn lzma(kind: CoderKind, properties: &[u8], input: &[u8], size: usize, usage: &Usage) -> Parsed<Option<Vec<u8>>> {
-    let need = (size as u64).max(4096);
-    let mut filters = liblzma::stream::Filters::new();
-    let window = if kind == CoderKind::Lzma {
-        let mut props: [u8; 5] = properties.try_into().map_err(|_| Bad::Malformed("7z LZMA properties"))?;
-        let dict = u64::from(u32::from_le_bytes(props[1..].try_into().expect("four bytes"))).clamp(4096, need);
-        props[1..].copy_from_slice(&(dict as u32).to_le_bytes());
-        filters.lzma1_properties(&props).map_err(|_| Bad::Malformed("7z LZMA properties"))?;
-        dict
-    } else {
-        let &[b] = properties else { return Err(Bad::Malformed("7z LZMA2 properties")) };
-        if b > 40 {
-            return Err(Bad::Malformed("7z LZMA2 properties"));
-        }
-        let b = (0..=b).find(|&s| lzma2_dict(s) >= need).unwrap_or(b);
-        filters.lzma2_properties(&[b]).map_err(|_| Bad::Malformed("7z LZMA2 properties"))?;
-        lzma2_dict(b)
+    let shaped = match kind {
+        CoderKind::Lzma => properties.len() == 5,
+        _ => properties.len() == 1,
     };
-    usage.check(Resource::DecoderWindow, window)?;
-    let mut stream =
-        liblzma::stream::Stream::new_raw_decoder(&filters).map_err(|_| Bad::Unsupported("7z LZMA decoder"))?;
-    let mut out = vec![0u8; size];
-    let (mut consumed, mut produced) = (0usize, 0usize);
-    while produced < size {
-        let (i, o) = (stream.total_in(), stream.total_out());
-        let status = stream.process(&input[consumed..], &mut out[produced..], liblzma::stream::Action::Run);
-        consumed += (stream.total_in() - i) as usize;
-        produced += (stream.total_out() - o) as usize;
-        match status {
-            Err(_) => return Ok(None),
-            Ok(liblzma::stream::Status::StreamEnd) if produced < size => return Ok(None),
-            Ok(_) if produced < size && stream.total_in() == i && stream.total_out() == o => return Ok(None),
-            Ok(_) => {}
-        }
+    let what = if kind == CoderKind::Lzma { "7z LZMA properties" } else { "7z LZMA2 properties" };
+    if !shaped {
+        return Err(Bad::Malformed(what));
     }
-    Ok(Some(out))
+    let (filters, window) = crate::codec::filters(properties, size as u64).map_err(|_| Bad::Malformed(what))?;
+    usage.check(Resource::DecoderWindow, window)?;
+    match crate::codec::decode(&filters, input, Some(size as u64), size as u64) {
+        Ok(out) => Ok(Some(out)),
+        Err(crate::codec::LzmaError::Allocation) => Err(Bad::Unsupported("7z LZMA decoder")),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Decodes a header folder over its packed bytes. Ok(None) means the bytes do not decode (or decode to the wrong
