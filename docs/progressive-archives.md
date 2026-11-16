@@ -305,7 +305,11 @@ that established Passed packed evidence; the missing original ciphertext has not
 silently become available.
 
 Publication still requires the original whole-set authority and protection of
-**every** supplied replacement input. Initial replacement publication supports
+**every** supplied replacement input. **Use `ImmutableFileSource` for every
+replacement lane that should be able to publish:** it is the only source type
+that authorizes publication, and the session recognises it by its concrete type,
+so a wrapper around it does not. A single lane from any other source keeps the
+artifact `Unpublished` even when verification reaches `Strict`. Initial replacement publication supports
 actual `ImmutableFileSource` native adapters, with retained path/descriptor/stamp
 checks and alias protection. Custom opaque or claimed native/non-file replacement
 providers can establish cooperative content evidence but remain unpublished,

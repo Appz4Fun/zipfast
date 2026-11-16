@@ -139,8 +139,19 @@ impl ProgressiveSession {
             std::mem::take(&mut self.part_evidence),
         ))
     }
-    /// Admit an explicit verification generation. Encrypted stored replay requires
-    /// every member-part volume; custom sources cannot grant publication authority.
+    /// Admit an explicit verification generation (a replacement lane) for `volume`.
+    ///
+    /// Encrypted stored replay requires every member-part volume
+    /// ([`Artifact::required_verification_volumes`](super::Artifact::required_verification_volumes)).
+    ///
+    /// Only an [`ImmutableFileSource`](super::ImmutableFileSource) lane can authorize publication. The session
+    /// recognises that concrete type (through `Any`, so a wrapper around it does not count) and then binds the
+    /// replacement's path, descriptor and stamp and protects it from aliasing with the output, like an original
+    /// immutable volume. Any other `RangeSource`, including one whose `backing_files` returns real files, can still
+    /// produce `Strict` content evidence, but the artifact stays
+    /// [`ArtifactPublication::Unpublished`](super::ArtifactPublication::Unpublished), also if recovered
+    /// publication is requested later. One such lane is enough to withhold publication for the whole artifact. The
+    /// original whole-set authority (a Complete native declaration or sealed memory) is still required too.
     pub fn supply_verification_source(&mut self, volume: u32, source: Box<dyn RangeSource>) -> ProgressiveResult<()> {
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));

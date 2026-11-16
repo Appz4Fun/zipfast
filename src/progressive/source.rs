@@ -2140,6 +2140,12 @@ mod retained_tests;
 mod tests;
 
 /// A complete, immutable native file. Growth and metadata/content replacement are changes.
+///
+/// It is also the only source that authorizes publication from a replacement lane
+/// ([`ProgressiveSession::supply_verification_source`](super::ProgressiveSession::supply_verification_source)):
+/// the session recognises this exact type and binds and protects its file. Caller-provided `RangeSource`s, even
+/// ones backed by native files, and wrappers around this type can establish content evidence but never authorize
+/// publication.
 pub struct ImmutableFileSource {
     file: File,
     path: PathBuf,
