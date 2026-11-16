@@ -158,6 +158,8 @@ impl RarSession {
                 })?;
                 let method = self.model.members[index].header.method;
                 let result = driver.member(&mut run, self, index, &entry);
+                // a member makes at most one rename; it goes out with the member's own outcome too
+                let renamed = run.renames.last().cloned();
                 summary.renames.append(&mut run.renames);
                 let (outcome, terminal) = match result {
                     Ok(outcome) => (outcome, None),
@@ -167,7 +169,7 @@ impl RarSession {
                 if let Err(fault) = count_outcome(&mut summary, &outcome) {
                     return Err(DriverError::Native(run_error(summary, Some(entry), Arc::from(fault.failure))));
                 }
-                let event = RarEntryOutcome { entry, method, outcome };
+                let event = RarEntryOutcome { entry, method, outcome, renamed };
                 let callback = driver.entry(&event, self);
                 if let Some(failure) = terminal {
                     return Err(DriverError::Native(run_error(summary, Some(event.entry), failure)));
@@ -480,6 +482,7 @@ impl SelectedRun {
             entry: RarEntryIdentity { index: Some(index as u64), order: index as u64, name: String::new() },
             method: header.method,
             password: RarPasswordEvidence::NotEncrypted,
+            renamed: None,
         };
         let mut pending = Pending::new(header, context);
         if header.encrypted {

@@ -29,6 +29,15 @@ pub struct RarEntryOutcome {
     /// Raw compression method bits from this member's initial header.
     pub method: u8,
     pub outcome: RarOutcome,
+    /// The rename [`super::Overwrite::RenameNew`] or [`super::Overwrite::RenameExisting`] made for this member, if
+    /// any, delivered with the member's own outcome so a caller can report it as it happens (UnRAR's
+    /// `Extracting  (1).bashrc  OK`). It is the same record that is added to [`RarRunSummary::renames`]. It can come
+    /// with a failure: an existing file or folder moved aside by `RenameExisting` stays moved when writing the member
+    /// then fails.
+    ///
+    /// This field was added after the rename modes; the struct is `#[non_exhaustive]`, so callers outside the crate
+    /// could never build or exhaustively destructure it, and the addition doesn't break them.
+    pub renamed: Option<RenamedOutput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +153,8 @@ pub(crate) struct EntryContext {
     pub(crate) entry: RarEntryIdentity,
     pub(crate) method: u8,
     pub(crate) password: RarPasswordEvidence,
+    /// the rename a rename mode made for this member, reported with its outcome
+    pub(crate) renamed: Option<RenamedOutput>,
 }
 
 impl EntryContext {
@@ -156,7 +167,7 @@ impl EntryContext {
     }
 
     pub(crate) fn event(&self, outcome: RarOutcome) -> RarEntryOutcome {
-        RarEntryOutcome { entry: self.entry.clone(), method: self.method, outcome }
+        RarEntryOutcome { entry: self.entry.clone(), method: self.method, outcome, renamed: self.renamed.clone() }
     }
 
     pub(crate) fn checks(&self, size_checked: bool, crc32_checked: bool, blake2sp_checked: bool) -> RarVerification {
@@ -240,7 +251,7 @@ impl Reports<'_> {
             _ => None,
         };
         let entry = RarEntryIdentity { index, order: position, name };
-        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted })
+        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted, renamed: None })
     }
 
     /// A member the run's filter didn't take: it keeps its listing index, so later members' indexes still match a
@@ -255,7 +266,7 @@ impl Reports<'_> {
             Self::Legacy { .. } => None,
         };
         let entry = RarEntryIdentity { index, order, name };
-        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted })
+        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted, renamed: None })
     }
 
     pub(super) fn volume(&mut self) -> RunResult<()> {

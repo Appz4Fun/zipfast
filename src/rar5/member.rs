@@ -1046,6 +1046,7 @@ mod tests {
             entry: crate::extract::RarEntryIdentity { index: Some(0), order: 0, name: String::new() },
             method: 0,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
+            renamed: None,
         }
     }
     fn recovery_fixture(size: usize) -> (super::super::FileHeader, Vec<u8>, Vec<u8>) {

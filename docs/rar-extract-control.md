@@ -12,7 +12,11 @@ takes precedence over the control's mode: every conflict is settled by renaming,
 and `overwrite` is never called. The target is still bound and rechecked as for
 Always. `RenameExisting` moves the verified incumbent aside with a no-replace
 rename just before publishing; `RenameNew` publishes under the first free
-renamed name with no-replace renames. `RarRunSummary::renames` lists both. A new
+renamed name with no-replace renames. `RarRunSummary::renames` lists both, and
+each member's rename also arrives with its outcome in `RarEntryOutcome::renamed`,
+at the observer's `entry` call. A folder at a file member's target is moved aside
+(`RenameExisting`, unless it holds an archive volume or protected path) or left
+alone (`RenameNew`), and `RenameNew` writes past a protected input. A new
 file published under a renamed name has no prepared diagnostic binding, so the
 guard skips its publication check; the stage it came from was checked.
 

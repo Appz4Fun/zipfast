@@ -111,9 +111,13 @@ UTF-8 character boundary, to fit `NAME_MAX` (255 bytes). Each name is claimed wi
 `O_EXCL`, `renameat2(RENAME_NOREPLACE)` (Linux) or `renameatx_np(RENAME_EXCL)` (macOS), never looked up first, so
 duplicate members in one run number sequentially and nothing is clobbered.
 
-The rename modes refuse what `Always` refuses: a symlink, a folder, and a protected path or alias of one (the
-archive, its volumes and `Options::protected_paths`). A candidate name that is a protected path is passed over.
-Folder members are reused, never renamed. The whole-archive runners (`run`, `run_with_password`,
+A symlink at the target is refused. A folder at a file member's target is handled as 7-Zip 26.06 does: `RenameNew`
+leaves it alone and writes the member at the first free renamed name, and `RenameExisting` moves the folder, contents
+and all, to that name with a no-replace rename and writes the member in its place; the move is reported as
+`RenamedOutput::existing`. A protected path or alias of one (the archive, its volumes and `Options::protected_paths`)
+at the target is only a name in use for `RenameNew`, which replaces nothing (`self.zip` extracted beside itself is
+written as `self_1.zip`, like `-aou`), but `RenameExisting` refuses it, and refuses a folder holding one, since it
+would move it. A candidate name that is a protected path is passed over. Folder members are reused, never renamed. The whole-archive runners (`run`, `run_with_password`,
 `run_with_zip_policy`, `run_with_zip_context`, `run_rar_with_outcomes`, ZIP, tar, lone compressed files, RAR4/RAR5)
 and `RarSession::extract_selected`/`extract_selected_controlled` support them. In controlled extraction the options'
 rename mode settles every conflict: the control's `RarOverwriteMode` and the observer's `overwrite` are not asked.
@@ -121,7 +125,9 @@ Progressive and persistent-partial sessions refuse them with `FailureKind::Inval
 `ZipReadStage::prepare_file` refuses them with `ReadFault::InvalidPlan`, before doing anything.
 
 Each rename is reported as an `extract::RenamedOutput { requested, path, existing }` in `Summary::renames`,
-`RarRunSummary::renames` (kept in a terminal error's `partial` too), or as a `ZipRunEvent::MemberRenamed` event from
+`RarRunSummary::renames` (kept in a terminal error's `partial` too, and delivered with each member's outcome as
+`RarEntryOutcome::renamed`, so a live listing can print UnRAR's `Extracting  (1).bashrc  OK`), or as a
+`ZipRunEvent::MemberRenamed` event from
 `run_with_zip_policy`/`run_with_zip_context`, sent as each rename is made. `extract::run_with_renames` is
 `run_with_password` with a terminal `RunError { error, renames }`; `run` and `run_with_password` keep returning
 `Error`, and their report callback gets a line per rename as it happens (`<requested>: exists, written as <path>` or

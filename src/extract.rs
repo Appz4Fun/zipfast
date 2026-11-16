@@ -68,15 +68,20 @@ pub enum Mode {
 /// The enum is `#[non_exhaustive]`: matches on it need a wildcard arm. The two rename modes were added after `Skip`
 /// and `Always`, so an exhaustive match written before them no longer compiles.
 ///
-/// Every mode refuses the same targets `Always` refuses: a symlink (never followed or replaced), a directory, and a
-/// protected path or an alias of one ([`Options::protected_paths`], the archive and its volumes). A rename mode never
+/// Every mode refuses a symlink at the target (never followed or replaced). `Skip` leaves anything else alone;
+/// `Always` also refuses a directory and a protected path or an alias of one ([`Options::protected_paths`], the
+/// archive and its volumes). The rename modes follow 7-Zip 26.06: `RenameNew` leaves a directory or protected input at
+/// the target alone and writes the member at a renamed name (`self.zip` extracted beside itself becomes
+/// `self_1.zip`), while `RenameExisting` moves a directory aside with its contents, as it moves a file, but refuses a
+/// protected path, and a directory holding one (the archive, say), rather than move it. A rename mode never
 /// replaces anything: the renamed name is claimed with a create-new or no-replace primitive, never chosen by looking
 /// first, so two members (or another process) can't be handed the same name. A renamed name is in the same folder as
 /// the requested one and follows the same containment rules. Folder members are never renamed: an existing folder is
 /// reused as with the other modes.
 ///
 /// Runs report each rename as a [`RenamedOutput`]: [`Summary::renames`], [`RarRunSummary::renames`] (kept in a
-/// terminal error's `partial`), [`RunError::renames`] from [`run_with_renames`], and
+/// terminal error's `partial`, and each also delivered with its member's outcome as [`RarEntryOutcome::renamed`]),
+/// [`RunError::renames`] from [`run_with_renames`], and
 /// [`crate::zip::ZipRunEvent::MemberRenamed`] for [`run_with_zip_policy`] and [`run_with_zip_context`], sent as each
 /// rename is made. The legacy report callback of [`run`] and [`run_with_password`] gets a line for each rename as
 /// it is made, so a run that stops with an error still says where moved files went.
@@ -96,10 +101,11 @@ pub enum Overwrite {
     /// replace a file that is already there, once the new one is verified
     Always,
     /// Write the member under the first free renamed name (`a_1.txt`, `a_2.txt`, ... or `a(1).txt`, ...), leaving
-    /// the existing file alone: 7-Zip's `-aou` with [`RenameStyle::Underscore`], UnRAR's `-or` with
+    /// the existing file, folder or protected input alone: 7-Zip's `-aou` with [`RenameStyle::Underscore`], UnRAR's `-or` with
     /// [`RenameStyle::Parenthesized`]. Members with the same name in one run take the next free number each.
     RenameNew(RenameStyle),
-    /// Move the existing file to the first free renamed name, then write the member at its own name: 7-Zip's `-aot`.
+    /// Move the existing file or folder to the first free renamed name, then write the member at its own name:
+    /// 7-Zip's `-aot`.
     /// The existing file is moved with a no-replace rename, so it always has a name; if writing the member fails
     /// afterwards, it stays at the renamed name and [`RenamedOutput::existing`] says where.
     RenameExisting(RenameStyle),
@@ -413,13 +419,13 @@ impl<F: FnMut(&str)> LegacyReport for F {
 fn check_target_detailed(
     opts: &Options,
     rel: &Path,
-    dirs: Option<&mut Dirs>,
+    mut dirs: Option<&mut Dirs>,
     log: &mut RenameLog<'_>,
 ) -> crate::error::RarResult<DetailedChecked> {
     let target = opts.dest.join(rel);
     let rename = opts.overwrite.rename();
     if let Some(parent) = rel.parent() {
-        match dirs {
+        match dirs.as_deref_mut() {
             Some(dirs) => {
                 make_dirs_known_detailed(&opts.dest, parent, dirs)?;
                 let first = dirs.note(rel);
@@ -431,7 +437,7 @@ fn check_target_detailed(
         }
     }
     if let Some(mode) = rename {
-        return place_renamed(opts, target, mode, log);
+        return place_renamed(opts, target, rel, mode, dirs, log);
     }
     let metadata = |e| RarFault::output(IoOperation::Metadata, Some(target.clone()), None, e, false);
     Ok(match fs::symlink_metadata(&target) {
@@ -452,18 +458,23 @@ fn check_target_detailed(
 
 /// Claims the output file for a rename mode, whose parent folders are already made and checked.
 ///
-/// The requested name is created with `O_EXCL` first. When it is taken, what is there is refused exactly as
-/// `Overwrite::Always` refuses it (a symlink, a folder, a protected path or an alias of one). Otherwise
-/// `RenameNew` creates the first free renamed name with `O_EXCL`, and `RenameExisting` moves the existing file to the
-/// first free renamed name with a no-replace rename and then creates the requested name with `O_EXCL`. A candidate
-/// that is a protected path is passed over. Nothing is ever replaced, and the file this returns is new and empty.
+/// The requested name is created with `O_EXCL` first. When it is taken, a symlink there is refused. Otherwise
+/// `RenameNew` creates the first free renamed name with `O_EXCL`, leaving what is at the requested name alone, even a
+/// folder or a protected input (7-Zip's `-aou` writes `self.zip` beside the archive as `self_1.zip`). `RenameExisting`
+/// moves what is there, a file or a folder with its contents, to the first free renamed name with a no-replace rename
+/// and then creates the requested name with `O_EXCL` (7-Zip's `-aot`); it refuses a protected input, and a folder that
+/// holds one (the archive, say), since that would move it. A candidate that is a protected path is passed over.
+/// Nothing is ever replaced, and the file this returns is new and empty. A folder moved aside is forgotten by `dirs`,
+/// so a later member under its old name makes the folder again.
 ///
 /// Running out of names (or of the run's rename attempts) and a file system that can't move without replacing are
 /// this member's failure ([`DetailedChecked::Blocked`]), not the run's.
 fn place_renamed(
     opts: &Options,
     target: PathBuf,
+    rel: &Path,
     mode: RenameMode,
+    dirs: Option<&mut Dirs>,
     log: &mut RenameLog<'_>,
 ) -> crate::error::RarResult<DetailedChecked> {
     let create = |path: &Path, e| RarFault::output(IoOperation::CreateFile, Some(path.to_path_buf()), None, e, false);
@@ -477,11 +488,11 @@ fn place_renamed(
     if meta.file_type().is_symlink() {
         return Ok(DetailedChecked::Blocked(RarPolicyReason::Symlink));
     }
-    if meta.is_dir() {
-        return Ok(DetailedChecked::Blocked(RarPolicyReason::Directory));
-    }
-    if is_protected(opts, &target.canonicalize().map_err(|e| metadata(&target, e))?) {
-        return Ok(DetailedChecked::Blocked(RarPolicyReason::ProtectedInput));
+    if let RenameMode::Existing(_) = mode {
+        let canonical = target.canonicalize().map_err(|e| metadata(&target, e))?;
+        if is_protected(opts, &canonical) || meta.is_dir() && holds_protected(opts, &canonical) {
+            return Ok(DetailedChecked::Blocked(RarPolicyReason::ProtectedInput));
+        }
     }
     let parent = target.parent().and_then(|p| p.canonicalize().ok());
     let skip = |candidate: &Path| {
@@ -508,6 +519,11 @@ fn place_renamed(
                     Ok(claimed) => claimed,
                     Err(error) => return failed(error),
                 };
+            if meta.is_dir()
+                && let Some(dirs) = dirs
+            {
+                dirs.forget(rel);
+            }
             (log.record)(RenamedOutput {
                 requested: target.clone(),
                 path: target.clone(),
@@ -527,6 +543,11 @@ fn place_renamed(
 
 fn is_protected(opts: &Options, path: &Path) -> bool {
     !opts.protected_paths.is_empty() && opts.protected_paths.contains(path)
+}
+
+/// Whether the folder `dir` (canonical) holds a protected path at any depth.
+fn holds_protected(opts: &Options, dir: &Path) -> bool {
+    opts.protected_paths.iter().any(|path| path.starts_with(dir))
 }
 
 /// Files from this size up are given their full length when created. A small file gains nothing from it, and the
@@ -2835,8 +2856,16 @@ impl Run<'_, '_, '_> {
         };
 
         let place = if self.opts.mode == Mode::Extract {
-            let mut log = RenameLog { budget: &mut self.rename_budget, record: &mut |r| self.reports.renamed(r) };
+            let mut renamed = None;
+            let mut log = RenameLog {
+                budget: &mut self.rename_budget,
+                record: &mut |r| {
+                    renamed = Some(r.clone());
+                    self.reports.renamed(r)
+                },
+            };
             let checked = check_target_detailed(self.opts, &rel, Some(&mut self.dirs), &mut log);
+            ctx.renamed = renamed;
             match checked.map_err(|e| self.terminal(&ctx, e))? {
                 DetailedChecked::Write(place) => Some(place),
                 DetailedChecked::Exists => {
@@ -3536,6 +3565,11 @@ pub fn archive_time(seconds: i64, nanos: u32) -> Option<SystemTime> {
 }
 
 impl Dirs {
+    /// Forgets the folder `rel` and everything under it, which a rename mode has moved away.
+    fn forget(&mut self, rel: &Path) {
+        self.known.retain(|path, _| !path.starts_with(rel));
+    }
+
     /// Records the path `rel` as used by this run. True when nothing this run wrote can be at `rel` under any
     /// spelling: every part of it is a plain name, it was not used before in any letter case, and no name seen so
     /// far could be another spelling of it. A plain name has only ASCII letters, digits and common punctuation, and
@@ -3726,6 +3760,7 @@ mod tests {
             entry: RarEntryIdentity { index: None, order: 0, name: String::new() },
             method: 0,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
+            renamed: None,
         }
     }
 
