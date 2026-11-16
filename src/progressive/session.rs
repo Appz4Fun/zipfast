@@ -221,6 +221,8 @@ pub struct ProgressiveSession {
     rar4_independent: Option<rar4::Independent>,
     /// the RAR4 decoder a solid successor goes on from
     rar4_history: Option<crate::rar5::member::Rar4Owner>,
+    /// every member so far was written by an archiver older than RAR 2.9, which writes no end-of-archive block
+    pre_29: bool,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -349,6 +351,7 @@ impl ProgressiveSession {
             history_failure: None,
             rar4_independent: None,
             rar4_history: None,
+            pre_29: true,
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -639,6 +642,25 @@ impl ProgressiveSession {
                             self.driver.validate_step()?;
                             return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index, id }))));
                         }
+                        Poll::Ready(Ok(SourceStep::EndOfVolume))
+                            if self.main_seen
+                                && self.ordinal > 0
+                                && self.pre_29
+                                && self.parser.at_rar4_block_start() =>
+                        {
+                            // Archives older than RAR 2.9 write no end-of-archive block: UnRAR ends them at a block
+                            // boundary, going on to the next volume while a member waits for its next part.
+                            if self.member.is_some() {
+                                self.phase = Phase::NextVolume;
+                            } else {
+                                if let Some(output) = &mut self.output {
+                                    output.finish_directories(&mut self.driver)?;
+                                }
+                                #[cfg(feature = "persistent-partials")]
+                                self.partial_finish_directories()?;
+                                self.phase = Phase::Done;
+                            }
+                        }
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
                             return Err(self.parser.truncated());
                         }
@@ -905,6 +927,10 @@ impl ProgressiveSession {
                 self.main_seen = true;
             }
             Block::File(header) => {
+                // RAR 2.9 introduced the extended-time record and always writes an end-of-archive block.
+                if header.rar4.is_none_or(|raw| raw.unpack_version >= 29 || raw.flags & 0x1000 != 0) {
+                    self.pre_29 = false;
+                }
                 // A member a persistent session refuses is never decoded: only what walking past its data needs
                 // is checked (the continuation identity of its later parts below).
                 #[cfg(feature = "persistent-partials")]

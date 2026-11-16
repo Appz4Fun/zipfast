@@ -187,7 +187,7 @@ fn issue(path: &Path) -> Vec<std::sync::Arc<RarFailure>> {
 }
 
 #[test]
-fn unsupported_modes_and_bad_crc_never_publish_and_later_members_reset() {
+fn truncated_ppm_and_filter_records_and_bad_crc_never_publish_and_later_members_reset() {
     let dir = tempfile::tempdir().unwrap();
     let good = include_bytes!("fixtures/rar4-lz/initial-delta-zero-baseline.packed");
     let cases = [
@@ -205,14 +205,8 @@ fn unsupported_modes_and_bad_crc_never_publish_and_later_members_reset() {
         let failures = issue(&path);
         assert_eq!(failures.len(), 1);
         match case {
-            0 => assert!(matches!(
-                failures[0].as_ref(),
-                RarFailure::Unsupported(RarUnsupported::Rar4Feature("PPM payload"))
-            )),
-            1 => assert!(matches!(
-                failures[0].as_ref(),
-                RarFailure::Unsupported(RarUnsupported::Rar4Feature("VM/filter payload"))
-            )),
+            // a PPM block header or filter record the data cuts off is corrupt
+            0 | 1 => assert!(matches!(failures[0].as_ref(), RarFailure::Integrity { .. }), "{failures:?}"),
             _ => assert!(matches!(
                 failures[0].as_ref(),
                 RarFailure::Integrity { reason: RarIntegrityReason::FinalChecks { crc32: true, .. }, .. }
@@ -296,9 +290,9 @@ fn old_versions_and_methods_stay_excluded() {
     let path = dir.path().join("excluded.rar");
     let packed = include_bytes!("fixtures/rar4-lz/literal-a.packed");
     for (version, method, flags, label) in [
-        (20, 0x33, 0, "unpack version"),
-        (26, 0x33, 0, "unpack version"),
-        (15, 0x33, 0, "unpack version"),
+        // Versions 15, 20, 26 and 29 decode (tests/rar4_split_solid.rs); RAR 1.3 and anything past 2.9 don't.
+        (10, 0x33, 0, "unpack version"),
+        (36, 0x33, 0, "unpack version"),
         (29, 0x36, 0, "compression method"),
         // Split, solid and encrypted version 29 members decode (tests/rar4_split_solid.rs); RAR 2.0's cipher doesn't.
         (20, 0x30, 4, "encrypted payload"),
@@ -415,16 +409,13 @@ fn cancellation_and_protected_archive_destination_are_preserved() {
     ));
 }
 
-fn legacy_unsupported(packed: &[u8], label: &str) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("unsupported.rar");
-    fs::write(&path, fixed_archive(packed, b"AA")).unwrap();
-    let failures = issue(&path);
+fn legacy_unsupported(path: &Path, label: &str) {
+    let failures = issue(path);
     assert_eq!(failures.len(), 1);
     assert!(matches!(failures[0].as_ref(),
         RarFailure::Unsupported(RarUnsupported::Rar4Feature(actual)) if *actual == label));
     let mut provisional = Vec::new();
-    let error = extract::SelectedEntry::open(&path, 0, None, 1 << 20)
+    let error = extract::SelectedEntry::open(path, 0, None, 1 << 20)
         .unwrap()
         .read(None, |bytes| {
             provisional.extend_from_slice(bytes);
@@ -437,11 +428,18 @@ fn legacy_unsupported(packed: &[u8], label: &str) {
 }
 
 #[test]
-fn ppm_legacy_error_is_unsupported() {
-    legacy_unsupported(include_bytes!("fixtures/rar4-lz/ppm-marker.packed"), "PPM payload");
+fn truncated_ppm_legacy_error_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ppm.rar");
+    fs::write(&path, fixed_archive(include_bytes!("fixtures/rar4-lz/ppm-marker.packed"), b"AA")).unwrap();
+    let error = extract::SelectedEntry::open(&path, 0, None, 1 << 20).unwrap().read(None, |_| Ok(())).unwrap_err();
+    assert!(matches!(error, zipfast::error::Error::Corrupt(_)), "{error:?}");
 }
 
+/// A VM program other than the six standard filters would need the VM itself.
 #[test]
-fn vm_legacy_error_is_unsupported() {
-    legacy_unsupported(include_bytes!("fixtures/rar4-lz/vm-marker-after-prefix.packed"), "VM/filter payload");
+fn vm_program_other_than_a_standard_filter_is_unsupported() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-rar300/generic_delta_padding_mutation.rar");
+    legacy_unsupported(&path, "VM/filter payload");
 }

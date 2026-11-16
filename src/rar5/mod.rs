@@ -221,7 +221,7 @@ impl Rar4Metadata {
             "encrypted payload"
         } else if !(0x30..=0x35).contains(&self.method) {
             "compression method"
-        } else if self.method != 0x30 && self.unpack_version != 29 {
+        } else if !matches!(self.unpack_version, 15 | 20 | 26 | 29) {
             "unpack version"
         } else if self.flags & 0x800 != 0 {
             "old file revision"
@@ -229,8 +229,6 @@ impl Rar4Metadata {
             "host attributes"
         } else if self.host == 3 && !matches!(attributes & 0o170000, 0 | 0o100000 | 0o040000 | 0o120000) {
             "special file"
-        } else if !matches!(self.unpack_version, 20 | 29) {
-            "unpack version"
         } else if self.host == 3
             && attributes & 0o170000 != 0
             && (self.flags & 0xe0 == 0xe0) != (attributes & 0o170000 == 0o040000)

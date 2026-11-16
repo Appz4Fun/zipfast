@@ -15,10 +15,11 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 ## What works
 
 - RAR4 archives: bounded header listing and verification, extraction, and selected
-  printing of Stored and version-29 LZ compressed regular files, including files split across
-  `name.partN.rar` or `name.rar`/`name.r00` volumes, solid archives and AES-encrypted (`-p`) files, through
-  every entry point including progressive sessions. PPM and VM/filter commands remain excluded. The
-  catalogue retains unsupported member metadata and reports typed payload exclusions.
+  printing of Stored and compressed regular files of every unpack version (RAR 1.5's 15, RAR 2.0's 20/26
+  with audio blocks, RAR 2.9's 29 with PPMd variant H and the VM standard filters), including files split
+  across `name.partN.rar` or `name.rar`/`name.r00` volumes, solid archives and AES-encrypted (`-p`) files,
+  through every entry point including progressive sessions. The catalogue retains unsupported member
+  metadata and reports typed payload exclusions.
 - RAR 5.0 archives: listing, testing and extracting stored and compressed files (every method, solid archives,
   filters), including files split across `name.partNN.rar` or `name.rar`/`name.r00` volume sets, self-extracting
   stubs, CRC32 and BLAKE2sp checks, modification times and Unix permissions. Big files decode on several cores.
@@ -231,9 +232,27 @@ Decoding is serial and retains bounded incremental input state. Real decoded
 bits are required. Once the declared output is complete, remaining declared
 packed bytes are charged and drained without claiming canonical tail encoding.
 Empty compressed members use the same logical-completion policy and verify the
-empty CRC. PPM and VM/filter commands encountered before completion report typed
-unsupported outcomes. No unsupported command can be skipped into CRC success.
-Compressed versions 15, 20 and 26, RAR 2.0 encryption, symbolic
+empty CRC. PPM blocks decode with PPMd variant H (the model asks for its memory,
+up to 256 MiB, which is committed in 64 KiB pages as the model writes it; a
+progressive session's `decoder_window` and a selected session's window limit
+bound it, and a held filter block, with a typed limit failure) and
+are buffered 4 KiB ahead until the member's data is all in; LZ matches, filter
+records and the end-of-file escape inside them are honoured, and a solid member
+goes on from the model. Filter records are parsed and the six standard filters
+(E8, E8E9, ITANIUM, DELTA, RGB and AUDIO), recognised by their program's length
+and CRC as UnRAR does, run natively on output held back until each block is
+complete (at most the VM's 256 KiB); any other VM program reports a typed
+unsupported outcome, and no unsupported command can be skipped into CRC
+success. Unpack versions 15 and 20/26 decode with RAR 1.5's and 2.0's own
+engines, solid streams included. Before version 20 a non-final part's CRC field
+holds no packed-data hash, so only the member CRC is checked. A progressive
+session over complete volumes ends an archive that has no end-of-archive block
+at a block boundary, as UnRAR does, when every member so far predates RAR 2.9
+(unpack version below 29, no extended-time record); a later archive cut there
+is still truncated, and a session following growing files waits for more. A
+filter block reaching into the next solid member, which UnRAR would keep
+waiting, is refused as corrupt: its bytes are the first member's output.
+RAR 1.5 and 2.0 encryption, symbolic
 links, special files, old file revisions, and unsupported host attributes retain
 explicit exclusions. Encrypted headers,
 old embedded comments and legacy service layouts stop catalogue construction.

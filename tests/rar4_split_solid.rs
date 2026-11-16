@@ -90,6 +90,9 @@ fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
             if kind.is_dir() {
                 walk(root, &path, out);
             } else if kind.is_file() {
+                // a member's stored attributes may leave its file unreadable to its owner
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
                 let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
                 out.insert(rel, fs::read(&path).unwrap());
             }
@@ -176,6 +179,18 @@ fn cases() -> Vec<Case> {
             "in_rar4-archiver_win-encvol.rar",
         ),
         case(&["rar4/solid.rar"], None, "in_rarinfo_solid.rar"),
+        // PPMd variant H, with a solid member going on from the first one's model
+        case(&["rar4/latest_winrar.rar"], None, "in_rarinfo_latest_winrar.rar"),
+        // the six VM standard filters
+        case(&["rar4-rar300/rarvm_x86_e8_rar300.rar"], None, "in_rar300_rarvm_x86_e8_rar300.rar"),
+        case(&["rar4-rar300/rarvm_x86_e8e9_rar300.rar"], None, "in_rar300_rarvm_x86_e8e9_rar300.rar"),
+        case(&["rar4-rar300/rarvm_itanium_synthetic_rar300.rar"], None, "in_rar300_rarvm_itanium_synthetic_rar300.rar"),
+        case(&["rar4-rar300/rarvm_delta_4ch_rar300.rar"], None, "in_rar300_rarvm_delta_4ch_rar300.rar"),
+        case(&["rar4-rar300/rarvm_rgb_gradient_rar300.rar"], None, "in_rar300_rarvm_rgb_gradient_rar300.rar"),
+        case(&["rar4-rar300/rarvm_audio_stereo_rar300.rar"], None, "in_rar300_rarvm_audio_stereo_rar300.rar"),
+        // a solid PPMd stream, and an E8 filter whose block offset counts from its own member in a solid stream
+        case(&["rar4-rar300/ppmd_solid_rar300.rar"], None, "rars_ppmd_solid_rar300.rar"),
+        case(&["rar4-rar300/solid_e8_filter_member_offset.rar"], None, "rars_solid_e8_filter_member_offset.rar"),
         case(&["rar4-rar300/solid_simple_rar300.rar"], None, "in_rar300_solid_simple_rar300.rar"),
         case(&["rar4-rar300/solid_rar300.rar"], None, "in_rar300_solid_rar300.rar"),
         Case {
@@ -715,6 +730,110 @@ fn a_continuation_with_another_dictionary_or_salt_fails_typed() {
     }
 }
 
+/// The archive's own final CRC-32 for each regular file, as the expected output.
+fn crc_manifest(first: &Path) -> Manifest {
+    let session = RarSession::open(first, None, RarSessionOptions::default()).unwrap();
+    session
+        .entries()
+        .filter(|e| !e.is_directory())
+        .map(|e| (e.name().to_owned(), Expect::Crc32(e.final_checks().unwrap().crc32.unwrap())))
+        .collect()
+}
+
+/// RAR 1.5 (unpack version 15) and RAR 2.0 (20) compression, solid streams and an old split set, through every
+/// route.
+#[test]
+fn rar15_and_rar20_compression_extracts_through_every_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sets: &[&[&str]] = &[
+        &["rar4-legacy/readme_154_normal.rar"],
+        &["rar4-legacy/readme_154_store_solid.rar"],
+        &["rar4-legacy/rars-compressed.rar"],
+        &["rar4-legacy/rars-solid.rar"],
+        &["rar4-legacy/rars-split-store.rar", "rar4-legacy/rars-split-store.r00", "rar4-legacy/rars-split-store.r01"],
+        &["rar4-legacy/SOLID.RAR"],
+        &["rar4-legacy/AUDIO.RAR"],
+        &["rar4-legacy/AUTOREJ.RAR"],
+        &["rar4-legacy/BIGLZ.RAR"],
+        &["rar4-legacy/unpack20_multiblock.rar"],
+    ];
+    // Archives this old write no end-of-archive block: a progressive session over complete volumes ends them at a
+    // block boundary, as UnRAR does, but one following growing files can't tell that end from a pause.
+    type Route = fn(&Case, &Path);
+    let routes: [(&str, Route); 5] = [
+        ("run", via_run),
+        ("outcomes", via_outcomes),
+        ("selected", via_selected),
+        ("controlled", via_controlled),
+        ("progressive", via_progressive),
+    ];
+    for (n, volumes) in sets.iter().enumerate() {
+        let volumes = paths(volumes);
+        let want = crc_manifest(&volumes[0]);
+        assert!(!want.is_empty());
+        let case = Case { volumes, password: None, want };
+        for (route, extract) in routes {
+            let dest = tmp.path().join(format!("legacy-{n}-{route}"));
+            extract(&case, &dest);
+            check_tree(&label(&case, route), &dest, &case.want);
+        }
+    }
+}
+
+/// A filter record inside a PPMd block: the member's CRC holds only if the filter ran.
+#[test]
+fn a_filter_inside_a_ppm_block_runs() {
+    let path = fixtures().join("rar4-rar300/ppmd_embedded_vm_filter.rar");
+    let tmp = tempfile::tempdir().unwrap();
+    let summary = extract::run(&path, &options(tmp.path()), |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(summary.files, 1);
+}
+
+/// A progressive session over complete volumes ends an archive older than RAR 2.9, which has no end-of-archive
+/// block, at a block boundary; a RAR 2.9+ archive cut at a block boundary is still truncated.
+#[test]
+fn only_archives_older_than_rar_2_9_may_end_without_an_end_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = |name: &str, bytes: Vec<u8>| {
+        let dest = tmp.path().join(name);
+        let case = Case { volumes: vec![PathBuf::from(name)], password: None, want: Manifest::new() };
+        let mut session = ProgressiveSession::from_sealed_memory(
+            vec![(OsString::from(name), bytes.into_boxed_slice())],
+            progressive_options(&case, &dest),
+        )
+        .unwrap();
+        drive(&mut session, || {})
+    };
+    // RAR 1.54 writes no end block
+    let old = fs::read(fixtures().join("rar4-legacy/readme_154_normal.rar")).unwrap();
+    assert!(run("old.rar", old).is_empty());
+    // a RAR 3.x archive without its end block
+    let mut modern = fs::read(fixtures().join("rar4/solid.rar")).unwrap();
+    assert_eq!(modern[modern.len() - 5], 0x7b, "ends with the end-of-archive block");
+    modern.truncate(modern.len() - 7);
+    let problems = run("modern.rar", modern);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("Truncated"), "{problems:?}");
+}
+
+/// A PPM block asks for its model's memory up front; a progressive session's decoder window bounds it, typed.
+#[test]
+fn a_ppm_model_larger_than_the_progressive_window_is_a_typed_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = fixtures().join("rar4/latest_winrar.rar");
+    let case = Case { volumes: vec![path.clone()], password: None, want: Manifest::new() };
+    let mut opts = progressive_options(&case, tmp.path());
+    // the LZ dictionary (1 MiB) fits; the PPM model and filter memory don't
+    opts.limits.decoder_window = 1 << 20;
+    let volume = fs::read(&path).unwrap().into_boxed_slice();
+    let mut session =
+        ProgressiveSession::from_sealed_memory(vec![(OsString::from("latest_winrar.rar"), volume)], opts).unwrap();
+    let problems = drive(&mut session, || {});
+    assert!(!problems.is_empty() && problems.iter().any(|p| p.contains("Limit")), "{problems:?}");
+    assert!(tree(tmp.path()).is_empty());
+}
+
 /// The whole Prybar reference corpus, when `ZIPFAST_RAR4_CORPUS` names it: every archive UnRAR extracts must
 /// extract identically, except the shapes listed as not yet supported.
 #[test]
@@ -725,8 +844,6 @@ fn prybar_corpus_matches_unrar() {
     };
     // Not supported yet, with the reason; each still must not extract anything UnRAR doesn't.
     let pending: &[(&str, &str)] = &[
-        ("in_rar300_rarvm_", "RAR 3.x VM standard filters"),
-        ("in_rarinfo_latest_winrar.rar", "PPMd variant H"),
         ("in_rar4-archiver_win-enchdr.rar", "encrypted headers"),
         ("in_rarinfo_dirlink_unix.rar", "symbolic links (a progressive session stops at the first)"),
     ];

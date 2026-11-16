@@ -45,7 +45,7 @@ pub(crate) struct CoreFrame {
 }
 impl CoreFrame {
     fn validate(self, retained: u64) -> DecodeResult<()> {
-        if self.unpack_version != 29 || !(0x31..=0x35).contains(&self.method) {
+        if !matches!(self.unpack_version, 15 | 20 | 26 | 29) || !(0x31..=0x35).contains(&self.method) {
             return Err(Rar4DecodeError::Binding);
         }
         if !(65536..=4194304).contains(&self.dictionary) || !self.dictionary.is_power_of_two() {
@@ -123,6 +123,9 @@ impl Rar4Decoder {
     pub(crate) fn new_frame(frame: CoreFrame, window_limit: u64, cancel: Option<Cancellation>) -> DecodeResult<Self> {
         frame.validate(4194304)?;
         let mut d = Self::new_with_cancel(frame.dictionary, frame.packed, frame.unpacked, window_limit, cancel)?;
+        d.set_version(frame.unpack_version)?;
+        // a progressive session's decoder window also bounds a PPM model and held filter blocks
+        d.set_memory_limit(window_limit);
         d.binding.frame = frame;
         Ok(d)
     }
@@ -141,6 +144,12 @@ impl Rar4Decoder {
             self.work.check()?;
             if self.fed != self.packed {
                 return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
+            }
+            self.drain_input(sink)?;
+            if !self.hold.is_empty() {
+                // UnRAR keeps a block waiting into the next solid member, but its bytes are this member's output,
+                // which must be complete and checked now; no archiver writes such a block.
+                return Err(Rar4DecodeError::Malformed("RAR4 filter block runs past the member"));
             }
             if self.in_tail && self.produced == self.expected {
                 // The member's data ends inside its end-of-file marker.
@@ -264,6 +273,9 @@ impl Rar4Decoder {
         self.low = 0;
         self.low_repeats = 0;
         self.saved_phase = Phase::Align;
+        self.ppm = None;
+        self.esc = 2;
+        self.filters.reset();
         self.start_frame(frame);
         Ok(())
     }
@@ -298,6 +310,11 @@ impl Rar4Decoder {
             return Err(Rar4DecodeError::WindowLimit { requested: frame.dictionary, allowed: retained });
         }
         frame.validate(retained)?;
+        if frame.unpack_version != self.version
+            && !(matches!(frame.unpack_version, 20 | 26) && matches!(self.version, 20 | 26))
+        {
+            return Err(Rar4DecodeError::Malformed("solid member changes unpack version"));
+        }
         let base = self
             .chain_base
             .checked_add(self.produced)
@@ -312,6 +329,9 @@ impl Rar4Decoder {
         self.chain_base = base;
         self.saved_phase = start;
         self.start_frame(frame);
+        if let Some(engine) = &mut self.legacy {
+            engine.start_member(frame.unpacked);
+        }
         Ok(())
     }
     pub(super) fn tail_tolerates(error: &Rar4DecodeError) -> bool {
@@ -332,7 +352,12 @@ impl Rar4Decoder {
             | Phase::BuildBc
             | Phase::Lengths { .. }
             | Phase::LengthRun { .. }
-            | Phase::BuildTables => Phase::Align,
+            | Phase::BuildTables
+            | Phase::PpmInit
+            | Phase::PpmChar
+            | Phase::PpmEscape
+            | Phase::PpmVmCode { .. } => Phase::Align,
+            Phase::Legacy => Phase::Legacy,
             _ => Phase::Token,
         };
         self.finish_tail(start);
@@ -356,6 +381,14 @@ impl Rar4Decoder {
         self.phase = if frame.unpacked == 0 { Phase::Complete } else { self.saved_phase };
         self.in_tail = false;
         self.boundary = None;
+        self.ppm_in.clear();
+        self.ppm_pos = 0;
+        self.legacy_bit = 0;
+        self.carry.clear();
+        self.finishing = false;
+        self.vm_code.clear();
+        self.hold.clear();
+        self.filters.next_member();
         if self.track_boundary && frame.unpacked == 0 && frame.packed != 0 {
             self.in_tail = true;
             self.phase = self.saved_phase;
