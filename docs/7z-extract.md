@@ -10,8 +10,9 @@ through the same entry points as the other formats. The headers come from the me
   signature (`7z\xBC\xAF\x27\x1C`) is 7z, before any other format test.
 - `extract::run_with_policy` and `extract::run_with_context` (also named `run_with_zip_policy`/`run_with_zip_context`;
   see [one entry point](extract-entry.md)): the checked dispatcher routes 7z, as
-  a legacy route, so its report lines reach the observer as `ZipRunEvent::LegacyDiagnostic` and
-  `ZipRunEvent::LegacyError`, the `Cancellation` passed in is honoured, and the run ends with `RunEnded`.
+  a legacy route: each member reaches the observer live as `MemberSucceeded`/`MemberSkipped`/`MemberFailed` with
+  its listing index (renames as `MemberRenamed { ordinal: Some(..) }`), its report lines as `LegacyDiagnostic` and
+  `LegacyError`, the `Cancellation` passed in is honoured, and the run ends with `RunEnded`.
 - `extract::list`, `extract::list_with_password`, `extract::inspect*`: the entries in archive order.
 - `sevenzip::run(first, &Options, password, &Cancellation, &SevenZipLimits, report)` and
   `sevenzip::list(first, password)`: the same, with explicit limits. The dispatchers use

@@ -1006,7 +1006,7 @@ impl LegacyRoute {
                 crate::sevenzip::run_reporting(first, options, password, cancel, &limits, report)
             }
             Self::Rar { signature, .. } => {
-                let mut reports = Reports::Legacy { summary: Summary::default(), callback: report };
+                let mut reports = Reports::legacy(report);
                 let result = rar_run_shared_open(first, options, password, Some(cancel), &mut reports, || {
                     Volume::from_held_signature_detailed(first, signature, password)
                 });
@@ -1688,11 +1688,10 @@ pub use crate::zip::{ZipRunEvent as RunEvent, ZipRunObserver as RunObserver, Zip
 ///   [`crate::zip::ZipReadError::operation`] is [`crate::zip::ReadFault::Cancelled`]; members finished before it
 ///   stay published, the one in progress is not.
 /// - [`Options::overwrite`] (Skip, Always, RenameNew, RenameExisting) and [`Options::select`] apply to every format.
-/// - Observer events ([`RunEvent`]): ZIP and tar (including a lone compressed stream, ordinal 0) send
-///   `MemberSucceeded`, `MemberSkipped` and `MemberFailed` live, with the member's listing index, and
-///   `MemberRenamed` with `Some(ordinal)` just before. RAR and 7z send their report lines as `LegacyDiagnostic` as
-///   they happen, renames as `MemberRenamed { ordinal: None }`, and their failures as `LegacyError` at the end.
-///   Every run ends with `RunEnded`.
+/// - Observer events ([`RunEvent`]): every format (a lone compressed stream is ordinal 0) sends `MemberSucceeded`,
+///   `MemberSkipped` and `MemberFailed` live, with the member's listing index, and `MemberRenamed` with
+///   `Some(ordinal)` just before. Tar, RAR and 7z also send their report lines as `LegacyDiagnostic` as they happen
+///   and their failures as `LegacyError` at the end. Every run ends with `RunEnded`.
 /// - A wrong or missing password is [`crate::zip::ReadFault::PasswordRequired`] or `PasswordCheckFailed` for ZIP and
 ///   7z; other non-ZIP failures are [`crate::zip::ReadFault::Legacy`] carrying the format's own [`Error`].
 ///
@@ -2609,7 +2608,7 @@ fn rar_run(
     password: Option<&str>,
     mut report: impl FnMut(&str),
 ) -> std::result::Result<Summary, RunError> {
-    let mut reports = Reports::Legacy { summary: Summary::default(), callback: &mut report };
+    let mut reports = Reports::legacy(&mut report);
     let result = rar_run_shared(first, opts, password, &mut reports);
     let Reports::Legacy { summary, .. } = reports else { unreachable!() };
     legacy_result(result, summary)
@@ -2749,7 +2748,7 @@ fn rar_read_at(
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
-    let mut reports = Reports::Legacy { summary: Summary::default(), callback: &mut callback };
+    let mut reports = Reports::legacy(&mut callback);
     let mut run = Run::new(&opts, password, &mut reports, 1);
     run.selection = Some(RarSelection { sink: &mut *selection.sink, ..selection });
     let mut next = 0;
@@ -3202,11 +3201,12 @@ impl Run<'_, '_, '_> {
 
         let place = if self.opts.mode == Mode::Extract {
             let mut renamed = None;
+            let order = ctx.entry.order;
             let mut log = RenameLog {
                 budget: &mut self.rename_budget,
                 record: &mut |r| {
                     renamed = Some(r.clone());
-                    self.reports.renamed(r)
+                    self.reports.renamed_at(order, r)
                 },
             };
             let checked = check_target_detailed(self.opts, &rel, Some(&mut self.dirs), &mut log);

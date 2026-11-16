@@ -59,14 +59,19 @@ Every run ends with `RunEnded { report, error }`.
 
 | | ZIP | tar, lone stream | RAR, 7z |
 |---|---|---|---|
-| `MemberSucceeded` / `MemberSkipped` / `MemberFailed` | live, with the listing index | live, with the listing index | not sent; see the legacy lines |
-| `MemberRenamed` | `ordinal: Some(..)`, just before the member's own event | `ordinal: Some(..)`, just before the member's own event | `ordinal: None`, as each rename is made |
+| `MemberSucceeded` / `MemberSkipped` / `MemberFailed` | live, with the listing index | live, with the listing index | live, with the listing index |
+| `MemberRenamed` | `ordinal: Some(..)`, just before the member's own event | `ordinal: Some(..)`, just before the member's own event | `ordinal: Some(..)`, just before the member's own event |
 | `LegacyDiagnostic` (report lines: skips, failures) | not sent | as they happen | as they happen |
 | `LegacyError` (`Summary::errors` text) | not sent | at the end | at the end |
 
 A compressed tar is staged and published once the whole stream has decoded and checked out, so its members'
 success events arrive at the end; failures found while decoding come as they are found. A tar member that fails
 carries `ReadFault::Legacy` with the reason.
+
+RAR and 7z send a member's event as soon as it is published (or tested). A 7z member in a solid folder that stores
+its own CRC is held until the folder's end, so those members' events come together when the folder checks out, in
+listing order. A RAR or 7z member that fails carries `ReadFault::Legacy` with the reason. The listing index is the
+member's position in `extract::list`, counting folders and members a filter left out.
 
 ## Errors
 

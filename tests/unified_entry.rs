@@ -35,10 +35,33 @@ enum Family {
     TarGz,
     Gzip,
     Rar,
+    /// RAR 4.x: a solid, compressed WinRAR fixture
+    Rar4,
     SevenZip,
+    /// 7z with one solid PPMd folder
+    SevenZipPpmd,
 }
 
-const FAMILIES: [Family; 6] = [Family::Zip, Family::Tar, Family::TarGz, Family::Gzip, Family::Rar, Family::SevenZip];
+const FAMILIES: [Family; 8] = [
+    Family::Zip,
+    Family::Tar,
+    Family::TarGz,
+    Family::Gzip,
+    Family::Rar,
+    Family::Rar4,
+    Family::SevenZip,
+    Family::SevenZipPpmd,
+];
+
+/// Families whose members are fixtures, not the bytes asked for.
+fn fixed(family: Family) -> bool {
+    matches!(family, Family::Rar4 | Family::SevenZip | Family::SevenZipPpmd)
+}
+
+/// The listing index of `name` in the archive at `path`.
+fn ordinal_of(path: &Path, name: &str) -> u64 {
+    extract::list(path).unwrap().iter().position(|e| e.name == name).unwrap_or_else(|| panic!("{name}")) as u64
+}
 
 const SEVEN_ZIP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/7z-extract");
 
@@ -139,8 +162,16 @@ fn archive(dir: &Path, family: Family, first: &[u8], second: &[u8]) -> (PathBuf,
         Family::TarGz => ("in.tar.gz", gzip(&tar(&members)), vec!["a.txt", "b.txt"]),
         Family::Gzip => ("a.txt.gz", gzip(first), vec!["a.txt"]),
         Family::Rar => ("in.rar", rar(&members), vec!["a.txt", "b.txt"]),
+        Family::Rar4 => (
+            "in.rar",
+            fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar4/latest_winrar.rar")).unwrap(),
+            vec!["1.txt", "2.txt"],
+        ),
         Family::SevenZip => {
             ("in.7z", fs::read(Path::new(SEVEN_ZIP).join("lzma2.7z")).unwrap(), vec!["text/a.txt", "text/b.txt"])
+        }
+        Family::SevenZipPpmd => {
+            ("in.7z", fs::read(Path::new(SEVEN_ZIP).join("ppmd_solid.7z")).unwrap(), vec!["big/one.txt", "big/two.txt"])
         }
     };
     let path = dir.join(name);
@@ -208,7 +239,7 @@ fn a_canceled_token_stops_every_format_before_anything_is_written() {
         cancel.cancel();
         let (result, _) = run(&path, &options(&out, Overwrite::Skip), &cancel, |_| {});
         assert!(cancelled(&result), "{family:?}: {result:?}");
-        assert!(!out.join("a.txt").exists() && !out.join("text/a.txt").exists(), "{family:?}");
+        assert!(!out.exists() || fs::read_dir(&out).unwrap().next().is_none(), "{family:?}");
     }
 }
 
@@ -408,8 +439,8 @@ fn every_overwrite_mode_in_every_format() {
             let target = out.join(names[0]);
             fs::create_dir_all(target.parent().unwrap()).unwrap();
             fs::write(&target, b"old").unwrap();
-            // The 7z fixture's own text; the rest hold "one".
-            let new = (family != Family::SevenZip).then(|| b"one".to_vec());
+            // The fixtures' own text; the rest hold "one".
+            let new = (!fixed(family)).then(|| b"one".to_vec());
             let (result, events) = run(&path, &options(&out, mode), &Cancellation::default(), |_| {});
             let report = result.unwrap_or_else(|e| panic!("{family:?} {mode:?}: {e:?}"));
             let what = format!("{family:?} {mode:?}");
@@ -440,29 +471,107 @@ fn every_overwrite_mode_in_every_format() {
                 }
             }
             assert_eq!(report.failed(), 0, "{what}");
-            assert_eq!(report.files() + report.skipped(), names.len() as u64, "{what}");
-            // ZIP and tar name the member a rename was for.
-            if matches!(family, Family::Zip | Family::Tar | Family::TarGz | Family::Gzip) {
-                assert!(events.renamed.iter().all(|o| *o == Some(0)), "{what}: {:?}", events.renamed);
+            if !fixed(family) {
+                assert_eq!(report.files() + report.skipped(), names.len() as u64, "{what}");
             }
+            // Every format names the member a rename was for.
+            let first = ordinal_of(&path, names[0]);
+            assert!(events.renamed.iter().all(|o| *o == Some(first)), "{what}: {:?}", events.renamed);
+            // and reports each member it took, live, with its listing index
+            let want: Vec<u64> = names.iter().map(|n| ordinal_of(&path, n)).collect();
+            let mut got: Vec<u64> =
+                events.members.iter().filter(|(_, _, n)| names.contains(&n.as_str())).map(|(_, o, _)| *o).collect();
+            got.sort_unstable();
+            assert_eq!(got, want, "{what}: {:?}", events.members);
         }
     }
 }
 
 #[test]
-fn rar_and_7z_runs_still_report_through_legacy_lines() {
-    for family in [Family::Rar, Family::SevenZip] {
+fn rar_and_7z_report_members_live_with_their_ordinals() {
+    for family in [Family::Rar, Family::Rar4, Family::SevenZip, Family::SevenZipPpmd] {
         let dir = tempfile::tempdir().unwrap();
         let (path, names) = archive(dir.path(), family, b"one", b"two");
         let out = dir.path().join("out");
         fs::create_dir_all(out.join(names[0]).parent().unwrap()).unwrap();
         fs::write(out.join(names[0]), b"old").unwrap();
-        let (result, events) = run(&path, &options(&out, Overwrite::Skip), &Default::default(), |_| {});
+        let (result, events) = run(&path, &options(&out, Overwrite::Skip), &Default::default(), |event| {
+            // A member is on disk when its success arrives.
+            if let RunEvent::MemberSucceeded { name, .. } = event {
+                assert!(out.join(name).exists(), "{family:?}: {name} reported before it was written");
+            }
+        });
         let report = result.unwrap();
-        assert_eq!((report.files(), report.skipped()), (1, 1), "{family:?}");
+        assert_eq!(report.skipped(), 1, "{family:?}");
         assert!(events.lines.iter().any(|l| l.contains("exists, skipped")), "{family:?}: {:?}", events.lines);
+        let listing = extract::list(&path).unwrap();
+        // One event per member, in listing order, each with its listing index and name.
+        let got: Vec<(u64, String)> = events.members.iter().map(|(_, o, n)| (*o, n.clone())).collect();
+        let want: Vec<(u64, String)> = listing
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| got.iter().any(|(_, n)| *n == e.name))
+            .map(|(i, e)| (i as u64, e.name.clone()))
+            .collect();
+        assert_eq!(got, want, "{family:?}");
+        assert_eq!(got.len() as u64, report.files() + report.skipped() + report.dirs(), "{family:?}: {got:?}");
+        let skipped = ordinal_of(&path, names[0]);
+        assert!(events.members.contains(&("skipped", skipped, names[0].to_owned())), "{family:?}");
+        assert!(events.members.contains(&("ok", ordinal_of(&path, names[1]), names[1].to_owned())), "{family:?}");
         assert!(events.ended);
     }
+}
+
+/// A 7z archive holding one member, `big.bin` = `len` copies of `byte`, stored with the Copy coder.
+fn seven_zip_copy(len: u64, byte: u8) -> Vec<u8> {
+    fn number(out: &mut Vec<u8>, value: u64) {
+        let extra = (0..8).find(|&i| value < 1u64 << (7 * (i + 1))).unwrap_or(8);
+        let first = if extra == 8 { 0xFF } else { ((0xFFu16 << (8 - extra)) as u8) | (value >> (8 * extra)) as u8 };
+        out.push(first);
+        out.extend_from_slice(&value.to_le_bytes()[..extra]);
+    }
+    let data = vec![byte; len as usize];
+    let crc = crc32fast::hash(&data);
+    let mut header = vec![0x01, 0x04, 0x06, 0x00, 0x01, 0x09];
+    number(&mut header, len);
+    header.extend_from_slice(&[0x00, 0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C]);
+    number(&mut header, len);
+    header.extend_from_slice(&[0x0A, 0x01]);
+    header.extend_from_slice(&crc.to_le_bytes());
+    header.extend_from_slice(&[0x00, 0x00, 0x05, 0x01, 0x11]);
+    let name: Vec<u8> = "big.bin\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    number(&mut header, name.len() as u64 + 1);
+    header.push(0x00);
+    header.extend_from_slice(&name);
+    header.extend_from_slice(&[0x00, 0x00]);
+    let mut start = Vec::new();
+    start.extend_from_slice(&len.to_le_bytes());
+    start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    start.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend_from_slice(&crc32fast::hash(&start).to_le_bytes());
+    out.extend_from_slice(&start);
+    out.extend_from_slice(&data);
+    out.extend_from_slice(&header);
+    out
+}
+
+#[test]
+fn a_7z_member_is_canceled_mid_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.7z");
+    fs::write(&path, seven_zip_copy(5, b'x')).unwrap();
+    // The hand-made archive is one a run reads.
+    let small = dir.path().join("small");
+    let (result, events) = run(&path, &options(&small, Overwrite::Skip), &Default::default(), |_| {});
+    assert_eq!(result.unwrap().files(), 1);
+    assert_eq!(events.members, [("ok", 0, "big.bin".to_owned())]);
+    assert_eq!(fs::read(small.join("big.bin")).unwrap(), b"xxxxx");
+    fs::write(&path, seven_zip_copy(512 << 20, 7)).unwrap();
+    let out = dir.path().join("out");
+    let result = cancel_once_output_appears(&path, &out);
+    assert!(cancelled(&result), "{result:?}");
+    assert!(!out.join("big.bin").exists(), "a canceled member was published");
 }
 
 #[test]

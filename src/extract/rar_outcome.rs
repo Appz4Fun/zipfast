@@ -209,24 +209,50 @@ impl RunFault {
 }
 
 pub(super) enum Reports<'a> {
-    Legacy { summary: Summary, callback: &'a mut dyn super::LegacyReport },
-    Typed { summary: RarRunSummary, callback: &'a mut dyn FnMut(&RarEntryOutcome) },
+    Legacy {
+        summary: Summary,
+        callback: &'a mut dyn super::LegacyReport,
+        /// listing indexes handed out so far, as a typed run counts them
+        encountered: u64,
+        /// the listing index of each reported member not finished yet, by its reporting order
+        ordinals: std::collections::HashMap<u64, u64>,
+    },
+    Typed {
+        summary: RarRunSummary,
+        callback: &'a mut dyn FnMut(&RarEntryOutcome),
+    },
 }
 
-impl Reports<'_> {
-    pub(super) fn typed(&self) -> bool {
-        matches!(self, Self::Typed { .. })
+impl<'a> Reports<'a> {
+    pub(super) fn legacy(callback: &'a mut dyn super::LegacyReport) -> Self {
+        Self::Legacy { summary: Summary::default(), callback, encountered: 0, ordinals: Default::default() }
     }
 
-    /// Records a rename as soon as it is made; a legacy caller hears of it then too.
-    pub(super) fn renamed(&mut self, renamed: RenamedOutput) {
+    /// Records a rename made for the member reported at `order`, as soon as it is made.
+    pub(super) fn renamed_at(&mut self, order: u64, renamed: RenamedOutput) {
         match self {
-            Self::Legacy { summary, callback } => {
-                callback.renamed(&renamed);
+            Self::Legacy { summary, callback, ordinals, .. } => {
+                match ordinals.get(&order) {
+                    Some(&ordinal) => callback.renamed_member(ordinal, &renamed),
+                    None => callback.renamed(&renamed),
+                }
                 summary.renames.push(renamed);
             }
             Self::Typed { summary, .. } => summary.renames.push(renamed),
         }
+    }
+
+    /// The live member event of a legacy run, for its observer.
+    fn member(&mut self, ctx: &EntryContext, member: impl FnOnce(u64, &str) -> super::LegacyMember<'_>) {
+        if let Self::Legacy { callback, ordinals, .. } = self
+            && let Some(ordinal) = ordinals.remove(&ctx.entry.order)
+        {
+            callback.member(member(ordinal, &ctx.entry.name));
+        }
+    }
+
+    pub(super) fn typed(&self) -> bool {
+        matches!(self, Self::Typed { .. })
     }
 
     pub(super) fn encounter(
@@ -246,8 +272,10 @@ impl Reports<'_> {
                 summary.match_state = RarMatchState::Matched;
                 Some(index)
             }
-            Self::Legacy { summary, .. } if normal => {
+            Self::Legacy { summary, encountered, ordinals, .. } if normal => {
                 add(&mut summary.matched, 1)?;
+                ordinals.insert(position, *encountered);
+                add(encountered, 1)?;
                 None
             }
             _ => None,
@@ -265,7 +293,10 @@ impl Reports<'_> {
                 add(&mut summary.encountered, 1)?;
                 Some(index)
             }
-            Self::Legacy { .. } => None,
+            Self::Legacy { encountered, .. } => {
+                add(encountered, 1)?;
+                None
+            }
         };
         let entry = RarEntryIdentity { index, order, name };
         Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted, renamed: None })
@@ -286,7 +317,11 @@ impl Reports<'_> {
         mode: Mode,
     ) -> RunResult<()> {
         match self {
-            Self::Legacy { summary, .. } => complete_file(&mut summary.files, &mut summary.bytes, bytes),
+            Self::Legacy { summary, .. } => {
+                complete_file(&mut summary.files, &mut summary.bytes, bytes)?;
+                self.member(ctx, |ordinal, name| super::LegacyMember::Succeeded { ordinal, name, bytes });
+                Ok(())
+            }
             Self::Typed { summary, callback } => {
                 complete_file(&mut summary.files, &mut summary.bytes, bytes)?;
                 let output = match mode {
@@ -301,7 +336,11 @@ impl Reports<'_> {
 
     pub(super) fn directory(&mut self, ctx: &EntryContext) -> RunResult<()> {
         match self {
-            Self::Legacy { summary, .. } => add(&mut summary.dirs, 1),
+            Self::Legacy { summary, .. } => {
+                add(&mut summary.dirs, 1)?;
+                self.member(ctx, |ordinal, name| super::LegacyMember::Succeeded { ordinal, name, bytes: 0 });
+                Ok(())
+            }
             Self::Typed { summary, callback } => {
                 add(&mut summary.dirs, 1)?;
                 callback(&ctx.event(RarOutcome::Directory));
@@ -312,7 +351,7 @@ impl Reports<'_> {
 
     pub(super) fn skipped(&mut self, ctx: &EntryContext, reason: RarSkipReason) -> RunResult<()> {
         match self {
-            Self::Legacy { summary, callback } => {
+            Self::Legacy { summary, callback, .. } => {
                 match reason {
                     RarSkipReason::ExistingTarget => callback.line(&format!("{}: exists, skipped", ctx.entry.name)),
                     RarSkipReason::Declined => callback.line(&format!("{}: declined, skipped", ctx.entry.name)),
@@ -321,7 +360,9 @@ impl Reports<'_> {
                     }
                     RarSkipReason::MissingStart => {}
                 }
-                add(&mut summary.skipped, 1)
+                add(&mut summary.skipped, 1)?;
+                self.member(ctx, |ordinal, name| super::LegacyMember::Skipped { ordinal, name });
+                Ok(())
             }
             Self::Typed { summary, callback } => {
                 add(&mut summary.skipped, 1)?;
@@ -338,10 +379,16 @@ impl Reports<'_> {
         legacy: impl fmt::Display,
     ) -> RunResult<()> {
         match self {
-            Self::Legacy { summary, callback } => {
-                let line = format!("{}: {legacy}", ctx.entry.name);
+            Self::Legacy { summary, callback, .. } => {
+                let why = legacy.to_string();
+                let line = format!("{}: {why}", ctx.entry.name);
                 callback.line(&line);
                 summary.errors.push(line);
+                self.member(ctx, |ordinal, name| super::LegacyMember::Failed {
+                    ordinal,
+                    name,
+                    error: Error::Io(std::io::Error::other(why)),
+                });
                 Ok(())
             }
             Self::Typed { summary, callback } => {

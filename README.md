@@ -80,7 +80,7 @@ publication failure can leave earlier verified members in place.
 extracts ZIP, tar, lone `.gz`/`.xz`/`.bz2`/`.zst` streams, RAR4/RAR5 and 7z with one `Options`, one
 `Cancellation` and one observer of `extract::RunEvent`s. The format comes from the content. Cancellation reaches
 every format's inner loop and ends the run with `ReadFault::Cancelled`; `Overwrite` (Skip, Always, RenameNew,
-RenameExisting) and `Options::select` apply everywhere. ZIP and tar report each member live with its listing index.
+RenameExisting) and `Options::select` apply everywhere. Every format reports each member live with its listing index.
 `tar::run_with_policy` is the same API for tar and streams alone. See [one entry point](docs/extract-entry.md).
 
 ```rust

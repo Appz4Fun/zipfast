@@ -505,7 +505,12 @@ fn whole_wave_generic_legacy_errors_preserve_quiet_silent_normal_and_stops() {
                         }
                     }
                     ZipRunEvent::RunEnded { .. } => ended += 1,
-                    _ => panic!("non-ZIP route emitted checked member event"),
+                    // RAR members now arrive live as member events too; the legacy lines are unchanged.
+                    ZipRunEvent::MemberSucceeded { .. }
+                    | ZipRunEvent::MemberSkipped { .. }
+                    | ZipRunEvent::MemberFailed { .. }
+                    | ZipRunEvent::MemberRenamed { .. } => {}
+                    _ => panic!("unexpected event"),
                 }
                 Ok(())
             },
