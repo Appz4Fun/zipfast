@@ -168,7 +168,10 @@ fn keeps_unlinked_link(fd: i32) -> bool {
     let v = unsafe { v.assume_init() };
     #[cfg(target_os = "linux")]
     {
-        matches!(v.f_type as i64, 0x6969 | 0x2011_bab0 | 0x4d44)
+        // `f_type` is `i64` on glibc x86_64 but narrower on some targets (musl, 32-bit).
+        #[allow(clippy::unnecessary_cast)]
+        let kind = v.f_type as i64;
+        matches!(kind, 0x6969 | 0x2011_bab0 | 0x4d44)
     }
     #[cfg(target_os = "macos")]
     {
