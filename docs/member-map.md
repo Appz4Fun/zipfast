@@ -129,7 +129,7 @@ Volumes are passed in disk order, `.z01` first and `.zip` last, and `MapPiece::v
   `MemberReader` asks for a split set's volumes with the same names.
 - Volumes stay open for the walk, at most `ProgressiveLimits::volume_handles` of them (64 by default; 0 is a
   `Limit` failure). Past that the volume used least recently is closed and asked for again when it is needed, which
-  must give the same length (`Source` failure otherwise).
+  must give the same length (`Source` failure otherwise). Volume 0 is always asked for under the first name.
 
 The walk reads the last volume's tail for the end record (its last 42 bytes, then up to a 64 KiB comment), the
 ZIP64 end record when the directory's disk is only stated there, then the central directory over the volumes that
@@ -147,7 +147,7 @@ Missing and cut volumes:
 |---|---|
 | a middle volume is missing (`Missing`, or an empty slice) | the walk goes on; `end` is `MissingVolume { volume }` for the first one met. A member whose local header is on it (or runs into it) is listed without pieces, `cipher: None`, `checks: None`, `complete: false`; one whose data runs into it lists its pieces before it and is `complete: false` |
 | a volume before the last ends before a local header on it | `Truncated { volume, offset }` at that header, and the walk stops; members before it are listed |
-| a volume before the last is cut inside the data of a member that crosses its end | `Truncated { volume, offset }` with the first volume the member's data crosses and its length, and the walk stops before that member (see below) |
+| a volume before the last is cut inside the data of a member that crosses its end | `Truncated { volume, offset }` with the cut volume and its length, and the walk stops before that member (see below). The volumes before the last all have one length, so the cut one is the first volume the data runs to the end of that is shorter than the longest; when none is, the first volume the data crosses is named |
 | the last volume is missing, or cut so that its end record is gone | `MapError::MissingDirectory { volume }` |
 | a volume holding part of the central directory or the ZIP64 end record is missing | `MapError::MissingDirectory { volume }` |
 

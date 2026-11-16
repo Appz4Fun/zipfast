@@ -289,6 +289,15 @@ impl ZipSplitWalker {
         }
     }
 
+    /// The name volume `index` is asked for under once the search for the last volume is over: the first name for
+    /// volume 0 (whatever its pattern), the derived names otherwise.
+    fn volume_name(&self, index: u32) -> OsString {
+        if index == 0 {
+            return self.first_name.clone();
+        }
+        split_volume_name(&self.first_name, index, self.last == Some(index))
+    }
+
     /// Keeps the current volume open under `slot`. At most `volume_handles` volumes stay open: past that, the one
     /// used least recently is closed, and asked for again if it is needed later.
     fn keep(&mut self, input: &mut dyn MapInput, slot: u32) -> Result<(), MapError> {
@@ -322,7 +331,7 @@ impl ZipSplitWalker {
                 Ok(Avail::Ready(len))
             }
             Vol::Present(len) => {
-                let name = split_volume_name(&self.first_name, index, self.last == Some(index));
+                let name = self.volume_name(index);
                 match self.open(input, cx, index, name)? {
                     Avail::Ready(again) if again != len => {
                         Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceChanged))))
@@ -334,7 +343,7 @@ impl ZipSplitWalker {
                 }
             }
             Vol::Unknown => {
-                let name = split_volume_name(&self.first_name, index, self.last == Some(index));
+                let name = self.volume_name(index);
                 let avail = self.open(input, cx, index, name)?;
                 match avail {
                     Avail::Ready(len) => self.set_vol(index, Vol::Present(len))?,
@@ -932,16 +941,28 @@ impl ZipSplitWalker {
     /// A member's data runs past the next record, or past the end of the last volume. Data that crosses a volume
     /// boundary was placed by the volume lengths, so a volume it crosses was cut short: the map ends there, before
     /// the member. Data within one volume means a wrong directory.
+    ///
+    /// The volumes of a set before the last all have one length, so the cut one is the first volume the data runs
+    /// to the end of that is shorter than the longest of them; when none is, the first volume the data crosses.
     fn overrun(&mut self, pieces: &[ZipPiece], disk: u32) -> Result<Option<Poll<MemberMap>>, MapError> {
-        match pieces.first() {
-            Some(first) if pieces.len() > 1 || first.volume != disk => {
-                let volume = first.volume;
-                let Vol::Present(len) = self.vol(volume) else { unreachable!("pieces lie on present volumes") };
-                self.problem(MapEnd::Truncated { volume, offset: len });
-                Ok(Some(Poll::Ready(self.finish())))
-            }
-            _ => Err(malformed(disk, "ZIP entry data runs past the next record")),
-        }
+        let Some(first) = pieces.first().filter(|first| pieces.len() > 1 || first.volume != disk) else {
+            return Err(malformed(disk, "ZIP entry data runs past the next record"));
+        };
+        let last = self.last.expect("last volume known");
+        let len = |v: u32| match self.vol(v) {
+            Vol::Present(len) => len,
+            _ => 0,
+        };
+        let full = self.vols.iter().take(last as usize).filter_map(|v| match v {
+            Vol::Present(len) => Some(*len),
+            _ => None,
+        });
+        let longest = full.max().unwrap_or(0);
+        // Every piece but the final one runs to the end of its volume.
+        let crossed = &pieces[..pieces.len() - 1];
+        let volume = crossed.iter().map(|p| p.volume).find(|&v| v < last && len(v) < longest).unwrap_or(first.volume);
+        self.problem(MapEnd::Truncated { volume, offset: len(volume) });
+        Ok(Some(Poll::Ready(self.finish())))
     }
 
     /// Goes on once a member's data is placed: to its WinZip AES salt and verifier, or to the next member.

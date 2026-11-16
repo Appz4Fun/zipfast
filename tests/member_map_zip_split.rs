@@ -1377,3 +1377,34 @@ fn kept_volumes_are_bounded_by_the_volume_handle_budget() {
     assert_eq!(result.unwrap(), expected);
     assert_eq!(asked.len(), 5, "{asked:?}");
 }
+
+#[test]
+fn a_cut_names_the_volume_that_was_cut() {
+    // a.bin crosses .z01 and .z02; RustyGet fetches again the volume a report names.
+    for v in 0..2 {
+        let mut cut_set = real_set("stored");
+        let len = cut_set[v].len();
+        cut_set[v].truncate(len - 100);
+        let map = MemberMap::from_memory(&refs(&cut_set), "stored.z01", None).unwrap();
+        assert_eq!(map.end, MapEnd::Truncated { volume: v as u32, offset: len as u64 - 100 }, "volume {v} cut");
+    }
+}
+
+#[test]
+fn volume_0_is_asked_for_again_under_the_first_name() {
+    // A first volume named off the `.z01` pattern (found by its spanning signature), closed and needed again.
+    let (entries, _) = several();
+    let b_start = data_abs(&entries, 1, true);
+    let empty_local = data_abs(&entries, 2, true) - 30 - "empty.bin".len();
+    let set =
+        split_zip(&entries, &[b_start + 1000, b_start + 2000, empty_local], Layout { marker: true, zip64: false });
+    let expected = map(&set.volumes);
+    let mut files = named("first", &set.volumes);
+    files[0].0 = "first.bin".into();
+    let mut options = MapOptions::new("first.bin");
+    options.limits.volume_handles = 1;
+    let (result, asked) = files_map(files, options);
+    assert_eq!(result.unwrap(), expected);
+    assert!(asked.iter().filter(|(i, _)| *i == 0).all(|(_, n)| n == "first.bin"), "{asked:?}");
+    assert!(asked.iter().filter(|(i, _)| *i == 0).count() > 1, "{asked:?}");
+}
