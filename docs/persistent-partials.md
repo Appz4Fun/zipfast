@@ -1,6 +1,6 @@
 # Persistent RAR stored output
 
-Enable `persistent-partials`. On Linux and macOS, `ProgressiveSession::new_partial` exclusively creates ordinary named files at full logical size. Existing output is never truncated or replaced, even with `Overwrite::Always`. Treat those files as read-only until the handle is closed; fill through `PartialFile`, and keep the output and state bundle together. Dropping the session or handle preserves both.
+Enable `persistent-partials`. On Linux and macOS, `ProgressiveSession::new_partial` exclusively creates ordinary named files at full logical size. Existing output is never truncated or replaced, even with `Overwrite::Always`; the rename modes are refused with `FailureKind::InvalidCapability`. Treat those files as read-only until the handle is closed; fill through `PartialFile`, and keep the output and state bundle together. Dropping the session or handle preserves both.
 
 This H2 path accepts RAR5 Stored members with known sizes and a Complete source catalogue, plain or encrypted (AES-256-CBC, with the password set through `ProgressiveOptions::set_password`), and plain RAR4 Stored members (see below). Encrypted RAR4 members, encrypted headers (`-hp`, RAR4 or RAR5), compression, redirections and unknown sizes are refused when known. Complete describes all source names and native handles; it grants no legacy publication receipt. `PersistentComplete` carries its own `Verdict`, and only `Verdict::Ok` permits archive metadata to be applied. Modified time and permissions report separate results.
 

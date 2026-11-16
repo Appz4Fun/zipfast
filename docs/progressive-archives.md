@@ -72,6 +72,10 @@ CRC32, BLAKE2sp, packed and authentication verdicts; absent optional checks rema
 provided. Tested is never a publication result. Discarded/tested bytes produce
 no `BytesWritten` event.
 
+The rename modes (`Overwrite::RenameNew`, `Overwrite::RenameExisting`) are
+refused at construction with `FailureKind::InvalidCapability`, before any
+source or output is touched; a session binds its publication names ahead of time.
+
 `Overwrite::Skip` reports `Skipped(ExistingTarget)` after checking the bound
 safe target and source identities; existing bytes, timestamps and permissions
 are preserved. Independent skipped payloads are traversed without decoding or

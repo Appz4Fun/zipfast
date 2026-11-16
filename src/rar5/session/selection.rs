@@ -157,7 +157,9 @@ impl RarSession {
                     cause,
                 })?;
                 let method = self.model.members[index].header.method;
-                let (outcome, terminal) = match driver.member(&mut run, self, index, &entry) {
+                let result = driver.member(&mut run, self, index, &entry);
+                summary.renames.append(&mut run.renames);
+                let (outcome, terminal) = match result {
                     Ok(outcome) => (outcome, None),
                     Err(SelectedStop::Native(failure)) => (RarOutcome::Failed(Arc::clone(&failure)), Some(failure)),
                     Err(cause) => return Err(DriverError::Owned { partial: summary, entry: Some(entry), cause }),
@@ -310,6 +312,10 @@ fn count_outcome(summary: &mut RarRunSummary, outcome: &RarOutcome) -> RarResult
 }
 
 struct SelectedRun {
+    /// Renames the member being extracted made, moved to the run's summary after it.
+    renames: Vec<crate::extract::RenamedOutput>,
+    /// the rename attempts this run has left
+    rename_budget: crate::extract::RenameBudget,
     limits: RarDecodeLimits,
     packed: u64,
     decoded: u64,
@@ -330,6 +336,8 @@ impl SelectedRun {
         let mut decrypted = Vec::new();
         decrypted.try_reserve_exact(CHUNK + 15).map_err(|_| allocation())?;
         Ok(Self {
+            renames: Vec::new(),
+            rename_budget: Default::default(),
             limits,
             packed: 0,
             decoded: 0,

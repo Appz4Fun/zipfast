@@ -30,8 +30,8 @@ use zip_container::{
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    Cancellation, Entry, Meta, Mode, MtimeOrigin, Options, Summary, Target, finish_dirs, finish_file, make_dirs,
-    open_target,
+    Cancellation, Entry, Meta, Mode, MtimeOrigin, Options, RenameLog, RunError, Summary, Target, finish_dirs,
+    finish_file, make_dirs, open_target,
 };
 use crate::path::sanitize;
 use crate::rar5::Redirection;
@@ -863,6 +863,17 @@ pub fn run_with_password(
     password: Option<&str>,
     mut report: impl FnMut(&str),
 ) -> Result<Summary> {
+    run_renaming(path, opts, password, &mut report).map_err(|e| e.error)
+}
+
+/// [`run_with_password`], whose terminal error keeps the renames a rename mode made before it, and whose report
+/// callback hears of each rename as it is made.
+pub(crate) fn run_renaming(
+    path: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    mut report: impl FnMut(&str),
+) -> std::result::Result<Summary, RunError> {
     let mut archive = Archive::open(path)?;
     let opts = &*opts.protecting(path)?;
     let mut summary = Summary { volumes: 1, ..Summary::default() };
@@ -874,96 +885,112 @@ pub fn run_with_password(
         report(&line);
         summary.errors.push(line);
     }
-    for (ordinal, e) in entries.iter().enumerate() {
-        if !opts.selects(&e.name, None, e.is_dir(), ordinal as u64) {
-            continue;
-        }
-        summary.matched += 1;
-        let rel = match sanitize(&e.name, e.host != HOST_UNIX) {
-            Ok(rel) => rel,
-            Err(err) => {
-                fail(&mut summary, &mut report, &e.name, &err.to_string());
+    // A run that stops early still says which files a rename mode renamed or moved aside.
+    let result = (|| -> Result<()> {
+        for (ordinal, e) in entries.iter().enumerate() {
+            if !opts.selects(&e.name, None, e.is_dir(), ordinal as u64) {
                 continue;
             }
-        };
-        let rel = if opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
-        if e.is_dir() {
-            if opts.mode == Mode::Extract && !opts.flatten {
-                make_dirs(&opts.dest, &rel)?;
-                summary.dir_meta.push((opts.dest.join(&rel), e.meta()));
-            }
-            summary.dirs += 1;
-            continue;
-        }
-        let eff_method = e.effective_method();
-        let refuse = if e.encrypted() && password.is_none() {
-            Some("encrypted (password required)".to_string())
-        } else if !supported(eff_method) {
-            Some(format!("compression method {} is not supported yet", eff_method))
-        } else if e.is_link() {
-            Some("links are not supported yet".to_string())
-        } else {
-            None
-        };
-        if let Some(why) = refuse {
-            fail(&mut summary, &mut report, &e.name, &why);
-            continue;
-        }
-        let mut target = None;
-        if opts.mode == Mode::Extract {
-            match open_target(opts, &rel, Some(e.size))? {
-                Target::Write(out) => target = Some(out),
-                Target::Exists => {
-                    report(&format!("{}: exists, skipped", e.name));
-                    summary.skipped += 1;
+            summary.matched += 1;
+            let rel = match sanitize(&e.name, e.host != HOST_UNIX) {
+                Ok(rel) => rel,
+                Err(err) => {
+                    fail(&mut summary, &mut report, &e.name, &err.to_string());
                     continue;
                 }
-                Target::Blocked(why) => {
-                    fail(&mut summary, &mut report, &e.name, why);
-                    continue;
+            };
+            let rel = if opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+            if e.is_dir() {
+                if opts.mode == Mode::Extract && !opts.flatten {
+                    make_dirs(&opts.dest, &rel)?;
+                    summary.dir_meta.push((opts.dest.join(&rel), e.meta()));
+                }
+                summary.dirs += 1;
+                continue;
+            }
+            let eff_method = e.effective_method();
+            let refuse = if e.encrypted() && password.is_none() {
+                Some("encrypted (password required)".to_string())
+            } else if !supported(eff_method) {
+                Some(format!("compression method {} is not supported yet", eff_method))
+            } else if e.is_link() {
+                Some("links are not supported yet".to_string())
+            } else {
+                None
+            };
+            if let Some(why) = refuse {
+                fail(&mut summary, &mut report, &e.name, &why);
+                continue;
+            }
+            let mut target = None;
+            if opts.mode == Mode::Extract {
+                let mut log = RenameLog {
+                    budget: &mut summary.rename_budget,
+                    record: &mut |renamed| {
+                        report(&renamed.line());
+                        summary.renames.push(renamed);
+                    },
+                };
+                match open_target(opts, &rel, Some(e.size), &mut log)? {
+                    Target::Write(out) => target = Some(out),
+                    Target::Exists => {
+                        report(&format!("{}: exists, skipped", e.name));
+                        summary.skipped += 1;
+                        continue;
+                    }
+                    Target::Blocked(why) => {
+                        fail(&mut summary, &mut report, &e.name, why);
+                        continue;
+                    }
                 }
             }
-        }
-        let entry = e.read_description();
-        let read = match target.as_mut() {
-            Some(out) => read_entry(
-                &mut archive.file,
-                archive.len,
-                &entry,
-                password,
-                &mut buf,
-                &mut |chunk| Ok(out.write(chunk)?),
-                None,
-            ),
-            None => read_entry(&mut archive.file, archive.len, &entry, password, &mut buf, &mut |_| Ok(()), None),
-        };
-        match read {
-            Ok(()) => {
-                if let Some(out) = target
-                    && let Err(io) = out.finish(|file| finish_file(file, &e.meta()))
-                {
-                    finish_dirs(&mut summary);
-                    return Err(Error::Io(io));
-                }
-                summary.files += 1;
-                summary.bytes += e.size;
-            }
-            Err(err) => {
-                drop(target);
-                match err {
-                    // a failure writing out stops the run; anything about this entry's data fails only the entry
-                    Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof => {
+            let entry = e.read_description();
+            let read = match target.as_mut() {
+                Some(out) => read_entry(
+                    &mut archive.file,
+                    archive.len,
+                    &entry,
+                    password,
+                    &mut buf,
+                    &mut |chunk| Ok(out.write(chunk)?),
+                    None,
+                ),
+                None => read_entry(&mut archive.file, archive.len, &entry, password, &mut buf, &mut |_| Ok(()), None),
+            };
+            match read {
+                Ok(()) => {
+                    if let Some(out) = target
+                        && let Err(io) = out.finish(|file| finish_file(file, &e.meta()))
+                    {
                         finish_dirs(&mut summary);
                         return Err(Error::Io(io));
                     }
-                    Error::Io(_) => fail(&mut summary, &mut report, &e.name, &Error::Truncated.to_string()),
-                    other => fail(&mut summary, &mut report, &e.name, &other.to_string()),
+                    summary.files += 1;
+                    summary.bytes += e.size;
+                }
+                Err(err) => {
+                    drop(target);
+                    match err {
+                        // a failure writing out stops the run; anything about this entry's data fails only the entry
+                        Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof => {
+                            finish_dirs(&mut summary);
+                            return Err(Error::Io(io));
+                        }
+                        Error::Io(_) => fail(&mut summary, &mut report, &e.name, &Error::Truncated.to_string()),
+                        other => fail(&mut summary, &mut report, &e.name, &other.to_string()),
+                    }
                 }
             }
         }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            finish_dirs(&mut summary);
+            Ok(summary)
+        }
+        Err(error) => Err(RunError::new(error, std::mem::take(&mut summary.renames))),
     }
-    finish_dirs(&mut summary);
-    Ok(summary)
 }
 
 #[cfg(test)]

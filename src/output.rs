@@ -51,6 +51,12 @@ pub(crate) enum OutputError {
     Symlink(PathBuf),
     #[cfg(unix)]
     StageChanged(PathBuf),
+    /// Every renamed name for this path was taken.
+    #[cfg(unix)]
+    RenameExhausted(PathBuf),
+    /// The file system can neither rename without replacing nor make a hard link.
+    #[cfg(unix)]
+    RenameUnsupported(PathBuf),
 }
 
 impl OutputError {
@@ -61,6 +67,12 @@ impl OutputError {
             Self::Symlink(_) => io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way"),
             #[cfg(unix)]
             Self::StageChanged(_) => io::Error::other("the verified output stage changed"),
+            #[cfg(unix)]
+            Self::RenameExhausted(_) => io::Error::new(io::ErrorKind::AlreadyExists, "no free name to rename to"),
+            #[cfg(unix)]
+            Self::RenameUnsupported(_) => {
+                io::Error::new(io::ErrorKind::Unsupported, "the file system can't rename without replacing")
+            }
         }
     }
 
@@ -83,6 +95,16 @@ impl OutputError {
             Self::StageChanged(path) => RarFault::new(
                 RarFailure::Policy { reason: RarPolicyReason::StageChanged, path },
                 Error::Io(io::Error::other("the verified output stage changed")),
+            ),
+            #[cfg(unix)]
+            Self::RenameExhausted(path) => RarFault::new(
+                RarFailure::Policy { reason: RarPolicyReason::RenameExhausted, path },
+                Error::Io(io::Error::new(io::ErrorKind::AlreadyExists, "no free name to rename to")),
+            ),
+            #[cfg(unix)]
+            Self::RenameUnsupported(path) => RarFault::new(
+                RarFailure::Policy { reason: RarPolicyReason::RenameUnsupported, path },
+                Error::Io(io::Error::new(io::ErrorKind::Unsupported, "the file system can't rename without replacing")),
             ),
         }
     }
@@ -156,14 +178,41 @@ impl Drop for SelectedStage {
     }
 }
 
-struct Cleanup(Option<PathBuf>);
+/// Removes a file this run created and then gave up on. On Unix only while the name still holds the file created
+/// (`identity`): two members whose names a file system folds together (NFC and NFD spellings, letter case) may
+/// both be in flight, and one's failure must not remove the other's output.
+struct Cleanup(Option<PathBuf>, Option<(u64, u64)>);
+
+impl Cleanup {
+    fn new(file: &File, path: PathBuf) -> Self {
+        Self(Some(path), file_identity(file))
+    }
+}
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            let _ = fs::remove_file(path);
+        let Some(path) = &self.0 else { return };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current = fs::symlink_metadata(path).ok().filter(|m| m.is_file()).map(|m| (m.dev(), m.ino()));
+            if self.1.is_none() || current != self.1 {
+                return;
+            }
         }
+        let _ = fs::remove_file(path);
     }
+}
+
+#[cfg(unix)]
+fn file_identity(file: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_: &File) -> Option<(u64, u64)> {
+    None
 }
 
 /// Use the same default mode as a regular newly created output file.
@@ -233,6 +282,31 @@ impl WriteFile {
         replace: bool,
         mut observe: impl FnMut(&File, bool),
     ) -> Result<(), OutputError> {
+        self.publish_selected_with(
+            |temporary, target| {
+                if replace {
+                    replace_detailed(temporary, target)?;
+                } else {
+                    temporary.persist_noclobber(target).map_err(|error| OutputError::Io {
+                        operation: IoOperation::Publish,
+                        path: Some(target.to_path_buf()),
+                        source: error.error,
+                    })?;
+                }
+                Ok(target.to_path_buf())
+            },
+            |file, published| observe(file, published.is_some()),
+        )
+    }
+
+    /// Publishes the verified stage with `publish`, which moves the stage's temporary name to the final path and
+    /// returns that path. `observe` sees the original descriptor and the final path on success, `None` on failure.
+    #[cfg(unix)]
+    pub(crate) fn publish_selected_with(
+        self,
+        publish: impl FnOnce(TempPath, &Path) -> Result<PathBuf, OutputError>,
+        observe: impl FnOnce(&File, Option<&Path>),
+    ) -> Result<(), OutputError> {
         let Self { file, pending } = self;
         let Some(PendingPath::Selected(mut stage, target)) = pending else {
             unreachable!("selected output has a stage");
@@ -241,18 +315,10 @@ impl WriteFile {
             return Err(OutputError::StageChanged(target));
         }
         let temporary = stage.path.take().expect("selected stage pathname");
-        let result = if replace {
-            replace_detailed(temporary, &target)
-        } else {
-            temporary.persist_noclobber(&target).map_err(|error| OutputError::Io {
-                operation: IoOperation::Publish,
-                path: Some(target),
-                source: error.error,
-            })
-        };
-        observe(&file, result.is_ok());
+        let result = publish(temporary, &target);
+        observe(&file, result.as_ref().ok().map(PathBuf::as_path));
         drop(file);
-        result
+        result.map(drop)
     }
 
     pub(crate) fn publish(self) -> Result<(), OutputError> {
@@ -309,8 +375,9 @@ impl Output {
     }
 
     pub fn created(file: File, size: Option<u64>, path: PathBuf) -> Self {
+        let cleanup = Cleanup::new(&file, path);
         let mut output = Self::new(file, size);
-        output.pending = Some(PendingPath::New(Cleanup(Some(path))));
+        output.pending = Some(PendingPath::New(cleanup));
         output
     }
 
@@ -439,6 +506,22 @@ mod tests {
             assert!(back == data, "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_given_up_file_is_removed_only_while_its_name_still_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member");
+        let out = Output::created(File::create(&path).unwrap(), Some(4), path.clone());
+        // another member, spelled differently but folded to the same name, replaced the file meanwhile
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"other member").unwrap();
+        drop(out);
+        assert_eq!(fs::read(&path).unwrap(), b"other member");
+        let out = Output::created(File::create(dir.path().join("own")).unwrap(), Some(4), dir.path().join("own"));
+        drop(out);
+        assert!(!dir.path().join("own").exists(), "an untouched file is still removed");
     }
 
     #[test]

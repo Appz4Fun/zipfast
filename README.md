@@ -91,6 +91,50 @@ apply the filter. `RarSession::extract_selected`/`extract_selected_controlled`, 
 sessions, and `ZipReadStage::prepare_file` have their own member selection and refuse `select: Some(..)` with a typed
 error before doing anything.
 
+### Library: renaming on conflict
+
+`extract::Overwrite` has `Skip` (default), `Always`, and two rename modes for an existing target. Neither ever
+replaces a file:
+
+| Mode | Matches | Existing `a.txt` | New member |
+|---|---|---|---|
+| `RenameNew(RenameStyle::Underscore)` | 7-Zip `-aou` | kept | `a_1.txt`, then `a_2.txt`, ... |
+| `RenameNew(RenameStyle::Parenthesized)` | UnRAR `-or` | kept | `a(1).txt`, then `a(2).txt`, ... |
+| `RenameExisting(RenameStyle::Underscore)` | 7-Zip `-aot` | moved to `a_1.txt` | `a.txt` |
+
+The name is split at its last dot (`d/b.tar.gz` becomes `d/b.tar_1.gz`, `noext` becomes `noext_1`). `Underscore`
+follows 7-Zip for a leading dot (`.bashrc_1`); `Parenthesized` follows UnRAR, which counts a leading dot as the
+extension (`(1).bashrc`). `extract::renamed_name` spells a candidate. N starts at 1 and takes the first free value up
+to `extract::RENAME_LIMIT` (10,000); beyond that the member fails with a typed error and the run goes on. A run makes
+at most 2^20 rename attempts in all. A name too long to take a number is shortened from the end of its stem, at a
+UTF-8 character boundary, to fit `NAME_MAX` (255 bytes). Each name is claimed with
+`O_EXCL`, `renameat2(RENAME_NOREPLACE)` (Linux) or `renameatx_np(RENAME_EXCL)` (macOS), never looked up first, so
+duplicate members in one run number sequentially and nothing is clobbered.
+
+The rename modes refuse what `Always` refuses: a symlink, a folder, and a protected path or alias of one (the
+archive, its volumes and `Options::protected_paths`). A candidate name that is a protected path is passed over.
+Folder members are reused, never renamed. The whole-archive runners (`run`, `run_with_password`,
+`run_with_zip_policy`, `run_with_zip_context`, `run_rar_with_outcomes`, ZIP, tar, lone compressed files, RAR4/RAR5)
+and `RarSession::extract_selected`/`extract_selected_controlled` support them. In controlled extraction the options'
+rename mode settles every conflict: the control's `RarOverwriteMode` and the observer's `overwrite` are not asked.
+Progressive and persistent-partial sessions refuse them with `FailureKind::InvalidCapability`, and
+`ZipReadStage::prepare_file` refuses them with `ReadFault::InvalidPlan`, before doing anything.
+
+Each rename is reported as an `extract::RenamedOutput { requested, path, existing }` in `Summary::renames`,
+`RarRunSummary::renames` (kept in a terminal error's `partial` too), or as a `ZipRunEvent::MemberRenamed` event from
+`run_with_zip_policy`/`run_with_zip_context`, sent as each rename is made. `extract::run_with_renames` is
+`run_with_password` with a terminal `RunError { error, renames }`; `run` and `run_with_password` keep returning
+`Error`, and their report callback gets a line per rename as it happens (`<requested>: exists, written as <path>` or
+`<requested>: existing file moved to <path>`). A member written at its own name gets no record. `RenameExisting`
+records the move as soon as it happens, so an existing file moved aside for a member that then fails is still
+reported (and stays at the renamed name). Staged runners (checked ZIP, `RarSession` selected extraction) move it
+only once the new member is verified; the other runners claim names when the member starts, as 7-Zip does.
+`RenameExisting` needs a no-replace rename or hard links: on FAT or exFAT the member fails with
+`RarPolicyReason::RenameUnsupported`. The hard-link fallback removes the old name only after checking that both names
+hold the linked file, and reports a link it had to leave behind.
+
+`Overwrite` is now `#[non_exhaustive]`. Code that matched `Skip` and `Always` exhaustively needs a wildcard arm.
+
 ### Library: listing metadata
 
 `extract::list` and `list_with_password` return one `extract::Entry` per member: `name`, `size`, `packed`, `mtime`,

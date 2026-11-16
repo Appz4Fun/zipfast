@@ -636,6 +636,17 @@ impl Drop for OutputReservation {
 }
 #[non_exhaustive]
 pub enum ZipRunEvent<'a> {
+    /// A rename mode ([`crate::extract::Overwrite::RenameNew`] or [`crate::extract::Overwrite::RenameExisting`])
+    /// renamed this member's output or moved its existing target aside. It comes just before the member's own
+    /// `MemberSucceeded` or `MemberFailed`: an existing file moved aside is reported even when the member then
+    /// fails. `ordinal` is `None` for the tar and RAR runs [`crate::extract::run_with_zip_policy`] hands to the
+    /// legacy runners: they send this event as each rename is made, in the run's order, before any
+    /// `LegacyDiagnostic` for that member, and also when the run then stops with an error.
+    #[non_exhaustive]
+    MemberRenamed {
+        ordinal: Option<u64>,
+        renamed: &'a crate::extract::RenamedOutput,
+    },
     MemberFailed {
         ordinal: u64,
         name: &'a str,

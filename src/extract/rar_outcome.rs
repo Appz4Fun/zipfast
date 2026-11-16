@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarScope};
 
-use super::{Mode, Summary};
+use super::{Mode, RenamedOutput, Summary};
 
 /// One completion reported by a RAR bulk run.
 #[derive(Debug)]
@@ -98,6 +98,10 @@ pub struct RarRunSummary {
     /// Successfully opened volumes, including those opened before a terminal failure.
     pub volumes: u64,
     pub match_state: RarMatchState,
+    /// Members renamed by [`super::Overwrite::RenameNew`] or [`super::Overwrite::RenameExisting`], in the order the
+    /// names were claimed. A terminal error's `partial` keeps the renames made before it, including an existing file
+    /// moved aside for a member that then failed.
+    pub renames: Vec<RenamedOutput>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -192,13 +196,24 @@ impl RunFault {
 }
 
 pub(super) enum Reports<'a> {
-    Legacy { summary: Summary, callback: &'a mut dyn FnMut(&str) },
+    Legacy { summary: Summary, callback: &'a mut dyn super::LegacyReport },
     Typed { summary: RarRunSummary, callback: &'a mut dyn FnMut(&RarEntryOutcome) },
 }
 
 impl Reports<'_> {
     pub(super) fn typed(&self) -> bool {
         matches!(self, Self::Typed { .. })
+    }
+
+    /// Records a rename as soon as it is made; a legacy caller hears of it then too.
+    pub(super) fn renamed(&mut self, renamed: RenamedOutput) {
+        match self {
+            Self::Legacy { summary, callback } => {
+                callback.renamed(&renamed);
+                summary.renames.push(renamed);
+            }
+            Self::Typed { summary, .. } => summary.renames.push(renamed),
+        }
     }
 
     pub(super) fn encounter(
@@ -286,9 +301,9 @@ impl Reports<'_> {
         match self {
             Self::Legacy { summary, callback } => {
                 match reason {
-                    RarSkipReason::ExistingTarget => callback(&format!("{}: exists, skipped", ctx.entry.name)),
+                    RarSkipReason::ExistingTarget => callback.line(&format!("{}: exists, skipped", ctx.entry.name)),
                     RarSkipReason::OlderVersion(v) => {
-                        callback(&format!("{}: older version {v}, skipped", ctx.entry.name))
+                        callback.line(&format!("{}: older version {v}, skipped", ctx.entry.name))
                     }
                     RarSkipReason::MissingStart => {}
                 }
@@ -311,7 +326,7 @@ impl Reports<'_> {
         match self {
             Self::Legacy { summary, callback } => {
                 let line = format!("{}: {legacy}", ctx.entry.name);
-                callback(&line);
+                callback.line(&line);
                 summary.errors.push(line);
                 Ok(())
             }

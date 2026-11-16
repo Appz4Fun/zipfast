@@ -246,6 +246,7 @@ fn controlled_policy_envelope_is_once_bound_exact_and_does_not_reset_usage() {
             absolute_bytes: 41,
             cwd_bytes: 10,
             relative: true,
+            renames: false,
         })
         .unwrap();
     assert_eq!(state.run.usage, before);

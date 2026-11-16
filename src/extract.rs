@@ -40,6 +40,7 @@ use crate::volume::next_volume;
 use crate::zip::{InspectionSource, ReadSession, SessionResult};
 
 mod rar_outcome;
+mod rename;
 use crate::error::{
     IoOperation, RarFailure, RarFault, RarIntegrityReason, RarInternal, RarPolicyReason, RarResource, RarUnsupported,
 };
@@ -49,6 +50,10 @@ pub use rar_outcome::{
     RarVerification,
 };
 use rar_outcome::{Reports, RunFault};
+pub use rename::{RENAME_LIMIT, RENAME_NAME_MAX, RenameStyle, RenamedOutput, RunError, renamed_name};
+pub(crate) use rename::{
+    RUN_RENAME_ATTEMPTS, RenameBudget, RenameError, RenameMode, Reserved, claim_candidate, rename_noreplace,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -58,12 +63,56 @@ pub enum Mode {
     Extract,
 }
 
+/// What extraction does when a member's target already exists.
+///
+/// The enum is `#[non_exhaustive]`: matches on it need a wildcard arm. The two rename modes were added after `Skip`
+/// and `Always`, so an exhaustive match written before them no longer compiles.
+///
+/// Every mode refuses the same targets `Always` refuses: a symlink (never followed or replaced), a directory, and a
+/// protected path or an alias of one ([`Options::protected_paths`], the archive and its volumes). A rename mode never
+/// replaces anything: the renamed name is claimed with a create-new or no-replace primitive, never chosen by looking
+/// first, so two members (or another process) can't be handed the same name. A renamed name is in the same folder as
+/// the requested one and follows the same containment rules. Folder members are never renamed: an existing folder is
+/// reused as with the other modes.
+///
+/// Runs report each rename as a [`RenamedOutput`]: [`Summary::renames`], [`RarRunSummary::renames`] (kept in a
+/// terminal error's `partial`), [`RunError::renames`] from [`run_with_renames`], and
+/// [`crate::zip::ZipRunEvent::MemberRenamed`] for [`run_with_zip_policy`] and [`run_with_zip_context`], sent as each
+/// rename is made. The legacy report callback of [`run`] and [`run_with_password`] gets a line for each rename as
+/// it is made, so a run that stops with an error still says where moved files went.
+///
+/// Running out of names, and `RenameExisting` on a file system with neither a no-replace rename nor hard links
+/// (FAT, exFAT: [`crate::error::RarPolicyReason::RenameUnsupported`]), fail only that member. A name too long to
+/// number has its stem shortened to fit `NAME_MAX` (see [`renamed_name`]). Progressive
+/// and persistent-partial sessions refuse the rename modes with `FailureKind::InvalidCapability` before doing
+/// anything, and so does `ZipReadStage::prepare_file` (with `ReadFault::InvalidPlan`), which has no report to name
+/// the file in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Overwrite {
     /// leave a file that is already there alone
     #[default]
     Skip,
+    /// replace a file that is already there, once the new one is verified
     Always,
+    /// Write the member under the first free renamed name (`a_1.txt`, `a_2.txt`, ... or `a(1).txt`, ...), leaving
+    /// the existing file alone: 7-Zip's `-aou` with [`RenameStyle::Underscore`], UnRAR's `-or` with
+    /// [`RenameStyle::Parenthesized`]. Members with the same name in one run take the next free number each.
+    RenameNew(RenameStyle),
+    /// Move the existing file to the first free renamed name, then write the member at its own name: 7-Zip's `-aot`.
+    /// The existing file is moved with a no-replace rename, so it always has a name; if writing the member fails
+    /// afterwards, it stays at the renamed name and [`RenamedOutput::existing`] says where.
+    RenameExisting(RenameStyle),
+}
+
+impl Overwrite {
+    pub(crate) fn rename(self) -> Option<RenameMode> {
+        match self {
+            Self::RenameNew(style) => Some(RenameMode::New(style)),
+            Self::RenameExisting(style) => Some(RenameMode::Existing(style)),
+            Self::Skip | Self::Always => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +270,11 @@ pub struct Summary {
     /// one line per file that failed
     pub errors: Vec<String>,
     pub volumes: u64,
+    /// Members renamed by [`Overwrite::RenameNew`] or [`Overwrite::RenameExisting`], in the order the names were
+    /// claimed. Empty for the other modes.
+    pub renames: Vec<RenamedOutput>,
+    /// the rename attempts this run has left
+    pub(crate) rename_budget: RenameBudget,
     /// folders whose times and permissions are set once everything inside them is written
     pub(crate) dir_meta: Vec<(PathBuf, Meta)>,
 }
@@ -254,6 +308,18 @@ pub(crate) enum Target {
 pub(crate) struct Place {
     pub path: PathBuf,
     pub replace: bool,
+    /// The file already created at `path` by a rename mode, to be written in place.
+    pub reserved: Option<Reserved>,
+}
+
+impl Place {
+    fn new(path: PathBuf, replace: bool) -> Self {
+        Self { path, replace, reserved: None }
+    }
+
+    fn reserved(reserved: Reserved) -> Self {
+        Self { path: reserved.path().to_path_buf(), replace: false, reserved: Some(reserved) }
+    }
 }
 
 /// What [`check_target`] found.
@@ -265,8 +331,8 @@ pub(crate) enum Checked {
 
 /// Prepares the output file for `rel`: makes its folders, honours the overwrite choice, and never writes through a
 /// link left at the target. `size` is preallocated when known.
-pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>) -> Result<Target> {
-    Ok(match check_target(opts, rel, None)? {
+pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>, log: &mut RenameLog<'_>) -> Result<Target> {
+    Ok(match check_target(opts, rel, None, log)? {
         Checked::Write(place) => Target::Write(create_target(place, size)?),
         Checked::Exists => Target::Exists,
         Checked::Blocked(why) => Target::Blocked(why),
@@ -288,8 +354,13 @@ pub(crate) struct Dirs {
 /// The first half of [`open_target`]: makes the folders and checks the target, without creating it. With `dirs`,
 /// folders are made only once, and a file in a folder this run made is not looked for, since nothing can be there
 /// that the run did not put there.
-pub(crate) fn check_target(opts: &Options, rel: &Path, dirs: Option<&mut Dirs>) -> Result<Checked> {
-    check_target_detailed(opts, rel, dirs)
+pub(crate) fn check_target(
+    opts: &Options,
+    rel: &Path,
+    dirs: Option<&mut Dirs>,
+    log: &mut RenameLog<'_>,
+) -> Result<Checked> {
+    check_target_detailed(opts, rel, dirs, log)
         .map(|result| match result {
             DetailedChecked::Write(place) => Checked::Write(place),
             DetailedChecked::Exists => Checked::Exists,
@@ -309,27 +380,58 @@ fn blocked_message(reason: &RarPolicyReason) -> &'static str {
         RarPolicyReason::Symlink => "a symlink is in the way",
         RarPolicyReason::Directory => "a folder is in the way",
         RarPolicyReason::ProtectedInput => "the output path would replace a protected input",
+        RarPolicyReason::RenameExhausted => "no free name to rename to",
+        RarPolicyReason::RenameUnsupported => "the file system can't rename without replacing",
         _ => unreachable!("unexpected target policy"),
     }
 }
 
+/// Where a run's rename mode records its renames, and the attempts it may still make.
+pub(crate) struct RenameLog<'a> {
+    pub(crate) budget: &'a mut RenameBudget,
+    /// called once per rename, as soon as it is made
+    pub(crate) record: &'a mut dyn FnMut(RenamedOutput),
+}
+
+/// The runners whose callers read plain report lines; a rename mode's renames reach the caller as they happen too.
+pub(crate) trait LegacyReport {
+    fn line(&mut self, line: &str);
+    fn renamed(&mut self, _renamed: &RenamedOutput) {}
+}
+
+impl<F: FnMut(&str)> LegacyReport for F {
+    fn line(&mut self, line: &str) {
+        self(line)
+    }
+    fn renamed(&mut self, renamed: &RenamedOutput) {
+        self(&renamed.line())
+    }
+}
+
+/// With a rename mode, the returned place already holds the file, created with `O_EXCL` (see [`place_renamed`]), and
+/// any rename goes to `log`.
 fn check_target_detailed(
     opts: &Options,
     rel: &Path,
     dirs: Option<&mut Dirs>,
+    log: &mut RenameLog<'_>,
 ) -> crate::error::RarResult<DetailedChecked> {
     let target = opts.dest.join(rel);
+    let rename = opts.overwrite.rename();
     if let Some(parent) = rel.parent() {
         match dirs {
             Some(dirs) => {
                 make_dirs_known_detailed(&opts.dest, parent, dirs)?;
                 let first = dirs.note(rel);
-                if first && dirs.known.get(parent) == Some(&true) {
-                    return Ok(DetailedChecked::Write(Place { path: target, replace: false }));
+                if rename.is_none() && first && dirs.known.get(parent) == Some(&true) {
+                    return Ok(DetailedChecked::Write(Place::new(target, false)));
                 }
             }
             None => make_dirs_detailed(&opts.dest, parent)?,
         }
+    }
+    if let Some(mode) = rename {
+        return place_renamed(opts, target, mode, log);
     }
     let metadata = |e| RarFault::output(IoOperation::Metadata, Some(target.clone()), None, e, false);
     Ok(match fs::symlink_metadata(&target) {
@@ -342,12 +444,89 @@ fn check_target_detailed(
         {
             DetailedChecked::Blocked(RarPolicyReason::ProtectedInput)
         }
-        Ok(_) => DetailedChecked::Write(Place { path: target, replace: true }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            DetailedChecked::Write(Place { path: target, replace: false })
-        }
+        Ok(_) => DetailedChecked::Write(Place::new(target, true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DetailedChecked::Write(Place::new(target, false)),
         Err(e) => return Err(metadata(e)),
     })
+}
+
+/// Claims the output file for a rename mode, whose parent folders are already made and checked.
+///
+/// The requested name is created with `O_EXCL` first. When it is taken, what is there is refused exactly as
+/// `Overwrite::Always` refuses it (a symlink, a folder, a protected path or an alias of one). Otherwise
+/// `RenameNew` creates the first free renamed name with `O_EXCL`, and `RenameExisting` moves the existing file to the
+/// first free renamed name with a no-replace rename and then creates the requested name with `O_EXCL`. A candidate
+/// that is a protected path is passed over. Nothing is ever replaced, and the file this returns is new and empty.
+///
+/// Running out of names (or of the run's rename attempts) and a file system that can't move without replacing are
+/// this member's failure ([`DetailedChecked::Blocked`]), not the run's.
+fn place_renamed(
+    opts: &Options,
+    target: PathBuf,
+    mode: RenameMode,
+    log: &mut RenameLog<'_>,
+) -> crate::error::RarResult<DetailedChecked> {
+    let create = |path: &Path, e| RarFault::output(IoOperation::CreateFile, Some(path.to_path_buf()), None, e, false);
+    let metadata = |path: &Path, e| RarFault::output(IoOperation::Metadata, Some(path.to_path_buf()), None, e, false);
+    match Reserved::create(&target) {
+        Ok(reserved) => return Ok(DetailedChecked::Write(Place::reserved(reserved))),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(create(&target, e)),
+    }
+    let meta = fs::symlink_metadata(&target).map_err(|e| metadata(&target, e))?;
+    if meta.file_type().is_symlink() {
+        return Ok(DetailedChecked::Blocked(RarPolicyReason::Symlink));
+    }
+    if meta.is_dir() {
+        return Ok(DetailedChecked::Blocked(RarPolicyReason::Directory));
+    }
+    if is_protected(opts, &target.canonicalize().map_err(|e| metadata(&target, e))?) {
+        return Ok(DetailedChecked::Blocked(RarPolicyReason::ProtectedInput));
+    }
+    let parent = target.parent().and_then(|p| p.canonicalize().ok());
+    let skip = |candidate: &Path| {
+        is_protected(opts, candidate)
+            || parent.as_ref().is_some_and(|p| candidate.file_name().is_some_and(|n| is_protected(opts, &p.join(n))))
+    };
+    let failed = |error| match error {
+        RenameError::Exhausted => Ok(DetailedChecked::Blocked(RarPolicyReason::RenameExhausted)),
+        RenameError::Unsupported => Ok(DetailedChecked::Blocked(RarPolicyReason::RenameUnsupported)),
+        RenameError::Io(path, e) => Err(RarFault::output(IoOperation::Publish, Some(path), None, e, false)),
+    };
+    match mode {
+        RenameMode::New(style) => {
+            let (path, reserved) = match claim_candidate(&target, style, log.budget, skip, Reserved::create) {
+                Ok(claimed) => claimed,
+                Err(error) => return failed(error),
+            };
+            (log.record)(RenamedOutput { requested: target, path, existing: None });
+            Ok(DetailedChecked::Write(Place::reserved(reserved)))
+        }
+        RenameMode::Existing(style) => {
+            let (moved, ()) =
+                match claim_candidate(&target, style, log.budget, skip, |to| rename_noreplace(&target, to)) {
+                    Ok(claimed) => claimed,
+                    Err(error) => return failed(error),
+                };
+            (log.record)(RenamedOutput {
+                requested: target.clone(),
+                path: target.clone(),
+                existing: Some(moved.clone()),
+            });
+            match Reserved::create(&target) {
+                Ok(reserved) => Ok(DetailedChecked::Write(Place::reserved(reserved))),
+                Err(e) => {
+                    // the existing file keeps its new name, and both the error and `renames` say where it went
+                    let why = format!("{} was moved to {}, but {e}", target.display(), moved.display());
+                    Err(create(&target, io::Error::new(e.kind(), why)))
+                }
+            }
+        }
+    }
+}
+
+fn is_protected(opts: &Options, path: &Path) -> bool {
+    !opts.protected_paths.is_empty() && opts.protected_paths.contains(path)
 }
 
 /// Files from this size up are given their full length when created. A small file gains nothing from it, and the
@@ -362,6 +541,13 @@ pub(crate) fn create_target(place: Place, size: Option<u64>) -> Result<Output> {
 pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::error::RarResult<Output> {
     use crate::error::{IoOperation, RarFailure, RarFault, RarPolicyReason};
     let create_fault = |e| RarFault::output(IoOperation::CreateFile, Some(place.path.clone()), None, e, false);
+    if let Some(reserved) = place.reserved {
+        let (file, path) = reserved.into_parts();
+        if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
+            let _ = file.set_len(size);
+        }
+        return Ok(Output::created(file, size, path));
+    }
     let (file, staged) = if place.replace {
         let parent = place.path.parent().ok_or_else(|| {
             RarFault::new(
@@ -653,18 +839,17 @@ impl LegacyRoute {
         first: &Path,
         options: &Options,
         password: Option<&str>,
-        mut report: impl FnMut(&str),
-    ) -> Result<Summary> {
+        report: &mut impl LegacyReport,
+    ) -> std::result::Result<Summary, RunError> {
         match self {
-            Self::Tar => crate::tar::run(first, options, &mut report),
+            Self::Tar => crate::tar::run_reporting(first, options, report),
             Self::Rar { signature, .. } => {
-                let mut reports = Reports::Legacy { summary: Summary::default(), callback: &mut report };
-                rar_run_shared_open(first, options, password, &mut reports, || {
+                let mut reports = Reports::Legacy { summary: Summary::default(), callback: report };
+                let result = rar_run_shared_open(first, options, password, &mut reports, || {
                     Volume::from_held_signature_detailed(first, signature, password)
-                })
-                .map_err(RunFault::into_legacy)?;
+                });
                 let Reports::Legacy { summary, .. } = reports else { unreachable!() };
-                Ok(summary)
+                legacy_result(result, summary)
             }
         }
     }
@@ -1372,17 +1557,36 @@ fn legacy_zip_report(
     mut observe: impl crate::zip::ZipRunObserver,
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
     use crate::zip::{ReadFault, ZipReadError, ZipRunEvent, ZipRunReport};
-    let mut fault: Option<ZipReadError> = None;
-    let result = route.run(first, options, password, |message| {
-        if fault.is_none() {
-            let mut scope = crate::zip::ZipDiagnosticScope::legacy();
-            let result = observe.observe(ZipRunEvent::LegacyDiagnostic { message }, &mut scope);
-            let e = scope.finish(result);
-            if e.failed() {
-                fault = Some(e.merge(ReadFault::InvalidPlan.into()));
+    /// Hands the legacy runner's lines and renames to the observer as they happen; the first observer failure stops
+    /// further events and fails the run.
+    struct Forward<'o, O> {
+        observe: &'o mut O,
+        fault: Option<ZipReadError>,
+    }
+    impl<O: crate::zip::ZipRunObserver> Forward<'_, O> {
+        fn send(&mut self, event: ZipRunEvent<'_>) {
+            if self.fault.is_none() {
+                let mut scope = crate::zip::ZipDiagnosticScope::legacy();
+                let result = self.observe.observe(event, &mut scope);
+                let e = scope.finish(result);
+                if e.failed() {
+                    self.fault = Some(e.merge(ReadFault::InvalidPlan.into()));
+                }
             }
         }
-    });
+    }
+    impl<O: crate::zip::ZipRunObserver> LegacyReport for Forward<'_, O> {
+        fn line(&mut self, message: &str) {
+            self.send(ZipRunEvent::LegacyDiagnostic { message });
+        }
+        fn renamed(&mut self, renamed: &RenamedOutput) {
+            self.send(ZipRunEvent::MemberRenamed { ordinal: None, renamed });
+        }
+    }
+    let mut forward = Forward { observe: &mut observe, fault: None };
+    // The renames have reached the observer as they were made, so a terminal error needn't carry them.
+    let result = route.run(first, options, password, &mut forward).map_err(|e| e.error);
+    let fault = forward.fault;
     let (report, summary, mut terminal) = match result {
         Ok(summary) => (ZipRunReport::from_legacy(&summary), Some(summary), None),
         Err(error) => (ZipRunReport::default(), None, Some(ZipReadError::from(ReadFault::Legacy(error)))),
@@ -1419,24 +1623,44 @@ pub fn run_with_password(
     first: &Path,
     opts: &Options,
     password: Option<&str>,
-    mut report: impl FnMut(&str),
+    report: impl FnMut(&str),
 ) -> Result<Summary> {
+    run_with_renames(first, opts, password, report).map_err(|e| e.error)
+}
+
+/// [`run_with_password`], whose terminal error keeps the renames a rename mode made before it ([`RunError`]).
+///
+/// With [`Overwrite::RenameNew`] or [`Overwrite::RenameExisting`], a run that stops early may already have moved
+/// existing files aside; `RunError::renames` says where, as [`Summary::renames`] does for a run that finishes. The
+/// report callback also gets a line for each rename as it is made (`<requested>: exists, written as <path>` or
+/// `<requested>: existing file moved to <path>`), with [`run`] and [`run_with_password`] too.
+pub fn run_with_renames(
+    first: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    mut report: impl FnMut(&str),
+) -> std::result::Result<Summary, RunError> {
     match sniff(first)? {
         Format::Zip => return zip_run(first, opts, password, &mut report),
-        Format::Tar => return crate::tar::run(first, opts, &mut report),
+        Format::Tar => return crate::tar::run_reporting(first, opts, &mut report),
         Format::Other => {}
     }
     match rar_run(first, opts, password, &mut report) {
-        Err(Error::NotAnArchive) => zip_run(first, opts, password, &mut report),
+        Err(RunError { error: Error::NotAnArchive, .. }) => zip_run(first, opts, password, &mut report),
         other => other,
     }
 }
 
-fn zip_run(path: &Path, opts: &Options, password: Option<&str>, report: &mut impl FnMut(&str)) -> Result<Summary> {
+fn zip_run(
+    path: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    report: &mut impl FnMut(&str),
+) -> std::result::Result<Summary, RunError> {
     if opts.mode == Mode::Extract {
-        fs::create_dir_all(&opts.dest)?;
+        fs::create_dir_all(&opts.dest).map_err(Error::from)?;
     }
-    crate::zip::run_with_password(path, opts, password, report)
+    crate::zip::run_renaming(path, opts, password, report)
 }
 
 fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
@@ -2000,6 +2224,8 @@ struct Run<'a, 'r, 'c> {
     password: Option<&'a str>,
     reports: &'r mut Reports<'c>,
     order: u64,
+    /// the rename attempts this run has left
+    rename_budget: RenameBudget,
     dir_meta: Vec<(PathBuf, Meta)>,
     unavailable: Option<HistoryFailure>,
     pending: Option<Pending>,
@@ -2040,11 +2266,24 @@ fn invariant(reason: &'static str, legacy: Error) -> RarFault {
     RarFault::new(RarFailure::Internal(RarInternal::Invariant(reason)), legacy)
 }
 
-fn rar_run(first: &Path, opts: &Options, password: Option<&str>, mut report: impl FnMut(&str)) -> Result<Summary> {
+fn rar_run(
+    first: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    mut report: impl FnMut(&str),
+) -> std::result::Result<Summary, RunError> {
     let mut reports = Reports::Legacy { summary: Summary::default(), callback: &mut report };
-    rar_run_shared(first, opts, password, &mut reports).map_err(RunFault::into_legacy)?;
+    let result = rar_run_shared(first, opts, password, &mut reports);
     let Reports::Legacy { summary, .. } = reports else { unreachable!() };
-    Ok(summary)
+    legacy_result(result, summary)
+}
+
+/// A legacy RAR run's result: a terminal error keeps the renames made before it.
+fn legacy_result(result: RunResult<()>, mut summary: Summary) -> std::result::Result<Summary, RunError> {
+    match result {
+        Ok(()) => Ok(summary),
+        Err(fault) => Err(RunError::new(fault.into_legacy(), std::mem::take(&mut summary.renames))),
+    }
 }
 
 /// Test or extract all logical members of a RAR archive, including RAR with an SFX prefix.
@@ -2236,6 +2475,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             password: password.filter(|s| !s.is_empty()),
             reports,
             order: 0,
+            rename_budget: RenameBudget::default(),
             dir_meta: Vec::new(),
             unavailable: None,
             pending: None,
@@ -2595,7 +2835,9 @@ impl Run<'_, '_, '_> {
         };
 
         let place = if self.opts.mode == Mode::Extract {
-            match check_target_detailed(self.opts, &rel, Some(&mut self.dirs)).map_err(|e| self.terminal(&ctx, e))? {
+            let mut log = RenameLog { budget: &mut self.rename_budget, record: &mut |r| self.reports.renamed(r) };
+            let checked = check_target_detailed(self.opts, &rel, Some(&mut self.dirs), &mut log);
+            match checked.map_err(|e| self.terminal(&ctx, e))? {
                 DetailedChecked::Write(place) => Some(place),
                 DetailedChecked::Exists => {
                     self.drain()?;
@@ -3444,7 +3686,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("target");
         fs::write(&path, b"original").unwrap();
-        let fault = create_target_detailed(Place { path: path.clone(), replace: false }, Some(0)).err().unwrap();
+        let fault = create_target_detailed(Place::new(path.clone(), false), Some(0)).err().unwrap();
         assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
             operation: IoOperation::CreateFile, path: Some(actual), source, ..
         } if actual == &path && source.raw_os_error() == Some(libc::EEXIST)));

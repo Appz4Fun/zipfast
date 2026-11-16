@@ -32,6 +32,11 @@ impl RarSession {
     /// Uses the destination, overwrite, flatten and protected paths in
     /// `options`. Selected extraction is synchronous. Keep the
     /// destination namespace under caller control during extraction.
+    ///
+    /// With `Overwrite::RenameNew` or `Overwrite::RenameExisting` nothing is
+    /// replaced: once a member is verified, it is published under the first
+    /// free renamed name, or the existing file is first moved to one, each
+    /// with a no-replace rename. `RarRunSummary::renames` lists the renames.
     #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
     pub fn extract_selected(
         &mut self,
@@ -208,6 +213,10 @@ impl<'a> Extraction<'a> {
         if self.stage_stamp(&file.file, &target)? != stage_stamp {
             return Err(policy(RarPolicyReason::StageChanged, target).into());
         }
+        if let Some(mode) = self.options.overwrite.rename() {
+            self.publish_renamed(run, session, index, file, &target, initial, mode, hooks)?;
+            return Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written });
+        }
         hooks.before_publication(index, initial);
         if hooks.observe_publication() {
             file.publish_selected_observed(initial.is_some(), |held, published| {
@@ -218,6 +227,100 @@ impl<'a> Extraction<'a> {
         }
         .map_err(|error| own_fault(error.detailed(false)))?;
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
+    }
+
+    /// Publishes a verified stage for a rename mode. Nothing is replaced: every name is claimed with a no-replace
+    /// rename, and a candidate that is a protected name is passed over. `initial` is the regular file the target
+    /// inspection found at `target` (it has refused a symlink, a folder and a protected path, as for
+    /// `Overwrite::Always`), unchanged since.
+    ///
+    /// `RenameExisting` moves that file to the first free renamed name and records the move in `run.renames` before
+    /// publishing at `target`, so a failed publication still reports where the existing file went. `RenameNew`
+    /// publishes at `target` when it was free, else (or when it was taken since) at the first free renamed name.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_renamed(
+        &self,
+        run: &mut SelectedRun,
+        session: &RarSession,
+        index: usize,
+        file: crate::output::WriteFile,
+        target: &Path,
+        initial: Option<SourceStamp>,
+        mode: crate::extract::RenameMode,
+        hooks: &mut impl ExtractionHooks,
+    ) -> Result<(), SelectedStop> {
+        use crate::extract::{RenameError, RenameMode, RenamedOutput, claim_candidate, rename_noreplace};
+        use crate::output::OutputError;
+        let skip = |candidate: &Path| self.protect_source_name(session, candidate).is_err();
+        // the engine itself unlinks nothing here: the incumbent, if any, is moved, never replaced
+        hooks.before_publication(index, None);
+        let publish_fault = |path: &Path, source| OutputError::Io {
+            operation: IoOperation::Publish,
+            path: Some(path.to_path_buf()),
+            source,
+        };
+        // Running out of names and a file system that can't move without replacing fail this member only.
+        let refused = |error| match error {
+            RenameError::Exhausted => OutputError::RenameExhausted(target.to_path_buf()),
+            RenameError::Unsupported => OutputError::RenameUnsupported(target.to_path_buf()),
+            RenameError::Io(path, source) => publish_fault(&path, source),
+        };
+        if let (RenameMode::Existing(style), Some(_)) = (mode, initial) {
+            let moved = claim_candidate(target, style, &mut run.rename_budget, skip, |to| rename_noreplace(target, to))
+                .map_err(|error| own_fault(refused(error).detailed(false)))?;
+            run.renames.push(RenamedOutput {
+                requested: target.to_path_buf(),
+                path: target.to_path_buf(),
+                existing: Some(moved.0),
+            });
+        }
+        let mut chosen = None;
+        let observe = hooks.observe_publication();
+        file.publish_selected_with(
+            |temporary, target| {
+                let temporary = match (mode, initial) {
+                    (RenameMode::New(_), Some(_)) => temporary,
+                    _ => match temporary.persist_noclobber(target) {
+                        Ok(()) => return Ok(target.to_path_buf()),
+                        Err(error)
+                            if matches!(mode, RenameMode::New(_))
+                                && error.error.kind() == io::ErrorKind::AlreadyExists =>
+                        {
+                            error.path
+                        }
+                        Err(error) => return Err(publish_fault(target, error.error)),
+                    },
+                };
+                let mut temporary = Some(temporary);
+                let found = claim_candidate(target, mode.style(), &mut run.rename_budget, skip, |candidate| {
+                    match temporary.take().expect("unpublished stage").persist_noclobber(candidate) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            temporary = Some(error.path);
+                            Err(error.error)
+                        }
+                    }
+                });
+                match found {
+                    Ok((path, ())) => {
+                        chosen = Some(path.clone());
+                        Ok(path)
+                    }
+                    Err(error) => Err(refused(error)),
+                }
+            },
+            |held, published| {
+                // A renamed new file has no binding of its own to verify; the stage it came from was checked.
+                if observe && published.is_none_or(|path| path == target) {
+                    hooks.published(index, target, held, published.is_some());
+                }
+            },
+        )
+        .map_err(|error| own_fault(error.detailed(false)))?;
+        if let Some(path) = chosen {
+            run.renames.push(RenamedOutput { requested: target.to_path_buf(), path, existing: None });
+        }
+        Ok(())
     }
 
     fn ensure_root(&self) -> RarResult<()> {
