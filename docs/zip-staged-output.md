@@ -121,7 +121,11 @@ private directory and makes two renames per member, and the portable stage flush
 
 Under `Bulk` every member takes the portable stage (a 0600 temp file in its target directory, one rename) **without**
 the per-file flush, and when the run ends every directory it published into (and each directory between it and the
-destination root) is flushed once with `fsync`/`fdatasync`. `StagedStorage::NativeOnly` takes precedence and keeps
+destination root) is flushed once with `fsync`/`fdatasync`. The flush reopens each directory by path: the
+destination root is opened following symlinks (it is caller configuration, like macOS `/tmp`), and each directory
+below it is opened with `O_NOFOLLOW` on its final component only; earlier components are followed as spelled,
+which can at worst flush a different directory than the one published into, never write anything. If the run stops
+early on a counter or limit fault, the directories published so far are still flushed before the fault is returned. `StagedStorage::NativeOnly` takes precedence and keeps
 native staging. Everything listed under "What both backends keep" still holds: containment, held parents, target and
 overwrite checks, source checks, and publication only after full verification (CRC or AES HMAC).
 

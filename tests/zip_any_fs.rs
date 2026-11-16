@@ -338,3 +338,29 @@ fn bulk_publication_matches_staged_results() {
         assert_eq!(report.portable_files(), 0);
     }
 }
+
+/// A destination root reached through a symlink (macOS `/tmp` is one) is caller configuration: a Bulk run publishes
+/// and flushes through it without a Flush fault.
+#[test]
+fn bulk_publication_through_a_symlinked_destination_root() {
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("a.zip");
+    let files = fixture(&archive, 200_000);
+    let real = work.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = work.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut overrides = overrides(StagedStorage::Auto);
+    overrides.publication = Publication::Bulk;
+    let report = run_with_policy(
+        &archive,
+        &options(&link, Overwrite::Skip),
+        Some("password"),
+        &Cancellation::default(),
+        &overrides,
+        |_: ZipRunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    assert_eq!((report.files(), report.failed()), (4, 0));
+    check_tree(&real, &files);
+}
