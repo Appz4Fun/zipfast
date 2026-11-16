@@ -118,6 +118,8 @@ pub(crate) struct HeaderParser {
     format: RarFormat,
     rar4_main: Option<MainHeader>,
     legacy_headers: bool,
+    /// Map walks only (see [`HeaderParser::lenient_map`]). Sessions, catalogues and extraction never set it.
+    map_lenient: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -145,6 +147,7 @@ impl HeaderParser {
             format: RarFormat::Rar5,
             rar4_main: None,
             legacy_headers: false,
+            map_lenient: false,
         }
     }
     pub(crate) fn format(&self) -> RarFormat {
@@ -163,6 +166,14 @@ impl HeaderParser {
         let mut parser = Self::progressive(path, 0, usage);
         parser.signature = Some(SignatureParser::default());
         parser
+    }
+    /// Accepts what a header map may list but extraction refuses, on RAR 4.x: a legacy name that is not UTF-8
+    /// (kept as raw bytes, with an empty decoded name), the legacy service blocks 0x75..=0x79 (skipped by their
+    /// declared sizes), embedded comments, bytes left over inside a header's declared size (ignored), an end
+    /// header of any size, and `MHD_ENCRYPTVER` on an encrypted-header archive.
+    pub(crate) fn lenient_map(mut self) -> Self {
+        self.map_lenient = true;
+        self
     }
     pub(crate) fn enable_encryption(
         &mut self,
@@ -414,7 +425,7 @@ impl HeaderParser {
                     {
                         return Err(self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")).into());
                     }
-                    if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
+                    if self.embedded_comment(kind, flags) {
                         return Err(self.rar4_unsupported("embedded comment").into());
                     }
                     if let Some(budget) = budget {

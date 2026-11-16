@@ -35,18 +35,29 @@ How a walk ends is `MemberMap::end`:
 | `Complete` | the archive's last end header was read (`complete: true`) |
 | `MissingVolume { volume }` | the volume source answered `Missing`, or the memory slice ended, after volume 0 |
 | `Truncated { volume, offset }` | the volume ended before its headers did; `offset` is the start of the header being read (the end of the signature when the bytes end inside the main header); pieces already announced are listed even when their data lies past the end |
+| `Damaged { volume, offset, reason }` | the header at `offset` in volume `volume` is damaged or unsupported (see below); members and pieces whose headers came before it are listed, a member split across it is `complete: false` |
 
 Failures are `MapError`: `NotArchive`, `MissingFirstVolume`, `PasswordRequired`, `WrongPassword`,
 `HeaderHole { volume, offset }` (a `RangeRead::Hole` inside header bytes; holes in member data are never reached),
 `Malformed`, `Unsupported` (both with the volume and the underlying typed `ProgressiveFailure`), `Limit { resource,
 limit, attempted }`, `Source` (provider failure, contract breach, cancellation) and `Aborted { volume }`.
 
+Damage: once volume 0's main header has been read, a damaged header ends the walk with `MapEnd::Damaged` instead
+of failing it. Damage is a header checksum, framing or field failure, a header out of order or inconsistent with an
+earlier one (a continuation that does not match its member, a later volume without a signature), or a RAR 4.x
+header feature not mapped. `reason` is a `HeaderDamage`: `Checksum`, `Malformed(what)` or `Unsupported(what)`;
+`offset` is the start of the damaged header. Everything else still fails the walk: damage in the signature or
+volume 0's main header, a wrong password, limits and allocation failures, internal errors, holes and source
+failures.
+
+`MapEnd`, `VolumeEnd` and `HeaderDamage` are `#[non_exhaustive]`: match them with a wildcard arm.
+
 Encrypted headers: RAR 5.0 headers with a password check value report a wrong password as soon as the key is
 derived. Without a check value (and for RAR 4.x, which has none), a wrong password shows up on the first header it
 decrypts, as a header checksum or framing failure, or as a header size that runs past the end of the
 volume; all are `WrongPassword`. A volume genuinely cut inside its first encrypted header cannot be told apart and
 is also reported as `WrongPassword`. Once any header has decrypted under the password, on any volume, later failures
-are damage (`Malformed`) and a later volume cut short is `Truncated`. Derived header keys are cached per salt, so a RAR4 archive repeating the same
+are damage (`Damaged`) and a later volume cut short is `Truncated`. Derived header keys are cached per salt, so a RAR4 archive repeating the same
 salt in every header costs one derivation.
 
 ## The map
@@ -57,7 +68,8 @@ salt in every header costs one derivation.
 `name` (decoded, when it decodes), `is_dir`,
 `unpacked_size`, `packed_size` (over the pieces seen), `method` (`Stored` or `Compressed { id }` with the format's
 method number), `mapping`, `solid`, `encrypted`, `cipher`, final `checks` (once the final piece is seen), `mtime`,
-`attributes`, `unix_mode` and `complete`, and its `pieces`.
+`dos_time` (RAR 4.x: the header's DOS date and time as stored, also when it is not a valid date and `mtime` is None;
+None for other formats), `attributes`, `unix_mode` and `complete`, and its `pieces`.
 
 `MapPiece` is one part header: `volume`, `packed` (data bytes in that volume), `header` (the header's wire extent,
 including the IV and padding of an encrypted header, or a ZIP local header with its name and extra field),
@@ -99,18 +111,23 @@ matched against that volume's part. RAR 4.x and RAR 5.0 volumes are read, behind
 | `format` | `Rar4` or `Rar5`, from the signature when the main header was not read |
 | `main_read` | the main header was read; false for a `Locked` RAR 5.0 volume and bytes that end inside the main header, where the facts below are defaults |
 | `volume_number` | zero-based. RAR 5.0: the main header's volume number, 0 when it records none (only the first volume omits it). RAR 4.x: the end header's number (`EARC_VOLNUMBER`) when the end header is read and records one, else 0 for a first volume and None otherwise. A non-volume archive is volume 0 |
-| `first_volume` | the first volume, or a single-volume archive. RAR 4.x: `MHD_FIRSTVOLUME` (written since RAR 3.0) or an end-header number of 0. RAR 2.x first volumes lack `MHD_FIRSTVOLUME`, so a prefix of one that stops before the end header reports `first_volume: false` and `volume_number: None`. A main header claiming the first volume with an end header numbering it otherwise is `Malformed` |
+| `first_volume` | the first volume, or a single-volume archive. RAR 4.x: `MHD_FIRSTVOLUME` (written since RAR 3.0) or an end-header number of 0. RAR 2.x first volumes lack `MHD_FIRSTVOLUME`, so a prefix of one that stops before the end header reports `first_volume: false` and `volume_number: None`. A main header claiming the first volume with an end header numbering it otherwise is `Damaged` at the end header, and the facts are the main header's |
 | `multi_volume` | the main header's volume flag |
 | `new_naming` | `.partNN.rar` naming: always true for RAR 5.0, RAR 4.x `MHD_NEWNUMBERING` (false means `.rar`, `.r00`, `.r01`, ...) |
 | `has_next_volume` | the end header's "not last volume" flag; false when the end header was not reached |
 | `solid`, `header_encrypted`, `header_cipher` | as the main header and encryption header state them |
-| `end` | `Complete` (the end header was read), `Truncated { offset }` or `Locked { offset }` |
+| `end` | `Complete` (the end header was read), `Truncated { offset }`, `Locked { offset }` or `Damaged { offset, reason }` |
 | `members` | one `VolumeMember` per file header, in volume order; service headers are not listed |
 
 Truncation is normal. Bytes that end inside member data or inside a header give `Truncated { offset }`, where
 `offset` is the start of the header being read; it lies past the end of the bytes when the last listed member's data
 does. A member whose header was read is listed with its declared packed size and data offsets even when its data
 runs past the end.
+
+Damage is reported, not raised, once the main header has been read: a damaged or unsupported header ends the map
+with `Damaged { offset, reason }` (as for whole-archive maps), listing the members whose headers came before it,
+with the main header's volume facts (`has_next_volume` is false, since the end header was not reached). Damage in
+the signature or the main header itself fails the walk.
 
 Encrypted headers (`-hp`): with a password, headers decrypt as for `from_memory`, and a wrong password is
 `WrongPassword` where it can be told. A single-volume map treats bytes that end inside the first encrypted header as
@@ -131,8 +148,36 @@ member's), `packed_size` and `packed` (this part's data bytes in this volume), `
 `split_before` (continues from the previous volume), `split_after` (continues in the next), `method`, `mapping`,
 `solid`, `encrypted`, `cipher`, `part_checks` (as stored in this header: of this part's packed bytes when it has
 `split_after`, of the member's output otherwise), `checks` (the member's final checks: `Some(part_checks)` exactly
-on its last part), `mtime`, `attributes` and `unix_mode`. Where a continuation part falls in the member's packed
+on its last part), `mtime`, `dos_time` (as for `MapMember`), `attributes` and `unix_mode`. Where a continuation part falls in the member's packed
 stream depends on earlier volumes; a whole-archive map gives that as `MapPiece::stream_offset`.
+
+## RAR 4.x leniency
+
+Map walks (`MemberMap::from_memory`, `MapBuilder` and single-volume `from_volume` / `VolumeMapBuilder`) accept these
+in old RAR 2.x/3.x/4.x archives, which `RarSession`, `extract::list` and extraction still refuse:
+
+- A legacy name that is not UTF-8 (no Unicode flag, OEM/CP437 bytes such as `caf\x82.mkv`): the member is listed
+  with `raw_name` holding the stored bytes and `name: None`. A whole-archive map matches split parts by those bytes.
+  An empty name or one holding a NUL byte is still damage.
+- Legacy service blocks 0x75..=0x79 (old comment, AV, old subblock, old recovery record, sign): skipped. Which have
+  data after the header follows unrar's `ReadHeader15`: the old comment (0x75) never has any, even with LONG_BLOCK
+  set; the old subblock (0x77) and old recovery record (0x78) always start with its size, LONG_BLOCK or not; the AV
+  (0x76) and sign (0x79) blocks have it exactly when LONG_BLOCK is set. Their header bytes count against the header
+  budgets like any other header. A header size below 7, or a 0x77/0x78 header too short for its data size, is
+  damage; a header or data size running past the volume ends the walk `Truncated` there.
+- Embedded comments: `MHD_COMMENT` (0x02) with the RAR 2.x comment inside the main header, and `LHD_COMMENT` (0x08)
+  with the comment after a file header's name. Both lie inside the declared header size and are skipped with it.
+  As in unrar, the CRC of such a header covers only what precedes the comment: the main header's 13 fixed bytes,
+  and the file header's fields up to the name, salt and extended times.
+- Header CRCs unrar does not check: the AV (0x76) and sign (0x79) blocks and the Unix-owner old subblock (0x77 with
+  subtype `UO_HEAD`, 0x0101), which old versions wrote without a proper CRC, are not checked either. In an archive
+  with encrypted headers every header is checked whole, since the CRC is what reveals a wrong password.
+- Sizes: a main header longer than its fixed fields, bytes left over inside a file or service header after the
+  fields its flags call for, and an end header of any size (bytes past its fields are ignored; a volume number the
+  header is too short to hold is absent). As in unrar, the main and end headers never have data after them.
+- `MHD_ENCRYPTVER` (0x200) on a `-hp` archive: the main header's extra byte gives the header encryption version.
+  RAR 3.x headers are always encrypted the RAR 2.9 way, so versions up to 36 (what unrar 3.x accepts) are read
+  like any `-hp` archive; a later version is `Unsupported` (the main header cannot be read).
 
 ## Output offsets and restart points
 
@@ -148,7 +193,7 @@ exact:
 | `None` | compressed | no mapping | None |
 
 Encrypted RAR stored members are one CBC stream across all their parts (a continuation part whose RAR 5.0
-encryption record names a different KDF count or salt is `Malformed`; only the first part's IV is used, so a later
+encryption record names a different KDF count or salt is damage; only the first part's IV is used, so a later
 part restating a different IV is accepted): a volume boundary never resets CBC, so a
 stream offset `c` is output offset `c`, clipped at the unpacked size. This is the same geometry persistent partials
 use (`docs/persistent-partials.md`).

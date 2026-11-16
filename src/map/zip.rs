@@ -323,6 +323,7 @@ impl ZipWalker {
             cipher,
             checks: Some(checks),
             mtime: entry.mtime.map(|s| (s, entry.nanos)),
+            dos_time: None,
             attributes: u64::from(entry.external),
             unix_mode: entry.unix_mode(),
             complete: true,

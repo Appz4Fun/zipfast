@@ -22,8 +22,8 @@ use super::physical::{PhysicalMember, PhysicalPart, continuation_issue};
 use super::reader::Block;
 use super::{FileHeader, FileWire, MemberCrypt, RarFormat};
 use crate::map::{
-    CipherParams, Got, MapChecks, MapEnd, MapError, MapFormat, MapInput, MapMember, MapMethod, MapOptions, MapPiece,
-    MemberMap, Opened, OutputMapping, VolumeEnd, VolumeMap, VolumeMember, Walked, read,
+    CipherParams, Got, HeaderDamage, MapChecks, MapEnd, MapError, MapFormat, MapInput, MapMember, MapMethod,
+    MapOptions, MapPiece, MemberMap, Opened, OutputMapping, VolumeEnd, VolumeMap, VolumeMember, Walked, read,
 };
 use crate::progressive::{FailureKind, ProgressiveFailure, Resource, SessionControl, Usage, VolumeRequest};
 use std::{
@@ -87,6 +87,8 @@ pub(crate) struct RarWalker {
     proven: bool,
     /// Offset of the header being read on the current volume.
     header_start: Option<u64>,
+    /// Offset of the last header parsed on the current volume, where a failure found in its frame lies.
+    frame_start: Option<u64>,
     rar5_keys: Option<(u8, [u8; 16], crate::crypto::Rar5Keys)>,
     rar4_keys: Option<([u8; 8], [u8; 16], [u8; 16])>,
     members: Vec<MapMember>,
@@ -99,7 +101,7 @@ impl RarWalker {
     pub(crate) fn new(options: &MapOptions, usage: Usage, single: bool) -> Self {
         let chunk = options.limits.read_chunk.clamp(1, READ_CHUNK) as usize;
         Self {
-            parser: HeaderParser::from_start(options.first_name.clone().into(), usage.clone()),
+            parser: HeaderParser::from_start(options.first_name.clone().into(), usage.clone()).lenient_map(),
             usage,
             control: options.control.clone(),
             password: options.password.clone(),
@@ -117,6 +119,7 @@ impl RarWalker {
             unproven: false,
             proven: false,
             header_start: None,
+            frame_start: None,
             rar5_keys: None,
             rar4_keys: None,
             members: Vec::new(),
@@ -130,6 +133,11 @@ impl RarWalker {
             volume: self.volume,
             failure: Box::new(ProgressiveFailure::new(FailureKind::Malformed(reason))),
         }
+    }
+
+    /// A member list that could not grow: an allocation failure, never damage.
+    fn allocation(&self) -> MapError {
+        MapError::from_failure(self.volume, super::framing::progressive_fault(super::session::allocation()))
     }
 
     fn fail(&self, failure: ProgressiveFailure) -> MapError {
@@ -191,8 +199,26 @@ impl RarWalker {
         match self.poll_inner(input, cx) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(map)) => Poll::Ready(Ok(map)),
-            Err(e) => Poll::Ready(Err(e)),
+            Err(e) => Poll::Ready(self.damaged(e)),
         }
+    }
+
+    /// Ends the walk at a damaged header once the main header (of volume 0, for a whole-archive walk) has been
+    /// read, keeping what was read before it. Other failures, and damage before that point, fail the walk.
+    fn damaged(&mut self, error: MapError) -> Result<Walked, MapError> {
+        let started = match &self.single {
+            Some(single) => single.main_read,
+            None => self.volume > 0 || self.main_seen,
+        };
+        let Some(reason) = HeaderDamage::of(&error).filter(|_| started) else {
+            return Err(error);
+        };
+        let offset = self.header_start.or(self.frame_start).unwrap_or_else(|| self.parser.header_offset());
+        Ok(if self.single.is_some() {
+            self.finish_volume(VolumeEnd::Damaged { offset, reason })
+        } else {
+            self.finish(MapEnd::Damaged { volume: self.volume, offset, reason })
+        })
     }
 
     fn poll_inner(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Result<Poll<Walked>, MapError> {
@@ -205,10 +231,12 @@ impl RarWalker {
                     let request = VolumeRequest { index: self.volume, expected: self.expected.clone() };
                     match input.open(&request, cx).map_err(|e| MapError::from_failure(self.volume, e))? {
                         Opened::Ready => {
-                            self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone());
+                            self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone())
+                                .lenient_map();
                             self.main_seen = false;
                             self.unproven = false;
                             self.header_start = None;
+                            self.frame_start = None;
                             self.phase = Phase::Header;
                         }
                         Opened::Wait => return Ok(Poll::Pending),
@@ -291,6 +319,7 @@ impl RarWalker {
             let progressed = used > 0 || matches!(step, ParserStep::Frame(_) | ParserStep::LegacyKeyRequired { .. });
             match step {
                 ParserStep::Frame(frame) => {
+                    self.frame_start = Some(frame.extent.start);
                     self.header_start = None;
                     if let Some(map) = self.frame(frame)? {
                         return Ok(Some(map));
@@ -435,7 +464,17 @@ impl RarWalker {
                 if !self.main_seen {
                     return Err(self.malformed("member before main"));
                 }
-                let wire = frame.wire.ok_or_else(|| self.malformed("missing member wire identity"))?;
+                let wire = frame.wire.ok_or_else(|| {
+                    MapError::from_failure(
+                        self.volume,
+                        super::framing::progressive_fault(crate::error::RarFault::new(
+                            crate::error::RarFailure::Internal(crate::error::RarInternal::Invariant(
+                                "missing member wire identity",
+                            )),
+                            crate::Error::Corrupt("missing member wire identity"),
+                        )),
+                    )
+                })?;
                 if self.single.is_some() {
                     self.volume_file(header, frame.crypt, wire)?;
                 } else {
@@ -537,7 +576,9 @@ impl RarWalker {
     ) -> Result<Described, MapError> {
         let name = match header.format {
             RarFormat::Rar5 => String::from_utf8(wire.name.to_vec()).ok(),
-            RarFormat::Rar4 => Some(header.name.clone()),
+            // The lenient map parser leaves a legacy name that is not UTF-8 undecoded (empty); a decoded RAR 4.x
+            // name is never empty.
+            RarFormat::Rar4 => Some(header.name.clone()).filter(|name| !name.is_empty()),
         };
         self.charge(Resource::MetadataBytes, (owner + wire.name.len() + name.as_ref().map_or(0, String::len)) as u64)?;
         let stored = header.method == 0;
@@ -641,12 +682,13 @@ impl RarWalker {
             part_checks,
             checks: part.final_part.then_some(part_checks),
             mtime: header.mtime.map(|s| (s, header.mtime_nanos)),
+            dos_time: header.rar4.map(|r| r.dos_time),
             attributes: header.attributes,
             unix_mode,
         };
         let members = &mut self.single.as_mut().expect("single-volume mode").members;
         if members.try_reserve(1).is_err() {
-            return Err(self.malformed("member allocation"));
+            return Err(self.allocation());
         }
         members.push(member);
         Ok(())
@@ -726,6 +768,7 @@ impl RarWalker {
             cipher,
             checks: part.final_part.then_some(checks),
             mtime: header.mtime.map(|s| (s, header.mtime_nanos)),
+            dos_time: header.rar4.map(|r| r.dos_time),
             attributes: header.attributes,
             unix_mode,
             complete: part.final_part,
@@ -739,7 +782,7 @@ impl RarWalker {
                 final_part: part.final_part,
             }],
         };
-        self.members.try_reserve(1).map_err(|_| self.malformed("member allocation"))?;
+        self.members.try_reserve(1).map_err(|_| self.allocation())?;
         self.members.push(member);
         if !part.final_part {
             let physical = PhysicalMember::new(header, wire, 0, &part)

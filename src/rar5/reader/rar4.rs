@@ -30,16 +30,26 @@ impl HeaderParser {
         let kind = header[2];
         let flags = u16::from_le_bytes([header[3], header[4]]);
         let size = header.len();
-        if crate::crc32::hash(&header[2..]) as u16 != u16::from_le_bytes([header[0], header[1]]) {
+        if let Some(end) = self.rar4_crc_end(header)
+            && crate::crc32::hash(&header[2..end]) as u16 != u16::from_le_bytes([header[0], header[1]])
+        {
             return Err(self
                 .fault(RarIntegrityReason::HeaderCrc, Error::BadChecksum("RAR4 header CRC".into()), true)
                 .into());
         }
-        if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
+        if self.embedded_comment(kind, flags) {
             return Err(self.rar4_unsupported("embedded comment").into());
         }
         let mut cursor = Fields::new(header, 7);
-        let packed = if flags & 0x8000 != 0 { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
+        // Map walks follow unrar's ReadHeader15 on which blocks have data after the header: the old subblock (0x77)
+        // and old recovery record (0x78) always start with its size, the main, old comment and end headers never
+        // have any, and every other block has it exactly when LONG_BLOCK is set.
+        let sized = match kind {
+            0x77 | 0x78 if self.map_lenient => true,
+            0x73 | 0x75 | 0x7b if self.map_lenient => false,
+            _ => flags & 0x8000 != 0,
+        };
+        let packed = if sized { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
         let data_at = self
             .at
             .checked_add(self.need as u64)
@@ -62,14 +72,19 @@ impl HeaderParser {
                         .framing("duplicate RAR4 main header", Error::Corrupt("duplicate RAR4 main header"))
                         .into());
                 }
-                if size != 13 && !(size == 14 && flags & 0x200 != 0) {
+                // MHD_ENCRYPTVER (0x200) adds a byte: the version of the header encryption. A map walk also accepts
+                // a longer header (a RAR 2.x embedded comment, or fields it does not know) and ignores the rest.
+                let fixed = 13 + usize::from(flags & 0x200 != 0);
+                if (self.map_lenient && size < fixed) || (!self.map_lenient && size != 13 && size != fixed) {
                     return Err(self.framing("RAR4 main header size", Error::Corrupt("RAR4 main header size")).into());
                 }
                 if flags & 0x80 != 0 {
                     if self.usage.is_none() {
                         return Err(self.rar4_unsupported("encrypted headers").into());
                     }
-                    if flags & 0x200 != 0 {
+                    // RAR 3.x headers are always encrypted the RAR 2.9 way; unrar 3.x refuses a version above its
+                    // own (36) and unrar 5 ignores the byte. Map walks accept what unrar 3.x accepts.
+                    if flags & 0x200 != 0 && !(self.map_lenient && header[13] <= 36) {
                         return Err(self.rar4_unsupported("header encryption version").into());
                     }
                     self.legacy_headers = true;
@@ -107,17 +122,24 @@ impl HeaderParser {
                     + usize::from(flags & 2 != 0) * 4
                     + usize::from(flags & 4 != 0) * 7
                     + usize::from(flags & 8 != 0) * 2;
-                if size != expected {
+                // A map walk takes any size, as unrar does: bytes past the fields are ignored, and a field the header
+                // is too short to hold is absent.
+                if size != expected && !self.map_lenient {
                     return Err(self
                         .framing("RAR4 end header fields", Error::Corrupt("RAR4 end header fields"))
                         .into());
                 }
                 // EARC_VOLNUMBER: a 16-bit volume number after the optional data CRC.
                 let at = 7 + usize::from(flags & 2 != 0) * 4;
-                let volume_number =
-                    (flags & 8 != 0).then(|| u64::from(u16::from_le_bytes([header[at], header[at + 1]])));
+                let volume_number = (flags & 8 != 0)
+                    .then(|| header.get(at..at + 2))
+                    .flatten()
+                    .map(|n| u64::from(u16::from_le_bytes([n[0], n[1]])));
                 Block::End { more_volumes: flags & 1 != 0, volume_number }
             }
+            // Old comment, AV, old subblock, old recovery record and sign blocks hold no members. A map walk skips
+            // them by their declared sizes, already bounded above, like unknown blocks marked skippable.
+            0x75..=0x79 if self.map_lenient => Block::Unknown,
             0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
             _ if flags & 0x4000 != 0 => Block::Unknown,
             _ => return Err(self.rar4_unsupported("header type").into()),
@@ -126,6 +148,38 @@ impl HeaderParser {
             return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
         }
         Ok(frame)
+    }
+    /// Where a header's CRC ends, None when it is not checked. Map walks follow unrar's `ReadHeader15`: a main header
+    /// with `MHD_COMMENT` is checked over its 13 fixed bytes only, a file header with `LHD_COMMENT` over the fields
+    /// it parses (checked in `rar4_file`), and the AV, sign and Unix-owner old subblocks, which old versions wrote
+    /// with a CRC not set properly, not at all. Encrypted headers are always checked whole: the CRC is what tells a
+    /// wrong password.
+    fn rar4_crc_end(&self, header: &[u8]) -> Option<usize> {
+        let (kind, flags) = (header[2], u16::from_le_bytes([header[3], header[4]]));
+        if !self.map_lenient || self.legacy_headers {
+            return Some(header.len());
+        }
+        match kind {
+            0x76 | 0x79 => None,
+            // UO_HEAD (0x0101): the subtype after the data size.
+            0x77 if header.get(11..13) == Some(&[0x01, 0x01]) => None,
+            0x73 if flags & 2 != 0 => Some(header.len().min(13)),
+            0x74 if flags & 8 != 0 => None,
+            _ => Some(header.len()),
+        }
+    }
+    /// A file header whose CRC covers only its parsed fields: one with a RAR 2.x comment, in a clear map walk.
+    fn file_comment(&self, header: &[u8]) -> bool {
+        self.map_lenient
+            && !self.legacy_headers
+            && header[2] == 0x74
+            && u16::from_le_bytes([header[3], header[4]]) & 8 != 0
+    }
+    /// A RAR 2.x comment embedded in the main header (`MHD_COMMENT`) or a file header (`LHD_COMMENT`) that this
+    /// parser refuses. Map walks accept both: the main header's comment lies past its fixed fields, and a file
+    /// header's after the name, where unrar leaves it unread too.
+    pub(super) fn embedded_comment(&self, kind: u8, flags: u16) -> bool {
+        !self.map_lenient && ((kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0))
     }
     pub(super) fn rar4_unsupported(&self, feature: &'static str) -> RarFault {
         RarFault::new(
@@ -157,10 +211,22 @@ impl HeaderParser {
                 unpacked |= u64::from(fields.u32()?) << 32;
             }
             let encoded = fields.take(name_len)?;
-            let name = decode_name(encoded, flags & 0x200 != 0, self.usage.as_ref())?;
-            if name.is_empty() || name.contains('\0') {
-                return Err(Error::Corrupt("RAR4 member name").into());
-            }
+            let name = match decode_name(encoded, flags & 0x200 != 0, self.usage.as_ref()) {
+                // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
+                // name, which no decoded name can be (see below).
+                Err(FileParseError::Format(Error::Unsupported(_)))
+                    if self.map_lenient && !encoded.is_empty() && !encoded.contains(&0) =>
+                {
+                    String::new()
+                }
+                result => {
+                    let name = result?;
+                    if name.is_empty() || name.contains('\0') {
+                        return Err(Error::Corrupt("RAR4 member name").into());
+                    }
+                    name
+                }
+            };
             let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
             let mut mtime = dos_timestamp(dos);
             let mut nanos = 0;
@@ -191,7 +257,12 @@ impl HeaderParser {
                     }
                 }
             }
-            if fields.at != bytes.len() {
+            if self.file_comment(bytes)
+                && crate::crc32::hash(&bytes[2..fields.at]) as u16 != u16::from_le_bytes([bytes[0], bytes[1]])
+            {
+                return Err(Error::BadChecksum("RAR4 header CRC".into()).into());
+            }
+            if fields.at != bytes.len() && !self.map_lenient {
                 return Err(Error::Unsupported("RAR4 trailing header fields".into()).into());
             }
             let directory = flags & 0xe0 == 0xe0;
@@ -227,6 +298,9 @@ impl HeaderParser {
         let (header, encoded, salt) = result.map_err(|error| match error {
             FileParseError::Allocation => allocation().into(),
             FileParseError::Progressive(error) => FramingError::Progressive(error),
+            FileParseError::Format(error @ Error::BadChecksum(_)) => {
+                self.fault(RarIntegrityReason::HeaderCrc, error, true).into()
+            }
             FileParseError::Format(Error::Unsupported(_)) => {
                 self.rar4_unsupported("header extension or name encoding").into()
             }
