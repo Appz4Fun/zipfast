@@ -961,6 +961,77 @@ fn winzip_aes_key_derivation_is_charged() {
     );
 }
 
+// Catches a held part that outlives the stream making its bytes vanish from an Ok read.
+#[test]
+fn pieces_must_fill_the_packed_stream_and_finish_on_a_final_part() {
+    let gold = data(10_000, 7);
+    let volumes = rar5_split(&gold, 2600);
+    let good = MemberMap::from_memory(&refs(&volumes), "big.part1.rar", None).unwrap();
+    let malformed = |edit: &dyn Fn(&mut MapMember), at: u64| {
+        let mut map = good.clone();
+        edit(&mut map.members[0]);
+        let mut out = Vec::new();
+        let result = extract_member_from(&refs(&volumes), &map, 0, at, None, &mut out);
+        assert!(matches!(result, Err(ExtractFromError::Malformed(_))), "offset {at}: {result:?}");
+    };
+    // The reviewed case: the last piece carries its own check, is not final, and runs past the stream's end, so it
+    // would be held and never released.
+    let held_forever = |m: &mut MapMember| {
+        let last = m.pieces.last_mut().unwrap();
+        last.final_part = false;
+        last.checks.crc32 = Some(crc32fast::hash(&gold[7800..]));
+        last.packed.end += 100;
+    };
+    for at in [7800, 8000] {
+        malformed(&held_forever, at);
+        malformed(
+            &|m| {
+                held_forever(m);
+                m.complete = false;
+            },
+            at,
+        );
+    }
+    // Only the last piece may be final, and a complete member must end on a final piece.
+    malformed(&|m| m.pieces[1].final_part = true, 0);
+    malformed(&|m| m.pieces[3].final_part = false, 0);
+    // A complete member's pieces must sum to its packed stream exactly.
+    malformed(&|m| m.pieces[3].packed.end -= 1, 0);
+    // An incomplete map's pieces may stop short.
+    let partial = MemberMap::from_memory(&refs(&volumes[..2]), "big.part1.rar", None).unwrap();
+    assert!(matches!(extract_err(&volumes, &partial, 0, 0, None), ExtractFromError::IncompleteMember { out: 5200 }));
+}
+
+// Catches held-back plaintext escaping the TempBytes budget, or a released hold not returning its charge.
+#[test]
+fn held_parts_are_charged_to_temp_bytes_and_refunded() {
+    let gold = data(10_000, 7);
+    let volumes = rar5_split(&gold, 2600);
+    let map = MemberMap::from_memory(&refs(&volumes), "big.part1.rar", None).unwrap();
+    let piece = map.members[0].pieces[2].clone();
+    let mut bad = volumes.clone();
+    bad[2][piece.packed.start as usize + 100] ^= 0x40;
+    // Each 2,600-byte part reserves 2,616 bytes (one CBC block of slack). Parts 0 and 1 are held and released before
+    // part 2 is held, so one reservation's worth suffices only if each is returned.
+    for (temp, released) in [(2616, false), (2615, true)] {
+        let mut options = MapOptions::new("big.part1.rar");
+        options.limits.temp_bytes = temp;
+        options.limits.read_chunk = 64;
+        let (result, out) = extract_with(&bad, &map, 0, options.clone());
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, ExtractFromError::PartBad { out: 5200, released: r, part: 2, .. } if r == released),
+            "temp {temp}: {error:?}"
+        );
+        assert_eq!(&out[..5200], &gold[..5200]);
+        assert_eq!(out.len() > 5200, released, "temp {temp}");
+        // An intact read under the same budget succeeds either way.
+        let (result, out) = extract_with(&volumes, &map, 0, options);
+        assert_eq!(result.unwrap().written, 10_000);
+        assert_eq!(out, gold);
+    }
+}
+
 // ---- Alt takeover into a persistent partial ----
 
 #[cfg(all(feature = "persistent-partials", any(target_os = "linux", target_os = "macos")))]

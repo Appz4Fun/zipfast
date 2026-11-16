@@ -564,7 +564,8 @@ pub struct MapOptions {
     /// Cancels a walk, including a key derivation in progress.
     pub control: SessionControl,
     /// [`MemberReader`] only: the most output a checked part may carry for its plaintext to be held back in memory
-    /// until its check passes. A larger part is streamed unchecked and reported after the fact (see
+    /// until its check passes. The hold is charged to `limits.temp_bytes` while it lasts. A larger part, or one whose
+    /// hold the budget or the allocator refuses, is streamed unchecked and reported after the fact (see
     /// [`ExtractFromError::PartBad`]). Default 256 MiB.
     pub part_hold_bytes: u64,
 }

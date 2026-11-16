@@ -95,7 +95,8 @@ pub enum ExtractFromError {
     ///
     /// A checked part's plaintext is held back until its check passes, so none of `bad` was returned
     /// (`released: false`) and `out` is the offset reached. A part carrying more than
-    /// [`MapOptions::part_hold_bytes`] is streamed unchecked instead (`released: true`): its bytes up to the reader's
+    /// [`MapOptions::part_hold_bytes`], or whose hold `temp_bytes` or the allocator refuses, is streamed unchecked
+    /// instead (`released: true`): its bytes up to the reader's
     /// position were already returned, and `out` is `bad.start`, the offset the caller must rewind to and discard
     /// everything written from.
     PartBad { out: u64, released: bool, volume: u32, part: usize, which: ChecksumAlgorithm, bad: Range<u64> },
@@ -284,6 +285,10 @@ fn validate(member: &MapMember, mapping: OutputMapping, size: u64) -> Result<(),
     if !cipher_fits {
         return Err(Malformed("cipher parameters do not match the output mapping"));
     }
+    let last = member.pieces.len().saturating_sub(1);
+    if member.pieces.iter().take(last).any(|p| p.final_part) {
+        return Err(Malformed("a piece before the last is marked final"));
+    }
     let mut next = 0u64;
     for piece in &member.pieces {
         if piece.packed.start > piece.packed.end {
@@ -297,6 +302,23 @@ fn validate(member: &MapMember, mapping: OutputMapping, size: u64) -> Result<(),
         if piece.out != mapping.out_of(piece.stream_offset..next, Some(size)) {
             return Err(Malformed("piece output range does not match its stream range"));
         }
+    }
+    // The packed stream the mapping implies: no piece may reach past it, and a complete member fills it exactly.
+    let overflow = Malformed("member size overflows");
+    let expected = match mapping {
+        OutputMapping::Direct => size,
+        OutputMapping::CbcBlocks => size.checked_next_multiple_of(16).ok_or(overflow)?,
+        OutputMapping::Counter { skip } => {
+            skip.checked_add(size).and_then(|n| n.checked_add(AES_TAG)).ok_or(overflow)?
+        }
+        OutputMapping::Sequential { skip } => skip.checked_add(size).ok_or(overflow)?,
+        OutputMapping::None => unreachable!("refused before validation"),
+    };
+    if next > expected {
+        return Err(Malformed("pieces reach past the member's packed stream"));
+    }
+    if member.complete && (next != expected || member.pieces.last().is_some_and(|p| !p.final_part)) {
+        return Err(Malformed("a complete member's pieces do not fill its packed stream"));
     }
     Ok(())
 }
@@ -394,6 +416,8 @@ struct Core {
     part: Option<PartHash>,
     /// Plaintext of the part being checked, held back until its check passes.
     held: Option<Vec<u8>>,
+    /// `TempBytes` charged for `held`'s reservation while the part lasts.
+    held_lease: Option<crate::progressive::Lease>,
     member_hash: Option<PartHash>,
     /// Whether the password is shown right: no encryption, a matching check value, or a passing check that
     /// covers plaintext or is keyed with the password.
@@ -439,6 +463,7 @@ impl Core {
             ready_pos: 0,
             part: None,
             held: None,
+            held_lease: None,
             member_hash,
             password_verified: false,
         };
@@ -461,17 +486,29 @@ impl Core {
             let own = !p.final_part && (p.checks.crc32.is_some() || p.checks.blake2sp.is_some());
             (own && self.stream_pos == p.stream_offset).then(|| PartHash::new(p.checks.blake2sp.is_some()))
         });
-        self.held = None;
+        drop(self.take_held());
         if self.part.is_some() {
             let len = self.member.pieces[self.piece].packed.end - self.member.pieces[self.piece].packed.start;
-            if len <= self.options.part_hold_bytes {
-                // Plaintext from the previous part's last partial CBC block can land here too.
+            // Plaintext from the previous part's last partial CBC block can land here too.
+            let reserve = len.saturating_add(16);
+            // A reservation the budget or the allocator refuses streams the part unchecked instead: its check
+            // still runs, and a failure reports `released: true`.
+            if len <= self.options.part_hold_bytes
+                && let Ok(lease) = self.usage.lease(Resource::TempBytes, reserve)
+            {
                 let mut held = Vec::new();
-                if held.try_reserve_exact(len as usize + 16).is_ok() {
+                if held.try_reserve_exact(reserve as usize).is_ok() {
                     self.held = Some(held);
+                    self.held_lease = Some(lease);
                 }
             }
         }
+    }
+
+    /// Ends the hold of the current part, returning its budget.
+    fn take_held(&mut self) -> Option<Vec<u8>> {
+        self.held_lease = None;
+        self.held.take()
     }
 
     fn password(&self) -> Result<&str, ExtractFromError> {
@@ -618,6 +655,8 @@ impl Core {
             }
             self.ready.clear();
             self.ready_pos = 0;
+            // A released hold became `ready`; once returned, drop back to the read chunk's size.
+            self.ready.shrink_to(2 * self.buffer.len());
             match self.phase {
                 Phase::Keys => {
                     if let Err(e) = self.keys() {
@@ -703,9 +742,9 @@ impl Core {
             part.update(bytes);
             if self.stream_pos == piece_end {
                 let part = self.part.take().expect("hashing this part");
+                let held = self.take_held();
                 let piece = &self.member.pieces[self.piece];
                 let key = self.hash_key.as_ref().filter(|_| piece.checks.keyed);
-                let held = self.held.take();
                 if let Some(which) = part.verify(&piece.checks, key) {
                     let out = piece.out.clone().unwrap_or(self.reached..self.reached);
                     let tail = if self.plan.mapping == OutputMapping::CbcBlocks { 16 } else { 0 };
@@ -723,7 +762,13 @@ impl Core {
                     self.password_verified = true;
                 }
                 if let Some(held) = held {
-                    self.ready.extend_from_slice(&held);
+                    // Plaintext is read only once `ready` was drained, so the held buffer simply becomes it.
+                    if self.ready.is_empty() {
+                        self.ready = held;
+                        self.ready_pos = 0;
+                    } else {
+                        self.ready.extend_from_slice(&held);
+                    }
                 }
             }
         }
@@ -848,7 +893,10 @@ impl Core {
             }
             _ => {}
         }
-        if self.produced != self.plan.size {
+        if self.part.is_some() || self.held.is_some() {
+            return Err(ExtractFromError::Malformed("stream ended inside a checked part"));
+        }
+        if self.produced != self.plan.size || self.reached != self.plan.size {
             return Err(ExtractFromError::Malformed("stream ended before the member's size"));
         }
         if let (Some(hash), Some(checks)) = (self.member_hash.take(), self.member.checks) {

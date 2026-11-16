@@ -46,9 +46,14 @@ writer.finish()?;
 - pieces must be contiguous from stream offset 0, with ordered packed ranges and no offset overflow;
 - `encrypted` must agree with `mapping`, and `cipher` with `mapping` (a CBC member needs RAR 5.0 parameters with
   an IV, or RAR 4.x parameters);
-- each `piece.out` must be the output range its stream range carries.
+- each `piece.out` must be the output range its stream range carries;
+- only the last piece may be `final_part`;
+- no piece may reach past the packed stream the mapping implies: `size` (plain), `size` rounded up to 16 (CBC),
+  `skip + size + 10` (WinZip AES) or `skip + size` (ZipCrypto);
+- a `complete` member must fill that stream exactly and end on a final piece.
 
-Anything else is `Malformed`.
+Anything else is `Malformed`. As a further guard, a read ends with `Malformed`, never `Ok`, if the stream ends
+inside a checked part or short of the member's size.
 
 ## Supported members
 
@@ -105,7 +110,11 @@ password there gives garbage with no error, which only the caller's verify of th
 - **Part checks.** A RAR part whose packed bytes the read covers from the first byte is checked when its last byte
   is read. Its plaintext is held back in memory until the check passes, so a bad part's bytes never reach the
   caller. The hold is capped by `MapOptions::part_hold_bytes` (default 256 MiB; a part's output is at most its
-  packed size). A larger part is streamed unchecked and still checked at its end. RAR 5.0 non-final part checks are CRC32 or BLAKE2sp of
+  packed size). Its reservation (the part's packed size plus one block) is charged to `ProgressiveLimits::temp_bytes`
+  and returned when the part ends, so one hold is charged at a time. The held buffer becomes the output buffer on
+  release, without a copy, and the reader shrinks back to its read chunk once that output is returned. A part
+  larger than the cap, or whose reservation the budget or the allocator refuses, is streamed unchecked and still
+  checked at its end; only if it then fails does that show, as `released: true`. RAR 5.0 non-final part checks are CRC32 or BLAKE2sp of
   the packed bytes (ciphertext for encrypted members), keyed with the password when the member's checks are keyed.
   RAR 4.x non-final part CRCs cover the packed bytes. A failure is `PartBad { out, volume, part, which, bad }`:
   - `volume` names the volume holding the bad bytes, so the bad article is pinned.
