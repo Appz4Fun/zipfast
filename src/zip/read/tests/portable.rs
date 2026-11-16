@@ -38,7 +38,16 @@ fn entry(name: &str) -> EntryOptions<'_> {
 
 fn archive(path: &Path) -> (Vec<u8>, Vec<u8>) {
     let plain: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
-    let secret: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    // Incompressible, so the AES ciphertext stays above the 64 KiB in-memory snapshot limit.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let secret: Vec<u8> = (0..300_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
     let mut writer = ZipStreamWriter::new(std::fs::File::create(path).unwrap(), WriterOptions::default()).unwrap();
     writer.add_file(entry("a.txt"), &mut plain.as_slice(), InputLength::Exact(plain.len() as u64)).unwrap();
     writer
@@ -288,4 +297,96 @@ fn portable_tampered_aes_leaves_nothing() {
     assert_eq!((report.files(), report.failed()), (1, 1));
     assert_eq!(names(dest.path()), ["a.txt"]);
     assert_eq!(std::fs::read(dest.path().join("a.txt")).unwrap(), plain);
+}
+
+#[allow(clippy::result_large_err)] // The public checked result.
+fn callback_read(zip: &Path, storage: StagedStorage, temp: &Path) -> ZipReadResult<(Vec<u8>, EncryptedReadUsage)> {
+    let cancel = Cancellation::default();
+    let mut session = ProjectedReadSession::open(zip, &cancel)?;
+    let overrides =
+        EncryptedReadOverrides { staged_storage: storage, temp_dir: Some(temp.to_path_buf()), ..Default::default() };
+    let mut context = EncryptedReadContext::for_projected(
+        &mut session,
+        ProjectedReadScope::Entry(1),
+        None,
+        ZipReadOutput::Callback,
+        Some("pw"),
+        &overrides,
+        &cancel,
+    )?;
+    let mut out = Vec::new();
+    session.read_at_with_context(1, Some("pw"), u64::MAX, &cancel, &mut context, |b| {
+        out.extend_from_slice(b);
+        Ok(())
+    })?;
+    Ok((out, context.usage()))
+}
+
+/// A caller-callback AES read still spools (its sink must only see authenticated bytes). With the temp directory
+/// outside the native allow-list it falls back to a portable spool under `Auto` and stays refused under `NativeOnly`.
+#[test]
+fn spool_on_unsupported_temp_dir_falls_back_unless_native_only() {
+    let work = tempfile::tempdir().unwrap();
+    let zip = work.path().join("a.zip");
+    let (_, secret) = archive(&zip);
+    let temp = tempfile::tempdir().unwrap();
+    let _forced = Forced::new(0);
+    for storage in [StagedStorage::Auto, StagedStorage::PortableOnly] {
+        let (out, usage) = callback_read(&zip, storage, temp.path()).unwrap();
+        assert_eq!(out, secret, "{storage:?}");
+        assert!(usage.member_spool_bytes > 0, "{storage:?}: {usage:?}");
+        assert_eq!(usage.live_fds, 0);
+        assert_eq!(names(temp.path()), Vec::<String>::new(), "{storage:?}");
+    }
+    let error = callback_read(&zip, StagedStorage::NativeOnly, temp.path()).unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::UnsupportedStorage)), "{error:?}");
+    assert_eq!(names(temp.path()), Vec::<String>::new());
+}
+
+/// Optional real-filesystem run: `ZIPFAST_ANYFS_DEST=/Volumes/exfat cargo test spool_on_real_portable_temp_dir`.
+#[test]
+fn spool_on_real_portable_temp_dir() {
+    let Some(base) = std::env::var_os("ZIPFAST_ANYFS_DEST") else { return };
+    let work = tempfile::tempdir().unwrap();
+    let zip = work.path().join("a.zip");
+    let (_, secret) = archive(&zip);
+    let temp = tempfile::tempdir_in(base).unwrap();
+    let (out, usage) = callback_read(&zip, StagedStorage::Auto, temp.path()).unwrap();
+    assert_eq!(out, secret);
+    assert!(usage.member_spool_bytes > 0);
+}
+
+/// Another user moves our portable spool away and puts their own file under its name just before we unlink it.
+/// We remove their file, ours keeps a link: the read must fail instead of continuing with a named spool.
+#[test]
+fn portable_spool_swapped_before_unlink_fails_the_read() {
+    use crate::zip::read::spool::hooks::HOOK;
+    let work = tempfile::tempdir().unwrap();
+    let zip = work.path().join("a.zip");
+    archive(&zip);
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
+    let _forced = Forced::new(0);
+    let mut swapped = false;
+    HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |op, _| {
+            if op == ReadIoOperation::Unlink && !swapped {
+                swapped = true;
+                let spool = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".zipfast"))
+                    .expect("spool name");
+                std::fs::rename(&spool, dir.join("moved")).unwrap();
+                std::fs::write(&spool, b"someone else's file").unwrap();
+            }
+            None
+        }))
+    });
+    let result = callback_read(&zip, StagedStorage::Auto, temp.path());
+    HOOK.with(|h| *h.borrow_mut() = None);
+    let error = result.unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::UnsupportedIdentity)), "{error:?}");
+    // Their file under the spool name was the one removed; ours survives only under the name it was moved to.
+    assert_eq!(names(temp.path()), ["moved"]);
 }

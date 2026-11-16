@@ -85,3 +85,30 @@ So a checked extraction needs no temporary directory at all, and `TMPDIR` on ove
 unauthenticated plaintext only ever reaches the stage (a 0600 file that is never published unauthenticated); no
 caller callback sees it. Contexts built by callers (`EncryptedReadContext::for_projected`, `for_session`) with a
 callback or stdout output keep the spool, because there the caller's sink would see the bytes.
+
+## The WinZip AES spool on a portable temp directory
+
+Reads that still spool a WinZip AES member (a caller callback or stdout sink, where unauthenticated bytes must not
+reach the caller) use the same `StagedStorage` choice for the spool directory (`EncryptedReadOverrides::temp_dir`,
+`EncryptedReadOptions::with_temp_dir`, else `TMPDIR`). Under `Auto` a temp directory outside the native allow-list
+(ZFS, NFS, overlayfs, exFAT, ...) gets a portable spool instead of `UnsupportedStorage`; `NativeOnly` still refuses it.
+
+The spool is a 0600 file created with `O_EXCL | O_NOFOLLOW`, checked, and unlinked at once, so it is anonymous while
+it holds ciphertext. On the portable path it loses:
+
+1. **Private directory checks.** Native requires the temp directory to be owned by the process user (or root) and
+   not group- or world-writable unless sticky, and the spool file to be owned by us with mode exactly 0600 and no ACL.
+   Portable only requires a directory and a regular file: NFS with squashed owners, SMB and shared FUSE mounts report
+   owners and modes that cannot be checked, and an inherited ACL may let others open the file before it is unlinked.
+   Only ciphertext is spooled, so what could leak is ciphertext that is already in the archive.
+2. **The unlink race.** In a shared writable directory without a sticky bit another user can move the spool away
+   and put their own file under its name between our identity check and our `unlinkat`; we then remove their file.
+   After the unlink the portable path requires the spool name to be gone (`ENOENT`) and our descriptor to have no
+   links left, so the read fails with `UnsupportedIdentity` instead of continuing; the only exceptions, detected with
+   `fstatfs`, are NFS, where an unlinked open file keeps one `.nfsXXXX` silly-rename link until it is closed, and
+   FAT/exFAT, which have no link counts (always 1); there the absent spool name is the only evidence, so a spool moved
+   away under another name goes unnoticed.
+   What portability cannot prevent: the other user's file is gone, and our ciphertext stays under whatever name it
+   was moved to.
+3. **Inode identity of the held descriptor.** exFAT renumbers an inode once its name is unlinked, so after the unlink
+   portable checks of our own descriptor compare the device only.

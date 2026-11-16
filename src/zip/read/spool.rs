@@ -103,6 +103,11 @@ impl Identity {
     fn matches(self, s: &libc::stat) -> bool {
         self.dev == s.st_dev && self.ino == s.st_ino
     }
+    /// An observation of our own held descriptor. Portable filesystems such as exFAT renumber an inode once its
+    /// name is unlinked, and a descriptor cannot change files, so there only the device is compared.
+    fn held(self, s: &libc::stat, portable: bool) -> bool {
+        if portable { self.dev == s.st_dev } else { self.matches(s) }
+    }
 }
 #[cfg(unix)]
 fn stat(fd: &File) -> std::io::Result<libc::stat> {
@@ -124,13 +129,67 @@ fn observe_storage_parent(parent: &File, path: &CStr) -> std::io::Result<libc::s
     }
 }
 #[cfg(unix)]
-pub(super) fn trusted_dir(s: &libc::stat, uid: libc::uid_t) -> bool {
+pub(super) fn trusted_dir(s: &libc::stat, uid: libc::uid_t, portable: bool) -> bool {
+    // Portable spool directories (NFS with squashed owners, SMB, shared FUSE mounts) need only be directories.
+    if portable {
+        return s.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    }
     s.st_mode & libc::S_IFMT == libc::S_IFDIR
         && (s.st_uid == uid || s.st_uid == 0)
         && (s.st_mode & 0o022 == 0 || s.st_mode & libc::S_ISVTX != 0)
 }
+/// Our held spool after its name was unlinked: no links, except on filesystems whose open-unlinked files still
+/// report one (see `keeps_unlinked_link`).
 #[cfg(unix)]
-pub(super) fn trusted_file(s: &libc::stat, links: libc::nlink_t, uid: libc::uid_t) -> bool {
+fn unlinked(s: &libc::stat, uid: libc::uid_t, portable: bool, nfs: bool) -> bool {
+    trusted_file(s, 0, uid, portable) || portable && nfs && trusted_file(s, 1, uid, true)
+}
+/// The spool name must be gone after our unlink; anything still there means another name was unlinked instead.
+#[cfg(unix)]
+fn name_absent(parent: &File, name: &[u8; 41]) -> std::io::Result<()> {
+    let mut s = std::mem::MaybeUninit::<libc::stat>::uninit();
+    match cvt(unsafe {
+        libc::fstatat(parent.as_raw_fd(), name.as_ptr().cast(), s.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    }) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+        Err(error) => Err(error),
+    }
+}
+/// Whether an unlinked open file on `fd`'s filesystem still reports one link: NFS keeps a `.nfsXXXX` silly-rename
+/// name until close, and FAT/exFAT have no link counts at all (always 1). There the absent spool name is the only
+/// unlink evidence.
+#[cfg(unix)]
+fn keeps_unlinked_link(fd: i32) -> bool {
+    let mut v = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(fd, v.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let v = unsafe { v.assume_init() };
+    #[cfg(target_os = "linux")]
+    {
+        // `f_type` is `i64` on glibc x86_64 but narrower on some targets (musl, 32-bit).
+        #[allow(clippy::unnecessary_cast)]
+        let kind = v.f_type as i64;
+        matches!(kind, 0x6969 | 0x2011_bab0 | 0x4d44)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let name: Vec<u8> = v.f_fstypename.iter().map(|b| *b as u8).take_while(|b| *b != 0).collect();
+        matches!(name.as_slice(), b"nfs" | b"exfat" | b"msdos")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = v;
+        false
+    }
+}
+#[cfg(unix)]
+pub(super) fn trusted_file(s: &libc::stat, links: libc::nlink_t, uid: libc::uid_t, portable: bool) -> bool {
+    // Portable: owner and mode are whatever the filesystem reports; the link count stays exact (see `unlinked`).
+    if portable {
+        return s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_nlink == links;
+    }
     s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_uid == uid && s.st_mode & 0o777 == 0o600 && s.st_nlink == links
 }
 
@@ -163,6 +222,10 @@ pub(super) struct PrivateCiphertextFile<'a> {
     uid: libc::uid_t,
     reserved: u64,
     scope: PrivateScope,
+    /// Created through the portable fallback (see [`StagedStorage`]).
+    portable: bool,
+    /// Portable spool on NFS, FAT or exFAT (one link tolerated after unlink; see `keeps_unlinked_link`).
+    nfs: bool,
 }
 impl<'a> OwnedCiphertext<'a> {
     #[allow(clippy::result_large_err)] // Inline terminal evidence is allocation independent.
@@ -362,6 +425,8 @@ pub(super) struct PrivateCreation<'a> {
     pub(super) name: &'a mut [u8; 41],
     pub(super) tilde: bool,
     pub(super) unknown: &'a mut bool,
+    /// Plain `O_EXCL` 0600 birth instead of the native private (Darwin extended-security) birth.
+    pub(super) portable: bool,
 }
 #[cfg(unix)]
 pub(super) fn create_private_at(
@@ -384,7 +449,11 @@ pub(super) fn create_private_at(
         let result = group.create_once(cancel, || {
             *creation.unknown = true;
             syscall(ReadIoOperation::Create, creation.parent.as_raw_fd(), || {
-                native_policy::atomic_file(creation.parent.as_raw_fd(), creation.path, leaf)
+                if creation.portable {
+                    native_policy::portable_file(creation.parent.as_raw_fd(), leaf)
+                } else {
+                    native_policy::atomic_file(creation.parent.as_raw_fd(), creation.path, leaf)
+                }
             })
         });
         match result {
@@ -401,6 +470,7 @@ pub(super) fn create_private_at(
 }
 /// Shared atomic-private birth proof before either ciphertext or output payload.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Flat birth-proof inputs; two call sites.
 pub(super) fn establish_private_file(
     ledger: &impl LedgerAccess,
     cancel: &Cancellation,
@@ -409,9 +479,17 @@ pub(super) fn establish_private_file(
     parent_device: libc::dev_t,
     uid: libc::uid_t,
     captured: &mut Option<Identity>,
+    portable: bool,
 ) -> Result<libc::stat, ReadFault> {
     let mut s = namespace(ledger, cancel, scope, ReadIoOperation::Stat, || stat(file))?;
     *captured = Some(Identity::of(&s));
+    if portable {
+        // Born 0600 with O_EXCL; owner, device and ACL are whatever the filesystem reports. See StagedStorage.
+        if !trusted_file(&s, 1, uid, true) {
+            return Err(policy());
+        }
+        return Ok(s);
+    }
     if s.st_mode & 0o077 != 0
         || s.st_uid != uid
         || s.st_mode & libc::S_IFMT != libc::S_IFREG
@@ -438,7 +516,7 @@ pub(super) fn establish_private_file(
             return Err(policy());
         }
     }
-    if !trusted_file(&s, 1, uid) {
+    if !trusted_file(&s, 1, uid, portable) {
         return Err(policy());
     }
     Ok(s)
@@ -482,7 +560,15 @@ impl<'a> PrivateCiphertextFile<'a> {
         len: u64,
         cancel: &Cancellation,
     ) -> ZipReadResult<Self> {
-        Self::create_scoped(ledger, directory.as_cstr(), directory.uid, len, cancel, PrivateScope::CIPHER)
+        Self::create_scoped(
+            ledger,
+            directory.as_cstr(),
+            directory.uid,
+            len,
+            cancel,
+            PrivateScope::CIPHER,
+            directory.storage,
+        )
     }
     #[allow(clippy::result_large_err)]
     fn create_scoped(
@@ -492,8 +578,11 @@ impl<'a> PrivateCiphertextFile<'a> {
         len: u64,
         cancel: &Cancellation,
         scope: PrivateScope,
+        storage: StagedStorage,
     ) -> ZipReadResult<Self> {
         // Reserve the entire file and both descriptors before acquisition.
+        let mut portable = storage == StagedStorage::PortableOnly;
+        let mut nfs = false;
         ledger.with_state(|s| s.reserve(scope.encrypted, len, 2))?;
         let mut directory: Option<AcquiredHandle<'_>> = None;
         let mut file: Option<AcquiredHandle<'_>> = None;
@@ -520,24 +609,38 @@ impl<'a> PrivateCiphertextFile<'a> {
             });
             let parent = directory.as_ref().unwrap();
             let s = namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || stat(parent))?;
-            if !trusted_dir(&s, uid) {
+            parent_identity = Some(Identity::of(&s));
+            if !portable {
+                ledger.with_state(|s| s.charge_category(RunCategory::StorageBackendOperations, 1))?;
+                let native = namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || {
+                    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+                    if super::output::file::FORCE_UNSUPPORTED.with(|f| f.get()) {
+                        return Err(std::io::ErrorKind::Unsupported.into());
+                    }
+                    native_policy::backend(parent.as_raw_fd())
+                });
+                match native {
+                    Ok(()) => {}
+                    // Outside the allow-list the spool falls back to portable storage unless the caller forbids it.
+                    Err(ReadFault::Io { error, .. }) if error.kind() == std::io::ErrorKind::Unsupported => {
+                        if storage == StagedStorage::NativeOnly {
+                            return Err(ReadFault::UnsupportedStorage);
+                        }
+                        portable = true;
+                    }
+                    Err(fault) => return Err(fault),
+                }
+            }
+            if !trusted_dir(&s, uid, portable) {
                 return Err(policy());
             }
-            parent_identity = Some(Identity::of(&s));
-            ledger.with_state(|s| s.charge_category(RunCategory::StorageBackendOperations, 1))?;
-            namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || native_policy::backend(parent.as_raw_fd()))
-                .map_err(|fault| match fault {
-                    ReadFault::Io { error, .. } if error.kind() == std::io::ErrorKind::Unsupported => {
-                        ReadFault::UnsupportedStorage
-                    }
-                    fault => fault,
-                })?;
+            nfs = portable && keeps_unlinked_link(parent.as_raw_fd());
             let acquired = create_private_at(
                 &ledger,
                 cancel,
                 scope,
                 &mut group,
-                PrivateCreation { parent, path, name: &mut name, tilde: false, unknown: &mut unknown_name },
+                PrivateCreation { parent, path, name: &mut name, tilde: false, unknown: &mut unknown_name, portable },
             )?;
             file =
                 Some(AcquiredHandle { file: Some(acquired), ledger, object: scope.object, encrypted: scope.encrypted });
@@ -550,9 +653,10 @@ impl<'a> PrivateCiphertextFile<'a> {
                 parent_identity.unwrap().dev,
                 uid,
                 &mut identity,
+                portable,
             )?;
             let s = namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || stat(parent))?;
-            if !trusted_dir(&s, uid) || !parent_identity.unwrap().matches(&s) {
+            if !trusted_dir(&s, uid, portable) || !parent_identity.unwrap().matches(&s) {
                 return Err(policy());
             }
             let mut s = std::mem::MaybeUninit::uninit();
@@ -562,15 +666,26 @@ impl<'a> PrivateCiphertextFile<'a> {
                 })
             })?;
             let s = unsafe { s.assume_init() };
-            if !identity.unwrap().matches(&s) || !trusted_file(&s, 1, uid) {
+            if !identity.unwrap().matches(&s) || !trusted_file(&s, 1, uid, portable) {
                 return Err(policy());
             }
             namespace(&ledger, cancel, scope, ReadIoOperation::Unlink, || {
                 cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr().cast(), 0) })
             })?;
             named = false;
+            // The spool name itself must be gone, and our descriptor unlinked: if another file was swapped in under
+            // the name, we removed that one and ours is still named. Cleanup then re-examines the name and removes
+            // it only if it is still our spool.
+            // Native storage needs no extra call: a zero link count on an allow-listed filesystem already proves it.
+            if portable
+                && namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || name_absent(parent, &name)).is_err()
+            {
+                named = true;
+                return Err(policy());
+            }
             let s = namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || stat(file.as_ref().unwrap()))?;
-            if !identity.unwrap().matches(&s) || !trusted_file(&s, 0, uid) {
+            if !identity.unwrap().held(&s, portable) || !unlinked(&s, uid, portable, nfs) {
+                named = true;
                 return Err(policy());
             }
             unlinked_verified = true;
@@ -588,7 +703,7 @@ impl<'a> PrivateCiphertextFile<'a> {
             let observation = match observation {
                 Err(fault) => Err(CleanupCause::Admission(fault)),
                 Ok(()) => observe_storage_parent(parent, path).map_err(CleanupCause::Io).and_then(|s| {
-                    if trusted_dir(&s, uid) && parent_identity.is_some_and(|id| id.matches(&s)) {
+                    if trusted_dir(&s, uid, portable) && parent_identity.is_some_and(|id| id.matches(&s)) {
                         parent_ok = true;
                         Ok(())
                     } else {
@@ -681,7 +796,7 @@ impl<'a> PrivateCiphertextFile<'a> {
                 let mut held_id = None;
                 checked(ReadIoOperation::Stat, &mut || {
                     let s = stat(held)?;
-                    if trusted_file(&s, 1, uid) {
+                    if trusted_file(&s, 1, uid, portable) {
                         held_id = Some(Identity::of(&s));
                     }
                     Ok(())
@@ -703,7 +818,7 @@ impl<'a> PrivateCiphertextFile<'a> {
                         )
                     })?;
                     let s = unsafe { s.assume_init() };
-                    same = id.matches(&s) && trusted_file(&s, 1, uid);
+                    same = id.matches(&s) && trusted_file(&s, 1, uid, portable);
                     Ok(())
                 })?;
                 if !same {
@@ -716,7 +831,8 @@ impl<'a> PrivateCiphertextFile<'a> {
                 let mut verified = false;
                 checked(ReadIoOperation::Stat, &mut || {
                     let s = stat(held)?;
-                    verified = id.matches(&s) && trusted_file(&s, 0, uid);
+                    verified =
+                        id.held(&s, portable) && unlinked(&s, uid, portable, nfs) && name_absent(parent, &name).is_ok();
                     Ok(())
                 })?;
                 if !verified {
@@ -814,6 +930,8 @@ impl<'a> PrivateCiphertextFile<'a> {
             uid,
             reserved: len,
             scope,
+            portable,
+            nfs,
         })
     }
     #[allow(clippy::result_large_err)]
@@ -836,6 +954,7 @@ impl<'a> PrivateCiphertextFile<'a> {
                 parent: OwnedObject::OutputParent,
                 stage: IoStage::Output,
             },
+            directory.storage,
         )
     }
     pub(super) fn into_output(mut self) -> (File, Identity, libc::uid_t) {
@@ -852,7 +971,10 @@ impl<'a> PrivateCiphertextFile<'a> {
             Some(cancel),
             || stat(self.file.as_ref().unwrap()),
         )?;
-        if !self.identity.matches(&s) || !trusted_file(&s, 0, self.uid) || s.st_size < 0 || s.st_size as u64 != self.len
+        if !self.identity.held(&s, self.portable)
+            || !unlinked(&s, self.uid, self.portable, self.nfs)
+            || s.st_size < 0
+            || s.st_size as u64 != self.len
         {
             return Err(policy());
         }
@@ -888,7 +1010,7 @@ impl<'a> PrivateCiphertextFile<'a> {
         let admitted = self.ledger.with_state(|s| s.charge_category(RunCategory::EmergencyCleanup, 1));
         let observation = if admitted.is_ok() {
             stat(&file).map_err(CleanupCause::Io).and_then(|s| {
-                if self.identity.matches(&s) && trusted_file(&s, 0, self.uid) {
+                if self.identity.held(&s, self.portable) && unlinked(&s, self.uid, self.portable, self.nfs) {
                     Ok(())
                 } else {
                     Err(CleanupCause::Policy("ciphertext identity changed"))
@@ -941,6 +1063,8 @@ pub(super) struct ResolvedTempDirectory {
     bytes: Vec<u8>,
     #[cfg(unix)]
     uid: libc::uid_t,
+    /// Native or portable spool storage, from the context's [`StagedStorage`].
+    pub(super) storage: StagedStorage,
     identity: LedgerIdentity,
 }
 impl ResolvedTempDirectory {
@@ -1003,7 +1127,7 @@ impl ResolvedTempDirectory {
             ledger.with_state(|s| s.release_capacity(Self::CAPACITY as u64));
             return Err(ReadFault::Allocation { capacity: Self::CAPACITY });
         }
-        let mut resolved = Self { bytes, uid: 0, identity: ledger.identity() };
+        let mut resolved = Self { bytes, uid: 0, identity: ledger.identity(), storage: StagedStorage::Auto };
         let result = (|| -> Result<(), ReadFault> {
             io::canceled(Some(cancel))?;
             charge(ResolveCharge::Attempt)?;

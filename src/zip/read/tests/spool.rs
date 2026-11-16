@@ -318,29 +318,29 @@ fn synthetic_owner_type_mode_and_link_policy() {
     let uid = unsafe { libc::geteuid() };
     s.st_uid = uid;
     s.st_mode = libc::S_IFDIR | 0o700;
-    assert!(spool::trusted_dir(&s, uid));
+    assert!(spool::trusted_dir(&s, uid, false));
     s.st_uid = uid.checked_add(1).unwrap_or(1);
-    assert!(!spool::trusted_dir(&s, uid));
+    assert!(!spool::trusted_dir(&s, uid, false));
     s.st_uid = 0;
     s.st_mode = libc::S_IFDIR | 0o1777;
-    assert!(spool::trusted_dir(&s, uid));
+    assert!(spool::trusted_dir(&s, uid, false));
     s.st_mode = libc::S_IFREG | 0o600;
-    assert!(!spool::trusted_dir(&s, uid));
+    assert!(!spool::trusted_dir(&s, uid, false));
     s.st_uid = uid;
     s.st_nlink = 1;
-    assert!(spool::trusted_file(&s, 1, uid));
-    assert!(!spool::trusted_file(&s, 0, uid));
+    assert!(spool::trusted_file(&s, 1, uid, false));
+    assert!(!spool::trusted_file(&s, 0, uid, false));
     for links in [2, libc::nlink_t::MAX] {
         s.st_nlink = links;
-        assert!(!spool::trusted_file(&s, 0, uid));
-        assert!(!spool::trusted_file(&s, 1, uid));
+        assert!(!spool::trusted_file(&s, 0, uid, false));
+        assert!(!spool::trusted_file(&s, 1, uid, false));
     }
     s.st_nlink = 0;
-    assert!(spool::trusted_file(&s, 0, uid));
+    assert!(spool::trusted_file(&s, 0, uid, false));
     s.st_mode |= 0o040;
-    assert!(!spool::trusted_file(&s, 0, uid));
+    assert!(!spool::trusted_file(&s, 0, uid, false));
     s.st_mode = libc::S_IFIFO | 0o600;
-    assert!(!spool::trusted_file(&s, 0, uid));
+    assert!(!spool::trusted_file(&s, 0, uid, false));
 }
 
 #[test]
