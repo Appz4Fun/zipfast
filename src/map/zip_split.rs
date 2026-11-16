@@ -33,6 +33,11 @@ const LOCATOR_LEN: usize = 20;
 const END64_LEN: usize = 56;
 /// The end record, a comment of up to 64 KiB, and the ZIP64 locator before it.
 const TAIL_MAX: u64 = (END_LEN + u16::MAX as usize + LOCATOR_LEN) as u64;
+/// How many indexes in a row may lack a volume, while looking for the last one through a source that keys on the
+/// index, before the last volume is taken to be missing.
+const MAX_GAP: u32 = 64;
+/// Bytes of the smallest data descriptor (no signature, 32-bit sizes).
+const DESCRIPTOR_MIN: u64 = 12;
 /// The spanning signature an Info-ZIP split set's first volume starts with.
 pub(super) const SPLIT_MARKER: &[u8; 4] = b"PK\x07\x08";
 
@@ -129,6 +134,8 @@ enum Step {
     Data { header: LocalHeader },
     /// Placing the data on the volumes it crosses.
     Pieces { header: LocalHeader, data: Pos, cursor: Pos, remaining: u64, pieces: Vec<ZipPiece> },
+    /// Checking the data descriptor after data that crosses a volume boundary.
+    Descriptor { header: LocalHeader, data: Pos, pieces: Vec<ZipPiece>, lead: bool },
     /// Gathering the WinZip AES salt and verifier.
     Prefix { header: LocalHeader, data: Pos, pieces: Vec<ZipPiece> },
 }
@@ -160,6 +167,7 @@ enum Phase {
         parser: Box<DirectoryParser<SplitEntry>>,
         first: u32,
         bases: Vec<u64>,
+        zip64: Option<Pos>,
     },
     Locals {
         entries: Vec<SplitEntry>,
@@ -184,6 +192,15 @@ pub(super) struct ZipSplitWalker {
     members: Vec<MapMember>,
     /// The first availability problem met: the map's end.
     end: Option<MapEnd>,
+    /// The volume count, when the input knows it (volumes in memory): the last one is then the `.zip`.
+    count: Option<u32>,
+    /// Indexes in a row without a volume while looking for the last one.
+    gap: u32,
+    /// Volumes held open, least recently used first, at most `handles` of them.
+    kept: Vec<u32>,
+    handles: u64,
+    /// Where each local header and the central directory start, in order: a member's data must end before the next.
+    starts: Vec<Pos>,
 }
 
 impl ZipSplitWalker {
@@ -201,6 +218,11 @@ impl ZipSplitWalker {
             at: Pos { vol: 0, off: 0 },
             members: Vec::new(),
             end: None,
+            count: None,
+            gap: 0,
+            kept: Vec::new(),
+            handles: options.limits.volume_handles,
+            starts: Vec::new(),
         }
     }
 
@@ -240,6 +262,9 @@ impl ZipSplitWalker {
 
     /// Asks the source for volume `index` under `name`. An empty volume counts as missing: no volume of a set is
     /// empty, and it lets a caller holding volumes in memory pass a missing one as an empty slice.
+    ///
+    /// The first name is never asked for again under another index: a first volume renamed to the last volume's name
+    /// (a one-volume set named `name.zip`) would otherwise come back as a second volume.
     fn open(
         &mut self,
         input: &mut dyn MapInput,
@@ -247,12 +272,15 @@ impl ZipSplitWalker {
         index: u32,
         name: OsString,
     ) -> Result<Avail, MapError> {
+        if index > 0 && name == self.first_name {
+            return Ok(Avail::Missing);
+        }
         self.charge(Resource::MetadataBytes, name.len() as u64, index)?;
         let request = VolumeRequest { index, expected: name };
         match input.open(&request, cx).map_err(|e| MapError::from_failure(index, e))? {
             Opened::Ready if input.len() > 0 => {
-                input.keep(index);
                 let len = input.len();
+                self.keep(input, index)?;
                 Ok(Avail::Ready(len))
             }
             Opened::Ready | Opened::Missing => Ok(Avail::Missing),
@@ -261,15 +289,49 @@ impl ZipSplitWalker {
         }
     }
 
-    /// Makes volume `index` current, asking for it under its name the first time.
+    /// Keeps the current volume open under `slot`. At most `volume_handles` volumes stay open: past that, the one
+    /// used least recently is closed, and asked for again if it is needed later.
+    fn keep(&mut self, input: &mut dyn MapInput, slot: u32) -> Result<(), MapError> {
+        if let Some(i) = self.kept.iter().position(|&k| k == slot) {
+            self.kept.remove(i);
+        } else {
+            if self.handles == 0 {
+                return Err(MapError::Limit { resource: Resource::VolumeHandles, limit: 0, attempted: 1 });
+            }
+            while self.kept.len() as u64 >= self.handles {
+                let oldest = self.kept.remove(0);
+                input.release(oldest);
+            }
+        }
+        self.kept.push(slot);
+        input.keep(slot);
+        Ok(())
+    }
+
+    /// Makes volume `index` current, asking for it under its name the first time, or again after it was closed.
     fn ensure(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>, index: u32) -> Result<Avail, MapError> {
         match self.vol(index) {
             Vol::Missing => Ok(Avail::Missing),
-            Vol::Present(len) => {
+            Vol::Present(len) if self.kept.contains(&index) => {
                 if !input.select(index) {
                     return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceContract))));
                 }
+                let i = self.kept.iter().position(|&k| k == index).expect("kept");
+                self.kept.remove(i);
+                self.kept.push(index);
                 Ok(Avail::Ready(len))
+            }
+            Vol::Present(len) => {
+                let name = split_volume_name(&self.first_name, index, self.last == Some(index));
+                match self.open(input, cx, index, name)? {
+                    Avail::Ready(again) if again != len => {
+                        Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceChanged))))
+                    }
+                    Avail::Missing => {
+                        Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceChanged))))
+                    }
+                    avail => Ok(avail),
+                }
             }
             Vol::Unknown => {
                 let name = split_volume_name(&self.first_name, index, self.last == Some(index));
@@ -351,9 +413,15 @@ impl ZipSplitWalker {
             match &mut self.phase {
                 Phase::Start => {
                     // The format detection left volume 0 open.
-                    input.keep(0);
                     self.set_vol(0, Vol::Present(input.len()))?;
-                    self.phase = Phase::Probe { index: 1, last_name: false };
+                    self.keep(input, 0)?;
+                    self.count = input.count();
+                    match self.count {
+                        // Volumes in memory: the last one is the `.zip`.
+                        Some(1) => self.enter_tail(0, true, None, false),
+                        Some(count) => self.phase = Phase::Probe { index: count - 1, last_name: true },
+                        None => self.phase = Phase::Probe { index: 1, last_name: false },
+                    }
                 }
                 &mut Phase::Probe { index, last_name } => {
                     if let Some(poll) = self.probe(input, cx, index, last_name)? {
@@ -421,6 +489,7 @@ impl ZipSplitWalker {
             Avail::Pending => Ok(Some(Poll::Pending)),
             Avail::Ready(len) => {
                 self.set_vol(index, Vol::Present(len))?;
+                self.gap = 0;
                 if last_name {
                     self.enter_tail(index, true, None, false);
                 } else {
@@ -433,20 +502,22 @@ impl ZipSplitWalker {
                 self.phase = Phase::Probe { index, last_name: true };
                 Ok(None)
             }
+            Avail::Missing if self.count.is_some() => Err(MapError::MissingDirectory { volume: index }),
             Avail::Missing => {
                 self.set_vol(index, Vol::Missing)?;
-                let before = index - 1;
-                match self.vol(before) {
-                    // A source that answers by index gives the last volume under its numbered name: it is the one
-                    // before the first index nothing answers.
-                    Vol::Present(_) => {
-                        let resume = index.checked_add(1).ok_or_else(|| malformed(index, "split ZIP volume count"))?;
-                        self.enter_tail(before, false, Some(resume), false);
-                        Ok(None)
-                    }
-                    // Two indexes in a row without a volume: the last one is not there.
-                    _ => Err(MapError::MissingDirectory { volume: before }),
+                self.gap += 1;
+                let resume = index.checked_add(1).ok_or_else(|| malformed(index, "split ZIP volume count"))?;
+                if self.gap == 1 && matches!(self.vol(index - 1), Vol::Present(_)) {
+                    // A source that answers by index gives the last volume under its numbered name: it may be the one
+                    // before the first index nothing answers. Its end record must say so.
+                    self.enter_tail(index - 1, false, Some(resume), false);
+                } else if self.gap > MAX_GAP {
+                    return Err(MapError::MissingDirectory { volume: index + 1 - self.gap });
+                } else {
+                    // Middle volumes may be missing: look further.
+                    self.phase = Phase::Probe { index: resume, last_name: false };
                 }
+                Ok(None)
             }
         }
     }
@@ -513,15 +584,22 @@ impl ZipSplitWalker {
             directory_disk: (dd16 != 0xffff).then_some(u32::from(dd16)),
             zip64: locator.map(|(record, _)| record),
         };
+        if !named && !plausible_end(record, &end, vol) {
+            // Not this volume's own end record (member data can look like one): look further.
+            let index = resume.expect("unnamed tails resume");
+            self.phase = Phase::Probe { index, last_name: false };
+            return Ok(None);
+        }
         // Bind the volume to its disk number.
         if last != vol {
-            if !named || last < vol {
+            if last < vol || self.count.is_some() {
                 return Err(malformed(vol, "split ZIP volume count does not match its end record"));
             }
             // A source that answers by name gave the last volume at the first index missing its numbered volume.
             self.set_vol(vol, Vol::Missing)?;
             self.set_vol(last, Vol::Present(len))?;
-            input.keep(last);
+            self.kept.retain(|&k| k != vol);
+            self.keep(input, last)?;
         }
         self.vols.truncate(last as usize + 1);
         self.last = Some(last);
@@ -557,7 +635,7 @@ impl ZipSplitWalker {
         let parser = DirectoryParser::spanned_at_eocd(total, eocd, self.limits, crate::crc32::hash, project)
             .map_err(|e| self.directory_error(e, end.last))?;
         self.parked = None;
-        self.phase = Phase::Directory { parser: Box::new(parser), first, bases };
+        self.phase = Phase::Directory { parser: Box::new(parser), first, bases, zip64: end.zip64 };
         Ok(())
     }
 
@@ -571,22 +649,35 @@ impl ZipSplitWalker {
         cx: &mut Context<'_>,
     ) -> Result<Option<Poll<MemberMap>>, MapError> {
         let last = self.last.expect("last volume known");
-        let Phase::Directory { parser, first, bases } = &mut self.phase else { unreachable!() };
+        let Phase::Directory { parser, first, bases, .. } = &mut self.phase else { unreachable!() };
         let first = *first;
         let limits = self.limits;
         let range = parser.next_read().map_err(|e| directory_error(e, &limits, last))?;
         let Some(range) = range else {
-            let Phase::Directory { parser, .. } = std::mem::replace(&mut self.phase, Phase::Start) else {
+            let Phase::Directory { parser, bases, zip64, .. } = std::mem::replace(&mut self.phase, Phase::Start) else {
                 unreachable!()
             };
             let found = parser.finish().map_err(|e| self.directory_error(e, last))?;
             if found.prefix_shift != 0 {
                 return Err(malformed(last, "central directory offset"));
             }
+            // The parser looks for the ZIP64 end record in the concatenation, where the locator's offset (relative to
+            // its own disk) does not apply: it must have taken the record the locator points at.
+            if let Some(record) = &found.zip64_end {
+                let at = zip64.filter(|at| at.vol >= first).map(|at| bases[(at.vol - first) as usize] + at.off);
+                if at != Some(record.source.start) {
+                    return Err(malformed(last, "ZIP64 end record"));
+                }
+            }
             let entries = found.entries;
             if entries.iter().any(|e| e.disk > last) {
                 return Err(malformed(last, "ZIP local header disk"));
             }
+            let mut starts: Vec<Pos> = entries.iter().map(|e| Pos { vol: e.disk, off: e.entry.local_at }).collect();
+            starts.push(Pos { vol: first, off: found.declaration.offset });
+            starts.sort_unstable_by_key(|p| (p.vol, p.off));
+            starts.dedup();
+            self.starts = starts;
             self.charge(Resource::Entries, entries.len() as u64, last)?;
             self.charge(Resource::Parts, entries.len() as u64, last)?;
             self.phase = Phase::Locals { entries, index: 0, step: Step::Open };
@@ -596,10 +687,11 @@ impl ZipSplitWalker {
         let i = bases.partition_point(|&base| base <= range.start) - 1;
         let vol = first + i as u32;
         let off = range.start - bases[i];
-        let Vol::Present(len) = self.vol(vol) else { unreachable!("directory volumes are present") };
-        if !input.select(vol) {
-            return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceContract))));
-        }
+        let len = match self.ensure(input, cx, vol)? {
+            Avail::Ready(len) => len,
+            Avail::Pending => return Ok(Some(Poll::Pending)),
+            Avail::Missing => return Err(MapError::MissingDirectory { volume: vol }),
+        };
         let want = (range.end - range.start).min(len - off).min(CHUNK as u64) as usize;
         let n = self.parked.take().unwrap_or(want);
         let count = match read(input, &self.usage, off, &mut self.buffer[..n], cx)
@@ -754,21 +846,53 @@ impl ZipSplitWalker {
                 }
                 remaining -= take;
                 if remaining == 0 {
-                    let aes = super::zip::aes_prefix(&entry);
-                    match aes {
-                        Some(prefix) if prefix as u64 <= entry.packed => {
-                            self.start_gather(data);
-                            self.set_step(Step::Prefix { header, data, pieces });
-                        }
-                        _ => self.push_member(&entry, Some(&header), None, pieces, true)?,
+                    // The data (and its descriptor) must end before the next local header or the directory. When it
+                    // does not, a volume it crosses is shorter than when it was written, or the directory is wrong.
+                    let data_end = pieces.last().map_or(data, |p| Pos { vol: p.volume, off: p.packed.end });
+                    let described = entry.flags & 0x0008 != 0;
+                    let end = Pos { vol: data_end.vol, off: data_end.off + if described { DESCRIPTOR_MIN } else { 0 } };
+                    let next = self.starts.iter().copied().find(|s| (s.vol, s.off) > (local_at.vol, local_at.off));
+                    if next.is_some_and(|next| self.after(end, next, last)) {
+                        return self.overrun(&pieces, disk);
+                    }
+                    let crossed = pieces.len() > 1 || pieces.first().is_some_and(|p| p.volume != disk);
+                    if described && crossed {
+                        // A descriptor leaves a few bytes of slack before the next record; its CRC pins the end. The
+                        // 4 bytes before it are read too: a descriptor's signature there means the data was placed 4
+                        // bytes too late.
+                        let lead = data_end.off >= 4;
+                        let from = if lead { Pos { vol: data_end.vol, off: data_end.off - 4 } } else { data_end };
+                        self.start_gather(from);
+                        self.set_step(Step::Descriptor { header, data, pieces, lead });
+                    } else {
+                        self.data_placed(&entry, header, data, pieces)?;
                     }
                     break;
                 }
                 if cursor.vol >= last {
-                    return Err(malformed(cursor.vol, "ZIP entry data past the end of the archive"));
+                    return self.overrun(&pieces, disk);
                 }
                 cursor = Pos { vol: cursor.vol + 1, off: 0 };
             },
+            Step::Descriptor { header, data, pieces, lead } => {
+                match self.gather(input, cx, if lead { 20 } else { 16 }, last)? {
+                    Gathered::Pending => {
+                        self.set_step(Step::Descriptor { header, data, pieces, lead });
+                        return Ok(Some(Poll::Pending));
+                    }
+                    // Not there to check.
+                    Gathered::Missing(_) | Gathered::Eof => self.data_placed(&entry, header, data, pieces)?,
+                    Gathered::Full => {
+                        let (before, descriptor) = self.scratch.split_at(if lead { 4 } else { 0 });
+                        let signed = descriptor.starts_with(SPLIT_MARKER);
+                        let early = !signed && before == SPLIT_MARKER;
+                        if early || le32(descriptor, if signed { 4 } else { 0 }) != entry.crc32 {
+                            return self.overrun(&pieces, disk);
+                        }
+                        self.data_placed(&entry, header, data, pieces)?;
+                    }
+                }
+            }
             Step::Prefix { header, data, pieces } => {
                 let prefix = super::zip::aes_prefix(&entry).expect("AES prefix");
                 match self.gather(input, cx, prefix, last)? {
@@ -788,6 +912,54 @@ impl ZipSplitWalker {
             }
         }
         Ok(None)
+    }
+
+    /// Whether position `a` lies after `b`. Either may lie at or past the end of its volume, which is the start of
+    /// the next one.
+    fn after(&self, a: Pos, b: Pos, last: u32) -> bool {
+        let canonical = |mut p: Pos| {
+            while p.vol < last {
+                match self.vol(p.vol) {
+                    Vol::Present(len) if p.off >= len => p = Pos { vol: p.vol + 1, off: p.off - len },
+                    _ => break,
+                }
+            }
+            (p.vol, p.off)
+        };
+        canonical(a) > canonical(b)
+    }
+
+    /// A member's data runs past the next record, or past the end of the last volume. Data that crosses a volume
+    /// boundary was placed by the volume lengths, so a volume it crosses was cut short: the map ends there, before
+    /// the member. Data within one volume means a wrong directory.
+    fn overrun(&mut self, pieces: &[ZipPiece], disk: u32) -> Result<Option<Poll<MemberMap>>, MapError> {
+        match pieces.first() {
+            Some(first) if pieces.len() > 1 || first.volume != disk => {
+                let volume = first.volume;
+                let Vol::Present(len) = self.vol(volume) else { unreachable!("pieces lie on present volumes") };
+                self.problem(MapEnd::Truncated { volume, offset: len });
+                Ok(Some(Poll::Ready(self.finish())))
+            }
+            _ => Err(malformed(disk, "ZIP entry data runs past the next record")),
+        }
+    }
+
+    /// Goes on once a member's data is placed: to its WinZip AES salt and verifier, or to the next member.
+    fn data_placed(
+        &mut self,
+        entry: &ZipEntry,
+        header: LocalHeader,
+        data: Pos,
+        pieces: Vec<ZipPiece>,
+    ) -> Result<(), MapError> {
+        match super::zip::aes_prefix(entry) {
+            Some(prefix) if prefix as u64 <= entry.packed => {
+                self.start_gather(data);
+                self.set_step(Step::Prefix { header, data, pieces });
+                Ok(())
+            }
+            _ => self.push_member(entry, Some(&header), None, pieces, true),
+        }
     }
 
     fn set_step(&mut self, next: Step) {
@@ -829,6 +1001,24 @@ impl ZipSplitWalker {
             }
             n -= room;
             pos = Pos { vol: pos.vol + 1, off: 0 };
+        }
+    }
+}
+
+/// Whether the end record `record` found at the end of volume `vol`, which did not answer to the last volume's name,
+/// is that volume's own: it states `vol` as its disk, and its directory (or ZIP64 end record) on that disk ends where
+/// the next record starts.
+fn plausible_end(record: &[u8], end: &End, vol: u32) -> bool {
+    if end.last != vol || end.directory_disk.is_some_and(|d| d > vol) {
+        return false;
+    }
+    match end.zip64 {
+        Some(at) => {
+            at.vol < vol || (at.vol == vol && at.off.checked_add(END64_LEN as u64 + LOCATOR_LEN as u64) <= Some(end.at))
+        }
+        None => {
+            let (size, offset) = (u64::from(le32(record, 12)), u64::from(le32(record, 16)));
+            end.directory_disk != Some(vol) || offset.checked_add(size) == Some(end.at)
         }
     }
 }

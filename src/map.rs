@@ -355,7 +355,8 @@ pub struct MapMember {
     pub name: Option<String>,
     pub is_dir: bool,
     pub unpacked_size: Option<u64>,
-    /// Packed bytes over the pieces seen.
+    /// Packed bytes: for RAR over the pieces seen; for ZIP the size the directory declares, even when only some
+    /// pieces are present (the pieces show what is).
     pub packed_size: u64,
     pub method: MapMethod,
     pub mapping: OutputMapping,
@@ -492,8 +493,8 @@ pub enum MapError {
     /// The builder already returned its result.
     AlreadyFinished,
     /// A split ZIP's end of central directory record, or a volume holding part of its central directory, is not
-    /// available: the volume is missing or cut short. `volume` is the zero-based index looked at; when the last
-    /// volume (the `.zip`) is missing, the first index at which no volume was found.
+    /// available: the volume is missing or cut short. `volume` is the zero-based index looked at: in memory, the last
+    /// slice; through a source whose last volume is missing, the first of the indexes in a row without a volume.
     MissingDirectory { volume: u32 },
 }
 
@@ -624,6 +625,13 @@ pub(crate) trait MapInput {
     fn select(&mut self, _slot: u32) -> bool {
         false
     }
+    /// Closes the volume kept under `slot`. Kept volumes otherwise stay open until the walk ends; walkers bound how
+    /// many they keep by [`ProgressiveLimits::volume_handles`].
+    fn release(&mut self, _slot: u32) {}
+    /// How many volumes the input holds, when it knows (volumes in memory).
+    fn count(&self) -> Option<u32> {
+        None
+    }
 }
 
 struct MemoryInput<'a> {
@@ -640,6 +648,18 @@ impl<'a> MemoryInput<'a> {
 }
 
 impl MapInput for MemoryInput<'_> {
+    fn count(&self) -> Option<u32> {
+        u32::try_from(self.volumes.len()).ok()
+    }
+    fn release(&mut self, slot: u32) {
+        if let Some(kept) = self.kept.get_mut(slot as usize) {
+            *kept = None;
+        }
+        if self.current_slot == Some(slot) {
+            self.current = None;
+            self.current_slot = None;
+        }
+    }
     fn keep(&mut self, slot: u32) {
         if let Some(old) = self.current_slot.replace(slot) {
             self.kept[old as usize] = None;
@@ -702,6 +722,14 @@ impl SourceInput {
 }
 
 impl MapInput for SourceInput {
+    fn release(&mut self, slot: u32) {
+        if self.current_slot == Some(slot) {
+            self.current = None;
+            self.current_slot = None;
+        } else if let Some(kept) = self.kept.get_mut(slot as usize) {
+            *kept = None;
+        }
+    }
     fn keep(&mut self, slot: u32) {
         self.current_slot = Some(slot);
         let slot = slot as usize;

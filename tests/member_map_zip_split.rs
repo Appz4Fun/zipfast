@@ -148,6 +148,12 @@ fn split_zip(entries: &[Entry], cuts: &[usize], layout: Layout) -> Set {
         out.extend(e.name.as_bytes());
         out.extend(&e.extra);
         out.extend(&e.payload);
+        if e.flags & 8 != 0 {
+            out.extend(b"PK\x07\x08");
+            out.extend(e.crc.to_le_bytes());
+            out.extend((e.payload.len() as u32).to_le_bytes());
+            out.extend(e.size.to_le_bytes());
+        }
     }
     let cd_abs = out.len();
     let last = cuts.len() as u32;
@@ -218,7 +224,7 @@ fn split_zip(entries: &[Entry], cuts: &[usize], layout: Layout) -> Set {
 fn data_abs(entries: &[Entry], index: usize, marker: bool) -> usize {
     let mut at = if marker { 4 } else { 0 };
     for e in &entries[..index] {
-        at += 30 + e.name.len() + e.extra.len() + e.payload.len();
+        at += 30 + e.name.len() + e.extra.len() + e.payload.len() + if e.flags & 8 != 0 { 16 } else { 0 };
     }
     at + 30 + entries[index].name.len() + entries[index].extra.len()
 }
@@ -618,8 +624,9 @@ fn a_missing_last_volume_is_a_typed_error() {
     let (entries, _) = several();
     let b_start = data_abs(&entries, 1, true);
     let set = split_zip(&entries, &[b_start + 1000, b_start + 2000], Layout::default());
+    // In memory the last slice is the `.zip`: here it holds no end record.
     let error = MemberMap::from_memory(&refs(&set.volumes[..2]), "set.z01", None).unwrap_err();
-    assert!(matches!(error, MapError::MissingDirectory { volume: 2 }), "{error:?}");
+    assert!(matches!(error, MapError::MissingDirectory { volume: 1 }), "{error:?}");
     // A cut last volume has no end record either.
     let mut cut = set.volumes.clone();
     let len = cut[2].len();
@@ -1176,4 +1183,197 @@ fn real_zipcrypto_set() {
         Err(ExtractFromError::WrongPassword)
     ));
     check_named_source("crypt", &volumes, &map);
+}
+
+// ---- Review regressions ----
+
+/// A file system: answers every request by name, as often as asked, and records the requests.
+struct Files {
+    files: Vec<(OsString, Vec<u8>)>,
+    asked: Arc<Mutex<Vec<VolumeRequest>>>,
+}
+
+impl VolumeSource for Files {
+    fn volume(&mut self, r: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        self.asked.lock().unwrap().push(r.clone());
+        Ok(match self.files.iter().find(|(n, _)| *n == r.expected) {
+            Some((_, data)) => VolumeAnswer::Ready(Box::new(Bytes {
+                index: r.index,
+                data: data.clone(),
+                chunk: 4096,
+                gate: None,
+                reads: Reads::default(),
+            })),
+            None => VolumeAnswer::Missing,
+        })
+    }
+}
+
+fn files_map(
+    files: Vec<(OsString, Vec<u8>)>,
+    options: MapOptions,
+) -> (Result<MemberMap, MapError>, Vec<(u32, OsString)>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = MapBuilder::new(Box::new(Files { files, asked: asked.clone() }), options);
+    let result = match builder.poll_map(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(result) => result,
+        Poll::Pending => unreachable!("files never wait"),
+    };
+    let asked = asked.lock().unwrap().iter().map(|r| (r.index, r.expected.clone())).collect();
+    (result, asked)
+}
+
+fn named(stem: &str, volumes: &[Vec<u8>]) -> Vec<(OsString, Vec<u8>)> {
+    stem_names(stem, volumes.len()).into_iter().zip(volumes.iter().cloned()).collect()
+}
+
+#[test]
+fn a_volume_cut_inside_member_data_is_never_a_complete_map() {
+    // Cut bytes from the end of every volume but the last: a member crossing that end would take its missing bytes
+    // from the next volume. The map must not claim to be complete with such spans.
+    let real = real_set("stored");
+    let (entries, _) = several();
+    let mut described = entries.clone();
+    described[1].flags = 8;
+    let b_start = data_abs(&described, 1, true);
+    let synthetic = split_zip(&described, &[b_start + 1000, b_start + 2000], Layout { marker: true, zip64: false });
+    for (stem, volumes) in [("stored", real), ("set", synthetic.volumes)] {
+        for v in 0..volumes.len() - 1 {
+            for cut in [1, 4, 5, 13, 100, 1000] {
+                let mut cut_set = volumes.clone();
+                let len = cut_set[v].len();
+                cut_set[v].truncate(len - cut);
+                let Ok(map) = MemberMap::from_memory(&refs(&cut_set), format!("{stem}.z01"), None) else { continue };
+                for member in map.members.iter().filter(|m| m.complete && m.mapping == OutputMapping::Direct) {
+                    let bytes = stream(&cut_set, member);
+                    assert_eq!(
+                        Some(crc32fast::hash(&bytes)),
+                        member.checks.unwrap().crc32,
+                        "{stem}: volume {v} cut by {cut}: {:?} listed complete with wrong spans",
+                        member.name
+                    );
+                }
+                assert!(!map.complete, "{stem}: volume {v} cut by {cut}");
+            }
+        }
+    }
+    // Cutting 100 bytes from the real set's first volume ends the map at that volume, before a.bin.
+    let mut cut_set = real_set("stored");
+    let len = cut_set[0].len();
+    cut_set[0].truncate(len - 100);
+    let map = MemberMap::from_memory(&refs(&cut_set), "stored.z01", None).unwrap();
+    assert_eq!(map.end, MapEnd::Truncated { volume: 0, offset: len as u64 - 100 });
+    assert!(map.members.is_empty());
+}
+
+#[test]
+fn adjacent_missing_middle_volumes_give_a_partial_map() {
+    let (entries, golds) = several();
+    let b_start = data_abs(&entries, 1, true);
+    let empty_local = data_abs(&entries, 2, true) - 30 - "empty.bin".len();
+    let set = split_zip(&entries, &[b_start + 1000, b_start + 2000, empty_local], Layout::default());
+    let mut holed = set.volumes.clone();
+    holed[1] = Vec::new();
+    holed[2] = Vec::new();
+    let map = map(&holed);
+    assert!(!map.complete);
+    assert_eq!(map.end, MapEnd::MissingVolume { volume: 1 });
+    assert_eq!(map.volumes, 4);
+    assert_eq!(stream(&holed, &map.members[3]), golds[3]);
+    // The declared packed size stays; the pieces show what is present.
+    assert_eq!(map.members[1].packed_size, 4000);
+    assert!(map.members[1].pieces.iter().map(|p| p.packed.end - p.packed.start).sum::<u64>() < 4000);
+    // Sources keyed on the index and on names give the same map.
+    let sparse: Vec<_> = holed.iter().map(|v| (!v.is_empty()).then(|| v.clone())).collect();
+    for by_name in [false, true] {
+        assert_eq!(drive(&mut source(&sparse, by_name, false)).unwrap(), map, "by name: {by_name}");
+    }
+}
+
+#[test]
+fn a_one_volume_set_named_zip_is_not_asked_for_twice() {
+    let gold = data(3000, 12);
+    let set = split_zip(&[Entry::stored("one.bin", &gold)], &[], Layout { marker: true, ..Layout::default() });
+    let (result, asked) = files_map(vec![("sp.zip".into(), set.volumes[0].clone())], MapOptions::new("sp.zip"));
+    let map = result.unwrap();
+    assert_eq!(map.volumes, 1);
+    assert_eq!(stream(&set.volumes, &map.members[0]), gold);
+    assert!(asked.iter().all(|(i, n)| *i == 0 || n != "sp.zip"), "{asked:?}");
+}
+
+#[test]
+fn a_zip64_record_planted_where_the_locator_offset_points_in_the_concatenation_is_rejected() {
+    // Two volumes, the directory crossing into the second, so the parser's concatenation starts at disk 0. The
+    // locator's offset is relative to disk 1; read as an offset into the concatenation it lands in a.bin's data,
+    // where a ZIP64 end record declaring an empty directory is planted.
+    let build = |payload: &[u8]| {
+        let entries = [Entry::stored("a.bin", payload), Entry::stored("b.bin", &data(50, 2))];
+        let cd = data_abs(&entries, 1, false) + 50;
+        split_zip(&entries, &[cd + 80], Layout { marker: false, zip64: true })
+    };
+    let mut payload = data(3000, 1);
+    let set = build(&payload);
+    assert_eq!(set.directory.0, 0);
+    let zip = &set.volumes[1];
+    let locator = zip.len() - 22 - 20;
+    let record_off = u64::from_le_bytes(zip[locator + 8..locator + 16].try_into().unwrap()) as usize;
+    let locator_v = set.volumes[0].len() + locator;
+    let at = record_off - 35; // into a.bin's data
+    let mut fake = b"PK\x06\x06".to_vec();
+    fake.extend(((locator_v - record_off - 12) as u64).to_le_bytes());
+    fake.extend([45, 0, 45, 0]);
+    fake.extend(1u32.to_le_bytes());
+    fake.extend(0u32.to_le_bytes());
+    fake.extend([0; 24]); // no entries, size 0
+    fake.extend((record_off as u64).to_le_bytes()); // the directory "starts" at the fake record
+    payload[at..at + 56].copy_from_slice(&fake);
+    let planted = build(&payload);
+    let error = MemberMap::from_memory(&refs(&planted.volumes), "set.z01", None).unwrap_err();
+    assert!(matches!(error, MapError::Malformed { .. }), "{error:?}");
+    assert!(error.to_string().contains("ZIP64 end record"), "{error}");
+}
+
+#[test]
+fn an_end_record_planted_in_member_data_does_not_end_the_search() {
+    // Volume 1 is missing; a source keyed on the index answers Missing for it under both names, so the walker
+    // looks at volume 0's tail, where a.bin's data ends with something shaped like an end record of disk 3.
+    let a = {
+        let mut a = data(1500, 2);
+        let n = a.len();
+        a[n - 22..].copy_from_slice(&[b"PK\x05\x06".as_slice(), &[3, 0, 3, 0, 1, 0, 1, 0], &[0; 10]].concat());
+        a
+    };
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", &data(4000, 3)), Entry::stored("c.bin", b"c")];
+    let b_start = data_abs(&entries, 1, false);
+    let set = split_zip(&entries, &[b_start - 35, b_start + 1000, b_start + 2000], Layout::default());
+    assert!(set.volumes[0].ends_with(&a[a.len() - 22..]));
+    let mut sparse: Vec<_> = set.volumes.iter().cloned().map(Some).collect();
+    sparse[1] = None;
+    let map = drive(&mut source(&sparse, false, false)).unwrap();
+    assert_eq!(map.volumes, 4);
+    assert_eq!(map.end, MapEnd::MissingVolume { volume: 1 });
+    assert_eq!(stream(&set.volumes, &map.members[0]), a);
+}
+
+#[test]
+fn kept_volumes_are_bounded_by_the_volume_handle_budget() {
+    let (entries, _) = several();
+    let b_start = data_abs(&entries, 1, true);
+    let empty_local = data_abs(&entries, 2, true) - 30 - "empty.bin".len();
+    let set =
+        split_zip(&entries, &[b_start + 1000, b_start + 2000, empty_local], Layout { marker: true, zip64: false });
+    let expected = map(&set.volumes);
+    let mut options = MapOptions::new("set.z01");
+    options.limits.volume_handles = 1;
+    let (result, asked) = files_map(named("set", &set.volumes), options.clone());
+    assert_eq!(result.unwrap(), expected);
+    // With one handle, volumes closed while finding the last one are asked for again.
+    assert!(asked.len() > 5, "{asked:?}");
+    options.limits.volume_handles = 0;
+    let (result, _) = files_map(named("set", &set.volumes), options);
+    assert!(matches!(result, Err(MapError::Limit { resource: zipfast::progressive::Resource::VolumeHandles, .. })));
+    // The default keeps every volume of a small set open: each is asked for once.
+    let (result, asked) = files_map(named("set", &set.volumes), MapOptions::new("set.z01"));
+    assert_eq!(result.unwrap(), expected);
+    assert_eq!(asked.len(), 5, "{asked:?}");
 }

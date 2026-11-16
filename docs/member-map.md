@@ -69,7 +69,8 @@ salt in every header costs one derivation.
 
 `MapMember` carries the ordinal, `raw_name` (bytes as stored; for ZIP, the UTF-8 bytes of the decoded name) and
 `name` (decoded, when it decodes), `is_dir`,
-`unpacked_size`, `packed_size` (over the pieces seen), `method` (`Stored` or `Compressed { id }` with the format's
+`unpacked_size`, `packed_size` (RAR: over the pieces seen; ZIP: the size the directory declares, also when only some
+pieces are present), `method` (`Stored` or `Compressed { id }` with the format's
 method number), `mapping`, `solid`, `encrypted`, `cipher`, final `checks` (once the final piece is seen), `mtime`,
 `dos_time` (RAR 4.x: the header's DOS date and time as stored, also when it is not a valid date and `mtime` is None;
 None for other formats), `attributes`, `unix_mode` and `complete`, and its `pieces`.
@@ -108,18 +109,27 @@ Volumes are passed in disk order, `.z01` first and `.zip` last, and `MapPiece::v
 - `from_memory(&[&z01, &z02, ..., &zip], "name.z01", None)`. The last slice must be the `.zip`: its end record's
   disk number must equal the slice count minus one, or the map fails `Malformed` ("volume count does not match its
   end record"). Pass a missing middle volume as an empty slice (no volume of a set is empty, so an empty volume
-  counts as missing). Without the `.zip` there is no end record: `MissingDirectory { volume }` with `volume` the
-  index after the last slice.
+  counts as missing). Middle volumes are opened as needed; the last slice is searched for the end record, and when it
+  holds none (no `.zip` was passed, or it is cut) the map fails `MissingDirectory { volume }` with `volume` the last
+  slice's index.
 - `MapBuilder` with `MapOptions::new("name.z01")`. The last volume's index is unknown until its end record is read,
   so volumes are asked for in order with names derived from the first name: the extension becomes `z02`, `z03`, ...
   (`z100` after `z99`), or `zip` for the last volume (upper case when the first name's extension is). Volume `i` is
   asked for as `name.z{i+1}`; when the source answers `Missing`, it is asked for again, at the same index, as
   `name.zip`. A source that keys on names thus answers `name.zip` the second time; one that keys on the index
   answers the last volume the first time (under its numbered name) and `Missing` twice for the next index, and the
-  volume before is then searched for the end record. Each volume is asked for once and kept open while the walk
-  needs it. A source that keys on names and lacks a middle volume answers `name.zip` at that index: the volume is
-  then bound to the disk number its end record states, and the volumes in between are asked for later by name.
+  volume before is then searched for the end record. That volume is taken as the last only when its end record
+  states its own index as the disk and its directory (or ZIP64 end record) ends where the end records start, so
+  member data shaped like an end record does not stop the search; otherwise, and across indexes missing in a row
+  (missing middle volumes), the search goes on, until 64 indexes in a row lack a volume, which is
+  `MissingDirectory { volume }` with the first of them. A source that keys on names and lacks a middle volume
+  answers `name.zip` at that index: the volume is then bound to the disk number its end record states, and the
+  volumes in between are asked for later by name. The first name is never asked for again at another index, so a
+  one-volume set starting with the spanning signature and named `name.zip` maps as one volume.
   `MemberReader` asks for a split set's volumes with the same names.
+- Volumes stay open for the walk, at most `ProgressiveLimits::volume_handles` of them (64 by default; 0 is a
+  `Limit` failure). Past that the volume used least recently is closed and asked for again when it is needed, which
+  must give the same length (`Source` failure otherwise).
 
 The walk reads the last volume's tail for the end record (its last 42 bytes, then up to a 64 KiB comment), the
 ZIP64 end record when the directory's disk is only stated there, then the central directory over the volumes that
@@ -137,13 +147,21 @@ Missing and cut volumes:
 |---|---|
 | a middle volume is missing (`Missing`, or an empty slice) | the walk goes on; `end` is `MissingVolume { volume }` for the first one met. A member whose local header is on it (or runs into it) is listed without pieces, `cipher: None`, `checks: None`, `complete: false`; one whose data runs into it lists its pieces before it and is `complete: false` |
 | a volume before the last ends before a local header on it | `Truncated { volume, offset }` at that header, and the walk stops; members before it are listed |
+| a volume before the last is cut inside the data of a member that crosses its end | `Truncated { volume, offset }` with the first volume the member's data crosses and its length, and the walk stops before that member (see below) |
 | the last volume is missing, or cut so that its end record is gone | `MapError::MissingDirectory { volume }` |
 | a volume holding part of the central directory or the ZIP64 end record is missing | `MapError::MissingDirectory { volume }` |
 
-Pieces are placed using each volume's length, so a volume before the last that is cut inside member data shifts the
-data of a member crossing its end; the member's checks catch it when it is read. `volumes` is the set's volume count
+Pieces are placed using each volume's length, so a volume before the last that is cut inside member data would shift
+the data of a member crossing its end. The placement is checked against the directory: a member's data, plus 12
+bytes when it has a data descriptor, must end at or before the next local header or the central directory in disk
+and offset order. For data that crosses a boundary and has a data descriptor, the descriptor is read: its CRC must be
+the member's, and a descriptor signature in the 4 bytes before it means the data was placed 4 bytes late. A failed
+check on data that crosses a boundary is the cut above (a member is never listed `complete` with shifted spans);
+on data within one volume it is a wrong directory, `Malformed`. (Data that genuinely ends with the bytes
+`PK\x07\x08`, crosses a boundary and has a descriptor without signature is reported as cut.) `volumes` is the set's volume count
 from the end record. Hostile disk numbers (past the last volume) and offsets (past the end of the last volume, or a
-directory offset that disagrees with the directory's position) are `Malformed`; a local header offset past the end
+directory offset that disagrees with the directory's position, a ZIP64 end record other than the one the locator
+points at) are `Malformed`; a local header offset past the end
 of an earlier volume reads as that volume being cut. A split set's `.zip` mapped on its own is `Unsupported`.
 
 ## Single-volume maps

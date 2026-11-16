@@ -378,7 +378,8 @@ pub(super) fn zip_member(
         name: Some(entry.name.clone()),
         is_dir: entry.is_dir(),
         unpacked_size: size,
-        packed_size: stream,
+        // The declared size; the pieces show what is present.
+        packed_size: entry.packed,
         method: if stored { MapMethod::Stored } else { MapMethod::Compressed { id: method_id } },
         mapping,
         solid: false,
