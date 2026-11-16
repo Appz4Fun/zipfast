@@ -2002,11 +2002,12 @@ fn complete_native_bookkeeping_does_not_grow_with_inventory_times_steps() {
     assert_eq!(opened, VOLUMES);
     assert_eq!(std::fs::read(out.join("member.bin")).unwrap(), data);
 
-    // The same run is still charged: a small ceiling stops it.
+    // The same run is still charged: a small ceiling stops it. Admission is incremental, so the whole run costs
+    // well under 1 MiB with short temporary paths; 64 KiB stops it wherever the temporary directory lives.
     let out = tmp.path().join("small");
     std::fs::create_dir_all(&out).unwrap();
     let mut o = complete_native_options(&out, VOLUMES);
-    o.limits.source_bookkeeping = 1 << 20;
+    o.limits.source_bookkeeping = 64 << 10;
     let mut s = ProgressiveSession::new(Box::new(NativeSet::new(paths)), o).unwrap();
     let failure = drive_complete(&mut s, |_| {}).expect("limit");
     assert!(matches!(failure.kind, FailureKind::Limit { resource: Resource::SourceBookkeeping, .. }), "{failure:?}");
