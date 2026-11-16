@@ -96,7 +96,12 @@ impl HeaderParser {
                 if flags & 8 != 0 {
                     normalized |= MHFL_SOLID;
                 }
-                let main = MainHeader { flags: normalized, volume_number: 0, rar4_flags: Some(flags) };
+                let main = MainHeader {
+                    flags: normalized,
+                    volume_number: 0,
+                    rar4_flags: Some(flags),
+                    ..MainHeader::default()
+                };
                 self.rar4_main = Some(main.clone());
                 Block::Main(main)
             }
@@ -231,6 +236,8 @@ impl HeaderParser {
             let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
             let mut mtime = dos_timestamp(dos);
             let mut nanos = 0;
+            let mut resolution = 2_000_000_000;
+            let mut other = [None; 2];
             if flags & 0x1000 != 0 {
                 let times = fields.u16()?;
                 for index in 0..4 {
@@ -252,9 +259,17 @@ impl HeaderParser {
                     if fraction >= 10_000_000 {
                         return Err(Error::Corrupt("RAR4 extended time").into());
                     }
+                    // Each omitted fraction byte coarsens the stored 100 ns step by 256.
+                    let step = if count == 0 { 1_000_000_000 } else { 100u32 << ((3 - count) * 8) };
                     if index == 0 {
                         mtime = seconds;
                         nanos = fraction * 100;
+                        resolution = step;
+                    } else if index < 3
+                        && let Some(seconds) = seconds
+                    {
+                        other[index - 1] =
+                            Some(crate::rar5::RarTime { seconds, nanos: fraction * 100, resolution_nanos: step });
                     }
                 }
             }
@@ -269,6 +284,12 @@ impl HeaderParser {
             if fields.at != bytes.len() && !self.map_lenient && bytes[2] != 0x7a {
                 return Err(Error::Unsupported("RAR4 trailing header fields".into()).into());
             }
+            let mut sub_data = Vec::new();
+            if bytes[2] == 0x7a && self.catalogue && self.usage.is_none() {
+                let data = &bytes[fields.at..];
+                sub_data.try_reserve_exact(data.len()).map_err(|_| FileParseError::Allocation)?;
+                sub_data.extend_from_slice(data);
+            }
             let directory = flags & 0xe0 == 0xe0;
             let normalized_host = match host {
                 0..=2 => 0,
@@ -277,6 +298,8 @@ impl HeaderParser {
             };
             let header = FileHeader {
                 format: RarFormat::Rar4,
+                service: bytes[2] == 0x7a,
+                sub_data,
                 rar4: Some(Rar4Metadata { flags, host, method, unpack_version: version, dos_time: dos, salt }),
                 block_flags: (u64::from(flags & 1 != 0) * HFL_SPLIT_BEFORE)
                     | (u64::from(flags & 2 != 0) * HFL_SPLIT_AFTER),
@@ -287,6 +310,9 @@ impl HeaderParser {
                 attributes,
                 mtime,
                 mtime_nanos: nanos,
+                mtime_resolution: if mtime.is_some() { resolution } else { 0 },
+                ctime: other[0],
+                atime: other[1],
                 crc32: Some(crc),
                 algorithm: 0,
                 method: method.checked_sub(0x30).unwrap_or(255),

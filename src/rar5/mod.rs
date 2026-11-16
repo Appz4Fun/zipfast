@@ -55,6 +55,10 @@ pub const HFL_SPLIT_AFTER: u64 = 0x0010;
 pub const MHFL_VOLUME: u64 = 0x0001;
 pub const MHFL_VOLNUMBER: u64 = 0x0002;
 pub const MHFL_SOLID: u64 = 0x0004;
+pub const MHFL_PROTECT: u64 = 0x0008;
+pub const MHFL_LOCK: u64 = 0x0010;
+/// Main header extra record: the original archive name and time.
+pub const MHEXTRA_METADATA: u64 = 0x02;
 
 pub const FHFL_DIRECTORY: u64 = 0x0001;
 pub const FHFL_UTIME: u64 = 0x0002;
@@ -68,6 +72,7 @@ pub const FHEXTRA_HASH: u64 = 0x02;
 pub const FHEXTRA_HTIME: u64 = 0x03;
 pub const FHEXTRA_VERSION: u64 = 0x04;
 pub const FHEXTRA_REDIR: u64 = 0x05;
+pub const FHEXTRA_SUBDATA: u64 = 0x07;
 
 /// A cursor over one header's bytes. Every read is checked; running off the end is corruption, since the header's
 /// own size said the bytes were there.
@@ -146,6 +151,21 @@ pub struct MainHeader {
     pub volume_number: u64,
     /// The RAR4 main header's own flags (`MHD_*`), before normalization into `flags`. None for RAR 5.0.
     pub rar4_flags: Option<u16>,
+    /// RAR 5.0 only: the archive name stored by `-ams` (the metadata record of the main header extra area).
+    pub original_name: Option<Vec<u8>>,
+    /// RAR 5.0 only: the archive creation time stored by `-ams`.
+    pub original_time: Option<RarTime>,
+}
+
+/// A timestamp as a header stores it. `resolution_nanos` is the step the stored form can express: 2 s for an MS-DOS
+/// time, 1 s for a Unix time, 100 ns for a FILETIME, 1 ns for a Unix time with nanoseconds, and for a RAR 4.x
+/// extended time 1 s or 100 ns scaled by the fraction bytes it omits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RarTime {
+    /// Seconds since 1970. RAR 4.x times are local wall-clock times projected as UTC.
+    pub seconds: i64,
+    pub nanos: u32,
+    pub resolution_nanos: u32,
 }
 
 /// RAR4 main header flag: volumes are named `NAME.partN.rar` rather than `NAME.rar`, `NAME.r00`, ...
@@ -240,6 +260,10 @@ pub struct FileHeader {
     /// seconds since 1970, from the header or the high precision time record
     pub mtime: Option<i64>,
     pub mtime_nanos: u32,
+    /// The step `mtime` can express, in nanoseconds; see [`RarTime`]. Zero without an mtime.
+    pub mtime_resolution: u32,
+    pub ctime: Option<RarTime>,
+    pub atime: Option<RarTime>,
     pub crc32: Option<u32>,
     pub blake2sp: Option<[u8; 32]>,
     /// 0 for RAR 5.0's algorithm, 1 for RAR 7.0's
@@ -256,6 +280,9 @@ pub struct FileHeader {
     pub redirection: Option<Redirection>,
     /// set on an older revision of a file kept alongside the current one
     pub version: Option<u64>,
+    /// A service header's SubData: the stream name of an `STM` header, the `Protect+` tag of a RAR 4.x `RR`, and
+    /// so on. Empty for file headers.
+    pub sub_data: Vec<u8>,
 }
 
 impl FileHeader {
@@ -452,6 +479,7 @@ fn parse_file_impl(
     f.attributes = c.vint()?;
     if f.file_flags & FHFL_UTIME != 0 {
         f.mtime = Some(i64::from(c.u32()?));
+        f.mtime_resolution = 1_000_000_000;
     }
     if f.file_flags & FHFL_CRC32 != 0 {
         f.crc32 = Some(c.u32()?);
@@ -598,7 +626,12 @@ fn parse_file_extra(
                     other => Redirection::Unknown(other),
                 });
             }
-            // version, owner, service data and anything newer are skipped
+            FHEXTRA_SUBDATA if f.service && catalogue => {
+                let data = r.bytes(r.remaining())?;
+                f.sub_data.try_reserve_exact(data.len()).map_err(|_| FileParseError::Allocation)?;
+                f.sub_data.extend_from_slice(data);
+            }
+            // owner, service data of other passes and anything newer are skipped
             _ => {}
         }
     }
@@ -611,28 +644,86 @@ const FILETIME_TO_UNIX: i64 = 11_644_473_600;
 fn parse_htime(f: &mut FileHeader, r: &mut Cursor<'_>) -> Result<()> {
     let flags = r.vint()?;
     let unix = flags & 1 != 0;
-    let read = |r: &mut Cursor<'_>| -> Result<(i64, u32)> {
+    let read = |r: &mut Cursor<'_>| -> Result<RarTime> {
         if unix {
-            Ok((i64::from(r.u32()?), 0))
+            Ok(RarTime { seconds: i64::from(r.u32()?), nanos: 0, resolution_nanos: 1_000_000_000 })
         } else {
             let ticks = r.u64()?;
-            let secs = (ticks / 10_000_000) as i64 - FILETIME_TO_UNIX;
-            Ok((secs, ((ticks % 10_000_000) * 100) as u32))
+            let seconds = (ticks / 10_000_000) as i64 - FILETIME_TO_UNIX;
+            Ok(RarTime { seconds, nanos: ((ticks % 10_000_000) * 100) as u32, resolution_nanos: 100 })
         }
     };
     let mtime = if flags & 2 != 0 { Some(read(r)?) } else { None };
-    if flags & 4 != 0 {
-        read(r)?;
-    }
-    if flags & 8 != 0 {
-        read(r)?;
-    }
-    if let Some((secs, nanos)) = mtime {
-        f.mtime = Some(secs);
-        f.mtime_nanos = nanos;
+    let mut ctime = if flags & 4 != 0 { Some(read(r)?) } else { None };
+    let mut atime = if flags & 8 != 0 { Some(read(r)?) } else { None };
+    if let Some(time) = mtime {
+        f.mtime = Some(time.seconds);
+        f.mtime_nanos = time.nanos;
+        f.mtime_resolution = time.resolution_nanos;
         if unix && flags & 0x10 != 0 {
             f.mtime_nanos = r.u32()?.min(999_999_999);
+            f.mtime_resolution = 1;
         }
     }
+    // The nanoseconds of the other times follow in the same order. They are listing metadata only, so a record
+    // too short to hold them keeps the whole seconds.
+    if unix && flags & 0x10 != 0 {
+        for time in [&mut ctime, &mut atime].into_iter().flatten() {
+            let Ok(nanos) = r.u32() else { break };
+            time.nanos = nanos.min(999_999_999);
+            time.resolution_nanos = 1;
+        }
+    }
+    f.ctime = ctime;
+    f.atime = atime;
     Ok(())
+}
+
+/// The original archive name and time from a RAR 5.0 main header extra area. Listing metadata only: a record that
+/// does not parse is ignored rather than failing the archive.
+pub(crate) fn main_metadata(extra: &[u8]) -> (Option<Vec<u8>>, Option<RarTime>) {
+    let mut c = Cursor::new(extra);
+    while c.remaining() > 0 {
+        let Ok(size) = c.vsize() else { break };
+        let Ok(record) = c.bytes(size) else { break };
+        let mut r = Cursor::new(record);
+        if r.vint().ok() != Some(MHEXTRA_METADATA) {
+            continue;
+        }
+        let parse = |r: &mut Cursor<'_>| -> Result<(Option<Vec<u8>>, Option<RarTime>)> {
+            let flags = r.vint()?;
+            let name = if flags & 1 != 0 {
+                let len = r.vsize()?;
+                let bytes = r.bytes(len)?;
+                // UnRAR stops at a NUL inside the stored name.
+                Some(bytes.split(|&b| b == 0).next().unwrap_or_default().to_vec())
+            } else {
+                None
+            };
+            let time = if flags & 2 == 0 {
+                None
+            } else if flags & 4 != 0 {
+                if flags & 8 != 0 {
+                    let nanos = r.u64()?;
+                    Some(RarTime {
+                        seconds: (nanos / 1_000_000_000) as i64,
+                        nanos: (nanos % 1_000_000_000) as u32,
+                        resolution_nanos: 1,
+                    })
+                } else {
+                    Some(RarTime { seconds: i64::from(r.u32()?), nanos: 0, resolution_nanos: 1_000_000_000 })
+                }
+            } else {
+                let ticks = r.u64()?;
+                Some(RarTime {
+                    seconds: (ticks / 10_000_000) as i64 - FILETIME_TO_UNIX,
+                    nanos: ((ticks % 10_000_000) * 100) as u32,
+                    resolution_nanos: 100,
+                })
+            };
+            Ok((name, time))
+        };
+        return parse(&mut r).unwrap_or_default();
+    }
+    (None, None)
 }

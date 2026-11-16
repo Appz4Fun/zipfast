@@ -553,7 +553,8 @@ impl HeaderParser {
                 let flags = f.vint().map_err(|e| self.parse_fault(e))?;
                 let volume_number =
                     if flags & MHFL_VOLNUMBER != 0 { f.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
-                Block::Main(MainHeader { flags, volume_number, rar4_flags: None })
+                let (original_name, original_time) = super::main_metadata(extra);
+                Block::Main(MainHeader { flags, volume_number, rar4_flags: None, original_name, original_time })
             }
             HEAD_FILE | HEAD_SERVICE => {
                 let (h, crypt, wire) = parse_file_impl(&head, fields, extra, self.catalogue, self.usage.as_ref())

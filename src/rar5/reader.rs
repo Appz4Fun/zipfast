@@ -326,6 +326,8 @@ pub struct Volume {
     header_key: Option<crate::crypto::Rar5Keys>,
     parser: Option<super::framing::HeaderParser>,
     format: RarFormat,
+    /// Bytes before the signature: a self-extracting module or other prefix.
+    sfx: u64,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
@@ -459,6 +461,10 @@ impl Volume {
             header_key: None,
             parser: None,
             format,
+            sfx: next.saturating_sub(match format {
+                RarFormat::Rar5 => SIGNATURE.len(),
+                RarFormat::Rar4 => SIGNATURE_V4.len(),
+            } as u64),
         };
         match vol.next_block_impl(detailed, budget, true)? {
             Some((Block::Main(m), _, _)) => vol.main = m,
@@ -524,6 +530,10 @@ impl Volume {
 
     pub(super) fn encrypted_headers(&self) -> bool {
         self.header_key.is_some()
+    }
+
+    pub(super) fn sfx_size(&self) -> u64 {
+        self.sfx
     }
 
     pub(super) fn into_catalogue_file(self) -> File {
@@ -773,6 +783,7 @@ mod tests {
             header_key: None,
             parser: None,
             format: RarFormat::Rar5,
+            sfx: 0,
         };
         let (send, recv) = sync_channel(1);
         let (spare, _) = channel();
@@ -809,6 +820,7 @@ mod tests {
             header_key: None,
             parser: None,
             format: RarFormat::Rar5,
+            sfx: 0,
         };
         let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
         else {
