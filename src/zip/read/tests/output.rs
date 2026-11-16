@@ -2542,6 +2542,10 @@ fn public_stdout_preparation_errors_snapshot_final_source_refusal_and_unresolved
         if scenario == 0 {
             source.as_file().set_len(source.as_file().metadata().unwrap().len() - 1).unwrap();
         }
+        if scenario == 2 {
+            // An unsupported spool backend is refused only under NativeOnly; Auto would fall back to portable.
+            context.temp.as_mut().unwrap().storage = StagedStorage::NativeOnly;
+        }
         let closes = Rc::new(Cell::new(0));
         let seen = closes.clone();
         let stats = Rc::new(Cell::new(0));

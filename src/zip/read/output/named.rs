@@ -113,6 +113,7 @@ impl NamedFile {
                     name: &mut stage.name,
                     tilde,
                     unknown: &mut stage.unknown_name,
+                    portable: false,
                 },
             )?;
             stage.file = Some(file);
@@ -126,6 +127,7 @@ impl NamedFile {
                 parent.identity.dev as libc::dev_t,
                 child.uid,
                 &mut captured,
+                false,
             );
             stage.identity = captured.map(|id| FileIdentity { dev: id.dev as u64, ino: id.ino as u64 });
             let actual = established?;

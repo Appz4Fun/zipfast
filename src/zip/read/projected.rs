@@ -867,13 +867,19 @@ pub(super) fn factory<'a>(
             context.bootstrap.acquisition(spool::ResolvedTempDirectory::CAPACITY)?;
             let ledger = &context.ledger;
             let bootstrap = &mut context.bootstrap;
-            context.temp = Some(spool::ResolvedTempDirectory::resolve_plan(
-                ledger,
-                overrides.temp_dir.as_deref().or(context.options.temp_dir.as_deref()),
-                cancel,
-                retries,
-                |charge| bootstrap.resolve_charge(charge),
-            )?);
+            context.temp = Some(
+                spool::ResolvedTempDirectory::resolve_plan(
+                    ledger,
+                    overrides.temp_dir.as_deref().or(context.options.temp_dir.as_deref()),
+                    cancel,
+                    retries,
+                    |charge| bootstrap.resolve_charge(charge),
+                )
+                .map(|mut t| {
+                    t.storage = context.options.staged_storage;
+                    t
+                })?,
+            );
         }
         let r1 = add(g.records, 1)?;
         let path_base = add(add(source_path_bytes as u128, destination_bytes as u128)?, 64)?;
