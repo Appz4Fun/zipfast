@@ -282,6 +282,63 @@ struct Member {
     mtime: Option<i64>,
     nanos: u32,
     mode: u32,
+    atime: Option<(i64, u32)>,
+    ctime: Option<(i64, u32)>,
+    tar: Box<TarMetadata>,
+}
+
+/// Most pax records kept for a listing per member.
+const MAX_PAX_RECORDS: usize = 256;
+
+/// Which header layout a tar member uses, from its magic field (bytes 257..265).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum TarMagic {
+    /// POSIX ustar (`ustar\0` and a version): what 7-Zip lists as `POSIX`.
+    Ustar,
+    /// GNU tar (`ustar  \0`): 7-Zip's `GNU`.
+    Gnu,
+    /// No magic: a pre-POSIX (V7) header.
+    V7,
+    /// Anything else.
+    Other,
+}
+
+impl TarMagic {
+    fn of(h: &[u8; BLOCK]) -> Self {
+        match &h[257..265] {
+            m if &m[..6] == b"ustar\0" => Self::Ustar,
+            b"ustar  \0" => Self::Gnu,
+            m if m.iter().all(|&b| b == 0) => Self::V7,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// What a tar header records beyond the common listing fields, for a 7-Zip-style `l -slt` (User, Group, User ID,
+/// Group ID, Device Major/Minor, Characteristics, and the pax header's name as Comment).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct TarMetadata {
+    pub magic: TarMagic,
+    /// The type flag byte (`0` file, `5` folder, `2` symlink, ...), as stored.
+    pub typeflag: u8,
+    /// Owner name: a pax `uname` record, else the header's (None in a V7 header, which has no such field).
+    pub user: Option<String>,
+    /// Group name: a pax `gname` record, else the header's (None in a V7 header).
+    pub group: Option<String>,
+    /// Owner id: a pax `uid` record, else the header's, when it reads as a number.
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+    /// Device numbers when the header's fields read as numbers (GNU tar leaves them blank; None in V7 headers).
+    pub device_major: Option<u64>,
+    pub device_minor: Option<u64>,
+    /// The name field of the member's own pax extended header (`PaxHeader/name`), when it has one.
+    pub pax_header_name: Option<String>,
+    /// The member's own pax records (not global ones) in order, as key and raw value; at most 256 are kept.
+    pub pax_records: Vec<(String, Vec<u8>)>,
+    /// The member's header block exactly as stored.
+    pub header: Box<[u8; BLOCK]>,
 }
 
 impl Member {
@@ -299,8 +356,9 @@ impl Member {
         Entry {
             mode: Some(self.mode),
             mtime_origin: self.mtime.map(|_| MtimeOrigin::Utc),
-            ctime: None,
-            atime: None,
+            ctime: self.ctime,
+            atime: self.atime,
+            tar: Some(self.tar),
             attributes: None,
             name: self.name,
             size: if data { self.size } else { 0 },
@@ -324,7 +382,15 @@ struct Pax {
     linkpath: Option<String>,
     size: Option<u64>,
     mtime: Option<(i64, u32)>,
+    atime: Option<(i64, u32)>,
+    ctime: Option<(i64, u32)>,
+    uname: Option<String>,
+    gname: Option<String>,
+    uid: Option<u64>,
+    gid: Option<u64>,
     sparse: bool,
+    /// Every record, in order, as stored.
+    records: Vec<(String, Vec<u8>)>,
 }
 
 impl Pax {
@@ -345,7 +411,17 @@ impl Pax {
             rest = &rest[len..];
             let eq = record.iter().position(|&b| b == b'=').ok_or_else(bad)?;
             let (key, value) = (&record[..eq], &record[eq + 1..]);
+            if self.records.len() < MAX_PAX_RECORDS {
+                self.records.push((name_of(key), value.to_vec()));
+            }
+            let id = || std::str::from_utf8(value).ok().and_then(|s| s.parse().ok());
             match key {
+                b"atime" => self.atime = parse_time(value),
+                b"ctime" => self.ctime = parse_time(value),
+                b"uname" => self.uname = Some(name_of(value)),
+                b"gname" => self.gname = Some(name_of(value)),
+                b"uid" => self.uid = id(),
+                b"gid" => self.gid = id(),
                 b"path" => self.path = Some(name_of(value)),
                 b"linkpath" => self.linkpath = Some(name_of(value)),
                 b"size" => {
@@ -366,7 +442,15 @@ impl Pax {
             linkpath: self.linkpath.clone().or_else(|| under.linkpath.clone()),
             size: self.size.or(under.size),
             mtime: self.mtime.or(under.mtime),
+            atime: self.atime.or(under.atime),
+            ctime: self.ctime.or(under.ctime),
+            uname: self.uname.clone().or_else(|| under.uname.clone()),
+            gname: self.gname.clone().or_else(|| under.gname.clone()),
+            uid: self.uid.or(under.uid),
+            gid: self.gid.or(under.gid),
             sparse: self.sparse || under.sparse,
+            // only the member's own records
+            records: self.records.clone(),
         }
     }
 }
@@ -485,6 +569,7 @@ impl Reader {
         let mut long_name: Option<Vec<u8>> = None;
         let mut long_link: Option<String> = None;
         let mut pax = Pax::default();
+        let mut pax_header_name = None;
         loop {
             let Some(h) = self.header_block()? else { return Ok(None) };
             let kind = h[156];
@@ -500,6 +585,7 @@ impl Reader {
                     continue;
                 }
                 b'x' | b'X' => {
+                    pax_header_name = Some(name_of(text(&h[0..100])));
                     let data = self.ext_data(size)?;
                     pax.parse(&data)?;
                     continue;
@@ -511,6 +597,7 @@ impl Reader {
                     self.global.path = None;
                     self.global.linkpath = None;
                     self.global.size = None;
+                    self.global.records.clear();
                     continue;
                 }
                 _ => {}
@@ -578,6 +665,21 @@ impl Reader {
                 mtime,
                 nanos,
                 mode,
+                atime: p.atime,
+                ctime: p.ctime,
+                tar: Box::new(TarMetadata {
+                    magic: TarMagic::of(&h),
+                    typeflag: h[156],
+                    user: p.uname.clone().or_else(|| (h[257] != 0).then(|| name_of(text(&h[265..297])))),
+                    group: p.gname.clone().or_else(|| (h[257] != 0).then(|| name_of(text(&h[297..329])))),
+                    uid: p.uid.or_else(|| number(&h[108..116]).and_then(|v| u64::try_from(v).ok())),
+                    gid: p.gid.or_else(|| number(&h[116..124]).and_then(|v| u64::try_from(v).ok())),
+                    device_major: number(&h[329..337]).and_then(|v| u64::try_from(v).ok()).filter(|_| h[257] != 0),
+                    device_minor: number(&h[337..345]).and_then(|v| u64::try_from(v).ok()).filter(|_| h[257] != 0),
+                    pax_header_name,
+                    pax_records: p.records,
+                    header: Box::new(h),
+                }),
             }));
         }
     }
@@ -744,6 +846,7 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
             mtime_origin: mtime.map(|_| MtimeOrigin::Utc),
             ctime: None,
             atime: None,
+            tar: None,
             attributes: None,
             name: single_name(codec, path),
             size,

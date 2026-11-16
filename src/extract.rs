@@ -740,7 +740,7 @@ pub enum MtimeOrigin {
 
 /// One entry for a listing.
 ///
-/// `mode`, `mtime_origin`, `ctime`, `atime` and `attributes` are additive in this unpublished
+/// `mode`, `mtime_origin`, `ctime`, `atime`, `tar` and `attributes` are additive in this unpublished
 /// 0.1 API; downstream struct literals must supply them (`None` when the
 /// archive holds no such metadata).
 #[derive(Clone, Debug)]
@@ -754,12 +754,15 @@ pub struct Entry {
     pub mtime: Option<i64>,
     /// Which clock `mtime` was read from: `Some` exactly when `mtime` is.
     pub mtime_origin: Option<MtimeOrigin>,
-    /// Creation time as UTC seconds since 1970 and nanoseconds, for 7z members whose header stores kCTime
-    /// (`7z a -mtc=on`); `None` for other formats.
+    /// Creation time as UTC seconds since 1970 and nanoseconds: 7z kCTime (`7z a -mtc=on`), or a tar pax `ctime`
+    /// record (strictly the status change time, which 7-Zip lists as Created); `None` otherwise.
     pub ctime: Option<(i64, u32)>,
-    /// Last access time as UTC seconds since 1970 and nanoseconds, for 7z members whose header stores kATime
-    /// (`7z a -mta=on`); `None` for other formats.
+    /// Last access time as UTC seconds since 1970 and nanoseconds: 7z kATime (`7z a -mta=on`) or a tar pax
+    /// `atime` record; `None` otherwise.
     pub atime: Option<(i64, u32)>,
+    /// Tar members: owner and group, ids, device numbers, magic, pax records and the raw header. None for other
+    /// formats and for a lone compressed file.
+    pub tar: Option<Box<crate::tar::TarMetadata>>,
     /// Raw Windows (MS-DOS) attribute bits (`FILE_ATTRIBUTE_*`: read-only 0x1,
     /// hidden 0x2, system 0x4, directory 0x10, archive 0x20, ...), when the
     /// archive was made on a host that stores them: ZIP hosts 0 (FAT), 6
@@ -2053,6 +2056,7 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
             mtime_origin: h.mtime_origin(),
             ctime: None,
             atime: None,
+            tar: None,
             attributes: h.windows_attributes(),
             name: h.name,
             size: h.unpacked_size,
