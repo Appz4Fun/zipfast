@@ -801,6 +801,8 @@ enum Format {
     Zip,
     /// tar, plain or compressed, or a lone compressed file
     Tar,
+    /// 7z, found by its signature
+    SevenZip,
     Other,
 }
 
@@ -813,7 +815,9 @@ fn sniff(path: &Path) -> Result<Format> {
 }
 
 fn classify_head(head: &[u8]) -> Format {
-    if crate::zip::sniff(head) {
+    if crate::sevenzip::sniff(head) {
+        Format::SevenZip
+    } else if crate::zip::sniff(head) {
         Format::Zip
     } else if crate::stream::Codec::sniff(head).is_some() || crate::tar::sniff_tar(head) {
         Format::Tar
@@ -832,6 +836,7 @@ pub(crate) enum CheckedRoute {
 }
 pub(crate) enum LegacyRoute {
     Tar,
+    SevenZip,
     Rar { signature: crate::rar5::reader::HeldSignature, path: PathBuf },
 }
 #[allow(clippy::result_large_err)]
@@ -843,6 +848,11 @@ pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::Z
             // TAR deliberately retains its incumbent path-based ownership scope.
             opened.retire()?;
             Ok(CheckedRoute::Legacy(LegacyRoute::Tar))
+        }
+        Format::SevenZip => {
+            // 7z reopens its volumes by path, as TAR does.
+            opened.retire()?;
+            Ok(CheckedRoute::Legacy(LegacyRoute::SevenZip))
         }
         Format::Other => {
             let (opened, probe) = opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?;
@@ -862,8 +872,22 @@ impl LegacyRoute {
         password: Option<&str>,
         report: &mut impl LegacyReport,
     ) -> std::result::Result<Summary, RunError> {
+        self.run_cancelable(first, options, password, &Cancellation::default(), report)
+    }
+    pub(crate) fn run_cancelable(
+        self,
+        first: &Path,
+        options: &Options,
+        password: Option<&str>,
+        cancel: &Cancellation,
+        report: &mut impl LegacyReport,
+    ) -> std::result::Result<Summary, RunError> {
         match self {
             Self::Tar => crate::tar::run_reporting(first, options, report),
+            Self::SevenZip => {
+                let limits = crate::sevenzip::SevenZipLimits::default();
+                crate::sevenzip::run_reporting(first, options, password, cancel, &limits, report)
+            }
             Self::Rar { signature, .. } => {
                 let mut reports = Reports::Legacy { summary: Summary::default(), callback: report };
                 let result = rar_run_shared_open(first, options, password, &mut reports, || {
@@ -877,6 +901,7 @@ impl LegacyRoute {
     pub(crate) fn list(self, first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
         match self {
             Self::Tar => crate::tar::list(first),
+            Self::SevenZip => crate::sevenzip::list(first, password),
             Self::Rar { signature, .. } => {
                 rar_list_from_volume(Volume::from_held_signature(first, signature, password)?, password)
             }
@@ -1110,6 +1135,7 @@ impl SelectedEntry {
                 Err(Error::NotAnArchive) => {}
                 Err(error) => return Err(error),
             },
+            Format::SevenZip => return Err(Error::Unsupported("reading one 7z entry on its own".into())),
             Format::Zip => {}
         }
         let archive = crate::zip::read::ProjectedOwner::open_legacy(path, &cancel)?;
@@ -1151,6 +1177,9 @@ impl SelectedEntry {
                     source: SelectedSource::Tar(Box::new(selected)),
                     cancel,
                 });
+            }
+            CheckedRoute::Legacy(LegacyRoute::SevenZip) => {
+                return Err(ReadFault::Legacy(Error::Unsupported("reading one 7z entry on its own".into())).into());
             }
             CheckedRoute::Legacy(LegacyRoute::Rar { signature, path: held_path }) => {
                 let volume = Volume::from_held_signature(&held_path, signature, password).map_err(ReadFault::Legacy)?;
@@ -1488,6 +1517,10 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
             drop(source);
             crate::tar::list(first)?
         }
+        Format::SevenZip => {
+            drop(source);
+            crate::sevenzip::list(first, password)?
+        }
         Format::Other => {
             let signature = signature_end(&source.probe_prefix(SIGNATURE_PROBE_BYTES, cancel)?);
             cancel.check_io().map_err(Error::from)?;
@@ -1515,6 +1548,7 @@ pub fn list_with_password(first: &Path, password: Option<&str>) -> Result<Vec<En
     match sniff(first)? {
         Format::Zip => return crate::zip::list(first),
         Format::Tar => return crate::tar::list(first),
+        Format::SevenZip => return crate::sevenzip::list(first, password),
         Format::Other => {}
     }
     match rar_list(first, password) {
@@ -1543,7 +1577,7 @@ pub fn run_with_zip_policy(
             overrides,
             observe,
         ),
-        CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, observe),
+        CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, cancel, observe),
     }
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1565,7 +1599,7 @@ pub fn run_with_zip_context(
             context,
             observe,
         ),
-        CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, observe),
+        CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, cancel, observe),
     }
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1575,9 +1609,11 @@ fn legacy_zip_report(
     first: &Path,
     options: &Options,
     password: Option<&str>,
+    cancel: &Cancellation,
     mut observe: impl crate::zip::ZipRunObserver,
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
     use crate::zip::{ReadFault, ZipReadError, ZipRunEvent, ZipRunReport};
+    let seven_zip = matches!(route, LegacyRoute::SevenZip);
     /// Hands the legacy runner's lines and renames to the observer as they happen; the first observer failure stops
     /// further events and fails the run.
     struct Forward<'o, O> {
@@ -1606,11 +1642,14 @@ fn legacy_zip_report(
     }
     let mut forward = Forward { observe: &mut observe, fault: None };
     // The renames have reached the observer as they were made, so a terminal error needn't carry them.
-    let result = route.run(first, options, password, &mut forward).map_err(|e| e.error);
+    let result = route.run_cancelable(first, options, password, cancel, &mut forward).map_err(|e| e.error);
     let fault = forward.fault;
     let (report, summary, mut terminal) = match result {
         Ok(summary) => (ZipRunReport::from_legacy(&summary), Some(summary), None),
-        Err(error) => (ZipRunReport::default(), None, Some(ZipReadError::from(ReadFault::Legacy(error)))),
+        Err(error) => {
+            let fault = if seven_zip { seven_zip_fault(error) } else { ReadFault::Legacy(error) };
+            (ZipRunReport::default(), None, Some(ZipReadError::from(fault)))
+        }
     };
     if let Some(fault) = fault {
         return Err(fault.with_partial(report));
@@ -1634,6 +1673,18 @@ fn legacy_zip_report(
         terminal = Some(evidence.merge(terminal.take().unwrap_or_else(|| ReadFault::InvalidPlan.into())));
     }
     terminal.map_or(Ok(report), |e| Err(e.with_partial(report)))
+}
+/// The checked-path fault for a failed 7z run: the password and cancellation failures ZIP reports, typed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn seven_zip_fault(error: Error) -> crate::zip::ReadFault {
+    use crate::sevenzip::SevenZipError;
+    use crate::zip::{CipherKind, ReadFault};
+    match (&error, SevenZipError::of(&error)) {
+        (Error::Encrypted, _) => ReadFault::PasswordRequired,
+        (_, Some(SevenZipError::WrongPassword)) => ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes },
+        (_, Some(SevenZipError::Canceled)) => ReadFault::Cancelled,
+        _ => ReadFault::Legacy(error),
+    }
 }
 pub fn run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
     run_with_password(first, opts, None, report)
@@ -1664,6 +1715,17 @@ pub fn run_with_renames(
     match sniff(first)? {
         Format::Zip => return zip_run(first, opts, password, &mut report),
         Format::Tar => return crate::tar::run_reporting(first, opts, &mut report),
+        Format::SevenZip => {
+            let limits = crate::sevenzip::SevenZipLimits::default();
+            return crate::sevenzip::run_reporting(
+                first,
+                opts,
+                password,
+                &Cancellation::default(),
+                &limits,
+                &mut report,
+            );
+        }
         Format::Other => {}
     }
     match rar_run(first, opts, password, &mut report) {

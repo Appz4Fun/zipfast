@@ -192,8 +192,9 @@ back into it. Archive offsets run over the volumes in order; `MapPiece::volume`,
 The walker is checked against archives written by 7-Zip (`tests/fixtures/7z`, from the rarinfo test suite):
 store, split, solid LZMA, 7zAES over Copy and LZMA, LZMA-encoded and encrypted headers.
 
-A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuses 7z (`NotArchive`), and
-`probe` reports `Packing::Unknown`.
+A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuses 7z (`NotArchive`); `probe`
+reports `Packing::SevenZip` from the signature header (see [probing](probe.md)). Decoding folders is
+[7z extraction](7z-extract.md).
 
 Members: one `MapMember` per file entry, in header order. `raw_name` is the name's UTF-16LE bytes as stored and
 `name` its decoding; `is_dir` follows 7-Zip's empty-stream and empty-file bits: an entry without a stream that is
@@ -239,7 +240,8 @@ hashing, the key is the salt and password zero-padded). `salt` is 0 to 16 bytes,
 Encrypted headers (`-mhe`): the encoded header's folder has a 7zAES coder. Without a password (`None` or empty)
 the walk fails with `PasswordRequired`. A wrong password is `WrongPassword`: the decrypted bytes do not decode, fail
 the folder CRC, or do not start with a header id. `header_encrypted` and `header_cipher` describe it. The key
-derivation counts against `kdf_exponent` (the cycle power), `kdf_derivation_blocks` and `kdf_session_blocks` (one
+derivation counts against `kdf_exponent` (the cycle power; for 7zAES the configured value is honoured up to 24, not
+clamped to RAR 5.0's 20; the default budget is still 20), `kdf_derivation_blocks` and `kdf_session_blocks` (one
 block per SHA-256 compression), and password sizes, and cancels with the `SessionControl`. Powers above 24 (other
 than 0x3F) are `Unsupported`, as in 7-Zip.
 

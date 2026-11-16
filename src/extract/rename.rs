@@ -269,6 +269,12 @@ impl Reserved {
         &self.path
     }
 
+    /// Whether the name still holds the file this reservation created (always false without a stable file
+    /// identity), so a publication over it replaces nothing someone else put there.
+    pub(crate) fn still_ours(&self) -> bool {
+        self.file.as_ref().is_some_and(|file| same_file(file, &self.path))
+    }
+
     /// The open file and its path. The caller takes over removing it on failure.
     pub(crate) fn into_parts(mut self) -> (File, PathBuf) {
         let file = self.file.take().expect("reserved file");
@@ -449,6 +455,20 @@ mod tests {
         let dotted = format!(".{}", "e".repeat(254));
         assert_eq!(name(&dotted, 7, Parenthesized), format!("(7).{}", "e".repeat(251)));
         assert_eq!(name(&"x".repeat(255), 1, Underscore), format!("{}_1", "x".repeat(253)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reservation_knows_when_its_name_was_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimed");
+        let reserved = Reserved::create(&path).unwrap();
+        assert!(reserved.still_ours());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"someone else's").unwrap();
+        assert!(!reserved.still_ours());
+        drop(reserved);
+        assert_eq!(fs::read(&path).unwrap(), b"someone else's", "dropping never removes another file");
     }
 
     #[test]

@@ -28,6 +28,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   `.tar.bz2` and so on): POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
   sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
   compresses. xz files written in blocks (`xz -T0`) decode on several cores.
+- 7z archives (`.7z`, split `.7z.001`, ...): testing and extracting through the same entry points, options and
+  checks as the other formats. Copy, LZMA, LZMA2, Deflate, BZip2, Zstandard, 7zAES (also with encrypted headers),
+  BCJ, BCJ2, ARM, ARM64, ARMT, PPC, SPARC, IA64, Delta and Swap; solid folders stream without buffering and every
+  CRC is checked before a file appears. PPMd and Deflate64 are refused; see [7z extraction](docs/7z-extract.md).
 - Member maps (`zipfast::map`): a typed header listing of RAR4, RAR 5.0 (including `-hp` with a password) and
   ZIP archives from memory or a range source, mapping each stored member's output offsets to per-volume packed
   spans; see [member maps](docs/member-map.md).
@@ -36,13 +40,13 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   needs, checking the parts they cover, for example to finish a partial output from another copy; see
   [extract-member-from](docs/extract-member-from.md).
 - Probing (`zipfast::probe`): from a file's first bytes (one Usenet article) and optionally its last, tells bare
-  media (mkv, webm, mp4, mov, avi, MPEG-TS, M2TS, ASF, MPEG-PS) from RAR4, RAR 5.0 and ZIP, picks the first media
+  media (mkv, webm, mp4, mov, avi, MPEG-TS, M2TS, ASF, MPEG-PS) from RAR4, RAR 5.0, ZIP and 7z, picks the first media
   member, says whether it is stored, compressed, data-encrypted or behind encrypted headers, and whether its bytes
   can be borrowed; see [probing](docs/probe.md).
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 
-Remaining RAR4 capabilities, links, 7z and the rarer ZIP methods (Deflate64, PPMd) are next.
+Remaining RAR4 capabilities, links, 7z PPMd and the rarer ZIP methods (Deflate64, PPMd) are next.
 
 ## Usage
 

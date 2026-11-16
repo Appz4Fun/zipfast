@@ -1,0 +1,400 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+//! Testing and extracting 7z archives, single files and split sets (`.7z.001`, `.7z.002`, ...).
+//!
+//! The headers come from the member map ([`crate::map`]); this module decodes the folders. Each folder's coders are
+//! wired up from its bind pairs, and its output is streamed in order: a solid folder is never held in memory, and
+//! members are cut from it by their sizes. Every member's CRC (and a folder's own CRC where one is stored) is checked
+//! before its file is published: data goes to a temporary file beside the target, which takes the target's name only
+//! once it checks out. See `docs/7z-extract.md`.
+//!
+//! [`crate::extract::run`], [`crate::extract::run_with_password`] and [`crate::extract::run_with_zip_policy`] find a
+//! 7z archive by its signature and come here, with the default [`SevenZipLimits`].
+
+mod bcj;
+mod bcj2;
+mod coders;
+mod run;
+mod source;
+
+use std::path::Path;
+use std::task::{Context, Poll, Waker};
+
+use crate::error::{Error, Result};
+use crate::extract::{Cancellation, Entry, MtimeOrigin, Options, Summary};
+use crate::map::{CoderKind, MapBuilder, MapEnd, MapError, MapFolder, MapFormat, MapOptions, MemberMap};
+
+/// Bounds on what a 7z archive may ask for. The defaults match what RustyGet enforced.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct SevenZipLimits {
+    /// Decoded bytes per folder (a solid block, or one file): 16 GiB. It bounds every coder's output in the folder,
+    /// not only the last one, and the outputs of all a folder's coders together may total at most four times this
+    /// (64 GiB by default), so no stage of a coder chain can expand a little packed data without bound.
+    pub folder_bytes: u64,
+    /// Folders in the archive: 4096.
+    pub folders: u64,
+    /// Packed streams in the archive: 4096.
+    pub pack_streams: u64,
+    /// Coders in one folder: 32.
+    pub coders: u64,
+    /// Property bytes of one coder: 64.
+    pub coder_properties: u64,
+    /// Entries (files, folders, empty files and anti items): 65536.
+    pub entries: u64,
+    /// LZMA and LZMA2 dictionary bytes one folder may allocate, summed over its LZMA coders (BCJ2 folders have
+    /// three), each dictionary first shrunk to its coder's output size: 1 GiB. 7-Zip's own default `-mmemuse` is
+    /// most of the machine's RAM; 1 GiB opens everything 7-Zip writes up to `-mx9 -md=1g`.
+    pub dictionary_bytes: u64,
+}
+
+impl Default for SevenZipLimits {
+    fn default() -> Self {
+        Self {
+            folder_bytes: 16 << 30,
+            folders: 4096,
+            pack_streams: 4096,
+            coders: 32,
+            coder_properties: 64,
+            entries: 65536,
+            dictionary_bytes: 1 << 30,
+        }
+    }
+}
+
+/// Which of [`SevenZipLimits`] an archive went past.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SevenZipLimit {
+    /// A folder's output, or any one coder's output in it, is larger than `folder_bytes`.
+    FolderBytes,
+    /// The outputs of all a folder's coders total more than four times `folder_bytes`.
+    FolderCoderBytes,
+    Folders,
+    PackStreams,
+    Coders,
+    CoderProperties,
+    Entries,
+    DictionaryBytes,
+}
+
+/// Why a 7z run stopped.
+///
+/// Through [`crate::extract::run`] and friends it arrives inside the crate [`Error`]: see [`SevenZipError::of`].
+/// Through [`crate::extract::run_with_zip_policy`] a missing password is `ReadFault::PasswordRequired`, a wrong one
+/// `ReadFault::PasswordCheckFailed` and cancellation `ReadFault::Cancelled`; the rest is `ReadFault::Legacy`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SevenZipError {
+    /// Encrypted data or headers, and no password.
+    PasswordRequired,
+    /// The password does not decrypt the headers, or the first encrypted data decoded does not decode or fails its
+    /// CRC (7z has no password check value; 7-Zip says "Wrong password?" in the same cases).
+    WrongPassword,
+    /// The [`Cancellation`] was triggered. Nothing in progress is published.
+    Canceled,
+    /// The archive asks for more than [`SevenZipLimits`] allows.
+    Limit { limit: SevenZipLimit, max: u64, attempted: u64 },
+    /// A coder this build does not decode (PPMd, Deflate64, RISC-V, or an unknown method id), found before anything
+    /// is written. `id` is the method id as stored.
+    UnsupportedCoder { id: u64 },
+    /// A header feature this build does not handle.
+    Unsupported(&'static str),
+    /// The headers are corrupt or inconsistent.
+    Corrupt(&'static str),
+    /// The member map failed (damaged headers, header limits).
+    Map(MapError),
+    /// A volume of a split set is not there.
+    MissingVolume(std::path::PathBuf),
+    /// The archive cannot be read, or the output cannot be written.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for SevenZipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PasswordRequired => f.write_str("7z: a password is required"),
+            Self::WrongPassword => f.write_str("7z: wrong password"),
+            Self::Canceled => f.write_str("7z: canceled"),
+            Self::Limit { limit, max, attempted } => write!(f, "7z limit {limit:?} exceeded ({attempted} > {max})"),
+            Self::UnsupportedCoder { id } => write!(f, "7z coder {id:#x} is not supported"),
+            Self::Unsupported(what) => write!(f, "7z: unsupported {what}"),
+            Self::Corrupt(what) => write!(f, "7z: corrupt archive: {what}"),
+            Self::Map(e) => write!(f, "7z: {e}"),
+            Self::MissingVolume(path) => write!(f, "7z: missing volume {}", path.display()),
+            Self::Io(e) => write!(f, "7z: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SevenZipError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map(e) => Some(e),
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl SevenZipError {
+    /// The 7z failure inside a crate [`Error`] a 7z run returned, if it is one.
+    ///
+    /// The legacy `Error` keeps its variants, so a 7z failure arrives as the variant that already means it
+    /// ([`Error::Encrypted`] for a missing password, [`Error::MissingVolume`], [`Error::Io`] for I/O) or else as an
+    /// [`Error::Io`] carrying the `SevenZipError`, whose kind is `PermissionDenied` for a wrong password,
+    /// `ConnectionAborted` for cancellation (as [`Cancellation`] reports it elsewhere), `Unsupported` for an
+    /// unsupported coder or feature, `InvalidInput` for a limit and `InvalidData` for corrupt headers.
+    pub fn of(error: &Error) -> Option<&SevenZipError> {
+        match error {
+            Error::Io(e) => e.get_ref().and_then(|inner| inner.downcast_ref::<SevenZipError>()),
+            _ => None,
+        }
+    }
+}
+
+impl From<SevenZipError> for Error {
+    fn from(e: SevenZipError) -> Self {
+        use std::io::{Error as IoError, ErrorKind};
+        let kind = match &e {
+            SevenZipError::PasswordRequired => return Error::Encrypted,
+            SevenZipError::MissingVolume(path) => return Error::MissingVolume(path.clone()),
+            SevenZipError::Io(_) => {
+                let SevenZipError::Io(io) = e else { unreachable!() };
+                return Error::Io(io);
+            }
+            SevenZipError::WrongPassword => ErrorKind::PermissionDenied,
+            SevenZipError::Canceled => ErrorKind::ConnectionAborted,
+            SevenZipError::UnsupportedCoder { .. } | SevenZipError::Unsupported(_) => ErrorKind::Unsupported,
+            SevenZipError::Limit { .. } => ErrorKind::InvalidInput,
+            SevenZipError::Corrupt(_) | SevenZipError::Map(_) => ErrorKind::InvalidData,
+        };
+        Error::Io(IoError::new(kind, e))
+    }
+}
+
+/// Whether `head`, a file's first bytes, starts a 7z archive.
+pub(crate) fn sniff(head: &[u8]) -> bool {
+    head.starts_with(&crate::map::sevenzip::MAGIC)
+}
+
+/// Tests or extracts the 7z archive whose first volume is `first`, decrypting with `password` when encrypted.
+///
+/// Options, member selection, overwrite choices (including the rename modes), protected paths and the per-file report
+/// lines work as for the other formats' whole-archive runs; a rename is a report line as it is made and an entry in
+/// [`Summary::renames`]. A member that fails (a CRC mismatch, data that does not decode, an unsafe name) is a
+/// line in [`Summary::errors`] and is not published; the run goes on. The run itself fails on a missing or wrong
+/// password, a limit, an unsupported coder, cancellation, unreadable headers or volumes and output errors.
+pub fn run(
+    first: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+    mut report: impl FnMut(&str),
+) -> Result<Summary> {
+    run_reporting(first, options, password, cancel, limits, &mut report).map_err(|e| e.error)
+}
+
+/// [`run`], reporting a rename mode's renames to `report` as they happen; a terminal error keeps them too.
+pub(crate) fn run_reporting(
+    first: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+    report: &mut impl crate::extract::LegacyReport,
+) -> std::result::Result<Summary, crate::extract::RunError> {
+    run::run(first, options, password, cancel, limits, report)
+        .map_err(|(error, renames)| crate::extract::RunError::new(Error::from(error), renames))
+}
+
+/// The entries of a 7z archive, in archive order. Anti items are left out.
+pub fn list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
+    let limits = SevenZipLimits::default();
+    let map = open_map(first, password, &Cancellation::default(), &limits)?;
+    check_bounds(&map, &limits)?;
+    Ok(map
+        .members
+        .iter()
+        .map(|m| {
+            let folder = m.folder.map(|slot| &map.folders[slot.index as usize]);
+            let first_in_folder = m.folder.is_some_and(|slot| slot.offset == 0);
+            Entry {
+                mode: m.unix_mode,
+                name: member_name(m),
+                size: m.unpacked_size.unwrap_or(0),
+                // A folder's packed bytes are counted once, on its first member.
+                packed: match folder {
+                    Some(f) if first_in_folder => f.pack_sizes.iter().sum(),
+                    _ => 0,
+                },
+                mtime: m.mtime.map(|t| t.0),
+                mtime_origin: m.mtime.map(|_| MtimeOrigin::Utc),
+                attributes: (m.attributes != 0).then_some(m.attributes as u32 & 0xFFFF),
+                crc32: m.checks.and_then(|c| c.crc32),
+                method: folder.map_or(0, method_number),
+                dir: m.is_dir,
+                encrypted: m.encrypted,
+                solid: folder.is_some_and(|f| f.members > 1),
+                link: None,
+            }
+        })
+        .collect())
+}
+
+/// A ZIP-style method number for listings: the folder's compressor (Copy 0, Deflate 8, Deflate64 9, BZip2 12, LZMA
+/// 14, LZMA2 33, Zstandard 93, PPMd 98, other 255).
+fn method_number(folder: &MapFolder) -> u8 {
+    let filter = |k: &CoderKind| {
+        !matches!(
+            k,
+            CoderKind::Aes
+                | CoderKind::Bcj
+                | CoderKind::Bcj2
+                | CoderKind::Delta
+                | CoderKind::PowerPc
+                | CoderKind::Ia64
+                | CoderKind::Arm
+                | CoderKind::ArmThumb
+                | CoderKind::Arm64
+                | CoderKind::Sparc
+                | CoderKind::RiscV
+        )
+    };
+    let compressors: Vec<CoderKind> = folder.coders.iter().map(|c| c.kind).filter(filter).collect();
+    match compressors.iter().find(|k| **k != CoderKind::Copy).or(compressors.first()) {
+        None | Some(CoderKind::Copy) => 0,
+        Some(CoderKind::Deflate) => 8,
+        Some(CoderKind::Deflate64) => 9,
+        Some(CoderKind::Bzip2) => 12,
+        Some(CoderKind::Lzma) => 14,
+        Some(CoderKind::Lzma2) => 33,
+        Some(CoderKind::Other(0x04F7_1101)) => 93,
+        Some(CoderKind::Ppmd) => 98,
+        Some(_) => 255,
+    }
+}
+
+/// The member's name as a filter and the report see it: decoded, or with each bad UTF-16 unit replaced.
+pub(crate) fn member_name(m: &crate::map::MapMember) -> String {
+    m.name.clone().unwrap_or_else(|| {
+        let units: Vec<u16> = m.raw_name.as_chunks::<2>().0.iter().map(|u| u16::from_le_bytes(*u)).collect();
+        String::from_utf16_lossy(&units)
+    })
+}
+
+fn limit(limit: SevenZipLimit, max: u64, attempted: u64) -> SevenZipError {
+    SevenZipError::Limit { limit, max, attempted }
+}
+
+/// Reads the headers of the archive at `first`.
+pub(crate) fn open_map(
+    first: &Path,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+) -> std::result::Result<MemberMap, SevenZipError> {
+    if cancel.is_canceled() {
+        return Err(SevenZipError::Canceled);
+    }
+    let mut options = MapOptions::new(first.as_os_str()).password(password);
+    options.limits.entries = limits.entries;
+    // Encrypted headers take the same key derivations as data: up to 2^24 rounds, as 7-Zip accepts; the work is
+    // bounded by the password length limit and stopped by cancellation.
+    options.limits.kdf_exponent = 24;
+    options.limits.kdf_derivation_blocks = 1 << 40;
+    options.limits.kdf_session_blocks = 1 << 40;
+    options.control = crate::progressive::SessionControl::from_cancellation(cancel.clone());
+    let source = source::FileVolumes { first: first.to_path_buf() };
+    let mut builder = MapBuilder::new(Box::new(source), options);
+    let mut cx = Context::from_waker(Waker::noop());
+    let map = match builder.poll_map(&mut cx) {
+        Poll::Ready(result) => result,
+        Poll::Pending => unreachable!("files never wait"),
+    };
+    let map = map.map_err(|e| match e {
+        MapError::PasswordRequired => SevenZipError::PasswordRequired,
+        MapError::WrongPassword => SevenZipError::WrongPassword,
+        MapError::Limit { resource: crate::progressive::Resource::Entries, limit: _, attempted } => {
+            limit(SevenZipLimit::Entries, limits.entries, attempted)
+        }
+        MapError::Source(failure) if matches!(failure.kind, crate::progressive::FailureKind::Canceled) => {
+            SevenZipError::Canceled
+        }
+        MapError::Source(failure) => match failure.kind {
+            crate::progressive::FailureKind::Input { cause, .. } => SevenZipError::Io(cause),
+            kind => SevenZipError::Map(MapError::Source(Box::new(crate::progressive::ProgressiveFailure::new(kind)))),
+        },
+        other => SevenZipError::Map(other),
+    })?;
+    if map.format != MapFormat::SevenZip {
+        return Err(SevenZipError::Map(MapError::NotArchive));
+    }
+    match map.end {
+        MapEnd::Complete => Ok(map),
+        MapEnd::HeaderUnavailable { volume, .. } => {
+            let set = source::VolumeSet::new(first, volume + 1);
+            let path = set.paths()[volume as usize].clone();
+            if path.exists() {
+                Err(SevenZipError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)))
+            } else {
+                Err(SevenZipError::MissingVolume(path))
+            }
+        }
+        MapEnd::Truncated { .. } => Err(SevenZipError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))),
+        _ => Err(SevenZipError::Corrupt("7z headers")),
+    }
+}
+
+/// Applies [`SevenZipLimits`] to the headers.
+pub(crate) fn check_bounds(map: &MemberMap, limits: &SevenZipLimits) -> std::result::Result<(), SevenZipError> {
+    let folders = map.folders.len() as u64;
+    if folders > limits.folders {
+        return Err(limit(SevenZipLimit::Folders, limits.folders, folders));
+    }
+    let packs: u64 = map.folders.iter().map(|f| f.pack_sizes.len() as u64).sum();
+    if packs > limits.pack_streams {
+        return Err(limit(SevenZipLimit::PackStreams, limits.pack_streams, packs));
+    }
+    let entries = map.members.len() as u64;
+    if entries > limits.entries {
+        return Err(limit(SevenZipLimit::Entries, limits.entries, entries));
+    }
+    for folder in &map.folders {
+        let coders = folder.coders.len() as u64;
+        if coders > limits.coders {
+            return Err(limit(SevenZipLimit::Coders, limits.coders, coders));
+        }
+        if let Some(props) = folder.coders.iter().map(|c| c.properties.len() as u64).max()
+            && props > limits.coder_properties
+        {
+            return Err(limit(SevenZipLimit::CoderProperties, limits.coder_properties, props));
+        }
+        if let Some(&largest) = folder.unpack_sizes.iter().chain([&folder.unpacked_size]).max()
+            && largest > limits.folder_bytes
+        {
+            return Err(limit(SevenZipLimit::FolderBytes, limits.folder_bytes, largest));
+        }
+        let total = folder.unpack_sizes.iter().fold(0u64, |a, &s| a.saturating_add(s));
+        let work = limits.folder_bytes.saturating_mul(4);
+        if total > work {
+            return Err(limit(SevenZipLimit::FolderCoderBytes, work, total));
+        }
+    }
+    Ok(())
+}

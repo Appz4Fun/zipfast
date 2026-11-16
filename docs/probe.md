@@ -3,7 +3,7 @@
 `zipfast::probe` says how a release is packed from the first bytes of its first file, typically one Usenet article
 of about 700 KB, held in memory. It answers three questions:
 
-1. Is the file bare media, a RAR volume, a ZIP archive, or something else?
+1. Is the file bare media, a RAR volume, a ZIP archive, a 7z archive, or something else?
 2. For an archive: which member is the media file, and is it stored, compressed, data-encrypted, or behind
    encrypted headers?
 3. Can that member's bytes be borrowed? That is, do its output offsets map to packed bytes, so another copy of the
@@ -38,7 +38,7 @@ directory is at the end). An empty password is no password.
 
 The ZIP local-header walk moves strictly forward with checked arithmetic and lists at most `limits.entries` entries.
 
-Detection order: a `Rar!` signature at offset 0 is RAR; a ZIP local header, an empty archive's end record, or the
+Detection order: the 7z signature (`7z\xBC\xAF\x27\x1C`) at offset 0 is 7z; a `Rar!` signature at offset 0 is RAR; a ZIP local header, an empty archive's end record, or the
 spanned-archive marker followed by a local header is ZIP; then the media magic at offset 0; then the RAR scanner,
 which finds a RAR signature behind a self-extracting stub in the first MiB. Anything else is `Packing::Unknown`.
 A ZIP behind a stub is not detected.
@@ -56,6 +56,7 @@ listed before it, as an incomplete listing, like `Truncated`.
 | `BareMedia(MediaMatch)` | `MediaMatch { kind, confidence }`; always `Borrowable::Yes` |
 | `Rar(RarPacking)` | `version` (`Rar4`/`Rar5`), `volume: VolumeFacts`, `header_encrypted`, `locked`, `first_media`, `borrowable`, and the full `map: VolumeMap` |
 | `Zip(ZipPacking)` | `directory` (central directory read from `tail`), `complete` (every member listed), `spanned`, `members` (count), `first_media`, `borrowable` |
+| `SevenZip(SevenZipPacking)` | `version`, `header_offset` and `header_len` (the end header, as archive offsets), `archive_len` (the whole archive; a split set's total), `complete`, `header_encrypted`, `locked`, `members`, `first_media`, `borrowable`, `map` |
 | `Unknown` | `Borrowable::Unknown(NotRecognised)` |
 
 `Packing::borrowable()` and `Packing::first_media()` read across variants.
@@ -177,3 +178,14 @@ member's output depends on earlier volumes.
 | `MpegPs` | pack header `00 00 01 BA` | the whole pack header (MPEG-2: 14 bytes plus stuffing, MPEG-1: 12 bytes) has its marker bits and is followed by a start code `00 00 01`. Bad marker bits, or no start code after the header, are rejected; bytes ending inside the header are the magic only |
 
 A lone `0x47` byte, two packets' worth, RIFF WAVE, and an `ftyp` of an impossible size are not media.
+
+## 7z
+
+A 7z archive keeps its headers at its end, so a first article normally holds only the 32-byte signature header. The
+probe reports what it says: the format version and where the end header lies, which gives the archive's whole
+length (`archive_len`; for a split set, the sum of its volumes). Members are listed only when the head holds the
+whole archive; until then `complete` is false and `borrowable` is `Unknown(Truncated)`. With the headers read, a
+Copy member is `Yes`, anything coded is `No(Compressed)`, and a member stored under 7zAES (`CipherKind::SevenZipAes`)
+is judged as other encrypted stored members are: 7z has no check value, so with a password it is
+`PasswordUnverified` unless its decrypted start sniffs as media. Encrypted headers (`-mhe`) that do not open give
+`locked` and `NeedsPassword(HeaderEncrypted)` or `NeedsPassword(WrongPassword)`.

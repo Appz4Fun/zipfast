@@ -37,7 +37,7 @@
 //! `docs/extract-member-from.md`.
 
 mod member_reader;
-mod sevenzip;
+pub(crate) mod sevenzip;
 pub(crate) mod zip;
 pub(crate) mod zip_split;
 

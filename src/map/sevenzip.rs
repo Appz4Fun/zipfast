@@ -30,7 +30,7 @@ use std::{
 };
 
 /// The signature that starts a 7z archive.
-pub(super) const MAGIC: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
+pub(crate) const MAGIC: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 /// Bytes of the signature header; the next header offset counts from its end.
 const SIGNATURE_LEN: u64 = 32;
 const CHUNK: usize = 64 << 10;
@@ -200,7 +200,7 @@ struct FileEntry {
 }
 
 /// The 7zAES parameters in coder properties.
-fn aes_params(properties: &[u8]) -> Option<CipherParams> {
+pub(crate) fn aes_params(properties: &[u8]) -> Option<CipherParams> {
     let (&first, rest) = properties.split_first()?;
     let num_cycles_power = first & 0x3F;
     if first & 0xC0 == 0 {
@@ -1190,9 +1190,7 @@ impl SevenZipWalker {
         let fail = |e| MapError::from_failure(volume, e);
         usage.check(Resource::PasswordUtf8Bytes, password.len() as u64).map_err(fail)?;
         usage.check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2).map_err(fail)?;
-        if num_cycles_power != 0x3F {
-            usage.check(Resource::KdfExponent, u64::from(num_cycles_power)).map_err(fail)?;
-        }
+        options.limits.check_seven_zip_kdf(num_cycles_power).map_err(fail)?;
         let mut meter = crate::rar5::member::KdfMeter::new(usage, &options.control);
         match crate::crypto::derive_7z_key_controlled(password, salt, num_cycles_power, &mut meter) {
             None => Err(unsupported(volume, "7zAES cycle count")),

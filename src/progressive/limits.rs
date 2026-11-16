@@ -172,6 +172,20 @@ impl ProgressiveLimits {
             _ => configured,
         }
     }
+    /// Checks a 7zAES `NumCyclesPower` against `kdf_exponent`. The shared ceiling of 20 in [`Self::limit`] is the
+    /// RAR 5.0 derivation's own; 7zAES derives up to 2^24 rounds, as 7-Zip accepts, so its ceiling is 24.
+    pub(crate) fn check_seven_zip_kdf(&self, num_cycles_power: u8) -> ProgressiveResult<()> {
+        let limit = self.kdf_exponent.min(u64::from(crate::crypto::SEVEN_ZIP_MAX_CYCLES_POWER));
+        let attempted = u64::from(num_cycles_power);
+        if num_cycles_power != 0x3F && attempted > limit {
+            return Err(ProgressiveFailure::new(FailureKind::Limit {
+                resource: Resource::KdfExponent,
+                limit,
+                attempted,
+            }));
+        }
+        Ok(())
+    }
 }
 struct UsageState {
     limits: ProgressiveLimits,
@@ -300,5 +314,22 @@ impl Drop for Lease {
             let used = &mut state.used[self.resource as usize];
             *used = used.saturating_sub(self.amount);
         }
+    }
+}
+
+#[cfg(test)]
+mod seven_zip_kdf_tests {
+    use super::*;
+
+    #[test]
+    fn seven_zip_kdf_ceiling_is_24_while_the_shared_one_stays_20() {
+        let limits = ProgressiveLimits { kdf_exponent: 64, ..ProgressiveLimits::default() };
+        assert_eq!(limits.limit(Resource::KdfExponent), 20);
+        assert!(limits.check_seven_zip_kdf(24).is_ok());
+        assert!(limits.check_seven_zip_kdf(0x3F).is_ok(), "0x3F is no hashing at all");
+        let error = limits.check_seven_zip_kdf(25).unwrap_err();
+        assert!(matches!(error.kind, FailureKind::Limit { resource: Resource::KdfExponent, limit: 24, attempted: 25 }));
+        let tight = ProgressiveLimits { kdf_exponent: 19, ..ProgressiveLimits::default() };
+        assert!(tight.check_seven_zip_kdf(19).is_ok() && tight.check_seven_zip_kdf(20).is_err());
     }
 }
