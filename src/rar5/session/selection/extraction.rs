@@ -601,7 +601,7 @@ impl Drop for Extraction<'_> {
 /// UTF-16 stream, which need not be UTF-8; its decoded name is what the catalogue decoded and lists. Either way the
 /// name still goes through `sanitize` before it reaches the file system.
 pub(super) fn projectable_name(header: &FileHeader, wire_name: &[u8]) -> bool {
-    !header.name.contains('\u{fffe}') && (header.format != RarFormat::Rar5 || std::str::from_utf8(wire_name).is_ok())
+    header.output_name().is_some() && (header.format != RarFormat::Rar5 || std::str::from_utf8(wire_name).is_ok())
 }
 
 // The controlled native path and optional inventory share this exact target
@@ -684,7 +684,8 @@ pub(super) trait ExtractionHooks {
 struct LegacyHooks;
 impl ExtractionHooks for LegacyHooks {
     fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop> {
-        sanitize(&header.name, !header.is_unix())
+        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        sanitize(&name, !header.is_unix())
             .map_err(|_| policy(RarPolicyReason::UnsafePath, PathBuf::from(&header.name)).into())
     }
     fn target(&mut self, options: &Options, relative: &Path, flatten: bool) -> Result<PathBuf, SelectedStop> {

@@ -1118,7 +1118,8 @@ impl ProgressiveSession {
         if refusal.is_none() && (self.options.extract.mode == crate::extract::Mode::Test || header.is_dir()) {
             self.usage.charge(Resource::MetadataBytes, (header.name.len() as u64).saturating_mul(3))?;
             self.usage.charge(Resource::SourceBookkeeping, (header.name.len() as u64).saturating_mul(8))?;
-            crate::path::sanitize_fallible(&header.name, !header.is_unix())
+            let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+            crate::path::sanitize_fallible(&name, !header.is_unix())
                 .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
         }
         if let Some(redirection) = header.redirection.as_ref().filter(|_| refusal.is_none()) {
@@ -1134,10 +1135,16 @@ impl ProgressiveSession {
                 crate::error::RarUnsupported::Redirection { kind },
             )))));
         }
-        // U+FFFE marks a RAR4 legacy name holding bytes that aren't UTF-8, which no route writes yet.
+        // A name mapped from bytes that aren't UTF-8 is written under its private-use characters
+        // (`crate::path::rar_output_name`); one that can't be written one to one is refused, and so is any mapped
+        // name in a persistent session, whose states record the name as decoded.
+        #[cfg(feature = "persistent-partials")]
+        let persistent = self.partial.is_some();
+        #[cfg(not(feature = "persistent-partials"))]
+        let persistent = false;
         if refusal.is_none()
             && self.options.extract.mode != crate::extract::Mode::Test
-            && header.name.contains('\u{FFFE}')
+            && (header.output_name().is_none() || (persistent && header.name.contains('\u{FFFE}')))
         {
             return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
                 crate::error::RarUnsupported::NameEncoding,
@@ -1311,7 +1318,8 @@ impl ProgressiveSession {
         header: &crate::rar5::FileHeader,
     ) -> ProgressiveResult<Disposition> {
         let output = self.output.as_ref().expect("output");
-        let target = output.prepare_target(member, &header.name, !header.is_unix())?;
+        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        let target = output.prepare_target(member, &name, !header.is_unix())?;
         let skip = self.options.extract.overwrite == crate::extract::Overwrite::Skip && target.exists();
         if skip {
             output.check_target(&target, &mut self.driver)?;
@@ -1536,7 +1544,8 @@ impl ProgressiveSession {
         if matches!(self.disposition, Disposition::Link) {
             let v = verification.ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
             let header = &self.model.members.last().expect("member").header;
-            let rel = crate::path::sanitize(&header.name, !header.is_unix())
+            let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+            let rel = crate::path::sanitize(&name, !header.is_unix())
                 .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
             // checked where the link goes: a flattened output drops the member's folders
             let rel = if self.options.extract.flatten {

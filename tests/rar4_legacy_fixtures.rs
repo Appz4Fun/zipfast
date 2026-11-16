@@ -511,21 +511,18 @@ fn a_damaged_solid_archive_with_unmapped_names_is_catalogued_and_reported_per_me
     assert_eq!(got_failed, failed);
     assert_eq!(verified, [unrar[0]]);
 
-    // Extraction creates every directory UnRAR creates and goes on past each failure. UnRAR also writes the one
-    // intact file under its raw (non-UTF-8) name; no route writes such a name yet, so it fails typed.
+    // Extraction creates every directory UnRAR creates and goes on past each failure. The one intact file is
+    // written under its private-use mapping (UnRAR writes its raw bytes); the rest of the stream is broken.
     let dir = tempfile::tempdir().unwrap();
+    let intact = unrar[0].replace('\u{fffe}', "");
     let out = dir.path().join("run");
-    let mut outcomes = Vec::new();
-    extract::run_rar_with_outcomes(&path, &options(&out), None, |o: &RarEntryOutcome| {
-        outcomes.push((o.entry.name.clone(), format!("{:?}", o.outcome)));
-    })
-    .unwrap();
-    assert!(outcomes[0].1.contains("NameEncoding"), "{:?}", outcomes[0]);
+    let summary = extract::run_rar_with_outcomes(&path, &options(&out), None, |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (1, 29));
     let out_selected = dir.path().join("selected");
     let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
     let all = session.select(|_| true).unwrap();
     let summary = session.extract_selected(&all, &options(&out_selected), RarDecodeLimits::default(), |_| {}).unwrap();
-    assert_eq!((summary.files, summary.failed), (0, 30));
+    assert_eq!((summary.files, summary.failed), (1, 29));
     let unrar_dirs: Vec<&str> =
         unrar.iter().copied().filter(|n| !n.contains('\u{fffe}') && !failed.contains(n)).collect();
     assert_eq!(unrar_dirs.len() as u64, summary.dirs);
@@ -533,24 +530,107 @@ fn a_damaged_solid_archive_with_unmapped_names_is_catalogued_and_reported_per_me
         for name in &unrar_dirs {
             assert!(out.join(name).is_dir(), "{name}");
         }
-        let mut files = Vec::new();
-        let mut stack = vec![out.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in fs::read_dir(&dir).unwrap().flatten() {
-                if entry.file_type().unwrap().is_dir() {
-                    stack.push(entry.path());
-                } else {
-                    files.push(entry.path());
-                }
+        let files: Vec<String> = files_under(out).into_iter().map(|(name, _)| name).collect();
+        assert_eq!(files, std::slice::from_ref(&intact));
+    }
+}
+
+fn files_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(entry.path());
+            } else {
+                let rel = entry.path().strip_prefix(dir).unwrap().to_string_lossy().into_owned();
+                out.push((rel, fs::read(entry.path()).unwrap()));
             }
         }
-        assert!(files.is_empty(), "{files:?}");
     }
-    // a progressive session stops at the first such name, as at any member it can't write
-    let failure = progressive(&path, &dir.path().join("progressive")).unwrap_err();
-    assert!(
-        matches!(&failure.kind, zipfast::progressive::FailureKind::Rar(f)
-            if matches!(f.as_ref(), RarFailure::Unsupported(RarUnsupported::NameEncoding))),
-        "{failure:?}"
-    );
+    out.sort();
+    out
+}
+
+/// Legacy names holding bytes that aren't UTF-8 (OEM/ANSI, from a Unix or a Windows host) extract under their
+/// private-use mapping, one file per distinct raw name, through every route. A name spelling such a private-use
+/// character in valid UTF-8 can't collide with them: it is refused.
+#[test]
+fn raw_legacy_names_extract_one_to_one_on_every_route() {
+    let dir = tempfile::tempdir().unwrap();
+    for host in [3u8, 2] {
+        let path = dir.path().join(format!("raw-{host}.rar"));
+        let members = [
+            header(0x74, host, b"caf\xe9.txt", b"e-acute", 0o100644, &[]),
+            header(0x74, host, b"caf\xe8.txt", b"e-grave", 0o100644, &[]),
+            header(0x74, host, b"d\xe9j\xe0\\vu.txt", b"nested", 0o100644, &[]),
+            header(0x74, host, "caf\u{e0e9}.txt".as_bytes(), b"impostor", 0o100644, &[]),
+        ];
+        fs::write(&path, archive(&members)).unwrap();
+        let want = vec![
+            ("caf\u{e0e8}.txt".to_owned(), b"e-grave".to_vec()),
+            ("caf\u{e0e9}.txt".to_owned(), b"e-acute".to_vec()),
+            ("d\u{e0e9}j\u{e0e0}/vu.txt".to_owned(), b"nested".to_vec()),
+        ];
+        let refused = |name: &str, failure: &str| {
+            name.contains('\u{e0e9}') && !name.contains('\u{fffe}') && failure.contains("NameEncoding")
+        };
+
+        let out = dir.path().join(format!("{host}-run"));
+        let mut failures = Vec::new();
+        extract::run_rar_with_outcomes(&path, &options(&out), None, |o: &RarEntryOutcome| {
+            if let extract::RarOutcome::Failed(f) = &o.outcome {
+                failures.push((o.entry.name.clone(), format!("{f:?}")));
+            }
+        })
+        .unwrap();
+        assert!(failures.len() == 1 && refused(&failures[0].0, &failures[0].1), "{host}: {failures:?}");
+        assert_eq!(files_under(&out), want, "{host}: run");
+
+        let out = dir.path().join(format!("{host}-selected"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!((summary.files, summary.failed), (3, 1), "{host}");
+        assert_eq!(files_under(&out), want, "{host}: selected");
+
+        let out = dir.path().join(format!("{host}-controlled"));
+        assert_eq!(controlled(&mut session, &out, |_| true), (3, 0, 1), "{host}");
+        assert_eq!(files_under(&out), want, "{host}: controlled");
+
+        // a progressive session writes the first three, then stops at the name it can't write
+        let out = dir.path().join(format!("{host}-progressive"));
+        let failure = progressive(&path, &out).unwrap_err();
+        assert!(format!("{failure:?}").contains("NameEncoding"), "{host}: {failure:?}");
+        assert_eq!(files_under(&out), want, "{host}: progressive");
+        // without the impostor it finishes
+        let path = dir.path().join(format!("raw-{host}-clean.rar"));
+        fs::write(&path, archive(&members[..3])).unwrap();
+        let out = dir.path().join(format!("{host}-progressive-clean"));
+        assert_eq!(progressive(&path, &out).unwrap(), ["verified"; 3]);
+        assert_eq!(files_under(&out), want, "{host}: progressive");
+    }
+}
+
+/// A name that stores U+FFFE itself would pass for the mark of a mapped name: it is refused, and a name with
+/// U+FFFD next to it is written as it is, so the two never meet.
+#[test]
+fn a_stored_mark_is_refused_and_never_merges_with_a_replacement_character() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("marks.rar");
+    let members = [
+        header(0x74, 3, "a\u{fffe}".as_bytes(), b"mark", 0o100644, &[]),
+        header(0x74, 3, "a\u{fffd}".as_bytes(), b"replacement", 0o100644, &[]),
+    ];
+    fs::write(&path, archive(&members)).unwrap();
+    let out = dir.path().join("out");
+    let mut failures = Vec::new();
+    extract::run_rar_with_outcomes(&path, &options(&out), None, |o: &RarEntryOutcome| {
+        if let extract::RarOutcome::Failed(f) = &o.outcome {
+            failures.push(format!("{f:?}"));
+        }
+    })
+    .unwrap();
+    assert!(failures.len() == 1 && failures[0].contains("NameEncoding"), "{failures:?}");
+    assert_eq!(files_under(&out), [("a\u{fffd}".to_owned(), b"replacement".to_vec())]);
 }

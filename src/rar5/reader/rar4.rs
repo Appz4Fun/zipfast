@@ -561,7 +561,10 @@ fn decode_name(
             .map_err(FileParseError::Progressive)?;
     }
     for scalar in char::decode_utf16(units) {
-        name.push(separator(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?));
+        // U+FFFE marks a name mapped from bytes that aren't UTF-8; a stored one would pass for that mark, so it
+        // lists as the noncharacter U+FFFF, which no name is written under (`crate::path::rar_output_name`)
+        let c = separator(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?);
+        name.push(if c == '\u{FFFE}' { '\u{FFFF}' } else { c });
     }
     Ok(name)
 }
@@ -575,19 +578,21 @@ fn separator(c: char) -> char {
 
 /// A RAR4 name without (usable) Unicode encoding. Stored bytes that aren't UTF-8 read as UnRAR on Unix reads them
 /// (`CharToWideMap` in a UTF-8 locale): U+FFFE marks the name, then each byte that doesn't start a valid sequence
-/// becomes U+E000 plus its value. A name so marked lists as UnRAR lists it; extraction refuses it, as it refuses
-/// any name holding bytes that aren't UTF-8. Map walks (`lenient`) keep such a name by its raw bytes instead.
+/// becomes U+E000 plus its value. A name so marked lists as UnRAR lists it, and is written under its private-use
+/// characters (`crate::path::rar_output_name`). Map walks (`lenient`) keep such a name by its raw bytes instead.
 fn legacy_name(
     encoded: &[u8],
     lenient: bool,
     usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<String, FileParseError> {
-    let mapped;
+    let mapped: String;
+    let mut mapped_ptr = std::ptr::null();
     let value = match std::str::from_utf8(encoded) {
         Ok(value) => value,
         Err(_) if lenient => return Err(Error::Unsupported("RAR4 legacy name encoding".into()).into()),
         Err(_) => {
             mapped = unrar_mapped_name(encoded).ok_or(Error::Corrupt("RAR4 member name"))?;
+            mapped_ptr = mapped.as_ptr();
             &mapped
         }
     };
@@ -599,37 +604,53 @@ fn legacy_name(
             .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
             .map_err(FileParseError::Progressive)?;
     }
-    name.extend(value.chars().map(separator));
+    // a stored U+FFFE lists as U+FFFF, as in a Unicode name; such a name is never written
+    let stored_mark = |c: char| if c == '\u{FFFE}' && value.as_ptr() != mapped_ptr { '\u{FFFF}' } else { c };
+    name.extend(value.chars().map(stored_mark).map(separator));
     Ok(name)
 }
 
-/// `bytes` as UnRAR's `CharToWideMap` reads them in a UTF-8 locale; None where it stops (an ASCII byte it can't
-/// convert, which can't happen in a name already split at its first NUL).
+/// `bytes`, which aren't UTF-8, as UnRAR's `CharToWideMap` reads them in a UTF-8 locale: U+FFFE marks the name
+/// before the first byte that doesn't start a valid sequence, and each such byte becomes U+E000 plus its value.
+/// None where UnRAR stops (an ASCII byte it can't convert, which can't happen in a name already split at its
+/// first NUL).
+///
+/// One difference keeps the name writable one to one (`crate::path::rar_output_name`): a character U+E080..U+E0FF
+/// spelled out in valid UTF-8 is mapped byte by byte too, as if its bytes were invalid, so every such character of
+/// the result stands for one raw byte. UnRAR would keep it as it is.
 fn unrar_mapped_name(mut bytes: &[u8]) -> Option<String> {
     const MAPPED_STRING_MARK: char = '\u{FFFE}';
     const MAP_AREA_START: u32 = 0xe000;
     let mut name = String::new();
     let mut marked = false;
+    let mut map = |name: &mut String, raw: &[u8]| {
+        if !marked {
+            name.push(MAPPED_STRING_MARK);
+            marked = true;
+        }
+        name.extend(raw.iter().map(|&b| char::from_u32(MAP_AREA_START + u32::from(b)).expect("private-use character")));
+    };
     while !bytes.is_empty() {
-        match std::str::from_utf8(bytes) {
-            Ok(rest) => {
-                name.push_str(rest);
-                break;
-            }
+        let (valid, rest) = match std::str::from_utf8(bytes) {
+            Ok(all) => (all, &[][..]),
             Err(error) => {
                 let (valid, rest) = bytes.split_at(error.valid_up_to());
-                name.push_str(std::str::from_utf8(valid).expect("valid prefix"));
-                if rest[0] < 0x80 {
-                    return None;
-                }
-                if !marked {
-                    name.push(MAPPED_STRING_MARK);
-                    marked = true;
-                }
-                name.push(char::from_u32(MAP_AREA_START + u32::from(rest[0])).expect("private-use character"));
-                bytes = &rest[1..];
+                (std::str::from_utf8(valid).expect("valid prefix"), rest)
+            }
+        };
+        for c in valid.chars() {
+            if ('\u{E080}'..='\u{E0FF}').contains(&c) {
+                map(&mut name, c.to_string().as_bytes());
+            } else {
+                name.push(c);
             }
         }
+        let Some(&byte) = rest.first() else { break };
+        if byte < 0x80 {
+            return None;
+        }
+        map(&mut name, &rest[..1]);
+        bytes = &rest[1..];
     }
     Some(name)
 }
