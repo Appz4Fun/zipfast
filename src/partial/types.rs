@@ -120,6 +120,10 @@ pub enum HoleCause {
     DeclaredBad,
     CipherNeighbour,
     HeaderLost,
+    /// Output past the committed `produced` of a member whose tail was abandoned with
+    /// [`PartialFile::abandon_tail`]: the original extraction never reached it, and only plaintext from another
+    /// copy (`fill`, `fill_writer`, `fill_from`) can fill it.
+    TailAbandoned,
 }
 #[derive(Clone, Debug)]
 pub struct HoleReport {
@@ -142,6 +146,18 @@ pub struct DamageReceipt {
     pub pending: Vec<PackedSpan>,
     /// Damaged bytes already read that map to no persistent output, such as headers or padding.
     pub unmapped: Vec<PackedSpan>,
+}
+/// Where the final checks of a member whose tail was abandoned ([`PartialFile::abandon_tail`]) come from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TailChecks {
+    /// The archive's own checks, which the original extraction had already read (from the final part's header).
+    /// `Verdict::Ok` then means what it means for any member.
+    Archive,
+    /// Checks the caller supplied, compared as plaintext CRC-32 / BLAKE2sp (never keyed with the password).
+    /// `Verdict::Ok` then means the output matches the caller's checks, not that the archive vouched for it: the
+    /// produced prefix came from the archive, the tail from wherever the caller filled it.
+    Supplied,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberChecks {
@@ -225,6 +241,9 @@ pub enum PartialErrorKind {
     /// before it) whose output the original extraction wrote, or fill plaintext with `fill`. `refill_from_packed`
     /// does this by itself while the password is unproven.
     PasswordUnverified,
+    /// The member's tail was abandoned ([`PartialFile::abandon_tail`]): its extraction cannot go on, and a second
+    /// abandon with different checks is refused.
+    TailAbandoned,
     Limit {
         resource: PartialResource,
         limit: u64,

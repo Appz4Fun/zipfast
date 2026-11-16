@@ -312,6 +312,7 @@ impl PartialCore {
             size: spec.size,
             produced: 0,
             member_finished: false,
+            tail: None,
             checks: checks.clone(),
             binding: native::NativeBinding {
                 root: crate::progressive::native::Identity(0, 0),
@@ -870,8 +871,11 @@ impl PartialCore {
         if self.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        if op.snapshot.evidence.parts.last().is_none_or(|part| end > part.out.end) {
+        if op.snapshot.writable_end().is_none_or(|limit| end > limit) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
+        }
+        if !alternate && op.snapshot.head.tail.is_some() {
+            return Err(err(PartialErrorKind::TailAbandoned));
         }
         if !alternate && offset > op.snapshot.head.produced {
             return Err(err(PartialErrorKind::IncompleteOutput));
@@ -928,8 +932,7 @@ impl PartialCore {
         for range in &plan.unknown {
             let mut at = range.start;
             while at < range.end {
-                let boundary =
-                    op.snapshot.evidence.parts.iter().find(|p| p.out.end > at).ok_or_else(malformed)?.out.end;
+                let boundary = op.snapshot.part_end(at).ok_or_else(malformed)?;
                 at = range.end.min(boundary).min(at.saturating_add(65_536 - at % 65_536));
                 count += 1;
             }
@@ -942,8 +945,7 @@ impl PartialCore {
         for range in &plan.unknown {
             let mut at = range.start;
             while at < range.end {
-                let boundary =
-                    op.snapshot.evidence.parts.iter().find(|p| p.out.end > at).ok_or_else(malformed)?.out.end;
+                let boundary = op.snapshot.part_end(at).ok_or_else(malformed)?;
                 let stop = range.end.min(boundary).min(at.saturating_add(65_536 - at % 65_536));
                 self.budget.usage.charge(Resource::VerifyWorkBytes, stop - at)?;
                 let mut hasher = crate::crc32::Hasher::new();
@@ -1102,10 +1104,13 @@ impl PartialCore {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        if op.snapshot.evidence.parts.last().is_none_or(|part| end > part.out.end) {
+        if op.snapshot.writable_end().is_none_or(|limit| end > limit) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
         }
         match mode {
+            FillMode::Original if op.snapshot.head.tail.is_some() => {
+                return Err(err(PartialErrorKind::TailAbandoned));
+            }
             FillMode::Original if offset != op.snapshot.head.produced => {
                 return Err(err(PartialErrorKind::IncompleteOutput));
             }
@@ -1142,10 +1147,8 @@ impl PartialCore {
         }
         let total: u64 = plan.unknown.iter().map(|r| r.end - r.start).sum();
         self.budget.usage.charge(Resource::OutputWriteBytes, total)?;
-        let parts = &op.snapshot.evidence.parts;
-        let part_end = |at: u64| -> PartialResult<u64> {
-            Ok(parts.get(parts.partition_point(|p| p.out.end <= at)).ok_or_else(malformed)?.out.end)
-        };
+        let snapshot = &op.snapshot;
+        let part_end = |at: u64| -> PartialResult<u64> { snapshot.part_end(at).ok_or_else(malformed) };
         let mut count = 0usize;
         for range in &plan.unknown {
             let mut at = range.start;
@@ -1816,11 +1819,103 @@ impl PartialCore {
         self.finish_transaction(&mut data, transaction)?;
         self.keep_part_results(&mut data, carried)
     }
+    /// Ends the member at its committed `produced`: `[produced, size)` becomes one `TailAbandoned` hole that
+    /// plaintext fills may write, and the member counts as finished, with the archive's checks when the extraction
+    /// had read them and the caller's `supplied` checks otherwise. One transaction: a crash leaves either the
+    /// state before or the abandoned one.
+    pub(crate) fn abandon_tail(&self, supplied: Option<MemberChecks>) -> PartialResult<HoleReport> {
+        let mut data = self.operation()?;
+        self.check(&data)?;
+        self.flush_group(&mut data)?;
+        self.reconcile(&mut data)?;
+        let head = &data.snapshot.head;
+        if supplied.as_ref().is_some_and(|c| c.size != head.size || (c.crc32.is_none() && c.blake2sp.is_none())) {
+            return Err(err(PartialErrorKind::InvalidOptions));
+        }
+        if let Some(previous) = head.tail {
+            // Abandoning again is idempotent when it changes nothing: the same supplied checks, or none (or ones
+            // that agree) when the archive's were kept.
+            let same = match previous {
+                TailChecks::Supplied => supplied.as_ref() == Some(&head.checks),
+                _ => supplied.as_ref().is_none_or(|c| {
+                    c.crc32.is_none_or(|v| head.checks.crc32.is_none_or(|h| h == v))
+                        && c.blake2sp.is_none_or(|v| head.checks.blake2sp.is_none_or(|h| h == v))
+                }),
+            };
+            if !same {
+                return Err(err(PartialErrorKind::TailAbandoned));
+            }
+            let found = data.snapshot.holes.iter().find(|h| h.cause == HoleCause::TailAbandoned).cloned();
+            return match found {
+                Some(report) => Ok(report),
+                None => {
+                    let size = head.size;
+                    self.report_for(&data.snapshot, head.revision, size..size, HoleCause::TailAbandoned)
+                }
+            };
+        }
+        let archive = head.checks.crc32.is_some() || head.checks.blake2sp.is_some();
+        // Checks the archive gave win. Supplied ones must agree with them where both are plain values.
+        let keyed = data.snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc);
+        let differs = |a: Option<&[u8]>, b: Option<&[u8]>| a.zip(b).is_some_and(|(a, b)| a != b);
+        if archive
+            && !keyed
+            && let Some(supplied) = &supplied
+            && (differs(
+                supplied.crc32.map(u32::to_le_bytes).as_ref().map(|b| &b[..]),
+                head.checks.crc32.map(u32::to_le_bytes).as_ref().map(|b| &b[..]),
+            ) || differs(supplied.blake2sp.as_ref().map(|b| &b[..]), head.checks.blake2sp.as_ref().map(|b| &b[..])))
+        {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+        }
+        let tail = if archive {
+            TailChecks::Archive
+        } else if supplied.is_some() {
+            TailChecks::Supplied
+        } else {
+            // Nothing could ever verify the member.
+            return Err(err(PartialErrorKind::InvalidOptions));
+        };
+        let produced = head.produced;
+        let size = head.size;
+        if head.member_finished {
+            // The extraction already ran to the end: there is no tail to abandon.
+            return Err(err(PartialErrorKind::InvalidOptions));
+        }
+        let (intent, mut valid, _snapshots) = self.next_snapshots(&data)?;
+        let revision = valid.head.revision;
+        valid.head.produced = size;
+        valid.head.member_finished = true;
+        valid.head.tail = Some(tail);
+        if tail == TailChecks::Supplied {
+            valid.head.checks = supplied.unwrap();
+        }
+        let report = self.report_for(&valid, revision, produced..size, HoleCause::TailAbandoned)?;
+        if produced < size {
+            self.budget
+                .usage
+                .check(Resource::HoleIntervals, valid.holes.len().checked_add(1).ok_or_else(malformed)? as u64)?;
+            self.budget.metadata(
+                (std::mem::size_of::<HoleReport>() + report.packed.len() * std::mem::size_of::<PackedSpan>()) as u64,
+            )?;
+            valid.holes.try_reserve_exact(1).map_err(|_| malformed())?;
+            valid.holes.push(report.clone());
+        }
+        // The intent claims no output: a crash before the commit reopens the state before the abandon.
+        let transaction = self.begin_transaction(&mut data, intent, valid, Vec::new())?;
+        self.finish_transaction(&mut data, transaction)?;
+        Ok(report)
+    }
     /// Appends parts, admissions and header witnesses. While a group is open the evidence joins it: it describes
     /// output the group writes, and the group commit makes both durable together.
     pub(crate) fn extend_evidence(&self, update: EvidenceUpdate) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;
+        // Once the tail is abandoned, parts a resumed session walks past are not recorded: the tail belongs to
+        // the caller's fill.
+        if data.snapshot.head.tail.is_some() {
+            return Ok(());
+        }
         if data.group.is_some() {
             let evidence = &data.snapshot.evidence;
             // A working copy, charged while it lives; growth is charged where `apply_evidence` makes it.
@@ -2394,6 +2489,36 @@ impl PartialFile {
     /// the root.
     pub fn relative_output_path(&self) -> PartialResult<&std::path::Path> {
         self.core.native.relative_output()
+    }
+    /// Ends this member at its committed `produced` without reading anything more, for a takeover by another copy
+    /// of the release: `[produced, size)` becomes one `TailAbandoned` hole that plaintext fills (`fill`,
+    /// `fill_writer`, `fill_from`) may write, and the member counts as finished, so `poll_verify` reaches
+    /// `Verdict::Ok` once every byte is known and the checks pass. The output file and its inode stay the same.
+    ///
+    /// The checks come from the archive when the extraction read them (the final part's header); `supplied` must
+    /// then agree with them where it can be compared (an encrypted RAR5 member's keyed checks cannot be). Otherwise
+    /// `supplied` is required (`size` must equal the member's, and it must carry a CRC-32 or BLAKE2sp) and
+    /// verification compares the output with it as plaintext, never keyed with the password. See
+    /// [`TailChecks`] for what `Verdict::Ok` claims either way, and [`PartialFile::tail_checks`].
+    ///
+    /// Durable in one transaction: a crash leaves the state before or the abandoned one, and a reopened handle (or
+    /// a resumed session, which then treats the member as finished and walks past its later parts) sees the
+    /// abandoned state. Commit or drop the session's extraction of this member first: a session still extracting it
+    /// fails with [`PartialErrorKind::TailAbandoned`] on its next write. Abandoning again with the same checks
+    /// returns the same report; with other checks it is `TailAbandoned`. A member whose extraction already
+    /// finished has no tail (`InvalidOptions`).
+    ///
+    /// Encrypted members: the tail is filled with plaintext, so no ciphertext, IV or key is needed for it, and the
+    /// hole's packed spans list only the archive bytes this copy is known to hold. `fill_packed` can still fill
+    /// holes in the produced prefix.
+    pub fn abandon_tail(&mut self, supplied: Option<MemberChecks>) -> PartialResult<HoleReport> {
+        self.core.abandon_tail(supplied)
+    }
+    /// Where the checks of a member whose tail was abandoned come from; `None` while it was not.
+    pub fn tail_checks(&self) -> PartialResult<Option<TailChecks>> {
+        let data = self.core.operation()?;
+        self.core.check(&data)?;
+        Ok(data.snapshot.head.tail)
     }
     pub fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         self.core.remaining()

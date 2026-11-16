@@ -106,7 +106,9 @@ impl Verification {
         budget: &PartialBudget,
         hash_key: Option<&[u8; 32]>,
     ) -> PartialResult<Self> {
-        let keyed = snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc);
+        // Checks the caller supplied for an abandoned tail are plain, whatever the archive keys.
+        let keyed =
+            snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc) && snapshot.head.tail != Some(TailChecks::Supplied);
         let password_required = keyed
             && hash_key.is_none()
             && (snapshot.head.checks.crc32.is_some() || snapshot.head.checks.blake2sp.is_some());
