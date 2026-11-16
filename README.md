@@ -15,9 +15,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 ## What works
 
 - RAR4 archives: bounded header listing and verification, extraction, and selected
-  printing of unencrypted, unsplit Stored regular files and non-solid version-29
-  LZ compressed regular files. PPM and VM/filter commands remain excluded. The catalogue retains
-  unsupported member metadata and reports typed payload exclusions.
+  printing of Stored and version-29 LZ compressed regular files, including files split across
+  `name.partN.rar` or `name.rar`/`name.r00` volumes, solid archives and AES-encrypted (`-p`) files, through
+  every entry point including progressive sessions. PPM and VM/filter commands remain excluded. The
+  catalogue retains unsupported member metadata and reports typed payload exclusions.
 - RAR 5.0 archives: listing, testing and extracting stored and compressed files (every method, solid archives,
   filters), including files split across `name.partNN.rar` or `name.rar`/`name.r00` volume sets, self-extracting
   stubs, CRC32 and BLAKE2sp checks, modification times and Unix permissions. Big files decode on several cores.
@@ -215,16 +216,24 @@ DOS timestamps have no time zone. RAR4 uses the existing ZIP UTC projection
 for valid civil dates and preserves the original bits for callers choosing
 another policy. Extended times retain the odd second and subsecond fields.
 
-Stored and version-29 non-solid LZ reads verify exact size and CRC before
+Stored and version-29 LZ reads verify exact size and CRC before
 publication or verified selected printing. LZ methods 0x31 through 0x35 use
-64 KiB through 4 MiB dictionaries and reset state for each independent member.
+64 KiB through 4 MiB dictionaries. An independent member resets the decoder; a
+member flagged solid goes on from the window, tables and recent distances the
+member before it left, starting where that member's end-of-file marker says
+(at a token, or at new tables). Members a run skips or doesn't select are still
+decoded through, unwritten, when a later member needs their history. A member
+split over volumes feeds one decoder across its parts, checking each non-final
+part's CRC of its packed bytes. RAR 3.x AES-128 (`-p`) decrypts ahead of the
+decoder; it has no password check value, so a wrong password shows as a
+checksum or decoder error.
 Decoding is serial and retains bounded incremental input state. Real decoded
 bits are required. Once the declared output is complete, remaining declared
 packed bytes are charged and drained without claiming canonical tail encoding.
 Empty compressed members use the same logical-completion policy and verify the
 empty CRC. PPM and VM/filter commands encountered before completion report typed
 unsupported outcomes. No unsupported command can be skipped into CRC success.
-Compressed versions 15, 20 and 26, solid, encrypted and split payloads, symbolic
+Compressed versions 15, 20 and 26, RAR 2.0 encryption, symbolic
 links, special files, old file revisions, and unsupported host attributes retain
 explicit exclusions. Encrypted headers,
 old embedded comments and legacy service layouts stop catalogue construction.

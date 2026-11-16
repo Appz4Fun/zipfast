@@ -640,6 +640,9 @@ fn encrypted_compressed_and_unknown_size_rar4_members_are_refused_and_header_enc
     let packed = [0u8; 8];
     let compressed = archive(file_header(b"c.bin", packed.len(), data.len(), hash(data), 0, 29, 0x33), &packed, 0);
     assert_eq!(refused_member(compressed), RefusalReason::Compressed { method: 3 });
+    // A solid stream's members are compressed members too, though other sessions now decode them.
+    let solid = archive(file_header(b"s.bin", packed.len(), data.len(), hash(data), 0x10, 29, 0x33), &packed, 0x08);
+    assert_eq!(refused_member(solid), RefusalReason::Compressed { method: 3 });
     // Encrypted stored, with and without a salt.
     for (flags, salt) in [(0x04u16, false), (0x404, true)] {
         let mut header = file_header(b"e.bin", 16, data.len(), hash(data), flags, 29, 0x30);

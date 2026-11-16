@@ -20,7 +20,7 @@ use super::unpack::{Sink, Unpacker};
 use crate::batch;
 use crate::error::{Error, RarFailure, RarIntegrityReason, Result};
 use crate::extract::EntryContext;
-pub(crate) use decoder::MemberDecoder;
+pub(crate) use decoder::{MemberDecoder, Rar4Owner, Rar4Stream};
 
 pub(crate) struct PendingCipher {
     pub(crate) aes: crate::crypto::AesKey,
@@ -588,6 +588,13 @@ impl MemberMachine {
                 })
                 .and_then(|()| {
                     let Some(MemberDecoder::Rar4(decoder)) = &mut self.decoder else { unreachable!() };
+                    let bytes = match &mut self.cipher {
+                        Some(cipher) => {
+                            cipher.decrypt_selected(bytes, &mut self.scratch);
+                            self.scratch.as_slice()
+                        }
+                        None => bytes,
+                    };
                     decoder
                         .feed(bytes, &mut CheckingSink { checks: &mut checks, sink })
                         .map(|_| ())
@@ -698,7 +705,10 @@ impl MemberMachine {
                 MemberDecoder::Rar5(d) => d
                     .finish(&mut sink)
                     .map_err(|e| batch::decoder_failure(e, self.context.scope(), self.context.password)),
-                MemberDecoder::Rar4(d) => d.finish(&mut sink).map_err(|e| e.detailed(self.context.scope())),
+                // the decoder stays open: a solid successor may go on from it
+                MemberDecoder::Rar4(d) => {
+                    d.finish_logical(&mut sink).map(|_| ()).map_err(|e| e.detailed(self.context.scope()))
+                }
             };
             if result.is_err() {
                 self.failed = true;
@@ -891,13 +901,15 @@ impl PendingCipher {
     pub(crate) fn checksum_key(&self) -> Option<&[u8; 32]> {
         self.hash_key.as_ref()
     }
-    fn from_legacy(key: [u8; 16], iv: [u8; 16], size: u64) -> Self {
+    /// RAR 3.x AES-128-CBC. A stored file's padding is trimmed from its output; a compressed one's is read past by
+    /// its decoder.
+    pub(crate) fn from_legacy(key: [u8; 16], iv: [u8; 16], size: u64, compressed: bool) -> Self {
         Self {
             aes: crate::crypto::AesKey::new(&key).expect("RAR4 AES128 key"),
             iv,
             rem: Vec::new(),
             hash_key: None,
-            stored_padding: Some(StoredCipherPadding { size, skipped: 0 }),
+            stored_padding: (!compressed).then_some(StoredCipherPadding { size, skipped: 0 }),
             blocks: None,
             recovery: None,
         }
@@ -994,7 +1006,7 @@ impl MemberMachine {
                 context.password = crate::error::RarPasswordEvidence::VerifierUnavailable(
                     crate::error::RarVerifierUnavailable::Absent,
                 );
-                Some(PendingCipher::from_legacy(key, iv, header.unpacked_size))
+                Some(PendingCipher::from_legacy(key, iv, header.unpacked_size, header.method != 0))
             } else {
                 let params = header
                     .crypt

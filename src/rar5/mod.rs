@@ -189,20 +189,20 @@ pub struct Rar4Metadata {
     pub unpack_version: u8,
     /// Local DOS wall-clock bits. The normalized timestamp projects these as UTC.
     pub dos_time: u32,
+    /// The encryption salt, when the header carries one.
+    pub salt: Option<[u8; 8]>,
 }
 
 impl Rar4Metadata {
     pub(crate) fn unsupported(self, attributes: u64) -> Option<crate::error::RarUnsupported> {
-        let feature = if self.flags & 3 != 0 {
-            "split payload"
-        } else if self.flags & 4 != 0 {
+        // Split and solid members decode on: the parts of a split one feed one decoder, and a solid one goes on from
+        // the history the member before it left.
+        let feature = if self.flags & 4 != 0 && self.unpack_version != 29 {
             "encrypted payload"
         } else if !(0x30..=0x35).contains(&self.method) {
             "compression method"
         } else if self.method != 0x30 && self.unpack_version != 29 {
             "unpack version"
-        } else if self.flags & 0x10 != 0 {
-            "solid payload"
         } else if self.flags & 0x800 != 0 {
             "old file revision"
         } else if self.host > 3 {
@@ -261,14 +261,19 @@ pub struct FileHeader {
 impl FileHeader {
     pub(crate) fn rar4_unsupported(&self) -> Option<crate::error::RarUnsupported> {
         let raw = self.rar4?;
-        raw.unsupported(self.attributes).or_else(|| self.rar4_common_unsupported())
+        raw.unsupported(self.attributes).or_else(|| self.rar4_common_unsupported()).or_else(|| {
+            if self.encrypted && self.is_dir() {
+                Some(crate::error::RarUnsupported::Rar4Feature("encrypted directory"))
+            } else if self.encrypted && raw.salt.is_none() {
+                Some(crate::error::RarUnsupported::Rar4Feature("legacy encryption scheme or salt"))
+            } else {
+                None
+            }
+        })
     }
 
     fn rar4_common_unsupported(&self) -> Option<crate::error::RarUnsupported> {
-        if self.solid {
-            Some(crate::error::RarUnsupported::Rar4Feature("solid payload"))
-        } else if self.is_dir()
-            && (self.packed_size != 0 || self.unpacked_size != 0 || self.crc32.is_some_and(|crc| crc != 0))
+        if self.is_dir() && (self.packed_size != 0 || self.unpacked_size != 0 || self.crc32.is_some_and(|crc| crc != 0))
         {
             Some(crate::error::RarUnsupported::Rar4Feature("directory payload"))
         } else {
@@ -281,6 +286,15 @@ impl FileHeader {
         legacy: Option<LegacyCrypt>,
     ) -> Option<crate::error::RarUnsupported> {
         let raw = self.rar4?;
+        // Admission precedes every disposition, including directory creation and skip.
+        if self.encrypted && raw.unpack_version == 29 {
+            if self.is_dir() {
+                return Some(crate::error::RarUnsupported::Rar4Feature("encrypted directory"));
+            }
+            if let Err(reason) = LegacyCrypt::stored_salt(legacy) {
+                return Some(reason);
+            }
+        }
         if raw.method != 0x30 {
             // Independent modern LZ only. Reject unsupported geometry before every disposition.
             return raw.unsupported(self.attributes).or_else(|| self.rar4_common_unsupported()).or_else(|| {
@@ -293,7 +307,6 @@ impl FileHeader {
                 }
             });
         }
-        // Admission precedes every disposition, including directory creation and skip.
         if self.encrypted {
             if self.is_dir() {
                 return Some(crate::error::RarUnsupported::Rar4Feature("encrypted directory"));

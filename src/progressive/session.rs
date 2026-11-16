@@ -219,6 +219,8 @@ pub struct ProgressiveSession {
     history: Option<crate::rar5::unpack::Unpacker>,
     history_failure: Option<u64>,
     rar4_independent: Option<rar4::Independent>,
+    /// the RAR4 decoder a solid successor goes on from
+    rar4_history: Option<crate::rar5::member::Rar4Owner>,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -346,6 +348,7 @@ impl ProgressiveSession {
             history: None,
             history_failure: None,
             rar4_independent: None,
+            rar4_history: None,
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -415,6 +418,7 @@ impl ProgressiveSession {
         self.rar4_independent.take();
         self.target.take();
         self.history.take();
+        self.rar4_history.take();
         if let Some(stage) = self.stage.take() {
             let output = self.output.as_mut().expect("output");
             let mut termination = output.terminate(stage, failure);
@@ -957,6 +961,7 @@ impl ProgressiveSession {
                     member.append(header, &part).map_err(progressive_fault)?;
                     if let Some(machine) = &mut self.machine {
                         machine.begin_part(&part);
+                        machine.extend_rar4(part.packed_size)?;
                     }
                     self.remaining = part.packed_size;
                     self.model
@@ -1095,26 +1100,46 @@ impl ProgressiveSession {
                 && self.solid_archive == Some(true)
                 && header.method != 0);
         self.rar4_independent = None;
+        let rar4_history = if header.format == crate::rar5::RarFormat::Rar4 && header.method != 0 {
+            self.rar4_history.take()
+        } else {
+            None
+        };
         let mut machine = if decode && header.format == crate::rar5::RarFormat::Rar4 && header.method != 0 {
             self.history.take();
             let source = self
                 .driver
                 .observed_info(self.volume)
                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?;
-            let core = rar4::core_frame(member, &header)?;
-            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<rar4::Independent>() as u64)?;
-            let witness = recovery::WireSnapshot::capture_current(&self.witnesses, self.volume, &self.usage)?;
-            let (machine, binding) = MemberMachine::new_rar4(
-                &header,
-                context,
-                core,
-                self.options.limits.decoder_window,
-                &self.usage,
-                &self.control,
-            )?;
-            self.rar4_independent =
-                Some(rar4::Independent::new(member, self.volume, source, binding, &header, &wire, witness));
-            Some(machine)
+            let core = rar4::core_frame(member, &header, wire.legacy.and_then(|w| w.crypt))?;
+            if header.solid && rar4_history.is_none() {
+                // A missing dependency is handled after recording the physical boundary below.
+                None
+            } else {
+                self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<rar4::Independent>() as u64)?;
+                let witness = recovery::WireSnapshot::capture_current(&self.witnesses, self.volume, &self.usage)?;
+                let stream = crate::rar5::member::Rar4Stream {
+                    history: rar4_history.filter(|_| header.solid),
+                    solid_archive: self.solid_archive == Some(true),
+                    password: self.options.password(),
+                    legacy: wire.legacy.and_then(|w| w.crypt),
+                };
+                let (machine, binding) = MemberMachine::new_rar4(
+                    &header,
+                    context,
+                    core,
+                    self.options.limits.decoder_window,
+                    &self.usage,
+                    &self.control,
+                    stream,
+                )?;
+                // A member split over volumes is checked part by part instead.
+                if !header.split_after() {
+                    self.rar4_independent =
+                        Some(rar4::Independent::new(member, self.volume, source, binding, &header, &wire, witness));
+                }
+                Some(machine)
+            }
         } else if decode {
             let decoder = if header.method != 0 {
                 if header.solid {
@@ -1215,6 +1240,7 @@ impl ProgressiveSession {
         self.target.take();
         if self.model.members.last().is_some_and(|m| m.header.method != 0) {
             self.history.take();
+            self.rar4_history.take();
             self.history_failure = self.member.map(|m| m.ordinal);
         }
         let part = self.model.parts.last().expect("part");
@@ -1382,6 +1408,9 @@ impl ProgressiveSession {
         if physical.header.method != 0 && physical.header.format == crate::rar5::RarFormat::Rar5 {
             self.history =
                 machine.take_rar5_decoder().map_err(|_| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+            self.history_failure = None;
+        } else if physical.header.method != 0 && self.solid_archive == Some(true) {
+            self.rar4_history = machine.take_rar4_history();
             self.history_failure = None;
         }
         if matches!(self.disposition, Disposition::Test) {

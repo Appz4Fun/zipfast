@@ -28,20 +28,22 @@ pub(super) fn admit_header_context(
     encrypted_headers: bool,
     solid_archive: bool,
 ) -> ProgressiveResult<()> {
-    if header.format == RarFormat::Rar4 && header.method != 0 && (encrypted_headers || solid_archive) {
+    // A solid archive's members decode in order, each going on from the one before.
+    let _ = solid_archive;
+    if header.format == RarFormat::Rar4 && header.method != 0 && encrypted_headers {
         return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
-            crate::error::RarUnsupported::Rar4Feature(if encrypted_headers {
-                "compressed encrypted headers"
-            } else {
-                "compressed solid archive"
-            }),
+            crate::error::RarUnsupported::Rar4Feature("compressed encrypted headers"),
         )))));
     }
     Ok(())
 }
-pub(super) fn core_frame(member: MemberId, h: &FileHeader) -> ProgressiveResult<CoreFrame> {
+pub(super) fn core_frame(
+    member: MemberId,
+    h: &FileHeader,
+    legacy: Option<crate::rar5::LegacyCrypt>,
+) -> ProgressiveResult<CoreFrame> {
     let raw = h.rar4.ok_or_else(invalid)?;
-    if h.rar4_progressive_unsupported(None).is_some() || h.method == 0 || h.size_unknown() {
+    if h.rar4_progressive_unsupported(legacy).is_some() || h.method == 0 || h.size_unknown() {
         return Err(invalid());
     }
     h.data_at.checked_add(h.packed_size).ok_or_else(invalid)?;
@@ -108,7 +110,7 @@ impl Independent {
             || h.packed_size != self.core.frame.packed
             || !p.final_part
             || p.volume != volume as usize
-            || core_frame(self.member, &h.header)? != self.core.frame
+            || core_frame(self.member, &h.header, h.wire.legacy.and_then(|w| w.crypt))? != self.core.frame
             || h.wire.extent != self.extent
             || p.wire_extent != self.extent
             || p.data_offset != self.data_at

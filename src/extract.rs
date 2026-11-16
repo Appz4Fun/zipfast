@@ -1950,6 +1950,13 @@ impl Pending {
         Ok(())
     }
 
+    /// RAR 3.x AES-128 for a selected RAR4 member.
+    pub(crate) fn start_selected_legacy_cipher(&mut self, salt: &[u8; 8], password: &str, size: u64) {
+        let (key, iv) = crate::crypto::derive_rar4_key_iv(password, salt);
+        self.context.password = RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);
+        self.cipher = Some(PendingCipher::from_legacy(key, iv, size, self.compressed));
+    }
+
     pub(crate) fn selected_cipher(&mut self) -> Option<&mut PendingCipher> {
         self.cipher.as_mut()
     }
@@ -2003,6 +2010,47 @@ impl Sink for PendingSink<'_> {
     fn crc(&mut self, crc: u32) {
         self.pending.crc(crc);
     }
+}
+
+/// Whether a RAR4 file goes on from the history of the one before it.
+fn rar4_continues(h: &FileHeader) -> bool {
+    h.rar4.is_some_and(|raw| raw.flags & 0x10 != 0)
+}
+
+/// The decoder for this part of a compressed RAR4 file: a new one, the solid stream's next file, or the same file
+/// going on from the volume before.
+pub(crate) fn rar4_part_decoder(
+    kept: &mut Option<Rar4Decoder>,
+    h: &FileHeader,
+    solid_archive: bool,
+    window_limit: u64,
+    cancel: Option<Cancellation>,
+) -> std::result::Result<Rar4Decoder, Rar4DecodeError> {
+    if h.split_before() {
+        let mut decoder = kept.take().ok_or(Rar4DecodeError::State)?;
+        decoder.extend_packed(h.packed_size)?;
+        return Ok(decoder);
+    }
+    let raw = h.rar4.ok_or(Rar4DecodeError::Binding)?;
+    if rar4_continues(h) {
+        let mut decoder = kept.take().ok_or(Rar4DecodeError::State)?;
+        let frame = crate::rar5::unpack::rar4::CoreFrame {
+            ordinal: 0,
+            packed: h.packed_size,
+            unpacked: h.unpacked_size,
+            unpack_version: raw.unpack_version,
+            method: raw.method,
+            dictionary: h.dictionary,
+        };
+        decoder.next_solid_member(frame)?;
+        return Ok(decoder);
+    }
+    *kept = None;
+    let mut decoder = Rar4Decoder::new_with_cancel(h.dictionary, h.packed_size, h.unpacked_size, window_limit, cancel)?;
+    if solid_archive {
+        decoder.track_boundary();
+    }
+    Ok(decoder)
 }
 
 fn with_rar4_member_sink(
@@ -2314,6 +2362,8 @@ struct Run<'a, 'r, 'c> {
     pending: Option<Pending>,
     /// the decoder, kept between files of a solid stream
     stream: Option<Unpacker>,
+    /// the RAR4 decoder, kept between the parts of a split file and the files of a solid stream
+    rar4: Option<Rar4Decoder>,
     /// threads for work spread over files; 1 for none
     threads: usize,
     /// small files being decoded and written on other threads
@@ -2563,6 +2613,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             unavailable: None,
             pending: None,
             stream: None,
+            rar4: None,
             threads,
             batch: None,
             batch_paths: HashSet::new(),
@@ -2627,6 +2678,7 @@ impl Run<'_, '_, '_> {
 
     fn lost_history(&mut self, ctx: &EntryContext, cause: Option<Arc<RarFailure>>) {
         self.stream = None;
+        self.rar4 = None;
         self.unavailable = Some((ctx.entry.index, cause));
     }
 
@@ -2703,7 +2755,11 @@ impl Run<'_, '_, '_> {
         }
         let ctx = self.reports.encounter(!continuation, &mut self.order, name, h.method)?;
         if let Some(reason) = h.rar4_unsupported() {
-            self.fail_in_order(&ctx, RarFailure::Unsupported(reason), "unsupported RAR4 payload feature")?;
+            let cause =
+                self.fail_in_order(&ctx, RarFailure::Unsupported(reason), "unsupported RAR4 payload feature")?;
+            if vol.main.is_solid() && h.method != 0 && !h.is_dir() {
+                self.lost_history(&ctx, Some(cause));
+            }
             return Ok(());
         }
         if !self.goes_to_batch(vol, &h) && !self.queueable(vol, &h) && !self.beside_batch(vol, &h) {
@@ -2733,6 +2789,9 @@ impl Run<'_, '_, '_> {
         }
         p.discard();
         self.stream = None;
+        if p.compressed {
+            self.rar4 = None;
+        }
         Ok(true)
     }
 
@@ -2749,7 +2808,11 @@ impl Run<'_, '_, '_> {
         }
         // every member with a first header takes its listing index, even one this reader can't decode
         let mut ctx = self.reports.unselected(self.order, name, h.method)?;
-        if h.rar4_unsupported().is_some() {
+        if let Some(reason) = h.rar4_unsupported() {
+            if vol.main.is_solid() && h.method != 0 && !h.is_dir() {
+                self.drain()?;
+                self.lost_history(&ctx, Some(Arc::new(RarFailure::Unsupported(reason))));
+            }
             return Ok(());
         }
         if !(vol.main.is_solid() && h.method != 0 && !h.is_dir()) {
@@ -2874,7 +2937,7 @@ impl Run<'_, '_, '_> {
             Some((RarFailure::Unsupported(reason), "unsupported RAR4 payload feature"))
         } else if let Some(Err(e)) = crypt {
             Some((RarFailure::crypt(e, ctx.scope()), "encrypted (password required)"))
-        } else if h.encrypted && (self.password.is_none() || h.crypt.is_none()) {
+        } else if h.encrypted && (self.password.is_none() || (h.format == RarFormat::Rar5 && h.crypt.is_none())) {
             Some((RarFailure::PasswordRequired { scope: ctx.scope() }, "encrypted (password required)"))
         } else if h.method != 0 && h.algorithm != 0 {
             let reason = RarUnsupported::CompressionAlgorithm { algorithm: h.algorithm, method: h.method };
@@ -2899,7 +2962,13 @@ impl Run<'_, '_, '_> {
             let cause = self.fail_in_order(&ctx, reason, format_args!("links are not supported yet ({link:?})"))?;
             return self.pass_over(vol, h, ctx, None, Some(cause));
         }
-        let cipher = if let (Some(cp), Some(pw)) = (h.crypt, self.password) {
+        let legacy_salt = h.rar4.and_then(|raw| raw.salt).filter(|_| h.encrypted);
+        let cipher = if let (Some(salt), Some(pw)) = (legacy_salt, self.password) {
+            // RAR 3.x AES-128: no password check value, so a wrong password shows as a checksum error
+            let (key, iv) = crate::crypto::derive_rar4_key_iv(pw, &salt);
+            ctx.password = RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);
+            Some(PendingCipher::from_legacy(key, iv, h.unpacked_size, h.method != 0))
+        } else if let (Some(cp), Some(pw)) = (h.crypt, self.password) {
             match Pending::start_cipher(&mut ctx, h.method != 0, cp, pw, (!h.size_unknown()).then_some(h.unpacked_size))
             {
                 Ok(cipher) => Some(cipher),
@@ -3008,6 +3077,22 @@ impl Run<'_, '_, '_> {
         }
         if h.format == RarFormat::Rar4 {
             self.stream = None;
+            if h.method != 0 && !h.split_before() {
+                if rar4_continues(h) {
+                    if !self.rar4.as_ref().is_some_and(Rar4Decoder::has_boundary) {
+                        let failure = self.dependency_failure();
+                        p.discard();
+                        self.rar4 = None;
+                        if !p.passive {
+                            self.fail_in_order(&p.context, failure, NEEDS_EARLIER)?;
+                        }
+                        return self.continue_file(vol, h, p, None);
+                    }
+                } else {
+                    self.rar4 = None;
+                    self.unavailable = None;
+                }
+            }
         }
         if h.format == RarFormat::Rar5 && h.method != 0 {
             let solid_archive = vol.main.is_solid();
@@ -3298,13 +3383,8 @@ impl Run<'_, '_, '_> {
         let mut rar4_error = None;
         let mut rar4 = if h.format == RarFormat::Rar4 && p.compressed {
             let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
-            match Rar4Decoder::new_with_cancel(
-                h.dictionary,
-                h.packed_size,
-                h.unpacked_size,
-                if self.selection.is_some() { RAR_SELECTED_WINDOW_LIMIT } else { 4 << 20 },
-                cancel,
-            ) {
+            let limit = if self.selection.is_some() { RAR_SELECTED_WINDOW_LIMIT } else { 4 << 20 };
+            match rar4_part_decoder(&mut self.rar4, h, vol.main.is_solid(), limit, cancel) {
                 Ok(decoder) => Some(decoder),
                 Err(error) => {
                     rar4_error = Some(error);
@@ -3316,6 +3396,9 @@ impl Run<'_, '_, '_> {
         };
         // stored data is only checked (and copied) as it comes; compressed data goes to the decoder
         vol.read_fast(self.threads > 1 && !p.compressed && p.cipher.is_none());
+        // a compressed RAR4 file is decrypted here, ahead of its decoder
+        let mut rar4_cipher = if rar4.is_some() || rar4_error.is_some() { p.cipher.take() } else { None };
+        let mut plain = Vec::new();
         let mut machine = MemberMachine::from_state(h, p.context.clone(), p.cipher.take(), stream.take(), p.bytes);
         let read = if let Some(error) = rar4_error {
             Err(ReadDataError::Sink(MemberDecodeError::Rar4(error)))
@@ -3324,13 +3407,15 @@ impl Run<'_, '_, '_> {
                 if let Some(selection) = &self.selection {
                     selection.cancel.check_io().map_err(|e| MemberDecodeError::Decoder(e.into()))?;
                 }
+                if h.format == RarFormat::Rar4 && split_after {
+                    // a RAR4 part's checksum covers its packed (and, if encrypted, encrypted) bytes
+                    part.update(&piece.bytes()[range.clone()]);
+                }
                 if let Some(decoder) = rar4.as_mut() {
-                    let chunk = &piece.bytes()[range];
-                    if split_after {
-                        part.update(chunk);
-                        if let Some(b) = &mut part_blake {
-                            b.update(chunk);
-                        }
+                    let mut chunk = &piece.bytes()[range];
+                    if let Some(cipher) = rar4_cipher.as_mut() {
+                        cipher.decrypt_selected(chunk, &mut plain);
+                        chunk = &plain;
                     }
                     with_rar4_member_sink(&mut p, self.selection.as_mut(), |sink| decoder.feed(chunk, sink).map(|_| ()))
                 } else {
@@ -3340,7 +3425,7 @@ impl Run<'_, '_, '_> {
                 }
             })
         };
-        p.cipher = machine.cipher.take();
+        p.cipher = rar4_cipher.take().or(machine.cipher.take());
         stream = machine.take_rar5_decoder()?;
         if h.format == RarFormat::Rar5 {
             (part, part_blake) = machine.into_part_hashes();
@@ -3369,8 +3454,10 @@ impl Run<'_, '_, '_> {
                 };
                 padding.and_then(|()| {
                     if let Some(decoder) = rar4.as_mut() {
-                        with_rar4_member_sink(&mut p, self.selection.as_mut(), |sink| decoder.finish(sink))
-                            .map_err(|error| sink_fault(error, &p, None))
+                        with_rar4_member_sink(&mut p, self.selection.as_mut(), |sink| {
+                            decoder.finish_logical(sink).map(|_| ())
+                        })
+                        .map_err(|error| sink_fault(error, &p, None))
                     } else {
                         match stream.as_mut() {
                             Some(u) => with_member_sink(&mut p, self.selection.as_mut(), |sink| u.finish(sink))
@@ -3434,6 +3521,12 @@ impl Run<'_, '_, '_> {
             return Ok(());
         }
         self.stream = stream.or(self.stream.take());
+        if let Some(decoder) = rar4
+            && (split_after || (vol.main.is_solid() && decoder.has_boundary()))
+        {
+            // the rest of the file, or the next file of the solid stream, goes on from here
+            self.rar4 = Some(decoder);
+        }
         if split_after {
             // The hash mode belongs to this part, even though CBC and its derived key span the member.
             let hash_key = p.hash_key(h.crypt.as_ref().is_some_and(|crypt| crypt.tweaked_crc));

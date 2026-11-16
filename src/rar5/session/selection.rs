@@ -325,6 +325,8 @@ struct SelectedRun {
     next: usize,
     failed: Option<(usize, Arc<RarFailure>)>,
     decoder: Option<Unpacker>,
+    /// the RAR4 decoder, kept between the members of a solid stream
+    rar4: Option<Rar4Decoder>,
     history_volumes: VolumeSet,
     buffer: Vec<u8>,
     decrypted: Vec<u8>,
@@ -347,6 +349,7 @@ impl SelectedRun {
             next: 0,
             failed: None,
             decoder: None,
+            rar4: None,
             history_volumes: [0; VOLUME_WORDS],
             buffer,
             decrypted,
@@ -382,7 +385,7 @@ impl SelectedRun {
             check_volumes(session, &volumes)?;
             return Ok(outcome);
         }
-        let compressed = member.header.format == RarFormat::Rar5 && member.header.method != 0;
+        let compressed = member.header.method != 0;
         if compressed {
             let Some(chain) = member.chain else {
                 return Ok(RarOutcome::Failed(history_failure(None)));
@@ -405,6 +408,7 @@ impl SelectedRun {
                         return Err(failure);
                     }
                     self.decoder = None;
+                    self.rar4 = None;
                     self.failed = Some((predecessor, failure));
                     return Ok(RarOutcome::Failed(history_failure(self.failed.as_ref())));
                 }
@@ -417,6 +421,7 @@ impl SelectedRun {
             Err(failure) => {
                 if compressed {
                     self.decoder = None;
+                    self.rar4 = None;
                     self.failed = Some((index, Arc::clone(&failure)));
                 }
                 Ok(RarOutcome::Failed(failure))
@@ -489,23 +494,23 @@ impl SelectedRun {
             let Some(password) = Some(session.password.as_str()).filter(|pw| !pw.is_empty()) else {
                 return Err(RarFailure::PasswordRequired { scope: pending.context().scope() });
             };
-            let params = parts[0]
-                .crypt
-                .and_then(Result::ok)
-                .ok_or_else(|| pending.context().integrity(RarIntegrityReason::MalformedEncryptionRecord, false))?;
-            pending.start_selected_cipher(params, password, member.unpacked_size)?;
+            if let Some(salt) = header.rar4.and_then(|raw| raw.salt) {
+                pending.start_selected_legacy_cipher(&salt, password, header.unpacked_size);
+            } else {
+                let params = parts[0]
+                    .crypt
+                    .and_then(Result::ok)
+                    .ok_or_else(|| pending.context().integrity(RarIntegrityReason::MalformedEncryptionRecord, false))?;
+                pending.start_selected_cipher(params, password, member.unpacked_size)?;
+            }
         }
         let compressed = header.method != 0;
         let mut rar4 = if compressed && header.format == RarFormat::Rar4 {
+            let first = &session.model.parts[member.parts.start];
+            let solid = member.has_successor || session.volumes[first.volume].metadata.main.is_solid();
             Some(
-                Rar4Decoder::new(
-                    header.dictionary,
-                    member.packed_size,
-                    header.unpacked_size,
-                    self.limits.window_bytes.min(WINDOW_MAX),
-                    session.options.cancel.clone(),
-                )
-                .map_err(|error| *error.detailed(pending.context().scope()).failure)?,
+                self.rar4_decoder(session, member, solid)
+                    .map_err(|error| *error.detailed(pending.context().scope()).failure)?,
             )
         } else {
             None
@@ -605,7 +610,7 @@ impl SelectedRun {
                 failure: None,
                 output: &mut output,
             };
-            let result = decoder.finish(&mut sink);
+            let result = decoder.finish_logical(&mut sink).map(|_| ());
             sink.finish_rar4(result)?;
         }
         if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5) {
@@ -620,6 +625,10 @@ impl SelectedRun {
             let result = decoder.finish(&mut sink);
             sink.finish(result, decoder.take_size_failure())?;
         }
+        if let Some(decoder) = rar4.filter(Rar4Decoder::has_boundary) {
+            // the next member of the solid stream goes on from here
+            self.rar4 = Some(decoder);
+        }
         let final_checks = parts.last().expect("catalogue members have a part").checks;
         let checks = pending.verify_selected(
             member.unpacked_size,
@@ -628,6 +637,41 @@ impl SelectedRun {
             final_checks.keyed,
         )?;
         Ok((pending.verified_size(), checks))
+    }
+
+    /// The RAR4 decoder for a member: the solid stream's, going on to it, or a new one.
+    fn rar4_decoder(
+        &mut self,
+        session: &RarSession,
+        member: &Member,
+        solid: bool,
+    ) -> Result<Rar4Decoder, Rar4DecodeError> {
+        let header = &member.header;
+        let raw = header.rar4.ok_or(Rar4DecodeError::Binding)?;
+        if header.solid {
+            let mut decoder = self.rar4.take().ok_or(Rar4DecodeError::State)?;
+            decoder.next_solid_member(crate::rar5::unpack::rar4::CoreFrame {
+                ordinal: 0,
+                packed: member.packed_size,
+                unpacked: header.unpacked_size,
+                unpack_version: raw.unpack_version,
+                method: raw.method,
+                dictionary: header.dictionary,
+            })?;
+            return Ok(decoder);
+        }
+        self.rar4 = None;
+        let mut decoder = Rar4Decoder::new(
+            header.dictionary,
+            member.packed_size,
+            header.unpacked_size,
+            self.limits.window_bytes.min(WINDOW_MAX),
+            session.options.cancel.clone(),
+        )?;
+        if solid {
+            decoder.track_boundary();
+        }
+        Ok(decoder)
     }
 
     fn prepare_decoder(

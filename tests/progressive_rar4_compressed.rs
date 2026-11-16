@@ -347,16 +347,9 @@ fn dictionary_and_output_limits_refuse_before_success() {
 }
 #[test]
 fn unsupported_geometry_precedes_skip_test_directory_and_key_work() {
-    for (flags, version, unknown) in [
-        (1, 29, false),
-        (2, 29, false),
-        (0x10, 29, false),
-        (4, 29, false),
-        (0xe4, 29, false),
-        (0, 20, false),
-        (0, 15, false),
-        (0, 29, true),
-    ] {
+    // Split and solid members decode now (tests/rar4_split_solid.rs).
+    for (flags, version, unknown) in [(4, 29, false), (0xe4, 29, false), (0, 20, false), (0, 15, false), (0, 29, true)]
+    {
         for mode in 0..3 {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("one"), b"old").unwrap();
@@ -587,7 +580,7 @@ fn compressed_hole_keeps_actual_prefix_but_cannot_restart() {
     panic!("no stopped outcome")
 }
 #[test]
-fn solid_archive_and_encrypted_headers_remain_explicit_refusals() {
+fn encrypted_headers_remain_an_explicit_refusal_and_a_solid_archive_decodes() {
     for encrypted in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = options(dir.path());
@@ -614,6 +607,12 @@ fn solid_archive_and_encrypted_headers_remain_explicit_refusals() {
         }
         let mut s =
             ProgressiveSession::from_sealed_memory(vec![("a.rar".into(), data.into_boxed_slice())], opts).unwrap();
+        if !encrypted {
+            // a solid archive's first member starts the stream
+            drive(&mut s, None).unwrap();
+            assert_eq!(std::fs::read(dir.path().join("one")).unwrap(), b"A");
+            continue;
+        }
         let e = drive(&mut s, None).err().expect("unsupported");
         assert!(
             matches!(e.kind,FailureKind::Rar(ref f) if matches!(f.as_ref(),zipfast::error::RarFailure::Unsupported(_))),

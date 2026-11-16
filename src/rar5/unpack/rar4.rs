@@ -14,7 +14,8 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Bounded, serial RAR4 version-29 LZ core; production solid admission stays disabled.
+//! Bounded, serial RAR4 version-29 LZ core, continuing across the parts of a split member and the members of a
+//! solid stream.
 //! Original implementation from the SDD factual worksheet and independent vectors.
 //! No external decoder implementation was copied or translated.
 
@@ -297,6 +298,12 @@ pub(crate) struct Rar4Decoder {
     output: [u8; OUTPUT],
     filled: usize,
     table_builds: u64,
+    /// Solid chaining: past a member's last byte, read its end-of-file marker for the next member's start.
+    track_boundary: bool,
+    /// Reading the end-of-file marker after the member's output is complete.
+    in_tail: bool,
+    /// Where the next solid member starts: at a token, or at new tables.
+    boundary: Option<Phase>,
     #[cfg(test)]
     first_cross: Option<(u64, u64, u64)>,
     #[cfg(test)]
@@ -382,6 +389,9 @@ impl Rar4Decoder {
             output: [0; OUTPUT],
             filled: 0,
             table_builds: 0,
+            track_boundary: false,
+            in_tail: false,
+            boundary: None,
             #[cfg(test)]
             first_cross: None,
             #[cfg(test)]
@@ -407,7 +417,14 @@ impl Rar4Decoder {
                 return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
             }
             let mut input = bytes;
-            while self.step_counted(&mut input, sink)? {}
+            loop {
+                match self.step_counted(&mut input, sink) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) if self.in_tail && Self::tail_tolerates(&error) => self.end_tail(),
+                    Err(error) => return Err(error),
+                }
+            }
             self.work.check()?;
             Ok(if matches!(self.phase, Phase::Complete) { Rar4FeedState::Complete } else { Rar4FeedState::NeedInput })
         })();
@@ -416,6 +433,8 @@ impl Rar4Decoder {
         }
         result
     }
+    /// Finishes a member and closes the decoder: no solid successor can follow.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finish(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
         if self.poisoned || self.finished {
             return Err(Rar4DecodeError::Malformed("decoder is no longer usable"));
@@ -632,6 +651,16 @@ impl Rar4Decoder {
             }
             Phase::Token => {
                 let token = symbol!(1);
+                if self.in_tail {
+                    // Past the member's output only the end-of-file marker belongs to it. Anything else is
+                    // read as UnRAR does: the next member goes on with the tables in force.
+                    if token == 256 {
+                        self.phase = Phase::End;
+                    } else {
+                        self.finish_tail(Phase::Token);
+                    }
+                    return Ok(true);
+                }
                 #[cfg(test)]
                 match token {
                     256 => self.observe(tests::TraceKind::EndSymbol),
@@ -662,8 +691,12 @@ impl Rar4Decoder {
                     && self.lifecycle == Lifecycle::Active
                 {
                     self.flush(sink)?;
-                    self.saved_phase = self.phase;
-                    self.phase = Phase::Complete;
+                    if self.track_boundary {
+                        self.in_tail = true;
+                    } else {
+                        self.saved_phase = self.phase;
+                        self.phase = Phase::Complete;
+                    }
                 }
             }
             Phase::End => {
@@ -675,6 +708,10 @@ impl Rar4Decoder {
                 let _hint = take!(1);
                 #[cfg(test)]
                 self.observe(tests::TraceKind::EndHint { read_tables_next: _hint != 0 });
+                if self.in_tail {
+                    self.finish_tail(if _hint == 0 { Phase::Token } else { Phase::Align });
+                    return Ok(true);
+                }
                 if self.lifecycle == Lifecycle::Deferred {
                     self.lifecycle = Lifecycle::BoundaryReady;
                     self.saved_phase = if _hint == 0 { Phase::Token } else { Phase::Align };
@@ -760,8 +797,12 @@ impl Rar4Decoder {
                 self.phase = if left == 1 { Phase::Token } else { Phase::Copy { distance, left: left - 1 } };
                 if self.produced == self.expected && left == 1 && self.lifecycle == Lifecycle::Active {
                     self.flush(sink)?;
-                    self.saved_phase = self.phase;
-                    self.phase = Phase::Complete;
+                    if self.track_boundary {
+                        self.in_tail = true;
+                    } else {
+                        self.saved_phase = self.phase;
+                        self.phase = Phase::Complete;
+                    }
                 }
             }
             Phase::Complete => return Ok(false),

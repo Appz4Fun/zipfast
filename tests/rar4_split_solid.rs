@@ -1,0 +1,660 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+//! RAR 4.x members split over volumes, solid streams and encrypted members, written by real archivers, extracted
+//! through every route and compared with what UnRAR extracts from them (`tests/fixtures/rar4-unrar`).
+//!
+//! With `ZIPFAST_RAR4_CORPUS` naming a directory laid out as Prybar's RAR4 reference corpus (`in/<set>/<archive>` and
+//! UnRAR's `out/<name>.sha256`), `prybar_corpus_matches_unrar` extracts the whole corpus the same way.
+
+#![cfg(unix)]
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
+
+use zipfast::crc32::hash;
+use zipfast::crypto::sha256;
+use zipfast::error::RarFailure;
+use zipfast::extract::{self, Cancellation, Mode, Options, Overwrite, RarEntryOutcome, RarOutcome};
+use zipfast::progressive::*;
+use zipfast::rar5::session::*;
+
+fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+fn options(dest: &Path) -> Options {
+    Options {
+        mode: Mode::Extract,
+        dest: dest.into(),
+        overwrite: Overwrite::Always,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What a file must hold.
+#[derive(Clone, Debug)]
+enum Expect {
+    Sha256(String),
+    Crc32(u32),
+}
+
+type Manifest = BTreeMap<String, Expect>;
+
+/// `sha256sum` output, as the reference corpus records it.
+fn manifest(text: &str) -> Manifest {
+    text.lines()
+        .filter_map(|line| line.split_once("  "))
+        .map(|(sum, name)| (name.trim_start_matches("./").to_owned(), Expect::Sha256(sum.to_owned())))
+        .collect()
+}
+
+fn unrar_manifest(name: &str) -> Manifest {
+    manifest(&fs::read_to_string(fixtures().join("rar4-unrar").join(format!("{name}.sha256"))).unwrap())
+}
+
+/// Every regular file under `dir`, by its path relative to it.
+fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                walk(root, &path, out);
+            } else if kind.is_file() {
+                let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+fn check_tree(label: &str, dir: &Path, want: &Manifest) {
+    let got = tree(dir);
+    assert_eq!(got.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>(), "{label}: extracted names");
+    for (name, expect) in want {
+        let bytes = &got[name];
+        match expect {
+            Expect::Sha256(sum) => assert_eq!(&hex(&sha256(bytes)), sum, "{label}: {name}"),
+            Expect::Crc32(crc) => assert_eq!(hash(bytes), *crc, "{label}: {name}"),
+        }
+    }
+}
+
+struct Case {
+    /// volumes in order
+    volumes: Vec<PathBuf>,
+    password: Option<&'static str>,
+    want: Manifest,
+}
+
+fn paths(volumes: &[&str]) -> Vec<PathBuf> {
+    volumes.iter().map(|v| fixtures().join(v)).collect()
+}
+
+fn case(volumes: &[&str], password: Option<&'static str>, unrar: &str) -> Case {
+    Case { volumes: paths(volumes), password, want: unrar_manifest(unrar) }
+}
+
+fn cases() -> Vec<Case> {
+    vec![
+        case(
+            &["rar4-volumes/multi.part1.rar", "rar4-volumes/multi.part2.rar", "rar4-volumes/multi.part3.rar"],
+            None,
+            "in_rarinfo_multi.part1.rar",
+        ),
+        case(
+            &[
+                "rar4-rar300/compressed_multivol_prng_rar300.rar",
+                "rar4-rar300/compressed_multivol_prng_rar300.r00",
+                "rar4-rar300/compressed_multivol_prng_rar300.r01",
+                "rar4-rar300/compressed_multivol_prng_rar300.r02",
+                "rar4-rar300/compressed_multivol_prng_rar300.r03",
+            ],
+            None,
+            "in_rar300_compressed_multivol_prng_rar300.rar",
+        ),
+        case(
+            &["rar4-rar300/multivol_oldnaming_rar300.rar", "rar4-rar300/multivol_oldnaming_rar300.r00"],
+            None,
+            "in_rar300_multivol_oldnaming_rar300.rar",
+        ),
+        case(
+            &["rar4-rar300/multivol_newnaming_rar300.part01.rar", "rar4-rar300/multivol_newnaming_rar300.part02.rar"],
+            None,
+            "in_rar300_multivol_newnaming_rar300.part01.rar",
+        ),
+        case(
+            &[
+                "rar4-archiver/mac-oldvol.rar",
+                "rar4-archiver/mac-oldvol.r00",
+                "rar4-archiver/mac-oldvol.r01",
+                "rar4-archiver/mac-oldvol.r02",
+            ],
+            None,
+            "in_rar4-archiver_mac-oldvol.rar",
+        ),
+        case(
+            &[
+                "rar4-archiver/win-encvol.rar",
+                "rar4-archiver/win-encvol.r00",
+                "rar4-archiver/win-encvol.r01",
+                "rar4-archiver/win-encvol.r02",
+            ],
+            Some("testpw123"),
+            "in_rar4-archiver_win-encvol.rar",
+        ),
+        case(&["rar4/solid.rar"], None, "in_rarinfo_solid.rar"),
+        case(&["rar4-rar300/solid_simple_rar300.rar"], None, "in_rar300_solid_simple_rar300.rar"),
+        case(&["rar4-rar300/solid_rar300.rar"], None, "in_rar300_solid_rar300.rar"),
+        Case {
+            volumes: paths(&["rar4-rar300/per_file_rar300_password.rar"]),
+            password: Some("password"),
+            want: [("hello.txt".to_owned(), Expect::Crc32(0xa538_535e))].into(),
+        },
+        Case {
+            volumes: paths(&["rar4-rar300/rar4_junrar_password.rar"]),
+            password: Some("junrar"),
+            want: [("file1.txt".to_owned(), Expect::Sha256(hex(&sha256(b"file1\n"))))].into(),
+        },
+    ]
+}
+
+/// Copies a case's volumes into `dir`, keeping their names.
+fn stage(case: &Case, dir: &Path) -> Vec<PathBuf> {
+    fs::create_dir_all(dir).unwrap();
+    case.volumes
+        .iter()
+        .map(|from| {
+            let to = dir.join(from.file_name().unwrap());
+            fs::copy(from, &to).unwrap();
+            to
+        })
+        .collect()
+}
+
+fn first(case: &Case) -> PathBuf {
+    case.volumes[0].clone()
+}
+
+fn label(case: &Case, route: &str) -> String {
+    format!("{} via {route}", case.volumes[0].display())
+}
+
+#[derive(Default)]
+struct Events {
+    failures: Vec<String>,
+}
+
+/// Extracts through `extract::run` / `run_with_password`.
+fn via_run(case: &Case, dest: &Path) {
+    let mut events = Events::default();
+    let summary = match case.password {
+        None => extract::run(&first(case), &options(dest), |m| events.failures.push(m.into())),
+        Some(pw) => {
+            extract::run_with_password(&first(case), &options(dest), Some(pw), |m| events.failures.push(m.into()))
+        }
+    }
+    .unwrap_or_else(|e| panic!("{}: {e}", label(case, "run")));
+    assert!(summary.errors.is_empty() && events.failures.is_empty(), "{}: {:?}", label(case, "run"), summary.errors);
+    assert_eq!(summary.files as usize, case.want.len(), "{}", label(case, "run"));
+}
+
+fn via_outcomes(case: &Case, dest: &Path) {
+    let mut outcomes = Vec::new();
+    let summary = extract::run_rar_with_outcomes(&first(case), &options(dest), case.password, |o: &RarEntryOutcome| {
+        outcomes.push(format!("{:?}", o.outcome))
+    })
+    .unwrap_or_else(|e| panic!("{}: {e:?}", label(case, "outcomes")));
+    assert_eq!(
+        (summary.files as usize, summary.failed),
+        (case.want.len(), 0),
+        "{}: {outcomes:?}",
+        label(case, "outcomes")
+    );
+}
+
+fn via_zip_policy(case: &Case, dest: &Path) {
+    let report = extract::run_with_zip_policy(
+        &first(case),
+        &options(dest),
+        case.password,
+        &Cancellation::default(),
+        &Default::default(),
+        |_: zipfast::zip::ZipRunEvent<'_>| Ok(()),
+    )
+    .unwrap_or_else(|e| panic!("{}: {e:?}", label(case, "zip policy")));
+    assert_eq!((report.files() as usize, report.failed()), (case.want.len(), 0), "{}", label(case, "zip policy"));
+}
+
+fn session(case: &Case) -> RarSession {
+    RarSession::open(&first(case), case.password, RarSessionOptions::default()).unwrap()
+}
+
+fn via_selected(case: &Case, dest: &Path) {
+    let mut session = session(case);
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(dest), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files as usize, summary.failed), (case.want.len(), 0), "{}", label(case, "selected"));
+}
+
+struct Replace;
+impl RarExtractObserver for Replace {
+    fn overwrite(
+        &mut self,
+        _: &RarOverwriteConflict<'_>,
+        _: RarDiagnostic<'_>,
+    ) -> Result<RarOverwriteDecision, RarDecisionError> {
+        Ok(RarOverwriteDecision::Replace)
+    }
+    fn entry(&mut self, _: &RarEntryOutcome, _: RarDiagnostic<'_>) {}
+}
+
+fn via_controlled(case: &Case, dest: &Path) {
+    let mut session = session(case);
+    let all = session.select(|_| true).unwrap();
+    let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+    let report = session.extract_selected_controlled(
+        &all,
+        &options(dest),
+        RarDecodeLimits::default(),
+        &mut control,
+        &mut Replace,
+    );
+    let summary = report.finish().outcome.unwrap();
+    assert_eq!((summary.files as usize, summary.failed), (case.want.len(), 0), "{}", label(case, "controlled"));
+}
+
+fn progressive_options(case: &Case, dest: &Path) -> ProgressiveOptions {
+    let name = case.volumes[0].file_name().unwrap().to_owned();
+    let mut opts = ProgressiveOptions::new(options(dest), name);
+    if let Some(pw) = case.password {
+        opts.set_password(Some(pw.into())).unwrap();
+    }
+    opts
+}
+
+struct Unpark {
+    thread: std::thread::Thread,
+    woken: AtomicBool,
+}
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+        self.thread.unpark();
+    }
+}
+
+/// Polls a progressive session to its end; `between` runs whenever it waits. Returns each member's outcome.
+fn drive(session: &mut ProgressiveSession, mut between: impl FnMut()) -> Vec<String> {
+    let unpark = Arc::new(Unpark { thread: std::thread::current(), woken: AtomicBool::new(false) });
+    let waker = Waker::from(unpark.clone());
+    let start = Instant::now();
+    let mut problems = Vec::new();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(60), "progressive session stalled");
+        match session.poll_event(&mut Context::from_waker(&waker)) {
+            Poll::Pending => {
+                between();
+                while !unpark.woken.swap(false, Ordering::SeqCst) {
+                    std::thread::park_timeout(Duration::from_millis(20));
+                    assert!(start.elapsed() < Duration::from_secs(60), "no wake");
+                }
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => match outcome {
+                MemberOutcome::Verified(_) | MemberOutcome::Directory { .. } => {}
+                MemberOutcome::Skipped(reason) => problems.push(format!("Skipped {reason:?}")),
+                MemberOutcome::Stopped { failure, .. } => problems.push(format!("stopped: {failure:?}")),
+                _ => problems.push("other outcome".into()),
+            },
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
+                problems.push(format!("terminated: {failure:?}"));
+                break;
+            }
+            Poll::Ready(Ok(Some(_))) => {}
+            Poll::Ready(Err(failure)) => {
+                problems.push(format!("failed: {failure:?}"));
+                break;
+            }
+        }
+    }
+    problems
+}
+
+/// A progressive session over the complete volumes, held in memory.
+fn via_progressive(case: &Case, dest: &Path) {
+    let volumes = case
+        .volumes
+        .iter()
+        .map(|path| (OsString::from(path.file_name().unwrap()), fs::read(path).unwrap().into_boxed_slice()))
+        .collect();
+    let mut session = ProgressiveSession::from_sealed_memory(volumes, progressive_options(case, dest)).unwrap();
+    let problems = drive(&mut session, || {});
+    assert!(problems.is_empty(), "{}: {problems:?}", label(case, "progressive"));
+}
+
+fn growing() -> GrowingOptions {
+    let mut options = GrowingOptions::default();
+    options.poll_interval = Some(Duration::from_millis(10));
+    options.idle_timeout = Duration::from_secs(20);
+    options
+}
+
+/// Following the volumes as they arrive (`--follow`): only the first exists when the session starts; each later
+/// one appears while the session waits for it.
+fn via_follow(case: &Case, dest: &Path, inputs: &Path) {
+    let staged = stage(case, &inputs.join("all"));
+    let live = inputs.join("live");
+    fs::create_dir_all(&live).unwrap();
+    let place = |i: usize| fs::copy(&staged[i], live.join(staged[i].file_name().unwrap())).unwrap();
+    place(0);
+    let mut next = 1;
+    let provider = GrowingFileVolumes::new(live.join(staged[0].file_name().unwrap()), growing()).unwrap();
+    let mut session = ProgressiveSession::new(Box::new(provider), progressive_options(case, dest)).unwrap();
+    let problems = drive(&mut session, || {
+        if next < staged.len() {
+            place(next);
+            next += 1;
+        }
+    });
+    assert!(problems.is_empty(), "{}: {problems:?}", label(case, "follow"));
+    assert_eq!(next, staged.len(), "{}: every volume was read", label(case, "follow"));
+}
+
+/// Each route extracts each fixture as UnRAR does.
+#[test]
+fn every_route_extracts_split_solid_and_encrypted_rar4_like_unrar() {
+    let tmp = tempfile::tempdir().unwrap();
+    type Route = fn(&Case, &Path);
+    let routes: [(&str, Route); 7] = [
+        ("run", via_run),
+        ("outcomes", via_outcomes),
+        ("zip policy", via_zip_policy),
+        ("selected", via_selected),
+        ("controlled", via_controlled),
+        ("progressive", via_progressive),
+        ("follow", |case, dest| via_follow(case, dest, &dest.with_extension("in"))),
+    ];
+    for (n, case) in cases().iter().enumerate() {
+        for (route, extract) in routes {
+            let dest = tmp.path().join(format!("{n}-{}", route.replace(' ', "-")));
+            extract(case, &dest);
+            check_tree(&label(case, route), &dest, &case.want);
+        }
+    }
+}
+
+/// Selecting only a later member of a solid stream still decodes the ones before it, unwritten.
+#[test]
+fn a_later_solid_member_alone_extracts_correctly() {
+    let tmp = tempfile::tempdir().unwrap();
+    for case in cases().iter().filter(|c| c.volumes.len() == 1 && c.want.len() > 1) {
+        let (last, expect) = case.want.iter().next_back().unwrap();
+        let want: Manifest = [(last.clone(), expect.clone())].into();
+        // whole-archive extraction with a member filter
+        let dest = tmp.path().join(format!("filter-{}", want.len()));
+        let _ = fs::remove_dir_all(&dest);
+        let mut opts = options(&dest);
+        let keep = last.clone();
+        opts.select = Some(extract::MemberFilter::new(move |m| m.name == keep));
+        let summary = extract::run_with_password(&first(case), &opts, case.password, |_| {}).unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        check_tree(&label(case, "filtered run"), &dest, &want);
+        // a session selecting only that member
+        let dest = tmp.path().join("selected-last");
+        let _ = fs::remove_dir_all(&dest);
+        let mut session = session(case);
+        let keep = last.clone();
+        let selected = session.select(|m| m.name() == keep).unwrap();
+        let summary = session.extract_selected(&selected, &options(&dest), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!((summary.files, summary.failed), (1, 0));
+        check_tree(&label(case, "selected last"), &dest, &want);
+        // the single-entry reader, by listing index
+        let index = session.entries().position(|e| e.name() == last).unwrap();
+        let mut bytes = Vec::new();
+        extract::SelectedEntry::open(&first(case), index, case.password, 1 << 20)
+            .unwrap()
+            .read(None, |chunk| {
+                bytes.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        match expect {
+            Expect::Sha256(sum) => assert_eq!(&hex(&sha256(&bytes)), sum, "{}", label(case, "entry reader")),
+            Expect::Crc32(crc) => assert_eq!(hash(&bytes), *crc),
+        }
+        // a progressive session that skips the earlier members: they are decoded, not written
+        let dest = tmp.path().join("progressive-last");
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&dest).unwrap();
+        let volume = fs::read(first(case)).unwrap().into_boxed_slice();
+        let name = OsString::from(first(case).file_name().unwrap());
+        let mut opts = progressive_options(case, &dest);
+        opts.extract.overwrite = Overwrite::Skip;
+        for other in case.want.keys().filter(|n| *n != last) {
+            fs::write(dest.join(other), b"keep").unwrap();
+        }
+        let mut session = ProgressiveSession::from_sealed_memory(vec![(name, volume)], opts).unwrap();
+        let problems = drive(&mut session, || {});
+        assert!(problems.iter().all(|p| p.starts_with("Skipped")), "{problems:?}");
+        let bytes = fs::read(dest.join(last)).unwrap();
+        match expect {
+            Expect::Sha256(sum) => assert_eq!(&hex(&sha256(&bytes)), sum),
+            Expect::Crc32(crc) => assert_eq!(hash(&bytes), *crc),
+        }
+    }
+}
+
+fn multi_parts(dir: &Path) -> Vec<PathBuf> {
+    let case = &cases()[0];
+    stage(case, dir)
+}
+
+/// A damaged continuation volume is a typed failure of the split member, never wrong output.
+#[test]
+fn corrupt_and_truncated_continuations_fail_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    // flip a byte in the packed data of the second volume's continuation
+    let dir = tmp.path().join("corrupt");
+    let parts = multi_parts(&dir);
+    let mut bytes = fs::read(&parts[1]).unwrap();
+    let at = bytes.len() - 200;
+    bytes[at] ^= 0x55;
+    fs::write(&parts[1], bytes).unwrap();
+    let dest = tmp.path().join("corrupt-out");
+    let mut failed = Vec::new();
+    extract::run_rar_with_outcomes(&parts[0], &options(&dest), None, |o: &RarEntryOutcome| {
+        if let RarOutcome::Failed(failure) = &o.outcome {
+            failed.push((o.entry.name.clone(), Arc::clone(failure)));
+        }
+    })
+    .unwrap();
+    assert!(!failed.is_empty(), "a damaged part must fail its member");
+    for (_, failure) in &failed {
+        assert!(matches!(failure.as_ref(), RarFailure::Integrity { .. }), "{failure:?}");
+    }
+    let mut session = RarSession::open(&parts[0], None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.test_selected(&all, RarDecodeLimits::default(), |_| {}).unwrap();
+    assert!(summary.failed >= 1);
+
+    // cut the last volume short
+    let dir = tmp.path().join("truncated");
+    let parts = multi_parts(&dir);
+    let bytes = fs::read(&parts[2]).unwrap();
+    fs::write(&parts[2], &bytes[..bytes.len() / 2]).unwrap();
+    let dest = tmp.path().join("truncated-out");
+    let result = extract::run_rar_with_outcomes(&parts[0], &options(&dest), None, |_| {});
+    assert!(result.is_err() || result.as_ref().is_ok_and(|s| s.failed > 0), "{result:?}");
+    if let Err(error) = &result {
+        assert!(
+            matches!(error.failure.as_ref(), RarFailure::Integrity { .. } | RarFailure::Input { .. }),
+            "{:?}",
+            error.failure
+        );
+    }
+
+    // and a missing last volume
+    let dir = tmp.path().join("missing");
+    let parts = multi_parts(&dir);
+    fs::remove_file(&parts[2]).unwrap();
+    let dest = tmp.path().join("missing-out");
+    let result = extract::run_rar_with_outcomes(&parts[0], &options(&dest), None, |_| {});
+    assert!(result.is_err() || result.as_ref().is_ok_and(|s| s.failed > 0), "{result:?}");
+}
+
+/// Canceling a session that waits in the middle of a compressed split member for its next volume stops it, typed,
+/// and publishes nothing.
+#[test]
+fn cancellation_mid_member_stops_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let case = &cases()[2]; // multivol_oldnaming: one 64 KiB member over two volumes
+    let staged = stage(case, &tmp.path().join("all"));
+    let live = tmp.path().join("live");
+    fs::create_dir_all(&live).unwrap();
+    fs::copy(&staged[0], live.join(staged[0].file_name().unwrap())).unwrap();
+    let dest = tmp.path().join("out");
+    let provider = GrowingFileVolumes::new(live.join(staged[0].file_name().unwrap()), growing()).unwrap();
+    let mut session = ProgressiveSession::new(Box::new(provider), progressive_options(case, &dest)).unwrap();
+    let control = session.control();
+    let mut started = false;
+    let mut canceled = false;
+    let problems = drive(&mut session, || {
+        // the first wait after the member started is for the volume its second part is in
+        if started && !canceled {
+            control.cancel();
+            canceled = true;
+        }
+        started = true;
+    });
+    assert!(canceled);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("Canceled"), "{problems:?}");
+    assert!(tree(&dest).is_empty(), "nothing is published");
+}
+
+/// The whole Prybar reference corpus, when `ZIPFAST_RAR4_CORPUS` names it: every archive UnRAR extracts must
+/// extract identically, except the shapes listed as not yet supported.
+#[test]
+fn prybar_corpus_matches_unrar() {
+    let Some(root) = std::env::var_os("ZIPFAST_RAR4_CORPUS").map(PathBuf::from) else {
+        eprintln!("ZIPFAST_RAR4_CORPUS is not set: skipping the reference corpus");
+        return;
+    };
+    // Not supported yet, with the reason; each still must not extract anything UnRAR doesn't.
+    let pending: &[(&str, &str)] = &[
+        ("in_rar300_rarvm_", "RAR 3.x VM standard filters"),
+        ("in_rarinfo_latest_winrar.rar", "PPMd variant H"),
+        ("in_rar4-archiver_win-enchdr.rar", "encrypted headers"),
+        ("in_rarinfo_dirlink_unix.rar", "symbolic links (a progressive session stops at the first)"),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let mut matched = Vec::new();
+    let mut waiting = Vec::new();
+    let mut mismatched = Vec::new();
+    let mut sets: Vec<_> = fs::read_dir(root.join("in")).unwrap().flatten().map(|e| e.path()).collect();
+    sets.sort();
+    for set in sets {
+        let mut archives: Vec<_> = fs::read_dir(&set).unwrap().flatten().map(|e| e.path()).collect();
+        archives.sort();
+        for archive in archives {
+            let file = archive.file_name().unwrap().to_string_lossy().into_owned();
+            let later_part = file
+                .rsplit_once(".part")
+                .is_some_and(|(_, n)| n.trim_end_matches(".rar").trim_start_matches('0') != "1");
+            if !file.ends_with(".rar") || later_part {
+                continue;
+            }
+            let rel = archive.strip_prefix(&root).unwrap().to_string_lossy().replace('/', "_");
+            let Ok(status) = fs::read_to_string(root.join("out").join(format!("{rel}.xstatus"))) else { continue };
+            if status.trim() != "status=0" {
+                continue;
+            }
+            let want = manifest(&fs::read_to_string(root.join("out").join(format!("{rel}.sha256"))).unwrap());
+            let password = file.starts_with("win-enc").then_some("testpw123");
+            let mut volumes = vec![archive.clone()];
+            while let Some(next) = zipfast::volume::next_volume(volumes.last().unwrap()).filter(|p| p.exists()) {
+                volumes.push(next);
+            }
+            let case = Case { volumes, password, want };
+            // whole-archive, selected-session and progressive extraction must all agree with UnRAR
+            let same = ["run", "selected", "progressive"].iter().all(|route| {
+                let dest = tmp.path().join(&rel).join(route);
+                match *route {
+                    "run" => drop(extract::run_with_password(&archive, &options(&dest), password, |_| {})),
+                    "selected" => {
+                        if let Ok(mut session) = RarSession::open(&archive, password, RarSessionOptions::default()) {
+                            let all = session.select(|_| true).unwrap();
+                            let _ = session.extract_selected(&all, &options(&dest), RarDecodeLimits::default(), |_| {});
+                        }
+                    }
+                    _ => {
+                        let volumes = case
+                            .volumes
+                            .iter()
+                            .map(|p| (OsString::from(p.file_name().unwrap()), fs::read(p).unwrap().into_boxed_slice()))
+                            .collect();
+                        if let Ok(mut session) =
+                            ProgressiveSession::from_sealed_memory(volumes, progressive_options(&case, &dest))
+                        {
+                            drive(&mut session, || {});
+                        }
+                    }
+                }
+                // UnRAR's listing has regular files only (symbolic links are a later step)
+                let got = tree(&dest);
+                got.len() == case.want.len()
+                    && case.want.iter().all(|(name, expect)| {
+                        got.get(name).is_some_and(|bytes| match expect {
+                            Expect::Sha256(sum) => &hex(&sha256(bytes)) == sum,
+                            Expect::Crc32(crc) => hash(bytes) == *crc,
+                        })
+                    })
+            });
+            let reason = pending.iter().find(|(prefix, _)| rel.starts_with(prefix)).map(|(_, why)| *why);
+            match (same, reason) {
+                (true, _) => matched.push(rel),
+                (false, Some(why)) => waiting.push(format!("{rel}: {why}")),
+                (false, None) => mismatched.push(rel),
+            }
+        }
+    }
+    eprintln!("RAR4 corpus: {} identical to UnRAR, {} not yet supported", matched.len(), waiting.len());
+    for line in &waiting {
+        eprintln!("  pending {line}");
+    }
+    assert!(mismatched.is_empty(), "differ from UnRAR: {mismatched:?}");
+    assert!(!matched.is_empty());
+}

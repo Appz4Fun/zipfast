@@ -145,14 +145,15 @@ fn latest_winrar_recovery_record_header_opens_and_lists() {
     let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
     assert_eq!(names(&session), ["1.txt", "2.txt"]);
     assert_eq!(extract::list(&path).unwrap().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["1.txt", "2.txt"]);
-    for entry in session.entries() {
+    for (index, entry) in session.entries().enumerate() {
         assert_eq!(entry.format(), RarFormat::Rar4);
         assert!(!entry.is_directory());
         assert_eq!(entry.unpacked_size(), Some(5));
-        assert!(entry.solid());
-        // Solid RAR4 payloads keep their typed refusal.
-        assert_eq!(rar4_unsupported(entry), Some("solid payload"));
+        // As UnRAR lists it: the first member starts the solid stream, the second goes on from it.
+        assert_eq!(entry.solid(), index == 1);
+        assert_eq!(rar4_unsupported(entry), None);
     }
+    // 1.txt is PPMd, which isn't decoded yet; 2.txt needs its history.
     let all = session.select(|_| true).unwrap();
     let summary = session.test_selected(&all, RarDecodeLimits::default(), |_| {}).unwrap();
     assert_eq!((summary.files, summary.failed), (0, 2));
