@@ -829,3 +829,22 @@ fn a_directory_entry_after_its_files_gets_its_metadata() {
         assert!(matches!(verify(file), Verdict::Ok { .. }));
     }
 }
+
+#[test]
+fn a_partial_file_reports_its_output_path() {
+    let (a, b) = (data(800, 21), data(600, 22));
+    let set = Set::rar5(vec![common::archive(&[FileSpec::new("a.bin", &a), FileSpec::new("d/e/b.bin", &b)])]);
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut seen = Seen::default();
+    assert!(run(&mut session(&set, dir.path(), &anchors), &mut seen, None));
+    let root = std::path::absolute(dir.path().join("out")).unwrap();
+    let expected = [Path::new("a.bin").to_path_buf(), Path::new("d").join("e").join("b.bin")];
+    assert_eq!(seen.files.len(), 2);
+    for ((_, file), relative) in seen.files.iter().zip(&expected) {
+        assert_eq!(file.relative_output_path().unwrap(), relative.as_path());
+        assert_eq!(file.output_path(), root.join(relative));
+        assert!(file.output_path().is_absolute());
+    }
+    assert_eq!(fs::read(seen.files[1].1.output_path()).unwrap(), b);
+}

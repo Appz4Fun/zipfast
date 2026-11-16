@@ -2383,6 +2383,18 @@ impl PartialFile {
             None => self.core.fill_packed(volume, range.start, &[]),
         }
     }
+    /// The absolute path of the output file this partial writes to: the output root (made absolute when the
+    /// session opened it) joined with [`relative_output_path`](Self::relative_output_path). Its parents were
+    /// opened without following symbolic links and the file is held by native identity, so the path names this
+    /// member's output while the handle lives, unless something outside the session renames it.
+    pub fn output_path(&self) -> &std::path::Path {
+        self.core.output_path()
+    }
+    /// The output path relative to the output root: sanitized, with only normal components, so it never escapes
+    /// the root.
+    pub fn relative_output_path(&self) -> PartialResult<&std::path::Path> {
+        self.core.native.relative_output()
+    }
     pub fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         self.core.remaining()
     }
