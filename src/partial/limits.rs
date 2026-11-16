@@ -130,6 +130,9 @@ pub(crate) struct PartialBudget {
     counters: Arc<Mutex<[u64; 10]>>,
     prepaid: Arc<Mutex<[Vec<Reservation>; 10]>>,
     genesis: Arc<Mutex<Option<GenesisCredits>>>,
+    /// Protection path charges of this member's genesis exclusions: held as long as the budget (its core) lives,
+    /// so a session that releases finished members gets them back.
+    held: Arc<Mutex<Vec<crate::progressive::Lease>>>,
 }
 // Only the concrete genesis transaction uses these credits; future mutations cannot consume them.
 struct GenesisCredits {
@@ -177,6 +180,7 @@ impl PartialBudget {
             counters,
             prepaid: Arc::new(Mutex::new(std::array::from_fn(|_| Vec::new()))),
             genesis: Arc::new(Mutex::new(None)),
+            held: Arc::new(Mutex::new(Vec::new())),
         })
     }
     pub(super) fn reserve(&self, resource: PartialResource, amount: u64) -> PartialResult<Reservation> {
@@ -228,8 +232,8 @@ impl PartialBudget {
         let genesis = genesis.as_mut().ok_or_else(|| err(PartialErrorKind::InvalidOptions))?;
         let paths = genesis.pages as u64 + 5;
         let metadata = genesis.journal_metadata.checked_add(exclusion_bytes).ok_or_else(malformed)?;
-        self.usage.charge(Resource::ProtectionPaths, paths)?;
-        self.usage.charge(Resource::ProtectionPathBytes, exclusion_bytes)?;
+        self.hold(Resource::ProtectionPaths, paths)?;
+        self.hold(Resource::ProtectionPathBytes, exclusion_bytes)?;
         self.usage.charge(Resource::MetadataBytes, metadata)?;
         genesis.remaining = Some([metadata, paths, exclusion_bytes, 0]);
         Ok(())
@@ -288,8 +292,19 @@ impl PartialBudget {
             remaining -= prepaid;
         }
         if remaining != 0 {
-            self.usage.charge(resource, remaining)?;
+            match resource {
+                Resource::MetadataBytes => self.usage.charge(resource, remaining)?,
+                _ => self.hold(resource, remaining)?,
+            }
         }
+        Ok(())
+    }
+    /// Charges `amount` of `resource` for as long as this budget lives.
+    fn hold(&self, resource: Resource, amount: u64) -> PartialResult<()> {
+        let lease = self.usage.lease(resource, amount)?;
+        let mut held = self.held.lock().unwrap();
+        held.try_reserve(1).map_err(|_| malformed())?;
+        held.push(lease);
         Ok(())
     }
     pub(super) fn metadata(&self, bytes: u64) -> PartialResult<()> {

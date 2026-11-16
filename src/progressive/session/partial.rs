@@ -245,8 +245,16 @@ impl ProgressiveSession {
             // The active member first: its machine must learn of streamed damage even if another member fails.
             // Released members whose handles were all dropped are reported in `released`, from the packed
             // ranges kept at release: their damage is the caller's to declare on a reopened handle.
-            for slot in &persistent.cores {
-                if slot.live().is_some() {
+            // One snapshot per slot: a handle dropped meanwhile cannot move a span between the two lists.
+            let ordered = active
+                .as_ref()
+                .and_then(|key| persistent.cores.iter().find(|slot| slot.key == *key))
+                .into_iter()
+                .chain(persistent.cores.iter().filter(|slot| Some(&slot.key) != active.as_ref()));
+            let mut live: Vec<(MemberKey, Arc<PartialCore>)> = Vec::new();
+            for slot in ordered {
+                if let Some(core) = slot.live() {
+                    live.push((slot.key.clone(), core));
                     continue;
                 }
                 for span in slot.spans.iter().filter(|span| span.volume == volume) {
@@ -257,13 +265,6 @@ impl ProgressiveSession {
                     }
                 }
             }
-            let live: Vec<(MemberKey, Arc<PartialCore>)> = active
-                .as_ref()
-                .and_then(|key| persistent.cores.iter().find(|slot| slot.key == *key))
-                .into_iter()
-                .chain(persistent.cores.iter().filter(|slot| Some(&slot.key) != active.as_ref()))
-                .filter_map(|slot| slot.live().map(|core| (slot.key.clone(), core)))
-                .collect();
             let order = live.iter().map(|(key, core)| (key, core));
             let mut fed = Vec::new();
             if active.is_some() {

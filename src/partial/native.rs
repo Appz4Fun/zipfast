@@ -117,6 +117,20 @@ impl PartialExclusions {
         self.revision.store(next, Ordering::Release);
         Ok(())
     }
+    /// Drops the exclusions of a member whose last owner is gone: its output and everything in its state bundle.
+    /// The files stay; creating another member over them still fails, since outputs are created exclusively and
+    /// bundle names are unique per member.
+    pub(super) fn retire_member(&self, output: &Path, bundle: &Path) {
+        let mut list = self.entries.lock().unwrap();
+        let owned = |path: &Path| path == output || path.starts_with(bundle);
+        if list.iter().any(|entry| owned(&entry.path))
+            && let Some(next) = self.revision.load(Ordering::Relaxed).checked_add(1)
+        {
+            list.retain(|entry| !owned(&entry.path));
+            self.revision.store(next, Ordering::Release);
+            self.leases.lock().unwrap().retain(|(held, _)| !owned(held));
+        }
+    }
     // Called only after acknowledged retirement has actually removed the name.
     pub(super) fn retire(&self, path: &Path) {
         let mut list = self.entries.lock().unwrap();

@@ -2369,6 +2369,7 @@ impl Drop for PartialCore {
     /// re-extracted needlessly. A failure leaves the anchored state as it is, exactly as a crash would.
     /// Skipped while the thread is panicking: the commit syncs files and calls the caller's anchor store, and a
     /// second panic during unwinding would abort the process. The anchored state then stays as after a crash.
+    /// Then the member's exclusions are retired.
     fn drop(&mut self) {
         if std::thread::panicking() {
             return;
@@ -2379,6 +2380,8 @@ impl Drop for PartialCore {
         {
             let _ = self.flush_group(&mut data);
         }
+        // Nothing of this member is written any more: its exclusions go (their charges with the budget).
+        self.budget.exclusions.retire_member(&self.native.output_path, &self.native.bundle.path);
     }
 }
 impl PartialFile {
