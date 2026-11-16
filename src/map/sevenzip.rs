@@ -30,7 +30,7 @@ use std::{
 };
 
 /// The signature that starts a 7z archive.
-pub(super) const MAGIC: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
+pub(crate) const MAGIC: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 /// Bytes of the signature header; the next header offset counts from its end.
 const SIGNATURE_LEN: u64 = 32;
 const CHUNK: usize = 64 << 10;
@@ -200,7 +200,7 @@ struct FileEntry {
 }
 
 /// The 7zAES parameters in coder properties.
-fn aes_params(properties: &[u8]) -> Option<CipherParams> {
+pub(crate) fn aes_params(properties: &[u8]) -> Option<CipherParams> {
     let (&first, rest) = properties.split_first()?;
     let num_cycles_power = first & 0x3F;
     if first & 0xC0 == 0 {

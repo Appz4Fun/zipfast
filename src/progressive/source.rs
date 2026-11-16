@@ -146,6 +146,10 @@ pub struct SessionControl {
     wake: Arc<ControlWake>,
 }
 impl SessionControl {
+    /// A control whose cancellation is `token`'s.
+    pub(crate) fn from_cancellation(token: Cancellation) -> Self {
+        Self { token, wake: Arc::default() }
+    }
     pub(crate) fn cancellation_token(&self) -> Cancellation {
         self.token.clone()
     }

@@ -39,6 +39,7 @@ pub mod path;
 pub mod probe;
 pub mod progressive;
 pub mod rar5;
+pub mod sevenzip;
 pub mod stream;
 pub mod tar;
 pub mod volume;
