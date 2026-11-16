@@ -351,7 +351,8 @@ fn link_then_unlink(from: &Path, to: &Path) -> io::Result<()> {
     }
     if let Err(error) = fs::hard_link(from, to) {
         // FAT and exFAT have no hard links (EPERM on Linux, ENOTSUP or EOPNOTSUPP elsewhere).
-        if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOTSUP | libc::EOPNOTSUPP)) {
+        if matches!(error.raw_os_error(), Some(code) if code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the file system has neither a no-replace rename nor hard links",
