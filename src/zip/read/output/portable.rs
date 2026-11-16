@@ -186,8 +186,11 @@ impl PortableTemp {
                 };
                 // Some portable filesystems (exFAT, SMB, FUSE) do not keep stable inode numbers, so the name is
                 // matched as a regular file under our random 128-bit leaf rather than by identity alone.
+                // `dev_t` is `u64` on Linux but `i32` on macOS.
+                #[allow(clippy::unnecessary_cast)]
+                let actual_dev = actual.st_dev as u64;
                 if actual.st_mode & libc::S_IFMT != libc::S_IFREG
-                    || self.identity.is_some_and(|id| id.dev != actual.st_dev as u64)
+                    || self.identity.is_some_and(|id| id.dev != actual_dev)
                 {
                     return Err((ReadIoOperation::Stat, CleanupCause::Policy("replaced stage name preserved")));
                 }
