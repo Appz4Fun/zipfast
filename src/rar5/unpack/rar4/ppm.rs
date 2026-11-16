@@ -1240,6 +1240,24 @@ impl Ppm {
         self.min_ctx != 0 && !self.broken
     }
 
+    /// Starts a 7-Zip PPMd (PPMd7: variant H with 7-Zip's range coder) stream of model `order` and `mem_size`
+    /// bytes of model memory. False: the properties or the stream's first bytes aren't valid.
+    pub(crate) fn init_7z(&mut self, bits: &mut Bits<'_>, order: u8, mem_size: u32) -> bool {
+        if !(2..=64).contains(&order) || !((1 << 11)..=(MAX_MB << 20)).contains(&mem_size) {
+            return false;
+        }
+        if get_byte(bits) != 0 {
+            return false;
+        }
+        self.seven_z = true;
+        self.bin_decoded = false;
+        self.broken = false;
+        self.coder_init(bits);
+        self.start_sub_allocator_bytes(mem_size);
+        self.start_model_rare(i32::from(order));
+        self.min_ctx != 0 && !self.broken
+    }
+
     /// The next byte, or None for damaged data.
     pub(crate) fn decode_char(&mut self, bits: &mut Bits<'_>) -> Option<u8> {
         if self.broken || !self.ctx_ok(self.min_ctx) {

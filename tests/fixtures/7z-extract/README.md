@@ -17,7 +17,8 @@ The password of the encrypted ones is `password`.
 | `bcj_x86.7z`, `bcj_arm.7z`, `bcj_armt.7z`, `bcj_arm64.7z`, `bcj_ppc.7z`, `bcj_sparc.7z`, `bcj_ia64.7z` | `code/<arch>.bin` (generated code-like bytes full of branches), the branch converter over LZMA |
 | `bcj2.7z` | `code/x86.bin`, BCJ2 over three LZMA coders and a raw range coder stream |
 | `delta.7z` | `delta/samples.raw`, Delta:4 over LZMA2 |
-| `ppmd.7z` | `text/a.txt`, PPMd (refused) |
+| `ppmd.7z` | `text/a.txt`, PPMd (order 6, 16 MiB) |
+| `ppmd_solid.7z` | `text` and `big` in one solid PPMd folder, order 32 with a 2 MiB model |
 | `solid.7z` | the folders `big` and `text` and their six files in one solid LZMA2 block |
 | `tree.7z` | directories (one empty), an empty file, a file in a subfolder and the executable `text/run.sh` (mode 0755) |
 | `aes.7z` | `text/a.txt`, `text/b.txt`, 7zAES over LZMA2, plain header |

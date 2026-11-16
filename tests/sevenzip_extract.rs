@@ -109,6 +109,12 @@ fn every_coder_extracts() {
         extracts_to(&format!("bcj_{arch}.7z"), None, &[&format!("code/{arch}.bin")]);
     }
     extracts_to("bcj2.7z", None, &["code/x86.bin"]);
+    extracts_to("ppmd.7z", None, &["text/a.txt"]);
+    extracts_to(
+        "ppmd_solid.7z",
+        None,
+        &["big/one.txt", "big/two.txt", "text/a.txt", "text/b.txt", "text/run.sh", "text/tiny.txt"],
+    );
 }
 
 #[test]
@@ -128,6 +134,8 @@ fn the_branch_fixtures_use_the_coders_they_are_named_for() {
         ("bzip2.7z", CoderKind::Bzip2),
         ("lzma.7z", CoderKind::Lzma),
         ("lzma2.7z", CoderKind::Lzma2),
+        ("ppmd.7z", CoderKind::Ppmd),
+        ("ppmd_solid.7z", CoderKind::Ppmd),
     ] {
         let bytes = fs::read(fixture(name)).unwrap();
         let map = MemberMap::from_memory(&[&bytes], name, None).unwrap();
@@ -233,18 +241,26 @@ fn the_checked_dispatcher_runs_7z_with_typed_password_faults() {
     canceled.cancel();
     let error = run("lzma.7z", None, &canceled).unwrap_err();
     assert!(matches!(error.operation(), Some(ReadFault::Cancelled)), "{error:?}");
-    let error = run("ppmd.7z", None, &Cancellation::default()).unwrap_err();
-    let Some(ReadFault::Legacy(legacy)) = error.operation() else { panic!("{error:?}") };
-    assert!(matches!(SevenZipError::of(legacy), Some(SevenZipError::UnsupportedCoder { id: 0x03_0401 })));
+    // text/a.txt is already there from lzma2.7z, so the PPMd member decodes and is skipped
+    let report = run("ppmd.7z", None, &Cancellation::default()).unwrap();
+    assert_eq!((report.files() + report.skipped(), report.failed()), (1, 0));
 }
 
+/// A damaged PPMd stream is a typed failure and publishes nothing.
 #[test]
-fn ppmd_is_refused_before_anything_is_written() {
+fn damaged_ppmd_data_is_not_published() {
     let dir = tempfile::tempdir().unwrap();
+    let mut bytes = fs::read(fixture("ppmd.7z")).unwrap();
+    // the packed stream starts right after the 32-byte signature header
+    for b in &mut bytes[40..80] {
+        *b ^= 0x5a;
+    }
+    let path = dir.path().join("bad.7z");
+    fs::write(&path, bytes).unwrap();
     let out = dir.path().join("out");
-    let result = extract::run(&fixture("ppmd.7z"), &opts(Mode::Extract, &out), |_| {});
-    assert!(matches!(seven(&result), Some(SevenZipError::UnsupportedCoder { id: 0x03_0401 })), "{result:?}");
-    assert!(!out.exists());
+    let result = extract::run(&path, &opts(Mode::Extract, &out), |_| {});
+    assert!(result.is_err() || result.as_ref().is_ok_and(|s| !s.errors.is_empty()), "{result:?}");
+    assert!(!out.join("text/a.txt").exists());
 }
 
 #[test]
@@ -349,13 +365,15 @@ fn a_missing_volume_is_reported() {
 #[test]
 fn limits_are_typed() {
     let dir = tempfile::tempdir().unwrap();
-    let cases: [LimitCase; 6] = [
+    let cases: [LimitCase; 7] = [
         ("copy.7z", |l| l.folder_bytes = 100, SevenZipLimit::FolderBytes),
         ("copy.7z", |l| l.folders = 2, SevenZipLimit::Folders),
         ("copy.7z", |l| l.pack_streams = 2, SevenZipLimit::PackStreams),
         ("copy.7z", |l| l.entries = 2, SevenZipLimit::Entries),
         ("bcj2.7z", |l| l.coders = 3, SevenZipLimit::Coders),
         ("lzma2.7z", |l| l.dictionary_bytes = 4096, SevenZipLimit::DictionaryBytes),
+        // a PPMd model's memory counts as dictionary
+        ("ppmd.7z", |l| l.dictionary_bytes = 4096, SevenZipLimit::DictionaryBytes),
     ];
     for (archive, set, want) in cases {
         let mut limits = SevenZipLimits::default();

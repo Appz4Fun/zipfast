@@ -25,7 +25,7 @@ use crate::extract::Cancellation;
 mod filters;
 mod legacy;
 pub(crate) mod lifecycle;
-mod ppm;
+pub(crate) mod ppm;
 use lifecycle::Lifecycle;
 pub(crate) use lifecycle::{CoreBinding, CoreFrame};
 

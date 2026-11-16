@@ -27,6 +27,7 @@ a delta.7z -mf=Delta:4 -m0=LZMA2:d=64k delta/samples.raw
 a deflate.7z -m0=Deflate text/a.txt text/b.txt
 a bzip2.7z -m0=BZip2 text/a.txt text/b.txt
 a ppmd.7z -m0=PPMd text/a.txt
+a ppmd_solid.7z -m0=PPMd:mem=2m:o=32 -ms=on text big
 a aes.7z -m0=LZMA2:d=64k -ppassword text/a.txt text/b.txt
 a aes_hdr.7z -m0=LZMA2:d=64k -ppassword -mhe=on text/a.txt text/b.txt
 a aes_copy.7z -m0=Copy -ppassword text/tiny.txt

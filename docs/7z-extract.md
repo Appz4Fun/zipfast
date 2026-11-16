@@ -57,9 +57,10 @@ sessions read RAR only and refuse a 7z archive as before.
 | ARM64 | `0A` | |
 | Delta | `03` | one property byte, distance minus one |
 | Swap2, Swap4 | `020302`, `020304` | |
+| PPMd | `030401` | variant H with 7-Zip's range coder, the model shared with RAR 2.9's PPM blocks; its memory (up to 256 MiB) counts against `dictionary_bytes` |
 
-Not decoded, refused before anything is written with `SevenZipError::UnsupportedCoder { id }`: PPMd (`030401`),
-RISC-V (`0B`) and any other id. Only folders holding a selected member are checked, so a filter
+Not decoded, refused before anything is written with `SevenZipError::UnsupportedCoder { id }`: RISC-V (`0B`) and any
+other id. Only folders holding a selected member are checked, so a filter
 can still take the rest of an archive.
 
 No new dependencies: liblzma, flate2, bzip2 and zstd were already used for ZIP, xz and tar, and Deflate64 is zipfast's own decoder.
