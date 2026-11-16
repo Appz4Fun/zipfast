@@ -327,6 +327,8 @@ struct SelectedRun {
     decoder: Option<Unpacker>,
     /// the RAR4 decoder, kept between the members of a solid stream
     rar4: Option<Rar4Decoder>,
+    /// RAR 3.x keys already derived for the session's password, by salt
+    rar4_keys: crate::crypto::Rar4KeyCache,
     history_volumes: VolumeSet,
     buffer: Vec<u8>,
     decrypted: Vec<u8>,
@@ -350,6 +352,7 @@ impl SelectedRun {
             failed: None,
             decoder: None,
             rar4: None,
+            rar4_keys: Default::default(),
             history_volumes: [0; VOLUME_WORDS],
             buffer,
             decrypted,
@@ -495,7 +498,11 @@ impl SelectedRun {
                 return Err(RarFailure::PasswordRequired { scope: pending.context().scope() });
             };
             if let Some(salt) = header.rar4.and_then(|raw| raw.salt) {
-                pending.start_selected_legacy_cipher(&salt, password, header.unpacked_size);
+                let keys = self
+                    .rar4_keys
+                    .keys(password, &salt, Some(&session.options.cancel))
+                    .map_err(|_| RarFailure::Canceled)?;
+                pending.start_selected_legacy_cipher(keys, header.unpacked_size);
             } else {
                 let params = parts[0]
                     .crypt

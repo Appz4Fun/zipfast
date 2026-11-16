@@ -565,6 +565,156 @@ fn cancellation_mid_member_stops_typed() {
     assert!(tree(&dest).is_empty(), "nothing is published");
 }
 
+/// Rewrites a RAR 3.x archive as `rar -p` would have written it: each file header gains a salt and the
+/// encryption flag, and each member's packed data is padded to whole AES blocks and encrypted with the keys for
+/// `password` and that salt.
+fn encrypt_rar4(archive: &[u8], password: &str, salt: [u8; 8]) -> Vec<u8> {
+    let (key, iv) = zipfast::crypto::derive_rar4_key_iv(password, &salt);
+    let mut out = archive[..7].to_vec();
+    let mut at = 7;
+    while at + 7 <= archive.len() {
+        let kind = archive[at + 2];
+        let flags = u16::from_le_bytes([archive[at + 3], archive[at + 4]]);
+        let size = usize::from(u16::from_le_bytes([archive[at + 5], archive[at + 6]]));
+        let mut header = archive[at..at + size].to_vec();
+        let data_len = if kind == 0x74 || flags & 0x8000 != 0 {
+            u32::from_le_bytes(archive[at + 7..at + 11].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        let mut data = archive[at + size..at + size + data_len].to_vec();
+        if kind == 0x74 {
+            assert_eq!(flags & 0x100, 0, "no high sizes in these fixtures");
+            let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
+            header.splice(32 + name_len..32 + name_len, salt);
+            header[3..5].copy_from_slice(&(flags | 0x404).to_le_bytes());
+            header[5..7].copy_from_slice(&((size + 8) as u16).to_le_bytes());
+            data.resize(data.len().next_multiple_of(16), 0);
+            data = zipfast::crypto::encrypt_cbc(&key, &iv, &data).unwrap();
+            header[7..11].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            let crc = hash(&header[2..]) as u16;
+            header[..2].copy_from_slice(&crc.to_le_bytes());
+        }
+        out.extend(header);
+        out.extend(data);
+        at += size + data_len;
+    }
+    out
+}
+
+/// A solid `-s -p` archive whose earlier members a run doesn't take: they are still decrypted and decoded, so the
+/// member taken gets its history (every route).
+#[test]
+fn an_encrypted_solid_archive_extracts_a_later_member_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("solid-encrypted.rar");
+    let plain = fs::read(fixtures().join("rar4/solid.rar")).unwrap();
+    fs::write(&path, encrypt_rar4(&plain, "secret", *b"saltsalt")).unwrap();
+    let want = unrar_manifest("in_rarinfo_solid.rar");
+    // every member, through every route
+    let case = Case { volumes: vec![path.clone()], password: Some("secret"), want: want.clone() };
+    for (route, extract) in
+        [("run", via_run as fn(&Case, &Path)), ("selected", via_selected), ("progressive", via_progressive)]
+    {
+        let dest = tmp.path().join(format!("all-{route}"));
+        extract(&case, &dest);
+        check_tree(&label(&case, route), &dest, &want);
+    }
+    let last = "unrardll.txt".to_owned();
+    let only: Manifest = [(last.clone(), want[&last].clone())].into();
+    // whole-archive extraction with a member filter
+    let dest = tmp.path().join("filtered");
+    let mut opts = options(&dest);
+    let keep = last.clone();
+    opts.select = Some(extract::MemberFilter::new(move |m| m.name == keep));
+    let summary = extract::run_with_password(&path, &opts, Some("secret"), |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    check_tree("filtered run", &dest, &only);
+    // a session selecting only that member
+    let dest = tmp.path().join("selected");
+    let mut session = RarSession::open(&path, Some("secret"), RarSessionOptions::default()).unwrap();
+    let keep = last.clone();
+    let selected = session.select(|m| m.name() == keep).unwrap();
+    let summary = session.extract_selected(&selected, &options(&dest), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (1, 0));
+    check_tree("selected", &dest, &only);
+    // the single-entry reader
+    let mut bytes = Vec::new();
+    extract::SelectedEntry::open(&path, 1, Some("secret"), 1 << 20)
+        .unwrap()
+        .read(Some("secret"), |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert!(matches!(&want[&last], Expect::Sha256(sum) if *sum == hex(&sha256(&bytes))));
+    // a progressive session skipping the first member, whose output exists
+    let dest = tmp.path().join("progressive");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("tese.txt"), b"keep").unwrap();
+    let mut opts = progressive_options(&case, &dest);
+    opts.extract.overwrite = Overwrite::Skip;
+    let volume = fs::read(&path).unwrap().into_boxed_slice();
+    let mut session =
+        ProgressiveSession::from_sealed_memory(vec![(OsString::from("solid-encrypted.rar"), volume)], opts).unwrap();
+    let problems = drive(&mut session, || {});
+    assert!(problems.iter().all(|p| p.starts_with("Skipped")), "{problems:?}");
+    assert!(matches!(&want[&last], Expect::Sha256(sum) if *sum == hex(&sha256(&fs::read(dest.join(&last)).unwrap()))));
+}
+
+/// A later part that changes the member's dictionary or salt is a changed continuation, not more of the member.
+#[test]
+fn a_continuation_with_another_dictionary_or_salt_fails_typed() {
+    let tmp = tempfile::tempdir().unwrap();
+    for mutation in ["dictionary", "salt"] {
+        let dir = tmp.path().join(mutation);
+        let parts = if mutation == "salt" {
+            let case = &cases()[5]; // win-encvol: one encrypted stored member over four volumes
+            stage(case, &dir)
+        } else {
+            multi_parts(&dir)
+        };
+        // the second volume's first file header continues the first volume's split member
+        let mut bytes = fs::read(&parts[1]).unwrap();
+        let main_size = usize::from(u16::from_le_bytes([bytes[7 + 5], bytes[7 + 6]]));
+        let at = 7 + main_size;
+        assert_eq!(bytes[at + 2], 0x74);
+        let flags = u16::from_le_bytes([bytes[at + 3], bytes[at + 4]]);
+        assert_ne!(flags & 1, 0, "a continuation");
+        if mutation == "dictionary" {
+            let dictionary = (flags >> 5) & 7;
+            let changed = (flags & !0xe0) | (if dictionary == 0 { 1 } else { dictionary - 1 } << 5);
+            assert_ne!(changed, flags);
+            bytes[at + 3..at + 5].copy_from_slice(&changed.to_le_bytes());
+        } else {
+            let name_len = usize::from(u16::from_le_bytes([bytes[at + 26], bytes[at + 27]]));
+            bytes[at + 32 + name_len] ^= 1;
+        }
+        let size = usize::from(u16::from_le_bytes([bytes[at + 5], bytes[at + 6]]));
+        let crc = hash(&bytes[at + 2..at + size]) as u16;
+        bytes[at..at + 2].copy_from_slice(&crc.to_le_bytes());
+        fs::write(&parts[1], bytes).unwrap();
+        let password = (mutation == "salt").then_some("testpw123");
+        let mut failures = Vec::new();
+        extract::run_rar_with_outcomes(&parts[0], &options(&dir.join("out")), password, |o: &RarEntryOutcome| {
+            if let RarOutcome::Failed(failure) = &o.outcome {
+                failures.push(Arc::clone(failure));
+            }
+        })
+        .unwrap();
+        assert!(
+            failures.iter().any(|f| matches!(
+                f.as_ref(),
+                RarFailure::Integrity { reason: zipfast::error::RarIntegrityReason::ChangedContinuationEncoding, .. }
+            )),
+            "{mutation}: {failures:?}"
+        );
+        let mut session = RarSession::open(&parts[0], password, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        assert!(session.test_selected(&all, RarDecodeLimits::default(), |_| {}).unwrap().failed >= 1, "{mutation}");
+    }
+}
+
 /// The whole Prybar reference corpus, when `ZIPFAST_RAR4_CORPUS` names it: every archive UnRAR extracts must
 /// extract identically, except the shapes listed as not yet supported.
 #[test]

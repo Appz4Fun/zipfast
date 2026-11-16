@@ -1809,6 +1809,8 @@ pub(crate) struct Pending {
     place: Option<Place>,
     /// its bytes, gathered to be checked and written whole on a worker
     mem: Option<Vec<u8>>,
+    /// what each later RAR4 part must repeat: dictionary, unpack version, method and salt
+    rar4_identity: Option<(u64, u8, u8, Option<[u8; 8]>)>,
 }
 
 impl std::ops::Deref for Pending {
@@ -1838,6 +1840,7 @@ impl Pending {
             key: None,
             place: None,
             mem: None,
+            rar4_identity: h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)),
         }
     }
 
@@ -1950,9 +1953,8 @@ impl Pending {
         Ok(())
     }
 
-    /// RAR 3.x AES-128 for a selected RAR4 member.
-    pub(crate) fn start_selected_legacy_cipher(&mut self, salt: &[u8; 8], password: &str, size: u64) {
-        let (key, iv) = crate::crypto::derive_rar4_key_iv(password, salt);
+    /// RAR 3.x AES-128 for a selected RAR4 member, from keys derived for its salt.
+    pub(crate) fn start_selected_legacy_cipher(&mut self, (key, iv): ([u8; 16], [u8; 16]), size: u64) {
         self.context.password = RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);
         self.cipher = Some(PendingCipher::from_legacy(key, iv, size, self.compressed));
     }
@@ -2364,6 +2366,8 @@ struct Run<'a, 'r, 'c> {
     stream: Option<Unpacker>,
     /// the RAR4 decoder, kept between the parts of a split file and the files of a solid stream
     rar4: Option<Rar4Decoder>,
+    /// RAR 3.x keys already derived for the run's password, by salt
+    rar4_keys: crate::crypto::Rar4KeyCache,
     /// threads for work spread over files; 1 for none
     threads: usize,
     /// small files being decoded and written on other threads
@@ -2614,6 +2618,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             pending: None,
             stream: None,
             rar4: None,
+            rar4_keys: Default::default(),
             threads,
             batch: None,
             batch_paths: HashSet::new(),
@@ -2826,6 +2831,11 @@ impl Run<'_, '_, '_> {
             return Ok(());
         }
         let (cipher, failure) = match (h.crypt, self.password) {
+            _ if h.format == RarFormat::Rar4 => match self.legacy_cipher(&mut ctx, &h) {
+                Some(Ok(cipher)) => (Some(cipher), None),
+                Some(Err(fault)) => return Err(fault.into()),
+                None => (None, None),
+            },
             (Some(params), Some(password)) => {
                 let size = (!h.size_unknown()).then_some(h.unpacked_size);
                 match Pending::start_cipher(&mut ctx, true, params, password, size) {
@@ -2962,12 +2972,12 @@ impl Run<'_, '_, '_> {
             let cause = self.fail_in_order(&ctx, reason, format_args!("links are not supported yet ({link:?})"))?;
             return self.pass_over(vol, h, ctx, None, Some(cause));
         }
-        let legacy_salt = h.rar4.and_then(|raw| raw.salt).filter(|_| h.encrypted);
-        let cipher = if let (Some(salt), Some(pw)) = (legacy_salt, self.password) {
-            // RAR 3.x AES-128: no password check value, so a wrong password shows as a checksum error
-            let (key, iv) = crate::crypto::derive_rar4_key_iv(pw, &salt);
-            ctx.password = RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);
-            Some(PendingCipher::from_legacy(key, iv, h.unpacked_size, h.method != 0))
+        let cipher = if h.format == RarFormat::Rar4 {
+            match self.legacy_cipher(&mut ctx, h) {
+                Some(Ok(cipher)) => Some(cipher),
+                Some(Err(fault)) => return Err(self.terminal(&ctx, fault)),
+                None => None,
+            }
         } else if let (Some(cp), Some(pw)) = (h.crypt, self.password) {
             match Pending::start_cipher(&mut ctx, h.method != 0, cp, pw, (!h.size_unknown()).then_some(h.unpacked_size))
             {
@@ -3028,6 +3038,25 @@ impl Run<'_, '_, '_> {
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.place = place;
         self.begin_decoding(vol, h, p)
+    }
+
+    /// RAR 3.x AES-128 for an encrypted RAR4 member, when the run has a password: derived once per salt. It has no
+    /// password check value, so a wrong password shows as a checksum or decoder error.
+    fn legacy_cipher(
+        &mut self,
+        ctx: &mut EntryContext,
+        h: &FileHeader,
+    ) -> Option<crate::error::RarResult<PendingCipher>> {
+        let salt = h.rar4.and_then(|raw| raw.salt).filter(|_| h.encrypted)?;
+        let password = self.password?;
+        let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
+        Some(match self.rar4_keys.keys(password, &salt, cancel.as_ref()) {
+            Ok((key, iv)) => {
+                ctx.password = RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);
+                Ok(PendingCipher::from_legacy(key, iv, h.unpacked_size, h.method != 0))
+            }
+            Err(_) => Err(RarFault::new(RarFailure::Canceled, Error::Io(io::Error::from(io::ErrorKind::Interrupted)))),
+        })
     }
 
     /// Sets the decoder up for a compressed file, then reads its first part.
@@ -3333,7 +3362,10 @@ impl Run<'_, '_, '_> {
             }
             return Ok(());
         }
-        let changed = (h.method != 0) != p.compressed || h.encrypted != p.encrypted;
+        let changed = (h.method != 0) != p.compressed
+            || h.encrypted != p.encrypted
+            || (h.split_before()
+                && p.rar4_identity != h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)));
         if changed || matches!(crypt, Some(Err(_))) {
             let (failure, legacy) = match crypt {
                 Some(Err(e)) if !changed => (RarFailure::crypt(e, p.context.scope()), "encrypted (password required)"),
