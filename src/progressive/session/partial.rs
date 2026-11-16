@@ -25,7 +25,7 @@ use std::ops::Range;
 pub(super) struct Persistent {
     options: PartialOptions,
     exclusions: Arc<PartialExclusions>,
-    cores: Vec<(MemberKey, Arc<PartialCore>)>,
+    cores: Vec<Slot>,
     current: Option<usize>,
     header_start: u64,
     header: Vec<u8>,
@@ -48,6 +48,32 @@ pub(super) struct Persistent {
     directories: Vec<PendingDirectory>,
     /// Identities of every directory this session created: parents of its outputs and directory entries.
     created: Vec<crate::progressive::native::Identity>,
+}
+/// A member this session created or adopted. Its core (state pages, descriptors, `open_partials` lease) is held
+/// until the member has finished and the caller has taken its handle with `partial_file`; then the session keeps
+/// only a weak reference, and the core lives exactly as long as the caller's handles.
+struct Slot {
+    key: MemberKey,
+    core: Option<Arc<PartialCore>>,
+    weak: std::sync::Weak<PartialCore>,
+    output: std::path::PathBuf,
+    taken: bool,
+    finished: bool,
+}
+impl Slot {
+    fn new(key: MemberKey, core: Arc<PartialCore>) -> Self {
+        let output = core.output_path().to_path_buf();
+        Self { key, weak: Arc::downgrade(&core), core: Some(core), output, taken: false, finished: false }
+    }
+    /// The core while anyone holds it.
+    fn live(&self) -> Option<Arc<PartialCore>> {
+        self.core.clone().or_else(|| self.weak.upgrade())
+    }
+    fn release_if_done(&mut self) {
+        if self.taken && self.finished {
+            self.core = None;
+        }
+    }
 }
 /// A directory entry's directory: its metadata waits until nothing more is created inside it.
 struct PendingDirectory {
@@ -114,8 +140,8 @@ impl Persistent {
         Ok(())
     }
     fn active(&self) -> (&MemberKey, &Arc<PartialCore>) {
-        let (key, core) = &self.cores[self.current.expect("persistent member")];
-        (key, core)
+        let slot = &self.cores[self.current.expect("persistent member")];
+        (&slot.key, slot.core.as_ref().expect("the active member's core is held"))
     }
 }
 impl ProgressiveSession {
@@ -160,12 +186,23 @@ impl ProgressiveSession {
         Ok(session)
     }
     #[allow(clippy::result_large_err, reason = "preserve the public typed partial receipt API")]
+    ///
+    /// Once a member has finished and its handle was taken here, the session releases its own reference: the
+    /// member's state pages, descriptors and `open_partials` lease are freed when the caller drops its last handle,
+    /// so a set with many members does not run out of them. A released member is never verified or extracted
+    /// again by the session; while any handle lives this returns another one, and after the last is dropped it is
+    /// `BindingMismatch(Member)`: reopen the member with [`PartialFile::open`] from its state.
     pub fn partial_file(&mut self, member: &MemberKey) -> PartialResult<PartialFile> {
-        self.partial
-            .as_ref()
-            .and_then(|p| p.cores.iter().find(|(key, _)| key == member))
-            .map(|(_, core)| PartialFile::from_core(core.clone()))
-            .ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))
+        let slot = self
+            .partial
+            .as_mut()
+            .and_then(|p| p.cores.iter_mut().find(|slot| slot.key == *member))
+            .ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
+        let core =
+            slot.live().ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
+        slot.taken = true;
+        slot.release_if_done();
+        Ok(PartialFile::from_core(core))
     }
     /// Declares archive bytes `range` of zero-based `volume` damaged, at any time, including bytes already
     /// extracted (for example when an article's yEnc CRC turns out wrong after it was consumed).
@@ -190,13 +227,18 @@ impl ProgressiveSession {
         let mut mapped = Vec::new();
         if !read.is_empty() {
             let persistent = self.partial.as_ref().unwrap();
-            let active = persistent.current.map(|index| persistent.cores[index].0.clone());
+            let active = persistent.current.map(|index| persistent.cores[index].key.clone());
             // The active member first: its machine must learn of streamed damage even if another member fails.
-            let order = active
+            // Released members whose handles were all dropped are skipped: their damage is the caller's to
+            // declare on a reopened handle.
+            let live: Vec<(MemberKey, Arc<PartialCore>)> = active
                 .as_ref()
-                .and_then(|key| persistent.cores.iter().find(|(k, _)| k == key))
+                .and_then(|key| persistent.cores.iter().find(|slot| slot.key == *key))
                 .into_iter()
-                .chain(persistent.cores.iter().filter(|(k, _)| Some(k) != active.as_ref()));
+                .chain(persistent.cores.iter().filter(|slot| Some(&slot.key) != active.as_ref()))
+                .filter_map(|slot| slot.live().map(|core| (slot.key.clone(), core)))
+                .collect();
+            let order = live.iter().map(|(key, core)| (key, core));
             let mut fed = Vec::new();
             if active.is_some() {
                 fed = self.fed_damage(volume, &read)?;
@@ -437,8 +479,8 @@ impl ProgressiveSession {
         }
         // Directories that must stay usable: those holding an output of this session.
         let mut holding = Vec::new();
-        for (_, core) in &persistent.cores {
-            ancestor_identities(core.output_path(), &mut holding, &self.usage)?;
+        for slot in &persistent.cores {
+            ancestor_identities(&slot.output, &mut holding, &self.usage)?;
         }
         // Stable: among entries for one directory the last stays last.
         directories.sort_by_key(|d| std::cmp::Reverse(d.path.components().count()));
@@ -601,7 +643,7 @@ impl ProgressiveSession {
         persistent.created.extend_from_slice(parents.created());
         let (core, state, event_lease) = prepared.complete_ready().map_err(failure)?;
         persistent.current = Some(persistent.cores.len());
-        persistent.cores.push((key.clone(), core));
+        persistent.cores.push(Slot::new(key.clone(), core));
         persistent.stream = 0;
         persistent.unavailable.clear();
         persistent.resume = None;
@@ -683,7 +725,7 @@ impl ProgressiveSession {
         }
         let persistent = self.partial.as_mut().unwrap();
         persistent.current = Some(persistent.cores.len());
-        persistent.cores.push((key.clone(), core));
+        persistent.cores.push(Slot::new(key.clone(), core));
         persistent.stream = 0;
         persistent.unavailable.clear();
         persistent.resume = Some(Resume {
@@ -822,7 +864,8 @@ impl ProgressiveSession {
         let persistent = self.partial.as_mut().unwrap();
         let resume = persistent.resume.take().unwrap();
         let mut machine = resume.machine.ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
-        let core = &persistent.cores[persistent.current.unwrap()].1;
+        let core =
+            persistent.cores[persistent.current.unwrap()].core.as_ref().expect("the active member's core is held");
         let encrypted = machine.cipher.is_some();
         let member_blake = machine.inner.as_ref().is_some_and(|inner| inner.blake.is_some());
         // Encrypted part checks cover ciphertext, which the resume skipped: the resumed part's check is not judged.
@@ -856,7 +899,12 @@ impl ProgressiveSession {
         if let Some(persistent) = &self.partial
             && let Some(index) = persistent.current
         {
-            persistent.cores[index].1.commit_due().map_err(failure)?;
+            persistent.cores[index]
+                .core
+                .as_ref()
+                .expect("the active member's core is held")
+                .commit_due()
+                .map_err(failure)?;
         }
         Ok(())
     }
@@ -911,7 +959,7 @@ impl ProgressiveSession {
             persistent.unavailable.push((stream..stream + count as u64, declared));
         }
         let Persistent { cores, current, holes, unavailable, .. } = persistent;
-        let core = &cores[current.expect("persistent member")].1;
+        let core = cores[current.expect("persistent member")].core.as_ref().expect("the active member's core is held");
         let mut sink = PersistentSink {
             core,
             produced: &mut self.produced,
@@ -967,7 +1015,7 @@ impl ProgressiveSession {
     pub(super) fn partial_finish_decode(&mut self) -> ProgressiveResult<()> {
         let encrypted = self.model.members.last().unwrap().header.encrypted;
         let Persistent { cores, current, holes, unavailable, .. } = self.partial.as_mut().unwrap();
-        let core = &cores[current.expect("persistent member")].1;
+        let core = cores[current.expect("persistent member")].core.as_ref().expect("the active member's core is held");
         let mut sink = PersistentSink {
             core,
             produced: &mut self.produced,
@@ -1024,7 +1072,9 @@ impl ProgressiveSession {
         } else {
             MemberOutcome::PersistentComplete { member: key.clone(), state, verdict }
         };
-        persistent.current = None;
+        let slot = &mut persistent.cores[persistent.current.take().expect("persistent member")];
+        slot.finished = true;
+        slot.release_if_done();
         persistent.unavailable.clear();
         persistent.resume = None;
         self.phase = Phase::Header;

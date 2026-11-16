@@ -978,3 +978,57 @@ fn rar4_aes_stored_member_with_a_wrong_password_fails_its_crc_and_publishes_noth
     let out = dir.path().join("out").join("movie.mkv");
     assert!(fs::read(&out).ok().is_none_or(|bytes| bytes != gold));
 }
+
+/// Open descriptors of this process.
+fn open_descriptors() -> usize {
+    fs::read_dir("/dev/fd").unwrap().count()
+}
+/// A session over 200 members: each member's core is released once it finished and its handle was taken, so
+/// neither the state page budget nor the descriptor count grows with the number of members.
+#[test]
+fn a_session_with_200_members_releases_finished_members() {
+    let data: Vec<(Vec<u8>, Vec<u8>)> = (0..200).map(|i| (format!("m{i:03}.bin").into_bytes(), gold(64 + i))).collect();
+    let members: Vec<(&[u8], &[u8])> = data.iter().map(|(n, d)| (n.as_slice(), d.as_slice())).collect();
+    let set = Set::single(&members);
+    let dir = tempfile::tempdir().unwrap();
+    let before = open_descriptors();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options(&dir.path().join("out"), set.naming.name(0)),
+        partial_options(&dir.path().join("state"), Arc::default()),
+    )
+    .unwrap();
+    let mut held: Option<(MemberKey, PartialFile)> = None;
+    let mut released: Vec<MemberKey> = Vec::new();
+    let (mut finished, mut peak) = (0, 0);
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => continue,
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                held = Some((member.clone(), session.partial_file(&member).unwrap()));
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => {
+                assert!(matches!(outcome, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }));
+                let (key, file) = held.take().unwrap();
+                // While a handle lives, the session hands out more; once the last is dropped the core is gone.
+                let again = session.partial_file(&key).unwrap();
+                drop((file, again));
+                released.push(key);
+                finished += 1;
+                peak = peak.max(open_descriptors());
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(finished, 200);
+    // A handful of descriptors for the session and the member in flight, not ~6 per member.
+    assert!(peak <= before + 24, "descriptors grew from {before} to {peak}");
+    let Err(error) = session.partial_file(&released[0]) else { panic!("a released member has no core left") };
+    assert!(matches!(error.kind, PartialErrorKind::BindingMismatch(BindingField::Member)), "{error:?}");
+    for (name, bytes) in &data {
+        assert_eq!(fs::read(dir.path().join("out").join(std::str::from_utf8(name).unwrap())).unwrap(), *bytes);
+    }
+}
