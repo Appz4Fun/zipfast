@@ -523,10 +523,12 @@ impl ProgressiveSession {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
                 Phase::NextVolume
                     if self.pre_29_open_end
-                        && self.driver.sealed_volume_count().is_some_and(|n| n <= self.volume as usize + 1) =>
+                        && (self.driver.sealed_volume_count().is_some_and(|n| n <= self.volume as usize + 1)
+                            || self.driver.declared_last_volume(self.volume)?) =>
                 {
-                    // Every volume of a sealed set was given up front: one that ends between members with no
-                    // next volume after it is the last.
+                    // Every volume of a sealed set was given up front, and a final Complete declaration names
+                    // every volume of the set: a volume that ends between members with no next volume after it
+                    // is the last.
                     self.pre_29_open_end = false;
                     if let Some(output) = &mut self.output {
                         output.finish_directories(&mut self.driver)?;

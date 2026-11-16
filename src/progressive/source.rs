@@ -703,6 +703,26 @@ impl SourceDriver {
         driver.sealed_volumes = volumes;
         Ok(driver)
     }
+    /// Whether `index` is the last volume of a final set: the provider's declaration, refreshed now, is Complete,
+    /// cannot grow any more, and names no volume after `index`. A Complete declaration is frozen for the session's
+    /// life, so it names the whole set, unless it may grow: the library's `GrowingFileVolumes`, or a persistent
+    /// session's provider that opted in with `extends_protection`. Those never end a set here.
+    pub(crate) fn declared_last_volume(&mut self, index: u32) -> ProgressiveResult<bool> {
+        #[cfg(feature = "persistent-partials")]
+        let extends = self.extends;
+        #[cfg(not(feature = "persistent-partials"))]
+        let extends = false;
+        if self.library_provider || extends {
+            return Ok(false);
+        }
+        self.refresh_protection(false)?;
+        Ok(match &self.protection {
+            ProtectionDeclaration::Complete { inventory, .. } => {
+                inventory.volumes.iter().map(|v| v.index).max() == Some(index)
+            }
+            ProtectionDeclaration::Opaque => false,
+        })
+    }
     /// The number of volumes of a sealed in-memory set, every one given up front; `None` for a provider.
     pub(crate) fn sealed_volume_count(&self) -> Option<usize> {
         self.sealed_memory.then_some(self.sealed_volumes)

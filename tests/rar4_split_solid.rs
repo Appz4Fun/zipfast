@@ -1167,3 +1167,54 @@ fn a_rar_2_x_set_split_between_members_goes_on_to_the_next_volume() {
     // (An opaque provider's member is provisional, an "other outcome" here.)
     assert!(problems.last().is_some_and(|p| p.contains("MissingVolume")), "{problems:?}");
 }
+
+/// Files on disk declared Complete: the inventory names every volume of the set.
+struct Declared {
+    paths: Vec<PathBuf>,
+    handles: Vec<Arc<fs::File>>,
+}
+impl VolumeSource for Declared {
+    fn volume(&mut self, request: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        Ok(match self.paths.get(request.index as usize) {
+            Some(path) => VolumeAnswer::Ready(Box::new(ImmutableFileSource::open(path)?)),
+            None => VolumeAnswer::Missing,
+        })
+    }
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        let volumes = self
+            .paths
+            .iter()
+            .zip(&self.handles)
+            .enumerate()
+            .map(|(i, (path, file))| ProtectedVolume {
+                index: i as u32,
+                name: path.file_name().unwrap().into(),
+                backing: VolumeBacking::Native(vec![ProtectedPath { path: path.clone(), file: Some(file.clone()) }]),
+            })
+            .collect();
+        Ok(ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory { volumes, auxiliary_paths: vec![] },
+        })
+    }
+}
+
+/// A Complete declaration names every volume, so the last one it names ends the set even between members.
+#[test]
+fn a_rar_2_x_set_declared_complete_ends_after_its_last_declared_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (x, y) = (b"first member, in the first volume".as_slice(), b"second member, in the second".as_slice());
+    let input = tmp.path().join("in");
+    fs::create_dir_all(&input).unwrap();
+    let paths = vec![input.join("set.rar"), input.join("set.r00")];
+    fs::write(&paths[0], rar20_volume(&[(b"x.txt", x)])).unwrap();
+    fs::write(&paths[1], rar20_volume(&[(b"y.txt", y)])).unwrap();
+    let handles = paths.iter().map(|p| Arc::new(fs::File::open(p).unwrap())).collect();
+    let dest = tmp.path().join("out");
+    let options = ProgressiveOptions::new(options(&dest), OsString::from("set.rar"));
+    let mut session = ProgressiveSession::new(Box::new(Declared { paths, handles }), options).unwrap();
+    let problems = drive(&mut session, || {});
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(fs::read(dest.join("x.txt")).unwrap(), x);
+    assert_eq!(fs::read(dest.join("y.txt")).unwrap(), y);
+}
