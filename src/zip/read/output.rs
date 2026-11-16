@@ -215,7 +215,7 @@ impl ZipReadStage {
                     .output_descriptor
                     .ok_or(ReadFault::InvalidPlan)?;
                 let token = context.ledger.mint_reservation()?;
-                let (file, identity, uid) = spool::PrivateCiphertextFile::create_output(
+                let (file, identity, uid, portable) = spool::PrivateCiphertextFile::create_output(
                     token.view(),
                     context.temp.as_ref().ok_or(ReadFault::InvalidPlan)?,
                     bytes,
@@ -235,6 +235,7 @@ impl ZipReadStage {
                         identity: FileIdentity { dev: identity.dev as u64, ino: identity.ino as u64 },
                         handle,
                         retired: false,
+                        loose_identity: portable,
                     },
                     source,
                     uid,
@@ -401,11 +402,15 @@ impl ZipReadStage {
             let observation = match observation {
                 Err(fault) => Err(CleanupCause::Admission(fault)),
                 Ok(()) => native_policy::stat(file.as_raw_fd()).map_err(CleanupCause::Io).and_then(|stat| {
+                    // A portable stage keeps only type and device: exFAT renumbers its inode, reports one link
+                    // after unlink and whatever owner the mount gives.
+                    let strict = self.reservation.loose_identity
+                        || stat.st_uid == self.uid
+                            && stat.st_nlink == 0
+                            && stat.st_ino as u64 == self.reservation.identity.ino;
                     if stat.st_mode & libc::S_IFMT == libc::S_IFREG
-                        && stat.st_uid == self.uid
-                        && stat.st_nlink == 0
+                        && strict
                         && stat.st_dev as u64 == self.reservation.identity.dev
-                        && stat.st_ino as u64 == self.reservation.identity.ino
                     {
                         Ok(())
                     } else {

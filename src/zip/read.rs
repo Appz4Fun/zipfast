@@ -476,9 +476,24 @@ impl EncryptedReadContext {
                 identity: FileIdentity::capture(&identity),
                 handle: file_handle(file),
                 retired: false,
+                loose_identity: loose_identity(file),
             })
         })();
         result.map_err(|fault: ReadFault| ZipReadError::from(fault).with_usage(self.usage(), self.run_usage()))
+    }
+}
+/// Whether a caller's output file lives outside the native allow-list, where an open file's inode number need not
+/// stay stable (exFAT numbers it by its first cluster, so it changes once data is written).
+fn loose_identity(file: &File) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::fd::AsRawFd;
+        matches!(native_policy::backend(file.as_raw_fd()), Err(e) if e.kind() == std::io::ErrorKind::Unsupported)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = file;
+        false
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -566,6 +581,9 @@ pub struct OutputReservation {
     identity: FileIdentity,
     handle: usize,
     retired: bool,
+    /// A portable stage (see [`StagedStorage`]): exFAT and similar renumber the inode of an open file as it is
+    /// unlinked and written, so only the device and file type identify it.
+    loose_identity: bool,
 }
 struct ScratchLease<'a> {
     ledger: &'a ReservationLedger,
@@ -587,12 +605,14 @@ impl OutputReservation {
             Some(cancel),
             || file.metadata(),
         )?;
-        if !metadata.is_file()
-            || FileIdentity::capture(&metadata) != self.identity
-            || file_handle(file) != self.handle
-            || metadata.len() != self.bytes
-        {
+        let actual = FileIdentity::capture(&metadata);
+        let same = if self.loose_identity { actual.dev == self.identity.dev } else { actual == self.identity };
+        if file_handle(file) != self.handle {
             return Err(ReadFault::InvalidPlan);
+        }
+        // A stage that is no longer the file we wrote is a typed, reportable failure, not a caller bug.
+        if !metadata.is_file() || !same || metadata.len() != self.bytes {
+            return Err(ReadFault::CheckedFormat { reason: "verified output stage changed before it was copied" });
         }
         Ok(())
     }

@@ -628,6 +628,7 @@ impl ZipReadStage {
                         identity,
                         handle,
                         retired: false,
+                        loose_identity: false,
                     },
                     source: binding.source,
                     uid,
