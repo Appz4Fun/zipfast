@@ -28,6 +28,8 @@ pub(super) mod named;
 #[cfg(unix)]
 pub(super) mod parent;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) mod portable;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) mod target;
 
 /// A borrowed original catalogue record, consumed synchronously by preparation.
@@ -111,11 +113,12 @@ use std::os::fd::{AsRawFd, IntoRawFd};
 /// One owned verified-output stage. File-backed stdout includes empty members.
 /// Publication/copy requires exact member completion and fresh original-source checks.
 ///
-/// Storage currently requires ownership-enforced local APFS on macOS, or
-/// ext/XFS/Btrfs/tmpfs on Linux. Named Linux output also requires a trusted
-/// kernel procfs descriptor view. Darwin atomic private birth has a checked
-/// native limit on the combined parent/leaf spelling. Unsupported storage or
-/// native capabilities fail without selecting another storage route.
+/// Native storage requires ownership-enforced local APFS on macOS, or
+/// ext/XFS/Btrfs/tmpfs on Linux; named Linux output also requires a trusted
+/// kernel procfs descriptor view, and Darwin atomic private birth has a checked
+/// native limit on the combined parent/leaf spelling. Any other filesystem uses
+/// the portable backend under [`StagedStorage::Auto`] (the default), with the
+/// weaker guarantees listed in `docs/zip-staged-output.md`; see [`Self::backend`].
 /// Namespace and source checks are optimistic observations, not filesystem locks.
 pub struct ZipReadStage {
     pub(super) file: Option<File>,
@@ -124,8 +127,9 @@ pub struct ZipReadStage {
     uid: u32,
     descriptor: (usize, u64, u64, u32),
     terminal: bool,
+    /// The prepared named stage, on either backend; one inline slot sized by the larger.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    named: Option<file::PreparedNamed>,
+    named: Option<file::Prepared>,
 }
 impl ZipStageEntry<'_> {
     fn validate_limits(&self, context: &EncryptedReadContext) -> Result<bool, ReadFault> {

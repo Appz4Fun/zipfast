@@ -96,6 +96,8 @@ pub(super) struct Action {
     /// The rename a rename mode made while publishing the active member, for the run to report.
     pub(super) renamed: Option<crate::extract::RenamedOutput>,
     pub(super) attempt_ceiling: u128,
+    /// The backend the active member's stage was prepared on.
+    pub(super) backend: Option<StagedBackend>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) policy: Option<policy::FrozenPolicy>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -768,6 +770,8 @@ pub(super) fn factory<'a>(
     let (mut mp, mut mu, mut mf, mut live) = (0u64, 0u64, 0u64, 0u128);
     let mut needs_temp = false;
     let threshold = if derive_limits { 64 << 10 } else { context.options.limits.ciphertext_memory_bytes };
+    // A streamed staged AES member never spools; only stdout and caller-sink reads still need the private spool.
+    let stream_aes = context.options.stream_staged_aes && output == budget::PlannedOutput::StagedFiles;
     for (e, dir, link) in records {
         io::canceled(Some(cancel))?;
         g.records = add(g.records, 1)?;
@@ -783,7 +787,7 @@ pub(super) fn factory<'a>(
         g.packed = add(g.packed, e.packed.into())?;
         g.decoded = add(g.decoded, e.size.into())?;
         let (kind, c, _) = cipher_geometry(&e);
-        let f = if kind == Some(CipherKind::Aes) && c > threshold { c } else { 0 };
+        let f = if kind == Some(CipherKind::Aes) && c > threshold && !stream_aes { c } else { 0 };
         let o = if passes > 0 { e.size } else { 0 };
         g.live_spool = g.live_spool.max(add(f.into(), o.into())?);
         g.ciphertext = add(g.ciphertext, f.into())?;
@@ -923,6 +927,7 @@ pub(super) fn factory<'a>(
             output_descriptor: None,
             renamed: None,
             attempt_ceiling,
+            backend: None,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             policy: None,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -959,6 +964,21 @@ impl EncryptedReadContext {
         overrides: &EncryptedReadOverrides,
         cancel: &Cancellation,
     ) -> ZipReadResult<Self> {
+        Self::for_owner_streaming(owner, scope, caller_max_bytes, output, password, overrides, cancel, false)
+    }
+    /// [`Self::for_owner`]; `stream_staged_aes` plans staged WinZip AES members without a ciphertext spool. Only the
+    /// checked run passes true, because only its own staged sink may receive provisional plaintext.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_owner_streaming(
+        owner: &mut ProjectedOwner,
+        scope: ProjectedReadScope,
+        caller_max_bytes: Option<u64>,
+        output: ZipReadOutput<'_>,
+        password: Option<&str>,
+        overrides: &EncryptedReadOverrides,
+        cancel: &Cancellation,
+        stream_staged_aes: bool,
+    ) -> ZipReadResult<Self> {
         let range = match scope {
             ProjectedReadScope::AllRegular => 0..owner.entries.len(),
             ProjectedReadScope::Entry(i) if i < owner.entries.len() => i..i + 1,
@@ -967,6 +987,7 @@ impl EncryptedReadContext {
         owner.proof()?;
         let source = owner.source.as_mut().map_err(|_| ReadFault::InvalidPlan)?;
         let mut context = planning_context(overrides)?;
+        context.options.stream_staged_aes = stream_staged_aes;
         io::canceled(Some(cancel))
             .map_err(|fault| ZipReadError::from(fault).with_bootstrap(context.bootstrap.usage()))?;
         source
@@ -1228,6 +1249,12 @@ fn checked_read_inner(
         cipher,
         crc,
         output: action.output,
+        // Only the checked run's own staged sink may receive provisional AES plaintext.
+        streaming: matches!(kind, cipher::InputKind::Aes { .. })
+            && context.options.stream_staged_aes
+            && action.run_bound
+            && action.controlled_output
+            && action.output == budget::PlannedOutput::StagedFiles,
     };
     let mut source = HeldSource { file, binding, local_at: e.local_at, prepared: false };
     if let Some(fault) = rejection {
@@ -1244,6 +1271,9 @@ fn checked_read_inner(
         cipher::InputKind::Clear => admitted.clear()?,
         cipher::InputKind::ZipCrypto { .. } => {
             codecs::PlainInput::ZipCrypto(cipher::ZipCryptoInput::open_admitted(admitted, cancel)?)
+        }
+        cipher::InputKind::Aes { .. } if plan.streaming => {
+            codecs::PlainInput::AesStream(cipher::StreamingAes::open_admitted(admitted, cancel)?)
         }
         cipher::InputKind::Aes { .. } => {
             let pending =
@@ -1263,7 +1293,9 @@ fn checked_read_inner(
 fn planning_context(overrides: &EncryptedReadOverrides) -> ZipReadResult<EncryptedReadContext> {
     let limits =
         EncryptedReadLimits { interrupted_retries: overrides.interrupted_retries.unwrap_or(16), ..Default::default() };
-    EncryptedReadContext::new(EncryptedReadOptions::default().with_limits(limits))
+    EncryptedReadContext::new(
+        EncryptedReadOptions::default().with_limits(limits).with_staged_storage(overrides.staged_storage),
+    )
 }
 #[allow(clippy::result_large_err)]
 impl EncryptedReadContext {
@@ -1281,10 +1313,11 @@ impl EncryptedReadContext {
         let mut context = planning_context(overrides)?;
         io::canceled(Some(cancel))
             .map_err(|fault| ZipReadError::from(fault).with_bootstrap(context.bootstrap.usage()))?;
-        session
-            .source
-            .verify_with(&session.file, |stage, call| context.bootstrap.stat(stage, call))
-            .map_err(|f| ZipReadError::from(f).with_bootstrap(context.bootstrap.usage()))?;
+        // A source that already failed a check stays refused without a new observation.
+        if let Some(fault) = session.source.previous_invalidation() {
+            return Err(ZipReadError::from(fault).with_bootstrap(context.bootstrap.usage()));
+        }
+        // The plan reads only retained metadata, never the source, so the one observation after it covers it.
         let e = session.metadata.view(index);
         let result = factory(
             &mut context,
@@ -1544,6 +1577,7 @@ pub(super) fn test_original_all_member(
         cipher,
         crc,
         output: budget::PlannedOutput::Callback,
+        streaming: false,
     };
     context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1))?;
     let mut source = HeldSource { file: &mut owner.file, binding, local_at: e.local_at, prepared: false };

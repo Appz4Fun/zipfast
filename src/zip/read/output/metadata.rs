@@ -56,7 +56,7 @@ fn syscall<T>(step: MetadataStep, call: impl FnOnce() -> std::io::Result<T>) -> 
     let _ = step;
     call()
 }
-fn time(at: Option<(i64, u32)>) -> Option<libc::timespec> {
+pub(super) fn time(at: Option<(i64, u32)>) -> Option<libc::timespec> {
     let (seconds, nanos) = at?;
     crate::extract::archive_time(seconds, nanos)?;
     // The complete i64 seconds/u32 nanoseconds domain fits comfortably in i128.

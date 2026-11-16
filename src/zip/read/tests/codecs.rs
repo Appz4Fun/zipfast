@@ -66,6 +66,7 @@ fn member(
         cipher,
         crc: Some(crc32fast::hash(data)),
         output: budget::PlannedOutput::Callback,
+        streaming: false,
     }
 }
 struct Fragments {
@@ -835,8 +836,8 @@ fn fixed_control_and_reader_capacity_receipt() {
     // state (even phases that are exclusive), both LZMA headers, fixed scalars.
     let control = 2 * error + 2 * report + sizes[..6].iter().sum::<usize>() + 22 + 512;
     assert!(control <= sizes[6]);
-    assert_eq!(error, 5360);
-    assert_eq!(result, 5360);
+    assert_eq!(error, 5376);
+    assert_eq!(result, 5376);
     assert_eq!(report, 656);
     let total = shared::SHARED_LEDGER_CAPACITY + 4096 + 2 * 65536 + 65536 + sizes[6];
     assert!(total <= 256 << 10);

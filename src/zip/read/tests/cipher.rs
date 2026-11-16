@@ -66,6 +66,7 @@ fn member(
         cipher: Some(cipher),
         crc: Some(0),
         output: budget::PlannedOutput::Callback,
+        streaming: false,
     }
 }
 

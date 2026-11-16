@@ -573,7 +573,8 @@ fn actual_sixteen_encrypted_members_fit_staged_source_allowance() {
     println!("actual AES16 result {result:?}");
     let report = result.unwrap();
     assert_eq!(report.files(), 16);
-    assert_eq!(report.usage().allocation_attempts, 3);
+    // Each AES member streams into its stage: no ciphertext snapshot allocation.
+    assert_eq!(report.usage().allocation_attempts, 2);
     assert_eq!(report.usage().live_fds, 0);
     for name in names {
         assert_eq!(std::fs::read(dest.path().join(name)).unwrap(), b"data");

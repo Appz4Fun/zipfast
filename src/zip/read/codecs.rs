@@ -50,6 +50,12 @@ impl<'a> Workspace<'a> {
                     }
                 })?;
                 workspace.reserved += io::WINDOW as u64;
+                // A many-small-files archive acquires a workspace per member; reuse this thread's last windows rather
+                // than allocate, zero and return 128 KiB to the OS each time. Charges are unchanged.
+                if let Some(recycled) = POOL.with(|pool| pool.borrow_mut().pop()) {
+                    *buffer = recycled;
+                    continue;
+                }
                 buffer.try_reserve_exact(io::WINDOW).map_err(|_| ReadFault::Allocation { capacity: io::WINDOW })?;
                 assert_eq!(buffer.capacity(), io::WINDOW);
                 buffer.resize(io::WINDOW, 0);
@@ -62,8 +68,22 @@ impl<'a> Workspace<'a> {
         }
     }
 }
+thread_local! {
+    /// At most two spare decode windows per thread, each exactly `io::WINDOW` long.
+    static POOL: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 impl Drop for Workspace<'_> {
     fn drop(&mut self) {
+        for buffer in [std::mem::take(&mut self.input), std::mem::take(&mut self.output)] {
+            if buffer.len() == io::WINDOW && buffer.capacity() == io::WINDOW {
+                let _ = POOL.try_with(|pool| {
+                    let mut pool = pool.borrow_mut();
+                    if pool.len() < 2 && pool.try_reserve(1).is_ok() {
+                        pool.push(buffer);
+                    }
+                });
+            }
+        }
         self.ledger.with_state(|s| {
             s.release_capacity(self.reserved);
         });
@@ -80,6 +100,8 @@ pub(super) enum PlainInput<'a, 's> {
     Clear(ClearInput<'a, 's>),
     ZipCrypto(ZipCryptoInput<'a, 's>),
     Aes(AuthenticatedAes<'a, 's>),
+    /// Provisional plaintext for a staged output; authenticated in `finish`, before any publication.
+    AesStream(cipher::StreamingAes<'a, 's>),
 }
 impl PlainInput<'_, '_> {
     fn ledger(&self) -> LedgerView<'_> {
@@ -87,11 +109,13 @@ impl PlainInput<'_, '_> {
             Self::Clear(v) => v.ledger,
             Self::ZipCrypto(v) => v.ledger,
             Self::Aes(v) => v.ledger,
+            Self::AesStream(v) => v.ledger,
         }
     }
     fn crc(&self) -> Option<u32> {
         match self {
             Self::Aes(v) if !v.crc_required => None,
+            Self::AesStream(v) if !v.crc_required => None,
             _ => self.plan().crc,
         }
     }
@@ -100,6 +124,7 @@ impl PlainInput<'_, '_> {
             Self::Clear(v) => v.plan,
             Self::ZipCrypto(v) => v.plan,
             Self::Aes(v) => v.plan,
+            Self::AesStream(v) => v.plan,
         }
     }
     #[allow(clippy::result_large_err)] // Inline 4352-byte terminal evidence; no failure allocation.
@@ -111,6 +136,7 @@ impl PlainInput<'_, '_> {
         };
         match self {
             Self::Aes(v) => v.read_plain_chunk(bytes, cancel),
+            Self::AesStream(v) => v.read_plain_chunk(bytes, cancel),
             Self::ZipCrypto(v) => v.read_plain_chunk(bytes, cancel),
             Self::Clear(v) => {
                 io::canceled(Some(cancel))?;
@@ -148,6 +174,7 @@ impl PlainInput<'_, '_> {
     fn finish(self, result: ZipReadResult<()>) -> ZipReadResult<()> {
         match self {
             Self::Aes(v) => v.finish(result),
+            Self::AesStream(v) => v.finish(result),
             Self::ZipCrypto(v) => v.finish(result),
             Self::Clear(v) => {
                 let result =
@@ -220,7 +247,8 @@ pub(super) fn decode(
     let evidence = match &input {
         PlainInput::Clear(_) => PasswordEvidence::NotEncrypted,
         PlainInput::ZipCrypto(_) => PasswordEvidence::HeaderMatched,
-        PlainInput::Aes(_) => PasswordEvidence::Authenticated,
+        // A streamed member's codec failure is re-reported as an authentication failure when the tag disagrees.
+        PlainInput::Aes(_) | PlainInput::AesStream(_) => PasswordEvidence::Authenticated,
     };
     let integrity = |reason| ZipReadError::from(ReadFault::Integrity { reason, password_evidence: evidence });
     let mut consumed = 0u64;
