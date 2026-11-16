@@ -101,9 +101,14 @@ it holds ciphertext. On the portable path it loses:
    Portable only requires a directory and a regular file: NFS with squashed owners, SMB and shared FUSE mounts report
    owners and modes that cannot be checked, and an inherited ACL may let others open the file before it is unlinked.
    Only ciphertext is spooled, so what could leak is ciphertext that is already in the archive.
-2. **The unlink race.** In a shared writable directory without a sticky bit another user can replace the spool name
-   between our identity check and our `unlinkat`; we would then remove their file and keep ours named. The checks of
-   our own descriptor after the unlink catch the second half (the read fails rather than continuing), but the
-   other user's file is gone. On NFS an unlinked open file stays as a `.nfsXXXX` name until it is closed.
+2. **The unlink race.** In a shared writable directory without a sticky bit another user can move the spool away
+   and put their own file under its name between our identity check and our `unlinkat`; we then remove their file.
+   After the unlink the portable path requires the spool name to be gone (`ENOENT`) and our descriptor to have no
+   links left, so the read fails with `UnsupportedIdentity` instead of continuing; the only exceptions, detected with
+   `fstatfs`, are NFS, where an unlinked open file keeps one `.nfsXXXX` silly-rename link until it is closed, and
+   FAT/exFAT, which have no link counts (always 1); there the absent spool name is the only evidence, so a spool moved
+   away under another name goes unnoticed.
+   What portability cannot prevent: the other user's file is gone, and our ciphertext stays under whatever name it
+   was moved to.
 3. **Inode identity of the held descriptor.** exFAT renumbers an inode once its name is unlinked, so after the unlink
    portable checks of our own descriptor compare the device only.

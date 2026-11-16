@@ -355,3 +355,38 @@ fn spool_on_real_portable_temp_dir() {
     assert_eq!(out, secret);
     assert!(usage.member_spool_bytes > 0);
 }
+
+/// Another user moves our portable spool away and puts their own file under its name just before we unlink it.
+/// We remove their file, ours keeps a link: the read must fail instead of continuing with a named spool.
+#[test]
+fn portable_spool_swapped_before_unlink_fails_the_read() {
+    use crate::zip::read::spool::hooks::HOOK;
+    let work = tempfile::tempdir().unwrap();
+    let zip = work.path().join("a.zip");
+    archive(&zip);
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
+    let _forced = Forced::new(0);
+    let mut swapped = false;
+    HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |op, _| {
+            if op == ReadIoOperation::Unlink && !swapped {
+                swapped = true;
+                let spool = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".zipfast"))
+                    .expect("spool name");
+                std::fs::rename(&spool, dir.join("moved")).unwrap();
+                std::fs::write(&spool, b"someone else's file").unwrap();
+            }
+            None
+        }))
+    });
+    let result = callback_read(&zip, StagedStorage::Auto, temp.path());
+    HOOK.with(|h| *h.borrow_mut() = None);
+    let error = result.unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::UnsupportedIdentity)), "{error:?}");
+    // Their file under the spool name was the one removed; ours survives only under the name it was moved to.
+    assert_eq!(names(temp.path()), ["moved"]);
+}

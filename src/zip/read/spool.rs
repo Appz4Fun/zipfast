@@ -138,12 +138,54 @@ pub(super) fn trusted_dir(s: &libc::stat, uid: libc::uid_t, portable: bool) -> b
         && (s.st_uid == uid || s.st_uid == 0)
         && (s.st_mode & 0o022 == 0 || s.st_mode & libc::S_ISVTX != 0)
 }
+/// Our held spool after its name was unlinked: no links, except on filesystems whose open-unlinked files still
+/// report one (see `keeps_unlinked_link`).
+#[cfg(unix)]
+fn unlinked(s: &libc::stat, uid: libc::uid_t, portable: bool, nfs: bool) -> bool {
+    trusted_file(s, 0, uid, portable) || portable && nfs && trusted_file(s, 1, uid, true)
+}
+/// The spool name must be gone after our unlink; anything still there means another name was unlinked instead.
+#[cfg(unix)]
+fn name_absent(parent: &File, name: &[u8; 41]) -> std::io::Result<()> {
+    let mut s = std::mem::MaybeUninit::<libc::stat>::uninit();
+    match cvt(unsafe {
+        libc::fstatat(parent.as_raw_fd(), name.as_ptr().cast(), s.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    }) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+        Err(error) => Err(error),
+    }
+}
+/// Whether an unlinked open file on `fd`'s filesystem still reports one link: NFS keeps a `.nfsXXXX` silly-rename
+/// name until close, and FAT/exFAT have no link counts at all (always 1). There the absent spool name is the only
+/// unlink evidence.
+#[cfg(unix)]
+fn keeps_unlinked_link(fd: i32) -> bool {
+    let mut v = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(fd, v.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let v = unsafe { v.assume_init() };
+    #[cfg(target_os = "linux")]
+    {
+        matches!(v.f_type as i64, 0x6969 | 0x2011_bab0 | 0x4d44)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let name: Vec<u8> = v.f_fstypename.iter().map(|b| *b as u8).take_while(|b| *b != 0).collect();
+        matches!(name.as_slice(), b"nfs" | b"exfat" | b"msdos")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = v;
+        false
+    }
+}
 #[cfg(unix)]
 pub(super) fn trusted_file(s: &libc::stat, links: libc::nlink_t, uid: libc::uid_t, portable: bool) -> bool {
-    // Portable: owner and mode are whatever the filesystem reports, and NFS keeps an unlinked open file as a
-    // `.nfsXXXX` name until it is closed, so an unlinked spool may still show one link.
+    // Portable: owner and mode are whatever the filesystem reports; the link count stays exact (see `unlinked`).
     if portable {
-        return s.st_mode & libc::S_IFMT == libc::S_IFREG && (s.st_nlink == links || links == 0 && s.st_nlink <= 1);
+        return s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_nlink == links;
     }
     s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_uid == uid && s.st_mode & 0o777 == 0o600 && s.st_nlink == links
 }
@@ -179,6 +221,8 @@ pub(super) struct PrivateCiphertextFile<'a> {
     scope: PrivateScope,
     /// Created through the portable fallback (see [`StagedStorage`]).
     portable: bool,
+    /// Portable spool on NFS, FAT or exFAT (one link tolerated after unlink; see `keeps_unlinked_link`).
+    nfs: bool,
 }
 impl<'a> OwnedCiphertext<'a> {
     #[allow(clippy::result_large_err)] // Inline terminal evidence is allocation independent.
@@ -535,6 +579,7 @@ impl<'a> PrivateCiphertextFile<'a> {
     ) -> ZipReadResult<Self> {
         // Reserve the entire file and both descriptors before acquisition.
         let mut portable = storage == StagedStorage::PortableOnly;
+        let mut nfs = false;
         ledger.with_state(|s| s.reserve(scope.encrypted, len, 2))?;
         let mut directory: Option<AcquiredHandle<'_>> = None;
         let mut file: Option<AcquiredHandle<'_>> = None;
@@ -586,6 +631,7 @@ impl<'a> PrivateCiphertextFile<'a> {
             if !trusted_dir(&s, uid, portable) {
                 return Err(policy());
             }
+            nfs = portable && keeps_unlinked_link(parent.as_raw_fd());
             let acquired = create_private_at(
                 &ledger,
                 cancel,
@@ -624,8 +670,19 @@ impl<'a> PrivateCiphertextFile<'a> {
                 cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr().cast(), 0) })
             })?;
             named = false;
+            // The spool name itself must be gone, and our descriptor unlinked: if another file was swapped in under
+            // the name, we removed that one and ours is still named. Cleanup then re-examines the name and removes
+            // it only if it is still our spool.
+            // Native storage needs no extra call: a zero link count on an allow-listed filesystem already proves it.
+            if portable
+                && namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || name_absent(parent, &name)).is_err()
+            {
+                named = true;
+                return Err(policy());
+            }
             let s = namespace(&ledger, cancel, scope, ReadIoOperation::Stat, || stat(file.as_ref().unwrap()))?;
-            if !identity.unwrap().held(&s, portable) || !trusted_file(&s, 0, uid, portable) {
+            if !identity.unwrap().held(&s, portable) || !unlinked(&s, uid, portable, nfs) {
+                named = true;
                 return Err(policy());
             }
             unlinked_verified = true;
@@ -771,7 +828,8 @@ impl<'a> PrivateCiphertextFile<'a> {
                 let mut verified = false;
                 checked(ReadIoOperation::Stat, &mut || {
                     let s = stat(held)?;
-                    verified = id.held(&s, portable) && trusted_file(&s, 0, uid, portable);
+                    verified =
+                        id.held(&s, portable) && unlinked(&s, uid, portable, nfs) && name_absent(parent, &name).is_ok();
                     Ok(())
                 })?;
                 if !verified {
@@ -870,6 +928,7 @@ impl<'a> PrivateCiphertextFile<'a> {
             reserved: len,
             scope,
             portable,
+            nfs,
         })
     }
     #[allow(clippy::result_large_err)]
@@ -910,7 +969,7 @@ impl<'a> PrivateCiphertextFile<'a> {
             || stat(self.file.as_ref().unwrap()),
         )?;
         if !self.identity.held(&s, self.portable)
-            || !trusted_file(&s, 0, self.uid, self.portable)
+            || !unlinked(&s, self.uid, self.portable, self.nfs)
             || s.st_size < 0
             || s.st_size as u64 != self.len
         {
@@ -948,7 +1007,7 @@ impl<'a> PrivateCiphertextFile<'a> {
         let admitted = self.ledger.with_state(|s| s.charge_category(RunCategory::EmergencyCleanup, 1));
         let observation = if admitted.is_ok() {
             stat(&file).map_err(CleanupCause::Io).and_then(|s| {
-                if self.identity.held(&s, self.portable) && trusted_file(&s, 0, self.uid, self.portable) {
+                if self.identity.held(&s, self.portable) && unlinked(&s, self.uid, self.portable, self.nfs) {
                     Ok(())
                 } else {
                     Err(CleanupCause::Policy("ciphertext identity changed"))
