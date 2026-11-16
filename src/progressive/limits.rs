@@ -51,6 +51,56 @@ pub enum Resource {
     OutputWriteBytes,
     VerifyWorkBytes,
 }
+impl Resource {
+    /// Every resource, in declaration order.
+    pub const ALL: [Resource; 31] = [
+        Resource::VolumeHandles,
+        Resource::ActiveOutputs,
+        Resource::RetainedArtifacts,
+        Resource::ReadChunk,
+        Resource::HeaderAllocation,
+        Resource::HeaderBytes,
+        Resource::VolumeHeaderBytes,
+        Resource::MetadataBytes,
+        Resource::NameBytes,
+        Resource::Entries,
+        Resource::Parts,
+        Resource::HoleIntervals,
+        Resource::HeaderBlocks,
+        Resource::SourceRequests,
+        Resource::SourceBookkeeping,
+        Resource::ProviderWakes,
+        Resource::SourceBytes,
+        Resource::LogicalOutputBytes,
+        Resource::TempBytes,
+        Resource::VerifyBytes,
+        Resource::DecoderWindow,
+        Resource::PackedWorkPerPoll,
+        Resource::KdfExponent,
+        Resource::KdfDerivationBlocks,
+        Resource::KdfSessionBlocks,
+        Resource::PasswordUtf8Bytes,
+        Resource::PasswordEncodedBytes,
+        Resource::ProtectionPaths,
+        Resource::ProtectionPathBytes,
+        Resource::OutputWriteBytes,
+        Resource::VerifyWorkBytes,
+    ];
+}
+/// A read-only snapshot of one budget: what the session has charged so far and the effective ceiling (the
+/// configured limit, clamped by any fixed safety ceiling). Leased scratch counts only while it is live, and a
+/// resource scoped to a smaller unit (one allocation, poll or derivation) reports its cumulative charge as well.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceUsage {
+    pub used: u64,
+    pub limit: u64,
+}
+impl ResourceUsage {
+    /// What is left before the limit.
+    pub fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(self.used)
+    }
+}
 /// Adjustable budgets; descriptor and protection-inventory safety ceilings remain fixed.
 /// Counts are cumulative unless a consumer explicitly establishes a smaller scope
 /// (single allocation, volume, derivation, member, or poll).
@@ -251,6 +301,10 @@ impl Usage {
     pub(crate) fn used(&self, resource: Resource) -> u64 {
         self.0.lock().unwrap().used[resource as usize]
     }
+    pub(crate) fn snapshot(&self, resource: Resource) -> ResourceUsage {
+        let state = self.0.lock().unwrap();
+        ResourceUsage { used: state.used[resource as usize], limit: state.limits.limit(resource) }
+    }
     /// Tightens one budget mid-session, so a test can bound a single step.
     #[cfg_attr(
         not(feature = "persistent-partials"),
@@ -331,5 +385,24 @@ mod seven_zip_kdf_tests {
         assert!(matches!(error.kind, FailureKind::Limit { resource: Resource::KdfExponent, limit: 24, attempted: 25 }));
         let tight = ProgressiveLimits { kdf_exponent: 19, ..ProgressiveLimits::default() };
         assert!(tight.check_seven_zip_kdf(19).is_ok() && tight.check_seven_zip_kdf(20).is_err());
+    }
+}
+
+#[cfg(test)]
+mod usage_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn all_lists_each_resource_at_its_index_and_snapshots_track_charges() {
+        for (i, r) in Resource::ALL.iter().enumerate() {
+            assert_eq!(*r as usize, i);
+        }
+        let usage =
+            Usage::new(ProgressiveLimits { metadata_bytes: 100, volume_handles: 1 << 40, ..Default::default() });
+        assert_eq!(usage.snapshot(Resource::MetadataBytes), ResourceUsage { used: 0, limit: 100 });
+        usage.charge(Resource::MetadataBytes, 30).unwrap();
+        let snap = usage.snapshot(Resource::MetadataBytes);
+        assert_eq!((snap.used, snap.limit, snap.remaining()), (30, 100, 70));
+        assert_eq!(usage.snapshot(Resource::VolumeHandles).limit, 4096, "the fixed ceiling is reported");
     }
 }

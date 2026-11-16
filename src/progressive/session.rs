@@ -383,6 +383,20 @@ impl ProgressiveSession {
             part_evidence: Vec::new(),
         })
     }
+    /// What this session has charged to `resource` so far, and its effective limit. Read-only: a caller can
+    /// budget further work (such as a Complete declaration) from real numbers rather than estimates.
+    pub fn resource_usage(&self, resource: Resource) -> ResourceUsage {
+        self.usage.snapshot(resource)
+    }
+    /// [`Self::resource_usage`] for every resource, in [`Resource::ALL`] order.
+    pub fn resource_usages(&self) -> impl Iterator<Item = (Resource, ResourceUsage)> + '_ {
+        Resource::ALL.into_iter().map(|r| (r, self.usage.snapshot(r)))
+    }
+    /// The limits this session was opened with, as configured; [`Self::resource_usage`] reports the effective
+    /// ceiling after fixed safety clamps.
+    pub fn limits(&self) -> &ProgressiveLimits {
+        &self.options.limits
+    }
     pub fn control(&self) -> SessionControl {
         self.control.clone()
     }

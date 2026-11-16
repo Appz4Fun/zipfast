@@ -2260,3 +2260,24 @@ fn opaque_promotion_with_a_repaired_volume_falls_back_instead_of_failing() {
         assert_eq!(out.join("member.bin").exists(), !repair);
     }
 }
+#[test]
+fn resource_usage_is_read_only_and_grows_as_the_session_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut s, _) = session(vec![archive(&[FileSpec::new("one", b"payload")])], options(tmp.path()), false, false, 4);
+    let before: Vec<_> = s.resource_usages().collect();
+    assert_eq!(before.len(), Resource::ALL.len());
+    assert_eq!(s.resource_usage(Resource::MetadataBytes).limit, s.limits().metadata_bytes);
+    loop {
+        match poll(&mut s) {
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    let after = s.resource_usage(Resource::MetadataBytes);
+    assert!(after.used > before[Resource::MetadataBytes as usize].1.used);
+    assert!(after.used <= after.limit);
+    assert!(s.resource_usage(Resource::SourceBytes).used > 0);
+    // Reading never charges.
+    assert_eq!(s.resource_usage(Resource::MetadataBytes), after);
+}
