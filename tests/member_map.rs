@@ -2046,3 +2046,27 @@ fn rar4_unicode_name_without_an_encoded_part_falls_back_to_the_legacy_name() {
         assert_eq!(&bytes[piece.packed.start as usize..piece.packed.end as usize], &gold[..]);
     }
 }
+
+// Catches decoding stricter than unrar's: the name ends at the first NUL unit, data running out keeps what was
+// decoded (or falls back), and a legacy fallback that is not UTF-8 is listed raw by map walks.
+#[test]
+fn rar4_unicode_name_decodes_as_unrar_does() {
+    let gold = data(64, 5);
+    let cases: [(&[u8], Option<&str>); 4] = [
+        // High byte 0, then flags 00 (literal) units "\0\0": decodes to an empty name, so the legacy name is used.
+        (b"movie.mkv\0\0\x00\x00\x00", Some("movie.mkv")),
+        // Literal "ab" then NUL padding: the name ends at the first NUL unit.
+        (b"ab\0\0\x00ab\x00\x00", Some("ab")),
+        // A 16-bit unit cut short: nothing decoded, so the legacy name is used.
+        (b"movie.mkv\0\0\x80\x41", Some("movie.mkv")),
+        // An OEM legacy part behind a Unicode flag with nothing encoded: listed raw, no decoded name.
+        (b"caf\x82\0", None),
+    ];
+    for (field, want) in cases {
+        let bytes = r4_archive(&[r4_member(field, &gold, 0x200, 0x30, gold.len(), crc32fast::hash(&gold))]);
+        let volume = vol(&bytes, "x.rar", None).unwrap();
+        assert_eq!(volume.end, VolumeEnd::Complete, "{field:?}");
+        assert_eq!(volume.members.len(), 1, "{field:?}");
+        assert_eq!(volume.members[0].name.as_deref(), want, "{field:?}");
+    }
+}
