@@ -382,7 +382,8 @@ impl<O: ?Sized> Hooks<'_, O> {
             path: target.to_path_buf(),
         }))
     }
-    fn bind(&mut self, target: &Path, initial: SourceStamp) -> Result<(), SelectedStop> {
+    /// `folder`: a rename mode may find a folder at the target, which it moves aside or leaves alone.
+    fn bind(&mut self, target: &Path, initial: SourceStamp, folder: bool) -> Result<(), SelectedStop> {
         self.control.native_charge(RarResource::ExtractControlWork, linear_work(target.as_os_str().len(), 2)?)?;
         self.parent_path = self.bytes(target.parent().expect("sanitized parent"))?;
         self.leaf = self.bytes(Path::new(target.file_name().expect("sanitized leaf")))?;
@@ -408,7 +409,11 @@ impl<O: ?Sized> Hooks<'_, O> {
         let n = self.leaf.len();
         let observed = self
             .io(IoOperation::Metadata, target, || guard::stat_at(fd, unsafe { std::slice::from_raw_parts(leaf, n) }))?;
-        if observed.filter(|s| s.mode & libc::S_IFMT == libc::S_IFREG).map(guard::Stamp::source) != Some(initial) {
+        let kind_ok = |s: &guard::Stamp| {
+            let kind = s.mode & libc::S_IFMT;
+            kind == libc::S_IFREG || folder && kind == libc::S_IFDIR
+        };
+        if observed.filter(kind_ok).map(guard::Stamp::source) != Some(initial) {
             return Err(Self::changed(target));
         }
         self.bind_ancestors(target)?;
@@ -609,7 +614,7 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
         let Some(initial) = initial else {
             return Ok(true);
         };
-        self.bind(target, initial)?;
+        self.bind(target, initial, legacy.rename().is_some())?;
         // A rename mode in the options settles every conflict without the control's mode or the observer: the
         // existing file is never replaced, only kept (`RenameNew`) or moved aside (`RenameExisting`).
         let decision = match self.control.overwrite {

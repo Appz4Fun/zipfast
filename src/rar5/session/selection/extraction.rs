@@ -230,11 +230,11 @@ impl<'a> Extraction<'a> {
     }
 
     /// Publishes a verified stage for a rename mode. Nothing is replaced: every name is claimed with a no-replace
-    /// rename, and a candidate that is a protected name is passed over. `initial` is the regular file the target
-    /// inspection found at `target` (it has refused a symlink, a folder and a protected path, as for
-    /// `Overwrite::Always`), unchanged since.
+    /// rename, and a candidate that is a protected name is passed over. `initial` is what the target inspection found
+    /// at `target`, unchanged since: a regular file, or a folder, or for `RenameNew` a protected input (it has
+    /// refused a symlink, and for `RenameExisting` a protected path or a folder holding one).
     ///
-    /// `RenameExisting` moves that file to the first free renamed name and records the move in `run.renames` before
+    /// `RenameExisting` moves that file or folder to the first free renamed name and records the move in `run.renames` before
     /// publishing at `target`, so a failed publication still reports where the existing file went. `RenameNew`
     /// publishes at `target` when it was free, else (or when it was taken since) at the first free renamed name.
     #[allow(clippy::too_many_arguments)]
@@ -341,27 +341,51 @@ impl<'a> Extraction<'a> {
             return Err(policy(RarPolicyReason::UnsafePath, target.to_path_buf()));
         };
         self.inspect_parents(parent)?;
-        self.protect_source_name(session, target)?;
+        // `RenameNew` leaves what is at the requested name alone, so a protected input or a folder there is only a
+        // name in use: the member goes to a renamed name (7-Zip's `-aou`). A missing protected name is still refused.
+        let rename = self.options.overwrite.rename();
+        let keeps = matches!(rename, Some(crate::extract::RenameMode::New(_)));
+        let named = self.protect_source_name(session, target);
+        if !keeps {
+            named.clone()?;
+        }
         let metadata = match fs::symlink_metadata(target) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return named.map(|()| None),
             Err(source) => return Err(output_fault(IoOperation::Metadata, target, source)),
         };
         if metadata.file_type().is_symlink() {
             return Err(policy(RarPolicyReason::Symlink, target.to_path_buf()));
         }
         let identity = (metadata.dev(), metadata.ino());
-        if session.volumes.iter().any(|volume| (volume.stamp.device, volume.stamp.inode) == identity)
-            || self
-                .options
-                .protected_paths
-                .iter()
-                .any(|path| fs::metadata(path).is_ok_and(|other| (other.dev(), other.ino()) == identity))
+        if !keeps
+            && (session.volumes.iter().any(|volume| (volume.stamp.device, volume.stamp.inode) == identity)
+                || self
+                    .options
+                    .protected_paths
+                    .iter()
+                    .any(|path| fs::metadata(path).is_ok_and(|other| (other.dev(), other.ino()) == identity)))
         {
             return Err(policy(RarPolicyReason::ProtectedInput, target.to_path_buf()));
         }
         if metadata.is_dir() {
-            return Err(policy(RarPolicyReason::Directory, target.to_path_buf()));
+            match rename {
+                None => return Err(policy(RarPolicyReason::Directory, target.to_path_buf())),
+                Some(crate::extract::RenameMode::New(_)) => {}
+                // `RenameExisting` moves the folder aside with its contents (7-Zip's `-aot`), unless that would move
+                // an archive volume or another protected path with it.
+                Some(crate::extract::RenameMode::Existing(_)) => {
+                    let dir = fs::canonicalize(target)
+                        .map_err(|source| output_fault(IoOperation::Metadata, target, source))?;
+                    let inside = |path: &Path| fs::canonicalize(path).is_ok_and(|path| path.starts_with(&dir));
+                    if session.volumes.iter().any(|volume| inside(&volume.path))
+                        || self.options.protected_paths.iter().any(|path| path.starts_with(&dir) || inside(path))
+                    {
+                        return Err(policy(RarPolicyReason::ProtectedInput, target.to_path_buf()));
+                    }
+                }
+            }
+            return Ok(Some(SourceStamp::from_entry_metadata(&metadata)));
         }
         let stamp = SourceStamp::from_metadata(metadata)
             .map_err(|source| output_fault(IoOperation::Metadata, target, source))?;

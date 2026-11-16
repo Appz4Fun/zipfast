@@ -87,6 +87,22 @@ struct Report {
     terminal: Option<String>,
     /// the legacy report lines, for `extract::run`
     lines: Vec<String>,
+    /// the renames the typed RAR runners delivered with each member's outcome, in order
+    live: Vec<(PathBuf, PathBuf, Option<PathBuf>)>,
+}
+
+/// Records the rename a typed RAR runner delivers with a member's outcome, checking it is already on disk when the
+/// outcome arrives (so it reached the caller as the member finished, not after the run).
+fn live(outcome: &extract::RarEntryOutcome, seen: &mut Vec<(PathBuf, PathBuf, Option<PathBuf>)>) {
+    if let Some(r) = &outcome.renamed {
+        if matches!(outcome.outcome, extract::RarOutcome::Verified { .. }) {
+            assert!(fs::symlink_metadata(&r.path).is_ok(), "{r:?} not written when its outcome arrived");
+        }
+        if let Some(moved) = &r.existing {
+            assert!(fs::symlink_metadata(moved).is_ok(), "{r:?} not moved when its outcome arrived");
+        }
+        seen.push((r.requested.clone(), r.path.clone(), r.existing.clone()));
+    }
 }
 
 fn renames(list: &[RenamedOutput]) -> Vec<(PathBuf, PathBuf, Option<PathBuf>)> {
@@ -196,7 +212,8 @@ fn options(dest: &Path, overwrite: Overwrite) -> Options {
     }
 }
 
-struct NoQuestions;
+#[derive(Default)]
+struct NoQuestions(Vec<(PathBuf, PathBuf, Option<PathBuf>)>);
 impl RarExtractObserver for NoQuestions {
     fn overwrite(
         &mut self,
@@ -205,7 +222,9 @@ impl RarExtractObserver for NoQuestions {
     ) -> Result<RarOverwriteDecision, RarDecisionError> {
         panic!("a rename mode settles conflicts without asking")
     }
-    fn entry(&mut self, _: &extract::RarEntryOutcome, _: RarDiagnostic<'_>) {}
+    fn entry(&mut self, outcome: &extract::RarEntryOutcome, _: RarDiagnostic<'_>) {
+        live(outcome, &mut self.0);
+    }
 }
 
 fn run(runner: Runner, archive: &Path, opts: &Options) -> Report {
@@ -250,7 +269,8 @@ fn run(runner: Runner, archive: &Path, opts: &Options) -> Report {
             }
             report.renames = renames(&seen);
         }
-        Runner::RarOutcomes => match extract::run_rar_with_outcomes(archive, opts, None, |_| {}) {
+        Runner::RarOutcomes => match extract::run_rar_with_outcomes(archive, opts, None, |o| live(o, &mut report.live))
+        {
             Ok(summary) => {
                 report.files = summary.files;
                 report.failed = summary.failed;
@@ -264,7 +284,8 @@ fn run(runner: Runner, archive: &Path, opts: &Options) -> Report {
         Runner::RarSelected => {
             let mut session = RarSession::open(archive, None, RarSessionOptions::default()).unwrap();
             let selection = session.select(|_| true).unwrap();
-            match session.extract_selected(&selection, opts, RarDecodeLimits::default(), |_| {}) {
+            match session.extract_selected(&selection, opts, RarDecodeLimits::default(), |o| live(o, &mut report.live))
+            {
                 Ok(summary) => {
                     report.files = summary.files;
                     report.failed = summary.failed;
@@ -281,13 +302,15 @@ fn run(runner: Runner, archive: &Path, opts: &Options) -> Report {
             let selection = session.select(|_| true).unwrap();
             // The control's own mode is never consulted for a conflict: the options' rename mode settles it.
             let mut control = RarExtractControl::new(None, RarOverwriteMode::Ask, RarExtractControlLimits::default());
+            let mut observer = NoQuestions::default();
             let result = session.extract_selected_controlled(
                 &selection,
                 opts,
                 RarDecodeLimits::default(),
                 &mut control,
-                &mut NoQuestions,
+                &mut observer,
             );
+            report.live = std::mem::take(&mut observer.0);
             match result.outcome() {
                 Ok(summary) => {
                     report.files = summary.files;
@@ -408,8 +431,16 @@ fn every_runner_renames_like_7zip_and_unrar() {
             let renamed: Vec<_> =
                 renamed.iter().map(|(r, p, e)| (absolute(r), absolute(p), e.as_ref().map(absolute))).collect();
             assert_eq!(report.renames, renamed, "{context}");
+            if typed_rar(runner) {
+                assert_eq!(report.live, renamed, "{context}: each rename arrives with its member's outcome");
+            }
         }
     }
+}
+
+/// The runners that report each RAR member's outcome as it finishes.
+fn typed_rar(runner: Runner) -> bool {
+    matches!(runner, Runner::RarOutcomes | Runner::RarSelected | Runner::RarControlled)
 }
 
 #[test]
@@ -450,7 +481,7 @@ fn a_free_target_is_written_in_place_and_reports_no_rename() {
 }
 
 #[test]
-fn a_protected_or_aliased_target_is_refused_and_nothing_is_renamed() {
+fn a_protected_target_is_refused_by_rename_existing_and_written_past_by_rename_new() {
     for runner in RUNNERS {
         for overwrite in MODES {
             let dir = tempfile::tempdir().unwrap();
@@ -467,12 +498,24 @@ fn a_protected_or_aliased_target_is_refused_and_nothing_is_renamed() {
             let report = run(runner, &archive, &opts);
             let context = format!("{runner:?} {overwrite:?}: {report:?}");
             assert_eq!(report.terminal, None, "{context}");
-            assert_eq!((report.files, report.failed), (0, 2), "{context}");
-            assert!(report.renames.is_empty(), "{context}");
             assert_eq!(fs::read(&keep).unwrap(), b"protected", "{context}");
             assert!(fs::symlink_metadata(dest.join("link.txt")).unwrap().file_type().is_symlink(), "{context}");
             let names: Vec<_> = fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name()).collect();
-            assert_eq!(names.len(), 2, "{context}: {names:?}");
+            match overwrite {
+                // the symlink is refused either way; RenameNew writes past the protected file, replacing nothing
+                Overwrite::RenameNew(style) => {
+                    let beside = dest.join(spelled("keep.txt", 1, style));
+                    assert_eq!((report.files, report.failed), (1, 1), "{context}");
+                    assert_eq!(report.renames, [(keep.clone(), beside.clone(), None)], "{context}");
+                    assert_eq!(fs::read(&beside).unwrap(), b"new", "{context}");
+                    assert_eq!(names.len(), 3, "{context}: {names:?}");
+                }
+                _ => {
+                    assert_eq!((report.files, report.failed), (0, 2), "{context}");
+                    assert!(report.renames.is_empty(), "{context}");
+                    assert_eq!(names.len(), 2, "{context}: {names:?}");
+                }
+            }
             assert_eq!(
                 fs::read(&archive).unwrap(),
                 build(runner.family(), &[("keep.txt", b"new"), ("link.txt", b"new link")])
@@ -482,21 +525,167 @@ fn a_protected_or_aliased_target_is_refused_and_nothing_is_renamed() {
 }
 
 #[test]
-fn a_directory_in_the_way_is_refused_and_a_directory_member_merges() {
-    for runner in [Runner::Run(Family::Rar), Runner::Policy(Family::Zip), Runner::RarSelected] {
+fn a_directory_in_the_way_is_renamed_around_or_moved_aside() {
+    // Recorded by Prybar from 7-Zip 26.06: a file member `noext` over a folder `noext/` holding `k`. `-aou` writes
+    // the member as `noext_1` and leaves the folder alone; `-aot` moves the folder, contents and all, to `noext_1/`
+    // with a no-replace rename and writes the member as `noext`.
+    for runner in RUNNERS {
         for overwrite in MODES {
             let dir = tempfile::tempdir().unwrap();
             let archive = dir.path().join("archive.bin");
-            fs::write(&archive, build(runner.family(), &[("folder", b"file where a folder is")])).unwrap();
+            fs::write(&archive, build(runner.family(), &[("noext", b"file where a folder is")])).unwrap();
             let dest = dir.path().join("out");
-            fs::create_dir_all(dest.join("folder")).unwrap();
+            fs::create_dir_all(dest.join("noext")).unwrap();
+            fs::write(dest.join("noext/k"), b"kept").unwrap();
             let report = run(runner, &archive, &options(&dest, overwrite));
-            assert_eq!((report.files, report.failed), (0, 1), "{runner:?} {overwrite:?}: {report:?}");
-            assert!(report.renames.is_empty());
-            assert!(dest.join("folder").is_dir());
-            assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
+            let context = format!("{runner:?} {overwrite:?}: {report:?}");
+            assert_eq!(report.terminal, None, "{context}");
+            assert_eq!((report.files, report.failed), (1, 0), "{context}");
+            let (requested, (style, moved)) = (
+                dest.join("noext"),
+                match overwrite {
+                    Overwrite::RenameNew(style) => (style, false),
+                    Overwrite::RenameExisting(style) => (style, true),
+                    _ => unreachable!(),
+                },
+            );
+            let beside = dest.join(spelled("noext", 1, style));
+            let want: BTreeMap<String, Vec<u8>> = if moved {
+                assert!(beside.is_dir(), "{context}");
+                assert_eq!(report.renames, [(requested.clone(), requested.clone(), Some(beside.clone()))], "{context}");
+                [
+                    (format!("{}/k", spelled("noext", 1, style)), b"kept".to_vec()),
+                    ("noext".into(), b"file where a folder is".to_vec()),
+                ]
+                .into()
+            } else {
+                assert!(requested.is_dir(), "{context}");
+                assert_eq!(report.renames, [(requested.clone(), beside.clone(), None)], "{context}");
+                [
+                    ("noext/k".to_string(), b"kept".to_vec()),
+                    (spelled("noext", 1, style), b"file where a folder is".to_vec()),
+                ]
+                .into()
+            };
+            assert_eq!(tree(&dest), want, "{context}");
+            if typed_rar(runner) {
+                assert_eq!(report.live, report.renames, "{context}");
+            }
         }
     }
+}
+
+#[test]
+fn a_directory_holding_a_protected_path_is_never_moved() {
+    for runner in RUNNERS {
+        for overwrite in MODES {
+            // the folder in the way holds a protected file, or the archive itself
+            for archive_inside in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let dest = dir.path().join("out");
+                fs::create_dir_all(dest.join("noext")).unwrap();
+                let archive =
+                    if archive_inside { dest.join("noext/archive.bin") } else { dir.path().join("archive.bin") };
+                let bytes = build(runner.family(), &[("noext", b"new")]);
+                fs::write(&archive, &bytes).unwrap();
+                let mut opts = options(&dest, overwrite);
+                if !archive_inside {
+                    fs::write(dest.join("noext/k"), b"protected").unwrap();
+                    opts.protected_paths.insert(dest.join("noext/k"));
+                }
+                let report = run(runner, &archive, &opts);
+                let context = format!("{runner:?} {overwrite:?} archive inside {archive_inside}: {report:?}");
+                assert_eq!(report.terminal, None, "{context}");
+                assert!(dest.join("noext").is_dir(), "{context}");
+                assert_eq!(fs::read(&archive).unwrap(), bytes, "{context}");
+                match overwrite {
+                    Overwrite::RenameNew(style) => {
+                        assert_eq!((report.files, report.failed), (1, 0), "{context}");
+                        assert_eq!(fs::read(dest.join(spelled("noext", 1, style))).unwrap(), b"new", "{context}");
+                    }
+                    _ => {
+                        assert_eq!((report.files, report.failed), (0, 1), "{context}");
+                        assert!(report.renames.is_empty(), "{context}");
+                        assert_eq!(fs::read_dir(&dest).unwrap().count(), 1, "{context}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_member_named_like_the_archive_beside_it() {
+    // 7-Zip's `-aou` writes `self.zip` from inside `self.zip` as `self_1.zip`; `-aot` would have to move the
+    // archive, so it is refused.
+    for runner in RUNNERS {
+        for overwrite in MODES {
+            let dir = tempfile::tempdir().unwrap();
+            let name = match runner.family() {
+                Family::Zip => "self.zip",
+                Family::Tar => "self.tar",
+                Family::Rar => "self.rar",
+            };
+            let bytes = build(runner.family(), &[(name, b"inner")]);
+            let archive = dir.path().join(name);
+            fs::write(&archive, &bytes).unwrap();
+            let report = run(runner, &archive, &options(dir.path(), overwrite));
+            let context = format!("{runner:?} {overwrite:?}: {report:?}");
+            assert_eq!(report.terminal, None, "{context}");
+            assert_eq!(fs::read(&archive).unwrap(), bytes, "{context}");
+            match overwrite {
+                Overwrite::RenameNew(style) => {
+                    let beside = dir.path().join(spelled(name, 1, style));
+                    assert_eq!((report.files, report.failed), (1, 0), "{context}");
+                    assert_eq!(report.renames, [(archive.clone(), beside.clone(), None)], "{context}");
+                    assert_eq!(fs::read(&beside).unwrap(), b"inner", "{context}");
+                    if typed_rar(runner) {
+                        assert_eq!(report.live, report.renames, "{context}");
+                    }
+                }
+                _ => {
+                    assert_eq!((report.files, report.failed), (0, 1), "{context}");
+                    assert!(report.renames.is_empty(), "{context}");
+                    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "{context}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_member_under_a_moved_directory_does_not_follow_it() {
+    // `noext/a` makes the folder, `noext` moves it aside and takes its name, and `noext/b` then finds a file where
+    // its folder was: it is refused (alone, or by stopping a runner that always stops there), and nothing is written
+    // into the moved folder.
+    for runner in RUNNERS {
+        let overwrite = Overwrite::RenameExisting(RenameStyle::Underscore);
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.bin");
+        fs::write(&archive, build(runner.family(), &[("noext/a", b"a"), ("noext", b"file"), ("noext/b", b"b")]))
+            .unwrap();
+        let dest = dir.path().join("out");
+        fs::create_dir_all(dest.join("noext")).unwrap();
+        let report = run(runner, &archive, &options(&dest, overwrite));
+        let context = format!("{runner:?}: {report:?}");
+        match &report.terminal {
+            // a runner may stop the run at a file where a folder should be, as it does without a rename mode
+            Some(terminal) => assert!(
+                ["a file is in the way", "ParentIsFile", "parent is a symlink or nondirectory"]
+                    .iter()
+                    .any(|why| terminal.contains(why)),
+                "{context}"
+            ),
+            None => assert_eq!((report.files, report.failed), (2, 1), "{context}"),
+        }
+        let want: BTreeMap<String, Vec<u8>> =
+            [("noext_1/a".to_string(), b"a".to_vec()), ("noext".to_string(), b"file".to_vec())].into();
+        assert_eq!(tree(&dest), want, "{context}");
+    }
+}
+
+#[test]
+fn a_directory_member_merges_with_an_existing_folder() {
     // A folder member over an existing folder is reused, never renamed.
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("archive.rar");

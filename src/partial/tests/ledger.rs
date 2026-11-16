@@ -255,6 +255,7 @@ impl Fixture {
                     entry: crate::extract::RarEntryIdentity { index: Some(0), order: 0, name: header.name.clone() },
                     method: header.method,
                     password: crate::error::RarPasswordEvidence::NotEncrypted,
+                    renamed: None,
                 };
                 machine = Some(MemberMachine::new(&header, context, None, &usage, &SessionControl::default()).unwrap());
                 member = Some(PhysicalMember::new(header, wire, 0, &part).unwrap());

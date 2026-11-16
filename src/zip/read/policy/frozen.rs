@@ -263,6 +263,11 @@ impl FrozenPolicy {
             || self.canonical.binary_search_by(|k| path(&k.bytes).cmp(name)).is_ok()
             || self.identities.binary_search_by_key(&identity_key(id), |id| identity_key(*id)).is_ok()
     }
+    /// Whether a protected path, as given or canonical, lies inside the folder `dir` (a canonical path) at any depth.
+    pub(in crate::zip::read) fn protects_within(&self, dir: &Path) -> bool {
+        self.entries.iter().any(|k| key(&self.raw, k).starts_with(dir))
+            || self.canonical.iter().any(|k| path(&k.bytes).starts_with(dir))
+    }
     pub(in crate::zip::read) fn cwd(&self) -> &Path {
         if self.cwd.is_empty() { Path::new("/") } else { path(&self.cwd[..self.cwd.len() - 1]) }
     }

@@ -86,8 +86,15 @@ pub(in crate::zip::read) fn inspect(
     if overwrite == crate::extract::Overwrite::Skip {
         return Ok(Target::Skip);
     }
-    if actual.st_mode & libc::S_IFMT == libc::S_IFDIR {
-        return Ok(Target::Blocked(Refusal::Directory));
+    let directory = actual.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    match overwrite.rename() {
+        // Nothing at the requested name is touched: a folder or a protected input stays where it is, and the member
+        // is published at a renamed name (7-Zip's `-aou`).
+        Some(crate::extract::RenameMode::New(_)) => return Ok(Target::Existing),
+        // A folder is moved aside like a file (7-Zip's `-aot`), once it is known to hold no protected path.
+        Some(crate::extract::RenameMode::Existing(_)) => {}
+        None if directory => return Ok(Target::Blocked(Refusal::Directory)),
+        None => {}
     }
     let expected = policy::CanonicalIdentity::of(&actual);
     let retries = ledger.with_state(|s| s.creation_policy(false).map(|p| p.1))?;
@@ -119,7 +126,7 @@ pub(in crate::zip::read) fn inspect(
         );
     }
     let name = Path::new(std::ffi::OsStr::from_bytes(evidence.bytes(scratch)));
-    if policy.protects(name, evidence.identity) {
+    if policy.protects(name, evidence.identity) || directory && policy.protects_within(name) {
         return Ok(Target::Blocked(Refusal::Protected));
     }
     Ok(Target::Existing)

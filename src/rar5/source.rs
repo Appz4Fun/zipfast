@@ -73,6 +73,19 @@ impl SourceStamp {
         RarFault::new(RarFailure::SourceChanged { path: path.to_path_buf() }, Error::Corrupt("RAR source changed"))
     }
 
+    /// The stamp of whatever `metadata` describes, a folder included: what a rename mode found at a target.
+    #[cfg(unix)]
+    pub(crate) fn from_entry_metadata(metadata: &Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn from_metadata(metadata: Metadata) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;

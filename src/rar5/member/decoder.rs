@@ -127,6 +127,7 @@ mod tests {
                 entry: crate::extract::RarEntryIdentity { index: Some(0), order: 0, name: String::new() },
                 method: 3,
                 password: crate::error::RarPasswordEvidence::NotEncrypted,
+                renamed: None,
             };
             let result = MemberMachine::new_rar4(&header, context, frame, 65536, &usage, &SessionControl::default());
             if allowance < bytes {
@@ -164,6 +165,7 @@ mod tests {
             entry: crate::extract::RarEntryIdentity { index: Some(0), order: 0, name: String::new() },
             method: 3,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
+            renamed: None,
         };
         let frame = CoreFrame {
             ordinal: 0,

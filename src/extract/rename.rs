@@ -82,8 +82,9 @@ pub struct RenamedOutput {
     pub requested: PathBuf,
     /// Where the member's data went: the renamed path for `RenameNew`, `requested` for `RenameExisting`.
     pub path: PathBuf,
-    /// For `RenameExisting`, where the file that stood at `requested` was moved. It stays there even when writing
-    /// the member then fails; the member's own outcome says whether its data arrived at `path`.
+    /// For `RenameExisting`, where the file or folder that stood at `requested` was moved (a folder with its
+    /// contents). It stays there even when writing the member then fails; the member's own outcome says whether its
+    /// data arrived at `path`.
     pub existing: Option<PathBuf>,
 }
 
