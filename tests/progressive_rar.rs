@@ -2067,6 +2067,31 @@ fn complete_native_many_long_paths_fit_default_bookkeeping() {
     assert_eq!(opened, VOLUMES);
     assert_eq!(std::fs::read(out.join("member.bin")).unwrap(), data);
 }
+#[test]
+fn complete_native_same_epoch_change_to_a_read_volume_is_refused_at_publication() {
+    // Admission compares repeated declarations on a sample only; publication compares them whole, so a same-epoch
+    // change to an entry no later admission requests or samples (an already read volume, changed after the last
+    // volume opened) is still refused before the member is published.
+    const VOLUMES: usize = 40;
+    for victim in [1, 5, 13, 21] {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let data: Vec<u8> = (0..VOLUMES * 512).map(|i| (i * 11 % 251) as u8).collect();
+        let paths = complete_native_set(tmp.path(), &data, 512);
+        let after = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = ChangingSet { set: NativeSet::new(paths), after: after.clone(), victim };
+        let mut s = ProgressiveSession::new(Box::new(provider), complete_native_options(&out, VOLUMES)).unwrap();
+        let failure = drive_complete(&mut s, |e| {
+            if matches!(e, ProgressiveEvent::VolumeOpened { index, .. } if *index as usize == VOLUMES - 1) {
+                after.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .unwrap_or_else(|| panic!("victim {victim}: the changed declaration must be refused"));
+        assert!(matches!(failure.kind, FailureKind::SourceChanged), "victim {victim}: {failure:?}");
+        assert!(!out.join("member.bin").exists(), "victim {victim}");
+    }
+}
 struct ChangingSet {
     set: NativeSet,
     after: Arc<std::sync::atomic::AtomicBool>,

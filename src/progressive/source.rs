@@ -716,7 +716,7 @@ impl SourceDriver {
     }
     #[cfg(feature = "persistent-partials")]
     pub(crate) fn require_partial_catalogue(&mut self) -> ProgressiveResult<()> {
-        self.refresh_protection()?;
+        self.refresh_protection(true)?;
         if !matches!(self.protection, ProtectionDeclaration::Complete { .. }) {
             return Err(ProgressiveFailure::new(FailureKind::Partial(Box::new(crate::partial::PartialError::new(
                 crate::partial::PartialErrorKind::InvalidOptions,
@@ -839,7 +839,7 @@ impl SourceDriver {
         }
         let result = (|| {
             self.validate_current()?;
-            self.refresh_protection()?;
+            self.refresh_protection(true)?;
             self.validate_current()?;
             self.native.check_target(target, identity, &mut self.usage)?;
             let mut replacement_authority = true;
@@ -973,7 +973,7 @@ impl SourceDriver {
         self.parked = false;
         if self.original.is_none() {
             self.check_original_capacity()?;
-            self.refresh_protection()?;
+            self.refresh_protection(false)?;
             #[cfg(feature = "persistent-partials")]
             if let Some(source) = self.undeclared.take() {
                 // Woken after a Ready for a volume the declaration did not name yet: admit it once it does.
@@ -1005,7 +1005,7 @@ impl SourceDriver {
                     #[cfg(feature = "persistent-partials")]
                     if self.awaits_declaration(self.request.index)? {
                         // The provider may have declared the volume while answering.
-                        self.refresh_protection()?;
+                        self.refresh_protection(false)?;
                         if self.awaits_declaration(self.request.index)? {
                             // Hold it unread and wait, still armed, for the provider to wake this request once
                             // a larger declaration names it.
@@ -1407,7 +1407,10 @@ impl SourceDriver {
     fn check_info(&mut self) -> ProgressiveResult<()> {
         self.original.as_mut().unwrap().check_info(&mut self.usage)
     }
-    fn refresh_protection(&mut self) -> ProgressiveResult<()> {
+    /// Asks the provider for its declaration and checks it against the one the session enforces. `full` compares
+    /// a repeated declaration entry by entry (authority points: publication, member creation and its target
+    /// checks); otherwise (volume admission) a repeat is judged on a bounded sample, see `sample_redeclaration`.
+    fn refresh_protection(&mut self, full: bool) -> ProgressiveResult<()> {
         self.usage.charge(Resource::SourceRequests, 1)?;
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
@@ -1417,7 +1420,7 @@ impl SourceDriver {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
         let mut next = next?;
-        if self.sample_redeclaration(&next)? {
+        if !full && self.sample_redeclaration(&next)? {
             // The provider repeated the declaration the session already validated and enforces. Nothing is
             // adopted from it, so only the bounded step recheck runs.
             let external = self.other_lane_handles()? + self.backing_count();
@@ -1542,10 +1545,10 @@ impl SourceDriver {
     ///
     /// This is safe because a matching repeat is never adopted: the session keeps enforcing the declaration it
     /// validated in full, whatever the unsampled entries of the repeat say. A same-epoch change to an entry is
-    /// still refused when that volume is requested (its entry is always compared) or when the rotation reaches
-    /// it; a change to an entry neither requested nor sampled before the session ends goes unreported, though
-    /// the retained declaration still protected it. A handle supplied late for such an entry is likewise
-    /// adopted only when the rotation or a request reaches it.
+    /// still refused when that volume is requested (its entry is always compared), when the rotation reaches it,
+    /// and at the latest at the next authority point (publication, persistent member creation and its target
+    /// checks), which compares the whole declaration. Only volume admission samples. A handle supplied late for
+    /// an entry is likewise adopted when a request, the rotation or an authority point reaches it.
     fn sample_redeclaration(&mut self, next: &ProtectionDeclaration) -> ProgressiveResult<bool> {
         const SAMPLE: usize = 8;
         let (
