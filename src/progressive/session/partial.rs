@@ -497,6 +497,11 @@ impl ProgressiveSession {
         let plain = plain_part(part, 0)?;
         // The extraction's machine holds the keys of an encrypted member; the core keeps them in memory only.
         let keys = match self.machine.as_ref().and_then(|machine| machine.cipher.as_ref()) {
+            // A RAR4 cipher has no checksum key (its CRC is plain) but an IV derived with its key; the machine has
+            // decrypted nothing yet, so its IV is still the first one.
+            Some(cipher) if format == crate::rar5::RarFormat::Rar4 => {
+                Some(MemberKeys::new(cipher.aes, [0; 32]).with_iv(cipher.iv))
+            }
             Some(cipher) => Some(MemberKeys::new(
                 cipher.aes,
                 *cipher.checksum_key().ok_or_else(|| error(PartialErrorKind::UnsupportedMethod))?,
@@ -1032,8 +1037,9 @@ pub(super) fn refusal(header: &crate::rar5::FileHeader) -> Option<RefusalReason>
     let rar4 = header.format == crate::rar5::RarFormat::Rar4;
     if header.redirection.is_some() {
         Some(RefusalReason::Redirection)
-    } else if rar4 && header.encrypted {
-        // Encrypted RAR5 stored members are admitted (their password is in the session options); RAR4 ones are not.
+    } else if header.encrypted && crate::partial::member_crypt(header).is_none() {
+        // Encrypted stored members are admitted (their password is in the session options): RAR5 ones, and RAR4
+        // ones with RAR 3.x AES and a salt. Older RAR4 ciphers are not.
         Some(RefusalReason::Encrypted)
     } else if header.is_dir() && !(rar4 && header.method != 0) {
         None

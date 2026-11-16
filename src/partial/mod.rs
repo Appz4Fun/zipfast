@@ -24,6 +24,7 @@ mod ledger;
 mod limits;
 mod native;
 mod state;
+pub(crate) use state::member_crypt;
 mod types;
 mod verify;
 use crate::progressive::{Lease, OutputOperation, Resource, SessionControl};
@@ -2048,6 +2049,10 @@ impl PartialCore {
         let mut snapshot = bundle.snapshot(state)?;
         let keys = match (keys, &snapshot.crypt, &context.password) {
             (Some(keys), Some(_), _) => Some(keys),
+            (None, Some(params), Some(password)) if snapshot.evidence.format == crate::rar5::RarFormat::Rar4 => {
+                let salt = params.salt[..8].try_into().expect("8-byte RAR4 salt");
+                Some(MemberKeys::derive_rar4(password, &salt, &budget, &context.control)?)
+            }
             (None, Some(params), Some(password)) => {
                 Some(MemberKeys::derive(password, params, &budget, &context.control)?)
             }
