@@ -480,4 +480,5 @@ fn redirection_flags_and_file_flags() {
     assert!(members[0].redirection().is_some());
     assert_eq!((members[0].redirection_flags(), members[1].redirection_flags()), (1, 0));
     assert_eq!(members[1].rar5_file_flags().map(|f| f & 0x4), Some(0x4));
+    assert_eq!(session.volume_paths().collect::<Vec<_>>(), [path.as_path()]);
 }

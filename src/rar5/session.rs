@@ -774,6 +774,11 @@ impl RarSession {
         self.volumes.iter().map(|volume| &volume.metadata)
     }
 
+    /// The path of each volume, in the order of [`Self::volumes`].
+    pub fn volume_paths(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.volumes.iter().map(|volume| volume.path.as_path())
+    }
+
     pub fn entries(&self) -> impl ExactSizeIterator<Item = RarMember<'_>> {
         self.model.members.iter().enumerate().map(|(index, member)| RarMember {
             ordinal: index as u64,
