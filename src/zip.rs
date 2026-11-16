@@ -310,6 +310,8 @@ pub struct Archive {
     len: u64,
     /// Every piece of a byte-split set; empty for one file.
     pieces: Vec<PathBuf>,
+    /// The first absent piece of a byte-split set with a gap: `entries` are then the members found before it.
+    missing: Option<PathBuf>,
     pub entries: Vec<ZipEntry>,
 }
 
@@ -319,21 +321,26 @@ impl Archive {
     }
 
     pub(crate) fn open_cancelable(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
-        let (mut file, len, pieces) = match byte_split::ByteSplit::open(path)? {
+        let (mut file, len, pieces, missing) = match byte_split::ByteSplit::open(path)? {
             Some(split) => {
                 let pieces = split.paths().map(Path::to_path_buf).collect();
                 let len = split.len();
-                (byte_split::ArchiveSource::Split(split), len, pieces)
+                let missing = split.missing().map(Path::to_path_buf);
+                (byte_split::ArchiveSource::Split(split), len, pieces, missing)
             }
             None => {
                 let file = File::open(path)?;
                 let len = file.metadata()?.len();
-                (byte_split::ArchiveSource::File(file), len, Vec::new())
+                (byte_split::ArchiveSource::File(file), len, Vec::new(), None)
             }
         };
         check_cancel(cancel)?;
-        let (entries, _) = read_projected_legacy(&mut file, len, cancel)?;
-        Ok(Archive { file, len, pieces, entries })
+        // A set cut short by a missing piece has no central directory: list the local headers before the gap.
+        let entries = match missing {
+            Some(_) => byte_split::scan_local_headers(&mut file, len)?,
+            None => read_projected_legacy(&mut file, len, cancel)?.0,
+        };
+        Ok(Archive { file, len, pieces, missing, entries })
     }
 
     /// Decodes the entry at a zero-based index and checks its integrity.
@@ -1014,6 +1021,13 @@ pub(crate) fn run_renaming(
                 }
                 Err(err) => {
                     drop(target);
+                    // Data running past the end of a set cut short by a missing piece: that piece is the cause.
+                    let crosses_gap =
+                        e.local_at.saturating_add(e.packed).saturating_add(LOCAL_HEADER_LEN as u64) > archive.len;
+                    if let Some(missing) = archive.missing.as_ref().filter(|_| crosses_gap) {
+                        fail(&mut summary, &mut report, &e.name, &Error::MissingVolume(missing.clone()).to_string());
+                        continue;
+                    }
                     match err {
                         // a failure writing out stops the run; anything about this entry's data fails only the entry
                         Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof => {
@@ -1025,6 +1039,12 @@ pub(crate) fn run_renaming(
                     }
                 }
             }
+        }
+        // Members after the gap are unknown: the set as a whole is incomplete.
+        if let Some(missing) = &archive.missing {
+            let line = Error::MissingVolume(missing.clone()).to_string();
+            report(&line);
+            summary.errors.push(line);
         }
         Ok(())
     })();
