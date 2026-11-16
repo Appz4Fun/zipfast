@@ -440,3 +440,80 @@ fn rar4_backslashes_separate_directories_on_every_host_and_stay_sanitized() {
         assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
     }
 }
+
+fn unrar_reference(name: &str) -> Vec<u8> {
+    fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-unrar").join(name)).unwrap()
+}
+
+/// `corrupted.rar`: a solid archive whose legacy names hold bytes that aren't UTF-8 and whose stream breaks after
+/// its first file. The catalogue opens, lists every name as UnRAR does (`unrar lb`), and testing reports each
+/// member as `unrar t` does: the first file and every directory are OK, every later file fails.
+#[test]
+fn a_damaged_solid_archive_with_unmapped_names_is_catalogued_and_reported_per_member() {
+    let path = fixture("corrupted.rar");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let listing = String::from_utf8(unrar_reference("in_rarinfo_corrupted.rar.lb")).unwrap();
+    let unrar: Vec<&str> = listing.lines().take_while(|l| !l.starts_with("status=")).collect();
+    assert_eq!(names(&session), unrar);
+
+    // `unrar t`: "<name> - checksum error" for each failed file
+    let tested = String::from_utf8(unrar_reference("in_rarinfo_corrupted.rar.t")).unwrap();
+    let failed: Vec<&str> =
+        tested.lines().filter_map(|l| l.strip_suffix(" - checksum error")).map(str::trim_end).collect();
+    assert_eq!(failed.len(), 29);
+    let all = session.select(|_| true).unwrap();
+    let mut got_failed = Vec::new();
+    let mut verified = Vec::new();
+    session
+        .test_selected(&all, RarDecodeLimits::default(), |o| match &o.outcome {
+            extract::RarOutcome::Failed(_) => got_failed.push(o.entry.name.clone()),
+            extract::RarOutcome::Verified { .. } => verified.push(o.entry.name.clone()),
+            _ => {}
+        })
+        .unwrap();
+    assert_eq!(got_failed, failed);
+    assert_eq!(verified, [unrar[0]]);
+
+    // Extraction creates every directory UnRAR creates and goes on past each failure. UnRAR also writes the one
+    // intact file under its raw (non-UTF-8) name; no route writes such a name yet, so it fails typed.
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("run");
+    let mut outcomes = Vec::new();
+    extract::run_rar_with_outcomes(&path, &options(&out), None, |o: &RarEntryOutcome| {
+        outcomes.push((o.entry.name.clone(), format!("{:?}", o.outcome)));
+    })
+    .unwrap();
+    assert!(outcomes[0].1.contains("NameEncoding"), "{:?}", outcomes[0]);
+    let out_selected = dir.path().join("selected");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(&out_selected), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (0, 30));
+    let unrar_dirs: Vec<&str> =
+        unrar.iter().copied().filter(|n| !n.contains('\u{fffe}') && !failed.contains(n)).collect();
+    assert_eq!(unrar_dirs.len() as u64, summary.dirs);
+    for out in [&out, &out_selected] {
+        for name in &unrar_dirs {
+            assert!(out.join(name).is_dir(), "{name}");
+        }
+        let mut files = Vec::new();
+        let mut stack = vec![out.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    files.push(entry.path());
+                }
+            }
+        }
+        assert!(files.is_empty(), "{files:?}");
+    }
+    // a progressive session stops at the first such name, as at any member it can't write
+    let failure = progressive(&path, &dir.path().join("progressive")).unwrap_err();
+    assert!(
+        matches!(&failure.kind, zipfast::progressive::FailureKind::Rar(f)
+            if matches!(f.as_ref(), RarFailure::Unsupported(RarUnsupported::NameEncoding))),
+        "{failure:?}"
+    );
+}

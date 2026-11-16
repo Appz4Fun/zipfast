@@ -1090,6 +1090,15 @@ impl ProgressiveSession {
                 crate::error::RarUnsupported::Redirection { kind },
             )))));
         }
+        // U+FFFE marks a RAR4 legacy name holding bytes that aren't UTF-8, which no route writes yet.
+        if refusal.is_none()
+            && self.options.extract.mode != crate::extract::Mode::Test
+            && header.name.contains('\u{FFFE}')
+        {
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
+                crate::error::RarUnsupported::NameEncoding,
+            )))));
+        }
         #[cfg(feature = "persistent-partials")]
         let refused = refusal.map(Disposition::Refused);
         #[cfg(not(feature = "persistent-partials"))]

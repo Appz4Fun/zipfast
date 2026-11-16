@@ -7,3 +7,6 @@ and compares.
 
 `rars_*.sha256` are the SHA-256 of the expected payloads the `rars` crate ships beside those fixtures
 (`ppmd/solid_lorem_{a,b}.txt`, `rarvm/solid_e8_filter_{lead.txt,payload.exe}`), named as the archive lists them.
+
+`in_rarinfo_corrupted.rar.{lb,t}` and `in_rarinfo_multi_broken.part1.rar.t` are UnRAR's `lb` and `t` output for
+those archives (same version and switches), from Prybar's corpus.

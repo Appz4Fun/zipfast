@@ -435,14 +435,14 @@ fn decode_name(
     usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<String, FileParseError> {
     if !unicode || !encoded.contains(&0) {
-        return legacy_name(encoded, usage);
+        return legacy_name(encoded, lenient, usage);
     }
     let split = encoded.iter().position(|&byte| byte == 0).ok_or(Error::Corrupt("RAR4 Unicode separator"))?;
     let legacy = &encoded[..split];
     // As unrar: the encoded Unicode part is decoded only when the name field is longer than the legacy name and its
     // NUL; otherwise, or when it decodes to nothing, the legacy name is used.
     if split + 1 >= encoded.len() {
-        return legacy_name(legacy, usage);
+        return legacy_name(legacy, lenient, usage);
     }
     let units = if lenient {
         // A port of unrar's EncodeFileName::Decode: it stops quietly where the encoded data runs out, copies runs from
@@ -546,7 +546,7 @@ fn decode_name(
         units
     };
     if units.is_empty() {
-        return legacy_name(legacy, usage);
+        return legacy_name(legacy, lenient, usage);
     }
     let length = char::decode_utf16(units.iter().copied()).try_fold(0usize, |length, scalar| {
         let scalar = scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?;
@@ -573,12 +573,24 @@ fn separator(c: char) -> char {
     if c == '\\' { '/' } else { c }
 }
 
-/// A RAR4 name without (usable) Unicode encoding: the stored bytes must be UTF-8.
+/// A RAR4 name without (usable) Unicode encoding. Stored bytes that aren't UTF-8 read as UnRAR on Unix reads them
+/// (`CharToWideMap` in a UTF-8 locale): U+FFFE marks the name, then each byte that doesn't start a valid sequence
+/// becomes U+E000 plus its value. A name so marked lists as UnRAR lists it; extraction refuses it, as it refuses
+/// any name holding bytes that aren't UTF-8. Map walks (`lenient`) keep such a name by its raw bytes instead.
 fn legacy_name(
     encoded: &[u8],
+    lenient: bool,
     usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<String, FileParseError> {
-    let value = std::str::from_utf8(encoded).map_err(|_| Error::Unsupported("RAR4 legacy name encoding".into()))?;
+    let mapped;
+    let value = match std::str::from_utf8(encoded) {
+        Ok(value) => value,
+        Err(_) if lenient => return Err(Error::Unsupported("RAR4 legacy name encoding".into()).into()),
+        Err(_) => {
+            mapped = unrar_mapped_name(encoded).ok_or(Error::Corrupt("RAR4 member name"))?;
+            &mapped
+        }
+    };
     admit_name(usage, value.len())?;
     let mut name = String::new();
     name.try_reserve_exact(value.len()).map_err(|_| FileParseError::Allocation)?;
@@ -589,6 +601,37 @@ fn legacy_name(
     }
     name.extend(value.chars().map(separator));
     Ok(name)
+}
+
+/// `bytes` as UnRAR's `CharToWideMap` reads them in a UTF-8 locale; None where it stops (an ASCII byte it can't
+/// convert, which can't happen in a name already split at its first NUL).
+fn unrar_mapped_name(mut bytes: &[u8]) -> Option<String> {
+    const MAPPED_STRING_MARK: char = '\u{FFFE}';
+    const MAP_AREA_START: u32 = 0xe000;
+    let mut name = String::new();
+    let mut marked = false;
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(rest) => {
+                name.push_str(rest);
+                break;
+            }
+            Err(error) => {
+                let (valid, rest) = bytes.split_at(error.valid_up_to());
+                name.push_str(std::str::from_utf8(valid).expect("valid prefix"));
+                if rest[0] < 0x80 {
+                    return None;
+                }
+                if !marked {
+                    name.push(MAPPED_STRING_MARK);
+                    marked = true;
+                }
+                name.push(char::from_u32(MAP_AREA_START + u32::from(rest[0])).expect("private-use character"));
+                bytes = &rest[1..];
+            }
+        }
+    }
+    Some(name)
 }
 
 fn dos_timestamp(bits: u32) -> Option<i64> {
