@@ -245,8 +245,13 @@ pub enum Borrowable {
     /// Plain stored data (or bare media): output byte `o` is a known packed byte.
     Yes,
     /// Stored data that is encrypted (or behind encrypted headers): it maps once decrypted with the password that
-    /// was given. The proof says how far that password was checked.
+    /// was given, and the proof says what showed that password to be right.
     YesWithPassword(PasswordProof),
+    /// Stored data, encrypted with a mapped cipher, and a password that nothing could check or refute: no check
+    /// value, and the member's first bytes are not in the head (or its name names no media to compare with).
+    /// **Do not borrow on this verdict**: a wrong password would turn borrowed bytes into noise. Prove the password
+    /// another way first (a full decrypt against the member's CRC).
+    PasswordUnverified,
     /// A password is needed and was not given, or the one given is wrong.
     NeedsPassword(PasswordNeed),
     /// Output offsets do not map to packed bytes.
@@ -255,18 +260,17 @@ pub enum Borrowable {
     Unknown(Undecided),
 }
 
-/// How far the given password was checked, strongest first.
+/// What showed the given password to be right, strongest first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PasswordProof {
     /// The format's password check matched: a RAR 5.0 check value, or a WinZip AES 2-byte verifier (which a wrong
     /// password passes about once in 65,536).
     Verifier,
-    /// The decrypted first bytes of the member are a recognised media magic.
+    /// The decrypted first bytes of the member are a recognised media magic, of the kind its name names when the
+    /// name has a media extension.
     Plaintext,
     /// The password decrypted the archive's encrypted headers (`-hp`).
     Headers,
-    /// Nothing could check it: no check value, and the member's first bytes are not in the head or not media.
-    Unverified,
 }
 
 /// Why a password is needed.
@@ -276,7 +280,8 @@ pub enum PasswordNeed {
     HeaderEncrypted,
     /// The member's data is encrypted and no password was given.
     DataEncrypted,
-    /// The password given fails a check (encrypted headers, a RAR 5.0 check value, or a WinZip AES verifier).
+    /// The password given fails a check: encrypted headers, a RAR 5.0 check value, a WinZip AES verifier, or a
+    /// member named as media whose decrypted first bytes (at least 4 KiB, or the whole member) are no media.
     WrongPassword,
 }
 
@@ -288,7 +293,8 @@ pub enum NotBorrowable {
     Compressed,
     /// The member is compressed in a solid stream that depends on earlier members.
     Solid,
-    /// The cipher does not map offsets (older RAR encryption, ZIP strong encryption, AES without its parameters).
+    /// The cipher does not map offsets (older RAR encryption, ZIP strong encryption, AES without its parameters), or
+    /// its key derivation is past what the probe derives (a RAR 5.0 KDF count above 24).
     UnsupportedCipher,
     /// ZipCrypto: output byte `o` needs every earlier byte of the stream decrypted first.
     SequentialCipher,
@@ -298,8 +304,12 @@ pub enum NotBorrowable {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Undecided {
-    /// The head ends before a member header that could be chosen.
+    /// The head ends, or a damaged header stops the listing ([`VolumeEnd::Damaged`]), before a member that could be
+    /// chosen.
     Truncated,
+    /// No member listed so far is media by name or magic, and the listing is incomplete: a media member may follow.
+    /// [`Packing::first_media`] holds the largest member so far ([`Selection::Largest`]), tentatively.
+    NoMediaYet,
     /// The archive (or volume) lists no files.
     NoMembers,
     /// The file is neither recognised media nor an archive.
@@ -407,7 +417,7 @@ fn rar(head: &[u8], password: Option<&str>, options: &ProbeOptions) -> Result<Pa
             })
             .collect();
         let complete = map.end == VolumeEnd::Complete;
-        decide(head, &candidates, complete, password, map.header_encrypted)
+        decide(head, &candidates, complete, password, map.header_encrypted, &mut KdfMeter::new(&options.limits))?
     };
     Ok(Packing::Rar(RarPacking {
         version,
@@ -427,7 +437,8 @@ fn zip_packing(
     options: &ProbeOptions,
 ) -> Result<Packing, MapError> {
     let listing = zip::list(head, tail, options.file_len, &options.limits)?;
-    let (first_media, borrowable) = decide(head, &listing.candidates, listing.complete, password, false);
+    let (first_media, borrowable) =
+        decide(head, &listing.candidates, listing.complete, password, false, &mut KdfMeter::new(&options.limits))?;
     Ok(Packing::Zip(ZipPacking {
         directory: listing.directory,
         complete: listing.complete,
@@ -505,41 +516,44 @@ fn decide(
     complete: bool,
     password: Option<&str>,
     header_encrypted: bool,
-) -> (Option<MemberFacts>, Borrowable) {
+    kdf: &mut KdfMeter,
+) -> Result<(Option<MemberFacts>, Borrowable), MapError> {
     let Some((index, selected, mut sniffed)) = select(head, candidates, complete) else {
         let reason =
             if complete && candidates.iter().all(|c| c.is_dir) { Undecided::NoMembers } else { Undecided::Truncated };
-        return (None, Borrowable::Unknown(reason));
+        return Ok((None, Borrowable::Unknown(reason)));
     };
     let c = &candidates[index];
+    let name_kind = c.name.as_deref().and_then(media_kind_for_name);
     let stored = c.method == MapMethod::Stored;
-    let borrowable = match (c.method, c.encrypted) {
-        (MapMethod::Compressed { .. }, _) if c.solid => Borrowable::No(NotBorrowable::Solid),
-        (MapMethod::Compressed { .. }, _) => Borrowable::No(NotBorrowable::Compressed),
-        (_, false) if header_encrypted => Borrowable::YesWithPassword(PasswordProof::Headers),
-        (_, false) => Borrowable::Yes,
-        (_, true) => match c.mapping {
-            OutputMapping::CbcBlocks | OutputMapping::Counter { .. } => match password {
-                None => Borrowable::NeedsPassword(PasswordNeed::DataEncrypted),
-                Some(password) => match prove(head, c, password) {
-                    Err(()) => Borrowable::NeedsPassword(PasswordNeed::WrongPassword),
-                    Ok((verified, plain)) => {
+    let borrowable = if c.encrypted && c.cipher_kind == Some(CipherKind::Unknown) {
+        // ZIP strong encryption, or method 99 without its AES field: the method itself is not known.
+        Borrowable::No(NotBorrowable::UnsupportedCipher)
+    } else {
+        match (c.method, c.encrypted) {
+            (MapMethod::Compressed { .. }, _) if c.solid => Borrowable::No(NotBorrowable::Solid),
+            (MapMethod::Compressed { .. }, _) => Borrowable::No(NotBorrowable::Compressed),
+            (_, false) if header_encrypted => Borrowable::YesWithPassword(PasswordProof::Headers),
+            (_, false) => Borrowable::Yes,
+            (_, true) => match c.mapping {
+                OutputMapping::CbcBlocks | OutputMapping::Counter { .. } => match password {
+                    None => Borrowable::NeedsPassword(PasswordNeed::DataEncrypted),
+                    Some(password) => {
+                        let (verdict, plain) = judge(head, c, password, name_kind, header_encrypted, kdf)?;
                         sniffed = sniffed.or(plain);
-                        Borrowable::YesWithPassword(if verified {
-                            PasswordProof::Verifier
-                        } else if plain.is_some() {
-                            PasswordProof::Plaintext
-                        } else if header_encrypted {
-                            PasswordProof::Headers
-                        } else {
-                            PasswordProof::Unverified
-                        })
+                        verdict
                     }
                 },
+                OutputMapping::Sequential { .. } => Borrowable::No(NotBorrowable::SequentialCipher),
+                _ => Borrowable::No(NotBorrowable::UnsupportedCipher),
             },
-            OutputMapping::Sequential { .. } => Borrowable::No(NotBorrowable::SequentialCipher),
-            _ => Borrowable::No(NotBorrowable::UnsupportedCipher),
-        },
+        }
+    };
+    // A largest-member pick from an incomplete listing is tentative: a media member may follow.
+    let borrowable = if selected == Selection::Largest && !complete {
+        Borrowable::Unknown(Undecided::NoMediaYet)
+    } else {
+        borrowable
     };
     let packing = match (c.encrypted, c.method) {
         (true, _) => MemberPacking::DataEncrypted { cipher: c.cipher_kind.unwrap_or(CipherKind::Unknown), stored },
@@ -559,69 +573,184 @@ fn decide(
         continued: c.continued,
         header: c.header.clone(),
         data: c.data.clone(),
-        name_kind: c.name.as_deref().and_then(media_kind_for_name),
+        name_kind,
         sniffed,
         selected,
     };
-    (Some(facts), borrowable)
+    Ok((Some(facts), borrowable))
 }
 
-/// A KDF control that lets the derivation's own limits (exponent 20, 2^22 blocks) decide.
-struct Unmetered;
-impl crate::crypto::KdfControl for Unmetered {
-    fn charge(&mut self, _: u64) -> Result<(), crate::crypto::KdfControlError> {
+/// Whether a sniffed kind is the kind a name names, counting each container family as one (a `.mkv` holding WebM,
+/// a `.mp4` with a QuickTime brand, a `.ts` written with 192-byte packets).
+fn same_family(a: MediaKind, b: MediaKind) -> bool {
+    use MediaKind::*;
+    let family = |k| match k {
+        Mkv | Webm => 0,
+        Mp4 | Mov => 1,
+        MpegTs | M2ts => 2,
+        Avi => 3,
+        Asf => 4,
+        MpegPs => 5,
+    };
+    family(a) == family(b)
+}
+
+/// The verdict for an encrypted stored member and a password, and the sniffed kind of its decrypted first bytes.
+fn judge(
+    head: &[u8],
+    c: &Candidate,
+    password: &str,
+    name_kind: Option<MediaKind>,
+    header_encrypted: bool,
+    kdf: &mut KdfMeter,
+) -> Result<(Borrowable, Option<MediaMatch>), MapError> {
+    let (verified, plain) = match prove(head, c, password, kdf)? {
+        Proved::Wrong => return Ok((Borrowable::NeedsPassword(PasswordNeed::WrongPassword), None)),
+        Proved::Unsupported => return Ok((Borrowable::No(NotBorrowable::UnsupportedCipher), None)),
+        Proved::Checked { verified, plain } => (verified, plain),
+    };
+    let sniffed = plain.as_deref().and_then(sniff);
+    if verified {
+        return Ok((Borrowable::YesWithPassword(PasswordProof::Verifier), sniffed));
+    }
+    if let (Some(plain), Some(named)) = (plain.as_deref(), name_kind) {
+        let enough = plain.len() >= c.size.map_or(MIN_CONTRADICTION, |s| s.min(MIN_CONTRADICTION as u64) as usize);
+        match sniffed {
+            Some(found) if same_family(found.kind, named) => {
+                return Ok((Borrowable::YesWithPassword(PasswordProof::Plaintext), sniffed));
+            }
+            // An MPEG elementary stream named `.mpg` starts with a start code but no pack header.
+            None if enough && !(named == MediaKind::MpegPs && plain.starts_with(&[0, 0, 1])) => {
+                return Ok((Borrowable::NeedsPassword(PasswordNeed::WrongPassword), None));
+            }
+            _ => {}
+        }
+    } else if name_kind.is_none() && sniffed.is_some() {
+        return Ok((Borrowable::YesWithPassword(PasswordProof::Plaintext), sniffed));
+    }
+    let verdict = if header_encrypted {
+        Borrowable::YesWithPassword(PasswordProof::Headers)
+    } else {
+        Borrowable::PasswordUnverified
+    };
+    Ok((verdict, sniffed))
+}
+
+/// Decrypted bytes needed before a member named as media whose plaintext sniffs as nothing proves a wrong password.
+const MIN_CONTRADICTION: usize = 4096;
+
+/// Meters data key derivations against [`ProbeOptions::limits`]: the KDF exponent, blocks per derivation, and
+/// blocks over the whole probe.
+struct KdfMeter {
+    limits: ProgressiveLimits,
+    derivation: u64,
+    session: u64,
+}
+
+impl KdfMeter {
+    fn new(limits: &ProgressiveLimits) -> Self {
+        Self { limits: limits.clone(), derivation: 0, session: 0 }
+    }
+
+    fn start(&mut self) {
+        self.derivation = 0;
+    }
+}
+
+impl crate::crypto::KdfControl for KdfMeter {
+    fn charge(&mut self, blocks: u64) -> Result<(), crate::crypto::KdfControlError> {
+        use crate::progressive::Resource;
+        for (resource, used) in
+            [(Resource::KdfDerivationBlocks, &mut self.derivation), (Resource::KdfSessionBlocks, &mut self.session)]
+        {
+            let limit = self.limits.limit(resource);
+            let attempted = used.saturating_add(blocks);
+            if attempted > limit {
+                return Err(crate::crypto::KdfControlError::Limit { resource, limit, attempted });
+            }
+            *used = attempted;
+        }
         Ok(())
     }
 }
 
-/// Checks `password` against an encrypted stored member: `Err` when a check proves it wrong, else whether a check
-/// value matched and the media magic of the decrypted first bytes.
-fn prove(head: &[u8], c: &Candidate, password: &str) -> Result<(bool, Option<MediaMatch>), ()> {
-    let size_cap = |plain: &mut Vec<u8>| {
+fn kdf_limit(error: crate::crypto::KdfControlError) -> MapError {
+    match error {
+        crate::crypto::KdfControlError::Limit { resource, limit, attempted } => {
+            MapError::Limit { resource, limit, attempted }
+        }
+        crate::crypto::KdfControlError::Canceled => MapError::Source(Box::new(
+            crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::Canceled),
+        )),
+    }
+}
+
+/// What checking a password against an encrypted stored member gave.
+enum Proved {
+    /// A check proves the password wrong.
+    Wrong,
+    /// The cipher's key derivation is outside what is derived (a RAR 5.0 KDF count above 24).
+    Unsupported,
+    /// Whether a check value matched, and the decrypted first bytes in the head (up to 64 KiB, cut at the size).
+    Checked { verified: bool, plain: Option<Vec<u8>> },
+}
+
+/// Checks `password` against an encrypted stored member. KDF budgets in the meter are [`MapError::Limit`].
+fn prove(head: &[u8], c: &Candidate, password: &str, kdf: &mut KdfMeter) -> Result<Proved, MapError> {
+    use crate::progressive::Resource;
+    let size_cap = |mut plain: Vec<u8>| {
         if let Some(size) = c.size.and_then(|s| usize::try_from(s).ok()) {
             plain.truncate(size);
         }
+        plain
     };
-    let cbc_sniff = |key: &[u8], iv: &[u8; 16]| {
+    let cbc = |key: &[u8], iv: &[u8; 16]| {
         let bytes = data_in_head(head, c)?;
         let n = bytes.len().min(SNIFF_DECRYPT) & !15;
-        let mut plain = crate::crypto::decrypt_cbc(key, iv, bytes.get(..n).filter(|b| !b.is_empty())?)?;
-        size_cap(&mut plain);
-        sniff(&plain)
+        crate::crypto::decrypt_cbc(key, iv, bytes.get(..n).filter(|b| !b.is_empty())?).map(size_cap)
     };
+    kdf.start();
     match &c.cipher {
         Some(CipherParams::Rar5 { kdf_count, salt, iv, check, .. }) => {
             use crate::crypto::{ControlledKdfError, Rar5CryptError, derive_rar5_keys_controlled};
-            match derive_rar5_keys_controlled(password, *kdf_count, salt, *check, &mut Unmetered) {
-                Err(ControlledKdfError::Crypt(Rar5CryptError::WrongPassword)) => Err(()),
-                // Past the KDF budget: nothing checked.
-                Err(_) => Ok((false, None)),
-                Ok(keys) => {
-                    let verified = keys.evidence == crate::error::RarPasswordEvidence::VerifierMatched;
-                    Ok((verified, iv.as_ref().and_then(|iv| cbc_sniff(&keys.key, iv))))
-                }
+            let limit = kdf.limits.limit(Resource::KdfExponent);
+            if u64::from(*kdf_count) > limit && *kdf_count <= 24 {
+                return Err(MapError::Limit {
+                    resource: Resource::KdfExponent,
+                    limit,
+                    attempted: u64::from(*kdf_count),
+                });
+            }
+            match derive_rar5_keys_controlled(password, *kdf_count, salt, *check, kdf) {
+                Err(ControlledKdfError::Crypt(Rar5CryptError::WrongPassword)) => Ok(Proved::Wrong),
+                Err(ControlledKdfError::Crypt(_)) => Ok(Proved::Unsupported),
+                Err(ControlledKdfError::Control(error)) => Err(kdf_limit(error)),
+                Ok(keys) => Ok(Proved::Checked {
+                    verified: keys.evidence == crate::error::RarPasswordEvidence::VerifierMatched,
+                    plain: iv.as_ref().and_then(|iv| cbc(&keys.key, iv)),
+                }),
             }
         }
         Some(CipherParams::Rar4 { salt }) => {
-            let (key, iv) = crate::crypto::derive_rar4_key_iv(password, salt);
-            Ok((false, cbc_sniff(&key, &iv)))
+            let (key, iv) = crate::crypto::derive_rar4_key_iv_controlled(password, salt, kdf).map_err(kdf_limit)?;
+            Ok(Proved::Checked { verified: false, plain: cbc(&key, &iv) })
         }
         Some(CipherParams::WinZipAes { strength, salt, verifier, .. }) => {
             let key_len = (usize::from(*strength) + 1) * 8;
-            let derived = crate::crypto::aes_derive(password.as_bytes(), salt, key_len).ok_or(())?;
+            let Some(derived) = crate::crypto::aes_derive(password.as_bytes(), salt, key_len) else {
+                return Ok(Proved::Unsupported);
+            };
             if derived.get(key_len * 2..) != Some(verifier.as_slice()) {
-                return Err(());
+                return Ok(Proved::Wrong);
             }
             let prefix = salt.len() + 2;
             let plain = data_in_head(head, c).and_then(|bytes| {
                 let body = bytes.get(prefix..)?;
-                let mut plain =
-                    crate::crypto::decrypt_winzip_ctr(&derived[..key_len], &body[..body.len().min(SNIFF_DECRYPT)])?;
-                size_cap(&mut plain);
-                sniff(&plain)
+                crate::crypto::decrypt_winzip_ctr(&derived[..key_len], &body[..body.len().min(SNIFF_DECRYPT)])
+                    .map(size_cap)
             });
-            Ok((true, plain))
+            Ok(Proved::Checked { verified: true, plain })
         }
-        _ => Ok((false, None)),
+        _ => Ok(Proved::Checked { verified: false, plain: None }),
     }
 }

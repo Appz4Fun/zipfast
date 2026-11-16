@@ -245,17 +245,39 @@ fn packets(bytes: &[u8], stride: usize, offset: usize, kind: MediaKind) -> Optio
     }
 }
 
+/// An MPEG program stream: a pack header (MPEG-2: 14 bytes plus stuffing; MPEG-1: 12 bytes) with its marker bits,
+/// validated by the start code that must follow it.
 fn mpeg_ps(bytes: &[u8]) -> Option<MediaMatch> {
     if bytes.get(..4)? != [0, 0, 1, 0xba] {
         return None;
     }
-    match bytes.get(4).copied() {
-        // MPEG-2 ('01' marker bits) or MPEG-1 ('0010').
-        Some(b) if b >> 6 == 0b01 || b >> 4 == 0b0010 => {
-            Some(MediaMatch::new(MediaKind::MpegPs, Confidence::Validated))
+    let magic = Some(MediaMatch::new(MediaKind::MpegPs, Confidence::Magic));
+    let Some(&first) = bytes.get(4) else { return magic };
+    let next = if first >> 6 == 0b01 {
+        // MPEG-2: marker bits in bytes 4, 6, 8 and 9, the low two bits of byte 12, then stuffing.
+        let Some(fixed) = bytes.get(4..14) else { return magic };
+        let markers = fixed[0] & 0x04 != 0 && fixed[2] & 0x04 != 0 && fixed[4] & 0x04 != 0 && fixed[5] & 0x01 != 0;
+        if !markers || fixed[8] & 0x03 != 0x03 {
+            return None;
         }
+        14 + usize::from(fixed[9] & 0x07)
+    } else if first >> 4 == 0b0010 {
+        // MPEG-1: marker bits in bytes 4, 6, 8, 9 and 11.
+        let Some(fixed) = bytes.get(4..12) else { return magic };
+        if fixed[0] & 0x01 == 0 || fixed[2] & 0x01 == 0 || fixed[4] & 0x01 == 0 || fixed[5] & 0x80 == 0 {
+            return None;
+        }
+        if fixed[7] & 0x01 == 0 {
+            return None;
+        }
+        12
+    } else {
+        return None;
+    };
+    match bytes.get(next..next + 3) {
+        Some([0, 0, 1]) => Some(MediaMatch::new(MediaKind::MpegPs, Confidence::Validated)),
         Some(_) => None,
-        None => Some(MediaMatch::new(MediaKind::MpegPs, Confidence::Magic)),
+        None => magic,
     }
 }
 

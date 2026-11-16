@@ -173,7 +173,7 @@ pub(super) fn list(
             .collect();
         return Ok(Listing { candidates, directory: true, complete: true, spanned });
     }
-    let (candidates, complete) = walk_locals(head, if spanned { 4 } else { 0 })?;
+    let (candidates, complete) = walk_locals(head, if spanned { 4 } else { 0 }, limits)?;
     Ok(Listing { candidates, directory: false, complete, spanned })
 }
 
@@ -206,10 +206,15 @@ fn zip64_sizes(extra: &[u8], header: &LocalHeader) -> (Option<u64>, Option<u64>)
 
 /// Walks local headers from `start` while they are in the head. Returns the entries and whether the central
 /// directory (or the end record) was reached.
-fn walk_locals(head: &[u8], start: usize) -> Result<(Vec<Candidate>, bool), MapError> {
+///
+/// Every step moves strictly forward with checked arithmetic, and at most `limits.entries` entries are listed.
+fn walk_locals(head: &[u8], start: usize, limits: &ProgressiveLimits) -> Result<(Vec<Candidate>, bool), MapError> {
     let mut out = Vec::new();
     let mut at = start;
     loop {
+        if at >= head.len() {
+            return Ok((out, false));
+        }
         let Some(sig) = head.get(at..at + 4) else { return Ok((out, false)) };
         if sig == CENTRAL_SIG || sig == END_SIG {
             return Ok((out, true));
@@ -247,17 +252,29 @@ fn walk_locals(head: &[u8], start: usize) -> Result<(Vec<Candidate>, bool), MapE
             size,
             packed,
         };
+        if out.len() as u64 >= limits.entries {
+            return Err(MapError::Limit {
+                resource: crate::progressive::Resource::Entries,
+                limit: limits.entries,
+                attempted: out.len() as u64 + 1,
+            });
+        }
         out.push(candidate(head, fields, Some((at as u64..data_at as u64, data_at as u64, header.mod_time))));
-        let Some(next) = packed.and_then(|p| usize::try_from(p).ok()).and_then(|p| data_at.checked_add(p)) else {
+        let Some(mut next) = packed.and_then(|p| usize::try_from(p).ok()).and_then(|p| data_at.checked_add(p)) else {
             return Ok((out, false));
         };
-        at = next;
         if descriptor {
             // CRC and sizes, with an optional signature; ZIP64 sizes are 8 bytes each.
             let wide = header.packed_size == u32::MAX || header.unpacked_size == u32::MAX;
-            let body = if wide { 20 } else { 12 };
-            at += body + if head.get(at..at + 4) == Some(SPAN_SIG.as_slice()) { 4 } else { 0 };
+            let signature = next.checked_add(4).and_then(|end| head.get(next..end)) == Some(SPAN_SIG.as_slice());
+            let body = if wide { 20 } else { 12 } + if signature { 4 } else { 0 };
+            let Some(after) = next.checked_add(body) else { return Ok((out, false)) };
+            next = after;
         }
+        if next <= at {
+            return Ok((out, false));
+        }
+        at = next;
     }
 }
 
@@ -281,7 +298,8 @@ fn implied_len(tail: &[u8]) -> Option<u64> {
     }
     let record_at = le64(locator + 8);
     let record = (0..locator.saturating_sub(55)).rev().find(|&at| {
-        tail[at..].starts_with(b"PK\x06\x06") && (at as u64).checked_add(12 + le64(at + 4)) == Some(locator as u64)
+        tail[at..].starts_with(b"PK\x06\x06")
+            && le64(at + 4).checked_add(12).and_then(|n| n.checked_add(at as u64)) == Some(locator as u64)
     })?;
     record_at.checked_add((tail.len() - record) as u64)
 }

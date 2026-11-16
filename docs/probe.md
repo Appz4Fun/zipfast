@@ -16,9 +16,13 @@ use zipfast::probe::{probe, Borrowable, Packing};
 let packing = probe(&first_article, None, Some("password"))?;
 match packing.borrowable() {
     Borrowable::Yes | Borrowable::YesWithPassword(_) => { /* map offsets, borrow */ }
-    Borrowable::NeedsPassword(_) | Borrowable::No(_) | Borrowable::Unknown(_) => { /* fetch it all */ }
+    // PasswordUnverified: prove the password some other way before borrowing.
+    _ => { /* fetch it all */ }
 }
 ```
+
+Only `Yes` and `YesWithPassword(_)` are safe to borrow on. `PasswordUnverified` is deliberately a separate verdict:
+the password may be wrong, and borrowed bytes decrypted with a wrong key are noise.
 
 ## API
 
@@ -32,13 +36,18 @@ match packing.borrowable() {
 `head` is the file's first bytes. `tail`, when given, is its last bytes and is used only for ZIP (the central
 directory is at the end). An empty password is no password.
 
+The ZIP local-header walk moves strictly forward with checked arithmetic and lists at most `limits.entries` entries.
+
 Detection order: a `Rar!` signature at offset 0 is RAR; a ZIP local header, an empty archive's end record, or the
 spanned-archive marker followed by a local header is ZIP; then the media magic at offset 0; then the RAR scanner,
 which finds a RAR signature behind a self-extracting stub in the first MiB. Anything else is `Packing::Unknown`.
 A ZIP behind a stub is not detected.
 
-Errors are `MapError`s from the member map: damaged or unsupported RAR headers, a budget in `limits`, or a ZIP
-whose first local header is damaged. A wrong password for encrypted headers is not an error (see below).
+Errors are `MapError`s from the member map: unsupported or damaged RAR headers the map does not tolerate, a budget
+in `limits` (including `Limit { resource: Entries }` when the ZIP local-header walk passes `limits.entries`, and the
+KDF budgets below), or a ZIP whose first local header is damaged. A wrong password for encrypted headers is not an
+error (see below). A RAR volume whose map stops at a damaged header (`VolumeEnd::Damaged`) is probed from the members
+listed before it, as an incomplete listing, like `Truncated`.
 
 ## `Packing`
 
@@ -94,6 +103,9 @@ always, for encrypted stored data when the password is given (up to 64 KiB is de
    reached), the largest member of all.
 5. Otherwise none: the head ends before a member worth choosing, `Borrowable::Unknown(Truncated)`.
 
+A `Largest` pick from an incomplete listing (step 3 before the end header or central directory) is tentative: a
+media member may follow. The member is reported in `first_media`, but the verdict is `Unknown(NoMediaYet)`.
+
 So an `nfo` before the `mkv` never wins, and a head holding only an `nfo` header so far stays undecided.
 
 ## `Borrowable`
@@ -101,27 +113,36 @@ So an `nfo` before the `mkv` never wins, and a head holding only an `nfo` header
 | verdict | when |
 |---|---|
 | `Yes` | bare media, or the member is stored in the clear |
-| `YesWithPassword(proof)` | the member is stored and encrypted with a mapped cipher (RAR AES-CBC, WinZip AES), and a password was given that no check rejects; or it is stored in the clear behind encrypted headers that the password opened |
+| `YesWithPassword(proof)` | the member is stored and encrypted with a mapped cipher (RAR AES-CBC, WinZip AES), and something proved the password given (see `PasswordProof`); or it is stored in the clear behind encrypted headers that the password opened |
+| `PasswordUnverified` | as above, but nothing could check or refute the password. **Not safe to borrow on** |
 | `NeedsPassword(HeaderEncrypted)` | encrypted headers (`-hp`), no password |
 | `NeedsPassword(DataEncrypted)` | encrypted stored data, no password |
-| `NeedsPassword(WrongPassword)` | the password fails the encrypted headers, a RAR 5.0 check value, or a WinZip AES verifier |
+| `NeedsPassword(WrongPassword)` | the password fails the encrypted headers, a RAR 5.0 check value, or a WinZip AES verifier; or the member's name has a media extension and at least 4 KiB of decrypted plaintext (or the whole member, if smaller) is not media |
 | `No(Solid)` | compressed in a solid stream |
 | `No(Compressed)` | compressed (whether or not also encrypted) |
-| `No(UnsupportedCipher)` | older RAR encryption, ZIP strong encryption, AES without its parameters |
+| `No(UnsupportedCipher)` | older RAR encryption, ZIP strong encryption, ZIP method 99 without its AES extra field, a RAR 5.0 KDF count above 24 |
 | `No(SequentialCipher)` | ZipCrypto: output byte `o` needs the whole stream before it decrypted |
-| `Unknown(Truncated)` | the head ends before a member header that could be chosen |
+| `Unknown(Truncated)` | the head ends (or a damaged header stops the listing) before a member that could be chosen |
+| `Unknown(NoMediaYet)` | no media member yet, and the largest member so far comes from an incomplete listing |
 | `Unknown(NoMembers)` | a complete listing with no files |
 | `Unknown(NotRecognised)` | `Packing::Unknown` |
 
 `PasswordProof`, strongest first:
 
-- `Verifier`: the format's own check matched. RAR 5.0: the 8-byte password check value (needs a KDF of at most
-  2^20 rounds; above that nothing is checked). WinZip AES: the 2-byte verifier, which a wrong password passes about
-  once in 65,536.
-- `Plaintext`: the decrypted first bytes of the member are a recognised media magic.
+- `Verifier`: the format's own check matched. RAR 5.0: the 8-byte password check value. WinZip AES: the 2-byte
+  verifier, which a wrong password passes about once in 65,536.
+- `Plaintext`: the decrypted first bytes of the member are a recognised media magic. When the name has a media
+  extension, the sniffed kind must be of the same family (Matroska/WebM, MP4/QuickTime, TS/M2TS, or the kind
+  itself); a `.avi` that decrypts to Matroska is no proof.
 - `Headers`: the password decrypted the encrypted headers.
-- `Unverified`: nothing checked it. RAR 4.x has no check value, so a wrong password for a RAR 4.x member whose
-  first bytes are not in the head (or not media) is `Unverified`.
+
+Without any of these the verdict is `PasswordUnverified`: no check value (always for RAR 4.x), and the member's
+first bytes are not in the head, or its name names no media to compare the plaintext with. An `.mpg` member whose
+plaintext starts with an MPEG start code (`00 00 01`) but no pack header is not counted as a contradiction.
+
+Data key derivations are charged to `ProbeOptions::limits`: `kdf_exponent` (RAR 5.0 counts above it, up to 24, are
+`MapError::Limit { resource: KdfExponent }`), `kdf_derivation_blocks` per derivation and `kdf_session_blocks` over
+the whole probe. Running out is `MapError::Limit`. Header decryption is charged by the member map as usual.
 
 A continued member (`continued: true`) is judged the same way: stored data maps, but where this part falls in the
 member's output depends on earlier volumes.
@@ -139,6 +160,6 @@ member's output depends on earlier volumes.
 | `MpegTs` | `0x47` every 188 bytes from offset 0, at least 3 present and all present matching (16 checked) | 8 or more |
 | `M2ts` | `0x47` every 192 bytes from offset 4, same counts | 8 or more |
 | `Asf` | the ASF header object GUID | the header size is at least 30 and the reserved bytes are `01 02`; a smaller size is rejected |
-| `MpegPs` | pack header `00 00 01 BA` | MPEG-2 or MPEG-1 marker bits; other bits are rejected |
+| `MpegPs` | pack header `00 00 01 BA` | the whole pack header (MPEG-2: 14 bytes plus stuffing, MPEG-1: 12 bytes) has its marker bits and is followed by a start code `00 00 01`. Bad marker bits, or no start code after the header, are rejected; bytes ending inside the header are the magic only |
 
 A lone `0x47` byte, two packets' worth, RIFF WAVE, and an `ftyp` of an impossible size are not media.

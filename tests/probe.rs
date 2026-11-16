@@ -95,7 +95,7 @@ fn asf() -> Vec<u8> {
 }
 
 fn mpg() -> Vec<u8> {
-    pad(vec![0, 0, 1, 0xba, 0x44, 0, 4, 0, 4, 1], 4096)
+    pad(vec![0, 0, 1, 0xba, 0x44, 0, 4, 0, 4, 1, 1, 0x89, 0xc3, 0xf8, 0, 0, 1, 0xbb], 4096)
 }
 
 fn found(kind: MediaKind, confidence: Confidence) -> Option<MediaMatch> {
@@ -364,8 +364,9 @@ fn rar5_data_encrypted_with_and_without_the_password() {
     let bytes = rar5_encrypted("movie.mkv", &movie, false);
     let packing = probe(&bytes, None, Some("pw")).unwrap();
     assert_eq!(packing.borrowable(), Borrowable::YesWithPassword(PasswordProof::Plaintext));
+    // A member named as media whose 4 KiB of plaintext sniffs as nothing: the password is wrong.
     let packing = probe(&bytes, None, Some("wrong")).unwrap();
-    assert_eq!(packing.borrowable(), Borrowable::YesWithPassword(PasswordProof::Unverified));
+    assert_eq!(packing.borrowable(), Borrowable::NeedsPassword(PasswordNeed::WrongPassword));
     assert_eq!(packing.first_media().unwrap().sniffed, None);
 }
 
@@ -550,9 +551,9 @@ fn rar4_stored_compressed_and_encrypted() {
     let packing = probe(&bytes, None, Some("pw")).unwrap();
     assert_eq!(packing.borrowable(), Borrowable::YesWithPassword(PasswordProof::Plaintext));
     assert_eq!(packing.first_media().unwrap().sniffed, found(MediaKind::Mkv, Confidence::Validated));
-    // RAR 4.x has no check value: a wrong password goes unproven.
+    // RAR 4.x has no check value, but the plaintext of a member named `.mkv` contradicts a wrong password.
     let packing = probe(&bytes, None, Some("wrong")).unwrap();
-    assert_eq!(packing.borrowable(), Borrowable::YesWithPassword(PasswordProof::Unverified));
+    assert_eq!(packing.borrowable(), Borrowable::NeedsPassword(PasswordNeed::WrongPassword));
 }
 
 // ---- ZIP ----
@@ -721,4 +722,174 @@ fn zip_head_cut_inside_its_first_local_header_is_truncated() {
     let zip = zip_of(&packing);
     assert_eq!(zip.members, 0);
     assert_eq!(zip.borrowable, Borrowable::Unknown(Undecided::Truncated));
+}
+
+// ---- Review regressions ----
+
+#[test]
+fn a_descriptor_step_that_would_wrap_ends_the_walk() {
+    // Data descriptor flag, both sizes 0xFFFFFFFF, and a ZIP64 packed size that puts the next header at
+    // 2^64 - 20: stepping over the 20-byte ZIP64 descriptor used to wrap to offset 0 and loop forever.
+    let name = b"movie.mkv";
+    let data_at = 30 + name.len() + 20;
+    let mut bytes = b"PK\x03\x04".to_vec();
+    bytes.extend(45u16.to_le_bytes());
+    bytes.extend(0x0008u16.to_le_bytes());
+    bytes.extend(0u16.to_le_bytes());
+    bytes.extend([0; 8]);
+    bytes.extend(u32::MAX.to_le_bytes());
+    bytes.extend(u32::MAX.to_le_bytes());
+    bytes.extend((name.len() as u16).to_le_bytes());
+    bytes.extend(20u16.to_le_bytes());
+    bytes.extend(name);
+    bytes.extend([1, 0, 16, 0]);
+    bytes.extend(1000u64.to_le_bytes());
+    bytes.extend((u64::MAX - 19 - data_at as u64).to_le_bytes());
+    bytes.extend([0; 64]);
+    let packing = probe(&bytes, None, None).unwrap();
+    let zip = zip_of(&packing);
+    assert_eq!(zip.members, 1);
+    assert!(!zip.complete);
+}
+
+#[test]
+fn the_local_header_walk_is_capped_at_the_entry_budget() {
+    let bytes = zip(&[stored("a.nfo", b"1"), stored("b.nfo", b"2"), stored("c.mkv", b"3")]);
+    let mut options = ProbeOptions::new();
+    options.limits.entries = 2;
+    let error = probe_with(&bytes, None, None, &options).unwrap_err();
+    assert!(
+        matches!(error, zipfast::map::MapError::Limit { resource: zipfast::progressive::Resource::Entries, .. }),
+        "{error:?}"
+    );
+    options.limits.entries = 3;
+    assert!(probe_with(&bytes, None, None, &options).is_ok());
+}
+
+#[test]
+fn a_zip64_end_record_of_impossible_size_is_ignored() {
+    let movie = mkv();
+    let bytes = zip(&[stored("movie.mkv", &movie)]);
+    let mut tail = b"PK\x06\x06".to_vec();
+    tail.extend(u64::MAX.to_le_bytes());
+    tail.extend([0; 44]);
+    tail.extend(b"PK\x06\x07");
+    tail.extend(0u32.to_le_bytes());
+    tail.extend(5000u64.to_le_bytes());
+    tail.extend(1u32.to_le_bytes());
+    tail.extend(b"PK\x05\x06");
+    tail.extend([0; 4]);
+    tail.extend([0xff; 4]);
+    tail.extend([0xff; 8]);
+    tail.extend([0; 2]);
+    let packing = probe(&bytes, Some(&tail), None).unwrap();
+    let zip = zip_of(&packing);
+    assert!(!zip.directory);
+    assert_eq!(zip.borrowable, Borrowable::Yes);
+}
+
+#[test]
+fn an_unchecked_password_is_its_own_verdict_and_never_yes() {
+    // An obfuscated name and no check value: nothing to compare the plaintext with.
+    let movie = mkv();
+    let bytes = rar5_encrypted("a8f3e0c1", &movie, false);
+    let packing = probe(&bytes, None, Some("wrong")).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::PasswordUnverified);
+    // The right one sniffs as media, which proves it.
+    let packing = probe(&bytes, None, Some("pw")).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::YesWithPassword(PasswordProof::Plaintext));
+
+    // A head cut before the member's data: nothing to decrypt.
+    let bytes = rar5_encrypted("movie.mkv", &movie, false);
+    let data_at = bytes.len() - movie.len() - end_block(false).len();
+    let packing = probe(&bytes[..data_at + 8], None, Some("wrong")).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::PasswordUnverified);
+
+    // Plaintext of another family than the name names is no proof.
+    let bytes = rar5_encrypted("movie.avi", &movie, false);
+    let packing = probe(&bytes, None, Some("pw")).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::PasswordUnverified);
+    assert_eq!(packing.first_media().unwrap().sniffed, found(MediaKind::Mkv, Confidence::Validated));
+}
+
+#[test]
+fn data_key_derivation_is_charged_to_the_kdf_budgets() {
+    use zipfast::{map::MapError, progressive::Resource};
+    let bytes = rar5_encrypted("movie.mkv", &mkv(), true);
+    let mut options = ProbeOptions::new();
+    options.limits.kdf_session_blocks = 10;
+    let error = probe_with(&bytes, None, Some("pw"), &options).unwrap_err();
+    assert!(matches!(error, MapError::Limit { resource: Resource::KdfSessionBlocks, limit: 10, .. }), "{error:?}");
+    let mut options = ProbeOptions::new();
+    options.limits.kdf_exponent = 0;
+    let error = probe_with(&bytes, None, Some("pw"), &options).unwrap_err();
+    assert!(matches!(error, MapError::Limit { resource: Resource::KdfExponent, attempted: 1, .. }), "{error:?}");
+    // Without a password nothing is derived.
+    assert!(probe_with(&bytes, None, None, &options).is_ok());
+
+    let salt = [1, 2, 3, 4, 5, 6, 7, 8];
+    let bytes = r4_archive(&[r4_member(b"movie.mkv", &[0; 64], 0, 0x30, 64, Some(salt))]);
+    let mut options = ProbeOptions::new();
+    options.limits.kdf_derivation_blocks = 100;
+    let error = probe_with(&bytes, None, Some("pw"), &options).unwrap_err();
+    assert!(matches!(error, MapError::Limit { resource: Resource::KdfDerivationBlocks, .. }), "{error:?}");
+}
+
+#[test]
+fn a_largest_pick_from_an_incomplete_listing_is_tentative() {
+    let big = vec![0x33u8; 50_000];
+    let bytes = zip(&[stored("disc.iso", &big), stored("movie.mkv", &mkv())]);
+    let head = &bytes[..8192];
+    let packing = probe(head, None, None).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::Unknown(Undecided::NoMediaYet));
+    let member = packing.first_media().unwrap();
+    assert_eq!((member.name.as_deref(), member.selected), (Some("disc.iso"), Selection::Largest));
+    // The directory in the tail lists the mkv after it.
+    let packing = probe(head, Some(&bytes[bytes.len() - 1000..]), None).unwrap();
+    assert_eq!(packing.first_media().unwrap().name.as_deref(), Some("movie.mkv"));
+
+    // A RAR volume whose end header was read is complete: its largest member is a firm pick.
+    let bytes = archive(&[FileSpec::new("disc.iso", &big[..5000])]);
+    assert_eq!(probe(&bytes, None, None).unwrap().borrowable(), Borrowable::Yes);
+    assert_eq!(probe(&bytes[..3000], None, None).unwrap().borrowable(), Borrowable::Unknown(Undecided::NoMediaYet));
+}
+
+#[test]
+fn mpeg_ps_needs_the_whole_pack_header_to_validate() {
+    let full = mpg();
+    assert_eq!(sniff(&full[..5]), found(MediaKind::MpegPs, Confidence::Magic));
+    assert_eq!(sniff(&full[..16]), found(MediaKind::MpegPs, Confidence::Magic));
+    assert_eq!(sniff(&full[..17]), found(MediaKind::MpegPs, Confidence::Validated));
+    let mut no_start_code = full.clone();
+    no_start_code[14] = 0x55;
+    assert_eq!(sniff(&no_start_code), None);
+    let mut bad_marker = full.clone();
+    bad_marker[6] = 0;
+    assert_eq!(sniff(&bad_marker), None);
+    // MPEG-1: a 12-byte pack header.
+    let mpeg1 = [0, 0, 1, 0xba, 0x21, 0, 1, 0, 1, 0x80, 0, 1, 0, 0, 1, 0xbb];
+    assert_eq!(sniff(&mpeg1), found(MediaKind::MpegPs, Confidence::Validated));
+}
+
+#[test]
+fn zip_method_99_without_an_aes_field_is_an_unsupported_cipher() {
+    let entry = ZipSpec { method: 99, flags: 1, ..stored("movie.mkv", &[0; 64]) };
+    let packing = probe(&zip(&[entry]), None, None).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::No(NotBorrowable::UnsupportedCipher));
+    assert_eq!(
+        packing.first_media().unwrap().packing,
+        MemberPacking::DataEncrypted { cipher: CipherKind::Unknown, stored: false }
+    );
+}
+
+#[test]
+fn a_damaged_header_ends_the_listing_as_incomplete() {
+    let big = vec![0u8; 3000];
+    let mut bytes = archive(&[FileSpec::new("a.nfo", &big[..10]), FileSpec::new("disc.iso", &big)]);
+    let at = bytes.windows(8).position(|w| w == b"disc.iso").unwrap() - 20;
+    bytes[at] ^= 0xff;
+    let packing = probe(&bytes, None, None).unwrap();
+    let rar = rar_of(&packing);
+    assert!(matches!(rar.map.end, VolumeEnd::Damaged { .. }), "{:?}", rar.map.end);
+    assert_eq!(rar.borrowable, Borrowable::Unknown(Undecided::Truncated), "only a side file was listed");
 }
