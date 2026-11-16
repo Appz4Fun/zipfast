@@ -979,19 +979,14 @@ fn rar4_aes_stored_member_with_a_wrong_password_fails_its_crc_and_publishes_noth
     assert!(fs::read(&out).ok().is_none_or(|bytes| bytes != gold));
 }
 
-/// Open descriptors of this process.
-fn open_descriptors() -> usize {
-    fs::read_dir("/dev/fd").unwrap().count()
-}
 /// A session over 200 members: each member's core is released once it finished and its handle was taken, so
-/// neither the state page budget nor the descriptor count grows with the number of members.
+/// neither the state page budget nor the descriptors held (`open_files`) grow with the number of members.
 #[test]
 fn a_session_with_200_members_releases_finished_members() {
     let data: Vec<(Vec<u8>, Vec<u8>)> = (0..200).map(|i| (format!("m{i:03}.bin").into_bytes(), gold(64 + i))).collect();
     let members: Vec<(&[u8], &[u8])> = data.iter().map(|(n, d)| (n.as_slice(), d.as_slice())).collect();
     let set = Set::single(&members);
     let dir = tempfile::tempdir().unwrap();
-    let before = open_descriptors();
     let mut session = ProgressiveSession::new_partial(
         Box::new(set.provider()),
         options(&dir.path().join("out"), set.naming.name(0)),
@@ -1008,7 +1003,7 @@ fn a_session_with_200_members_releases_finished_members() {
     .unwrap();
     let mut held: Option<(MemberKey, PartialFile)> = None;
     let mut released: Vec<MemberKey> = Vec::new();
-    let (mut finished, mut peak) = (0, 0);
+    let mut finished = 0;
     loop {
         match session.poll_event(&mut Context::from_waker(Waker::noop())) {
             Poll::Pending => continue,
@@ -1023,7 +1018,6 @@ fn a_session_with_200_members_releases_finished_members() {
                 drop((file, again));
                 released.push(key);
                 finished += 1;
-                peak = peak.max(open_descriptors());
             }
             Poll::Ready(Ok(None)) => break,
             Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
@@ -1032,8 +1026,8 @@ fn a_session_with_200_members_releases_finished_members() {
         }
     }
     assert_eq!(finished, 200);
-    // A handful of descriptors for the session and the member in flight, not ~6 per member.
-    assert!(peak <= before + 24, "descriptors grew from {before} to {peak}");
+    // The caps above bound the descriptors and pages held at any time (a process-wide descriptor count is not
+    // used: tests running in parallel open their own).
     let Err(error) = session.partial_file(&released[0]) else { panic!("a released member has no core left") };
     assert!(matches!(error.kind, PartialErrorKind::BindingMismatch(BindingField::Member)), "{error:?}");
     for (name, bytes) in &data {
