@@ -83,10 +83,24 @@ impl Fault {
     }
 }
 
-/// A coder's output, cut to its declared size; ending early is [`Fault::Truncated`].
+/// Bytes a stream passes between cancellation checks.
+const CANCEL_EVERY: u64 = 1 << 20;
+
+/// A coder's output (or a packed stream), cut to its declared size; ending early is [`Fault::Truncated`]. Every
+/// stream of a folder goes through one, so cancellation is seen every [`CANCEL_EVERY`] bytes at every stage, even
+/// inside a decoder that loops on its input without producing output (empty Deflate blocks).
 struct Exact<R> {
     inner: R,
     left: u64,
+    cancel: Cancellation,
+    /// Bytes passed since cancellation was last checked.
+    unchecked: u64,
+}
+
+impl<R> Exact<R> {
+    fn new(inner: R, left: u64, cancel: &Cancellation) -> Self {
+        Self { inner, left, cancel: cancel.clone(), unchecked: CANCEL_EVERY }
+    }
 }
 
 impl<R: Read> Read for Exact<R> {
@@ -94,12 +108,19 @@ impl<R: Read> Read for Exact<R> {
         if self.left == 0 || buf.is_empty() {
             return Ok(0);
         }
+        if self.unchecked >= CANCEL_EVERY {
+            if self.cancel.is_canceled() {
+                return Err(Fault::Canceled.into());
+            }
+            self.unchecked = 0;
+        }
         let n = (self.left.min(buf.len() as u64)) as usize;
         let got = self.inner.read(&mut buf[..n])?;
         if got == 0 {
             return Err(Fault::Truncated.into());
         }
         self.left -= got as u64;
+        self.unchecked += got as u64;
         Ok(got)
     }
 }
@@ -145,7 +166,15 @@ fn lzma2_dict(b: u8) -> u64 {
     if b >= 40 { u64::from(u32::MAX) } else { (2 | u64::from(b & 1)) << (b / 2 + 11) }
 }
 
-fn lzma(kind: CoderKind, properties: &[u8], input: Stream, size: u64, limits: &SevenZipLimits) -> Built {
+/// `dictionaries` is what the folder's earlier LZMA coders allocated; this one's window is added to it.
+fn lzma(
+    kind: CoderKind,
+    properties: &[u8],
+    input: Stream,
+    size: u64,
+    limits: &SevenZipLimits,
+    dictionaries: &mut u64,
+) -> Built {
     // The dictionary never needs to be larger than the output, so a stated dictionary never allocates more.
     let need = size.max(4096);
     let mut filters = liblzma::stream::Filters::new();
@@ -165,13 +194,15 @@ fn lzma(kind: CoderKind, properties: &[u8], input: Stream, size: u64, limits: &S
         filters.lzma2_properties(&[b]).map_err(|_| SevenZipError::Corrupt("7z LZMA2 properties"))?;
         lzma2_dict(b)
     };
-    if window > limits.dictionary_bytes {
+    let total = dictionaries.saturating_add(window);
+    if total > limits.dictionary_bytes {
         return Err(SevenZipError::Limit {
             limit: SevenZipLimit::DictionaryBytes,
             max: limits.dictionary_bytes,
-            attempted: window,
+            attempted: total,
         });
     }
+    *dictionaries = total;
     let stream = liblzma::stream::Stream::new_raw_decoder(&filters).map_err(|e| match e {
         liblzma::stream::Error::Mem | liblzma::stream::Error::MemLimit => {
             SevenZipError::Io(io::Error::from(io::ErrorKind::OutOfMemory))
@@ -298,6 +329,8 @@ pub(crate) struct Context<'a> {
     pub(crate) keys: &'a mut Keys,
     pub(crate) limits: &'a SevenZipLimits,
     pub(crate) cancel: &'a Cancellation,
+    /// LZMA dictionary bytes the folder being built has allocated so far.
+    pub(crate) dictionaries: u64,
 }
 
 /// The folder's output stream, exactly `folder.unpacked_size` bytes.
@@ -356,10 +389,8 @@ impl Graph<'_> {
             } else if let Some(k) = self.folder.packed_streams.iter().position(|&p| p == input) {
                 let start: u64 = self.folder.pack_sizes[..k].iter().sum();
                 let range = start..start + self.folder.pack_sizes[k];
-                Box::new(Exact {
-                    inner: PackReader::new(cx.set.clone(), &self.folder.packed, range, cx.cancel.clone()),
-                    left: self.folder.pack_sizes[k],
-                }) as Stream
+                let pack = PackReader::new(cx.set.clone(), &self.folder.packed, range, cx.cancel.clone());
+                Box::new(Exact::new(pack, self.folder.pack_sizes[k], cx.cancel)) as Stream
             } else {
                 return Err(SevenZipError::Corrupt("7z coder input bound to nothing"));
             };
@@ -367,7 +398,7 @@ impl Graph<'_> {
         }
         let size = self.folder.unpack_sizes[out as usize];
         let reader = coder_reader(coder, inputs, size, cx)?;
-        Ok(Box::new(Exact { inner: reader, left: size }))
+        Ok(Box::new(Exact::new(reader, size, cx.cancel)))
     }
 }
 
@@ -385,7 +416,9 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
     };
     match coder.kind {
         CoderKind::Copy => one(inputs),
-        kind @ (CoderKind::Lzma | CoderKind::Lzma2) => lzma(kind, props, one(inputs)?, size, cx.limits),
+        kind @ (CoderKind::Lzma | CoderKind::Lzma2) => {
+            lzma(kind, props, one(inputs)?, size, cx.limits, &mut cx.dictionaries)
+        }
         CoderKind::Deflate => {
             Ok(Box::new(flate2::bufread::DeflateDecoder::new(BufReader::with_capacity(BUF, one(inputs)?))))
         }
@@ -432,5 +465,51 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
         }
         CoderKind::Ppmd => Err(SevenZipError::UnsupportedCoder { id: coder.id }),
         _ => Err(SevenZipError::UnsupportedCoder { id: coder.id }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Empty stored Deflate blocks, forever.
+    struct EmptyBlocks;
+
+    impl Read for EmptyBlocks {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = [0u8, 0, 0, 0xFF, 0xFF][i % 5];
+            }
+            Ok(buf.len() / 5 * 5)
+        }
+    }
+
+    #[test]
+    fn a_decoder_looping_on_its_input_still_sees_cancellation() {
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        // Deflate makes no output from empty blocks, so it keeps reading; the stream it reads checks the token.
+        let input = Exact::new(EmptyBlocks, u64::MAX, &cancel);
+        let mut deflate = flate2::bufread::DeflateDecoder::new(BufReader::new(input));
+        let error = deflate.read(&mut [0u8; 16]).unwrap_err();
+        assert!(matches!(Fault::of(error), Fault::Canceled));
+    }
+
+    #[test]
+    fn exact_checks_cancellation_every_mebibyte() {
+        let cancel = Cancellation::default();
+        let mut exact = Exact::new(io::repeat(0), u64::MAX, &cancel);
+        let mut buf = vec![0u8; 64 << 10];
+        assert!(exact.read(&mut buf).unwrap() > 0);
+        cancel.cancel();
+        let mut read = 0u64;
+        let error = loop {
+            match exact.read(&mut buf) {
+                Ok(n) => read += n as u64,
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(Fault::of(error), Fault::Canceled));
+        assert!(read <= CANCEL_EVERY);
     }
 }

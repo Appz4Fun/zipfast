@@ -793,3 +793,261 @@ fn the_checked_dispatcher_reports_7z_renames() {
     assert_eq!(renamed, [text.join("b(1).txt")]);
     assert_eq!(fs::read(text.join("b.txt")).unwrap(), b"old");
 }
+
+// ---- Review fixes: inner sizes, cancellation inside coders, dictionaries, unverifiable members ----
+
+/// One coder of a hand-built folder: its method id bytes and properties (one input, one output each).
+struct Coder(&'static [u8], Vec<u8>);
+
+/// A one-folder, one-file archive. `coders` are stored in this order and chained: coder `i`'s input is coder
+/// `i + 1`'s output, and the last coder reads the packed stream. `sizes` are the coders' output sizes.
+fn raw_archive(coders: &[Coder], packed: &[u8], sizes: &[u64], name: &str, crc: Option<u32>) -> Vec<u8> {
+    let mut h = vec![0x01, 0x04, 0x06, 0x00, 0x01, 0x09];
+    num(&mut h, packed.len() as u64);
+    h.extend([0x00, 0x07, 0x0B, 0x01, 0x00]);
+    num(&mut h, coders.len() as u64);
+    for Coder(id, props) in coders {
+        let mut flags = id.len() as u8;
+        if !props.is_empty() {
+            flags |= 0x20;
+        }
+        h.push(flags);
+        h.extend_from_slice(id);
+        if !props.is_empty() {
+            num(&mut h, props.len() as u64);
+            h.extend_from_slice(props);
+        }
+    }
+    for i in 0..coders.len() - 1 {
+        num(&mut h, i as u64);
+        num(&mut h, i as u64 + 1);
+    }
+    h.push(0x0C);
+    for &size in sizes {
+        num(&mut h, size);
+    }
+    h.push(0x00);
+    if let Some(crc) = crc {
+        h.extend([0x08, 0x0A, 0x01]);
+        h.extend(crc.to_le_bytes());
+        h.push(0x00);
+    }
+    h.extend([0x00, 0x05, 0x01]);
+    let mut names = vec![0u8];
+    names.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+    names.extend([0, 0]);
+    h.push(0x11);
+    num(&mut h, names.len() as u64);
+    h.extend(names);
+    h.extend([0x00, 0x00]);
+    let mut start = [0u8; 20];
+    start[..8].copy_from_slice(&(packed.len() as u64).to_le_bytes());
+    start[8..16].copy_from_slice(&(h.len() as u64).to_le_bytes());
+    start[16..].copy_from_slice(&crc32fast::hash(&h).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend(crc32fast::hash(&start).to_le_bytes());
+    out.extend(start);
+    out.extend(packed);
+    out.extend(h);
+    out
+}
+
+/// A raw LZMA2 stream (written with a 64 KiB dictionary; property 16 declares 1 MiB) of `blocks` empty stored Deflate
+/// blocks and a final stored block holding `tail`: Deflate decodes it to `tail` after looping over all of them.
+fn empty_deflate_blocks_in_lzma2(blocks: usize, tail: &[u8]) -> (Vec<u8>, u64) {
+    let mut options = liblzma::stream::LzmaOptions::new_preset(0).unwrap();
+    options.dict_size(1 << 16);
+    let mut filters = liblzma::stream::Filters::new();
+    filters.lzma2(&options);
+    let mut stream = liblzma::stream::Stream::new_raw_encoder(&filters).unwrap();
+    let chunk: Vec<u8> = std::iter::repeat_n([0u8, 0, 0, 0xFF, 0xFF], 1 << 14).flatten().collect();
+    let mut last = vec![1u8];
+    last.extend((tail.len() as u16).to_le_bytes());
+    last.extend((!(tail.len() as u16)).to_le_bytes());
+    last.extend_from_slice(tail);
+    let mut out = Vec::with_capacity(1 << 20);
+    let mut feed = |data: &[u8], finish: bool| {
+        let mut at = 0;
+        loop {
+            if out.capacity() - out.len() < 1 << 16 {
+                out.reserve(1 << 20);
+            }
+            let before = stream.total_in();
+            let action = if finish { liblzma::stream::Action::Finish } else { liblzma::stream::Action::Run };
+            let status = stream.process_vec(&data[at..], &mut out, action).unwrap();
+            at += (stream.total_in() - before) as usize;
+            if finish {
+                if status == liblzma::stream::Status::StreamEnd {
+                    break;
+                }
+            } else if at == data.len() {
+                break;
+            }
+        }
+    };
+    let mut written = 0usize;
+    while written + chunk.len() <= blocks * 5 {
+        feed(&chunk, false);
+        written += chunk.len();
+    }
+    let rest: Vec<u8> = std::iter::repeat_n([0u8, 0, 0, 0xFF, 0xFF], blocks - written / 5).flatten().collect();
+    feed(&rest, false);
+    feed(&last, true);
+    (out, (blocks * 5 + last.len()) as u64)
+}
+
+/// Deflate over LZMA2: a little packed data, a large inner stream, a tiny file.
+fn deflate_bomb(dir: &Path, blocks: usize) -> PathBuf {
+    let (packed, inner) = empty_deflate_blocks_in_lzma2(blocks, b"x");
+    let coders = [Coder(&[0x04, 0x01, 0x08], vec![]), Coder(&[0x21], vec![16])];
+    let path = dir.join("bomb.7z");
+    fs::write(&path, raw_archive(&coders, &packed, &[1, inner], "x.txt", Some(crc32fast::hash(b"x")))).unwrap();
+    path
+}
+
+#[test]
+fn an_inner_coder_output_is_bounded_by_folder_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = deflate_bomb(dir.path(), 400_000);
+    // Within the defaults it decodes to its one byte.
+    let summary = extract::run(&archive, &opts(Mode::Extract, &dir.path().join("o")), |_| {}).unwrap();
+    assert_eq!(fs::read(dir.path().join("o/x.txt")).unwrap(), b"x");
+    assert_eq!(summary.files, 1);
+    // The final output is one byte, but the LZMA2 stage's 2 MB is past a 1 MiB folder limit.
+    let mut limits = SevenZipLimits::default();
+    limits.folder_bytes = 1 << 20;
+    let result =
+        sevenzip::run(&archive, &opts(Mode::Test, dir.path()), None, &Cancellation::default(), &limits, |_| {});
+    match seven(&result) {
+        Some(SevenZipError::Limit { limit: SevenZipLimit::FolderBytes, attempted, .. }) => {
+            assert!(*attempted > 2_000_000)
+        }
+        _ => panic!("{result:?}"),
+    }
+    // All coders' outputs together are bounded at four times folder_bytes: five 9-byte Copy stages are 45 > 40.
+    let chained = write(dir.path(), &Built { chain: 5, ..Built::default() }.archive(&[vec![("a.txt", b"123456789")]]));
+    limits.folder_bytes = 10;
+    let result =
+        sevenzip::run(&chained, &opts(Mode::Test, dir.path()), None, &Cancellation::default(), &limits, |_| {});
+    assert!(
+        matches!(
+            seven(&result),
+            Some(SevenZipError::Limit { limit: SevenZipLimit::FolderCoderBytes, max: 40, attempted: 45 })
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn cancellation_reaches_inside_a_coder_that_produces_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // About 64 MiB of empty Deflate blocks: Deflate loops over them all without producing a byte, so only the
+    // check inside the stream between LZMA2 and Deflate can see the cancellation.
+    let archive = deflate_bomb(dir.path(), 13_000_000);
+    let cancel = Cancellation::default();
+    let canceller = {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancel.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+    let result =
+        sevenzip::run(&archive, &opts(Mode::Test, dir.path()), None, &cancel, &SevenZipLimits::default(), |_| {});
+    canceller.join().unwrap();
+    assert!(matches!(seven(&result), Some(SevenZipError::Canceled)), "{result:?} after {:?}", started.elapsed());
+}
+
+#[test]
+fn dictionaries_are_bounded_per_folder_in_total() {
+    let dir = tempfile::tempdir().unwrap();
+    // bcj2.7z's three LZMA coders take 4 KiB, 4 KiB and about 5 KiB once shrunk: each fits 10000 bytes, the sum
+    // does not.
+    let mut limits = SevenZipLimits::default();
+    limits.dictionary_bytes = 10_000;
+    let result = sevenzip::run(
+        &fixture("bcj2.7z"),
+        &opts(Mode::Test, dir.path()),
+        None,
+        &Cancellation::default(),
+        &limits,
+        |_| {},
+    );
+    match seven(&result) {
+        Some(SevenZipError::Limit { limit: SevenZipLimit::DictionaryBytes, max: 10_000, attempted }) => {
+            assert!(*attempted > 10_000)
+        }
+        _ => panic!("{result:?}"),
+    }
+    assert_eq!(SevenZipLimits::default().dictionary_bytes, 1 << 30);
+}
+
+#[test]
+fn test_mode_fails_members_of_a_folder_with_a_bad_crc() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = Built { folder_crc: Some(0xDEAD_BEEF), ..Built::default() };
+    let archive = write(dir.path(), &built.archive(&[vec![("a.txt", b"one"), ("b.txt", b"two")]]));
+    let summary = extract::run(&archive, &opts(Mode::Test, dir.path()), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (0, 2), "{:?}", summary.errors);
+    let built = Built { folder_crc: Some(crc32fast::hash(b"onetwo")), ..Built::default() };
+    let archive = write(dir.path(), &built.archive(&[vec![("a.txt", b"one"), ("b.txt", b"two")]]));
+    let summary = extract::run(&archive, &opts(Mode::Test, dir.path()), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.bytes, summary.errors.len()), (2, 6, 0));
+}
+
+/// A 7zAES-over-nothing folder (the AES coder reads the packed stream) with no CRC, key without hashing (0x3F).
+fn aes_without_crc(dir: &Path, password: &str, plain: &[u8]) -> PathBuf {
+    let mut key = [0u8; 32];
+    for (slot, byte) in key.iter_mut().zip(password.encode_utf16().flat_map(u16::to_le_bytes)) {
+        *slot = byte;
+    }
+    let iv = [7u8; 16];
+    let mut padded = plain.to_vec();
+    padded.resize(plain.len().next_multiple_of(16), 0);
+    let packed = zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap();
+    let mut props = vec![0x7F, 0x0F];
+    props.extend(iv);
+    let coders = [Coder(&[0x06, 0xF1, 0x07, 0x01], props)];
+    let path = dir.join("aes-nocrc.7z");
+    fs::write(&path, raw_archive(&coders, &packed, &[plain.len() as u64], "secret.txt", None)).unwrap();
+    path
+}
+
+#[test]
+fn encrypted_members_without_a_crc_are_not_published_unverified() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = aes_without_crc(dir.path(), "right", b"plaintext nobody can check");
+    for password in ["right", "wrong"] {
+        for mode in [Mode::Extract, Mode::Test] {
+            let out = dir.path().join(format!("{password}-{mode:?}"));
+            let summary = extract::run_with_password(&archive, &opts(mode, &out), Some(password), |_| {}).unwrap();
+            assert_eq!(summary.files, 0, "{password} {mode:?}");
+            assert_eq!(summary.errors.len(), 1, "{password} {mode:?}");
+            assert!(summary.errors[0].contains("cannot be verified"), "{:?}", summary.errors);
+            assert!(!out.join("secret.txt").exists());
+        }
+    }
+    // Unencrypted members without a CRC are published unverified, as 7-Zip extracts them.
+    let plain = raw_archive(&[Coder(&[0x00], vec![])], b"no crc", &[6], "plain.txt", None);
+    let path = write(dir.path(), &plain);
+    let summary = extract::run(&path, &opts(Mode::Extract, &dir.path().join("plain")), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (1, 0));
+    assert_eq!(fs::read(dir.path().join("plain/plain.txt")).unwrap(), b"no crc");
+}
+
+#[test]
+fn decrypted_headers_prove_the_password_so_bad_data_is_a_data_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = fs::read(fixture("aes_hdr.7z")).unwrap();
+    // The packed data starts right after the signature header; the encrypted header is at the end.
+    bytes[32 + 40] ^= 0x55;
+    let archive = dir.path().join("bad-data.7z");
+    fs::write(&archive, &bytes).unwrap();
+    let summary =
+        extract::run_with_password(&archive, &opts(Mode::Extract, &dir.path().join("o")), Some("password"), |_| {})
+            .unwrap();
+    assert_eq!(summary.files, 0);
+    assert!(!summary.errors.is_empty(), "the corrupt folder's members fail");
+    assert!(!dir.path().join("o/text/a.txt").exists());
+}

@@ -60,6 +60,8 @@ struct Active {
     failed: Option<String>,
     /// Files held back for the folder's CRC: only for a folder of several members that stores one.
     staged: Vec<Staged>,
+    /// Tested members held back for the folder's CRC in the same case: name and size.
+    tested: Vec<(String, u64)>,
     defer: bool,
 }
 
@@ -74,7 +76,8 @@ struct Run<'a> {
     summary: Summary,
     dirs: Dirs,
     active: Option<Active>,
-    /// Some encrypted data has decoded and checked out, so the password is right.
+    /// The password is known to be right: the encrypted headers decoded and passed their CRC, or some encrypted
+    /// data has decoded and checked out.
     password_proven: bool,
     buf: Vec<u8>,
 }
@@ -129,7 +132,7 @@ pub(super) fn run(
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
         active: None,
-        password_proven: false,
+        password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],
     };
     let result = run.members(&selected, &needed);
@@ -287,7 +290,12 @@ impl Run<'_> {
     fn publish(&mut self, staged: Staged) -> Outcome<bool> {
         let Staged { temporary, place, name, size } = staged;
         if let Some(reserved) = place.reserved {
-            // The rename mode's own empty file, created with O_EXCL when the member started, takes the data.
+            // The rename mode's own empty file, created with O_EXCL when the member started, takes the data, as long
+            // as the name still holds that file.
+            if cfg!(unix) && !reserved.still_ours() {
+                self.fail(&name, "the claimed name was replaced while the member was extracted");
+                return Ok(false);
+            }
             crate::output::replace(temporary, reserved.path()).map_err(SevenZipError::Io)?;
             drop(reserved.into_parts());
         } else if place.replace {
@@ -313,7 +321,7 @@ impl Run<'_> {
     fn close_folder(&mut self) -> Outcome<()> {
         let Some(mut active) = self.active.take() else { return Ok(()) };
         let folder = &self.map.folders[active.index];
-        if active.defer && active.failed.is_none() && !active.staged.is_empty() {
+        if active.defer && active.failed.is_none() && (!active.staged.is_empty() || !active.tested.is_empty()) {
             // Read to the end, so the folder's CRC can vouch for what is held.
             let left = folder.unpacked_size - active.pos;
             self.pump(&mut active, left, None, None)?;
@@ -321,12 +329,17 @@ impl Run<'_> {
         let complete = active.failed.is_none() && active.pos == folder.unpacked_size;
         let good = complete && folder.crc32.is_none_or(|crc| crc == active.crc.clone().finalize());
         let staged = std::mem::take(&mut active.staged);
+        let tested = std::mem::take(&mut active.tested);
         if !good {
             let why = active.failed.clone().unwrap_or_else(|| "checksum error in its solid block".to_owned());
-            for staged in staged {
-                self.fail(&staged.name, &why);
+            for name in staged.iter().map(|s| &s.name).chain(tested.iter().map(|(n, _)| n)) {
+                self.fail(name, &why);
             }
             return Ok(());
+        }
+        for (_, size) in tested {
+            self.summary.files += 1;
+            self.summary.bytes += size;
         }
         for staged in staged {
             self.publish(staged)?;
@@ -337,7 +350,13 @@ impl Run<'_> {
     fn open_folder(&mut self, index: usize) -> Outcome<()> {
         self.close_folder()?;
         let folder: &MapFolder = &self.map.folders[index];
-        let mut cx = coders::Context { set: &self.set, keys: &mut self.keys, limits: self.limits, cancel: self.cancel };
+        let mut cx = coders::Context {
+            set: &self.set,
+            keys: &mut self.keys,
+            limits: self.limits,
+            cancel: self.cancel,
+            dictionaries: 0,
+        };
         let reader = coders::folder_reader(folder, &mut cx)?;
         self.active = Some(Active {
             index,
@@ -346,6 +365,7 @@ impl Run<'_> {
             crc: crc32fast::Hasher::new(),
             failed: None,
             staged: Vec::new(),
+            tested: Vec::new(),
             defer: folder.crc32.is_some() && folder.members > 1,
         });
         Ok(())
@@ -447,6 +467,13 @@ impl Run<'_> {
         if let Some(why) = outcome {
             return self.data_failure(active, name, &why, encrypted, take);
         }
+        if encrypted && member.checks.and_then(|c| c.crc32).is_none() && !active.defer && !self.password_proven {
+            // Nothing could tell decrypted garbage from the data: with a wrong password it would be published.
+            if take {
+                self.fail(name, "encrypted without a CRC, and no password proven yet: cannot be verified");
+            }
+            return Ok(());
+        }
         let crc_ok = member.checks.and_then(|c| c.crc32).is_none_or(|want| want == crc.finalize());
         if !crc_ok {
             if encrypted && !self.password_proven {
@@ -462,9 +489,13 @@ impl Run<'_> {
         }
         let Some((_, place)) = target else { return Ok(()) };
         let Some(place) = place else {
-            // Testing: checked, nothing to write.
-            self.summary.files += 1;
-            self.summary.bytes += size;
+            // Testing: checked, nothing to write; a folder with its own CRC vouches for it at its end.
+            if active.defer {
+                active.tested.push((name.to_owned(), size));
+            } else {
+                self.summary.files += 1;
+                self.summary.bytes += size;
+            }
             return Ok(());
         };
         let (temporary, output) = staged.take().expect("a staged output");

@@ -28,7 +28,9 @@ Overwrite choices are made by `extract::check_target`, the function every whole-
   member's own name (or, for `RenameNew`, the first free `stem_N.ext` / `stem(N).ext`) is created empty with
   `O_EXCL`, and for `RenameExisting` the file in the way is first moved to the first free renamed name without
   replacing anything. The data still goes to a temporary file and replaces the claimed empty file only after its
-  CRC matches; a member that fails removes its claimed file, but a file `RenameExisting` moved aside stays moved.
+  CRC matches, and only if the name still holds the file the run created (same device and inode); if something
+  else was put there meanwhile, the member fails and that file is left alone. A member that fails removes its
+  claimed file, but a file `RenameExisting` moved aside stays moved.
   Each rename is reported to the callback as it is made (`<requested>: exists, written as <path>` or
   `<requested>: existing file moved to <path>`), recorded in `Summary::renames`, sent to the observer as
   `ZipRunEvent::MemberRenamed` on the checked dispatcher, and kept in `RunError::renames` when
@@ -87,7 +89,14 @@ the rest of that folder cannot be decoded, and its selected members are reported
 
 A folder of several members that stores its own CRC (7-Zip stores per-file CRCs instead, but the format allows
 it) holds its verified files back until the whole folder has been read and its CRC matches; then they are
-published together, or all reported as failed.
+published together, or all reported as failed. `Mode::Test` does the same: the members count as tested only once
+the folder's CRC matches.
+
+A member with no CRC of its own and no folder CRC behind it cannot be checked:
+
+- **Unencrypted, it is published unverified**, as 7-Zip extracts it: only a decoding error can catch damage.
+- Encrypted, it is refused (`encrypted without a CRC, and no password proven yet: cannot be verified`) unless the
+  password was already proven in this run, since a wrong key would turn it into garbage nothing could detect.
 
 Destination safety is the shared code's: names are made relative and refused when they would leave the destination
 (`..`, absolute paths; a backslash counts as a separator, so `..\x` is refused too), folders are made without
@@ -108,8 +117,15 @@ following links, a link at a target or in the way is refused, and protected path
 
 Data encryption and encrypted headers (`-mhe`) are both read. 7z stores no password check value, so as 7-Zip
 does, a wrong password is recognised by its effect: for encrypted headers, a header that does not decode; for
-encrypted data, the first encrypted member failing to decode or failing its CRC before any encrypted member has
-checked out. Either stops the run with `SevenZipError::WrongPassword`; nothing is published.
+encrypted data, the first encrypted member failing to decode or failing its CRC before the password is proven.
+Either stops the run with `SevenZipError::WrongPassword`; nothing is published.
+
+The password is proven by encrypted headers that decode and pass their CRC, or by an encrypted member that passes
+its CRC. After that, a failing encrypted member is a data error for that member. Before it, a correct password
+with a damaged first encrypted member is indistinguishable from a wrong one and is reported as
+`WrongPassword`, as 7-Zip reports "Wrong password?" in the same case.
+
+Key derivation accepts `NumCyclesPower` up to 24 (7-Zip's own limit) for headers and data alike; 7-Zip writes 19.
 
 | failure | `extract::run*` | `extract::run_with_zip_policy` |
 |---|---|---|
@@ -126,11 +142,19 @@ The crate's legacy `Error` keeps its variants (a test pins them), so the typed `
 ## Limits
 
 `SevenZipLimits` (defaults in brackets; `#[non_exhaustive]`, start from `Default` and set fields):
-`folder_bytes` (16 GiB, decoded bytes per folder), `folders` (4096), `pack_streams` (4096), `coders` per folder
-(32), `coder_properties` bytes per coder (64), `entries` (65536, counting anti items, checked while the header is
-read) and `dictionary_bytes` (4 GiB, the largest LZMA dictionary allocated after shrinking to the output size). An
-archive past one fails with `SevenZipError::Limit { limit, max, attempted }` before anything is written. The member
-map's own header budgets (`ProgressiveLimits`) apply as well.
+
+- `folder_bytes` (16 GiB): the decoded size of a folder, and of every coder's output inside it, not only the last
+  (`FolderBytes`). The outputs of all a folder's coders together may total at most four times this, 64 GiB by
+  default (`FolderCoderBytes`). So a chain like Deflate over LZMA2 cannot expand a little packed data into an
+  unbounded inner stream.
+- `dictionary_bytes` (1 GiB): LZMA and LZMA2 dictionary bytes one folder allocates, summed over its LZMA coders
+  (a BCJ2 folder has three), each first shrunk to its coder's output size (`DictionaryBytes`). That opens
+  everything 7-Zip writes up to `-mx9 -md=1g`; raise it for larger dictionaries.
+- `folders` (4096), `pack_streams` (4096), `coders` per folder (32), `coder_properties` bytes per coder (64) and
+  `entries` (65536, counting anti items, checked while the header is read).
+
+An archive past one fails with `SevenZipError::Limit { limit, max, attempted }` before anything is written. The
+member map's own header budgets (`ProgressiveLimits`) apply as well.
 
 ## Split sets
 
@@ -140,8 +164,9 @@ Volumes concatenate: the first volume is the path given, later ones are named by
 
 ## Cancellation
 
-The `Cancellation` is checked between members, before every packed read and between 256 KiB output chunks, and
-during key derivation. A canceled run returns `SevenZipError::Canceled`; the member being written is not
+The `Cancellation` is checked between members, before every packed read, in every stream between two coders and
+at every coder's output at least once per MiB passed (so a decoder that loops over its input without producing
+output, such as Deflate over empty blocks, still stops), between 256 KiB output chunks, and during key derivation. A canceled run returns `SevenZipError::Canceled`; the member being written is not
 published and its temporary file is removed.
 
 ## Probe

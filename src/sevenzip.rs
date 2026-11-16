@@ -42,7 +42,9 @@ use crate::map::{CoderKind, MapBuilder, MapEnd, MapError, MapFolder, MapFormat, 
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SevenZipLimits {
-    /// Decoded bytes per folder (a solid block, or one file): 16 GiB.
+    /// Decoded bytes per folder (a solid block, or one file): 16 GiB. It bounds every coder's output in the folder,
+    /// not only the last one, and the outputs of all a folder's coders together may total at most four times this
+    /// (64 GiB by default), so no stage of a coder chain can expand a little packed data without bound.
     pub folder_bytes: u64,
     /// Folders in the archive: 4096.
     pub folders: u64,
@@ -54,8 +56,9 @@ pub struct SevenZipLimits {
     pub coder_properties: u64,
     /// Entries (files, folders, empty files and anti items): 65536.
     pub entries: u64,
-    /// The largest LZMA or LZMA2 dictionary allocated, after it is shrunk to the coder's output size: 4 GiB, the
-    /// format's own maximum.
+    /// LZMA and LZMA2 dictionary bytes one folder may allocate, summed over its LZMA coders (BCJ2 folders have
+    /// three), each dictionary first shrunk to its coder's output size: 1 GiB. 7-Zip's own default `-mmemuse` is
+    /// most of the machine's RAM; 1 GiB opens everything 7-Zip writes up to `-mx9 -md=1g`.
     pub dictionary_bytes: u64,
 }
 
@@ -68,7 +71,7 @@ impl Default for SevenZipLimits {
             coders: 32,
             coder_properties: 64,
             entries: 65536,
-            dictionary_bytes: 4 << 30,
+            dictionary_bytes: 1 << 30,
         }
     }
 }
@@ -77,7 +80,10 @@ impl Default for SevenZipLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SevenZipLimit {
+    /// A folder's output, or any one coder's output in it, is larger than `folder_bytes`.
     FolderBytes,
+    /// The outputs of all a folder's coders total more than four times `folder_bytes`.
+    FolderCoderBytes,
     Folders,
     PackStreams,
     Coders,
@@ -308,6 +314,11 @@ pub(crate) fn open_map(
     }
     let mut options = MapOptions::new(first.as_os_str()).password(password);
     options.limits.entries = limits.entries;
+    // Encrypted headers take the same key derivations as data: up to 2^24 rounds, as 7-Zip accepts; the work is
+    // bounded by the password length limit and stopped by cancellation.
+    options.limits.kdf_exponent = 24;
+    options.limits.kdf_derivation_blocks = 1 << 40;
+    options.limits.kdf_session_blocks = 1 << 40;
     options.control = crate::progressive::SessionControl::from_cancellation(cancel.clone());
     let source = source::FileVolumes { first: first.to_path_buf() };
     let mut builder = MapBuilder::new(Box::new(source), options);
@@ -374,8 +385,15 @@ pub(crate) fn check_bounds(map: &MemberMap, limits: &SevenZipLimits) -> std::res
         {
             return Err(limit(SevenZipLimit::CoderProperties, limits.coder_properties, props));
         }
-        if folder.unpacked_size > limits.folder_bytes {
-            return Err(limit(SevenZipLimit::FolderBytes, limits.folder_bytes, folder.unpacked_size));
+        if let Some(&largest) = folder.unpack_sizes.iter().chain([&folder.unpacked_size]).max()
+            && largest > limits.folder_bytes
+        {
+            return Err(limit(SevenZipLimit::FolderBytes, limits.folder_bytes, largest));
+        }
+        let total = folder.unpack_sizes.iter().fold(0u64, |a, &s| a.saturating_add(s));
+        let work = limits.folder_bytes.saturating_mul(4);
+        if total > work {
+            return Err(limit(SevenZipLimit::FolderCoderBytes, work, total));
         }
     }
     Ok(())
