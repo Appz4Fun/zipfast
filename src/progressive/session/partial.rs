@@ -581,6 +581,14 @@ impl ProgressiveSession {
         let iv_from = resume.iv_from;
         let want = (resume.stream - pos).min(self.remaining) as usize;
         let at = data_offset + (packed_size - self.remaining);
+        // Damage declared on the block's bytes in this part: the output an earlier session decrypted from them
+        // becomes `DeclaredBad` holes (as for skipped bytes), and the block is unknown, so the first block after
+        // the resume point becomes a `CipherNeighbour` hole. The bytes are then read as usual.
+        let declared = self.driver.take_declared(self.volume, &(at..at + want as u64));
+        if !declared.is_empty() {
+            self.apply_declared(declared)?;
+            self.partial.as_mut().unwrap().resume.as_mut().unwrap().iv_known = false;
+        }
         if at != self.cursor {
             self.driver.seek(at)?;
             self.cursor = at;
@@ -627,20 +635,26 @@ impl ProgressiveSession {
         let from = part.data_offset + (part.packed_size - self.remaining);
         let at = from + n;
         let declared = self.driver.take_declared(self.volume, &(from..at));
-        if !declared.is_empty() {
-            let persistent = self.partial.as_mut().unwrap();
-            let core = persistent.active().1.clone();
-            for range in declared {
-                let (reports, _) = core.declare_damage(self.volume, &range).map_err(failure)?;
-                self.usage
-                    .charge(Resource::MetadataBytes, (reports.len() * std::mem::size_of::<HoleReport>()) as u64)?;
-                persistent.holes.try_reserve(reports.len()).map_err(|_| error(PartialErrorKind::StateMalformed))?;
-                persistent.holes.extend(reports);
-            }
-        }
+        self.apply_declared(declared)?;
         self.driver.seek(at)?;
         self.cursor = at;
         self.remaining -= n;
+        Ok(())
+    }
+    /// Applies damage declared on packed `ranges` of the current volume to the active member's produced output,
+    /// queueing the `DeclaredBad` (and, encrypted, `CipherNeighbour`) holes it records as events.
+    fn apply_declared(&mut self, ranges: Vec<Range<u64>>) -> ProgressiveResult<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let persistent = self.partial.as_mut().unwrap();
+        let core = persistent.active().1.clone();
+        for range in ranges {
+            let (reports, _) = core.declare_damage(self.volume, &range).map_err(failure)?;
+            self.usage.charge(Resource::MetadataBytes, (reports.len() * std::mem::size_of::<HoleReport>()) as u64)?;
+            persistent.holes.try_reserve(reports.len()).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+            persistent.holes.extend(reports);
+        }
         Ok(())
     }
     /// Restores the held-back machine at the resume point: `part_bytes` of the active part lie before it, whose

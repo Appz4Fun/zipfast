@@ -1783,8 +1783,9 @@ impl PartialCore {
         let transaction = self.begin_transaction(&mut op, intent, valid, Vec::new())?;
         self.finish_transaction(&mut op, transaction)
     }
-    // Called only after the canonical MemberMachine has successfully finished.
-    // The acknowledged commit, not complete output coverage, grants finalization.
+    // Called only after the canonical MemberMachine has finished: successfully, or, for a member resumed after a
+    // restart, with check mismatches it left to verification (which then reports Bad or PartBad). The acknowledged
+    // commit, not complete output coverage, grants finalization; it never grants Verdict::Ok by itself.
     pub(crate) fn finish_member(&self) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;

@@ -4261,3 +4261,39 @@ fn encrypted_damage_on_the_previous_ciphertext_block_makes_the_next_block_a_hole
     fill_plain(file, &fixture);
     assert!(matches!(verify(file), Verdict::Ok { .. }));
 }
+
+#[test]
+fn encrypted_damage_declared_before_polling_on_the_previous_block_is_a_declared_hole() {
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let session = |provider: Provider| {
+        let mut opts = options(&dir.path().join("out"));
+        opts.set_password(Some("pw".into())).unwrap();
+        opts.limits.read_chunk = 16;
+        let mut partial = partial_options(&dir.path().join("state"));
+        partial.anchors = anchors.clone();
+        partial.limits.group_commit_bytes = 0;
+        ProgressiveSession::new_partial(Box::new(provider), opts, partial).unwrap()
+    };
+    let mut first = session(fixture.provider(&[]).0);
+    let mut seen = Seen::default();
+    while seen.written < 400 {
+        assert!(!step(&mut first, &mut seen));
+    }
+    assert_eq!(seen.written, 400);
+    crash((first, std::mem::take(&mut seen.files)));
+    // Before the restart reads anything, damage on ciphertext 384..388: the block the resume reads for its CBC
+    // state, from which the earlier session decrypted output 384..400.
+    let mut second = session(fixture.provider(&[]).0);
+    let piece = fixture.packed(384..388);
+    let receipt = second.declare_hole(piece[0].0, piece[0].1.clone()).unwrap();
+    assert_eq!(receipt.pending.len(), 1);
+    let mut seen = Seen::default();
+    assert!(run_events(&mut second, &mut seen, None));
+    assert_eq!(joined(&seen.holes), vec![(384..400, HoleCause::DeclaredBad), (400..416, HoleCause::CipherNeighbour)]);
+    let (_, file) = seen.files.last_mut().unwrap();
+    assert_eq!(file.remaining().unwrap(), vec![384..416]);
+    fill_plain(file, &fixture);
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+}
