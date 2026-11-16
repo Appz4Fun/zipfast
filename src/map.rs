@@ -32,15 +32,25 @@
 //! appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
 //! See `docs/member-map.md`.
 //!
+//! [`Lzma2Index`] lists the chunks of an LZMA2 stream from their headers alone (a 7z LZMA2 folder through
+//! [`MemberMap::lzma2_chunks`] or [`Lzma2IndexBuilder::for_folder`]): stored chunk payloads map straight to output
+//! offsets ([`Lzma2Index::plan`]) and LZMA chunks decode from their dictionary reset ([`Lzma2Decoder`]).
+//!
 //! [`MemberReader`] and [`extract_member_from`] stream a stored member's plaintext from any output offset, reading
 //! only the packed bytes that offset needs, for example to fill the rest of a partial output from another copy. See
 //! `docs/extract-member-from.md`.
 
+mod lzma2;
 mod member_reader;
 pub(crate) mod sevenzip;
 pub(crate) mod zip;
 pub(crate) mod zip_split;
 
+pub use lzma2::{
+    LZMA2_MAX_LZMA_UNPACKED, LZMA2_MAX_PAYLOAD, Lzma2Bound, Lzma2Chunk, Lzma2ChunkKind, Lzma2Damage, Lzma2DecodeError,
+    Lzma2DecodeOptions, Lzma2Decoder, Lzma2End, Lzma2Error, Lzma2Index, Lzma2IndexBuilder, Lzma2IndexOptions,
+    Lzma2Piece, Lzma2Position, Lzma2Reset, Lzma2Stage, Lzma2Start, Lzma2Step, find_stored_chunk_chains,
+};
 pub use member_reader::{
     ExtractFromError, ExtractedFrom, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
 };

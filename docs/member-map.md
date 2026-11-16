@@ -8,7 +8,9 @@ data is skipped, never fetched. A caller that has lost part of one copy of a rel
 Mapped: RAR 5.0 and RAR 4.x (stored and compressed members, split across volumes, data encryption, and encrypted
 headers `-hp` when a password is given), single-disk ZIP and split ZIP sets (`.z01`, ..., `.zip`; every method is
 listed; stored, ZipCrypto and WinZip AES entries get output mappings, see [Split ZIP sets](#split-zip-sets)), and 7z
-(single files and plain byte splits `.7z.001`, `.7z.002`, ...; see [7z](#7z)).
+(single files and plain byte splits `.7z.001`, `.7z.002`, ...; see [7z](#7z)). LZMA2 streams, such as a 7z LZMA2
+folder, get chunk indexes that locate stored chunks and decode LZMA chunks from their dictionary reset (see
+[LZMA2 chunk indexes](#lzma2-chunk-indexes)).
 
 ## Building a map
 
@@ -228,7 +230,7 @@ Members mapped `None` carry no pieces and `packed_size: 0`, so a solid folder of
 hundreds of volumes lists its spans once, in its `MapFolder`, rather than once per member.
 
 So an LZMA2 member gives its folder's packed range (`map.folders[slot.index].packed`) and the folder's
-`unpacked_size`; the caller finds LZMA2 chunks in that range itself. A later member of a 7zAES folder can still be
+`unpacked_size`; [LZMA2 chunk indexes](#lzma2-chunk-indexes) list the chunks in that range. A later member of a 7zAES folder can still be
 read from its `FolderSlot::offset` with the folder's spans: CBC decryption starts at any block given the block
 before it.
 
@@ -267,6 +269,94 @@ header are `Malformed` (CRC failures as a header `ChecksumMismatch`); external (
 properties, additional streams, alternative coder methods, a major version other than 0, and header coders other
 than Copy, LZMA, LZMA2 and 7zAES in a single chain are `Unsupported`. 7z damage is never `MapEnd::Damaged`: the
 header is one unit.
+
+## LZMA2 chunk indexes
+
+An LZMA2 stream is a run of chunks, each with a short header: `0x00` ends the stream; `0x01` (dictionary reset) and
+`0x02` start a stored chunk whose payload (1 to 65536 bytes, size in the next two bytes) is the output byte for byte;
+`0x80` and up start an LZMA chunk (5-byte header with unpacked size up to 2 MiB and packed size up to 64 KiB, 6 bytes
+with a props byte from `0xC0`), whose bits 5-6 reset nothing, the state, the state and props, or the dictionary state
+and props. Data that does not compress (video, audio, packed files) is stored, so its bytes sit in the packed stream
+in the clear, cut by a 3-byte header every 64 KiB or so at positions that depend on the data.
+
+`Lzma2Index` lists the chunks from their headers alone, at most 6 bytes per chunk; payloads are never read.
+`Lzma2Chunk { packed_offset, packed_len, unpacked_offset, unpacked_len, kind, reset, props }`: `packed_len` counts
+header and payload, `kind` is `Stored` or `Lzma`, `reset` is `None`, `Dict` (stored `0x01`), `State`, `StateProps`
+or `DictStateProps`, and `props` is the LZMA props byte where the chunk sets one. `payload()`, `packed()` and
+`unpacked()` give the ranges. Packed offsets count from the stream's first byte (for a 7z folder, the LZMA2 stage's
+packed stream; for a byte range of a source, its start).
+
+Building:
+
+| input | call |
+|---|---|
+| bytes in memory | `Lzma2Index::from_bytes(packed, options)` |
+| a byte range of one `progressive::RangeSource`, pollable | `Lzma2IndexBuilder::new(source, range, options)`, then `poll_index(cx)` |
+| a 7z folder in memory | `map.lzma2_chunks(folder_index, volumes, options)` |
+| a 7z folder through a `progressive::VolumeSource`, pollable | `Lzma2IndexBuilder::for_folder(source, &map.folders[i], first_name, options)` |
+
+The pollable builder returns `Pending` on `RangeRead::NotYet` (or `VolumeAnswer::Wait`) and retries the parked read
+after the provider's wake; `chunks()` shows what is listed so far. It issues about one read per chunk, of at most
+6 bytes. A hole in a payload is never seen, so a damaged copy still indexes as long as its chunk headers are present.
+
+`Lzma2IndexOptions`: `max_chunks` (default 1 << 20, about 48 MiB of index covering at least 64 GiB of output),
+`expected_unpacked` (the folder builders default it to the coder's unpack size), and `start`: `StreamStart` (the
+first chunk must reset the dictionary; props are checked) or `Resume(Lzma2Position { packed, unpacked })` to start at
+a chunk header known by other means, after a hole or a re-synchronization (below).
+
+The walk never fails on the bytes: it ends and says where and why in `Lzma2Index::end`, keeping every chunk before
+that point. `Err(Lzma2Error)` is only for a source failure (`Source`), an aborted volume source (`Aborted`), a folder
+without an LZMA2 stage (`NotLzma2Folder`), or polling again (`AlreadyFinished`).
+
+| `Lzma2End` | meaning |
+|---|---|
+| `EndMarker { offset }` | the `0x00` end marker; `complete()` is true |
+| `RangeEnd { offset }` | the range ended at a chunk boundary without an end marker |
+| `Truncated { offset, partial }` | the range ended inside the chunk at `offset`, or the source ended before the range did; `partial` is that chunk when its header was read (its payload runs past the end, so a stored payload's first bytes are still there) |
+| `Hole { chunk, offset }` | the source reported a hole at `offset`, inside the header of the chunk at `chunk` |
+| `MissingVolume { offset, volume }` | the volume holding that header is missing |
+| `Damaged { offset, damage }` | `BadControl(byte)` (`0x03..=0x7F`), `NoDictionaryReset` (first chunk), `MissingProps` (an LZMA chunk below `0xC0` first after a dictionary reset), `BadProps(byte)` (225 or more, or `lc + lp > 4`), `UnpackedOverflow` (past `expected_unpacked`, or past 2^64) |
+| `ChunkLimit { offset }` | `max_chunks` chunks were listed |
+
+Mapping an output range: `Lzma2Index::plan(unpacked)` splits it into `Lzma2Piece`s in output order:
+`Stored { unpacked, packed, chunk }` (copy packed bytes `packed`), `Decode { unpacked, chunks, from }` (consecutive
+LZMA chunks, a new piece at every dictionary reset; decode from chunk `from`, the last dictionary reset before them, to the end of `chunks` and drop the
+output before `unpacked.start`; `from` is None when the index has no reset before them) and `Unindexed { unpacked }`
+(before a resumed start or past the end). `chunk_at(unpacked)`, `decode_start(chunk)` and `stored_bytes()` help
+callers choose. For a 7z folder, `Lzma2Stage::spans(folder, packed)` turns a packed range of the index into
+per-volume `PackedSpan`s to fetch.
+
+Decoding uses liblzma's raw LZMA2 decoder, fed the run's chunks followed by an end marker, so state and props
+resets inside a run (and later dictionary resets) decode as in a whole stream. `Lzma2Decoder::new(run, dict_prop,
+options)` takes consecutive chunks whose first resets the dictionary; `decode(packed, out)` streams, taking exactly
+the run's packed bytes and writing exactly its output, and fails with `Data` when the data disagrees with the
+headers. In memory: `decode_chunks(range, packed, packed_base, dict_prop, options)` (a run from a reset),
+`decode_chunk(i, ...)` (one chunk's output, decoded from its reset while discarding earlier output) and
+`read_range(unpacked, ...)` (stored pieces copied, LZMA pieces decoded; `packed`, whose byte 0 is packed offset
+`packed_base`, need only cover what the plan uses). `dict_prop` is the 7z coder's property byte
+(`Lzma2Stage::dict_prop`). `Lzma2DecodeOptions` bounds memory: the dictionary is the coder's shrunk to the run's
+output size, so a stated 4 GiB dictionary allocates only what the run can use, and is checked against
+`max_dictionary` (default 256 MiB). `max_output` (default 256 MiB) caps the bytes returned in one buffer, not the
+output decoded and discarded before them; `max_streamed` (default 16 GiB, the 7z folder cap) caps what a run decodes
+from its dictionary reset, since 7-Zip and xz usually reset only at the start and a byte near the end of a large
+folder decodes through all of it, the discarded part through a 64 KiB buffer. `control` (a `SessionControl`)
+cancels the in-memory decodes between 64 KiB steps. Failures are `Lzma2DecodeError`: `NotDictionaryReset`,
+`NotContiguous`, `BadDictionaryProp`, `Limit { bound: Dictionary | Output | Streamed, .. }`, `MissingPacked
+{ offset }`, `Unindexed { unpacked }`, `Data { produced }`, `Decoder`, `Canceled`.
+
+7z folders: `MapFolder::lzma2_stage()` finds the LZMA2 coder whose input is a packed stream, following the bind
+pairs: a single LZMA2 coder, or the LZMA2 stage of a chain (BCJ, Delta or another filter over LZMA2). It gives the
+coder index, `dict_prop`, the stage's packed range over the folder's packed streams, its unpack size, and
+`folder_output`: true when the LZMA2 output is the folder's, so unpacked offsets are folder offsets and a member's
+range is `slot.offset..slot.offset + size`. In a chain, stored payloads are the filter's input, not member bytes.
+7zAES under LZMA2 has no stage (the packed stream is ciphertext). `MapFolder::packed_spans(stream)` cuts a range of
+folder stream offsets into per-volume spans.
+
+Re-synchronizing: `find_stored_chunk_chains(window, links)` lists the positions in a window of packed bytes, at no
+known alignment, where `links` stored chunk headers follow one another and the next byte is a plausible control
+byte; random bytes almost never chain 3 links. The headers do not say which output offset a candidate carries; a
+caller that knows (by matching the payload against output it already has) resumes the walk there with
+`Lzma2Start::Resume`.
 
 ## Single-volume maps
 
