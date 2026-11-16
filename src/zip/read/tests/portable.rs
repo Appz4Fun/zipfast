@@ -165,39 +165,111 @@ fn portable_no_replace_ladder_keeps_every_overwrite_mode() {
     }
 }
 
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    Some((meta.dev(), meta.ino()))
+}
+
 #[test]
 fn portable_rename_refuses_existing_name_on_every_rung() {
+    use crate::zip::read::native_policy::{Published, rename_portable};
     use std::os::fd::AsRawFd;
     let dir = tempfile::tempdir().unwrap();
     let handle = std::fs::File::open(dir.path()).unwrap();
+    let fd = handle.as_raw_fd();
     for rung in 0..=2 {
         PORTABLE_RENAME_RUNG.with(|r| r.set(rung));
         std::fs::write(dir.path().join("stage"), b"new").unwrap();
+        let ours = identity(&dir.path().join("stage"));
         std::fs::write(dir.path().join("target"), b"old").unwrap();
-        let error = crate::zip::read::native_policy::rename_portable(
-            handle.as_raw_fd(),
-            c"stage",
-            handle.as_raw_fd(),
-            c"target",
-            false,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "rung {rung}");
+        let error = rename_portable(fd, c"stage", fd, c"target", false, ours).unwrap_err();
+        // A raw EEXIST, so publication reads as definitely not published.
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST), "rung {rung}");
         assert_eq!(std::fs::read(dir.path().join("target")).unwrap(), b"old");
         std::fs::remove_file(dir.path().join("target")).unwrap();
-        crate::zip::read::native_policy::rename_portable(
-            handle.as_raw_fd(),
-            c"stage",
-            handle.as_raw_fd(),
-            c"target",
-            false,
-        )
-        .unwrap();
+        assert_eq!(rename_portable(fd, c"stage", fd, c"target", false, ours).unwrap(), Published::Clean);
         assert_eq!(std::fs::read(dir.path().join("target")).unwrap(), b"new");
         assert!(!dir.path().join("stage").exists(), "rung {rung}");
         std::fs::remove_file(dir.path().join("target")).unwrap();
     }
     PORTABLE_RENAME_RUNG.with(|r| r.set(0));
+}
+
+/// Another user swaps the stage name for their own file after our descriptor closed: refused on every rung and for
+/// `Always`, and the swapped-in bytes are never published.
+#[test]
+fn portable_rename_refuses_a_substituted_stage() {
+    use crate::zip::read::native_policy::rename_portable;
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let handle = std::fs::File::open(dir.path()).unwrap();
+    let fd = handle.as_raw_fd();
+    for (rung, replace) in [(0, false), (1, false), (2, false), (0, true)] {
+        PORTABLE_RENAME_RUNG.with(|r| r.set(rung));
+        std::fs::write(dir.path().join("stage"), b"verified").unwrap();
+        let ours = identity(&dir.path().join("stage"));
+        std::fs::write(dir.path().join("evil"), b"attacker").unwrap();
+        std::fs::rename(dir.path().join("evil"), dir.path().join("stage")).unwrap();
+        let error = rename_portable(fd, c"stage", fd, c"target", replace, ours).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESTALE), "rung {rung} replace {replace}");
+        assert!(!dir.path().join("target").exists());
+        std::fs::remove_file(dir.path().join("stage")).unwrap();
+    }
+    PORTABLE_RENAME_RUNG.with(|r| r.set(0));
+}
+
+/// A hard-link publication whose stage unlink fails still publishes, and the leftover plaintext name is retired.
+#[test]
+fn portable_link_publication_retires_a_stage_it_could_not_unlink() {
+    use crate::zip::read::native_policy::PORTABLE_UNLINK_FAILS;
+    let work = tempfile::tempdir().unwrap();
+    let zip = work.path().join("a.zip");
+    let (plain, secret) = archive(&zip);
+    let _forced = Forced::new(1);
+    PORTABLE_UNLINK_FAILS.with(|f| f.set(true));
+    for overwrite in [Overwrite::Skip, Overwrite::RenameNew(RenameStyle::Underscore)] {
+        let dest = tempfile::tempdir().unwrap();
+        let report = run(&zip, dest.path(), overwrite, StagedStorage::Auto).unwrap();
+        assert_eq!((report.files(), report.failed()), (2, 0), "{overwrite:?}");
+        assert_eq!(names(dest.path()), ["a.txt", "s.bin"], "{overwrite:?}");
+        assert_eq!(std::fs::read(dest.path().join("a.txt")).unwrap(), plain);
+        assert_eq!(std::fs::read(dest.path().join("s.bin")).unwrap(), secret);
+    }
+    PORTABLE_UNLINK_FAILS.with(|f| f.set(false));
+}
+
+/// `run_with_context` plans streaming only for its own run; the caller's context gets its setting back.
+#[test]
+fn run_with_context_restores_the_stream_setting() {
+    let work = tempfile::tempdir().unwrap();
+    let zip = work.path().join("a.zip");
+    let (_, secret) = archive(&zip);
+    let dest = tempfile::tempdir().unwrap();
+    let options = Options {
+        mode: Mode::Extract,
+        dest: dest.path().into(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+    };
+    let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+    assert!(!context.options.stream_staged_aes);
+    let report = crate::zip::run_with_context(
+        &zip,
+        &options,
+        Some("pw"),
+        &Cancellation::default(),
+        &mut context,
+        |_: ZipRunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    assert_eq!((report.files(), report.failed(), report.usage().member_spool_bytes), (2, 0, 0));
+    assert_eq!(std::fs::read(dest.path().join("s.bin")).unwrap(), secret);
+    assert!(!context.options.stream_staged_aes);
 }
 
 #[test]

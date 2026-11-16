@@ -888,6 +888,9 @@ pub(crate) fn with_opened_context(
     context: &mut EncryptedReadContext,
     observe: impl ZipRunObserver,
 ) -> ZipReadResult<ZipRunReport> {
+    // Streaming is planned only for this run; the caller's context keeps its own setting afterwards.
+    let previous_stream = context.options.stream_staged_aes;
+    let mut restore_stream = false;
     let binding_result = (|| -> ZipReadResult<()> {
         if !context.has_action_plan() {
             let owner = &mut session.owner;
@@ -901,6 +904,7 @@ pub(crate) fn with_opened_context(
                 ZipReadOutput::Discard
             };
             context.options.stream_staged_aes = true;
+            restore_stream = true;
             let result = projected::factory(
                 context,
                 false,
@@ -928,9 +932,14 @@ pub(crate) fn with_opened_context(
         Ok(())
     })();
     if let Err(error) = binding_result {
+        context.options.stream_staged_aes = previous_stream;
         return Err(session.owner.reject(error));
     }
-    session.run_owned(options, password, cancel, context, observe)
+    let result = session.run_owned(options, password, cancel, context, observe);
+    if restore_stream {
+        context.options.stream_staged_aes = previous_stream;
+    }
+    result
 }
 
 #[cfg(test)]

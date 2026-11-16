@@ -268,7 +268,7 @@ impl PreparedPortable {
         file: &File,
         bytes: u64,
         cancel: &Cancellation,
-    ) -> Result<(), ReadFault> {
+    ) -> Result<FileIdentity, ReadFault> {
         let fd = file.as_raw_fd();
         let op = |operation, call: &mut dyn FnMut() -> std::io::Result<()>| {
             io::operation(
@@ -314,16 +314,26 @@ impl PreparedPortable {
         if actual.st_mode & libc::S_IFMT != libc::S_IFREG || actual.st_size < 0 || actual.st_size as u64 != bytes {
             return Err(ReadFault::CheckedFormat { reason: "portable output stage changed" });
         }
-        Ok(())
+        Ok(identity(&actual))
     }
-    /// After publication: closes the parent.
+    /// After publication: removes a stage name a hard-link publication could not unlink, then closes the parent.
     #[allow(clippy::result_large_err)]
     pub(in crate::zip::read) fn finish_published(
-        self,
+        mut self,
         ledger: &impl LedgerAccess,
         encrypted: bool,
     ) -> ZipReadResult<()> {
-        self.parent.finish_observed(ledger, true, encrypted)
+        let mut error = None;
+        if self.temp.named {
+            let (_, report) = self.temp.retire(ledger, &self.parent, encrypted, true);
+            merge(&mut error, report);
+        }
+        let closed = self.parent.finish_observed(ledger, error.is_none(), encrypted);
+        match (error, closed) {
+            (None, result) => result,
+            (Some(error), Ok(())) => Err(error),
+            (Some(error), Err(next)) => Err(error.merge_cleanup_only(next)),
+        }
     }
     /// Without publication (skip, refusal, failure): removes the temporary file and closes the parent.
     pub(in crate::zip::read) fn finish_unpublished(

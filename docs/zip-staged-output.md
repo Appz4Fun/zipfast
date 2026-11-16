@@ -58,7 +58,14 @@ the payload, best-effort time and mode, a flush where supported, then one rename
    of the stage name (still atomic), and where neither exists (exFAT, many SMB and FUSE mounts) it checks that the
    target is absent and then renames. Only in that last case can a name created by another process between the check
    and the rename be replaced. `Overwrite::Always` is one plain `renameat` on both backends.
-5. **Cleanup by identity.** Native removes a stage only when its identity still matches. Portable removes the stage
+5. **Stage substitution in shared directories.** Native stages live in a private 0700 directory nobody else can
+   enter. The portable stage name sits in the target directory, so in a shared writable directory without a sticky
+   bit (common on SMB and NFS) another user could rename their own file over it after our descriptor is closed.
+   Before every rename or link the portable path checks that the name still holds the device and inode our
+   descriptor had just before closing, and refuses with `ESTALE` otherwise. The check and the rename are separate
+   calls, so a swap inside that window stays possible; and on a filesystem whose inode numbers are not stable this
+   check is only as good as those numbers.
+6. **Cleanup by identity.** Native removes a stage only when its identity still matches. Portable removes the stage
    name when it is still a regular file on the same device; the 128-bit random name is what keeps that to our own
    file.
 

@@ -754,13 +754,14 @@ fn publish_renamed(
     parent: &parent::HeldParent,
     dir: std::os::fd::RawFd,
     stage_leaf: &CStr,
-    portable: bool,
+    portable: Option<Option<(u64, u64)>>,
     mode: crate::extract::RenameMode,
     existing: bool,
     ledger: &impl LedgerAccess,
     encrypted: bool,
     cancel: &Cancellation,
     renamed: &mut Option<crate::extract::RenamedOutput>,
+    stage_left: &mut bool,
 ) -> ZipReadResult<Option<std::io::Result<()>>> {
     use crate::extract::{RenameMode, RenamedOutput, renamed_name};
     use std::os::unix::ffi::OsStrExt;
@@ -772,7 +773,9 @@ fn publish_renamed(
         encrypted,
         cancel,
         charged: false,
-        portable,
+        portable: portable.is_some(),
+        expected: portable.flatten(),
+        stage_left: false,
     };
     let leaf = parent.target();
     let named = |n: u32| {
@@ -786,12 +789,17 @@ fn publish_renamed(
     match mode {
         RenameMode::New(_) => {
             if !existing {
-                match publisher.attempt(dir, stage_leaf, leaf)? {
+                match publisher.attempt(dir, stage_leaf, leaf, true)? {
                     Some(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    result => return Ok(result),
+                    result => {
+                        *stage_left = publisher.stage_left;
+                        return Ok(result);
+                    }
                 }
             }
-            Ok(publisher.claim(dir, stage_leaf)?.map(|claimed| {
+            let claimed = publisher.claim(dir, stage_leaf, true)?;
+            *stage_left = publisher.stage_left;
+            Ok(claimed.map(|claimed| {
                 claimed.map(|n| {
                     let (requested, path) = named(n);
                     *renamed = Some(RenamedOutput { requested, path, existing: None });
@@ -800,7 +808,7 @@ fn publish_renamed(
         }
         RenameMode::Existing(_) => {
             if existing {
-                let n = match publisher.claim(publisher.parent, leaf)? {
+                let n = match publisher.claim(publisher.parent, leaf, false)? {
                     Some(Ok(n)) => n,
                     Some(Err(error)) => return Ok(Some(Err(error))),
                     None => return Ok(None),
@@ -808,7 +816,9 @@ fn publish_renamed(
                 let (requested, moved) = named(n);
                 *renamed = Some(RenamedOutput { path: requested.clone(), requested, existing: Some(moved) });
             }
-            publisher.attempt(dir, stage_leaf, leaf)
+            let result = publisher.attempt(dir, stage_leaf, leaf, true);
+            *stage_left = publisher.stage_left;
+            result
         }
     }
 }
@@ -823,6 +833,10 @@ struct RenamePublisher<'a, L> {
     charged: bool,
     /// Publish with the portable no-replace ladder instead of the native no-replace rename.
     portable: bool,
+    /// The portable stage's (device, inode), checked against its name before each stage rename.
+    expected: Option<(u64, u64)>,
+    /// A hard-link publication could not remove the stage name.
+    stage_left: bool,
 }
 
 #[allow(clippy::result_large_err)]
@@ -834,6 +848,7 @@ impl<L: LedgerAccess> RenamePublisher<'_, L> {
         from: std::os::fd::RawFd,
         from_leaf: &CStr,
         to: &CStr,
+        stage: bool,
     ) -> ZipReadResult<Option<std::io::Result<()>>> {
         if std::mem::replace(&mut self.charged, true) {
             if !self.ledger.with_state(|s| s.take_rename_attempt())? {
@@ -845,7 +860,12 @@ impl<L: LedgerAccess> RenamePublisher<'_, L> {
         }
         Ok(Some(spool::syscall(ReadIoOperation::Publish, self.parent, || {
             if self.portable {
-                native_policy::rename_portable(from, from_leaf, self.parent, to, false)
+                let expected = if stage { self.expected } else { None };
+                native_policy::rename_portable(from, from_leaf, self.parent, to, false, expected).map(|published| {
+                    if stage && published == native_policy::Published::StageLeft {
+                        self.stage_left = true;
+                    }
+                })
             } else {
                 native_policy::rename_file(from, from_leaf, self.parent, to, false)
             }
@@ -854,7 +874,12 @@ impl<L: LedgerAccess> RenamePublisher<'_, L> {
 
     /// Moves `from_leaf` to the first free renamed name: its number, the failed attempt that stopped the search, or
     /// `None` when every number up to `RENAME_LIMIT` is taken or the run's reserved rename attempts are used up.
-    fn claim(&mut self, from: std::os::fd::RawFd, from_leaf: &CStr) -> ZipReadResult<Option<std::io::Result<u32>>> {
+    fn claim(
+        &mut self,
+        from: std::os::fd::RawFd,
+        from_leaf: &CStr,
+        stage: bool,
+    ) -> ZipReadResult<Option<std::io::Result<u32>>> {
         use std::os::unix::ffi::OsStrExt;
         // NAME_MAX plus the longest number and a NUL, kept off the heap like the rest of publication
         let mut buffer = [0u8; 272];
@@ -867,7 +892,7 @@ impl<L: LedgerAccess> RenamePublisher<'_, L> {
             slot[..bytes.len()].copy_from_slice(bytes);
             slot[bytes.len()] = 0;
             let to = CStr::from_bytes_with_nul(slot).map_err(|_| ReadFault::InvalidPlan)?;
-            match self.attempt(from, from_leaf, to)? {
+            match self.attempt(from, from_leaf, to, stage)? {
                 None => return Ok(None),
                 Some(Ok(())) => return Ok(Some(Ok(n))),
                 Some(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1027,13 +1052,14 @@ impl ZipReadStage {
                         &ready.parent,
                         dir,
                         leaf,
-                        false,
+                        None,
                         mode,
                         existing,
                         ledger,
                         encrypted,
                         cancel,
                         &mut renamed,
+                        &mut false.clone(),
                     )? {
                         Some(result) => result,
                         None => {
@@ -1122,6 +1148,7 @@ impl ZipReadStage {
         let mut publication = PublicationState::NotPublished;
         let mut renamed = None;
         let mut exhausted = false;
+        let mut stage_left = false;
         let result = (|| -> ZipReadResult<bool> {
             let ledger = &self.reservation.ledger;
             let encrypted = self.reservation.encrypted;
@@ -1138,7 +1165,10 @@ impl ZipReadStage {
                     cancel,
                 )
                 .map_err(ZipReadError::from);
-            boundary(metadata, self.source.observe(context, &mut final_check))?;
+            // The identity the descriptor holds now, just before close, is what publication must still find.
+            let current = boundary(metadata, self.source.observe(context, &mut final_check))?;
+            ready.temp.identity = Some(current);
+            let expected = Some((current.dev, current.ino));
             let closed =
                 ready.temp.close_for_publish(ledger, self.file.take().ok_or(ReadFault::InvalidPlan)?, encrypted);
             if let Err(error) = closed {
@@ -1179,7 +1209,9 @@ impl ZipReadStage {
                         dir,
                         ready.parent.target(),
                         ready.overwrite == crate::extract::Overwrite::Always,
+                        expected,
                     )
+                    .map(|published| stage_left = published == native_policy::Published::StageLeft)
                 }),
                 Some(mode) => {
                     let leaf = ready.temp.leaf();
@@ -1187,13 +1219,14 @@ impl ZipReadStage {
                         &ready.parent,
                         dir,
                         leaf,
-                        true,
+                        Some(expected),
                         mode,
                         existing,
                         ledger,
                         encrypted,
                         cancel,
                         &mut renamed,
+                        &mut stage_left,
                     )? {
                         Some(result) => result,
                         None => {
@@ -1206,7 +1239,10 @@ impl ZipReadStage {
             match moved {
                 Ok(()) => {
                     publication = PublicationState::Published;
-                    ready.temp.published();
+                    // A hard-link publication whose stage unlink failed keeps the name for `retire` to remove.
+                    if !stage_left {
+                        ready.temp.published();
+                    }
                     Ok(true)
                 }
                 Err(error)

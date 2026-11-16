@@ -487,16 +487,50 @@ fn unsupported(error: &io::Error) -> bool {
 // treats hard links as unsupported, so the last rung (check, then rename) runs.
 #[cfg(test)]
 thread_local! {pub(super) static PORTABLE_RENAME_RUNG: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };}
-/// Portable publication of `leaf` in `from` as `target` in `to`. `replace` is one plain `renameat`. Without it the
-/// rename must not replace an existing name; filesystems differ in how that can be had, so this tries, in order:
-/// the native no-replace rename (`renameat2(RENAME_NOREPLACE)` / `renameatx_np(RENAME_EXCL)`), then a hard link
-/// (atomic, fails if the name exists) followed by unlinking the stage name, and last a check that the target is
-/// absent followed by a plain rename. Only that last rung, used where neither exists (exFAT, many SMB and FUSE
-/// mounts), can replace a name created by someone else between the check and the rename.
+/// What a successful portable publication left behind.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(super) fn rename_portable(from: RawFd, leaf: &CStr, to: RawFd, target: &CStr, replace: bool) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Published {
+    /// The stage name is gone.
+    Clean,
+    /// Published through a hard link, but the stage name could not be unlinked; it still names the published bytes.
+    StageLeft,
+}
+/// Portable publication of `leaf` in `from` as `target` in `to`.
+///
+/// `expected` is the stage's (device, inode) from its own descriptor just before it was closed. Every rung first
+/// checks that `leaf` still names that inode, so a stage name swapped by another user of a shared writable directory
+/// (SMB, NFS without a sticky bit) is refused with `ESTALE` instead of published. A swap between that check and the
+/// rename itself stays possible: no portable call renames by descriptor. `None` skips the check (a caller-owned name).
+///
+/// `replace` is one plain `renameat`. Without it the rename must not replace an existing name, which this tries, in
+/// order: the native no-replace rename (`renameat2(RENAME_NOREPLACE)` / `renameatx_np(RENAME_EXCL)`), a hard link
+/// (atomic, fails if the name exists) and then unlinking the stage name, and last a check that the target is absent
+/// followed by a plain rename. Only that last rung, used where neither exists (exFAT, many SMB and FUSE mounts), can
+/// replace a name created by someone else between the check and the rename.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn rename_portable(
+    from: RawFd,
+    leaf: &CStr,
+    to: RawFd,
+    target: &CStr,
+    replace: bool,
+    expected: Option<(u64, u64)>,
+) -> io::Result<Published> {
+    #[allow(clippy::unnecessary_cast)] // stat widths vary by target.
+    let still_ours = || -> io::Result<()> {
+        let Some((dev, ino)) = expected else { return Ok(()) };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        cvt(unsafe { libc::fstatat(from, leaf.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) })?;
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_dev as u64 != dev || stat.st_ino as u64 != ino || stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        Ok(())
+    };
+    still_ours()?;
     if replace {
-        return cvt(unsafe { libc::renameat(from, leaf.as_ptr(), to, target.as_ptr()) }).map(|_| ());
+        return cvt(unsafe { libc::renameat(from, leaf.as_ptr(), to, target.as_ptr()) }).map(|_| Published::Clean);
     }
     #[cfg(test)]
     let rung = PORTABLE_RENAME_RUNG.with(|r| r.get());
@@ -509,7 +543,7 @@ pub(super) fn rename_portable(from: RawFd, leaf: &CStr, to: RawFd, target: &CStr
     };
     match native {
         Err(error) if unsupported(&error) => {}
-        result => return result,
+        result => return result.map(|()| Published::Clean),
     }
     let linked = if rung >= 2 {
         Err(io::Error::from_raw_os_error(libc::ENOTSUP))
@@ -518,10 +552,17 @@ pub(super) fn rename_portable(from: RawFd, leaf: &CStr, to: RawFd, target: &CStr
     };
     match linked {
         Ok(()) => {
-            // The target now names the stage; dropping the second name cannot unpublish it. A failure here leaves
-            // only a hidden `.zipfast` name behind, so the publication still stands.
-            let _ = cvt(unsafe { libc::unlinkat(from, leaf.as_ptr(), 0) });
-            return Ok(());
+            #[cfg(test)]
+            let unlinked = if PORTABLE_UNLINK_FAILS.with(|f| f.get()) {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                cvt(unsafe { libc::unlinkat(from, leaf.as_ptr(), 0) })
+            };
+            #[cfg(not(test))]
+            let unlinked = cvt(unsafe { libc::unlinkat(from, leaf.as_ptr(), 0) });
+            // The target now names the stage; a failed unlink cannot unpublish it, but the caller must still retire
+            // the second name.
+            return Ok(if unlinked.is_ok() { Published::Clean } else { Published::StageLeft });
         }
         Err(error)
             if unsupported(&error)
@@ -530,12 +571,16 @@ pub(super) fn rename_portable(from: RawFd, leaf: &CStr, to: RawFd, target: &CStr
     }
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     match cvt(unsafe { libc::fstatat(to, target.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) }) {
-        Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+        Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
         Err(error) => return Err(error),
     }
-    cvt(unsafe { libc::renameat(from, leaf.as_ptr(), to, target.as_ptr()) }).map(|_| ())
+    still_ours()?;
+    cvt(unsafe { libc::renameat(from, leaf.as_ptr(), to, target.as_ptr()) }).map(|_| Published::Clean)
 }
+// Test control: the unlink after a successful hard-link publication fails.
+#[cfg(test)]
+thread_local! {pub(super) static PORTABLE_UNLINK_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
 /// The process file-creation mask, read once. Linux reads it from procfs; elsewhere it is read by setting a
 /// stricter mask (0077) and restoring it, so a racing creation can only come out more private, never less.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
