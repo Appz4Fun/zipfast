@@ -87,6 +87,14 @@ use zipfast::extract::{MemberFilter, Options};
 let opts = Options { select: Some(MemberFilter::new(|m| m.is_dir || m.name.ends_with(".mkv"))), ..opts };
 ```
 
+The filter runs as members are listed. `MemberFilter::on_start` adds a hook asked, in archive order, about each
+selected member as it starts to be written, once its output path is final (after any rename mode chose its name):
+`StartDecision::Skip` writes nothing for it and reports it skipped (`RarSkipReason::Declined`), so a caller can count
+and limit what is really written. It runs on extraction by tar, lone compressed files, legacy ZIP, 7z and RAR
+whole-archive runs; the checked ZIP route, test mode and folders don't call it. `MemberFilter::all()` takes every
+member, for the hook alone. Staged output files are created under `zipfast::STAGED_PREFIX` (`.zipfast-`), so a
+temporary a crash leaves can be told from a finished file.
+
 An unselected member is not written, tested, counted or reported. Folder entries are offered with `is_dir` set. An
 unselected folder entry is not created, but the folders above a selected file still are. Path safety and overwrite
 checks apply to selected members as before. ZIP doesn't read unselected entries. In a solid RAR archive, unselected

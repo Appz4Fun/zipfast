@@ -64,6 +64,13 @@ impl Default for RenameBudget {
 }
 
 impl RenameBudget {
+    /// The attempts left, to give back what a declined member used.
+    pub(crate) fn left(&self) -> u64 {
+        self.left
+    }
+    pub(crate) fn restore(&mut self, left: u64) {
+        self.left = left;
+    }
     #[cfg(test)]
     pub(crate) fn with(left: u64) -> Self {
         Self { left }

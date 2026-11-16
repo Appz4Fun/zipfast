@@ -943,6 +943,11 @@ pub(crate) fn run_renaming(
                         summary.skipped += 1;
                         continue;
                     }
+                    Target::Declined => {
+                        report(&format!("{}: declined, skipped", e.name));
+                        summary.skipped += 1;
+                        continue;
+                    }
                     Target::Blocked(why) => {
                         fail(&mut summary, &mut report, &e.name, why);
                         continue;

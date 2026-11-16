@@ -211,22 +211,70 @@ impl MemberRef<'_> {
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
 #[derive(Clone)]
-pub struct MemberFilter(Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>);
+pub struct MemberFilter {
+    filter: Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>,
+    start: Option<StartHook>,
+}
+
+/// The hook [`MemberFilter::on_start`] keeps.
+type StartHook = Arc<dyn Fn(&MemberStart<'_>) -> StartDecision + Send + Sync>;
+
+/// A selected member about to be written, as [`MemberFilter::on_start`] sees it.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct MemberStart<'a> {
+    /// Where the member is written: the final output path, after a rename mode chose its name.
+    pub path: &'a Path,
+}
+
+/// What [`MemberFilter::on_start`] decides for a member about to be written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StartDecision {
+    /// Write it.
+    Write,
+    /// Don't: nothing is written for it, a renamed name it claimed is let go, and it is reported as skipped
+    /// ([`RarSkipReason::Declined`] on typed RAR runs, "declined, skipped" on report lines).
+    Skip,
+}
 
 impl MemberFilter {
     pub fn new(filter: impl Fn(&MemberRef<'_>) -> bool + Send + Sync + 'static) -> Self {
-        Self(Arc::new(filter))
+        Self { filter: Arc::new(filter), start: None }
+    }
+
+    /// A filter that takes every member, for use with [`MemberFilter::on_start`] alone.
+    pub fn all() -> Self {
+        Self::new(|_| true)
+    }
+
+    /// Adds a hook asked about each selected member, in archive order, as it starts to be written: once its output
+    /// path is final (after the overwrite choice and any rename mode's renaming) and before anything is written for
+    /// it. Unlike the filter, which runs as members are listed, this sees only members that will really be written,
+    /// so a caller can count them or limit them in order.
+    ///
+    /// It runs on extraction (not [`Mode::Test`]) of tar, lone compressed files, the legacy ZIP route, 7z and RAR
+    /// whole-archive runs. Folders, members whose target is skipped or blocked, and the checked ZIP route
+    /// ([`run_with_zip_policy`](crate::extract::run_with_zip_policy)) don't call it.
+    pub fn on_start(mut self, hook: impl Fn(&MemberStart<'_>) -> StartDecision + Send + Sync + 'static) -> Self {
+        self.start = Some(Arc::new(hook));
+        self
     }
 
     /// Whether the filter takes `member`.
     pub fn selects(&self, member: &MemberRef<'_>) -> bool {
-        (self.0)(member)
+        (self.filter)(member)
+    }
+
+    /// What the start hook decides for a member about to be written; [`StartDecision::Write`] without one.
+    pub fn starts(&self, member: &MemberStart<'_>) -> StartDecision {
+        self.start.as_ref().map_or(StartDecision::Write, |hook| hook(member))
     }
 }
 
 impl From<Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>> for MemberFilter {
     fn from(filter: Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>) -> Self {
-        Self(filter)
+        Self { filter, start: None }
     }
 }
 
@@ -306,6 +354,8 @@ pub(crate) enum Target {
     Write(Output),
     /// already there and not to be overwritten
     Exists,
+    /// the start hook declined the member
+    Declined,
     /// something else stands in the way
     Blocked(&'static str),
 }
@@ -332,6 +382,8 @@ impl Place {
 pub(crate) enum Checked {
     Write(Place),
     Exists,
+    /// the start hook declined the member
+    Declined,
     Blocked(&'static str),
 }
 
@@ -341,6 +393,7 @@ pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>, log: &m
     Ok(match check_target(opts, rel, None, log)? {
         Checked::Write(place) => Target::Write(create_target(place, size)?),
         Checked::Exists => Target::Exists,
+        Checked::Declined => Target::Declined,
         Checked::Blocked(why) => Target::Blocked(why),
     })
 }
@@ -370,6 +423,7 @@ pub(crate) fn check_target(
         .map(|result| match result {
             DetailedChecked::Write(place) => Checked::Write(place),
             DetailedChecked::Exists => Checked::Exists,
+            DetailedChecked::Declined => Checked::Declined,
             DetailedChecked::Blocked(reason) => Checked::Blocked(blocked_message(&reason)),
         })
         .map_err(RarFault::into_legacy)
@@ -378,6 +432,7 @@ pub(crate) fn check_target(
 enum DetailedChecked {
     Write(Place),
     Exists,
+    Declined,
     Blocked(RarPolicyReason),
 }
 
@@ -415,8 +470,37 @@ impl<F: FnMut(&str)> LegacyReport for F {
 }
 
 /// With a rename mode, the returned place already holds the file, created with `O_EXCL` (see [`place_renamed`]), and
-/// any rename goes to `log`.
+/// any rename goes to `log`. A place to write is offered to the filter's start hook last.
 fn check_target_detailed(
+    opts: &Options,
+    rel: &Path,
+    dirs: Option<&mut Dirs>,
+    log: &mut RenameLog<'_>,
+) -> crate::error::RarResult<DetailedChecked> {
+    let Some(filter) = opts.select.as_ref().filter(|f| f.start.is_some()) else {
+        return place_target(opts, rel, dirs, log);
+    };
+    // Hold this member's renames until the hook decides: a declined one must leave no trace of a new name.
+    let budget = log.budget.left();
+    let mut held = Vec::new();
+    let checked = place_target(opts, rel, dirs, &mut RenameLog { budget: log.budget, record: &mut |r| held.push(r) })?;
+    if let DetailedChecked::Write(place) = &checked
+        && filter.starts(&MemberStart { path: &place.path }) == StartDecision::Skip
+    {
+        if matches!(opts.overwrite.rename(), Some(rename::RenameMode::Existing(_))) {
+            // what was at the name was really moved aside: that rename stands
+            held.into_iter().for_each(|r| (log.record)(r));
+        } else {
+            // the new name a rename claimed is let go with the place, and its attempts are given back
+            log.budget.restore(budget);
+        }
+        return Ok(DetailedChecked::Declined);
+    }
+    held.into_iter().for_each(|r| (log.record)(r));
+    Ok(checked)
+}
+
+fn place_target(
     opts: &Options,
     rel: &Path,
     mut dirs: Option<&mut Dirs>,
@@ -3013,6 +3097,11 @@ impl Run<'_, '_, '_> {
                 DetailedChecked::Exists => {
                     self.drain()?;
                     self.reports.skipped(&ctx, RarSkipReason::ExistingTarget)?;
+                    return self.pass_over(vol, h, ctx, cipher, None);
+                }
+                DetailedChecked::Declined => {
+                    self.drain()?;
+                    self.reports.skipped(&ctx, RarSkipReason::Declined)?;
                     return self.pass_over(vol, h, ctx, cipher, None);
                 }
                 DetailedChecked::Blocked(reason) => {

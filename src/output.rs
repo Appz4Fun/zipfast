@@ -215,9 +215,14 @@ fn file_identity(_: &File) -> Option<(u64, u64)> {
     None
 }
 
+/// What every staged output's name starts with, so a caller can tell a temporary that a crash left behind from a
+/// finished file.
+pub const STAGED_PREFIX: &str = ".zipfast-";
+
 /// Use the same default mode as a regular newly created output file.
 pub(crate) fn temporary(parent: &Path) -> io::Result<NamedTempFile> {
     let builder = &mut tempfile::Builder::new();
+    builder.prefix(STAGED_PREFIX);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -522,6 +527,14 @@ mod tests {
         let out = Output::created(File::create(dir.path().join("own")).unwrap(), Some(4), dir.path().join("own"));
         drop(out);
         assert!(!dir.path().join("own").exists(), "an untouched file is still removed");
+    }
+
+    #[test]
+    fn staged_temporaries_carry_the_zipfast_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = temporary(dir.path()).unwrap();
+        let name = temp.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(STAGED_PREFIX), "{name}");
     }
 
     #[test]

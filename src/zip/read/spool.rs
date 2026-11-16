@@ -1179,10 +1179,12 @@ impl ResolvedTempDirectory {
 pub(super) fn random_leaf(name: &mut [u8; 41], tilde: bool) -> std::io::Result<()> {
     let mut random = [0u8; 16];
     random_name_bytes(&mut random)?;
-    name[..8].copy_from_slice(if tilde { b"~zipfast" } else { b".zipfast" });
-    for (i, b) in random.into_iter().enumerate() {
-        name[8 + 2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
-        name[9 + 2 * i] = b"0123456789abcdef"[(b & 15) as usize];
+    // `.zipfast-` (crate::output::STAGED_PREFIX), or `~zipfast-` where a leading dot is unwanted, then 31 hex digits
+    name[..9].copy_from_slice(if tilde { b"~zipfast-" } else { b".zipfast-" });
+    for i in 0..31 {
+        let b = random[i / 2];
+        let digit = if i % 2 == 0 { b >> 4 } else { b & 15 };
+        name[9 + i] = b"0123456789abcdef"[digit as usize];
     }
     name[40] = 0;
     Ok(())
@@ -1248,4 +1250,18 @@ pub(super) mod hooks {
     use super::*;
     pub(in crate::zip::read) type Hook = Box<dyn FnMut(ReadIoOperation, i32) -> Option<std::io::Error>>;
     thread_local! { pub(in crate::zip::read) static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) }; }
+}
+
+#[cfg(all(test, unix))]
+mod leaf_tests {
+    #[test]
+    fn stage_leaves_carry_the_zipfast_prefix() {
+        for (tilde, prefix) in [(false, b".zipfast-"), (true, b"~zipfast-")] {
+            let mut name = [0u8; 41];
+            super::random_leaf(&mut name, tilde).unwrap();
+            assert_eq!(&name[..9], prefix);
+            assert!(name[9..40].iter().all(u8::is_ascii_hexdigit));
+            assert_eq!(name[40], 0);
+        }
+    }
 }
