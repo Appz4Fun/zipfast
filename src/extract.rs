@@ -1810,6 +1810,15 @@ pub(crate) fn legacy_zip_report(
         fn send(&mut self, event: ZipRunEvent<'_>) {
             if self.fault.is_none() {
                 let mut scope = crate::zip::ZipDiagnosticScope::legacy();
+                if matches!(
+                    event,
+                    ZipRunEvent::MemberSucceeded { .. }
+                        | ZipRunEvent::MemberSkipped { .. }
+                        | ZipRunEvent::MemberFailed { .. }
+                        | ZipRunEvent::MemberRenamed { .. }
+                ) {
+                    scope = crate::zip::ZipDiagnosticScope::legacy_member();
+                }
                 let result = self.observe.observe(event, &mut scope);
                 let e = scope.finish(result);
                 if e.failed() {

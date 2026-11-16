@@ -74,6 +74,11 @@ A compressed tar is staged and published once the whole stream has decoded and c
 success events arrive at the end; failures found while decoding come as they are found. A tar member that fails
 carries `ReadFault::Legacy` with the reason.
 
+On the tar, stream, RAR and 7z routes there are no checked diagnostic sinks: a member event's
+`ZipDiagnosticScope::emit` (and `admit_sinks`) writes nothing and succeeds, since the same text also comes as a
+`LegacyDiagnostic` line. An observer that renders member events through the scope, as it does for ZIP, works
+unchanged on every route.
+
 RAR and 7z send a member's event as soon as it is published (or tested). A 7z member in a solid folder that stores
 its own CRC is held until the folder's end, so those members' events come together when the folder checks out, in
 listing order. A RAR or 7z member that fails carries `ReadFault::Legacy` with the reason. The listing index is the
