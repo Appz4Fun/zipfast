@@ -90,6 +90,9 @@ fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
             if kind.is_dir() {
                 walk(root, &path, out);
             } else if kind.is_file() {
+                // a member's stored attributes may leave its file unreadable to its owner
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
                 let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
                 out.insert(rel, fs::read(&path).unwrap());
             }
@@ -725,6 +728,58 @@ fn a_continuation_with_another_dictionary_or_salt_fails_typed() {
         let all = session.select(|_| true).unwrap();
         assert!(session.test_selected(&all, RarDecodeLimits::default(), |_| {}).unwrap().failed >= 1, "{mutation}");
     }
+}
+
+/// The archive's own final CRC-32 for each regular file, as the expected output.
+fn crc_manifest(first: &Path) -> Manifest {
+    let session = RarSession::open(first, None, RarSessionOptions::default()).unwrap();
+    session
+        .entries()
+        .filter(|e| !e.is_directory())
+        .map(|e| (e.name().to_owned(), Expect::Crc32(e.final_checks().unwrap().crc32.unwrap())))
+        .collect()
+}
+
+/// RAR 1.5 (unpack version 15) and RAR 2.0 (20) compression, solid streams and an old split set, through every
+/// route.
+#[test]
+fn rar15_and_rar20_compression_extracts_through_every_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sets: &[&[&str]] = &[
+        &["rar4-legacy/readme_154_normal.rar"],
+        &["rar4-legacy/readme_154_store_solid.rar"],
+        &["rar4-legacy/rars-compressed.rar"],
+        &["rar4-legacy/rars-solid.rar"],
+        &["rar4-legacy/rars-split-store.rar", "rar4-legacy/rars-split-store.r00", "rar4-legacy/rars-split-store.r01"],
+        &["rar4-legacy/SOLID.RAR"],
+        &["rar4-legacy/AUDIO.RAR"],
+        &["rar4-legacy/AUTOREJ.RAR"],
+        &["rar4-legacy/BIGLZ.RAR"],
+        &["rar4-legacy/unpack20_multiblock.rar"],
+    ];
+    // Archives this old write no end-of-archive block: a progressive session over complete volumes ends them at a
+    // block boundary, as UnRAR does, but one following growing files can't tell that end from a pause.
+    type Route = fn(&Case, &Path);
+    let routes: [(&str, Route); 5] = [
+        ("run", via_run),
+        ("outcomes", via_outcomes),
+        ("selected", via_selected),
+        ("controlled", via_controlled),
+        ("progressive", via_progressive),
+    ];
+    for (n, volumes) in sets.iter().enumerate() {
+        let volumes = paths(volumes);
+        let want = crc_manifest(&volumes[0]);
+        assert!(!want.is_empty());
+        let case = Case { volumes, password: None, want };
+        for (route, extract) in routes {
+            let dest = tmp.path().join(format!("legacy-{n}-{route}"));
+            extract(&case, &dest);
+            check_tree(&label(&case, route), &dest, &case.want);
+        }
+    }
+}
+
 /// A filter record inside a PPMd block: the member's CRC holds only if the filter ran.
 #[test]
 fn a_filter_inside_a_ppm_block_runs() {

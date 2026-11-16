@@ -2049,6 +2049,7 @@ pub(crate) fn rar4_part_decoder(
     }
     *kept = None;
     let mut decoder = Rar4Decoder::new_with_cancel(h.dictionary, h.packed_size, h.unpacked_size, window_limit, cancel)?;
+    decoder.set_version(raw.unpack_version)?;
     if solid_archive {
         decoder.track_boundary();
     }

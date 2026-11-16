@@ -313,7 +313,9 @@ impl HeaderParser {
                 mtime_resolution: if mtime.is_some() { resolution } else { 0 },
                 ctime: other[0],
                 atime: other[1],
-                crc32: Some(crc),
+                // Before RAR 2.0 a non-final part's CRC field holds no hash of its packed data; UnRAR checks it only
+                // from unpack version 20 on.
+                crc32: (flags & 2 == 0 || version >= 20).then_some(crc),
                 algorithm: 0,
                 method: method.checked_sub(0x30).unwrap_or(255),
                 dictionary: if directory { 0 } else { 65_536u64 << ((flags >> 5) & 7) },

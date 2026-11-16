@@ -127,7 +127,8 @@ fn visible_unsupported_members_remain_catalogued_without_decoding() {
     fs::write(
         &path,
         archive(&[
-            member(b"compressed", b"", 0, 0x33),
+            // RAR 2.0 compression decodes now; method 0x36 is no method at all
+            member(b"compressed", b"", 0, 0x36),
             member(b"encrypted", b"", 4, 0x30),
             member(b"split", b"", 2, 0x30),
         ]),

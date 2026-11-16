@@ -45,7 +45,7 @@ pub(crate) struct CoreFrame {
 }
 impl CoreFrame {
     fn validate(self, retained: u64) -> DecodeResult<()> {
-        if self.unpack_version != 29 || !(0x31..=0x35).contains(&self.method) {
+        if !matches!(self.unpack_version, 15 | 20 | 26 | 29) || !(0x31..=0x35).contains(&self.method) {
             return Err(Rar4DecodeError::Binding);
         }
         if !(65536..=4194304).contains(&self.dictionary) || !self.dictionary.is_power_of_two() {
@@ -123,6 +123,7 @@ impl Rar4Decoder {
     pub(crate) fn new_frame(frame: CoreFrame, window_limit: u64, cancel: Option<Cancellation>) -> DecodeResult<Self> {
         frame.validate(4194304)?;
         let mut d = Self::new_with_cancel(frame.dictionary, frame.packed, frame.unpacked, window_limit, cancel)?;
+        d.set_version(frame.unpack_version)?;
         d.binding.frame = frame;
         Ok(d)
     }
@@ -305,6 +306,11 @@ impl Rar4Decoder {
             return Err(Rar4DecodeError::WindowLimit { requested: frame.dictionary, allowed: retained });
         }
         frame.validate(retained)?;
+        if frame.unpack_version != self.version
+            && !(matches!(frame.unpack_version, 20 | 26) && matches!(self.version, 20 | 26))
+        {
+            return Err(Rar4DecodeError::Malformed("solid member changes unpack version"));
+        }
         let base = self
             .chain_base
             .checked_add(self.produced)
@@ -319,6 +325,9 @@ impl Rar4Decoder {
         self.chain_base = base;
         self.saved_phase = start;
         self.start_frame(frame);
+        if let Some(engine) = &mut self.legacy {
+            engine.start_member(frame.unpacked);
+        }
         Ok(())
     }
     pub(super) fn tail_tolerates(error: &Rar4DecodeError) -> bool {
@@ -344,6 +353,7 @@ impl Rar4Decoder {
             | Phase::PpmChar
             | Phase::PpmEscape
             | Phase::PpmVmCode { .. } => Phase::Align,
+            Phase::Legacy => Phase::Legacy,
             _ => Phase::Token,
         };
         self.finish_tail(start);
@@ -369,6 +379,7 @@ impl Rar4Decoder {
         self.boundary = None;
         self.ppm_in.clear();
         self.ppm_pos = 0;
+        self.legacy_bit = 0;
         self.carry.clear();
         self.finishing = false;
         self.vm_code.clear();

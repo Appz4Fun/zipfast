@@ -223,6 +223,14 @@ impl HeaderParser {
     pub(crate) fn scanning(&self) -> bool {
         self.signature.is_some()
     }
+    /// At the first byte of a RAR4 block, with nothing of it read: where an archive older than RAR 2.9, which
+    /// writes no end-of-archive block, may simply end.
+    pub(crate) fn at_rar4_block_start(&self) -> bool {
+        self.signature.is_none()
+            && self.format == RarFormat::Rar4
+            && matches!(self.phase, Phase::Rar4Prefix)
+            && self.buffer.is_empty()
+    }
     pub(crate) fn encrypted(&self) -> bool {
         self.legacy_headers || self.cipher.is_some()
     }

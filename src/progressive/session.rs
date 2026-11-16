@@ -639,6 +639,22 @@ impl ProgressiveSession {
                             self.driver.validate_step()?;
                             return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index, id }))));
                         }
+                        Poll::Ready(Ok(SourceStep::EndOfVolume))
+                            if self.main_seen && self.ordinal > 0 && self.parser.at_rar4_block_start() =>
+                        {
+                            // Archives older than RAR 2.9 write no end-of-archive block: UnRAR ends them at a block
+                            // boundary, going on to the next volume while a member waits for its next part.
+                            if self.member.is_some() {
+                                self.phase = Phase::NextVolume;
+                            } else {
+                                if let Some(output) = &mut self.output {
+                                    output.finish_directories(&mut self.driver)?;
+                                }
+                                #[cfg(feature = "persistent-partials")]
+                                self.partial_finish_directories()?;
+                                self.phase = Phase::Done;
+                            }
+                        }
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
                             return Err(self.parser.truncated());
                         }

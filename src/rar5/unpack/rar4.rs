@@ -23,6 +23,7 @@ use super::Sink;
 use crate::extract::Cancellation;
 
 mod filters;
+mod legacy;
 pub(crate) mod lifecycle;
 mod ppm;
 use lifecycle::Lifecycle;
@@ -320,6 +321,8 @@ enum Phase {
         first: u32,
         left: usize,
     },
+    /// a RAR 1.5 or 2.0 engine's next code
+    Legacy,
     Complete,
 }
 
@@ -382,6 +385,11 @@ pub(crate) struct Rar4Decoder {
     /// decoded bytes held from the first waiting block's start until it can be filtered
     hold: Vec<u8>,
     hold_start: u64,
+    /// the member's unpack version, and the RAR 1.5 or 2.0 engine that decodes it
+    version: u8,
+    legacy: Option<Box<legacy::Engine>>,
+    /// the bit within the next buffered byte where the legacy engine reads on
+    legacy_bit: u32,
     #[cfg(test)]
     first_cross: Option<(u64, u64, u64)>,
     #[cfg(test)]
@@ -480,6 +488,9 @@ impl Rar4Decoder {
             vm_code: Vec::new(),
             hold: Vec::new(),
             hold_start: 0,
+            version: 29,
+            legacy: None,
+            legacy_bit: 0,
             #[cfg(test)]
             first_cross: None,
             #[cfg(test)]
@@ -559,7 +570,7 @@ impl Rar4Decoder {
     /// The member's data is all in: decodes what PPM held back for lookahead.
     pub(super) fn drain_input(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
         self.finishing = true;
-        if self.phase.ppm() || !self.carry.is_empty() {
+        if self.phase.ppm() || matches!(self.phase, Phase::Legacy) || !self.carry.is_empty() {
             self.pump(&[], sink)?;
         }
         Ok(())
@@ -704,9 +715,10 @@ impl Rar4Decoder {
         Ok(())
     }
     /// One PPM step: a character, an escape, or a filter byte. False: more input is needed first.
-    fn ppm_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
+    /// Buffers `input` for a byte-reading engine. How much is buffered and not read yet.
+    fn absorb(&mut self, input: &mut &[u8]) -> DecodeResult<usize> {
         if !input.is_empty() {
-            if self.ppm_pos > CHUNK {
+            if self.ppm_pos > CHUNK && self.ppm_pos <= self.ppm_in.len() {
                 self.ppm_in.drain(..self.ppm_pos);
                 self.ppm_pos = 0;
             }
@@ -716,7 +728,63 @@ impl Rar4Decoder {
             self.ppm_in.extend_from_slice(input);
             *input = &[];
         }
-        let available = self.ppm_in.len() - self.ppm_pos.min(self.ppm_in.len());
+        Ok(self.ppm_in.len() - self.ppm_pos.min(self.ppm_in.len()))
+    }
+    /// The unpack version decides the engine: RAR 1.5 and 2.0 decode with their own, 2.9 with this one.
+    pub(crate) fn set_version(&mut self, version: u8) -> DecodeResult<()> {
+        if !matches!(version, 15 | 20 | 26 | 29) {
+            return Err(Rar4DecodeError::Binding);
+        }
+        self.version = version;
+        self.legacy = legacy::Engine::new(version).map(Box::new);
+        if let Some(engine) = &mut self.legacy {
+            engine.start_member(self.expected);
+            self.saved_phase = Phase::Legacy;
+            if !matches!(self.phase, Phase::Complete) || self.in_tail {
+                self.phase = Phase::Legacy;
+            }
+        }
+        Ok(())
+    }
+    /// One code of a RAR 1.5 or 2.0 engine.
+    fn legacy_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
+        let available = self.absorb(input)?;
+        if available < PPM_LOOKAHEAD && !self.finishing {
+            return Ok(false);
+        }
+        if self.ppm_pos > self.ppm_in.len() + 8 {
+            return Err(Rar4DecodeError::Malformed("RAR 1.5/2.0 data ends early"));
+        }
+        let mut engine = self.legacy.take().ok_or(Rar4DecodeError::State)?;
+        let data = std::mem::take(&mut self.ppm_in);
+        let mut bits = ppm::Bits { data: &data, addr: self.ppm_pos, bit: self.legacy_bit };
+        let result = if self.in_tail {
+            engine.member_end(&mut bits);
+            Ok(())
+        } else {
+            self.work.tick(1).and_then(|()| engine.step(&mut bits, &mut LegacyOut { decoder: self, sink }))
+        };
+        let (addr, bit) = (bits.addr, bits.bit);
+        self.ppm_in = data;
+        self.ppm_pos = addr;
+        self.legacy_bit = bit;
+        self.legacy = Some(engine);
+        result?;
+        if self.in_tail {
+            self.finish_tail(Phase::Legacy);
+        } else if self.produced == self.expected && self.lifecycle == Lifecycle::Active {
+            self.flush(sink)?;
+            if self.track_boundary {
+                self.in_tail = true;
+            } else {
+                self.saved_phase = Phase::Legacy;
+                self.phase = Phase::Complete;
+            }
+        }
+        Ok(true)
+    }
+    fn ppm_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
+        let available = self.absorb(input)?;
         if available < PPM_LOOKAHEAD && !self.finishing {
             return Ok(false);
         }
@@ -926,6 +994,9 @@ impl Rar4Decoder {
     fn step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
         if self.phase.ppm() {
             return self.ppm_step(input, sink);
+        }
+        if matches!(self.phase, Phase::Legacy) {
+            return self.legacy_step(input, sink);
         }
         self.work.tick(1)?;
         macro_rules! take {
@@ -1225,7 +1296,7 @@ impl Rar4Decoder {
                     Phase::VmCode { first, left: left - 1 }
                 };
             }
-            Phase::PpmInit | Phase::PpmChar | Phase::PpmEscape | Phase::PpmVmCode { .. } => {
+            Phase::PpmInit | Phase::PpmChar | Phase::PpmEscape | Phase::PpmVmCode { .. } | Phase::Legacy => {
                 return Err(Rar4DecodeError::State);
             }
             Phase::Complete => return Ok(false),
@@ -1236,6 +1307,38 @@ impl Rar4Decoder {
 
 #[cfg(test)]
 mod tests;
+
+/// A legacy engine's output: the decoder's window and sink, up to the member's end.
+struct LegacyOut<'a> {
+    decoder: &'a mut Rar4Decoder,
+    sink: &'a mut dyn Sink,
+}
+impl legacy::Out for LegacyOut<'_> {
+    fn put(&mut self, byte: u8) -> DecodeResult<()> {
+        self.decoder.emit(byte, self.sink)
+    }
+    fn copy(&mut self, dist: u32, len: u32, lenient: bool) -> DecodeResult<()> {
+        let d = &mut *self.decoder;
+        let len = u64::from(len).min(d.expected - d.produced);
+        let history = d.chain_base.checked_add(d.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+        let dist = u64::from(dist);
+        let reachable = dist != 0 && dist <= history && dist <= d.dictionary.len() as u64;
+        if !reachable && !lenient {
+            return Err(Rar4DecodeError::Malformed("match distance outside initialized history"));
+        }
+        d.work.tick(len)?;
+        for _ in 0..len {
+            let byte = if reachable {
+                let cursor = d.chain_base + d.produced;
+                d.dictionary[((cursor - dist) & (d.dictionary.len() as u64 - 1)) as usize]
+            } else {
+                0
+            };
+            d.emit(byte, self.sink)?;
+        }
+        Ok(())
+    }
+}
 
 /// Wrap the immutable literal vector for source/output ownership unit tests.
 /// This helper cannot compress data and is absent from normal builds.

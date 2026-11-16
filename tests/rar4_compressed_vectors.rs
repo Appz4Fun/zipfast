@@ -290,9 +290,9 @@ fn old_versions_and_methods_stay_excluded() {
     let path = dir.path().join("excluded.rar");
     let packed = include_bytes!("fixtures/rar4-lz/literal-a.packed");
     for (version, method, flags, label) in [
-        (20, 0x33, 0, "unpack version"),
-        (26, 0x33, 0, "unpack version"),
-        (15, 0x33, 0, "unpack version"),
+        // Versions 15, 20, 26 and 29 decode (tests/rar4_split_solid.rs); RAR 1.3 and anything past 2.9 don't.
+        (10, 0x33, 0, "unpack version"),
+        (36, 0x33, 0, "unpack version"),
         (29, 0x36, 0, "compression method"),
         // Split, solid and encrypted version 29 members decode (tests/rar4_split_solid.rs); RAR 2.0's cipher doesn't.
         (20, 0x30, 4, "encrypted payload"),

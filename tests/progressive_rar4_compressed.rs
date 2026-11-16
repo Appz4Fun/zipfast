@@ -348,7 +348,8 @@ fn dictionary_and_output_limits_refuse_before_success() {
 #[test]
 fn unsupported_geometry_precedes_skip_test_directory_and_key_work() {
     // Split and solid members decode now (tests/rar4_split_solid.rs).
-    for (flags, version, unknown) in [(4, 29, false), (0xe4, 29, false), (0, 20, false), (0, 15, false), (0, 29, true)]
+    // Versions 15, 20, 26 and 29 decode; 10 and 36 don't.
+    for (flags, version, unknown) in [(4, 29, false), (0xe4, 29, false), (0, 10, false), (0, 36, false), (0, 29, true)]
     {
         for mode in 0..3 {
             let dir = tempfile::tempdir().unwrap();
