@@ -1796,7 +1796,7 @@ fn rar4_embedded_comments_and_odd_header_sizes_are_accepted_by_map_walks() {
     ];
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.rar");
-    for (head, file) in cases {
+    for (case, (head, file)) in cases.into_iter().enumerate() {
         let mut bytes = head;
         bytes.extend(&file);
         bytes.extend(r4_block(0x7b, 0x4000, &[]));
@@ -1808,9 +1808,14 @@ fn rar4_embedded_comments_and_odd_header_sizes_are_accepted_by_map_walks() {
         assert_eq!(listed.packed.end, (bytes.len() - 7) as u64, "the end header follows the member's data");
         let map = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap();
         assert!(map.complete);
-        // Sessions still refuse them.
+        // Sessions keep a main header comment (whose stored CRC here is wrong) and refuse the others.
         std::fs::write(&path, &bytes).unwrap();
-        assert!(RarSession::open(&path, None, RarSessionOptions::default()).is_err());
+        let session = RarSession::open(&path, None, RarSessionOptions::default());
+        if case == 0 {
+            assert!(session.unwrap().comment(0).is_err());
+        } else {
+            assert!(session.is_err());
+        }
     }
     // End headers longer than their flags call for, and too short for the volume number they announce.
     for end in [r4_block(0x7b, 0x4000 | 0x8, &[2, 0, 9, 9]), r4_block(0x7b, 0x4000 | 0x8, &[2])] {
