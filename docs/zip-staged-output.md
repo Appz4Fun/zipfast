@@ -112,3 +112,27 @@ it holds ciphertext. On the portable path it loses:
    was moved to.
 3. **Inode identity of the held descriptor.** exFAT renumbers an inode once its name is unlinked, so after the unlink
    portable checks of our own descriptor compare the device only.
+
+## Bulk publication for many small files
+
+`Publication::Bulk` (`EncryptedReadOverrides::publication`, `EncryptedReadOptions::with_publication`) is for archives
+of many small files, where per-member staging dominates: native staging creates and removes a probe file and a
+private directory and makes two renames per member, and the portable stage flushes every file.
+
+Under `Bulk` every member takes the portable stage (a 0600 temp file in its target directory, one rename) **without**
+the per-file flush, and when the run ends every directory it published into (and each directory between it and the
+destination root) is flushed once with `fsync`/`fdatasync`. `StagedStorage::NativeOnly` takes precedence and keeps
+native staging. Everything listed under "What both backends keep" still holds: containment, held parents, target and
+overwrite checks, source checks, and publication only after full verification (CRC or AES HMAC).
+
+What `Bulk` gives up, beyond the portable list above:
+
+1. **File data durability.** No file is flushed before or after its rename. After a power loss or kernel crash a
+   published name can point at an empty or partly written file, on any filesystem; a process crash loses nothing.
+   Callers that need per-file durability keep the default `Publication::Staged`.
+2. **Ordering until the run ends.** Directory entries are flushed only at the end of the run, so after a crash a
+   name may be missing, or present while an earlier name is not.
+3. **macOS strength.** `fsync` on macOS flushes to the drive, not through its cache (`F_FULLFSYNC` is not used), so
+   even the final directory flush is weaker than on Linux.
+4. A directory flush that fails ends the run with a `ReadFault::Io { operation: Flush }` after the files are already
+   published.

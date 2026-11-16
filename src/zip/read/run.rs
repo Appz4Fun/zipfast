@@ -249,6 +249,8 @@ impl ProjectedReadSession {
                 terminal = Some(evidence.merge(terminal.take().unwrap_or_else(|| ReadFault::InvalidPlan.into())));
             }
         }
+        // Directories a Publication::Bulk run published into, flushed once when the run ends.
+        let mut bulk_dirs = std::collections::BTreeSet::<PathBuf>::new();
         if terminal.is_none() {
             for ordinal in 0..self.owner.entries.len() {
                 if cancel.is_canceled() {
@@ -285,7 +287,8 @@ impl ProjectedReadSession {
                     add(&mut report.dirs)?;
                     continue;
                 }
-                let (result, skipped, local_refusal) = self.member(ordinal, options, password, cancel, context);
+                let (result, skipped, local_refusal) =
+                    self.member(ordinal, options, password, cancel, context, &mut bulk_dirs);
                 let bytes = self.owner.entries[ordinal].size;
                 let mut fault = result.err().map(|error| {
                     let local = (continued(&error) || local_refusal)
@@ -383,6 +386,12 @@ impl ProjectedReadSession {
         if let Some(action) = context.action.as_mut() {
             action.active_ordinal = None;
             action.active_record_charged = false;
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Err(fault) = sync_directories(&bulk_dirs, cancel)
+            && terminal.is_none()
+        {
+            terminal = Some(fault.into());
         }
         if let Err(boundary) = self.check_source(context) {
             terminal = Some(match terminal.take() {
@@ -522,6 +531,7 @@ impl ProjectedReadSession {
         password: Option<&str>,
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
+        bulk_dirs: &mut std::collections::BTreeSet<PathBuf>,
     ) -> (ZipReadResult<()>, bool, bool) {
         context.ledger.with_state(|s| s.active_encrypted = Some(self.owner.entries[ordinal].encrypted()));
         let Some(action) = context.action.as_mut() else { return (Err(ReadFault::InvalidPlan.into()), false, false) };
@@ -604,7 +614,18 @@ impl ProjectedReadSession {
                         stage.finish_error(error, context)
                     });
                 }
+                let bulk =
+                    context.options.publication == Publication::Bulk && stage.backend() == StagedBackend::Portable;
                 let published = stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx));
+                if bulk && matches!(published, Ok(true)) {
+                    // The published name's directory and every directory between it and the destination root.
+                    let mut dir = options.dest.join(relative.path());
+                    while dir.pop() && dir.starts_with(&options.dest) {
+                        if !bulk_dirs.insert(dir.clone()) {
+                            break;
+                        }
+                    }
+                }
                 // Running out of renamed names fails this member, like a refused target.
                 if let Err(error) = &published
                     && matches!(error.operation(), Some(ReadFault::CheckedFormat { reason })
@@ -959,4 +980,26 @@ pub(crate) fn with_opened_context(
 #[cfg(test)]
 pub(super) fn final_completion_control_layout() -> [usize; 2] {
     [std::mem::size_of::<Completion>(), std::mem::size_of::<policy::FrozenPolicy>()]
+}
+
+/// Flushes each directory a [`Publication::Bulk`] run published into, once, after the run. Opened by path without
+/// following a final symlink; a filesystem with no directory flush (EINVAL, ENOTSUP, EROFS) is not an error.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sync_directories(dirs: &std::collections::BTreeSet<PathBuf>, cancel: &Cancellation) -> Result<(), ReadFault> {
+    use std::os::unix::ffi::OsStrExt;
+    for dir in dirs.iter().rev() {
+        io::canceled(Some(cancel))?;
+        let fault =
+            |error| ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Flush, offset: 0, error };
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+            .map_err(|_| fault(std::io::ErrorKind::InvalidInput.into()))?;
+        let fd = native_policy::cvt(unsafe {
+            libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        })
+        .map_err(fault)?;
+        let synced = native_policy::portable_sync(fd);
+        unsafe { libc::close(fd) };
+        synced.map_err(fault)?;
+    }
+    Ok(())
 }

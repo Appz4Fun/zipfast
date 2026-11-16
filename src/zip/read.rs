@@ -75,6 +75,22 @@ pub enum StagedStorage {
     /// Portable everywhere, even on an allow-listed filesystem.
     PortableOnly,
 }
+/// How checked staged output is made durable ([`EncryptedReadOverrides::publication`]).
+///
+/// `docs/zip-staged-output.md` lists exactly what [`Publication::Bulk`] gives up.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Publication {
+    /// Per-member staging as chosen by [`StagedStorage`]: native private staging where allowed, otherwise the
+    /// portable stage flushed with `fsync`/`fdatasync` before its rename (the default).
+    #[default]
+    Staged,
+    /// For archives of many small files: every member takes the portable stage (temp file in its target directory,
+    /// then one rename) with no per-file flush, and each directory the run published into is flushed once when the
+    /// run ends. Path containment, target, overwrite, source and verification checks are unchanged.
+    /// [`StagedStorage::NativeOnly`] takes precedence and keeps native staging.
+    Bulk,
+}
 /// The backend one staged output was written through; see [`StagedStorage`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -89,6 +105,7 @@ pub struct EncryptedReadOptions {
     lzma_memory_bytes: u64,
     zstd_window_log_max: u32,
     staged_storage: StagedStorage,
+    publication: Publication,
     /// Set only by the checked run before it plans: staged AES members stream instead of spooling.
     stream_staged_aes: bool,
 }
@@ -100,6 +117,7 @@ impl Default for EncryptedReadOptions {
             lzma_memory_bytes: 256 << 20,
             zstd_window_log_max: 27,
             staged_storage: StagedStorage::Auto,
+            publication: Publication::Staged,
             stream_staged_aes: false,
         }
     }
@@ -111,6 +129,13 @@ impl EncryptedReadOptions {
     }
     pub fn staged_storage(&self) -> StagedStorage {
         self.staged_storage
+    }
+    pub fn with_publication(mut self, publication: Publication) -> Self {
+        self.publication = publication;
+        self
+    }
+    pub fn publication(&self) -> Publication {
+        self.publication
     }
     pub fn with_limits(mut self, limits: EncryptedReadLimits) -> Self {
         self.limits = limits;
@@ -152,6 +177,8 @@ pub struct EncryptedReadOverrides {
     pub temp_dir: Option<PathBuf>,
     /// Staged-output backend choice for contexts these overrides plan; see [`StagedStorage`].
     pub staged_storage: StagedStorage,
+    /// Per-file durable staging or bulk publication for contexts these overrides plan; see [`Publication`].
+    pub publication: Publication,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]

@@ -228,9 +228,12 @@ fn select_backend(
     parent: &parent::HeldParent,
     encrypted: bool,
     storage: StagedStorage,
+    publication: Publication,
     cancel: &Cancellation,
 ) -> Result<StagedBackend, ReadFault> {
-    if storage == StagedStorage::PortableOnly {
+    if storage == StagedStorage::PortableOnly
+        || publication == Publication::Bulk && storage != StagedStorage::NativeOnly
+    {
         return Ok(StagedBackend::Portable);
     }
     let native = io::operation(
@@ -414,8 +417,14 @@ fn acquire(
             _ => {}
         }
         let tilde = !parent.target().to_bytes().contains(&b'~');
-        if select_backend(&ledger, parent, binding.encrypted, context.options.staged_storage, cancel)?
-            == StagedBackend::Portable
+        if select_backend(
+            &ledger,
+            parent,
+            binding.encrypted,
+            context.options.staged_storage,
+            context.options.publication,
+            cancel,
+        )? == StagedBackend::Portable
         {
             preparing.stage_unbound = false;
             preparing.storage_clear = false;
@@ -481,6 +490,7 @@ fn acquire(
                 mode: binding.mode,
                 mtime: binding.mtime,
                 overwrite: options.overwrite,
+                sync: context.options.publication != Publication::Bulk,
             };
             preparing.finished = true;
             Ok(Some(Prepared::Portable(ready)))

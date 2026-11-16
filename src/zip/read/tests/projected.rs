@@ -849,6 +849,7 @@ fn mixed_all_record_geometry_paths_spools_outputs_and_override_intersections() {
         create_attempts: Some(3),
         temp_dir: Some("x".repeat(5000).into()),
         staged_storage: Default::default(),
+        publication: Default::default(),
     };
     let mut c = EncryptedReadContext::new(Default::default()).unwrap();
     factory(

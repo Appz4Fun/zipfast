@@ -15,9 +15,9 @@
 // rights and limitations under the RPL.
 
 //! Per-member overhead on a many-small-files ZIP: RustyGet's `ReadSession` + `EncryptedReadContext::for_session` +
-//! `read_with_context` loop, and the checked `run_with_policy` extraction (native and forced portable backend), against the legacy `zip::run`.
+//! `read_with_context` loop, and the checked `run_with_policy` extraction (native, forced portable backend, and `Publication::Bulk`), against the legacy `zip::run`.
 //!
-//! `cargo run --release --example zip_small_files_bench -- <work dir> [files] [rounds] [session|policy|portable|test|legacy|all]`
+//! `cargo run --release --example zip_small_files_bench -- <work dir> [files] [rounds] [session|policy|portable|bulk|test|legacy|all]`
 //!
 //! The archive (`files` members of 1-4 KiB, half Deflate and half stored) is written once into `<work dir>` and
 //! reused. Every extraction goes to a fresh directory under `<work dir>` that is removed afterwards, so `<work dir>`
@@ -115,9 +115,10 @@ fn session(archive: &Path) -> u64 {
     bytes
 }
 
-fn policy(archive: &Path, dest: &Path, mode: Mode, storage: StagedStorage) -> u64 {
+fn policy(archive: &Path, dest: &Path, mode: Mode, storage: StagedStorage, publication: Publication) -> u64 {
     let mut overrides = EncryptedReadOverrides::default();
     overrides.staged_storage = storage;
+    overrides.publication = publication;
     let report = run_with_policy(
         archive,
         &options(dest, mode),
@@ -143,7 +144,8 @@ fn main() {
     let which = args.get(4).map_or("all", String::as_str);
     std::fs::create_dir_all(&work).unwrap();
     let archive = generate(&work, files);
-    let modes: &[&str] = if which == "all" { &["session", "policy", "portable", "test", "legacy"] } else { &[which] };
+    let modes: &[&str] =
+        if which == "all" { &["session", "policy", "portable", "bulk", "test", "legacy"] } else { &[which] };
     for &mode in modes {
         let mut best = Duration::MAX;
         for round in 0..rounds {
@@ -153,9 +155,10 @@ fn main() {
             let start = Instant::now();
             let count = match mode {
                 "session" => session(&archive),
-                "policy" => policy(&archive, &dest, Mode::Extract, StagedStorage::Auto),
-                "portable" => policy(&archive, &dest, Mode::Extract, StagedStorage::PortableOnly),
-                "test" => policy(&archive, &dest, Mode::Test, StagedStorage::Auto),
+                "policy" => policy(&archive, &dest, Mode::Extract, StagedStorage::Auto, Publication::Staged),
+                "bulk" => policy(&archive, &dest, Mode::Extract, StagedStorage::Auto, Publication::Bulk),
+                "portable" => policy(&archive, &dest, Mode::Extract, StagedStorage::PortableOnly, Publication::Staged),
+                "test" => policy(&archive, &dest, Mode::Test, StagedStorage::Auto, Publication::Staged),
                 "legacy" => legacy(&archive, &dest),
                 other => panic!("unknown mode {other}"),
             };
