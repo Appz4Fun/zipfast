@@ -460,6 +460,10 @@ impl PartialCore {
         let lease = self.budget.metadata_lease(bytes as u64)?;
         Ok((snapshot.clone(), lease))
     }
+    /// Where this member's output is.
+    pub(crate) fn output_path(&self) -> &std::path::Path {
+        &self.native.output_path
+    }
     pub(crate) fn validate_current(&self) -> PartialResult<()> {
         let data = self.operation()?;
         self.check(&data)

@@ -341,6 +341,10 @@ impl ProgressiveSession {
         let part = self.model.parts.last().unwrap();
         let from = part.data_offset + (part.packed_size - self.remaining);
         let at = part.data_offset + part.packed_size;
+        // Data running past the end of its volume is truncated, as reading it would find.
+        if self.driver.observed_info(self.volume).is_some_and(|info| info.length.value() < at) {
+            return Err(ProgressiveFailure::new(FailureKind::Truncated));
+        }
         drop(self.driver.take_declared(self.volume, &(from..at)));
         self.driver.seek(at)?;
         self.cursor = at;
@@ -380,7 +384,10 @@ impl ProgressiveSession {
         let path = std::path::absolute(&self.options.extract.dest)
             .map_err(|_| error(PartialErrorKind::UnsafePath))?
             .join(&relative);
-        persistent.directories.push(PendingDirectory { path, identity, meta });
+        // Only a directory this session created gets the entry's metadata; an existing one is left as it is.
+        if created {
+            persistent.directories.push(PendingDirectory { path, identity, meta });
+        }
         self.driver.validate_current()?;
         self.phase = Phase::Header;
         Ok(ProgressiveEvent::MemberFinished {
@@ -388,33 +395,65 @@ impl ProgressiveSession {
             outcome: MemberOutcome::Directory { created },
         })
     }
-    /// At the end of the set: applies each directory entry's modified time and permissions, deepest first and the
-    /// last entry for a directory winning, to the directory created (or found) for it. A directory replaced since
-    /// fails with `OutputChanged` and is left alone.
+    /// At the end of the set: applies each directory entry's modified time and permissions to the directory this
+    /// session created for it, deepest first and the last entry for a directory winning. A directory that is, or
+    /// holds, the state root or a path the declaration names gets no metadata at all, and one that holds an output
+    /// of this session keeps its owner's read, write and search permission. A directory replaced since fails with
+    /// `OutputChanged` and is left alone.
     pub(super) fn partial_finish_directories(&mut self) -> ProgressiveResult<()> {
-        let Some(persistent) = self.partial.as_mut() else { return Ok(()) };
+        if self.partial.as_ref().is_none_or(|p| p.directories.is_empty()) {
+            return Ok(());
+        }
+        let protection = self.driver.partial_catalogue()?;
+        let persistent = self.partial.as_mut().unwrap();
         let mut directories = std::mem::take(&mut persistent.directories);
         let count = directories.len() as u64;
         self.usage.charge(
             Resource::SourceBookkeeping,
             count.saturating_mul(16).saturating_mul(u64::from(count.max(1).ilog2()) + 1),
         )?;
+        // Directories that must stay as they are: the state root and every declared path, with their ancestors.
+        let mut kept = Vec::new();
+        let mut protected = vec![persistent.options.state_dir.clone()];
+        if let ProtectionDeclaration::Complete { inventory, .. } = &protection {
+            for volume in &inventory.volumes {
+                if let VolumeBacking::Native(paths) = &volume.backing {
+                    protected.extend(paths.iter().map(|p| p.path.clone()));
+                }
+            }
+            protected.extend(inventory.auxiliary_paths.iter().map(|p| p.path.clone()));
+        }
+        for path in &protected {
+            ancestor_identities(path, &mut kept, &self.usage)?;
+        }
+        // Directories that must stay usable: those holding an output of this session.
+        let mut holding = Vec::new();
+        for (_, core) in &persistent.cores {
+            ancestor_identities(core.output_path(), &mut holding, &self.usage)?;
+        }
         // Stable: among entries for one directory the last stays last.
         directories.sort_by_key(|d| std::cmp::Reverse(d.path.components().count()));
         for (index, directory) in directories.iter().enumerate() {
-            if directories[index + 1..].iter().any(|later| later.identity == directory.identity) {
+            if directories[index + 1..].iter().any(|later| later.identity == directory.identity)
+                || kept.contains(&directory.identity)
+            {
                 continue;
             }
             if self.control.is_canceled() || persistent.options.control.is_canceled() {
                 return Ok(());
             }
-            let file = crate::progressive::guard::open_directory(&directory.path)?;
+            let file = crate::progressive::guard::open_directory(&directory.path)
+                .map_err(|_| error(PartialErrorKind::OutputChanged))?;
             let identity = crate::progressive::native::Identity::file(&file)
                 .map_err(|_| error(PartialErrorKind::OutputChanged))?;
             if identity != directory.identity {
                 return Err(error(PartialErrorKind::OutputChanged));
             }
-            crate::extract::finish_file(&file, &directory.meta);
+            let mut meta = directory.meta;
+            if holding.contains(&directory.identity) {
+                meta.mode = meta.mode.map(|mode| mode | 0o700);
+            }
+            crate::extract::finish_file(&file, &meta);
         }
         Ok(())
     }
@@ -988,6 +1027,26 @@ pub(super) fn refusal(header: &crate::rar5::FileHeader) -> Option<RefusalReason>
     } else {
         None
     }
+}
+/// Adds the identity of `path` (when it exists, through any links) and of each of its existing ancestors.
+fn ancestor_identities(
+    path: &std::path::Path,
+    out: &mut Vec<crate::progressive::native::Identity>,
+    usage: &Usage,
+) -> ProgressiveResult<()> {
+    let Ok(path) = std::path::absolute(path) else { return Ok(()) };
+    for at in path.ancestors() {
+        usage.charge(Resource::SourceBookkeeping, 1 + out.len() as u64)?;
+        if let Ok(identity) =
+            std::fs::metadata(at).and_then(|meta| crate::progressive::native::Identity::metadata(&meta))
+            && !out.contains(&identity)
+        {
+            usage.charge(Resource::MetadataBytes, std::mem::size_of_val(&identity) as u64)?;
+            out.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+            out.push(identity);
+        }
+    }
+    Ok(())
 }
 fn member_checks(member: &PhysicalMember) -> MemberChecks {
     let checks = member.final_checks;

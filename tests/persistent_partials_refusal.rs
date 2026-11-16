@@ -176,14 +176,18 @@ fn extract_options(dest: &Path, first: OsString) -> ProgressiveOptions {
 }
 /// A persistent session over `set` under `dir`, with small reads and every write committed.
 fn session(set: &Set, dir: &Path, anchors: &Arc<Anchors>) -> ProgressiveSession {
-    let mut options = extract_options(&dir.join("out"), set.names[0].clone());
+    session_at(set, &dir.join("out"), &dir.join("state"), anchors)
+}
+/// A persistent session over `set` with output root `dest` and state root `state`.
+fn session_at(set: &Set, dest: &Path, state: &Path, anchors: &Arc<Anchors>) -> ProgressiveSession {
+    let mut options = extract_options(dest, set.names[0].clone());
     options.hole_policy = HolePolicy::PartialStored { fill: HoleFill::Sparse };
     options.limits.read_chunk = 256;
     let limits = PartialLimits { group_commit_bytes: 0, ..Default::default() };
     let partial = PartialOptions {
         binding: ArchiveBinding { job: [1; 16], archive: [2; 32] },
         naming: PartialNaming::ArchivePath,
-        state_dir: dir.join("state"),
+        state_dir: state.into(),
         limits,
         anchors: anchors.clone(),
         control: SessionControl::default(),
@@ -259,13 +263,17 @@ fn run(session: &mut ProgressiveSession, seen: &mut Seen, stop: Option<usize>) -
 }
 /// The first failure of a session, as its partial error kind.
 fn run_failure(session: &mut ProgressiveSession) -> PartialErrorKind {
+    match run_failure_kind(session) {
+        FailureKind::Partial(error) => error.kind,
+        other => panic!("{other:?}"),
+    }
+}
+/// The first failure of a session.
+fn run_failure_kind(session: &mut ProgressiveSession) -> FailureKind {
     for _ in 0..1_000_000 {
         match session.poll_event(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Err(failure)) | Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
-                return match failure.kind {
-                    FailureKind::Partial(error) => error.kind,
-                    other => panic!("{other:?}"),
-                };
+                return failure.kind;
             }
             Poll::Ready(Ok(None)) => panic!("the session finished"),
             _ => {}
@@ -669,4 +677,131 @@ fn encrypted_compressed_and_unknown_size_rar4_members_are_refused_and_the_next_s
         assert_eq!(anchors.0.lock().unwrap().len(), 2);
         assert!(set.reads_in(0, &find(&set.volumes[0], &middle)).is_empty());
     }
+}
+
+/// A symbolic link in the middle of a path must never be followed, for a directory entry or for a file member's
+/// parents: nothing is created or changed outside the output root.
+#[test]
+fn a_symlink_in_the_middle_of_the_path_is_refused_for_directory_entries_and_file_members() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = data(300, 20);
+    let directory = |name| FileSpec { dir: true, unix_mode: Some(0o700), ..FileSpec::new(name, b"") };
+    let archives = [
+        common::archive(&[directory("d/x"), directory("d/x/y")]),
+        common::archive(&[FileSpec::new("d/x/f.bin", &f)]),
+        common::archive(&[FileSpec::new("d/x/y/f.bin", &f)]),
+    ];
+    for (case, archive) in archives.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("x")).unwrap();
+        fs::set_permissions(elsewhere.join("x"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(dir.path().join("out")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("out/d")).unwrap();
+        let set = Set::rar5(vec![archive]);
+        let kind = run_failure(&mut session(&set, dir.path(), &Arc::default()));
+        assert!(
+            matches!(&kind, PartialErrorKind::UnsafePath)
+                || matches!(&kind, PartialErrorKind::Progressive(e) if matches!(e.kind, FailureKind::UnsafePath)),
+            "case {case}: {kind:?}"
+        );
+        assert_eq!(fs::read_dir(elsewhere.join("x")).unwrap().count(), 0, "case {case}");
+        assert_eq!(fs::metadata(elsewhere.join("x")).unwrap().permissions().mode() & 0o777, 0o755, "case {case}");
+    }
+}
+
+/// Directory metadata never makes the state root, a declared path or an existing directory unusable.
+#[test]
+fn directory_metadata_spares_the_state_root_declared_paths_existing_and_output_holding_directories() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let a = data(400, 21);
+    let locked =
+        |name| FileSpec { dir: true, unix_mode: Some(0o000), mtime: Some(1_500_000_000), ..FileSpec::new(name, b"") };
+    // The output root holds the state root; the entry `state` comes first, so this session creates it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut set = Set::rar5(vec![common::archive(&[
+        locked("state"),
+        locked("incoming"),
+        locked("kept"),
+        FileSpec { dir: true, unix_mode: Some(0o500), ..FileSpec::new("held", b"") },
+        FileSpec::new("held/a.bin", &a),
+    ])]);
+    let root = std::path::absolute(dir.path()).unwrap();
+    set.auxiliary.push(root.join("incoming/set.part01.rar"));
+    fs::create_dir(dir.path().join("kept")).unwrap();
+    fs::set_permissions(dir.path().join("kept"), fs::Permissions::from_mode(0o755)).unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut seen = Seen::default();
+    assert!(run(&mut session_at(&set, dir.path(), &dir.path().join("state"), &anchors), &mut seen, None));
+    assert_eq!(seen.complete, ["held/a.bin"]);
+    let mode = |name: &str| fs::metadata(dir.path().join(name)).unwrap().permissions().mode() & 0o777;
+    assert_ne!(mode("state"), 0, "the state root keeps its permissions");
+    assert_ne!(fs::metadata(dir.path().join("state")).unwrap().mtime(), 1_500_000_000);
+    assert_ne!(mode("incoming"), 0, "a directory holding a declared path keeps its permissions");
+    assert_eq!(mode("kept"), 0o755, "an existing directory is left as it is");
+    assert_eq!(mode("held"), 0o700, "a directory holding an output keeps the owner's access");
+    // The member still verifies, and a restart still adopts it.
+    for (_, file) in &mut seen.files {
+        assert!(matches!(verify(file), Verdict::Ok { .. }));
+    }
+    drop(seen);
+    let mut again = Seen::default();
+    assert!(run(&mut session_at(&set, dir.path(), &dir.path().join("state"), &anchors), &mut again, None));
+    assert_eq!(again.adopted.len(), 1);
+    assert_eq!(again.complete, ["held/a.bin"]);
+}
+
+#[test]
+fn a_directory_swapped_for_a_symlink_before_the_end_is_output_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let a = data(400, 22);
+    let set = Set::rar5(vec![common::archive(&[
+        FileSpec { dir: true, unix_mode: Some(0o700), ..FileSpec::new("d", b"") },
+        FileSpec::new("a.bin", &a),
+    ])]);
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut session = session(&set, dir.path(), &Arc::default());
+    let mut seen = Seen::default();
+    while seen.directories.is_empty() {
+        let stop = seen.events + 1;
+        assert!(!run(&mut session, &mut seen, Some(stop)));
+    }
+    fs::rename(dir.path().join("out/d"), dir.path().join("moved")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, dir.path().join("out/d")).unwrap();
+    let kind = run_failure(&mut session);
+    assert!(matches!(kind, PartialErrorKind::OutputChanged), "{kind:?}");
+    assert_eq!(fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777, 0o755);
+}
+
+#[test]
+fn a_refused_member_running_past_its_volume_end_is_truncated() {
+    let (a, c) = (data(400, 23), data(2000, 24));
+    let mut wire = common::archive(&[FileSpec::new("a.bin", &a), FileSpec { method: 3, ..FileSpec::new("c.bin", &c) }]);
+    let cut = find(&wire, &c).start as usize + 500;
+    wire.truncate(cut);
+    let set = Set::rar5(vec![wire]);
+    let dir = tempfile::tempdir().unwrap();
+    let kind = run_failure_kind(&mut session(&set, dir.path(), &Arc::default()));
+    assert!(matches!(kind, FailureKind::Truncated), "{kind:?}");
+}
+
+#[test]
+fn a_refused_rar4_directory_with_an_unsafe_name_is_refused_not_fatal() {
+    let x = data(500, 25);
+    let mut wire = b"Rar!\x1a\x07\0".to_vec();
+    wire.extend(rar4_block(0x73, 0, &[0; 6]));
+    // A compressed RAR4 directory entry (directory flags 0xe0) with a name that escapes the root.
+    wire.extend(rar4_file(b"../evil", b"", 0, 0, 0xe0, 29, 0x33));
+    wire.extend(rar4_file(b"x.bin", &x, x.len() as u32, crc32fast::hash(&x), 0, 20, 0x30));
+    wire.extend(rar4_block(0x7b, 0x4000, &[]));
+    let set = Set::rar4(wire);
+    let dir = tempfile::tempdir().unwrap();
+    let mut seen = Seen::default();
+    assert!(run(&mut session(&set, dir.path(), &Arc::default()), &mut seen, None));
+    assert_eq!(seen.refused, [("../evil".to_string(), RefusalReason::Compressed { method: 3 })]);
+    assert_eq!(seen.complete, ["x.bin"]);
+    assert!(!dir.path().join("evil").exists());
 }

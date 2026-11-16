@@ -349,6 +349,38 @@ impl Directory {
         value.check()?;
         Ok(value)
     }
+    /// Opens `path`, a single name beneath the held `parent`, relative to the parent's descriptor and without
+    /// following a symbolic link: a link (or any non-directory) there is `UnsafePath`.
+    pub(super) fn open_beneath(parent: &Directory, path: PathBuf, budget: &PartialBudget) -> PartialResult<Self> {
+        platform()?;
+        if path.parent() != Some(parent.path.as_path()) {
+            return Err(malformed());
+        }
+        let reservation = budget.reserve(PartialResource::OpenFiles, 1)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let file = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let name = cname(path.file_name().ok_or_else(malformed)?)?;
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+            // The parent descriptor is held and name is exactly one component.
+            let raw = unsafe { libc::openat(parent.held.file.as_raw_fd(), name.as_ptr(), flags) };
+            if raw < 0 {
+                let cause = io::Error::last_os_error();
+                return Err(match cause.raw_os_error() {
+                    Some(libc::ELOOP | libc::ENOTDIR) => err(PartialErrorKind::UnsafePath),
+                    _ => io_error(OutputOperation::Create, cause),
+                });
+            }
+            // openat returned a newly owned descriptor.
+            unsafe { File::from_raw_fd(raw) }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let file: File = return Err(err(PartialErrorKind::UnsupportedPlatform));
+        let identity = Identity::file(&file).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+        let value = Self { path, held: HeldFile::from(file, reservation), identity };
+        value.check()?;
+        Ok(value)
+    }
     pub(super) fn check(&self) -> PartialResult<()> {
         guard::check_directory(&self.path, &self.held.file, self.identity).map_err(Into::into)
     }
@@ -739,7 +771,8 @@ pub(super) fn prepare_parents(
     let output = std::path::absolute(&spec.output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
     let state = std::path::absolute(&spec.state_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
     let parent = output.join(&spec.relative_output).parent().ok_or_else(malformed)?.to_path_buf();
-    let ancestors = hold_ancestors(&[&output, &state, &parent], genesis, control, &mut check)?;
+    let ancestors =
+        hold_ancestors(&[(&output, &output), (&state, &state), (&output, &parent)], genesis, control, &mut check)?;
     // The parent checks read the declaration again, so it may have grown since the output and bundle were
     // checked against it; their exclusions do not exist until the genesis, so an extension cannot see them.
     check(GenesisPath::Output(targets.0))?;
@@ -769,7 +802,7 @@ pub(crate) fn create_directory(
     let budget = PartialBudget::new(limits, usage, exclusions)?;
     let output = std::path::absolute(output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
     let target = output.join(relative);
-    let ancestors = hold_ancestors(&[&output, &target], &budget, control, &mut check)?;
+    let ancestors = hold_ancestors(&[(&output, &output), (&output, &target)], &budget, control, &mut check)?;
     let created = ancestors.missing.contains(&target);
     let prepared = create_missing(ancestors, control)?;
     let directory = prepared.held.iter().find(|d| d.path == target).ok_or_else(malformed)?;
@@ -781,10 +814,15 @@ struct HeldAncestors {
     held: Vec<Directory>,
     missing: Vec<PathBuf>,
 }
-/// Holds every existing directory on the way to each of `targets` (including the targets) and reserves every
+/// Holds every existing directory on the way to each `(base, target)` (including the target) and reserves every
 /// missing one, after checking each with `check` as a `GenesisPath::Parent`. Nothing is created.
+///
+/// Below its `base` (the output root, given by the caller and trusted as it is) a target is walked component by
+/// component: every existing component must be a real directory, never a symbolic link, and is opened relative to
+/// its held parent without following links, so no component can lead outside the base. Above the base only the
+/// first existing ancestor is examined, as the base itself may be reached through links.
 fn hold_ancestors(
-    targets: &[&Path],
+    targets: &[(&Path, &Path)],
     genesis: &PartialBudget,
     control: &SessionControl,
     check: &mut impl FnMut(GenesisPath<'_>) -> PartialResult<()>,
@@ -792,8 +830,8 @@ fn hold_ancestors(
     // Separate transient reservations cannot consume the prepared Core's credits.
     let budget = PartialBudget::new(genesis.limits.clone(), genesis.usage.clone(), genesis.exclusions.clone())?;
     let mut paths = Vec::<PathBuf>::new();
-    for target in targets {
-        let mut at = *target;
+    for &(base, target) in targets {
+        let mut at = target;
         loop {
             canceled(control)?;
             budget.usage.charge(Resource::SourceBookkeeping, paths.len() as u64 + 1)?;
@@ -802,14 +840,22 @@ fn hold_ancestors(
                 paths.try_reserve_exact(1).map_err(|_| malformed())?;
                 paths.push(at.to_path_buf());
             }
+            let below_base = at != base && at.starts_with(base);
             match fs::symlink_metadata(at) {
                 Ok(meta) => {
                     if !meta.is_dir() {
                         return Err(err(PartialErrorKind::UnsafePath));
                     }
-                    break;
+                    if !below_base {
+                        break;
+                    }
+                    at = at.parent().ok_or_else(malformed)?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => at = at.parent().ok_or_else(malformed)?,
+                // A path below a symbolic link or a file: the component that is not a directory is found above.
+                Err(e) if below_base && e.raw_os_error() == Some(libc::ENOTDIR) => {
+                    at = at.parent().ok_or_else(malformed)?
+                }
                 Err(e) => return Err(io_error(OutputOperation::Metadata, e)),
             }
         }
@@ -833,7 +879,11 @@ fn hold_ancestors(
                 if !meta.is_dir() {
                     return Err(err(PartialErrorKind::UnsafePath));
                 }
-                held.push(Directory::open(path, &budget)?);
+                let directory = match held.iter().find(|d| Some(d.path.as_path()) == path.parent()) {
+                    Some(parent) => Directory::open_beneath(parent, path, &budget)?,
+                    None => Directory::open(path, &budget)?,
+                };
+                held.push(directory);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let ancestor = held.iter().rev().find(|d| path.starts_with(&d.path)).ok_or_else(malformed)?;
@@ -864,7 +914,7 @@ fn create_missing(ancestors: HeldAncestors, control: &SessionControl) -> Partial
         let parent = held.iter().find(|d| Some(d.path.as_path()) == path.parent()).ok_or_else(malformed)?;
         mkdir_at(&parent.held.file, path.file_name().ok_or_else(malformed)?)?;
         super::sync_file(&parent.held.file).map_err(|e| io_error(OutputOperation::Flush, e))?;
-        let directory = Directory::open(path, &budget)?;
+        let directory = Directory::open_beneath(parent, path, &budget)?;
         budget.exclusions.bind(&directory.path, &directory.held.file)?;
         held.push(directory);
     }

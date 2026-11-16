@@ -1033,7 +1033,8 @@ impl ProgressiveSession {
         self.produced = 0;
         self.part_evidence.clear();
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
-        if self.options.extract.mode == crate::extract::Mode::Test || header.is_dir() {
+        // A refused member's name is never used, so it is not checked either.
+        if refusal.is_none() && (self.options.extract.mode == crate::extract::Mode::Test || header.is_dir()) {
             self.usage.charge(Resource::MetadataBytes, (header.name.len() as u64).saturating_mul(3))?;
             self.usage.charge(Resource::SourceBookkeeping, (header.name.len() as u64).saturating_mul(8))?;
             crate::path::sanitize_fallible(&header.name, !header.is_unix())
