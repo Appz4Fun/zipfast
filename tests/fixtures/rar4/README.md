@@ -1,0 +1,11 @@
+# RAR 4.x fixtures
+
+Archives written by WinRAR and rar, copied unchanged from the test fixtures of the `dariusiii/rarinfo` PHP library
+(`tests/fixtures/rar/`, exercised by its `RarInfoTest.php`), which is distributed under the BSD-3-Clause license.
+`tests/rar4_legacy_fixtures.rs` checks them against `unrar lb` listings.
+
+| file | contents |
+|---|---|
+| `rar_unicode.rar` | `file1À۞.txt` (18 bytes, stored), a Unicode-encoded name after its legacy `file1·?.txt` |
+| `latest_winrar.rar` | `1.txt` and `2.txt` (5 bytes each), solid, compressed, with a recovery record (an `RR` service header carrying `Protect+` SubData) |
+| `dirlink_unix.rar` | made on Unix: symbolic links `emptydir\link` and `link`, `file` (8 bytes, stored), directories `emptydir`, `nopermdir` (mode 000), `setuiddir` (04000) and `stickydir` (01700), each followed by a `UOW` owner service header with SubData |
