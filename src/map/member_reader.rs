@@ -402,6 +402,8 @@ struct Core {
     /// The volume open on the input, and the name of the last volume asked for.
     volume: Option<u32>,
     names: Vec<OsString>,
+    /// The volume count of a split ZIP set, whose volumes are named `.z01`, ..., `.zip`.
+    split_zip: Option<u32>,
     piece: usize,
     stream_pos: u64,
     parked: Option<usize>,
@@ -444,6 +446,7 @@ impl Core {
             .map(|c| PartHash::new(c.blake2sp.is_some()));
         let mut core = Self {
             names: vec![options.first_name.clone()],
+            split_zip: (map.format == super::MapFormat::Zip && map.volumes > 1).then_some(map.volumes),
             stream_pos: plan.stream.start,
             reached: out_offset,
             produced: plan.out_of(plan.stream.start),
@@ -609,6 +612,14 @@ impl Core {
     }
 
     fn volume_name(&mut self, index: u32) -> Result<OsString, ExtractFromError> {
+        if let Some(count) = self.split_zip {
+            if index == 0 {
+                return Ok(self.options.first_name.clone());
+            }
+            let name = super::zip_split::split_volume_name(&self.options.first_name, index, index + 1 == count);
+            self.usage.charge(Resource::MetadataBytes, name.len() as u64).map_err(ExtractFromError::from_failure)?;
+            return Ok(name);
+        }
         while self.names.len() <= index as usize {
             let last = self.names.last().expect("first name");
             let next = crate::volume::next_volume_os(last).unwrap_or_else(|| {
@@ -978,8 +989,9 @@ pub struct MemberReader {
 
 impl MemberReader {
     /// A reader of member `member` of `map` from output offset `out_offset`. `options` names the first volume (later
-    /// volumes are asked for with the names [`next_volume_os`](crate::volume::next_volume_os) derives, though
-    /// providers usually key on [`VolumeRequest::index`]), and carries the password, limits and cancellation.
+    /// volumes are asked for with the names [`next_volume_os`](crate::volume::next_volume_os) derives, or `name.z02`,
+    /// ..., `name.zip` for a split ZIP set, though providers usually key on [`VolumeRequest::index`]), and carries the
+    /// password, limits and cancellation.
     ///
     /// Fails at once, before any read, when the member cannot be read from that offset.
     pub fn new(
@@ -989,7 +1001,7 @@ impl MemberReader {
         out_offset: u64,
         options: MapOptions,
     ) -> Result<Self, ExtractFromError> {
-        Ok(Self { input: SourceInput { source, current: None }, core: Core::new(map, member, out_offset, options)? })
+        Ok(Self { input: SourceInput::new(source), core: Core::new(map, member, out_offset, options)? })
     }
 
     /// Reads plaintext into `buf`. `Ok(0)` (for a nonempty `buf`) is the end of the member, after the checks
@@ -1049,7 +1061,7 @@ pub fn extract_member_from_with(
     options: MapOptions,
     sink: &mut dyn Write,
 ) -> Result<ExtractedFrom, ExtractFromError> {
-    let mut input = MemoryInput { volumes, current: None };
+    let mut input = MemoryInput::new(volumes);
     let mut core = Core::new(map, member, out_offset, options)?;
     let mut cx = Context::from_waker(Waker::noop());
     match core.poll_write_to(&mut input, &mut cx, sink) {

@@ -30,6 +30,7 @@ use super::Accounting;
 pub(super) fn reduce<'a>(
     view: &CentralView<'a>,
     profile: Profile,
+    spanned: bool,
     central_ut_only: bool,
     name_crc32: fn(&[u8]) -> u32,
     accounting: &mut Accounting,
@@ -53,7 +54,7 @@ pub(super) fn reduce<'a>(
         match extra.id {
             0x0001 if !seen_zip64 || profile == Profile::Zipfast => {
                 seen_zip64 = true;
-                resolve_zip64(&mut resolved, body, profile, accounting)?;
+                resolve_zip64(&mut resolved, body, profile, spanned, accounting)?;
             }
             0x9901 if !seen_aes => {
                 seen_aes = profile == Profile::Zipview || body.len() >= 7;
@@ -116,12 +117,14 @@ fn resolve_zip64(
     resolved: &mut ResolvedFields,
     body: &[u8],
     profile: Profile,
+    spanned: bool,
     accounting: &mut Accounting,
 ) -> Result<(), DirectoryError> {
     let mut requested = resolved.unresolved;
     // Zipfast's three-value policy accepts the raw disk sentinel but never
-    // consumes a fourth value. Zipview preserves it for listing when present.
-    requested.disk_start &= profile == Profile::Zipview;
+    // consumes a fourth value, except for a disk-spanning set, whose entries
+    // need their disk. Zipview preserves it for listing when present.
+    requested.disk_start &= profile == Profile::Zipview || spanned;
     let wide_fields = usize::from(requested.unpacked_size)
         + usize::from(requested.packed_size)
         + usize::from(requested.local_header_offset);

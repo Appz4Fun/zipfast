@@ -55,6 +55,15 @@ skips the Unicode Path projection used by Zipfast. Zipfast computes IEEE
 CRC-32 once per eligible raw name and accepts an optional function pointer
 for callers with an existing implementation.
 
+Both profiles' archive-level checks assume one disk, and Zipfast rejects
+disk declarations. `DirectoryParser::spanned_at_eocd` reads the directory of
+a disk-spanning (split) set over the caller's concatenation of the disks that
+hold the directory and the end records, anchored at the classic end record.
+It applies the strict Zipfast checks but accepts the disk declarations and
+resolves each entry's start disk, from its ZIP64 field when the header holds
+the sentinel. Each local header offset is relative to its own disk, so the
+caller checks it against that disk.
+
 Range supplies must start at the first byte of the current request and may
 cover any contiguous prefix. Polling an unchanged request consumes no work.
 A bad caller supply leaves progress intact. Drop the parser between requests

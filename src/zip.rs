@@ -645,7 +645,7 @@ fn stream_decoder<'a>(e: &ReadDescription<'_>, method: u16, packed: impl BufRead
     })
 }
 
-fn project_record(record: ReducedCentralRecord<'_>) -> std::result::Result<ZipEntry, DirectoryError> {
+pub(crate) fn project_record(record: ReducedCentralRecord<'_>) -> std::result::Result<ZipEntry, DirectoryError> {
     #[cfg(test)]
     read::observe_projected(2);
     let view = record.view();

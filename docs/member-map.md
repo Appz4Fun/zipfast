@@ -6,13 +6,15 @@ data is skipped, never fetched. A caller that has lost part of one copy of a rel
 (the same file in a different container) to fetch only the articles covering the missing output range.
 
 Mapped: RAR 5.0 and RAR 4.x (stored and compressed members, split across volumes, data encryption, and encrypted
-headers `-hp` when a password is given) and single-disk ZIP (every method is listed; stored, ZipCrypto and WinZip AES
-entries get output mappings). 7z is not mapped yet; the types are format-neutral so it can be added (`MapFormat`,
+headers `-hp` when a password is given), single-disk ZIP and split ZIP sets (`.z01`, ..., `.zip`; every method is
+listed; stored, ZipCrypto and WinZip AES entries get output mappings, see [Split ZIP sets](#split-zip-sets)). 7z is not mapped yet; the types are format-neutral so it can be added (`MapFormat`,
 `CipherParams` and `OutputMapping` are `#[non_exhaustive]`).
 
 ## Building a map
 
-Format detection: a first volume starting with a ZIP local or end header is ZIP, one starting with `Rar!` is RAR.
+Format detection: a first volume starting with the spanning signature `PK\x07\x08`, or with a ZIP local header
+when the first name ends in `.z01`, is a split ZIP set. Otherwise a first volume starting with a ZIP local or end
+header is ZIP, one starting with `Rar!` is RAR.
 Anything else (a self-extracting stub) is ZIP when its last 1,046 bytes hold a ZIP end-of-central-directory record,
 so a stored `.rar` inside a ZIP is not mistaken for the archive; otherwise the RAR scanner looks for a signature in
 the first MiB, reading 4 KiB at a time. Over a `VolumeSource` this tail check waits for the volume's last bytes.
@@ -40,7 +42,8 @@ How a walk ends is `MemberMap::end`:
 Failures are `MapError`: `NotArchive`, `MissingFirstVolume`, `PasswordRequired`, `WrongPassword`,
 `HeaderHole { volume, offset }` (a `RangeRead::Hole` inside header bytes; holes in member data are never reached),
 `Malformed`, `Unsupported` (both with the volume and the underlying typed `ProgressiveFailure`), `Limit { resource,
-limit, attempted }`, `Source` (provider failure, contract breach, cancellation) and `Aborted { volume }`.
+limit, attempted }`, `Source` (provider failure, contract breach, cancellation), `Aborted { volume }` and, for split
+ZIP sets, `MissingDirectory { volume }`.
 
 Damage: once volume 0's main header has been read, a damaged header ends the walk with `MapEnd::Damaged` instead
 of failing it. Damage is a header checksum, framing or field failure, a header out of order or inconsistent with an
@@ -89,6 +92,57 @@ encrypted members' checks are keyed with the password (`MapChecks::keyed`).
 - `WinZipAes { strength, vendor_version, salt, verifier }`: read from the first bytes of the entry's data. An entry
   is WinZip AES when its method is 99 or it has an AES extra field, as the extractor decides; one without a valid
   extra field gets `cipher: None` and `mapping: None`.
+
+## Split ZIP sets
+
+An Info-ZIP split set is `name.z01`, `name.z02`, ..., `name.zNN` and the final `name.zip`, which holds the end of
+central directory record. Its disks are numbered from 0 in that order: `.z01` is disk 0 and `.zip` the last disk.
+Every disk number (end records, ZIP64 end record and locator, central directory entries, including ZIP64 start
+disks) and every offset is relative to that numbering; an offset is relative to the start of its disk. Disk 0 may
+start with the 4-byte spanning signature `PK\x07\x08`; offsets in disk 0 count it, so nothing is adjusted.
+
+Volumes are passed in disk order, `.z01` first and `.zip` last, and `MapPiece::volume` is the disk number.
+
+- `from_memory(&[&z01, &z02, ..., &zip], "name.z01", None)`. The last slice must be the `.zip`: its end record's
+  disk number must equal the slice count minus one, or the map fails `Malformed` ("volume count does not match its
+  end record"). Pass a missing middle volume as an empty slice (no volume of a set is empty, so an empty volume
+  counts as missing). Without the `.zip` there is no end record: `MissingDirectory { volume }` with `volume` the
+  index after the last slice.
+- `MapBuilder` with `MapOptions::new("name.z01")`. The last volume's index is unknown until its end record is read,
+  so volumes are asked for in order with names derived from the first name: the extension becomes `z02`, `z03`, ...
+  (`z100` after `z99`), or `zip` for the last volume (upper case when the first name's extension is). Volume `i` is
+  asked for as `name.z{i+1}`; when the source answers `Missing`, it is asked for again, at the same index, as
+  `name.zip`. A source that keys on names thus answers `name.zip` the second time; one that keys on the index
+  answers the last volume the first time (under its numbered name) and `Missing` twice for the next index, and the
+  volume before is then searched for the end record. Each volume is asked for once and kept open while the walk
+  needs it. A source that keys on names and lacks a middle volume answers `name.zip` at that index: the volume is
+  then bound to the disk number its end record states, and the volumes in between are asked for later by name.
+  `MemberReader` asks for a split set's volumes with the same names.
+
+The walk reads the last volume's tail for the end record (its last 42 bytes, then up to a 64 KiB comment), the
+ZIP64 end record when the directory's disk is only stated there, then the central directory over the volumes that
+hold it (it may span several), with the same parser, checks and `ProgressiveLimits` as a single-disk ZIP. Then each
+entry's local header is read on its disk, and the member's data is placed on the volumes it crosses: one `MapPiece`
+per volume, cut at volume boundaries, with `stream_offset` and `out` running on across them. A local header, the
+WinZip AES salt and verifier, or the ZipCrypto header may cross a boundary too. The first piece's `header` is the
+part of the local header in its volume; a piece the data continues into has the empty `header` `0..0`. Only the last
+piece carries the member's `checks` and is `final_part`. Budgets are charged as for single-disk ZIP: header bytes
+read, entries, one part per piece, metadata per member and the derived volume names.
+
+Missing and cut volumes:
+
+| situation | result |
+|---|---|
+| a middle volume is missing (`Missing`, or an empty slice) | the walk goes on; `end` is `MissingVolume { volume }` for the first one met. A member whose local header is on it (or runs into it) is listed without pieces, `cipher: None`, `checks: None`, `complete: false`; one whose data runs into it lists its pieces before it and is `complete: false` |
+| a volume before the last ends before a local header on it | `Truncated { volume, offset }` at that header, and the walk stops; members before it are listed |
+| the last volume is missing, or cut so that its end record is gone | `MapError::MissingDirectory { volume }` |
+| a volume holding part of the central directory or the ZIP64 end record is missing | `MapError::MissingDirectory { volume }` |
+
+Pieces are placed using each volume's length, so a volume before the last that is cut inside member data shifts the
+data of a member crossing its end; the member's checks catch it when it is read. `volumes` is the set's volume count
+from the end record. Hostile disk numbers (past the last volume) and offsets (past the end of the last volume, or a
+directory offset that disagrees with the directory's position) are `Malformed`; a local header offset past the end
+of an earlier volume reads as that volume being cut. A split set's `.zip` mapped on its own is `Unsupported`.
 
 ## Single-volume maps
 

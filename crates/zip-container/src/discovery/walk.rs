@@ -61,6 +61,7 @@ pub struct Directory<T = CentralRecord> {
     /// Final cumulative discovery and walk usage.
     pub usage: Usage,
     profile: Profile,
+    spanned: bool,
 }
 
 impl<T> Directory<T> {
@@ -86,6 +87,10 @@ impl Directory<CentralRecord> {
     /// and checking the resolved lengths needed by the operation.
     pub fn physical_local_header_offset(&self, index: usize) -> Option<u64> {
         let entry = self.entries.get(index)?;
+        if self.spanned {
+            // Offsets are relative to each entry's own disk.
+            return None;
+        }
         if self.profile == Profile::Zipview
             && (entry.resolved.unresolved.disk_start
                 || entry.resolved.disk_start != 0
@@ -145,6 +150,7 @@ pub type RecordProjection<T> = for<'a> fn(ReducedCentralRecord<'a>) -> Result<T,
 pub struct DirectoryParser<T = CentralRecord> {
     state: State<T>,
     profile: Profile,
+    spanned: bool,
     central_ut_only: bool,
     name_crc32: fn(&[u8]) -> u32,
     projection: RecordProjection<T>,
@@ -277,10 +283,41 @@ impl<T> DirectoryParser<T> {
                 retain_comment,
             )?),
             profile,
+            spanned: false,
             central_ut_only: false,
             name_crc32: reducers::ieee_crc32,
             projection,
         })
+    }
+
+    /// Creates an anchored strict parser for the central directory of a
+    /// disk-spanning (split) set, over the caller's concatenation of the disks
+    /// that hold the directory and the end records.
+    ///
+    /// `end_offset` is the classic end record's offset in that concatenation,
+    /// and its complete comment must end at `archive_len`. The checks are
+    /// [`Self::at_eocd`]'s, except that the end records' disk declarations are
+    /// accepted, and that each entry's start disk is resolved (from its ZIP64
+    /// field when the header holds the sentinel) and left with its local
+    /// header offset for the caller to check against that disk: neither is
+    /// checked against `archive_len`. A stored directory offset is relative to
+    /// its disk, so a concatenation starting at the directory's disk has a
+    /// prefix shift of zero. [`Directory::physical_local_header_offset`] is
+    /// always None for such a directory.
+    pub fn spanned_at_eocd(
+        archive_len: u64,
+        end_offset: u64,
+        limits: Limits,
+        name_crc32: fn(&[u8]) -> u32,
+        projection: RecordProjection<T>,
+    ) -> Result<Self, DirectoryError> {
+        let mut parser = Self::anchored(archive_len, end_offset, limits, usize::MAX, true, projection)?;
+        parser.spanned = true;
+        parser.name_crc32 = name_crc32;
+        if let State::Discovery(discovery) = &mut parser.state {
+            discovery.spanned = true;
+        }
+        Ok(parser)
     }
 
     /// Creates a parser that owns one projected value per admitted record.
@@ -309,6 +346,7 @@ impl<T> DirectoryParser<T> {
         Ok(Self {
             state: State::Discovery(EndDiscovery::new(archive_len, profile, limits)?),
             profile,
+            spanned: false,
             central_ut_only: false,
             name_crc32,
             projection,
@@ -325,8 +363,14 @@ impl<T> DirectoryParser<T> {
             }
             let location = discovery.location.take().expect("completed discovery has a location");
             let usage = location.usage();
-            self.state = match Walk::new(location, self.profile, self.central_ut_only, self.name_crc32, self.projection)
-            {
+            self.state = match Walk::new(
+                location,
+                self.profile,
+                self.spanned,
+                self.central_ut_only,
+                self.name_crc32,
+                self.projection,
+            ) {
                 Ok(walk) => State::Walk(walk),
                 Err(error) => State::HandoffFailure(error, usage),
             };
@@ -467,6 +511,7 @@ impl<T> Walk<T> {
     fn new(
         location: DirectoryLocation,
         profile: Profile,
+        spanned: bool,
         central_ut_only: bool,
         name_crc32: fn(&[u8]) -> u32,
         projection: RecordProjection<T>,
@@ -502,6 +547,7 @@ impl<T> Walk<T> {
                 raw_comment: comment,
                 usage: Usage::default(),
                 profile,
+                spanned,
             },
             accounting,
             ownership,
@@ -831,9 +877,18 @@ impl<T> Walk<T> {
 
     fn project_record(&mut self, view: CentralView<'_>) -> Result<(), DirectoryError> {
         let profile = self.directory.profile;
+        let spanned = self.directory.spanned;
         let (resolved, known) =
-            reducers::reduce(&view, profile, self.central_ut_only, self.name_crc32, &mut self.accounting)?;
-        if profile == Profile::Zipfast {
+            reducers::reduce(&view, profile, spanned, self.central_ut_only, self.name_crc32, &mut self.accounting)?;
+        if spanned {
+            // Each entry's offset is relative to its own disk, which the caller checks. The disk itself must be known.
+            if resolved.unresolved.disk_start {
+                return Err(DirectoryError::MalformedZip64);
+            }
+            if resolved.unresolved.local_header_offset {
+                return Err(DirectoryError::InvalidLocalOffset);
+            }
+        } else if profile == Profile::Zipfast {
             if !matches!(view.header().disk_start, 0 | u16::MAX) {
                 return Err(DirectoryError::UnsupportedDisk);
             }

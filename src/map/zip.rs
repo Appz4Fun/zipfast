@@ -22,6 +22,7 @@ use super::{
 };
 use crate::progressive::{FailureKind, ProgressiveFailure, ProgressiveLimits, Resource, Usage};
 use crate::zip::ZipEntry;
+use std::ops::Range;
 use std::task::{Context, Poll};
 use zip_container::{DirectoryError, DirectoryParser, LOCAL_HEADER_LEN, Limits, LocalHeader, local_layout};
 
@@ -29,7 +30,7 @@ const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DESCRIPTOR: u16 = 0x0008;
 const FLAG_STRONG: u16 = 0x0040;
 const METHOD_AES: u16 = 99;
-const CHUNK: usize = 64 << 10;
+pub(super) const CHUNK: usize = 64 << 10;
 
 enum Phase {
     Start,
@@ -56,6 +57,11 @@ fn is_aes(entry: &ZipEntry) -> bool {
     entry.method == METHOD_AES || entry.aes_info.is_some()
 }
 
+/// Bytes of the WinZip AES salt and verifier at the start of an AES entry's data, when its extra field is valid.
+pub(super) fn aes_prefix(entry: &ZipEntry) -> Option<usize> {
+    is_aes(entry).then_some(entry.aes_info).flatten().map(|(strength, _, _)| 4 + 4 * usize::from(strength) + 2)
+}
+
 fn malformed(reason: &'static str) -> MapError {
     MapError::Malformed { volume: 0, failure: Box::new(ProgressiveFailure::new(FailureKind::Malformed(reason))) }
 }
@@ -74,7 +80,7 @@ pub(crate) fn zip_limits(limits: &ProgressiveLimits) -> Limits {
     }
 }
 
-fn directory(error: DirectoryError, limits: &Limits) -> MapError {
+pub(super) fn directory(error: DirectoryError, limits: &Limits) -> MapError {
     match error {
         DirectoryError::Limit(kind) => {
             use zip_container::LimitKind;
@@ -104,7 +110,9 @@ fn directory(error: DirectoryError, limits: &Limits) -> MapError {
         DirectoryError::NotZip => MapError::NotArchive,
         DirectoryError::UnsupportedDisk => MapError::Unsupported {
             volume: 0,
-            failure: Box::new(ProgressiveFailure::new(FailureKind::Malformed("split ZIP archive"))),
+            failure: Box::new(ProgressiveFailure::new(FailureKind::Malformed(
+                "split ZIP archive volume: map the set from its first volume (.z01)",
+            ))),
         },
         DirectoryError::Ownership(_) | DirectoryError::Allocation => MapError::Unsupported {
             volume: 0,
@@ -221,10 +229,7 @@ impl ZipWalker {
                         }));
                     };
                     let local_at = entry.local_at;
-                    let aes_prefix = is_aes(&entry)
-                        .then_some(entry.aes_info)
-                        .flatten()
-                        .map(|(strength, _, _)| 4 + 4 * usize::from(strength) + 2);
+                    let aes_prefix = aes_prefix(&entry);
                     // Gather the local header, then the AES salt and verifier.
                     let (at, want) = match &self.local {
                         None => (local_at + self.scratch.len() as u64, LOCAL_HEADER_LEN - self.scratch.len()),
@@ -264,78 +269,127 @@ impl ZipWalker {
     }
 
     fn member(&self, entry: &ZipEntry, aes_prefix: Option<usize>) -> Result<MapMember, MapError> {
-        let (header_range, payload, local) = self.local.clone().expect("local header parsed");
-        self.usage
-            .charge(
-                Resource::MetadataBytes,
-                (std::mem::size_of::<MapMember>() + std::mem::size_of::<MapPiece>() + 2 * entry.name.len()) as u64,
-            )
-            .map_err(|e| MapError::from_failure(0, e))?;
-        // As the extractor decides (src/zip.rs): flag bit 0, method 99, or an AES extra field.
-        let encrypted = entry.flags & FLAG_ENCRYPTED != 0 || is_aes(entry);
-        let method_id = entry.effective_method();
-        let stored = method_id == 0;
-        let (cipher, mapping) = if !encrypted {
-            (None, if stored { OutputMapping::Direct } else { OutputMapping::None })
-        } else if entry.flags & FLAG_STRONG != 0 {
-            (None, OutputMapping::None)
-        } else if is_aes(entry) {
-            // As the extractor decides: method 99 or an AES extra field. Without a valid extra field (or with data
-            // too short for the salt and verifier) nothing is mapped.
-            match (entry.aes_info, aes_prefix) {
-                (Some((strength, vendor_version, _)), Some(prefix)) if self.scratch.len() == prefix => (
+        let (header, packed, local) = self.local.clone().expect("local header parsed");
+        let prefix = aes_prefix.filter(|&prefix| self.scratch.len() == prefix).map(|_| self.scratch.as_slice());
+        zip_member(
+            &self.usage,
+            self.members.len() as u64,
+            entry,
+            Some(&local),
+            prefix,
+            vec![ZipPiece { volume: 0, packed, header }],
+            true,
+        )
+    }
+}
+
+/// One piece of a ZIP member: its packed bytes in one volume, and the part of the local header just before them in
+/// that volume (empty at the start of a volume the data continues into).
+pub(super) struct ZipPiece {
+    pub(super) volume: u32,
+    pub(super) packed: Range<u64>,
+    pub(super) header: Range<u64>,
+}
+
+/// Lists one ZIP member from its directory entry, its local header (None when it could not be read) and the WinZip
+/// AES salt and verifier at the start of its data (None when not read in full). `complete` says whether `pieces`
+/// cover all of its data.
+pub(super) fn zip_member(
+    usage: &Usage,
+    ordinal: u64,
+    entry: &ZipEntry,
+    local: Option<&LocalHeader>,
+    aes_prefix: Option<&[u8]>,
+    pieces: Vec<ZipPiece>,
+    complete: bool,
+) -> Result<MapMember, MapError> {
+    usage
+        .charge(
+            Resource::MetadataBytes,
+            (std::mem::size_of::<MapMember>() + pieces.len() * std::mem::size_of::<MapPiece>() + 2 * entry.name.len())
+                as u64,
+        )
+        .map_err(|e| MapError::from_failure(0, e))?;
+    // As the extractor decides (src/zip.rs): flag bit 0, method 99, or an AES extra field.
+    let encrypted = entry.flags & FLAG_ENCRYPTED != 0 || is_aes(entry);
+    let method_id = entry.effective_method();
+    let stored = method_id == 0;
+    let (cipher, mapping) = if !encrypted {
+        (None, if stored { OutputMapping::Direct } else { OutputMapping::None })
+    } else if entry.flags & FLAG_STRONG != 0 {
+        (None, OutputMapping::None)
+    } else if is_aes(entry) {
+        // As the extractor decides: method 99 or an AES extra field. Without a valid extra field (or with data
+        // too short for the salt and verifier) nothing is mapped.
+        match (entry.aes_info, aes_prefix) {
+            (Some((strength, vendor_version, _)), Some(prefix))
+                if prefix.len() == 4 + 4 * usize::from(strength) + 2 =>
+            {
+                let n = prefix.len();
+                (
                     Some(CipherParams::WinZipAes {
                         strength,
                         vendor_version,
-                        salt: self.scratch[..prefix - 2].to_vec(),
-                        verifier: [self.scratch[prefix - 2], self.scratch[prefix - 1]],
+                        salt: prefix[..n - 2].to_vec(),
+                        verifier: [prefix[n - 2], prefix[n - 1]],
                     }),
-                    if stored { OutputMapping::Counter { skip: prefix as u64 } } else { OutputMapping::None },
-                ),
-                _ => (None, OutputMapping::None),
+                    if stored { OutputMapping::Counter { skip: n as u64 } } else { OutputMapping::None },
+                )
             }
-        } else {
-            let check = if entry.flags & FLAG_DESCRIPTOR != 0 {
-                (local.mod_time >> 8) as u8
-            } else {
-                (entry.crc32 >> 24) as u8
+            _ => (None, OutputMapping::None),
+        }
+    } else if let Some(local) = local {
+        let check =
+            if entry.flags & FLAG_DESCRIPTOR != 0 { (local.mod_time >> 8) as u8 } else { (entry.crc32 >> 24) as u8 };
+        (
+            Some(CipherParams::ZipCrypto { check }),
+            if stored { OutputMapping::Sequential { skip: 12 } } else { OutputMapping::None },
+        )
+    } else {
+        (None, OutputMapping::None)
+    };
+    let crc_known = !(encrypted && is_aes(entry) && matches!(entry.aes_info, Some((_, 2, _))));
+    let checks = MapChecks { crc32: crc_known.then_some(entry.crc32), blake2sp: None, keyed: false };
+    let size = Some(entry.size);
+    let count = pieces.len();
+    let mut stream = 0u64;
+    let pieces = pieces
+        .into_iter()
+        .enumerate()
+        .map(|(i, piece)| {
+            let len = piece.packed.end - piece.packed.start;
+            let last = complete && i + 1 == count;
+            let mapped = MapPiece {
+                volume: piece.volume,
+                packed: piece.packed,
+                header: piece.header,
+                stream_offset: stream,
+                out: mapping.out_of(stream..stream + len, size),
+                checks: if last { checks } else { MapChecks::default() },
+                final_part: last,
             };
-            (
-                Some(CipherParams::ZipCrypto { check }),
-                if stored { OutputMapping::Sequential { skip: 12 } } else { OutputMapping::None },
-            )
-        };
-        let crc_known = !(encrypted && is_aes(entry) && matches!(entry.aes_info, Some((_, 2, _))));
-        let checks = MapChecks { crc32: crc_known.then_some(entry.crc32), blake2sp: None, keyed: false };
-        let size = Some(entry.size);
-        let out = mapping.out_of(0..entry.packed, size);
-        Ok(MapMember {
-            ordinal: self.members.len() as u64,
-            raw_name: entry.name.as_bytes().to_vec(),
-            name: Some(entry.name.clone()),
-            is_dir: entry.is_dir(),
-            unpacked_size: size,
-            packed_size: entry.packed,
-            method: if stored { MapMethod::Stored } else { MapMethod::Compressed { id: method_id } },
-            mapping,
-            solid: false,
-            encrypted,
-            cipher,
-            checks: Some(checks),
-            mtime: entry.mtime.map(|s| (s, entry.nanos)),
-            dos_time: None,
-            attributes: u64::from(entry.external),
-            unix_mode: entry.unix_mode(),
-            complete: true,
-            pieces: vec![MapPiece {
-                volume: 0,
-                packed: payload,
-                header: header_range,
-                stream_offset: 0,
-                out,
-                checks,
-                final_part: true,
-            }],
+            stream += len;
+            mapped
         })
-    }
+        .collect();
+    Ok(MapMember {
+        ordinal,
+        raw_name: entry.name.as_bytes().to_vec(),
+        name: Some(entry.name.clone()),
+        is_dir: entry.is_dir(),
+        unpacked_size: size,
+        packed_size: stream,
+        method: if stored { MapMethod::Stored } else { MapMethod::Compressed { id: method_id } },
+        mapping,
+        solid: false,
+        encrypted,
+        cipher,
+        checks: complete.then_some(checks),
+        mtime: entry.mtime.map(|s| (s, entry.nanos)),
+        dos_time: None,
+        attributes: u64::from(entry.external),
+        unix_mode: entry.unix_mode(),
+        complete,
+        pieces,
+    })
 }

@@ -976,3 +976,64 @@ fn anchored_scratch_limit_precedes_fragmented_body_reservation_even_for_corrupte
         }
     }
 }
+
+fn drive_parser<T>(mut parser: DirectoryParser<T>, bytes: &[u8]) -> Result<Directory<T>, DirectoryError> {
+    while let Some(range) = parser.next_read()? {
+        parser.supply(range.start, &bytes[range.start as usize..range.end as usize])?;
+    }
+    parser.finish()
+}
+
+#[test]
+fn spanned_directories_accept_disk_declarations_and_resolve_zip64_start_disks() {
+    // One central record whose local header is on disk 3 at offset 900, a directory on disk 5 (the start of these
+    // bytes) and the end record on the same disk.
+    let mut record = central().to_vec();
+    set16(&mut record, 34, 3);
+    set32(&mut record, 42, 900);
+    let mut bytes = record.clone();
+    let mut record_end = end(1, 46, 0, 0);
+    set16(&mut record_end, 4, 5);
+    set16(&mut record_end, 6, 5);
+    bytes.extend(record_end);
+    let len = bytes.len() as u64;
+    assert_eq!(
+        drive_parser(DirectoryParser::at_eocd(len, 46, Limits::default()).unwrap(), &bytes).unwrap_err(),
+        DirectoryError::UnsupportedDisk
+    );
+    let spanned = |bytes: &[u8]| {
+        let parser = DirectoryParser::spanned_at_eocd(
+            bytes.len() as u64,
+            bytes.len() as u64 - 22,
+            Limits::default(),
+            |_| 0,
+            |record| Ok((record.resolved().disk_start, record.resolved().local_header_offset)),
+        );
+        drive_parser(parser.unwrap(), bytes)
+    };
+    let directory = spanned(&bytes).unwrap();
+    assert_eq!(directory.entries, [(3, 900)]);
+    assert_eq!(directory.prefix_shift, 0);
+
+    // A ZIP64 start disk and offset, from the fourth and third ZIP64 values.
+    let mut record = central().to_vec();
+    set16(&mut record, 30, 16);
+    set16(&mut record, 34, u16::MAX);
+    set32(&mut record, 42, u32::MAX);
+    record.extend([1, 0, 12, 0]);
+    record.extend(5_000_000_000u64.to_le_bytes());
+    record.extend(70_000u32.to_le_bytes());
+    let mut bytes = record.clone();
+    let mut record_end = end(1, 62, 0, 0);
+    set16(&mut record_end, 4, 5);
+    set16(&mut record_end, 6, 5);
+    bytes.extend(record_end);
+    assert_eq!(spanned(&bytes).unwrap().entries, [(70_000, 5_000_000_000)]);
+    // Without the disk value the start disk is unknown.
+    set16(&mut bytes, 30, 12);
+    bytes.drain(46 + 12..46 + 16);
+    set16(&mut bytes, 46 + 2, 8);
+    let at = bytes.len() - 22 + 12;
+    set32(&mut bytes, at, 58);
+    assert_eq!(spanned(&bytes).unwrap_err(), DirectoryError::MalformedZip64);
+}
