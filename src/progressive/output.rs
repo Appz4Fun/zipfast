@@ -29,6 +29,7 @@ use std::{
 pub(crate) mod native;
 mod policy;
 mod quota;
+pub(crate) use policy::DirectoryVerdict;
 use policy::Policy;
 pub(crate) use quota::Capacity;
 use quota::{Lease, Quota};

@@ -1054,7 +1054,10 @@ fn task4b_directory_finalization_budget_is_finite_and_one_shot() {
     let mut output = setup(dir.path());
     let header =
         crate::rar5::FileHeader { name: "directory".into(), host_os: 1, attributes: 0o500, ..Default::default() };
-    assert!(output.directory(member(0), &header, &mut source).unwrap());
+    assert!(matches!(
+        output.directory(member(0), &header, &mut source).unwrap(),
+        DirectoryVerdict::Done { created: true }
+    ));
     fs::set_permissions(dir.path().join("directory"), fs::Permissions::from_mode(0o700)).unwrap();
     output.usage = Usage::new(ProgressiveLimits { source_bookkeeping: 0, ..Default::default() });
     assert!(matches!(
@@ -1120,7 +1123,10 @@ fn check_finalization_ancestor(attack: Option<&str>) {
         mtime: Some(1_700_000_000),
         ..Default::default()
     };
-    assert!(!output.directory(member(0), &header, &mut source).unwrap());
+    assert!(matches!(
+        output.directory(member(0), &header, &mut source).unwrap(),
+        DirectoryVerdict::Done { created: false }
+    ));
     armed.store(attack.is_some(), Ordering::SeqCst);
     let result = output.finish_directories(&mut source);
     let after = file.metadata().unwrap();

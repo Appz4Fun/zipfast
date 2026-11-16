@@ -611,6 +611,8 @@ pub(crate) struct SourceDriver {
     declined_promotion: Option<u64>,
     native: super::output::native::NativeProtection,
     sealed_memory: bool,
+    /// How many volumes a sealed in-memory set holds.
+    sealed_volumes: usize,
     wake: Arc<WakeGate>,
     replacements: Vec<(u32, SourceDriver)>,
     replacement_native: bool,
@@ -672,6 +674,7 @@ impl SourceDriver {
             declined_promotion: None,
             native,
             sealed_memory: false,
+            sealed_volumes: 0,
             wake: Arc::new(WakeGate::default()),
             replacements: Vec::new(),
             replacement_native: false,
@@ -691,12 +694,38 @@ impl SourceDriver {
         let metadata = provider.metadata_bytes;
         let names = provider.name_bytes;
         let input = provider.source_bytes;
+        let volumes = provider.volume_count();
         let mut driver = Self::new(Box::new(provider), first, limits, control)?;
         driver.usage.charge(Resource::MetadataBytes, metadata)?;
         driver.usage.charge(Resource::NameBytes, names)?;
         driver.usage.check(Resource::SourceBytes, input)?;
         driver.sealed_memory = true;
+        driver.sealed_volumes = volumes;
         Ok(driver)
+    }
+    /// Whether `index` is the last volume of a final set: the provider's declaration, refreshed now, is Complete,
+    /// cannot grow any more, and names no volume after `index`. A Complete declaration is frozen for the session's
+    /// life, so it names the whole set, unless it may grow: the library's `GrowingFileVolumes`, or a persistent
+    /// session's provider that opted in with `extends_protection`. Those never end a set here.
+    pub(crate) fn declared_last_volume(&mut self, index: u32) -> ProgressiveResult<bool> {
+        #[cfg(feature = "persistent-partials")]
+        let extends = self.extends;
+        #[cfg(not(feature = "persistent-partials"))]
+        let extends = false;
+        if self.library_provider || extends {
+            return Ok(false);
+        }
+        self.refresh_protection(false)?;
+        Ok(match &self.protection {
+            ProtectionDeclaration::Complete { inventory, .. } => {
+                inventory.volumes.iter().map(|v| v.index).max() == Some(index)
+            }
+            ProtectionDeclaration::Opaque => false,
+        })
+    }
+    /// The number of volumes of a sealed in-memory set, every one given up front; `None` for a provider.
+    pub(crate) fn sealed_volume_count(&self) -> Option<usize> {
+        self.sealed_memory.then_some(self.sealed_volumes)
     }
     /// Full validation for authority points: volume and member boundaries,
     /// publication and replacement admission re-observe every protected path.

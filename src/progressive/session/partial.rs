@@ -401,7 +401,7 @@ impl ProgressiveSession {
         self.phase = Phase::Header;
         Ok(ProgressiveEvent::MemberFinished {
             member: self.member.take().unwrap(),
-            outcome: MemberOutcome::Directory { created },
+            outcome: MemberOutcome::Directory { created, deferred: None },
         })
     }
     /// At the end of the set: applies each directory entry's modified time and permissions to the directory this

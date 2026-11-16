@@ -22,7 +22,7 @@ mod rar4;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
 use super::{
-    output::{Capacity, OutputContext, Publication, Stage, Target},
+    output::{Capacity, DirectoryVerdict, OutputContext, Publication, Stage, Target},
     source::{SourceDriver, SourceStep},
     *,
 };
@@ -158,6 +158,10 @@ pub enum MemberOutcome {
     /// before it; only such a directory gets the entry's metadata.
     Directory {
         created: bool,
+        /// Set when the session lacks whole-set authority to create directories (an undeclared, Opaque source):
+        /// nothing was created, and this is the sanitized target path, relative to the destination root and
+        /// contained in it, for the caller to create itself. `None` otherwise.
+        deferred: Option<std::path::PathBuf>,
     },
     Verified(Verification),
     /// Publication succeeded; a subsequent failure stopped the session. An artifact,
@@ -223,6 +227,9 @@ pub struct ProgressiveSession {
     rar4_history: Option<crate::rar5::member::Rar4Owner>,
     /// every member so far was written by an archiver older than RAR 2.9, which writes no end-of-archive block
     pre_29: bool,
+    /// A pre-2.9 volume that names itself part of a set ended between members: the next volume is asked for, and
+    /// only a sealed in-memory set (every volume given up front) may end there when it has no next volume.
+    pre_29_open_end: bool,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -356,6 +363,7 @@ impl ProgressiveSession {
             rar4_independent: None,
             rar4_history: None,
             pre_29: true,
+            pre_29_open_end: false,
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -378,6 +386,20 @@ impl ProgressiveSession {
             extraction_active: false,
             part_evidence: Vec::new(),
         })
+    }
+    /// What this session has charged to `resource` so far, and its effective limit. Read-only: a caller can
+    /// budget further work (such as a Complete declaration) from real numbers rather than estimates.
+    pub fn resource_usage(&self, resource: Resource) -> ResourceUsage {
+        self.usage.snapshot(resource)
+    }
+    /// [`Self::resource_usage`] for every resource, in [`Resource::ALL`] order.
+    pub fn resource_usages(&self) -> impl Iterator<Item = (Resource, ResourceUsage)> + '_ {
+        Resource::ALL.into_iter().map(|r| (r, self.usage.snapshot(r)))
+    }
+    /// The limits this session was opened with, as configured; [`Self::resource_usage`] reports the effective
+    /// ceiling after fixed safety clamps.
+    pub fn limits(&self) -> &ProgressiveLimits {
+        &self.options.limits
     }
     pub fn control(&self) -> SessionControl {
         self.control.clone()
@@ -499,7 +521,24 @@ impl ProgressiveSession {
             }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
+                Phase::NextVolume
+                    if self.pre_29_open_end
+                        && (self.driver.sealed_volume_count().is_some_and(|n| n <= self.volume as usize + 1)
+                            || self.driver.declared_last_volume(self.volume)?) =>
+                {
+                    // Every volume of a sealed set was given up front, and a final Complete declaration names
+                    // every volume of the set: a volume that ends between members with no next volume after it
+                    // is the last.
+                    self.pre_29_open_end = false;
+                    if let Some(output) = &mut self.output {
+                        output.finish_directories(&mut self.driver)?;
+                    }
+                    #[cfg(feature = "persistent-partials")]
+                    self.partial_finish_directories()?;
+                    self.phase = Phase::Done;
+                }
                 Phase::NextVolume => {
+                    self.pre_29_open_end = false;
                     self.volume = self
                         .volume
                         .checked_add(1)
@@ -656,7 +695,12 @@ impl ProgressiveSession {
                         {
                             // Archives older than RAR 2.9 write no end-of-archive block: UnRAR ends them at a block
                             // boundary, going on to the next volume while a member waits for its next part.
+                            // A volume whose main header has MHD_VOLUME set expects more volumes, so ending
+                            // between members there is not the end of the set: ask for the next one.
                             if self.member.is_some() {
+                                self.phase = Phase::NextVolume;
+                            } else if self.volume_set == Some(true) {
+                                self.pre_29_open_end = true;
                                 self.phase = Phase::NextVolume;
                             } else {
                                 if let Some(output) = &mut self.output {
@@ -1357,23 +1401,25 @@ impl ProgressiveSession {
         }
         if matches!(self.disposition, Disposition::Directory) {
             let header = &self.model.members.last().expect("member").header;
-            let created = if self.options.extract.mode == crate::extract::Mode::Test || self.options.extract.flatten {
-                false
-            } else {
-                match self.output.as_mut().expect("output").directory(
-                    self.member.expect("member"),
-                    header,
-                    &mut self.driver,
-                ) {
-                    Ok(created) => created,
-                    Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
-                    Err(e) => return Err(e),
-                }
-            };
+            let (created, deferred) =
+                if self.options.extract.mode == crate::extract::Mode::Test || self.options.extract.flatten {
+                    (false, None)
+                } else {
+                    match self.output.as_mut().expect("output").directory(
+                        self.member.expect("member"),
+                        header,
+                        &mut self.driver,
+                    ) {
+                        Ok(DirectoryVerdict::Done { created }) => (created, None),
+                        Ok(DirectoryVerdict::Deferred(path)) => (false, Some(path)),
+                        Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
+                        Err(e) => return Err(e),
+                    }
+                };
             self.phase = Phase::Header;
             return Ok(ProgressiveEvent::MemberFinished {
                 member: self.member.take().unwrap(),
-                outcome: MemberOutcome::Directory { created },
+                outcome: MemberOutcome::Directory { created, deferred },
             });
         }
         if self.finalizer.is_none() {

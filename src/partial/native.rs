@@ -532,6 +532,12 @@ struct NativeSpec<'a> {
     protection: &'a ProtectionDeclaration,
 }
 impl PersistentNative {
+    /// The output path relative to the output root: only normal components, as genesis validated it.
+    pub(super) fn relative_output(&self) -> PartialResult<&Path> {
+        let relative = self.output_path.strip_prefix(&self.root.path).map_err(|_| err(PartialErrorKind::UnsafePath))?;
+        validate_relative(relative)?;
+        Ok(relative)
+    }
     pub(crate) fn create(spec: &CreateSpec, budget: &PartialBudget, prepared: PreparedNative) -> PartialResult<Self> {
         Self::bind(
             NativeSpec {

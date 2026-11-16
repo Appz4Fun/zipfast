@@ -25,6 +25,9 @@ pub(crate) struct SealedMemory {
     pub(crate) source_bytes: u64,
 }
 impl SealedMemory {
+    pub(crate) fn volume_count(&self) -> usize {
+        self.volumes.len()
+    }
     pub(crate) fn new(
         volumes: Vec<(OsString, Box<[u8]>)>,
         first: &std::ffi::OsStr,
