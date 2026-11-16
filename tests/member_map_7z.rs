@@ -888,6 +888,23 @@ fn truncation_and_bit_flip_sweeps_never_panic() {
             }
         }
     }
+    // Archives written by 7-Zip: every prefix, and every next header byte flipped and re-sealed.
+    for name in
+        ["store_with_directories.7z", "solid_lzma_multi.7z", "encrypted_files.7z", "store_method_enc_headers.7z"]
+    {
+        let archive = &fixture(&[name])[0];
+        for cut in 0..archive.len() {
+            let _ = map_set(&[archive[..cut].to_vec()], None);
+        }
+        let header_at = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
+        for at in header_at..archive.len() {
+            for flip in [0x01u8, 0x80, 0xFF] {
+                let mut header = archive[header_at..].to_vec();
+                header[at - header_at] ^= flip;
+                let _ = map_set(&[wrap(&archive[32..header_at], &header)], None);
+            }
+        }
+    }
     // Every byte of a plain header set to hostile values, re-sealed.
     let archive = &seeds[0];
     let header_at = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
@@ -987,4 +1004,348 @@ fn map_builder_waits_and_names_numbered_volumes() {
     let names: Vec<_> = asked.lock().unwrap().iter().take(3).cloned().collect();
     assert_eq!(names, vec![(0, "dir/set.7z.001".into()), (1, "dir/set.7z.002".into()), (2, "dir/set.7z.003".into())]);
     assert_direct_round_trips(&map.members[0], &volumes, &gold);
+}
+
+// ---- Archives written by 7-Zip (tests/fixtures/7z) ----
+
+fn fixture(names: &[&str]) -> Vec<Vec<u8>> {
+    names
+        .iter()
+        .map(|n| std::fs::read(format!("{}/tests/fixtures/7z/{n}", env!("CARGO_MANIFEST_DIR"))).unwrap())
+        .collect()
+}
+
+const FORMAT_TXT_CRC: u32 = 0x3f8c_cf66;
+const FOO_CRC: u32 = 0x1a92_d0b1;
+const BAR_CRC: u32 = 0x71af_b453;
+
+/// Expected entry: name, size, directory, CRC.
+type Want = (&'static str, u64, bool, Option<u32>);
+
+fn assert_entries(map: &MemberMap, want: &[Want]) {
+    let got: Vec<Want> = map
+        .members
+        .iter()
+        .zip(want)
+        .map(|(m, w)| (w.0, m.unpacked_size.unwrap(), m.is_dir, m.checks.and_then(|c| c.crc32)))
+        .collect();
+    assert_eq!(
+        map.members.iter().map(|m| m.name.clone().unwrap()).collect::<Vec<_>>(),
+        want.iter().map(|w| w.0).collect::<Vec<_>>()
+    );
+    assert_eq!(got, want);
+}
+
+/// Every Direct member's bytes, gathered from its pieces, have its CRC, and stream from offset 0 and the middle.
+fn assert_direct_members(map: &MemberMap, volumes: &[Vec<u8>]) -> usize {
+    let mut checked = 0;
+    for (i, m) in map.members.iter().enumerate() {
+        if m.mapping != OutputMapping::Direct || m.pieces.is_empty() {
+            continue;
+        }
+        let size = m.unpacked_size.unwrap();
+        let bytes = gather(volumes, &m.packed_spans(0..size).unwrap());
+        assert_eq!(bytes.len() as u64, size);
+        assert_eq!(Some(crc(&bytes)), m.checks.unwrap().crc32, "{:?}", m.name);
+        let mut out = Vec::new();
+        extract_member_from(&refs(volumes), map, i, 0, None, &mut out).unwrap();
+        assert_eq!(out, bytes);
+        let mid = size / 2;
+        let mut out = Vec::new();
+        extract_member_from(&refs(volumes), map, i, mid, None, &mut out).unwrap();
+        assert_eq!(out, &bytes[mid as usize..]);
+        checked += 1;
+    }
+    checked
+}
+
+/// Decodes a folder from its packed spans independently of the walker: 7zAES, LZMA and Copy coders in a chain,
+/// followed from the packed stream along the bind pairs.
+fn decode_folder(volumes: &[Vec<u8>], folder: &MapFolder, password: &str) -> Vec<u8> {
+    assert_eq!(folder.packed_streams.len(), 1);
+    let mut data = gather(volumes, &folder.packed);
+    assert_eq!(data.len() as u64, folder.pack_sizes.iter().sum::<u64>());
+    let mut coder = folder.packed_streams[0];
+    loop {
+        let c = &folder.coders[coder as usize];
+        let size = folder.unpack_sizes[coder as usize] as usize;
+        data = match c.kind {
+            CoderKind::Copy => data[..size].to_vec(),
+            CoderKind::Aes => {
+                let Some(CipherParams::SevenZipAes { num_cycles_power, salt, iv }) = &folder.cipher else { panic!() };
+                let key = zipfast::crypto::derive_7z_key(password, salt, *num_cycles_power).unwrap();
+                let plain = zipfast::crypto::decrypt_cbc(&key, iv, &data).unwrap();
+                plain[..size].to_vec()
+            }
+            CoderKind::Lzma => {
+                let mut filters = liblzma::stream::Filters::new();
+                filters.lzma1_properties(&c.properties).unwrap();
+                let mut stream = liblzma::stream::Stream::new_raw_decoder(&filters).unwrap();
+                let mut out = vec![0; size];
+                stream.process(&data, &mut out, liblzma::stream::Action::Run).unwrap();
+                assert_eq!(stream.total_out() as usize, size);
+                out
+            }
+            other => panic!("{other:?}"),
+        };
+        match folder.bind_pairs.iter().find(|&&(_, out)| out == coder) {
+            Some(&(input, _)) => coder = input,
+            None => break,
+        }
+    }
+    assert_eq!(data.len() as u64, folder.unpacked_size);
+    data
+}
+
+/// Members of coded folders (mapping None): their pieces are the folder's spans, and the folder decodes to output
+/// where each member's substream has its CRC.
+fn assert_coded_members(map: &MemberMap, volumes: &[Vec<u8>], password: &str) -> usize {
+    let mut checked = 0;
+    for m in &map.members {
+        if m.mapping != OutputMapping::None {
+            continue;
+        }
+        let slot = m.folder.unwrap();
+        let folder = &map.folders[slot.index as usize];
+        let spans: Vec<_> = m.pieces.iter().map(|p| (p.volume, p.packed.clone(), p.stream_offset)).collect();
+        let want: Vec<_> = folder.packed.iter().map(|s| (s.volume, s.packed.clone(), s.stream.start)).collect();
+        assert_eq!(spans, want);
+        assert_eq!(m.packed_size, folder.pack_sizes.iter().sum::<u64>());
+        assert_eq!(m.packed_spans(0..1), None);
+        let out = decode_folder(volumes, folder, password);
+        let size = m.unpacked_size.unwrap();
+        let bytes = &out[slot.offset as usize..(slot.offset + size) as usize];
+        assert_eq!(Some(crc(bytes)), m.checks.unwrap().crc32, "{:?}", m.name);
+        checked += 1;
+    }
+    checked
+}
+
+/// CbcBlocks members decrypt from their spans with "password" to bytes with their CRC, and stream through
+/// extract_member_from from offset 0 and the middle.
+fn assert_cbc_members(map: &MemberMap, volumes: &[Vec<u8>]) -> usize {
+    let mut checked = 0;
+    for (i, m) in map.members.iter().enumerate() {
+        if m.mapping != OutputMapping::CbcBlocks {
+            continue;
+        }
+        let Some(CipherParams::SevenZipAes { num_cycles_power, salt, iv }) = &m.cipher else { panic!() };
+        let key = zipfast::crypto::derive_7z_key("password", salt, *num_cycles_power).unwrap();
+        let size = m.unpacked_size.unwrap();
+        let cipher = gather(volumes, &m.packed_spans(0..size).unwrap());
+        assert_eq!(cipher.len() as u64, size.next_multiple_of(16));
+        let plain = zipfast::crypto::decrypt_cbc(&key, iv, &cipher).unwrap();
+        let plain = &plain[..size as usize];
+        assert_eq!(Some(crc(plain)), m.checks.unwrap().crc32, "{:?}", m.name);
+        let mut out = Vec::new();
+        extract_member_from(&refs(volumes), map, i, 0, Some("password"), &mut out).unwrap();
+        assert_eq!(out, plain);
+        let mid = size / 2 + 3;
+        let mut out = Vec::new();
+        extract_member_from(&refs(volumes), map, i, mid, Some("password"), &mut out).unwrap();
+        assert_eq!(out, &plain[mid as usize..]);
+        checked += 1;
+    }
+    checked
+}
+
+fn kinds(folder: &MapFolder) -> Vec<CoderKind> {
+    folder.coders.iter().map(|c| c.kind).collect()
+}
+
+#[test]
+fn real_store_archives() {
+    use CoderKind::Copy;
+    let cases: [(&[&str], &[Want], usize); 5] = [
+        (
+            &["store_method.7z"],
+            &[("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)), ("foo.txt", 15, false, Some(FOO_CRC))],
+            2,
+        ),
+        (
+            &["store_method_enc_headers.7z"],
+            &[("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)), ("foo.txt", 15, false, Some(FOO_CRC))],
+            2,
+        ),
+        (
+            &["store_with_directories.7z"],
+            &[
+                ("testdir/7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)),
+                ("testdir/testdir2/bar.txt", 15, false, Some(BAR_CRC)),
+                ("testdir/foo.txt", 15, false, Some(FOO_CRC)),
+                ("testdir/testdir2/foo.txt", 15, false, Some(FOO_CRC)),
+                ("testdir/testdir2", 0, true, None),
+                ("testdir", 0, true, None),
+            ],
+            4,
+        ),
+        (
+            &["store_with_empty.7z"],
+            &[
+                ("testdir3/7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)),
+                ("testdir3/foo.txt", 15, false, Some(FOO_CRC)),
+                ("testdir3/empty.txt", 0, false, None),
+                ("testdir3", 0, true, None),
+            ],
+            2,
+        ),
+        (
+            &["multi_volume.7z.001", "multi_volume.7z.002"],
+            &[("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)), ("foo.txt", 15, false, Some(FOO_CRC))],
+            2,
+        ),
+    ];
+    for (names, want, stored) in cases {
+        let volumes = fixture(names);
+        let map = map_set(&volumes, None).unwrap();
+        assert!(map.complete && !map.header_encrypted, "{names:?}");
+        assert_eq!(map.volumes as usize, names.len());
+        assert_entries(&map, want);
+        assert_eq!(map.folders.len(), stored, "{names:?}");
+        assert!(map.folders.iter().all(|f| kinds(f) == [Copy]));
+        assert_eq!(assert_direct_members(&map, &volumes), stored, "{names:?}");
+        for m in &map.members {
+            assert_eq!(m.folder.is_none(), m.unpacked_size == Some(0));
+            if m.folder.is_none() {
+                assert!(m.pieces.is_empty() && m.mapping == OutputMapping::Direct && m.method == MapMethod::Stored);
+            }
+        }
+    }
+
+    // Ranges as rarinfo reports them, and the text itself.
+    let volumes = fixture(&["store_method.7z"]);
+    let map = map_set(&volumes, None).unwrap();
+    assert_eq!(map.members[0].pieces[0].packed, 32..7605);
+    assert_eq!(map.members[1].pieces[0].packed, 7605..7620);
+    assert_eq!(map.members[0].mtime, Some((1_284_641_836, 0)));
+    assert_eq!(map.members[1].mtime.unwrap().0, 1_373_228_890);
+    let text = gather(&volumes, &map.members[0].packed_spans(0..7573).unwrap());
+    assert!(text.starts_with(b"7z Format description") && text.ends_with(b"End of document\r\n"));
+    assert_eq!(gather(&volumes, &map.members[1].packed_spans(0..15).unwrap()), b"sample foo text");
+
+    // The split set: 7zFormat.txt crosses from .001 into .002, as rarinfo's ranges in .002 say (0..3509, then
+    // foo.txt at 3509..3524).
+    let volumes = fixture(&["multi_volume.7z.001", "multi_volume.7z.002"]);
+    let map = map_set(&volumes, None).unwrap();
+    let pieces: Vec<_> = map.members[0].pieces.iter().map(|p| (p.volume, p.packed.clone())).collect();
+    assert_eq!(pieces, vec![(0, 32..4096), (1, 0..3509)]);
+    assert_eq!(map.members[1].pieces[0].packed, 3509..3524);
+    let spans = map.members[0].packed_spans(4000..4100).unwrap();
+    assert_eq!(gather(&volumes, &spans), &gather(&volumes, &map.members[0].packed_spans(0..7573).unwrap())[4000..4100]);
+    // Only the first piece: the header is in .002.
+    let cut = map_set(&volumes[..1], None).unwrap();
+    assert!(matches!(cut.end, MapEnd::HeaderUnavailable { volume: 1, .. }) && cut.members.is_empty());
+
+    // An archive holding one empty file has no folders.
+    let map = map_set(&fixture(&["empty_file.7z"]), None).unwrap();
+    assert_entries(&map, &[("empty.txt", 0, false, None)]);
+    assert!(map.folders.is_empty() && map.members[0].pieces.is_empty());
+}
+
+#[test]
+fn real_coded_and_encrypted_archives() {
+    use CoderKind::{Aes, Copy, Lzma};
+    // Single and solid LZMA folders.
+    let volumes = fixture(&["solid_lzma_single.7z"]);
+    let map = map_set(&volumes, None).unwrap();
+    assert_entries(&map, &[("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC))]);
+    assert_eq!(kinds(&map.folders[0]), [Lzma]);
+    assert_eq!(map.folders[0].packed[0].packed, 32..2071);
+    assert_eq!(assert_coded_members(&map, &volumes, ""), 1);
+
+    let volumes = fixture(&["solid_lzma_multi.7z"]);
+    let map = map_set(&volumes, None).unwrap();
+    assert_entries(
+        &map,
+        &[
+            ("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)),
+            ("bar.txt", 15, false, Some(BAR_CRC)),
+            ("foo.txt", 15, false, Some(FOO_CRC)),
+        ],
+    );
+    assert_eq!(map.folders.len(), 1);
+    assert_eq!(map.folders[0].members, 3);
+    assert_eq!(map.folders[0].unpacked_size, 7603);
+    // rarinfo's range for every member: 32-2087.
+    assert_eq!(map.folders[0].packed[0].packed, 32..2088);
+    let slots: Vec<_> = map.members.iter().map(|m| (m.folder.unwrap().offset, m.solid)).collect();
+    assert_eq!(slots, vec![(0, false), (7573, true), (7588, true)]);
+    assert_eq!(assert_coded_members(&map, &volumes, ""), 3);
+    let error = extract_member_from(&refs(&volumes), &map, 1, 0, None, &mut Vec::new()).unwrap_err();
+    assert!(matches!(error, ExtractFromError::Unsupported(UnsupportedRead::Coders)), "{error:?}");
+
+    // Data encryption with a plain header: Copy, LZMA, 7zAES+LZMA and 7zAES+Copy folders. 7-Zip stores the 7zAES
+    // coder first, the packed stream feeding it and its output bound to the next coder's input.
+    let volumes = fixture(&["encrypted_files.7z"]);
+    for password in [None, Some("password"), Some("wrong")] {
+        let map = map_set(&volumes, password).unwrap();
+        assert!(map.complete && !map.header_encrypted && map.header_cipher.is_none());
+        assert_entries(
+            &map,
+            &[
+                ("bar.txt", 15, false, Some(BAR_CRC)),
+                ("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)),
+                ("foo.txt", 15, false, Some(FOO_CRC)),
+                ("baz.txt", 15, false, Some(0x9dfc_363e)),
+            ],
+        );
+        let chains: Vec<_> = map.folders.iter().map(kinds).collect();
+        assert_eq!(chains, vec![vec![Copy], vec![Lzma], vec![Aes, Lzma], vec![Aes, Copy]]);
+        assert_eq!(map.folders[2].bind_pairs, vec![(1, 0)]);
+        assert_eq!(map.folders[2].packed_streams, vec![0]);
+        assert_eq!(map.folders[2].unpack_sizes, vec![20, 15]);
+        let mappings: Vec<_> = map.members.iter().map(|m| (m.mapping, m.method, m.encrypted)).collect();
+        assert_eq!(
+            mappings,
+            vec![
+                (OutputMapping::Direct, MapMethod::Stored, false),
+                (OutputMapping::None, MapMethod::Coders, false),
+                (OutputMapping::None, MapMethod::Coders, true),
+                (OutputMapping::CbcBlocks, MapMethod::Stored, true),
+            ]
+        );
+        let Some(CipherParams::SevenZipAes { num_cycles_power: 19, .. }) = &map.members[3].cipher else {
+            panic!("{:?}", map.members[3].cipher);
+        };
+        assert_eq!(assert_direct_members(&map, &volumes), 1);
+        assert_eq!(assert_coded_members(&map, &volumes, "password"), 2);
+        assert_eq!(assert_cbc_members(&map, &volumes), 1);
+    }
+
+    let volumes = fixture(&["multi_substreams_encrypted.7z"]);
+    let map = map_set(&volumes, None).unwrap();
+    assert_entries(
+        &map,
+        &[
+            ("bar.txt", 15, false, Some(BAR_CRC)),
+            ("foo.txt", 15, false, Some(FOO_CRC)),
+            ("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC)),
+        ],
+    );
+    assert_eq!(map.folders.iter().map(kinds).collect::<Vec<_>>(), vec![vec![Lzma], vec![Aes, Lzma]]);
+    assert_eq!(map.members[1].folder, Some(FolderSlot { index: 0, offset: 15 }));
+    assert!(map.members[2].encrypted && map.members[2].cipher == map.folders[1].cipher);
+    assert_eq!(assert_coded_members(&map, &volumes, "password"), 3);
+}
+
+#[test]
+fn real_encrypted_headers() {
+    let volumes = fixture(&["encrypted_headers.7z"]);
+    assert!(matches!(map_set(&volumes, None), Err(MapError::PasswordRequired)));
+    assert!(matches!(map_set(&volumes, Some("wrong")), Err(MapError::WrongPassword)));
+    assert!(matches!(map_set(&volumes, Some("Password")), Err(MapError::WrongPassword)));
+    let map = map_set(&volumes, Some("password")).unwrap();
+    assert!(map.complete && map.header_encrypted);
+    let Some(CipherParams::SevenZipAes { num_cycles_power: 19, salt, iv }) = &map.header_cipher else {
+        panic!("{:?}", map.header_cipher);
+    };
+    assert!(salt.is_empty());
+    assert_eq!(iv[8..], [0; 8], "an 8-byte IV, zero-padded");
+    assert_entries(&map, &[("7zFormat.txt", 7573, false, Some(FORMAT_TXT_CRC))]);
+    assert_eq!(map.folders.iter().map(kinds).collect::<Vec<_>>(), vec![vec![CoderKind::Aes, CoderKind::Copy]]);
+    let m = &map.members[0];
+    assert_eq!(m.mapping, OutputMapping::CbcBlocks);
+    // rarinfo's range: 32-7615, the plaintext size rounded up to whole blocks.
+    assert_eq!(m.pieces[0].packed, 32..7616);
+    assert_eq!(assert_cbc_members(&map, &volumes), 1);
 }

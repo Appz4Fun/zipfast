@@ -186,6 +186,9 @@ back into it. Archive offsets run over the volumes in order; `MapPiece::volume`,
    header byte budget before allocation, and the dictionary is shrunk to that size, so a stated 4 GiB dictionary
    never allocates more than the header. The folder CRC is checked. Encoded headers may nest up to 4 deep.
 
+The walker is checked against archives written by 7-Zip (`tests/fixtures/7z`, from the rarinfo test suite):
+store, split, solid LZMA, 7zAES over Copy and LZMA, LZMA-encoded and encrypted headers.
+
 A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuses 7z (`NotArchive`), and
 `probe` reports `Packing::Unknown`.
 
@@ -201,7 +204,9 @@ properties, in_streams, out_streams }`, where `kind` is a `CoderKind` such as `C
 `Bcj`, `Delta`, or `Other(id)` for an id it does not name), its bind pairs and packed stream indexes, the size of
 each packed stream, `packed` (all its packed streams back to back as per-volume `PackedSpan`s), every coder output
 size, `unpacked_size` (the unbound output), its CRC, how many members it holds and, when a coder is 7zAES, the
-`cipher`. 7-Zip lists the coder producing the folder's output first: LZMA2 over 7zAES is `[Lzma2, Aes]`.
+`cipher`. The stored order is not the decoding order: follow the packed stream and the bind pairs. 7-Zip stores
+7zAES first, so LZMA over 7zAES is `[Aes, Lzma]` with bind pair `(1, 0)` (the 7zAES output feeds the LZMA input)
+and the packed stream feeding input 0; the walker and its mapping decisions do not depend on the order.
 
 The mapping depends on the folder:
 

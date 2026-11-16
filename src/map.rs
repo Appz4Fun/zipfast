@@ -168,8 +168,9 @@ pub struct MemberMap {
 pub struct MapFolder {
     /// Zero-based position among the archive's folders ([`FolderSlot::index`]).
     pub index: u32,
-    /// The coders as stored. 7-Zip lists the coder that produces the folder's output first: LZMA2 over 7zAES is
-    /// `[Lzma2, Aes]`, and the packed stream feeds the last one.
+    /// The coders as stored. Their order is not the decoding order: follow [`Self::packed_streams`] and
+    /// [`Self::bind_pairs`]. 7-Zip stores 7zAES first, so LZMA over 7zAES is `[Aes, Lzma]` with bind pair `(1, 0)`
+    /// (the 7zAES output feeds the LZMA input) and the packed stream feeding input 0.
     pub coders: Vec<MapCoder>,
     /// Bind pairs as stored: `(in_index, out_index)`, coder input stream `in_index` is fed by coder output stream
     /// `out_index`. Stream indexes count over all coders in order.
