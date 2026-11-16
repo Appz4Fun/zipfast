@@ -269,10 +269,45 @@ impl UsageState {
 
 /// Shared cumulative accounting only. Callers never hold this mutex across IO or callbacks.
 #[derive(Clone)]
-pub(crate) struct Usage(std::sync::Arc<std::sync::Mutex<UsageState>>);
+pub(crate) struct Usage(std::sync::Arc<std::sync::Mutex<UsageState>>, Option<std::sync::Arc<UsageScope>>);
+/// Resources a [`Usage::scoped`] view gives back when its last clone drops: memory that lives exactly as long
+/// as the owner of the scope (a persistent member's core), never work done.
+const SCOPED: [Resource; 3] = [Resource::MetadataBytes, Resource::ProtectionPaths, Resource::ProtectionPathBytes];
+fn scoped_index(resource: Resource) -> Option<usize> {
+    SCOPED.iter().position(|r| *r == resource)
+}
+/// What one scope has charged to the shared accounting, refunded when the scope's last [`Usage`] drops.
+pub(crate) struct UsageScope {
+    state: std::sync::Arc<std::sync::Mutex<UsageState>>,
+    charged: std::sync::Mutex<[u64; SCOPED.len()]>,
+}
+impl Drop for UsageScope {
+    fn drop(&mut self) {
+        let charged = *self.charged.get_mut().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (resource, amount) in SCOPED.iter().zip(charged) {
+            let used = &mut state.used[*resource as usize];
+            *used = used.saturating_sub(amount);
+        }
+    }
+}
 impl Usage {
     pub(crate) fn new(limits: ProgressiveLimits) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(UsageState::new(limits))))
+        Self(std::sync::Arc::new(std::sync::Mutex::new(UsageState::new(limits))), None)
+    }
+    /// A view of the same accounting whose metadata and protection path charges are given back once every clone
+    /// of the view has dropped. Charges keep counting against the shared limits while it lives.
+    #[cfg_attr(not(feature = "persistent-partials"), allow(dead_code, reason = "persistent partial cores scope usage"))]
+    pub(crate) fn scoped(&self) -> Self {
+        let scope = UsageScope { state: self.0.clone(), charged: std::sync::Mutex::new([0; SCOPED.len()]) };
+        Self(self.0.clone(), Some(std::sync::Arc::new(scope)))
+    }
+    fn record(&self, resource: Resource, amount: u64, add: bool) {
+        if let (Some(scope), Some(index)) = (&self.1, scoped_index(resource)) {
+            let mut charged = scope.charged.lock().unwrap_or_else(|e| e.into_inner());
+            charged[index] =
+                if add { charged[index].saturating_add(amount) } else { charged[index].saturating_sub(amount) };
+        }
     }
     pub(crate) fn check(&self, resource: Resource, attempted: u64) -> ProgressiveResult<()> {
         self.0.lock().unwrap().check(resource, attempted)
@@ -294,7 +329,9 @@ impl Usage {
     }
 
     pub(crate) fn charge(&self, resource: Resource, amount: u64) -> ProgressiveResult<()> {
-        self.0.lock().unwrap().charge(resource, amount)
+        self.0.lock().unwrap().charge(resource, amount)?;
+        self.record(resource, amount, true);
+        Ok(())
     }
     /// What has been charged to `resource` so far.
     #[cfg(test)]
@@ -364,9 +401,12 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if self.amount != 0 {
-            let mut state = self.usage.0.lock().unwrap_or_else(|e| e.into_inner());
-            let used = &mut state.used[self.resource as usize];
-            *used = used.saturating_sub(self.amount);
+            {
+                let mut state = self.usage.0.lock().unwrap_or_else(|e| e.into_inner());
+                let used = &mut state.used[self.resource as usize];
+                *used = used.saturating_sub(self.amount);
+            }
+            self.usage.record(self.resource, self.amount, false);
         }
     }
 }
@@ -404,5 +444,27 @@ mod usage_snapshot_tests {
         let snap = usage.snapshot(Resource::MetadataBytes);
         assert_eq!((snap.used, snap.limit, snap.remaining()), (30, 100, 70));
         assert_eq!(usage.snapshot(Resource::VolumeHandles).limit, 4096, "the fixed ceiling is reported");
+    }
+
+    #[test]
+    fn a_scoped_view_gives_back_its_memory_charges_when_its_last_clone_drops() {
+        let usage = Usage::new(ProgressiveLimits { metadata_bytes: 100, ..Default::default() });
+        usage.charge(Resource::MetadataBytes, 10).unwrap();
+        let scope = usage.scoped();
+        scope.charge(Resource::MetadataBytes, 50).unwrap();
+        scope.charge(Resource::VerifyWorkBytes, 7).unwrap();
+        // The shared limit still applies while the scope lives.
+        assert!(scope.charge(Resource::MetadataBytes, 41).is_err());
+        let mut lease = scope.lease(Resource::MetadataBytes, 20).unwrap();
+        lease.grow(5).unwrap();
+        drop(lease);
+        assert_eq!(usage.snapshot(Resource::MetadataBytes).used, 60);
+        let clone = scope.clone();
+        drop(scope);
+        assert_eq!(usage.snapshot(Resource::MetadataBytes).used, 60, "a clone keeps the scope alive");
+        drop(clone);
+        assert_eq!(usage.snapshot(Resource::MetadataBytes).used, 10);
+        // Work done is not memory: it stays charged.
+        assert_eq!(usage.snapshot(Resource::VerifyWorkBytes).used, 7);
     }
 }

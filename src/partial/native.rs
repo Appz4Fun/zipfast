@@ -826,7 +826,7 @@ pub(crate) fn create_directory(
     control: &SessionControl,
     mut check: impl FnMut(GenesisPath<'_>) -> PartialResult<()>,
 ) -> PartialResult<(bool, Identity, Vec<Identity>)> {
-    let budget = PartialBudget::new(limits, usage, exclusions)?;
+    let budget = PartialBudget::new(limits, usage.scoped(), exclusions)?;
     let output = std::path::absolute(output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
     let target = output.join(relative);
     let ancestors = hold_ancestors(&[(&output, &output), (&output, &target)], &budget, control, &mut check)?;

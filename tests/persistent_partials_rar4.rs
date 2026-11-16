@@ -1004,6 +1004,8 @@ fn a_session_with_200_members_releases_finished_members() {
     let mut held: Option<(MemberKey, PartialFile)> = None;
     let mut released: Vec<MemberKey> = Vec::new();
     let mut finished = 0;
+    // (protection path bytes, metadata bytes) charged to the session after the 10th member.
+    let mut after_ten = None;
     loop {
         match session.poll_event(&mut Context::from_waker(Waker::noop())) {
             Poll::Pending => continue,
@@ -1018,6 +1020,10 @@ fn a_session_with_200_members_releases_finished_members() {
                 drop((file, again));
                 released.push(key);
                 finished += 1;
+                let used = |resource| session.resource_usage(resource).used;
+                if finished == 10 {
+                    after_ten = Some((used(Resource::ProtectionPathBytes), used(Resource::MetadataBytes)));
+                }
             }
             Poll::Ready(Ok(None)) => break,
             Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
@@ -1026,6 +1032,13 @@ fn a_session_with_200_members_releases_finished_members() {
         }
     }
     assert_eq!(finished, 200);
+    // A released member's memory charges come back: protection paths are flat, and metadata grows only by the
+    // progressive walk's own per-member bookkeeping (names, parts, frames: under 4 KB a member, as in any
+    // session), not by the ~22 KB a member's core charges.
+    let (paths, metadata) = after_ten.unwrap();
+    assert_eq!(session.resource_usage(Resource::ProtectionPathBytes).used, paths);
+    let growth = session.resource_usage(Resource::MetadataBytes).used - metadata;
+    assert!(growth < 190 * 4096, "metadata grew {growth} bytes over 190 members");
     // The caps above bound the descriptors and pages held at any time (a process-wide descriptor count is not
     // used: tests running in parallel open their own).
     let Err(error) = session.partial_file(&released[0]) else { panic!("a released member has no core left") };

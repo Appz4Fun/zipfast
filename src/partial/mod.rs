@@ -291,7 +291,8 @@ impl PartialCore {
         if checks.size != spec.size || options.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        let budget = PartialBudget::new(options.limits, options.usage, options.exclusions)?;
+        // The member's memory charges go back to the session when its core (or a failed genesis) is gone.
+        let budget = PartialBudget::new(options.limits, options.usage.scoped(), options.exclusions)?;
         let lease = budget.reserve(PartialResource::OpenPartials, 1)?;
         let _event = budget.reserve(PartialResource::Events, 1)?;
         budget.usage.charge(Resource::NameBytes, spec.name.len() as u64)?;
@@ -2215,7 +2216,7 @@ impl PartialCore {
         if options.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        let budget = PartialBudget::new(options.limits.clone(), options.usage, options.exclusions)?;
+        let budget = PartialBudget::new(options.limits.clone(), options.usage.scoped(), options.exclusions)?;
         let event = budget.reserve(PartialResource::Events, 1)?;
         let state = PartialState::load_budgeted(&spec.state_root, &spec.anchor, &budget)?;
         if state.member() != &spec.member {
