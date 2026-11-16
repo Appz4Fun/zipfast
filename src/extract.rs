@@ -213,8 +213,11 @@ impl MemberRef<'_> {
 #[derive(Clone)]
 pub struct MemberFilter {
     filter: Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>,
-    start: Option<Arc<dyn Fn(&MemberStart<'_>) -> StartDecision + Send + Sync>>,
+    start: Option<StartHook>,
 }
+
+/// The hook [`MemberFilter::on_start`] keeps.
+type StartHook = Arc<dyn Fn(&MemberStart<'_>) -> StartDecision + Send + Sync>;
 
 /// A selected member about to be written, as [`MemberFilter::on_start`] sees it.
 #[derive(Clone, Copy, Debug)]
