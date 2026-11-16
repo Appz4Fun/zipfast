@@ -553,6 +553,17 @@ impl<'a> RarMember<'a> {
         self.member.header.redirection.as_ref()
     }
 
+    /// RAR 5.0: the redirection record's raw flags (0x1: the link target is a directory). Zero without one.
+    pub fn redirection_flags(&self) -> u64 {
+        self.member.header.redirection_flags
+    }
+
+    /// RAR 5.0: the file header's raw file flags (0x1 directory, 0x2 time, 0x4 CRC, 0x8 unknown size). None for
+    /// RAR4 members.
+    pub fn rar5_file_flags(&self) -> Option<u64> {
+        (self.format() == super::RarFormat::Rar5).then_some(self.member.header.file_flags)
+    }
+
     pub fn version(&self) -> Option<u64> {
         self.member.header.version
     }

@@ -292,6 +292,9 @@ pub struct FileHeader {
     /// RAR 5.0: the version, flags and KDF count of the file encryption record as stored, even when `crypt` is
     /// None because the record is unsupported (a KDF count over 24, a newer version). None without the record.
     pub crypt_record: Option<Rar5CryptRecord>,
+    /// RAR 5.0: the redirection record's flags as stored (0x1: the target is a directory, which 7-Zip lists as
+    /// `:D`). Zero without the record.
+    pub redirection_flags: u64,
     pub redirection: Option<Redirection>,
     /// set on an older revision of a file kept alongside the current one
     pub version: Option<u64>,
@@ -640,7 +643,7 @@ fn parse_file_extra(
             }
             FHEXTRA_REDIR => {
                 let kind = r.vint()?;
-                let _flags = r.vint()?;
+                f.redirection_flags = r.vint()?;
                 let len = r.vsize()?;
                 let target = r.bytes(len)?;
                 if catalogue && !(1..=5).contains(&kind) {
