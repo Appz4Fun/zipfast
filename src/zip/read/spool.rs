@@ -688,6 +688,11 @@ impl<'a> PrivateCiphertextFile<'a> {
                 named = true;
                 return Err(policy());
             }
+            if portable {
+                // exFAT and similar renumber an inode once its last name is gone; every later check of this
+                // descriptor (stage copy, stdout retirement) compares against what it holds now.
+                identity = Some(Identity::of(&s));
+            }
             unlinked_verified = true;
             Ok(())
         })();
@@ -957,9 +962,9 @@ impl<'a> PrivateCiphertextFile<'a> {
             directory.storage,
         )
     }
-    pub(super) fn into_output(mut self) -> (File, Identity, libc::uid_t) {
+    pub(super) fn into_output(mut self) -> (File, Identity, libc::uid_t, bool) {
         // The sole reservation token takes ownership of the surviving FD/bytes.
-        (self.file.take().expect("successful anonymous acquisition"), self.identity, self.uid)
+        (self.file.take().expect("successful anonymous acquisition"), self.identity, self.uid, self.portable)
     }
     fn check(&self, cancel: &Cancellation) -> Result<(), ReadFault> {
         let s = io::operation(

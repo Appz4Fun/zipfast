@@ -390,3 +390,53 @@ fn portable_spool_swapped_before_unlink_fails_the_read() {
     // Their file under the spool name was the one removed; ours survives only under the name it was moved to.
     assert_eq!(names(temp.path()), ["moved"]);
 }
+
+/// The verified-stdout route stages through a private file in the temp directory, then copies it out.
+#[allow(clippy::result_large_err)] // The public checked result.
+fn stdout_read(zip: &Path, ordinal: usize, password: Option<&str>, temp: &Path, max: u64) -> ZipReadResult<Vec<u8>> {
+    use std::io::{Read, Seek};
+    use std::os::fd::AsFd;
+    let cancel = Cancellation::default();
+    let mut session = ProjectedReadSession::open(zip, &cancel)?;
+    let overrides = EncryptedReadOverrides { temp_dir: Some(temp.to_path_buf()), ..Default::default() };
+    let mut context = EncryptedReadContext::for_projected(
+        &mut session,
+        ProjectedReadScope::Entry(ordinal),
+        None,
+        ZipReadOutput::VerifiedStdout,
+        password,
+        &overrides,
+        &cancel,
+    )?;
+    let mut out = tempfile::tempfile().unwrap();
+    session.admit_output_fd(out.as_fd(), &mut context)?;
+    let mut stage = ZipReadStage::prepare_stdout(session.stage_entry(ordinal).unwrap(), &cancel, &mut context)?;
+    if let Err(error) =
+        session.read_at_with_context(ordinal, password, max, &cancel, &mut context, |b| stage.write_all(b, &cancel))
+    {
+        return Err(stage.finish_error(error, &mut context));
+    }
+    stage.copy_verified(&mut out, &cancel, &mut context, |c| session.check_source(c))?;
+    out.rewind().unwrap();
+    let mut bytes = Vec::new();
+    out.read_to_end(&mut bytes).unwrap();
+    Ok(bytes)
+}
+
+/// Stdout of AES and plain members through a portable temp directory: forced through the test hook here, and on a
+/// real filesystem (exFAT renumbers the unlinked stage's inode) with `ZIPFAST_ANYFS_DEST`.
+#[test]
+fn stdout_through_portable_temp_dir() {
+    let work = tempfile::tempdir().unwrap();
+    let zip = work.path().join("a.zip");
+    let (plain, secret) = archive(&zip);
+    let real = std::env::var_os("ZIPFAST_ANYFS_DEST");
+    let temp = match &real {
+        Some(base) => tempfile::tempdir_in(base).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    let _forced = real.is_none().then(|| Forced::new(0));
+    assert_eq!(stdout_read(&zip, 0, Some("pw"), temp.path(), u64::MAX).unwrap(), plain);
+    assert_eq!(stdout_read(&zip, 1, Some("pw"), temp.path(), u64::MAX).unwrap(), secret);
+    assert_eq!(names(temp.path()).iter().filter(|n| n.contains("zipfast")).count(), 0);
+}
