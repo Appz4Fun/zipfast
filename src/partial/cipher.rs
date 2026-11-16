@@ -35,10 +35,28 @@ pub(super) fn ceil_block(offset: u64) -> u64 {
 pub(crate) struct MemberKeys {
     pub aes: crate::crypto::AesKey,
     pub hash: [u8; 32],
+    /// The first IV of a RAR4 member, derived with its key; a RAR5 member's is in its header.
+    pub iv: Option<[u8; 16]>,
 }
 impl MemberKeys {
     pub(crate) fn new(aes: crate::crypto::AesKey, hash: [u8; 32]) -> Self {
-        Self { aes, hash }
+        Self { aes, hash, iv: None }
+    }
+    pub(crate) fn with_iv(mut self, iv: [u8; 16]) -> Self {
+        self.iv = Some(iv);
+        self
+    }
+    /// Derives the RAR 3.x AES-128 key and IV of a RAR4 member from `password` and its 8-byte salt.
+    pub(super) fn derive_rar4(
+        password: &str,
+        salt: &[u8; 8],
+        budget: &PartialBudget,
+        control: &SessionControl,
+    ) -> PartialResult<Self> {
+        canceled(control)?;
+        let (key, iv) = crate::rar5::member::controlled_legacy_keys(password, salt, &budget.usage, control)?;
+        let aes = crate::crypto::AesKey::new(&key).ok_or_else(|| err(PartialErrorKind::UnsupportedMethod))?;
+        Ok(Self::new(aes, [0; 32]).with_iv(iv))
     }
     /// Derives the keys from `password` and the member's header witness parameters, with KDF work metered by the
     /// budget and cancellable by `control`.
@@ -74,7 +92,7 @@ impl MemberKeys {
             }
         })?;
         let aes = crate::crypto::AesKey::new(&keys.key).ok_or_else(|| err(PartialErrorKind::UnsupportedMethod))?;
-        Ok(Self { aes, hash: keys.hash_key })
+        Ok(Self::new(aes, keys.hash_key))
     }
 }
 
@@ -278,7 +296,7 @@ pub(super) fn decrypt(
     result.plain = budget.vector((last.min(size) - first.min(size)) as usize)?;
     let mut run: Option<(u64, usize)> = None;
     let mut previous = if first == 0 {
-        Some(CipherBlock { offset: 0, have: 0..16, bytes: crypt.iv })
+        Some(CipherBlock { offset: 0, have: 0..16, bytes: keys.iv.unwrap_or(crypt.iv) })
     } else {
         assemble(&snapshot.cipher, first - 16, at, supply)
     };

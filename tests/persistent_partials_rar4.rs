@@ -78,6 +78,9 @@ struct Source {
     bytes: Vec<u8>,
     holes: Vec<Range<u64>>,
     reads: Arc<Mutex<Vec<(u32, u64)>>>,
+    /// Answers every other read `NotYet`, as a volume still downloading does.
+    slow: bool,
+    ticks: usize,
 }
 impl RangeSource for Source {
     fn info(&self) -> SourceInfo {
@@ -91,7 +94,13 @@ impl RangeSource for Source {
     fn backing_files(&self) -> &[File] {
         &[]
     }
-    fn read_at(&mut self, at: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+    fn read_at(&mut self, at: u64, buf: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        self.ticks += 1;
+        if self.slow && self.ticks % 2 == 1 {
+            // The next bytes arrive at once: wake the session to read again.
+            cx.waker().wake_by_ref();
+            return Ok(RangeRead::NotYet);
+        }
         self.reads.lock().unwrap().push((self.index, at));
         let mut end = (at + buf.len() as u64).min(self.bytes.len() as u64);
         for hole in &self.holes {
@@ -111,13 +120,20 @@ struct Provider {
     naming: Naming,
     volumes: Vec<Option<Source>>,
     protection: ProtectionDeclaration,
+    slow: bool,
+    ticks: usize,
 }
 impl VolumeSource for Provider {
     fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
         Ok(self.protection.clone())
     }
-    fn volume(&mut self, request: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+    fn volume(&mut self, request: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
         assert_eq!(request.expected, self.naming.name(request.index));
+        self.ticks += 1;
+        if self.slow && self.ticks % 2 == 1 {
+            cx.waker().wake_by_ref();
+            return Ok(VolumeAnswer::Wait);
+        }
         match self.volumes.get_mut(request.index as usize).and_then(Option::take) {
             Some(source) => Ok(VolumeAnswer::Ready(Box::new(source))),
             None => Ok(VolumeAnswer::Missing),
@@ -159,6 +175,8 @@ struct Set {
     holes: Vec<Vec<Range<u64>>>,
     /// (volume, offset) of every source read.
     reads: Arc<Mutex<Vec<(u32, u64)>>>,
+    /// Whether the provider and its sources answer as a set still downloading.
+    slow: bool,
 }
 impl Set {
     /// One member, `gold`, split across volumes at `cuts` (output offsets).
@@ -183,7 +201,7 @@ impl Set {
             wire.extend(block(0x7b, 0x4000 | u16::from(!last), &[]));
             volumes.push(wire);
         }
-        Self { naming, holes: vec![Vec::new(); count], volumes, payloads, reads: Arc::default() }
+        Self { naming, holes: vec![Vec::new(); count], volumes, payloads, reads: Arc::default(), slow: false }
     }
     /// One unsplit volume holding each `(name, data)` member in order.
     fn single(members: &[(&[u8], &[u8])]) -> Self {
@@ -196,7 +214,43 @@ impl Set {
             wire.extend(*data);
         }
         wire.extend(block(0x7b, 0x4000, &[]));
-        Self { naming: Naming::Old, volumes: vec![wire], payloads, holes: vec![Vec::new()], reads: Arc::default() }
+        Self {
+            naming: Naming::Old,
+            volumes: vec![wire],
+            payloads,
+            holes: vec![Vec::new()],
+            reads: Arc::default(),
+            slow: false,
+        }
+    }
+    /// One RAR4 stored member, `gold`, AES-encrypted with `password` (plain headers, salt present), its ciphertext
+    /// split across volumes at the part lengths `cuts`.
+    fn aes_split(naming: Naming, gold: &[u8], cuts: &[usize], password: &str) -> Self {
+        const SALT: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let (key, iv) = zipfast::crypto::derive_rar4_key_iv(password, &SALT);
+        let mut padded = gold.to_vec();
+        padded.resize(gold.len().next_multiple_of(16), 0xa5);
+        let cipher = zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap();
+        assert_eq!(cuts.iter().sum::<usize>(), cipher.len());
+        let (mut volumes, mut payloads, mut at) = (Vec::new(), Vec::new(), 0);
+        for (i, &len) in cuts.iter().enumerate() {
+            let payload = &cipher[at..at + len];
+            at += len;
+            let last = i + 1 == cuts.len();
+            let flags = 0x404 | u16::from(i > 0) | (u16::from(!last) * 2);
+            let crc = hash(if last { gold } else { payload });
+            let mut body = file_header(b"movie.mkv", len, gold.len(), crc, flags, 29, 0x30)[7..].to_vec();
+            body.extend(SALT);
+            let mut wire = SIG.to_vec();
+            let main = 0x01 | if matches!(naming, Naming::Parts) { 0x10 } else { 0 } | if i == 0 { 0x100 } else { 0 };
+            wire.extend(block(0x73, main, &[0; 6]));
+            wire.extend(block(0x74, flags | 0x8000, &body));
+            payloads.push(wire.len() as u64..(wire.len() + len) as u64);
+            wire.extend(payload);
+            wire.extend(block(0x7b, 0x4000 | u16::from(!last), &[]));
+            volumes.push(wire);
+        }
+        Self { naming, holes: vec![Vec::new(); cuts.len()], volumes, payloads, reads: Arc::default(), slow: false }
     }
     /// Makes the source answer archive bytes `packed` of `volume` as a hole.
     fn hole(&mut self, volume: usize, packed: Range<u64>) {
@@ -231,10 +285,14 @@ impl Set {
                         bytes: bytes.clone(),
                         holes: holes.clone(),
                         reads: self.reads.clone(),
+                        slow: self.slow,
+                        ticks: 0,
                     })
                 })
                 .collect(),
             protection: self.protection(),
+            slow: self.slow,
+            ticks: 0,
         }
     }
 }
@@ -566,6 +624,7 @@ fn refused_member(volume: Vec<u8>) -> RefusalReason {
         payloads: Vec::new(),
         holes: vec![Vec::new()],
         reads: Arc::default(),
+        slow: false,
     };
     let mut session = ProgressiveSession::new_partial(
         Box::new(set.provider()),
@@ -602,6 +661,7 @@ fn refused(volume: Vec<u8>) -> PartialErrorKind {
         payloads: Vec::new(),
         holes: vec![Vec::new()],
         reads: Arc::default(),
+        slow: false,
     };
     let mut session = ProgressiveSession::new_partial(
         Box::new(set.provider()),
@@ -643,14 +703,10 @@ fn encrypted_compressed_and_unknown_size_rar4_members_are_refused_and_header_enc
     // A solid stream's members are compressed members too, though other sessions now decode them.
     let solid = archive(file_header(b"s.bin", packed.len(), data.len(), hash(data), 0x10, 29, 0x33), &packed, 0x08);
     assert_eq!(refused_member(solid), RefusalReason::Compressed { method: 3 });
-    // Encrypted stored, with and without a salt.
-    for (flags, salt) in [(0x04u16, false), (0x404, true)] {
-        let mut header = file_header(b"e.bin", 16, data.len(), hash(data), flags, 29, 0x30);
-        if salt {
-            let mut body = header[7..].to_vec();
-            body.extend([7u8; 8]);
-            header = block(0x74, flags | 0x8000, &body);
-        }
+    // Encrypted stored without a salt (an AES member with one is admitted: see the RAR4 AES tests below), and
+    // with an older cipher.
+    for version in [29, 20] {
+        let header = file_header(b"e.bin", 16, data.len(), hash(data), 0x04, version, 0x30);
         assert_eq!(refused_member(archive(header, &[0; 16], 0)), RefusalReason::Encrypted);
     }
     // Header encryption (-hp): refused at the main header, before any encrypted header is read.
@@ -672,7 +728,11 @@ fn crash<T>(value: T) {
 }
 /// A session over `set` under `dir` with 300-byte reads, committing every write.
 fn session(set: &Set, dir: &Path, anchors: &Arc<Anchors>) -> ProgressiveSession {
+    session_with(set, dir, anchors, None)
+}
+fn session_with(set: &Set, dir: &Path, anchors: &Arc<Anchors>, password: Option<&str>) -> ProgressiveSession {
     let mut opts = options(&dir.join("out"), set.naming.name(0));
+    opts.set_password(password.map(String::from)).unwrap();
     opts.limits.read_chunk = 300;
     let mut partial = partial_options(&dir.join("state"), anchors.clone());
     partial.limits.group_commit_bytes = 0;
@@ -781,4 +841,140 @@ fn restart_resumes_split_and_multi_member_sets_at_every_crash_point() {
             }
         }
     }
+}
+
+fn describe(outcome: &MemberOutcome) -> &'static str {
+    match outcome {
+        MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. } => "complete, verified",
+        MemberOutcome::PersistentComplete { .. } => "complete, not verified",
+        MemberOutcome::PersistentPartial { .. } => "partial",
+        MemberOutcome::Refused { .. } => "refused",
+        _ => "other",
+    }
+}
+/// RustyGet's case: a 5-volume RAR4 set whose one stored member is AES-encrypted (plain headers, salt present),
+/// 60,000 bytes of ciphertext per volume. The persistent session admits it and publishes the decrypted member with
+/// a verified CRC, whether the set is still downloading or already complete.
+#[test]
+fn rar4_aes_stored_member_publishes_its_output_downloading_and_complete() {
+    let gold = gold(250_000);
+    for slow in [true, false] {
+        for naming in [Naming::Parts, Naming::Old] {
+            let mut set = Set::aes_split(naming, &gold, &[60_000, 60_000, 60_000, 60_000, 10_000], "pw");
+            set.slow = slow;
+            let dir = tempfile::tempdir().unwrap();
+            let mut seen = Seen::default();
+            // Default reads and group commits: a commit per 300-byte read is slow on a set this size.
+            let mut opts = options(&dir.path().join("out"), set.naming.name(0));
+            opts.set_password(Some("pw".into())).unwrap();
+            let partial = partial_options(&dir.path().join("state"), Arc::default());
+            let mut session = ProgressiveSession::new_partial(Box::new(set.provider()), opts, partial).unwrap();
+            assert!(run(&mut session, &mut seen, None));
+            assert_eq!(seen.outcomes.len(), 1, "slow {slow}");
+            // `Verdict::Ok` is the member CRC-32 over the decrypted output, checked against the header's.
+            assert!(
+                matches!(&seen.outcomes[0], MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }),
+                "{}",
+                describe(&seen.outcomes[0])
+            );
+            assert_eq!(fs::read(dir.path().join("out").join("movie.mkv")).unwrap(), gold, "slow {slow}");
+        }
+    }
+}
+
+/// A wrong or missing password for a RAR4 AES member fails typed, and nothing is published.
+#[test]
+fn rar4_aes_stored_member_without_its_password_publishes_nothing() {
+    let gold = gold(4000);
+    let set = Set::aes_split(Naming::Parts, &gold, &[1008, 1008, 1008, 976], "pw");
+    for password in [None, Some("wrong")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session_with(&set, dir.path(), &Arc::default(), password);
+        let mut failed = false;
+        for _ in 0..1_000_000 {
+            match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+                Poll::Pending => continue,
+                Poll::Ready(Ok(None)) => break,
+                Poll::Ready(Err(_)) | Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { .. }))) => {
+                    failed = true;
+                    break;
+                }
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => {
+                    assert!(
+                        !matches!(outcome, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }),
+                        "{password:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(failed, "{password:?}");
+        assert!(fs::read(dir.path().join("out").join("movie.mkv")).ok().is_none_or(|bytes| bytes != gold));
+    }
+}
+
+/// A RAR4 AES member resumes after a restart at every crash point, and every byte lands decrypted.
+#[test]
+fn restart_resumes_a_rar4_aes_stored_member_at_every_crash_point() {
+    let gold = gold(4000);
+    let set = Set::aes_split(Naming::Parts, &gold, &[1008, 1008, 1008, 976], "pw");
+    let pw = Some("pw");
+    let total = {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = Seen::default();
+        assert!(run(&mut session_with(&set, dir.path(), &Arc::default(), pw), &mut seen, None));
+        seen.events
+    };
+    for crash_at in 1..total {
+        let dir = tempfile::tempdir().unwrap();
+        let anchors = Arc::new(Anchors::default());
+        let mut first = session_with(&set, dir.path(), &anchors, pw);
+        let mut before = Seen::default();
+        assert!(!run(&mut first, &mut before, Some(crash_at)));
+        crash((first, std::mem::take(&mut before.files)));
+        let mut second = session_with(&set, dir.path(), &anchors, pw);
+        let mut after = Seen::default();
+        assert!(run(&mut second, &mut after, None), "crash at {crash_at}");
+        assert_eq!(after.outcomes.len(), 1, "crash at {crash_at}");
+        assert!(
+            matches!(&after.outcomes[0], MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }),
+            "crash at {crash_at}: {}",
+            describe(&after.outcomes[0])
+        );
+        for (_, produced, _) in &after.adopted {
+            assert_eq!(produced % 16, 0, "crash at {crash_at}");
+        }
+        assert_eq!(fs::read(dir.path().join("out").join("movie.mkv")).unwrap(), gold, "crash at {crash_at}");
+    }
+}
+
+/// A wrong password on the persistent RAR4 AES route: RAR 3.x AES has no check value, so the member decrypts to
+/// garbage and the session fails on its final CRC-32. No member finishes, so nothing is published: the in-place
+/// partial output holds no decrypted bytes and is never reported complete.
+#[test]
+fn rar4_aes_stored_member_with_a_wrong_password_fails_its_crc_and_publishes_nothing() {
+    let gold = gold(4000);
+    let set = Set::aes_split(Naming::Parts, &gold, &[1008, 1008, 1008, 976], "pw");
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session_with(&set, dir.path(), &Arc::default(), Some("wrong"));
+    let mut outcomes = Vec::new();
+    let failure = loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => continue,
+            Poll::Ready(Err(failure)) => break failure,
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => break failure,
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(outcome),
+            Poll::Ready(Ok(None)) => panic!("a wrong password must fail the session"),
+            _ => {}
+        }
+    };
+    let FailureKind::Rar(rar) = &failure.kind else { panic!("not a RAR integrity failure: {failure:?}") };
+    let detail = format!("{rar:?}");
+    assert!(
+        detail.contains("EncryptedIntegrity") && detail.contains("crc32: true"),
+        "the member CRC-32 must fail: {detail}"
+    );
+    assert!(outcomes.is_empty(), "no member may finish: {:?}", outcomes.iter().map(describe).collect::<Vec<_>>());
+    let out = dir.path().join("out").join("movie.mkv");
+    assert!(fs::read(&out).ok().is_none_or(|bytes| bytes != gold));
 }

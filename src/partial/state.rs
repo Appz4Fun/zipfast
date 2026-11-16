@@ -1022,14 +1022,13 @@ pub(super) fn validate_evidence(
         if header.method != 0 || header.is_dir() || header.redirection.is_some() {
             return Err(err(PartialErrorKind::UnsupportedMethod));
         }
-        // RAR4 is admitted plain only: its encryption, and any header the progressive RAR4 path refuses, stay out.
-        if header.format == crate::rar5::RarFormat::Rar4
-            && (header.encrypted || header.rar4_progressive_unsupported(None).is_some())
-        {
+        // RAR4 is admitted plain or AES with a salt; any header the progressive RAR4 path refuses stays out.
+        let legacy = header.rar4.map(|raw| crate::rar5::LegacyCrypt { version: raw.unpack_version, salt: raw.salt });
+        if header.format == crate::rar5::RarFormat::Rar4 && header.rar4_progressive_unsupported(legacy).is_some() {
             return Err(err(PartialErrorKind::UnsupportedMethod));
         }
         let params = if header.encrypted {
-            Some(header.crypt.ok_or_else(|| err(PartialErrorKind::UnsupportedMethod))?)
+            Some(member_crypt(&header).ok_or_else(|| err(PartialErrorKind::UnsupportedMethod))?)
         } else {
             None
         };
@@ -1104,5 +1103,21 @@ impl<'de> serde::Deserialize<'de> for PartialState {
             }
         }
         deserializer.deserialize_bytes(ManifestVisitor)
+    }
+}
+
+/// The cipher parameters a partial keeps for an encrypted stored member: a RAR5 header's own, or for a RAR4 member
+/// (RAR 3.x AES-128-CBC, which needs its salt) the salt in the first 8 salt bytes and no check value. A RAR4 IV is
+/// derived from the password with the key, so it lives in the in-memory keys and `iv` here is zero.
+pub(crate) fn member_crypt(header: &crate::rar5::FileHeader) -> Option<crate::crypto::Rar5CryptParams> {
+    match header.format {
+        crate::rar5::RarFormat::Rar5 => header.crypt,
+        crate::rar5::RarFormat::Rar4 => {
+            let raw = header.rar4?;
+            let salt8 = raw.salt.filter(|_| header.encrypted && raw.unpack_version == 29)?;
+            let mut salt = [0; 16];
+            salt[..8].copy_from_slice(&salt8);
+            Some(crate::crypto::Rar5CryptParams { kdf_count: 0, salt, iv: [0; 16], check: None, tweaked_crc: false })
+        }
     }
 }
