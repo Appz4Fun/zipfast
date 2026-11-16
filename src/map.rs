@@ -61,6 +61,59 @@ pub enum MapEnd {
     /// Volume `volume` ended at `offset` before its headers did, for example a buffer holding only a volume's
     /// first bytes. Pieces whose headers were read are listed even when their data lies past the end.
     Truncated { volume: u32, offset: u64 },
+    /// The header at `offset` in volume `volume` is damaged or unsupported, after volume 0's main header was read.
+    /// The walk stops there; members and pieces whose headers came before it are listed.
+    Damaged { volume: u32, offset: u64, reason: HeaderDamage },
+}
+
+/// What is wrong with the header a walk stopped at ([`MapEnd::Damaged`], [`VolumeEnd::Damaged`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HeaderDamage {
+    /// The header failed its checksum.
+    Checksum,
+    /// The header's fields or sizes are inconsistent, or it cannot stand where it is. The text says what.
+    Malformed(&'static str),
+    /// The header uses a feature this module does not map. The text names it.
+    Unsupported(&'static str),
+}
+
+impl HeaderDamage {
+    /// The damage a walk failure describes, if it is header damage: `Malformed` or `Unsupported`.
+    pub(crate) fn of(error: &MapError) -> Option<Self> {
+        use crate::error::{RarFailure, RarIntegrityReason, RarUnsupported};
+        Some(match error {
+            MapError::Malformed { failure, .. } => match &failure.kind {
+                FailureKind::ChecksumMismatch { .. } => Self::Checksum,
+                FailureKind::Malformed(what) => Self::Malformed(what),
+                FailureKind::Truncated => Self::Malformed("header fields run past the header size"),
+                FailureKind::Rar(rar) => match rar.as_ref() {
+                    RarFailure::Integrity { reason, .. } | RarFailure::EncryptedIntegrity { reason, .. } => {
+                        match reason {
+                            RarIntegrityReason::HeaderCrc => Self::Checksum,
+                            RarIntegrityReason::HeaderFraming(what) => Self::Malformed(what),
+                            RarIntegrityReason::ChangedContinuationEncoding
+                            | RarIntegrityReason::SplitSizeMismatch { .. } => Self::Malformed("member continuation"),
+                            _ => Self::Malformed("header"),
+                        }
+                    }
+                    _ => Self::Malformed("header"),
+                },
+                _ => Self::Malformed("header"),
+            },
+            MapError::Unsupported { failure, .. } => match &failure.kind {
+                FailureKind::Rar(rar) => match rar.as_ref() {
+                    RarFailure::Unsupported(RarUnsupported::Rar4Feature(what)) => Self::Unsupported(what),
+                    RarFailure::Unsupported(RarUnsupported::EncryptionVersion(_)) => {
+                        Self::Unsupported("encryption version")
+                    }
+                    _ => Self::Unsupported("header feature"),
+                },
+                _ => Self::Unsupported("header feature"),
+            },
+            _ => return None,
+        })
+    }
 }
 
 /// A listing of an archive's members and where their bytes are.
@@ -181,6 +234,9 @@ pub enum VolumeEnd {
     /// For RAR 5.0 the main header is among them, so the volume facts are unknown; RAR 4.x keeps its main
     /// header in the clear.
     Locked { offset: u64 },
+    /// The header at `offset` is damaged or unsupported, after the main header was read. The walk stops there;
+    /// members whose headers came before it are listed, and the volume facts are the main header's.
+    Damaged { offset: u64, reason: HeaderDamage },
 }
 
 /// The headers of one RAR volume, read on their own: any volume of a set, or only its first bytes.

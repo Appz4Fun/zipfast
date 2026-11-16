@@ -35,13 +35,18 @@ impl HeaderParser {
                 .fault(RarIntegrityReason::HeaderCrc, Error::BadChecksum("RAR4 header CRC".into()), true)
                 .into());
         }
-        if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
+        if self.embedded_comment(kind, flags) {
             return Err(self.rar4_unsupported("embedded comment").into());
         }
         let mut cursor = Fields::new(header, 7);
-        // The old subblock (0x77) and old recovery record (0x78) carry their data size whether or not they set
-        // LONG_BLOCK, as unrar reads them; only lenient map walks admit those blocks at all.
-        let sized = flags & 0x8000 != 0 || (self.map_lenient && matches!(kind, 0x77 | 0x78));
+        // Map walks follow unrar's ReadHeader15 on which blocks have data after the header: the old subblock (0x77)
+        // and old recovery record (0x78) always start with its size, the main, old comment and end headers never
+        // have any, and every other block has it exactly when LONG_BLOCK is set.
+        let sized = match kind {
+            0x77 | 0x78 if self.map_lenient => true,
+            0x73 | 0x75 | 0x7b if self.map_lenient => false,
+            _ => flags & 0x8000 != 0,
+        };
         let packed = if sized { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
         let data_at = self
             .at
@@ -65,14 +70,19 @@ impl HeaderParser {
                         .framing("duplicate RAR4 main header", Error::Corrupt("duplicate RAR4 main header"))
                         .into());
                 }
-                if size != 13 && !(size == 14 && flags & 0x200 != 0) {
+                // MHD_ENCRYPTVER (0x200) adds a byte: the version of the header encryption. A map walk also accepts
+                // a longer header (a RAR 2.x embedded comment, or fields it does not know) and ignores the rest.
+                let fixed = 13 + usize::from(flags & 0x200 != 0);
+                if (self.map_lenient && size < fixed) || (!self.map_lenient && size != 13 && size != fixed) {
                     return Err(self.framing("RAR4 main header size", Error::Corrupt("RAR4 main header size")).into());
                 }
                 if flags & 0x80 != 0 {
                     if self.usage.is_none() {
                         return Err(self.rar4_unsupported("encrypted headers").into());
                     }
-                    if flags & 0x200 != 0 {
+                    // RAR 3.x headers are always encrypted the RAR 2.9 way; unrar 3.x refuses a version above its
+                    // own (36) and unrar 5 ignores the byte. Map walks accept what unrar 3.x accepts.
+                    if flags & 0x200 != 0 && !(self.map_lenient && header[13] <= 36) {
                         return Err(self.rar4_unsupported("header encryption version").into());
                     }
                     self.legacy_headers = true;
@@ -110,15 +120,19 @@ impl HeaderParser {
                     + usize::from(flags & 2 != 0) * 4
                     + usize::from(flags & 4 != 0) * 7
                     + usize::from(flags & 8 != 0) * 2;
-                if size != expected {
+                // A map walk takes any size, as unrar does: bytes past the fields are ignored, and a field the header
+                // is too short to hold is absent.
+                if size != expected && !self.map_lenient {
                     return Err(self
                         .framing("RAR4 end header fields", Error::Corrupt("RAR4 end header fields"))
                         .into());
                 }
                 // EARC_VOLNUMBER: a 16-bit volume number after the optional data CRC.
                 let at = 7 + usize::from(flags & 2 != 0) * 4;
-                let volume_number =
-                    (flags & 8 != 0).then(|| u64::from(u16::from_le_bytes([header[at], header[at + 1]])));
+                let volume_number = (flags & 8 != 0)
+                    .then(|| header.get(at..at + 2))
+                    .flatten()
+                    .map(|n| u64::from(u16::from_le_bytes([n[0], n[1]])));
                 Block::End { more_volumes: flags & 1 != 0, volume_number }
             }
             // Old comment, AV, old subblock, old recovery record and sign blocks hold no members. A map walk skips
@@ -132,6 +146,12 @@ impl HeaderParser {
             return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
         }
         Ok(frame)
+    }
+    /// A RAR 2.x comment embedded in the main header (`MHD_COMMENT`) or a file header (`LHD_COMMENT`) that this
+    /// parser refuses. Map walks accept both: the main header's comment lies past its fixed fields, and a file
+    /// header's after the name, where unrar leaves it unread too.
+    pub(super) fn embedded_comment(&self, kind: u8, flags: u16) -> bool {
+        !self.map_lenient && ((kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0))
     }
     pub(super) fn rar4_unsupported(&self, feature: &'static str) -> RarFault {
         RarFault::new(

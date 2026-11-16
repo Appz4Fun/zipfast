@@ -22,8 +22,8 @@ use super::physical::{PhysicalMember, PhysicalPart, continuation_issue};
 use super::reader::Block;
 use super::{FileHeader, FileWire, MemberCrypt, RarFormat};
 use crate::map::{
-    CipherParams, Got, MapChecks, MapEnd, MapError, MapFormat, MapInput, MapMember, MapMethod, MapOptions, MapPiece,
-    MemberMap, Opened, OutputMapping, VolumeEnd, VolumeMap, VolumeMember, Walked, read,
+    CipherParams, Got, HeaderDamage, MapChecks, MapEnd, MapError, MapFormat, MapInput, MapMember, MapMethod,
+    MapOptions, MapPiece, MemberMap, Opened, OutputMapping, VolumeEnd, VolumeMap, VolumeMember, Walked, read,
 };
 use crate::progressive::{FailureKind, ProgressiveFailure, Resource, SessionControl, Usage, VolumeRequest};
 use std::{
@@ -87,6 +87,8 @@ pub(crate) struct RarWalker {
     proven: bool,
     /// Offset of the header being read on the current volume.
     header_start: Option<u64>,
+    /// Offset of the last header parsed on the current volume, where a failure found in its frame lies.
+    frame_start: Option<u64>,
     rar5_keys: Option<(u8, [u8; 16], crate::crypto::Rar5Keys)>,
     rar4_keys: Option<([u8; 8], [u8; 16], [u8; 16])>,
     members: Vec<MapMember>,
@@ -117,6 +119,7 @@ impl RarWalker {
             unproven: false,
             proven: false,
             header_start: None,
+            frame_start: None,
             rar5_keys: None,
             rar4_keys: None,
             members: Vec::new(),
@@ -191,8 +194,26 @@ impl RarWalker {
         match self.poll_inner(input, cx) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(map)) => Poll::Ready(Ok(map)),
-            Err(e) => Poll::Ready(Err(e)),
+            Err(e) => Poll::Ready(self.damaged(e)),
         }
+    }
+
+    /// Ends the walk at a damaged header once the main header (of volume 0, for a whole-archive walk) has been
+    /// read, keeping what was read before it. Other failures, and damage before that point, fail the walk.
+    fn damaged(&mut self, error: MapError) -> Result<Walked, MapError> {
+        let started = match &self.single {
+            Some(single) => single.main_read,
+            None => self.volume > 0 || self.main_seen,
+        };
+        let Some(reason) = HeaderDamage::of(&error).filter(|_| started) else {
+            return Err(error);
+        };
+        let offset = self.header_start.or(self.frame_start).unwrap_or_else(|| self.parser.header_offset());
+        Ok(if self.single.is_some() {
+            self.finish_volume(VolumeEnd::Damaged { offset, reason })
+        } else {
+            self.finish(MapEnd::Damaged { volume: self.volume, offset, reason })
+        })
     }
 
     fn poll_inner(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Result<Poll<Walked>, MapError> {
@@ -210,6 +231,7 @@ impl RarWalker {
                             self.main_seen = false;
                             self.unproven = false;
                             self.header_start = None;
+                            self.frame_start = None;
                             self.phase = Phase::Header;
                         }
                         Opened::Wait => return Ok(Poll::Pending),
@@ -292,6 +314,7 @@ impl RarWalker {
             let progressed = used > 0 || matches!(step, ParserStep::Frame(_) | ParserStep::LegacyKeyRequired { .. });
             match step {
                 ParserStep::Frame(frame) => {
+                    self.frame_start = Some(frame.extent.start);
                     self.header_start = None;
                     if let Some(map) = self.frame(frame)? {
                         return Ok(Some(map));

@@ -169,7 +169,8 @@ impl HeaderParser {
     }
     /// Accepts what a header map may list but extraction refuses, on RAR 4.x: a legacy name that is not UTF-8
     /// (kept as raw bytes, with an empty decoded name), the legacy service blocks 0x75..=0x79 (skipped by their
-    /// declared sizes), and bytes left over inside a file or service header's declared size (ignored).
+    /// declared sizes), embedded comments, bytes left over inside a header's declared size (ignored), an end
+    /// header of any size, and `MHD_ENCRYPTVER` on an encrypted-header archive.
     pub(crate) fn lenient_map(mut self) -> Self {
         self.map_lenient = true;
         self
@@ -424,7 +425,7 @@ impl HeaderParser {
                     {
                         return Err(self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")).into());
                     }
-                    if (kind == 0x73 && flags & 2 != 0) || (kind == 0x74 && flags & 8 != 0) {
+                    if self.embedded_comment(kind, flags) {
                         return Err(self.rar4_unsupported("embedded comment").into());
                     }
                     if let Some(budget) = budget {

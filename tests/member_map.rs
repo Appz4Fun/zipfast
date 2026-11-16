@@ -900,11 +900,13 @@ fn later_volume_cut_inside_its_first_encrypted_header_is_truncated_not_a_wrong_p
         assert!(matches!(map.end, MapEnd::Truncated { volume: 2, .. }), "cut {cut}: {:?}", map.end);
         assert_eq!(map.members[0].pieces.len(), 2, "cut {cut}: volume 2's file header is never complete");
     }
-    // Damage in a later volume's encrypted header is damage, not a wrong password.
+    // Damage in a later volume's encrypted header is damage, not a wrong password: the walk stops there.
     let mut damaged = volumes.clone();
     damaged[2][50] ^= 1;
-    let error = MemberMap::from_memory(&refs(&damaged), "a.part01.rar", Some("pw")).unwrap_err();
-    assert!(matches!(error, MapError::Malformed { volume: 2, .. }), "{error:?}");
+    let map = MemberMap::from_memory(&refs(&damaged), "a.part01.rar", Some("pw")).unwrap();
+    assert!(!map.complete);
+    assert!(matches!(map.end, MapEnd::Damaged { volume: 2, reason: HeaderDamage::Checksum, .. }), "{:?}", map.end);
+    assert_eq!(map.members[0].pieces.len(), 2);
 }
 
 #[test]
@@ -992,8 +994,17 @@ fn rar5_split_part_must_keep_the_key_but_may_restate_another_iv() {
     for (salt, kdf) in [([0x44; 16], 1), (SALT, 2)] {
         let (_, _, other) = encrypted_volumes_with(3000, &[1000, 2000], IV, salt, kdf);
         let mixed = vec![a[0].clone(), other[1].clone(), a[2].clone()];
-        let error = MemberMap::from_memory(&refs(&mixed), "e.part1.rar", None).unwrap_err();
-        assert!(matches!(error, MapError::Malformed { volume: 1, .. }), "{error:?}");
+        let map = MemberMap::from_memory(&refs(&mixed), "e.part1.rar", None).unwrap();
+        assert!(!map.complete);
+        assert!(
+            matches!(
+                map.end,
+                MapEnd::Damaged { volume: 1, reason: HeaderDamage::Malformed("member continuation identity"), .. }
+            ),
+            "{:?}",
+            map.end
+        );
+        assert_eq!(map.members[0].pieces.len(), 1);
     }
 }
 
@@ -1446,9 +1457,17 @@ fn rar4_first_volume_flag_and_end_header_number_must_agree() {
     let mut bytes = b"Rar!\x1a\x07\0".to_vec();
     bytes.extend(r4_block(0x73, 0x111, &[0; 6]));
     bytes.extend(r4_member(b"one", &gold[..40], 2, 0x30, gold.len(), crc32fast::hash(&gold[..40])));
+    let end_at = bytes.len() as u64;
     bytes.extend(r4_block(0x7b, 0x4000 | 0x8 | 1, &5u16.to_le_bytes()));
-    let error = vol(&bytes, "x.part1.rar", None).unwrap_err();
-    assert!(matches!(error, MapError::Malformed { volume: 0, .. }), "{error:?}");
+    let map = vol(&bytes, "x.part1.rar", None).unwrap();
+    assert_eq!(
+        map.end,
+        VolumeEnd::Damaged {
+            offset: end_at,
+            reason: HeaderDamage::Malformed("first volume with a nonzero volume number")
+        }
+    );
+    assert_eq!((map.first_volume, map.volume_number, map.members.len()), (true, Some(0), 1), "the main header's facts");
     // A RAR 2.x first volume has no MHD_FIRSTVOLUME: its end header's 0 makes it first, and a prefix knows nothing.
     let mut old = b"Rar!\x1a\x07\0".to_vec();
     old.extend(r4_block(0x73, 0x01, &[0; 6]));
@@ -1494,9 +1513,10 @@ fn r4_member_dos(name: &[u8], data: &[u8], dos: u32, trailing: &[u8]) -> Vec<u8>
 
 /// A legacy service block of `kind`. With `data`, LONG_BLOCK declares it in ADD_SIZE and it follows the header;
 /// without, the payload sits inside the header, as in an old comment (the old subblock and recovery record always
-/// start with a data size, here 0).
+/// start with a data size, here 0). The old comment never has data: there LONG_BLOCK is set over its own fields.
 fn r4_legacy(kind: u8, data: Option<&[u8]>) -> Vec<u8> {
     match data {
+        Some(_) if kind == 0x75 => r4_block(kind, 0x8000, b"\x05\x00\x0f\x30\x00\x00stuff"),
         Some(data) => {
             let mut body = (data.len() as u32).to_le_bytes().to_vec();
             body.extend([1, 2, 3, 4, 5, 6]);
@@ -1555,10 +1575,16 @@ fn rar4_cp437_name_is_listed_raw_by_map_walks() {
     // A continuation under another raw name is not the same member.
     let mut other = volumes.clone();
     other[1] = r4_split_named(&gold, 50, b"caf\x83.mkv").swap_remove(1);
-    assert!(matches!(
-        MemberMap::from_memory(&refs(&other), "old.part1.rar", None),
-        Err(MapError::Malformed { volume: 1, .. })
-    ));
+    let map = MemberMap::from_memory(&refs(&other), "old.part1.rar", None).unwrap();
+    assert!(!map.complete);
+    assert!(
+        matches!(
+            map.end,
+            MapEnd::Damaged { volume: 1, reason: HeaderDamage::Malformed("member continuation identity"), .. }
+        ),
+        "{:?}",
+        map.end
+    );
 }
 
 #[test]
@@ -1632,13 +1658,20 @@ fn rar4_legacy_service_blocks_are_skipped_by_map_walks() {
 fn rar4_hostile_legacy_block_sizes_are_typed() {
     let a = data(100, 7);
     let member = r4_member_dos(b"a.bin", &a, DOS, &[]);
-    // A header size below the fixed fields, and an old recovery record too short to hold its data size.
-    for block in [r4_resize(r4_legacy(0x76, None), 3), r4_block(0x78, 0, &[1, 2])] {
+    // A header size below the fixed fields, and an old recovery record too short to hold its data size: damage
+    // at that header, with the member before it.
+    let at = (SIG.len() - 1 + 13 + member.len()) as u64;
+    for (block, what) in [
+        (r4_resize(r4_legacy(0x76, None), 3), "RAR4 header size"),
+        (r4_block(0x78, 0, &[1, 2]), "header fields run past the header size"),
+    ] {
         let bytes = r4_archive(&[member.clone(), block]);
-        let error = vol(&bytes, "old.rar", None).unwrap_err();
-        assert!(matches!(error, MapError::Malformed { volume: 0, .. }), "{error:?}");
-        let error = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap_err();
-        assert!(matches!(error, MapError::Malformed { volume: 0, .. }), "{error:?}");
+        let map = vol(&bytes, "old.rar", None).unwrap();
+        assert_eq!(map.end, VolumeEnd::Damaged { offset: at, reason: HeaderDamage::Malformed(what) });
+        assert_eq!(map.members.len(), 1);
+        let map = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap();
+        assert_eq!(map.end, MapEnd::Damaged { volume: 0, offset: at, reason: HeaderDamage::Malformed(what) });
+        assert_eq!((map.complete, map.members.len()), (false, 1));
     }
     // A data size or a header size running past the volume: the walk ends truncated at that block, with the
     // members before it.
@@ -1701,4 +1734,197 @@ fn rar4_dos_time_is_exposed_even_when_invalid() {
     let bytes = archive(&[FileSpec::new("a.bin", b"x")]);
     assert_eq!(MemberMap::from_memory(&[&bytes], "x.rar", None).unwrap().members[0].dos_time, None);
     assert_eq!(vol(&bytes, "x.rar", None).unwrap().members[0].dos_time, None);
+}
+
+#[test]
+fn rar4_old_comment_never_has_data_but_av_and_sign_follow_long_block() {
+    // unrar reads an old comment's fixed fields and never an ADD_SIZE, even with LONG_BLOCK set; the AV and sign
+    // blocks take their data size from LONG_BLOCK like any other block.
+    let a = data(120, 3);
+    let comment = r4_block(0x75, 0x8000, b"\x05\x00\x0f\x30\x00\x00stuff");
+    let bytes = r4_archive(&[comment, r4_member_dos(b"a.bin", &a, DOS, &[])]);
+    let map = vol(&bytes, "old.rar", None).unwrap();
+    assert_eq!(map.end, VolumeEnd::Complete);
+    assert_eq!(packed_of(&bytes, &map.members[0]), &a[..]);
+    for kind in [0x76u8, 0x79] {
+        let sig = data(40, 4);
+        let bytes = r4_archive(&[r4_legacy(kind, Some(&sig)), r4_member_dos(b"a.bin", &a, DOS, &[])]);
+        let map = vol(&bytes, "old.rar", None).unwrap();
+        assert_eq!(map.end, VolumeEnd::Complete);
+        assert_eq!(packed_of(&bytes, &map.members[0]), &a[..]);
+        // Without LONG_BLOCK the same bytes after the header are read as the next header.
+        let mut plain = r4_legacy(kind, Some(&sig));
+        plain[3..5].copy_from_slice(&0u16.to_le_bytes());
+        let crc = crc32fast::hash(&plain[2..7 + 10]) as u16;
+        plain[..2].copy_from_slice(&crc.to_le_bytes());
+        let bytes = r4_archive(&[plain, r4_member_dos(b"a.bin", &a, DOS, &[])]);
+        assert!(!matches!(vol(&bytes, "old.rar", None).unwrap().end, VolumeEnd::Complete));
+    }
+}
+
+#[test]
+fn rar4_embedded_comments_and_odd_header_sizes_are_accepted_by_map_walks() {
+    use zipfast::rar5::session::{RarSession, RarSessionOptions};
+    let a = data(150, 5);
+    let member = r4_member_dos(b"a.bin", &a, DOS, &[]);
+    let with_main = |flags: u16, extra: &[u8]| {
+        let mut body = vec![0; 6];
+        body.extend(extra);
+        let mut bytes = b"Rar!\x1a\x07\0".to_vec();
+        bytes.extend(r4_block(0x73, flags, &body));
+        bytes
+    };
+    // RAR 2.x: MHD_COMMENT with the comment block inside the main header, a main header with unknown extra
+    // bytes, and LHD_COMMENT with the comment after the name.
+    let mut file_comment = r4_member_dos(b"a.bin", &[], DOS, b"\x05\x00\x0f\x30\x00\x00file comment");
+    file_comment[3..5].copy_from_slice(&(0x8000u16 | 0x08).to_le_bytes());
+    let crc = crc32fast::hash(&file_comment[2..]) as u16;
+    file_comment[..2].copy_from_slice(&crc.to_le_bytes());
+    let cases = [
+        (with_main(0x02, &r4_block(0x75, 0, b"\x05\x00\x0f\x30\x00\x00hello")), member.clone()),
+        (with_main(0x00, &[1, 2, 3]), member.clone()),
+        (with_main(0x00, &[]), file_comment),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.rar");
+    for (head, file) in cases {
+        let mut bytes = head;
+        bytes.extend(&file);
+        bytes.extend(r4_block(0x7b, 0x4000, &[]));
+        let map = vol(&bytes, "old.rar", None).unwrap();
+        assert_eq!(map.end, VolumeEnd::Complete);
+        assert!(map.main_read);
+        let [listed] = map.members.as_slice() else { panic!("{:?}", map.members) };
+        assert_eq!(listed.name.as_deref(), Some("a.bin"));
+        assert_eq!(listed.packed.end, (bytes.len() - 7) as u64, "the end header follows the member's data");
+        let map = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap();
+        assert!(map.complete);
+        // Sessions still refuse them.
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(RarSession::open(&path, None, RarSessionOptions::default()).is_err());
+    }
+    // End headers longer than their flags call for, and too short for the volume number they announce.
+    for end in [r4_block(0x7b, 0x4000 | 0x8, &[2, 0, 9, 9]), r4_block(0x7b, 0x4000 | 0x8, &[2])] {
+        let mut bytes = with_main(0x01, &[]);
+        bytes.extend(&member);
+        bytes.extend(end);
+        let map = vol(&bytes, "old.r01", None).unwrap();
+        assert_eq!(map.end, VolumeEnd::Complete);
+        assert_eq!(map.members.len(), 1);
+    }
+    let mut bytes = with_main(0x01, &[]);
+    bytes.extend(&member);
+    bytes.extend(r4_block(0x7b, 0x4000 | 0x8, &[2, 0, 9, 9]));
+    assert_eq!(vol(&bytes, "old.r01", None).unwrap().volume_number, Some(2));
+}
+
+#[test]
+fn rar4_hp_with_an_encryption_version_byte_is_mapped() {
+    let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
+    let volumes = r4_aes(gold, true, &[29, 31, 20]);
+    let with_version = |version: u8| -> Vec<Vec<u8>> {
+        volumes
+            .iter()
+            .map(|v| {
+                let mut out = v[..7].to_vec();
+                out.extend(r4_block(0x73, 1 | 0x80 | 0x200, &[0, 0, 0, 0, 0, 0, version]));
+                out.extend(&v[7 + 13..]);
+                out
+            })
+            .collect()
+    };
+    let expected = MemberMap::from_memory(&refs(&volumes), "a.part01.rar", Some("pw")).unwrap();
+    for version in [29, 36] {
+        let set = with_version(version);
+        let map = MemberMap::from_memory(&refs(&set), "a.part01.rar", Some("pw")).unwrap();
+        assert!(map.complete && map.header_encrypted);
+        assert_eq!(map.members[0].pieces.len(), expected.members[0].pieces.len());
+        assert_eq!(map.members[0].raw_name, b"one");
+        let single = vol(&set[1], "a.part02.rar", Some("pw")).unwrap();
+        assert_eq!(single.end, VolumeEnd::Complete);
+        assert_eq!(single.members[0].header.start, 7 + 14);
+        assert_eq!(vol(&set[1], "a.part02.rar", None).unwrap().end, VolumeEnd::Locked { offset: 7 + 14 });
+        assert!(matches!(vol(&set[1], "a.part02.rar", Some("wrong")), Err(MapError::WrongPassword)));
+    }
+    // A version newer than RAR 3.x's is a main header the walk cannot read.
+    let error = vol(&with_version(37)[0], "a.part01.rar", Some("pw")).unwrap_err();
+    assert!(matches!(error, MapError::Unsupported { volume: 0, .. }), "{error:?}");
+}
+
+#[test]
+fn damage_after_the_main_header_keeps_what_was_read() {
+    let (a, b) = (data(300, 1), data(200, 2));
+    // RAR 4.x: a bad CRC, an unknown block that may not be skipped, and a broken name.
+    let second = r4_member_dos(b"b.bin", &b, DOS, &[]);
+    let mut bad_crc = second.clone();
+    bad_crc[0] ^= 1;
+    let mut bad_name = second.clone();
+    bad_name[26..28].copy_from_slice(&200u16.to_le_bytes());
+    let crc = crc32fast::hash(&bad_name[2..usize::from(u16::from_le_bytes([bad_name[5], bad_name[6]]))]) as u16;
+    bad_name[..2].copy_from_slice(&crc.to_le_bytes());
+    let first = r4_member_dos(b"a.bin", &a, DOS, &[]);
+    let at = (7 + 13 + first.len()) as u64;
+    for (block, reason) in [
+        (bad_crc, HeaderDamage::Checksum),
+        (r4_block(0x7c, 0, &[]), HeaderDamage::Unsupported("header type")),
+        (bad_name, HeaderDamage::Malformed("header fields run past the header size")),
+    ] {
+        let mut bytes = b"Rar!\x1a\x07\0".to_vec();
+        bytes.extend(r4_block(0x73, 0x01 | 0x10, &[0; 6]));
+        bytes.extend(&first);
+        bytes.extend(block);
+        bytes.extend(&second);
+        bytes.extend(r4_block(0x7b, 0x4000, &[]));
+        let map = vol(&bytes, "old.r00", None).unwrap();
+        assert_eq!(map.end, VolumeEnd::Damaged { offset: at, reason });
+        assert!(map.main_read && map.multi_volume && map.new_naming && !map.has_next_volume);
+        let [listed] = map.members.as_slice() else { panic!("{:?}", map.members) };
+        assert_eq!(packed_of(&bytes, listed), &a[..]);
+        let map = MemberMap::from_memory(&[&bytes], "old.part1.rar", None).unwrap();
+        assert_eq!(map.end, MapEnd::Damaged { volume: 0, offset: at, reason });
+        assert!(!map.complete);
+        assert_eq!(map.volumes, 1);
+        assert_eq!(map.members.len(), 1);
+    }
+
+    // RAR 5.0: the second file header's CRC.
+    let bytes = archive(&[FileSpec::new("a.bin", &a), FileSpec::new("b.bin", &b)]);
+    let clean = vol(&bytes, "x.rar", None).unwrap();
+    let second_at = clean.members[1].header.start as usize;
+    let mut broken = bytes.clone();
+    broken[second_at] ^= 1;
+    let map = vol(&broken, "x.rar", None).unwrap();
+    assert_eq!(map.end, VolumeEnd::Damaged { offset: second_at as u64, reason: HeaderDamage::Checksum });
+    assert_eq!(map.members, clean.members[..1]);
+    assert_eq!(map.volume_number, Some(0));
+    let map = MemberMap::from_memory(&[&broken], "x.rar", None).unwrap();
+    assert_eq!(map.end, MapEnd::Damaged { volume: 0, offset: second_at as u64, reason: HeaderDamage::Checksum });
+    assert_eq!(map.members.len(), 1);
+
+    // A damaged main header still fails the walk.
+    let mut bytes = r4_archive(&[r4_member_dos(b"a.bin", &a, DOS, &[])]);
+    bytes[7] ^= 1;
+    assert!(matches!(vol(&bytes, "old.rar", None), Err(MapError::Malformed { volume: 0, .. })));
+    assert!(matches!(MemberMap::from_memory(&[&bytes], "old.rar", None), Err(MapError::Malformed { volume: 0, .. })));
+    let mut broken = archive(&[FileSpec::new("a.bin", &a)]);
+    broken[SIG.len()] ^= 1;
+    assert!(matches!(vol(&broken, "x.rar", None), Err(MapError::Malformed { volume: 0, .. })));
+}
+
+#[test]
+fn rar4_invalid_dos_times_come_back_raw() {
+    let hour_24 = (40 << 25) | (1 << 21) | (2 << 16) | (24 << 11);
+    let day_0 = (40 << 25) | (1 << 21) | (3 << 11);
+    let all = u32::MAX;
+    let bytes = r4_archive(&[
+        r4_member_dos(b"a", b"a", hour_24, &[]),
+        r4_member_dos(b"b", b"b", day_0, &[]),
+        r4_member_dos(b"c", b"c", all, &[]),
+    ]);
+    let map = vol(&bytes, "old.rar", None).unwrap();
+    let times: Vec<_> = map.members.iter().map(|m| (m.dos_time, m.mtime)).collect();
+    assert_eq!(times, [(Some(hour_24), None), (Some(day_0), None), (Some(all), None)]);
+    let map = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap();
+    let times: Vec<_> = map.members.iter().map(|m| (m.dos_time, m.mtime)).collect();
+    assert_eq!(times, [(Some(hour_24), None), (Some(day_0), None), (Some(all), None)]);
 }
