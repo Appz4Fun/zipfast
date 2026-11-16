@@ -2040,3 +2040,77 @@ fn complete_native_replaced_volume_path_is_detected_before_publication() {
         assert!(!out.join("member.bin").exists(), "victim {victim}");
     }
 }
+#[test]
+fn complete_native_many_long_paths_fit_default_bookkeeping() {
+    // A Complete declaration used to be swept whole at every volume admission and member boundary (shape,
+    // comparison and handle checks of the provider's answer, every binding re-observed, the new volume covered
+    // against the whole inventory and binding list): about 3.1 V^2 (P + 16) units, so 600 volumes with ~100-byte
+    // paths ran out of the default 64 MiB around volume 491. Admission now pays for the admitted volume and a
+    // bounded slice of the rest.
+    const VOLUMES: usize = 600;
+    let tmp = tempfile::tempdir().unwrap();
+    // Pad the directory so each volume path is about 100 bytes.
+    let pad = 100usize.saturating_sub(tmp.path().as_os_str().len() + "/in/a.part001.rar".len() + 1).max(1);
+    let base = tmp.path().join("p".repeat(pad));
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let data: Vec<u8> = (0..VOLUMES * 256).map(|i| (i * 7 % 251) as u8).collect();
+    let paths = complete_native_set(&base, &data, 256);
+    assert_eq!(paths.len(), VOLUMES);
+    assert!(paths[0].as_os_str().len() >= 95, "{}", paths[0].display());
+    let o = complete_native_options(&out, VOLUMES);
+    assert_eq!(o.limits.source_bookkeeping, ProgressiveLimits::default().source_bookkeeping);
+    let mut s = ProgressiveSession::new(Box::new(NativeSet::new(paths)), o).unwrap();
+    let mut opened = 0;
+    let failure = drive_complete(&mut s, |e| opened += matches!(e, ProgressiveEvent::VolumeOpened { .. }) as usize);
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(opened, VOLUMES);
+    assert_eq!(std::fs::read(out.join("member.bin")).unwrap(), data);
+}
+struct ChangingSet {
+    set: NativeSet,
+    after: Arc<std::sync::atomic::AtomicBool>,
+    victim: usize,
+}
+impl VolumeSource for ChangingSet {
+    fn volume(&mut self, r: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        self.set.volume(r, cx)
+    }
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        let mut declaration = self.set.protection()?;
+        if self.after.load(std::sync::atomic::Ordering::Relaxed)
+            && let ProtectionDeclaration::Complete { inventory, .. } = &mut declaration
+            && let VolumeBacking::Native(paths) = &mut inventory.volumes[self.victim].backing
+        {
+            paths[0].path = paths[0].path.with_extension("moved");
+        }
+        Ok(declaration)
+    }
+}
+#[test]
+fn complete_native_same_epoch_change_is_refused_by_the_requested_volume() {
+    // Repeated declarations are compared in full only for the requested volume and a rotating sample, so a
+    // same-epoch change to a later entry is refused at the latest when that volume is requested.
+    const VOLUMES: usize = 40;
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let data: Vec<u8> = (0..VOLUMES * 512).map(|i| (i * 11 % 251) as u8).collect();
+    let paths = complete_native_set(tmp.path(), &data, 512);
+    let after = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = ChangingSet { set: NativeSet::new(paths), after: after.clone(), victim: 30 };
+    let mut s = ProgressiveSession::new(Box::new(provider), complete_native_options(&out, VOLUMES)).unwrap();
+    let mut last = 0;
+    let failure = drive_complete(&mut s, |e| {
+        if let ProgressiveEvent::VolumeOpened { index, .. } = e {
+            last = *index;
+            if *index == 2 {
+                after.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    })
+    .expect("the changed declaration must be refused");
+    assert!(matches!(failure.kind, FailureKind::SourceChanged), "{failure:?}");
+    assert!((2..30).contains(&last), "refused after opening volume {last}");
+    assert!(!out.join("member.bin").exists());
+}
