@@ -155,7 +155,9 @@ The crate's legacy `Error` keeps its variants (a test pins them), so the typed `
   summed over the folder's coders (a BCJ2 folder has three), each dictionary first shrunk to its
   coder's output size (`DictionaryBytes`). This is the memory-bomb guard: a tiny archive declaring a huge
   dictionary and output allocates at most this. 4 GiB is the largest LZMA dictionary and opens 7-Zip's largest
-  setting, `-md=1536m`; an allocation the system refuses is an `OutOfMemory` I/O error. Lower it where memory is
+  setting, `-md=1536m`; an allocation the system refuses up front is an `OutOfMemory` I/O error, though with the
+  usual overcommit memory may only run short as a dictionary fills, where the OOM killer can end the process. The
+  Zstandard coder's window isn't counted. Lower it where memory is
   short.
 - `folders` (4096), `pack_streams` (4096), `coders` per folder (32), `coder_properties` bytes per coder (64) and
   `entries` (65536, counting anti items, checked while the header is read).

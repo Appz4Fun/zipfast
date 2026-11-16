@@ -477,13 +477,26 @@ fn check_target_detailed(
     dirs: Option<&mut Dirs>,
     log: &mut RenameLog<'_>,
 ) -> crate::error::RarResult<DetailedChecked> {
-    let checked = place_target(opts, rel, dirs, log)?;
-    if let (DetailedChecked::Write(place), Some(filter)) = (&checked, &opts.select)
+    let Some(filter) = opts.select.as_ref().filter(|f| f.start.is_some()) else {
+        return place_target(opts, rel, dirs, log);
+    };
+    // Hold this member's renames until the hook decides: a declined one must leave no trace of a new name.
+    let budget = log.budget.left();
+    let mut held = Vec::new();
+    let checked = place_target(opts, rel, dirs, &mut RenameLog { budget: log.budget, record: &mut |r| held.push(r) })?;
+    if let DetailedChecked::Write(place) = &checked
         && filter.starts(&MemberStart { path: &place.path }) == StartDecision::Skip
     {
-        // a name a rename mode claimed is let go with the place
+        if matches!(opts.overwrite.rename(), Some(rename::RenameMode::Existing(_))) {
+            // what was at the name was really moved aside: that rename stands
+            held.into_iter().for_each(|r| (log.record)(r));
+        } else {
+            // the new name a rename claimed is let go with the place, and its attempts are given back
+            log.budget.restore(budget);
+        }
         return Ok(DetailedChecked::Declined);
     }
+    held.into_iter().for_each(|r| (log.record)(r));
     Ok(checked)
 }
 

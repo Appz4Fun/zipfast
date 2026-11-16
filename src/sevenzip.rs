@@ -65,8 +65,10 @@ pub struct SevenZipLimits {
     /// coder's declared output size, summed over the folder's coders (a BCJ2 folder has three): 4 GiB, the largest
     /// LZMA dictionary there is (7-Zip offers up to 1536 MiB, `-md=1536m`). This is the memory-bomb guard: a small
     /// archive can declare a large dictionary and a large output, and this caps what that makes the decoder
-    /// allocate. An allocation the system refuses is an `OutOfMemory` I/O error, never an abort. Lower it on a
-    /// machine with less memory to spare.
+    /// allocate. An allocation the system refuses up front is an `OutOfMemory` I/O error, but Linux and macOS usually
+    /// overcommit, so memory may only run short as a dictionary fills, where the system (Linux's OOM killer, say) may
+    /// end the process instead. The Zstandard coder's window, at most what its frame header asks for, isn't counted
+    /// here. Lower it on a machine with less memory to spare.
     pub dictionary_bytes: u64,
 }
 

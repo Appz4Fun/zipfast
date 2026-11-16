@@ -96,6 +96,7 @@ fn the_hook_counts_and_limits_members_in_order() {
 fn the_hook_sees_the_final_name_after_a_rename() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("file1.txt"), b"old").unwrap();
+    fs::write(tmp.path().join("file2.txt"), b"old").unwrap();
     let (filter, seen) = limited(1);
     let summary = extract::run(
         &fixture("rar4-volumes/multi.part1.rar"),
@@ -105,8 +106,11 @@ fn the_hook_sees_the_final_name_after_a_rename() {
     .unwrap();
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen[0], tmp.path().join("file1_1.txt"), "{seen:?}");
+    assert_eq!(seen[1], tmp.path().join("file2_1.txt"), "{seen:?}");
     assert_eq!(summary.files, 1);
-    assert_eq!(files(tmp.path()), ["file1.txt", "file1_1.txt"]);
+    // file2's declined rename leaves neither a file nor a record
+    assert_eq!(files(tmp.path()), ["file1.txt", "file1_1.txt", "file2.txt"]);
+    assert_eq!(summary.renames.len(), 1, "{:?}", summary.renames);
     assert_eq!(fs::read(tmp.path().join("file1.txt")).unwrap(), b"old");
 }
 
