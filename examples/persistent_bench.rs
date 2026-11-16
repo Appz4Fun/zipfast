@@ -41,6 +41,7 @@ use zipfast::progressive::*;
 
 #[path = "../tests/common/mod.rs"]
 mod common;
+#[allow(dead_code, reason = "the shared doc store also carries fault hooks the benchmark does not use")]
 mod anchor_store {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/persistent-anchor-store.rs"));
 }
