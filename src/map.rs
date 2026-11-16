@@ -53,6 +53,7 @@ pub enum MapFormat {
 
 /// How a mapped walk ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum MapEnd {
     /// The archive's final end header was read.
     Complete,
@@ -79,40 +80,45 @@ pub enum HeaderDamage {
 }
 
 impl HeaderDamage {
-    /// The damage a walk failure describes, if it is header damage: `Malformed` or `Unsupported`.
+    /// The damage a walk failure describes, if it is damage to a header: a header checksum, framing or field failure,
+    /// a header out of order or inconsistent with an earlier one, or a RAR 4.x header feature not mapped. Limits,
+    /// allocation failures, internal invariants and everything else are not.
     pub(crate) fn of(error: &MapError) -> Option<Self> {
         use crate::error::{RarFailure, RarIntegrityReason, RarUnsupported};
-        Some(match error {
+        use crate::progressive::ChecksumScope;
+        match error {
             MapError::Malformed { failure, .. } => match &failure.kind {
-                FailureKind::ChecksumMismatch { .. } => Self::Checksum,
-                FailureKind::Malformed(what) => Self::Malformed(what),
-                FailureKind::Truncated => Self::Malformed("header fields run past the header size"),
+                FailureKind::ChecksumMismatch { scope: ChecksumScope::Header, .. } => Some(Self::Checksum),
+                // The walker's own header order and consistency checks, and the parser's framing.
+                FailureKind::Malformed(what) => Some(Self::Malformed(what)),
+                // A field running past its header's declared size.
+                FailureKind::Truncated => Some(Self::Malformed("header fields run past the header size")),
                 FailureKind::Rar(rar) => match rar.as_ref() {
                     RarFailure::Integrity { reason, .. } | RarFailure::EncryptedIntegrity { reason, .. } => {
                         match reason {
-                            RarIntegrityReason::HeaderCrc => Self::Checksum,
-                            RarIntegrityReason::HeaderFraming(what) => Self::Malformed(what),
+                            RarIntegrityReason::HeaderCrc => Some(Self::Checksum),
+                            RarIntegrityReason::HeaderFraming(what) => Some(Self::Malformed(what)),
+                            RarIntegrityReason::MalformedEncryptionRecord => Some(Self::Malformed("encryption record")),
                             RarIntegrityReason::ChangedContinuationEncoding
-                            | RarIntegrityReason::SplitSizeMismatch { .. } => Self::Malformed("member continuation"),
-                            _ => Self::Malformed("header"),
+                            | RarIntegrityReason::SplitSizeMismatch { .. } => {
+                                Some(Self::Malformed("member continuation"))
+                            }
+                            _ => None,
                         }
                     }
-                    _ => Self::Malformed("header"),
+                    _ => None,
                 },
-                _ => Self::Malformed("header"),
+                _ => None,
             },
             MapError::Unsupported { failure, .. } => match &failure.kind {
                 FailureKind::Rar(rar) => match rar.as_ref() {
-                    RarFailure::Unsupported(RarUnsupported::Rar4Feature(what)) => Self::Unsupported(what),
-                    RarFailure::Unsupported(RarUnsupported::EncryptionVersion(_)) => {
-                        Self::Unsupported("encryption version")
-                    }
-                    _ => Self::Unsupported("header feature"),
+                    RarFailure::Unsupported(RarUnsupported::Rar4Feature(what)) => Some(Self::Unsupported(what)),
+                    _ => None,
                 },
-                _ => Self::Unsupported("header feature"),
+                _ => None,
             },
-            _ => return None,
-        })
+            _ => None,
+        }
     }
 }
 
@@ -224,6 +230,7 @@ pub struct MapPiece {
 
 /// How a single-volume walk ([`MemberMap::from_volume`]) ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum VolumeEnd {
     /// The volume's end header was read.
     Complete,
@@ -961,5 +968,36 @@ impl VolumeMapBuilder {
 
     pub fn poll_map(&mut self, cx: &mut Context<'_>) -> Poll<Result<VolumeMap, MapError>> {
         self.core.poll_volume(&mut self.input, cx)
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+    use crate::error::{RarFailure, RarInternal, RarResource};
+
+    fn malformed(kind: FailureKind) -> MapError {
+        MapError::Malformed { volume: 0, failure: Box::new(ProgressiveFailure::new(kind)) }
+    }
+
+    #[test]
+    fn only_header_failures_are_damage() {
+        let limit = RarFailure::Limit { resource: RarResource::CatalogueAllocation, requested: None, allowed: None };
+        for error in [
+            malformed(FailureKind::Rar(Box::new(limit))),
+            malformed(FailureKind::Rar(Box::new(RarFailure::Internal(RarInternal::Invariant("x"))))),
+            malformed(FailureKind::IncompleteOutput),
+            MapError::Unsupported {
+                volume: 0,
+                failure: Box::new(ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(
+                    crate::error::RarUnsupported::NameEncoding,
+                ))))),
+            },
+            MapError::Limit { resource: Resource::HeaderBytes, limit: 1, attempted: 2 },
+            MapError::WrongPassword,
+        ] {
+            assert_eq!(HeaderDamage::of(&error), None, "{error:?}");
+        }
+        assert_eq!(HeaderDamage::of(&malformed(FailureKind::Malformed("why"))), Some(HeaderDamage::Malformed("why")));
     }
 }

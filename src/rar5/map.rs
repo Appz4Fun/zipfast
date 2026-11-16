@@ -135,6 +135,11 @@ impl RarWalker {
         }
     }
 
+    /// A member list that could not grow: an allocation failure, never damage.
+    fn allocation(&self) -> MapError {
+        MapError::from_failure(self.volume, super::framing::progressive_fault(super::session::allocation()))
+    }
+
     fn fail(&self, failure: ProgressiveFailure) -> MapError {
         if self.unproven && header_integrity(&failure) {
             return MapError::WrongPassword;
@@ -459,7 +464,17 @@ impl RarWalker {
                 if !self.main_seen {
                     return Err(self.malformed("member before main"));
                 }
-                let wire = frame.wire.ok_or_else(|| self.malformed("missing member wire identity"))?;
+                let wire = frame.wire.ok_or_else(|| {
+                    MapError::from_failure(
+                        self.volume,
+                        super::framing::progressive_fault(crate::error::RarFault::new(
+                            crate::error::RarFailure::Internal(crate::error::RarInternal::Invariant(
+                                "missing member wire identity",
+                            )),
+                            crate::Error::Corrupt("missing member wire identity"),
+                        )),
+                    )
+                })?;
                 if self.single.is_some() {
                     self.volume_file(header, frame.crypt, wire)?;
                 } else {
@@ -673,7 +688,7 @@ impl RarWalker {
         };
         let members = &mut self.single.as_mut().expect("single-volume mode").members;
         if members.try_reserve(1).is_err() {
-            return Err(self.malformed("member allocation"));
+            return Err(self.allocation());
         }
         members.push(member);
         Ok(())
@@ -767,7 +782,7 @@ impl RarWalker {
                 final_part: part.final_part,
             }],
         };
-        self.members.try_reserve(1).map_err(|_| self.malformed("member allocation"))?;
+        self.members.try_reserve(1).map_err(|_| self.allocation())?;
         self.members.push(member);
         if !part.final_part {
             let physical = PhysicalMember::new(header, wire, 0, &part)

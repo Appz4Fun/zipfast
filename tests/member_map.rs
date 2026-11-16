@@ -1538,6 +1538,13 @@ fn r4_resize(mut block: Vec<u8>, size: u16) -> Vec<u8> {
     block
 }
 
+/// Sets the CRC of the RAR4 header starting at `at` to cover only its first `len` bytes.
+fn r4_comment_crc(mut bytes: Vec<u8>, at: usize, len: usize) -> Vec<u8> {
+    let crc = crc32fast::hash(&bytes[at + 2..at + len]) as u16;
+    bytes[at..at + 2].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
 const CP437: &[u8] = b"caf\x82.mkv";
 const DOS: u32 = 0x5022_1884;
 
@@ -1775,13 +1782,15 @@ fn rar4_embedded_comments_and_odd_header_sizes_are_accepted_by_map_walks() {
         bytes
     };
     // RAR 2.x: MHD_COMMENT with the comment block inside the main header, a main header with unknown extra
-    // bytes, and LHD_COMMENT with the comment after the name.
-    let mut file_comment = r4_member_dos(b"a.bin", &[], DOS, b"\x05\x00\x0f\x30\x00\x00file comment");
+    // bytes, and LHD_COMMENT with the comment after the name. As RAR 2.x writes them (and unrar checks them),
+    // the CRC of a commented header covers only what precedes the comment.
+    let main_comment = r4_comment_crc(with_main(0x02, &r4_block(0x75, 0, b"\x05\x00\x0f\x30\x00\x00hello")), 7, 13);
+    let comment = b"\x05\x00\x0f\x30\x00\x00file comment";
+    let mut file_comment = r4_member_dos(b"a.bin", &[], DOS, comment);
     file_comment[3..5].copy_from_slice(&(0x8000u16 | 0x08).to_le_bytes());
-    let crc = crc32fast::hash(&file_comment[2..]) as u16;
-    file_comment[..2].copy_from_slice(&crc.to_le_bytes());
+    let file_comment = r4_comment_crc(file_comment.clone(), 0, file_comment.len() - comment.len());
     let cases = [
-        (with_main(0x02, &r4_block(0x75, 0, b"\x05\x00\x0f\x30\x00\x00hello")), member.clone()),
+        (main_comment, member.clone()),
         (with_main(0x00, &[1, 2, 3]), member.clone()),
         (with_main(0x00, &[]), file_comment),
     ];
@@ -1927,4 +1936,94 @@ fn rar4_invalid_dos_times_come_back_raw() {
     let map = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap();
     let times: Vec<_> = map.members.iter().map(|m| (m.dos_time, m.mtime)).collect();
     assert_eq!(times, [(Some(hour_24), None), (Some(day_0), None), (Some(all), None)]);
+}
+
+#[test]
+fn rar4_commented_headers_are_checked_over_what_precedes_the_comment() {
+    let a = data(90, 6);
+    let mut main = b"Rar!\x1a\x07\0".to_vec();
+    let mut body = vec![0; 6];
+    body.extend(r4_block(0x75, 0, b"\x05\x00\x0f\x30\x00\x00hello"));
+    main.extend(r4_block(0x73, 0x02, &body));
+    let comment = b"\x05\x00\x0f\x30\x00\x00file comment";
+    let mut file = r4_member_dos(b"a.bin", &a, DOS, comment);
+    file[3..5].copy_from_slice(&(0x8000u16 | 0x08).to_le_bytes());
+    let header_len = file.len() - a.len();
+    let file_ok = r4_comment_crc(file.clone(), 0, header_len - comment.len());
+    let main_ok = r4_comment_crc(main.clone(), 7, 13);
+    let build = |main: &[u8], file: &[u8]| {
+        let mut bytes = main.to_vec();
+        bytes.extend(file);
+        bytes.extend(file);
+        bytes.extend(r4_block(0x7b, 0x4000, &[]));
+        bytes
+    };
+    let bytes = build(&main_ok, &file_ok);
+    let map = vol(&bytes, "old.rar", None).unwrap();
+    assert_eq!(map.end, VolumeEnd::Complete);
+    assert_eq!(map.members.len(), 2);
+    assert_eq!(packed_of(&bytes, &map.members[1]), &a[..]);
+    assert!(MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap().complete);
+    // A CRC over the whole main header is not what unrar checks: the main header cannot be read.
+    let whole_main = r4_comment_crc(main.clone(), 7, main.len() - 7);
+    assert!(matches!(vol(&build(&whole_main, &file_ok), "old.rar", None), Err(MapError::Malformed { volume: 0, .. })));
+    // Nor is one over the whole file header, or one with the parsed fields changed.
+    let whole_file = r4_comment_crc(file.clone(), 0, header_len);
+    let mut changed = file_ok.clone();
+    changed[11] ^= 1;
+    for file in [whole_file, changed] {
+        let map = vol(&build(&main_ok, &file), "old.rar", None).unwrap();
+        assert_eq!(map.end, VolumeEnd::Damaged { offset: main_ok.len() as u64, reason: HeaderDamage::Checksum });
+    }
+    // The comment itself is not covered.
+    let mut other_comment = file_ok.clone();
+    other_comment[header_len - 3] ^= 0xff;
+    assert_eq!(vol(&build(&main_ok, &other_comment), "old.rar", None).unwrap().members.len(), 2);
+}
+
+#[test]
+fn rar4_av_sign_and_unix_owner_blocks_are_not_crc_checked() {
+    let a = data(80, 7);
+    let member = r4_member_dos(b"a.bin", &a, DOS, &[]);
+    let broken = |mut block: Vec<u8>| {
+        block[0] ^= 0x5a;
+        block
+    };
+    // UO_HEAD (subtype 0x0101) after the data size, then a level byte and owner names.
+    let uo = r4_block(0x77, 0, &[0, 0, 0, 0, 0x01, 0x01, 0, b'u', b'g']);
+    let other_subblock = r4_block(0x77, 0, &[0, 0, 0, 0, 0x02, 0x01, 0, b'x']);
+    for block in [broken(r4_legacy(0x76, None)), broken(r4_legacy(0x79, Some(b"sig"))), broken(uo)] {
+        let bytes = r4_archive(&[block, member.clone()]);
+        let map = vol(&bytes, "old.rar", None).unwrap();
+        assert_eq!(map.end, VolumeEnd::Complete);
+        assert_eq!(packed_of(&bytes, &map.members[0]), &a[..]);
+        assert!(MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap().complete);
+    }
+    // Every other block is still checked.
+    for block in [broken(other_subblock), broken(r4_legacy(0x75, None)), broken(r4_legacy(0x78, Some(b"rr")))] {
+        let bytes = r4_archive(&[member.clone(), block]);
+        let map = vol(&bytes, "old.rar", None).unwrap();
+        assert_eq!(
+            map.end,
+            VolumeEnd::Damaged { offset: (7 + 13 + member.len()) as u64, reason: HeaderDamage::Checksum }
+        );
+        assert_eq!(map.members.len(), 1);
+    }
+}
+
+#[test]
+fn limits_after_the_main_header_stay_errors() {
+    let (a, b) = (data(300, 1), data(200, 2));
+    let bytes = r4_archive(&[r4_member_dos(b"a.bin", &a, DOS, &[]), r4_member_dos(b"b.bin", &b, DOS, &[])]);
+    for limits in [
+        |l: &mut zipfast::progressive::ProgressiveLimits| l.entries = 1,
+        |l: &mut zipfast::progressive::ProgressiveLimits| l.header_blocks = 2,
+    ] {
+        let mut options = MapOptions::new("old.rar");
+        limits(&mut options.limits);
+        let error = MemberMap::from_volume(&bytes, options.clone()).unwrap_err();
+        assert!(matches!(error, MapError::Limit { .. }), "{error:?}");
+        let error = MemberMap::from_memory_with(&[&bytes], options).unwrap_err();
+        assert!(matches!(error, MapError::Limit { .. }), "{error:?}");
+    }
 }

@@ -42,12 +42,15 @@ Failures are `MapError`: `NotArchive`, `MissingFirstVolume`, `PasswordRequired`,
 `Malformed`, `Unsupported` (both with the volume and the underlying typed `ProgressiveFailure`), `Limit { resource,
 limit, attempted }`, `Source` (provider failure, contract breach, cancellation) and `Aborted { volume }`.
 
-Damage: once volume 0's main header has been read, a header that would be `Malformed` or `Unsupported` (a bad
-checksum, inconsistent fields or sizes, a header out of order, a continuation that does not match its member, a
-later volume without a signature, a feature not mapped) ends the walk with `MapEnd::Damaged` instead of failing it.
-`reason` is a `HeaderDamage`: `Checksum`, `Malformed(what)` or `Unsupported(what)`; `offset` is the start of the
-damaged header. Damage in the signature or volume 0's main header, a wrong password, limits, holes and source
-failures still fail the walk.
+Damage: once volume 0's main header has been read, a damaged header ends the walk with `MapEnd::Damaged` instead
+of failing it. Damage is a header checksum, framing or field failure, a header out of order or inconsistent with an
+earlier one (a continuation that does not match its member, a later volume without a signature), or a RAR 4.x
+header feature not mapped. `reason` is a `HeaderDamage`: `Checksum`, `Malformed(what)` or `Unsupported(what)`;
+`offset` is the start of the damaged header. Everything else still fails the walk: damage in the signature or
+volume 0's main header, a wrong password, limits and allocation failures, internal errors, holes and source
+failures.
+
+`MapEnd`, `VolumeEnd` and `HeaderDamage` are `#[non_exhaustive]`: match them with a wildcard arm.
 
 Encrypted headers: RAR 5.0 headers with a password check value report a wrong password as soon as the key is
 derived. Without a check value (and for RAR 4.x, which has none), a wrong password shows up on the first header it
@@ -164,6 +167,11 @@ in old RAR 2.x/3.x/4.x archives, which `RarSession`, `extract::list` and extract
   damage; a header or data size running past the volume ends the walk `Truncated` there.
 - Embedded comments: `MHD_COMMENT` (0x02) with the RAR 2.x comment inside the main header, and `LHD_COMMENT` (0x08)
   with the comment after a file header's name. Both lie inside the declared header size and are skipped with it.
+  As in unrar, the CRC of such a header covers only what precedes the comment: the main header's 13 fixed bytes,
+  and the file header's fields up to the name, salt and extended times.
+- Header CRCs unrar does not check: the AV (0x76) and sign (0x79) blocks and the Unix-owner old subblock (0x77 with
+  subtype `UO_HEAD`, 0x0101), which old versions wrote without a proper CRC, are not checked either. In an archive
+  with encrypted headers every header is checked whole, since the CRC is what reveals a wrong password.
 - Sizes: a main header longer than its fixed fields, bytes left over inside a file or service header after the
   fields its flags call for, and an end header of any size (bytes past its fields are ignored; a volume number the
   header is too short to hold is absent). As in unrar, the main and end headers never have data after them.

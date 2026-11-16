@@ -30,7 +30,9 @@ impl HeaderParser {
         let kind = header[2];
         let flags = u16::from_le_bytes([header[3], header[4]]);
         let size = header.len();
-        if crate::crc32::hash(&header[2..]) as u16 != u16::from_le_bytes([header[0], header[1]]) {
+        if let Some(end) = self.rar4_crc_end(header)
+            && crate::crc32::hash(&header[2..end]) as u16 != u16::from_le_bytes([header[0], header[1]])
+        {
             return Err(self
                 .fault(RarIntegrityReason::HeaderCrc, Error::BadChecksum("RAR4 header CRC".into()), true)
                 .into());
@@ -147,6 +149,32 @@ impl HeaderParser {
         }
         Ok(frame)
     }
+    /// Where a header's CRC ends, None when it is not checked. Map walks follow unrar's `ReadHeader15`: a main header
+    /// with `MHD_COMMENT` is checked over its 13 fixed bytes only, a file header with `LHD_COMMENT` over the fields
+    /// it parses (checked in `rar4_file`), and the AV, sign and Unix-owner old subblocks, which old versions wrote
+    /// with a CRC not set properly, not at all. Encrypted headers are always checked whole: the CRC is what tells a
+    /// wrong password.
+    fn rar4_crc_end(&self, header: &[u8]) -> Option<usize> {
+        let (kind, flags) = (header[2], u16::from_le_bytes([header[3], header[4]]));
+        if !self.map_lenient || self.legacy_headers {
+            return Some(header.len());
+        }
+        match kind {
+            0x76 | 0x79 => None,
+            // UO_HEAD (0x0101): the subtype after the data size.
+            0x77 if header.get(11..13) == Some(&[0x01, 0x01]) => None,
+            0x73 if flags & 2 != 0 => Some(header.len().min(13)),
+            0x74 if flags & 8 != 0 => None,
+            _ => Some(header.len()),
+        }
+    }
+    /// A file header whose CRC covers only its parsed fields: one with a RAR 2.x comment, in a clear map walk.
+    fn file_comment(&self, header: &[u8]) -> bool {
+        self.map_lenient
+            && !self.legacy_headers
+            && header[2] == 0x74
+            && u16::from_le_bytes([header[3], header[4]]) & 8 != 0
+    }
     /// A RAR 2.x comment embedded in the main header (`MHD_COMMENT`) or a file header (`LHD_COMMENT`) that this
     /// parser refuses. Map walks accept both: the main header's comment lies past its fixed fields, and a file
     /// header's after the name, where unrar leaves it unread too.
@@ -229,6 +257,11 @@ impl HeaderParser {
                     }
                 }
             }
+            if self.file_comment(bytes)
+                && crate::crc32::hash(&bytes[2..fields.at]) as u16 != u16::from_le_bytes([bytes[0], bytes[1]])
+            {
+                return Err(Error::BadChecksum("RAR4 header CRC".into()).into());
+            }
             if fields.at != bytes.len() && !self.map_lenient {
                 return Err(Error::Unsupported("RAR4 trailing header fields".into()).into());
             }
@@ -265,6 +298,9 @@ impl HeaderParser {
         let (header, encoded, salt) = result.map_err(|error| match error {
             FileParseError::Allocation => allocation().into(),
             FileParseError::Progressive(error) => FramingError::Progressive(error),
+            FileParseError::Format(error @ Error::BadChecksum(_)) => {
+                self.fault(RarIntegrityReason::HeaderCrc, error, true).into()
+            }
             FileParseError::Format(Error::Unsupported(_)) => {
                 self.rar4_unsupported("header extension or name encoding").into()
             }
