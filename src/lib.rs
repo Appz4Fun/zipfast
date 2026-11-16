@@ -27,6 +27,7 @@ mod test_alloc;
 
 mod batch;
 pub mod blake2sp;
+pub mod codec;
 pub mod crc32;
 pub mod crypto;
 pub mod error;
