@@ -1,7 +1,8 @@
 # 7z fixtures
 
 Archives written by 7-Zip, copied unchanged from the test fixtures of the `dariusiii/rarinfo` PHP library
-(`tests/fixtures/szip/`, exercised by its `SzipInfoTest.php`). The password of the encrypted ones is `password`.
+(`tests/fixtures/szip/`, exercised by its `SzipInfoTest.php`), which is distributed under the BSD-3-Clause
+license. The password of the encrypted ones is `password`.
 
 | file | contents |
 |---|---|
