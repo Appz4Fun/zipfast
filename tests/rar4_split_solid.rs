@@ -203,7 +203,78 @@ fn cases() -> Vec<Case> {
             password: Some("junrar"),
             want: [("file1.txt".to_owned(), Expect::Sha256(hex(&sha256(b"file1\n"))))].into(),
         },
+        // encrypted headers (`-hp`): stored, and compressed over old- and new-style volumes. UnRAR's reference run
+        // has no password for the RAR 3.00 pair, whose member is the one `multivol_oldnaming_rar300` holds.
+        case(&["rar4-archiver/win-enchdr.rar"], Some("testpw123"), "in_rar4-archiver_win-enchdr.rar"),
+        Case {
+            password: Some("password"),
+            ..case(
+                &[
+                    "rar4-rar300/header_encrypted_multivol_rar300.rar",
+                    "rar4-rar300/header_encrypted_multivol_rar300.r00",
+                ],
+                None,
+                "in_rar300_multivol_oldnaming_rar300.rar",
+            )
+        },
+        Case {
+            password: Some("password"),
+            ..case(
+                &[
+                    "rar4-rar300/header_encrypted_newnaming_rar300.part01.rar",
+                    "rar4-rar300/header_encrypted_newnaming_rar300.part02.rar",
+                ],
+                None,
+                "in_rar300_multivol_oldnaming_rar300.rar",
+            )
+        },
     ]
+}
+
+/// Encrypted headers without the password, or with a wrong one: as UnRAR, nothing is listed or extracted. Every
+/// route fails typed: a password is required, or the decrypted headers fail their checks.
+#[test]
+fn encrypted_headers_without_the_password_extract_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archives: &[(&[&str], Option<&'static str>)] = &[
+        (&["rar4/encrypted_headers.rar"], None),
+        (&["rar4/secret-crypted-none.rar"], None),
+        (&["rar4-archiver/win-enchdr.rar"], None),
+        (&["rar4-archiver/win-enchdr.rar"], Some("wrong")),
+        (
+            &["rar4-rar300/header_encrypted_multivol_rar300.rar", "rar4-rar300/header_encrypted_multivol_rar300.r00"],
+            None,
+        ),
+        (
+            &[
+                "rar4-rar300/header_encrypted_newnaming_rar300.part01.rar",
+                "rar4-rar300/header_encrypted_newnaming_rar300.part02.rar",
+            ],
+            Some("wrong"),
+        ),
+    ];
+    for (n, (volumes, password)) in archives.iter().enumerate() {
+        let case = Case { volumes: paths(volumes), password: *password, want: Manifest::new() };
+        let dest = tmp.path().join(format!("{n}-run"));
+        assert!(extract::run_with_password(&first(&case), &options(&dest), case.password, |_| {}).is_err());
+        assert!(tree(&dest).is_empty(), "{}", label(&case, "run"));
+        let error = RarSession::open(&first(&case), case.password, RarSessionOptions::default()).err().unwrap();
+        match case.password {
+            None => assert!(matches!(error.failure.as_ref(), RarFailure::PasswordRequired { .. }), "{error:?}"),
+            Some(_) => assert!(matches!(error.failure.as_ref(), RarFailure::EncryptedIntegrity { .. }), "{error:?}"),
+        }
+        let dest = tmp.path().join(format!("{n}-progressive"));
+        let volumes = case
+            .volumes
+            .iter()
+            .map(|path| (OsString::from(path.file_name().unwrap()), fs::read(path).unwrap().into_boxed_slice()))
+            .collect();
+        let mut session = ProgressiveSession::from_sealed_memory(volumes, progressive_options(&case, &dest)).unwrap();
+        let problems = drive(&mut session, || {});
+        let want = if case.password.is_some() { "EncryptedIntegrity" } else { "PasswordRequired" };
+        assert!(problems.len() == 1 && problems[0].contains(want), "{}: {problems:?}", label(&case, "progressive"));
+        assert!(tree(&dest).is_empty(), "{}", label(&case, "progressive"));
+    }
 }
 
 /// Copies a case's volumes into `dir`, keeping their names.
@@ -843,10 +914,8 @@ fn prybar_corpus_matches_unrar() {
         return;
     };
     // Not supported yet, with the reason; each still must not extract anything UnRAR doesn't.
-    let pending: &[(&str, &str)] = &[
-        ("in_rar4-archiver_win-enchdr.rar", "encrypted headers"),
-        ("in_rarinfo_dirlink_unix.rar", "symbolic links (a progressive session stops at the first)"),
-    ];
+    let pending: &[(&str, &str)] =
+        &[("in_rarinfo_dirlink_unix.rar", "symbolic links (a progressive session stops at the first)")];
     let tmp = tempfile::tempdir().unwrap();
     let mut matched = Vec::new();
     let mut waiting = Vec::new();

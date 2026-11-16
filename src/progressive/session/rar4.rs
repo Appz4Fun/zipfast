@@ -17,25 +17,11 @@
 //! Independent exact-frame admission; no deferred history or archive restart authority.
 use super::*;
 use crate::rar5::{
-    FileHeader, FileWire, RarFormat,
+    FileHeader, FileWire,
     unpack::rar4::{CoreBinding, CoreFrame},
 };
 fn invalid() -> ProgressiveFailure {
     ProgressiveFailure::new(FailureKind::InvalidCapability)
-}
-pub(super) fn admit_header_context(
-    header: &FileHeader,
-    encrypted_headers: bool,
-    solid_archive: bool,
-) -> ProgressiveResult<()> {
-    // A solid archive's members decode in order, each going on from the one before.
-    let _ = solid_archive;
-    if header.format == RarFormat::Rar4 && header.method != 0 && encrypted_headers {
-        return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
-            crate::error::RarUnsupported::Rar4Feature("compressed encrypted headers"),
-        )))));
-    }
-    Ok(())
 }
 pub(super) fn core_frame(
     member: MemberId,

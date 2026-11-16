@@ -9,6 +9,7 @@ RAR4 compatibility corpus carries the same files.
 | `compressed_multivol_prng_rar300.{rar,r00,r01,r02,r03}` | `cvolume.bin`, LZ compressed (v29) and split over five old-style named volumes |
 | `multivol_oldnaming_rar300.{rar,r00}` | `bigtext_64k.bin`, compressed and split over `.rar`/`.r00` volumes |
 | `multivol_newnaming_rar300.part0{1,2}.rar` | the same file over `.partNN.rar` volumes |
+| `header_encrypted_multivol_rar300.{rar,r00}`, `header_encrypted_newnaming_rar300.part0{1,2}.rar` | the same file behind encrypted headers (`-hp`); password `password` |
 | `solid_simple_rar300.rar` | `one.txt` and `two.txt`, solid LZ |
 | `solid_rar300.rar` | four files in one solid LZ stream |
 | `per_file_rar300_password.rar` | `hello.txt`, AES-128 encrypted and compressed; password `password` |

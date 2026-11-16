@@ -937,15 +937,13 @@ impl ProgressiveSession {
                 let refused = self.partial_refused(header)?;
                 #[cfg(not(feature = "persistent-partials"))]
                 let refused = false;
-                if !refused {
-                    rar4::admit_header_context(header, self.parser.encrypted(), self.solid_archive == Some(true))?;
-                    if let Some(reason) = header
+                if !refused
+                    && let Some(reason) = header
                         .rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
-                    {
-                        return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
-                            crate::error::RarFailure::Unsupported(reason),
-                        ))));
-                    }
+                {
+                    return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                        crate::error::RarFailure::Unsupported(reason),
+                    ))));
                 }
                 if !self.main_seen {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("member before main")));
@@ -1036,15 +1034,13 @@ impl ProgressiveSession {
         let refusal = self.partial.as_ref().and_then(|_| partial::refusal(&header));
         #[cfg(not(feature = "persistent-partials"))]
         let refusal: Option<std::convert::Infallible> = None;
-        if refusal.is_none() {
-            rar4::admit_header_context(&header, self.parser.encrypted(), self.solid_archive == Some(true))?;
-            if let Some(reason) =
+        if refusal.is_none()
+            && let Some(reason) =
                 header.rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
-            {
-                return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
-                    crate::error::RarFailure::Unsupported(reason),
-                ))));
-            }
+        {
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
+                reason,
+            )))));
         }
         if header.split_before() {
             return Err(ProgressiveFailure::new(FailureKind::Malformed("orphan continuation")));

@@ -324,6 +324,8 @@ pub struct Volume {
     pub main: MainHeader,
     password: Option<String>,
     header_key: Option<crate::crypto::Rar5Keys>,
+    /// RAR 3.x encrypted headers (`-hp`): each header carries its own salt, the keys derived once per salt.
+    legacy_keys: Option<crate::crypto::Rar4KeyCache>,
     parser: Option<super::framing::HeaderParser>,
     format: RarFormat,
     /// Bytes before the signature: a self-extracting module or other prefix.
@@ -459,6 +461,7 @@ impl Volume {
             main: MainHeader::default(),
             password: password.filter(|s| !s.is_empty()).map(str::to_owned),
             header_key: None,
+            legacy_keys: None,
             parser: None,
             format,
             sfx: next.saturating_sub(match format {
@@ -529,7 +532,7 @@ impl Volume {
     }
 
     pub(super) fn encrypted_headers(&self) -> bool {
-        self.header_key.is_some()
+        self.header_key.is_some() || self.legacy_keys.is_some()
     }
 
     pub(super) fn sfx_size(&self) -> u64 {
@@ -549,7 +552,11 @@ impl Volume {
     }
 
     fn header_fault(&self, reason: RarIntegrityReason, legacy: Error, plaintext_dependent: bool) -> RarFault {
-        let password = self.header_key.as_ref().map_or(RarPasswordEvidence::NotEncrypted, |keys| keys.evidence);
+        let password = match (&self.header_key, &self.legacy_keys) {
+            (Some(keys), _) => keys.evidence,
+            (None, Some(_)) => RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent),
+            (None, None) => RarPasswordEvidence::NotEncrypted,
+        };
         RarFault::new(RarFailure::integrity(self.scope(), reason, password, plaintext_dependent), legacy)
     }
 
@@ -583,11 +590,26 @@ impl Volume {
                     parser.advance_core_budget(&[], budget.as_deref()).map_err(super::framing::FramingError::legacy)?;
                 let frame = loop {
                     match step {
-                        ParserStep::LegacyKeyRequired { .. } => {
-                            return Err(RarFault::new(
-                                RarFailure::Unsupported(crate::error::RarUnsupported::Rar4Feature("encrypted headers")),
-                                Error::Encrypted,
-                            ));
+                        ParserStep::LegacyKeyRequired { salt } => {
+                            let pw = self.password.as_deref().ok_or_else(|| self.password_required())?;
+                            if let Some(budget) = budget.as_deref_mut() {
+                                budget.check()?;
+                            }
+                            let (key, iv) = self
+                                .legacy_keys
+                                .get_or_insert_with(Default::default)
+                                .keys(pw, &salt, None)
+                                .map_err(|_| self.framing("RAR4 header key", Error::Encrypted))?;
+                            parser.set_legacy_keys(&key, iv).map_err(|_| {
+                                RarFault::new(
+                                    RarFailure::Internal(RarInternal::Invariant("RAR4 header key out of turn")),
+                                    Error::Encrypted,
+                                )
+                            })?;
+                            step = parser
+                                .advance_core_budget(&[], budget.as_deref())
+                                .map_err(super::framing::FramingError::legacy)?
+                                .1;
                         }
                         ParserStep::End => return Ok(None),
                         ParserStep::Frame(frame) => break frame,
@@ -781,6 +803,7 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            legacy_keys: None,
             parser: None,
             format: RarFormat::Rar5,
             sfx: 0,
@@ -818,6 +841,7 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            legacy_keys: None,
             parser: None,
             format: RarFormat::Rar5,
             sfx: 0,

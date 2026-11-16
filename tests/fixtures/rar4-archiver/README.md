@@ -6,6 +6,7 @@ Written with RARLAB `rar` 6.24 (`-ma4`), from our own 2800-byte payload `split.b
 | file | switches | contents |
 |---|---|---|
 | `mac-oldvol.{rar,r00,r01,r02}` | `-m0 -v1000b -vn` (macOS host) | stored `split.bin` over old-style `.rar`/`.r00`/`.r01`/`.r02` volumes |
+| `win-enchdr.rar` | `-m0 -hptestpw123` (Windows host) | a stored 1000-byte `inner.bin` behind encrypted headers; password `testpw123` |
 | `win-encvol.{rar,r00,r01,r02}` | `-m0 -ptestpw123 -v1000b -vn` (Windows host) | the same, AES-128 encrypted; password `testpw123` |
 | `mac-rr-comment.rar` | `-m0 -rr -z` (macOS host) | stored `inner.bin` (1000 bytes), a compressed archive comment (`CMT`) and a recovery record (`RR`) |
 

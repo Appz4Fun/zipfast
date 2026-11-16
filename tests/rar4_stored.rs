@@ -279,17 +279,22 @@ fn stored_size_modes_and_extended_times_are_verified() {
 
 #[test]
 fn encrypted_headers_high_sizes_and_special_modes_have_typed_boundaries() {
-    use zipfast::error::{RarFailure, RarUnsupported};
+    use zipfast::error::RarFailure;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boundary.rar");
     let mut bytes = b"Rar!\x1a\x07\0".to_vec();
     bytes.extend(block(0x73, 0x80, &[0; 6]));
-    fs::write(&path, bytes).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    // encrypted headers end where the volume does: no members
+    let session = RarSession::open(&path, Some("password"), RarSessionOptions::default()).unwrap();
+    assert_eq!(session.entries().count(), 0);
+    // and an encrypted header cut short is an integrity failure of the encrypted headers
+    bytes.extend([0; 8 + 16]);
+    fs::write(&path, &bytes).unwrap();
     let error = RarSession::open(&path, Some("password"), RarSessionOptions::default()).err().unwrap();
-    assert!(matches!(
-        error.failure.as_ref(),
-        RarFailure::Unsupported(RarUnsupported::Rar4Feature("encrypted headers"))
-    ));
+    assert!(matches!(error.failure.as_ref(), RarFailure::EncryptedIntegrity { .. }), "{error:?}");
+    let error = RarSession::open(&path, None, RarSessionOptions::default()).err().unwrap();
+    assert!(matches!(error.failure.as_ref(), RarFailure::PasswordRequired { .. }), "{error:?}");
 
     for mode in [0o120777u32, 0o010644] {
         let mut file = member(b"link", b"target", 0, 0x30);

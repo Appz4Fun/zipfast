@@ -86,9 +86,6 @@ impl HeaderParser {
                     return Err(self.framing("RAR4 main header size", Error::Corrupt("RAR4 main header size")).into());
                 }
                 if flags & 0x80 != 0 {
-                    if self.usage.is_none() {
-                        return Err(self.rar4_unsupported("encrypted headers").into());
-                    }
                     // RAR 3.x headers are always encrypted the RAR 2.9 way; unrar 3.x refuses a version above its
                     // own (36) and unrar 5 ignores the byte. Map walks accept what unrar 3.x accepts.
                     if flags & 0x200 != 0 && !(self.map_lenient && header[13] <= 36) {
