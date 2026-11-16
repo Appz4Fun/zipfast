@@ -39,6 +39,7 @@ use crate::rar5::{FileHeader, MemberCrypt, RarFormat, Redirection};
 use crate::volume::next_volume;
 use crate::zip::{InspectionSource, ReadSession, SessionResult};
 
+pub(crate) mod link;
 mod rar_outcome;
 mod rename;
 use crate::error::{
@@ -444,6 +445,7 @@ fn blocked_message(reason: &RarPolicyReason) -> &'static str {
         RarPolicyReason::ProtectedInput => "the output path would replace a protected input",
         RarPolicyReason::RenameExhausted => "no free name to rename to",
         RarPolicyReason::RenameUnsupported => "the file system can't rename without replacing",
+        RarPolicyReason::LinkTarget => "the link's target is absolute or leads out of the destination",
         _ => unreachable!("unexpected target policy"),
     }
 }
@@ -907,11 +909,29 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
             };
         };
         if !next.exists() {
-            return if saw_end {
-                Err(RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into())
-            } else {
-                Ok(())
-            };
+            if !saw_end {
+                return Ok(());
+            }
+            // A file split into the missing volume fails on its own, as UnRAR reports it; what came before stands.
+            if run.pending.is_some() {
+                run.drain()?;
+                let mut p = run.pending.take().expect("pending member");
+                let failure = Arc::new(RarFailure::MissingVolume { path: next.clone() });
+                if !p.hidden && (!run.reports.typed() || (!p.failed && !p.passive)) {
+                    run.reports.failed(
+                        &p.context,
+                        Arc::clone(&failure),
+                        format_args!("missing volume {}", next.display()),
+                    )?;
+                }
+                p.discard();
+                run.stream = None;
+                run.rar4 = None;
+                return Ok(());
+            }
+            return Err(
+                RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into()
+            );
         }
         vol = Volume::open_detailed(&next, run.password)?;
         if vol.format() != format {
@@ -2030,6 +2050,16 @@ pub(crate) struct Pending {
     rar4_identity: Option<(u64, u8, u8, Option<[u8; 8]>)>,
     /// stops the member as its data comes in
     cancel: Option<Cancellation>,
+    /// a RAR4 symbolic link: where it goes and its target, gathered as it is decoded
+    link: Option<LinkOut>,
+}
+
+/// A symbolic link being extracted: created once its target is decoded and checked.
+struct LinkOut {
+    place: Place,
+    /// where it goes, relative to the destination
+    rel: PathBuf,
+    target: Vec<u8>,
 }
 
 impl std::ops::Deref for Pending {
@@ -2061,6 +2091,7 @@ impl Pending {
             mem: None,
             rar4_identity: h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)),
             cancel: None,
+            link: None,
         }
     }
 
@@ -2077,6 +2108,7 @@ impl Pending {
         self.failed = true;
         self.place = None;
         self.mem = None;
+        self.link = None;
         drop(self.out.take());
     }
 
@@ -2124,6 +2156,11 @@ impl Pending {
         }
         if let Some(out) = self.out.as_mut() {
             out.write_detailed(chunk).map_err(|e| e.detailed(false))?;
+        }
+        if let Some(link) = self.link.as_mut() {
+            // more than a target may hold fails the size check or the target check
+            let room = (link::MAX_TARGET as usize + 1).saturating_sub(link.target.len()).min(chunk.len());
+            link.target.extend_from_slice(&chunk[..room]);
         }
         self.bytes = new_size;
         Ok(())
@@ -2488,6 +2525,22 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
         && let Err(e) = out.finish_detailed(|file| finish_file(file, &c.meta))
     {
         return Err(books.terminal(&p.context, e.detailed(false)));
+    }
+    if let Some(LinkOut { place, rel, target }) = p.link.take() {
+        if !link::contained(&rel, &target) {
+            let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path };
+            return books.fail(&p.context, failure, blocked_message(&RarPolicyReason::LinkTarget));
+        }
+        // a rename mode's reserved file is replaced by the link
+        let (path, replace) = match place.reserved {
+            Some(reserved) => (reserved.into_parts().1, true),
+            None => (place.path, place.replace),
+        };
+        if let Err(e) = link::create(&path, &target, replace) {
+            return Err(
+                books.terminal(&p.context, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false))
+            );
+        }
     }
     let drained = if books.reports.typed() { books.catch_up_for_completion() } else { Ok(()) };
     if drained.is_err() && !matches!(drained, Err(RunFault::Reported { .. })) {
@@ -3233,6 +3286,12 @@ impl Run<'_, '_, '_> {
             None
         };
 
+        let link = h.is_rar4_symlink() && self.opts.mode == Mode::Extract;
+        if link && (h.unpacked_size > link::MAX_TARGET || !cfg!(unix)) {
+            let reason = RarFailure::Unsupported(RarUnsupported::Rar4Feature("symbolic link"));
+            let cause = self.fail_in_order(&ctx, reason, "unsupported symbolic link")?;
+            return self.pass_over(vol, h, ctx, cipher, Some(cause));
+        }
         let place = if self.opts.mode == Mode::Extract {
             let mut renamed = None;
             let order = ctx.entry.order;
@@ -3281,6 +3340,9 @@ impl Run<'_, '_, '_> {
         p.cancel = self.cancel.clone();
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.place = place;
+        if link && let Some(place) = p.place.take() {
+            p.link = Some(LinkOut { place, rel, target: Vec::new() });
+        }
         self.begin_decoding(vol, h, p)
     }
 

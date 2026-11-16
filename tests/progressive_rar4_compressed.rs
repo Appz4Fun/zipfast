@@ -55,20 +55,21 @@ fn archive(files: &[Vec<u8>]) -> Vec<u8> {
     bytes.extend(block(0x7b, 0x4000, &[]));
     bytes
 }
+fn opts_for(dir: &std::path::Path) -> zipfast::extract::Options {
+    zipfast::extract::Options {
+        mode: zipfast::extract::Mode::Extract,
+        dest: dir.to_owned(),
+        overwrite: zipfast::extract::Overwrite::Always,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+    }
+}
+
 fn options(dir: &std::path::Path) -> ProgressiveOptions {
-    ProgressiveOptions::new(
-        zipfast::extract::Options {
-            mode: zipfast::extract::Mode::Extract,
-            dest: dir.to_owned(),
-            overwrite: zipfast::extract::Overwrite::Always,
-            flatten: false,
-            threads: Some(1),
-            protected_paths: Default::default(),
-            parallel_min: None,
-            select: None,
-        },
-        OsString::from("a.rar"),
-    )
+    ProgressiveOptions::new(opts_for(dir), OsString::from("a.rar"))
 }
 
 fn poll(s: &mut ProgressiveSession) -> Poll<ProgressiveResult<Option<ProgressiveEvent>>> {
@@ -581,7 +582,7 @@ fn compressed_hole_keeps_actual_prefix_but_cannot_restart() {
     panic!("no stopped outcome")
 }
 #[test]
-fn encrypted_headers_remain_an_explicit_refusal_and_a_solid_archive_decodes() {
+fn a_compressed_member_behind_encrypted_headers_and_a_solid_archive_decode() {
     for encrypted in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = options(dir.path());
@@ -606,19 +607,20 @@ fn encrypted_headers_remain_an_explicit_refusal_and_a_solid_archive_decodes() {
             data.extend(f);
             data.extend(end);
         }
+        let bytes = data.clone();
         let mut s =
             ProgressiveSession::from_sealed_memory(vec![("a.rar".into(), data.into_boxed_slice())], opts).unwrap();
-        if !encrypted {
-            // a solid archive's first member starts the stream
-            drive(&mut s, None).unwrap();
-            assert_eq!(std::fs::read(dir.path().join("one")).unwrap(), b"A");
-            continue;
+        // a solid archive's first member starts the stream; behind encrypted headers too
+        drive(&mut s, None).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("one")).unwrap(), b"A");
+        if encrypted {
+            // and the whole-archive run reads the same headers
+            let archive = dir.path().join("a.rar");
+            std::fs::write(&archive, &bytes).unwrap();
+            let out = dir.path().join("run");
+            let summary = zipfast::extract::run_with_password(&archive, &opts_for(&out), Some("pw"), |_| {}).unwrap();
+            assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+            assert_eq!(std::fs::read(out.join("one")).unwrap(), b"A");
         }
-        let e = drive(&mut s, None).err().expect("unsupported");
-        assert!(
-            matches!(e.kind,FailureKind::Rar(ref f) if matches!(f.as_ref(),zipfast::error::RarFailure::Unsupported(_))),
-            "{e:?}"
-        );
-        assert!(!dir.path().join("one").exists());
     }
 }

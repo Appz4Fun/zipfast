@@ -1019,7 +1019,7 @@ pub(super) fn validate_evidence(
         if header.format != evidence.format {
             return Err(err(PartialErrorKind::UnsupportedFormat));
         }
-        if header.method != 0 || header.is_dir() || header.redirection.is_some() {
+        if header.method != 0 || header.is_dir() || header.redirection.is_some() || header.is_rar4_symlink() {
             return Err(err(PartialErrorKind::UnsupportedMethod));
         }
         // RAR4 is admitted plain or AES with a salt; any header the progressive RAR4 path refuses stays out.

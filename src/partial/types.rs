@@ -172,7 +172,7 @@ pub enum RefusalReason {
     Encrypted,
     /// The member's unpacked size is unknown (the RAR5 unknown-size flag, or an all-ones RAR4 size).
     UnknownSize,
-    /// The member is a link or file copy (a RAR5 redirection record).
+    /// The member is a link or file copy (a RAR5 redirection record, or a RAR4 Unix symbolic link).
     Redirection,
 }
 #[derive(Clone, Debug)]

@@ -201,6 +201,8 @@ pub enum RarPolicyReason {
     /// `RenameExisting` needs a no-replace rename or hard links, and the destination's file system (FAT, exFAT) has
     /// neither.
     RenameUnsupported,
+    /// A symbolic link member whose target is absolute or leads out of the destination.
+    LinkTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

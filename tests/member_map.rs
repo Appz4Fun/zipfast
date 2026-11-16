@@ -1600,8 +1600,27 @@ fn rar4_leniency_stays_out_of_sessions_and_extraction() {
     use zipfast::rar5::session::{RarSession, RarSessionOptions};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.rar");
+    // A legacy name that isn't UTF-8 opens and lists as UnRAR reads it (U+FFFE, then U+E000 plus each byte that
+    // isn't); extraction refuses the name.
+    std::fs::write(&path, r4_archive(&[r4_member_dos(CP437, b"payload", DOS, &[])])).unwrap();
+    let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    assert!(session.entries().next().unwrap().name().contains('\u{fffe}'));
+    assert_eq!(zipfast::extract::list(&path).unwrap().len(), 1);
+    let out = dir.path().join("out");
+    let options = zipfast::extract::Options {
+        mode: zipfast::extract::Mode::Extract,
+        dest: out.clone(),
+        overwrite: zipfast::extract::Overwrite::Always,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+    };
+    let summary = zipfast::extract::run(&path, &options, |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (0, 1));
+    assert!(!out.exists() || std::fs::read_dir(&out).unwrap().next().is_none());
     let cases = [
-        (vec![r4_member_dos(CP437, b"payload", DOS, &[])], "header extension or name encoding"),
         (vec![r4_legacy(0x75, None), r4_member_dos(b"one", b"payload", DOS, &[])], "legacy service block"),
         (vec![r4_member_dos(b"one", b"payload", DOS, &[0xde, 0xad])], "header extension or name encoding"),
     ];

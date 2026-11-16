@@ -237,8 +237,6 @@ impl Rar4Metadata {
             && (self.flags & 0xe0 == 0xe0) != (attributes & 0o170000 == 0o040000)
         {
             "file type flags"
-        } else if self.host == 3 && attributes & 0o170000 == 0o120000 {
-            "symbolic link"
         } else {
             return None;
         };
@@ -371,6 +369,11 @@ impl FileHeader {
 
     pub fn is_unix(&self) -> bool {
         self.host_os == 1
+    }
+
+    /// A RAR 4.x Unix symbolic link: a Unix-host member whose mode is `S_IFLNK`. Its data is the link's target.
+    pub fn is_rar4_symlink(&self) -> bool {
+        self.rar4.is_some_and(|raw| raw.host == 3) && self.attributes & 0o170000 == 0o120000
     }
 
     /// Whether `attributes` holds Windows attribute bits: RAR 5.0 host

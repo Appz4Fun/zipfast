@@ -98,15 +98,16 @@ fn joins_a_file_split_across_volumes() {
 }
 
 #[test]
-fn missing_volume_is_an_error() {
+fn missing_volume_fails_the_file_split_into_it() {
     let dir = tmp("missing");
     let data = vec![9u8; 1000];
     let spec = FileSpec::new("f", &data);
     let vols = volumes(&spec, 400);
     fs::write(dir.join("s.part1.rar"), &vols[0]).unwrap();
     fs::write(dir.join("s.part2.rar"), &vols[1]).unwrap();
-    let err = extract::run(&dir.join("s.part1.rar"), &opts(&dir.join("o")), |_| {}).unwrap_err();
-    assert!(matches!(err, zipfast::Error::MissingVolume(_)), "{err}");
+    let s = extract::run(&dir.join("s.part1.rar"), &opts(&dir.join("o")), |_| {}).unwrap();
+    assert!(s.errors.len() == 1 && s.errors[0].contains("missing volume"), "{:?}", s.errors);
+    assert!(!dir.join("o/f").exists());
 }
 
 #[test]
@@ -318,7 +319,8 @@ fn a_missing_volume_removes_the_half_written_file() {
     let vols = volumes(&FileSpec::new("f", &data), 400);
     fs::write(dir.join("s.part1.rar"), &vols[0]).unwrap();
     let out = dir.join("out");
-    assert!(extract::run(&dir.join("s.part1.rar"), &opts(&out), |_| {}).is_err());
+    let s = extract::run(&dir.join("s.part1.rar"), &opts(&out), |_| {}).unwrap();
+    assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
     assert!(!out.join("f").exists());
 }
 

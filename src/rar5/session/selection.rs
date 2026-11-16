@@ -762,6 +762,7 @@ fn copy_catalogue_issue(failure: &RarFailure) -> RarFailure {
             RarFailure::Integrity { scope: scope.clone(), reason: reason.clone(), password: *password }
         }
         RarFailure::Unsupported(reason) => RarFailure::Unsupported(reason.clone()),
+        RarFailure::MissingVolume { path } => RarFailure::MissingVolume { path: path.clone() },
         RarFailure::Limit { resource, requested, allowed } => {
             RarFailure::Limit { resource: resource.clone(), requested: *requested, allowed: *allowed }
         }
