@@ -59,19 +59,32 @@ struct Slot {
     output: std::path::PathBuf,
     taken: bool,
     finished: bool,
+    /// Packed ranges of the recorded parts, kept once the core is released so declared damage still maps.
+    spans: Vec<PackedSpan>,
 }
 impl Slot {
     fn new(key: MemberKey, core: Arc<PartialCore>) -> Self {
         let output = core.output_path().to_path_buf();
-        Self { key, weak: Arc::downgrade(&core), core: Some(core), output, taken: false, finished: false }
+        Self {
+            key,
+            weak: Arc::downgrade(&core),
+            core: Some(core),
+            output,
+            taken: false,
+            finished: false,
+            spans: Vec::new(),
+        }
     }
     /// The core while anyone holds it.
     fn live(&self) -> Option<Arc<PartialCore>> {
         self.core.clone().or_else(|| self.weak.upgrade())
     }
     fn release_if_done(&mut self) {
-        if self.taken && self.finished {
-            self.core = None;
+        if self.taken
+            && self.finished
+            && let Some(core) = self.core.take()
+        {
+            self.spans = core.packed_parts();
         }
     }
 }
@@ -225,12 +238,25 @@ impl ProgressiveSession {
         let future = split..range.end;
         let mut holes = Vec::new();
         let mut mapped = Vec::new();
+        let mut released = Vec::new();
         if !read.is_empty() {
             let persistent = self.partial.as_ref().unwrap();
             let active = persistent.current.map(|index| persistent.cores[index].key.clone());
             // The active member first: its machine must learn of streamed damage even if another member fails.
-            // Released members whose handles were all dropped are skipped: their damage is the caller's to
-            // declare on a reopened handle.
+            // Released members whose handles were all dropped are reported in `released`, from the packed
+            // ranges kept at release: their damage is the caller's to declare on a reopened handle.
+            for slot in &persistent.cores {
+                if slot.live().is_some() {
+                    continue;
+                }
+                for span in slot.spans.iter().filter(|span| span.volume == volume) {
+                    let hit = span.range.start.max(read.start)..span.range.end.min(read.end);
+                    if hit.start < hit.end {
+                        mapped.push(hit.clone());
+                        released.push((slot.key.clone(), PackedSpan { volume, range: hit }));
+                    }
+                }
+            }
             let live: Vec<(MemberKey, Arc<PartialCore>)> = active
                 .as_ref()
                 .and_then(|key| persistent.cores.iter().find(|slot| slot.key == *key))
@@ -333,7 +359,7 @@ impl ProgressiveSession {
             unmapped.push(PackedSpan { volume, range: at..read.end });
         }
         let pending = if future.is_empty() { Vec::new() } else { vec![PackedSpan { volume, range: future }] };
-        Ok(DamageReceipt { holes, pending, unmapped })
+        Ok(DamageReceipt { holes, pending, unmapped, released })
     }
     /// Stream and packed ranges of `range` (on `volume`) that the machine of an active encrypted member still
     /// holds in its CBC state: the block being assembled, and the last complete block, which decrypts the next.

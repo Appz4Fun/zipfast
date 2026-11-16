@@ -1683,6 +1683,14 @@ impl PartialCore {
     /// Whether any proven part of this member lies in `range` of `volume`. Checked without taking the
     /// operation or touching the output, so unrelated members never fail a declaration; a member busy in another
     /// operation answers true and is then tried for real.
+    /// Packed ranges of every part recorded so far, for a session that releases this core.
+    pub(crate) fn packed_parts(&self) -> Vec<PackedSpan> {
+        self.data
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(Vec::new, |data| data.snapshot.evidence.parts.iter().map(|part| part.packed.clone()).collect())
+    }
     pub(crate) fn touches(&self, volume: u32, range: &Range<u64>) -> bool {
         self.data.lock().unwrap().as_ref().is_none_or(|data| {
             data.snapshot.evidence.parts.iter().any(|part| {

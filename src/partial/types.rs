@@ -146,6 +146,10 @@ pub struct DamageReceipt {
     pub pending: Vec<PackedSpan>,
     /// Damaged bytes already read that map to no persistent output, such as headers or padding.
     pub unmapped: Vec<PackedSpan>,
+    /// Damaged bytes of members the session has released (finished, handle taken, every handle dropped): their
+    /// output may now be bad, but the session no longer holds them. Reopen each member with [`PartialFile::open`]
+    /// and declare the span there with [`PartialFile::declare_hole`].
+    pub released: Vec<(MemberKey, PackedSpan)>,
 }
 /// Where the final checks of a member whose tail was abandoned ([`PartialFile::abandon_tail`]) come from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
