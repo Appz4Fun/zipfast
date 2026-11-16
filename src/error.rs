@@ -35,7 +35,8 @@ pub enum Error {
     UnnamedVolume(PathBuf),
     /// A feature the archive uses that this build cannot handle yet.
     Unsupported(String),
-    /// The archive or a file in it is encrypted.
+    /// The archive or a file in it is encrypted, and no password was given or the one given does not open it (a 7z
+    /// run uses it only for a missing password).
     Encrypted,
     /// Extracted data does not match the checksum stored for it.
     BadChecksum(String),
@@ -57,7 +58,7 @@ impl fmt::Display for Error {
                 write!(f, "{} says more volumes follow, but its name has no volume number to find them by", p.display())
             }
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
-            Error::Encrypted => f.write_str("encrypted (passwords are not supported yet)"),
+            Error::Encrypted => f.write_str("encrypted: a password is required, or the one given is wrong"),
             Error::BadChecksum(name) => write!(f, "checksum error in {name}"),
             Error::UnsafePath(name) => write!(f, "unsafe path refused: {name}"),
         }
