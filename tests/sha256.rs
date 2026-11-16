@@ -58,5 +58,13 @@ fn the_default_backend_uses_the_hardware_where_it_can() {
         assert_eq!(zipfast::crypto::sha256_backend(), "arm-sha2");
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sha")
+        && std::arch::is_x86_feature_detected!("ssse3")
+        && std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        assert_eq!(zipfast::crypto::sha256_backend(), "x86-sha-ni");
+        return;
+    }
     assert_eq!(zipfast::crypto::sha256_backend(), "scalar");
 }
