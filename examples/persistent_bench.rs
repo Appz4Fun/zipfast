@@ -18,7 +18,7 @@
 //! anchor store on the same disk) against a plain progressive extraction of the same set.
 //!
 //! `cargo run --release --features persistent-partials --example persistent_bench -- <work dir> [MiB] [volumes]
-//! [plain|persistent|both]`
+//! [plain|persistent|both]`; set `ZF_GROUP_MIB` to override `PartialLimits::group_commit_bytes`.
 //!
 //! The volumes are generated once into `<work dir>/set-<MiB>-<volumes>` and reused. Each run extracts into a fresh
 //! directory under `<work dir>` and removes it afterwards. The persistent run also reports durable syncs issued by
@@ -224,7 +224,15 @@ fn persistent(set: &Path, work: &Path, volumes: u32, size: u64) -> f64 {
         binding: ArchiveBinding { job: [1; 16], archive: [2; 32] },
         naming: PartialNaming::ArchivePath,
         state_dir: root.join("state"),
-        limits: PartialLimits::default(),
+        // `ZF_GROUP_MIB` overrides the group size (0: one transaction per write) and disables the interval.
+        limits: match std::env::var("ZF_GROUP_MIB") {
+            Ok(mib) => PartialLimits {
+                group_commit_bytes: mib.parse::<u64>().unwrap() << 20,
+                group_commit_interval: std::time::Duration::from_secs(3600),
+                ..PartialLimits::default()
+            },
+            Err(_) => PartialLimits::default(),
+        },
         anchors: anchors.clone(),
         control: SessionControl::default(),
     };
