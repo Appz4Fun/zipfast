@@ -566,6 +566,20 @@ impl ProjectedReadSession {
             {
                 let mode = e.unix_mode();
                 let mtime = e.mtime.map(|s| (s, e.nanos));
+                // The start hook (`MemberFilter::on_start`) decides before anything is staged or decoded; a target
+                // Skip leaves alone is not asked about. A rename mode picks its name only when the member is
+                // published, so the hook sees the requested path here.
+                if let Some(select) = &options.select {
+                    let requested = options.dest.join(relative.path());
+                    let kept = options.overwrite == crate::extract::Overwrite::Skip
+                        && std::fs::symlink_metadata(&requested).is_ok();
+                    if !kept
+                        && select.starts(&crate::extract::MemberStart { path: &requested })
+                            == crate::extract::StartDecision::Skip
+                    {
+                        return Ok(true);
+                    }
+                }
                 let (stage, blocked) = ZipReadStage::prepare_run_file(
                     self.stage_entry(ordinal)?,
                     relative.path(),

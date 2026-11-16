@@ -26,7 +26,8 @@ use super::coders::{self, Fault, Keys};
 use super::source::VolumeSet;
 use super::{SevenZipError, SevenZipLimits, check_bounds, member_name, open_map};
 use crate::extract::{
-    Cancellation, Checked, Dirs, LegacyReport, Meta, Mode, Options, Overwrite, Place, RenameLog, RenamedOutput, Summary,
+    Cancellation, Checked, Dirs, LegacyMember, LegacyReport, Meta, Mode, Options, Overwrite, Place, RenameLog,
+    RenamedOutput, Summary,
 };
 use crate::map::{MapFolder, MapMember, MemberMap};
 use crate::output::Output;
@@ -47,6 +48,8 @@ struct Staged {
     place: Place,
     name: String,
     size: u64,
+    /// its listing index, for the observer
+    ordinal: u64,
 }
 
 /// The folder being decoded.
@@ -61,7 +64,7 @@ struct Active {
     /// Files held back for the folder's CRC: only for a folder of several members that stores one.
     staged: Vec<Staged>,
     /// Tested members held back for the folder's CRC in the same case: name and size.
-    tested: Vec<(String, u64)>,
+    tested: Vec<(String, u64, u64)>,
     defer: bool,
 }
 
@@ -80,6 +83,8 @@ struct Run<'a> {
     /// data has decoded and checked out.
     password_proven: bool,
     buf: Vec<u8>,
+    /// the listing index of the member being handled
+    current: u64,
 }
 
 pub(super) fn run(
@@ -134,6 +139,7 @@ pub(super) fn run(
         active: None,
         password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],
+        current: 0,
     };
     let result = run.members(&selected, &needed);
     crate::extract::finish_dirs(&mut run.summary);
@@ -174,9 +180,31 @@ fn legacy_error(e: crate::Error) -> SevenZipError {
 
 impl Run<'_> {
     fn fail(&mut self, name: &str, why: &str) {
+        self.fail_at(self.current, name, why);
+    }
+
+    /// A member failed: reported as a line and, live, as its outcome.
+    fn fail_at(&mut self, ordinal: u64, name: &str, why: &str) {
         let line = format!("{name}: {why}");
         self.report.line(&line);
+        self.report.member(LegacyMember::Failed {
+            ordinal,
+            name,
+            error: crate::Error::Io(io::Error::other(why.to_owned())),
+        });
         self.summary.errors.push(line);
+    }
+
+    fn skipped(&mut self, ordinal: u64, name: &str) {
+        self.report.line(&format!("{name}: exists, skipped"));
+        self.summary.skipped += 1;
+        self.report.member(LegacyMember::Skipped { ordinal, name });
+    }
+
+    fn succeeded(&mut self, ordinal: u64, name: &str, bytes: u64) {
+        self.summary.files += 1;
+        self.summary.bytes += bytes;
+        self.report.member(LegacyMember::Succeeded { ordinal, name, bytes });
     }
 
     fn members(&mut self, selected: &[bool], needed: &[Option<usize>]) -> Outcome<()> {
@@ -186,6 +214,7 @@ impl Run<'_> {
                 return Err(SevenZipError::Canceled);
             }
             let take = selected[ordinal];
+            self.current = ordinal as u64;
             if take {
                 self.summary.matched += 1;
             }
@@ -232,10 +261,11 @@ impl Run<'_> {
         }
         let report = &mut *self.report;
         let renames = &mut self.summary.renames;
+        let ordinal = self.current;
         let mut log = RenameLog {
             budget: &mut self.summary.rename_budget,
             record: &mut |renamed| {
-                report.renamed(&renamed);
+                report.renamed_member(ordinal, &renamed);
                 renames.push(renamed);
             },
         };
@@ -243,13 +273,13 @@ impl Run<'_> {
         match checked.map_err(legacy_error)? {
             Checked::Write(place) => Ok(Some((rel, Some(place)))),
             Checked::Exists => {
-                self.report.line(&format!("{name}: exists, skipped"));
-                self.summary.skipped += 1;
+                self.skipped(self.current, name);
                 Ok(None)
             }
             Checked::Declined => {
                 self.report.line(&format!("{name}: declined, skipped"));
                 self.summary.skipped += 1;
+                self.report.member(LegacyMember::Skipped { ordinal: self.current, name });
                 Ok(None)
             }
             Checked::Blocked(why) => {
@@ -269,16 +299,17 @@ impl Run<'_> {
                 self.summary.dir_meta.push((self.opts.dest.join(&rel), meta(member)));
             }
             self.summary.dirs += 1;
+            self.report.member(LegacyMember::Succeeded { ordinal: self.current, name: &name, bytes: 0 });
             return Ok(());
         }
         if let Some(place) = place {
             let (temporary, output) = self.stage(&place, 0)?;
             output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
-            if !self.publish(Staged { temporary, place, name, size: 0 })? {
+            if !self.publish(Staged { temporary, place, name, size: 0, ordinal: self.current })? {
                 return Ok(());
             }
         } else {
-            self.summary.files += 1;
+            self.succeeded(self.current, &name, 0);
         }
         Ok(())
     }
@@ -293,12 +324,12 @@ impl Run<'_> {
     /// Gives a verified file its name: replacing what is there only when that was asked for, never through a link.
     /// False when it was not published (already reported).
     fn publish(&mut self, staged: Staged) -> Outcome<bool> {
-        let Staged { temporary, place, name, size } = staged;
+        let Staged { temporary, place, name, size, ordinal } = staged;
         if let Some(reserved) = place.reserved {
             // The rename mode's own empty file, created with O_EXCL when the member started, takes the data, as long
             // as the name still holds that file.
             if cfg!(unix) && !reserved.still_ours() {
-                self.fail(&name, "the claimed name was replaced while the member was extracted");
+                self.fail_at(ordinal, &name, "the claimed name was replaced while the member was extracted");
                 return Ok(false);
             }
             crate::output::replace(temporary, reserved.path()).map_err(SevenZipError::Io)?;
@@ -308,17 +339,15 @@ impl Run<'_> {
         } else if let Err(error) = temporary.persist_noclobber(&place.path) {
             if error.error.kind() == io::ErrorKind::AlreadyExists {
                 if self.opts.overwrite == Overwrite::Skip {
-                    self.report.line(&format!("{name}: exists, skipped"));
-                    self.summary.skipped += 1;
+                    self.skipped(ordinal, &name);
                 } else {
-                    self.fail(&name, "another file appeared at the target while it was extracted");
+                    self.fail_at(ordinal, &name, "another file appeared at the target while it was extracted");
                 }
                 return Ok(false);
             }
             return Err(SevenZipError::Io(error.error));
         }
-        self.summary.files += 1;
-        self.summary.bytes += size;
+        self.succeeded(ordinal, &name, size);
         Ok(true)
     }
 
@@ -337,14 +366,19 @@ impl Run<'_> {
         let tested = std::mem::take(&mut active.tested);
         if !good {
             let why = active.failed.clone().unwrap_or_else(|| "checksum error in its solid block".to_owned());
-            for name in staged.iter().map(|s| &s.name).chain(tested.iter().map(|(n, _)| n)) {
-                self.fail(name, &why);
+            let mut failed: Vec<(u64, &str)> = staged
+                .iter()
+                .map(|s| (s.ordinal, s.name.as_str()))
+                .chain(tested.iter().map(|(n, _, o)| (*o, n.as_str())))
+                .collect();
+            failed.sort_by_key(|(o, _)| *o);
+            for (ordinal, name) in failed {
+                self.fail_at(ordinal, name, &why);
             }
             return Ok(());
         }
-        for (_, size) in tested {
-            self.summary.files += 1;
-            self.summary.bytes += size;
+        for (name, size, ordinal) in tested {
+            self.succeeded(ordinal, &name, size);
         }
         for staged in staged {
             self.publish(staged)?;
@@ -496,16 +530,15 @@ impl Run<'_> {
         let Some(place) = place else {
             // Testing: checked, nothing to write; a folder with its own CRC vouches for it at its end.
             if active.defer {
-                active.tested.push((name.to_owned(), size));
+                active.tested.push((name.to_owned(), size, self.current));
             } else {
-                self.summary.files += 1;
-                self.summary.bytes += size;
+                self.succeeded(self.current, name, size);
             }
             return Ok(());
         };
         let (temporary, output) = staged.take().expect("a staged output");
         output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
-        let staged = Staged { temporary, place, name: name.to_owned(), size };
+        let staged = Staged { temporary, place, name: name.to_owned(), size, ordinal: self.current };
         if active.defer {
             active.staged.push(staged);
         } else {

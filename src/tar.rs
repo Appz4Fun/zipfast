@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    Cancellation, Checked, Entry, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options, Overwrite, Place,
-    RenameLog, RunError, Summary, check_target, create_target, finish_dirs, finish_file, make_dirs,
+    Cancellation, Checked, Entry, LegacyMember, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options,
+    Overwrite, Place, RenameLog, RunError, Summary, check_target, create_target, finish_dirs, finish_file, make_dirs,
 };
 use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
@@ -128,7 +128,9 @@ impl Source {
         let Some(codec) = Codec::sniff(&head[..n]) else {
             return Ok(Source::Plain { r: BufReader::with_capacity(1 << 20, file), len, pos: 0, cancel });
         };
-        let Some(limit) = limit else {
+        // A cancellation is checked as the packed bytes are read and as decoded bytes come out, so a decoder that
+        // loops on its input without producing output still stops.
+        let Some(limit) = limit.or(cancel.as_ref().map(|_| u64::MAX)) else {
             let reader = BufReader::with_capacity(1 << 20, file);
             return Ok(Source::Packed(codec.open(reader, threads).map_err(read_error)?, codec));
         };
@@ -408,10 +410,6 @@ struct Reader {
 }
 
 impl Reader {
-    fn open(path: &Path, threads: usize) -> Result<Reader> {
-        Self::open_with_limit(path, threads, None, None)
-    }
-
     fn open_with_limit(
         path: &Path,
         threads: usize,
@@ -775,14 +773,54 @@ pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<
     run_reporting(path, opts, &mut report).map_err(|e| e.error)
 }
 
+/// Tests or extracts a tar archive or lone compressed stream with the same options, cancellation and observer as
+/// [`crate::extract::run_with_policy`], which dispatches here for these formats.
+///
+/// Members are reported live through `observe` with their listing index: `MemberSucceeded`, `MemberSkipped` or
+/// `MemberFailed`, preceded by `MemberRenamed { ordinal: Some(..) }` when a rename mode renamed. Members of a
+/// compressed tar are published (and reported) once the whole stream has decoded and checked out. A canceled run
+/// returns [`crate::zip::ReadFault::Cancelled`]; files already published stay, the member in progress does not.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)]
+pub fn run_with_policy(
+    path: &Path,
+    options: &Options,
+    cancel: &Cancellation,
+    observe: impl crate::zip::ZipRunObserver,
+) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
+    use crate::extract::LegacyRoute;
+    if !is_tar_or_stream(path).map_err(crate::zip::ReadFault::Legacy)? {
+        return Err(crate::zip::ReadFault::Legacy(Error::NotAnArchive).into());
+    }
+    crate::extract::legacy_zip_report(LegacyRoute::Tar, path, options, None, cancel, observe)
+}
+
+/// Whether the file starts like a tar archive or one of the compressed streams this module reads.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_tar_or_stream(path: &Path) -> Result<bool> {
+    let mut head = [0u8; 2 * BLOCK];
+    let n = read_full(&mut File::open(path)?, &mut head)?;
+    Ok(Codec::sniff(&head[..n]).is_some() || sniff_tar(&head[..n]))
+}
+
 /// [`run`], reporting a rename mode's renames to `report` as they happen. A terminal error keeps them too.
 pub(crate) fn run_reporting(
     path: &Path,
     opts: &Options,
     report: &mut impl LegacyReport,
 ) -> std::result::Result<Summary, RunError> {
+    run_reporting_cancelable(path, opts, None, report)
+}
+
+/// [`run_reporting`], stopping with [`crate::extract::canceled_error`] once `cancel` is triggered.
+pub(crate) fn run_reporting_cancelable(
+    path: &Path,
+    opts: &Options,
+    cancel: Option<&Cancellation>,
+    report: &mut impl LegacyReport,
+) -> std::result::Result<Summary, RunError> {
     let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    let mut reader = Reader::open(path, threads)?;
+    let mut reader = Reader::open_with_limit(path, threads, None, cancel.cloned())?;
     let opts = &*opts.protecting(path)?;
     if opts.mode == Mode::Extract {
         std::fs::create_dir_all(&opts.dest).map_err(Error::from)?;
@@ -806,16 +844,48 @@ fn fail(summary: &mut Summary, report: &mut impl LegacyReport, name: &str, why: 
     summary.errors.push(line);
 }
 
+/// [`fail`] for one member, also reported as its outcome.
+fn fail_member(
+    summary: &mut Summary,
+    report: &mut impl LegacyReport,
+    ordinal: u64,
+    name: &str,
+    why: &str,
+    error: Error,
+) {
+    fail(summary, report, name, why);
+    report.member(LegacyMember::Failed { ordinal, name, error });
+}
+
+/// A member written (or found whole, when testing).
+fn succeeded(summary: &mut Summary, report: &mut impl LegacyReport, ordinal: u64, name: &str, bytes: u64) {
+    summary.files += 1;
+    summary.bytes += bytes;
+    report.member(LegacyMember::Succeeded { ordinal, name, bytes });
+}
+
+/// A folder made (or found, when testing).
+fn folder(summary: &mut Summary, report: &mut impl LegacyReport, ordinal: u64, name: &str) {
+    summary.dirs += 1;
+    report.member(LegacyMember::Succeeded { ordinal, name, bytes: 0 });
+}
+
+fn skipped(summary: &mut Summary, report: &mut impl LegacyReport, ordinal: u64, name: &str) {
+    report.line(&format!("{name}: exists, skipped"));
+    summary.skipped += 1;
+    report.member(LegacyMember::Skipped { ordinal, name });
+}
+
 /// Opens where `rel` is to be written, or says why not. `Ok(None)` means skip it, already reported.
 fn target(
     opts: &Options,
     rel: &Path,
-    name: &str,
+    (ordinal, name): (u64, &str),
     size: Option<u64>,
     summary: &mut Summary,
     report: &mut impl LegacyReport,
 ) -> Result<Option<Output>> {
-    checked_place(opts, rel, name, summary, report)?.map(|place| create_target(place, size)).transpose()
+    checked_place(opts, rel, (ordinal, name), summary, report)?.map(|place| create_target(place, size)).transpose()
 }
 
 /// How a member's data went: written whole, or the error that stopped it.
@@ -826,8 +896,8 @@ enum Outcome {
 }
 
 enum StagedMember {
-    Directory(PathBuf, Meta),
-    File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64 },
+    Directory { relative: PathBuf, meta: Meta, ordinal: u64, name: String },
+    File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64, ordinal: u64 },
 }
 
 #[derive(Default)]
@@ -840,13 +910,15 @@ impl StagedTar {
     fn publish(self, opts: &Options, summary: &mut Summary, report: &mut impl LegacyReport) -> Result<()> {
         for member in self.members {
             match member {
-                StagedMember::Directory(relative, meta) => {
+                StagedMember::Directory { relative, meta, ordinal, name } => {
                     make_dirs(&opts.dest, &relative)?;
                     summary.dir_meta.push((opts.dest.join(relative), meta));
-                    summary.dirs += 1;
+                    folder(summary, report, ordinal, &name);
                 }
-                StagedMember::File { relative, name, temporary, size } => {
-                    let Some(place) = checked_place(opts, &relative, &name, summary, report)? else { continue };
+                StagedMember::File { relative, name, temporary, size, ordinal } => {
+                    let Some(place) = checked_place(opts, &relative, (ordinal, &name), summary, report)? else {
+                        continue;
+                    };
                     if let Some(reserved) = place.reserved {
                         // the rename mode's own empty file, created with O_EXCL a moment ago, takes the data
                         replace(temporary, reserved.path())?;
@@ -855,14 +927,12 @@ impl StagedTar {
                         replace(temporary, &place.path)?;
                     } else if let Err(error) = temporary.persist_noclobber(place.path) {
                         if opts.overwrite == Overwrite::Skip && error.error.kind() == io::ErrorKind::AlreadyExists {
-                            report.line(&format!("{name}: exists, skipped"));
-                            summary.skipped += 1;
+                            skipped(summary, report, ordinal, &name);
                             continue;
                         }
                         return Err(error.error.into());
                     }
-                    summary.files += 1;
-                    summary.bytes += size;
+                    succeeded(summary, report, ordinal, &name, size);
                 }
             }
         }
@@ -873,31 +943,31 @@ impl StagedTar {
 fn checked_place(
     opts: &Options,
     relative: &Path,
-    name: &str,
+    (ordinal, name): (u64, &str),
     summary: &mut Summary,
     report: &mut impl LegacyReport,
 ) -> Result<Option<Place>> {
     let mut log = RenameLog {
         budget: &mut summary.rename_budget,
         record: &mut |renamed| {
-            report.renamed(&renamed);
+            report.renamed_member(ordinal, &renamed);
             summary.renames.push(renamed);
         },
     };
     match check_target(opts, relative, None, &mut log)? {
         Checked::Write(place) => Ok(Some(place)),
         Checked::Exists => {
-            report.line(&format!("{name}: exists, skipped"));
-            summary.skipped += 1;
+            skipped(summary, report, ordinal, name);
             Ok(None)
         }
         Checked::Declined => {
             report.line(&format!("{name}: declined, skipped"));
             summary.skipped += 1;
+            report.member(LegacyMember::Skipped { ordinal, name });
             Ok(None)
         }
         Checked::Blocked(why) => {
-            fail(summary, report, name, why);
+            fail_member(summary, report, ordinal, name, why, Error::Io(io::Error::other(why)));
             Ok(None)
         }
     }
@@ -972,7 +1042,7 @@ fn run_single(
     let mut out = None;
     if opts.mode == Mode::Extract {
         let rel = PathBuf::from(&name);
-        match target(opts, &rel, &name, None, summary, report)? {
+        match target(opts, &rel, (0, &name), None, summary, report)? {
             Some(t) => out = Some(t),
             None => return Ok(()),
         }
@@ -983,11 +1053,8 @@ fn run_single(
         Ok(())
     })?;
     match outcome {
-        Outcome::Done => {
-            summary.files += 1;
-            summary.bytes += total;
-        }
-        Outcome::Archive(e) => fail(summary, report, &name, &e.to_string()),
+        Outcome::Done => succeeded(summary, report, 0, &name, total),
+        Outcome::Archive(e) => fail_member(summary, report, 0, &name, &e.to_string(), e),
     }
     Ok(())
 }
@@ -1052,7 +1119,7 @@ fn run_tar(
         let rel = match sanitize(&m.name, false) {
             Ok(rel) => rel,
             Err(e) => {
-                fail(summary, report, &m.name, &e.to_string());
+                fail_member(summary, report, position, &m.name, &e.to_string(), e);
                 continue;
             }
         };
@@ -1062,13 +1129,19 @@ fn run_tar(
                 if opts.mode == Mode::Extract && !opts.flatten {
                     if let Some(staged) = &mut staged {
                         staged.budget.record(&m.name)?;
-                        staged.members.push(StagedMember::Directory(rel, m.meta()));
+                        let meta = m.meta();
+                        staged.members.push(StagedMember::Directory {
+                            relative: rel,
+                            meta,
+                            ordinal: position,
+                            name: m.name,
+                        });
                         continue;
                     }
                     make_dirs(&opts.dest, &rel)?;
                     summary.dir_meta.push((opts.dest.join(&rel), m.meta()));
                 }
-                summary.dirs += 1;
+                folder(summary, report, position, &m.name);
                 continue;
             }
             Kind::File => None,
@@ -1079,13 +1152,16 @@ fn run_tar(
             Kind::Other(_) => Some("devices and pipes are not extracted"),
         };
         if let Some(why) = why {
-            fail(summary, report, &m.name, why);
+            fail_member(summary, report, position, &m.name, why, Error::Unsupported(why.to_owned()));
             continue;
         }
         if let Some(staged) = &mut staged {
             let parent = staging_parent(&opts.dest, &rel)?;
-            if opts.dest.join(&rel).parent() == Some(parent.as_path())
-                && checked_place(opts, &rel, &m.name, summary, report)?.is_none()
+            // An early look at the target saves decoding a member that is to be skipped or refused; a rename mode
+            // settles its target only when publishing, so it renames once.
+            if opts.overwrite.rename().is_none()
+                && opts.dest.join(&rel).parent() == Some(parent.as_path())
+                && checked_place(opts, &rel, (position, &m.name), summary, report)?.is_none()
             {
                 continue;
             }
@@ -1094,10 +1170,11 @@ fn run_tar(
             let output = Output::new(file, Some(m.size));
             match copy_out(Some(output), &m.meta(), |sink| reader.read_data(m.size, buf, sink))? {
                 Outcome::Done => {
-                    staged.members.push(StagedMember::File { relative: rel, name: m.name, temporary, size: m.size });
+                    let (name, size) = (m.name, m.size);
+                    staged.members.push(StagedMember::File { relative: rel, name, temporary, size, ordinal: position });
                 }
                 Outcome::Archive(error) => {
-                    fail(summary, report, &m.name, &error.to_string());
+                    fail_member(summary, report, position, &m.name, &error.to_string(), error);
                     return Ok(());
                 }
             }
@@ -1105,7 +1182,7 @@ fn run_tar(
         }
         let mut out = None;
         if opts.mode == Mode::Extract {
-            match target(opts, &rel, &m.name, Some(m.size), summary, report)? {
+            match target(opts, &rel, (position, &m.name), Some(m.size), summary, report)? {
                 Some(t) => out = Some(t),
                 None => continue,
             }
@@ -1115,25 +1192,21 @@ fn run_tar(
             match reader.src.skip(size, &mut reader.scratch) {
                 Ok(()) => {
                     reader.unread = 0;
-                    summary.files += 1;
-                    summary.bytes += m.size;
+                    succeeded(summary, report, position, &m.name, m.size);
                     continue;
                 }
                 Err(Error::Io(e)) => return Err(Error::Io(e)),
                 Err(e) => {
-                    fail(summary, report, &m.name, &e.to_string());
+                    fail_member(summary, report, position, &m.name, &e.to_string(), e);
                     return Ok(());
                 }
             }
         }
         let size = m.size;
         match copy_out(out, &m.meta(), |sink| reader.read_data(size, buf, sink))? {
-            Outcome::Done => {
-                summary.files += 1;
-                summary.bytes += m.size;
-            }
+            Outcome::Done => succeeded(summary, report, position, &m.name, m.size),
             Outcome::Archive(e) => {
-                fail(summary, report, &m.name, &e.to_string());
+                fail_member(summary, report, position, &m.name, &e.to_string(), e);
                 return Ok(());
             }
         }

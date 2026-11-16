@@ -683,9 +683,10 @@ pub enum ZipRunEvent<'a> {
     /// A rename mode ([`crate::extract::Overwrite::RenameNew`] or [`crate::extract::Overwrite::RenameExisting`])
     /// renamed this member's output or moved its existing target aside. It comes just before the member's own
     /// `MemberSucceeded` or `MemberFailed`: an existing file moved aside is reported even when the member then
-    /// fails. `ordinal` is `None` for the tar and RAR runs [`crate::extract::run_with_zip_policy`] hands to the
-    /// legacy runners: they send this event as each rename is made, in the run's order, before any
-    /// `LegacyDiagnostic` for that member, and also when the run then stops with an error.
+    /// fails. ZIP and tar (including a lone compressed stream) give the member's `ordinal`. It is `None` for the RAR
+    /// and 7z runs [`crate::extract::run_with_policy`] hands to the legacy runners: they send this event as each
+    /// rename is made, in the run's order, before any `LegacyDiagnostic` for that member, and also when the run then
+    /// stops with an error.
     #[non_exhaustive]
     MemberRenamed {
         ordinal: Option<u64>,

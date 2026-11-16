@@ -32,7 +32,7 @@ use crate::blake2sp::Blake2sp;
 use crate::error::{
     Error, IoOperation, RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarResult, RarScope, Result,
 };
-use crate::extract::{EntryContext, Meta, Place, RunResult, create_target_detailed, finish_file};
+use crate::extract::{Cancellation, EntryContext, Meta, Place, RunResult, create_target_detailed, finish_file};
 use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 /// Files up to this size, packed and unpacked, go to the workers whole.
@@ -80,6 +80,8 @@ pub(crate) enum Outcome {
     Failed { reason: Box<RarFailure>, legacy: LegacyFailure },
     /// writing failed: the run stops
     Fatal(RarFault),
+    /// the run was canceled before the file was published: nothing of it is left
+    Canceled,
 }
 
 pub(crate) enum LegacyFailure {
@@ -118,7 +120,7 @@ pub(crate) struct Batch {
 }
 
 impl Batch {
-    pub(crate) fn new(workers: usize) -> Batch {
+    pub(crate) fn new(workers: usize, cancel: Option<Cancellation>) -> Batch {
         let (tx, jobs) = mpsc::channel::<Vec<(u64, Job)>>();
         let (done_tx, rx) = mpsc::channel();
         let jobs = Arc::new(Mutex::new(jobs));
@@ -126,6 +128,7 @@ impl Batch {
             .filter_map(|i| {
                 let jobs = Arc::clone(&jobs);
                 let done_tx = done_tx.clone();
+                let cancel = cancel.clone();
                 thread::Builder::new()
                     .name(format!("zipfast-file-{i}"))
                     .spawn(move || {
@@ -137,7 +140,7 @@ impl Batch {
                             let mut dones = Vec::with_capacity(group.len());
                             for (seq, job) in group {
                                 let weight = weight(&job);
-                                dones.push((seq, run(job, &mut unpacker), weight));
+                                dones.push((seq, run(job, &mut unpacker, cancel.as_ref()), weight));
                             }
                             if done_tx.send(dones).is_err() {
                                 break;
@@ -260,9 +263,13 @@ fn stopped() -> RarFault {
     )
 }
 
-fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
+fn run(job: Job, unpacker: &mut Option<Unpacker>, cancel: Option<&Cancellation>) -> Done {
     let Job { context, data } = job;
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&context, data, unpacker)))
+    if cancel.is_some_and(Cancellation::is_canceled) {
+        // Its file was never created.
+        return Done { context, outcome: Outcome::Canceled };
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&context, data, unpacker, cancel)))
         .unwrap_or_else(|_| {
             *unpacker = None;
             Outcome::Fatal(RarFault::new(
@@ -273,7 +280,13 @@ fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
     Done { context, outcome }
 }
 
-fn run_job(context: &EntryContext, data: JobData, unpacker: &mut Option<Unpacker>) -> Outcome {
+fn run_job(
+    context: &EntryContext,
+    data: JobData,
+    unpacker: &mut Option<Unpacker>,
+    cancel: Option<&Cancellation>,
+) -> Outcome {
+    let canceled = || cancel.is_some_and(Cancellation::is_canceled);
     let JobData { packed, method, dictionary, size, size_checked, crc32, blake2sp, out, meta } = data;
     let mut hasher = crate::crc32::Hasher::new();
     let mut blake = blake2sp.map(|_| Blake2sp::new());
@@ -290,6 +303,9 @@ fn run_job(context: &EntryContext, data: JobData, unpacker: &mut Option<Unpacker
         }
         if output_fault.is_some() {
             return Err(Error::Corrupt("RAR output stopped"));
+        }
+        if canceled() {
+            return Err(crate::extract::canceled_error());
         }
         if let Some(o) = out.as_mut()
             && let Err(e) = o.write_detailed(chunk)
@@ -308,6 +324,11 @@ fn run_job(context: &EntryContext, data: JobData, unpacker: &mut Option<Unpacker
     };
     if let Some(fault) = output_fault {
         return Outcome::Fatal(fault);
+    }
+    if canceled() {
+        // Dropped unfinished, the staged output is removed: nothing is published after the cancellation.
+        drop(out);
+        return Outcome::Canceled;
     }
     if let Err(fault) = decoded {
         let (reason, legacy) = fault.into_parts();
@@ -328,6 +349,10 @@ fn run_job(context: &EntryContext, data: JobData, unpacker: &mut Option<Unpacker
             reason: Box::new(RarFailure::integrity(scope, reason, RarPasswordEvidence::NotEncrypted, true)),
             legacy: LegacyFailure::Size { expected: size, actual: bytes },
         };
+    }
+    if canceled() {
+        drop(out);
+        return Outcome::Canceled;
     }
     if let Some(o) = out
         && let Err(e) = o.finish_detailed(|file| finish_file(file, &meta))
@@ -396,6 +421,7 @@ pub(crate) fn stored_detailed(
     out: Option<(&File, Option<&Path>)>,
     out_at: u64,
     threads: usize,
+    cancel: Option<&Cancellation>,
 ) -> RarResult<crate::crc32::Hasher> {
     let pieces = len.div_ceil(PIECE) as usize;
     let crcs: Vec<Mutex<Option<crate::crc32::Hasher>>> = (0..pieces).map(|_| Mutex::new(None)).collect();
@@ -411,6 +437,9 @@ pub(crate) fn stored_detailed(
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             return Ok(());
+                        }
+                        if cancel.is_some_and(Cancellation::is_canceled) {
+                            return Err(RarFault::new(RarFailure::Canceled, crate::extract::canceled_error()));
                         }
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= pieces {
@@ -579,13 +608,14 @@ mod positional_tests {
         fs::write(&output, b"keep").unwrap();
         let write_only = OpenOptions::new().write(true).open(&input).unwrap();
         let read_only = File::open(&output).unwrap();
-        let fault = stored_detailed((&write_only, Some(&input)), 1, 1, None, 0, 2).err().unwrap();
+        let fault = stored_detailed((&write_only, Some(&input)), 1, 1, None, 0, 2, None).err().unwrap();
         assert!(matches!(fault.failure.as_ref(), RarFailure::Input {
             operation: IoOperation::Read, path: Some(path), offset: Some(1), source, ..
         } if path == &input && source.raw_os_error() == Some(libc::EBADF)));
         let source_file = File::open(&input).unwrap();
-        let fault =
-            stored_detailed((&source_file, Some(&input)), 1, 1, Some((&read_only, Some(&output))), 2, 2).err().unwrap();
+        let fault = stored_detailed((&source_file, Some(&input)), 1, 1, Some((&read_only, Some(&output))), 2, 2, None)
+            .err()
+            .unwrap();
         assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
             operation: IoOperation::Write, path: Some(path), offset: Some(2), source, ..
         } if path == &output && source.raw_os_error() == Some(libc::EBADF)));

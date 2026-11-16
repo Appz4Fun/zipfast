@@ -74,6 +74,26 @@ For compressed TAR, extraction stages member payloads and archive-supplied direc
 stream passes verification. Pending payloads use temporary disk space. Members publish in archive order, so a
 publication failure can leave earlier verified members in place.
 
+### Library: one entry point for every format
+
+`extract::run_with_policy` (or `extract::run_with_context`, with a caller-owned `EncryptedReadContext`) tests or
+extracts ZIP, tar, lone `.gz`/`.xz`/`.bz2`/`.zst` streams, RAR4/RAR5 and 7z with one `Options`, one
+`Cancellation` and one observer of `extract::RunEvent`s. The format comes from the content. Cancellation reaches
+every format's inner loop and ends the run with `ReadFault::Cancelled`; `Overwrite` (Skip, Always, RenameNew,
+RenameExisting) and `Options::select` apply everywhere. Every format reports each member live with its listing index.
+`tar::run_with_policy` is the same API for tar and streams alone. See [one entry point](docs/extract-entry.md).
+
+```rust
+use zipfast::extract::{self, Cancellation, RunEvent};
+let cancel = Cancellation::default();
+let report = extract::run_with_policy(&path, &opts, password, &cancel, &Default::default(), |event: RunEvent<'_>| {
+    if let RunEvent::MemberSucceeded { ordinal, name, .. } = event {
+        println!("{ordinal} {name}");
+    }
+    Ok(())
+})?;
+```
+
 ### Library: choosing members
 
 `extract::Options::select` takes an optional `MemberFilter`, a shared predicate over a `MemberRef` (decoded name,
