@@ -209,7 +209,7 @@ fn riff_avi(bytes: &[u8]) -> Option<MediaMatch> {
     Some(MediaMatch::new(MediaKind::Avi, confidence))
 }
 
-const ASF_HEADER: [u8; 16] =
+pub(crate) const ASF_HEADER: [u8; 16] =
     [0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce, 0x6c];
 
 fn asf(bytes: &[u8]) -> Option<MediaMatch> {

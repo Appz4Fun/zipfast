@@ -281,7 +281,9 @@ pub enum PasswordNeed {
     /// The member's data is encrypted and no password was given.
     DataEncrypted,
     /// The password given fails a check: encrypted headers, a RAR 5.0 check value, a WinZip AES verifier, or a
-    /// member named as media whose decrypted first bytes (at least 4 KiB, or the whole member) are no media.
+    /// member named as a kind whose start is mandatory (Matroska, WebM, AVI, ASF, MP4, QuickTime) whose decrypted
+    /// first bytes (at least 4 KiB, or the whole member) do not start that way. Never for a password the encrypted
+    /// headers proved.
     WrongPassword,
 }
 
@@ -294,7 +296,7 @@ pub enum NotBorrowable {
     /// The member is compressed in a solid stream that depends on earlier members.
     Solid,
     /// The cipher does not map offsets (older RAR encryption, ZIP strong encryption, AES without its parameters), or
-    /// its key derivation is past what the probe derives (a RAR 5.0 KDF count above 24).
+    /// its key derivation is past what the probe derives (a RAR 5.0 KDF count above 20).
     UnsupportedCipher,
     /// ZipCrypto: output byte `o` needs every earlier byte of the stream decrypted first.
     SequentialCipher,
@@ -610,31 +612,64 @@ fn judge(
         Proved::Checked { verified, plain } => (verified, plain),
     };
     let sniffed = plain.as_deref().and_then(sniff);
-    if verified {
-        return Ok((Borrowable::YesWithPassword(PasswordProof::Verifier), sniffed));
-    }
-    if let (Some(plain), Some(named)) = (plain.as_deref(), name_kind) {
-        let enough = plain.len() >= c.size.map_or(MIN_CONTRADICTION, |s| s.min(MIN_CONTRADICTION as u64) as usize);
-        match sniffed {
-            Some(found) if same_family(found.kind, named) => {
-                return Ok((Borrowable::YesWithPassword(PasswordProof::Plaintext), sniffed));
+    let plaintext_proof = match (sniffed, name_kind) {
+        (Some(found), Some(named)) => same_family(found.kind, named),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let contradicted = sniffed.is_none()
+        && match (plain.as_deref(), name_kind) {
+            (Some(plain), Some(named)) => {
+                let enough = c.size.map_or(MIN_CONTRADICTION, |s| s.min(MIN_CONTRADICTION as u64) as usize);
+                plain.len() >= enough && contradicts(named, plain)
             }
-            // An MPEG elementary stream named `.mpg` starts with a start code but no pack header.
-            None if enough && !(named == MediaKind::MpegPs && plain.starts_with(&[0, 0, 1])) => {
-                return Ok((Borrowable::NeedsPassword(PasswordNeed::WrongPassword), None));
-            }
-            _ => {}
+            _ => false,
+        };
+    let verdict = if verified {
+        // A RAR 5.0 check value is 8 bytes and stands; a WinZip AES verifier is 2 and the plaintext can still refute it.
+        let weak = matches!(c.cipher, Some(CipherParams::WinZipAes { .. }));
+        if weak && contradicted {
+            Borrowable::NeedsPassword(PasswordNeed::WrongPassword)
+        } else {
+            Borrowable::YesWithPassword(PasswordProof::Verifier)
         }
-    } else if name_kind.is_none() && sniffed.is_some() {
-        return Ok((Borrowable::YesWithPassword(PasswordProof::Plaintext), sniffed));
-    }
-    let verdict = if header_encrypted {
+    } else if plaintext_proof {
+        Borrowable::YesWithPassword(PasswordProof::Plaintext)
+    } else if header_encrypted {
+        // The headers already proved the password; the data's plaintext does not overrule that.
         Borrowable::YesWithPassword(PasswordProof::Headers)
+    } else if contradicted {
+        Borrowable::NeedsPassword(PasswordNeed::WrongPassword)
     } else {
         Borrowable::PasswordUnverified
     };
+    let sniffed = if matches!(verdict, Borrowable::NeedsPassword(_)) { None } else { sniffed };
     Ok((verdict, sniffed))
 }
+
+/// Whether plaintext that sniffs as no media contradicts the media kind a member's name names. Only kinds whose start
+/// is mandatory count: Matroska/WebM must start with the EBML magic, AVI with `RIFF`, ASF with its header GUID, and
+/// MP4/QuickTime with something that parses as a box header (a size of 0, 1 or at least 8, then four printable
+/// bytes), since a fragment may start with `styp`, `moof` and others, or with an `ftyp` too large to sniff. A
+/// transport stream may start mid-packet or use other packet sizes, and an MPEG file may be an elementary stream:
+/// for those nothing is a contradiction.
+fn contradicts(named: MediaKind, plain: &[u8]) -> bool {
+    match named {
+        MediaKind::Mkv | MediaKind::Webm => !plain.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        MediaKind::Avi => !plain.starts_with(b"RIFF"),
+        MediaKind::Asf => !plain.starts_with(&media::ASF_HEADER),
+        MediaKind::Mp4 | MediaKind::Mov => {
+            let Some(header) = plain.get(..8) else { return false };
+            let size = u32::from_be_bytes(header[..4].try_into().unwrap());
+            let sized = size == 0 || size == 1 || size >= 8;
+            !(sized && header[4..].iter().all(|b| (0x20..0x7f).contains(b)))
+        }
+        MediaKind::MpegTs | MediaKind::M2ts | MediaKind::MpegPs => false,
+    }
+}
+
+/// The largest RAR 5.0 KDF count the probe derives (`2^20` rounds); larger counts are an unsupported cipher.
+const MAX_KDF_COUNT: u8 = 20;
 
 /// Decrypted bytes needed before a member named as media whose plaintext sniffs as nothing proves a wrong password.
 const MIN_CONTRADICTION: usize = 4096;
@@ -689,7 +724,7 @@ fn kdf_limit(error: crate::crypto::KdfControlError) -> MapError {
 enum Proved {
     /// A check proves the password wrong.
     Wrong,
-    /// The cipher's key derivation is outside what is derived (a RAR 5.0 KDF count above 24).
+    /// The cipher's key derivation is outside what is derived (a RAR 5.0 KDF count above 20).
     Unsupported,
     /// Whether a check value matched, and the decrypted first bytes in the head (up to 64 KiB, cut at the size).
     Checked { verified: bool, plain: Option<Vec<u8>> },
@@ -713,8 +748,12 @@ fn prove(head: &[u8], c: &Candidate, password: &str, kdf: &mut KdfMeter) -> Resu
     match &c.cipher {
         Some(CipherParams::Rar5 { kdf_count, salt, iv, check, .. }) => {
             use crate::crypto::{ControlledKdfError, Rar5CryptError, derive_rar5_keys_controlled};
+            // The derivation supports counts up to 20; within that, the caller's exponent budget applies.
+            if *kdf_count > MAX_KDF_COUNT {
+                return Ok(Proved::Unsupported);
+            }
             let limit = kdf.limits.limit(Resource::KdfExponent);
-            if u64::from(*kdf_count) > limit && *kdf_count <= 24 {
+            if u64::from(*kdf_count) > limit {
                 return Err(MapError::Limit {
                     resource: Resource::KdfExponent,
                     limit,

@@ -117,10 +117,10 @@ So an `nfo` before the `mkv` never wins, and a head holding only an `nfo` header
 | `PasswordUnverified` | as above, but nothing could check or refute the password. **Not safe to borrow on** |
 | `NeedsPassword(HeaderEncrypted)` | encrypted headers (`-hp`), no password |
 | `NeedsPassword(DataEncrypted)` | encrypted stored data, no password |
-| `NeedsPassword(WrongPassword)` | the password fails the encrypted headers, a RAR 5.0 check value, or a WinZip AES verifier; or the member's name has a media extension and at least 4 KiB of decrypted plaintext (or the whole member, if smaller) is not media |
+| `NeedsPassword(WrongPassword)` | the password fails the encrypted headers, a RAR 5.0 check value, or a WinZip AES verifier; or a plaintext contradiction (below) |
 | `No(Solid)` | compressed in a solid stream |
 | `No(Compressed)` | compressed (whether or not also encrypted) |
-| `No(UnsupportedCipher)` | older RAR encryption, ZIP strong encryption, ZIP method 99 without its AES extra field, a RAR 5.0 KDF count above 24 |
+| `No(UnsupportedCipher)` | older RAR encryption, ZIP strong encryption, ZIP method 99 without its AES extra field, a RAR 5.0 KDF count above 20 (the most the probe derives) |
 | `No(SequentialCipher)` | ZipCrypto: output byte `o` needs the whole stream before it decrypted |
 | `Unknown(Truncated)` | the head ends (or a damaged header stops the listing) before a member that could be chosen |
 | `Unknown(NoMediaYet)` | no media member yet, and the largest member so far comes from an incomplete listing |
@@ -129,20 +129,34 @@ So an `nfo` before the `mkv` never wins, and a head holding only an `nfo` header
 
 `PasswordProof`, strongest first:
 
-- `Verifier`: the format's own check matched. RAR 5.0: the 8-byte password check value. WinZip AES: the 2-byte
-  verifier, which a wrong password passes about once in 65,536.
+- `Verifier`: the format's own check matched. RAR 5.0: the 8-byte password check value, which stands on its own.
+  WinZip AES: the 2-byte verifier, which a wrong password passes about once in 65,536, so a plaintext contradiction
+  (below) still overrules it.
 - `Plaintext`: the decrypted first bytes of the member are a recognised media magic. When the name has a media
   extension, the sniffed kind must be of the same family (Matroska/WebM, MP4/QuickTime, TS/M2TS, or the kind
   itself); a `.avi` that decrypts to Matroska is no proof.
-- `Headers`: the password decrypted the encrypted headers.
+- `Headers`: the password decrypted the encrypted headers. A plaintext contradiction does not overrule it.
 
-Without any of these the verdict is `PasswordUnverified`: no check value (always for RAR 4.x), and the member's
-first bytes are not in the head, or its name names no media to compare the plaintext with. An `.mpg` member whose
-plaintext starts with an MPEG start code (`00 00 01`) but no pack header is not counted as a contradiction.
+A **plaintext contradiction** proves a password wrong: the member's name names a kind whose start is mandatory, at
+least 4 KiB of plaintext (or the whole member, if smaller) was decrypted, nothing sniffs, and the plaintext does
+not start the way that kind must:
 
-Data key derivations are charged to `ProbeOptions::limits`: `kdf_exponent` (RAR 5.0 counts above it, up to 24, are
-`MapError::Limit { resource: KdfExponent }`), `kdf_derivation_blocks` per derivation and `kdf_session_blocks` over
-the whole probe. Running out is `MapError::Limit`. Header decryption is charged by the member map as usual.
+| named kind | must start with |
+|---|---|
+| Matroska, WebM | the EBML magic `1A 45 DF A3` |
+| AVI | `RIFF` |
+| ASF | the ASF header GUID |
+| MP4, QuickTime | a box header: a size of 0, 1 or at least 8, then four printable ASCII bytes (fragments start with `styp`, `moof`, `sidx` and others, and an `ftyp` over 4 KiB is not sniffed) |
+| MPEG-TS, M2TS, MPEG-PS | never a contradiction: a stream may start mid-packet, use 204-byte packets, or be an elementary stream |
+
+Without a proof or a contradiction the verdict is `PasswordUnverified`: no check value (always for RAR 4.x), and the
+member's first bytes are not in the head, its name names no media, or the plaintext is of an unsniffed but
+plausible form.
+
+Data key derivations are charged to `ProbeOptions::limits`. RAR 5.0 KDF counts above 20 are past what the probe
+derives and give `No(UnsupportedCipher)`; counts up to 20 but above `kdf_exponent` are
+`MapError::Limit { resource: KdfExponent }`. `kdf_derivation_blocks` (per derivation) and `kdf_session_blocks` (over
+the whole probe) are `MapError::Limit` when they run out. Header decryption is charged by the member map as usual.
 
 A continued member (`continued: true`) is judged the same way: stored data maps, but where this part falls in the
 member's output depends on earlier volumes.

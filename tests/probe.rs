@@ -315,13 +315,13 @@ fn password_check(password: &str, kdf_count: u8) -> [u8; 8] {
     folded
 }
 
-/// A RAR 5.0 archive with one stored member encrypted with "pw", with or without a password check value.
-fn rar5_encrypted(name: &str, plain: &[u8], with_check: bool) -> Vec<u8> {
-    let (key, hash_key) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap();
+/// `plain` encrypted with "pw" (KDF count 1) and an encryption record naming KDF count `kdf`: (ciphertext, extra).
+fn rar5_crypt(plain: &[u8], with_check: bool, kdf: u8) -> (Vec<u8>, Vec<u8>) {
+    let key = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap().0;
     let mut padded = plain.to_vec();
     padded.resize(plain.len().next_multiple_of(16), 0);
     let cipher = zipfast::crypto::encrypt_cbc(&key, &IV, &padded).unwrap();
-    let mut extra = vec![if with_check { 48 } else { 36 }, 1, 0, if with_check { 3 } else { 2 }, 1];
+    let mut extra = vec![if with_check { 48 } else { 36 }, 1, 0, if with_check { 3 } else { 2 }, kdf];
     extra.extend(SALT);
     extra.extend(IV);
     if with_check {
@@ -329,6 +329,17 @@ fn rar5_encrypted(name: &str, plain: &[u8], with_check: bool) -> Vec<u8> {
         extra.extend(check);
         extra.extend(&zipfast::crypto::sha256(&check)[..4]);
     }
+    (cipher, extra)
+}
+
+/// A RAR 5.0 archive with one stored member encrypted with "pw", with or without a password check value.
+fn rar5_encrypted(name: &str, plain: &[u8], with_check: bool) -> Vec<u8> {
+    rar5_encrypted_kdf(name, plain, with_check, 1)
+}
+
+fn rar5_encrypted_kdf(name: &str, plain: &[u8], with_check: bool, kdf: u8) -> Vec<u8> {
+    let hash_key = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap().1;
+    let (cipher, extra) = rar5_crypt(plain, with_check, kdf);
     let mut spec = FileSpec::new(name, &cipher);
     spec.size = Some(plain.len() as u64);
     spec.extra = extra;
@@ -375,15 +386,19 @@ const HP_SALT: [u8; 16] = [0x53; 16];
 const HP_CHECK: [u8; 12] = [0x17, 0x41, 0x9a, 0xfa, 0xa6, 0x98, 0xfd, 0x50, 0xa8, 0x4b, 0x9b, 0x32];
 
 fn hp_archive(name: &str, payload: &[u8]) -> Vec<u8> {
+    hp_archive_of(&FileSpec::new(name, payload))
+}
+
+fn hp_archive_of(spec: &FileSpec<'_>) -> Vec<u8> {
+    let payload = spec.data;
     let iv = [0x49; 16];
     let key = zipfast::crypto::derive_rar5_key_and_hash_key(HP_PASSWORD, 4, &HP_SALT, None).unwrap().0;
     let params = [&[0, 1, 4], HP_SALT.as_slice(), HP_CHECK.as_slice()].concat();
     let mut bytes = SIG.to_vec();
     bytes.extend(block(4, 0, &params, &[], &[], false));
-    let spec = FileSpec::new(name, payload);
     for (mut header, data) in [
         (main_block(false, None), b"".as_slice()),
-        (file_block(&spec, payload, crc32fast::hash(payload), false, false), payload),
+        (file_block(spec, payload, crc32fast::hash(payload), false, false), payload),
         (end_block(false), b"".as_slice()),
     ] {
         header.truncate(header.len() - data.len());
@@ -892,4 +907,107 @@ fn a_damaged_header_ends_the_listing_as_incomplete() {
     let rar = rar_of(&packing);
     assert!(matches!(rar.map.end, VolumeEnd::Damaged { .. }), "{:?}", rar.map.end);
     assert_eq!(rar.borrowable, Borrowable::Unknown(Undecided::Truncated), "only a side file was listed");
+}
+
+// ---- Review round 2 ----
+
+/// Plaintexts a correct password can decrypt to that the media sniffer does not recognise.
+fn unsniffed_media() -> Vec<(&'static str, Vec<u8>)> {
+    let mut cases = Vec::new();
+    for (name, kind) in [
+        ("styp.mp4", b"styp"),
+        ("uuid.mp4", b"uuid"),
+        ("moof.mp4", b"moof"),
+        ("sidx.mp4", b"sidx"),
+        ("meta.mp4", b"meta"),
+        ("pdin.mp4", b"pdin"),
+    ] {
+        let mut bytes = 24u32.to_be_bytes().to_vec();
+        bytes.extend(kind);
+        cases.push((name, pad(bytes, 8192)));
+    }
+    let mut big_ftyp = 5000u32.to_be_bytes().to_vec();
+    big_ftyp.extend(b"ftypisom");
+    cases.push(("big-ftyp.mp4", pad(big_ftyp, 8192)));
+    cases.push(("mid-packet.ts", packets(188, 0, 50)[50..].to_vec()));
+    cases.push(("fec.ts", packets(204, 0, 40)));
+    cases
+}
+
+#[test]
+fn a_correct_password_is_never_wrong_on_media_the_sniffer_misses() {
+    for (name, plain) in unsniffed_media() {
+        assert_eq!(sniff(&plain), None, "{name}");
+        let bytes = rar5_encrypted(name, &plain, false);
+        let packing = probe(&bytes, None, Some("pw")).unwrap();
+        assert_eq!(packing.borrowable(), Borrowable::PasswordUnverified, "{name}");
+    }
+    // A wrong password still contradicts a kind whose start is mandatory, and never a transport stream.
+    for (name, plain) in [("movie.mp4", iso(b"isom")), ("movie.avi", avi()), ("movie.wmv", asf())] {
+        let bytes = rar5_encrypted(name, &plain, false);
+        assert_eq!(
+            probe(&bytes, None, Some("pw")).unwrap().borrowable(),
+            Borrowable::YesWithPassword(PasswordProof::Plaintext),
+            "{name}"
+        );
+        let packing = probe(&bytes, None, Some("wrong")).unwrap();
+        assert_eq!(packing.borrowable(), Borrowable::NeedsPassword(PasswordNeed::WrongPassword), "{name}");
+    }
+    for name in ["movie.ts", "movie.m2ts", "movie.mpg"] {
+        let bytes = rar5_encrypted(name, &packets(188, 0, 50), false);
+        let packing = probe(&bytes, None, Some("wrong")).unwrap();
+        assert_eq!(packing.borrowable(), Borrowable::PasswordUnverified, "{name}");
+    }
+}
+
+#[test]
+fn a_password_the_headers_proved_is_not_overruled_by_the_plaintext() {
+    // Headers under HP_PASSWORD, data under "pw": the header password decrypts the data to noise.
+    let movie = mkv();
+    let (cipher, extra) = rar5_crypt(&movie, false, 1);
+    let mut spec = FileSpec::new("movie.mkv", &cipher);
+    spec.size = Some(movie.len() as u64);
+    spec.extra = extra;
+    let bytes = hp_archive_of(&spec);
+    let packing = probe(&bytes, None, Some(HP_PASSWORD)).unwrap();
+    let rar = rar_of(&packing);
+    assert!(rar.header_encrypted && !rar.locked);
+    assert_eq!(rar.borrowable, Borrowable::YesWithPassword(PasswordProof::Headers));
+}
+
+#[test]
+fn a_winzip_verifier_match_is_still_refuted_by_the_plaintext() {
+    // The data is encrypted under "pw", but the verifier is that of "other": a 2-byte collision, as a wrong
+    // password meets about once in 65,536.
+    let movie = mkv();
+    let mut entry = aes("movie.mkv", &movie, "pw");
+    let other = zipfast::crypto::aes_derive(b"other", &[0x77; 16], 32).unwrap();
+    entry.payload[16..18].copy_from_slice(&other[64..66]);
+    let bytes = zip(&[entry]);
+    let packing = probe(&bytes, None, Some("other")).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::NeedsPassword(PasswordNeed::WrongPassword));
+    // An obfuscated name gives the plaintext nothing to contradict: the verifier stands.
+    let mut entry = aes("a8f3e0c1", &movie, "pw");
+    entry.payload[16..18].copy_from_slice(&other[64..66]);
+    let packing = probe(&zip(&[entry]), None, Some("other")).unwrap();
+    assert_eq!(packing.borrowable(), Borrowable::YesWithPassword(PasswordProof::Verifier));
+}
+
+#[test]
+fn kdf_counts_past_the_supported_maximum_are_unsupported_and_within_it_are_budgeted() {
+    use zipfast::{map::MapError, progressive::Resource};
+    let movie = mkv();
+    for kdf in [21, 24] {
+        let bytes = rar5_encrypted_kdf("movie.mkv", &movie, true, kdf);
+        let packing = probe(&bytes, None, Some("pw")).unwrap();
+        assert_eq!(packing.borrowable(), Borrowable::No(NotBorrowable::UnsupportedCipher), "count {kdf}");
+    }
+    let bytes = rar5_encrypted_kdf("movie.mkv", &movie, true, 20);
+    let mut options = ProbeOptions::new();
+    options.limits.kdf_exponent = 19;
+    let error = probe_with(&bytes, None, Some("pw"), &options).unwrap_err();
+    assert!(
+        matches!(error, MapError::Limit { resource: Resource::KdfExponent, limit: 19, attempted: 20 }),
+        "{error:?}"
+    );
 }
