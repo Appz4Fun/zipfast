@@ -770,6 +770,9 @@ pub(crate) struct SevenZipWalker {
     header_encrypted: bool,
     header_cipher: Option<CipherParams>,
     depth: u32,
+    /// Volumes kept open on the input, least recently used first, at most `handles` of them.
+    kept: Vec<u32>,
+    handles: u64,
 }
 
 impl SevenZipWalker {
@@ -789,6 +792,8 @@ impl SevenZipWalker {
             header_encrypted: false,
             header_cipher: None,
             depth: 0,
+            kept: Vec::new(),
+            handles: options.limits.volume_handles,
         }
     }
 
@@ -884,10 +889,56 @@ impl SevenZipWalker {
             }
             Opened::Ready => {
                 self.current = Some(index);
+                self.keep(input, index)?;
                 Ok(Some(Opened::Ready))
             }
             Opened::Abort => Err(MapError::Aborted { volume: index }),
             Opened::Missing => Ok(Some(Opened::Missing)),
+        }
+    }
+
+    /// Keeps the current volume open under its index. At most `volume_handles` volumes stay open: past that, the
+    /// one used least recently is closed, and asked for again if it is needed later.
+    fn keep(&mut self, input: &mut dyn MapInput, index: u32) -> Result<(), MapError> {
+        if let Some(i) = self.kept.iter().position(|&k| k == index) {
+            self.kept.remove(i);
+        } else {
+            if self.handles == 0 {
+                return Err(MapError::Limit { resource: Resource::VolumeHandles, limit: 0, attempted: 1 });
+            }
+            while self.kept.len() as u64 >= self.handles {
+                input.release(self.kept.remove(0));
+            }
+        }
+        self.kept.push(index);
+        input.keep(index);
+        Ok(())
+    }
+
+    /// Makes volume `index`, whose length is known, current again: from the kept volumes, or by asking the source
+    /// again, which must give the same length. Ok(None) means pending; Ok(Some(false)) that it is missing now.
+    fn reselect(
+        &mut self,
+        input: &mut dyn MapInput,
+        cx: &mut Context<'_>,
+        index: u32,
+    ) -> Result<Option<bool>, MapError> {
+        if let Some(i) = self.kept.iter().position(|&k| k == index) {
+            if !input.select(index) {
+                return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceContract))));
+            }
+            self.kept.remove(i);
+            self.kept.push(index);
+            self.current = Some(index);
+            return Ok(Some(true));
+        }
+        match self.open(input, cx, index)? {
+            None => Ok(None),
+            Some(Opened::Ready) if input.len() != self.lens[index as usize] => {
+                Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::SourceChanged))))
+            }
+            Some(Opened::Ready) => Ok(Some(true)),
+            Some(_) => Ok(Some(false)),
         }
     }
 
@@ -904,10 +955,10 @@ impl SevenZipWalker {
                 return Ok(Poll::Ready(Filled::Unavailable(self.lens.len() as u32)));
             };
             if self.current != Some(volume) {
-                match self.open(input, cx, volume)? {
+                match self.reselect(input, cx, volume)? {
                     None => return Ok(Poll::Pending),
-                    Some(Opened::Ready) => {}
-                    Some(_) => return Ok(Poll::Ready(Filled::Unavailable(volume))),
+                    Some(true) => {}
+                    Some(false) => return Ok(Poll::Ready(Filled::Unavailable(volume))),
                 }
             }
             let want = left.min(in_volume).min(CHUNK as u64) as usize;
@@ -961,6 +1012,7 @@ impl SevenZipWalker {
                         // Format detection left volume 0 open.
                         self.lens.push(input.len());
                         self.current = Some(0);
+                        self.keep(input, 0)?;
                         if self.lens[0] < SIGNATURE_LEN {
                             return Ok(Poll::Ready(MemberMap {
                                 format: MapFormat::SevenZip,

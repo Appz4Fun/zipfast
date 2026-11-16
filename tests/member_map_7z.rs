@@ -1471,3 +1471,104 @@ fn anti_items_are_not_listed_and_streams_are_files() {
     assert_direct_round_trips(&map.members[1], &volumes, &b);
     assert_direct_round_trips(&map.members[0], &volumes, &a);
 }
+
+// ---- Kept volumes (the map input's keep/select) ----
+
+/// Answers volumes at once; each at most `answers` times, and from the second answer on with `grow` extra bytes.
+struct Counting {
+    volumes: Vec<Vec<u8>>,
+    asked: Arc<Mutex<Vec<u32>>>,
+    answers: usize,
+    grow: usize,
+}
+
+struct Plain(Vec<u8>);
+
+impl RangeSource for Plain {
+    fn info(&self) -> SourceInfo {
+        SourceInfo {
+            id: SourceId(2),
+            generation: 0,
+            extent: self.0.len() as u64,
+            length: SourceLength::Final(self.0.len() as u64),
+        }
+    }
+    fn backing_files(&self) -> &[File] {
+        &[]
+    }
+    fn read_at(&mut self, at: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        let end = (at as usize + buf.len()).min(self.0.len());
+        let n = end - at as usize;
+        buf[..n].copy_from_slice(&self.0[at as usize..end]);
+        Ok(RangeRead::Filled { count: n })
+    }
+}
+
+impl VolumeSource for Counting {
+    fn volume(&mut self, r: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        let mut asked = self.asked.lock().unwrap();
+        let before = asked.iter().filter(|&&i| i == r.index).count();
+        asked.push(r.index);
+        let Some(data) = self.volumes.get(r.index as usize) else { return Ok(VolumeAnswer::Missing) };
+        if before >= self.answers {
+            return Ok(VolumeAnswer::Missing);
+        }
+        let mut data = data.clone();
+        if before > 0 {
+            data.extend(std::iter::repeat_n(0, self.grow));
+        }
+        Ok(VolumeAnswer::Ready(Box::new(Plain(data))))
+    }
+}
+
+fn counting_map(
+    volumes: &[Vec<u8>],
+    answers: usize,
+    grow: usize,
+    handles: u64,
+) -> (Result<MemberMap, MapError>, Vec<u32>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let source = Counting { volumes: volumes.to_vec(), asked: asked.clone(), answers, grow };
+    let mut options = MapOptions::new("set.7z.001");
+    options.limits.volume_handles = handles;
+    let mut builder = MapBuilder::new(Box::new(source), options);
+    let result = match builder.poll_map(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(result) => result,
+        Poll::Pending => panic!("the source never waits"),
+    };
+    let asked = asked.lock().unwrap().clone();
+    (result, asked)
+}
+
+#[test]
+fn kept_volumes_are_selected_again_without_asking_the_source() {
+    // The encoded header's packed stream starts in the volume before the one holding the next header, so the walk
+    // reads the last volume, then goes back to the one before it.
+    let gold = data(5000, 30);
+    let archive =
+        build(&[(Method::Copy, vec![Entry::File("f", gold.clone())])], &[Entry::Dir("d")], &HeaderMode::Lzma2);
+    let header_at = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
+    // Cut so the next header starts a volume and the encoded header's packed bytes end the one before.
+    let volumes = split_sizes(&archive, &[2000, 2000, header_at - 4000]);
+    assert_eq!(volumes.len(), 4);
+    let (map, asked) = counting_map(&volumes, 1, 0, 64);
+    let map = map.unwrap();
+    assert!(map.complete);
+    assert_eq!(asked, vec![0, 1, 2, 3], "every volume asked for once");
+    assert_direct_round_trips(&map.members[0], &volumes, &gold);
+
+    // With one handle the volume before the last is closed, asked for again, and must keep its length.
+    let (map, asked) = counting_map(&volumes, 2, 0, 1);
+    assert!(map.unwrap().complete);
+    assert!(asked.len() > 4, "{asked:?}");
+    let (map, _) = counting_map(&volumes, 2, 7, 1);
+    let error = map.unwrap_err();
+    assert!(error.to_string().contains("source"), "{error:?}");
+    assert!(matches!(error, MapError::Source(_)), "{error:?}");
+    // A source that answers once cannot give it back: the header is unavailable.
+    let (map, _) = counting_map(&volumes, 1, 0, 1);
+    assert!(matches!(map.unwrap().end, MapEnd::HeaderUnavailable { .. }));
+    // No handles at all.
+    let (map, _) = counting_map(&volumes, 1, 0, 0);
+    assert!(matches!(map, Err(MapError::Limit { resource: Resource::VolumeHandles, .. })), "{map:?}");
+}

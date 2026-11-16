@@ -178,7 +178,10 @@ back into it. Archive offsets run over the volumes in order; `MapPiece::volume`,
 1. the 32-byte signature header at offset 0 (its CRC is checked), which says where the next header is;
 2. the volumes' lengths, opening volumes in order until they reach the end of the next header (over a
    `VolumeSource` later volumes are asked for by index, with names counting up the numeric extension:
-   `set.7z.001`, `set.7z.002`, ...);
+   `set.7z.001`, `set.7z.002`, ...). As for split ZIP sets, volumes stay open for the walk, at most
+   `ProgressiveLimits::volume_handles` of them (0 is a `Limit` failure); past that the volume used least recently is
+   closed and asked for again when the header reads need it, which must give the same length (`Source` failure
+   otherwise, and a volume missing the second time ends `HeaderUnavailable`);
 3. the next header (CRC checked), at the end of the set;
 4. for an encoded header (the usual case), its packed stream, decoded into the real header. LZMA and LZMA2 are
    decoded with liblzma raw decoders from the coder properties, 7zAES with the key derived from
