@@ -2008,8 +2008,21 @@ fn complete_native_bookkeeping_does_not_grow_with_inventory_times_steps() {
     std::fs::create_dir_all(&out).unwrap();
     let mut o = complete_native_options(&out, VOLUMES);
     o.limits.source_bookkeeping = 64 << 10;
-    let mut s = ProgressiveSession::new(Box::new(NativeSet::new(paths)), o).unwrap();
-    let failure = drive_complete(&mut s, |_| {}).expect("limit");
+    // Taking the declaration may already exceed it; otherwise the run stops on the way.
+    let failure = match ProgressiveSession::new(Box::new(NativeSet::new(paths)), o) {
+        Err(failure) => failure,
+        Ok(mut s) => loop {
+            match poll(&mut s) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. })))
+                | Poll::Ready(Err(failure)) => {
+                    break failure;
+                }
+                Poll::Ready(Ok(None)) => panic!("the run fit the small ceiling"),
+                Poll::Ready(Ok(Some(_))) => {}
+                Poll::Pending => panic!("pending"),
+            }
+        },
+    };
     assert!(matches!(failure.kind, FailureKind::Limit { resource: Resource::SourceBookkeeping, .. }), "{failure:?}");
     assert!(!out.join("member.bin").exists());
 }
