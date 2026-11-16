@@ -732,7 +732,7 @@ fn cp437(byte: u8) -> char {
     if byte < 0x80 { byte as char } else { CP437_HIGH[usize::from(byte - 0x80)] }
 }
 
-fn decode_name(raw: &[u8], utf8: bool) -> std::result::Result<String, DirectoryError> {
+pub(crate) fn decode_name(raw: &[u8], utf8: bool) -> std::result::Result<String, DirectoryError> {
     #[cfg(test)]
     read::observe_projected(3);
     // Many tools write valid UTF-8 without setting the flag.
