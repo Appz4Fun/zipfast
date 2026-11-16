@@ -555,6 +555,43 @@ fn reopened_state_keeps_its_format() {
     assert_eq!(fs::read(dir.path().join("out/one.bin")).unwrap(), gold);
 }
 
+/// The refusal of the one member of `volume`, after a session that created nothing.
+fn refused_member(volume: Vec<u8>) -> RefusalReason {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let state = dir.path().join("state");
+    let set = Set {
+        naming: Naming::Old,
+        volumes: vec![volume],
+        payloads: Vec::new(),
+        holes: vec![Vec::new()],
+        reads: Arc::default(),
+    };
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options(&dest, set.naming.name(0)),
+        partial_options(&state, Arc::new(Anchors::default())),
+    )
+    .unwrap();
+    let mut reasons = Vec::new();
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { .. }))) => panic!("refused member created output"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                outcome: MemberOutcome::Refused { reason },
+                ..
+            }))) => reasons.push(reason),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => panic!("member not refused"),
+            Poll::Ready(Ok(None)) => break,
+            _ => {}
+        }
+    }
+    assert!(!dest.exists(), "refusal precedes output effects");
+    assert!(!state.exists(), "refusal precedes state effects");
+    assert_eq!(reasons.len(), 1);
+    reasons[0]
+}
 fn refused(volume: Vec<u8>) -> PartialErrorKind {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out");
@@ -589,7 +626,7 @@ fn refused(volume: Vec<u8>) -> PartialErrorKind {
 }
 
 #[test]
-fn encrypted_compressed_and_header_encrypted_rar4_are_refused_before_effects() {
+fn encrypted_compressed_and_unknown_size_rar4_members_are_refused_and_header_encryption_ends_the_session() {
     let data = b"some member data";
     let archive = |header: Vec<u8>, payload: &[u8], main: u16| {
         let mut wire = SIG.to_vec();
@@ -602,7 +639,7 @@ fn encrypted_compressed_and_header_encrypted_rar4_are_refused_before_effects() {
     // Compressed (method 0x33, version 29).
     let packed = [0u8; 8];
     let compressed = archive(file_header(b"c.bin", packed.len(), data.len(), hash(data), 0, 29, 0x33), &packed, 0);
-    assert!(matches!(refused(compressed), PartialErrorKind::UnsupportedMethod));
+    assert_eq!(refused_member(compressed), RefusalReason::Compressed { method: 3 });
     // Encrypted stored, with and without a salt.
     for (flags, salt) in [(0x04u16, false), (0x404, true)] {
         let mut header = file_header(b"e.bin", 16, data.len(), hash(data), flags, 29, 0x30);
@@ -611,7 +648,7 @@ fn encrypted_compressed_and_header_encrypted_rar4_are_refused_before_effects() {
             body.extend([7u8; 8]);
             header = block(0x74, flags | 0x8000, &body);
         }
-        assert!(matches!(refused(archive(header, &[0; 16], 0)), PartialErrorKind::UnsupportedMethod));
+        assert_eq!(refused_member(archive(header, &[0; 16], 0)), RefusalReason::Encrypted);
     }
     // Header encryption (-hp): refused at the main header, before any encrypted header is read.
     let mut hp = SIG.to_vec();
@@ -620,7 +657,7 @@ fn encrypted_compressed_and_header_encrypted_rar4_are_refused_before_effects() {
     assert!(matches!(refused(hp), PartialErrorKind::UnsupportedMethod));
     // All-ones RAR4 size means unknown.
     let unknown = archive(file_header(b"u.bin", data.len(), u32::MAX as usize, hash(data), 0, 20, 0x30), data, 0);
-    assert!(matches!(refused(unknown), PartialErrorKind::UnknownMemberSize));
+    assert_eq!(refused_member(unknown), RefusalReason::UnknownSize);
 }
 
 /// Drops `value` as a crash leaves it: an open group is not committed. (Drop skips that commit while unwinding.)

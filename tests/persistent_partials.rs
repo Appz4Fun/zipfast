@@ -769,16 +769,42 @@ fn failure_before_output(
     let FailureKind::Partial(error) = error.kind else { panic!("not typed partial refusal: {error:?}") };
     error.kind
 }
+/// Runs a session whose every member is refused: each is skipped, and nothing is created.
+fn refused_without_effects(mut fixture: Fixture) -> Vec<RefusalReason> {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let state = dir.path().join("state");
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(fixture.provider()), options(&dest), partial_options(&state)).unwrap();
+    let mut reasons = Vec::new();
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { .. }))) => panic!("refused member created output"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                outcome: MemberOutcome::Refused { reason },
+                ..
+            }))) => reasons.push(reason),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => panic!("member not refused"),
+            Poll::Ready(Ok(None)) => break,
+            _ => {}
+        }
+    }
+    assert!(!dest.exists());
+    assert!(!state.exists());
+    reasons
+}
 #[test]
 fn known_unsupported_members_and_invalid_options_refuse_before_effects() {
-    assert!(matches!(
-        failure_before_output(Fixture::configured(|_, s| s.method = 1), |_, _, _| {}),
-        PartialErrorKind::UnsupportedMethod
-    ));
-    assert!(matches!(
-        failure_before_output(Fixture::configured(|_, s| s.size_unknown = true), |_, _, _| {}),
-        PartialErrorKind::UnknownMemberSize
-    ));
+    // Unsupported members are refused one by one; the session skips them and ends without effects.
+    assert_eq!(
+        refused_without_effects(Fixture::configured(|_, s| s.method = 1)),
+        [RefusalReason::Compressed { method: 1 }; 2]
+    );
+    assert_eq!(
+        refused_without_effects(Fixture::configured(|_, s| s.size_unknown = true)),
+        [RefusalReason::UnknownSize; 2]
+    );
     assert!(matches!(
         failure_before_output(Fixture::new(), |_, p, _| p.limits.events = 0),
         PartialErrorKind::InvalidOptions
@@ -801,7 +827,7 @@ fn known_unsupported_members_and_invalid_options_refuse_before_effects() {
         common::vint(record.len() as u64, &mut s.extra);
         s.extra.extend(record);
     });
-    assert!(matches!(failure_before_output(redirection, |_, _, _| {}), PartialErrorKind::UnsupportedMethod));
+    assert_eq!(refused_without_effects(redirection), [RefusalReason::Redirection; 2]);
     // RAR4 stored members are admitted; tests/persistent_partials_rar4.rs covers the RAR4 refusals.
     let mut aes = Fixture::new();
     let mut params = Vec::new();

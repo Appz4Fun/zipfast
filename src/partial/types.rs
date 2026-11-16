@@ -160,6 +160,21 @@ pub enum BindingField {
     Source,
     Anchor,
 }
+/// Why a persistent session refused a member: it created no output or state for it, skipped its data without
+/// reading it and went on with the next member. An ordinary session can extract it afterwards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RefusalReason {
+    /// The member is compressed with this method (1 to 5). In a solid archive an ordinary session decodes every
+    /// earlier compressed member to extract it.
+    Compressed { method: u8 },
+    /// A RAR4 member with encrypted data (only RAR5 encrypted stored members are admitted).
+    Encrypted,
+    /// The member's unpacked size is unknown (the RAR5 unknown-size flag, or an all-ones RAR4 size).
+    UnknownSize,
+    /// The member is a link or file copy (a RAR5 redirection record).
+    Redirection,
+}
 #[derive(Clone, Debug)]
 pub struct PartialLocation {
     pub output: PathBuf,

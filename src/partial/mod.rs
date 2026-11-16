@@ -35,7 +35,7 @@ pub(crate) use limits::PartialBudget;
 pub use limits::{PartialLimits, PartialResource};
 use limits::{Reservation, limit};
 use native::PersistentNative;
-pub(crate) use native::{GenesisPath, PartialExclusions, PartialProtectedPath};
+pub(crate) use native::{GenesisPath, PartialExclusions, PartialProtectedPath, create_directory};
 pub(crate) use state::CipherBlock;
 pub use state::PartialState;
 use state::{CommittedState, MutationCommit, MutationIntent, Snapshot};
@@ -459,6 +459,10 @@ impl PartialCore {
                 .sum::<usize>();
         let lease = self.budget.metadata_lease(bytes as u64)?;
         Ok((snapshot.clone(), lease))
+    }
+    /// Where this member's output is.
+    pub(crate) fn output_path(&self) -> &std::path::Path {
+        &self.native.output_path
     }
     pub(crate) fn validate_current(&self) -> PartialResult<()> {
         let data = self.operation()?;

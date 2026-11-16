@@ -146,7 +146,16 @@ pub enum MemberOutcome {
     },
     Tested(TestEvidence),
     Skipped(crate::extract::RarSkipReason),
-    /// Policy completed. False also includes Test and flattened directory entries.
+    /// A persistent session refused the member before creating any output or state for it, skipped its data
+    /// (every part, across volumes) without reading it, and goes on with the next member. Extract it with an
+    /// ordinary session.
+    #[cfg(feature = "persistent-partials")]
+    Refused {
+        reason: crate::partial::RefusalReason,
+    },
+    /// Policy completed. False also includes Test and flattened directory entries. In a persistent session,
+    /// true when this session created the directory, for this entry or earlier as the parent of a member stored
+    /// before it; only such a directory gets the entry's metadata.
     Directory {
         created: bool,
     },
@@ -237,6 +246,9 @@ enum Disposition {
     Test,
     Skip(crate::extract::RarSkipReason),
     Directory,
+    /// A persistent session refused the member: its data is skipped without being read.
+    #[cfg(feature = "persistent-partials")]
+    Refused(crate::partial::RefusalReason),
 }
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 fn nonce() -> ProgressiveResult<NonZeroU64> {
@@ -667,6 +679,11 @@ impl ProgressiveSession {
                             partial::ResumeStep::Done => {}
                         }
                     }
+                    #[cfg(feature = "persistent-partials")]
+                    if self.remaining > 0 && matches!(self.disposition, Disposition::Refused(_)) {
+                        self.partial_skip_refused()?;
+                        continue;
+                    }
                     if self.remaining == 0 {
                         let part = self.model.parts.last().expect("active part");
                         if let Some(machine) = &mut self.machine {
@@ -884,22 +901,26 @@ impl ProgressiveSession {
                 self.main_seen = true;
             }
             Block::File(header) => {
+                // A member a persistent session refuses is never decoded: only what walking past its data needs
+                // is checked (the continuation identity of its later parts below).
                 #[cfg(feature = "persistent-partials")]
-                if self.partial.is_some() {
-                    self.partial_header(header)?;
-                }
-                rar4::admit_header_context(header, self.parser.encrypted(), self.solid_archive == Some(true))?;
-                if let Some(reason) = header
-                    .rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
-                {
-                    return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
-                        crate::error::RarFailure::Unsupported(reason),
-                    ))));
+                let refused = self.partial_refused(header)?;
+                #[cfg(not(feature = "persistent-partials"))]
+                let refused = false;
+                if !refused {
+                    rar4::admit_header_context(header, self.parser.encrypted(), self.solid_archive == Some(true))?;
+                    if let Some(reason) = header
+                        .rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
+                    {
+                        return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                            crate::error::RarFailure::Unsupported(reason),
+                        ))));
+                    }
                 }
                 if !self.main_seen {
                     return Err(ProgressiveFailure::new(FailureKind::Malformed("member before main")));
                 }
-                if let Some(Err(error)) = frame.crypt {
+                if !refused && let Some(Err(error)) = frame.crypt {
                     return Err(progressive_fault(crate::error::RarFault::new(
                         crate::error::RarFailure::crypt(
                             error,
@@ -965,6 +986,8 @@ impl ProgressiveSession {
                     if let Some(output) = &mut self.output {
                         output.finish_directories(&mut self.driver)?;
                     }
+                    #[cfg(feature = "persistent-partials")]
+                    self.partial_finish_directories()?;
                     self.phase = Phase::Done;
                 }
             }
@@ -978,13 +1001,19 @@ impl ProgressiveSession {
     }
     fn start(&mut self, frame: PhysicalFrame) -> ProgressiveResult<ProgressiveEvent> {
         let Block::File(header) = frame.block else { unreachable!() };
-        rar4::admit_header_context(&header, self.parser.encrypted(), self.solid_archive == Some(true))?;
-        if let Some(reason) =
-            header.rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
-        {
-            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
-                reason,
-            )))));
+        #[cfg(feature = "persistent-partials")]
+        let refusal = self.partial.as_ref().and_then(|_| partial::refusal(&header));
+        #[cfg(not(feature = "persistent-partials"))]
+        let refusal: Option<std::convert::Infallible> = None;
+        if refusal.is_none() {
+            rar4::admit_header_context(&header, self.parser.encrypted(), self.solid_archive == Some(true))?;
+            if let Some(reason) =
+                header.rar4_progressive_unsupported(frame.wire.as_ref().and_then(|w| w.legacy).and_then(|w| w.crypt))
+            {
+                return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                    crate::error::RarFailure::Unsupported(reason),
+                ))));
+            }
         }
         if header.split_before() {
             return Err(ProgressiveFailure::new(FailureKind::Malformed("orphan continuation")));
@@ -1006,13 +1035,14 @@ impl ProgressiveSession {
         self.produced = 0;
         self.part_evidence.clear();
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
-        if self.options.extract.mode == crate::extract::Mode::Test || header.is_dir() {
+        // A refused member's name is never used, so it is not checked either.
+        if refusal.is_none() && (self.options.extract.mode == crate::extract::Mode::Test || header.is_dir()) {
             self.usage.charge(Resource::MetadataBytes, (header.name.len() as u64).saturating_mul(3))?;
             self.usage.charge(Resource::SourceBookkeeping, (header.name.len() as u64).saturating_mul(8))?;
             crate::path::sanitize_fallible(&header.name, !header.is_unix())
                 .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
         }
-        if let Some(redirection) = &header.redirection {
+        if let Some(redirection) = header.redirection.as_ref().filter(|_| refusal.is_none()) {
             let kind = match redirection {
                 crate::rar5::Redirection::UnixSymlink(_) => 1,
                 crate::rar5::Redirection::WindowsSymlink(_) => 2,
@@ -1025,7 +1055,13 @@ impl ProgressiveSession {
                 crate::error::RarUnsupported::Redirection { kind },
             )))));
         }
-        self.disposition = if header.is_dir() {
+        #[cfg(feature = "persistent-partials")]
+        let refused = refusal.map(Disposition::Refused);
+        #[cfg(not(feature = "persistent-partials"))]
+        let refused: Option<Disposition> = None;
+        self.disposition = if let Some(refused) = refused {
+            refused
+        } else if header.is_dir() {
             if header.split_after() || header.packed_size != 0 || header.size_unknown() || header.unpacked_size != 0 {
                 return Err(ProgressiveFailure::new(FailureKind::Malformed("directory payload or continuation")));
             }
@@ -1231,6 +1267,19 @@ impl ProgressiveSession {
         })
     }
     fn finish(&mut self) -> ProgressiveResult<ProgressiveEvent> {
+        #[cfg(feature = "persistent-partials")]
+        if let Disposition::Refused(reason) = self.disposition {
+            self.driver.validate_current()?;
+            self.phase = Phase::Header;
+            return Ok(ProgressiveEvent::MemberFinished {
+                member: self.member.take().unwrap(),
+                outcome: MemberOutcome::Refused { reason },
+            });
+        }
+        #[cfg(feature = "persistent-partials")]
+        if self.partial.is_some() && matches!(self.disposition, Disposition::Directory) {
+            return self.partial_directory();
+        }
         if matches!(self.disposition, Disposition::Directory) {
             let header = &self.model.members.last().expect("member").header;
             let created = if self.options.extract.mode == crate::extract::Mode::Test || self.options.extract.flatten {
