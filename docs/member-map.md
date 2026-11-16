@@ -99,7 +99,9 @@ An Info-ZIP split set is `name.z01`, `name.z02`, ..., `name.zNN` and the final `
 central directory record. Its disks are numbered from 0 in that order: `.z01` is disk 0 and `.zip` the last disk.
 Every disk number (end records, ZIP64 end record and locator, central directory entries, including ZIP64 start
 disks) and every offset is relative to that numbering; an offset is relative to the start of its disk. Disk 0 may
-start with the 4-byte spanning signature `PK\x07\x08`; offsets in disk 0 count it, so nothing is adjusted.
+start with the 4-byte spanning signature `PK\x07\x08`; offsets in disk 0 count it, so nothing is adjusted. Real Info-ZIP
+sets (`tests/fixtures/zip-split`) are checked: Info-ZIP writes the signature, cuts volumes at the byte (mid-member)
+and keeps the central directory in the `.zip`.
 
 Volumes are passed in disk order, `.z01` first and `.zip` last, and `MapPiece::volume` is the disk number.
 

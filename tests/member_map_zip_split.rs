@@ -20,6 +20,7 @@ use std::{
     ffi::OsString,
     fs::File,
     io::{Cursor, Write},
+    ops::Range,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
@@ -727,7 +728,13 @@ impl VolumeSource for Provider {
 }
 
 fn set_names(count: usize) -> Vec<OsString> {
-    (0..count).map(|i| if i + 1 == count { "set.zip".into() } else { format!("set.z{:02}", i + 1).into() }).collect()
+    stem_names("set", count)
+}
+
+fn stem_names(stem: &str, count: usize) -> Vec<OsString> {
+    (0..count)
+        .map(|i| if i + 1 == count { format!("{stem}.zip").into() } else { format!("{stem}.z{:02}", i + 1).into() })
+        .collect()
 }
 
 struct Source {
@@ -738,6 +745,10 @@ struct Source {
 }
 
 fn source(volumes: &[Option<Vec<u8>>], by_name: bool, waits: bool) -> Source {
+    stem_source("set", volumes, by_name, waits)
+}
+
+fn stem_source(stem: &str, volumes: &[Option<Vec<u8>>], by_name: bool, waits: bool) -> Source {
     let gate = waits.then(|| Arc::new(Mutex::new(Gate::default())));
     let reads = Reads::default();
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -754,9 +765,14 @@ fn source(volumes: &[Option<Vec<u8>>], by_name: bool, waits: bool) -> Source {
             })
         })
         .collect();
-    let provider =
-        Provider { volumes: bytes, names: set_names(volumes.len()), by_name, gate: gate.clone(), asked: asked.clone() };
-    let builder = MapBuilder::new(Box::new(provider), MapOptions::new("set.z01"));
+    let provider = Provider {
+        volumes: bytes,
+        names: stem_names(stem, volumes.len()),
+        by_name,
+        gate: gate.clone(),
+        asked: asked.clone(),
+    };
+    let builder = MapBuilder::new(Box::new(provider), MapOptions::new(format!("{stem}.z01")));
     Source { builder, gate, reads, asked }
 }
 
@@ -1022,4 +1038,142 @@ fn a_hostile_disk_count_from_a_named_last_volume_is_charged_not_allocated() {
             "{error:?}"
         );
     }
+}
+
+// ---- Real Info-ZIP split sets (tests/fixtures/zip-split, see its README) ----
+
+/// The volumes of fixture set `stem`, `.z01` first and `.zip` last.
+fn real_set(stem: &str) -> Vec<Vec<u8>> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/zip-split");
+    let mut volumes = Vec::new();
+    for i in 1.. {
+        match std::fs::read(format!("{dir}/{stem}.z{i:02}")) {
+            Ok(bytes) => volumes.push(bytes),
+            Err(_) => break,
+        }
+    }
+    volumes.push(std::fs::read(format!("{dir}/{stem}.zip")).unwrap());
+    volumes
+}
+
+fn real_map(stem: &str, volumes: &[Vec<u8>]) -> MemberMap {
+    let map = MemberMap::from_memory(&refs(volumes), format!("{stem}.z01"), None).unwrap();
+    assert!(map.complete, "{stem}: {:?}", map.end);
+    assert_eq!(map.volumes as usize, volumes.len());
+    // Info-ZIP starts the first volume with the spanning signature, and every offset in disk 0 counts it.
+    assert!(volumes[0].starts_with(b"PK\x07\x08PK\x03\x04"));
+    assert_eq!(map.members[0].pieces[0].header.start, 4);
+    map
+}
+
+/// Pieces as (volume, packed range).
+fn placement(member: &MapMember) -> Vec<(u32, Range<u64>)> {
+    member.pieces.iter().map(|p| (p.volume, p.packed.clone())).collect()
+}
+
+/// Every Direct member's bytes, sliced from its pieces, match its CRC32 and size, and stream back from offset 0
+/// and from the middle.
+fn check_direct(map: &MemberMap, volumes: &[Vec<u8>]) {
+    for (i, member) in map.members.iter().enumerate() {
+        if member.mapping != OutputMapping::Direct {
+            continue;
+        }
+        let bytes = stream(volumes, member);
+        assert_eq!(bytes.len() as u64, member.unpacked_size.unwrap());
+        assert_eq!(Some(crc32fast::hash(&bytes)), member.checks.unwrap().crc32, "{:?}", member.name);
+        for at in [0, bytes.len() as u64 / 2] {
+            let mut out = Vec::new();
+            extract_member_from(&refs(volumes), map, i, at, None, &mut out).unwrap();
+            assert_eq!(out, &bytes[at as usize..], "{:?} from {at}", member.name);
+        }
+    }
+}
+
+/// A source keyed on names is asked for each volume once, in order, the last as `.z{n}` and then as `.zip`.
+fn check_named_source(stem: &str, volumes: &[Vec<u8>], expected: &MemberMap) {
+    let all: Vec<_> = volumes.iter().cloned().map(Some).collect();
+    let mut src = stem_source(stem, &all, true, true);
+    assert_eq!(&drive(&mut src).unwrap(), expected);
+    let asked: Vec<_> = src.asked.lock().unwrap().iter().map(|r| (r.index, r.expected.clone())).collect();
+    let n = volumes.len() as u32;
+    let mut want: Vec<(u32, OsString)> = (0..n).map(|i| (i, format!("{stem}.z{:02}", i + 1).into())).collect();
+    want.push((n - 1, format!("{stem}.zip").into()));
+    assert_eq!(asked, want);
+}
+
+#[test]
+fn real_stored_set_with_a_directory() {
+    let volumes = real_set("stored");
+    assert_eq!(volumes.len(), 3);
+    let map = real_map("stored", &volumes);
+    let listed: Vec<_> =
+        map.members.iter().map(|m| (m.name.clone().unwrap(), m.unpacked_size.unwrap(), m.is_dir)).collect();
+    assert_eq!(
+        listed,
+        [("a.bin".to_owned(), 140_000, false), ("dir/".to_owned(), 0, true), ("dir/b.txt".to_owned(), 640, false)]
+    );
+    // a.bin crosses both boundaries; the directory and b.txt sit in the last volume.
+    assert_eq!(placement(&map.members[0]), [(0, 39..65_536), (1, 0..65_536), (2, 0..8967)]);
+    assert_eq!(placement(&map.members[1]), [(2, 9001..9001)]);
+    assert_eq!(placement(&map.members[2]), [(2, 9040..9680)]);
+    assert!(map.members.iter().all(|m| m.mapping == OutputMapping::Direct && m.cipher.is_none()));
+    assert_eq!(map.members[0].checks.unwrap().crc32, Some(0x329a_e6f9));
+    assert_eq!(stream(&volumes, &map.members[2]), b"hello split zip\n".repeat(40));
+    check_direct(&map, &volumes);
+    let spans = map.members[0].packed_spans(65_000..75_000).unwrap();
+    assert_eq!(spans.iter().map(|s| s.volume).collect::<Vec<_>>(), [0, 1]);
+    check_named_source("stored", &volumes, &map);
+}
+
+#[test]
+fn real_deflated_set() {
+    let volumes = real_set("deflated");
+    assert_eq!(volumes.len(), 2);
+    let map = real_map("deflated", &volumes);
+    let listed: Vec<_> = map.members.iter().map(|m| (m.name.clone().unwrap(), m.unpacked_size.unwrap())).collect();
+    assert_eq!(listed, [("c.txt".to_owned(), 93_336), ("dir/b.txt".to_owned(), 640)]);
+    for member in &map.members {
+        assert_eq!(member.method, MapMethod::Compressed { id: 8 });
+        assert_eq!(member.mapping, OutputMapping::None);
+        assert_eq!(member.packed_spans(0..1), None);
+    }
+    assert_eq!(placement(&map.members[0]), [(0, 39..65_536), (1, 0..5129)]);
+    assert_eq!(placement(&map.members[1]), [(1, 5168..5193)]);
+    // The packed streams inflate to data with the listed sizes and CRCs.
+    for member in &map.members {
+        let packed = stream(&volumes, member);
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::DeflateDecoder::new(&packed[..]), &mut plain).unwrap();
+        assert_eq!(plain.len() as u64, member.unpacked_size.unwrap());
+        assert_eq!(Some(crc32fast::hash(&plain)), member.checks.unwrap().crc32);
+    }
+    assert_eq!(map.members[0].packed_size, 70_626);
+    check_named_source("deflated", &volumes, &map);
+}
+
+#[test]
+fn real_zipcrypto_set() {
+    let volumes = real_set("crypt");
+    assert_eq!(volumes.len(), 2);
+    let map = real_map("crypt", &volumes);
+    let member = &map.members[0];
+    assert_eq!(member.name.as_deref(), Some("s.bin"));
+    assert_eq!(member.unpacked_size, Some(66_000));
+    assert!(member.encrypted);
+    // Info-ZIP writes encrypted entries with a data descriptor, so the check byte is the DOS time's high byte
+    // (03:04:05 is 0x1882), not the CRC's (0x02e571c8).
+    assert_eq!(member.cipher, Some(CipherParams::ZipCrypto { check: 0x18 }));
+    assert_eq!(member.mapping, OutputMapping::Sequential { skip: 12 });
+    assert_eq!(member.packed_size, 66_012);
+    assert_eq!(placement(member)[0], (0, 39..65_536));
+    assert_eq!(placement(member)[1].0, 1);
+    let mut out = Vec::new();
+    extract_member_from(&refs(&volumes), &map, 0, 0, Some("password"), &mut out).unwrap();
+    assert_eq!(out.len(), 66_000);
+    assert_eq!(crc32fast::hash(&out), 0x02e5_71c8);
+    assert!(matches!(
+        extract_member_from(&refs(&volumes), &map, 0, 0, Some("wrong"), &mut Vec::new()),
+        Err(ExtractFromError::WrongPassword)
+    ));
+    check_named_source("crypt", &volumes, &map);
 }
