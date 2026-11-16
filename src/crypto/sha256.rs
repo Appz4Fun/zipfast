@@ -17,9 +17,10 @@
 //! SHA-256 (FIPS 180-4), in one call or in pieces.
 //!
 //! Every compression goes through one function picked the first time it is needed and kept from then on: on 64-bit
-//! ARM with the SHA2 instructions (every Apple M-series chip) the hardware rounds, elsewhere portable Rust. Setting
-//! `ZIPFAST_SHA256=scalar` in the environment before the first hash forces the portable rounds, so tests can cover
-//! them on any machine. x86 SHA-NI is not used: it cannot be checked on the machines this is developed on.
+//! ARM with the SHA2 instructions (every Apple M-series chip) and on x86-64 with SHA-NI (Intel Goldmont, Ice Lake and
+//! later, every AMD Zen) the hardware rounds, elsewhere portable Rust. Setting `ZIPFAST_SHA256=scalar` in the
+//! environment before the first hash forces the portable rounds, so tests can cover them on any machine. The SHA-NI
+//! rounds are tested under Intel's Software Development Emulator in CI.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -107,6 +108,9 @@ pub(super) enum Backend {
     /// The ARMv8 SHA2 instructions. Only made once they have been found on the processor.
     #[cfg(target_arch = "aarch64")]
     ArmSha2,
+    /// The x86 SHA extensions (with SSSE3 and SSE4.1). Only made once they have been found on the processor.
+    #[cfg(target_arch = "x86_64")]
+    X86ShaNi,
 }
 
 impl Backend {
@@ -127,6 +131,12 @@ impl Backend {
                 debug_assert!(std::arch::is_aarch64_feature_detected!("sha2"));
                 unsafe { arm::compress(state, blocks) }
             }
+            // SAFETY: an `X86ShaNi` is only made once the instructions have been found
+            #[cfg(target_arch = "x86_64")]
+            Backend::X86ShaNi => {
+                debug_assert!(x86::usable());
+                unsafe { x86::compress(state, blocks) }
+            }
         }
     }
 
@@ -135,17 +145,23 @@ impl Backend {
             Backend::Scalar => "scalar",
             #[cfg(target_arch = "aarch64")]
             Backend::ArmSha2 => "arm-sha2",
+            #[cfg(target_arch = "x86_64")]
+            Backend::X86ShaNi => "x86-sha-ni",
         }
     }
 
     /// Every backend this processor can run, the portable one first.
     #[cfg(test)]
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+    #[cfg_attr(not(any(target_arch = "aarch64", target_arch = "x86_64")), allow(unused_mut))]
     pub(super) fn available() -> Vec<Backend> {
         let mut all = vec![Backend::Scalar];
         #[cfg(target_arch = "aarch64")]
         if std::arch::is_aarch64_feature_detected!("sha2") {
             all.push(Backend::ArmSha2);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if x86::usable() {
+            all.push(Backend::X86ShaNi);
         }
         all
     }
@@ -161,6 +177,10 @@ impl Backend {
         if std::arch::is_aarch64_feature_detected!("sha2") {
             return Backend::ArmSha2;
         }
+        #[cfg(target_arch = "x86_64")]
+        if x86::usable() {
+            return Backend::X86ShaNi;
+        }
         Backend::Scalar
     }
 
@@ -172,12 +192,16 @@ impl Backend {
             1 => Backend::Scalar,
             #[cfg(target_arch = "aarch64")]
             2 => Backend::ArmSha2,
+            #[cfg(target_arch = "x86_64")]
+            3 => Backend::X86ShaNi,
             _ => {
                 let b = Backend::detect();
                 let code = match b {
                     Backend::Scalar => 1,
                     #[cfg(target_arch = "aarch64")]
                     Backend::ArmSha2 => 2,
+                    #[cfg(target_arch = "x86_64")]
+                    Backend::X86ShaNi => 3,
                 };
                 PICKED.store(code, Ordering::Relaxed);
                 b
@@ -186,7 +210,7 @@ impl Backend {
     }
 }
 
-/// The name of the compression function this process uses: `"arm-sha2"` or `"scalar"`.
+/// The name of the compression function this process uses: `"arm-sha2"`, `"x86-sha-ni"` or `"scalar"`.
 #[doc(hidden)]
 pub fn sha256_backend() -> &'static str {
     Backend::current().name()
@@ -279,6 +303,78 @@ mod arm {
             }
             vst1q_u32(state.as_mut_ptr(), abcd);
             vst1q_u32(state.as_mut_ptr().add(4), efgh);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::*;
+
+    /// The round constants where the vector loads can reach them.
+    static K: [u32; 64] = super::SHA256_K;
+
+    /// Whether the processor has the SHA extensions and the SSSE3 and SSE4.1 shuffles they are used with.
+    pub(super) fn usable() -> bool {
+        std::arch::is_x86_feature_detected!("sha")
+            && std::arch::is_x86_feature_detected!("ssse3")
+            && std::arch::is_x86_feature_detected!("sse4.1")
+    }
+
+    /// The next four schedule words from the previous sixteen, oldest first in `w`.
+    #[inline]
+    #[target_feature(enable = "sha,ssse3")]
+    fn schedule(w: [__m128i; 4]) -> __m128i {
+        let partial = _mm_sha256msg1_epu32(w[0], w[1]);
+        // words t-7 .. t-4
+        let middle = _mm_alignr_epi8::<4>(w[3], w[2]);
+        _mm_sha256msg2_epu32(_mm_add_epi32(partial, middle), w[3])
+    }
+
+    /// Runs `blocks` through the compression function with SHA-NI. `sha256rnds2` works on the state as ABEF and
+    /// CDGH and does two rounds per call, taking the two schedule-plus-constant words in the low half of its third
+    /// operand; each group of four rounds takes the next four schedule words, extended four at a time.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have the SHA extensions, SSSE3 and SSE4.1 (`usable`).
+    #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+    pub(super) unsafe fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+        // SAFETY: as the caller promises; every load and store is of 16 bytes inside `state`, `K` or a block
+        unsafe {
+            // big-endian words within each 32-bit lane
+            let swap = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
+            let p = state.as_mut_ptr().cast::<__m128i>();
+            let dcba = _mm_shuffle_epi32::<0xB1>(_mm_loadu_si128(p));
+            let efgh = _mm_shuffle_epi32::<0x1B>(_mm_loadu_si128(p.add(1)));
+            let mut abef = _mm_alignr_epi8::<8>(dcba, efgh);
+            let mut cdgh = _mm_blend_epi16::<0xF0>(efgh, dcba);
+            for block in blocks {
+                let (abef0, cdgh0) = (abef, cdgh);
+                let b = block.as_ptr().cast::<__m128i>();
+                let mut w = [
+                    _mm_shuffle_epi8(_mm_loadu_si128(b), swap),
+                    _mm_shuffle_epi8(_mm_loadu_si128(b.add(1)), swap),
+                    _mm_shuffle_epi8(_mm_loadu_si128(b.add(2)), swap),
+                    _mm_shuffle_epi8(_mm_loadu_si128(b.add(3)), swap),
+                ];
+                for i in 0..16 {
+                    if i >= 4 {
+                        // `w[i % 4]` holds the oldest four words: replace them with the next four
+                        let next = schedule([w[i % 4], w[(i + 1) % 4], w[(i + 2) % 4], w[(i + 3) % 4]]);
+                        w[i % 4] = next;
+                    }
+                    let wk = _mm_add_epi32(w[i % 4], _mm_loadu_si128(K.as_ptr().add(4 * i).cast()));
+                    cdgh = _mm_sha256rnds2_epu32(cdgh, abef, wk);
+                    abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32::<0x0E>(wk));
+                }
+                abef = _mm_add_epi32(abef, abef0);
+                cdgh = _mm_add_epi32(cdgh, cdgh0);
+            }
+            let feba = _mm_shuffle_epi32::<0x1B>(abef);
+            let dchg = _mm_shuffle_epi32::<0xB1>(cdgh);
+            _mm_storeu_si128(p, _mm_blend_epi16::<0xF0>(feba, dchg));
+            _mm_storeu_si128(p.add(1), _mm_alignr_epi8::<8>(dchg, feba));
         }
     }
 }

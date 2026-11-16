@@ -72,6 +72,46 @@ jobs:
       - run: cargo test --workspace --doc --locked
       - run: cargo test --workspace --doc --locked --features persistent-partials
 
+  sde:
+    name: SHA-256 under Intel SDE (${{ matrix.cpu }})
+    # GitHub's x86 runners vary. Intel's Software Development Emulator runs the SHA-256 tests on emulated CPUs with
+    # known features, so the SHA-NI rounds and the portable fallback are both checked, as in par-rs and Rust's
+    # stdarch CI. Sapphire Rapids has SHA-NI; Skylake client (the Coffee Lake instruction set) does not.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [spr, skl]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # Rust 1.100.0
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install Intel SDE
+        env:
+          SDE: sde-external-10.13.1-2026-07-28-lin
+          SDE_SHA256: 94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://downloadmirror.intel.com/924984/$SDE.tar.xz" -o "$RUNNER_TEMP/sde.tar.xz"
+          echo "$SDE_SHA256  $RUNNER_TEMP/sde.tar.xz" | sha256sum --check --strict
+          tar -xJf "$RUNNER_TEMP/sde.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$SDE" >> "$GITHUB_PATH"
+      - name: Build the library tests
+        run: |
+          set -o pipefail
+          bin=$(cargo test --locked --release --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test) | .executable' \
+            | tail -n 1)
+          test -x "$bin"
+          echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Run the SHA-256 tests on the emulated CPU
+        run: sde64 -${{ matrix.cpu }} -- "$TEST_BIN" sha256
+      - name: Run them again with the portable rounds forced
+        run: ZIPFAST_SHA256=scalar sde64 -${{ matrix.cpu }} -- "$TEST_BIN" sha256
+
   zipview-msrv:
     name: Zipview on Rust 1.100.0
     runs-on: ubuntu-latest
