@@ -81,7 +81,9 @@ Typed refusals (`ExtractFromError::Unsupported(UnsupportedRead::..)`):
 - `UnknownSize`: no recorded unpacked size.
 
 Other refusals made at construction: `NoSuchMember`, `OffsetPastEnd`, `PasswordRequired`, and `IncompleteMember {
-out }`. The last one means the map (one with `complete: false`) lists the member's pieces only up to output `out`.
+out }`. The last one means the map (one with `complete: false`) lists the member's pieces only up to output `out`. A
+map that stopped at a damaged header (`MapEnd::Damaged`) is incomplete in the same way: a member split across the
+damage is `IncompleteMember`, while members whose headers all came before it read normally.
 
 ## Passwords
 

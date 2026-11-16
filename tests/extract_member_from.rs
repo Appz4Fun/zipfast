@@ -1032,6 +1032,35 @@ fn held_parts_are_charged_to_temp_bytes_and_refunded() {
     }
 }
 
+// A map that stops at a damaged header (MapEnd::Damaged) is incomplete: a member split across it cannot be read,
+// members whose headers all came before it can.
+#[test]
+fn damaged_maps_are_incomplete() {
+    let gold = data(10_000, 7);
+    let mut volumes = rar5_split(&gold, 2600);
+    // Volume 2's file header fails its checksum.
+    let header_at = SIG.len() + main_block(true, Some(2)).len() + 6;
+    volumes[2][header_at] ^= 0x55;
+    let map = MemberMap::from_memory(&refs(&volumes), "big.part1.rar", None).unwrap();
+    assert!(matches!(map.end, MapEnd::Damaged { volume: 2, .. }), "{:?}", map.end);
+    assert!(!map.members[0].complete);
+    for at in [0, 3000, 9000] {
+        let error = extract_err(&volumes, &map, 0, at, None);
+        assert!(matches!(error, ExtractFromError::IncompleteMember { out: 5200 }), "offset {at}: {error:?}");
+    }
+
+    let a = data(3000, 1);
+    let mut bytes = common::archive(&[FileSpec::new("a.bin", &a), FileSpec::new("b.bin", b"after the damage")]);
+    let good = MemberMap::from_memory(&[&bytes], "x.rar", None).unwrap();
+    let b_header = good.members[1].pieces[0].header.start as usize;
+    bytes[b_header + 6] ^= 0x55;
+    let volumes = vec![bytes];
+    let map = MemberMap::from_memory(&refs(&volumes), "x.rar", None).unwrap();
+    assert!(matches!(map.end, MapEnd::Damaged { volume: 0, .. }), "{:?}", map.end);
+    assert_eq!(map.members.len(), 1);
+    assert_eq!(extract(&volumes, &map, 0, 1234, None), &a[1234..]);
+}
+
 // ---- Alt takeover into a persistent partial ----
 
 #[cfg(all(feature = "persistent-partials", any(target_os = "linux", target_os = "macos")))]
