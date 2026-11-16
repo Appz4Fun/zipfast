@@ -774,6 +774,28 @@ fn encrypted_header_kdf_respects_limits_and_cancellation() {
     assert!(matches!(MemberMap::from_memory_with(&[&archive], options), Err(MapError::Source(_))));
 }
 
+#[test]
+fn encrypted_header_kdf_ceiling_is_7zips_24_not_rar5s_20() {
+    let mut aes = Aes::new("pw");
+    aes.power = 21;
+    let archive = build(&[(Method::Copy, vec![Entry::File("f", data(10, 1))])], &[], &HeaderMode::Encrypted(aes));
+    // The default exponent budget is 20.
+    let error = MemberMap::from_memory_with(&[&archive], MapOptions::new("a.7z").password(Some("pw"))).unwrap_err();
+    assert!(
+        matches!(error, MapError::Limit { resource: Resource::KdfExponent, limit: 20, attempted: 21 }),
+        "{error:?}"
+    );
+    // Raised, it is honoured past RAR 5.0's ceiling of 20, up to 7-Zip's 24.
+    let mut options = MapOptions::new("a.7z").password(Some("pw"));
+    options.limits.kdf_exponent = 30;
+    options.limits.kdf_derivation_blocks = 1 << 30;
+    options.limits.kdf_session_blocks = 1 << 30;
+    let map = MemberMap::from_memory_with(&[&archive], options.clone()).unwrap();
+    assert!(map.complete && map.header_encrypted);
+    options.limits.kdf_exponent = 21;
+    assert!(MemberMap::from_memory_with(&[&archive], options).is_ok());
+}
+
 // ---- Cut sets ----
 
 #[test]
