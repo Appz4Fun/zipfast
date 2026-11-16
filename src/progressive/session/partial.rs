@@ -44,6 +44,14 @@ pub(super) struct Persistent {
     /// How the active member, adopted from an earlier session, is resumed; `None` for a member this session
     /// created, and for an adopted member once extraction has resumed at its committed `produced`.
     resume: Option<Resume>,
+    /// Directories of directory entries, whose metadata is applied when the walk reaches the end of the set.
+    directories: Vec<PendingDirectory>,
+}
+/// A directory entry's directory: its metadata waits until nothing more is created inside it.
+struct PendingDirectory {
+    path: std::path::PathBuf,
+    identity: crate::progressive::native::Identity,
+    meta: crate::extract::Meta,
 }
 /// An adopted member being walked to its resume point.
 struct Resume {
@@ -144,6 +152,7 @@ impl ProgressiveSession {
             stream: 0,
             unavailable: Vec::new(),
             resume: None,
+            directories: Vec::new(),
         });
         Ok(session)
     }
@@ -308,16 +317,104 @@ impl ProgressiveSession {
         }
         Ok(fed)
     }
-    pub(super) fn partial_header(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<()> {
-        // Encrypted RAR5 stored members are admitted; their password must be in the session options. RAR4 stored
-        // members are admitted plain only.
-        let rar4 = header.format == crate::rar5::RarFormat::Rar4;
-        if header.method != 0 || header.is_dir() || header.redirection.is_some() || (rar4 && header.encrypted) {
-            return Err(error(PartialErrorKind::UnsupportedMethod));
+    /// Whether the member `header` starts or continues is refused, so that it is walked past without being
+    /// decoded. A later part of an admitted member that would be refused fails the session, as it always did.
+    pub(super) fn partial_refused(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<bool> {
+        if self.partial.is_none() {
+            return Ok(false);
         }
-        // RAR4 has no unknown-size flag: the progressive RAR4 path reads an all-ones size as unknown.
-        if header.size_unknown() || (rar4 && matches!(header.unpacked_size, u64::MAX | 0xffff_ffff)) {
-            return Err(error(PartialErrorKind::UnknownMemberSize));
+        if self.member.is_none() {
+            return Ok(refusal(header).is_some());
+        }
+        if matches!(self.disposition, Disposition::Refused(_)) {
+            return Ok(true);
+        }
+        match refusal(header) {
+            None => Ok(false),
+            Some(RefusalReason::UnknownSize) => Err(error(PartialErrorKind::UnknownMemberSize)),
+            Some(_) => Err(error(PartialErrorKind::UnsupportedMethod)),
+        }
+    }
+    /// Skips the rest of a refused member's active part without reading it. Damage declared on those bytes is
+    /// dropped: no output was produced from them and none ever will be.
+    pub(super) fn partial_skip_refused(&mut self) -> ProgressiveResult<()> {
+        let part = self.model.parts.last().unwrap();
+        let from = part.data_offset + (part.packed_size - self.remaining);
+        let at = part.data_offset + part.packed_size;
+        drop(self.driver.take_declared(self.volume, &(from..at)));
+        self.driver.seek(at)?;
+        self.cursor = at;
+        self.remaining = 0;
+        Ok(())
+    }
+    /// Creates a directory entry's directory with the checks a member creation applies to its parents, and
+    /// queues its metadata for the end of the set.
+    #[allow(clippy::result_large_err, reason = "the path check callback returns typed partial receipts")]
+    pub(super) fn partial_directory(&mut self) -> ProgressiveResult<ProgressiveEvent> {
+        let header = &self.model.members.last().unwrap().header;
+        let relative = crate::path::sanitize_fallible(&header.name, !header.is_unix())
+            .map_err(|_| error(PartialErrorKind::UnsafePath))?;
+        let meta = crate::extract::Meta::from(header);
+        let persistent = self.partial.as_mut().unwrap();
+        self.usage.charge(
+            Resource::MetadataBytes,
+            (std::mem::size_of::<PendingDirectory>()
+                + relative.as_os_str().len()
+                + self.options.extract.dest.as_os_str().len()) as u64,
+        )?;
+        persistent.directories.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+        let driver = &mut self.driver;
+        let (created, identity) = create_directory(
+            &self.options.extract.dest,
+            &relative,
+            persistent.options.limits.clone(),
+            self.usage.clone(),
+            persistent.exclusions.clone(),
+            &persistent.options.control,
+            |path| match path {
+                GenesisPath::Parent(path) | GenesisPath::Output(path) => Ok(driver.check_partial_target(path)?),
+                GenesisPath::Bundle(path) => Ok(driver.check_partial_subtree(path)?),
+            },
+        )
+        .map_err(failure)?;
+        let path = std::path::absolute(&self.options.extract.dest)
+            .map_err(|_| error(PartialErrorKind::UnsafePath))?
+            .join(&relative);
+        persistent.directories.push(PendingDirectory { path, identity, meta });
+        self.driver.validate_current()?;
+        self.phase = Phase::Header;
+        Ok(ProgressiveEvent::MemberFinished {
+            member: self.member.take().unwrap(),
+            outcome: MemberOutcome::Directory { created },
+        })
+    }
+    /// At the end of the set: applies each directory entry's modified time and permissions, deepest first and the
+    /// last entry for a directory winning, to the directory created (or found) for it. A directory replaced since
+    /// fails with `OutputChanged` and is left alone.
+    pub(super) fn partial_finish_directories(&mut self) -> ProgressiveResult<()> {
+        let Some(persistent) = self.partial.as_mut() else { return Ok(()) };
+        let mut directories = std::mem::take(&mut persistent.directories);
+        let count = directories.len() as u64;
+        self.usage.charge(
+            Resource::SourceBookkeeping,
+            count.saturating_mul(16).saturating_mul(u64::from(count.max(1).ilog2()) + 1),
+        )?;
+        // Stable: among entries for one directory the last stays last.
+        directories.sort_by_key(|d| std::cmp::Reverse(d.path.components().count()));
+        for (index, directory) in directories.iter().enumerate() {
+            if directories[index + 1..].iter().any(|later| later.identity == directory.identity) {
+                continue;
+            }
+            if self.control.is_canceled() || persistent.options.control.is_canceled() {
+                return Ok(());
+            }
+            let file = crate::progressive::guard::open_directory(&directory.path)?;
+            let identity = crate::progressive::native::Identity::file(&file)
+                .map_err(|_| error(PartialErrorKind::OutputChanged))?;
+            if identity != directory.identity {
+                return Err(error(PartialErrorKind::OutputChanged));
+            }
+            crate::extract::finish_file(&file, &directory.meta);
         }
         Ok(())
     }
@@ -870,6 +967,26 @@ impl ProgressiveSession {
         persistent.resume = None;
         self.phase = Phase::Header;
         Ok(Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { member: self.member.take().unwrap(), outcome }))))
+    }
+}
+/// Why a persistent session refuses the member `header` starts, if it does. Directory entries are not refused
+/// (they create their directory), except a compressed RAR4 one, which the RAR4 path does not read.
+pub(super) fn refusal(header: &crate::rar5::FileHeader) -> Option<RefusalReason> {
+    let rar4 = header.format == crate::rar5::RarFormat::Rar4;
+    if header.redirection.is_some() {
+        Some(RefusalReason::Redirection)
+    } else if rar4 && header.encrypted {
+        // Encrypted RAR5 stored members are admitted (their password is in the session options); RAR4 ones are not.
+        Some(RefusalReason::Encrypted)
+    } else if header.is_dir() && !(rar4 && header.method != 0) {
+        None
+    } else if header.method != 0 {
+        Some(RefusalReason::Compressed { method: header.method })
+    } else if header.size_unknown() || (rar4 && matches!(header.unpacked_size, u64::MAX | 0xffff_ffff)) {
+        // RAR4 has no unknown-size flag: the progressive RAR4 path reads an all-ones size as unknown.
+        Some(RefusalReason::UnknownSize)
+    } else {
+        None
     }
 }
 fn member_checks(member: &PhysicalMember) -> MemberChecks {

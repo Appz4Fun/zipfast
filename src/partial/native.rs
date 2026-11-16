@@ -736,13 +736,64 @@ pub(super) fn prepare_parents(
     targets: (&Path, &Path),
     mut check: impl FnMut(GenesisPath<'_>) -> PartialResult<()>,
 ) -> PartialResult<PreparedParents> {
+    let output = std::path::absolute(&spec.output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+    let state = std::path::absolute(&spec.state_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+    let parent = output.join(&spec.relative_output).parent().ok_or_else(malformed)?.to_path_buf();
+    let ancestors = hold_ancestors(&[&output, &state, &parent], genesis, control, &mut check)?;
+    // The parent checks read the declaration again, so it may have grown since the output and bundle were
+    // checked against it; their exclusions do not exist until the genesis, so an extension cannot see them.
+    check(GenesisPath::Output(targets.0))?;
+    check(GenesisPath::Bundle(targets.1))?;
+    for directory in &ancestors.held {
+        directory.check()?;
+    }
+    // The remaining native rechecks and exclusion-table visits are predictable
+    // now: provider callbacks and provisional parent reservations have finished.
+    genesis.admit_genesis_bookkeeping()?;
+    create_missing(ancestors, control)
+}
+/// Creates the directory of a directory entry at `relative` under `output_root`, as a member creation creates its
+/// parents: every ancestor and the directory itself are checked with `check` (as `GenesisPath::Parent`) before any
+/// name is created, each missing one is created exclusively beneath its held parent (mode 0700, the parent synced)
+/// and registered as an exclusion. An existing directory is kept; an existing non-directory (or a symbolic link)
+/// at any of those paths is `UnsafePath`. Returns whether the directory was created and its identity.
+pub(crate) fn create_directory(
+    output_root: &Path,
+    relative: &Path,
+    limits: PartialLimits,
+    usage: Usage,
+    exclusions: Arc<PartialExclusions>,
+    control: &SessionControl,
+    mut check: impl FnMut(GenesisPath<'_>) -> PartialResult<()>,
+) -> PartialResult<(bool, Identity)> {
+    let budget = PartialBudget::new(limits, usage, exclusions)?;
+    let output = std::path::absolute(output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+    let target = output.join(relative);
+    let ancestors = hold_ancestors(&[&output, &target], &budget, control, &mut check)?;
+    let created = ancestors.missing.contains(&target);
+    let prepared = create_missing(ancestors, control)?;
+    let directory = prepared.held.iter().find(|d| d.path == target).ok_or_else(malformed)?;
+    Ok((created, directory.identity))
+}
+/// Every existing ancestor of the targets held, every missing one reserved as an exclusion, in depth order.
+struct HeldAncestors {
+    budget: PartialBudget,
+    held: Vec<Directory>,
+    missing: Vec<PathBuf>,
+}
+/// Holds every existing directory on the way to each of `targets` (including the targets) and reserves every
+/// missing one, after checking each with `check` as a `GenesisPath::Parent`. Nothing is created.
+fn hold_ancestors(
+    targets: &[&Path],
+    genesis: &PartialBudget,
+    control: &SessionControl,
+    check: &mut impl FnMut(GenesisPath<'_>) -> PartialResult<()>,
+) -> PartialResult<HeldAncestors> {
     // Separate transient reservations cannot consume the prepared Core's credits.
     let budget = PartialBudget::new(genesis.limits.clone(), genesis.usage.clone(), genesis.exclusions.clone())?;
     let mut paths = Vec::<PathBuf>::new();
-    let output = std::path::absolute(&spec.output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
-    let state = std::path::absolute(&spec.state_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
-    for target in [&output, &state, &output.join(&spec.relative_output).parent().ok_or_else(malformed)?.to_path_buf()] {
-        let mut at = target.as_path();
+    for target in targets {
+        let mut at = *target;
         loop {
             canceled(control)?;
             budget.usage.charge(Resource::SourceBookkeeping, paths.len() as u64 + 1)?;
@@ -800,16 +851,11 @@ pub(super) fn prepare_parents(
             Err(e) => return Err(io_error(OutputOperation::Metadata, e)),
         }
     }
-    // The parent checks read the declaration again, so it may have grown since the output and bundle were
-    // checked against it; their exclusions do not exist until the genesis, so an extension cannot see them.
-    check(GenesisPath::Output(targets.0))?;
-    check(GenesisPath::Bundle(targets.1))?;
-    for directory in &held {
-        directory.check()?;
-    }
-    // The remaining native rechecks and exclusion-table visits are predictable
-    // now: provider callbacks and provisional parent reservations have finished.
-    genesis.admit_genesis_bookkeeping()?;
+    Ok(HeldAncestors { budget, held, missing })
+}
+/// Creates each missing directory `hold_ancestors` reserved, beneath its held parent.
+fn create_missing(ancestors: HeldAncestors, control: &SessionControl) -> PartialResult<PreparedParents> {
+    let HeldAncestors { budget, mut held, missing } = ancestors;
     for path in missing {
         canceled(control)?;
         for directory in &held {

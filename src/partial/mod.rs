@@ -35,7 +35,7 @@ pub(crate) use limits::PartialBudget;
 pub use limits::{PartialLimits, PartialResource};
 use limits::{Reservation, limit};
 use native::PersistentNative;
-pub(crate) use native::{GenesisPath, PartialExclusions, PartialProtectedPath};
+pub(crate) use native::{GenesisPath, PartialExclusions, PartialProtectedPath, create_directory};
 pub(crate) use state::CipherBlock;
 pub use state::PartialState;
 use state::{CommittedState, MutationCommit, MutationIntent, Snapshot};
