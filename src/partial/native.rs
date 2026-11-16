@@ -312,11 +312,27 @@ impl PreparedNative {
 
 pub(super) struct HeldFile {
     pub file: File,
+    /// Whether `lock` took the advisory lock on this descriptor; drop then releases it explicitly.
+    locked: std::sync::atomic::AtomicBool,
     _reservation: Reservation,
 }
 impl HeldFile {
     fn from(file: File, reservation: Reservation) -> Arc<Self> {
-        Arc::new(Self { file, _reservation: reservation })
+        Arc::new(Self { file, locked: std::sync::atomic::AtomicBool::new(false), _reservation: reservation })
+    }
+}
+impl Drop for HeldFile {
+    /// Releases the lock before the descriptor closes. Closing alone is not enough: the lock belongs to the open
+    /// file description, and a child that another thread is spawning holds a copy of every descriptor until its
+    /// exec closes the close-on-exec ones (on macOS, `posix_spawn` copies them too). A close here during that
+    /// window leaves the lock held by the child, and an immediate reopen of the same partial fails as `Busy`.
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if *self.locked.get_mut() {
+            use std::os::fd::AsRawFd;
+            // The descriptor is still owned here; unlocking it cannot affect any other open file description.
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 pub(super) struct Directory {
@@ -351,7 +367,7 @@ pub(crate) struct PersistentNative {
     parents: Vec<Directory>,
     state_root: Directory,
     pub(super) bundle: Directory,
-    lock: Arc<HeldFile>,
+    pub(super) lock: Arc<HeldFile>,
     lock_identity: Identity,
     pub(super) binding: NativeBinding,
     protection: NativeProtection,
@@ -440,19 +456,20 @@ fn regular(file: &File) -> PartialResult<()> {
     }
     Ok(())
 }
-fn lock(file: &File) -> PartialResult<()> {
+fn lock(held: &HeldFile) -> PartialResult<()> {
     platform()?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::fd::AsRawFd;
-        // Nonblocking advisory exclusion; held descriptor lifetime owns the lock.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        // Nonblocking advisory exclusion; held descriptor lifetime owns the lock, and its drop releases it.
+        if unsafe { libc::flock(held.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let cause = io::Error::last_os_error();
             if cause.kind() == io::ErrorKind::WouldBlock {
                 return Err(err(PartialErrorKind::Busy));
             }
             return Err(io_error(OutputOperation::Create, cause));
         }
+        held.locked.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
@@ -606,10 +623,10 @@ impl PersistentNative {
             })?;
             let lock_file = open_at(&bundle.held.file, OsStr::new("lock"), create, budget)?;
             budget.exclusions.bind(&lock_path, &lock_file.file)?;
-            lock(&lock_file.file)?;
+            lock(&lock_file)?;
             let lock_identity = Identity::file(&lock_file.file).map_err(|e| io_error(OutputOperation::Metadata, e))?;
             let output = open_at(&parent.held.file, output_path.file_name().ok_or_else(malformed)?, create, budget)?;
-            lock(&output.file)?;
+            lock(&output)?;
             let binding = NativeBinding {
                 root: root.identity,
                 parent: parent.identity,

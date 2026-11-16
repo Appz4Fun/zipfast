@@ -273,9 +273,23 @@ fn each_native_lock_independently_excludes_reopen() {
         // Tests take the same nonblocking native lock through an independent open.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
         assert!(matches!(f.open(state.clone()).err().unwrap().kind, PartialErrorKind::Busy));
+        // Unlock before closing: a child spawned concurrently by another test may hold a copy of this descriptor.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(held);
         assert_eq!(f.open(state).unwrap().remaining().unwrap(), vec![0..16]);
     }
+}
+// A copy of a locked descriptor that outlives the partial (as in a child that another thread is spawning, which holds
+// every descriptor until its exec) must not keep the partial locked: dropping the last owner releases both locks.
+#[test]
+fn dropping_the_owner_unlocks_despite_surviving_descriptor_copies() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    let copies = [file.core.native.lock.file.try_clone().unwrap(), file.core.native.output.file.try_clone().unwrap()];
+    let state = file.state().unwrap();
+    drop(file);
+    assert_eq!(f.open(state).unwrap().remaining().unwrap(), vec![0..16]);
+    drop(copies);
 }
 
 // A failed creation must identify the bundle it already created, without removing it.
