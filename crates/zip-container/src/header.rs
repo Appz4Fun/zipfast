@@ -322,6 +322,11 @@ impl<'a> CentralView<'a> {
         self.comment
     }
 
+    /// The whole undecoded central extra block, in wire order.
+    pub fn raw_extra(&self) -> &'a [u8] {
+        self.extra
+    }
+
     /// Iterates extra fields in wire order within the validated extra block.
     pub fn extras(&self) -> ExtraIter<'a> {
         ExtraIter::from_checked_range(self.extra, self.location.extra_range().start)

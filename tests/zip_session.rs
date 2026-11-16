@@ -336,6 +336,8 @@ mod unix {
         let entry = entries[1];
         assert_eq!(entry.raw_name(), b"wire");
         assert_eq!(entry.raw_unicode_path(), Some("雪".as_bytes()));
+        assert!(entry.raw_central_extra().windows(extras.len()).any(|w| w == extras));
+        assert_eq!(dir.raw_central_extra(), b"");
         assert_eq!(entry.modified(), Some((-1, 0)));
         assert!(matches!(entry.raw_mtime_override(), Some(zipfast::zip::ExtraMtime::UnixSeconds(-1))));
         assert_eq!((entry.header().mod_date, entry.header().mod_time), (0x5022, 0x1883));
@@ -628,6 +630,7 @@ mod unix {
         let (_file, session) = open_fixture(&build(&[member], &[0], b"", b"", false).bytes);
         let metadata = session.metadata();
         let entry = metadata.entries().next().unwrap();
+        assert_eq!(entry.raw_central_extra(), extras.as_slice());
         assert_eq!(entry.name(), "bad�");
         assert_eq!(entry.raw_name(), b"wire");
         assert_eq!(entry.raw_unicode_path(), Some(&b"bad\xff"[..]));
