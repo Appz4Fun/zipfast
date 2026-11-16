@@ -17,6 +17,10 @@
 //! RAR 5.0 member names decoded the way UnRAR decodes them on Unix.
 
 /// UnRAR's `NM`: the longest name, in wide characters, including the terminating zero.
+///
+/// This models UnRAR 6.x's fixed `wchar FileName[NM]`. If UnRAR 7.x decodes header names into a growable
+/// string without this cap, names longer than 2047 units are the only ones that would differ; the decoding
+/// rules themselves are the same.
 const NM: usize = 2048;
 
 /// The name UnRAR on Unix reads from a RAR 5.0 header's name bytes `raw`, as the 32-bit `wchar_t` units it
