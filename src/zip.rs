@@ -818,6 +818,8 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
             Entry {
                 mode,
                 mtime_origin: e.mtime_origin,
+                ctime: None,
+                atime: None,
                 attributes,
                 name: e.name,
                 size: e.size,

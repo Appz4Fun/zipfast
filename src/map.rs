@@ -531,6 +531,10 @@ pub struct MapMember {
     pub checks: Option<MapChecks>,
     /// Modification time as seconds since 1970 and nanoseconds.
     pub mtime: Option<(i64, u32)>,
+    /// 7z: creation time (kCTime) as seconds since 1970 and nanoseconds. None for other formats.
+    pub ctime: Option<(i64, u32)>,
+    /// 7z: last access time (kATime) as seconds since 1970 and nanoseconds. None for other formats.
+    pub atime: Option<(i64, u32)>,
     /// RAR 4.x: the header's DOS date and time exactly as stored (time in the low 16 bits, date in the high), even
     /// when it is not a valid date and `mtime` is None. None for other formats.
     pub dos_time: Option<u32>,

@@ -388,6 +388,8 @@ pub(super) fn zip_member(
         cipher,
         checks: complete.then_some(checks),
         mtime: entry.mtime.map(|s| (s, entry.nanos)),
+        ctime: None,
+        atime: None,
         dos_time: None,
         attributes: u64::from(entry.external),
         unix_mode: entry.unix_mode(),

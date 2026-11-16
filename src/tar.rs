@@ -299,6 +299,8 @@ impl Member {
         Entry {
             mode: Some(self.mode),
             mtime_origin: self.mtime.map(|_| MtimeOrigin::Utc),
+            ctime: None,
+            atime: None,
             attributes: None,
             name: self.name,
             size: if data { self.size } else { 0 },
@@ -740,6 +742,8 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         return Ok(vec![Entry {
             mode: None,
             mtime_origin: mtime.map(|_| MtimeOrigin::Utc),
+            ctime: None,
+            atime: None,
             attributes: None,
             name: single_name(codec, path),
             size,

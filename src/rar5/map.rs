@@ -768,6 +768,8 @@ impl RarWalker {
             cipher,
             checks: part.final_part.then_some(checks),
             mtime: header.mtime.map(|s| (s, header.mtime_nanos)),
+            ctime: None,
+            atime: None,
             dos_time: header.rar4.map(|r| r.dos_time),
             attributes: header.attributes,
             unix_mode,

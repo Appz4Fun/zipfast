@@ -262,6 +262,8 @@ pub fn list_with_limits(first: &Path, password: Option<&str>, limits: &SevenZipL
                 },
                 mtime: m.mtime.map(|t| t.0),
                 mtime_origin: m.mtime.map(|_| MtimeOrigin::Utc),
+                ctime: m.ctime,
+                atime: m.atime,
                 attributes: (m.attributes != 0).then_some(m.attributes as u32 & 0xFFFF),
                 crc32: m.checks.and_then(|c| c.crc32),
                 method: folder.map_or(0, method_number),
