@@ -752,8 +752,14 @@ pub(crate) enum GenesisPath<'a> {
 /// Holds every observed ancestor through the independent Core binding.
 pub(crate) struct PreparedParents {
     held: Vec<Directory>,
+    /// Identities of the directories this preparation created.
+    created: Vec<Identity>,
 }
 impl PreparedParents {
+    /// Identities of the directories this preparation created.
+    pub(crate) fn created(&self) -> &[Identity] {
+        &self.created
+    }
     pub(crate) fn check(&self) -> PartialResult<()> {
         for directory in &self.held {
             directory.check()?;
@@ -789,7 +795,8 @@ pub(super) fn prepare_parents(
 /// parents: every ancestor and the directory itself are checked with `check` (as `GenesisPath::Parent`) before any
 /// name is created, each missing one is created exclusively beneath its held parent (mode 0700, the parent synced)
 /// and registered as an exclusion. An existing directory is kept; an existing non-directory (or a symbolic link)
-/// at any of those paths is `UnsafePath`. Returns whether the directory was created and its identity.
+/// at any of those paths is `UnsafePath`. Returns whether the directory was created, its identity, and the
+/// identities of every directory created (the missing ancestors and the directory itself).
 pub(crate) fn create_directory(
     output_root: &Path,
     relative: &Path,
@@ -798,7 +805,7 @@ pub(crate) fn create_directory(
     exclusions: Arc<PartialExclusions>,
     control: &SessionControl,
     mut check: impl FnMut(GenesisPath<'_>) -> PartialResult<()>,
-) -> PartialResult<(bool, Identity)> {
+) -> PartialResult<(bool, Identity, Vec<Identity>)> {
     let budget = PartialBudget::new(limits, usage, exclusions)?;
     let output = std::path::absolute(output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
     let target = output.join(relative);
@@ -806,7 +813,7 @@ pub(crate) fn create_directory(
     let created = ancestors.missing.contains(&target);
     let prepared = create_missing(ancestors, control)?;
     let directory = prepared.held.iter().find(|d| d.path == target).ok_or_else(malformed)?;
-    Ok((created, directory.identity))
+    Ok((created, directory.identity, prepared.created))
 }
 /// Every existing ancestor of the targets held, every missing one reserved as an exclusion, in depth order.
 struct HeldAncestors {
@@ -906,6 +913,7 @@ fn hold_ancestors(
 /// Creates each missing directory `hold_ancestors` reserved, beneath its held parent.
 fn create_missing(ancestors: HeldAncestors, control: &SessionControl) -> PartialResult<PreparedParents> {
     let HeldAncestors { budget, mut held, missing } = ancestors;
+    let mut created = budget.vector::<Identity>(missing.len())?;
     for path in missing {
         canceled(control)?;
         for directory in &held {
@@ -916,9 +924,10 @@ fn create_missing(ancestors: HeldAncestors, control: &SessionControl) -> Partial
         super::sync_file(&parent.held.file).map_err(|e| io_error(OutputOperation::Flush, e))?;
         let directory = Directory::open_beneath(parent, path, &budget)?;
         budget.exclusions.bind(&directory.path, &directory.held.file)?;
+        created.push(directory.identity);
         held.push(directory);
     }
-    let prepared = PreparedParents { held };
+    let prepared = PreparedParents { held, created };
     prepared.check()?;
     Ok(prepared)
 }

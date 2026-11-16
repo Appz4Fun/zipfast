@@ -153,7 +153,9 @@ pub enum MemberOutcome {
     Refused {
         reason: crate::partial::RefusalReason,
     },
-    /// Policy completed. False also includes Test and flattened directory entries.
+    /// Policy completed. False also includes Test and flattened directory entries. In a persistent session,
+    /// true when this session created the directory, for this entry or earlier as the parent of a member stored
+    /// before it; only such a directory gets the entry's metadata.
     Directory {
         created: bool,
     },

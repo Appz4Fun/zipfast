@@ -46,6 +46,8 @@ pub(super) struct Persistent {
     resume: Option<Resume>,
     /// Directories of directory entries, whose metadata is applied when the walk reaches the end of the set.
     directories: Vec<PendingDirectory>,
+    /// Identities of every directory this session created: parents of its outputs and directory entries.
+    created: Vec<crate::progressive::native::Identity>,
 }
 /// A directory entry's directory: its metadata waits until nothing more is created inside it.
 struct PendingDirectory {
@@ -153,6 +155,7 @@ impl ProgressiveSession {
             unavailable: Vec::new(),
             resume: None,
             directories: Vec::new(),
+            created: Vec::new(),
         });
         Ok(session)
     }
@@ -367,8 +370,11 @@ impl ProgressiveSession {
                 + self.options.extract.dest.as_os_str().len()) as u64,
         )?;
         persistent.directories.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+        // Room to remember every directory this may create, admitted before any is created.
+        let root = std::path::absolute(&self.options.extract.dest).map_err(|_| error(PartialErrorKind::UnsafePath))?;
+        reserve_created(&mut persistent.created, root.join(&relative).components().count(), &self.usage)?;
         let driver = &mut self.driver;
-        let (created, identity) = create_directory(
+        let (_, identity, made) = create_directory(
             &self.options.extract.dest,
             &relative,
             persistent.options.limits.clone(),
@@ -384,7 +390,10 @@ impl ProgressiveSession {
         let path = std::path::absolute(&self.options.extract.dest)
             .map_err(|_| error(PartialErrorKind::UnsafePath))?
             .join(&relative);
-        // Only a directory this session created gets the entry's metadata; an existing one is left as it is.
+        // Only a directory this session created, for this entry or earlier as the parent of a member stored before
+        // its entry (as RAR usually stores them), gets the entry's metadata; an existing one is left as it is.
+        persistent.created.extend(made);
+        let created = persistent.created.contains(&identity);
         if created {
             persistent.directories.push(PendingDirectory { path, identity, meta });
         }
@@ -530,8 +539,15 @@ impl ProgressiveSession {
         // again and an extension may land meanwhile. Their exclusions are registered only by the genesis, so the
         // extension's own check cannot see them: after the parents, and before any name is created, both are
         // checked against the current declaration, and creation is prepared again if it grew.
+        // Room to remember every directory the parents may create (output and state roots included), admitted
+        // before any is created.
+        let root = std::path::absolute(&self.options.extract.dest).map_err(|_| error(PartialErrorKind::UnsafePath))?;
+        let state =
+            std::path::absolute(&persistent.options.state_dir).map_err(|_| error(PartialErrorKind::UnsafePath))?;
+        let bound = root.join(&spec.relative_output).components().count() + state.components().count();
+        reserve_created(&mut persistent.created, bound, &self.usage)?;
         let mut attempts = 0;
-        let (prepared, _parents) = loop {
+        let (prepared, parents) = loop {
             spec.protection = self.driver.partial_catalogue()?;
             let epoch = self.driver.protection_epoch();
             let mut prepared = PartialCore::prepare_create(
@@ -576,6 +592,8 @@ impl ProgressiveSession {
                 Err(e) => return Err(failure(e)),
             }
         };
+        // Parents created here are this session's: a directory entry arriving later gives them its metadata.
+        persistent.created.extend_from_slice(parents.created());
         let (core, state, event_lease) = prepared.complete_ready().map_err(failure)?;
         persistent.current = Some(persistent.cores.len());
         persistent.cores.push((key.clone(), core));
@@ -1027,6 +1045,22 @@ pub(super) fn refusal(header: &crate::rar5::FileHeader) -> Option<RefusalReason>
     } else {
         None
     }
+}
+/// Admits and reserves room for `count` more identities in the session's created-directory list.
+fn reserve_created(
+    created: &mut Vec<crate::progressive::native::Identity>,
+    count: usize,
+    usage: &Usage,
+) -> ProgressiveResult<()> {
+    let spare = created.capacity() - created.len();
+    if count > spare {
+        usage.charge(
+            Resource::MetadataBytes,
+            ((count - spare) * std::mem::size_of::<crate::progressive::native::Identity>()) as u64,
+        )?;
+        created.try_reserve_exact(count - spare).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+    }
+    Ok(())
 }
 /// Adds the identity of `path` (when it exists, through any links) and of each of its existing ancestors.
 fn ancestor_identities(

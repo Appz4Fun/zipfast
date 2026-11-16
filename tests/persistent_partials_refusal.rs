@@ -805,3 +805,27 @@ fn a_refused_rar4_directory_with_an_unsafe_name_is_refused_not_fatal() {
     assert_eq!(seen.complete, ["x.bin"]);
     assert!(!dir.path().join("evil").exists());
 }
+
+/// RAR usually stores a directory record after its files: the parent this session created for the file is the
+/// entry's directory, so it still gets the entry's metadata.
+#[test]
+fn a_directory_entry_after_its_files_gets_its_metadata() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let f = data(700, 26);
+    let set = Set::rar5(vec![common::archive(&[
+        FileSpec::new("d/f", &f),
+        FileSpec { dir: true, unix_mode: Some(0o750), mtime: Some(1_400_000_000), ..FileSpec::new("d", b"") },
+    ])]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut seen = Seen::default();
+    assert!(run(&mut session(&set, dir.path(), &Arc::default()), &mut seen, None));
+    assert_eq!(seen.directories, [("d".to_string(), true)]);
+    assert_eq!(seen.complete, ["d/f"]);
+    let meta = fs::metadata(dir.path().join("out/d")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o750);
+    assert_eq!(meta.mtime(), 1_400_000_000);
+    assert_eq!(fs::read(dir.path().join("out/d/f")).unwrap(), f);
+    for (_, file) in &mut seen.files {
+        assert!(matches!(verify(file), Verdict::Ok { .. }));
+    }
+}
