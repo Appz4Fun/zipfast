@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    Cancellation, Checked, Entry, ListingBudget, Meta, Mode, Options, Overwrite, Place, Summary, check_target,
-    create_target, finish_dirs, finish_file, make_dirs,
+    Cancellation, Checked, Entry, ListingBudget, Meta, Mode, MtimeOrigin, Options, Overwrite, Place, Summary,
+    check_target, create_target, finish_dirs, finish_file, make_dirs,
 };
 use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
@@ -296,6 +296,8 @@ impl Member {
         let data = self.kind == Kind::File;
         Entry {
             mode: Some(self.mode),
+            mtime_origin: self.mtime.map(|_| MtimeOrigin::Utc),
+            attributes: None,
             name: self.name,
             size: if data { self.size } else { 0 },
             packed: if data { self.size } else { 0 },
@@ -734,12 +736,16 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         let packed = std::fs::metadata(path)?.len();
         let mut buf = vec![0u8; BUF];
         let size = reader.read_single(&mut buf, &mut |_| Ok(()))?;
+        // RFC 1952: MTIME is Unix time, 0 when none was recorded.
+        let mtime = if gzip { stream::gzip_mtime(path) } else { None };
         return Ok(vec![Entry {
             mode: None,
+            mtime_origin: mtime.map(|_| MtimeOrigin::Utc),
+            attributes: None,
             name: single_name(codec, path),
             size,
             packed,
-            mtime: None,
+            mtime,
             crc32: None,
             method: if gzip { 8 } else { 0 },
             dir: false,

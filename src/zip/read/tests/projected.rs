@@ -110,6 +110,7 @@ fn mutable_archive_cannot_seal_original_metadata() {
         external: u32::MAX,
         mtime: Some(0),
         nanos: u32::MAX,
+        mtime_origin: None,
         aes_info: Some((3, 2, 0)),
     };
     assert_eq!(session.entries().next().unwrap().name, "original");

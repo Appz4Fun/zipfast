@@ -139,6 +139,18 @@ impl<R: BufRead> Read for XzStreams<R> {
     }
 }
 
+/// The modification time stored in a gzip header (RFC 1952's MTIME field), in
+/// seconds since 1970 UTC. None when the field is 0, which means no time was recorded.
+pub fn gzip_mtime(path: &Path) -> Option<i64> {
+    let mut fixed = [0u8; 8];
+    File::open(path).ok()?.read_exact(&mut fixed).ok()?;
+    if fixed[..3] != [0x1f, 0x8b, 8] {
+        return None;
+    }
+    let seconds = u32::from_le_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+    (seconds != 0).then_some(i64::from(seconds))
+}
+
 /// The file name stored in a gzip header (RFC 1952's FNAME field), if there is one. The header is read field by
 /// field, so an extra field of any size before the name is passed over.
 pub fn gzip_name(path: &Path) -> Option<String> {

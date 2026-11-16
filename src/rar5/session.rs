@@ -125,8 +125,26 @@ impl RarVolumeMetadata {
         self.format
     }
 
+    /// The normalized main header flags (`MHFL_*`). For RAR 4.x only the
+    /// volume and solid bits are carried over; see [`Self::rar4_flags`].
     pub fn flags(&self) -> u64 {
         self.main.flags
+    }
+
+    /// The RAR 4.x main header's own flags (`MHD_*`) as stored. None for RAR 5.0.
+    pub fn rar4_flags(&self) -> Option<u16> {
+        self.main.rar4_flags
+    }
+
+    /// Whether the set uses `NAME.partN.rar` volume names: always for RAR 5.0,
+    /// and for RAR 4.x when the main header sets `MHD_NEWNUMBERING` (0x0010).
+    /// UnRAR's `VolNameToFirstName` uses it to tell `.partN.rar` numbering from
+    /// the `.rar`, `.r00`, `.r01`, ... scheme.
+    pub fn new_numbering(&self) -> bool {
+        match self.format {
+            super::RarFormat::Rar5 => true,
+            super::RarFormat::Rar4 => self.main.rar4_flags.is_some_and(|flags| flags & super::MHD_NEWNUMBERING != 0),
+        }
     }
 
     pub fn declared_number(&self) -> Option<u64> {

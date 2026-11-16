@@ -385,10 +385,29 @@ pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::
     })
 }
 
+/// Which clock an [`Entry::mtime`] was read from.
+///
+/// Every `mtime` is a count of seconds since 1970-01-01 00:00:00, but only a
+/// `Utc` one is a true Unix timestamp. A `LocalWallClock` one is the stored
+/// date and time fields, which carry no time zone, counted as if they were UTC:
+/// formatting it as UTC gives back the wall-clock time the archiver recorded.
+/// 7-Zip and UnRAR print such a time as stored and convert a UTC time to local
+/// time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum MtimeOrigin {
+    /// A Unix timestamp: ZIP extended-timestamp (0x5455) and NTFS (0x000a)
+    /// extras, RAR 5.0, tar and the gzip `MTIME` field.
+    Utc,
+    /// MS-DOS date and time fields read as UTC: ZIP without a time extra and
+    /// RAR 4.x, including its extended-time precision record.
+    LocalWallClock,
+}
+
 /// One entry for a listing.
 ///
-/// `mode` is additive in this unpublished 0.1 API; downstream struct literals
-/// must supply it (`None` when Unix metadata is unavailable).
+/// `mode`, `mtime_origin` and `attributes` are additive in this unpublished
+/// 0.1 API; downstream struct literals must supply them (`None` when the
+/// archive holds no such metadata).
 #[derive(Clone, Debug)]
 pub struct Entry {
     /// Unix mode bits as stored by the archive, when available.
@@ -396,7 +415,18 @@ pub struct Entry {
     pub name: String,
     pub size: u64,
     pub packed: u64,
+    /// Seconds since 1970; see `mtime_origin` for the clock it was read from.
     pub mtime: Option<i64>,
+    /// Which clock `mtime` was read from: `Some` exactly when `mtime` is.
+    pub mtime_origin: Option<MtimeOrigin>,
+    /// Raw Windows (MS-DOS) attribute bits (`FILE_ATTRIBUTE_*`: read-only 0x1,
+    /// hidden 0x2, system 0x4, directory 0x10, archive 0x20, ...), when the
+    /// archive was made on a host that stores them: ZIP hosts 0 (FAT), 6
+    /// (HPFS), 10 and 11 (NTFS), 14 (VFAT), from the low 16 bits of the
+    /// external attributes; RAR 4.x hosts MS-DOS, OS/2 and Win32 and RAR 5.0
+    /// host Windows, from the file attributes. `None` for Unix and other
+    /// hosts, whose permission bits are in `mode`, and for tar and gzip.
+    pub attributes: Option<u32>,
     pub crc32: Option<u32>,
     pub method: u8,
     pub dir: bool,
@@ -1433,6 +1463,8 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
         let mode = Meta::from(&h).mode;
         out.push(Entry {
             mode,
+            mtime_origin: h.mtime_origin(),
+            attributes: h.windows_attributes(),
             name: h.name,
             size: h.unpacked_size,
             packed: h.packed_size,

@@ -30,7 +30,8 @@ use zip_container::{
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    Cancellation, Entry, Meta, Mode, Options, Summary, Target, finish_dirs, finish_file, make_dirs, open_target,
+    Cancellation, Entry, Meta, Mode, MtimeOrigin, Options, Summary, Target, finish_dirs, finish_file, make_dirs,
+    open_target,
 };
 use crate::path::sanitize;
 use crate::rar5::Redirection;
@@ -121,12 +122,21 @@ pub struct ZipEntry {
     pub external: u32,
     pub mtime: Option<i64>,
     pub nanos: u32,
+    /// Which clock `mtime` was read from: `Utc` from an extended-timestamp
+    /// (0x5455) or NTFS (0x000a) extra, `LocalWallClock` from the DOS fields.
+    pub mtime_origin: Option<MtimeOrigin>,
     pub aes_info: Option<(u8, u16, u16)>,
 }
 
 impl ZipEntry {
     pub fn unix_mode(&self) -> Option<u32> {
         extraction_unix_mode(self.host, self.external)
+    }
+
+    /// The raw Windows attribute bits: the low 16 bits of the external
+    /// attributes when the host stores MS-DOS attributes there.
+    pub fn windows_attributes(&self) -> Option<u32> {
+        windows_attributes(self.host, self.external)
     }
 
     pub fn is_dir(&self) -> bool {
@@ -165,6 +175,13 @@ impl ZipEntry {
 
 fn extraction_unix_mode(host: u8, external: u32) -> Option<u32> {
     (host == HOST_UNIX && external >> 16 != 0).then_some(external >> 16)
+}
+
+/// Hosts whose external attributes carry MS-DOS/Windows attribute bits in the
+/// low 16 bits: 0 FAT, 6 OS/2 HPFS, 10 NTFS (APPNOTE 4.4.2), 11 NTFS (Info-ZIP
+/// and 7-Zip numbering) and 14 VFAT.
+fn windows_attributes(host: u8, external: u32) -> Option<u32> {
+    matches!(host, 0 | 6 | 10 | 11 | 14).then_some(external & 0xffff)
 }
 
 fn is_dir(name: &str, host: u8, external: u32) -> bool {
@@ -669,6 +686,7 @@ fn project_entry(
     aes: Option<AesFields>,
 ) -> std::result::Result<ZipEntry, DirectoryError> {
     let (mtime, nanos) = project_mtime(header, mtime_override);
+    let mtime_origin = project_mtime_origin(mtime, mtime_override);
     Ok(ZipEntry {
         name: decode_name(unicode_path.unwrap_or(raw_name), unicode_path.is_some() || header.flags & FLAG_UTF8 != 0)?,
         flags: header.flags,
@@ -681,6 +699,7 @@ fn project_entry(
         external: header.external_attributes,
         mtime,
         nanos,
+        mtime_origin,
         aes_info: project_aes(aes),
     })
 }
@@ -693,6 +712,12 @@ fn project_mtime(header: CentralHeader, mtime_override: Option<ExtraMtime>) -> (
         Some(ExtraMtime::UnixSeconds(seconds)) => (Some(i64::from(seconds)), 0),
         None => (dos_time(header.mod_time, header.mod_date), 0),
     }
+}
+
+/// An extended-timestamp or NTFS extra overrides the DOS fields (the last one
+/// in the central extra field wins) and is UTC; the DOS fields are local.
+fn project_mtime_origin(mtime: Option<i64>, mtime_override: Option<ExtraMtime>) -> Option<MtimeOrigin> {
+    mtime.map(|_| if mtime_override.is_some() { MtimeOrigin::Utc } else { MtimeOrigin::LocalWallClock })
 }
 
 fn project_aes(aes: Option<AesFields>) -> Option<(u8, u16, u16)> {
@@ -784,8 +809,11 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
             let encrypted = e.encrypted();
             let link = e.is_link().then(|| Redirection::UnixSymlink(String::new()));
             let mode = e.unix_mode();
+            let attributes = e.windows_attributes();
             Entry {
                 mode,
+                mtime_origin: e.mtime_origin,
+                attributes,
                 name: e.name,
                 size: e.size,
                 packed: e.packed,

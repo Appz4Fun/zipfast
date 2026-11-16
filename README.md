@@ -91,6 +91,29 @@ apply the filter. `RarSession::extract_selected`/`extract_selected_controlled`, 
 sessions, and `ZipReadStage::prepare_file` have their own member selection and refuse `select: Some(..)` with a typed
 error before doing anything.
 
+### Library: listing metadata
+
+`extract::list` and `list_with_password` return one `extract::Entry` per member: `name`, `size`, `packed`, `mtime`,
+`mtime_origin`, `crc32`, `method`, `dir`, `encrypted`, `solid`, `link`, `mode` and `attributes`.
+
+- `mtime` counts seconds since 1970. `mtime_origin` (`Some` exactly when `mtime` is) says which clock it came from.
+  `MtimeOrigin::Utc` is a true Unix time: a ZIP extended-timestamp (0x5455) or NTFS (0x000a) extra (the later of the
+  two in the central extra field wins over the DOS fields), RAR 5.0, tar and the gzip `MTIME` field (0 means none).
+  `MtimeOrigin::LocalWallClock` is MS-DOS date and time fields counted as if they were UTC: a ZIP without a time
+  extra, and every RAR 4.x time. RAR 4.x's extended-time record only adds a second and a fraction to the local DOS
+  time, as UnRAR reads it. 7-Zip prints a local wall-clock time as stored and converts a UTC time to local time.
+- `mode` holds Unix mode bits: ZIP host 3, RAR 4.x host Unix, RAR 5.0 host Unix and tar.
+- `attributes` holds raw Windows attribute bits (`FILE_ATTRIBUTE_*`, the source of 7-Zip's `D R H S A` column):
+  the low 16 bits of a ZIP entry's external attributes for hosts 0 (FAT), 6 (HPFS), 10 and 11 (NTFS) and 14 (VFAT),
+  and the file attributes of a RAR 4.x MS-DOS, OS/2 or Win32 member or a RAR 5.0 Windows member. It is `None`
+  for Unix and other hosts, and for tar and gzip.
+
+`RarSession::volumes()` yields a `RarVolumeMetadata` per volume. `flags()` is normalized to the RAR 5.0 `MHFL_*`
+bits, keeping only the volume and solid bits for RAR 4.x. `rar4_flags()` returns the RAR 4.x main header's raw
+`MHD_*` flags, and `new_numbering()` says whether the set is named `NAME.partN.rar` (always for RAR 5.0, and
+`MHD_NEWNUMBERING`, 0x0010, for RAR 4.x) rather than `NAME.rar`, `NAME.r00`, ..., as UnRAR's `VolNameToFirstName`
+needs to know.
+
 ## Builds tuned for a processor
 
 A plain `cargo build --release` runs on any x86-64 or Apple silicon processor, and picks AVX2 at run time where

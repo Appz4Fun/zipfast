@@ -20,7 +20,7 @@
 use super::framing::{HeaderParser, ParserStep, PhysicalFrame};
 use super::physical::{PhysicalMember, PhysicalPart, continuation_issue};
 use super::reader::Block;
-use super::{FileHeader, FileWire, MemberCrypt, RarFormat};
+use super::{FileHeader, FileWire, MHD_NEWNUMBERING, MemberCrypt, RarFormat};
 use crate::map::{
     CipherParams, Got, HeaderDamage, MapChecks, MapEnd, MapError, MapFormat, MapInput, MapMember, MapMethod,
     MapOptions, MapPiece, MemberMap, Opened, OutputMapping, VolumeEnd, VolumeMap, VolumeMember, Walked, read,
@@ -61,8 +61,7 @@ struct Described {
     unix_mode: Option<u32>,
 }
 
-/// RAR4 main header flags (`MHD_*`).
-const MHD_NEWNUMBERING: u16 = 0x0010;
+/// RAR4 main header flags (`MHD_*`); `MHD_NEWNUMBERING` is shared from the parent module.
 const MHD_FIRSTVOLUME: u16 = 0x0100;
 
 pub(crate) struct RarWalker {
