@@ -22,7 +22,7 @@ mod rar4;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
 use super::{
-    output::{Capacity, OutputContext, Publication, Stage, Target},
+    output::{Capacity, DirectoryVerdict, OutputContext, Publication, Stage, Target},
     source::{SourceDriver, SourceStep},
     *,
 };
@@ -158,6 +158,10 @@ pub enum MemberOutcome {
     /// before it; only such a directory gets the entry's metadata.
     Directory {
         created: bool,
+        /// Set when the session lacks whole-set authority to create directories (an undeclared, Opaque source):
+        /// nothing was created, and this is the sanitized target path, relative to the destination root and
+        /// contained in it, for the caller to create itself. `None` otherwise.
+        deferred: Option<std::path::PathBuf>,
     },
     Verified(Verification),
     /// Publication succeeded; a subsequent failure stopped the session. An artifact,
@@ -1357,23 +1361,25 @@ impl ProgressiveSession {
         }
         if matches!(self.disposition, Disposition::Directory) {
             let header = &self.model.members.last().expect("member").header;
-            let created = if self.options.extract.mode == crate::extract::Mode::Test || self.options.extract.flatten {
-                false
-            } else {
-                match self.output.as_mut().expect("output").directory(
-                    self.member.expect("member"),
-                    header,
-                    &mut self.driver,
-                ) {
-                    Ok(created) => created,
-                    Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
-                    Err(e) => return Err(e),
-                }
-            };
+            let (created, deferred) =
+                if self.options.extract.mode == crate::extract::Mode::Test || self.options.extract.flatten {
+                    (false, None)
+                } else {
+                    match self.output.as_mut().expect("output").directory(
+                        self.member.expect("member"),
+                        header,
+                        &mut self.driver,
+                    ) {
+                        Ok(DirectoryVerdict::Done { created }) => (created, None),
+                        Ok(DirectoryVerdict::Deferred(path)) => (false, Some(path)),
+                        Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
+                        Err(e) => return Err(e),
+                    }
+                };
             self.phase = Phase::Header;
             return Ok(ProgressiveEvent::MemberFinished {
                 member: self.member.take().unwrap(),
-                outcome: MemberOutcome::Directory { created },
+                outcome: MemberOutcome::Directory { created, deferred },
             });
         }
         if self.finalizer.is_none() {

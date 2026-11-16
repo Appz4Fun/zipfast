@@ -1622,9 +1622,13 @@ fn task4b_solid_missing_check_is_not_failed_history_and_reset_recovers_failure()
     assert!(matches!(&outcomes[3], MemberOutcome::Tested(v) if v.crc32_verdict() == CheckVerdict::Passed));
 }
 #[test]
-fn task4b_opaque_directory_is_typed_and_regular_successor_survives() {
+fn task4b_opaque_directory_is_deferred_and_regular_successor_survives() {
     let tmp = tempfile::tempdir().unwrap();
-    let bytes = archive(&[FileSpec { dir: true, ..FileSpec::new("directory", b"") }, FileSpec::new("one", b"payload")]);
+    let bytes = archive(&[
+        FileSpec { dir: true, ..FileSpec::new("directory", b"") },
+        FileSpec { dir: true, ..FileSpec::new("a/b", b"") },
+        FileSpec::new("one", b"payload"),
+    ]);
     let (mut s, _) = session(vec![bytes], options(tmp.path()), false, false, 4);
     let mut outcomes = Vec::new();
     loop {
@@ -1635,16 +1639,16 @@ fn task4b_opaque_directory_is_typed_and_regular_successor_survives() {
             Poll::Ready(Err(e)) => panic!("{e:?}"),
         }
     }
-    assert!(matches!(
-        outcomes[0],
-        MemberOutcome::Stopped {
-            failure: ProgressiveFailure { kind: FailureKind::PublicationAuthorityRequired, .. },
-            artifact: None,
-            ..
-        }
-    ));
-    assert!(matches!(outcomes[1], MemberOutcome::Provisional(_)));
+    // Without whole-set authority the session creates nothing and hands back the sanitized relative path.
+    assert!(
+        matches!(&outcomes[0], MemberOutcome::Directory { created: false, deferred: Some(p) } if p == std::path::Path::new("directory"))
+    );
+    assert!(
+        matches!(&outcomes[1], MemberOutcome::Directory { created: false, deferred: Some(p) } if p == &std::path::Path::new("a").join("b"))
+    );
+    assert!(matches!(outcomes[2], MemberOutcome::Provisional(_)));
     assert!(!tmp.path().join("directory").exists());
+    assert!(!tmp.path().join("a").exists());
 }
 #[cfg(unix)]
 #[test]
@@ -1685,7 +1689,7 @@ fn task4b_directory_replacement_cancellation_and_duplicate_metadata() {
         .unwrap();
         loop {
             if let Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
-                outcome: MemberOutcome::Directory { created: true },
+                outcome: MemberOutcome::Directory { created: true, .. },
                 ..
             }))) = poll(&mut s)
             {
@@ -1727,7 +1731,7 @@ fn task4b_directory_flatten_test_and_obstruction_policies() {
             o.extract.flatten = true;
         }
         let outcomes = policy_run(archive(&[FileSpec { dir: true, ..FileSpec::new("dir", b"") }]), o);
-        assert!(matches!(outcomes[0], MemberOutcome::Directory { created: false }));
+        assert!(matches!(outcomes[0], MemberOutcome::Directory { created: false, .. }));
         assert!(!tmp.path().join("dir").exists());
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1936,7 +1940,7 @@ fn task4b_late_directory_and_zero_file_mode_match_complete_metadata() {
     ]);
     let outcomes = policy_run(bytes, options(tmp.path()));
     assert_eq!(outcomes.len(), 3);
-    assert!(matches!(outcomes[2], MemberOutcome::Directory { created: false }));
+    assert!(matches!(outcomes[2], MemberOutcome::Directory { created: false, .. }));
     assert_eq!(std::fs::metadata(tmp.path().join("zero")).unwrap().permissions().mode() & 0o7777, 0);
     let directory = std::fs::metadata(tmp.path().join("late")).unwrap();
     assert_eq!(directory.permissions().mode() & 0o777, 0o510);

@@ -188,6 +188,15 @@ impl Policy<'_> {
     }
 }
 
+/// What the directory policy did with a directory entry.
+pub(crate) enum DirectoryVerdict {
+    Done {
+        created: bool,
+    },
+    /// The session lacks authority to create it; nothing was created. The path is relative to the root.
+    Deferred(PathBuf),
+}
+
 impl OutputContext {
     pub(crate) fn prepare_target(
         &self,
@@ -232,11 +241,14 @@ impl OutputContext {
         member: MemberId,
         header: &crate::rar5::FileHeader,
         source: &mut crate::progressive::source::SourceDriver,
-    ) -> ProgressiveResult<bool> {
+    ) -> ProgressiveResult<DirectoryVerdict> {
         let policy = Policy { root: &self.root, usage: &self.usage };
         let mut target = policy.target_kind(member, &header.name, !header.is_unix(), true)?;
         if !policy.check_target(&target, source)? {
-            return Err(ProgressiveFailure::new(FailureKind::PublicationAuthorityRequired));
+            // Without whole-set authority nothing is created: the sanitized, root-contained path is handed back
+            // so the caller can create the directory itself.
+            let relative = target.path.strip_prefix(&self.root.path).map_err(|_| invalid())?.to_path_buf();
+            return Ok(DirectoryVerdict::Deferred(relative));
         }
         // Geometric growth bounds total relocation work; reserve before mutation.
         self.usage.charge(Resource::MetadataBytes, target.path.as_os_str().len() as u64)?;
@@ -279,7 +291,7 @@ impl OutputContext {
             depth,
             order: self.directories.len(),
         });
-        Ok(created)
+        Ok(DirectoryVerdict::Done { created })
     }
     pub(crate) fn skip_directories(&mut self) {
         self.directories.clear();

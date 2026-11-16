@@ -85,12 +85,14 @@ complete extractor's skip policy. Skip avoids temporary files and artifact
 capacity parking; Extract construction still requires nonzero output/artifact
 capacity. A changed target, protected input alias or symlink fails closed.
 
-Basic zero-payload, nonsplit directories produce `Directory { created }`.
+Basic zero-payload, nonsplit directories produce `Directory { created, deferred }`.
 `created: false` includes existing directories and Test/flatten entries; it
 claims neither checksum verification nor successful metadata restoration.
 Directory mutation requires whole-source-set authority. An otherwise valid
-opaque-provider directory reports a member-local `Stopped` with
-`PublicationAuthorityRequired`; independent successors can continue. Existing
+opaque-provider directory creates nothing and reports
+`Directory { created: false, deferred: Some(path) }`, where `path` is the
+sanitized target relative to (and contained in) the destination root, for the
+caller to create itself; the session goes on with the next member. Existing
 regular files and symlinks are never removed to make directories.
 
 Regular-file metadata is applied best effort through the original staging

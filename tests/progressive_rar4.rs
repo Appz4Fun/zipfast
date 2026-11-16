@@ -930,7 +930,7 @@ fn r1_unsupported_crypto_is_refused_before_directory_and_skip_dispositions() {
                     let outcomes = outcomes
                         .iter()
                         .map(|o| match o {
-                            MemberOutcome::Directory { created } => format!("Directory(created={created})"),
+                            MemberOutcome::Directory { created, .. } => format!("Directory(created={created})"),
                             MemberOutcome::Skipped(_) => "Skipped".to_owned(),
                             _ => "other outcome".to_owned(),
                         })
@@ -957,7 +957,7 @@ fn r1_plain_directories_and_admitted_regular_aes_keep_existing_dispositions() {
         let (outcomes, failure) = r1_observe(r1_metadata_record(true, false, false, 29), opts);
         assert!(failure.is_none(), "{failure:?}");
         let extract = mode == zipfast::extract::Mode::Extract;
-        assert!(matches!(outcomes.as_slice(), [MemberOutcome::Directory { created }] if *created == extract));
+        assert!(matches!(outcomes.as_slice(), [MemberOutcome::Directory { created, .. }] if *created == extract));
         assert_eq!(dir.path().join("entry").is_dir(), extract);
         let mut opts = options(dir.path());
         opts.extract.mode = mode;

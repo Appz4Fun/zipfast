@@ -250,7 +250,7 @@ fn run(session: &mut ProgressiveSession, seen: &mut Seen, stop: Option<usize>) -
                         seen.refused_at_once &= previous == Some(member);
                         seen.refused.push((name, reason));
                     }
-                    MemberOutcome::Directory { created } => seen.directories.push((name, created)),
+                    MemberOutcome::Directory { created, .. } => seen.directories.push((name, created)),
                     MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. } => seen.complete.push(name),
                     _ => panic!("unexpected outcome for {name}"),
                 }
