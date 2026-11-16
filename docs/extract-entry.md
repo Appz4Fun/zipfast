@@ -35,6 +35,10 @@ The format comes from the file's content, never its name:
 One `Options` for all of them: `mode` (Test or Extract), `dest`, `overwrite`, `flatten`, `threads`,
 `protected_paths` and `select` apply to every format.
 
+`select`'s start hook (`MemberFilter::on_start`) is asked about each member about to be written in every format;
+a member it declines is not written and is reported as `MemberSkipped`. On the checked ZIP route a rename mode
+picks its name only when the member is published, so there the hook sees the requested path.
+
 `Overwrite::Skip`, `Always`, `RenameNew` and `RenameExisting` behave the same way in every format; see the README's
 "renaming on conflict".
 
@@ -47,11 +51,13 @@ The `Cancellation` reaches every format's inner loop:
   compressed stream, every read of packed bytes and of decoded bytes, so a decoder that loops on its input without
   producing output still stops.
 - RAR: before each member and with every chunk of a member's decoded data. A big stored RAR 5.0 part copied on
-  several threads is checked once its copy finishes, and dropped unpublished.
+  several threads is checked before every piece. Small members decoded on the file workers are checked before each
+  is created, with every decoded chunk and just before it is published; files still queued are dropped unwritten
+  and unreported.
 - 7z: between members, before every packed read and every 1 MiB between coders.
 
 A canceled run returns an error whose `operation()` is `ReadFault::Cancelled`. Members published before it stay;
-the member in progress is not published.
+the member in progress is not published. Only a `Cancellation` reads as `Cancelled`: other aborted I/O stays the error it is.
 
 ## Events
 

@@ -279,6 +279,7 @@ impl Run<'_> {
             Checked::Declined => {
                 self.report.line(&format!("{name}: declined, skipped"));
                 self.summary.skipped += 1;
+                self.report.member(LegacyMember::Skipped { ordinal: self.current, name });
                 Ok(None)
             }
             Checked::Blocked(why) => {

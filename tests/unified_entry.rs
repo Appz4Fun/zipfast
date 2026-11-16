@@ -589,3 +589,71 @@ fn a_rar_member_is_canceled_mid_member() {
         assert!(!out.join("big.bin").exists(), "{threads:?}: a canceled member was published");
     }
 }
+
+#[test]
+fn a_threaded_rar_run_publishes_nothing_once_canceled() {
+    // Many small members go to the file workers in groups; canceling at the first success must stop them.
+    let datas: Vec<(String, Vec<u8>)> =
+        (0..3000).map(|i| (format!("f{i:04}.txt"), format!("member {i} ").repeat(50).into_bytes())).collect();
+    let members: Vec<(&str, &[u8])> = datas.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.rar");
+    fs::write(&path, rar(&members)).unwrap();
+    let threads = 4;
+    let out = dir.path().join("out");
+    let cancel = Cancellation::default();
+    let opts = Options { threads: Some(threads), ..options(&out, Overwrite::Skip) };
+    // The workers run ahead of the reports, so some files are already out when the first success arrives.
+    let mut at_cancel = None;
+    let (result, events) = run(&path, &opts, &cancel.clone(), |event| {
+        if matches!(event, RunEvent::MemberSucceeded { .. }) && at_cancel.is_none() {
+            cancel.cancel();
+            at_cancel = Some(fs::read_dir(&out).unwrap().count());
+        }
+    });
+    let at_cancel = at_cancel.expect("a member succeeded");
+    assert!(cancelled(&result), "{result:?}");
+    let succeeded = events.members.iter().filter(|(k, _, _)| *k == "ok").count();
+    assert_eq!(succeeded, 1, "members were reported after the cancellation: {:?}", events.members.len());
+    // No member still queued is reported as failed.
+    assert!(events.members.iter().all(|(k, _, _)| *k != "failed"), "{:?}", events.members);
+    let on_disk = || fs::read_dir(&out).unwrap().count();
+    let published = on_disk();
+    // Past those, at most the file each worker was publishing as the token was set.
+    assert!(published <= at_cancel + threads, "{at_cancel} files out at the cancellation, {published} after it");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(on_disk(), published, "files kept appearing after the run returned");
+}
+
+#[test]
+fn the_start_hook_reaches_every_format() {
+    for family in FAMILIES {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, names) = archive(dir.path(), family, b"one", b"two");
+        let out = dir.path().join("out");
+        let declined = out.join(names[0]);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let filter = {
+            let (asked, declined) = (asked.clone(), declined.clone());
+            extract::MemberFilter::all().on_start(move |start| {
+                asked.lock().unwrap().push(start.path.to_path_buf());
+                if start.path == declined { extract::StartDecision::Skip } else { extract::StartDecision::Write }
+            })
+        };
+        let opts = Options { select: Some(filter), ..options(&out, Overwrite::Skip) };
+        let (result, events) = run(&path, &opts, &Cancellation::default(), |_| {});
+        let report = result.unwrap_or_else(|e| panic!("{family:?}: {e:?}"));
+        assert!(report.skipped() >= 1, "{family:?}");
+        assert!(!declined.exists(), "{family:?}: a declined member was written");
+        assert!(asked.lock().unwrap().contains(&declined), "{family:?}: the hook was not asked");
+        let ordinal = ordinal_of(&path, names[0]);
+        assert!(
+            events.members.contains(&("skipped", ordinal, names[0].to_owned())),
+            "{family:?}: {:?}",
+            events.members
+        );
+        if names.len() > 1 {
+            assert!(out.join(names[1]).exists(), "{family:?}");
+        }
+    }
+}

@@ -963,6 +963,7 @@ fn checked_place(
         Checked::Declined => {
             report.line(&format!("{name}: declined, skipped"));
             summary.skipped += 1;
+            report.member(LegacyMember::Skipped { ordinal, name });
             Ok(None)
         }
         Checked::Blocked(why) => {

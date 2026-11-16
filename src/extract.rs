@@ -254,8 +254,9 @@ impl MemberFilter {
     /// so a caller can count them or limit them in order.
     ///
     /// It runs on extraction (not [`Mode::Test`]) of tar, lone compressed files, the legacy ZIP route, 7z and RAR
-    /// whole-archive runs. Folders, members whose target is skipped or blocked, and the checked ZIP route
-    /// ([`run_with_zip_policy`](crate::extract::run_with_zip_policy)) don't call it.
+    /// whole-archive runs, and the checked ZIP route of [`run_with_policy`](crate::extract::run_with_policy). On
+    /// the checked ZIP route a rename mode picks its name only when the member is published, so there the hook sees
+    /// the requested path. Folders and members whose target is skipped or blocked don't call it.
     pub fn on_start(mut self, hook: impl Fn(&MemberStart<'_>) -> StartDecision + Send + Sync + 'static) -> Self {
         self.start = Some(Arc::new(hook));
         self
@@ -476,12 +477,29 @@ pub(crate) enum LegacyMember<'a> {
 
 /// The error a run stopped with when its [`Cancellation`] was triggered.
 pub(crate) fn canceled_error() -> Error {
-    Error::Io(io::Error::new(io::ErrorKind::ConnectionAborted, "operation canceled"))
+    Error::Io(canceled_io())
+}
+
+/// The marker a [`Cancellation`] puts in the I/O errors it causes, so they are told from any other aborted I/O.
+#[derive(Debug)]
+struct Canceled;
+
+impl std::fmt::Display for Canceled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("operation canceled")
+    }
+}
+
+impl std::error::Error for Canceled {}
+
+/// The I/O error of a run stopping for its [`Cancellation`].
+pub(crate) fn canceled_io() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, Canceled)
 }
 
 /// Whether `error` is a run stopping for its [`Cancellation`] (see [`Cancellation::check_io`]).
 fn is_cancellation(error: &Error) -> bool {
-    matches!(error, Error::Io(e) if e.kind() == io::ErrorKind::ConnectionAborted)
+    matches!(error, Error::Io(e) if e.get_ref().is_some_and(|inner| inner.is::<Canceled>()))
 }
 
 impl<F: FnMut(&str)> LegacyReport for F {
@@ -1052,7 +1070,7 @@ impl Cancellation {
 
     pub(crate) fn check_io(&self) -> std::io::Result<()> {
         if self.is_canceled() {
-            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "operation canceled"));
+            return Err(canceled_io());
         }
         Ok(())
     }
@@ -2595,6 +2613,7 @@ fn apply_done(reports: &mut Reports<'_>, mode: Mode, done: Done) -> RunResult<()
         }
         Outcome::Failed { reason, legacy } => reports.failed(ctx, Arc::from(reason), legacy),
         Outcome::Fatal(fault) => Err(reports.terminal(ctx, fault)),
+        Outcome::Canceled => Err(RarFault::new(RarFailure::Canceled, canceled_error()).into()),
     }
 }
 
@@ -2702,7 +2721,12 @@ fn rar_run_shared_open<'a>(
     let mut run = Run::new(&opts, password, reports, threads);
     run.cancel = cancel.cloned();
     let walked = walk_rar(first_volume, &mut run).and_then(|()| run.drain());
-    if walked.is_err() {
+    let canceled = cancel.is_some_and(Cancellation::is_canceled);
+    if canceled {
+        // Nothing more is published or reported: the workers drop what is still queued unwritten.
+        run.batch = None;
+    }
+    if walked.is_err() && !canceled {
         // Retain the primary failure. Typed runs report each available genuine completion during cleanup.
         loop {
             match run.drain() {
@@ -2850,7 +2874,8 @@ impl Run<'_, '_, '_> {
 
     /// Whether `h` goes to the workers: it can, and at least one of them started.
     fn goes_to_batch(&mut self, vol: &Volume, h: &FileHeader) -> bool {
-        self.batchable(vol, h) && self.batch.get_or_insert_with(|| Batch::new(self.threads)).usable()
+        self.batchable(vol, h)
+            && self.batch.get_or_insert_with(|| Batch::new(self.threads, self.cancel.clone())).usable()
     }
 
     /// Reports a failure after every file before it, so reports keep archive order.
@@ -2938,7 +2963,7 @@ impl Run<'_, '_, '_> {
                 meta: Meta::from(h),
             },
         };
-        let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads));
+        let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads, self.cancel.clone()));
         batch.submit(job, &mut |done| apply_done(self.reports, self.opts.mode, done))
     }
 
@@ -3427,7 +3452,7 @@ impl Run<'_, '_, '_> {
         let size = h.unpacked_size;
         if p.place.is_some()
             && size <= GATHER_MAX
-            && self.batch.get_or_insert_with(|| Batch::new(self.threads)).usable()
+            && self.batch.get_or_insert_with(|| Batch::new(self.threads, self.cancel.clone())).usable()
         {
             p.mem = Some(Vec::with_capacity(size as usize));
             // checked on the worker
@@ -3825,6 +3850,7 @@ impl Run<'_, '_, '_> {
             file.as_ref().map(|f| (&f.file, f.target())),
             p.bytes,
             self.threads,
+            self.cancel.as_ref(),
         );
         let part = match part {
             Ok(part) => part,
@@ -4081,6 +4107,19 @@ pub(crate) fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_cancellation_reads_as_one() {
+        assert!(super::is_cancellation(&super::canceled_error()));
+        let mut cancel = super::Cancellation::default();
+        cancel.cancel();
+        assert!(super::is_cancellation(&cancel.check_io().unwrap_err().into()));
+        cancel = super::Cancellation::default();
+        assert!(cancel.check_io().is_ok());
+        // Some other aborted I/O, such as a peer dropping a connection, is not a cancellation.
+        let aborted = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "operation canceled");
+        assert!(!super::is_cancellation(&crate::Error::Io(aborted)));
+    }
+
     use super::*;
     #[cfg(unix)]
     #[test]
