@@ -42,6 +42,8 @@ const ZIPCRYPTO_HEADER: u64 = 12;
 pub enum UnsupportedRead {
     /// Compressed data: output offsets do not map to packed offsets. Restart points are future work.
     Compressed { id: u16 },
+    /// 7z data coded by its folder's coder chain ([`MapMethod::Coders`]).
+    Coders,
     /// The member's unpacked size is not recorded, so where its output (and an encrypted stream's padding) ends is
     /// unknown.
     UnknownSize,
@@ -195,8 +197,12 @@ struct Plan {
 
 impl Plan {
     fn new(member: &MapMember, out_offset: u64) -> Result<Self, ExtractFromError> {
-        if let MapMethod::Compressed { id } = member.method {
-            return Err(ExtractFromError::Unsupported(UnsupportedRead::Compressed { id }));
+        match member.method {
+            MapMethod::Compressed { id } => {
+                return Err(ExtractFromError::Unsupported(UnsupportedRead::Compressed { id }));
+            }
+            MapMethod::Coders => return Err(ExtractFromError::Unsupported(UnsupportedRead::Coders)),
+            MapMethod::Stored => {}
         }
         let mapping = member.mapping;
         if mapping == OutputMapping::None {
@@ -278,7 +284,14 @@ fn validate(member: &MapMember, mapping: OutputMapping, size: u64) -> Result<(),
     let cipher_fits = matches!(
         (mapping, &member.cipher),
         (OutputMapping::Direct, None)
-            | (OutputMapping::CbcBlocks, Some(CipherParams::Rar5 { iv: Some(_), .. } | CipherParams::Rar4 { .. }))
+            | (
+                OutputMapping::CbcBlocks,
+                Some(
+                    CipherParams::Rar5 { iv: Some(_), .. }
+                        | CipherParams::Rar4 { .. }
+                        | CipherParams::SevenZipAes { .. }
+                )
+            )
             | (OutputMapping::Counter { .. }, Some(CipherParams::WinZipAes { .. }))
             | (OutputMapping::Sequential { .. }, Some(CipherParams::ZipCrypto { .. }))
     );
@@ -557,6 +570,30 @@ impl Core {
                 .map_err(ExtractFromError::from_failure)?;
                 self.cbc(crate::crypto::AesKey::new(&key).expect("AES-128 key"), iv)
             }
+            (Some(CipherParams::SevenZipAes { num_cycles_power, salt, iv }), OutputMapping::CbcBlocks) => {
+                let password = self.password()?;
+                let fail = ExtractFromError::from_failure;
+                self.usage.check(Resource::PasswordUtf8Bytes, password.len() as u64).map_err(fail)?;
+                self.usage
+                    .check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2)
+                    .map_err(fail)?;
+                if *num_cycles_power != 0x3F {
+                    self.usage.check(Resource::KdfExponent, u64::from(*num_cycles_power)).map_err(fail)?;
+                }
+                let mut meter = crate::rar5::member::KdfMeter::new(&self.usage, &self.options.control);
+                let key = match crate::crypto::derive_7z_key_controlled(password, salt, *num_cycles_power, &mut meter) {
+                    None => return Err(ExtractFromError::Unsupported(UnsupportedRead::UnmappedCipher)),
+                    Some(Ok(key)) => key,
+                    Some(Err(crate::crypto::KdfControlError::Canceled)) => {
+                        return Err(ExtractFromError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
+                    }
+                    Some(Err(crate::crypto::KdfControlError::Limit { resource, limit, attempted })) => {
+                        return Err(ExtractFromError::Limit { resource, limit, attempted });
+                    }
+                };
+                let iv = *iv;
+                self.cbc(crate::crypto::AesKey::new(&key).expect("AES-256 key"), iv)
+            }
             (Some(CipherParams::WinZipAes { strength, salt, verifier, .. }), OutputMapping::Counter { skip }) => {
                 if !(1..=3).contains(strength) {
                     return Err(ExtractFromError::Malformed("WinZip AES strength"));
@@ -621,12 +658,7 @@ impl Core {
             return Ok(name);
         }
         while self.names.len() <= index as usize {
-            let last = self.names.last().expect("first name");
-            let next = crate::volume::next_volume_os(last).unwrap_or_else(|| {
-                let mut name = last.clone();
-                name.push(".next");
-                name
-            });
+            let next = super::next_volume_name(self.names.last().expect("first name"));
             self.usage.charge(Resource::MetadataBytes, next.len() as u64).map_err(ExtractFromError::from_failure)?;
             self.names.push(next);
         }

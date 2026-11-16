@@ -226,6 +226,7 @@ impl ZipWalker {
                             end: MapEnd::Complete,
                             volumes: 1,
                             members: std::mem::take(&mut self.members),
+                            folders: Vec::new(),
                         }));
                     };
                     let local_at = entry.local_at;
@@ -392,5 +393,6 @@ pub(super) fn zip_member(
         unix_mode: entry.unix_mode(),
         complete,
         pieces,
+        folder: None,
     })
 }

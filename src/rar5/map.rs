@@ -174,6 +174,7 @@ impl RarWalker {
                 _ => self.volume + 1,
             },
             members: std::mem::take(&mut self.members),
+            folders: Vec::new(),
         })
     }
 
@@ -781,6 +782,7 @@ impl RarWalker {
                 checks,
                 final_part: part.final_part,
             }],
+            folder: None,
         };
         self.members.try_reserve(1).map_err(|_| self.allocation())?;
         self.members.push(member);

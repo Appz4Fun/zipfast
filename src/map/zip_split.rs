@@ -735,6 +735,7 @@ impl ZipSplitWalker {
             end,
             volumes: self.last.map_or(0, |last| last + 1),
             members: std::mem::take(&mut self.members),
+            folders: Vec::new(),
         }
     }
 
