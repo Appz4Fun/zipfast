@@ -35,7 +35,9 @@ use crate::volume::next_volume;
 use super::physical::{PhysicalMember as Member, PhysicalModel, PhysicalPart as Part, continuation_issue};
 use super::reader::{Block, Volume, read_failure};
 use super::source::SourceStamp;
-use super::{FileHeader, FileWire, MHFL_VOLNUMBER, MainHeader, MemberCrypt, Redirection};
+use super::{
+    FileHeader, FileWire, MHFL_LOCK, MHFL_PROTECT, MHFL_VOLNUMBER, MainHeader, MemberCrypt, RarTime, Redirection,
+};
 
 mod selection;
 #[cfg(unix)]
@@ -72,10 +74,19 @@ impl Default for RarCatalogueLimits {
 }
 
 /// Options for opening a catalogue.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RarSessionOptions {
     pub limits: RarCatalogueLimits,
     pub cancel: Cancellation,
+    /// Follow the end header's "more volumes" mark to later volumes (the default). With false the session holds
+    /// only the named volume, as UnRAR's `l` does without `-v`: a member split past it is catalogued as incomplete.
+    pub follow_volumes: bool,
+}
+
+impl Default for RarSessionOptions {
+    fn default() -> Self {
+        Self { limits: RarCatalogueLimits::default(), cancel: Cancellation::default(), follow_volumes: true }
+    }
 }
 
 /// Work and retained capacity used when opening the catalogue.
@@ -118,6 +129,16 @@ pub struct RarVolumeMetadata {
     format: super::RarFormat,
     main: MainHeader,
     encrypted_headers: bool,
+    sfx_size: u64,
+    end: Option<VolumeEnd>,
+    headers: std::ops::Range<usize>,
+    comment: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VolumeEnd {
+    more_volumes: bool,
+    volume_number: Option<u64>,
 }
 
 impl RarVolumeMetadata {
@@ -153,6 +174,282 @@ impl RarVolumeMetadata {
 
     pub fn encrypted_headers(&self) -> bool {
         self.encrypted_headers
+    }
+
+    /// Whether the main header marks the archive solid (`MHD_SOLID`, `MHFL_SOLID`).
+    pub fn is_solid(&self) -> bool {
+        self.main.is_solid()
+    }
+
+    /// Whether the main header marks this file as a volume (`MHD_VOLUME`, `MHFL_VOLUME`).
+    pub fn is_volume(&self) -> bool {
+        self.main.is_volume()
+    }
+
+    /// Whether the archive is locked against changes (`MHD_LOCK` 0x0004, `MHFL_LOCK` 0x0010).
+    pub fn locked(&self) -> bool {
+        match self.main.rar4_flags {
+            Some(flags) => flags & 0x0004 != 0,
+            None => self.main.flags & MHFL_LOCK != 0,
+        }
+    }
+
+    /// Whether the main header announces a recovery record (`MHD_PROTECT` 0x0040, `MHFL_PROTECT` 0x0008). UnRAR
+    /// prints "recovery record" on its details line from this flag.
+    pub fn protected(&self) -> bool {
+        match self.main.rar4_flags {
+            Some(flags) => flags & 0x0040 != 0,
+            None => self.main.flags & MHFL_PROTECT != 0,
+        }
+    }
+
+    /// Whether this is the first volume: RAR 4.x `MHD_FIRSTVOLUME` (0x0100, written by RAR 3.0 and later), or a RAR
+    /// 5.0 volume with no volume number. Always true for a file that is not a volume.
+    pub fn first_volume(&self) -> bool {
+        if !self.is_volume() {
+            return true;
+        }
+        match self.main.rar4_flags {
+            Some(flags) => flags & 0x0100 != 0,
+            None => self.main.flags & MHFL_VOLNUMBER == 0,
+        }
+    }
+
+    /// Bytes before the archive signature, such as a self-extracting module.
+    pub fn sfx_size(&self) -> u64 {
+        self.sfx_size
+    }
+
+    /// The zero-based volume number a RAR 5.0 volume declares in its main header; 0 for a first volume, which stores
+    /// none. UnRAR's details line prints it plus one ("RAR 5, volume N"). None for RAR 4.x and for a RAR 5.0 file
+    /// that is not a volume.
+    pub fn rar5_volume_number(&self) -> Option<u64> {
+        (self.format == super::RarFormat::Rar5 && self.is_volume()).then(|| self.declared_number().unwrap_or(0))
+    }
+
+    /// The zero-based volume number in a RAR 4.x end-of-archive header (`EARC_VOLNUMBER`, written when
+    /// [`Self::rar4_store_vol_number`] holds). UnRAR's listing footer prints it plus one ("volume N").
+    pub fn rar4_end_volume_number(&self) -> Option<u64> {
+        (self.format == super::RarFormat::Rar4).then(|| self.end.and_then(|end| end.volume_number)).flatten()
+    }
+
+    /// Whether the RAR 4.x end-of-archive header stores a volume number (`EARC_VOLNUMBER`, UnRAR's
+    /// `StoreVolNumber`). False for RAR 5.0 and when the volume has no end header.
+    pub fn rar4_store_vol_number(&self) -> bool {
+        self.rar4_end_volume_number().is_some()
+    }
+
+    /// Whether the volume has an end-of-archive header. A volume cut short before it has none.
+    pub fn has_end_header(&self) -> bool {
+        self.end.is_some()
+    }
+
+    /// Whether the end-of-archive header marks a later volume. False without an end header.
+    pub fn more_volumes(&self) -> bool {
+        self.end.is_some_and(|end| end.more_volumes)
+    }
+
+    /// The original archive name a RAR 5.0 main header stores (`-ams`), as raw bytes (UTF-8 in practice).
+    pub fn original_name(&self) -> Option<&[u8]> {
+        self.main.original_name.as_deref()
+    }
+
+    /// The original archive time a RAR 5.0 main header stores (`-ams`).
+    pub fn original_time(&self) -> Option<RarTime> {
+        self.main.original_time
+    }
+
+    /// Positions of this volume's headers in [`RarSession::headers`].
+    pub fn header_range(&self) -> std::ops::Range<usize> {
+        self.headers.clone()
+    }
+
+    /// Position in [`RarSession::headers`] of the archive comment header (the service header named `CMT`) in this
+    /// volume, if any. [`RarSession::comment`] reads its text.
+    pub fn comment_header(&self) -> Option<usize> {
+        self.comment
+    }
+}
+
+struct HeaderRecord {
+    volume: usize,
+    header: FileHeader,
+    raw_name: Option<Arc<Vec<u8>>>,
+}
+
+/// One file or service header as stored in a volume, without merging the parts of a split member. Listing every
+/// header of [`RarSession::headers`] in order gives UnRAR's `lt` and `v` output, orphan continuations included.
+///
+/// UnRAR's totals add [`Self::packed_size`] for every file header, but [`Self::unpacked_size`] and the file count
+/// only for headers where [`Self::split_before`] is false.
+#[derive(Clone, Copy)]
+pub struct RarHeader<'a>(&'a HeaderRecord);
+
+impl<'a> RarHeader<'a> {
+    /// Zero-based volume position in the session.
+    pub fn volume(&self) -> usize {
+        self.0.volume
+    }
+
+    pub fn format(&self) -> super::RarFormat {
+        self.0.header.format
+    }
+
+    /// Whether this is a service header (RAR 5.0 type 3, RAR 4.x `NEWSUB_HEAD`) rather than a file header.
+    pub fn is_service(&self) -> bool {
+        self.0.header.service
+    }
+
+    /// For a service header, its type name: `CMT`, `QO`, `RR`, `ACL`, `STM` or another.
+    pub fn service_name(&self) -> Option<&'a str> {
+        self.is_service().then_some(self.0.header.name.as_str())
+    }
+
+    /// A service header's SubData as stored, such as the stream name of an `STM` header (UnRAR's "Target"; UTF-8
+    /// in RAR 5.0, UTF-16LE in RAR 4.x). Empty for file headers.
+    pub fn service_data(&self) -> &'a [u8] {
+        &self.0.header.sub_data
+    }
+
+    /// The part continues a member from an earlier volume.
+    pub fn split_before(&self) -> bool {
+        self.0.header.split_before()
+    }
+
+    /// The member continues in a later volume.
+    pub fn split_after(&self) -> bool {
+        self.0.header.split_after()
+    }
+
+    /// Stored name bytes, including RAR 4.x legacy and Unicode encoding.
+    pub fn raw_name(&self) -> &'a [u8] {
+        match &self.0.raw_name {
+            Some(name) => name,
+            None => self.0.header.name.as_bytes(),
+        }
+    }
+
+    /// Name decoded by the header parser. RAR 4.x legacy names that are not UTF-8 decode to an empty string; use
+    /// [`Self::raw_name`].
+    pub fn name(&self) -> &'a str {
+        &self.0.header.name
+    }
+
+    /// The name UnRAR on Unix gives a RAR 5.0 header, as raw `wchar_t` units; see [`RarMember::unrar_name`].
+    pub fn unrar_name(&self) -> Option<Vec<u32>> {
+        (self.format() == super::RarFormat::Rar5).then(|| super::unrar_name(self.raw_name()))
+    }
+
+    /// The declared unpacked size of the whole member, or None when the header marks it unknown.
+    pub fn unpacked_size(&self) -> Option<u64> {
+        (!self.0.header.size_unknown()).then_some(self.0.header.unpacked_size)
+    }
+
+    /// Packed bytes of this part in this volume.
+    pub fn packed_size(&self) -> u64 {
+        self.0.header.packed_size
+    }
+
+    /// Offset of this part's data in its volume.
+    pub fn data_offset(&self) -> u64 {
+        self.0.header.data_at
+    }
+
+    pub fn attributes(&self) -> u64 {
+        self.0.header.attributes
+    }
+
+    /// Normalized host: 0 Windows (RAR 4.x MS-DOS, OS/2, Win32), 1 Unix, 2 other. RAR 4.x keeps its own value in
+    /// [`super::Rar4Metadata::host`].
+    pub fn host_os(&self) -> u64 {
+        self.0.header.host_os
+    }
+
+    pub fn rar4_metadata(&self) -> Option<super::Rar4Metadata> {
+        self.0.header.rar4
+    }
+
+    pub fn modified(&self) -> Option<RarTime> {
+        let header = &self.0.header;
+        header.mtime.map(|seconds| RarTime {
+            seconds,
+            nanos: header.mtime_nanos,
+            resolution_nanos: header.mtime_resolution,
+        })
+    }
+
+    pub fn created(&self) -> Option<RarTime> {
+        self.0.header.ctime
+    }
+
+    pub fn accessed(&self) -> Option<RarTime> {
+        self.0.header.atime
+    }
+
+    /// Which clock the times were read from: RAR 4.x local wall clock, RAR 5.0 UTC.
+    pub fn time_origin(&self) -> crate::extract::MtimeOrigin {
+        match self.format() {
+            super::RarFormat::Rar4 => crate::extract::MtimeOrigin::LocalWallClock,
+            super::RarFormat::Rar5 => crate::extract::MtimeOrigin::Utc,
+        }
+    }
+
+    /// Declared checks. A part with [`Self::split_after`] set checks its own packed bytes, not the member.
+    pub fn checks(&self) -> RarChecks {
+        let header = &self.0.header;
+        RarChecks { crc32: header.crc32, blake2sp: header.blake2sp, keyed: header.crypt.is_some_and(|c| c.tweaked_crc) }
+    }
+
+    /// The CRC-32 of the member's unpacked data, declared by a final part.
+    pub fn crc32(&self) -> Option<u32> {
+        self.0.header.crc32.filter(|_| !self.split_after())
+    }
+
+    /// The CRC-32 of this part's packed data, declared by a part with a later continuation (UnRAR's "Pack-CRC32").
+    pub fn pack_crc32(&self) -> Option<u32> {
+        self.0.header.crc32.filter(|_| self.split_after())
+    }
+
+    pub fn blake2sp(&self) -> Option<[u8; 32]> {
+        self.0.header.blake2sp
+    }
+
+    /// Compression level: 0 is stored, 1 to 5 are `-m1` to `-m5`.
+    pub fn method(&self) -> u8 {
+        self.0.header.method
+    }
+
+    /// RAR 5.0 algorithm: 0 for RAR 5.0 ("v50"), 1 for RAR 7.0 ("v70"). RAR 4.x keeps its unpack version in
+    /// [`super::Rar4Metadata::unpack_version`].
+    pub fn algorithm(&self) -> u8 {
+        self.0.header.algorithm
+    }
+
+    /// The file version number of an older revision kept by `-ver` (RAR 5.0 version record).
+    pub fn version(&self) -> Option<u64> {
+        self.0.header.version
+    }
+
+    pub fn dictionary(&self) -> u64 {
+        self.0.header.dictionary
+    }
+
+    /// The header's own solid flag (RAR 4.x `LHD_SOLID`, RAR 5.0 compression info), which UnRAR lists as "solid".
+    /// The first member of a RAR 4.x solid archive does not set it.
+    pub fn solid(&self) -> bool {
+        self.0.header.solid
+    }
+
+    pub fn encrypted(&self) -> bool {
+        self.0.header.encrypted
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.0.header.is_dir()
+    }
+
+    pub fn redirection(&self) -> Option<&'a Redirection> {
+        self.0.header.redirection.as_ref()
     }
 }
 
@@ -323,6 +620,7 @@ pub struct RarSession {
     archive: RarArchiveMetadata,
     volumes: Vec<HeldVolume>,
     model: PhysicalModel,
+    headers: Vec<HeaderRecord>,
     issues: Vec<RarFailure>,
     usage: RarCatalogueUsage,
     password: String,
@@ -370,6 +668,7 @@ impl RarSession {
                 archive: RarArchiveMetadata::default(),
                 volumes: Vec::new(),
                 model: PhysicalModel::default(),
+                headers: Vec::new(),
                 issues: Vec::new(),
                 usage: RarCatalogueUsage::default(),
                 password: String::new(),
@@ -439,6 +738,59 @@ impl RarSession {
     pub fn usage(&self) -> RarCatalogueUsage {
         self.usage
     }
+
+    /// Every file and service header in volume order, orphan continuations and each part of a split member
+    /// included. [`RarVolumeMetadata::header_range`] selects one volume's headers.
+    pub fn headers(&self) -> impl ExactSizeIterator<Item = RarHeader<'_>> {
+        self.headers.iter().map(RarHeader)
+    }
+
+    /// The headers of one volume, in order. Empty for a volume index past the end.
+    pub fn volume_headers(&self, volume: usize) -> impl ExactSizeIterator<Item = RarHeader<'_>> {
+        let range = self.volumes.get(volume).map_or(0..0, |held| held.metadata.headers.clone());
+        self.headers[range].iter().map(RarHeader)
+    }
+
+    /// Read the archive comment of a volume: the data of its `CMT` service header, as stored (UTF-8 for RAR 5.0,
+    /// the archiver's code page for RAR 4.x). None when the volume has no comment header. Only a stored,
+    /// unencrypted comment of at most 1 MiB can be read; any other is refused as unsupported. The stored CRC-32 is
+    /// checked.
+    pub fn comment(&self, volume: usize) -> Result<Option<Vec<u8>>, Arc<RarFailure>> {
+        const MAX_COMMENT: u64 = 1 << 20;
+        let Some(held) = self.volumes.get(volume) else { return Ok(None) };
+        let Some(index) = held.metadata.comment else { return Ok(None) };
+        let header = &self.headers[index].header;
+        if header.encrypted || header.method != 0 || header.split_before() || header.split_after() {
+            return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::Decoder(
+                "compressed, encrypted or split archive comment".into(),
+            ))));
+        }
+        if header.packed_size > MAX_COMMENT {
+            return Err(Arc::new(RarFailure::Limit {
+                resource: RarResource::CatalogueReadBytes,
+                requested: Some(header.packed_size),
+                allowed: Some(MAX_COMMENT),
+            }));
+        }
+        held.stamp.check(&held.file, &held.path).map_err(|fault| Arc::from(fault.failure))?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(header.packed_size as usize).map_err(|_| Arc::from(allocation().failure))?;
+        bytes.resize(header.packed_size as usize, 0);
+        read_at_detailed(&held.file, &mut bytes, header.data_at).map_err(|error| {
+            Arc::from(read_failure(error, Some(held.path.clone()), RarIntegrityReason::TruncatedData).failure)
+        })?;
+        if let Some(expected) = header.crc32
+            && crate::crc32::hash(&bytes) != expected
+        {
+            return Err(Arc::new(RarFailure::integrity(
+                RarScope::Header { volume: held.path.clone() },
+                RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false },
+                RarPasswordEvidence::NotEncrypted,
+                false,
+            )));
+        }
+        Ok(Some(bytes))
+    }
 }
 
 struct Catalogue {
@@ -506,23 +858,49 @@ impl Catalogue {
             }
             let volume_index = self.session.volumes.len();
             let mut next = volume.main.is_volume().then_some(false);
+            let first_header = self.session.headers.len();
+            let mut end = None;
+            let mut comment = None;
             while let Some((block, crypt, wire)) = volume.next_catalogue(&mut self.scan_budget())? {
                 match block {
                     Block::File(header) => {
                         let wire = wire.expect("catalogue file metadata includes the wire name");
+                        let listed = header.clone();
+                        let raw_name = wire.name.clone();
                         self.add_part(volume_index, header, crypt, wire)?;
+                        self.add_header(volume_index, listed, Some(raw_name))?;
                     }
-                    Block::End { more_volumes, .. } => {
+                    Block::Service(header) => {
+                        if comment.is_none() && header.name == "CMT" {
+                            comment = Some(self.session.headers.len());
+                        }
+                        self.add_header(volume_index, header, wire.map(|wire| wire.name))?;
+                    }
+                    Block::End { more_volumes, volume_number } => {
                         next = more_volumes.then_some(true);
+                        end = Some(VolumeEnd { more_volumes, volume_number });
                         break;
                     }
                     Block::Main(_) | Block::Crypt => return Err(volume_framing(&path, "unexpected RAR volume header")),
-                    Block::Service(_) | Block::Unknown => {}
+                    Block::Unknown => {}
                 }
             }
-            let metadata = RarVolumeMetadata { format, main: volume.main.clone(), encrypted_headers };
+            let original = volume.main.original_name.as_ref().map_or(0, |name| name.capacity() as u64);
+            self.owned_capacity = add(self.owned_capacity, original)?;
+            let metadata = RarVolumeMetadata {
+                format,
+                main: volume.main.clone(),
+                encrypted_headers,
+                sfx_size: volume.sfx_size(),
+                end,
+                headers: first_header..self.session.headers.len(),
+                comment,
+            };
             let file = volume.into_catalogue_file();
             stamp.check(&file, &path)?;
+            if !self.options.follow_volumes {
+                next = None;
+            }
             let next_path = next.and_then(|_| next_volume(&path));
             self.session.volumes.push(HeldVolume { metadata, file, path, stamp });
             self.update_capacity()?;
@@ -662,6 +1040,25 @@ impl Catalogue {
         self.update_capacity()
     }
 
+    /// Retain one file or service header for [`RarSession::headers`]. The decoded name, redirection target and
+    /// SubData are charged here; the raw name too unless a member already owns (and was charged for) it, as with an
+    /// orphan continuation or a service header.
+    fn add_header(&mut self, volume: usize, header: FileHeader, raw_name: Option<Arc<Vec<u8>>>) -> RarResult<()> {
+        let unowned_name = raw_name
+            .as_ref()
+            .filter(|name| Arc::strong_count(name) == 1)
+            .map_or(0, |name| (name.capacity() + crate::rar5::RAW_NAME_OWNER_BYTES) as u64);
+        let allocation = add(
+            add(header.name.capacity() as u64, target_name(&header).map_or(0, |t| t.capacity() as u64))?,
+            add(header.sub_data.capacity() as u64, unowned_name)?,
+        )?;
+        let base = add(self.capacity_without::<HeaderRecord>(self.session.headers.capacity())?, allocation)?;
+        reserve_one(&mut self.session.headers, base, self.options.limits.capacity)?;
+        self.owned_capacity = add(self.owned_capacity, allocation)?;
+        self.session.headers.push(HeaderRecord { volume, header, raw_name });
+        self.update_capacity()
+    }
+
     fn end_incomplete(&mut self) -> RarResult<()> {
         if std::mem::take(&mut self.pending) {
             let index = self.session.model.members.len() - 1;
@@ -689,19 +1086,16 @@ impl Catalogue {
     }
 
     fn capacity(&self) -> RarResult<u64> {
-        add(
-            add(
-                self.owned_capacity,
-                add(
-                    vector_bytes::<HeldVolume>(self.session.volumes.capacity())?,
-                    vector_bytes::<RarFailure>(self.session.issues.capacity())?,
-                )?,
-            )?,
-            add(
-                vector_bytes::<Member>(self.session.model.members.capacity())?,
-                vector_bytes::<Part>(self.session.model.parts.capacity())?,
-            )?,
-        )
+        let volumes = add(
+            vector_bytes::<HeldVolume>(self.session.volumes.capacity())?,
+            vector_bytes::<RarFailure>(self.session.issues.capacity())?,
+        )?;
+        let model = add(
+            vector_bytes::<Member>(self.session.model.members.capacity())?,
+            vector_bytes::<Part>(self.session.model.parts.capacity())?,
+        )?;
+        let headers = vector_bytes::<HeaderRecord>(self.session.headers.capacity())?;
+        add(add(self.owned_capacity, volumes)?, add(model, headers)?)
     }
 
     fn capacity_without<T>(&self, count: usize) -> RarResult<u64> {
@@ -1100,15 +1494,21 @@ mod tests {
                 .members
                 .iter()
                 .map(|row| row.header.name.capacity() + row.wire.name.capacity() + crate::rar5::RAW_NAME_OWNER_BYTES)
+                .sum::<usize>()
+            + session
+                .headers
+                .iter()
+                .map(|row| row.header.name.capacity() + row.header.sub_data.capacity())
                 .sum::<usize>();
         let actual = variable
+            + session.headers.capacity() * size_of::<HeaderRecord>()
             + session.model.members.capacity() * size_of::<Member>()
             + session.model.parts.capacity() * size_of::<Part>()
             + session.issues.capacity() * size_of::<RarFailure>()
             + session.volumes.capacity() * size_of::<HeldVolume>();
         assert_eq!(session.usage().capacity, actual as u64);
         let impossible = variable
-            + 9 * (size_of::<Member>() + size_of::<Part>() + size_of::<RarFailure>())
+            + 9 * (size_of::<Member>() + size_of::<Part>() + size_of::<RarFailure>() + size_of::<HeaderRecord>())
             + size_of::<HeldVolume>()
             - 1;
         let mut options = RarSessionOptions::default();
