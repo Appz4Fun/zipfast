@@ -146,17 +146,23 @@ fn properties_are_bounded() {
 }
 
 #[test]
-fn dictionary_is_bounded_when_the_cap_is_huge() {
+fn large_stated_dictionaries_are_not_refused() {
     use zipfast::codec::MAX_DICTIONARY;
-    // No stated size and a 1 TiB cap: a 4 GiB stated dictionary would be allocated up front, so it is refused.
-    let huge = 1u64 << 40;
-    assert_eq!(
-        lzma_decode(&[0x5d, 0xff, 0xff, 0xff, 0xff], &[0; 16], None, huge),
-        Err(LzmaError::DictionaryLimit { requested: u64::from(u32::MAX), allowed: MAX_DICTIONARY })
-    );
-    assert!(matches!(lzma_decode(&[40], &[0; 16], None, huge), Err(LzmaError::DictionaryLimit { .. })));
-    // A modest stated dictionary under the same cap decodes.
+    // Every dictionary LZMA or LZMA2 can state fits the bound: 7-Zip writes LZMA1 dictionaries past 1.5 GiB.
+    assert_eq!(MAX_DICTIONARY, u64::from(u32::MAX));
     let data = sample(10_000);
+    let (_, packed) = encode(false, &data);
+    for dict in [(1536u32 << 20) + 1, 3 << 30, u32::MAX] {
+        let mut props = vec![0x5d];
+        props.extend(dict.to_le_bytes());
+        // Shrunk to the output, so nothing near the stated size is allocated.
+        assert_eq!(lzma_decode(&props, &packed, None, 1 << 20).unwrap(), data, "{dict}");
+    }
+    let (_, packed) = encode(true, &data);
+    for code in [37u8, 38, 39, 40] {
+        assert_eq!(lzma_decode(&[code], &packed, Some(data.len() as u64), 1 << 20).unwrap(), data, "{code}");
+    }
+    // A modest stated dictionary under a huge cap decodes.
     let (props, packed) = encode(true, &data);
-    assert_eq!(lzma_decode(&props, &packed, None, huge).unwrap(), data);
+    assert_eq!(lzma_decode(&props, &packed, None, 1 << 40).unwrap(), data);
 }

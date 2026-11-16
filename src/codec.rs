@@ -25,7 +25,8 @@ use std::fmt;
 pub enum LzmaError {
     /// The properties are neither 5 valid LZMA bytes nor one LZMA2 dictionary byte of at most 40.
     Properties,
-    /// The dictionary, after shrinking to the output, would pass [`MAX_DICTIONARY`].
+    /// The dictionary, after shrinking to the output, would pass [`MAX_DICTIONARY`]. No valid property reaches it at
+    /// the current bound; it is kept so the bound can tighten without an API change.
     DictionaryLimit { requested: u64, allowed: u64 },
     /// The output would pass `max_output` (or the stated unpacked size does).
     OutputLimit { limit: u64 },
@@ -87,8 +88,10 @@ pub fn lzma_decode(
     decode(&filters, packed, unpacked_size, max_output)
 }
 
-/// The largest dictionary [`lzma_decode`] allocates: 1.5 GiB, 7-Zip's largest LZMA dictionary.
-pub const MAX_DICTIONARY: u64 = 1536 << 20;
+/// The largest dictionary [`lzma_decode`] allocates: 4 GiB - 1, the largest LZMA and LZMA2 can state (and the 7z
+/// default). Every valid property therefore fits; the dictionary is still allocated up front, so a caller with no
+/// stated size bounds it through `max_output`.
+pub const MAX_DICTIONARY: u64 = u32::MAX as u64;
 
 /// LZMA2's dictionary size for property byte `b` (at most 40).
 pub(crate) fn lzma2_dict(b: u8) -> u64 {
