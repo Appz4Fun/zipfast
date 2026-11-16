@@ -37,11 +37,38 @@ pub enum RenameStyle {
     Parenthesized,
 }
 
-/// The highest number tried for a renamed name. When `N = 1 ..= RENAME_LIMIT` are all taken, the member fails with a
-/// typed error: [`crate::error::RarPolicyReason::RenameExhausted`] for RAR, tar and the legacy ZIP runner, and
-/// [`crate::zip::ReadFault::CheckedFormat`] for checked ZIP runs, which stop there as on any publication failure.
-/// Each attempt in a checked ZIP run is charged to its I/O budget, which may end the search sooner.
+/// The highest number tried for a renamed name. When `N = 1 ..= RENAME_LIMIT` are all taken, that member fails and
+/// the run goes on: [`crate::error::RarPolicyReason::RenameExhausted`] for RAR, tar and the legacy ZIP runner, and
+/// [`crate::zip::ReadFault::CheckedFormat`] for checked ZIP runs. A run also makes at most 2^20 rename attempts in
+/// all (a checked ZIP run reserves them in its plan); a member that would need more fails the same way.
 pub const RENAME_LIMIT: u32 = 10_000;
+
+/// The longest file name, in bytes, [`renamed_name`] spells: `NAME_MAX` on Linux and macOS.
+pub const RENAME_NAME_MAX: usize = 255;
+
+/// The most rename attempts one run makes outside checked ZIP runs, whose own I/O budget counts them. A member that
+/// would need more fails with [`crate::error::RarPolicyReason::RenameExhausted`], so many members with the same name
+/// can't make a run cost tens of millions of system calls.
+pub(crate) const RUN_RENAME_ATTEMPTS: u64 = 1 << 20;
+
+/// The rename attempts left in one run.
+#[derive(Debug)]
+pub(crate) struct RenameBudget {
+    left: u64,
+}
+
+impl Default for RenameBudget {
+    fn default() -> Self {
+        Self { left: RUN_RENAME_ATTEMPTS }
+    }
+}
+
+impl RenameBudget {
+    #[cfg(test)]
+    pub(crate) fn with(left: u64) -> Self {
+        Self { left }
+    }
+}
 
 /// A member written under another name, or whose existing target was moved aside, by [`super::Overwrite::RenameNew`]
 /// or [`super::Overwrite::RenameExisting`].
@@ -58,6 +85,53 @@ pub struct RenamedOutput {
     /// For `RenameExisting`, where the file that stood at `requested` was moved. It stays there even when writing
     /// the member then fails; the member's own outcome says whether its data arrived at `path`.
     pub existing: Option<PathBuf>,
+}
+
+impl RenamedOutput {
+    /// The report line a legacy run's callback receives for this rename, as soon as it is made.
+    pub(crate) fn line(&self) -> String {
+        match &self.existing {
+            Some(moved) => format!("{}: existing file moved to {}", self.requested.display(), moved.display()),
+            None => format!("{}: exists, written as {}", self.requested.display(), self.path.display()),
+        }
+    }
+}
+
+/// A whole-archive run's terminal error, with the renames a rename mode made before it: [`super::run_with_renames`].
+///
+/// Those renames would otherwise be lost with the [`Summary`](super::Summary). [`super::run`] and
+/// [`super::run_with_password`] return just `error`; their report callback has already had a line for each rename
+/// as it was made.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RunError {
+    pub error: crate::Error,
+    /// The renames made before the run stopped, in order: empty unless a rename mode renamed something.
+    pub renames: Vec<RenamedOutput>,
+}
+
+impl RunError {
+    pub(crate) fn new(error: crate::Error, renames: Vec<RenamedOutput>) -> Self {
+        Self { error, renames }
+    }
+}
+
+impl From<crate::Error> for RunError {
+    fn from(error: crate::Error) -> Self {
+        Self { error, renames: Vec::new() }
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for RunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// What an [`super::Overwrite`] asks for when the target exists.
@@ -82,6 +156,11 @@ impl RenameMode {
 /// start an extension, as in 7-Zip; for [`RenameStyle::Parenthesized`] it does, as in UnRAR. A trailing dot is an
 /// empty extension, so `a.` becomes `a_1.` or `a(1).`.
 ///
+/// The result is never longer than [`RENAME_NAME_MAX`] bytes. When the number doesn't fit, the stem is cut short
+/// from its end to make room, at a UTF-8 character boundary (a byte that doesn't continue a character); if even an
+/// empty stem leaves no room, the extension's end is cut the same way. Different numbers may therefore keep
+/// different lengths of the stem.
+///
 /// ```
 /// use std::ffi::OsStr;
 /// use zipfast::extract::{RenameStyle, renamed_name};
@@ -103,20 +182,39 @@ pub fn renamed_name(name: &OsStr, n: u32, style: RenameStyle) -> OsString {
         RenameStyle::Underscore => format!("_{n}"),
         RenameStyle::Parenthesized => format!("({n})"),
     };
-    let mut out = Vec::with_capacity(bytes.len() + number.len());
+    let room = RENAME_NAME_MAX - number.len();
+    let (stem, extension) = if stem.len() + extension.len() <= room {
+        (stem, extension)
+    } else if extension.len() <= room {
+        (&stem[..char_floor(stem, room - extension.len())], extension)
+    } else {
+        (&stem[..0], &extension[..char_floor(extension, room)])
+    };
+    let mut out = Vec::with_capacity(stem.len() + number.len() + extension.len());
     out.extend_from_slice(stem);
     out.extend_from_slice(number.as_bytes());
     out.extend_from_slice(extension);
-    // SAFETY: `stem` and `extension` split a valid encoded OsStr at an ASCII byte, and the inserted bytes are ASCII,
-    // so the result is valid encoded OsStr bytes.
+    // SAFETY: `stem` and `extension` split a valid encoded OsStr at an ASCII byte and are cut only before a byte
+    // that starts a character, and the inserted bytes are ASCII, so the result is valid encoded OsStr bytes.
     unsafe { OsString::from_encoded_bytes_unchecked(out) }
+}
+
+/// The largest `n <= max` at which `bytes` may be cut without splitting a UTF-8 (or WTF-8) character.
+fn char_floor(bytes: &[u8], max: usize) -> usize {
+    let mut n = max.min(bytes.len());
+    while n > 0 && n < bytes.len() && bytes[n] & 0xC0 == 0x80 {
+        n -= 1;
+    }
+    n
 }
 
 /// Why no renamed name could be claimed.
 #[derive(Debug)]
 pub(crate) enum RenameError {
-    /// Every candidate up to [`RENAME_LIMIT`] was taken.
+    /// Every candidate up to [`RENAME_LIMIT`] was taken, or the run's attempts ran out.
     Exhausted,
+    /// The file system can neither rename without replacing nor make a hard link (FAT, exFAT).
+    Unsupported,
     Io(PathBuf, io::Error),
 }
 
@@ -128,9 +226,11 @@ pub(crate) fn candidates(target: &Path, style: RenameStyle) -> impl Iterator<Ite
 
 /// Claims the first free renamed name for `target` with a no-replace primitive. `claim` tries one name and reports
 /// `AlreadyExists` when it is taken; `skip` passes over a candidate that must never be used (a protected path).
+/// Each attempt is charged to the run's `budget`.
 pub(crate) fn claim_candidate<T>(
     target: &Path,
     style: RenameStyle,
+    budget: &mut RenameBudget,
     skip: impl Fn(&Path) -> bool,
     mut claim: impl FnMut(&Path) -> io::Result<T>,
 ) -> Result<(PathBuf, T), RenameError> {
@@ -138,9 +238,12 @@ pub(crate) fn claim_candidate<T>(
         if skip(&candidate) {
             continue;
         }
+        let Some(left) = budget.left.checked_sub(1) else { break };
+        budget.left = left;
         match claim(&candidate) {
             Ok(value) => return Ok((candidate, value)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(RenameError::Unsupported),
             Err(error) => return Err(RenameError::Io(candidate, error)),
         }
     }
@@ -190,13 +293,15 @@ fn same_file(file: &File, path: &Path) -> bool {
     }
 }
 
+/// Without a stable file identity, an unused reservation is left in place rather than risk removing another file.
 #[cfg(not(unix))]
-fn same_file(file: &File, path: &Path) -> bool {
-    matches!((file.metadata(), fs::symlink_metadata(path)), (Ok(a), Ok(b)) if b.is_file() && a.len() == b.len())
+fn same_file(_: &File, _: &Path) -> bool {
+    false
 }
 
 /// Moves `from` to `to` without replacing anything at `to`: `AlreadyExists` when `to` is taken. A symlink at `from`
-/// is moved itself, never followed.
+/// is moved itself, never followed. A file system with neither a no-replace rename nor hard links (FAT, exFAT)
+/// reports `Unsupported`, and so does every platform but Unix.
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -225,7 +330,7 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
             return Ok(());
         }
         let error = io::Error::last_os_error();
-        // A file system without the no-replace rename still has an atomic no-clobber link.
+        // A file system without the no-replace rename may still have an atomic no-clobber link.
         if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)) {
             return Err(error);
         }
@@ -234,13 +339,37 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// The portable no-replace move: a hard link fails when `to` is taken, and the old name goes only once the new one
-/// holds the file, so the file is never without a name.
+/// is seen to hold the same file, so the file is never without a name. If the old name can't be removed, or no
+/// longer holds the linked file, the error names the link left at `to`.
+#[cfg(unix)]
 fn link_then_unlink(from: &Path, to: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(from)?.file_type().is_symlink() {
-        return Err(io::ErrorKind::Unsupported.into());
+    use std::os::unix::fs::MetadataExt;
+    let identity = |path: &Path| fs::symlink_metadata(path).map(|m| (m.file_type().is_symlink(), m.dev(), m.ino()));
+    let before = identity(from)?;
+    if before.0 {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "a symlink can't be moved by linking"));
     }
-    fs::hard_link(from, to)?;
-    fs::remove_file(from)
+    if let Err(error) = fs::hard_link(from, to) {
+        // FAT and exFAT have no hard links (EPERM on Linux, ENOTSUP or EOPNOTSUPP elsewhere).
+        if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOTSUP | libc::EOPNOTSUPP)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the file system has neither a no-replace rename nor hard links",
+            ));
+        }
+        return Err(error);
+    }
+    let leftover = |why: String| io::Error::other(format!("{why}; a second link to it was left at {}", to.display()));
+    match (identity(from), identity(to)) {
+        (Ok(a), Ok(b)) if a == before && b == before => {}
+        _ => return Err(leftover(format!("{} changed while it was being moved", from.display()))),
+    }
+    fs::remove_file(from).map_err(|e| leftover(format!("{} could not be unlinked: {e}", from.display())))
+}
+
+#[cfg(not(unix))]
+fn link_then_unlink(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no no-replace rename on this platform"))
 }
 
 #[cfg(test)]
@@ -274,12 +403,50 @@ mod tests {
         let target = dir.path().join("a.txt");
         fs::write(dir.path().join("a_1.txt"), b"x").unwrap();
         let skip = dir.path().join("a_2.txt");
+        let mut budget = RenameBudget::default();
         let (path, reserved) =
-            claim_candidate(&target, RenameStyle::Underscore, |p| p == skip, Reserved::create).unwrap();
+            claim_candidate(&target, RenameStyle::Underscore, &mut budget, |p| p == skip, Reserved::create).unwrap();
         assert_eq!(path, dir.path().join("a_3.txt"));
         assert_eq!(reserved.path(), path);
         drop(reserved);
         assert!(!path.exists(), "an unused reservation is removed");
+        // the run's attempts are bounded: the one left is spent on a_1, then nothing more is tried
+        let mut budget = RenameBudget::with(1);
+        let taken =
+            |p: &Path| -> io::Result<()> { Err(io::Error::new(io::ErrorKind::AlreadyExists, p.display().to_string())) };
+        assert!(matches!(
+            claim_candidate(&target, RenameStyle::Underscore, &mut budget, |_| false, taken),
+            Err(RenameError::Exhausted)
+        ));
+        assert!(matches!(
+            claim_candidate(&target, RenameStyle::Underscore, &mut budget, |_| false, Reserved::create),
+            Err(RenameError::Exhausted)
+        ));
+    }
+
+    #[test]
+    fn long_names_are_shortened_to_fit_name_max() {
+        use RenameStyle::*;
+        let long = format!("{}.txt", "s".repeat(251));
+        for (n, style) in [(1, Underscore), (10_000, Parenthesized)] {
+            let renamed = name(&long, n, style);
+            assert_eq!(renamed.len(), RENAME_NAME_MAX, "{renamed}");
+            assert!(
+                renamed.ends_with(&format!(
+                    "{}.txt",
+                    if style == Underscore { format!("_{n}") } else { format!("({n})") }
+                ))
+            );
+        }
+        // a cut never splits a character: four-byte characters drop whole
+        let wide = format!("{}.md", "\u{1F600}".repeat(63));
+        let renamed = name(&wide, 1, Underscore);
+        assert!(renamed.len() <= RENAME_NAME_MAX);
+        assert_eq!(renamed, format!("{}_1.md", "\u{1F600}".repeat(62)));
+        // an extension too long for any stem loses its end
+        let dotted = format!(".{}", "e".repeat(254));
+        assert_eq!(name(&dotted, 7, Parenthesized), format!("(7).{}", "e".repeat(251)));
+        assert_eq!(name(&"x".repeat(255), 1, Underscore), format!("{}_1", "x".repeat(253)));
     }
 
     #[test]
@@ -293,7 +460,19 @@ mod tests {
         rename_noreplace(&a, &b).unwrap();
         assert_eq!(fs::read(&b).unwrap(), b"a");
         assert!(!a.exists());
+        // a file system without the no-replace rename or hard links fails the claim with a typed refusal
+        let unsupported = |_: &Path| -> io::Result<()> { Err(io::ErrorKind::Unsupported.into()) };
+        let claimed =
+            claim_candidate(&a, RenameStyle::Underscore, &mut RenameBudget::default(), |_| false, unsupported);
+        assert!(matches!(claimed, Err(RenameError::Unsupported)));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert_eq!(link_then_unlink(&link, &dir.path().join("moved")).unwrap_err().kind(), io::ErrorKind::Unsupported);
         assert!(link_then_unlink(&b, &a).is_ok());
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        assert!(!b.exists());
+        fs::write(&b, b"b").unwrap();
+        assert_eq!(link_then_unlink(&a, &b).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&a).unwrap(), b"a");
     }
 }

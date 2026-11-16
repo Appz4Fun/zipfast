@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    Cancellation, Checked, Entry, ListingBudget, Meta, Mode, MtimeOrigin, Options, Overwrite, Place, Summary,
-    check_target, create_target, finish_dirs, finish_file, make_dirs,
+    Cancellation, Checked, Entry, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options, Overwrite, Place,
+    RenameLog, RunError, Summary, check_target, create_target, finish_dirs, finish_file, make_dirs,
 };
 use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
@@ -770,25 +770,37 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
 }
 
 pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
+    run_reporting(path, opts, &mut report).map_err(|e| e.error)
+}
+
+/// [`run`], reporting a rename mode's renames to `report` as they happen. A terminal error keeps them too.
+pub(crate) fn run_reporting(
+    path: &Path,
+    opts: &Options,
+    report: &mut impl LegacyReport,
+) -> std::result::Result<Summary, RunError> {
     let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let mut reader = Reader::open(path, threads)?;
     let opts = &*opts.protecting(path)?;
     if opts.mode == Mode::Extract {
-        std::fs::create_dir_all(&opts.dest)?;
+        std::fs::create_dir_all(&opts.dest).map_err(Error::from)?;
     }
     let mut summary = Summary { volumes: 1, ..Summary::default() };
     let mut buf = vec![0u8; BUF];
     let result = match reader.content {
-        Content::Single => run_single(&mut reader, path, opts, &mut summary, &mut buf, &mut report),
-        Content::Tar => run_tar(&mut reader, opts, &mut summary, &mut buf, &mut report),
+        Content::Single => run_single(&mut reader, path, opts, &mut summary, &mut buf, report),
+        Content::Tar => run_tar(&mut reader, opts, &mut summary, &mut buf, report),
     };
     finish_dirs(&mut summary);
-    result.map(|()| summary)
+    match result {
+        Ok(()) => Ok(summary),
+        Err(error) => Err(RunError::new(error, std::mem::take(&mut summary.renames))),
+    }
 }
 
-fn fail(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
+fn fail(summary: &mut Summary, report: &mut impl LegacyReport, name: &str, why: &str) {
     let line = format!("{name}: {why}");
-    report(&line);
+    report.line(&line);
     summary.errors.push(line);
 }
 
@@ -799,7 +811,7 @@ fn target(
     name: &str,
     size: Option<u64>,
     summary: &mut Summary,
-    report: &mut impl FnMut(&str),
+    report: &mut impl LegacyReport,
 ) -> Result<Option<Output>> {
     checked_place(opts, rel, name, summary, report)?.map(|place| create_target(place, size)).transpose()
 }
@@ -823,7 +835,7 @@ struct StagedTar {
 }
 
 impl StagedTar {
-    fn publish(self, opts: &Options, summary: &mut Summary, report: &mut impl FnMut(&str)) -> Result<()> {
+    fn publish(self, opts: &Options, summary: &mut Summary, report: &mut impl LegacyReport) -> Result<()> {
         for member in self.members {
             match member {
                 StagedMember::Directory(relative, meta) => {
@@ -841,7 +853,7 @@ impl StagedTar {
                         replace(temporary, &place.path)?;
                     } else if let Err(error) = temporary.persist_noclobber(place.path) {
                         if opts.overwrite == Overwrite::Skip && error.error.kind() == io::ErrorKind::AlreadyExists {
-                            report(&format!("{name}: exists, skipped"));
+                            report.line(&format!("{name}: exists, skipped"));
                             summary.skipped += 1;
                             continue;
                         }
@@ -861,12 +873,19 @@ fn checked_place(
     relative: &Path,
     name: &str,
     summary: &mut Summary,
-    report: &mut impl FnMut(&str),
+    report: &mut impl LegacyReport,
 ) -> Result<Option<Place>> {
-    match check_target(opts, relative, None, &mut summary.renames)? {
+    let mut log = RenameLog {
+        budget: &mut summary.rename_budget,
+        record: &mut |renamed| {
+            report.renamed(&renamed);
+            summary.renames.push(renamed);
+        },
+    };
+    match check_target(opts, relative, None, &mut log)? {
         Checked::Write(place) => Ok(Some(place)),
         Checked::Exists => {
-            report(&format!("{name}: exists, skipped"));
+            report.line(&format!("{name}: exists, skipped"));
             summary.skipped += 1;
             Ok(None)
         }
@@ -936,7 +955,7 @@ fn run_single(
     opts: &Options,
     summary: &mut Summary,
     buf: &mut [u8],
-    report: &mut impl FnMut(&str),
+    report: &mut impl LegacyReport,
 ) -> Result<()> {
     let name = single_name(reader.src.codec().unwrap_or(Codec::Gzip), path);
     if !opts.selects(&name, None, false, 0) {
@@ -971,7 +990,7 @@ fn run_tar(
     opts: &Options,
     summary: &mut Summary,
     buf: &mut [u8],
-    report: &mut impl FnMut(&str),
+    report: &mut impl LegacyReport,
 ) -> Result<()> {
     let mut staged = (opts.mode == Mode::Extract && reader.src.codec().is_some()).then(StagedTar::default);
     // the next member's position in a listing, which leaves out volume labels

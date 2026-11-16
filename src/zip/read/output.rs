@@ -20,7 +20,7 @@ use crate::zip::{ReadDescription, session::SourceBinding};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) mod directory;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-mod file;
+pub(in crate::zip::read) mod file;
 #[cfg(unix)]
 pub(super) mod metadata;
 #[cfg(any(target_os = "macos", target_os = "linux"))]

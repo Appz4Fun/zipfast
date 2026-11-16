@@ -237,7 +237,7 @@ fn run(archive: &Path, opts: &Options, password: Option<&str>, quiet: bool) -> E
                 archive,
                 quiet,
                 started,
-                route.run(archive, opts, password, |line| eprintln!("{line}")),
+                route.run(archive, opts, password, &mut |line: &str| eprintln!("{line}")).map_err(|e| e.error),
             );
         }
         Err(error) => {

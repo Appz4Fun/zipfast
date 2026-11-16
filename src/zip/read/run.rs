@@ -585,7 +585,15 @@ impl ProjectedReadSession {
                         stage.finish_error(error, context)
                     });
                 }
-                stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx)).map(|published| !published)
+                let published = stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx));
+                // Running out of renamed names fails this member, like a refused target.
+                if let Err(error) = &published
+                    && matches!(error.operation(), Some(ReadFault::CheckedFormat { reason })
+                        if *reason == super::output::file::RENAME_EXHAUSTED)
+                {
+                    local_refusal = true;
+                }
+                published.map(|published| !published)
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             Err(ReadFault::UnsupportedIdentity.into())

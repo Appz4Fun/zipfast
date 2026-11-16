@@ -85,6 +85,8 @@ struct Report {
     renames: Vec<(PathBuf, PathBuf, Option<PathBuf>)>,
     /// a terminal error, if the run stopped
     terminal: Option<String>,
+    /// the legacy report lines, for `extract::run`
+    lines: Vec<String>,
 }
 
 fn renames(list: &[RenamedOutput]) -> Vec<(PathBuf, PathBuf, Option<PathBuf>)> {
@@ -136,24 +138,38 @@ fn zip(members: &[(&str, &[u8])]) -> Vec<u8> {
 fn tar(members: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, data) in members {
-        let mut header = [0u8; 512];
-        header[..name.len()].copy_from_slice(name.as_bytes());
-        header[100..108].copy_from_slice(b"0000644\0");
-        header[108..116].copy_from_slice(b"0000000\0");
-        header[116..124].copy_from_slice(b"0000000\0");
-        header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
-        header[136..148].copy_from_slice(b"14000000000\0");
-        header[148..156].copy_from_slice(b"        ");
-        header[156] = b'0';
-        header[257..265].copy_from_slice(b"ustar\x0000");
-        let sum: u32 = header.iter().map(|&b| b as u32).sum();
-        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-        out.extend(header);
+        if name.len() > 100 {
+            // a GNU long-name record carries a name ustar's 100 bytes can't
+            let mut long = name.as_bytes().to_vec();
+            long.push(0);
+            out.extend(tar_header("././@LongLink", long.len(), b'L'));
+            out.extend(&long);
+            out.resize(out.len().next_multiple_of(512), 0);
+        }
+        out.extend(tar_header(&name[..name.len().min(100)], data.len(), b'0'));
         out.extend(*data);
         out.resize(out.len().next_multiple_of(512), 0);
     }
     out.resize(out.len() + 1024, 0);
     out
+}
+
+fn tar_header(name: &str, size: usize, kind: u8) -> [u8; 512] {
+    {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        header[136..148].copy_from_slice(b"14000000000\0");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = kind;
+        header[257..265].copy_from_slice(b"ustar\x0000");
+        let sum: u32 = header.iter().map(|&b| b as u32).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        header
+    }
 }
 
 fn build(family: Family, members: &[(&str, &[u8])]) -> Vec<u8> {
@@ -195,14 +211,21 @@ impl RarExtractObserver for NoQuestions {
 fn run(runner: Runner, archive: &Path, opts: &Options) -> Report {
     let mut report = Report::default();
     match runner {
-        Runner::Run(_) => match extract::run(archive, opts, |_| {}) {
-            Ok(summary) => {
-                report.files = summary.files;
-                report.failed = summary.errors.len() as u64;
-                report.renames = renames(&summary.renames);
+        Runner::Run(_) => {
+            let mut lines = Vec::new();
+            match extract::run_with_renames(archive, opts, None, |line| lines.push(line.to_string())) {
+                Ok(summary) => {
+                    report.files = summary.files;
+                    report.failed = summary.errors.len() as u64;
+                    report.renames = renames(&summary.renames);
+                }
+                Err(error) => {
+                    report.renames = renames(&error.renames);
+                    report.terminal = Some(error.to_string());
+                }
             }
-            Err(error) => report.terminal = Some(error.to_string()),
-        },
+            report.lines = lines;
+        }
         Runner::Policy(_) | Runner::Context(_) => {
             let mut seen = Vec::new();
             let observe = |event: ZipRunEvent<'_>| {
@@ -223,7 +246,7 @@ fn run(runner: Runner, archive: &Path, opts: &Options) -> Report {
                     report.files = done.files();
                     report.failed = done.failed();
                 }
-                Err(error) => report.terminal = Some(error.to_string()),
+                Err(error) => report.terminal = Some(format!("{error:?}")),
             }
             report.renames = renames(&seen);
         }
@@ -534,30 +557,105 @@ fn rename_existing_reports_the_moved_file_when_the_new_member_fails() {
 }
 
 #[test]
-fn the_rename_limit_is_a_typed_error() {
+fn running_out_of_names_fails_only_that_member_in_every_runner() {
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("archive.rar");
-    fs::write(&archive, rar_archive(&[FileSpec::new("a", b"new")])).unwrap();
     let dest = dir.path().join("out");
     fs::create_dir(&dest).unwrap();
     fs::write(dest.join("a"), b"old").unwrap();
     for n in 1..=extract::RENAME_LIMIT {
         fs::File::create(dest.join(format!("a_{n}"))).unwrap();
     }
+    let before = fs::read_dir(&dest).unwrap().count();
+    for runner in RUNNERS {
+        let archive = dir.path().join("archive.bin");
+        fs::write(&archive, build(runner.family(), &[("a", b"new"), ("z", b"later")])).unwrap();
+        for overwrite in
+            [Overwrite::RenameNew(RenameStyle::Underscore), Overwrite::RenameExisting(RenameStyle::Underscore)]
+        {
+            let report = run(runner, &archive, &options(&dest, overwrite));
+            let context = format!("{runner:?} {overwrite:?}: {report:?}");
+            assert_eq!(report.terminal, None, "{context}");
+            assert_eq!((report.files, report.failed), (1, 1), "{context}");
+            assert!(report.renames.is_empty(), "{context}");
+            assert_eq!(fs::read(dest.join("a")).unwrap(), b"old", "{context}");
+            assert_eq!(fs::read(dest.join("z")).unwrap(), b"later", "{context}");
+            fs::remove_file(dest.join("z")).unwrap();
+            assert_eq!(fs::read_dir(&dest).unwrap().count(), before, "{context}");
+        }
+    }
+    // the typed reason, from the whole-archive and the selected RAR runs
+    let archive = dir.path().join("archive.rar");
+    fs::write(&archive, rar_archive(&[FileSpec::new("a", b"new")])).unwrap();
     let opts = options(&dest, Overwrite::RenameNew(RenameStyle::Underscore));
-    let error = extract::run_rar_with_outcomes(&archive, &opts, None, |_| {}).unwrap_err();
-    assert!(
-        matches!(
-            error.failure.as_ref(),
-            zipfast::error::RarFailure::Policy { reason: zipfast::error::RarPolicyReason::RenameExhausted, .. }
-        ),
-        "{error:?}"
-    );
+    let mut reasons = Vec::new();
+    extract::run_rar_with_outcomes(&archive, &opts, None, |e| reasons.push(format!("{:?}", e.outcome))).unwrap();
     let mut session = RarSession::open(&archive, None, RarSessionOptions::default()).unwrap();
     let selection = session.select(|_| true).unwrap();
-    let summary = session.extract_selected(&selection, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
-    assert_eq!(summary.failed, 1);
-    assert_eq!(fs::read(dest.join("a")).unwrap(), b"old");
+    session
+        .extract_selected(&selection, &opts, RarDecodeLimits::default(), |e| reasons.push(format!("{:?}", e.outcome)))
+        .unwrap();
+    assert_eq!(reasons.len(), 2);
+    assert!(reasons.iter().all(|r| r.contains("RenameExhausted")), "{reasons:?}");
+}
+
+#[test]
+fn a_name_too_long_to_number_is_shortened_and_the_run_goes_on() {
+    let long = format!("{}.txt", "\u{e9}".repeat(125)); // 254 bytes
+    for runner in RUNNERS {
+        for overwrite in MODES {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.bin");
+            fs::write(&archive, build(runner.family(), &[(&long, b"new long"), ("after.txt", b"after")])).unwrap();
+            let dest = dir.path().join("out");
+            fs::create_dir(&dest).unwrap();
+            fs::write(dest.join(&long), b"old long").unwrap();
+            let report = run(runner, &archive, &options(&dest, overwrite));
+            let context = format!("{runner:?} {overwrite:?}: {report:?}");
+            assert_eq!(report.terminal, None, "{context}");
+            assert_eq!((report.files, report.failed), (2, 0), "{context}");
+            let style = match overwrite {
+                Overwrite::RenameNew(style) | Overwrite::RenameExisting(style) => style,
+                _ => unreachable!(),
+            };
+            let renamed = extract::renamed_name(long.as_ref(), 1, style);
+            assert!(renamed.len() <= extract::RENAME_NAME_MAX && renamed.to_str().is_some(), "{context}");
+            let (new, old) = if matches!(overwrite, Overwrite::RenameNew(_)) {
+                (dest.join(&renamed), dest.join(&long))
+            } else {
+                (dest.join(&long), dest.join(&renamed))
+            };
+            assert_eq!(fs::read(new).unwrap(), b"new long", "{context}");
+            assert_eq!(fs::read(old).unwrap(), b"old long", "{context}");
+            assert_eq!(fs::read(dest.join("after.txt")).unwrap(), b"after", "{context}");
+            assert_eq!(report.renames.len(), 1, "{context}");
+        }
+    }
+}
+
+#[test]
+fn a_terminal_error_still_reports_a_moved_file() {
+    // The second member's parent folder is a file in the destination, which stops the legacy runners; the first
+    // member had already moved the user's b.txt aside.
+    let members: [(&str, &[u8]); 2] = [("b.txt", b"new b"), ("blocker/x", b"x")];
+    for runner in RUNNERS {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.bin");
+        fs::write(&archive, build(runner.family(), &members)).unwrap();
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("b.txt"), b"old b").unwrap();
+        fs::write(dest.join("blocker"), b"a file").unwrap();
+        let report = run(runner, &archive, &options(&dest, Overwrite::RenameExisting(RenameStyle::Underscore)));
+        let context = format!("{runner:?}: {report:?}");
+        assert!(report.terminal.is_some() || report.failed == 1, "{context}");
+        assert_eq!(fs::read(dest.join("b_1.txt")).unwrap(), b"old b", "{context}");
+        assert_eq!(report.renames, [(dest.join("b.txt"), dest.join("b.txt"), Some(dest.join("b_1.txt")))], "{context}");
+        if let Runner::Run(_) = runner {
+            let line =
+                format!("{}: existing file moved to {}", dest.join("b.txt").display(), dest.join("b_1.txt").display());
+            assert!(report.lines.contains(&line), "{context}");
+        }
+    }
 }
 
 #[test]

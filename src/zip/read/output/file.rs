@@ -640,7 +640,8 @@ impl ZipReadStage {
 /// renamed name. `RenameExisting` first moves the file at the requested name to the first free renamed name, then
 /// publishes at the requested name; once moved, the existing file stays where it went whatever happens next, and
 /// `renamed` reports it. Candidate names are leaves in the held parent, so they stay inside it, and a no-replace
-/// rename can never land on a protected file. The `io::Result` is the final publication's.
+/// rename can never land on a protected file. The `io::Result` is the final publication's; `None` means every renamed
+/// name was taken, which fails only this member.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn publish_renamed(
     ready: &PreparedNamed,
@@ -651,7 +652,7 @@ fn publish_renamed(
     encrypted: bool,
     cancel: &Cancellation,
     renamed: &mut Option<crate::extract::RenamedOutput>,
-) -> ZipReadResult<std::io::Result<()>> {
+) -> ZipReadResult<Option<std::io::Result<()>>> {
     use crate::extract::{RenameMode, RenamedOutput, renamed_name};
     use std::os::unix::ffi::OsStrExt;
     let mut publisher = RenamePublisher {
@@ -676,20 +677,23 @@ fn publish_renamed(
         RenameMode::New(_) => {
             if !existing {
                 match publisher.attempt(dir, ready.inode.leaf(), leaf)? {
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Some(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     result => return Ok(result),
                 }
             }
-            Ok(publisher.claim(dir, ready.inode.leaf())?.map(|n| {
-                let (requested, path) = named(n);
-                *renamed = Some(RenamedOutput { requested, path, existing: None });
+            Ok(publisher.claim(dir, ready.inode.leaf())?.map(|claimed| {
+                claimed.map(|n| {
+                    let (requested, path) = named(n);
+                    *renamed = Some(RenamedOutput { requested, path, existing: None });
+                })
             }))
         }
         RenameMode::Existing(_) => {
             if existing {
                 let n = match publisher.claim(publisher.parent, leaf)? {
-                    Ok(n) => n,
-                    Err(error) => return Ok(Err(error)),
+                    Some(Ok(n)) => n,
+                    Some(Err(error)) => return Ok(Some(Err(error))),
+                    None => return Ok(None),
                 };
                 let (requested, moved) = named(n);
                 *renamed = Some(RenamedOutput { path: requested.clone(), requested, existing: Some(moved) });
@@ -711,20 +715,30 @@ struct RenamePublisher<'a, L> {
 
 #[allow(clippy::result_large_err)]
 impl<L: LedgerAccess> RenamePublisher<'_, L> {
-    /// One no-replace rename of `from_leaf` in `from` to `to` in the held parent.
-    fn attempt(&mut self, from: std::os::fd::RawFd, from_leaf: &CStr, to: &CStr) -> ZipReadResult<std::io::Result<()>> {
+    /// One no-replace rename of `from_leaf` in `from` to `to` in the held parent. Every attempt after the first takes
+    /// one of the plan's reserved rename attempts; `None` when they are used up.
+    fn attempt(
+        &mut self,
+        from: std::os::fd::RawFd,
+        from_leaf: &CStr,
+        to: &CStr,
+    ) -> ZipReadResult<Option<std::io::Result<()>>> {
         if std::mem::replace(&mut self.charged, true) {
+            if !self.ledger.with_state(|s| s.take_rename_attempt())? {
+                return Ok(None);
+            }
             self.ledger.with_state(|s| s.charge_category(RunCategory::StageFinalization, 1))?;
             io::canceled(Some(self.cancel))?;
             self.ledger.with_state(|s| s.attempt(self.encrypted))?;
         }
-        Ok(spool::syscall(ReadIoOperation::Publish, self.parent, || {
+        Ok(Some(spool::syscall(ReadIoOperation::Publish, self.parent, || {
             native_policy::rename_file(from, from_leaf, self.parent, to, false)
-        }))
+        })))
     }
 
-    /// Moves `from_leaf` to the first free renamed name: its number, or the failed attempt that stopped the search.
-    fn claim(&mut self, from: std::os::fd::RawFd, from_leaf: &CStr) -> ZipReadResult<std::io::Result<u32>> {
+    /// Moves `from_leaf` to the first free renamed name: its number, the failed attempt that stopped the search, or
+    /// `None` when every number up to `RENAME_LIMIT` is taken or the run's reserved rename attempts are used up.
+    fn claim(&mut self, from: std::os::fd::RawFd, from_leaf: &CStr) -> ZipReadResult<Option<std::io::Result<u32>>> {
         use std::os::unix::ffi::OsStrExt;
         // NAME_MAX plus the longest number and a NUL, kept off the heap like the rest of publication
         let mut buffer = [0u8; 272];
@@ -732,20 +746,24 @@ impl<L: LedgerAccess> RenamePublisher<'_, L> {
             let candidate = crate::extract::renamed_name(self.name, n, self.style);
             let bytes = candidate.as_bytes();
             let Some(slot) = buffer.get_mut(..=bytes.len()) else {
-                return Ok(Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG)));
+                return Ok(Some(Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG))));
             };
             slot[..bytes.len()].copy_from_slice(bytes);
             slot[bytes.len()] = 0;
             let to = CStr::from_bytes_with_nul(slot).map_err(|_| ReadFault::InvalidPlan)?;
             match self.attempt(from, from_leaf, to)? {
-                Ok(()) => return Ok(Ok(n)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Ok(Err(error)),
+                None => return Ok(None),
+                Some(Ok(())) => return Ok(Some(Ok(n))),
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Some(Err(error)) => return Ok(Some(Err(error))),
             }
         }
-        Err(ReadFault::CheckedFormat { reason: "every renamed output name is taken" }.into())
+        Ok(None)
     }
 }
+
+/// The checked-format reason a member fails with when every renamed name is taken. Only that member fails.
+pub(in crate::zip::read) const RENAME_EXHAUSTED: &str = "every renamed output name is taken";
 
 fn same_time(a: Option<(i64, u32)>, b: Option<(i64, u32)>) -> bool {
     match (a, b) {
@@ -809,6 +827,7 @@ impl ZipReadStage {
         }
         let mut publication = PublicationState::NotPublished;
         let mut renamed = None;
+        let mut exhausted = false;
         let result = (|| -> ZipReadResult<bool> {
             let ledger = &self.reservation.ledger;
             let encrypted = self.reservation.encrypted;
@@ -879,7 +898,15 @@ impl ZipReadStage {
                         ready.overwrite == crate::extract::Overwrite::Always,
                     )
                 }),
-                Some(mode) => publish_renamed(ready, dir, mode, existing, ledger, encrypted, cancel, &mut renamed)?,
+                Some(mode) => {
+                    match publish_renamed(ready, dir, mode, existing, ledger, encrypted, cancel, &mut renamed)? {
+                        Some(result) => result,
+                        None => {
+                            exhausted = true;
+                            return Ok(false);
+                        }
+                    }
+                }
             };
             match moved {
                 Ok(_) => {
@@ -939,6 +966,11 @@ impl ZipReadStage {
                 if result.is_err() {
                     self.reservation.ledger.with_state(|s| s.poisoned = true);
                 }
+                // Out of renamed names: the stage is retired like a skip, and only this member fails.
+                let result = match result {
+                    Ok(false) if exhausted => Err(ReadFault::CheckedFormat { reason: RENAME_EXHAUSTED }.into()),
+                    result => result,
+                };
                 result.map_err(|error| self.usage(error.with_publication(PublicationState::NotPublished, 0)))
             }
         }

@@ -314,6 +314,8 @@ fn count_outcome(summary: &mut RarRunSummary, outcome: &RarOutcome) -> RarResult
 struct SelectedRun {
     /// Renames the member being extracted made, moved to the run's summary after it.
     renames: Vec<crate::extract::RenamedOutput>,
+    /// the rename attempts this run has left
+    rename_budget: crate::extract::RenameBudget,
     limits: RarDecodeLimits,
     packed: u64,
     decoded: u64,
@@ -335,6 +337,7 @@ impl SelectedRun {
         decrypted.try_reserve_exact(CHUNK + 15).map_err(|_| allocation())?;
         Ok(Self {
             renames: Vec::new(),
+            rename_budget: Default::default(),
             limits,
             packed: 0,
             decoded: 0,

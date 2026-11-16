@@ -259,16 +259,15 @@ impl<'a> Extraction<'a> {
             path: Some(path.to_path_buf()),
             source,
         };
+        // Running out of names and a file system that can't move without replacing fail this member only.
+        let refused = |error| match error {
+            RenameError::Exhausted => OutputError::RenameExhausted(target.to_path_buf()),
+            RenameError::Unsupported => OutputError::RenameUnsupported(target.to_path_buf()),
+            RenameError::Io(path, source) => publish_fault(&path, source),
+        };
         if let (RenameMode::Existing(style), Some(_)) = (mode, initial) {
-            let moved = claim_candidate(target, style, skip, |to| rename_noreplace(target, to)).map_err(|error| {
-                own_fault(
-                    match error {
-                        RenameError::Exhausted => OutputError::RenameExhausted(target.to_path_buf()),
-                        RenameError::Io(path, source) => publish_fault(&path, source),
-                    }
-                    .detailed(false),
-                )
-            })?;
+            let moved = claim_candidate(target, style, &mut run.rename_budget, skip, |to| rename_noreplace(target, to))
+                .map_err(|error| own_fault(refused(error).detailed(false)))?;
             run.renames.push(RenamedOutput {
                 requested: target.to_path_buf(),
                 path: target.to_path_buf(),
@@ -293,7 +292,7 @@ impl<'a> Extraction<'a> {
                     },
                 };
                 let mut temporary = Some(temporary);
-                let found = claim_candidate(target, mode.style(), skip, |candidate| {
+                let found = claim_candidate(target, mode.style(), &mut run.rename_budget, skip, |candidate| {
                     match temporary.take().expect("unpublished stage").persist_noclobber(candidate) {
                         Ok(()) => Ok(()),
                         Err(error) => {
@@ -307,8 +306,7 @@ impl<'a> Extraction<'a> {
                         chosen = Some(path.clone());
                         Ok(path)
                     }
-                    Err(RenameError::Exhausted) => Err(OutputError::RenameExhausted(target.to_path_buf())),
-                    Err(RenameError::Io(path, source)) => Err(publish_fault(&path, source)),
+                    Err(error) => Err(refused(error)),
                 }
             },
             |held, published| {

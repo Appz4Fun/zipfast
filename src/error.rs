@@ -194,8 +194,12 @@ pub enum RarPolicyReason {
     ParentIsFile,
     TargetChanged,
     StageChanged,
-    /// A rename mode found every renamed name up to [`crate::extract::RENAME_LIMIT`] taken.
+    /// A rename mode found every renamed name up to [`crate::extract::RENAME_LIMIT`] taken, or the run had used up
+    /// its rename attempts.
     RenameExhausted,
+    /// `RenameExisting` needs a no-replace rename or hard links, and the destination's file system (FAT, exFAT) has
+    /// neither.
+    RenameUnsupported,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

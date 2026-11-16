@@ -366,6 +366,8 @@ pub(super) struct PolicyGeometry {
     pub(super) absolute_bytes: u128,
     pub(super) cwd_bytes: u128,
     pub(super) relative: bool,
+    /// The run uses a rename mode, whose extra publication attempts the plan reserves.
+    pub(super) renames: bool,
 }
 // Task4 alone binds immutable source/scope identity after borrowed catalogue derivation.
 #[derive(Debug)]
@@ -373,6 +375,8 @@ pub(super) struct ActionPlan {
     geometry: PlanGeometry,
     policy_bound: bool,
     diagnostic_attempts: u128,
+    /// extra publication attempts reserved for a rename mode (at most `RUN_RENAME_ATTEMPTS`)
+    rename_attempts: u32,
     bounds: RunUsage,
     pub(super) live_spool: u128,
     output_encrypted: bool,
@@ -459,6 +463,15 @@ impl ActionPlan {
             bounds.path_steps = checked_sum(bounds.path_steps, dl)?;
             bounds.stage_finalization = checked_sum(bounds.stage_finalization, final_extra)?;
             bounds.io_attempts = checked_sum(bounds.io_attempts, extra_attempts)?;
+            // A rename mode may try up to RENAME_LIMIT more names per member, but no more than the run's own bound
+            // on rename attempts: once those are used, a member needing more fails on its own.
+            if policy.renames {
+                let renames = product(g.regular, u128::from(crate::extract::RENAME_LIMIT) + 1)?
+                    .min(u128::from(crate::extract::RUN_RENAME_ATTEMPTS));
+                bounds.stage_finalization = checked_sum(bounds.stage_finalization, renames)?;
+                bounds.io_attempts = checked_sum(bounds.io_attempts, renames)?;
+                self.rename_attempts = u32::try_from(renames).map_err(|_| ReadFault::CounterOverflow)?;
+            }
             self.bounds = bounds;
             self.policy_bound = true;
             bounds.io_attempts.checked_sub(self.diagnostic_attempts).ok_or(ReadFault::CounterOverflow)
@@ -556,6 +569,7 @@ impl ActionPlan {
             output_passes: g.output_passes,
             namespace_creates: creates,
             namespace_retries: retries,
+            rename_attempts: 0,
         })
     }
 }
@@ -581,6 +595,8 @@ pub(super) struct LedgerState {
     // borrowed occupancy, never authority to close or reconstruct that File.
     controlled_source: bool,
     pub(super) poisoned: bool,
+    /// rename attempts used from the plan's reservation
+    rename_attempts: u32,
     pub(super) active_encrypted: Option<bool>,
     pub(super) diagnostic_identities: [Option<(u64, u64)>; 2],
 }
@@ -614,6 +630,7 @@ impl LedgerState {
             peak_fds: 0,
             controlled_source: false,
             poisoned: false,
+            rename_attempts: 0,
             active_encrypted: None,
             diagnostic_identities: [None; 2],
         })
@@ -755,6 +772,15 @@ impl LedgerState {
         let bound = self.run.plan.as_ref().ok_or(ReadFault::InvalidPlan)?.attempt_bound().min(ceiling);
         self.encrypted.limits.io_attempts = bound;
         Ok(bound)
+    }
+    /// Takes one rename attempt from the plan's reservation: false once it is used up.
+    pub(super) fn take_rename_attempt(&mut self) -> Result<bool, ReadFault> {
+        let reserved = self.run.plan.as_ref().ok_or(ReadFault::InvalidPlan)?.rename_attempts;
+        if self.rename_attempts >= reserved {
+            return Ok(false);
+        }
+        self.rename_attempts += 1;
+        Ok(true)
     }
     pub(super) fn bind_policy_geometry(&mut self, policy: PolicyGeometry) -> Result<u128, ReadFault> {
         if self.poisoned {

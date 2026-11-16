@@ -196,7 +196,7 @@ impl RunFault {
 }
 
 pub(super) enum Reports<'a> {
-    Legacy { summary: Summary, callback: &'a mut dyn FnMut(&str) },
+    Legacy { summary: Summary, callback: &'a mut dyn super::LegacyReport },
     Typed { summary: RarRunSummary, callback: &'a mut dyn FnMut(&RarEntryOutcome) },
 }
 
@@ -205,10 +205,14 @@ impl Reports<'_> {
         matches!(self, Self::Typed { .. })
     }
 
-    pub(super) fn renames(&mut self) -> &mut Vec<RenamedOutput> {
+    /// Records a rename as soon as it is made; a legacy caller hears of it then too.
+    pub(super) fn renamed(&mut self, renamed: RenamedOutput) {
         match self {
-            Self::Legacy { summary, .. } => &mut summary.renames,
-            Self::Typed { summary, .. } => &mut summary.renames,
+            Self::Legacy { summary, callback } => {
+                callback.renamed(&renamed);
+                summary.renames.push(renamed);
+            }
+            Self::Typed { summary, .. } => summary.renames.push(renamed),
         }
     }
 
@@ -297,9 +301,9 @@ impl Reports<'_> {
         match self {
             Self::Legacy { summary, callback } => {
                 match reason {
-                    RarSkipReason::ExistingTarget => callback(&format!("{}: exists, skipped", ctx.entry.name)),
+                    RarSkipReason::ExistingTarget => callback.line(&format!("{}: exists, skipped", ctx.entry.name)),
                     RarSkipReason::OlderVersion(v) => {
-                        callback(&format!("{}: older version {v}, skipped", ctx.entry.name))
+                        callback.line(&format!("{}: older version {v}, skipped", ctx.entry.name))
                     }
                     RarSkipReason::MissingStart => {}
                 }
@@ -322,7 +326,7 @@ impl Reports<'_> {
         match self {
             Self::Legacy { summary, callback } => {
                 let line = format!("{}: {legacy}", ctx.entry.name);
-                callback(&line);
+                callback.line(&line);
                 summary.errors.push(line);
                 Ok(())
             }

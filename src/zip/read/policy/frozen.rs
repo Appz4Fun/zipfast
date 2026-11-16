@@ -210,6 +210,7 @@ impl FrozenPolicy {
                 absolute_bytes: absolute,
                 cwd_bytes: w as u128,
                 relative: needs_cwd,
+                renames: o.overwrite.rename().is_some(),
             })
         })?;
         ledger.with_state(|s| s.encrypted.limits.io_attempts = bound.min(ceiling));
