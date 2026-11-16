@@ -31,6 +31,9 @@ pub(in crate::zip::read) enum Refusal {
     Symlink,
     Directory,
     Protected,
+    /// A folder above the target is a regular file or another nondirectory (not a symlink): only this member and the
+    /// ones below that path fail, as with 7-Zip.
+    ParentNotDirectory,
 }
 impl Refusal {
     pub(in crate::zip::read) fn fault(self) -> ReadFault {
@@ -39,6 +42,7 @@ impl Refusal {
                 Self::Symlink => "output target is a symlink",
                 Self::Directory => "output target is a directory",
                 Self::Protected => "output target replaces a protected input",
+                Self::ParentNotDirectory => parent::NONDIRECTORY_PARENT,
             },
         }
     }

@@ -454,6 +454,7 @@ fn blocked_message(reason: &RarPolicyReason) -> &'static str {
         RarPolicyReason::RenameExhausted => "no free name to rename to",
         RarPolicyReason::RenameUnsupported => "the file system can't rename without replacing",
         RarPolicyReason::LinkTarget => "the link's target is absolute or leads out of the destination",
+        RarPolicyReason::ParentIsFile => "a file is in the way",
         _ => unreachable!("unexpected target policy"),
     }
 }
@@ -560,16 +561,30 @@ fn place_target(
 ) -> crate::error::RarResult<DetailedChecked> {
     let target = opts.dest.join(rel);
     let rename = opts.overwrite.rename();
+    // A file where a folder above the target should be fails only this member (and the others below it), as with
+    // 7-Zip; a symlinked folder still stops the run.
+    let parent_is_file =
+        |fault: &RarFault| matches!(*fault.failure, RarFailure::Policy { reason: RarPolicyReason::ParentIsFile, .. });
     if let Some(parent) = rel.parent() {
         match dirs.as_deref_mut() {
             Some(dirs) => {
-                make_dirs_known_detailed(&opts.dest, parent, dirs)?;
+                match make_dirs_known_detailed(&opts.dest, parent, dirs) {
+                    Err(fault) if parent_is_file(&fault) => {
+                        return Ok(DetailedChecked::Blocked(RarPolicyReason::ParentIsFile));
+                    }
+                    result => result?,
+                }
                 let first = dirs.note(rel);
                 if rename.is_none() && first && dirs.known.get(parent) == Some(&true) {
                     return Ok(DetailedChecked::Write(Place::new(target, false)));
                 }
             }
-            None => make_dirs_detailed(&opts.dest, parent)?,
+            None => match make_dirs_detailed(&opts.dest, parent) {
+                Err(fault) if parent_is_file(&fault) => {
+                    return Ok(DetailedChecked::Blocked(RarPolicyReason::ParentIsFile));
+                }
+                result => result?,
+            },
         }
     }
     if let Some(mode) = rename {

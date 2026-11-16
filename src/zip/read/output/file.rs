@@ -403,7 +403,18 @@ fn acquire(
         let frozen = context.action.as_ref().and_then(|a| a.policy.as_ref()).ok_or(ReadFault::InvalidPlan)?;
         let relative = binding.relative;
         preparing.parent_unbound = false;
-        preparing.parent = Some(parent::open_parent(&ledger, &options.dest, relative, frozen.cwd(), cancel)?);
+        match parent::open_parent(&ledger, &options.dest, relative, frozen.cwd(), cancel) {
+            Ok(parent) => preparing.parent = Some(parent),
+            // open_parent has already given its slot back
+            Err(error) if allow_blocked && parent::nondirectory_parent(&error) => {
+                *blocked = Some(target::Refusal::ParentNotDirectory);
+                return Ok(false);
+            }
+            Err(error) => {
+                ledger.with_state(|s| s.poisoned = true);
+                return Err(error);
+            }
+        }
         let parent = preparing.parent.as_mut().unwrap();
         let mut scratch = policy::PolicyScratch::new(ledger)?;
         match target::inspect(&ledger, parent, frozen, options.overwrite, RunCategory::PathSteps, &mut scratch, cancel)?
@@ -511,13 +522,16 @@ fn acquire(
         Ok(false) => {
             // Skip is a successful no-storage outcome. Retire the held parent
             // normally without poisoning this completed selected action.
-            let parent = preparing.parent.take().unwrap();
+            let parent = preparing.parent.take();
             preparing.finished = true;
             ledger.with_state(|s| {
                 s.retire_fd(true);
                 s.release_bytes(binding.encrypted, binding.bytes);
             });
-            parent.finish(&ledger)?;
+            // No parent is held when a nondirectory above the target refused it.
+            if let Some(parent) = parent {
+                parent.finish(&ledger)?;
+            }
             Ok(None)
         }
         Err(error) => Err(match preparing.cleanup() {

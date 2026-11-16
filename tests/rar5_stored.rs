@@ -181,14 +181,16 @@ fn never_writes_through_a_link_below_a_folder_it_made() {
 }
 
 #[test]
-fn a_file_in_the_way_of_a_folder_stops_the_run() {
+fn a_file_in_the_way_of_a_folder_fails_only_that_member() {
     let dir = tmp("fileway");
     let arc = dir.join("t.rar");
     fs::write(&arc, archive(&[FileSpec::new("a/b/f", b"y")])).unwrap();
     let out = dir.join("out");
     fs::create_dir_all(out.join("a")).unwrap();
     fs::write(out.join("a/b"), b"old").unwrap();
-    assert!(extract::run(&arc, &opts(&out), |_| {}).is_err());
+    let summary = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (0, 1), "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("a file is in the way"), "{:?}", summary.errors);
     assert_eq!(fs::read(out.join("a/b")).unwrap(), b"old");
 }
 
