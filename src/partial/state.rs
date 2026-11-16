@@ -52,6 +52,8 @@ pub(crate) struct CommittedState {
     pub size: u64,
     pub produced: u64,
     pub member_finished: bool,
+    /// Set once the tail past `produced` was abandoned (`member_finished` is then true): which checks verify it.
+    pub tail: Option<TailChecks>,
     pub checks: MemberChecks,
     pub binding: NativeBinding,
     pub pages: Vec<PageRef>,
@@ -90,6 +92,21 @@ pub(crate) struct CipherBlock {
 impl CipherBlock {
     pub fn whole(&self) -> bool {
         self.have == (0..16)
+    }
+}
+impl Snapshot {
+    /// End of the output a write may reach: the last recorded part's, or the size once the tail is abandoned.
+    pub(super) fn writable_end(&self) -> Option<u64> {
+        if self.head.tail.is_some() { Some(self.head.size) } else { self.evidence.parts.last().map(|p| p.out.end) }
+    }
+    /// End of the part holding output `at` (leaves never cross it), or the size past the last part of a member
+    /// whose tail is abandoned.
+    pub(super) fn part_end(&self, at: u64) -> Option<u64> {
+        let parts = &self.evidence.parts;
+        match parts.get(parts.partition_point(|p| p.out.end <= at)) {
+            Some(part) => Some(part.out.end),
+            None => self.head.tail.map(|_| self.head.size).filter(|&end| at < end),
+        }
     }
 }
 #[derive(Clone)]
@@ -394,7 +411,12 @@ pub(super) fn encode_record(
     p.blob(os_bytes(head.relative_output.as_os_str()))?;
     p.u64(head.size)?;
     p.u64(head.produced)?;
-    p.u8(head.member_finished as u8)?;
+    // 0 running, 1 finished, 2 tail abandoned with the archive's checks, 3 with checks the caller supplied.
+    p.u8(match head.tail {
+        None => head.member_finished as u8,
+        Some(TailChecks::Archive) => 2,
+        Some(TailChecks::Supplied) => 3,
+    })?;
     p.option32(head.checks.crc32)?;
     p.hash(head.checks.blake2sp)?;
     for id in [head.binding.root, head.binding.parent, head.binding.output, head.binding.bundle] {
@@ -464,7 +486,13 @@ pub(super) fn decode_record(
     if produced > size {
         return Err(malformed());
     }
-    let member_finished = d.bool()?;
+    let (member_finished, tail) = match d.u8()? {
+        0 => (false, None),
+        1 => (true, None),
+        2 => (true, Some(TailChecks::Archive)),
+        3 => (true, Some(TailChecks::Supplied)),
+        _ => return Err(malformed()),
+    };
     let checks = MemberChecks { size, crc32: d.option32()?, blake2sp: d.hash()? };
     let mut ids = [Identity(0, 0); 4];
     for id in &mut ids {
@@ -509,6 +537,7 @@ pub(super) fn decode_record(
             size,
             produced,
             member_finished,
+            tail,
             checks,
             binding: NativeBinding { root: ids[0], parent: ids[1], output: ids[2], bundle: ids[3] },
             pages,
@@ -654,6 +683,7 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             HoleCause::DeclaredBad => 1,
             HoleCause::CipherNeighbour => 2,
             HoleCause::HeaderLost => 3,
+            HoleCause::TailAbandoned => 4,
         })?;
     }
     // Versioned ciphertext block section of encrypted members, written only when some block is kept.
@@ -888,6 +918,7 @@ pub(super) fn decode_pages(
                 1 => HoleCause::DeclaredBad,
                 2 => HoleCause::CipherNeighbour,
                 3 => HoleCause::HeaderLost,
+                4 => HoleCause::TailAbandoned,
                 _ => return Err(malformed()),
             };
         }

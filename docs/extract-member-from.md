@@ -160,9 +160,9 @@ After an error, the reader answers `AlreadyFailed`.
 
 ## Limitations
 
-- Persistent partials accept alt plaintext only inside holes that the session has already produced
-  (`PartialFile::fill`; see [persistent partials](persistent-partials.md)). A takeover therefore needs the original
-  session to have run the member to its end, with `[offset_reached, end)` reported as holes. A member that was
-  mid-extraction when its session stopped (for example after a restart) cannot be filled past `produced` yet.
-  Resume after a restart is a separate item.
+- Persistent partials accept alt plaintext only inside holes. When the original session stopped mid-member (a
+  missing volume, a download that never resumes, a restart), call `PartialFile::abandon_tail(checks)` first: it
+  turns `[produced, size)` into one `TailAbandoned` hole, and `offset_reached` is that hole's start. Pass the
+  alt's `MapMember::checks` (CRC-32 and size) as `checks` when they are plain; see
+  [persistent partials](persistent-partials.md#taking-over-an-unfinished-member).
 - Compressed members and 7z are not supported.
