@@ -947,3 +947,34 @@ fn restart_resumes_a_rar4_aes_stored_member_at_every_crash_point() {
         assert_eq!(fs::read(dir.path().join("out").join("movie.mkv")).unwrap(), gold, "crash at {crash_at}");
     }
 }
+
+/// A wrong password on the persistent RAR4 AES route: RAR 3.x AES has no check value, so the member decrypts to
+/// garbage and the session fails on its final CRC-32. No member finishes, so nothing is published: the in-place
+/// partial output holds no decrypted bytes and is never reported complete.
+#[test]
+fn rar4_aes_stored_member_with_a_wrong_password_fails_its_crc_and_publishes_nothing() {
+    let gold = gold(4000);
+    let set = Set::aes_split(Naming::Parts, &gold, &[1008, 1008, 1008, 976], "pw");
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session_with(&set, dir.path(), &Arc::default(), Some("wrong"));
+    let mut outcomes = Vec::new();
+    let failure = loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => continue,
+            Poll::Ready(Err(failure)) => break failure,
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => break failure,
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(outcome),
+            Poll::Ready(Ok(None)) => panic!("a wrong password must fail the session"),
+            _ => {}
+        }
+    };
+    let FailureKind::Rar(rar) = &failure.kind else { panic!("not a RAR integrity failure: {failure:?}") };
+    let detail = format!("{rar:?}");
+    assert!(
+        detail.contains("EncryptedIntegrity") && detail.contains("crc32: true"),
+        "the member CRC-32 must fail: {detail}"
+    );
+    assert!(outcomes.is_empty(), "no member may finish: {:?}", outcomes.iter().map(describe).collect::<Vec<_>>());
+    let out = dir.path().join("out").join("movie.mkv");
+    assert!(fs::read(&out).ok().is_none_or(|bytes| bytes != gold));
+}
