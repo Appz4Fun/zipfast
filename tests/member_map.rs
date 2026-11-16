@@ -2027,3 +2027,22 @@ fn limits_after_the_main_header_stay_errors() {
         assert!(matches!(error, MapError::Limit { .. }), "{error:?}");
     }
 }
+
+// Catches a RAR4 Unicode-flagged name with nothing (or nothing decodable) after its NUL being treated as damage;
+// unrar decodes the Unicode part only when the field is longer than the legacy name and its NUL.
+#[test]
+fn rar4_unicode_name_without_an_encoded_part_falls_back_to_the_legacy_name() {
+    let gold = data(64, 3);
+    for field in [&b"movie.mkv\0"[..], &b"movie.mkv\0\0"[..]] {
+        let bytes = r4_archive(&[r4_member(field, &gold, 0x200, 0x30, gold.len(), crc32fast::hash(&gold))]);
+        let volume = vol(&bytes, "x.rar", None).unwrap();
+        assert_eq!(volume.end, VolumeEnd::Complete, "{field:?}");
+        assert_eq!(volume.members.len(), 1);
+        assert_eq!(volume.members[0].name.as_deref(), Some("movie.mkv"));
+        let map = MemberMap::from_memory(&[&bytes], "x.rar", None).unwrap();
+        assert!(map.complete);
+        assert_eq!(map.members[0].name.as_deref(), Some("movie.mkv"));
+        let piece = &map.members[0].pieces[0];
+        assert_eq!(&bytes[piece.packed.start as usize..piece.packed.end as usize], &gold[..]);
+    }
+}

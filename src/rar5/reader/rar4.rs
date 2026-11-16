@@ -374,20 +374,15 @@ fn decode_name(
     usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<String, FileParseError> {
     if !unicode || !encoded.contains(&0) {
-        let value = std::str::from_utf8(encoded).map_err(|_| Error::Unsupported("RAR4 legacy name encoding".into()))?;
-        admit_name(usage, value.len())?;
-        let mut name = String::new();
-        name.try_reserve_exact(value.len()).map_err(|_| FileParseError::Allocation)?;
-        if let Some(usage) = usage {
-            usage
-                .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
-                .map_err(FileParseError::Progressive)?;
-        }
-        name.push_str(value);
-        return Ok(name);
+        return legacy_name(encoded, usage);
     }
     let split = encoded.iter().position(|&byte| byte == 0).ok_or(Error::Corrupt("RAR4 Unicode separator"))?;
     let legacy = &encoded[..split];
+    // As unrar: the encoded Unicode part is decoded only when the name field is longer than the legacy name and its
+    // NUL; otherwise, or when it decodes to nothing, the legacy name is used.
+    if split + 1 >= encoded.len() {
+        return legacy_name(legacy, usage);
+    }
     let mut fields = Fields::new(encoded, split + 1);
     let high = u16::from(fields.byte()?) << 8;
     let mut units = Vec::new();
@@ -417,6 +412,9 @@ fn decode_name(
             }
         }
     }
+    if units.is_empty() {
+        return legacy_name(legacy, usage);
+    }
     let length = char::decode_utf16(units.iter().copied()).try_fold(0usize, |length, scalar| {
         let scalar = scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?;
         length.checked_add(scalar.len_utf8()).ok_or(FileParseError::Allocation)
@@ -432,6 +430,24 @@ fn decode_name(
     for scalar in char::decode_utf16(units) {
         name.push(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?);
     }
+    Ok(name)
+}
+
+/// A RAR4 name without (usable) Unicode encoding: the stored bytes must be UTF-8.
+fn legacy_name(
+    encoded: &[u8],
+    usage: Option<&crate::progressive::Usage>,
+) -> std::result::Result<String, FileParseError> {
+    let value = std::str::from_utf8(encoded).map_err(|_| Error::Unsupported("RAR4 legacy name encoding".into()))?;
+    admit_name(usage, value.len())?;
+    let mut name = String::new();
+    name.try_reserve_exact(value.len()).map_err(|_| FileParseError::Allocation)?;
+    if let Some(usage) = usage {
+        usage
+            .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
+            .map_err(FileParseError::Progressive)?;
+    }
+    name.push_str(value);
     Ok(name)
 }
 
