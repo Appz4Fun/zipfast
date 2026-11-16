@@ -4149,3 +4149,115 @@ fn encrypted_restart_resumes_at_every_crash_point() {
     }
     assert!(straddled, "a previous ciphertext block cut by a part boundary was read from two volumes");
 }
+
+#[test]
+fn a_wrong_fill_before_the_crash_is_judged_by_verification_not_the_resumed_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    // a's hole 1300..2000 is filled with one wrong byte, then the session dies inside a.
+    let mut session = resume_session(&mut Fixture::new(), dir.path(), &anchors, 0);
+    let mut seen = Seen::default();
+    while seen.written < 3500 {
+        assert!(!step(&mut session, &mut seen));
+    }
+    let mut fill = Fixture::new().data[0][1300..2000].to_vec();
+    fill[10] ^= 1;
+    seen.files[0].1.fill(1300, &fill).unwrap();
+    crash((session, std::mem::take(&mut seen.files)));
+    // The restart neither fails nor wedges: a verifies PartBad (the wrong byte is in part 0), b is extracted.
+    for _ in 0..2 {
+        let mut fixture = whole_fixture();
+        let mut session = resume_session(&mut fixture, dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        assert!(run_events(&mut session, &mut seen, None));
+        assert_eq!(seen.outcomes.len(), 2);
+        assert!(matches!(
+            &seen.outcomes[0].1,
+            MemberOutcome::PersistentComplete { verdict: Verdict::PartBad { part: 0, .. }, .. }
+        ));
+        assert!(matches!(&seen.outcomes[1].1, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }));
+        assert_eq!(fs::read(dir.path().join("out/b.bin")).unwrap(), fixture.data[1]);
+    }
+}
+
+#[test]
+fn damage_declared_on_bytes_the_resume_walk_skips_becomes_holes() {
+    // Crash inside a (the declared bytes lie before its resume point) and inside b (a is finished).
+    for (stop_in_b, written) in [(false, 3500), (true, 3500)] {
+        let dir = tempfile::tempdir().unwrap();
+        let anchors = Arc::new(Anchors::default());
+        let mut session = resume_session(&mut whole_fixture(), dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        while (stop_in_b && seen.outcomes.is_empty()) || seen.written < written {
+            assert!(!step(&mut session, &mut seen));
+        }
+        crash((session, std::mem::take(&mut seen.files)));
+        let mut fixture = whole_fixture();
+        let payload = fixture.payloads[1].clone();
+        let mut session = resume_session(&mut fixture, dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        assert!(!step(&mut session, &mut seen));
+        // Volume 1 is not open yet: the damage is pending, and lies on a's part 1 (output 1410..1420).
+        let receipt = session.declare_hole(1, payload.start + 10..payload.start + 20).unwrap();
+        assert_eq!(receipt.pending.len(), 1);
+        assert!(run_events(&mut session, &mut seen, None));
+        let holes: Vec<_> = seen.holes.iter().map(|h| (h.out.clone(), h.cause.clone())).collect();
+        assert_eq!(holes, vec![(1410..1420, HoleCause::DeclaredBad)], "stop in b: {stop_in_b}");
+        assert!(matches!(&seen.outcomes[0].1, MemberOutcome::PersistentPartial { .. }));
+        let (_, a) = seen.files.iter_mut().find(|(k, _)| k.ordinal() == 0).unwrap();
+        assert_eq!(a.remaining().unwrap(), vec![1410..1420]);
+        a.fill(1410, &fixture.data[0][1410..1420]).unwrap();
+        assert!(matches!(verify(a), Verdict::Ok { .. }));
+    }
+}
+
+#[test]
+fn encrypted_damage_on_the_previous_ciphertext_block_makes_the_next_block_a_hole() {
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let session = |provider: Provider| {
+        let mut opts = options(&dir.path().join("out"));
+        opts.set_password(Some("pw".into())).unwrap();
+        opts.limits.read_chunk = 16;
+        let mut partial = partial_options(&dir.path().join("state"));
+        partial.anchors = anchors.clone();
+        partial.limits.group_commit_bytes = 0;
+        ProgressiveSession::new_partial(Box::new(provider), opts, partial).unwrap()
+    };
+    // Crash at produced 1008: the block before it, 992..1008, is cut by the volume boundary at 1001.
+    let mut first = session(fixture.provider(&[]).0);
+    let mut seen = Seen::default();
+    while seen.written < 1008 {
+        assert!(!step(&mut first, &mut seen));
+    }
+    assert_eq!(seen.written, 1008);
+    crash((first, std::mem::take(&mut seen.files)));
+    // The restart reads 992..1001 from volume 0, then waits for volume 1's bytes 1001..1008.
+    let (mut provider, _) = fixture.provider(&[]);
+    let gate = Arc::new(WaitGate::default());
+    provider.volumes[1].as_mut().unwrap().wait = Some((fixture.payloads[1].start, gate.clone()));
+    let mut second = session(provider);
+    let mut seen = Seen::default();
+    for _ in 0..100_000 {
+        if gate.0.lock().unwrap().is_some() {
+            break;
+        }
+        if let Poll::Ready(Ok(Some(ProgressiveEvent::PartialAdopted { member, .. }))) =
+            second.poll_event(&mut Context::from_waker(Waker::noop()))
+        {
+            seen.files.push((member.clone(), second.partial_file(&member).unwrap()));
+        }
+    }
+    assert!(gate.0.lock().unwrap().is_some(), "waiting inside the previous block");
+    // Damage on the half of the block already read.
+    let piece = fixture.packed(992..1001);
+    second.declare_hole(piece[0].0, piece[0].1.clone()).unwrap();
+    gate.0.lock().unwrap().take().unwrap().wake();
+    assert!(run_events(&mut second, &mut seen, None));
+    let (_, file) = seen.files.last_mut().unwrap();
+    let remaining = file.remaining().unwrap();
+    assert!(remaining.iter().any(|r| r.start <= 1008 && 1024 <= r.end), "{remaining:?}");
+    fill_plain(file, &fixture);
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+}

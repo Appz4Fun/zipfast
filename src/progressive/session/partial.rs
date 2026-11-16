@@ -240,6 +240,29 @@ impl ProgressiveSession {
                 persistent.unavailable.push((stream, true));
             }
         }
+        // An adopted encrypted member reading its previous ciphertext block holds its machine back, so neither the
+        // machine nor `fed_damage` sees damage on those bytes: mark the block unknown, so the first block after
+        // the resume point becomes a `CipherNeighbour` hole instead of output decrypted with damaged ciphertext.
+        if let Some(resume) = self.partial.as_ref().and_then(|p| p.resume.as_ref())
+            && !resume.finished
+            && resume.iv_from < resume.stream
+        {
+            let (iv, mut stream, mut hit) = (resume.iv_from..resume.stream, 0u64, false);
+            for part in &self.model.parts {
+                let start = range.start.max(part.data_offset);
+                let end = range.end.min(part.data_offset.saturating_add(part.packed_size));
+                if part.volume as u32 == volume && start < end {
+                    let a = stream + (start - part.data_offset);
+                    let b = stream + (end - part.data_offset);
+                    hit |= a < iv.end && iv.start < b;
+                }
+                stream = stream.saturating_add(part.packed_size);
+            }
+            // A part not parsed yet holds no byte of the block: it lies before the resume point.
+            if hit {
+                self.partial.as_mut().unwrap().resume.as_mut().unwrap().iv_known = false;
+            }
+        }
         if !future.is_empty() {
             self.driver.declare_future(volume, future.clone())?;
         }
@@ -593,13 +616,28 @@ impl ProgressiveSession {
             }
         }
     }
-    /// Skips `n` data bytes of the active part without reading them.
+    /// Skips `n` data bytes of the active part without reading them. Damage declared on them (with
+    /// `declare_hole`, while they were still ahead of the session) is applied to the output already produced from
+    /// them: its runs become `DeclaredBad` holes, delivered as `Hole` events, instead of being seeked over.
     fn skip(&mut self, n: u64) -> ProgressiveResult<()> {
         if n == 0 {
             return Ok(());
         }
         let part = self.model.parts.last().unwrap();
-        let at = part.data_offset + (part.packed_size - self.remaining) + n;
+        let from = part.data_offset + (part.packed_size - self.remaining);
+        let at = from + n;
+        let declared = self.driver.take_declared(self.volume, &(from..at));
+        if !declared.is_empty() {
+            let persistent = self.partial.as_mut().unwrap();
+            let core = persistent.active().1.clone();
+            for range in declared {
+                let (reports, _) = core.declare_damage(self.volume, &range).map_err(failure)?;
+                self.usage
+                    .charge(Resource::MetadataBytes, (reports.len() * std::mem::size_of::<HoleReport>()) as u64)?;
+                persistent.holes.try_reserve(reports.len()).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+                persistent.holes.extend(reports);
+            }
+        }
         self.driver.seek(at)?;
         self.cursor = at;
         self.remaining -= n;
@@ -623,14 +661,17 @@ impl ProgressiveSession {
         } else {
             resume.iv_known.then_some(resume.iv)
         };
-        machine.resume_stored(crate::rar5::member::StoredResume {
-            delivered: resume.produced,
-            part_bytes,
-            member: hashes.member,
-            part: if encrypted && part_bytes > 0 { None } else { hashes.part },
-            iv: if encrypted { iv } else { None },
-            padding: (resume.stream - resume.produced.min(resume.stream)) as usize,
-        })?;
+        machine.resume_stored(
+            self.model.parts.last().unwrap(),
+            crate::rar5::member::StoredResume {
+                delivered: resume.produced,
+                part_bytes,
+                member: hashes.member,
+                part: if encrypted && part_bytes > 0 { None } else { hashes.part },
+                iv: if encrypted { iv } else { None },
+                padding: (resume.stream - resume.produced.min(resume.stream)) as usize,
+            },
+        )?;
         self.machine = Some(machine);
         self.produced = resume.produced;
         persistent.stream = resume.stream;

@@ -2175,11 +2175,22 @@ impl PartialCore {
             return Err(malformed());
         }
         let part = part_start..at;
+        // Only output the extraction produced counts. A hole filled with alt bytes was never judged by a streaming
+        // check, and a wrong fill there must reach `poll_verify` as `Bad` or `PartBad`, as it does without a
+        // restart, rather than fail the resumed stream: a range with alt output, or overlapping a recorded hole,
+        // is not usable. Archive bytes a `fill_packed` wrote are recorded as original and cannot be told apart,
+        // so a resumed member's streaming checks never fail the session either (`MemberMachine::resume_stored`).
         let covered = |range: &Range<u64>| {
+            if snapshot.holes.iter().any(|hole| hole.out.start < range.end && range.start < hole.out.end) {
+                return false;
+            }
             let mut next = range.start;
             for leaf in &snapshot.known[snapshot.known.partition_point(|leaf| leaf.range.end <= range.start)..] {
                 if next >= range.end || leaf.range.start > next {
                     break;
+                }
+                if leaf.provenance != state::Provenance::Original {
+                    return false;
                 }
                 next = leaf.range.end;
             }
