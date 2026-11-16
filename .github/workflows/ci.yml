@@ -82,7 +82,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cpu: [spr, skl]
+        include:
+          - cpu: spr
+            expect: x86-sha-ni
+          - cpu: skl
+            expect: scalar
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # Rust 1.100.0
@@ -108,9 +112,9 @@ jobs:
           test -x "$bin"
           echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
       - name: Run the SHA-256 tests on the emulated CPU
-        run: sde64 -${{ matrix.cpu }} -- "$TEST_BIN" sha256
+        run: ZIPFAST_SHA256_EXPECT=${{ matrix.expect }} sde64 -${{ matrix.cpu }} -- "$TEST_BIN" sha256
       - name: Run them again with the portable rounds forced
-        run: ZIPFAST_SHA256=scalar sde64 -${{ matrix.cpu }} -- "$TEST_BIN" sha256
+        run: ZIPFAST_SHA256=scalar ZIPFAST_SHA256_EXPECT=scalar sde64 -${{ matrix.cpu }} -- "$TEST_BIN" sha256
 
   zipview-msrv:
     name: Zipview on Rust 1.100.0

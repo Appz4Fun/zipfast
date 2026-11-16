@@ -633,5 +633,10 @@ mod tests {
         let forced = std::env::var_os("ZIPFAST_SHA256").is_some_and(|v| v == "scalar");
         let want = if forced { Backend::Scalar } else { *Backend::available().last().unwrap() };
         assert_eq!(sha256_backend(), want.name());
+        // CI names the backend it expects on an emulated CPU, so a detection miss cannot quietly test the
+        // portable rounds alone.
+        if let Some(expected) = std::env::var_os("ZIPFAST_SHA256_EXPECT") {
+            assert_eq!(std::ffi::OsStr::new(sha256_backend()), expected);
+        }
     }
 }
