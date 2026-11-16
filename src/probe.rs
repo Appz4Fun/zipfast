@@ -68,6 +68,8 @@ pub enum Packing {
     Rar(RarPacking),
     /// A ZIP archive.
     Zip(ZipPacking),
+    /// A 7z archive, or the first volume of a split one (`.7z.001`).
+    SevenZip(SevenZipPacking),
     /// Neither recognised media nor an archive this module reads.
     Unknown,
 }
@@ -80,6 +82,7 @@ impl Packing {
             Self::BareMedia(_) => Borrowable::Yes,
             Self::Rar(rar) => rar.borrowable,
             Self::Zip(zip) => zip.borrowable,
+            Self::SevenZip(seven) => seven.borrowable,
             Self::Unknown => Borrowable::Unknown(Undecided::NotRecognised),
         }
     }
@@ -89,6 +92,7 @@ impl Packing {
         match self {
             Self::Rar(rar) => rar.first_media.as_ref(),
             Self::Zip(zip) => zip.first_media.as_ref(),
+            Self::SevenZip(seven) => seven.first_media.as_ref(),
             _ => None,
         }
     }
@@ -154,6 +158,35 @@ pub struct ZipPacking {
     pub borrowable: Borrowable,
 }
 
+/// What a probe found in a 7z archive.
+///
+/// A 7z archive keeps its headers at the end, so a first article usually holds only the 32-byte signature header:
+/// the facts below come from it, and members are listed only when the head holds the whole archive (`complete`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SevenZipPacking {
+    /// The format version from the signature header (major, minor): 0.4 for 7-Zip's archives.
+    pub version: (u8, u8),
+    /// Where the end header starts, as an offset into the whole archive (over every volume of a split set), and
+    /// its length. Zero for a head shorter than the signature header.
+    pub header_offset: u64,
+    pub header_len: u64,
+    /// The archive's whole length, `header_offset + header_len`: for a split set, the sum of the volumes.
+    pub archive_len: u64,
+    /// The head holds the whole archive and its headers were read: `members` lists them all.
+    pub complete: bool,
+    /// The headers are encrypted (`-mhe`); known only once they are read.
+    pub header_encrypted: bool,
+    /// The headers are encrypted and could not be read: no password, or the wrong one.
+    pub locked: bool,
+    /// Members listed.
+    pub members: usize,
+    pub first_media: Option<MemberFacts>,
+    pub borrowable: Borrowable,
+    /// The member map, when the headers were read.
+    pub map: Option<MemberMap>,
+}
+
 /// How the chosen member was picked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Selection {
@@ -181,6 +214,8 @@ pub enum CipherKind {
     ZipCrypto,
     /// WinZip AES (`strength` 1 to 3: AES-128, -192, -256).
     WinZipAes { strength: u8 },
+    /// 7zAES (AES-256-CBC).
+    SevenZipAes,
     /// ZIP strong encryption, or a WinZip AES entry without a valid AES extra field.
     Unknown,
 }
@@ -343,7 +378,7 @@ pub fn probe(head: &[u8], tail: Option<&[u8]>, password: Option<&str>) -> Result
 
 /// Says how a file is packed from its first bytes `head` and, optionally, its last bytes `tail`.
 ///
-/// Detection order: a RAR signature at the start, a ZIP local header (or empty-archive end record, or spanned
+/// Detection order: a 7z signature at the start ([`Packing::SevenZip`]), a RAR signature at the start, a ZIP local header (or empty-archive end record, or spanned
 /// marker) at the start, a media magic at the start ([`sniff`]), then the RAR scanner for a self-extracting stub.
 /// `tail` is used only for ZIP, to read the central directory. An empty password is no password.
 ///
@@ -357,6 +392,9 @@ pub fn probe_with(
     options: &ProbeOptions,
 ) -> Result<Packing, MapError> {
     let password = password.filter(|p| !p.is_empty());
+    if head.starts_with(&crate::map::sevenzip::MAGIC) {
+        return seven_zip(head, password, options);
+    }
     if head.starts_with(b"Rar!") {
         return rar(head, password, options);
     }
@@ -451,6 +489,79 @@ fn zip_packing(
     }))
 }
 
+fn seven_zip(head: &[u8], password: Option<&str>, options: &ProbeOptions) -> Result<Packing, MapError> {
+    let field = |at: usize| head.get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().expect("eight bytes")));
+    let version = (head.get(6).copied().unwrap_or(0), head.get(7).copied().unwrap_or(0));
+    let (header_offset, header_len) =
+        if head.len() >= 32 { (32u64.saturating_add(field(12)), field(20)) } else { (0, 0) };
+    let mut packing = SevenZipPacking {
+        version,
+        header_offset,
+        header_len,
+        archive_len: header_offset.saturating_add(header_len),
+        complete: false,
+        header_encrypted: false,
+        locked: false,
+        members: 0,
+        first_media: None,
+        borrowable: Borrowable::Unknown(Undecided::Truncated),
+        map: None,
+    };
+    let mut map_options = MapOptions::new("probe.7z").password(password);
+    map_options.limits = options.limits.clone();
+    let map = match MemberMap::from_memory_with(&[head], map_options) {
+        Ok(map) => map,
+        Err(e @ (MapError::PasswordRequired | MapError::WrongPassword)) => {
+            packing.header_encrypted = true;
+            packing.locked = true;
+            let need = if matches!(e, MapError::WrongPassword) {
+                PasswordNeed::WrongPassword
+            } else {
+                PasswordNeed::HeaderEncrypted
+            };
+            packing.borrowable = Borrowable::NeedsPassword(need);
+            return Ok(Packing::SevenZip(packing));
+        }
+        // A head too short for the signature header, or cut before the end header.
+        Err(MapError::Malformed { .. }) if (head.len() as u64) < packing.archive_len.max(32) => {
+            return Ok(Packing::SevenZip(packing));
+        }
+        Err(e) => return Err(e),
+    };
+    packing.header_encrypted = map.header_encrypted;
+    if !map.complete {
+        return Ok(Packing::SevenZip(packing));
+    }
+    let candidates: Vec<Candidate> = map
+        .members
+        .iter()
+        .map(|m| Candidate {
+            raw_name: m.raw_name.clone(),
+            name: m.name.clone(),
+            is_dir: m.is_dir,
+            size: m.unpacked_size,
+            packed_size: Some(m.packed_size),
+            header: None,
+            data: m.pieces.first().map(|p| p.packed.start..p.packed.start + m.packed_size),
+            continued: false,
+            method: m.method,
+            solid: m.solid,
+            encrypted: m.encrypted,
+            cipher_kind: m.cipher.as_ref().map(cipher_kind),
+            cipher: m.cipher.clone(),
+            mapping: m.mapping,
+        })
+        .collect();
+    let (first_media, borrowable) =
+        decide(head, &candidates, true, password, map.header_encrypted, &mut KdfMeter::new(&options.limits))?;
+    packing.complete = true;
+    packing.members = candidates.len();
+    packing.first_media = first_media;
+    packing.borrowable = borrowable;
+    packing.map = Some(map);
+    Ok(Packing::SevenZip(packing))
+}
+
 fn cipher_kind(params: &CipherParams) -> CipherKind {
     match params {
         CipherParams::Rar5 { .. } => CipherKind::Rar5Aes256,
@@ -458,8 +569,7 @@ fn cipher_kind(params: &CipherParams) -> CipherKind {
         CipherParams::Rar4Legacy { .. } => CipherKind::Rar4Legacy,
         CipherParams::ZipCrypto { .. } => CipherKind::ZipCrypto,
         CipherParams::WinZipAes { strength, .. } => CipherKind::WinZipAes { strength: *strength },
-        // 7z is not probed (a 7z first article is `Packing::Unknown`).
-        CipherParams::SevenZipAes { .. } => CipherKind::Unknown,
+        CipherParams::SevenZipAes { .. } => CipherKind::SevenZipAes,
     }
 }
 
@@ -791,6 +901,22 @@ fn prove(head: &[u8], c: &Candidate, password: &str, kdf: &mut KdfMeter) -> Resu
                     .map(size_cap)
             });
             Ok(Proved::Checked { verified: true, plain })
+        }
+        Some(CipherParams::SevenZipAes { num_cycles_power, salt, iv }) => {
+            // No check value: the decrypted first bytes are all there is to go on.
+            let limit = kdf.limits.limit(Resource::KdfExponent);
+            if *num_cycles_power != 0x3F && u64::from(*num_cycles_power) > limit {
+                return Err(MapError::Limit {
+                    resource: Resource::KdfExponent,
+                    limit,
+                    attempted: u64::from(*num_cycles_power),
+                });
+            }
+            match crate::crypto::derive_7z_key_controlled(password, salt, *num_cycles_power, kdf) {
+                None => Ok(Proved::Unsupported),
+                Some(Err(error)) => Err(kdf_limit(error)),
+                Some(Ok(key)) => Ok(Proved::Checked { verified: false, plain: cbc(&key, iv) }),
+            }
         }
         _ => Ok(Proved::Checked { verified: false, plain: None }),
     }

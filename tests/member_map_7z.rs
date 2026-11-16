@@ -806,10 +806,14 @@ fn cut_sets_report_the_header_unavailable() {
 // ---- Detection ----
 
 #[test]
-fn seven_zip_is_not_mapped_volume_by_volume_or_probed() {
+fn seven_zip_is_not_mapped_volume_by_volume_but_is_probed() {
     let archive = build(&[(Method::Copy, vec![Entry::File("f", data(100, 1))])], &[], &HeaderMode::Plain);
     assert!(matches!(MemberMap::from_volume(&archive, MapOptions::new("a.7z")), Err(MapError::NotArchive)));
-    assert!(matches!(zipfast::probe::probe(&archive, None, None), Ok(zipfast::probe::Packing::Unknown)));
+    // The probe reads a head holding the whole archive (see tests/sevenzip_extract.rs for first articles).
+    match zipfast::probe::probe(&archive, None, None) {
+        Ok(zipfast::probe::Packing::SevenZip(seven)) => assert_eq!((seven.complete, seven.members), (true, 1)),
+        other => panic!("{other:?}"),
+    }
     let empty = wrap(&[], &[]);
     let map = map_set(&[empty], None).unwrap();
     assert!(map.complete && map.members.is_empty());
