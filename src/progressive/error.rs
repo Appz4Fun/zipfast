@@ -138,6 +138,10 @@ pub enum FailureKind {
     IncompleteOutput,
     PublicationAuthorityRequired,
     InvalidCapability,
+    /// A growing source saw no growth for its caller-set idle timeout while the session needed more bytes.
+    IdleTimeout {
+        idle: std::time::Duration,
+    },
 }
 #[derive(Debug)]
 pub struct ProgressiveFailure {

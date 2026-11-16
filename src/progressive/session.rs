@@ -504,6 +504,10 @@ impl ProgressiveSession {
                     let mut stage = output.create(self.member.expect("member"), member.unpacked_size)?;
                     self.had_stage = true;
                     stage.bind_target(self.target.as_mut().expect("target"))?;
+                    if let Some(identity) = self.target.as_ref().and_then(|target| target.stage_identity()) {
+                        // A growing declaration must never name this file as an input.
+                        self.driver.record_output(identity)?;
+                    }
                     stage.set_metadata(crate::extract::Meta::from(&member.header));
                     self.stage = Some(stage);
                     self.phase = Phase::Part;

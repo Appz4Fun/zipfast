@@ -910,6 +910,10 @@ pub(super) fn out_range(
 }
 
 impl Target {
+    /// Native identity of the stage file bound to this target, which publication renames into place.
+    pub(crate) fn stage_identity(&self) -> Option<native::Identity> {
+        self.stage_identity
+    }
     fn check_parent(&self) -> ProgressiveResult<()> {
         if self.parent_unbound {
             return Err(invalid());

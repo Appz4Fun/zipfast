@@ -34,6 +34,10 @@ use std::{
 pub struct SourceId(pub u128);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Both variants promise the same exact logical EOF; neither implies contiguous availability.
+///
+/// `Advertised(u64::MAX)` is the one exception: an open-ended source whose EOF is not known yet, such as a
+/// [`super::GrowingFileSource`]. The driver never reaches that offset, so the archive's own end block (not the
+/// source) ends the volume, and reads past the observed `extent` answer `NotYet` until the file grows.
 pub enum SourceLength {
     Advertised(u64),
     Final(u64),
@@ -84,7 +88,8 @@ pub trait VolumeSource: Send + 'static {
         Ok(ProtectionDeclaration::Opaque)
     }
     /// Opts in to a growing Complete declaration; read once, when a persistent session starts. Ordinary sessions
-    /// ignore it.
+    /// ignore it, except for the library-owned [`super::GrowingFileVolumes`], whose growth an ordinary session
+    /// accepts after checking every appended path against every output file it created.
     ///
     /// When true, a persistent session (`ProgressiveSession::new_partial`, feature `persistent-partials`) also
     /// accepts a Complete declaration with a higher epoch that only appends volumes and auxiliary paths, every
@@ -94,6 +99,21 @@ pub trait VolumeSource: Send + 'static {
     /// A provider that opts in and never declares the index leaves the session waiting.
     fn extends_protection(&self) -> bool {
         false
+    }
+    /// Growth authority for ordinary sessions. Only zipfast's own providers ([`super::GrowingFileVolumes`]) can
+    /// answer it: [`LibraryGrowth`] cannot be constructed outside the crate.
+    #[doc(hidden)]
+    fn library_growth(&self) -> Option<LibraryGrowth> {
+        None
+    }
+}
+/// Proof that a provider is library-owned and may grow its Complete declaration in an ordinary session.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct LibraryGrowth(());
+impl LibraryGrowth {
+    pub(crate) fn new() -> Self {
+        Self(())
     }
 }
 /// The caller owns availability and immutability leases. After NotYet, wake the
@@ -602,6 +622,10 @@ pub(crate) struct SourceDriver {
     replacements: Vec<(u32, SourceDriver)>,
     replacement_native: bool,
     external_handles: usize,
+    /// Whether a library-owned provider may grow its Complete declaration in this (ordinary) session.
+    ordinary_growth: bool,
+    /// Native identities of every output file this ordinary session created; appended paths must not name one.
+    outputs: std::collections::HashSet<super::output::native::Identity>,
 }
 impl SourceDriver {
     pub(crate) fn new(
@@ -621,6 +645,7 @@ impl SourceDriver {
         usage.charge(Resource::NameBytes, first.capacity() as u64)?;
         usage.charge(Resource::MetadataBytes, first.capacity() as u64)?;
         let native = super::output::native::NativeProtection::new(&usage)?;
+        let ordinary_growth = provider.library_growth().is_some() && provider.extends_protection();
         Ok(Self {
             #[cfg(feature = "persistent-partials")]
             partial_exclusions: None,
@@ -655,6 +680,8 @@ impl SourceDriver {
             replacements: Vec::new(),
             replacement_native: false,
             external_handles: 0,
+            ordinary_growth,
+            outputs: std::collections::HashSet::new(),
         })
     }
     // This constructor consumes the private owning backend; no caller-supplied
@@ -1467,7 +1494,9 @@ impl SourceDriver {
                 ProtectionDeclaration::Complete { epoch: b, inventory: y },
             ) if a == b && same_inventory(x, y, &mut self.usage)? => false,
             // Only a persistent session checks every declared path against every output it creates, so only it
-            // may learn of volumes later. An extension needs a higher epoch and leaves every entry unchanged.
+            // may learn of volumes later, besides an ordinary session growing a library-owned declaration (which
+            // checks appended paths against its outputs). An extension needs a higher epoch and leaves every
+            // entry unchanged.
             (
                 ProtectionDeclaration::Complete { epoch: a, inventory: x },
                 ProtectionDeclaration::Complete { epoch: b, inventory: y },
@@ -1476,6 +1505,11 @@ impl SourceDriver {
             _ => false,
         };
         self.check_inventory_admitted(&next)?;
+        if self.ordinary_extension() && (extension || matches!(self.protection, ProtectionDeclaration::Opaque)) {
+            // An ordinary session learns of volumes later only from a library-owned provider; nothing it declares
+            // may be an output file this session created.
+            self.check_appended_outputs(&next)?;
+        }
         #[cfg(feature = "persistent-partials")]
         if extension {
             // Appended paths must not name an output, bundle or lock created under an earlier epoch, by any
@@ -1595,15 +1629,73 @@ impl SourceDriver {
     }
     /// Whether a Complete declaration may grow: persistent sessions only, whose exclusions refuse any declared
     /// path that names an output, bundle or lock, and only when the provider opted in.
+    ///
+    /// An ordinary session also accepts the growth of a library-owned provider ([`VolumeSource::library_growth`]).
+    /// There every appended path is checked against every output file the session created, see
+    /// [`Self::check_appended_outputs`].
     fn extendable(&self) -> bool {
         #[cfg(feature = "persistent-partials")]
-        {
-            self.partial_exclusions.is_some() && self.extends
+        if self.partial_exclusions.is_some() {
+            return self.extends;
         }
-        #[cfg(not(feature = "persistent-partials"))]
-        {
-            false
+        // A retained driver is persistent: it grows only once its exclusions are installed.
+        self.ordinary_growth && self.retained.is_none()
+    }
+    /// Whether this driver is an ordinary session growing a library-owned declaration.
+    fn ordinary_extension(&self) -> bool {
+        #[cfg(feature = "persistent-partials")]
+        if self.partial_exclusions.is_some() {
+            return false;
         }
+        self.ordinary_growth && self.retained.is_none()
+    }
+    /// Records an output file this session created, so a later declaration cannot name it as an input.
+    pub(crate) fn record_output(&mut self, identity: super::output::native::Identity) -> ProgressiveResult<()> {
+        if !self.ordinary_extension() {
+            return Ok(());
+        }
+        self.usage.charge(Resource::SourceBookkeeping, 1)?;
+        if !self.outputs.contains(&identity) {
+            self.usage.charge(
+                Resource::MetadataBytes,
+                (std::mem::size_of::<super::output::native::Identity>() + std::mem::size_of::<u64>()) as u64,
+            )?;
+            self.outputs.try_reserve(1).map_err(|_| contract())?;
+            self.outputs.insert(identity);
+        }
+        Ok(())
+    }
+    /// Refuses a growing declaration whose newly declared native paths name an output file this ordinary session
+    /// created. Identities are compared, both of the declared handle and of whatever the path resolves to now, so
+    /// a case-folded, normalised or hard-linked alias of an output is caught too (`UnsafePath`).
+    fn check_appended_outputs(&mut self, next: &ProtectionDeclaration) -> ProgressiveResult<()> {
+        let ProtectionDeclaration::Complete { inventory: new, .. } = next else { return Ok(()) };
+        let old = match &self.protection {
+            ProtectionDeclaration::Complete { inventory, .. } => Some(inventory),
+            ProtectionDeclaration::Opaque => None,
+        };
+        let log = 1 + new.volumes.len().max(new.auxiliary_paths.len()).max(1).ilog2() as u64;
+        for volume in &new.volumes {
+            self.usage.charge(Resource::SourceBookkeeping, log)?;
+            if old.is_some_and(|old| old.volumes.binary_search_by_key(&volume.index, |v| v.index).is_ok()) {
+                continue;
+            }
+            if let VolumeBacking::Native(paths) = &volume.backing {
+                for path in paths {
+                    check_output_alias(path, &self.outputs, &mut self.usage)?;
+                }
+            }
+        }
+        for path in &new.auxiliary_paths {
+            self.usage.charge(Resource::SourceBookkeeping, log)?;
+            if old.is_some_and(|old| {
+                old.auxiliary_paths.binary_search_by(|p| p.path.as_path().cmp(path.path.as_path())).is_ok()
+            }) {
+                continue;
+            }
+            check_output_alias(path, &self.outputs, &mut self.usage)?;
+        }
+        Ok(())
     }
     /// Whether the current declaration leaves `index` undeclared, so a persistent session waits for a larger one.
     #[cfg(feature = "persistent-partials")]
@@ -1623,6 +1715,33 @@ impl SourceDriver {
         }
         Ok(())
     }
+}
+fn check_output_alias(
+    path: &ProtectedPath,
+    outputs: &std::collections::HashSet<super::output::native::Identity>,
+    usage: &mut Usage,
+) -> ProgressiveResult<()> {
+    use super::output::native::Identity;
+    usage.charge(Resource::SourceBookkeeping, 2 + path.path.as_os_str().len() as u64)?;
+    let input =
+        |cause| ProgressiveFailure::new(FailureKind::Input { operation: super::InputOperation::Metadata, cause });
+    if let Some(file) = &path.file
+        && outputs.contains(&Identity::file(file).map_err(input)?)
+    {
+        return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+    }
+    match std::fs::metadata(&path.path) {
+        Ok(meta) if meta.is_file() => {
+            if outputs.contains(&Identity::metadata(&meta).map_err(input)?) {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
+        }
+        // Absent names bind later; directories and other kinds are refused by the binding itself.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(input(e)),
+    }
+    Ok(())
 }
 struct NoVolumes;
 impl VolumeSource for NoVolumes {

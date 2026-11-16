@@ -37,6 +37,11 @@ Native inventories reserve future volume names and aliases before output can
 replace any target. Retained original immutable stamps remain checked after
 volume switches and before publication.
 
+For sets that are still being downloaded, the library-owned `GrowingFileVolumes`
+provider waits for absent volumes, answers `NotYet` past each file's current end,
+and grows a Complete native inventory as volumes appear, so verified members
+still publish Strict. See `docs/growing-volumes.md`.
+
 `Verification` exposes the exact-size verdict, CRC32 and BLAKE2sp verdicts,
 provenance, packed evidence, authentication evidence, and level. A declared
 checksum failure never becomes missing evidence. A member without a whole-inner
