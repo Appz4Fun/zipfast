@@ -243,7 +243,8 @@ impl OutputContext {
         source: &mut crate::progressive::source::SourceDriver,
     ) -> ProgressiveResult<DirectoryVerdict> {
         let policy = Policy { root: &self.root, usage: &self.usage };
-        let mut target = policy.target_kind(member, &header.name, !header.is_unix(), true)?;
+        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        let mut target = policy.target_kind(member, &name, !header.is_unix(), true)?;
         if !policy.check_target(&target, source)? {
             // Without whole-set authority nothing is created: the sanitized, root-contained path is handed back
             // so the caller can create the directory itself.

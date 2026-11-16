@@ -1068,7 +1068,7 @@ impl LegacyRoute {
 enum SelectedSource {
     Zip(crate::zip::read::ProjectedOwner),
     Tar(Box<crate::tar::Selected>),
-    Rar { path: PathBuf, chain_start: usize, name: String },
+    Rar { path: PathBuf, chain_start: usize, name: String, rar4: bool },
 }
 
 const RAR_SELECTED_WINDOW_LIMIT: u64 = 256 << 20;
@@ -1283,7 +1283,12 @@ impl SelectedEntry {
                         windows_names: !header.is_unix(),
                         index,
                         limit,
-                        source: SelectedSource::Rar { path: path.to_path_buf(), chain_start, name: header.name },
+                        source: SelectedSource::Rar {
+                            path: path.to_path_buf(),
+                            chain_start,
+                            rar4: header.format == RarFormat::Rar4,
+                            name: header.name,
+                        },
                         cancel,
                     });
                 }
@@ -1357,7 +1362,12 @@ impl SelectedEntry {
                     windows_names: !header.is_unix(),
                     index,
                     limit: max_bytes,
-                    source: SelectedSource::Rar { path: held_path, chain_start, name: header.name },
+                    source: SelectedSource::Rar {
+                        path: held_path,
+                        chain_start,
+                        rar4: header.format == RarFormat::Rar4,
+                        name: header.name,
+                    },
                     cancel,
                 });
             }
@@ -1454,8 +1464,10 @@ impl SelectedEntry {
 
     /// Returns a path checked for traversal and absolute components.
     pub fn relative_path(&self) -> Result<PathBuf> {
-        if matches!(self.source, SelectedSource::Rar { .. }) && self.name().contains('\u{FFFE}') {
-            return Err(Error::Unsupported("the selected name contains bytes that are not UTF-8".into()));
+        if let SelectedSource::Rar { name, rar4, .. } = &self.source {
+            let output = crate::path::rar_output_name(name, *rar4)
+                .ok_or_else(|| Error::Unsupported("the selected name can't be written one to one".into()))?;
+            return sanitize(&output, self.windows_names);
         }
         sanitize(self.name(), self.windows_names)
     }
@@ -1519,7 +1531,7 @@ impl SelectedEntry {
                 observer.notify(0, selected.source_path(), SelectedReadRole::Selected, Some(&self.cancel))?;
                 selected.read(&mut checked_sink)
             }
-            SelectedSource::Rar { path, chain_start, name } => {
+            SelectedSource::Rar { path, chain_start, name, .. } => {
                 let selection = RarSelection {
                     sink: &mut checked_sink,
                     emit: false,
@@ -3189,10 +3201,22 @@ impl Run<'_, '_, '_> {
             self.reports.skipped(&ctx, RarSkipReason::OlderVersion(v))?;
             return self.pass_over(vol, h, ctx, None, None);
         }
+        // A name mapped from bytes that aren't UTF-8 is written under its private-use characters; one that can't
+        // be written one to one is refused (`crate::path::rar_output_name`).
+        // (`h.name` was moved into `ctx`)
+        let output = crate::path::rar_output_name(&ctx.entry.name, h.format == RarFormat::Rar4);
+        if self.opts.mode == Mode::Extract && output.is_none() {
+            let cause = self.fail_in_order(
+                &ctx,
+                RarFailure::Unsupported(RarUnsupported::NameEncoding),
+                "the name can't be written one to one",
+            )?;
+            return self.pass_over(vol, h, ctx, None, Some(cause));
+        }
         let rel = if self.selection.is_some() {
             PathBuf::new()
         } else {
-            match sanitize(&ctx.entry.name, !h.is_unix()) {
+            match sanitize(output.as_deref().unwrap_or(&ctx.entry.name), !h.is_unix()) {
                 Ok(rel) => rel,
                 Err(e) => {
                     let failure = RarFailure::Policy {
@@ -3204,15 +3228,6 @@ impl Run<'_, '_, '_> {
                 }
             }
         };
-        // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters.
-        if self.opts.mode == Mode::Extract && ctx.entry.name.contains('\u{FFFE}') {
-            let cause = self.fail_in_order(
-                &ctx,
-                RarFailure::Unsupported(RarUnsupported::NameEncoding),
-                "the name holds bytes that aren't UTF-8, which isn't supported yet",
-            )?;
-            return self.pass_over(vol, h, ctx, None, Some(cause));
-        }
         let rel = if self.opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
         let key = rel.to_string_lossy().to_lowercase();
         if self.opts.mode == Mode::Extract

@@ -371,6 +371,11 @@ impl FileHeader {
         self.host_os == 1
     }
 
+    /// The name this member is written under; see [`crate::path::rar_output_name`].
+    pub(crate) fn output_name(&self) -> Option<std::borrow::Cow<'_, str>> {
+        crate::path::rar_output_name(&self.name, self.format == RarFormat::Rar4)
+    }
+
     /// A RAR 4.x Unix symbolic link: a Unix-host member whose mode is `S_IFLNK`. Its data is the link's target.
     pub fn is_rar4_symlink(&self) -> bool {
         self.rar4.is_some_and(|raw| raw.host == 3) && self.attributes & 0o170000 == 0o120000

@@ -404,13 +404,13 @@ impl Guard {
                 if checked(c.usage.diagnostics.capacity, header.name.len() as u64)? > c.limits.diagnostics.capacity {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
                 }
-                let relative =
-                    crate::path::sanitize_fallible(&header.name, !header.is_unix()).map_err(|e| match e {
-                        crate::path::ProjectionError::Unsafe => {
-                            RarDiagnosticFailure::ProjectionUnavailable { ordinal: index as u64 }
-                        }
-                        crate::path::ProjectionError::Allocation(e) => RarDiagnosticFailure::Allocation(e),
-                    })?;
+                let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+                let relative = crate::path::sanitize_fallible(&name, !header.is_unix()).map_err(|e| match e {
+                    crate::path::ProjectionError::Unsafe => {
+                        RarDiagnosticFailure::ProjectionUnavailable { ordinal: index as u64 }
+                    }
+                    crate::path::ProjectionError::Allocation(e) => RarDiagnosticFailure::Allocation(e),
+                })?;
                 c.proof_capacity(relative.capacity() as u64)?;
                 let projection_work =
                     checked(options.dest.as_os_str().len() as u64, relative.as_os_str().len() as u64)?
