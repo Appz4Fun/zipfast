@@ -145,6 +145,9 @@ pub struct MainHeader {
     pub rar4_flags: Option<u16>,
 }
 
+/// RAR4 main header flag: volumes are named `NAME.partN.rar` rather than `NAME.rar`, `NAME.r00`, ...
+pub const MHD_NEWNUMBERING: u16 = 0x0010;
+
 impl MainHeader {
     pub fn is_volume(&self) -> bool {
         self.flags & MHFL_VOLUME != 0
@@ -324,6 +327,29 @@ impl FileHeader {
 
     pub fn is_unix(&self) -> bool {
         self.host_os == 1
+    }
+
+    /// Whether `attributes` holds Windows attribute bits: RAR 5.0 host
+    /// Windows, or RAR 4.x host MS-DOS, OS/2 or Win32 (all normalized to 0).
+    pub fn is_windows(&self) -> bool {
+        self.host_os == 0
+    }
+
+    /// The raw Windows attribute bits, when the archiver's host stores them.
+    pub fn windows_attributes(&self) -> Option<u32> {
+        self.is_windows().then_some(self.attributes as u32)
+    }
+
+    /// Which clock `mtime` was read from. RAR 5.0 stores a Unix time or a
+    /// FILETIME, both UTC. RAR 4.x stores a local MS-DOS date and time; its
+    /// extended-time record only adds precision to those fields (UnRAR reads
+    /// the DOS time as local, adds the optional second and the fraction, and
+    /// sets the result as local time), so it stays a local wall-clock time.
+    pub fn mtime_origin(&self) -> Option<crate::extract::MtimeOrigin> {
+        self.mtime.map(|_| match self.format {
+            RarFormat::Rar4 => crate::extract::MtimeOrigin::LocalWallClock,
+            RarFormat::Rar5 => crate::extract::MtimeOrigin::Utc,
+        })
     }
 }
 

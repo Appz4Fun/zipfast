@@ -107,7 +107,13 @@ fn standalone(path: &Path, dest: &Path, name: &str, expected: &[u8], packed: usi
     let entry = &listed[0];
     assert_eq!(entry.name, name);
     assert_eq!((entry.size, entry.packed, entry.method), (expected.len() as u64, packed as u64, 8));
-    assert_eq!((entry.mtime, entry.crc32, &entry.link), (None, None, &None));
+    // The listing takes the first header's MTIME (Unix time, 0 for none); extraction does not restore it.
+    let wire = fs::read(path).unwrap();
+    let mtime = u32::from_le_bytes(wire[4..8].try_into().unwrap());
+    let mtime = (mtime != 0).then_some(i64::from(mtime));
+    assert_eq!((entry.mtime, entry.crc32, &entry.link), (mtime, None, &None));
+    assert_eq!(entry.mtime_origin, mtime.map(|_| extract::MtimeOrigin::Utc));
+    assert_eq!(entry.attributes, None);
     assert!(!entry.dir && !entry.encrypted && !entry.solid);
 
     let entry = SelectedEntry::open(path, 0, None, (expected.len().max(packed)) as u64).unwrap();
