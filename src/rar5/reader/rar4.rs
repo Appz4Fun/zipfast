@@ -211,11 +211,12 @@ impl HeaderParser {
                 unpacked |= u64::from(fields.u32()?) << 32;
             }
             let encoded = fields.take(name_len)?;
-            let name = match decode_name(encoded, flags & 0x200 != 0, self.usage.as_ref()) {
+            let name = match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
                 // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
                 // name, which no decoded name can be (see below).
+                // Also a Unicode-flagged field that fell back to its legacy part (the bytes before the NUL).
                 Err(FileParseError::Format(Error::Unsupported(_)))
-                    if self.map_lenient && !encoded.is_empty() && !encoded.contains(&0) =>
+                    if self.map_lenient && encoded.split(|&byte| byte == 0).next().is_some_and(|l| !l.is_empty()) =>
                 {
                     String::new()
                 }
@@ -368,54 +369,126 @@ impl<'a> Fields<'a> {
 }
 
 /// Decode the flag-directed RAR4 Unicode stream with bounded legacy references.
+/// `lenient` (map walks only) decodes as unrar does; otherwise malformed encodings are refused.
 fn decode_name(
     encoded: &[u8],
     unicode: bool,
+    lenient: bool,
     usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<String, FileParseError> {
     if !unicode || !encoded.contains(&0) {
-        let value = std::str::from_utf8(encoded).map_err(|_| Error::Unsupported("RAR4 legacy name encoding".into()))?;
-        admit_name(usage, value.len())?;
-        let mut name = String::new();
-        name.try_reserve_exact(value.len()).map_err(|_| FileParseError::Allocation)?;
-        if let Some(usage) = usage {
-            usage
-                .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
-                .map_err(FileParseError::Progressive)?;
-        }
-        name.push_str(value);
-        return Ok(name);
+        return legacy_name(encoded, usage);
     }
     let split = encoded.iter().position(|&byte| byte == 0).ok_or(Error::Corrupt("RAR4 Unicode separator"))?;
     let legacy = &encoded[..split];
-    let mut fields = Fields::new(encoded, split + 1);
-    let high = u16::from(fields.byte()?) << 8;
-    let mut units = Vec::new();
-    units.try_reserve_exact(encoded.len()).map_err(|_| FileParseError::Allocation)?;
-    while fields.at < encoded.len() {
-        let flags = fields.byte()?;
-        for shift in [6, 4, 2, 0] {
-            if fields.at == encoded.len() {
-                break;
+    // As unrar: the encoded Unicode part is decoded only when the name field is longer than the legacy name and its
+    // NUL; otherwise, or when it decodes to nothing, the legacy name is used.
+    if split + 1 >= encoded.len() {
+        return legacy_name(legacy, usage);
+    }
+    let units = if lenient {
+        // A port of unrar's EncodeFileName::Decode: it stops quietly where the encoded data runs out, copies runs from
+        // the raw name field up to its end, and decodes at most MAX_UNITS units.
+        const MAX_UNITS: usize = 2048;
+        let raw = |i: usize| encoded.get(i).copied().unwrap_or(0);
+        let enc = &encoded[split + 1..];
+        let mut at = 0;
+        let high = u16::from(enc[at]) << 8;
+        at += 1;
+        let mut units: Vec<u16> = Vec::new();
+        units.try_reserve_exact(encoded.len().min(MAX_UNITS)).map_err(|_| FileParseError::Allocation)?;
+        let mut flags = 0u8;
+        let mut bits = 0u8;
+        'decode: while at < enc.len() && units.len() < MAX_UNITS {
+            if bits == 0 {
+                flags = enc[at];
+                at += 1;
+                bits = 8;
             }
-            match (flags >> shift) & 3 {
-                0 => units.push(u16::from(fields.byte()?)),
-                1 => units.push(high | u16::from(fields.byte()?)),
-                2 => units.push(fields.u16()?),
-                3 => {
-                    let length = fields.byte()?;
-                    let correction = if length & 128 != 0 { Some(fields.byte()?) } else { None };
-                    let count = usize::from(length & 127) + 2;
-                    let end = units.len().checked_add(count).ok_or(Error::Corrupt("RAR4 Unicode run"))?;
-                    let source = legacy.get(units.len()..end).ok_or(Error::Corrupt("RAR4 Unicode run"))?;
-                    units.extend(source.iter().map(|&byte| match correction {
-                        Some(correction) => high | u16::from(byte.wrapping_add(correction)),
-                        None => u16::from(byte),
-                    }));
+            match flags >> 6 {
+                0 => {
+                    let Some(&byte) = enc.get(at) else { break 'decode };
+                    units.push(u16::from(byte));
+                    at += 1;
                 }
-                _ => unreachable!(),
+                1 => {
+                    let Some(&byte) = enc.get(at) else { break 'decode };
+                    units.push(high | u16::from(byte));
+                    at += 1;
+                }
+                2 => {
+                    // As unrar's switch-level break: an incomplete 16-bit op consumes nothing and decoding goes on.
+                    if at + 1 < enc.len() {
+                        units.push(u16::from_le_bytes([enc[at], enc[at + 1]]));
+                        at += 2;
+                    }
+                }
+                _ => {
+                    let Some(&length) = enc.get(at) else { break 'decode };
+                    at += 1;
+                    let correction = if length & 0x80 != 0 {
+                        let Some(&correction) = enc.get(at) else { break 'decode };
+                        at += 1;
+                        Some(correction)
+                    } else {
+                        None
+                    };
+                    let count = usize::from(length & 0x7f) + 2;
+                    for _ in 0..count {
+                        // unrar's run stops at the end of the name field (and at its unit cap).
+                        if units.len() >= MAX_UNITS || units.len() >= encoded.len() {
+                            break;
+                        }
+                        let byte = raw(units.len());
+                        units.push(match correction {
+                            Some(correction) => high | u16::from(byte.wrapping_add(correction)),
+                            None => u16::from(byte),
+                        });
+                    }
+                }
+            }
+            flags <<= 2;
+            bits -= 2;
+        }
+        // unrar ends the name at its first NUL unit.
+        if let Some(nul) = units.iter().position(|&unit| unit == 0) {
+            units.truncate(nul);
+        }
+        units
+    } else {
+        let mut fields = Fields::new(encoded, split + 1);
+        let high = u16::from(fields.byte()?) << 8;
+        let mut units = Vec::new();
+        units.try_reserve_exact(encoded.len()).map_err(|_| FileParseError::Allocation)?;
+        while fields.at < encoded.len() {
+            let flags = fields.byte()?;
+            for shift in [6, 4, 2, 0] {
+                if fields.at == encoded.len() {
+                    break;
+                }
+                match (flags >> shift) & 3 {
+                    0 => units.push(u16::from(fields.byte()?)),
+                    1 => units.push(high | u16::from(fields.byte()?)),
+                    2 => units.push(fields.u16()?),
+                    3 => {
+                        let length = fields.byte()?;
+                        let correction = if length & 128 != 0 { Some(fields.byte()?) } else { None };
+                        let count = usize::from(length & 127) + 2;
+                        let end = units.len().checked_add(count).ok_or(Error::Corrupt("RAR4 Unicode run"))?;
+                        let source = legacy.get(units.len()..end).ok_or(Error::Corrupt("RAR4 Unicode run"))?;
+                        units.extend(source.iter().map(|&byte| match correction {
+                            Some(correction) => high | u16::from(byte.wrapping_add(correction)),
+                            None => u16::from(byte),
+                        }));
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
+        units
+    };
+    if units.is_empty() {
+        return legacy_name(legacy, usage);
     }
     let length = char::decode_utf16(units.iter().copied()).try_fold(0usize, |length, scalar| {
         let scalar = scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?;
@@ -432,6 +505,24 @@ fn decode_name(
     for scalar in char::decode_utf16(units) {
         name.push(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?);
     }
+    Ok(name)
+}
+
+/// A RAR4 name without (usable) Unicode encoding: the stored bytes must be UTF-8.
+fn legacy_name(
+    encoded: &[u8],
+    usage: Option<&crate::progressive::Usage>,
+) -> std::result::Result<String, FileParseError> {
+    let value = std::str::from_utf8(encoded).map_err(|_| Error::Unsupported("RAR4 legacy name encoding".into()))?;
+    admit_name(usage, value.len())?;
+    let mut name = String::new();
+    name.try_reserve_exact(value.len()).map_err(|_| FileParseError::Allocation)?;
+    if let Some(usage) = usage {
+        usage
+            .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
+            .map_err(FileParseError::Progressive)?;
+    }
+    name.push_str(value);
     Ok(name)
 }
 

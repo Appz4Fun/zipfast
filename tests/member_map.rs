@@ -2027,3 +2027,66 @@ fn limits_after_the_main_header_stay_errors() {
         assert!(matches!(error, MapError::Limit { .. }), "{error:?}");
     }
 }
+
+// Catches a RAR4 Unicode-flagged name with nothing (or nothing decodable) after its NUL being treated as damage;
+// unrar decodes the Unicode part only when the field is longer than the legacy name and its NUL.
+#[test]
+fn rar4_unicode_name_without_an_encoded_part_falls_back_to_the_legacy_name() {
+    let gold = data(64, 3);
+    for field in [&b"movie.mkv\0"[..], &b"movie.mkv\0\0"[..]] {
+        let bytes = r4_archive(&[r4_member(field, &gold, 0x200, 0x30, gold.len(), crc32fast::hash(&gold))]);
+        let volume = vol(&bytes, "x.rar", None).unwrap();
+        assert_eq!(volume.end, VolumeEnd::Complete, "{field:?}");
+        assert_eq!(volume.members.len(), 1);
+        assert_eq!(volume.members[0].name.as_deref(), Some("movie.mkv"));
+        let map = MemberMap::from_memory(&[&bytes], "x.rar", None).unwrap();
+        assert!(map.complete);
+        assert_eq!(map.members[0].name.as_deref(), Some("movie.mkv"));
+        let piece = &map.members[0].pieces[0];
+        assert_eq!(&bytes[piece.packed.start as usize..piece.packed.end as usize], &gold[..]);
+    }
+}
+
+// Catches decoding stricter than unrar's: the name ends at the first NUL unit, data running out keeps what was
+// decoded (or falls back), and a legacy fallback that is not UTF-8 is listed raw by map walks.
+#[test]
+fn rar4_unicode_name_decodes_as_unrar_does() {
+    let gold = data(64, 5);
+    let cases: [(&[u8], Option<&str>); 5] = [
+        // High byte 0, then flags 00 (literal) units "\0\0": decodes to an empty name, so the legacy name is used.
+        (b"movie.mkv\0\0\x00\x00\x00", Some("movie.mkv")),
+        // Literal "ab" then NUL padding: the name ends at the first NUL unit.
+        (b"ab\0\0\x00ab\x00\x00", Some("ab")),
+        // A 16-bit op with one byte left is skipped (unrar's switch-level break); the next 1-byte op reads "A".
+        (b"movie.mkv\0\0\x80\x41", Some("A")),
+        // A 16-bit op with nothing after it: nothing decodes, so the legacy name is used.
+        (b"movie.mkv\0\0\x80", Some("movie.mkv")),
+        // An OEM legacy part behind a Unicode flag with nothing encoded: listed raw, no decoded name.
+        (b"caf\x82\0", None),
+    ];
+    for (field, want) in cases {
+        let bytes = r4_archive(&[r4_member(field, &gold, 0x200, 0x30, gold.len(), crc32fast::hash(&gold))]);
+        let volume = vol(&bytes, "x.rar", None).unwrap();
+        assert_eq!(volume.end, VolumeEnd::Complete, "{field:?}");
+        assert_eq!(volume.members.len(), 1, "{field:?}");
+        assert_eq!(volume.members[0].name.as_deref(), want, "{field:?}");
+    }
+}
+
+// Catches two departures from unrar's decoder: an incomplete 16-bit op must not end decoding, and a run must stop
+// at the end of the name field instead of padding with zeros.
+#[test]
+fn rar4_unicode_decoding_skips_incomplete_ops_and_clips_runs() {
+    let gold = data(32, 7);
+    // flags 0b10_01_.. : a 16-bit op with one byte left is skipped, then the 1-byte op reads that byte as "A".
+    let skipped = b"zz\0\0\x60A";
+    // flags 0b11_.. : a corrected run of 2+10 units over a 7-byte field stops after 7 units (each byte + 1),
+    // where padding with zeros would add five more `high|correction` units.
+    let clipped = b"ab\0\0\xc0\x8a\x01";
+    let want = "bc\u{1}\u{1}\u{c1}\u{8b}\u{2}";
+    for (field, want) in [(&skipped[..], "A"), (&clipped[..], want)] {
+        let bytes = r4_archive(&[r4_member(field, &gold, 0x200, 0x30, gold.len(), crc32fast::hash(&gold))]);
+        let volume = vol(&bytes, "x.rar", None).unwrap();
+        assert_eq!(volume.members[0].name.as_deref(), Some(want), "{field:?}");
+    }
+}
