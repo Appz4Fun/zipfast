@@ -83,3 +83,59 @@ fn checked_entry_points_route_the_set_through_the_split_layer() {
         _ => panic!("a byte-split ZIP inspects as a listing"),
     }
 }
+
+/// A stored ZIP of `(name, data)` members.
+fn stored_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let (mut out, mut central) = (Vec::new(), Vec::new());
+    for (name, data) in members {
+        let at = out.len() as u32;
+        let crc = crc32fast::hash(data);
+        let common = |sig: &[u8], out: &mut Vec<u8>, central: bool| {
+            out.extend(sig);
+            if central {
+                out.extend(20u16.to_le_bytes());
+            }
+            out.extend(20u16.to_le_bytes());
+            out.extend([0; 2 + 2 + 4]); // flags, method, time and date
+            out.extend(crc.to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+        };
+        common(b"PK\x03\x04", &mut out, false);
+        out.extend(name.as_bytes());
+        out.extend(*data);
+        common(b"PK\x01\x02", &mut central, true);
+        central.extend([0; 2 + 2 + 2 + 4]); // comment, disk, internal and external attributes
+        central.extend(at.to_le_bytes());
+        central.extend(name.as_bytes());
+    }
+    let (cd_at, cd_len, n) = (out.len() as u32, central.len() as u32, members.len() as u16);
+    out.extend(central);
+    out.extend(b"PK\x05\x06");
+    out.extend([0; 4]);
+    out.extend(n.to_le_bytes());
+    out.extend(n.to_le_bytes());
+    out.extend(cd_len.to_le_bytes());
+    out.extend(cd_at.to_le_bytes());
+    out.extend([0; 2]);
+    out
+}
+
+#[test]
+fn extracting_beside_the_set_never_overwrites_a_piece() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = stored_zip(&[("set.zip.002", b"evil two"), ("set.zip.003", b"evil three"), ("ok.txt", b"fine")]);
+    let pieces: Vec<_> = zip.chunks(zip.len() / 3 + 1).collect();
+    for (i, piece) in pieces.iter().enumerate() {
+        fs::write(dir.path().join(format!("set.zip.{:03}", i + 1)), piece).unwrap();
+    }
+    let first = dir.path().join("set.zip.001");
+    let result = extract::run(&first, &options(dir.path(), Mode::Extract), |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (1, 2), "{:?}", result.errors);
+    for (i, piece) in pieces.iter().enumerate() {
+        assert_eq!(fs::read(dir.path().join(format!("set.zip.{:03}", i + 1))).unwrap(), *piece);
+    }
+    assert_eq!(fs::read(dir.path().join("ok.txt")).unwrap(), b"fine");
+}

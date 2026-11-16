@@ -308,7 +308,8 @@ fn read_directory<T>(
 pub struct Archive {
     file: byte_split::ArchiveSource,
     len: u64,
-    volumes: u32,
+    /// Every piece of a byte-split set; empty for one file.
+    pieces: Vec<PathBuf>,
     pub entries: Vec<ZipEntry>,
 }
 
@@ -318,20 +319,21 @@ impl Archive {
     }
 
     pub(crate) fn open_cancelable(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
-        let (mut file, len, volumes) = match byte_split::ByteSplit::open(path)? {
-            Some((split, paths)) => {
+        let (mut file, len, pieces) = match byte_split::ByteSplit::open(path)? {
+            Some(split) => {
+                let pieces = split.paths().map(Path::to_path_buf).collect();
                 let len = split.len();
-                (byte_split::ArchiveSource::Split(split), len, paths.len() as u32)
+                (byte_split::ArchiveSource::Split(split), len, pieces)
             }
             None => {
                 let file = File::open(path)?;
                 let len = file.metadata()?.len();
-                (byte_split::ArchiveSource::File(file), len, 1)
+                (byte_split::ArchiveSource::File(file), len, Vec::new())
             }
         };
         check_cancel(cancel)?;
         let (entries, _) = read_projected_legacy(&mut file, len, cancel)?;
-        Ok(Archive { file, len, volumes, entries })
+        Ok(Archive { file, len, pieces, entries })
     }
 
     /// Decodes the entry at a zero-based index and checks its integrity.
@@ -904,8 +906,15 @@ pub(crate) fn run_renaming(
     mut report: impl FnMut(&str),
 ) -> std::result::Result<Summary, RunError> {
     let mut archive = Archive::open(path)?;
-    let opts = &*opts.protecting(path)?;
-    let mut summary = Summary { volumes: archive.volumes.into(), ..Summary::default() };
+    let mut opts = opts.protecting(path)?;
+    // Protect every piece of a byte-split set, not only the first.
+    for piece in &archive.pieces {
+        if let Ok(canonical) = piece.canonicalize() {
+            opts.to_mut().protected_paths.insert(canonical);
+        }
+    }
+    let opts = &*opts;
+    let mut summary = Summary { volumes: archive.pieces.len().max(1) as u64, ..Summary::default() };
     let mut buf = vec![0u8; BUF];
     let entries = std::mem::take(&mut archive.entries);
     let password = password.filter(|s| !s.is_empty());
