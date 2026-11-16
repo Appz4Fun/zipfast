@@ -41,6 +41,34 @@ pub(super) struct Persistent {
     /// Recently unavailable stream ranges of the active member, and whether the caller declared them damaged.
     /// Kept until every block they touch is produced, to give each hole block its cause.
     unavailable: Vec<(Range<u64>, bool)>,
+    /// How the active member, adopted from an earlier session, is resumed; `None` for a member this session
+    /// created, and for an adopted member once extraction has resumed at its committed `produced`.
+    resume: Option<Resume>,
+}
+/// An adopted member being walked to its resume point.
+struct Resume {
+    /// Its canonical finish is committed: every part is walked header by header and its data is never read.
+    finished: bool,
+    /// The committed `produced` extraction continues from.
+    produced: u64,
+    /// The ciphertext stream offset (the output offset for a plain member) the machine is fed from again.
+    stream: u64,
+    /// Where an encrypted member's previous ciphertext block starts: bytes `iv_from..stream` are read into `iv`
+    /// and decrypt nothing themselves.
+    iv_from: u64,
+    iv: [u8; 16],
+    iv_known: bool,
+    /// The member machine, held back until the resume point so the bytes before it never reach it.
+    machine: Option<MemberMachine>,
+}
+/// What the resume walk did with the active part.
+pub(super) enum ResumeStep {
+    /// Moved forward; poll again.
+    Continue,
+    /// The source must wait.
+    Pending,
+    /// Nothing to do: the part ends here (or the member resumed); handle it as usual.
+    Done,
 }
 impl Persistent {
     pub(super) fn record_header(&mut self, offset: u64, bytes: &[u8], usage: &Usage) -> ProgressiveResult<()> {
@@ -115,6 +143,7 @@ impl ProgressiveSession {
             written: None,
             stream: 0,
             unavailable: Vec::new(),
+            resume: None,
         });
         Ok(session)
     }
@@ -307,6 +336,10 @@ impl ProgressiveSession {
             None if header.encrypted => return Err(error(PartialErrorKind::PasswordRequired)),
             None => None,
         };
+        // A member an earlier session created has its anchor already: adopt it instead of creating it again.
+        if let Some(anchor) = persistent.options.anchors.current(&key).map_err(failure)? {
+            return self.partial_adopt(key, anchor, relative, plain, witness, keys);
+        }
         let checks = member_checks(physical);
         let admission = SourceAdmission {
             volume: self.volume,
@@ -389,7 +422,218 @@ impl ProgressiveSession {
         persistent.cores.push((key.clone(), core));
         persistent.stream = 0;
         persistent.unavailable.clear();
+        persistent.resume = None;
         persistent.ready = Some((ProgressiveEvent::PartialReady { member: key, state }, event_lease));
+        Ok(())
+    }
+    /// Adopts the member an earlier session created under `key`: reopens its output and state bundle (nothing is
+    /// created or written), checks that it is this member (output path, name, size, and the first part with its
+    /// header witness), and arranges the walk to its resume point. A member that does not match fails the session
+    /// with the typed error, and its files are left as they are.
+    #[allow(clippy::result_large_err, reason = "adoption propagates typed partial receipts")]
+    fn partial_adopt(
+        &mut self,
+        key: MemberKey,
+        anchor: StateAnchor,
+        relative: std::path::PathBuf,
+        plain: PlainPart,
+        witness: HeaderWitness,
+        keys: Option<MemberKeys>,
+    ) -> ProgressiveResult<()> {
+        let persistent = self.partial.as_mut().unwrap();
+        let header = &self.model.members.last().unwrap().header;
+        let (output, bundle) = member_paths(&self.options.extract.dest, &persistent.options.state_dir, &relative, &key)
+            .map_err(failure)?;
+        // The paths are checked against the current declaration as a creation checks them, before anything is
+        // opened, and again once the adopted paths are registered, in case the declaration grew meanwhile.
+        let root = std::path::absolute(&self.options.extract.dest).map_err(|_| error(PartialErrorKind::UnsafePath))?;
+        let parents: Vec<std::path::PathBuf> =
+            relative.ancestors().skip(1).filter(|p| !p.as_os_str().is_empty()).map(|p| root.join(p)).collect();
+        let check = |driver: &mut SourceDriver| -> ProgressiveResult<()> {
+            for parent in &parents {
+                driver.check_partial_target(parent)?;
+            }
+            driver.check_partial_target(&output)?;
+            driver.check_partial_subtree(&bundle)
+        };
+        check(&mut self.driver)?;
+        self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<(MemberKey, Arc<PartialCore>)>() as u64)?;
+        persistent.cores.try_reserve_exact(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+        let (core, state, event_lease) = PartialCore::adopt(
+            AdoptSpec {
+                member: key.clone(),
+                anchor,
+                output_root: self.options.extract.dest.clone(),
+                state_root: persistent.options.state_dir.clone(),
+                protection: self.driver.partial_catalogue()?,
+                keys,
+            },
+            CoreOptions {
+                limits: persistent.options.limits.clone(),
+                usage: self.usage.clone(),
+                read_chunk: self.options.limits.read_chunk,
+                anchors: persistent.options.anchors.clone(),
+                control: persistent.options.control.clone(),
+                exclusions: persistent.exclusions.clone(),
+            },
+        )
+        .map_err(failure)?;
+        check(&mut self.driver)?;
+        core.check_adopted(&relative, header.name.as_bytes(), header.unpacked_size).map_err(failure)?;
+        if !core.recorded_part(&plain, &witness).map_err(failure)? {
+            return Err(error(PartialErrorKind::StateMalformed));
+        }
+        let (produced, finished, size) = core.resume_point().map_err(failure)?;
+        let encrypted = header.encrypted;
+        // An encrypted member resumes on a block boundary; once every output byte is known it resumes past the
+        // final padding, which belongs to the last block.
+        let stream = if encrypted && produced == size {
+            size.div_ceil(16) * 16
+        } else if encrypted && produced % 16 != 0 {
+            return Err(error(PartialErrorKind::StateMalformed));
+        } else {
+            produced
+        };
+        let iv_from = if encrypted && produced < size { stream.saturating_sub(16) } else { stream };
+        let machine = self.machine.take();
+        if finished {
+            self.produced = size;
+        }
+        let persistent = self.partial.as_mut().unwrap();
+        persistent.current = Some(persistent.cores.len());
+        persistent.cores.push((key.clone(), core));
+        persistent.stream = 0;
+        persistent.unavailable.clear();
+        persistent.resume = Some(Resume {
+            finished,
+            produced,
+            stream,
+            iv_from,
+            iv: [0; 16],
+            iv_known: true,
+            machine: if finished { None } else { machine },
+        });
+        persistent.ready =
+            Some((ProgressiveEvent::PartialAdopted { member: key, state, produced, finished }, event_lease));
+        Ok(())
+    }
+    pub(super) fn partial_resuming(&self) -> bool {
+        self.partial.as_ref().is_some_and(|p| p.current.is_some() && p.resume.is_some())
+    }
+    /// One step of walking an adopted member's active part to its resume point. A finished member's data is
+    /// skipped; otherwise the data before the resume point is skipped (except an encrypted member's previous
+    /// ciphertext block, which is read), and at the resume point the machine is restored with the hash state of
+    /// the output already produced and fed from there on.
+    pub(super) fn partial_resume_step(
+        &mut self,
+        cx: &mut Context<'_>,
+        work: &mut u64,
+    ) -> ProgressiveResult<ResumeStep> {
+        let index = self.model.parts.len() - 1;
+        let part = &self.model.parts[index];
+        let start = self.model.parts[..index]
+            .iter()
+            .try_fold(0u64, |sum, p| sum.checked_add(p.packed_size))
+            .ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
+        let packed_size = part.packed_size;
+        let data_offset = part.data_offset;
+        let out_start = part.plain_extent.as_ref().ok_or_else(|| error(PartialErrorKind::StateMalformed))?.start;
+        let pos = start + (packed_size - self.remaining);
+        let resume = self.partial.as_mut().unwrap().resume.as_mut().unwrap();
+        if resume.finished {
+            self.skip(self.remaining)?;
+            return Ok(ResumeStep::Done);
+        }
+        if pos == resume.stream {
+            return self.partial_restore(pos - start, out_start).map(|()| ResumeStep::Continue);
+        }
+        if self.remaining == 0 || pos > resume.stream {
+            return Ok(ResumeStep::Done);
+        }
+        if pos < resume.iv_from {
+            let n = (resume.iv_from - pos).min(self.remaining);
+            self.skip(n)?;
+            return Ok(ResumeStep::Continue);
+        }
+        let iv_from = resume.iv_from;
+        let want = (resume.stream - pos).min(self.remaining) as usize;
+        let at = data_offset + (packed_size - self.remaining);
+        if at != self.cursor {
+            self.driver.seek(at)?;
+            self.cursor = at;
+        }
+        let n = self.read_len(want, *work);
+        match self.driver.poll_step(cx, &mut self.buffer[..n]) {
+            Poll::Pending => {
+                self.parked_read = Some(n);
+                self.partial_wait()?;
+                Ok(ResumeStep::Pending)
+            }
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Ready(Ok(SourceStep::EndOfVolume)) => Err(ProgressiveFailure::new(FailureKind::Truncated)),
+            Poll::Ready(Ok(SourceStep::VolumeOpened { .. })) => {
+                Err(ProgressiveFailure::new(FailureKind::SourceContract))
+            }
+            Poll::Ready(Ok(SourceStep::Hole { offset, len })) => {
+                self.cursor = offset + len;
+                self.remaining -= len;
+                *work += len;
+                self.partial.as_mut().unwrap().resume.as_mut().unwrap().iv_known = false;
+                Ok(ResumeStep::Continue)
+            }
+            Poll::Ready(Ok(SourceStep::Filled { offset, count })) => {
+                self.cursor = offset + count as u64;
+                self.remaining -= count as u64;
+                *work += count as u64;
+                let resume = self.partial.as_mut().unwrap().resume.as_mut().unwrap();
+                let into = (pos - iv_from) as usize;
+                resume.iv[into..into + count].copy_from_slice(&self.buffer[..count]);
+                self.driver.validate_step()?;
+                Ok(ResumeStep::Continue)
+            }
+        }
+    }
+    /// Skips `n` data bytes of the active part without reading them.
+    fn skip(&mut self, n: u64) -> ProgressiveResult<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let part = self.model.parts.last().unwrap();
+        let at = part.data_offset + (part.packed_size - self.remaining) + n;
+        self.driver.seek(at)?;
+        self.cursor = at;
+        self.remaining -= n;
+        Ok(())
+    }
+    /// Restores the held-back machine at the resume point: `part_bytes` of the active part lie before it, whose
+    /// output starts at `out_start`.
+    fn partial_restore(&mut self, part_bytes: u64, out_start: u64) -> ProgressiveResult<()> {
+        let persistent = self.partial.as_mut().unwrap();
+        let resume = persistent.resume.take().unwrap();
+        let mut machine = resume.machine.ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
+        let core = &persistent.cores[persistent.current.unwrap()].1;
+        let encrypted = machine.cipher.is_some();
+        let member_blake = machine.inner.as_ref().is_some_and(|inner| inner.blake.is_some());
+        // Encrypted part checks cover ciphertext, which the resume skipped: the resumed part's check is not judged.
+        let hashes = core
+            .prefix_hashes(resume.produced, out_start.min(resume.produced), member_blake, !encrypted)
+            .map_err(failure)?;
+        let iv = if resume.stream == 0 {
+            machine.cipher.as_ref().map(|cipher| cipher.iv)
+        } else {
+            resume.iv_known.then_some(resume.iv)
+        };
+        machine.resume_stored(crate::rar5::member::StoredResume {
+            delivered: resume.produced,
+            part_bytes,
+            member: hashes.member,
+            part: if encrypted && part_bytes > 0 { None } else { hashes.part },
+            iv: if encrypted { iv } else { None },
+            padding: (resume.stream - resume.produced.min(resume.stream)) as usize,
+        })?;
+        self.machine = Some(machine);
+        self.produced = resume.produced;
+        persistent.stream = resume.stream;
         Ok(())
     }
     /// Before the session waits for a provider: commit the active member's open group if it has been open for
@@ -414,6 +658,10 @@ impl ProgressiveSession {
         part.plain_extent = Some(extent(header, out, part.packed_size)?);
         let plain = plain_part(part, index as u64)?;
         let witness = persistent.witness.take().ok_or_else(|| error(PartialErrorKind::StateMalformed))?;
+        // A part an earlier session recorded (of an adopted member) must be the same part; it is not recorded again.
+        if persistent.active().1.recorded_part(&plain, &witness).map_err(failure)? {
+            return Ok(());
+        }
         let admission = SourceAdmission {
             volume: self.volume,
             info: self
@@ -482,9 +730,10 @@ impl ProgressiveSession {
         let persistent = self.partial.as_ref().unwrap();
         let part = self.model.parts.last().unwrap();
         // Encrypted part checks cover ciphertext, never plaintext output, so they have no plaintext mirror.
+        // A part an adopted member skipped has no machine: it was checked when an earlier session produced it.
         if part.final_part
             || self.model.members.last().unwrap().header.encrypted
-            || self.machine.as_ref().unwrap().part_missing()
+            || self.machine.as_ref().is_none_or(MemberMachine::part_missing)
             || (part.checks.crc32.is_none() && part.checks.blake2sp.is_none())
         {
             return Ok(None);
@@ -546,7 +795,11 @@ impl ProgressiveSession {
             Poll::Pending => return Ok(Poll::Pending),
             Poll::Ready(v) => v.map_err(failure)?,
         };
-        core.compact().map_err(failure)?;
+        // A member adopted already finished is reported as it stands, without writing anything.
+        let adopted_finished = persistent.resume.as_ref().is_some_and(|resume| resume.finished);
+        if !adopted_finished {
+            core.compact().map_err(failure)?;
+        }
         let state = core.state().map_err(failure)?;
         let outcome = if matches!(verdict, Verdict::Incomplete { .. }) {
             MemberOutcome::PersistentPartial {
@@ -559,6 +812,7 @@ impl ProgressiveSession {
         };
         persistent.current = None;
         persistent.unavailable.clear();
+        persistent.resume = None;
         self.phase = Phase::Header;
         Ok(Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { member: self.member.take().unwrap(), outcome }))))
     }

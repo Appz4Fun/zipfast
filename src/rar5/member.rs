@@ -48,6 +48,16 @@ pub(crate) trait RecoverySink: Sink {
         Ok(())
     }
 }
+/// Where [`MemberMachine::resume_stored`] continues a stored member.
+#[cfg(feature = "persistent-partials")]
+pub(crate) struct StoredResume {
+    pub delivered: u64,
+    pub part_bytes: u64,
+    pub member: Option<(crate::crc32::Hasher, Option<crate::blake2sp::Blake2sp>)>,
+    pub part: Option<(crate::crc32::Hasher, Option<crate::blake2sp::Blake2sp>)>,
+    pub iv: Option<[u8; 16]>,
+    pub padding: usize,
+}
 pub(crate) struct StoredCipherPadding {
     pub(crate) size: u64,
     pub(crate) skipped: usize,
@@ -265,6 +275,61 @@ impl MemberMachine {
                 state.known = false;
             }
         }
+    }
+    /// Continues a stored member a previous session left at output offset `delivered`, without feeding the bytes
+    /// before it again. `part_bytes` are the current part's packed bytes before the resume point. `member` and
+    /// `part` are the hash states of the output already produced (whole member, and the current part's share);
+    /// `None` where that output has holes, so the check is not judged while streaming, exactly as after a hole.
+    /// `iv` is an encrypted member's previous ciphertext block (`None` when it is unavailable, which makes the next
+    /// block a hole), and `padding` the final padding bytes already behind the resume point.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn resume_stored(&mut self, resume: StoredResume) -> crate::progressive::ProgressiveResult<()> {
+        use crate::progressive::{FailureKind, ProgressiveFailure};
+        if self.failed || self.decoder.is_some() || self.delivered != 0 || self.part_bytes != 0 {
+            return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
+        }
+        let checks = self.inner.as_mut().ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+        match resume.member {
+            Some((crc, blake)) => {
+                checks.hasher = crc;
+                if checks.blake.is_some() {
+                    checks.blake = Some(blake.ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?);
+                }
+            }
+            None => self.missing = true,
+        }
+        checks.bytes = resume.delivered;
+        self.delivered = resume.delivered;
+        self.part_bytes = resume.part_bytes;
+        match resume.part {
+            Some((crc, blake)) => {
+                self.part_crc = crc;
+                if self.part_blake.is_some() {
+                    self.part_blake = blake;
+                    if self.part_blake.is_none() {
+                        self.part_missing = true;
+                    }
+                }
+            }
+            None => self.part_missing = true,
+        }
+        if let Some(cipher) = &mut self.cipher {
+            if !cipher.rem.is_empty() || cipher.recovery.is_some() {
+                return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
+            }
+            if let Some(padding) = &mut cipher.stored_padding {
+                padding.skipped = resume.padding;
+            }
+            let previous_known = match resume.iv {
+                Some(iv) => {
+                    cipher.iv = iv;
+                    true
+                }
+                None => false,
+            };
+            cipher.recovery = Some(CbcAvailability { block: [0; 16], used: 0, known: true, previous_known });
+        }
+        Ok(())
     }
     pub(crate) fn part_missing(&self) -> bool {
         self.part_missing

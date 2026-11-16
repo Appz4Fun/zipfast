@@ -50,6 +50,18 @@ pub enum ProgressiveEvent {
         member: crate::partial::MemberKey,
         state: crate::partial::PartialState,
     },
+    /// A member an earlier persistent session created under the same roots and anchor store was adopted instead
+    /// of created: its output and state bundle were reopened (nothing was created or rewritten) and its known
+    /// output rehashed. `produced` is its committed `produced`. When `finished` its canonical finish is committed:
+    /// its data is not read again and its `MemberFinished` follows with its current outcome. Otherwise extraction
+    /// continues from `produced`. Obtain a handle with `partial_file`, as after `PartialReady`.
+    #[cfg(feature = "persistent-partials")]
+    PartialAdopted {
+        member: crate::partial::MemberKey,
+        state: crate::partial::PartialState,
+        produced: u64,
+        finished: bool,
+    },
     #[cfg(feature = "persistent-partials")]
     Hole(crate::partial::HoleReport),
     #[cfg(feature = "persistent-partials")]
@@ -645,6 +657,14 @@ impl ProgressiveSession {
                     }
                 }
                 Phase::Part => {
+                    #[cfg(feature = "persistent-partials")]
+                    if self.partial_resuming() {
+                        match self.partial_resume_step(cx, &mut work)? {
+                            partial::ResumeStep::Continue => continue,
+                            partial::ResumeStep::Pending => return Ok(Poll::Pending),
+                            partial::ResumeStep::Done => {}
+                        }
+                    }
                     if self.remaining == 0 {
                         let part = self.model.parts.last().expect("active part");
                         if let Some(machine) = &mut self.machine {
