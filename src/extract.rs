@@ -720,6 +720,10 @@ pub struct Entry {
     pub attributes: Option<u32>,
     pub crc32: Option<u32>,
     pub method: u8,
+    /// The method as 7-Zip's `7z l -slt` prints it (`LZMA2:24 BCJ`, `LZMA:16`, `PPMD:o6:mem24`,
+    /// `LZMA2:24 7zAES:19`), for 7z members that have data; `None` for other formats and for empty
+    /// members and directories, which 7-Zip leaves blank.
+    pub method_name: Option<String>,
     pub dir: bool,
     pub encrypted: bool,
     pub solid: bool,
@@ -1862,6 +1866,7 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
             mtime: h.mtime,
             crc32,
             method: h.method,
+            method_name: None,
             dir,
             encrypted: h.encrypted,
             solid: h.solid,
