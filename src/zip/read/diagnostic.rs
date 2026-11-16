@@ -215,7 +215,9 @@ pub struct ZipDiagnosticScope<'a> {
 }
 enum ScopeInner<'a> {
     Bound(BoundScope<'a>),
-    Legacy(Evidence),
+    /// A non-ZIP route's scope. `true` for a member event: the route has no checked sinks, so emitting through it
+    /// writes nothing and succeeds (the member's text also comes as `LegacyDiagnostic`).
+    Legacy(Evidence, bool),
 }
 impl<'a> ZipDiagnosticScope<'a> {
     pub(super) fn new(
@@ -270,12 +272,17 @@ impl<'a> ZipDiagnosticScope<'a> {
         })
     }
     pub(crate) fn legacy() -> Self {
-        Self { inner: ScopeInner::Legacy(Evidence::default()) }
+        Self { inner: ScopeInner::Legacy(Evidence::default(), false) }
+    }
+    /// The scope of a member event on a non-ZIP route: see [`ScopeInner::Legacy`].
+    pub(crate) fn legacy_member() -> Self {
+        Self { inner: ScopeInner::Legacy(Evidence::default(), true) }
     }
     pub fn admit_sinks(&mut self, stdout: Option<&dyn AsFd>, stderr: Option<&dyn AsFd>) -> ZipDiagnosticResult<()> {
         match &mut self.inner {
             ScopeInner::Bound(inner) => inner.admit_sinks(stdout, stderr),
-            ScopeInner::Legacy(e) => {
+            ScopeInner::Legacy(_, true) => Ok(()),
+            ScopeInner::Legacy(e, false) => {
                 e.stop_callbacks = true;
                 e.boundary = Some(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
                 Err(ZipDiagnosticStop { token: Token { action: None, serial: 0 } })
@@ -290,7 +297,8 @@ impl<'a> ZipDiagnosticScope<'a> {
     {
         match &mut self.inner {
             ScopeInner::Bound(inner) => inner.emit(which, out, render),
-            ScopeInner::Legacy(e) => {
+            ScopeInner::Legacy(_, true) => Ok(0),
+            ScopeInner::Legacy(e, false) => {
                 e.stop_callbacks = true;
                 e.boundary = Some(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
                 Err(ZipDiagnosticStop { token: Token { action: None, serial: 0 } })
@@ -300,7 +308,7 @@ impl<'a> ZipDiagnosticScope<'a> {
     pub(crate) fn finish(self, result: ZipObserverResult<()>) -> Evidence {
         match self.inner {
             ScopeInner::Bound(inner) => inner.finish(result),
-            ScopeInner::Legacy(mut e) => {
+            ScopeInner::Legacy(mut e, _) => {
                 match result {
                     Ok(()) => {}
                     Err(ZipObserverFault::Caller(f)) => {

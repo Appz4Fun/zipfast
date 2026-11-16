@@ -657,3 +657,90 @@ fn the_start_hook_reaches_every_format() {
         }
     }
 }
+
+/// Runs like a CLI that renders member events through the observer's checked diagnostic scope (as Prybar does), and
+/// returns the report and the member events.
+fn run_rendering(
+    archive: &Path,
+    opts: &Options,
+) -> (Result<extract::RunReport, ZipReadError>, Vec<(&'static str, u64)>) {
+    use zipfast::zip::{ZipDiagnosticScope, ZipDiagnosticSink, ZipObserverResult, ZipRunObserver};
+    struct Render<'a> {
+        sink: fs::File,
+        members: &'a mut Vec<(&'static str, u64)>,
+    }
+    impl ZipRunObserver for Render<'_> {
+        fn prepare(&mut self, scope: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            scope.admit_sinks(None, Some(&self.sink))?;
+            Ok(())
+        }
+        fn observe(&mut self, event: RunEvent<'_>, scope: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            let (kind, ordinal, name) = match event {
+                RunEvent::MemberSucceeded { ordinal, name, .. } => ("ok", ordinal, name),
+                RunEvent::MemberSkipped { ordinal, name } => ("skipped", ordinal, name),
+                RunEvent::MemberFailed { ordinal, name, .. } => ("failed", ordinal, name),
+                _ => return Ok(()),
+            };
+            self.members.push((kind, ordinal));
+            scope.emit(ZipDiagnosticSink::Stderr, &mut self.sink, |_, writer| {
+                writer.write_fmt(format_args!("{kind} {name}\n"))
+            })?;
+            Ok(())
+        }
+    }
+    let mut members = Vec::new();
+    let render = Render { sink: tempfile::tempfile().unwrap(), members: &mut members };
+    let result = extract::run_with_policy(archive, opts, None, &Cancellation::default(), &Default::default(), render);
+    (result, members)
+}
+
+#[test]
+fn a_second_run_over_the_same_folder_finishes_in_every_format_and_mode() {
+    for family in FAMILIES {
+        for mode in [Overwrite::Skip, Overwrite::RenameNew(RenameStyle::Underscore), Overwrite::Always] {
+            let dir = tempfile::tempdir().unwrap();
+            let (path, names) = archive(dir.path(), family, b"one", b"two");
+            let out = dir.path().join("out");
+            let what = format!("{family:?} {mode:?}");
+            let (first, _) = run_rendering(&path, &options(&out, mode));
+            let first = first.unwrap_or_else(|e| panic!("{what}, first run: {e:?}"));
+            let (second, members) = run_rendering(&path, &options(&out, mode));
+            let second = second.unwrap_or_else(|e| panic!("{what}, second run: {e:?}"));
+            assert_eq!(second.failed(), 0, "{what}");
+            if mode == Overwrite::Skip {
+                // Everything is there already: every file is skipped, and each skip comes as an event.
+                assert_eq!((second.files(), second.skipped()), (0, first.files()), "{what}");
+                assert_eq!(members.iter().filter(|(k, _)| *k == "skipped").count() as u64, first.files(), "{what}");
+            } else {
+                assert_eq!((second.files(), second.skipped()), (first.files(), 0), "{what}");
+            }
+            for name in &names {
+                assert!(out.join(name).exists(), "{what}: {name}");
+            }
+            // Testing over it reports and renders as well.
+            let (tested, _) = run_rendering(&path, &Options { mode: Mode::Test, ..options(&out, mode) });
+            tested.unwrap_or_else(|e| panic!("{what}, test run: {e:?}"));
+        }
+        // A member the start hook declines is rendered as a skip too.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = archive(dir.path(), family, b"one", b"two");
+        let filter = extract::MemberFilter::all().on_start(|_| extract::StartDecision::Skip);
+        let opts = Options { select: Some(filter), ..options(&dir.path().join("out"), Overwrite::Skip) };
+        let (result, members) = run_rendering(&path, &opts);
+        let report = result.unwrap_or_else(|e| panic!("{family:?} declined: {e:?}"));
+        assert_eq!(report.files(), 0, "{family:?}");
+        // (folders still succeed: the hook is not asked about them)
+        assert!(members.iter().all(|(k, _)| *k != "failed"), "{family:?}: {members:?}");
+        assert!(members.iter().any(|(k, _)| *k == "skipped"), "{family:?}: {members:?}");
+    }
+}
+
+#[test]
+fn the_prybar_rar4_reference_extracts_twice_with_skip() {
+    let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar4/latest_winrar.rar"));
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    run_rendering(path, &options(&out, Overwrite::Skip)).0.unwrap();
+    let report = run_rendering(path, &options(&out, Overwrite::Skip)).0.unwrap();
+    assert_eq!((report.files(), report.skipped()), (0, 2));
+}
