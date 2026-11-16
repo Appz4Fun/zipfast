@@ -1592,3 +1592,113 @@ fn big_member_commit_writes_only_changed_ledger_pages() {
     let opened = f.open(state).unwrap();
     assert_eq!(opened.remaining().unwrap(), vec![65_536..600 << 20, (600 << 20) + 65_536..size]);
 }
+// Catches a compaction inside a group commit that anchors the group's run-ahead head (its `produced` past output
+// that is neither synced nor known): after a failed CAS anywhere in the run, both the live handle and a reopen
+// must show a state extraction can resume from, with every unknown byte at or after `produced`.
+#[test]
+fn compaction_inside_a_group_never_anchors_the_run_ahead_head() {
+    let data = b"abcdefghijklmnop";
+    let resume = |file: &PartialFile, phase: &str| {
+        let remaining = file.remaining().unwrap();
+        assert!(remaining.len() <= 1 && remaining.iter().all(|r| r.end == 16), "{phase}: {remaining:?}");
+        if let Some(r) = remaining.first() {
+            for at in r.start..16 {
+                file.core
+                    .write_original(at, &data[at as usize..at as usize + 1])
+                    .unwrap_or_else(|e| panic!("{phase}: resume at {at}: {e:?}"));
+            }
+        }
+        assert!(file.remaining().unwrap().is_empty(), "{phase}");
+    };
+    for persisted in [false, true] {
+        for call in 3..20 {
+            for reopen in [false, true] {
+                let phase = format!("call {call} persisted {persisted} reopen {reopen}");
+                let f = Fixture::new();
+                let limits =
+                    PartialLimits { group_commit_bytes: 2, journal_records: 6, state_pages: 9, ..Default::default() };
+                let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+                *f.store.fail.lock().unwrap() = Some((call, persisted));
+                let failed =
+                    (0..16u64).any(|at| file.core.write_original(at, &data[at as usize..at as usize + 1]).is_err());
+                *f.store.fail.lock().unwrap() = None;
+                if !failed {
+                    continue;
+                }
+                if reopen {
+                    drop(file);
+                    let anchor = f.store.current(&f.member).unwrap().unwrap();
+                    let state =
+                        PartialState::load(&f.dir.path().join("state"), &anchor, &PartialLimits::default()).unwrap();
+                    resume(&f.open(state).unwrap(), &phase);
+                } else {
+                    resume(&file, &phase);
+                }
+            }
+        }
+    }
+}
+// Catches a FillWriter that counts bytes as committed when the group commit's CAS was ambiguous and did not land:
+// its position and the error's progress must follow the durable state.
+#[test]
+fn fill_writer_position_follows_an_uncertain_group_commit() {
+    use std::io::Write;
+    for persisted in [false, true] {
+        let f = Fixture::new();
+        let limits = PartialLimits { fill_bytes: 4, group_commit_bytes: 8, ..Default::default() };
+        let mut file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+        hole(&f, &file, 1, 0..16);
+        // Genesis and the hole took four CAS calls; the group intent is the fifth, its commit the sixth.
+        *f.store.fail.lock().unwrap() = Some((6, persisted));
+        let mut writer = file.fill_writer(0).unwrap();
+        assert!(writer.write_all(b"abcdefghijklmnop").is_err());
+        *f.store.fail.lock().unwrap() = None;
+        let committed = if persisted { 8 } else { 0 };
+        assert_eq!(writer.position(), committed, "persisted {persisted}");
+        drop(writer);
+        assert_eq!(file.remaining().unwrap(), vec![committed..16]);
+        let f2 = Fixture::new();
+        let mut file2 = f2.create_with(limits_8(), ProgressiveLimits::default(), SessionControl::default()).unwrap();
+        hole(&f2, &file2, 1, 0..16);
+        *f2.store.fail.lock().unwrap() = Some((6, persisted));
+        let error = file2.fill_from(0, 16, &mut &b"abcdefghijklmnop"[..]).unwrap_err();
+        *f2.store.fail.lock().unwrap() = None;
+        assert_eq!(error.output.unwrap().completed, committed, "persisted {persisted}");
+        assert_eq!(file2.remaining().unwrap(), vec![committed..16]);
+    }
+}
+fn limits_8() -> PartialLimits {
+    PartialLimits { fill_bytes: 4, group_commit_bytes: 8, ..Default::default() }
+}
+// Catches windowed ledger pages that outgrow a caller's smaller `state_pages`: a big member then keeps the
+// single-stream layout and still commits and reopens.
+#[test]
+fn big_member_fits_a_small_state_page_budget() {
+    let size = 1u64 << 30;
+    let f = Fixture::sized(size);
+    let limits = PartialLimits { state_pages: 9, ..Default::default() };
+    let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    file.core.write_original(0, &[7; 65_536]).unwrap();
+    hole(&f, &file, 2, 65_536..600 << 20);
+    file.core.write_original(600 << 20, &[9; 65_536]).unwrap();
+    let state = file.close().unwrap();
+    let opened = f.open(state).unwrap();
+    assert_eq!(opened.remaining().unwrap(), vec![65_536..600 << 20, (600 << 20) + 65_536..size]);
+}
+// Catches a drop commit during unwinding, which syncs files and calls the caller's store: a second panic there
+// would abort the process. The group is left uncommitted, as after a crash.
+#[test]
+fn dropping_while_panicking_leaves_the_group_uncommitted() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    file.core.write_original(0, b"abcd").unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _owner = file;
+        panic!("unwind with an open group");
+    }));
+    assert!(unwound.is_err());
+    let anchor = f.store.current(&f.member).unwrap().unwrap();
+    assert_eq!(anchor.sequence(), 2, "the group intent stays anchored");
+    let state = PartialState::load(&f.dir.path().join("state"), &anchor, &PartialLimits::default()).unwrap();
+    assert_eq!(f.open(state).unwrap().remaining().unwrap(), vec![0..16]);
+}

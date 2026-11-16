@@ -479,11 +479,24 @@ impl PartialCore {
         self.reconcile(&mut op)?;
         self.fill_result(&mut op, Vec::new())
     }
-    /// Commits any open group now.
-    pub(crate) fn commit_group(&self) -> PartialResult<()> {
+    /// Commits any open group now, resolves an uncertain commit from the store, and returns the end of the known
+    /// output from `from` (at most `to`) in the committed state: how far a fill starting at `from` is durable.
+    pub(crate) fn commit_group(&self, from: u64, to: u64) -> PartialResult<u64> {
         let mut op = self.operation()?;
         self.check(&op)?;
-        self.flush_group(&mut op)
+        self.flush_group(&mut op)?;
+        if op.uncertain.is_some() {
+            self.reconcile(&mut op)?;
+        }
+        let known = &op.snapshot.known;
+        let mut at = from;
+        for leaf in &known[known.partition_point(|leaf| leaf.range.end <= from)..] {
+            if leaf.range.start > at || at >= to {
+                break;
+            }
+            at = leaf.range.end;
+        }
+        Ok(at.min(to).max(from))
     }
     /// Commits the open group if it has been open for `group_commit_interval`; the session calls this before it
     /// waits for a provider, so a stalled download does not keep written output uncommitted. A handle busy in
@@ -1906,9 +1919,28 @@ impl PartialCore {
         self.compact_locked(&mut op)
     }
     fn compact_locked(&self, op: &mut CoreData) -> PartialResult<()> {
-        let (mut snapshot, _snapshot) = self.clone_snapshot(&op.snapshot)?;
+        // Inside a group the snapshot runs ahead of the anchored intent (its `produced`, checks and leaves cover
+        // output that is neither synced nor committed), so the compaction re-anchors the intent's own head and
+        // the in-memory snapshot keeps running ahead. Outside a group the snapshot is the committed state.
+        if op.group.is_some() {
+            let (_, _, _, mut head) = state::decode_record(&op.state.wire, &self.budget.limits)?;
+            head.sequence = head.sequence.checked_add(1).ok_or_else(malformed)?;
+            return self.compact_head(op, head, None);
+        }
+        let (mut snapshot, lease) = self.clone_snapshot(&op.snapshot)?;
         snapshot.head.sequence = snapshot.head.sequence.checked_add(1).ok_or_else(malformed)?;
-        let prepared = op.bundle.prepare_compaction(&snapshot.head)?;
+        let head = snapshot.head.clone();
+        self.compact_head(op, head, Some((snapshot, lease)))
+    }
+    /// Anchors a compaction record of `head` and retires what it no longer names. `snapshot` replaces the
+    /// in-memory snapshot when given; otherwise only the snapshot's sequence follows the new anchor.
+    fn compact_head(
+        &self,
+        op: &mut CoreData,
+        head: state::CommittedState,
+        snapshot: Option<(Snapshot, Lease)>,
+    ) -> PartialResult<()> {
+        let prepared = op.bundle.prepare_compaction(&head)?;
         let next = prepared.state.clone();
         let previous = op.state.clone();
         op.uncertain =
@@ -1919,7 +1951,10 @@ impl PartialCore {
             e
         })?;
         op.state = next.clone();
-        op.snapshot = snapshot;
+        match snapshot {
+            Some((snapshot, _lease)) => op.snapshot = snapshot,
+            None => op.snapshot.head.sequence = head.sequence,
+        }
         op.uncertain = None;
         self.check(op).map_err(|mut e| {
             e.committed = Some(next.anchor.clone());
@@ -1954,7 +1989,12 @@ impl PartialCore {
 impl Drop for PartialCore {
     /// The last owner gone: commit an open group if that still works, so output written since its intent is not
     /// re-extracted needlessly. A failure leaves the anchored state as it is, exactly as a crash would.
+    /// Skipped while the thread is panicking: the commit syncs files and calls the caller's anchor store, and a
+    /// second panic during unwinding would abort the process. The anchored state then stays as after a crash.
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
         let data = self.data.get_mut().ok().and_then(Option::take);
         if let Some(mut data) = data
             && data.group.is_some()

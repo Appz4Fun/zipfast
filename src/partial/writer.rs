@@ -82,10 +82,9 @@ impl<'a> FillWriter<'a> {
         let (applied, committed) = match self.file.core.fill_grouped(self.at, &self.buffer) {
             Ok(result) => result,
             Err(error) => {
-                // Commit what earlier buffers wrote, so the caller can resume after it.
-                if self.file.core.commit_group().is_ok() {
-                    self.committed = self.at;
-                }
+                // Commit what earlier buffers wrote, so the caller can resume after it, and follow the durable
+                // state: an uncertain group commit may not have landed.
+                self.settle(self.at + self.buffer.len() as u64);
                 return Err(error);
             }
         };
@@ -101,6 +100,14 @@ impl<'a> FillWriter<'a> {
             self.committed = self.at;
         }
         Ok(())
+    }
+    /// After an error: commits what the writer handed over, if it can, and sets `committed` to the end of what
+    /// the durable state knows from there, up to `to` (the end of the bytes handed over, including a buffer
+    /// whose own threshold commit failed ambiguously but may have landed).
+    fn settle(&mut self, to: u64) {
+        if let Ok(end) = self.file.core.commit_group(self.committed, to) {
+            self.committed = end;
+        }
     }
     /// Commits through `io::Write`: keeps the typed error for `finish` and poisons the writer.
     fn commit_io(&mut self) -> io::Result<()> {
@@ -189,9 +196,7 @@ impl PartialFile {
                 Err(cause) => {
                     writer.buffer.truncate(start);
                     // Commit what was written before the input failed.
-                    if writer.file.core.commit_group().is_ok() {
-                        writer.committed = writer.at;
-                    }
+                    writer.settle(writer.at);
                     let done = writer.committed - offset;
                     let mut error = err(PartialErrorKind::FillRead(cause));
                     error.output = Some(crate::progressive::OutputRange { offset, attempted: len, completed: done });
@@ -210,6 +215,9 @@ impl PartialFile {
             result.applied = std::mem::take(&mut writer.applied);
             Ok(result)
         };
-        fill(&mut writer).map_err(|e| progress(e, offset, len, writer.committed - offset))
+        fill(&mut writer).map_err(|e| {
+            writer.settle(writer.at);
+            progress(e, offset, len, writer.committed - offset)
+        })
     }
 }

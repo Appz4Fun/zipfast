@@ -570,7 +570,7 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
     // Large members split the validity ledger into pages by output window (see `validity_window`), so a commit
     // rewrites only the pages whose windows changed. Their unknown gaps are cut on absolute 64 KiB boundaries,
     // which makes each window's extents depend only on the leaves inside it.
-    let window = validity_window(snapshot.head.size);
+    let window = validity_window(snapshot.head.size, budget.limits.state_pages);
     let aligned = window.is_some();
     let mut extent_count = snapshot.known.len() as u64;
     let mut end = 0;
@@ -717,12 +717,20 @@ const WINDOWS_MAX: u64 = 24;
 /// Output bytes covered by one validity page of a member whose extent list is large, or `None` for the
 /// single-stream layout of smaller members (which stays byte-identical to earlier builds). A window is a multiple of
 /// 64 KiB, so absolute 64 KiB gap pieces and leaves (which never cross a 64 KiB boundary) never straddle two.
-pub(super) fn validity_window(size: u64) -> Option<u64> {
+///
+/// The live pages of a windowed state (geometry, extent count, windows, holes, header witnesses) take at most half
+/// of `state_pages`, which also bounds the bundle's superseded pages until compaction; a budget too small for
+/// two windows keeps the single-stream layout.
+pub(super) fn validity_window(size: u64, state_pages: u32) -> Option<u64> {
     let bytes = size.div_ceil(65_536).saturating_mul(21);
     if bytes <= 2 * WINDOW_BYTES {
         return None;
     }
-    let windows = bytes.div_ceil(WINDOW_BYTES).min(WINDOWS_MAX);
+    let room = (u64::from(state_pages) / 2).saturating_sub(4);
+    let windows = bytes.div_ceil(WINDOW_BYTES).min(WINDOWS_MAX).min(room);
+    if windows < 2 {
+        return None;
+    }
     Some(size.div_ceil(windows).next_multiple_of(65_536))
 }
 /// End of the unknown piece starting at `end` of a gap ending at `limit`: at most 64 KiB, cut on absolute 64 KiB
