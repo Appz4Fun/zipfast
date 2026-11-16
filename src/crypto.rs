@@ -974,6 +974,45 @@ pub fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]
     derive_rar4_key_iv_impl(password, salt, &mut UnrestrictedKdf).expect("unrestricted RAR4 derivation")
 }
 
+/// RAR 3.x keys by salt, for the one password of a run: the 2^18-round derivation runs once per salt (a solid or
+/// split archive repeats one salt in every header). Derivation stops when `cancel` is set.
+#[derive(Default)]
+pub(crate) struct Rar4KeyCache {
+    keys: Vec<([u8; 8], [u8; 16], [u8; 16])>,
+}
+
+impl Rar4KeyCache {
+    /// Salts kept at most; an archive with more derives the oldest again.
+    const KEPT: usize = 64;
+
+    pub(crate) fn keys(
+        &mut self,
+        password: &str,
+        salt: &[u8; 8],
+        cancel: Option<&crate::extract::Cancellation>,
+    ) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
+        if let Some(&(_, key, iv)) = self.keys.iter().find(|(s, ..)| s == salt) {
+            return Ok((key, iv));
+        }
+        struct Cancelable<'a>(Option<&'a crate::extract::Cancellation>);
+        impl KdfControl for Cancelable<'_> {
+            fn charge(&mut self, _: u64) -> std::result::Result<(), KdfControlError> {
+                if self.0.is_some_and(crate::extract::Cancellation::is_canceled) {
+                    Err(KdfControlError::Canceled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let (key, iv) = derive_rar4_key_iv_impl(password, salt, &mut Cancelable(cancel))?;
+        if self.keys.len() == Self::KEPT {
+            self.keys.remove(0);
+        }
+        self.keys.push((*salt, key, iv));
+        Ok((key, iv))
+    }
+}
+
 pub(crate) fn derive_rar4_key_iv_controlled(
     password: &str,
     salt: &[u8; 8],
@@ -1813,6 +1852,20 @@ mod tests {
             b"WinZip AES fixture across CTR blocks",
         ),
     ];
+
+    #[test]
+    fn rar4_key_cache_derives_once_per_salt_and_stops_when_canceled() {
+        let mut cache = Rar4KeyCache::default();
+        let canceled = crate::extract::Cancellation::default();
+        canceled.cancel();
+        // a salt never derived stops at the first block once canceled
+        assert_eq!(cache.keys("pw", b"saltsalt", Some(&canceled)), Err(KdfControlError::Canceled));
+        let keys = cache.keys("pw", b"saltsalt", None).unwrap();
+        assert_eq!(keys, derive_rar4_key_iv("pw", b"saltsalt"));
+        // a salt derived before comes from the cache: no work left to cancel
+        assert_eq!(cache.keys("pw", b"saltsalt", Some(&canceled)), Ok(keys));
+        assert_eq!(cache.keys("pw", b"pepper!!", Some(&canceled)), Err(KdfControlError::Canceled));
+    }
 
     #[test]
     fn cancellable_derivation_and_persistent_ctr_match_legacy() {

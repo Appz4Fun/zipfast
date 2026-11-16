@@ -291,7 +291,7 @@ fn exact_selected_limits_window_and_spool_failures_are_typed() {
 }
 
 #[test]
-fn old_versions_solid_encrypted_split_and_methods_stay_excluded() {
+fn old_versions_and_methods_stay_excluded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("excluded.rar");
     let packed = include_bytes!("fixtures/rar4-lz/literal-a.packed");
@@ -300,9 +300,8 @@ fn old_versions_solid_encrypted_split_and_methods_stay_excluded() {
         (26, 0x33, 0, "unpack version"),
         (15, 0x33, 0, "unpack version"),
         (29, 0x36, 0, "compression method"),
-        (29, 0x33, 0x10, "solid payload"),
-        (29, 0x33, 4, "encrypted payload"),
-        (29, 0x33, 2, "split payload"),
+        // Split, solid and encrypted version 29 members decode (tests/rar4_split_solid.rs); RAR 2.0's cipher doesn't.
+        (20, 0x30, 4, "encrypted payload"),
     ] {
         fs::write(&path, archive(&[member(b"excluded", packed, b"A", version, method, flags)])).unwrap();
         let failures = issue(&path);

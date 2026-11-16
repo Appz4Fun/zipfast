@@ -277,7 +277,7 @@ impl HeaderParser {
             };
             let header = FileHeader {
                 format: RarFormat::Rar4,
-                rar4: Some(Rar4Metadata { flags, host, method, unpack_version: version, dos_time: dos }),
+                rar4: Some(Rar4Metadata { flags, host, method, unpack_version: version, dos_time: dos, salt }),
                 block_flags: (u64::from(flags & 1 != 0) * HFL_SPLIT_BEFORE)
                     | (u64::from(flags & 2 != 0) * HFL_SPLIT_AFTER),
                 file_flags: u64::from(directory) * FHFL_DIRECTORY,
@@ -294,7 +294,9 @@ impl HeaderParser {
                 host_os: normalized_host,
                 name,
                 encrypted: flags & 4 != 0,
-                solid: flags & 0x10 != 0 || self.rar4_main.as_ref().is_some_and(MainHeader::is_solid),
+                // As UnRAR: a member goes on from the history before it when its own flag says so. The first member of a
+                // solid archive starts the stream.
+                solid: flags & 0x10 != 0,
                 ..FileHeader::default()
             };
             Ok((header, encoded, salt))

@@ -17,6 +17,16 @@
 //! Private format ownership. Independent RAR4 state never becomes RAR5 history.
 use super::*;
 use crate::rar5::unpack::rar4::{CoreBinding, CoreFrame, Rar4Decoder};
+/// How a progressive RAR4 member's decoder relates to the stream around it.
+#[derive(Default)]
+pub(crate) struct Rar4Stream<'a> {
+    /// the solid stream's decoder, for a member that goes on from it
+    pub(crate) history: Option<Rar4Owner>,
+    /// whether a member after this one may go on from it
+    pub(crate) solid_archive: bool,
+    pub(crate) password: Option<&'a str>,
+    pub(crate) legacy: Option<crate::rar5::LegacyCrypt>,
+}
 #[allow(clippy::large_enum_variant, reason = "retain existing RAR5 ownership; RAR4 arrays use a fallible owner")]
 pub(crate) enum MemberDecoder {
     Rar5(Unpacker),
@@ -74,15 +84,60 @@ impl MemberMachine {
             )),
         }
     }
+    /// The decoder of a finished member that a solid successor can go on from.
+    pub(crate) fn take_rar4_history(&mut self) -> Option<Rar4Owner> {
+        match self.decoder.take() {
+            Some(MemberDecoder::Rar4(d)) if d.has_boundary() => Some(d),
+            other => {
+                self.decoder = other;
+                None
+            }
+        }
+    }
+    /// The member goes on in another volume.
+    pub(crate) fn extend_rar4(&mut self, packed: u64) -> crate::progressive::ProgressiveResult<()> {
+        let Some(MemberDecoder::Rar4(d)) = &mut self.decoder else { return Ok(()) };
+        d.extend_packed(packed).map_err(|e| crate::rar5::framing::progressive_fault(e.detailed(self.context.scope())))
+    }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_rar4(
         header: &crate::rar5::FileHeader,
-        context: EntryContext,
+        mut context: EntryContext,
         frame: CoreFrame,
         window_limit: u64,
         usage: &crate::progressive::Usage,
         control: &crate::progressive::SessionControl,
+        stream: Rar4Stream<'_>,
     ) -> crate::progressive::ProgressiveResult<(Self, CoreBinding)> {
-        use crate::progressive::Resource;
+        use crate::progressive::{FailureKind, ProgressiveFailure, Resource};
+        let cipher = if header.encrypted {
+            let salt = crate::rar5::LegacyCrypt::stored_salt(stream.legacy).map_err(|reason| {
+                ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(reason))))
+            })?;
+            let password = stream
+                .password
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+            let (key, iv) = super::controlled_legacy_keys(password, &salt, usage, control)?;
+            context.password =
+                crate::error::RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);
+            Some(PendingCipher::from_legacy(key, iv, header.unpacked_size, true))
+        } else {
+            None
+        };
+        if let Some(mut owner) = stream.history {
+            // a solid member goes on from the stream its predecessor left
+            owner
+                .next_solid_member(frame)
+                .map_err(|e| crate::rar5::framing::progressive_fault(e.detailed(context.scope())))?;
+            let binding = owner
+                .active_binding()
+                .map_err(|e| crate::rar5::framing::progressive_fault(e.detailed(context.scope())))?;
+            let mut machine = Self::from_state(header, context, cipher, None, 0);
+            machine.decoder = Some(MemberDecoder::Rar4(owner));
+            machine.inner = Some(InnerChecks::new(header));
+            return Ok((machine, binding));
+        }
         usage.check(Resource::DecoderWindow, frame.dictionary)?;
         let invalid =
             || crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::InvalidCapability);
@@ -93,12 +148,15 @@ impl MemberMachine {
         let actual =
             u64::try_from(owned.capacity()).ok().and_then(|n| n.checked_mul(item_bytes)).ok_or_else(invalid)?;
         usage.charge(Resource::MetadataBytes, actual.checked_sub(item_bytes).ok_or_else(invalid)?)?;
-        let decoder = Rar4Decoder::new_frame(frame, window_limit, Some(control.cancellation_token()))
+        let mut decoder = Rar4Decoder::new_frame(frame, window_limit, Some(control.cancellation_token()))
             .map_err(|e| crate::rar5::framing::progressive_fault(e.detailed(context.scope())))?;
+        if stream.solid_archive {
+            decoder.track_boundary();
+        }
         let binding = decoder
             .active_binding()
             .map_err(|e| crate::rar5::framing::progressive_fault(e.detailed(context.scope())))?;
-        let mut machine = Self::from_state(header, context, None, None, 0);
+        let mut machine = Self::from_state(header, context, cipher, None, 0);
         owned.push(decoder);
         machine.decoder = Some(MemberDecoder::Rar4(Rar4Owner(owned)));
         machine.inner = Some(InnerChecks::new(header));
@@ -129,7 +187,15 @@ mod tests {
                 password: crate::error::RarPasswordEvidence::NotEncrypted,
                 renamed: None,
             };
-            let result = MemberMachine::new_rar4(&header, context, frame, 65536, &usage, &SessionControl::default());
+            let result = MemberMachine::new_rar4(
+                &header,
+                context,
+                frame,
+                65536,
+                &usage,
+                &SessionControl::default(),
+                Rar4Stream::default(),
+            );
             if allowance < bytes {
                 assert!(
                     matches!(result.err().unwrap().kind, FailureKind::Limit { resource: Resource::MetadataBytes, limit, attempted } if limit == allowance && attempted == bytes)
@@ -175,7 +241,8 @@ mod tests {
             method: 0x33,
             dictionary: 65536,
         };
-        let (mut machine, _) = MemberMachine::new_rar4(&header, context, frame, 65536, &usage, &control).unwrap();
+        let (mut machine, _) =
+            MemberMachine::new_rar4(&header, context, frame, 65536, &usage, &control, Rar4Stream::default()).unwrap();
         let mut produced = 0;
         let e = machine
             .feed(packed, &mut |bytes: &[u8]| {

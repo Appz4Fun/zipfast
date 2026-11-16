@@ -60,8 +60,8 @@ pub(crate) fn continuation_issue(initial: &PhysicalMember, header: &FileHeader) 
         || (header.format == super::RarFormat::Rar4
             && (header.method != initial.header.method
                 || header.dictionary != initial.header.dictionary
-                || header.rar4.map(|m| (m.method, m.unpack_version))
-                    != initial.header.rar4.map(|m| (m.method, m.unpack_version))))
+                || header.rar4.map(|m| (m.method, m.unpack_version, m.salt))
+                    != initial.header.rar4.map(|m| (m.method, m.unpack_version, m.salt))))
         || (header.method == 0) != (initial.header.method == 0)
         || header.algorithm != initial.header.algorithm
         || header.encrypted != initial.header.encrypted

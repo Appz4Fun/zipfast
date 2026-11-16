@@ -78,6 +78,7 @@ pub(super) enum Lifecycle {
     Deferred,
     BoundaryReady,
     Unavailable,
+    #[cfg_attr(not(test), allow(dead_code))]
     Closed,
 }
 
@@ -140,6 +141,14 @@ impl Rar4Decoder {
             self.work.check()?;
             if self.fed != self.packed {
                 return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
+            }
+            if self.in_tail && self.produced == self.expected {
+                // The member's data ends inside its end-of-file marker.
+                self.end_tail();
+            }
+            if self.track_boundary && self.boundary.is_none() && matches!(self.phase, Phase::Complete) {
+                // An empty member leaves the next one where this one started.
+                self.boundary = Some(self.saved_phase);
             }
             if self.produced != self.expected || !matches!(self.phase, Phase::Complete) {
                 return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: self.produced });
@@ -258,6 +267,82 @@ impl Rar4Decoder {
         self.start_frame(frame);
         Ok(())
     }
+    /// Read each member's end-of-file marker past its output, so a solid successor can start where it says.
+    pub(crate) fn track_boundary(&mut self) {
+        self.track_boundary = true;
+        if self.lifecycle == Lifecycle::Active && self.produced == 0 && self.expected == 0 && self.packed != 0 {
+            self.in_tail = true;
+            self.phase = self.saved_phase;
+        }
+    }
+    /// The member goes on in the next volume: its packed data grows by that part's size.
+    pub(crate) fn extend_packed(&mut self, more: u64) -> DecodeResult<()> {
+        self.require(Lifecycle::Active)?;
+        let packed = self.packed.checked_add(more).ok_or(Rar4DecodeError::CounterOverflow);
+        let packed = self.poison_on_error(packed)?;
+        self.packed = packed;
+        self.binding.frame.packed = packed;
+        Ok(())
+    }
+    /// Whether a finished member left a start for a solid successor.
+    pub(crate) fn has_boundary(&self) -> bool {
+        !self.poisoned && self.lifecycle == Lifecycle::LogicalDone && self.boundary.is_some()
+    }
+    /// Starts the next member of a solid stream on the history, tables and distances the last one left.
+    pub(crate) fn next_solid_member(&mut self, frame: CoreFrame) -> DecodeResult<()> {
+        self.require(Lifecycle::LogicalDone)?;
+        let Some(start) = self.boundary else { return Err(Rar4DecodeError::State) };
+        let retained = self.dictionary.len() as u64;
+        if frame.dictionary > retained {
+            // the stream's window was sized for the members before
+            return Err(Rar4DecodeError::WindowLimit { requested: frame.dictionary, allowed: retained });
+        }
+        frame.validate(retained)?;
+        let base = self
+            .chain_base
+            .checked_add(self.produced)
+            .filter(|base| base.checked_add(frame.unpacked).is_some())
+            .ok_or(Rar4DecodeError::CounterOverflow);
+        let base = self.poison_on_error(base)?;
+        let sequence = self.binding.member_seq.checked_add(1).ok_or(Rar4DecodeError::CounterOverflow);
+        let sequence = self.poison_on_error(sequence)?;
+        self.check_transition()?;
+        self.binding.member_seq = sequence;
+        self.binding.frame = frame;
+        self.chain_base = base;
+        self.saved_phase = start;
+        self.start_frame(frame);
+        Ok(())
+    }
+    pub(super) fn tail_tolerates(error: &Rar4DecodeError) -> bool {
+        matches!(
+            error,
+            Rar4DecodeError::Malformed(_) | Rar4DecodeError::Unsupported(_) | Rar4DecodeError::DecodedSize { .. }
+        )
+    }
+    /// The end-of-file marker is cut short or isn't one: the next member starts as UnRAR would start it, on new
+    /// tables when this stopped inside them, otherwise on the tables in force.
+    pub(super) fn end_tail(&mut self) {
+        let start = match self.phase {
+            Phase::Align
+            | Phase::Mode
+            | Phase::Retain
+            | Phase::Bc { .. }
+            | Phase::BcRun { .. }
+            | Phase::BuildBc
+            | Phase::Lengths { .. }
+            | Phase::LengthRun { .. }
+            | Phase::BuildTables => Phase::Align,
+            _ => Phase::Token,
+        };
+        self.finish_tail(start);
+    }
+    pub(super) fn finish_tail(&mut self, start: Phase) {
+        self.in_tail = false;
+        self.boundary = Some(start);
+        self.saved_phase = start;
+        self.phase = Phase::Complete;
+    }
     fn start_frame(&mut self, frame: CoreFrame) {
         self.packed = frame.packed;
         self.expected = frame.unpacked;
@@ -269,6 +354,12 @@ impl Rar4Decoder {
         self.depth = 0;
         self.filled = 0;
         self.phase = if frame.unpacked == 0 { Phase::Complete } else { self.saved_phase };
+        self.in_tail = false;
+        self.boundary = None;
+        if self.track_boundary && frame.unpacked == 0 && frame.packed != 0 {
+            self.in_tail = true;
+            self.phase = self.saved_phase;
+        }
         self.finished = false;
         self.lifecycle = Lifecycle::Active;
         #[cfg(test)]
