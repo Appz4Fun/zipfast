@@ -123,7 +123,10 @@ impl Backend {
             }
             // SAFETY: an `ArmSha2` is only made once the instructions have been found
             #[cfg(target_arch = "aarch64")]
-            Backend::ArmSha2 => unsafe { arm::compress(state, blocks) },
+            Backend::ArmSha2 => {
+                debug_assert!(std::arch::is_aarch64_feature_detected!("sha2"));
+                unsafe { arm::compress(state, blocks) }
+            }
         }
     }
 
@@ -148,6 +151,8 @@ impl Backend {
     }
 
     /// The fastest backend this processor can run, unless the environment asks for the portable one.
+    ///
+    /// `ZIPFAST_SHA256=scalar` is read once, at the process's first hash; changing it later has no effect.
     fn detect() -> Backend {
         if std::env::var_os("ZIPFAST_SHA256").is_some_and(|v| v == "scalar") {
             return Backend::Scalar;
