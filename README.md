@@ -31,6 +31,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - Member maps (`zipfast::map`): a typed header listing of RAR4, RAR 5.0 (including `-hp` with a password) and
   ZIP archives from memory or a range source, mapping each stored member's output offsets to per-volume packed
   spans; see [member maps](docs/member-map.md).
+- Reading a stored member from any output offset (`zipfast::map::extract_member_from`, `MemberReader`): plain,
+  RAR 5.0 and RAR 4.x AES and WinZip AES members stream their plaintext suffix from the packed bytes that offset
+  needs, checking the parts they cover, for example to finish a partial output from another copy; see
+  [extract-member-from](docs/extract-member-from.md).
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 

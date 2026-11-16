@@ -29,8 +29,17 @@
 //! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given) and single-disk ZIP are
 //! mapped. Passwords and keys never appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
 //! See `docs/member-map.md`.
+//!
+//! [`MemberReader`] and [`extract_member_from`] stream a stored member's plaintext from any output offset, reading
+//! only the packed bytes that offset needs, for example to fill the rest of a partial output from another copy. See
+//! `docs/extract-member-from.md`.
 
+mod member_reader;
 mod zip;
+
+pub use member_reader::{
+    ExtractFromError, ExtractedFrom, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
+};
 
 use crate::progressive::{
     FailureKind, ProgressiveFailure, ProgressiveLimits, RangeRead, RangeSource, Resource, SessionControl, VolumeAnswer,
@@ -543,7 +552,7 @@ impl MapError {
     }
 }
 
-/// Options for building a map.
+/// Options for building a map, or for reading a member with [`MemberReader`].
 #[derive(Clone)]
 pub struct MapOptions {
     /// Name of the first volume. It names the volumes asked of a [`VolumeSource`] and appears in failures.
@@ -554,6 +563,11 @@ pub struct MapOptions {
     pub limits: ProgressiveLimits,
     /// Cancels a walk, including a key derivation in progress.
     pub control: SessionControl,
+    /// [`MemberReader`] only: the most output a checked part may carry for its plaintext to be held back in memory
+    /// until its check passes. The hold is charged to `limits.temp_bytes` while it lasts. A larger part, or one whose
+    /// hold the budget or the allocator refuses, is streamed unchecked and reported after the fact (see
+    /// [`ExtractFromError::PartBad`]). Default 256 MiB.
+    pub part_hold_bytes: u64,
 }
 
 impl MapOptions {
@@ -563,6 +577,7 @@ impl MapOptions {
             password: None,
             limits: ProgressiveLimits::default(),
             control: SessionControl::default(),
+            part_hold_bytes: 256 << 20,
         }
     }
 
