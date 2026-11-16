@@ -596,6 +596,12 @@ impl<'a> RarMember<'a> {
         self.member.header.encrypted
     }
 
+    /// RAR 5.0: the file encryption record's version, flags and KDF count as stored, for a 7-Zip-style method
+    /// string (`AES:15:3`). None for unencrypted and RAR4 members.
+    pub fn rar5_crypt_record(&self) -> Option<super::Rar5CryptRecord> {
+        self.member.header.crypt_record
+    }
+
     /// Whether the observed parts include a final header.
     pub fn is_complete(&self) -> bool {
         self.member.complete

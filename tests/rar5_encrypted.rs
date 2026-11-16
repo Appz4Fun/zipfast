@@ -721,3 +721,28 @@ fn a_wrong_password_on_an_unselected_solid_member_is_the_cause_its_dependent_rep
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn session_exposes_the_encryption_record() {
+    use zipfast::rar5::session::{RarSession, RarSessionOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.rar");
+    let plain = b"listed".to_vec();
+    let encrypted = encrypted_data(&plain, 0);
+    for (tweaked, flags) in [(false, 0), (true, 2)] {
+        let spec = FileSpec {
+            size: Some(plain.len() as u64),
+            extra: encryption_record(tweaked),
+            ..FileSpec::new("f", &encrypted)
+        };
+        fs::write(&archive, archive_with(&[(spec, encrypted_crc(&plain))], false)).unwrap();
+        let session = RarSession::open(&archive, None, RarSessionOptions::default()).unwrap();
+        let member = session.entries().next().unwrap();
+        let record = member.rar5_crypt_record().unwrap();
+        assert_eq!((record.version, record.flags, record.kdf_count), (0, flags, KDF_COUNT));
+    }
+    let spec = FileSpec { size: Some(plain.len() as u64), ..FileSpec::new("f", &plain) };
+    fs::write(&archive, archive_with(&[(spec, crc32fast::hash(&plain))], false)).unwrap();
+    let session = RarSession::open(&archive, None, RarSessionOptions::default()).unwrap();
+    assert!(session.entries().next().unwrap().rar5_crypt_record().is_none());
+}
