@@ -31,9 +31,9 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
   compresses. xz files written in blocks (`xz -T0`) decode on several cores.
 - 7z archives (`.7z`, split `.7z.001`, ...): testing and extracting through the same entry points, options and
-  checks as the other formats. Copy, LZMA, LZMA2, Deflate, Deflate64, BZip2, Zstandard, 7zAES (also with encrypted headers),
-  BCJ, BCJ2, ARM, ARM64, ARMT, PPC, SPARC, IA64, Delta and Swap; solid folders stream without buffering and every
-  CRC is checked before a file appears. PPMd is refused; see [7z extraction](docs/7z-extract.md).
+  checks as the other formats. Copy, LZMA, LZMA2, Deflate, Deflate64, BZip2, Zstandard, PPMd, 7zAES (also with
+  encrypted headers), BCJ, BCJ2, ARM, ARM64, ARMT, PPC, SPARC, IA64, Delta and Swap; solid folders stream without
+  buffering and every CRC is checked before a file appears; see [7z extraction](docs/7z-extract.md).
 - Member maps (`zipfast::map`): a typed header listing of RAR4, RAR 5.0 (including `-hp` with a password) and
   ZIP archives from memory or a range source, mapping each stored member's output offsets to per-volume packed
   spans; see [member maps](docs/member-map.md).
@@ -48,7 +48,7 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 
-Remaining RAR4 capabilities, links, 7z PPMd and ZIP PPMd are next.
+Remaining RAR4 capabilities, links and ZIP PPMd are next.
 
 ## Usage
 

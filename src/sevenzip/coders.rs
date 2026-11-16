@@ -316,6 +316,7 @@ pub(crate) fn supported(kind: CoderKind) -> bool {
             | CoderKind::ArmThumb
             | CoderKind::Arm64
             | CoderKind::Sparc
+            | CoderKind::Ppmd
     ) || matches!(kind, CoderKind::Other(SWAP2 | SWAP4 | ZSTD))
 }
 
@@ -323,6 +324,100 @@ const SWAP2: u64 = 0x02_0302;
 const SWAP4: u64 = 0x02_0304;
 /// Zstandard as the 7-Zip ZS fork and its plugins write it.
 const ZSTD: u64 = 0x04F7_1101;
+
+/// 7-Zip PPMd (PPMd variant H with 7-Zip's range coder): an order byte and the model's memory in bytes. The
+/// model's memory counts against the folder's dictionary budget.
+fn ppmd(props: &[u8], input: Stream, size: u64, cx: &mut Context<'_>) -> Built {
+    let &[order, m0, m1, m2, m3] = props else { return Err(SevenZipError::Corrupt("7z PPMd properties")) };
+    let memory = u32::from_le_bytes([m0, m1, m2, m3]);
+    if !(2..=64).contains(&order) || !((1 << 11)..=(256 << 20)).contains(&memory) {
+        return Err(SevenZipError::Corrupt("7z PPMd properties"));
+    }
+    let total = cx.dictionaries.saturating_add(u64::from(memory));
+    if total > cx.limits.dictionary_bytes {
+        return Err(SevenZipError::Limit {
+            limit: SevenZipLimit::DictionaryBytes,
+            max: cx.limits.dictionary_bytes,
+            attempted: total,
+        });
+    }
+    cx.dictionaries = total;
+    Ok(Box::new(PpmdReader {
+        input,
+        buf: Vec::with_capacity(PPMD_LOOKAHEAD * 2),
+        pos: 0,
+        eof: false,
+        model: None,
+        order,
+        memory,
+        left: size,
+    }))
+}
+
+/// One PPMd character never reads more than this much input.
+const PPMD_LOOKAHEAD: usize = 4096;
+
+struct PpmdReader {
+    input: Stream,
+    buf: Vec<u8>,
+    pos: usize,
+    eof: bool,
+    /// started at the first read
+    model: Option<Box<crate::rar5::unpack::rar4::ppm::Ppm>>,
+    order: u8,
+    memory: u32,
+    left: u64,
+}
+
+impl PpmdReader {
+    /// Buffers at least the lookahead, unless the input ends first.
+    fn fill(&mut self) -> io::Result<()> {
+        while !self.eof && self.buf.len() - self.pos < PPMD_LOOKAHEAD {
+            if self.pos > 0 {
+                self.buf.drain(..self.pos);
+                self.pos = 0;
+            }
+            let at = self.buf.len();
+            self.buf.resize(at + PPMD_LOOKAHEAD, 0);
+            let n = self.input.read(&mut self.buf[at..])?;
+            self.buf.truncate(at + n);
+            self.eof = n == 0;
+        }
+        Ok(())
+    }
+}
+
+impl Read for PpmdReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        use crate::rar5::unpack::rar4::ppm::{Bits, Ppm};
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "7z PPMd data");
+        let mut n = 0;
+        while n < out.len() && self.left > 0 {
+            self.fill()?;
+            let mut bits = Bits { data: &self.buf, addr: self.pos, bit: 0 };
+            let model = match &mut self.model {
+                Some(model) => model,
+                None => {
+                    let mut model = Box::<Ppm>::default();
+                    if !model.init_7z(&mut bits, self.order, self.memory) {
+                        return Err(bad());
+                    }
+                    self.model.insert(model)
+                }
+            };
+            let byte = model.decode_char(&mut bits).ok_or_else(bad)?;
+            // past the input's end the decoder reads zeros; more than a few is damage
+            if bits.addr > self.buf.len() + 8 {
+                return Err(bad());
+            }
+            self.pos = bits.addr;
+            out[n] = byte;
+            n += 1;
+            self.left -= 1;
+        }
+        Ok(n)
+    }
+}
 
 /// What building a folder needs besides the folder.
 pub(crate) struct Context<'a> {
@@ -467,7 +562,7 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
                 .map_err(SevenZipError::Io)?;
             Ok(Box::new(decoder))
         }
-        CoderKind::Ppmd => Err(SevenZipError::UnsupportedCoder { id: coder.id }),
+        CoderKind::Ppmd => ppmd(props, one(inputs)?, size, cx),
         _ => Err(SevenZipError::UnsupportedCoder { id: coder.id }),
     }
 }
