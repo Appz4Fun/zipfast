@@ -251,6 +251,8 @@ pub(in crate::zip::read) struct PreparedPortable {
     pub(in crate::zip::read) mode: Option<u32>,
     pub(in crate::zip::read) mtime: Option<(i64, u32)>,
     pub(in crate::zip::read) overwrite: crate::extract::Overwrite,
+    /// Flush before publication; false under [`Publication::Bulk`], which flushes directories once per run.
+    pub(in crate::zip::read) sync: bool,
 }
 fn merge(error: &mut Option<ZipReadError>, report: ObjectCleanupReport) {
     if !report.is_empty() {
@@ -299,15 +301,24 @@ impl PreparedPortable {
         // The stage was born 0600; give it what an ordinary creation would have had, then the archived mode.
         // Filesystems without Unix modes (exFAT, SMB without extensions) may refuse or ignore either change.
         let baseline = 0o666 & !native_policy::creation_mask();
-        ordinary(op(ReadIoOperation::DescriptorMode, &mut || {
-            native_policy::cvt(unsafe { libc::fchmod(fd, baseline as libc::mode_t) }).map(|_| ())
-        }))?;
-        if let Some(mode) = self.mode {
-            ordinary(op(ReadIoOperation::DescriptorMode, &mut || {
-                native_policy::cvt(unsafe { libc::fchmod(fd, (mode & 0o777) as libc::mode_t) }).map(|_| ())
-            }))?;
+        let chmod = |mode: u32| {
+            op(ReadIoOperation::DescriptorMode, &mut || {
+                native_policy::cvt(unsafe { libc::fchmod(fd, mode as libc::mode_t) }).map(|_| ())
+            })
+        };
+        // One fchmod when the archive has a mode; the baseline only stands in when it has none or it is refused.
+        let archived = match self.mode {
+            Some(mode) => chmod(mode & 0o777),
+            None => Err(ReadFault::InvalidPlan),
+        };
+        match archived {
+            Ok(()) => {}
+            Err(ReadFault::Io { .. }) | Err(ReadFault::InvalidPlan) => ordinary(chmod(baseline))?,
+            Err(error) => return Err(error),
         }
-        op(ReadIoOperation::Flush, &mut || native_policy::portable_sync(fd))?;
+        if self.sync {
+            op(ReadIoOperation::Flush, &mut || native_policy::portable_sync(fd))?;
+        }
         let mut actual = None;
         op(ReadIoOperation::Stat, &mut || {
             actual = Some(native_policy::stat(fd)?);

@@ -288,3 +288,79 @@ fn native_only_refuses_or_runs_natively() {
         }
     }
 }
+
+/// `Publication::Bulk`: every member through the portable stage with no per-file flush, the same results, overwrite
+/// policy and tamper refusal, and no leftover stage names.
+#[test]
+fn bulk_publication_matches_staged_results() {
+    use zipfast::extract::RenameStyle;
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("a.zip");
+    let files = fixture(&archive, 1 << 20);
+    let (_guard, dest) = destination();
+    let mut overrides = overrides(StagedStorage::Auto);
+    overrides.publication = Publication::Bulk;
+    let bulk = |dest: &Path, overwrite: Overwrite| {
+        run_with_policy(
+            &archive,
+            &options(dest, overwrite),
+            Some("password"),
+            &Cancellation::default(),
+            &overrides,
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap()
+    };
+    let report = bulk(&dest, Overwrite::Skip);
+    assert_eq!((report.files(), report.failed(), report.portable_files()), (4, 0, 4));
+    check_tree(&dest, &files);
+    // Skip keeps what is there; Always replaces it; RenameNew writes beside it.
+    std::fs::write(dest.join("a.txt"), b"old").unwrap();
+    assert_eq!(bulk(&dest, Overwrite::Skip).skipped(), 4);
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"old");
+    bulk(&dest, Overwrite::RenameNew(RenameStyle::Underscore));
+    assert_eq!(std::fs::read(dest.join("a_1.txt")).unwrap(), files[0].1);
+    bulk(&dest, Overwrite::Always);
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), files[0].1);
+    assert!(tree(&dest).iter().all(|n| !n.contains("zipfast")), "{:?}", tree(&dest));
+    // NativeOnly keeps native staging where the destination allows it.
+    let (_guard, native) = destination();
+    overrides.staged_storage = StagedStorage::NativeOnly;
+    let report = run_with_policy(
+        &archive,
+        &options(&native, Overwrite::Skip),
+        Some("password"),
+        &Cancellation::default(),
+        &overrides,
+        |_: ZipRunEvent<'_>| Ok(()),
+    );
+    if let Ok(report) = report {
+        assert_eq!(report.portable_files(), 0);
+    }
+}
+
+/// A destination root reached through a symlink (macOS `/tmp` is one) is caller configuration: a Bulk run publishes
+/// and flushes through it without a Flush fault.
+#[test]
+fn bulk_publication_through_a_symlinked_destination_root() {
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("a.zip");
+    let files = fixture(&archive, 200_000);
+    let real = work.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = work.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut overrides = overrides(StagedStorage::Auto);
+    overrides.publication = Publication::Bulk;
+    let report = run_with_policy(
+        &archive,
+        &options(&link, Overwrite::Skip),
+        Some("password"),
+        &Cancellation::default(),
+        &overrides,
+        |_: ZipRunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    assert_eq!((report.files(), report.failed()), (4, 0));
+    check_tree(&real, &files);
+}

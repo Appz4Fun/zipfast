@@ -249,103 +249,116 @@ impl ProjectedReadSession {
                 terminal = Some(evidence.merge(terminal.take().unwrap_or_else(|| ReadFault::InvalidPlan.into())));
             }
         }
-        if terminal.is_none() {
-            for ordinal in 0..self.owner.entries.len() {
-                if cancel.is_canceled() {
-                    terminal = Some(ReadFault::Cancelled.into());
-                    break;
-                }
-                let entry = &self.owner.entries[ordinal];
-                // an unselected member is not read, checked, charged or reported
-                if !options.selects(&entry.name, None, entry.is_dir(), ordinal as u64) {
-                    continue;
-                }
-                add(&mut report.matched)?;
-                if self.owner.entries[ordinal].is_dir() {
-                    if let Err(fault) = context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1)) {
-                        terminal = Some(fault.into());
+        // Directories a Publication::Bulk run published into, flushed once when the run ends.
+        let mut bulk_dirs = std::collections::BTreeSet::<PathBuf>::new();
+        // Counter and limit faults inside the loop return early; the directories already published into are still
+        // flushed before that fault is returned.
+        let looped = (|| -> ZipReadResult<()> {
+            if terminal.is_none() {
+                for ordinal in 0..self.owner.entries.len() {
+                    if cancel.is_canceled() {
+                        terminal = Some(ReadFault::Cancelled.into());
                         break;
                     }
-                    if let Err(error) = self.directory(ordinal, options, cancel, context, false) {
+                    let entry = &self.owner.entries[ordinal];
+                    // an unselected member is not read, checked, charged or reported
+                    if !options.selects(&entry.name, None, entry.is_dir(), ordinal as u64) {
+                        continue;
+                    }
+                    add(&mut report.matched)?;
+                    if self.owner.entries[ordinal].is_dir() {
+                        if let Err(fault) = context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1)) {
+                            terminal = Some(fault.into());
+                            break;
+                        }
+                        if let Err(error) = self.directory(ordinal, options, cancel, context, false) {
+                            terminal = Some(error);
+                            break;
+                        }
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        if let Some(index) =
+                            context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.directories_mut()?
+                        {
+                            let entry = &self.owner.entries[ordinal];
+                            let depth = entry
+                                .name
+                                .split(|c| c == '/' || entry.host != 3 && c == '\\')
+                                .filter(|part| !part.is_empty() && *part != ".")
+                                .count();
+                            index.push_bounded((ordinal, depth))?;
+                        }
+                        add(&mut report.dirs)?;
+                        continue;
+                    }
+                    let (result, skipped, local_refusal) =
+                        self.member(ordinal, options, password, cancel, context, &mut bulk_dirs);
+                    let bytes = self.owner.entries[ordinal].size;
+                    let mut fault = result.err().map(|error| {
+                        let local = (continued(&error) || local_refusal)
+                            && error.cleanup_errors().len() == 0
+                            && error.source_change().is_none()
+                            && error.sink_fault().is_none()
+                            && error.diagnostic_fault().is_none()
+                            && error.diagnostic_boundary_fault().is_none()
+                            && !context.ledger.with_state(|s| s.poisoned);
+                        error.with_member_local(local)
+                    });
+                    if fault.is_some() {
+                        add(&mut report.failed)?;
+                    } else if skipped {
+                        add(&mut report.skipped)?;
+                    } else {
+                        add(&mut report.files)?;
+                        if context.action.as_ref().and_then(|a| a.backend) == Some(StagedBackend::Portable) {
+                            add(&mut report.portable_files)?;
+                        }
+                        report.decoded_bytes =
+                            report.decoded_bytes.checked_add(bytes as u128).ok_or(ReadFault::CounterOverflow)?;
+                    }
+                    let evidence = self.member_event(
+                        ordinal,
+                        skipped,
+                        bytes,
+                        fault.as_ref(),
+                        options,
+                        cancel,
+                        context,
+                        diagnostics,
+                        observe,
+                    )?;
+                    observer_failed = evidence.observer_failed();
+                    if evidence.failed() {
+                        terminal = Some(evidence.merge(fault.take().unwrap_or_else(|| {
+                            ZipReadError::from(ReadFault::InvalidPlan).with_publication(
+                                if options.mode == Mode::Extract && !skipped {
+                                    PublicationState::Published
+                                } else {
+                                    PublicationState::NotPublished
+                                },
+                                if skipped { 0 } else { bytes },
+                            )
+                        })));
+                        break;
+                    }
+                    if let Some(error) = fault
+                        && (!(continued(&error)
+                            || local_refusal
+                                && error.cleanup_errors().len() == 0
+                                && error.source_change().is_none()
+                                && error.diagnostic_boundary_fault().is_none())
+                            || context.ledger.with_state(|s| s.poisoned))
+                    {
                         terminal = Some(error);
                         break;
                     }
-                    #[cfg(any(target_os = "macos", target_os = "linux"))]
-                    if let Some(index) =
-                        context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.directories_mut()?
-                    {
-                        let entry = &self.owner.entries[ordinal];
-                        let depth = entry
-                            .name
-                            .split(|c| c == '/' || entry.host != 3 && c == '\\')
-                            .filter(|part| !part.is_empty() && *part != ".")
-                            .count();
-                        index.push_bounded((ordinal, depth))?;
-                    }
-                    add(&mut report.dirs)?;
-                    continue;
-                }
-                let (result, skipped, local_refusal) = self.member(ordinal, options, password, cancel, context);
-                let bytes = self.owner.entries[ordinal].size;
-                let mut fault = result.err().map(|error| {
-                    let local = (continued(&error) || local_refusal)
-                        && error.cleanup_errors().len() == 0
-                        && error.source_change().is_none()
-                        && error.sink_fault().is_none()
-                        && error.diagnostic_fault().is_none()
-                        && error.diagnostic_boundary_fault().is_none()
-                        && !context.ledger.with_state(|s| s.poisoned);
-                    error.with_member_local(local)
-                });
-                if fault.is_some() {
-                    add(&mut report.failed)?;
-                } else if skipped {
-                    add(&mut report.skipped)?;
-                } else {
-                    add(&mut report.files)?;
-                    if context.action.as_ref().and_then(|a| a.backend) == Some(StagedBackend::Portable) {
-                        add(&mut report.portable_files)?;
-                    }
-                    report.decoded_bytes =
-                        report.decoded_bytes.checked_add(bytes as u128).ok_or(ReadFault::CounterOverflow)?;
-                }
-                let evidence = self.member_event(
-                    ordinal,
-                    skipped,
-                    bytes,
-                    fault.as_ref(),
-                    options,
-                    cancel,
-                    context,
-                    diagnostics,
-                    observe,
-                )?;
-                observer_failed = evidence.observer_failed();
-                if evidence.failed() {
-                    terminal = Some(evidence.merge(fault.take().unwrap_or_else(|| {
-                        ZipReadError::from(ReadFault::InvalidPlan).with_publication(
-                            if options.mode == Mode::Extract && !skipped {
-                                PublicationState::Published
-                            } else {
-                                PublicationState::NotPublished
-                            },
-                            if skipped { 0 } else { bytes },
-                        )
-                    })));
-                    break;
-                }
-                if let Some(error) = fault
-                    && (!(continued(&error)
-                        || local_refusal
-                            && error.cleanup_errors().len() == 0
-                            && error.source_change().is_none()
-                            && error.diagnostic_boundary_fault().is_none())
-                        || context.ledger.with_state(|s| s.poisoned))
-                {
-                    terminal = Some(error);
-                    break;
                 }
             }
+            Ok(())
+        })();
+        if let Err(error) = looped {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let _ = sync_directories(&bulk_dirs, &options.dest, cancel);
+            return Err(error);
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(mut index) = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.take_directories()? {
@@ -383,6 +396,12 @@ impl ProjectedReadSession {
         if let Some(action) = context.action.as_mut() {
             action.active_ordinal = None;
             action.active_record_charged = false;
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Err(fault) = sync_directories(&bulk_dirs, &options.dest, cancel)
+            && terminal.is_none()
+        {
+            terminal = Some(fault.into());
         }
         if let Err(boundary) = self.check_source(context) {
             terminal = Some(match terminal.take() {
@@ -522,6 +541,7 @@ impl ProjectedReadSession {
         password: Option<&str>,
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
+        bulk_dirs: &mut std::collections::BTreeSet<PathBuf>,
     ) -> (ZipReadResult<()>, bool, bool) {
         context.ledger.with_state(|s| s.active_encrypted = Some(self.owner.entries[ordinal].encrypted()));
         let Some(action) = context.action.as_mut() else { return (Err(ReadFault::InvalidPlan.into()), false, false) };
@@ -604,7 +624,18 @@ impl ProjectedReadSession {
                         stage.finish_error(error, context)
                     });
                 }
+                let bulk =
+                    context.options.publication == Publication::Bulk && stage.backend() == StagedBackend::Portable;
                 let published = stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx));
+                if bulk && matches!(published, Ok(true)) {
+                    // The published name's directory and every directory between it and the destination root.
+                    let mut dir = options.dest.join(relative.path());
+                    while dir.pop() && dir.starts_with(&options.dest) {
+                        if !bulk_dirs.insert(dir.clone()) {
+                            break;
+                        }
+                    }
+                }
                 // Running out of renamed names fails this member, like a refused target.
                 if let Err(error) = &published
                     && matches!(error.operation(), Some(ReadFault::CheckedFormat { reason })
@@ -959,4 +990,34 @@ pub(crate) fn with_opened_context(
 #[cfg(test)]
 pub(super) fn final_completion_control_layout() -> [usize; 2] {
     [std::mem::size_of::<Completion>(), std::mem::size_of::<policy::FrozenPolicy>()]
+}
+
+/// Flushes each directory a [`Publication::Bulk`] run published into, once, after the run. The destination root is
+/// caller configuration and is opened following symlinks (as the run itself does, e.g. macOS `/tmp`); every directory
+/// below it is opened with `O_NOFOLLOW` on its final component only, since the earlier components were already
+/// traversed when the files were published. A filesystem with no directory flush (EINVAL, ENOTSUP, EROFS) is not an
+/// error.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sync_directories(
+    dirs: &std::collections::BTreeSet<PathBuf>,
+    root: &std::path::Path,
+    cancel: &Cancellation,
+) -> Result<(), ReadFault> {
+    use std::os::unix::ffi::OsStrExt;
+    for dir in dirs.iter().rev() {
+        io::canceled(Some(cancel))?;
+        let fault =
+            |error| ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Flush, offset: 0, error };
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+            .map_err(|_| fault(std::io::ErrorKind::InvalidInput.into()))?;
+        let follow = if dir.as_path() == root { 0 } else { libc::O_NOFOLLOW };
+        let fd = native_policy::cvt(unsafe {
+            libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | follow | libc::O_CLOEXEC)
+        })
+        .map_err(fault)?;
+        let synced = native_policy::portable_sync(fd);
+        unsafe { libc::close(fd) };
+        synced.map_err(fault)?;
+    }
+    Ok(())
 }

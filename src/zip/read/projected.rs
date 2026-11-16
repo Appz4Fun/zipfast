@@ -1300,7 +1300,10 @@ fn planning_context(overrides: &EncryptedReadOverrides) -> ZipReadResult<Encrypt
     let limits =
         EncryptedReadLimits { interrupted_retries: overrides.interrupted_retries.unwrap_or(16), ..Default::default() };
     EncryptedReadContext::new(
-        EncryptedReadOptions::default().with_limits(limits).with_staged_storage(overrides.staged_storage),
+        EncryptedReadOptions::default()
+            .with_limits(limits)
+            .with_staged_storage(overrides.staged_storage)
+            .with_publication(overrides.publication),
     )
 }
 #[allow(clippy::result_large_err)]

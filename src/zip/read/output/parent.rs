@@ -245,29 +245,38 @@ pub(in crate::zip::read) fn open_parent(
         path[root_end + 1..capacity - 1].copy_from_slice(rel);
         // Root aliases are caller configuration. Follow them, matching incumbent
         // create_dir_all semantics; archive-relative components below never follow.
-        for end in 1..=root_end {
-            if end == root_end || path[end] == b'/' {
-                if path[end - 1] == b'/' {
-                    continue;
+        // The root almost always exists already (every member of a run shares it), so open it first and walk
+        // its components with mkdir only when that open finds it missing.
+        let open_root = |path: &mut policy::MetadataLease<'_, u8>| {
+            let saved = path[root_end];
+            path[root_end] = 0;
+            let opened = operation(ledger, ReadIoOperation::Open, cancel, || {
+                native_policy::cvt(unsafe {
+                    libc::open(
+                        c(&path[..=root_end]).map_err(|_| std::io::ErrorKind::InvalidInput)?.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                })
+            });
+            path[root_end] = saved;
+            opened
+        };
+        let mut opened = open_root(&mut path);
+        if matches!(&opened, Err(ReadFault::Io { error, .. }) if error.raw_os_error() == Some(libc::ENOENT)) {
+            for end in 1..=root_end {
+                if end == root_end || path[end] == b'/' {
+                    if path[end - 1] == b'/' {
+                        continue;
+                    }
+                    let saved = path[end];
+                    path[end] = 0;
+                    let made = mkdir(ledger, None, c(&path[..=end])?, cancel);
+                    path[end] = saved;
+                    made?;
                 }
-                let saved = path[end];
-                path[end] = 0;
-                let made = mkdir(ledger, None, c(&path[..=end])?, cancel);
-                path[end] = saved;
-                made?;
             }
+            opened = open_root(&mut path);
         }
-        let saved = path[root_end];
-        path[root_end] = 0;
-        let opened = operation(ledger, ReadIoOperation::Open, cancel, || {
-            native_policy::cvt(unsafe {
-                libc::open(
-                    c(&path[..=root_end]).map_err(|_| std::io::ErrorKind::InvalidInput)?.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                )
-            })
-        });
-        path[root_end] = saved;
         file = Some(unsafe { File::from_raw_fd(opened?) });
         let mut component = root_end + 1;
         for end in root_end + 1..capacity - 1 {
