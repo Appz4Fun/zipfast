@@ -635,3 +635,20 @@ impl Rar4Decoder {
         }
     }
 }
+
+/// A PPM block may ask for the largest model, 256 MiB: a limit of exactly that admits it, since a held filter block
+/// is bounded on its own. Just under it refuses, typed, before the model takes anything.
+#[test]
+fn a_maximum_ppm_model_fits_a_limit_of_exactly_256_mib() {
+    // PPM block, new model of order 6, 255 + 1 MiB, then four range-coder bytes
+    let packed = [0x80 | 0x20 | 5, 255, 0, 0, 0, 0, 0, 0];
+    for (limit, refused) in [(256u64 << 20, false), ((256 << 20) - 1, true)] {
+        let mut d = decoder(packed.len(), 4);
+        d.set_memory_limit(limit);
+        let mut out = Vec::new();
+        let fed = d.feed(&packed, &mut collect(&mut out));
+        let result = fed.and_then(|_| d.finish(&mut collect(&mut out)));
+        let limited = matches!(result, Err(Rar4DecodeError::WindowLimit { .. }));
+        assert_eq!(limited, refused, "{limit}: {result:?}");
+    }
+}

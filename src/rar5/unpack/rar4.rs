@@ -832,7 +832,8 @@ impl Rar4Decoder {
                 let flags = self.ppm_in.get(self.ppm_pos).copied().unwrap_or(0);
                 if flags & 0x20 != 0 {
                     let megabytes = u64::from(self.ppm_in.get(self.ppm_pos + 1).copied().unwrap_or(0)) + 1;
-                    let requested = (megabytes << 20) + filters::VM_MEM as u64;
+                    // the model alone: a held filter block is bounded on its own when one is defined
+                    let requested = megabytes << 20;
                     if requested > self.memory_limit {
                         return Err(Rar4DecodeError::WindowLimit { requested, allowed: self.memory_limit });
                     }
