@@ -328,6 +328,8 @@ fn fill_compares_every_overlap_before_mutation() {
     file.core.write_original(8, &f.data[8..17]).unwrap();
     f.hole(&file, 17..24);
     file.core.write_original(24, &f.data[24..33]).unwrap();
+    // Commit the extraction's open group, so the count below sees only the fill.
+    file.state().unwrap();
     let before = fs::read(f.output()).unwrap();
     let calls = f.store.calls.load(Ordering::SeqCst);
     let mut wrong = f.data[..33].to_vec();
@@ -435,6 +437,8 @@ fn split_fragment_leases_survive_uncertain_cas_at_exact_cap() {
             let limits = PartialLimits { crc_leaves: 2, ..PartialLimits::default() };
             let file = f.create_with(limits, ProgressiveLimits::default()).unwrap();
             file.core.write_original(0, &f.data).unwrap();
+            // Commit the extraction's open group, so `at` counts the hole's own CAS calls.
+            file.state().unwrap();
             let call = f.store.calls.load(Ordering::SeqCst) + at;
             *f.store.fail.lock().unwrap() = Some((call, persisted));
             let error = file.core.record_hole(f.report(&file, 10..20)).unwrap_err();

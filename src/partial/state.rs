@@ -567,6 +567,11 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         geometry.u64(a.info.length.value())?;
         geometry.blob(os_bytes(&a.expected))?;
     }
+    // Large members split the validity ledger into pages by output window (see `validity_window`), so a commit
+    // rewrites only the pages whose windows changed. Their unknown gaps are cut on absolute 64 KiB boundaries,
+    // which makes each window's extents depend only on the leaves inside it.
+    let window = validity_window(snapshot.head.size);
+    let aligned = window.is_some();
     let mut extent_count = snapshot.known.len() as u64;
     let mut end = 0;
     for leaf in &snapshot.known {
@@ -577,10 +582,10 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         {
             return Err(malformed());
         }
-        extent_count = extent_count.checked_add((leaf.range.start - end).div_ceil(65_536)).ok_or_else(malformed)?;
+        extent_count = extent_count.checked_add(gap_pieces(end, leaf.range.start, aligned)).ok_or_else(malformed)?;
         end = leaf.range.end;
     }
-    extent_count = extent_count.checked_add((snapshot.head.size - end).div_ceil(65_536)).ok_or_else(malformed)?;
+    extent_count = extent_count.checked_add(gap_pieces(end, snapshot.head.size, aligned)).ok_or_else(malformed)?;
     budget.limits.check(
         PartialResource::LedgerBytes,
         extent_count.checked_mul(21).and_then(|n| n.checked_add(8)).ok_or_else(malformed)?,
@@ -592,27 +597,41 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             .saturating_add(snapshot.holes.iter().map(|h| 37 + 20 * h.packed.len()).sum::<usize>())
             .saturating_add(snapshot.cipher.iter().map(|b| 10 + b.bytes.len()).sum::<usize>()),
     )?;
+    // Byte offsets in `validity` where a page must start: after the extent count, at the first extent of each
+    // window, and before the hole section. Only the windowed layout uses them.
+    let mut breaks = Vec::new();
     validity.u32(extent_count.try_into().map_err(|_| malformed())?)?;
+    let mut next_window = 0u64;
+    let mut extent = |validity: &mut Encoder, range: Range<u64>, tag: u8, crc: u32| -> PartialResult<()> {
+        if let Some(window) = window
+            && range.start >= next_window
+        {
+            breaks.try_reserve(1).map_err(|_| malformed())?;
+            breaks.push(validity.bytes.len());
+            next_window = (range.start / window + 1) * window;
+        }
+        validity.range(&range)?;
+        validity.u8(tag)?;
+        validity.u32(crc)
+    };
     let mut end = 0;
     for leaf in &snapshot.known {
         while end < leaf.range.start {
-            let stop = end.saturating_add(65_536).min(leaf.range.start);
-            validity.range(&(end..stop))?;
-            validity.u8(0)?;
-            validity.u32(0)?;
+            let stop = gap_piece_end(end, leaf.range.start, aligned);
+            extent(&mut validity, end..stop, 0, 0)?;
             end = stop;
         }
-        validity.range(&leaf.range)?;
-        validity.u8(leaf.provenance as u8)?;
-        validity.u32(leaf.crc)?;
+        extent(&mut validity, leaf.range.clone(), leaf.provenance as u8, leaf.crc)?;
         end = leaf.range.end;
     }
     while end < snapshot.head.size {
-        let stop = end.saturating_add(65_536).min(snapshot.head.size);
-        validity.range(&(end..stop))?;
-        validity.u8(0)?;
-        validity.u32(0)?;
+        let stop = gap_piece_end(end, snapshot.head.size, aligned);
+        extent(&mut validity, end..stop, 0, 0)?;
         end = stop;
+    }
+    if aligned {
+        breaks.try_reserve(1).map_err(|_| malformed())?;
+        breaks.push(validity.bytes.len());
     }
     validity.u32(snapshot.holes.len().try_into().map_err(|_| malformed())?)?;
     for h in &snapshot.holes {
@@ -670,17 +689,56 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
     budget.limits.check(PartialResource::LedgerBytes, total as u64)?;
     let lease = budget.metadata_lease(total as u64)?;
     let mut out = Vec::new();
-    for (kind, bytes) in [
-        (PageKind::Geometry, geometry.bytes),
-        (PageKind::Validity, validity.bytes),
-        (PageKind::HeaderWitnesses, headers.bytes),
+    // Pages of one kind are concatenated on decode, so where a kind is cut into pages is free: the single-stream
+    // layout cuts every PAGE_MAX bytes, the windowed validity ledger also at its window breaks.
+    for (kind, bytes, breaks) in [
+        (PageKind::Geometry, geometry.bytes, &[][..]),
+        (PageKind::Validity, validity.bytes, &breaks[..]),
+        (PageKind::HeaderWitnesses, headers.bytes, &[][..]),
     ] {
-        for chunk in bytes.chunks(PAGE_MAX - 15) {
+        let mut start = 0;
+        for stop in breaks.iter().copied().chain(std::iter::once(bytes.len())) {
+            for chunk in bytes[start..stop].chunks(PAGE_MAX - 15) {
+                budget.limits.check(PartialResource::StatePages, (out.len() + 1) as u64)?;
+                out.push((kind, page_bytes(kind, chunk)?));
+            }
+            start = stop;
+        }
+        if bytes.is_empty() {
             budget.limits.check(PartialResource::StatePages, (out.len() + 1) as u64)?;
-            out.push((kind, page_bytes(kind, chunk)?));
+            out.push((kind, page_bytes(kind, &bytes)?));
         }
     }
     Ok((out, lease))
+}
+/// Validity extent bytes per page targeted by the windowed layout, and the most windows a member is cut into.
+const WINDOW_BYTES: u64 = 64 * 1024;
+const WINDOWS_MAX: u64 = 24;
+/// Output bytes covered by one validity page of a member whose extent list is large, or `None` for the
+/// single-stream layout of smaller members (which stays byte-identical to earlier builds). A window is a multiple of
+/// 64 KiB, so absolute 64 KiB gap pieces and leaves (which never cross a 64 KiB boundary) never straddle two.
+pub(super) fn validity_window(size: u64) -> Option<u64> {
+    let bytes = size.div_ceil(65_536).saturating_mul(21);
+    if bytes <= 2 * WINDOW_BYTES {
+        return None;
+    }
+    let windows = bytes.div_ceil(WINDOW_BYTES).min(WINDOWS_MAX);
+    Some(size.div_ceil(windows).next_multiple_of(65_536))
+}
+/// End of the unknown piece starting at `end` of a gap ending at `limit`: at most 64 KiB, cut on absolute 64 KiB
+/// boundaries when `aligned`.
+fn gap_piece_end(end: u64, limit: u64, aligned: bool) -> u64 {
+    if aligned { limit.min((end / 65_536 + 1) * 65_536) } else { end.saturating_add(65_536).min(limit) }
+}
+/// Number of unknown pieces `gap_piece_end` cuts the gap `end..limit` into.
+fn gap_pieces(end: u64, limit: u64, aligned: bool) -> u64 {
+    if end >= limit {
+        0
+    } else if aligned {
+        (limit - 1) / 65_536 - end / 65_536 + 1
+    } else {
+        (limit - end).div_ceil(65_536)
+    }
 }
 pub(super) fn decode_pages(
     head: CommittedState,

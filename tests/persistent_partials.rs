@@ -1805,8 +1805,10 @@ fn canonical_finish_failure_never_commits_completion_or_metadata() {
         }
         let path = dest.join("a.bin");
         let before = fs::metadata(&path).unwrap();
-        let anchor = anchors.current(&key).unwrap().unwrap();
         let verdict = verify(&mut file);
+        // Verification commits the extraction's open group first; the anchor after it is the one finalization
+        // must leave alone.
+        let anchor = anchors.current(&key).unwrap().unwrap();
         if checksum_failure {
             assert!(matches!(verdict, Verdict::Bad { which: ChecksumAlgorithm::Crc32, .. }));
         } else {
@@ -3697,4 +3699,43 @@ fn long_persistent_extraction_fits_default_limits() {
     assert_eq!(files.len(), 1);
     assert!(matches!(verify(&mut files[0]), Verdict::Ok { .. }));
     assert_eq!(fs::read(dest.join("big.bin")).unwrap(), data);
+}
+
+// Catches written output that stays uncommitted while the session waits on a slow provider: once the open group
+// is older than `group_commit_interval`, the session commits it before waiting again.
+#[test]
+fn provider_wait_commits_a_group_older_than_the_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new();
+    for source in fixture.volumes.iter_mut().flatten() {
+        source.holes.clear();
+    }
+    let gate = Arc::new(WaitGate::default());
+    fixture.volumes[2].as_mut().unwrap().wait = Some((fixture.payloads[2].start, gate.clone()));
+    let anchors = Arc::new(Anchors::default());
+    let mut partial = partial_options(&dir.path().join("state"));
+    partial.anchors = anchors.clone();
+    partial.limits.group_commit_interval = std::time::Duration::from_millis(200);
+    let mut session =
+        ProgressiveSession::new_partial(Box::new(fixture.provider()), options(&dir.path().join("out")), partial)
+            .unwrap();
+    let (key, file) = next_partial(&mut session);
+    let started = std::time::Instant::now();
+    while session.poll_event(&mut Context::from_waker(Waker::noop())).is_ready() {}
+    assert!(gate.0.lock().unwrap().is_some(), "the session waits at volume 3");
+    // Two parts are written into the open group; only its intent is anchored.
+    let open = anchors.current(&key).unwrap().unwrap();
+    if started.elapsed() < std::time::Duration::from_millis(200) {
+        assert!(session.poll_event(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert_eq!(anchors.current(&key).unwrap().unwrap(), open, "a young group stays open while waiting");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(session.poll_event(&mut Context::from_waker(Waker::noop())).is_pending());
+    let committed = anchors.current(&key).unwrap().unwrap();
+    assert_eq!(committed.sequence(), open.sequence() + 1, "the wait committed the group");
+    assert_eq!(file.state().unwrap().anchor(), &committed);
+    assert_eq!(file.remaining().unwrap(), vec![2800..7000]);
+    gate.0.lock().unwrap().take().unwrap().wake();
+    let (_, _) = run_to_end(&mut session);
+    assert_eq!(fs::read(dir.path().join("out/a.bin")).unwrap(), fixture.data[0]);
 }

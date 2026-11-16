@@ -392,6 +392,16 @@ impl ProgressiveSession {
         persistent.ready = Some((ProgressiveEvent::PartialReady { member: key, state }, event_lease));
         Ok(())
     }
+    /// Before the session waits for a provider: commit the active member's open group if it has been open for
+    /// `group_commit_interval`, so a stalled source does not keep written output uncommitted.
+    pub(super) fn partial_wait(&self) -> ProgressiveResult<()> {
+        if let Some(persistent) = &self.partial
+            && let Some(index) = persistent.current
+        {
+            persistent.cores[index].1.commit_due().map_err(failure)?;
+        }
+        Ok(())
+    }
     pub(super) fn partial_extend(&mut self) -> ProgressiveResult<()> {
         let persistent = self.partial.as_mut().unwrap();
         let index = self.model.parts.len() - 1;

@@ -98,6 +98,18 @@ struct CoreData {
     // kept across transactions that do not change known leaves.
     part_results: Option<(u64, Vec<PartCheck>, Lease)>,
     reopened: bool,
+    /// An open group commit: its intent is anchored, and `snapshot` already holds the output written since, which
+    /// the next commit makes durable.
+    group: Option<Group>,
+}
+/// A group of writes committed together. While it is open, `CoreData::state` is the anchored intent (the state
+/// before the group, conservatively), and `CoreData::snapshot` runs ahead of it with every grouped write: their
+/// leaves, `produced`, and evidence the extraction appended. Output past the commit is never claimed durably before
+/// the output sync that precedes the commit.
+struct Group {
+    intent: PartialState,
+    bytes: u64,
+    opened: std::time::Instant,
 }
 struct Transaction {
     intent: PartialState,
@@ -425,15 +437,69 @@ impl PartialCore {
         let data = self.operation()?;
         self.check(&data)
     }
+    /// Writes output the extraction produced at `produced`. With grouping (the default) the write joins the open
+    /// group, opening one first, and the group commits once it holds `group_commit_bytes` or has been open for
+    /// `group_commit_interval`.
     pub(crate) fn write_original(&self, offset: u64, bytes: &[u8]) -> PartialResult<()> {
         let mut op = self.operation()?;
         self.check(&op)?;
+        if self.grouping() {
+            if op.group.is_none() {
+                self.reconcile(&mut op)?;
+            }
+            if offset == op.snapshot.head.produced {
+                return self.group_write(&mut op, offset, bytes, FillMode::Original).map(|_| ());
+            }
+        }
+        self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
         self.write_data(&mut op, offset, bytes, FillMode::Original).map(|_| ())
+    }
+    /// Plaintext fill of a [`FillWriter`]: grouped like extraction writes. Returns the ranges written and whether
+    /// every grouped write is committed now (no group remains open).
+    pub(crate) fn fill_grouped(&self, offset: u64, bytes: &[u8]) -> PartialResult<(Vec<Range<u64>>, bool)> {
+        let mut op = self.operation()?;
+        self.check(&op)?;
+        if !self.grouping() {
+            self.reconcile(&mut op)?;
+            self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
+            return Ok((self.write_data(&mut op, offset, bytes, FillMode::Alt)?.applied, true));
+        }
+        if op.group.is_none() {
+            self.reconcile(&mut op)?;
+        }
+        let applied = self.group_write(&mut op, offset, bytes, FillMode::Alt)?;
+        Ok((applied, op.group.is_none()))
+    }
+    /// Commits any open group and returns the resulting fill result with nothing applied.
+    pub(crate) fn commit_fills(&self) -> PartialResult<FillResult> {
+        let mut op = self.operation()?;
+        self.check(&op)?;
+        self.flush_group(&mut op)?;
+        self.reconcile(&mut op)?;
+        self.fill_result(&mut op, Vec::new())
+    }
+    /// Commits any open group now.
+    pub(crate) fn commit_group(&self) -> PartialResult<()> {
+        let mut op = self.operation()?;
+        self.check(&op)?;
+        self.flush_group(&mut op)
+    }
+    /// Commits the open group if it has been open for `group_commit_interval`; the session calls this before it
+    /// waits for a provider, so a stalled download does not keep written output uncommitted. A handle busy in
+    /// another operation is left alone.
+    pub(crate) fn commit_due(&self) -> PartialResult<()> {
+        let Ok(mut op) = self.operation() else { return Ok(()) };
+        if op.group.as_ref().is_some_and(|g| g.opened.elapsed() >= self.budget.limits.group_commit_interval) {
+            self.check(&op)?;
+            self.flush_group(&mut op)?;
+        }
+        Ok(())
     }
     pub(crate) fn fill_plain(&self, offset: u64, bytes: &[u8]) -> PartialResult<FillResult> {
         let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
         self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
         let applied = self.write_data(&mut op, offset, bytes, FillMode::Alt)?.applied;
@@ -449,6 +515,7 @@ impl PartialCore {
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
         let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
         self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
         let keys = match (&op.snapshot.crypt, &self.keys) {
@@ -647,8 +714,13 @@ impl PartialCore {
     /// the keys are unproven it starts one block earlier still, so the block before decrypts to output the original
     /// extraction wrote and proves them.
     pub(crate) fn refill_targets(&self, volume: u32, range: &Range<u64>) -> PartialResult<Vec<Range<u64>>> {
-        let op = self.operation()?;
+        let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
+        if op.uncertain.is_some() {
+            // After an uncertain group commit the snapshot is not conservative: rebuild it from the store.
+            self.reconcile(&mut op)?;
+        }
         let snapshot = &op.snapshot;
         let produced = snapshot.head.produced;
         let mut targets: Vec<Range<u64>> = Vec::new();
@@ -962,6 +1034,311 @@ impl PartialCore {
         op.verification = Some(verification);
         Ok(Written { applied: plan.unknown, corrected })
     }
+    fn grouping(&self) -> bool {
+        self.budget.limits.group_commit_bytes > 0
+    }
+    /// Writes `bytes` at `offset` inside a group: an original write at `produced`, or an alt write that may only
+    /// land in holes. Validation and overlap checks are those of `write_data`. The group's intent is anchored
+    /// before the first byte reaches output; leaves join the in-memory snapshot, and nothing else is durable until
+    /// the group commits. Work per write is proportional to the bytes written, not to the ledger.
+    fn group_write(
+        &self,
+        op: &mut CoreData,
+        offset: u64,
+        bytes: &[u8],
+        mode: FillMode,
+    ) -> PartialResult<Vec<Range<u64>>> {
+        debug_assert!(matches!(mode, FillMode::Original | FillMode::Alt));
+        self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
+        let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
+        if end > op.snapshot.head.size || self.read_chunk == 0 {
+            return Err(err(PartialErrorKind::InvalidOptions));
+        }
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if op.snapshot.evidence.parts.last().is_none_or(|part| end > part.out.end) {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
+        }
+        match mode {
+            FillMode::Original if offset != op.snapshot.head.produced => {
+                return Err(err(PartialErrorKind::IncompleteOutput));
+            }
+            FillMode::Alt if end > op.snapshot.head.produced => return Err(err(PartialErrorKind::IncompleteOutput)),
+            _ => {}
+        }
+        let range = offset..end;
+        // Alt bytes over known output must match it (packed corrections never group).
+        self.compare_known(op, offset, bytes, mode)?;
+        let plan = ledger::Ledger { known: &mut op.snapshot.known, size: op.snapshot.head.size, budget: &self.budget }
+            .plan_fill(range.clone())?;
+        if mode == FillMode::Alt {
+            // Holes reported before the group still cover these ranges: grouped writes only make holes smaller,
+            // and the reports are trimmed when the group commits.
+            for range in &plan.unknown {
+                let mut at = range.start;
+                while at < range.end {
+                    let mut next = at;
+                    for report in &op.snapshot.holes {
+                        self.budget.usage.charge(Resource::SourceBookkeeping, 1)?;
+                        if report.out.start <= at && report.out.end > next {
+                            next = report.out.end;
+                        }
+                    }
+                    if next == at {
+                        return Err(err(PartialErrorKind::IncompleteOutput));
+                    }
+                    at = next.min(range.end);
+                }
+            }
+        }
+        if plan.unknown.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total: u64 = plan.unknown.iter().map(|r| r.end - r.start).sum();
+        self.budget.usage.charge(Resource::OutputWriteBytes, total)?;
+        let parts = &op.snapshot.evidence.parts;
+        let part_end = |at: u64| -> PartialResult<u64> {
+            Ok(parts.get(parts.partition_point(|p| p.out.end <= at)).ok_or_else(malformed)?.out.end)
+        };
+        let mut count = 0usize;
+        for range in &plan.unknown {
+            let mut at = range.start;
+            while at < range.end {
+                at = range.end.min(part_end(at)?).min(at.saturating_add(65_536 - at % 65_536));
+                count += 1;
+            }
+        }
+        self.budget.limits.check(
+            PartialResource::CrcLeaves,
+            op.snapshot.known.len().checked_add(count).ok_or_else(malformed)? as u64,
+        )?;
+        // Transient: the leaves are cloned into the snapshot below, where they are charged.
+        let (mut leaves, _leaves) = self.budget.leased_vector(count)?;
+        for range in &plan.unknown {
+            let mut at = range.start;
+            while at < range.end {
+                let stop = range.end.min(part_end(at)?).min(at.saturating_add(65_536 - at % 65_536));
+                self.budget.usage.charge(Resource::VerifyWorkBytes, stop - at)?;
+                let mut hasher = crate::crc32::Hasher::new();
+                hasher.update(&bytes[(at - offset) as usize..(stop - offset) as usize]);
+                leaves.push(state::KnownLeaf {
+                    range: at..stop,
+                    crc: hasher.clone().finalize(),
+                    hasher,
+                    provenance: if mode == FillMode::Alt {
+                        state::Provenance::Alt
+                    } else {
+                        state::Provenance::Original
+                    },
+                    _lease: Arc::new(self.budget.reserve(PartialResource::CrcLeaves, 1)?),
+                });
+                at = stop;
+            }
+        }
+        self.budget.metadata(std::mem::size_of_val(leaves.as_slice()) as u64)?;
+        op.snapshot.known.try_reserve(leaves.len()).map_err(|_| malformed())?;
+        if op.group.is_none() {
+            self.begin_group(op)?;
+        }
+        let intent = op.group.as_ref().unwrap().intent.anchor.clone();
+        let mut completed = 0usize;
+        let write = (|| {
+            for range in &plan.unknown {
+                let mut at = range.start;
+                while at < range.end {
+                    canceled(&self.control)?;
+                    self.native.check(op.snapshot.head.size)?;
+                    let stop = range.end.min(at + self.read_chunk as u64);
+                    let n = write_output(
+                        &self.native.output.file,
+                        at,
+                        &bytes[(at - offset) as usize..(stop - offset) as usize],
+                    )
+                    .map_err(|e| io_error(OutputOperation::Write, e))?;
+                    if n == 0 {
+                        return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
+                    }
+                    completed += n;
+                    at += n as u64;
+                    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                    tests::state::checkpoint("write");
+                }
+            }
+            Ok(())
+        })();
+        let refresh = (|| {
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::fault_post_write_stamp().map_err(|e| io_error(OutputOperation::Metadata, e))?;
+            op.stamp = stamp(&self.native)?;
+            Ok(())
+        })();
+        // The group stays open: output written before this call is still committed by the next commit, and the
+        // bytes of this call stay unknown.
+        if let Err(mut error) = write.and(refresh) {
+            error.committed = Some(intent);
+            error.output =
+                Some(crate::progressive::OutputRange { offset, attempted: total, completed: completed as u64 });
+            return Err(error);
+        }
+        // Insert the leaves in order: one splice per unknown range (an original write appends).
+        let known = &mut op.snapshot.known;
+        let mut pending = leaves.as_slice();
+        while let Some(first) = pending.first() {
+            let at = known.partition_point(|leaf| leaf.range.start < first.range.start);
+            let next = known.get(at).map_or(u64::MAX, |leaf| leaf.range.start);
+            let run = pending.partition_point(|leaf| leaf.range.start < next);
+            known.splice(at..at, pending[..run].iter().cloned());
+            pending = &pending[run..];
+        }
+        if mode == FillMode::Original {
+            op.snapshot.head.produced = end;
+        }
+        // Part results and verification are keyed by revision, which a group does not advance.
+        op.verification = None;
+        op.part_results = None;
+        let group = op.group.as_mut().unwrap();
+        group.bytes = group.bytes.saturating_add(total);
+        if group.bytes >= self.budget.limits.group_commit_bytes
+            || group.opened.elapsed() >= self.budget.limits.group_commit_interval
+        {
+            self.flush_group(op)?;
+        }
+        Ok(plan.unknown)
+    }
+    /// Anchors the intent of a new group: the committed head with the next sequence and revision. The ledger is
+    /// unchanged (grouped writes only add output the committed state calls unknown), so only the record is written.
+    fn begin_group(&self, op: &mut CoreData) -> PartialResult<()> {
+        let next_head = |op: &CoreData| -> PartialResult<state::CommittedState> {
+            let mut head = op.snapshot.head.clone();
+            head.sequence = head.sequence.checked_add(1).ok_or_else(malformed)?;
+            head.revision = head.revision.checked_add(1).ok_or_else(malformed)?;
+            Ok(head)
+        };
+        let prior_sequence = op.state.anchor().sequence();
+        let result = (|| {
+            let mut head = next_head(op)?;
+            let probe = state::encode_record(2, head.revision, Some(op.state.anchor()), &head, &self.budget.limits)?;
+            let files = [(format!("r-{}", native::hex(probe.anchor().digest())), probe.wire, false)];
+            if op.bundle.needs_compaction(&op.snapshot.head, &files)? {
+                self.compact_locked(op)?;
+                head = next_head(op)?;
+            }
+            self.check(op)?;
+            let expected = op.state.clone();
+            let intent = op.bundle.group_intent(expected.anchor(), &head)?;
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::checkpoint("intent-sync");
+            op.uncertain = Some(Uncertain {
+                expected: expected.clone(),
+                intent: intent.clone(),
+                commit: None,
+                candidate_known: None,
+            });
+            let ack = self.anchors.advance(Some(expected.anchor()), intent.anchor()).map_err(|mut e| {
+                e.committed = Some(expected.anchor.clone());
+                e
+            })?;
+            op.bundle.acknowledge(intent.anchor(), &ack)?;
+            op.state = intent.clone();
+            op.snapshot.head = head;
+            op.uncertain = None;
+            op.group = Some(Group { intent: intent.clone(), bytes: 0, opened: std::time::Instant::now() });
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::checkpoint("intent-cas");
+            self.check(op).map_err(|mut e| {
+                e.committed = Some(intent.anchor.clone());
+                e
+            })
+        })();
+        result.map_err(|mut error: PartialError| {
+            if error.committed.is_none() && op.state.anchor().sequence() != prior_sequence {
+                error.committed = Some(op.state.anchor().clone());
+            }
+            error
+        })
+    }
+    /// Commits the open group, if any: trims holes and kept ciphertext to what is still unknown, writes the changed
+    /// ledger pages, syncs the output, then appends and anchors the commit record. A failure before the anchor CAS
+    /// keeps the group open (the next operation tries again); an uncertain CAS leaves recovery to `reconcile`,
+    /// which rebuilds the snapshot from whichever state the store holds.
+    fn flush_group(&self, op: &mut CoreData) -> PartialResult<()> {
+        let Some(group) = &op.group else { return Ok(()) };
+        let mut intent = group.intent.clone();
+        let result = (|| {
+            self.check(op)?;
+            if !op.snapshot.holes.is_empty() {
+                let holes = self.remaining_reports(&mut op.snapshot)?;
+                op.snapshot.holes = holes;
+            }
+            if op.snapshot.crypt.is_some() {
+                cipher::prune(&self.budget, &mut op.snapshot)?;
+            }
+            ledger::Ledger { known: &mut op.snapshot.known, size: op.snapshot.head.size, budget: &self.budget }
+                .remaining()?;
+            let mut lease = Lease::empty(&self.budget.usage, Resource::MetadataBytes);
+            let (refs, mut files) = op.bundle.encode_refs(&op.snapshot, &mut lease)?;
+            let commit_head = |intent: &PartialState, op: &CoreData| -> PartialResult<state::CommittedState> {
+                let mut head = op.snapshot.head.clone();
+                head.sequence = intent.anchor().sequence().checked_add(1).ok_or_else(malformed)?;
+                head.pages = refs.clone();
+                Ok(head)
+            };
+            let mut head = commit_head(&intent, op)?;
+            let mut commit = state::encode_record(3, head.revision, Some(intent.anchor()), &head, &self.budget.limits)?;
+            files.push((format!("r-{}", native::hex(commit.anchor().digest())), commit.wire.clone(), false));
+            if op.bundle.needs_compaction(&op.snapshot.head, &files)? {
+                // The compaction state re-anchors the intent's content (its head still names the intent's pages);
+                // the group then commits on top of it.
+                self.compact_locked(op)?;
+                intent = op.state.clone();
+                op.group.as_mut().unwrap().intent = intent.clone();
+                head = commit_head(&intent, op)?;
+                commit = state::encode_record(3, head.revision, Some(intent.anchor()), &head, &self.budget.limits)?;
+                files.pop();
+                files.push((format!("r-{}", native::hex(commit.anchor().digest())), commit.wire.clone(), false));
+            }
+            op.bundle.reserve_files(&files)?;
+            op.bundle.write_pages(&files)?;
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::fault_sync().map_err(|e| io_error(OutputOperation::Flush, e))?;
+            self.native.sync()?;
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::checkpoint("output-sync");
+            self.check(op)?;
+            op.bundle.append_record(&commit)?;
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::checkpoint("commit-sync");
+            op.uncertain = Some(Uncertain {
+                expected: intent.clone(),
+                intent: intent.clone(),
+                commit: Some(commit.clone()),
+                candidate_known: None,
+            });
+            op.group = None;
+            let ack = self.anchors.advance(Some(intent.anchor()), commit.anchor())?;
+            op.bundle.acknowledge(commit.anchor(), &ack)?;
+            op.state = commit.clone();
+            op.snapshot.head = head;
+            op.uncertain = None;
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            tests::state::checkpoint("commit-cas");
+            self.check(op).map_err(|mut e| {
+                e.committed = Some(commit.anchor.clone());
+                e
+            })
+        })();
+        result.map_err(|mut e| {
+            if op.uncertain.is_some() {
+                // `reconcile` rebuilds from the store; the in-memory group is no longer authoritative.
+                op.group = None;
+            }
+            if e.committed.is_none() {
+                e.committed = Some(op.state.anchor.clone());
+            }
+            e
+        })
+    }
     /// Compares `bytes` with every known leaf they overlap. A difference is an error, except that packed fills
     /// return the differing alt leaf ranges (clipped to the fill) so they can be rewritten.
     fn compare_known(
@@ -974,10 +1351,14 @@ impl PartialCore {
         let end = offset + bytes.len() as u64;
         let mut corrected: Vec<Range<u64>> = Vec::new();
         let mut confirmed: Vec<Range<u64>> = Vec::new();
+        let first = op.snapshot.known.partition_point(|leaf| leaf.range.end <= offset);
+        if op.snapshot.known.get(first).is_none_or(|leaf| leaf.range.start >= end) {
+            return Ok((corrected, confirmed));
+        }
         // Scratch freed on return; read_chunk already caps its size.
         let (mut compare, _compare) = self.budget.leased_vector(bytes.len().min(self.read_chunk))?;
         compare.resize(bytes.len().min(self.read_chunk), 0);
-        for leaf in &op.snapshot.known {
+        for leaf in op.snapshot.known[first..].iter().take_while(|leaf| leaf.range.start < end) {
             let start = offset.max(leaf.range.start);
             let stop = end.min(leaf.range.end);
             if start >= stop {
@@ -1192,6 +1573,7 @@ impl PartialCore {
     ) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;
+        self.flush_group(&mut data)?;
         self.reconcile(&mut data)?;
         if report.member != data.snapshot.head.member
             || report.name != data.snapshot.name
@@ -1280,6 +1662,7 @@ impl PartialCore {
         let (runs, mapped, damaged, forget) = {
             let mut data = self.operation()?;
             self.check(&data)?;
+            self.flush_group(&mut data)?;
             self.reconcile(&mut data)?;
             let snapshot = &data.snapshot;
             let produced = snapshot.head.produced;
@@ -1349,6 +1732,7 @@ impl PartialCore {
     fn forget_cipher(&self, damaged: &[Range<u64>]) -> PartialResult<()> {
         let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
         let (mut intent, mut valid, _snapshots) = self.next_snapshots(&op)?;
         if !cipher::forget(&self.budget, &mut valid.cipher, damaged)? {
@@ -1364,6 +1748,7 @@ impl PartialCore {
     pub(crate) fn finish_member(&self) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;
+        self.flush_group(&mut data)?;
         self.reconcile(&mut data)?;
         if data.snapshot.head.member_finished {
             return Ok(());
@@ -1385,69 +1770,44 @@ impl PartialCore {
         self.finish_transaction(&mut data, transaction)?;
         self.keep_part_results(&mut data, carried)
     }
+    /// Appends parts, admissions and header witnesses. While a group is open the evidence joins it: it describes
+    /// output the group writes, and the group commit makes both durable together.
     pub(crate) fn extend_evidence(&self, update: EvidenceUpdate) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;
-        self.reconcile(&mut data)?;
-        let (intent, mut valid, _snapshots) = self.next_snapshots(&data)?;
-        for part in update.parts {
-            if let Some(old) = valid.evidence.parts.iter().find(|old| old.ordinal == part.ordinal) {
-                if old != &part {
-                    return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
-                }
-                continue;
-            }
-            if part.ordinal != valid.evidence.parts.len() as u64
-                || valid.evidence.parts.last().is_some_and(|last| last.final_part)
-            {
-                return Err(malformed());
-            }
-            self.budget.usage.check(Resource::Parts, valid.evidence.parts.len() as u64 + 1)?;
-            self.budget.metadata(std::mem::size_of::<PlainPart>() as u64)?;
-            valid.evidence.parts.try_reserve_exact(1).map_err(|_| malformed())?;
-            valid.evidence.parts.push(part);
-        }
-        for admission in update.admissions {
-            if let Some(old) = valid.evidence.admissions.iter().find(|old| old.volume == admission.volume) {
-                if old != &admission {
-                    return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
-                }
-                continue;
-            }
-            self.budget.metadata((std::mem::size_of::<SourceAdmission>() + admission.expected.len()) as u64)?;
-            valid.evidence.admissions.try_reserve_exact(1).map_err(|_| malformed())?;
-            valid.evidence.admissions.push(admission);
-        }
-        for header in update.headers {
-            if let Some(old) =
-                valid.evidence.headers.iter().find(|old| old.volume == header.volume && old.packed == header.packed)
-            {
-                if old != &header {
-                    return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
-                }
-                continue;
-            }
-            if valid.evidence.headers.iter().any(|old| {
-                old.volume == header.volume
-                    && old.packed.start < header.packed.end
-                    && header.packed.start < old.packed.end
-            }) {
-                return Err(malformed());
-            }
-            self.budget.metadata((std::mem::size_of::<HeaderWitness>() + header.bytes.len()) as u64)?;
-            valid.evidence.headers.try_reserve_exact(1).map_err(|_| malformed())?;
-            valid.evidence.headers.push(header);
-        }
-        if let Some(checks) = update.checks {
-            let old = &valid.head.checks;
-            if checks.size != old.size
-                || old.crc32.is_some_and(|crc| checks.crc32 != Some(crc))
-                || old.blake2sp.is_some_and(|hash| checks.blake2sp != Some(hash))
+        if data.group.is_some() {
+            let evidence = &data.snapshot.evidence;
+            // A working copy, charged while it lives; growth is charged where `apply_evidence` makes it.
+            let _copy = self.budget.metadata_lease(
+                (std::mem::size_of::<PlainPart>() * evidence.parts.len()
+                    + evidence
+                        .admissions
+                        .iter()
+                        .map(|a| std::mem::size_of::<SourceAdmission>() + a.expected.len())
+                        .sum::<usize>()
+                    + evidence
+                        .headers
+                        .iter()
+                        .map(|h| std::mem::size_of::<HeaderWitness>() + h.bytes.len())
+                        .sum::<usize>()) as u64,
+            )?;
+            let mut evidence = evidence.clone();
+            let mut checks = data.snapshot.head.checks.clone();
+            self.apply_evidence(update, &mut evidence, &mut checks)?;
+            if state::validate_evidence(&data.snapshot.name, data.snapshot.head.size, &evidence, &self.budget)?
+                != data.snapshot.crypt
             {
                 return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
             }
-            valid.head.checks = checks;
+            data.snapshot.evidence = evidence;
+            data.snapshot.head.checks = checks;
+            data.verification = None;
+            data.part_results = None;
+            return Ok(());
         }
+        self.reconcile(&mut data)?;
+        let (intent, mut valid, _snapshots) = self.next_snapshots(&data)?;
+        self.apply_evidence(update, &mut valid.evidence, &mut valid.head.checks)?;
         if state::validate_evidence(&valid.name, valid.head.size, &valid.evidence, &self.budget)? != valid.crypt {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
         }
@@ -1457,6 +1817,71 @@ impl PartialCore {
         let transaction = self.begin_transaction(&mut data, intent, valid, Vec::new())?;
         self.finish_transaction(&mut data, transaction)?;
         self.keep_part_results(&mut data, carried)
+    }
+    fn apply_evidence(
+        &self,
+        update: EvidenceUpdate,
+        evidence: &mut InitialEvidence,
+        member_checks: &mut MemberChecks,
+    ) -> PartialResult<()> {
+        for part in update.parts {
+            if let Some(old) = evidence.parts.iter().find(|old| old.ordinal == part.ordinal) {
+                if old != &part {
+                    return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+                }
+                continue;
+            }
+            if part.ordinal != evidence.parts.len() as u64 || evidence.parts.last().is_some_and(|last| last.final_part)
+            {
+                return Err(malformed());
+            }
+            self.budget.usage.check(Resource::Parts, evidence.parts.len() as u64 + 1)?;
+            self.budget.metadata(std::mem::size_of::<PlainPart>() as u64)?;
+            evidence.parts.try_reserve_exact(1).map_err(|_| malformed())?;
+            evidence.parts.push(part);
+        }
+        for admission in update.admissions {
+            if let Some(old) = evidence.admissions.iter().find(|old| old.volume == admission.volume) {
+                if old != &admission {
+                    return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
+                }
+                continue;
+            }
+            self.budget.metadata((std::mem::size_of::<SourceAdmission>() + admission.expected.len()) as u64)?;
+            evidence.admissions.try_reserve_exact(1).map_err(|_| malformed())?;
+            evidence.admissions.push(admission);
+        }
+        for header in update.headers {
+            if let Some(old) =
+                evidence.headers.iter().find(|old| old.volume == header.volume && old.packed == header.packed)
+            {
+                if old != &header {
+                    return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
+                }
+                continue;
+            }
+            if evidence.headers.iter().any(|old| {
+                old.volume == header.volume
+                    && old.packed.start < header.packed.end
+                    && header.packed.start < old.packed.end
+            }) {
+                return Err(malformed());
+            }
+            self.budget.metadata((std::mem::size_of::<HeaderWitness>() + header.bytes.len()) as u64)?;
+            evidence.headers.try_reserve_exact(1).map_err(|_| malformed())?;
+            evidence.headers.push(header);
+        }
+        if let Some(checks) = update.checks {
+            let old = &*member_checks;
+            if checks.size != old.size
+                || old.crc32.is_some_and(|crc| checks.crc32 != Some(crc))
+                || old.blake2sp.is_some_and(|hash| checks.blake2sp != Some(hash))
+            {
+                return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+            }
+            *member_checks = checks;
+        }
+        Ok(())
     }
     /// Keeps part results across a committed transaction that left every known leaf as it was.
     fn keep_part_results(&self, data: &mut CoreData, parts: Vec<PartCheck>) -> PartialResult<()> {
@@ -1476,6 +1901,7 @@ impl PartialCore {
     pub(crate) fn compact(&self) -> PartialResult<()> {
         let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
         self.compact_locked(&mut op)
     }
@@ -1505,17 +1931,36 @@ impl PartialCore {
             e
         })
     }
+    /// The committed state; an open group is committed first, so the state covers every write so far.
     pub(crate) fn state(&self) -> PartialResult<PartialState> {
-        let op = self.operation()?;
+        let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
         self.budget.metadata(op.state.wire.len() as u64)?;
         Ok(op.state.clone())
     }
     fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
+        if op.uncertain.is_some() {
+            // After an uncertain group commit the snapshot is not conservative: rebuild it from the store.
+            self.reconcile(&mut op)?;
+        }
         let size = op.snapshot.head.size;
         ledger::Ledger { known: &mut op.snapshot.known, size, budget: &self.budget }.remaining()
+    }
+}
+impl Drop for PartialCore {
+    /// The last owner gone: commit an open group if that still works, so output written since its intent is not
+    /// re-extracted needlessly. A failure leaves the anchored state as it is, exactly as a crash would.
+    fn drop(&mut self) {
+        let data = self.data.get_mut().ok().and_then(Option::take);
+        if let Some(mut data) = data
+            && data.group.is_some()
+        {
+            let _ = self.flush_group(&mut data);
+        }
     }
 }
 impl PartialFile {
@@ -1593,6 +2038,7 @@ impl PartialFile {
                     verification: None,
                     part_results: None,
                     reopened: true,
+                    group: None,
                 })),
                 keys,
                 keys_proven: AtomicBool::new(keys_proven),
@@ -1820,6 +2266,7 @@ impl PreparedCreate {
                 verification: None,
                 part_results: None,
                 reopened: false,
+                group: None,
             })
         })()
         .map_err(|mut error: PartialError| {

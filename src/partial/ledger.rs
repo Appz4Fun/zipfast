@@ -27,10 +27,13 @@ pub(super) struct FillPlan {
 }
 impl Ledger<'_> {
     pub fn plan_fill(&self, range: Range<u64>) -> PartialResult<FillPlan> {
+        // Leaves are sorted and disjoint: start at the first one ending after the range start.
+        let first = self.known.partition_point(|leaf| leaf.range.end <= range.start);
+        let overlapping = || self.known[first..].iter().take_while(|leaf| leaf.range.start < range.end);
         let mut count = 0;
         let mut at = range.start;
-        for leaf in self.known.iter() {
-            if leaf.range.end <= at || leaf.range.start >= range.end {
+        for leaf in overlapping() {
+            if leaf.range.end <= at {
                 continue;
             }
             if at < leaf.range.start {
@@ -44,8 +47,8 @@ impl Ledger<'_> {
         self.budget.usage.check(Resource::HoleIntervals, count as u64)?;
         let mut unknown = self.budget.vector(count)?;
         at = range.start;
-        for leaf in self.known.iter() {
-            if leaf.range.end <= at || leaf.range.start >= range.end {
+        for leaf in overlapping() {
+            if leaf.range.end <= at {
                 continue;
             }
             if at < leaf.range.start {
