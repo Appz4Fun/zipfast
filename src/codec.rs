@@ -25,6 +25,8 @@ use std::fmt;
 pub enum LzmaError {
     /// The properties are neither 5 valid LZMA bytes nor one LZMA2 dictionary byte of at most 40.
     Properties,
+    /// The dictionary, after shrinking to the output, would pass [`MAX_DICTIONARY`].
+    DictionaryLimit { requested: u64, allowed: u64 },
     /// The output would pass `max_output` (or the stated unpacked size does).
     OutputLimit { limit: u64 },
     /// The data does not decode.
@@ -39,6 +41,9 @@ impl fmt::Display for LzmaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Properties => f.write_str("invalid LZMA or LZMA2 properties"),
+            Self::DictionaryLimit { requested, allowed } => {
+                write!(f, "LZMA dictionary of {requested} bytes passes the {allowed}-byte limit")
+            }
             Self::OutputLimit { limit } => write!(f, "LZMA output passes the {limit}-byte limit"),
             Self::Corrupt => f.write_str("corrupt LZMA data"),
             Self::Truncated => f.write_str("truncated LZMA data"),
@@ -56,8 +61,9 @@ impl std::error::Error for LzmaError {}
 /// there; without it, decoding runs to the end marker (LZMA's optional one, LZMA2's end chunk).
 ///
 /// At most `max_output` bytes are produced: a larger stated size, or more output before the end marker, fails with
-/// [`LzmaError::OutputLimit`]. The dictionary is shrunk to what that output can use (at least 4 KiB), so a stated
-/// dictionary never allocates more than the output; the output grows as it is produced.
+/// [`LzmaError::OutputLimit`]. The dictionary is allocated up front, shrunk to what the output can use (the stated
+/// size, else `max_output`; at least 4 KiB), and refused with [`LzmaError::DictionaryLimit`] past
+/// [`MAX_DICTIONARY`]. The output grows as it is produced, never past `max_output` plus one byte.
 ///
 /// ```
 /// let err = zipfast::codec::lzma_decode(&[41], &[], None, 1 << 20).unwrap_err();
@@ -74,9 +80,15 @@ pub fn lzma_decode(
     {
         return Err(LzmaError::OutputLimit { limit: max_output });
     }
-    let (filters, _) = filters(props, unpacked_size.unwrap_or(max_output))?;
+    let (filters, window) = filters(props, unpacked_size.unwrap_or(max_output))?;
+    if window > MAX_DICTIONARY {
+        return Err(LzmaError::DictionaryLimit { requested: window, allowed: MAX_DICTIONARY });
+    }
     decode(&filters, packed, unpacked_size, max_output)
 }
+
+/// The largest dictionary [`lzma_decode`] allocates: 1.5 GiB, 7-Zip's largest LZMA dictionary.
+pub const MAX_DICTIONARY: u64 = 1536 << 20;
 
 /// LZMA2's dictionary size for property byte `b` (at most 40).
 pub(crate) fn lzma2_dict(b: u8) -> u64 {
@@ -123,6 +135,9 @@ pub(crate) fn decode(
         let size = usize::try_from(size).map_err(|_| LzmaError::Allocation)?;
         out.try_reserve_exact(size).map_err(|_| LzmaError::Allocation)?;
     }
+    let mut chunk = Vec::new();
+    chunk.try_reserve_exact(STEP).map_err(|_| LzmaError::Allocation)?;
+    chunk.resize(STEP, 0);
     let mut consumed = 0usize;
     loop {
         let produced = out.len() as u64;
@@ -131,10 +146,18 @@ pub(crate) fn decode(
         }
         // Room for the next piece, one byte past the cap when no size is stated so that overflow shows.
         let room = (target - produced).saturating_add(u64::from(size.is_none())).min(STEP as u64) as usize;
-        out.try_reserve(room).map_err(|_| LzmaError::Allocation)?;
         let (i, o) = (stream.total_in(), stream.total_out());
-        let status = stream.process_vec(&input[consumed..], &mut out, Action::Run);
+        let status = stream.process(&input[consumed..], &mut chunk[..room], Action::Run);
         consumed += (stream.total_in() - i) as usize;
+        let written = &chunk[..(stream.total_out() - o) as usize];
+        if out.len() + written.len() > out.capacity() {
+            // Grow geometrically, but never past one byte over the cap.
+            let limit = usize::try_from(target.saturating_add(1)).unwrap_or(usize::MAX);
+            let want = out.capacity().saturating_mul(2).max(out.len() + written.len()).min(limit);
+            out.try_reserve_exact(want.max(out.len() + written.len()) - out.len())
+                .map_err(|_| LzmaError::Allocation)?;
+        }
+        out.extend_from_slice(written);
         if out.len() as u64 > target {
             return Err(LzmaError::OutputLimit { limit: max_output });
         }

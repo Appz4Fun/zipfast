@@ -144,3 +144,19 @@ fn properties_are_bounded() {
     let (_, packed) = encode(false, &data);
     assert_eq!(lzma_decode(&[0x5d, 0xff, 0xff, 0xff, 0xff], &packed, None, 1 << 16).unwrap(), data);
 }
+
+#[test]
+fn dictionary_is_bounded_when_the_cap_is_huge() {
+    use zipfast::codec::MAX_DICTIONARY;
+    // No stated size and a 1 TiB cap: a 4 GiB stated dictionary would be allocated up front, so it is refused.
+    let huge = 1u64 << 40;
+    assert_eq!(
+        lzma_decode(&[0x5d, 0xff, 0xff, 0xff, 0xff], &[0; 16], None, huge),
+        Err(LzmaError::DictionaryLimit { requested: u64::from(u32::MAX), allowed: MAX_DICTIONARY })
+    );
+    assert!(matches!(lzma_decode(&[40], &[0; 16], None, huge), Err(LzmaError::DictionaryLimit { .. })));
+    // A modest stated dictionary under the same cap decodes.
+    let data = sample(10_000);
+    let (props, packed) = encode(true, &data);
+    assert_eq!(lzma_decode(&props, &packed, None, huge).unwrap(), data);
+}
