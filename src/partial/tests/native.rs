@@ -170,12 +170,26 @@ fn all_partial_hard_caps_reject_one_over_without_names() {
             6 => limits.open_files = 4097,
             7 => limits.open_partials = 4097,
             8 => limits.events = 65,
-            9 => limits.fill_bytes = 1_048_577,
+            9 => limits.fill_bytes = (64 << 20) + 1,
             _ => unreachable!(),
         }
         assert!(matches!(
             f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).err().unwrap().kind,
             PartialErrorKind::Limit { .. }
+        ));
+        assert!(!f.output().exists());
+    }
+    for interval in [false, true] {
+        let f = Fixture::new();
+        let mut limits = PartialLimits::default();
+        if interval {
+            limits.group_commit_interval = std::time::Duration::from_secs(3601);
+        } else {
+            limits.group_commit_bytes = (16 << 30) + 1;
+        }
+        assert!(matches!(
+            f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).err().unwrap().kind,
+            PartialErrorKind::InvalidOptions
         ));
         assert!(!f.output().exists());
     }

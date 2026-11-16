@@ -28,6 +28,9 @@ type PreparedFiles = Vec<(String, Vec<u8>, bool)>;
 struct Stored {
     name: String,
     written: bool,
+    /// A `put` of this content-addressed file completed in this process, file and directory sync included, so an
+    /// equal `put` has nothing left to establish.
+    durable: bool,
     size: u64,
     _bytes: Reservation,
     _count: Reservation,
@@ -39,6 +42,14 @@ pub(crate) struct Bundle {
     budget: PartialBudget,
     files: Vec<Stored>,
     acknowledged: Option<StateAnchor>,
+    /// The pages last encoded with their digests, so an unchanged page is not hashed again.
+    cache: PageCache,
+}
+/// Pages of the last encoding, in encoding order, with their SHA-256 digests. A page equal to the cached one at the
+/// same position reuses its digest. Content addressed, so a stale entry only costs a hash.
+struct PageCache {
+    pages: Vec<(PageKind, Vec<u8>, [u8; 32])>,
+    _lease: Option<Lease>,
 }
 pub(crate) struct PreparedCompaction {
     pub(super) state: PartialState,
@@ -95,6 +106,7 @@ impl Bundle {
             files.push(Stored {
                 name,
                 written: true,
+                durable: false,
                 size: meta.len(),
                 _bytes: bytes,
                 _count: count,
@@ -102,7 +114,13 @@ impl Bundle {
             });
         }
         directory.check()?;
-        Ok(Self { directory, budget: budget.clone(), files, acknowledged: None })
+        Ok(Self {
+            directory,
+            budget: budget.clone(),
+            files,
+            acknowledged: None,
+            cache: PageCache { pages: Vec::new(), _lease: None },
+        })
     }
     fn exclude(
         directory: &Directory,
@@ -145,6 +163,13 @@ impl Bundle {
     }
     fn put(&mut self, name: &str, bytes: &[u8], page: bool) -> PartialResult<()> {
         self.directory.check()?;
+        // A content-addressed file this process already put durably needs nothing more, unless something outside
+        // changed its size; then the full path below re-reads it and refuses to repair anchored bytes.
+        if self.files.iter().any(|f| f.name == name && f.durable && f.size == bytes.len() as u64)
+            && std::fs::symlink_metadata(self.directory.path.join(name)).is_ok_and(|m| m.len() == bytes.len() as u64)
+        {
+            return Ok(());
+        }
         let exists = self.files.iter().any(|f| f.name == name && f.written);
         if !self.files.iter().any(|f| f.name == name) {
             self.reserve_files(&[(name.to_owned(), bytes.to_vec(), page)])?;
@@ -180,6 +205,7 @@ impl Bundle {
         sync_journal(&file.file, name, false).map_err(|e| io_error(OutputOperation::Flush, e))?;
         sync_journal(&self.directory.held.file, name, true).map_err(|e| io_error(OutputOperation::Flush, e))?;
         self.directory.check()?;
+        self.files.iter_mut().find(|f| f.name == name).unwrap().durable = true;
         Ok(())
     }
     fn require_unanchored(&self, name: &str) -> PartialResult<()> {
@@ -273,6 +299,7 @@ impl Bundle {
             added.push(Stored {
                 name: name.clone(),
                 written: false,
+                durable: false,
                 size: bytes.len() as u64,
                 _bytes: space,
                 _count: count,
@@ -293,16 +320,8 @@ impl Bundle {
         // The encoded pages live in `files` until they are written.
         let mut lease = Lease::empty(&self.budget.usage, Resource::MetadataBytes);
         for snapshot in [&mut *intent, &mut *commit] {
-            let (pages, encoded) = state::encode_pages(snapshot, &self.budget)?;
-            lease.absorb(encoded);
-            // The refs replace the copy's page list; the copy is transaction-scoped.
-            let (mut refs, list) = self.budget.leased_vector(pages.len())?;
-            lease.absorb(list);
-            for (kind, bytes) in pages {
-                let digest = crate::crypto::sha256(&bytes);
-                refs.push(PageRef { kind, digest, len: bytes.len() as u32 });
-                files.push((format!("p-{}", hex(&digest)), bytes, true));
-            }
+            let (refs, pages) = self.encode_refs(snapshot, &mut lease)?;
+            files.extend(pages);
             snapshot.head.pages = refs;
         }
         let intent_state =
@@ -317,6 +336,50 @@ impl Bundle {
         files.push((format!("r-{}", hex(intent_state.anchor().digest())), intent_state.wire.clone(), false));
         files.push((format!("r-{}", hex(commit_state.anchor().digest())), commit_state.wire.clone(), false));
         Ok((intent_state, commit_state, files, lease))
+    }
+    /// Encodes `snapshot`'s pages and returns their references and files. A page equal to the cached page at the
+    /// same position reuses its digest, so only changed pages are hashed; `put` then skips pages already durable,
+    /// so only changed pages are written and synced. The page bytes are charged to `lease`.
+    pub(super) fn encode_refs(
+        &mut self,
+        snapshot: &Snapshot,
+        lease: &mut Lease,
+    ) -> PartialResult<(Vec<PageRef>, PreparedFiles)> {
+        let (pages, encoded) = state::encode_pages(snapshot, &self.budget)?;
+        lease.absorb(encoded);
+        // The refs replace the copy's page list; the copy is transaction-scoped.
+        let (mut refs, list) = self.budget.leased_vector(pages.len())?;
+        lease.absorb(list);
+        let total: usize = pages.iter().map(|(_, bytes)| bytes.len()).sum();
+        let cache_lease = self.budget.metadata_lease(total as u64)?;
+        let mut cache = self.budget.vector(pages.len())?;
+        let mut files = Vec::new();
+        files.try_reserve_exact(pages.len()).map_err(|_| malformed())?;
+        for (index, (kind, bytes)) in pages.into_iter().enumerate() {
+            let digest = match self.cache.pages.get(index) {
+                Some((k, b, digest)) if *k == kind && *b == bytes => *digest,
+                _ => crate::crypto::sha256(&bytes),
+            };
+            refs.push(PageRef { kind, digest, len: bytes.len() as u32 });
+            cache.push((kind, bytes.clone(), digest));
+            files.push((format!("p-{}", hex(&digest)), bytes, true));
+        }
+        self.cache = PageCache { pages: cache, _lease: Some(cache_lease) };
+        Ok((refs, files))
+    }
+    /// The intent record of a group: the committed head with the next sequence and revision, its pages unchanged
+    /// (the group only adds output the committed state already calls unknown), so nothing is encoded or written
+    /// but the record. The record is written and synced; the caller anchors it.
+    pub(super) fn group_intent(&mut self, parent: &StateAnchor, head: &CommittedState) -> PartialResult<PartialState> {
+        let state = state::encode_record(2, head.revision, Some(parent), head, &self.budget.limits)?;
+        let name = format!("r-{}", hex(state.anchor().digest()));
+        self.reserve_files(&[(name.clone(), state.wire.clone(), false)])?;
+        self.put(&name, &state.wire, false)?;
+        Ok(state)
+    }
+    /// Writes and syncs an encoded record (reserved by the caller); the caller anchors it.
+    pub(super) fn append_record(&mut self, state: &PartialState) -> PartialResult<()> {
+        self.put(&format!("r-{}", hex(state.anchor().digest())), &state.wire, false)
     }
     /// Maintenance is useful only when it can reclaim the pressured storage
     /// and leave room for this already-validated transaction. Include one
@@ -465,7 +528,7 @@ impl Bundle {
             self.budget.exclusions.retire(&path);
             self.files.retain(|f| f.name != name);
         }
-        self.directory.held.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))
+        super::sync_file(&self.directory.held.file).map_err(|e| io_error(OutputOperation::Flush, e))
     }
 }
 
@@ -481,6 +544,7 @@ fn write_journal(file: &std::fs::File, name: &str, at: u64, bytes: &[u8]) -> std
     }
 }
 fn sync_journal(file: &std::fs::File, name: &str, directory: bool) -> std::io::Result<()> {
+    super::SYNCS.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     {
         super::tests::state::journal_sync(file, name, directory)

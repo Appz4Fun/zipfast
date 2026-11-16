@@ -596,6 +596,8 @@ impl ProgressiveSession {
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
                         Poll::Pending => {
                             self.parked_read = Some(n);
+                            #[cfg(feature = "persistent-partials")]
+                            self.partial_wait()?;
                             return Ok(Poll::Pending);
                         }
                         Poll::Ready(Err(e)) => return Err(e),
@@ -669,6 +671,8 @@ impl ProgressiveSession {
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
                         Poll::Pending => {
                             self.parked_read = Some(n);
+                            #[cfg(feature = "persistent-partials")]
+                            self.partial_wait()?;
                             return Ok(Poll::Pending);
                         }
                         Poll::Ready(Err(e)) => return Err(e),

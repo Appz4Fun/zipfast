@@ -1167,7 +1167,7 @@ fn r1_protection_upgrade_counts_replacements_before_retaining_bindings() {
     d.supply_replacement(0, Box::new(ImmutableFileSource::open(&replacement).unwrap())).unwrap();
     ready.store(true, Ordering::SeqCst);
     assert!(matches!(
-        d.refresh_protection().unwrap_err().kind,
+        d.refresh_protection(true).unwrap_err().kind,
         FailureKind::Limit { resource: Resource::VolumeHandles, limit: 4, attempted: 5 }
     ));
     assert_eq!(d.native.handle_count(), 1, "upgrade rejected before retaining new bindings");

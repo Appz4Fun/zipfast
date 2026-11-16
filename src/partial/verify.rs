@@ -44,7 +44,8 @@ struct Readback {
 }
 fn complete(snapshot: &Snapshot, range: &Range<u64>) -> bool {
     let mut at = range.start;
-    for leaf in &snapshot.known {
+    let first = snapshot.known.partition_point(|leaf| leaf.range.end <= at);
+    for leaf in &snapshot.known[first..] {
         if leaf.range.end <= at {
             continue;
         }
@@ -70,10 +71,8 @@ fn crc(
         return Ok(CheckResult::Pending);
     }
     let mut combined = crate::crc32::Hasher::new();
-    for leaf in &snapshot.known {
-        if leaf.range.end <= range.start || leaf.range.start >= range.end {
-            continue;
-        }
+    let first = snapshot.known.partition_point(|leaf| leaf.range.end <= range.start);
+    for leaf in snapshot.known[first..].iter().take_while(|leaf| leaf.range.start < range.end) {
         if leaf.range.start < range.start || leaf.range.end > range.end {
             return Err(malformed());
         }
@@ -300,6 +299,7 @@ impl PartialCore {
     fn verify_now(&self) -> PartialResult<Poll<Verdict>> {
         let mut op = self.operation()?;
         self.check(&op)?;
+        self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
         if op.verification.as_ref().is_none_or(|v| v.revision != op.snapshot.head.revision) {
             let previous = self.part_results(&mut op);

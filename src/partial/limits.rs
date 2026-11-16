@@ -43,8 +43,21 @@ pub struct PartialLimits {
     pub open_files: u32,
     pub open_partials: u32,
     pub events: u32,
+    /// Bytes of one `fill` or `fill_packed` call, one `refill_from_packed` step and one extraction write; also the
+    /// buffer of a [`FillWriter`](super::FillWriter). Default 1 MiB, at most 64 MiB.
     pub fill_bytes: u32,
+    /// Output bytes that extraction writes and [`FillWriter`](super::FillWriter) / `fill_from` fills group into one
+    /// durable transaction: one anchored intent before the first write of the group, one output sync and one
+    /// anchored commit after the last. Default 64 MiB, at most 16 GiB; 0 commits every write on its own.
+    pub group_commit_bytes: u64,
+    /// A group is also committed at the first write (or provider wait of the session) after it has been open this
+    /// long. Default 2 s, at most one hour.
+    pub group_commit_interval: std::time::Duration,
 }
+/// Hard cap of [`PartialLimits::group_commit_bytes`].
+const GROUP_COMMIT_BYTES_MAX: u64 = 16 << 30;
+/// Hard cap of [`PartialLimits::group_commit_interval`].
+const GROUP_COMMIT_INTERVAL_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
 impl Default for PartialLimits {
     fn default() -> Self {
         Self {
@@ -58,6 +71,8 @@ impl Default for PartialLimits {
             open_partials: 16,
             events: 64,
             fill_bytes: 1_048_576,
+            group_commit_bytes: 64 << 20,
+            group_commit_interval: std::time::Duration::from_secs(2),
         }
     }
 }
@@ -87,12 +102,15 @@ impl PartialLimits {
             (PartialResource::OpenFiles, 4096),
             (PartialResource::OpenPartials, 4096),
             (PartialResource::Events, 64),
-            (PartialResource::FillBytes, 1_048_576),
+            (PartialResource::FillBytes, 64 << 20),
         ] {
             let n = self.value(r);
             if n > hard {
                 return Err(limit(r, hard, n));
             }
+        }
+        if self.group_commit_bytes > GROUP_COMMIT_BYTES_MAX || self.group_commit_interval > GROUP_COMMIT_INTERVAL_MAX {
+            return Err(err(PartialErrorKind::InvalidOptions));
         }
         Ok(())
     }

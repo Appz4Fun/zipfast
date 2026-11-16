@@ -574,6 +574,12 @@ pub(crate) struct SourceDriver {
     /// It is held unread, and unadmitted, until a later declaration names it (persistent sessions only).
     #[cfg(feature = "persistent-partials")]
     undeclared: Option<Box<dyn RangeSource>>,
+    /// Exclusion registry revision against which every path and handle of the current declaration was last found
+    /// clear of persistent outputs, bundles and locks. Reset whenever the declaration is replaced.
+    #[cfg(feature = "persistent-partials")]
+    inputs_checked: Option<u64>,
+    /// Rotating position (volumes, then auxiliary paths) of the next redeclared entries compared in full.
+    sample_next: usize,
     provider: Box<dyn VolumeSource>,
     request: VolumeRequest,
     original: Option<OriginalSource>,
@@ -626,6 +632,9 @@ impl SourceDriver {
             declared: Vec::new(),
             #[cfg(feature = "persistent-partials")]
             undeclared: None,
+            #[cfg(feature = "persistent-partials")]
+            inputs_checked: None,
+            sample_next: 0,
             provider,
             request: VolumeRequest { index: 0, expected: first },
             original: None,
@@ -707,7 +716,7 @@ impl SourceDriver {
     }
     #[cfg(feature = "persistent-partials")]
     pub(crate) fn require_partial_catalogue(&mut self) -> ProgressiveResult<()> {
-        self.refresh_protection()?;
+        self.refresh_protection(true)?;
         if !matches!(self.protection, ProtectionDeclaration::Complete { .. }) {
             return Err(ProgressiveFailure::new(FailureKind::Partial(Box::new(crate::partial::PartialError::new(
                 crate::partial::PartialErrorKind::InvalidOptions,
@@ -725,9 +734,22 @@ impl SourceDriver {
         self.check_partial_inputs()
     }
     #[cfg(feature = "persistent-partials")]
-    fn check_partial_inputs(&self) -> ProgressiveResult<()> {
-        let Some(exclusions) = &self.partial_exclusions else { return Ok(()) };
-        self.check_inventory_inputs(&self.protection)?;
+    fn check_partial_inputs(&mut self) -> ProgressiveResult<()> {
+        let Some(exclusions) = self.partial_exclusions.clone() else { return Ok(()) };
+        // The declared paths and handles only need comparing again when the declaration or the exclusion registry
+        // changed (every registry change bumps its revision); comparing all V of them against every exclusion on
+        // every step cost O(V * exclusions) path and descriptor syscalls per step. The registry's directory
+        // identities are still re-observed on every call.
+        if self.inputs_checked.is_none() || self.inputs_checked != Some(exclusions.revision()) {
+            self.inputs_checked = None;
+            let before = exclusions.revision();
+            self.check_inventory_inputs(&self.protection)?;
+            if exclusions.revision() == before {
+                self.inputs_checked = Some(before);
+            }
+        } else if self.original.is_none() {
+            exclusions.check_input(&[], &[])?;
+        }
         if let Some(original) = &self.original {
             self.usage.charge(Resource::SourceRequests, 1)?;
             let files = original.source.backing_files();
@@ -817,7 +839,7 @@ impl SourceDriver {
         }
         let result = (|| {
             self.validate_current()?;
-            self.refresh_protection()?;
+            self.refresh_protection(true)?;
             self.validate_current()?;
             self.native.check_target(target, identity, &mut self.usage)?;
             let mut replacement_authority = true;
@@ -951,7 +973,7 @@ impl SourceDriver {
         self.parked = false;
         if self.original.is_none() {
             self.check_original_capacity()?;
-            self.refresh_protection()?;
+            self.refresh_protection(false)?;
             #[cfg(feature = "persistent-partials")]
             if let Some(source) = self.undeclared.take() {
                 // Woken after a Ready for a volume the declaration did not name yet: admit it once it does.
@@ -983,7 +1005,7 @@ impl SourceDriver {
                     #[cfg(feature = "persistent-partials")]
                     if self.awaits_declaration(self.request.index)? {
                         // The provider may have declared the volume while answering.
-                        self.refresh_protection()?;
+                        self.refresh_protection(false)?;
                         if self.awaits_declaration(self.request.index)? {
                             // Hold it unread and wait, still armed, for the provider to wake this request once
                             // a larger declaration names it.
@@ -1086,13 +1108,24 @@ impl SourceDriver {
         }
         let external = self.other_lane_handles()?;
         self.usage.check(Resource::VolumeHandles, (external + self.native.handle_count() + backing.len()) as u64)?;
-        self.native.refresh(&self.protection, &mut self.usage, external + backing.len())?;
+        self.native.refresh_admission(
+            &self.protection,
+            self.request.index,
+            &mut self.usage,
+            external + backing.len(),
+        )?;
         self.native.admit(self.request.index, backing, &self.protection, &mut self.usage, external)?;
         let backing_count = backing.len();
         // Only the concrete library adapter carries its original immutable stamp.
         // Custom providers retain the cooperative progressive identity contract.
         if let Some(immutable) = (&*source as &dyn std::any::Any).downcast_ref::<ImmutableFileSource>() {
-            self.native.remember_immutable(&immutable.file, &immutable.path, immutable.stamp, &self.usage)?;
+            self.native.remember_immutable(
+                &immutable.file,
+                &immutable.path,
+                immutable.stamp,
+                Some((self.request.index, &self.protection)),
+                &self.usage,
+            )?;
         }
         self.usage.charge(Resource::MetadataBytes, self.request.expected.capacity() as u64)?;
         self.usage.charge(Resource::NameBytes, self.request.expected.capacity() as u64)?;
@@ -1374,7 +1407,10 @@ impl SourceDriver {
     fn check_info(&mut self) -> ProgressiveResult<()> {
         self.original.as_mut().unwrap().check_info(&mut self.usage)
     }
-    fn refresh_protection(&mut self) -> ProgressiveResult<()> {
+    /// Asks the provider for its declaration and checks it against the one the session enforces. `full` compares
+    /// a repeated declaration entry by entry (authority points: publication, member creation and its target
+    /// checks); otherwise (volume admission) a repeat is judged on a bounded sample, see `sample_redeclaration`.
+    fn refresh_protection(&mut self, full: bool) -> ProgressiveResult<()> {
         self.usage.charge(Resource::SourceRequests, 1)?;
         if self.control.is_canceled() {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
@@ -1384,6 +1420,15 @@ impl SourceDriver {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
         let mut next = next?;
+        if !full && self.sample_redeclaration(&next)? {
+            // The provider repeated the declaration the session already validated and enforces. Nothing is
+            // adopted from it, so only the bounded step recheck runs.
+            let external = self.other_lane_handles()? + self.backing_count();
+            self.native.refresh_step(&self.protection, &mut self.usage, external)?;
+            #[cfg(feature = "persistent-partials")]
+            self.check_partial_inputs()?;
+            return Ok(());
+        }
         // A redeclaration that matches the current Complete inventory position by
         // position is already canonical and duplicate-free, so only its shape and
         // retained sizes are rechecked; the sorts run for a first or reordered one.
@@ -1466,6 +1511,10 @@ impl SourceDriver {
                 self.native.refresh(&next, &mut self.usage, external)?;
                 self.protection = next;
                 #[cfg(feature = "persistent-partials")]
+                {
+                    self.inputs_checked = None;
+                }
+                #[cfg(feature = "persistent-partials")]
                 self.check_partial_inputs()?;
                 Ok(())
             })();
@@ -1477,8 +1526,64 @@ impl SourceDriver {
         self.native.refresh(&next, &mut self.usage, external)?;
         self.protection = next;
         #[cfg(feature = "persistent-partials")]
+        {
+            self.inputs_checked = None;
+        }
+        #[cfg(feature = "persistent-partials")]
         self.check_partial_inputs()?;
         Ok(())
+    }
+    /// Whether `next` repeats the current Complete declaration, judged on a bounded sample.
+    ///
+    /// The provider is asked for its declaration at every volume admission (and at member creation in persistent
+    /// sessions), and it answers with a fresh value, so proving the whole answer equal costs O(V * P) per query
+    /// and O(V^2 * P) per session. Instead a repeat with the same epoch and the same counts is compared in full
+    /// only for the volume being requested and for `SAMPLE` more entries in rotation, so every entry is compared
+    /// again every V / `SAMPLE` queries. Any difference in the sample, including a newly supplied handle, falls
+    /// through to the full comparison below, which adopts the handle or refuses the change with `SourceChanged`;
+    /// so does any change of epoch or count, and with it every extension.
+    ///
+    /// This is safe because a matching repeat is never adopted: the session keeps enforcing the declaration it
+    /// validated in full, whatever the unsampled entries of the repeat say. A same-epoch change to an entry is
+    /// still refused when that volume is requested (its entry is always compared), when the rotation reaches it,
+    /// and at the latest at the next authority point (publication, persistent member creation and its target
+    /// checks), which compares the whole declaration. Only volume admission samples. A handle supplied late for
+    /// an entry is likewise adopted when a request, the rotation or an authority point reaches it.
+    fn sample_redeclaration(&mut self, next: &ProtectionDeclaration) -> ProgressiveResult<bool> {
+        const SAMPLE: usize = 8;
+        let (
+            ProtectionDeclaration::Complete { epoch: a, inventory: x },
+            ProtectionDeclaration::Complete { epoch: b, inventory: y },
+        ) = (&self.protection, next)
+        else {
+            return Ok(false);
+        };
+        self.usage.charge(Resource::SourceBookkeeping, 3)?;
+        if a != b || x.volumes.len() != y.volumes.len() || x.auxiliary_paths.len() != y.auxiliary_paths.len() {
+            return Ok(false);
+        }
+        let total = x.volumes.len() + x.auxiliary_paths.len();
+        if total <= SAMPLE + 1 {
+            // Small inventories are compared whole by the full path; it is no dearer than the sample.
+            return Ok(false);
+        }
+        self.usage.charge(Resource::SourceBookkeeping, 1 + x.volumes.len().max(1).ilog2() as u64)?;
+        let requested = x.volumes.binary_search_by_key(&self.request.index, |v| v.index).ok();
+        let start = self.sample_next % total;
+        self.sample_next = (start + SAMPLE) % total;
+        for i in requested.into_iter().chain((start..start + SAMPLE).map(|i| i % total)) {
+            let same = if i < x.volumes.len() {
+                same_volume(&x.volumes[i], &y.volumes[i], &mut self.usage)?
+                    && !volume_adds_handles(&x.volumes[i], &y.volumes[i], &mut self.usage)?
+            } else {
+                let (p, q) = (&x.auxiliary_paths[i - x.volumes.len()], &y.auxiliary_paths[i - x.volumes.len()]);
+                same_path(p, q, &mut self.usage)? && !(p.file.is_none() && q.file.is_some())
+            };
+            if !same {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     /// The epoch of the current Complete declaration.
     #[cfg(feature = "persistent-partials")]
@@ -1669,30 +1774,46 @@ fn same_inventory(a: &ProtectionInventory, b: &ProtectionInventory, usage: &mut 
         }
     }
     for (x, y) in a.volumes.iter().zip(&b.volumes) {
-        usage.charge(
-            Resource::SourceBookkeeping,
-            3 + x.name.as_encoded_bytes().len() as u64 + y.name.as_encoded_bytes().len() as u64,
-        )?;
-        if x.index != y.index || x.name != y.name {
+        if !same_volume(x, y, usage)? {
             return Ok(false);
-        }
-        match (&x.backing, &y.backing) {
-            (VolumeBacking::NonFile, VolumeBacking::NonFile) => {}
-            (VolumeBacking::Native(x), VolumeBacking::Native(y)) => {
-                usage.charge(Resource::SourceBookkeeping, 1)?;
-                if x.len() != y.len() {
-                    return Ok(false);
-                }
-                for (a, b) in x.iter().zip(y) {
-                    if !same_path(a, b, usage)? {
-                        return Ok(false);
-                    }
-                }
-            }
-            _ => return Ok(false),
         }
     }
     Ok(true)
+}
+/// Whether two declared volumes have the same index, name and backing (a handle absent in `x` may be present in
+/// `y`; see [`volume_adds_handles`]).
+fn same_volume(x: &ProtectedVolume, y: &ProtectedVolume, usage: &mut Usage) -> ProgressiveResult<bool> {
+    usage.charge(
+        Resource::SourceBookkeeping,
+        3 + x.name.as_encoded_bytes().len() as u64 + y.name.as_encoded_bytes().len() as u64,
+    )?;
+    if x.index != y.index || x.name != y.name {
+        return Ok(false);
+    }
+    match (&x.backing, &y.backing) {
+        (VolumeBacking::NonFile, VolumeBacking::NonFile) => {}
+        (VolumeBacking::Native(x), VolumeBacking::Native(y)) => {
+            usage.charge(Resource::SourceBookkeeping, 1)?;
+            if x.len() != y.len() {
+                return Ok(false);
+            }
+            for (a, b) in x.iter().zip(y) {
+                if !same_path(a, b, usage)? {
+                    return Ok(false);
+                }
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+/// Whether `y` declares a handle for a path of `x` declared without one; both must compare equal.
+fn volume_adds_handles(x: &ProtectedVolume, y: &ProtectedVolume, usage: &mut Usage) -> ProgressiveResult<bool> {
+    if let (VolumeBacking::Native(x), VolumeBacking::Native(y)) = (&x.backing, &y.backing) {
+        usage.charge(Resource::SourceBookkeeping, x.len() as u64)?;
+        return Ok(x.iter().zip(y).any(|(x, y)| x.file.is_none() && y.file.is_some()));
+    }
+    Ok(false)
 }
 /// Whether canonical `b` keeps every volume of canonical `a` (index, name and backing) and every auxiliary path,
 /// adding only new indices and paths.

@@ -161,6 +161,25 @@ pub(crate) struct NativeProtection {
     // Rotating cursors for step refreshes.
     next_binding: usize,
     next_immutable: usize,
+    // First binding of each declared volume, by inventory position, plus the end of the volume bindings, so an
+    // admission observes only the admitted volume's own paths.
+    starts: Vec<usize>,
+}
+/// First binding of each volume of `inventory` in binding order, then the end of the volume bindings.
+fn volume_starts(inventory: &ProtectionInventory, usage: &mut Usage) -> ProgressiveResult<Vec<usize>> {
+    usage.charge(Resource::SourceBookkeeping, inventory.volumes.len() as u64 + 1)?;
+    usage.charge(Resource::MetadataBytes, ((inventory.volumes.len() + 1) * std::mem::size_of::<usize>()) as u64)?;
+    let mut starts = Vec::new();
+    starts.try_reserve_exact(inventory.volumes.len() + 1).map_err(|_| contract())?;
+    let mut at = 0usize;
+    for volume in &inventory.volumes {
+        starts.push(at);
+        if let VolumeBacking::Native(paths) = &volume.backing {
+            at = at.checked_add(paths.len()).ok_or_else(contract)?;
+        }
+    }
+    starts.push(at);
+    Ok(starts)
 }
 impl NativeProtection {
     #[cfg(feature = "persistent-partials")]
@@ -216,6 +235,7 @@ impl NativeProtection {
             fingerprint: None,
             next_binding: 0,
             next_immutable: 0,
+            starts: Vec::new(),
         })
     }
 
@@ -285,6 +305,7 @@ impl NativeProtection {
                 let identity = observe(&path, p.file.as_deref())?;
                 self.bindings.push(Binding { path, identity, handle: p.file.clone() });
             }
+            self.starts = volume_starts(inventory, usage)?;
             self.native_only = native_only;
             self.complete = true;
         } else {
@@ -349,6 +370,59 @@ impl NativeProtection {
             return Err(changed());
         }
         Ok(())
+    }
+    /// Refresh before admitting volume `index` of the declaration last fully refreshed.
+    ///
+    /// The admitted volume's own bindings are observed in full, because that is the file about to be read;
+    /// the rest of the protected state gets the bounded step check (newest stamp, one rotating stamp and one
+    /// rotating binding), exactly as after a header or data step. Sweeping every binding and stamp here made a
+    /// Complete declaration cost O(V * P) per admission and O(V^2 * P) per session. Every other binding is still
+    /// re-observed every few steps, and publication and member boundaries keep the full refresh, so a replaced
+    /// input is still caught before any output is published. A first or changed declaration falls back to the
+    /// full refresh.
+    pub(crate) fn refresh_admission(
+        &mut self,
+        declaration: &ProtectionDeclaration,
+        index: u32,
+        usage: &mut Usage,
+        external_handles: usize,
+    ) -> ProgressiveResult<()> {
+        let fingerprint = Fingerprint::of(declaration);
+        if fingerprint.is_none() {
+            return self.refresh(declaration, usage, external_handles);
+        }
+        if !self.complete || self.fingerprint != fingerprint || self.covered != self.admitted.len() {
+            return self.refresh(declaration, usage, external_handles);
+        }
+        let ProtectionDeclaration::Complete { inventory, .. } = declaration else { unreachable!() };
+        if self.starts.len() != inventory.volumes.len() + 1 {
+            return self.refresh(declaration, usage, external_handles);
+        }
+        self.refresh_step(declaration, usage, external_handles)?;
+        usage.charge(Resource::SourceBookkeeping, 1 + inventory.volumes.len().max(1).ilog2() as u64)?;
+        let Ok(position) = inventory.volumes.binary_search_by_key(&index, |v| v.index) else {
+            // Undeclared: admission refuses it on name coverage.
+            return Ok(());
+        };
+        let VolumeBacking::Native(paths) = &inventory.volumes[position].backing else { return Ok(()) };
+        let start = self.starts[position];
+        if start.checked_add(paths.len()) != Some(self.starts[position + 1])
+            || self.starts[position + 1] > self.bindings.len()
+        {
+            return Err(contract());
+        }
+        for (binding, path) in self.bindings[start..start + paths.len()].iter_mut().zip(paths) {
+            bookkeeping!(self, usage, 1 + binding.path.as_os_str().len() as u64)?;
+            let now = observe(&binding.path, path.file.as_deref())?;
+            if binding.identity.is_some() && binding.identity != now {
+                return Err(changed());
+            }
+            if binding.identity.is_none() {
+                binding.identity = now;
+                binding.handle = path.file.clone();
+            }
+        }
+        usage.check(Resource::VolumeHandles, (external_handles + self.handle_count()) as u64)
     }
     /// Realigns the bindings of a bound Complete inventory `old` to `new`, which keeps every old path unchanged
     /// and in order. Old bindings keep their observed identities; appended paths are observed and bound here.
@@ -421,6 +495,7 @@ impl NativeProtection {
             next.extend(if keep { kept.next() } else { fresh.next() });
         }
         self.bindings = next;
+        self.starts = volume_starts(new, usage)?;
         self.native_only = !new.volumes.is_empty()
             && new.volumes.iter().all(|v| matches!(&v.backing, VolumeBacking::Native(p) if !p.is_empty()));
         Ok(())
@@ -433,7 +508,8 @@ impl NativeProtection {
         usage: &mut Usage,
     ) -> ProgressiveResult<()> {
         let ProtectionDeclaration::Complete { inventory, .. } = declaration else { return Ok(()) };
-        usage.charge(Resource::SourceBookkeeping, inventory.volumes.len() as u64 + self.bindings.len() as u64)?;
+        // A binary search of the canonical inventory.
+        usage.charge(Resource::SourceBookkeeping, 1 + inventory.volumes.len().max(1).ilog2() as u64)?;
         let v = inventory
             .volumes
             .binary_search_by_key(&index, |v| v.index)
@@ -459,7 +535,11 @@ impl NativeProtection {
         usage: &mut Usage,
         external_handles: usize,
     ) -> ProgressiveResult<()> {
-        usage.charge(Resource::SourceBookkeeping, (self.bindings.len() + self.admitted.len() + files.len()) as u64)?;
+        // Only an Opaque driver searches `admitted` (to share held handles); the handle count below is a filter.
+        usage.charge(
+            Resource::SourceBookkeeping,
+            (files.len() + if self.complete { 0 } else { self.admitted.len() + self.bindings.len() }) as u64,
+        )?;
         usage.check(
             Resource::VolumeHandles,
             (external_handles
@@ -480,7 +560,9 @@ impl NativeProtection {
             }
             let id = Identity::metadata(&meta).map_err(input)?;
             self.covers(index, id, declaration, usage)?;
-            usage.charge(Resource::SourceBookkeeping, self.admitted.len() as u64)?;
+            if !self.complete {
+                usage.charge(Resource::SourceBookkeeping, self.admitted.len() as u64)?;
+            }
             if !self.complete && !self.admitted.iter().any(|(_, old)| *old == id) {
                 let retained = file.try_clone().map_err(|cause| {
                     ProgressiveFailure::new(FailureKind::Input { operation: InputOperation::Open, cause })
@@ -503,21 +585,43 @@ impl NativeProtection {
         file: &File,
         path: &Path,
         stamp: crate::rar5::source::SourceStamp,
+        volume: Option<(u32, &ProtectionDeclaration)>,
         usage: &Usage,
     ) -> ProgressiveResult<()> {
-        usage.charge(Resource::SourceBookkeeping, 8 + path.as_os_str().len() as u64 + self.immutable.len() as u64)?;
+        usage.charge(Resource::SourceBookkeeping, 8 + path.as_os_str().len() as u64)?;
         stamp.check(file, path).map_err(super::super::source::immutable_error)?;
-        usage.charge(
-            Resource::MetadataBytes,
-            (std::mem::size_of::<ImmutableBinding>() + path.as_os_str().len()) as u64,
-        )?;
+        usage.charge(Resource::MetadataBytes, path.as_os_str().len() as u64)?;
         let old = self.immutable.capacity();
-        self.immutable.try_reserve_exact(1).map_err(|_| contract())?;
-        usage.charge(
-            Resource::MetadataBytes,
-            (self.immutable.capacity().saturating_sub(old + 1) * std::mem::size_of::<ImmutableBinding>()) as u64,
-        )?;
-        self.immutable.push(ImmutableBinding { path: path.to_path_buf(), stamp, slot: None });
+        if self.immutable.len() == old {
+            // Grow geometrically: the copy is charged once per doubling, so the list costs O(V) in all.
+            let target = old.saturating_mul(2).max(4);
+            usage.charge(Resource::SourceBookkeeping, self.immutable.len() as u64)?;
+            usage.charge(Resource::MetadataBytes, ((target - old) * std::mem::size_of::<ImmutableBinding>()) as u64)?;
+            self.immutable.try_reserve_exact(target - old).map_err(|_| contract())?;
+            usage.charge(
+                Resource::MetadataBytes,
+                (self.immutable.capacity().saturating_sub(target) * std::mem::size_of::<ImmutableBinding>()) as u64,
+            )?;
+        }
+        // The stamp normally resolves to a handle of the admitted volume's own declared paths: look there first,
+        // instead of searching every binding when the stamp is next checked.
+        let id = Identity(stamp.device, stamp.inode);
+        let mut slot = None;
+        if let Some((index, ProtectionDeclaration::Complete { inventory, .. })) = volume
+            && self.complete
+            && self.starts.len() == inventory.volumes.len() + 1
+        {
+            usage.charge(Resource::SourceBookkeeping, 1 + inventory.volumes.len().max(1).ilog2() as u64)?;
+            if let Ok(position) = inventory.volumes.binary_search_by_key(&index, |v| v.index) {
+                let range = self.starts[position]..self.starts[position + 1].min(self.bindings.len());
+                usage.charge(Resource::SourceBookkeeping, range.len() as u64)?;
+                slot = range
+                    .clone()
+                    .find(|&b| self.bindings[b].identity == Some(id) && self.bindings[b].handle.is_some())
+                    .map(Slot::Binding);
+            }
+        }
+        self.immutable.push(ImmutableBinding { path: path.to_path_buf(), stamp, slot });
         Ok(())
     }
     fn check_immutable(&mut self, usage: &Usage, sweep: Sweep) -> ProgressiveResult<()> {

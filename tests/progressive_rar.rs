@@ -2002,13 +2002,27 @@ fn complete_native_bookkeeping_does_not_grow_with_inventory_times_steps() {
     assert_eq!(opened, VOLUMES);
     assert_eq!(std::fs::read(out.join("member.bin")).unwrap(), data);
 
-    // The same run is still charged: a small ceiling stops it.
+    // The same run is still charged: a small ceiling stops it. Admission is incremental, so the whole run costs
+    // well under 1 MiB with short temporary paths; 64 KiB stops it wherever the temporary directory lives.
     let out = tmp.path().join("small");
     std::fs::create_dir_all(&out).unwrap();
     let mut o = complete_native_options(&out, VOLUMES);
-    o.limits.source_bookkeeping = 1 << 20;
-    let mut s = ProgressiveSession::new(Box::new(NativeSet::new(paths)), o).unwrap();
-    let failure = drive_complete(&mut s, |_| {}).expect("limit");
+    o.limits.source_bookkeeping = 64 << 10;
+    // Taking the declaration may already exceed it; otherwise the run stops on the way.
+    let failure = match ProgressiveSession::new(Box::new(NativeSet::new(paths)), o) {
+        Err(failure) => failure,
+        Ok(mut s) => loop {
+            match poll(&mut s) {
+                Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. })))
+                | Poll::Ready(Err(failure)) => {
+                    break failure;
+                }
+                Poll::Ready(Ok(None)) => panic!("the run fit the small ceiling"),
+                Poll::Ready(Ok(Some(_))) => {}
+                Poll::Pending => panic!("pending"),
+            }
+        },
+    };
     assert!(matches!(failure.kind, FailureKind::Limit { resource: Resource::SourceBookkeeping, .. }), "{failure:?}");
     assert!(!out.join("member.bin").exists());
 }
@@ -2039,4 +2053,103 @@ fn complete_native_replaced_volume_path_is_detected_before_publication() {
         assert!(matches!(failure.kind, FailureKind::SourceChanged), "victim {victim}: {failure:?}");
         assert!(!out.join("member.bin").exists(), "victim {victim}");
     }
+}
+#[test]
+fn complete_native_many_long_paths_fit_default_bookkeeping() {
+    // A Complete declaration used to be swept whole at every volume admission and member boundary (shape,
+    // comparison and handle checks of the provider's answer, every binding re-observed, the new volume covered
+    // against the whole inventory and binding list): about 3.1 V^2 (P + 16) units, so 600 volumes with ~100-byte
+    // paths ran out of the default 64 MiB around volume 491. Admission now pays for the admitted volume and a
+    // bounded slice of the rest.
+    const VOLUMES: usize = 600;
+    let tmp = tempfile::tempdir().unwrap();
+    // Pad the directory so each volume path is about 100 bytes.
+    let pad = 100usize.saturating_sub(tmp.path().as_os_str().len() + "/in/a.part001.rar".len() + 1).max(1);
+    let base = tmp.path().join("p".repeat(pad));
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let data: Vec<u8> = (0..VOLUMES * 256).map(|i| (i * 7 % 251) as u8).collect();
+    let paths = complete_native_set(&base, &data, 256);
+    assert_eq!(paths.len(), VOLUMES);
+    assert!(paths[0].as_os_str().len() >= 95, "{}", paths[0].display());
+    let o = complete_native_options(&out, VOLUMES);
+    assert_eq!(o.limits.source_bookkeeping, ProgressiveLimits::default().source_bookkeeping);
+    let mut s = ProgressiveSession::new(Box::new(NativeSet::new(paths)), o).unwrap();
+    let mut opened = 0;
+    let failure = drive_complete(&mut s, |e| opened += matches!(e, ProgressiveEvent::VolumeOpened { .. }) as usize);
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(opened, VOLUMES);
+    assert_eq!(std::fs::read(out.join("member.bin")).unwrap(), data);
+}
+#[test]
+fn complete_native_same_epoch_change_to_a_read_volume_is_refused_at_publication() {
+    // Admission compares repeated declarations on a sample only; publication compares them whole, so a same-epoch
+    // change to an entry no later admission requests or samples (an already read volume, changed after the last
+    // volume opened) is still refused before the member is published.
+    const VOLUMES: usize = 40;
+    for victim in [1, 5, 13, 21] {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let data: Vec<u8> = (0..VOLUMES * 512).map(|i| (i * 11 % 251) as u8).collect();
+        let paths = complete_native_set(tmp.path(), &data, 512);
+        let after = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = ChangingSet { set: NativeSet::new(paths), after: after.clone(), victim };
+        let mut s = ProgressiveSession::new(Box::new(provider), complete_native_options(&out, VOLUMES)).unwrap();
+        let failure = drive_complete(&mut s, |e| {
+            if matches!(e, ProgressiveEvent::VolumeOpened { index, .. } if *index as usize == VOLUMES - 1) {
+                after.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .unwrap_or_else(|| panic!("victim {victim}: the changed declaration must be refused"));
+        assert!(matches!(failure.kind, FailureKind::SourceChanged), "victim {victim}: {failure:?}");
+        assert!(!out.join("member.bin").exists(), "victim {victim}");
+    }
+}
+struct ChangingSet {
+    set: NativeSet,
+    after: Arc<std::sync::atomic::AtomicBool>,
+    victim: usize,
+}
+impl VolumeSource for ChangingSet {
+    fn volume(&mut self, r: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        self.set.volume(r, cx)
+    }
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        let mut declaration = self.set.protection()?;
+        if self.after.load(std::sync::atomic::Ordering::Relaxed)
+            && let ProtectionDeclaration::Complete { inventory, .. } = &mut declaration
+            && let VolumeBacking::Native(paths) = &mut inventory.volumes[self.victim].backing
+        {
+            paths[0].path = paths[0].path.with_extension("moved");
+        }
+        Ok(declaration)
+    }
+}
+#[test]
+fn complete_native_same_epoch_change_is_refused_by_the_requested_volume() {
+    // Repeated declarations are compared in full only for the requested volume and a rotating sample, so a
+    // same-epoch change to a later entry is refused at the latest when that volume is requested.
+    const VOLUMES: usize = 40;
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let data: Vec<u8> = (0..VOLUMES * 512).map(|i| (i * 11 % 251) as u8).collect();
+    let paths = complete_native_set(tmp.path(), &data, 512);
+    let after = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = ChangingSet { set: NativeSet::new(paths), after: after.clone(), victim: 30 };
+    let mut s = ProgressiveSession::new(Box::new(provider), complete_native_options(&out, VOLUMES)).unwrap();
+    let mut last = 0;
+    let failure = drive_complete(&mut s, |e| {
+        if let ProgressiveEvent::VolumeOpened { index, .. } = e {
+            last = *index;
+            if *index == 2 {
+                after.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    })
+    .expect("the changed declaration must be refused");
+    assert!(matches!(failure.kind, FailureKind::SourceChanged), "{failure:?}");
+    assert!((2..30).contains(&last), "refused after opening volume {last}");
+    assert!(!out.join("member.bin").exists());
 }
