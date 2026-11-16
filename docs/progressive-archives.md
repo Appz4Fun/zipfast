@@ -282,6 +282,28 @@ an already-published receipt. The artifact then owns only leftover-stage cleanup
 mutation. Metadata is applied through the original descriptor only after actual
 publication, preserving provisional mode 0600.
 
+## Promoting an Opaque set to Complete
+
+A provider that cannot name its files up front (obfuscated posts, names learned
+from par2 later) may start `Opaque` and promote the set once it is final: its
+next `protection()` answer is simply `Complete`. There is no separate call. The
+session asks for the declaration at every volume admission, member boundary and
+publication check, and adopts the promotion at the first of these. Every source
+admitted while Opaque must then be one of the files the declaration names for
+its volume (same device and inode as a declared handle), and every admitted
+name must be declared; members finished after the promotion can publish Strict.
+
+A volume the session already read may have been replaced on disk by then with a
+new inode: a par2 repair renamed over it, or the provider fell back to a backup
+copy. Its bytes came from a file the declaration no longer names, so the
+promotion is declined rather than failing the session: the session stays Opaque,
+keeps extracting, and finishes members as `Provisional` (no Strict publication
+authority). The same epoch is not retried; a declaration with a higher epoch is.
+A promotion whose inventory leaves out an admitted name is still a
+`SourceContract` failure. Sources served as `ImmutableFileSource` treat any
+replacement of their path as `SourceChanged` regardless, so serve volumes that
+may be repaired in place through a caller-provided `RangeSource`.
+
 ## Strict encrypted replacement evidence
 
 For strict verification of repaired encrypted store, supply explicit new sources
@@ -305,7 +327,11 @@ that established Passed packed evidence; the missing original ciphertext has not
 silently become available.
 
 Publication still requires the original whole-set authority and protection of
-**every** supplied replacement input. Initial replacement publication supports
+**every** supplied replacement input. **Use `ImmutableFileSource` for every
+replacement lane that should be able to publish:** it is the only source type
+that authorizes publication, and the session recognises it by its concrete type,
+so a wrapper around it does not. A single lane from any other source keeps the
+artifact `Unpublished` even when verification reaches `Strict`. Initial replacement publication supports
 actual `ImmutableFileSource` native adapters, with retained path/descriptor/stamp
 checks and alias protection. Custom opaque or claimed native/non-file replacement
 providers can establish cooperative content evidence but remain unpublished,

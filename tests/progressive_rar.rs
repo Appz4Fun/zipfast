@@ -2153,3 +2153,106 @@ fn complete_native_same_epoch_change_is_refused_by_the_requested_volume() {
     assert!((2..30).contains(&last), "refused after opening volume {last}");
     assert!(!out.join("member.bin").exists());
 }
+
+/// A caller-provided native source: reads through its own descriptor and reports it as its backing file.
+struct HeldFile {
+    file: File,
+    id: u128,
+    len: u64,
+}
+impl RangeSource for HeldFile {
+    fn info(&self) -> SourceInfo {
+        SourceInfo { id: SourceId(self.id), generation: 0, extent: self.len, length: SourceLength::Final(self.len) }
+    }
+    fn backing_files(&self) -> &[File] {
+        std::slice::from_ref(&self.file)
+    }
+    fn read_at(&mut self, at: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        use std::io::{Read, Seek, SeekFrom};
+        self.file.seek(SeekFrom::Start(at)).unwrap();
+        let n = self.file.read(buf).unwrap();
+        Ok(RangeRead::Filled { count: n })
+    }
+}
+
+/// Opaque until volume 1 is requested, then Complete with handles opened at that moment. With `repair`, volume 0
+/// is first replaced on disk by a byte-identical copy (a new inode), as a par2 repair renaming over it would.
+struct Promoting {
+    paths: Vec<std::path::PathBuf>,
+    handles: Option<Vec<Arc<File>>>,
+    repair: bool,
+    epoch: u64,
+}
+impl VolumeSource for Promoting {
+    fn volume(&mut self, r: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        if r.index == 1 && self.handles.is_none() {
+            if self.repair {
+                let copy = self.paths[0].with_extension("repaired");
+                std::fs::copy(&self.paths[0], &copy).unwrap();
+                std::fs::rename(&copy, &self.paths[0]).unwrap();
+            }
+            self.handles = Some(self.paths.iter().map(|p| Arc::new(File::open(p).unwrap())).collect());
+        }
+        Ok(match self.paths.get(r.index as usize) {
+            Some(p) => {
+                let file = File::open(p).unwrap();
+                let len = file.metadata().unwrap().len();
+                VolumeAnswer::Ready(Box::new(HeldFile { file, id: u128::from(r.index) + 1, len }))
+            }
+            None => VolumeAnswer::Missing,
+        })
+    }
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        let Some(handles) = &self.handles else { return Ok(ProtectionDeclaration::Opaque) };
+        Ok(ProtectionDeclaration::Complete {
+            epoch: self.epoch,
+            inventory: ProtectionInventory {
+                volumes: self
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| ProtectedVolume {
+                        index: i as u32,
+                        name: p.file_name().unwrap().into(),
+                        backing: VolumeBacking::Native(vec![ProtectedPath {
+                            path: p.clone(),
+                            file: Some(handles[i].clone()),
+                        }]),
+                    })
+                    .collect(),
+                auxiliary_paths: vec![],
+            },
+        })
+    }
+}
+#[test]
+fn opaque_promotion_with_a_repaired_volume_falls_back_instead_of_failing() {
+    // A provider promotes its Opaque declaration to Complete once the set is final. If a volume the session
+    // already read was replaced meanwhile (new inode), the promotion used to fail the whole session with
+    // SourceContract from the coverage check. It is now declined: the session stays Opaque and extracts
+    // everything, without Strict publication authority. Without the repair the promotion is adopted.
+    const VOLUMES: usize = 4;
+    for repair in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let data: Vec<u8> = (0..VOLUMES * 1024).map(|i| (i * 11 % 251) as u8).collect();
+        let paths = complete_native_set(tmp.path(), &data, 1024);
+        let provider = Promoting { paths, handles: None, repair, epoch: 1 };
+        let mut s = ProgressiveSession::new(Box::new(provider), complete_native_options(&out, VOLUMES)).unwrap();
+        let mut outcomes = Vec::new();
+        let failure = drive_complete(&mut s, |e| {
+            if let ProgressiveEvent::MemberFinished { outcome, .. } = e {
+                outcomes.push(match outcome {
+                    MemberOutcome::Verified(_) => "verified",
+                    MemberOutcome::Provisional(_) => "provisional",
+                    _ => "other",
+                });
+            }
+        });
+        assert!(failure.is_none(), "repair {repair}: {failure:?}");
+        assert_eq!(outcomes.len(), 1, "repair {repair}: {outcomes:?}");
+        assert_eq!(outcomes[0], if repair { "provisional" } else { "verified" });
+        assert_eq!(out.join("member.bin").exists(), !repair);
+    }
+}

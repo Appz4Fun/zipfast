@@ -1489,3 +1489,141 @@ fn outside_write_to_a_proven_part_forces_a_full_readback() {
         assert!(verify(&mut s, &mut a).is_err(), "a changed proven part must fail verification");
     }
 }
+
+/// An `ImmutableFileSource` that reports one range of its volume as a hole.
+struct HoledFile {
+    inner: ImmutableFileSource,
+    hole: Option<Range<u64>>,
+}
+impl RangeSource for HoledFile {
+    fn info(&self) -> SourceInfo {
+        self.inner.info()
+    }
+    fn backing_files(&self) -> &[File] {
+        self.inner.backing_files()
+    }
+    fn read_at(&mut self, at: u64, b: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        let mut len = b.len();
+        if let Some(h) = &self.hole {
+            if h.start <= at && at < h.end {
+                return Ok(RangeRead::Hole { len: (h.end - at).min(len as u64) });
+            }
+            if at < h.start {
+                len = len.min((h.start - at) as usize);
+            }
+        }
+        self.inner.read_at(at, &mut b[..len], cx)
+    }
+}
+struct HoledSet {
+    paths: Vec<std::path::PathBuf>,
+    handles: Vec<std::sync::Arc<File>>,
+    hole: (u32, Range<u64>),
+}
+impl VolumeSource for HoledSet {
+    fn volume(&mut self, r: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        Ok(match self.paths.get(r.index as usize) {
+            Some(p) => VolumeAnswer::Ready(Box::new(HoledFile {
+                inner: ImmutableFileSource::open(p)?,
+                hole: (r.index == self.hole.0).then(|| self.hole.1.clone()),
+            })),
+            None => VolumeAnswer::Missing,
+        })
+    }
+    fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
+        Ok(ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory {
+                volumes: self
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| ProtectedVolume {
+                        index: i as u32,
+                        name: p.file_name().unwrap().into(),
+                        backing: VolumeBacking::Native(vec![ProtectedPath {
+                            path: p.clone(),
+                            file: Some(self.handles[i].clone()),
+                        }]),
+                    })
+                    .collect(),
+                auxiliary_paths: vec![],
+            },
+        })
+    }
+}
+#[test]
+fn complete_set_of_200_volumes_with_200_replacement_lanes_fits_bookkeeping() {
+    // SourceBookkeeping is cumulative. Before #116/#121 every step rechecked the whole Complete inventory and every
+    // admission re-sorted it, so a set this size ran out of the default 64 MiB a fifth of the way in. Strict
+    // replacement evidence then adds one lane per member part, and every poll_verify used to run the full
+    // inventory recheck too: over 16 MiB at 200 volumes and over the default 64 MiB at 300. The whole run,
+    // extraction, 200 lane admissions, verification and publication, now fits in 16 MiB (300 volumes need about
+    // 9 MiB of it). 200 keeps the descriptors held, about three per volume, under common 1024 limits. Tiny volumes keep this fast; the
+    // cost is per volume, not per byte.
+    const VOLUMES: usize = 200;
+    const PART: usize = 32;
+    let dir = tempfile::tempdir().unwrap();
+    let plain: Vec<u8> = (0..VOLUMES * PART - 5).map(|i| (i * 7 % 251) as u8).collect();
+    let salt = [3; 16];
+    let iv = [9; 16];
+    let (key, _) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &salt, None).unwrap();
+    let mut padded = plain.clone();
+    padded.resize((plain.len() + 15) & !15, 0);
+    let cipher = zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap();
+    let mut spec = FileSpec::new("inner", &cipher);
+    spec.size = Some(plain.len() as u64);
+    spec.extra = vec![36, 1, 0, 0, 1];
+    spec.extra.extend(salt);
+    spec.extra.extend(iv);
+    let input = dir.path().join("in");
+    let replacements = dir.path().join("repaired");
+    std::fs::create_dir_all(&input).unwrap();
+    std::fs::create_dir_all(&replacements).unwrap();
+    let parts: Vec<&[u8]> = cipher.chunks(PART).collect();
+    assert_eq!(parts.len(), VOLUMES);
+    let damaged = (VOLUMES / 2) as u32;
+    let mut hole = 0..0;
+    let mut paths = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let last = i + 1 == VOLUMES;
+        let mut v = common::SIG.to_vec();
+        v.extend(common::main_block(true, (i > 0).then_some(i as u64)));
+        let crc = if last { crc32fast::hash(&plain) } else { crc32fast::hash(part) };
+        v.extend(common::file_block(&spec, part, crc, i > 0, !last));
+        v.extend(common::end_block(!last));
+        if i as u32 == damaged {
+            let start = v.windows(part.len()).position(|b| b == *part).unwrap() as u64;
+            hole = start + 1..start + 2;
+        }
+        let name = format!("a.part{:03}.rar", i + 1);
+        std::fs::write(input.join(&name), &v).unwrap();
+        std::fs::write(replacements.join(&name), &v).unwrap();
+        paths.push(input.join(name));
+    }
+    let handles = paths.iter().map(|p| std::sync::Arc::new(File::open(p).unwrap())).collect();
+    let mut opts = options(&dir.path().join("out"));
+    opts.first_name = "a.part001.rar".into();
+    opts.limits.volume_handles = 4 * VOLUMES as u64 + 16;
+    opts.limits.source_bookkeeping = 16 << 20;
+    opts.set_password(Some("pw".into())).unwrap();
+    let mut s =
+        ProgressiveSession::new(Box::new(HoledSet { paths: paths.clone(), handles, hole: (damaged, hole) }), opts)
+            .unwrap();
+    let mut a = artifact(&mut s);
+    let holes = a.holes().to_vec();
+    assert!(!holes.is_empty());
+    for h in holes {
+        s.patch(&mut a, h.offset, &plain[h.offset as usize..(h.offset + h.len) as usize]).unwrap();
+    }
+    let required: Vec<u32> = a.required_verification_volumes().collect();
+    assert_eq!(required.len(), VOLUMES);
+    for index in required {
+        let path = replacements.join(paths[index as usize].file_name().unwrap());
+        s.supply_verification_source(index, Box::new(ImmutableFileSource::open(&path).unwrap())).unwrap();
+    }
+    let v = verify(&mut s, &mut a).unwrap();
+    assert_eq!(v.level(), VerificationLevel::Strict);
+    assert_eq!(a.publication(), ArtifactPublication::Strict);
+    assert_eq!(std::fs::read(dir.path().join("out/inner")).unwrap(), plain);
+}
