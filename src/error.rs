@@ -98,6 +98,18 @@ pub enum RarScope {
     Member { index: Option<u64> },
 }
 
+impl fmt::Display for RarScope {
+    /// Reads as a person would say it: `member 3` (counting from 1) or `the headers of part2.rar`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Member { index: Some(index) } => write!(f, "member {}", index.saturating_add(1)),
+            Self::Member { index: None } => f.write_str("a member"),
+            Self::Header { volume } if volume.as_os_str().is_empty() => f.write_str("the archive headers"),
+            Self::Header { volume } => write!(f, "the headers of {}", volume.display()),
+        }
+    }
+}
+
 /// Checks and framing violations found while reading a RAR archive.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -256,11 +268,11 @@ pub enum RarFailure {
 impl fmt::Display for RarFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PasswordRequired { scope } => write!(f, "password required for {scope:?}"),
-            Self::WrongPassword { scope } => write!(f, "password rejected for {scope:?}"),
-            Self::Integrity { scope, reason, .. } => write!(f, "RAR integrity failure in {scope:?} ({reason:?})"),
+            Self::PasswordRequired { scope } => write!(f, "password required for {scope}"),
+            Self::WrongPassword { scope } => write!(f, "password rejected for {scope}"),
+            Self::Integrity { scope, reason, .. } => write!(f, "RAR integrity failure in {scope} ({reason:?})"),
             Self::EncryptedIntegrity { scope, reason, .. } => {
-                write!(f, "RAR integrity failure or wrong password in {scope:?} ({reason:?})")
+                write!(f, "RAR integrity failure or wrong password in {scope} ({reason:?})")
             }
             Self::Unsupported(reason) => write!(f, "unsupported RAR feature ({reason:?})"),
             Self::Limit { resource, requested, allowed } => {
@@ -401,5 +413,21 @@ impl RarFault {
             }
             _ => unreachable!("missing legacy RAR error projection"),
         }
+    }
+}
+
+#[cfg(test)]
+mod rar_scope_display_tests {
+    use super::{RarFailure, RarScope};
+    use std::path::PathBuf;
+
+    #[test]
+    fn scopes_read_as_words() {
+        assert_eq!(RarScope::Member { index: Some(0) }.to_string(), "member 1");
+        assert_eq!(RarScope::Member { index: None }.to_string(), "a member");
+        assert_eq!(RarScope::Header { volume: PathBuf::from("a.part2.rar") }.to_string(), "the headers of a.part2.rar");
+        assert_eq!(RarScope::Header { volume: PathBuf::new() }.to_string(), "the archive headers");
+        let e = RarFailure::PasswordRequired { scope: RarScope::Member { index: Some(0) } };
+        assert_eq!(e.to_string(), "password required for member 1");
     }
 }
