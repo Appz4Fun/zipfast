@@ -561,9 +561,10 @@ fn decode_name(
             .map_err(FileParseError::Progressive)?;
     }
     for scalar in char::decode_utf16(units) {
-        // U+FFFE marks a name mapped from bytes that aren't UTF-8; a stored one would pass for that mark
+        // U+FFFE marks a name mapped from bytes that aren't UTF-8; a stored one would pass for that mark, so it
+        // lists as the noncharacter U+FFFF, which no name is written under (`crate::path::rar_output_name`)
         let c = separator(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?);
-        name.push(if c == '\u{FFFE}' { '\u{FFFD}' } else { c });
+        name.push(if c == '\u{FFFE}' { '\u{FFFF}' } else { c });
     }
     Ok(name)
 }
@@ -577,8 +578,8 @@ fn separator(c: char) -> char {
 
 /// A RAR4 name without (usable) Unicode encoding. Stored bytes that aren't UTF-8 read as UnRAR on Unix reads them
 /// (`CharToWideMap` in a UTF-8 locale): U+FFFE marks the name, then each byte that doesn't start a valid sequence
-/// becomes U+E000 plus its value. A name so marked lists as UnRAR lists it; extraction refuses it, as it refuses
-/// any name holding bytes that aren't UTF-8. Map walks (`lenient`) keep such a name by its raw bytes instead.
+/// becomes U+E000 plus its value. A name so marked lists as UnRAR lists it, and is written under its private-use
+/// characters (`crate::path::rar_output_name`). Map walks (`lenient`) keep such a name by its raw bytes instead.
 fn legacy_name(
     encoded: &[u8],
     lenient: bool,
@@ -603,8 +604,8 @@ fn legacy_name(
             .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
             .map_err(FileParseError::Progressive)?;
     }
-    // a stored U+FFFE would pass for the mark of a mapped name
-    let stored_mark = |c: char| if c == '\u{FFFE}' && value.as_ptr() != mapped_ptr { '\u{FFFD}' } else { c };
+    // a stored U+FFFE lists as U+FFFF, as in a Unicode name; such a name is never written
+    let stored_mark = |c: char| if c == '\u{FFFE}' && value.as_ptr() != mapped_ptr { '\u{FFFF}' } else { c };
     name.extend(value.chars().map(stored_mark).map(separator));
     Ok(name)
 }

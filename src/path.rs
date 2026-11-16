@@ -20,8 +20,6 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// `windows_names`: the archive was made on Windows, so a backslash is a separator there and a drive letter or
-/// a reserved character means nothing on this side.
 /// The name a RAR member is written under, from its decoded name; None when it can't be written.
 ///
 /// A RAR 4.x legacy name holding bytes that aren't UTF-8 decodes as UnRAR decodes it: U+FFFE marks the name and
@@ -29,7 +27,8 @@ use crate::error::{Error, Result};
 /// characters and without the mark: valid UTF-8 on every file system, never a `/`, `\` or `.`, and distinct for
 /// distinct raw bytes. The decoder maps every U+E080..U+E0FF character of a marked name from a byte, so the
 /// written name gives the raw name back. To keep the mapping one to one, an unmarked name holding U+E080..U+E0FF
-/// is refused (it would collide with a mapped one), and so is any marked RAR 5.0 name.
+/// is refused (it would collide with a mapped one), and so is any marked RAR 5.0 name. A RAR 4.x name that stored
+/// U+FFFE itself decodes with U+FFFF in its place (it would pass for the mark otherwise) and is refused.
 pub(crate) fn rar_output_name(name: &str, rar4: bool) -> Option<std::borrow::Cow<'_, str>> {
     let mapped = |c: char| ('\u{E080}'..='\u{E0FF}').contains(&c);
     match name.find('\u{FFFE}') {
@@ -40,11 +39,14 @@ pub(crate) fn rar_output_name(name: &str, rar4: bool) -> Option<std::borrow::Cow
             (!before.contains(mapped) && !after.contains('\u{FFFE}'))
                 .then(|| std::borrow::Cow::Owned(format!("{before}{after}")))
         }
+        _ if rar4 && name.contains('\u{FFFF}') => None,
         None if rar4 && name.contains(mapped) => None,
         None => Some(std::borrow::Cow::Borrowed(name)),
     }
 }
 
+/// `windows_names`: the archive was made on Windows, so a backslash is a separator there and a drive letter or
+/// a reserved character means nothing on this side.
 pub fn sanitize(name: &str, windows_names: bool) -> Result<PathBuf> {
     sanitize_fallible(name, windows_names).map_err(|_| Error::UnsafePath(name.to_string()))
 }
@@ -137,6 +139,9 @@ mod tests {
         assert_eq!(out("caf\u{E0E9}.txt", true), None);
         assert_eq!(out("\u{E0E9}\u{FFFE}\u{E0E8}", true), None);
         assert_eq!(out("a\u{FFFE}\u{E0E9}\u{FFFE}", true), None);
+        // a stored U+FFFE (decoded as U+FFFF) is refused; U+FFFD is ordinary text
+        assert_eq!(out("a\u{FFFF}", true), None);
+        assert_eq!(out("a\u{FFFD}", true).as_deref(), Some("a\u{FFFD}"));
         // RAR 5.0 names are UTF-8: a mark there is refused, other private-use characters are only text
         assert_eq!(out("caf\u{FFFE}\u{E0E9}.txt", false), None);
         assert_eq!(out("caf\u{E0E9}.txt", false).as_deref(), Some("caf\u{E0E9}.txt"));

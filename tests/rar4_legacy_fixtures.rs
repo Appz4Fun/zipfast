@@ -611,3 +611,26 @@ fn raw_legacy_names_extract_one_to_one_on_every_route() {
         assert_eq!(files_under(&out), want, "{host}: progressive");
     }
 }
+
+/// A name that stores U+FFFE itself would pass for the mark of a mapped name: it is refused, and a name with
+/// U+FFFD next to it is written as it is, so the two never meet.
+#[test]
+fn a_stored_mark_is_refused_and_never_merges_with_a_replacement_character() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("marks.rar");
+    let members = [
+        header(0x74, 3, "a\u{fffe}".as_bytes(), b"mark", 0o100644, &[]),
+        header(0x74, 3, "a\u{fffd}".as_bytes(), b"replacement", 0o100644, &[]),
+    ];
+    fs::write(&path, archive(&members)).unwrap();
+    let out = dir.path().join("out");
+    let mut failures = Vec::new();
+    extract::run_rar_with_outcomes(&path, &options(&out), None, |o: &RarEntryOutcome| {
+        if let extract::RarOutcome::Failed(f) = &o.outcome {
+            failures.push(format!("{f:?}"));
+        }
+    })
+    .unwrap();
+    assert!(failures.len() == 1 && failures[0].contains("NameEncoding"), "{failures:?}");
+    assert_eq!(files_under(&out), [("a\u{fffd}".to_owned(), b"replacement".to_vec())]);
+}
