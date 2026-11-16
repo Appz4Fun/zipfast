@@ -165,6 +165,8 @@ pub struct EndDiscovery {
     tail_start: u64,
     end_offset: Option<u64>,
     retain_comment: bool,
+    /// Accept the disk declarations of a disk-spanning set (see [`DirectoryParser::spanned_at_eocd`]).
+    spanned: bool,
     rank: Rank,
     cursor: usize,
     rejected: Option<DirectoryError>,
@@ -225,6 +227,7 @@ impl EndDiscovery {
             tail_start,
             end_offset,
             retain_comment,
+            spanned: false,
             rank: Rank::Exact,
             cursor: 0,
             rejected: None,
@@ -760,7 +763,7 @@ impl EndDiscovery {
         declaration: DirectoryDeclaration,
         first_header: Option<CentralHeader>,
     ) -> Result<(), DirectoryError> {
-        if self.profile == Profile::Zipfast && self.candidate().unsupported_disk() {
+        if self.profile == Profile::Zipfast && !self.spanned && self.candidate().unsupported_disk() {
             return Err(DirectoryError::UnsupportedDisk);
         }
         let comment = self.candidate().comment.clone();

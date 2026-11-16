@@ -26,8 +26,8 @@
 //! A [`VolumeMap`] lists the headers of one RAR volume read on its own, at any position in its set and possibly cut
 //! short ([`MemberMap::from_volume`], [`VolumeMapBuilder`]).
 //!
-//! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given) and single-disk ZIP are
-//! mapped. Passwords and keys never appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
+//! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given), single-disk ZIP and split
+//! ZIP sets (`name.z01`, ..., `name.zip`, passed in that order) are mapped. Passwords and keys never appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
 //! See `docs/member-map.md`.
 //!
 //! [`MemberReader`] and [`extract_member_from`] stream a stored member's plaintext from any output offset, reading
@@ -36,6 +36,7 @@
 
 mod member_reader;
 pub(crate) mod zip;
+pub(crate) mod zip_split;
 
 pub use member_reader::{
     ExtractFromError, ExtractedFrom, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
@@ -354,7 +355,8 @@ pub struct MapMember {
     pub name: Option<String>,
     pub is_dir: bool,
     pub unpacked_size: Option<u64>,
-    /// Packed bytes over the pieces seen.
+    /// Packed bytes: for RAR over the pieces seen; for ZIP the size the directory declares, even when only some
+    /// pieces are present (the pieces show what is).
     pub packed_size: u64,
     pub method: MapMethod,
     pub mapping: OutputMapping,
@@ -490,6 +492,10 @@ pub enum MapError {
     Aborted { volume: u32 },
     /// The builder already returned its result.
     AlreadyFinished,
+    /// A split ZIP's end of central directory record, or a volume holding part of its central directory, is not
+    /// available: the volume is missing or cut short. `volume` is the zero-based index looked at: in memory, the last
+    /// slice; through a source whose last volume is missing, the first of the indexes in a row without a volume.
+    MissingDirectory { volume: u32 },
 }
 
 impl std::fmt::Display for MapError {
@@ -508,6 +514,9 @@ impl std::fmt::Display for MapError {
             Self::Source(failure) => write!(f, "source failure: {failure}"),
             Self::Aborted { volume } => write!(f, "source aborted at volume {volume}"),
             Self::AlreadyFinished => write!(f, "map already returned"),
+            Self::MissingDirectory { volume } => {
+                write!(f, "split ZIP directory or end record not available (volume {volume})")
+            }
         }
     }
 }
@@ -609,15 +618,70 @@ pub(crate) trait MapInput {
     fn read(&mut self, offset: u64, buf: &mut [u8], cx: &mut Context<'_>) -> Result<Got, ProgressiveFailure>;
     /// Length of the current volume.
     fn len(&self) -> u64;
+    /// Keeps the current volume under `slot`, so that [`Self::select`] can make it current again after other volumes
+    /// were opened, without asking the source again. A later call for the same volume moves it to the new slot.
+    fn keep(&mut self, _slot: u32) {}
+    /// Makes the volume kept under `slot` current. False when nothing is kept there.
+    fn select(&mut self, _slot: u32) -> bool {
+        false
+    }
+    /// Closes the volume kept under `slot`. Kept volumes otherwise stay open until the walk ends; walkers bound how
+    /// many they keep by [`ProgressiveLimits::volume_handles`].
+    fn release(&mut self, _slot: u32) {}
+    /// How many volumes the input holds, when it knows (volumes in memory).
+    fn count(&self) -> Option<u32> {
+        None
+    }
 }
 
 struct MemoryInput<'a> {
     volumes: &'a [&'a [u8]],
     current: Option<&'a [u8]>,
+    current_slot: Option<u32>,
+    kept: Vec<Option<&'a [u8]>>,
+}
+
+impl<'a> MemoryInput<'a> {
+    fn new(volumes: &'a [&'a [u8]]) -> Self {
+        Self { volumes, current: None, current_slot: None, kept: Vec::new() }
+    }
 }
 
 impl MapInput for MemoryInput<'_> {
+    fn count(&self) -> Option<u32> {
+        u32::try_from(self.volumes.len()).ok()
+    }
+    fn release(&mut self, slot: u32) {
+        if let Some(kept) = self.kept.get_mut(slot as usize) {
+            *kept = None;
+        }
+        if self.current_slot == Some(slot) {
+            self.current = None;
+            self.current_slot = None;
+        }
+    }
+    fn keep(&mut self, slot: u32) {
+        if let Some(old) = self.current_slot.replace(slot) {
+            self.kept[old as usize] = None;
+        }
+        let slot = slot as usize;
+        if self.kept.len() <= slot {
+            self.kept.resize(slot + 1, None);
+        }
+        self.kept[slot] = self.current;
+    }
+    fn select(&mut self, slot: u32) -> bool {
+        match self.kept.get(slot as usize).copied().flatten() {
+            Some(volume) => {
+                self.current = Some(volume);
+                self.current_slot = Some(slot);
+                true
+            }
+            None => false,
+        }
+    }
     fn open(&mut self, request: &VolumeRequest, _: &mut Context<'_>) -> Result<Opened, ProgressiveFailure> {
+        self.current_slot = None;
         self.current = self.volumes.get(request.index as usize).copied();
         Ok(if self.current.is_some() { Opened::Ready } else { Opened::Missing })
     }
@@ -638,11 +702,55 @@ impl MapInput for MemoryInput<'_> {
 struct SourceInput {
     source: Box<dyn VolumeSource>,
     current: Option<Box<dyn RangeSource>>,
+    /// The slot the current volume is kept under, if any.
+    current_slot: Option<u32>,
+    kept: Vec<Option<Box<dyn RangeSource>>>,
+}
+
+impl SourceInput {
+    pub(crate) fn new(source: Box<dyn VolumeSource>) -> Self {
+        Self { source, current: None, current_slot: None, kept: Vec::new() }
+    }
+
+    /// Puts the current volume back in its slot, or drops it when it is not kept.
+    fn put_back(&mut self) {
+        let current = self.current.take();
+        if let Some(slot) = self.current_slot.take() {
+            self.kept[slot as usize] = current;
+        }
+    }
 }
 
 impl MapInput for SourceInput {
+    fn release(&mut self, slot: u32) {
+        if self.current_slot == Some(slot) {
+            self.current = None;
+            self.current_slot = None;
+        } else if let Some(kept) = self.kept.get_mut(slot as usize) {
+            *kept = None;
+        }
+    }
+    fn keep(&mut self, slot: u32) {
+        self.current_slot = Some(slot);
+        let slot = slot as usize;
+        if self.kept.len() <= slot {
+            self.kept.resize_with(slot + 1, || None);
+        }
+    }
+    fn select(&mut self, slot: u32) -> bool {
+        if self.current_slot == Some(slot) {
+            return self.current.is_some();
+        }
+        if self.kept.get(slot as usize).is_none_or(Option::is_none) {
+            return false;
+        }
+        self.put_back();
+        self.current = self.kept[slot as usize].take();
+        self.current_slot = Some(slot);
+        true
+    }
     fn open(&mut self, request: &VolumeRequest, cx: &mut Context<'_>) -> Result<Opened, ProgressiveFailure> {
-        self.current = None;
+        self.put_back();
         Ok(match self.source.volume(request, cx)? {
             VolumeAnswer::Ready(source) => {
                 self.current = Some(source);
@@ -726,6 +834,7 @@ enum Engine {
     Tail,
     Rar(Box<crate::rar5::map::RarWalker>),
     Zip(Box<zip::ZipWalker>),
+    ZipSplit(Box<zip_split::ZipSplitWalker>),
     Done,
 }
 
@@ -817,6 +926,15 @@ impl Core {
                             if self.magic.len() < 4 {
                                 continue;
                             }
+                            let split_start = self.magic == zip_split::SPLIT_MARKER
+                                || (self.magic == b"PK\x03\x04" && zip_split::is_split_name(&self.options.first_name));
+                            if split_start && !self.single {
+                                self.engine = Engine::ZipSplit(Box::new(zip_split::ZipSplitWalker::new(
+                                    self.usage.clone(),
+                                    &self.options,
+                                )));
+                                continue;
+                            }
                             if self.magic == b"PK\x03\x04" || self.magic == b"PK\x05\x06" {
                                 if self.single {
                                     return Poll::Ready(Err(MapError::NotArchive));
@@ -875,6 +993,7 @@ impl Core {
                 }
                 Engine::Rar(walker) => return walker.poll(input, cx),
                 Engine::Zip(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
+                Engine::ZipSplit(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
                 Engine::Done => return Poll::Ready(Err(MapError::AlreadyFinished)),
             }
         }
@@ -884,6 +1003,9 @@ impl Core {
 impl MemberMap {
     /// Maps an archive whose volumes are in memory, in order, starting with the first. A volume may be cut short
     /// and later volumes may be absent: the map then has `complete: false` and lists what was seen.
+    ///
+    /// A split ZIP set is passed as `.z01`, `.z02`, ..., `.zip`: the last slice must be the `.zip`, whose end record
+    /// gives the volume count, and a missing middle volume is an empty slice. See `docs/member-map.md`.
     pub fn from_memory(
         volumes: &[&[u8]],
         first_name: impl AsRef<OsStr>,
@@ -894,7 +1016,7 @@ impl MemberMap {
 
     /// [`Self::from_memory`] with explicit options.
     pub fn from_memory_with(volumes: &[&[u8]], options: MapOptions) -> Result<MemberMap, MapError> {
-        let mut input = MemoryInput { volumes, current: None };
+        let mut input = MemoryInput::new(volumes);
         let mut core = Core::new(options, false);
         let mut cx = Context::from_waker(Waker::noop());
         match core.poll_map(&mut input, &mut cx) {
@@ -916,7 +1038,7 @@ impl MemberMap {
     /// failures; the volume in [`MapError`] variants is 0. ZIP is [`MapError::NotArchive`].
     pub fn from_volume(bytes: &[u8], options: MapOptions) -> Result<VolumeMap, MapError> {
         let volumes = [bytes];
-        let mut input = MemoryInput { volumes: &volumes, current: None };
+        let mut input = MemoryInput::new(&volumes);
         let mut core = Core::new(options, true);
         let mut cx = Context::from_waker(Waker::noop());
         match core.poll_volume(&mut input, &mut cx) {
@@ -932,6 +1054,9 @@ impl MemberMap {
 /// task's waker when a retry is warranted, and the parked read is retried with the same length. A
 /// [`RangeRead::Hole`] inside header bytes is [`MapError::HeaderHole`]. [`VolumeAnswer::Missing`] after the first
 /// volume ends the map with `complete: false`.
+///
+/// A split ZIP set's volumes are asked for in order, volume `i` first as `name.z{i+1}` and, when that is missing, as
+/// `name.zip` (names derived from [`MapOptions::first_name`], `name.z01`); see `docs/member-map.md`.
 pub struct MapBuilder {
     input: SourceInput,
     core: Core,
@@ -939,7 +1064,7 @@ pub struct MapBuilder {
 
 impl MapBuilder {
     pub fn new(source: Box<dyn VolumeSource>, options: MapOptions) -> Self {
-        Self { input: SourceInput { source, current: None }, core: Core::new(options, false) }
+        Self { input: SourceInput::new(source), core: Core::new(options, false) }
     }
 
     pub fn poll_map(&mut self, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
