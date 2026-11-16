@@ -71,6 +71,8 @@ pub enum RarSkipReason {
     ExistingTarget,
     OlderVersion(u64),
     MissingStart,
+    /// [`crate::extract::MemberFilter::on_start`] declined it.
+    Declined,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,6 +315,7 @@ impl Reports<'_> {
             Self::Legacy { summary, callback } => {
                 match reason {
                     RarSkipReason::ExistingTarget => callback.line(&format!("{}: exists, skipped", ctx.entry.name)),
+                    RarSkipReason::Declined => callback.line(&format!("{}: declined, skipped", ctx.entry.name)),
                     RarSkipReason::OlderVersion(v) => {
                         callback.line(&format!("{}: older version {v}, skipped", ctx.entry.name))
                     }

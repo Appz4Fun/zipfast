@@ -889,6 +889,11 @@ fn checked_place(
             summary.skipped += 1;
             Ok(None)
         }
+        Checked::Declined => {
+            report.line(&format!("{name}: declined, skipped"));
+            summary.skipped += 1;
+            Ok(None)
+        }
         Checked::Blocked(why) => {
             fail(summary, report, name, why);
             Ok(None)

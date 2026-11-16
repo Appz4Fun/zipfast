@@ -47,6 +47,7 @@ pub mod volume;
 pub mod zip;
 
 pub use error::{Error, Result};
+pub use output::STAGED_PREFIX;
 
 mod cli;
 

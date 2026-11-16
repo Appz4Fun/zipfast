@@ -247,6 +247,11 @@ impl Run<'_> {
                 self.summary.skipped += 1;
                 Ok(None)
             }
+            Checked::Declined => {
+                self.report.line(&format!("{name}: declined, skipped"));
+                self.summary.skipped += 1;
+                Ok(None)
+            }
             Checked::Blocked(why) => {
                 self.fail(name, why);
                 Ok(None)
