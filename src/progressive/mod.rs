@@ -17,11 +17,13 @@
 //! Bounded, caller-driven progressive source contracts.
 
 mod error;
+mod growing;
 mod limits;
 mod output;
 mod session;
 mod source;
 pub use error::*;
+pub use growing::{GrowingFileSource, GrowingFileVolumes, GrowingOptions, GrowthNotifier};
 pub use limits::*;
 pub use output::{
     Artifact, ArtifactAftermath, ArtifactEvidence, ArtifactPublication, ArtifactRead, AuthenticationEvidence,

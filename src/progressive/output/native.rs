@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Identity(pub u64, pub u64);
 impl Identity {
     pub(crate) fn metadata(meta: &Metadata) -> std::io::Result<Self> {
