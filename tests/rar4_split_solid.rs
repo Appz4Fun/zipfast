@@ -1048,3 +1048,122 @@ fn prybar_corpus_matches_unrar() {
     assert!(mismatched.is_empty(), "differ from UnRAR: {mismatched:?}");
     assert!(!matched.is_empty());
 }
+
+fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0, 0, kind];
+    bytes.extend(flags.to_le_bytes());
+    bytes.extend(((body.len() + 7) as u16).to_le_bytes());
+    bytes.extend(body);
+    let crc = hash(&bytes[2..]) as u16;
+    bytes[..2].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+/// A RAR 2.0 stored member.
+fn rar20_stored(name: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend((data.len() as u32).to_le_bytes());
+    body.extend((data.len() as u32).to_le_bytes());
+    body.push(3);
+    body.extend(hash(data).to_le_bytes());
+    body.extend(0x50221884u32.to_le_bytes());
+    body.extend([20, 0x30]);
+    body.extend((name.len() as u16).to_le_bytes());
+    body.extend(0o100644u32.to_le_bytes());
+    body.extend(name);
+    let mut wire = rar4_block(0x74, 0x8000, &body);
+    wire.extend(data);
+    wire
+}
+/// A volume of a RAR 2.0 set (main header `MHD_VOLUME`) holding whole members only.
+fn rar20_volume(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut wire = b"Rar!\x1a\x07\0".to_vec();
+    wire.extend(rar4_block(0x73, 0x0001, &[0; 6]));
+    for (name, data) in members {
+        wire.extend(rar20_stored(name, data));
+    }
+    wire
+}
+
+/// Serves the first volume of a set from memory, and answers the next one with `next`.
+struct FirstOnly {
+    first: Option<Box<[u8]>>,
+    next: fn() -> VolumeAnswer,
+}
+struct Memory(Box<[u8]>);
+impl RangeSource for Memory {
+    fn info(&self) -> SourceInfo {
+        SourceInfo {
+            id: SourceId(1),
+            generation: 0,
+            extent: self.0.len() as u64,
+            length: SourceLength::Final(self.0.len() as u64),
+        }
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        let bytes = &self.0[offset as usize..];
+        let count = bytes.len().min(buf.len());
+        buf[..count].copy_from_slice(&bytes[..count]);
+        Ok(RangeRead::Filled { count })
+    }
+    fn backing_files(&self) -> &[fs::File] {
+        &[]
+    }
+}
+impl VolumeSource for FirstOnly {
+    fn volume(&mut self, request: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
+        Ok(match (request.index, self.first.take()) {
+            (0, Some(first)) => VolumeAnswer::Ready(Box::new(Memory(first))),
+            _ => (self.next)(),
+        })
+    }
+}
+
+/// A RAR 2.x volume carries no end-of-archive block, so one whose main header says it is part of a set (MHD_VOLUME)
+/// and that ends exactly between members is not the end of the set: the next volume is asked for.
+#[test]
+fn a_rar_2_x_set_split_between_members_goes_on_to_the_next_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (x, y) = (b"first member, in the first volume".as_slice(), b"second member, in the second".as_slice());
+    let v0 = rar20_volume(&[(b"x.txt", x)]);
+    let v1 = rar20_volume(&[(b"y.txt", y)]);
+    let options = |dest: &Path| ProgressiveOptions::new(options(dest), OsString::from("set.rar"));
+
+    // Every volume given up front: both members extract and the set ends after the last volume.
+    let dest = tmp.path().join("sealed");
+    let mut session = ProgressiveSession::from_sealed_memory(
+        vec![("set.rar".into(), v0.clone().into_boxed_slice()), ("set.r00".into(), v1.into_boxed_slice())],
+        options(&dest),
+    )
+    .unwrap();
+    assert!(drive(&mut session, || {}).is_empty());
+    assert_eq!(fs::read(dest.join("x.txt")).unwrap(), x);
+    assert_eq!(fs::read(dest.join("y.txt")).unwrap(), y);
+
+    // The next volume has not arrived: the session waits for it instead of reporting the set complete.
+    let provider = FirstOnly { first: Some(v0.clone().into_boxed_slice()), next: || VolumeAnswer::Wait };
+    let mut session = ProgressiveSession::new(Box::new(provider), options(&tmp.path().join("wait"))).unwrap();
+    let mut finished = 0;
+    let mut pending = 0;
+    for _ in 0..10_000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => {
+                pending += 1;
+                if pending > 3 {
+                    break;
+                }
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => finished += 1,
+            Poll::Ready(Ok(Some(_))) => {}
+            Poll::Ready(Ok(None)) => panic!("the set ended before its next volume"),
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+        }
+    }
+    assert_eq!((finished, pending), (1, 4));
+
+    // A last volume cut off between members (the next one is missing) is not complete either.
+    let provider = FirstOnly { first: Some(v0.into_boxed_slice()), next: || VolumeAnswer::Missing };
+    let mut session = ProgressiveSession::new(Box::new(provider), options(&tmp.path().join("missing"))).unwrap();
+    let problems = drive(&mut session, || {});
+    // (An opaque provider's member is provisional, an "other outcome" here.)
+    assert!(problems.last().is_some_and(|p| p.contains("MissingVolume")), "{problems:?}");
+}

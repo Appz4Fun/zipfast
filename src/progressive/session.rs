@@ -227,6 +227,9 @@ pub struct ProgressiveSession {
     rar4_history: Option<crate::rar5::member::Rar4Owner>,
     /// every member so far was written by an archiver older than RAR 2.9, which writes no end-of-archive block
     pre_29: bool,
+    /// A pre-2.9 volume that names itself part of a set ended between members: the next volume is asked for, and
+    /// only a sealed in-memory set (every volume given up front) may end there when it has no next volume.
+    pre_29_open_end: bool,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -360,6 +363,7 @@ impl ProgressiveSession {
             rar4_independent: None,
             rar4_history: None,
             pre_29: true,
+            pre_29_open_end: false,
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -517,7 +521,22 @@ impl ProgressiveSession {
             }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
+                Phase::NextVolume
+                    if self.pre_29_open_end
+                        && self.driver.sealed_volume_count().is_some_and(|n| n <= self.volume as usize + 1) =>
+                {
+                    // Every volume of a sealed set was given up front: one that ends between members with no
+                    // next volume after it is the last.
+                    self.pre_29_open_end = false;
+                    if let Some(output) = &mut self.output {
+                        output.finish_directories(&mut self.driver)?;
+                    }
+                    #[cfg(feature = "persistent-partials")]
+                    self.partial_finish_directories()?;
+                    self.phase = Phase::Done;
+                }
                 Phase::NextVolume => {
+                    self.pre_29_open_end = false;
                     self.volume = self
                         .volume
                         .checked_add(1)
@@ -674,7 +693,12 @@ impl ProgressiveSession {
                         {
                             // Archives older than RAR 2.9 write no end-of-archive block: UnRAR ends them at a block
                             // boundary, going on to the next volume while a member waits for its next part.
+                            // A volume whose main header has MHD_VOLUME set expects more volumes, so ending
+                            // between members there is not the end of the set: ask for the next one.
                             if self.member.is_some() {
+                                self.phase = Phase::NextVolume;
+                            } else if self.volume_set == Some(true) {
+                                self.pre_29_open_end = true;
                                 self.phase = Phase::NextVolume;
                             } else {
                                 if let Some(output) = &mut self.output {
