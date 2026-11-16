@@ -244,6 +244,19 @@ impl Rar4Metadata {
     }
 }
 
+/// The leading fields of a RAR 5.0 file encryption record (extra record 0x01), as stored. 7-Zip lists them in the
+/// method string: `AES:<kdf_count>`, then `:<flags>` when the flags are not zero (`AES:15:3`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct Rar5CryptRecord {
+    /// Encryption version: 0 is AES-256.
+    pub version: u64,
+    /// Raw flags: 0x1 a password check value is stored, 0x2 checksums are keyed with the password.
+    pub flags: u64,
+    /// Base-2 logarithm of the PBKDF2 iteration count.
+    pub kdf_count: u8,
+}
+
 /// A file or service header.
 #[derive(Clone, Debug, Default)]
 pub struct FileHeader {
@@ -276,6 +289,12 @@ pub struct FileHeader {
     pub name: String,
     pub encrypted: bool,
     pub crypt: Option<crate::crypto::Rar5CryptParams>,
+    /// RAR 5.0: the version, flags and KDF count of the file encryption record as stored, even when `crypt` is
+    /// None because the record is unsupported (a KDF count over 24, a newer version). None without the record.
+    pub crypt_record: Option<Rar5CryptRecord>,
+    /// RAR 5.0: the redirection record's flags as stored (0x1: the target is a directory, which 7-Zip lists as
+    /// `:D`). Zero without the record.
+    pub redirection_flags: u64,
     pub redirection: Option<Redirection>,
     /// set on an older revision of a file kept alongside the current one
     pub version: Option<u64>,
@@ -602,6 +621,12 @@ fn parse_file_extra(
             FHEXTRA_CRYPT => {
                 f.encrypted = true;
                 let record = r.bytes(r.remaining())?;
+                let mut lead = Cursor::new(record);
+                if let (Ok(version), Ok(flags)) = (lead.vint(), lead.vint())
+                    && let Some(&kdf_count) = record.get(lead.pos())
+                {
+                    f.crypt_record = Some(Rar5CryptRecord { version, flags, kdf_count });
+                }
                 let parsed = crate::crypto::parse_rar5_crypt(record, crate::crypto::Rar5CryptLayout::Member);
                 f.crypt = parsed.ok();
                 crypt = Some(parsed);
@@ -618,7 +643,7 @@ fn parse_file_extra(
             }
             FHEXTRA_REDIR => {
                 let kind = r.vint()?;
-                let _flags = r.vint()?;
+                f.redirection_flags = r.vint()?;
                 let len = r.vsize()?;
                 let target = r.bytes(len)?;
                 if catalogue && !(1..=5).contains(&kind) {

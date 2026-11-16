@@ -57,6 +57,8 @@ const ID_EMPTY_STREAM: u64 = 0x0E;
 const ID_EMPTY_FILE: u64 = 0x0F;
 const ID_ANTI: u64 = 0x10;
 const ID_NAME: u64 = 0x11;
+const ID_CTIME: u64 = 0x12;
+const ID_ATIME: u64 = 0x13;
 const ID_MTIME: u64 = 0x14;
 const ID_WIN_ATTRIBUTES: u64 = 0x15;
 const ID_ENCODED_HEADER: u64 = 0x17;
@@ -196,6 +198,8 @@ struct FileEntry {
     /// An anti item (a deletion marker in an update archive): not listed.
     anti: bool,
     attributes: Option<u32>,
+    ctime: Option<u64>,
+    atime: Option<u64>,
     mtime: Option<u64>,
 }
 
@@ -572,7 +576,7 @@ impl<'a> Reader<'a> {
                         return Err(Bad::Malformed("7z names"));
                     }
                 }
-                ID_MTIME | ID_WIN_ATTRIBUTES => {
+                ID_CTIME | ID_ATIME | ID_MTIME | ID_WIN_ATTRIBUTES => {
                     let defined = sub.defined(n)?;
                     if sub.byte()? != 0 {
                         return Err(Bad::Unsupported("7z file properties stored outside the header"));
@@ -581,14 +585,15 @@ impl<'a> Reader<'a> {
                         if !defined {
                             continue;
                         }
-                        if id == ID_MTIME {
-                            file.mtime = Some(sub.u64()?);
-                        } else {
-                            file.attributes = Some(sub.u32()?);
+                        match id {
+                            ID_CTIME => file.ctime = Some(sub.u64()?),
+                            ID_ATIME => file.atime = Some(sub.u64()?),
+                            ID_MTIME => file.mtime = Some(sub.u64()?),
+                            _ => file.attributes = Some(sub.u32()?),
                         }
                     }
                 }
-                // Creation and access times, start positions, padding and the like.
+                // Start positions, padding and the like.
                 _ => {}
             }
         }
@@ -1276,6 +1281,8 @@ impl SevenZipWalker {
                 cipher: None,
                 checks: Some(MapChecks::default()),
                 mtime: file.mtime.map(filetime),
+                ctime: file.ctime.map(filetime),
+                atime: file.atime.map(filetime),
                 dos_time: None,
                 attributes: u64::from(file.attributes.unwrap_or(0)),
                 unix_mode: file.attributes.filter(|a| a & ATTRIBUTE_UNIX_EXTENSION != 0).map(|a| a >> 16),

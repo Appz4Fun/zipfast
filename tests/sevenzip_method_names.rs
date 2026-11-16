@@ -46,3 +46,19 @@ fn empty_members_and_directories_have_no_method() {
         }
     }
 }
+
+#[test]
+fn creation_and_access_times_when_stored() {
+    // times.7z: 7zz -mtc=on -mta=on; a.txt modified 2020-01-02 03:04:05, accessed 2021-03-04 05:06:07 (both local
+    // time, same UTC offset), created whenever the fixture was made (`7z l -slt`: `.5437579` past the second).
+    let e = &list("times.7z")[0];
+    let mtime = e.mtime.unwrap();
+    let (atime, atime_ns) = e.atime.unwrap();
+    assert_eq!((atime - mtime, atime_ns), (1_614_834_367 - 1_577_934_245, 0));
+    let (ctime, ctime_ns) = e.ctime.unwrap();
+    assert!(ctime > atime);
+    assert_eq!(ctime_ns, 543_757_900);
+    // Archives made without them (gen.sh passes -mtc=off -mta=off) carry neither.
+    let e = &list("lzma2.7z")[0];
+    assert_eq!((e.ctime, e.atime), (None, None));
+}

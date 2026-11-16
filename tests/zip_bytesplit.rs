@@ -1,0 +1,141 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+//! A raw byte-split ZIP (`.zip.001`, ...) lists, inspects and extracts as the pieces concatenated, as 7-Zip reads it.
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use zipfast::extract::{self, Inspection, Mode, Options, Overwrite};
+
+fn first() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zip-bytesplit/bytesplit.zip.001")
+}
+
+fn options(dest: &Path, mode: Mode) -> Options {
+    Options {
+        mode,
+        dest: dest.to_path_buf(),
+        overwrite: Overwrite::Always,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+    }
+}
+
+fn names(entries: &[extract::Entry]) -> Vec<(&str, u64)> {
+    entries.iter().map(|e| (e.name.as_str(), e.size)).collect()
+}
+
+#[test]
+fn lists_and_inspects_the_whole_set() {
+    let entries = extract::list(&first()).unwrap();
+    assert_eq!(names(&entries), [("noise.bin", 3000), ("tiny.txt", 5)]);
+    assert_eq!(entries[1].crc32, Some(crc32fast::hash(b"tiny\n")));
+    match extract::inspect(&first()).unwrap() {
+        Inspection::Other(entries) => assert_eq!(names(&entries), [("noise.bin", 3000), ("tiny.txt", 5)]),
+        _ => panic!("a byte-split ZIP inspects as a listing"),
+    }
+}
+
+#[test]
+fn tests_and_extracts_across_pieces() {
+    let dir = tempfile::tempdir().unwrap();
+    let crc = extract::list(&first()).unwrap()[0].crc32.unwrap();
+    let tested = extract::run(&first(), &options(dir.path(), Mode::Test), |_| {}).unwrap();
+    assert_eq!((tested.files, tested.volumes, tested.errors.len()), (2, 4, 0), "{:?}", tested.errors);
+    let extracted = extract::run(&first(), &options(dir.path(), Mode::Extract), |_| {}).unwrap();
+    assert_eq!((extracted.files, extracted.errors.len()), (2, 0), "{:?}", extracted.errors);
+    let noise = fs::read(dir.path().join("noise.bin")).unwrap();
+    assert_eq!((noise.len(), crc32fast::hash(&noise)), (3000, crc));
+    assert_eq!(fs::read(dir.path().join("tiny.txt")).unwrap(), b"tiny\n");
+}
+
+#[test]
+fn a_lone_first_piece_is_an_ordinary_zip() {
+    // Only the first piece: not a set, so the ZIP reader sees a truncated archive.
+    let dir = tempfile::tempdir().unwrap();
+    let lone = dir.path().join("lone.zip.001");
+    fs::copy(first(), &lone).unwrap();
+    assert!(extract::list(&lone).is_err());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn checked_entry_points_route_the_set_through_the_split_layer() {
+    use zipfast::extract::{Cancellation, ProjectedInspection};
+    match extract::inspect_projected_cancelable(&first(), None, &Cancellation::default()).unwrap() {
+        ProjectedInspection::Other(entries) => assert_eq!(names(&entries), [("noise.bin", 3000), ("tiny.txt", 5)]),
+        _ => panic!("a byte-split ZIP inspects as a listing"),
+    }
+}
+
+/// A stored ZIP of `(name, data)` members.
+fn stored_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let (mut out, mut central) = (Vec::new(), Vec::new());
+    for (name, data) in members {
+        let at = out.len() as u32;
+        let crc = crc32fast::hash(data);
+        let common = |sig: &[u8], out: &mut Vec<u8>, central: bool| {
+            out.extend(sig);
+            if central {
+                out.extend(20u16.to_le_bytes());
+            }
+            out.extend(20u16.to_le_bytes());
+            out.extend([0; 2 + 2 + 4]); // flags, method, time and date
+            out.extend(crc.to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+        };
+        common(b"PK\x03\x04", &mut out, false);
+        out.extend(name.as_bytes());
+        out.extend(*data);
+        common(b"PK\x01\x02", &mut central, true);
+        central.extend([0; 2 + 2 + 2 + 4]); // comment, disk, internal and external attributes
+        central.extend(at.to_le_bytes());
+        central.extend(name.as_bytes());
+    }
+    let (cd_at, cd_len, n) = (out.len() as u32, central.len() as u32, members.len() as u16);
+    out.extend(central);
+    out.extend(b"PK\x05\x06");
+    out.extend([0; 4]);
+    out.extend(n.to_le_bytes());
+    out.extend(n.to_le_bytes());
+    out.extend(cd_len.to_le_bytes());
+    out.extend(cd_at.to_le_bytes());
+    out.extend([0; 2]);
+    out
+}
+
+#[test]
+fn extracting_beside_the_set_never_overwrites_a_piece() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = stored_zip(&[("set.zip.002", b"evil two"), ("set.zip.003", b"evil three"), ("ok.txt", b"fine")]);
+    let pieces: Vec<_> = zip.chunks(zip.len() / 3 + 1).collect();
+    for (i, piece) in pieces.iter().enumerate() {
+        fs::write(dir.path().join(format!("set.zip.{:03}", i + 1)), piece).unwrap();
+    }
+    let first = dir.path().join("set.zip.001");
+    let result = extract::run(&first, &options(dir.path(), Mode::Extract), |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (1, 2), "{:?}", result.errors);
+    for (i, piece) in pieces.iter().enumerate() {
+        assert_eq!(fs::read(dir.path().join(format!("set.zip.{:03}", i + 1))).unwrap(), *piece);
+    }
+    assert_eq!(fs::read(dir.path().join("ok.txt")).unwrap(), b"fine");
+}

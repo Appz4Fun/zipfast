@@ -740,7 +740,7 @@ pub enum MtimeOrigin {
 
 /// One entry for a listing.
 ///
-/// `mode`, `mtime_origin` and `attributes` are additive in this unpublished
+/// `mode`, `mtime_origin`, `ctime`, `atime` and `attributes` are additive in this unpublished
 /// 0.1 API; downstream struct literals must supply them (`None` when the
 /// archive holds no such metadata).
 #[derive(Clone, Debug)]
@@ -754,6 +754,12 @@ pub struct Entry {
     pub mtime: Option<i64>,
     /// Which clock `mtime` was read from: `Some` exactly when `mtime` is.
     pub mtime_origin: Option<MtimeOrigin>,
+    /// Creation time as UTC seconds since 1970 and nanoseconds, for 7z members whose header stores kCTime
+    /// (`7z a -mtc=on`); `None` for other formats.
+    pub ctime: Option<(i64, u32)>,
+    /// Last access time as UTC seconds since 1970 and nanoseconds, for 7z members whose header stores kATime
+    /// (`7z a -mta=on`); `None` for other formats.
+    pub atime: Option<(i64, u32)>,
     /// Raw Windows (MS-DOS) attribute bits (`FILE_ATTRIBUTE_*`: read-only 0x1,
     /// hidden 0x2, system 0x4, directory 0x10, archive 0x20, ...), when the
     /// archive was made on a host that stores them: ZIP hosts 0 (FAT), 6
@@ -992,12 +998,22 @@ pub(crate) enum CheckedRoute {
 pub(crate) enum LegacyRoute {
     Tar,
     SevenZip,
-    Rar { signature: crate::rar5::reader::HeldSignature, path: PathBuf },
+    /// A raw byte-split ZIP (`name.zip.001`, `name.zip.002`, ...), read as the pieces concatenated.
+    SplitZip,
+    Rar {
+        signature: crate::rar5::reader::HeldSignature,
+        path: PathBuf,
+    },
 }
 #[allow(clippy::result_large_err)]
 pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::ZipReadResult<CheckedRoute> {
     let (opened, head) = crate::zip::read::CheckedOpen::open(path, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
     match classify_head(&head) {
+        Format::Zip if crate::zip::is_byte_split(path) => {
+            // The checked reader holds one source file; a byte-split set reopens its pieces by path.
+            opened.retire()?;
+            Ok(CheckedRoute::Legacy(LegacyRoute::SplitZip))
+        }
         Format::Zip => Ok(CheckedRoute::Zip(opened)),
         Format::Tar => {
             // TAR deliberately retains its incumbent path-based ownership scope.
@@ -1043,6 +1059,10 @@ impl LegacyRoute {
                 let limits = crate::sevenzip::SevenZipLimits::default();
                 crate::sevenzip::run_reporting(first, options, password, cancel, &limits, report)
             }
+            Self::SplitZip => {
+                cancel.check_io().map_err(Error::from)?;
+                crate::zip::run_renaming(first, options, password, |line: &str| report.line(line))
+            }
             Self::Rar { signature, .. } => {
                 let mut reports = Reports::legacy(report);
                 let result = rar_run_shared_open(first, options, password, Some(cancel), &mut reports, || {
@@ -1057,6 +1077,7 @@ impl LegacyRoute {
         match self {
             Self::Tar => crate::tar::list(first),
             Self::SevenZip => crate::sevenzip::list(first, password),
+            Self::SplitZip => crate::zip::list(first),
             Self::Rar { signature, .. } => {
                 rar_list_from_volume(Volume::from_held_signature(first, signature, password)?, password)
             }
@@ -1341,6 +1362,12 @@ impl SelectedEntry {
             CheckedRoute::Legacy(LegacyRoute::SevenZip) => {
                 return Err(ReadFault::Legacy(Error::Unsupported("reading one 7z entry on its own".into())).into());
             }
+            CheckedRoute::Legacy(LegacyRoute::SplitZip) => {
+                return Err(ReadFault::Legacy(Error::Unsupported(
+                    "reading one entry of a byte-split ZIP on its own".into(),
+                ))
+                .into());
+            }
             CheckedRoute::Legacy(LegacyRoute::Rar { signature, path: held_path }) => {
                 let volume = Volume::from_held_signature(&held_path, signature, password).map_err(ReadFault::Legacy)?;
                 let (header, chain_start) =
@@ -1594,7 +1621,7 @@ fn rar_selected_header_from_volume(
 pub enum ProjectedInspection {
     /// The original checked ZIP source and its single projected catalogue.
     Zip(crate::zip::ProjectedReadSession),
-    /// The existing listing for TAR, compressed streams, or RAR.
+    /// The existing listing for TAR, compressed streams, 7z, RAR, or a byte-split ZIP (`.zip.001`).
     Other(Vec<Entry>),
 }
 
@@ -1679,6 +1706,11 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
     let format = classify_head(&head[..n]);
     cancel.check_io().map_err(Error::from)?;
     let entries = match format {
+        // A byte-split set (`.zip.001`) has no single source for a ZIP read session: list it as a whole.
+        Format::Zip if crate::zip::is_byte_split(first) => {
+            drop(source);
+            crate::zip::list(first)?
+        }
         Format::Zip => return source.into_zip(cancel).map(Inspection::Zip),
         Format::Tar => {
             drop(source);
@@ -2019,6 +2051,8 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
         out.push(Entry {
             mode,
             mtime_origin: h.mtime_origin(),
+            ctime: None,
+            atime: None,
             attributes: h.windows_attributes(),
             name: h.name,
             size: h.unpacked_size,

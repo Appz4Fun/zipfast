@@ -37,6 +37,7 @@ use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
 
+mod byte_split;
 pub mod create;
 pub mod read;
 pub mod recovery;
@@ -303,10 +304,12 @@ fn read_directory<T>(
     parser.finish().map_err(directory_error)
 }
 
-/// An open archive: the file and its central directory.
+/// An open archive: the file (or the pieces of a byte-split `.zip.001` set) and its central directory.
 pub struct Archive {
-    file: File,
+    file: byte_split::ArchiveSource,
     len: u64,
+    /// Every piece of a byte-split set; empty for one file.
+    pieces: Vec<PathBuf>,
     pub entries: Vec<ZipEntry>,
 }
 
@@ -316,11 +319,21 @@ impl Archive {
     }
 
     pub(crate) fn open_cancelable(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
-        let mut file = File::open(path)?;
-        let len = file.metadata()?.len();
+        let (mut file, len, pieces) = match byte_split::ByteSplit::open(path)? {
+            Some(split) => {
+                let pieces = split.paths().map(Path::to_path_buf).collect();
+                let len = split.len();
+                (byte_split::ArchiveSource::Split(split), len, pieces)
+            }
+            None => {
+                let file = File::open(path)?;
+                let len = file.metadata()?.len();
+                (byte_split::ArchiveSource::File(file), len, Vec::new())
+            }
+        };
         check_cancel(cancel)?;
         let (entries, _) = read_projected_legacy(&mut file, len, cancel)?;
-        Ok(Archive { file, len, entries })
+        Ok(Archive { file, len, pieces, entries })
     }
 
     /// Decodes the entry at a zero-based index and checks its integrity.
@@ -384,7 +397,11 @@ pub(crate) fn relocate_projected(
     }
     Ok(())
 }
-fn read_projected_legacy(file: &mut File, len: u64, cancel: Option<&Cancellation>) -> Result<(Vec<ZipEntry>, Usage)> {
+fn read_projected_legacy(
+    file: &mut (impl Read + Seek),
+    len: u64,
+    cancel: Option<&Cancellation>,
+) -> Result<(Vec<ZipEntry>, Usage)> {
     let parser = projected_parser(len, Limits::default()).map_err(directory_error)?;
     let directory = read_directory(file, len, parser, cancel)?;
     let usage = directory.usage;
@@ -804,6 +821,12 @@ fn decode_invalid_name(
     Ok(name)
 }
 
+/// Whether `path` is the first piece of a raw byte-split set (`name.zip.001` with `name.zip.002` beside it), which
+/// [`list`], [`Archive::open`] and [`run`] read as the pieces concatenated, as 7-Zip does.
+pub(crate) fn is_byte_split(path: &Path) -> bool {
+    byte_split::is_split_set(path)
+}
+
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
     let archive = Archive::open(path)?;
     Ok(archive
@@ -818,6 +841,8 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
             Entry {
                 mode,
                 mtime_origin: e.mtime_origin,
+                ctime: None,
+                atime: None,
                 attributes,
                 name: e.name,
                 size: e.size,
@@ -881,8 +906,15 @@ pub(crate) fn run_renaming(
     mut report: impl FnMut(&str),
 ) -> std::result::Result<Summary, RunError> {
     let mut archive = Archive::open(path)?;
-    let opts = &*opts.protecting(path)?;
-    let mut summary = Summary { volumes: 1, ..Summary::default() };
+    let mut opts = opts.protecting(path)?;
+    // Protect every piece of a byte-split set, not only the first.
+    for piece in &archive.pieces {
+        if let Ok(canonical) = piece.canonicalize() {
+            opts.to_mut().protected_paths.insert(canonical);
+        }
+    }
+    let opts = &*opts;
+    let mut summary = Summary { volumes: archive.pieces.len().max(1) as u64, ..Summary::default() };
     let mut buf = vec![0u8; BUF];
     let entries = std::mem::take(&mut archive.entries);
     let password = password.filter(|s| !s.is_empty());

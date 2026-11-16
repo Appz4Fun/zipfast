@@ -460,3 +460,25 @@ fn orphan_continuation_names_are_charged_to_capacity() {
         failure.failure
     );
 }
+
+#[test]
+fn redirection_flags_and_file_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("links.rar");
+    // A Unix symlink to a directory: redirection record (type 5), kind 1, flags 1 (target is a directory).
+    let target = b"sub";
+    let mut body = vec![5, 1, 1, target.len() as u8];
+    body.extend(target);
+    let mut extra = Vec::new();
+    vint(body.len() as u64, &mut extra);
+    extra.extend(body);
+    let link = FileSpec { extra, ..FileSpec::new("link", b"") };
+    let plain = FileSpec::new("plain", b"data");
+    fs::write(&path, archive(&[link, plain])).unwrap();
+    let session = RarSession::open(&path, None, single()).unwrap();
+    let members: Vec<_> = session.entries().collect();
+    assert!(members[0].redirection().is_some());
+    assert_eq!((members[0].redirection_flags(), members[1].redirection_flags()), (1, 0));
+    assert_eq!(members[1].rar5_file_flags().map(|f| f & 0x4), Some(0x4));
+    assert_eq!(session.volume_paths().collect::<Vec<_>>(), [path.as_path()]);
+}

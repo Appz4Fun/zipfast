@@ -553,6 +553,17 @@ impl<'a> RarMember<'a> {
         self.member.header.redirection.as_ref()
     }
 
+    /// RAR 5.0: the redirection record's raw flags (0x1: the link target is a directory). Zero without one.
+    pub fn redirection_flags(&self) -> u64 {
+        self.member.header.redirection_flags
+    }
+
+    /// RAR 5.0: the file header's raw file flags (0x1 directory, 0x2 time, 0x4 CRC, 0x8 unknown size). None for
+    /// RAR4 members.
+    pub fn rar5_file_flags(&self) -> Option<u64> {
+        (self.format() == super::RarFormat::Rar5).then_some(self.member.header.file_flags)
+    }
+
     pub fn version(&self) -> Option<u64> {
         self.member.header.version
     }
@@ -594,6 +605,12 @@ impl<'a> RarMember<'a> {
 
     pub fn encrypted(&self) -> bool {
         self.member.header.encrypted
+    }
+
+    /// RAR 5.0: the file encryption record's version, flags and KDF count as stored, for a 7-Zip-style method
+    /// string (`AES:15:3`). None for unencrypted and RAR4 members.
+    pub fn rar5_crypt_record(&self) -> Option<super::Rar5CryptRecord> {
+        self.member.header.crypt_record
     }
 
     /// Whether the observed parts include a final header.
@@ -755,6 +772,11 @@ impl RarSession {
 
     pub fn volumes(&self) -> impl ExactSizeIterator<Item = &RarVolumeMetadata> {
         self.volumes.iter().map(|volume| &volume.metadata)
+    }
+
+    /// The path of each volume, in the order of [`Self::volumes`].
+    pub fn volume_paths(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.volumes.iter().map(|volume| volume.path.as_path())
     }
 
     pub fn entries(&self) -> impl ExactSizeIterator<Item = RarMember<'_>> {
