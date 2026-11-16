@@ -1359,7 +1359,7 @@ fn check_cancel(cancel: &Cancellation) -> RarResult<()> {
 }
 
 pub(super) struct ScanBudget<'a> {
-    cancel: &'a Cancellation,
+    pub(super) cancel: &'a Cancellation,
     limits: RarCatalogueLimits,
     usage: &'a mut RarCatalogueUsage,
 }

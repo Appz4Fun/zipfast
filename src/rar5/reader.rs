@@ -595,11 +595,18 @@ impl Volume {
                             if let Some(budget) = budget.as_deref_mut() {
                                 budget.check()?;
                             }
-                            let (key, iv) = self
-                                .legacy_keys
-                                .get_or_insert_with(Default::default)
-                                .keys(pw, &salt, None)
-                                .map_err(|_| self.framing("RAR4 header key", Error::Encrypted))?;
+                            let cancel = budget.as_deref().map(|budget| budget.cancel);
+                            let (key, iv) =
+                                match self.legacy_keys.get_or_insert_with(Default::default).keys(pw, &salt, cancel) {
+                                    Ok(keys) => keys,
+                                    Err(crate::crypto::KdfControlError::Canceled) => {
+                                        return Err(RarFault::new(
+                                            RarFailure::Canceled,
+                                            std::io::Error::from(std::io::ErrorKind::Interrupted).into(),
+                                        ));
+                                    }
+                                    Err(_) => return Err(self.framing("RAR4 header key", Error::Encrypted)),
+                                };
                             parser.set_legacy_keys(&key, iv).map_err(|_| {
                                 RarFault::new(
                                     RarFailure::Internal(RarInternal::Invariant("RAR4 header key out of turn")),

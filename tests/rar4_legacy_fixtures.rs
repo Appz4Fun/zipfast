@@ -323,6 +323,43 @@ fn links_leading_out_of_the_destination_are_refused() {
     }
 }
 
+/// Flattened, a link is checked where it goes: `a/b/esc -> ../../outside` would land as `esc -> ../../outside`, so
+/// every route refuses it.
+#[test]
+fn a_flattened_link_is_checked_where_it_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    fs::write(&path, archive(&[link_member(b"a/b/esc", b"../../outside")])).unwrap();
+    let flat = |dest: &Path| Options { flatten: true, ..options(dest) };
+
+    let out = dir.path().join("run");
+    let summary = extract::run(&path, &flat(&out), |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(fs::symlink_metadata(out.join("esc")).is_err());
+
+    let out = dir.path().join("selected");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &flat(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (0, 1));
+    assert!(fs::symlink_metadata(out.join("esc")).is_err());
+
+    let out = dir.path().join("progressive");
+    let volume = (path.file_name().unwrap().to_owned(), fs::read(&path).unwrap().into_boxed_slice());
+    let opts = zipfast::progressive::ProgressiveOptions::new(flat(&out), path.file_name().unwrap().to_owned());
+    let mut session = zipfast::progressive::ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
+    let waker = std::task::Waker::noop();
+    let failure = loop {
+        match session.poll_event(&mut std::task::Context::from_waker(waker)) {
+            std::task::Poll::Ready(Err(failure)) => break failure,
+            std::task::Poll::Ready(Ok(None)) => panic!("the flattened link was created"),
+            _ => {}
+        }
+    };
+    assert!(matches!(failure.kind, zipfast::progressive::FailureKind::UnsafePath), "{failure:?}");
+    assert!(fs::symlink_metadata(out.join("esc")).is_err());
+}
+
 /// A member below a link the archive created is not written through it.
 #[test]
 fn a_member_is_never_written_through_a_link_from_the_archive() {

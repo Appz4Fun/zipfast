@@ -1492,6 +1492,14 @@ impl ProgressiveSession {
             let header = &self.model.members.last().expect("member").header;
             let rel = crate::path::sanitize(&header.name, !header.is_unix())
                 .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
+            // checked where the link goes: a flattened output drops the member's folders
+            let rel = if self.options.extract.flatten {
+                std::path::PathBuf::from(
+                    rel.file_name().ok_or_else(|| ProgressiveFailure::new(FailureKind::UnsafePath))?,
+                )
+            } else {
+                rel
+            };
             let text = std::mem::take(&mut self.link_text);
             if !crate::extract::link::contained(&rel, &text) {
                 return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
