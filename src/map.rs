@@ -75,7 +75,9 @@ pub enum MapEnd {
     /// Volume `volume` (zero-based) was not available. Every earlier volume was read to its end header.
     MissingVolume { volume: u32 },
     /// Volume `volume` ended at `offset` before its headers did, for example a buffer holding only a volume's
-    /// first bytes. Pieces whose headers were read are listed even when their data lies past the end.
+    /// first bytes. Pieces whose headers were read are listed even when their data lies past the end. 7z: a volume
+    /// of a byte split that cannot be its last is shorter than the longest (all but the last are cut at the same
+    /// size), so its bytes end at `offset`; nothing past the start header was read and no members are listed.
     Truncated { volume: u32, offset: u64 },
     /// The header at `offset` in volume `volume` is damaged or unsupported, after volume 0's main header was read.
     /// The walk stops there; members and pieces whose headers came before it are listed.
@@ -522,6 +524,9 @@ pub struct MapMember {
     pub unix_mode: Option<u32>,
     /// Whether the final piece was seen.
     pub complete: bool,
+    /// 7z members with [`OutputMapping::None`] (coded folders, and later members of a 7zAES folder) have no
+    /// pieces: their bytes are the folder's, listed once in `map.folders[slot.index].packed` (see
+    /// [`Self::folder`]), and their `packed_size` is 0.
     pub pieces: Vec<MapPiece>,
     /// 7z: the folder holding the member's data and its offset there. None for members without data (directories
     /// and empty files) and for other formats.

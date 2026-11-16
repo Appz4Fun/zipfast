@@ -193,7 +193,9 @@ A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuse
 `probe` reports `Packing::Unknown`.
 
 Members: one `MapMember` per file entry, in header order. `raw_name` is the name's UTF-16LE bytes as stored and
-`name` its decoding; `is_dir` is an empty stream that is not an empty file (or the directory attribute); `mtime`
+`name` its decoding; `is_dir` follows 7-Zip: an entry without a stream that is not an empty file, or that has the
+directory attribute (an entry with a stream is always a file). Anti items (deletion markers of update archives)
+are not listed, and `ordinal` counts the members listed. `mtime`
 and `attributes` are the header's, and `unix_mode` is set when the attribute's Unix extension bit (0x8000) is.
 `checks.crc32` is the substream CRC. `folder` is `Some(FolderSlot { index, offset })`: the folder in
 `MemberMap::folders` and the member's offset in that folder's output (its substream position). Directories and
@@ -214,10 +216,13 @@ The mapping depends on the folder:
 |---|---|---|---|
 | Copy coders only, one packed stream | `Stored` | `Direct` | the member's own bytes: packed stream start + `offset`, `unpacked_size` long, stream offsets from 0 |
 | 7zAES and Copy coders only, one packed stream; the member at `offset` 0 | `Stored` | `CbcBlocks` | the folder's ciphertext from its start, `unpacked_size` rounded up to 16 bytes; block 0 decrypts with `CipherParams::SevenZipAes::iv` |
-| 7zAES and Copy, a later member | `Stored` | `None` | the folder's packed bytes |
-| anything else (LZMA, LZMA2, BCJ, PPMd, 7zAES over LZMA, ...) | `Coders` | `None` | the folder's packed bytes, stream offsets over the folder's packed streams; `solid` when `offset` is not 0 |
+| 7zAES and Copy, a later member | `Stored` | `None` | none: use `map.folders[slot.index].packed` |
+| anything else (LZMA, LZMA2, BCJ, PPMd, 7zAES over LZMA, ...) | `Coders` | `None` | none: use `map.folders[slot.index].packed` (stream offsets over the folder's packed streams); `solid` when `offset` is not 0 |
 
-So an LZMA2 member gives its folder's packed range (`MapFolder::packed`, also the member's pieces) and the folder's
+Members mapped `None` carry no pieces and `packed_size: 0`, so a solid folder of many thousand members split over
+hundreds of volumes lists its spans once, in its `MapFolder`, rather than once per member.
+
+So an LZMA2 member gives its folder's packed range (`map.folders[slot.index].packed`) and the folder's
 `unpacked_size`; the caller finds LZMA2 chunks in that range itself. A later member of a 7zAES folder can still be
 read from its `FolderSlot::offset` with the folder's spans: CBC decryption starts at any block given the block
 before it.
@@ -237,7 +242,11 @@ than 0x3F) are `Unsupported`, as in 7-Zip.
 Cut sets: the header is at the end, so a set with only its first pieces cannot be listed. When a volume the header
 needs is missing (or ends before its advertised length), the map ends `HeaderUnavailable { volume, offset }` with
 `complete: false`, `volumes` the volumes opened and no members or folders. Bytes that end inside the signature header
-are `Truncated { volume: 0, offset: 0 }`. An empty archive (next header size 0) is `Complete` with no members.
+are `Truncated { volume: 0, offset: 0 }`. The volumes of a byte split are all cut at the same size except the
+last. When the volumes opened so far do not reach the header and one of them (including the latest) is shorter than
+the longest, its bytes ended early: the map ends `Truncated { volume, offset }` at its own end (no members) instead
+of asking for volumes past the end of the set. So does a volume before the last that is short when the header is
+reached. A set cut after a full-size volume asks for the next one and ends `HeaderUnavailable` when it is missing. An empty archive (next header size 0) is `Complete` with no members.
 
 Failures and budgets: every count in the header is an untrusted number and is checked against the bytes left in the
 header (each item takes at least a byte) before anything is allocated; files count against `entries` and

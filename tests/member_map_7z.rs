@@ -228,6 +228,41 @@ enum Entry {
     File(&'static str, Vec<u8>),
     Empty(&'static str),
     Dir(&'static str),
+    /// A file with data whose attributes carry the directory bit.
+    FileDirAttribute(&'static str, Vec<u8>),
+    /// An anti item: an empty stream flagged as a deletion marker.
+    Anti(&'static str),
+}
+
+impl Entry {
+    fn data(&self) -> Option<&Vec<u8>> {
+        match self {
+            Entry::File(_, b) | Entry::FileDirAttribute(_, b) => Some(b),
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Entry::File(n, _) | Entry::FileDirAttribute(n, _) | Entry::Empty(n) | Entry::Dir(n) | Entry::Anti(n) => n,
+        }
+    }
+}
+
+/// Empty-stream style bit vector property `id` for `flags`, when any is set.
+fn bit_property(h: &mut Vec<u8>, id: u8, flags: &[bool], always: bool) {
+    if !always && !flags.iter().any(|&f| f) {
+        return;
+    }
+    let mut bits = vec![0u8; flags.len().div_ceil(8)];
+    for (i, &f) in flags.iter().enumerate() {
+        if f {
+            bits[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    h.push(id);
+    num(h, bits.len() as u64);
+    h.extend_from_slice(&bits);
 }
 
 /// Streams info for `folders`, whose packed streams start `pack_pos` bytes after the signature header.
@@ -292,7 +327,7 @@ fn plain_header(folders: &[Folder], groups: &[(Method, Vec<Entry>)], loose: &[En
     for (_, entries) in groups {
         let mut sizes = Vec::new();
         for e in entries {
-            if let Entry::File(_, bytes) = e {
+            if let Some(bytes) = e.data() {
                 sizes.push(bytes.len() as u64);
                 crcs.push(crc(bytes));
                 files.push(e);
@@ -307,32 +342,18 @@ fn plain_header(folders: &[Folder], groups: &[(Method, Vec<Entry>)], loose: &[En
     }
     h.push(0x05);
     num(&mut h, files.len() as u64);
-    let empty: Vec<bool> = files.iter().map(|e| !matches!(e, Entry::File(..))).collect();
+    let empty: Vec<bool> = files.iter().map(|e| e.data().is_none()).collect();
     if empty.iter().any(|&e| e) {
-        let mut bits = vec![0u8; files.len().div_ceil(8)];
-        for (i, &e) in empty.iter().enumerate() {
-            if e {
-                bits[i / 8] |= 0x80 >> (i % 8);
-            }
-        }
-        h.push(0x0E);
-        num(&mut h, bits.len() as u64);
-        h.extend_from_slice(&bits);
-        let empties: Vec<&&Entry> = files.iter().filter(|e| !matches!(e, Entry::File(..))).collect();
-        let mut bits = vec![0u8; empties.len().div_ceil(8)];
-        for (i, e) in empties.iter().enumerate() {
-            if matches!(e, Entry::Empty(_)) {
-                bits[i / 8] |= 0x80 >> (i % 8);
-            }
-        }
-        h.push(0x0F);
-        num(&mut h, bits.len() as u64);
-        h.extend_from_slice(&bits);
+        bit_property(&mut h, 0x0E, &empty, true);
+        let empties: Vec<&&Entry> = files.iter().filter(|e| e.data().is_none()).collect();
+        let empty_file: Vec<bool> = empties.iter().map(|e| matches!(e, Entry::Empty(_))).collect();
+        bit_property(&mut h, 0x0F, &empty_file, true);
+        let anti: Vec<bool> = empties.iter().map(|e| matches!(e, Entry::Anti(_))).collect();
+        bit_property(&mut h, 0x10, &anti, false);
     }
     let mut names = vec![0u8];
     for e in &files {
-        let (Entry::File(n, _) | Entry::Empty(n) | Entry::Dir(n)) = e;
-        for u in n.encode_utf16() {
+        for u in e.name().encode_utf16() {
             names.extend_from_slice(&u.to_le_bytes());
         }
         names.extend_from_slice(&[0, 0]);
@@ -350,7 +371,7 @@ fn plain_header(folders: &[Folder], groups: &[(Method, Vec<Entry>)], loose: &[En
     let mut attrs = vec![1u8, 0];
     for e in &files {
         let a: u32 = match e {
-            Entry::Dir(_) => 0x10 | 0x8000 | (0o040755 << 16),
+            Entry::Dir(_) | Entry::FileDirAttribute(..) => 0x10 | 0x8000 | (0o040755 << 16),
             _ => 0x20 | 0x8000 | (0o100644 << 16),
         };
         attrs.extend_from_slice(&a.to_le_bytes());
@@ -425,13 +446,7 @@ fn build(groups: &[(Method, Vec<Entry>)], loose: &[Entry], mode: &HeaderMode) ->
     let mut folders = Vec::new();
     let mut body = Vec::new();
     for (method, entries) in groups {
-        let plain: Vec<u8> = entries
-            .iter()
-            .flat_map(|e| match e {
-                Entry::File(_, b) => b.clone(),
-                _ => Vec::new(),
-            })
-            .collect();
+        let plain: Vec<u8> = entries.iter().flat_map(|e| e.data().cloned().unwrap_or_default()).collect();
         let folder = make_folder(method, &plain);
         body.extend_from_slice(&folder.packed);
         folders.push(folder);
@@ -627,12 +642,10 @@ fn lzma2_folder_reports_its_packed_range_and_size_without_mapping() {
         assert_eq!(m.method, MapMethod::Coders);
         assert_eq!(m.solid, offset > 0);
         assert_eq!(m.folder, Some(FolderSlot { index: 0, offset }));
-        assert_eq!(m.packed_size, packed_len);
         assert_eq!(m.packed_spans(0..10), None);
-        // The pieces are the folder's packed bytes.
-        let spans: Vec<_> = m.pieces.iter().map(|p| (p.volume, p.packed.clone(), p.stream_offset)).collect();
-        let want: Vec<_> = folder.packed.iter().map(|s| (s.volume, s.packed.clone(), s.stream.start)).collect();
-        assert_eq!(spans, want);
+        // The folder's spans are listed once, in the folder; the member has none of its own.
+        assert!(m.pieces.is_empty());
+        assert_eq!(m.packed_size, 0);
     }
     // The gathered packed bytes decode to the folder output.
     let packed = gather(&volumes, &folder.packed);
@@ -705,6 +718,9 @@ fn aes_copy_folder_maps_cbc_blocks_that_decrypt_from_the_spans() {
     assert_eq!(mb.method, MapMethod::Stored);
     assert_eq!(mb.folder, Some(FolderSlot { index: 0, offset: 1000 }));
     assert_eq!(mb.cipher, Some(params.clone()));
+    assert!(mb.pieces.is_empty());
+    let error = extract_member_from(&refs(&volumes), &map, 1, 0, Some("secret"), &mut Vec::new()).unwrap_err();
+    assert!(matches!(error, ExtractFromError::Unsupported(UnsupportedRead::UnmappedCipher)), "{error:?}");
     // A lone 7zAES coder maps too.
     let mc = &map.members[2];
     assert_eq!(mc.mapping, OutputMapping::CbcBlocks);
@@ -773,11 +789,17 @@ fn cut_sets_report_the_header_unavailable() {
         assert_eq!(map.volumes, present as u32);
         assert!(map.members.is_empty() && map.folders.is_empty());
     }
-    // The last volume cut short.
+    // The last volume cut short: shorter than the first, so its bytes ended early; no volume past it is asked for.
     let mut cut = volumes.clone();
     cut[2].pop();
+    let last = cut[2].len() as u64;
     let map = map_set(&cut, None).unwrap();
-    assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: 3, offset: header_at });
+    assert_eq!(map.end, MapEnd::Truncated { volume: 2, offset: last });
+    assert_eq!(map.volumes, 3);
+    // The set cut after a full-size volume: the next one is asked for and missing.
+    let full = split(&archive, 3000);
+    let map = map_set(&full[..2], None).unwrap();
+    assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: 2, offset: header_at });
     // A single file cut short, and cut inside the signature header.
     let map = map_set(&[archive[..archive.len() - 10].to_vec()], None).unwrap();
     assert!(matches!(map.end, MapEnd::HeaderUnavailable { volume: 1, .. }));
@@ -1107,10 +1129,9 @@ fn assert_coded_members(map: &MemberMap, volumes: &[Vec<u8>], password: &str) ->
         }
         let slot = m.folder.unwrap();
         let folder = &map.folders[slot.index as usize];
-        let spans: Vec<_> = m.pieces.iter().map(|p| (p.volume, p.packed.clone(), p.stream_offset)).collect();
-        let want: Vec<_> = folder.packed.iter().map(|s| (s.volume, s.packed.clone(), s.stream.start)).collect();
-        assert_eq!(spans, want);
-        assert_eq!(m.packed_size, folder.pack_sizes.iter().sum::<u64>());
+        assert!(m.pieces.is_empty() && m.packed_size == 0);
+        let spans: u64 = folder.packed.iter().map(|s| s.packed.end - s.packed.start).sum();
+        assert_eq!(spans, folder.pack_sizes.iter().sum::<u64>());
         assert_eq!(m.packed_spans(0..1), None);
         let out = decode_folder(volumes, folder, password);
         let size = m.unpacked_size.unwrap();
@@ -1348,4 +1369,71 @@ fn real_encrypted_headers() {
     // rarinfo's range: 32-7615, the plaintext size rounded up to whole blocks.
     assert_eq!(m.pieces[0].packed, 32..7616);
     assert_eq!(assert_cbc_members(&map, &volumes), 1);
+}
+
+// ---- Review fixes ----
+
+#[test]
+fn split_solid_folder_with_many_members_maps_within_default_limits() {
+    // 25,000 members in one LZMA2 folder over about 186 volumes: the folder's spans are listed once.
+    let entries: Vec<Entry> = (0..25_000)
+        .map(|i| Entry::File(Box::leak(format!("dir/file{i:05}.bin").into_boxed_str()), noise(40, i as u64 + 1)))
+        .collect();
+    let archive = build(&[(Method::Lzma2, entries)], &[], &HeaderMode::Lzma2);
+    let volumes = split(&archive, archive.len().div_ceil(186));
+    assert!(volumes.len() >= 180, "{}", volumes.len());
+    let map = map_set(&volumes, None).unwrap();
+    assert!(map.complete);
+    assert_eq!(map.members.len(), 25_000);
+    let folder = &map.folders[0];
+    assert_eq!(folder.members, 25_000);
+    assert!(folder.packed.len() >= 100, "{}", folder.packed.len());
+    assert!(map.members.iter().all(|m| m.pieces.is_empty() && m.mapping == OutputMapping::None));
+    let last = &map.members[24_999];
+    assert_eq!(last.folder, Some(FolderSlot { index: 0, offset: 24_999 * 40 }));
+    assert_eq!(last.name.as_deref(), Some("dir/file24999.bin"));
+}
+
+#[test]
+fn a_short_middle_volume_is_truncated_there() {
+    let archive = build(&[(Method::Copy, vec![Entry::File("big", data(9000, 15))])], &[], &HeaderMode::Lzma2);
+    let volumes = split(&archive, 3000);
+    assert_eq!(volumes.len(), 4);
+    for short in 0..3 {
+        let mut cut = volumes.clone();
+        cut[short].truncate(2990);
+        let map = map_set(&cut, None).unwrap();
+        assert!(!map.complete && map.members.is_empty(), "{short}");
+        assert_eq!(map.end, MapEnd::Truncated { volume: short as u32, offset: 2990 }, "{short}");
+        assert!(map.volumes as usize <= short + 2);
+    }
+    // A short volume found before the header is reached does not ask for volumes past the set's end.
+    let mut cut = volumes.clone();
+    cut[0].truncate(2990);
+    let map = map_set(&cut[..2], None).unwrap();
+    assert_eq!(map.end, MapEnd::Truncated { volume: 0, offset: 2990 });
+    assert_eq!(map.volumes, 2);
+    // The last volume may be any size; a complete set still maps.
+    assert!(map_set(&volumes, None).unwrap().complete);
+}
+
+#[test]
+fn anti_items_are_not_listed_and_streams_are_files() {
+    let (a, b) = (data(100, 1), data(20, 2));
+    let archive = build(
+        &[(Method::Copy, vec![Entry::File("a", a.clone()), Entry::FileDirAttribute("b", b.clone())])],
+        &[Entry::Anti("gone.txt"), Entry::Dir("d"), Entry::Anti("gone-dir"), Entry::Empty("e")],
+        &HeaderMode::Plain,
+    );
+    let volumes = vec![archive];
+    let map = map_set(&volumes, None).unwrap();
+    let listed: Vec<_> = map.members.iter().map(|m| (m.ordinal, m.name.clone().unwrap(), m.is_dir)).collect();
+    assert_eq!(
+        listed,
+        vec![(0, "a".into(), false), (1, "b".into(), false), (2, "d".into(), true), (3, "e".into(), false)]
+    );
+    // A member with data and the directory attribute is a file, and its bytes map.
+    assert_eq!(map.members[1].attributes & 0x10, 0x10);
+    assert_direct_round_trips(&map.members[1], &volumes, &b);
+    assert_direct_round_trips(&map.members[0], &volumes, &a);
 }

@@ -1021,9 +1021,12 @@ pub struct MemberReader {
 
 impl MemberReader {
     /// A reader of member `member` of `map` from output offset `out_offset`. `options` names the first volume (later
-    /// volumes are asked for with the names [`next_volume_os`](crate::volume::next_volume_os) derives, or `name.z02`,
-    /// ..., `name.zip` for a split ZIP set, though providers usually key on [`VolumeRequest::index`]), and carries the
-    /// password, limits and cancellation.
+    /// volumes are asked for with the names [`next_volume_os`](crate::volume::next_volume_os) derives; `name.z02`,
+    /// ..., `name.zip` for a split ZIP set; for another name ending in `.` and digits that `next_volume_os` does not
+    /// handle (`set.7z.001`), the same number of digits counting up; else the name with `.next` appended. Providers
+    /// usually key on [`VolumeRequest::index`]). `options` also carries the password, limits and cancellation.
+    /// 7zAES members have no password check: a wrong password from a mid-member offset yields wrong plaintext
+    /// without an error, so verify such output.
     ///
     /// Fails at once, before any read, when the member cannot be read from that offset.
     pub fn new(

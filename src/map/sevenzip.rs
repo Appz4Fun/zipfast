@@ -55,6 +55,7 @@ const ID_CODERS_UNPACK_SIZE: u64 = 0x0C;
 const ID_NUM_UNPACK_STREAM: u64 = 0x0D;
 const ID_EMPTY_STREAM: u64 = 0x0E;
 const ID_EMPTY_FILE: u64 = 0x0F;
+const ID_ANTI: u64 = 0x10;
 const ID_NAME: u64 = 0x11;
 const ID_MTIME: u64 = 0x14;
 const ID_WIN_ATTRIBUTES: u64 = 0x15;
@@ -193,6 +194,8 @@ struct FileEntry {
     name: Option<String>,
     has_stream: bool,
     is_dir: bool,
+    /// An anti item (a deletion marker in an update archive): not listed.
+    anti: bool,
     attributes: Option<u32>,
     mtime: Option<u64>,
 }
@@ -535,6 +538,7 @@ impl<'a> Reader<'a> {
         files.resize_with(n, FileEntry::default);
         let mut empty_stream = vec![false; n];
         let mut empty_file: Vec<bool> = Vec::new();
+        let mut anti: Vec<bool> = Vec::new();
         loop {
             let id = self.number()?;
             if id == ID_END {
@@ -548,6 +552,7 @@ impl<'a> Reader<'a> {
                     empty_file = vec![false; empty_stream.iter().filter(|&&e| e).count()];
                 }
                 ID_EMPTY_FILE => empty_file = sub.bits(empty_file.len())?,
+                ID_ANTI => anti = sub.bits(empty_file.len())?,
                 ID_NAME => {
                     if sub.byte()? != 0 {
                         return Err(Bad::Unsupported("7z names stored outside the header"));
@@ -584,15 +589,21 @@ impl<'a> Reader<'a> {
                         }
                     }
                 }
-                // Creation and access times, anti items, start positions, padding and the like.
+                // Creation and access times, start positions, padding and the like.
                 _ => {}
             }
         }
-        let mut empties = empty_file.into_iter();
+        // As 7-Zip: an entry without a stream is a directory unless it is an empty file, or when its attributes say
+        // so; an entry with a stream is always a file. The empty-file and anti bits count over the empty streams.
+        let mut empty_index = 0usize;
         for (file, empty) in files.iter_mut().zip(empty_stream) {
             file.has_stream = !empty;
-            let empty_file = empty && empties.next().unwrap_or(false);
-            file.is_dir = (empty && !empty_file) || file.attributes.is_some_and(|a| a & ATTRIBUTE_DIRECTORY != 0);
+            if empty {
+                let empty_file = empty_file.get(empty_index).copied().unwrap_or(false);
+                file.anti = anti.get(empty_index).copied().unwrap_or(false);
+                file.is_dir = !empty_file || file.attributes.is_some_and(|a| a & ATTRIBUTE_DIRECTORY != 0);
+                empty_index += 1;
+            }
         }
         Ok(files)
     }
@@ -810,6 +821,20 @@ impl SevenZipWalker {
         })
     }
 
+    /// A plain byte split cuts every volume but the last at the same size. When one of the first `full` volumes is
+    /// shorter than the longest of them, its bytes ended early: the map ends `Truncated` there instead of asking
+    /// for volumes past the set's end.
+    fn short_volume(&self, full: usize) -> Result<Option<MemberMap>, MapError> {
+        let lens = &self.lens[..full.min(self.lens.len())];
+        let Some(&longest) = lens.iter().max() else { return Ok(None) };
+        match lens.iter().position(|&l| l < longest) {
+            None => Ok(None),
+            Some(volume) => self
+                .map(MapEnd::Truncated { volume: volume as u32, offset: lens[volume] }, Streams::default(), Vec::new())
+                .map(Some),
+        }
+    }
+
     fn unavailable(&self, volume: u32) -> Result<MemberMap, MapError> {
         self.map(MapEnd::HeaderUnavailable { volume, offset: self.header_at }, Streams::default(), Vec::new())
     }
@@ -993,9 +1018,16 @@ impl SevenZipWalker {
                 Phase::Volumes => {
                     let end = self.header_at + self.header_len;
                     if self.lens.iter().fold(0u64, |a, &l| a.saturating_add(l)) >= end {
+                        if let Some(map) = self.short_volume(self.lens.len() - 1)? {
+                            return Ok(Poll::Ready(map));
+                        }
                         self.start_job(self.header_at, self.header_len)?;
                         self.phase = Phase::NextHeader;
                         continue;
+                    }
+                    // Every volume before the one now needed is a full piece of the split, as long as the first.
+                    if let Some(map) = self.short_volume(self.lens.len())? {
+                        return Ok(Poll::Ready(map));
                     }
                     let index = self.lens.len() as u32;
                     match self.open(input, cx, index)? {
@@ -1212,9 +1244,12 @@ impl SevenZipWalker {
             .zip(streams.sub_sizes.iter().zip(&streams.sub_crcs));
         let mut folder_offset = (usize::MAX, 0u64);
         let mut members = Vec::with_capacity(files.len());
-        for (ordinal, file) in files.into_iter().enumerate() {
+        for file in files {
+            if file.anti {
+                continue;
+            }
             let base = MapMember {
-                ordinal: ordinal as u64,
+                ordinal: members.len() as u64,
                 raw_name: file.raw_name,
                 name: file.name,
                 is_dir: file.is_dir,
@@ -1291,20 +1326,8 @@ impl SevenZipWalker {
                         stream += n;
                     }
                 }
-                None => {
-                    member.mapping = OutputMapping::None;
-                    for span in &folder.packed {
-                        member.pieces.push(MapPiece {
-                            volume: span.volume,
-                            packed: span.packed.clone(),
-                            header: 0..0,
-                            stream_offset: span.stream.start,
-                            out: None,
-                            checks: MapChecks::default(),
-                            final_part: false,
-                        });
-                    }
-                }
+                // The folder's spans are listed once, in `MapFolder::packed`; the slot points there.
+                None => member.mapping = OutputMapping::None,
             }
             if let Some(last) = member.pieces.last_mut() {
                 last.final_part = true;

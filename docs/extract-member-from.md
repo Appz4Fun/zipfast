@@ -99,8 +99,10 @@ damage is `IncompleteMember`, while members whose headers all came before it rea
 - WinZip AES: the 2-byte password verifier gives `WrongPassword` (with a 1 in 65,536 chance of passing a wrong
   password).
 - ZipCrypto: the check byte gives `WrongPassword` (1 in 256).
-- 7zAES records no check value: as RAR 4.x, a wrong password shows only as a failed member CRC from offset 0
-  (`MemberBad`) or in the caller's own verify.
+- 7zAES records no check value: as RAR 4.x, a wrong password shows only as a failed member CRC when the read
+  covers the whole member from offset 0 (`MemberBad`). A read from a mid-member offset with a wrong password
+  returns garbage without any error, so callers must verify that output themselves (for example
+  `PartialFile::poll_verify`).
 
 `MemberReader::password_verified()` (and `ExtractedFrom::password_verified`) is true when:
 - the member is not encrypted;
