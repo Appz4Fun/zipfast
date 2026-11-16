@@ -785,21 +785,17 @@ fn cut_sets_report_the_header_unavailable() {
     for present in 1..3 {
         let map = map_set(&volumes[..present], None).unwrap();
         assert!(!map.complete);
-        assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: present as u32, offset: header_at });
+        assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: present as u32, offset: header_at, suspect: None });
         assert_eq!(map.volumes, present as u32);
         assert!(map.members.is_empty() && map.folders.is_empty());
     }
-    // The last volume cut short: shorter than the first, so its bytes ended early; no volume past it is asked for.
+    // The last volume cut short: the next one is asked for and missing. The last volume may be short, so nothing is
+    // suspected.
     let mut cut = volumes.clone();
     cut[2].pop();
-    let last = cut[2].len() as u64;
     let map = map_set(&cut, None).unwrap();
-    assert_eq!(map.end, MapEnd::Truncated { volume: 2, offset: last });
+    assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: 3, offset: header_at, suspect: None });
     assert_eq!(map.volumes, 3);
-    // The set cut after a full-size volume: the next one is asked for and missing.
-    let full = split(&archive, 3000);
-    let map = map_set(&full[..2], None).unwrap();
-    assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: 2, offset: header_at });
     // A single file cut short, and cut inside the signature header.
     let map = map_set(&[archive[..archive.len() - 10].to_vec()], None).unwrap();
     assert!(matches!(map.end, MapEnd::HeaderUnavailable { volume: 1, .. }));
@@ -1394,27 +1390,65 @@ fn split_solid_folder_with_many_members_maps_within_default_limits() {
     assert_eq!(last.name.as_deref(), Some("dir/file24999.bin"));
 }
 
+/// Cuts `archive` into volumes of `sizes`, then the rest as the last one.
+fn split_sizes(archive: &[u8], sizes: &[usize]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for &n in sizes {
+        out.push(archive[at..at + n].to_vec());
+        at += n;
+    }
+    out.push(archive[at..].to_vec());
+    out
+}
+
 #[test]
-fn a_short_middle_volume_is_truncated_there() {
+fn honest_splits_of_several_sizes_map_complete() {
+    // 7-Zip's `-v1000b -v2000b`: several sizes, the last one repeating, and the remainder last.
+    let gold = data(7000, 21);
+    let archive = build(&[(Method::Copy, vec![Entry::File("f", gold.clone())])], &[], &HeaderMode::Lzma2);
+    for sizes in [&[1000, 2000, 2000, 2000][..], &[3000, 1000, 1000, 1000, 1000]] {
+        let volumes = split_sizes(&archive, sizes);
+        let map = map_set(&volumes, None).unwrap();
+        assert!(map.complete, "{sizes:?}: {:?}", map.end);
+        assert_eq!(map.volumes as usize, volumes.len());
+        assert_direct_round_trips(&map.members[0], &volumes, &gold);
+    }
+    let real = fixture(&["store_method.7z"]).remove(0);
+    let volumes = split_sizes(&real, &[2000, 3000]);
+    assert_eq!(volumes.iter().map(Vec::len).collect::<Vec<_>>(), [2000, 3000, 2739]);
+    let map = map_set(&volumes, None).unwrap();
+    assert!(map.complete, "{:?}", map.end);
+    assert_eq!(assert_direct_members(&map, &volumes), 2);
+}
+
+#[test]
+fn a_short_middle_volume_is_caught_by_the_header_or_suspected() {
     let archive = build(&[(Method::Copy, vec![Entry::File("big", data(9000, 15))])], &[], &HeaderMode::Lzma2);
+    let header_at = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap());
     let volumes = split(&archive, 3000);
     assert_eq!(volumes.len(), 4);
-    for short in 0..3 {
-        let mut cut = volumes.clone();
-        cut[short].truncate(2990);
-        let map = map_set(&cut, None).unwrap();
-        assert!(!map.complete && map.members.is_empty(), "{short}");
-        assert_eq!(map.end, MapEnd::Truncated { volume: short as u32, offset: 2990 }, "{short}");
-        assert!(map.volumes as usize <= short + 2);
-    }
-    // A short volume found before the header is reached does not ask for volumes past the set's end.
+    // .002 lost 10 bytes: the volumes no longer reach the header, the next one is missing, and .002 (shorter than
+    // .003) is suspected.
     let mut cut = volumes.clone();
-    cut[0].truncate(2990);
-    let map = map_set(&cut[..2], None).unwrap();
-    assert_eq!(map.end, MapEnd::Truncated { volume: 0, offset: 2990 });
-    assert_eq!(map.volumes, 2);
-    // The last volume may be any size; a complete set still maps.
-    assert!(map_set(&volumes, None).unwrap().complete);
+    cut[1].truncate(2990);
+    let map = map_set(&cut, None).unwrap();
+    assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: 4, offset: header_at, suspect: Some(1) });
+    assert!(!map.complete && map.members.is_empty());
+    // .001 lost 10 bytes in a two-volume set: .002 is the honest last one and shorter, so nothing is provably short.
+    let two = split(&archive, 6000);
+    let mut cut = two.clone();
+    cut[0].truncate(5990);
+    assert!(cut[1].len() < 5990);
+    let map = map_set(&cut, None).unwrap();
+    assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: 2, offset: header_at, suspect: None });
+    // A short middle volume that still reaches the header (an extra volume follows): the header is read from the
+    // wrong offset and fails its CRC.
+    let mut cut = volumes.clone();
+    cut[1].truncate(2990);
+    cut.push(vec![0; 10]);
+    let error = map_set(&cut, None).unwrap_err();
+    assert!(matches!(error, MapError::Malformed { .. }), "{error:?}");
 }
 
 #[test]

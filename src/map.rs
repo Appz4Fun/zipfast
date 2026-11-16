@@ -75,17 +75,21 @@ pub enum MapEnd {
     /// Volume `volume` (zero-based) was not available. Every earlier volume was read to its end header.
     MissingVolume { volume: u32 },
     /// Volume `volume` ended at `offset` before its headers did, for example a buffer holding only a volume's
-    /// first bytes. Pieces whose headers were read are listed even when their data lies past the end. 7z: a volume
-    /// of a byte split that cannot be its last is shorter than the longest (all but the last are cut at the same
-    /// size), so its bytes end at `offset`; nothing past the start header was read and no members are listed.
+    /// first bytes. Pieces whose headers were read are listed even when their data lies past the end. 7z: only
+    /// bytes that end inside the signature header.
     Truncated { volume: u32, offset: u64 },
     /// The header at `offset` in volume `volume` is damaged or unsupported, after volume 0's main header was read.
     /// The walk stops there; members and pieces whose headers came before it are listed.
     Damaged { volume: u32, offset: u64, reason: HeaderDamage },
     /// 7z: the archive's header, at archive offset `offset` near the end of the set, is not in the bytes available.
-    /// Volume `volume` (zero-based) is missing, or ends before the header does (a cut set, where only the first
-    /// pieces are present). Nothing but the start header was read, so no members are listed.
-    HeaderUnavailable { volume: u32, offset: u64 },
+    /// Volume `volume` (zero-based) is missing, or ends before its advertised length (a cut set, where only the
+    /// first pieces are present). Nothing but the start header was read, so no members are listed.
+    ///
+    /// `suspect` is a hint, not a finding: the first volume opened that is shorter than a later one. A split cut at
+    /// one size makes only the last volume short, so that volume may have lost bytes (and the set may be complete
+    /// after all); but 7-Zip also writes splits of several sizes (`-v1000b -v2000b`), where it is honest. Which
+    /// volume was cut cannot be told from the lengths alone.
+    HeaderUnavailable { volume: u32, offset: u64, suspect: Option<u32> },
 }
 
 /// What is wrong with the header a walk stopped at ([`MapEnd::Damaged`], [`VolumeEnd::Damaged`]).
@@ -495,7 +499,8 @@ pub struct PackedSpan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct MapMember {
-    /// Zero-based position among the archive's members.
+    /// Zero-based position among the archive's members. 7z: among the members listed, which leaves out anti items,
+    /// so it is not the raw file index of the 7z header.
     pub ordinal: u64,
     /// The name exactly as stored. For ZIP, the UTF-8 bytes of the decoded name.
     pub raw_name: Vec<u8>,

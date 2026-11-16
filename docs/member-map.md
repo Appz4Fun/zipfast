@@ -38,7 +38,7 @@ How a walk ends is `MemberMap::end`:
 | `MissingVolume { volume }` | the volume source answered `Missing`, or the memory slice ended, after volume 0 |
 | `Truncated { volume, offset }` | the volume ended before its headers did; `offset` is the start of the header being read (the end of the signature when the bytes end inside the main header); pieces already announced are listed even when their data lies past the end |
 | `Damaged { volume, offset, reason }` | the header at `offset` in volume `volume` is damaged or unsupported (see below); members and pieces whose headers came before it are listed, a member split across it is `complete: false` |
-| `HeaderUnavailable { volume, offset }` | 7z: the archive's header at archive offset `offset` is not in the bytes available, because volume `volume` is missing or ends early (a cut set); no members are listed |
+| `HeaderUnavailable { volume, offset, suspect }` | 7z: the archive's header at archive offset `offset` is not in the bytes available, because volume `volume` is missing or ends before its advertised length (a cut set); no members are listed. `suspect` is a hint only (see [7z](#7z)) |
 
 Failures are `MapError`: `NotArchive`, `MissingFirstVolume`, `PasswordRequired`, `WrongPassword`,
 `HeaderHole { volume, offset }` (a `RangeRead::Hole` inside header bytes; holes in member data are never reached),
@@ -193,9 +193,10 @@ A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuse
 `probe` reports `Packing::Unknown`.
 
 Members: one `MapMember` per file entry, in header order. `raw_name` is the name's UTF-16LE bytes as stored and
-`name` its decoding; `is_dir` follows 7-Zip: an entry without a stream that is not an empty file, or that has the
-directory attribute (an entry with a stream is always a file). Anti items (deletion markers of update archives)
-are not listed, and `ordinal` counts the members listed. `mtime`
+`name` its decoding; `is_dir` follows 7-Zip's empty-stream and empty-file bits: an entry without a stream that is
+not an empty file is a directory, an entry with a stream is always a file, and the attributes are not consulted.
+Anti items (deletion markers of update archives) are not listed, so `ordinal` counts the members listed and is not
+the raw file index of the 7z header. `mtime`
 and `attributes` are the header's, and `unix_mode` is set when the attribute's Unix extension bit (0x8000) is.
 `checks.crc32` is the substream CRC. `folder` is `Some(FolderSlot { index, offset })`: the folder in
 `MemberMap::folders` and the member's offset in that folder's output (its substream position). Directories and
@@ -240,13 +241,17 @@ block per SHA-256 compression), and password sizes, and cancels with the `Sessio
 than 0x3F) are `Unsupported`, as in 7-Zip.
 
 Cut sets: the header is at the end, so a set with only its first pieces cannot be listed. When a volume the header
-needs is missing (or ends before its advertised length), the map ends `HeaderUnavailable { volume, offset }` with
-`complete: false`, `volumes` the volumes opened and no members or folders. Bytes that end inside the signature header
-are `Truncated { volume: 0, offset: 0 }`. The volumes of a byte split are all cut at the same size except the
-last. When the volumes opened so far do not reach the header and one of them (including the latest) is shorter than
-the longest, its bytes ended early: the map ends `Truncated { volume, offset }` at its own end (no members) instead
-of asking for volumes past the end of the set. So does a volume before the last that is short when the header is
-reached. A set cut after a full-size volume asks for the next one and ends `HeaderUnavailable` when it is missing. An empty archive (next header size 0) is `Complete` with no members.
+needs is missing (or ends before its advertised length), the map ends `HeaderUnavailable { volume, offset, suspect }`
+with `complete: false`, `volumes` the volumes opened and no members or folders. Bytes that end inside the signature
+header are `Truncated { volume: 0, offset: 0 }`.
+
+Volume lengths are taken as they are: 7-Zip writes splits of one size and of several (`-v1000b -v2000b`, the last
+size repeating), so no length is wrong in itself. A volume in the middle that lost bytes shifts the header; when the
+volumes still reach it, the header fails its CRC (`Malformed`), and when they do not, the next volume is asked for.
+Only then, when that volume is missing, `suspect` names the first volume opened that is shorter than a later one:
+in a one-size split only the last volume may be short, so it may have lost bytes. It is a hint, never a finding,
+since a multi-size split has honest short volumes and which volume was cut cannot be told from lengths alone. An
+empty archive (next header size 0) is `Complete` with no members.
 
 Failures and budgets: every count in the header is an untrusted number and is checked against the bytes left in the
 header (each item takes at least a byte) before anything is allocated; files count against `entries` and

@@ -61,7 +61,6 @@ const ID_MTIME: u64 = 0x14;
 const ID_WIN_ATTRIBUTES: u64 = 0x15;
 const ID_ENCODED_HEADER: u64 = 0x17;
 
-const ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const ATTRIBUTE_UNIX_EXTENSION: u32 = 0x8000;
 
 /// A header parse failure, before the volume it belongs to is attached.
@@ -593,15 +592,15 @@ impl<'a> Reader<'a> {
                 _ => {}
             }
         }
-        // As 7-Zip: an entry without a stream is a directory unless it is an empty file, or when its attributes say
-        // so; an entry with a stream is always a file. The empty-file and anti bits count over the empty streams.
+        // As 7-Zip: an entry without a stream is a directory unless it is an empty file; an entry with a stream is
+        // always a file. Attributes are not consulted. The empty-file and anti bits count over the empty streams.
         let mut empty_index = 0usize;
         for (file, empty) in files.iter_mut().zip(empty_stream) {
             file.has_stream = !empty;
             if empty {
                 let empty_file = empty_file.get(empty_index).copied().unwrap_or(false);
                 file.anti = anti.get(empty_index).copied().unwrap_or(false);
-                file.is_dir = !empty_file || file.attributes.is_some_and(|a| a & ATTRIBUTE_DIRECTORY != 0);
+                file.is_dir = !empty_file;
                 empty_index += 1;
             }
         }
@@ -821,22 +820,17 @@ impl SevenZipWalker {
         })
     }
 
-    /// A plain byte split cuts every volume but the last at the same size. When one of the first `full` volumes is
-    /// shorter than the longest of them, its bytes ended early: the map ends `Truncated` there instead of asking
-    /// for volumes past the set's end.
-    fn short_volume(&self, full: usize) -> Result<Option<MemberMap>, MapError> {
-        let lens = &self.lens[..full.min(self.lens.len())];
-        let Some(&longest) = lens.iter().max() else { return Ok(None) };
-        match lens.iter().position(|&l| l < longest) {
-            None => Ok(None),
-            Some(volume) => self
-                .map(MapEnd::Truncated { volume: volume as u32, offset: lens[volume] }, Streams::default(), Vec::new())
-                .map(Some),
-        }
+    /// The first volume opened that is shorter than a later one, as a hint for [`MapEnd::HeaderUnavailable`]. A
+    /// split cut at one size makes only the last volume short, so such a volume may have lost bytes; but 7-Zip
+    /// also writes splits of several sizes (`-v1000b -v2000b`), where a short first volume is honest.
+    fn suspect(&self) -> Option<u32> {
+        let lens = &self.lens;
+        (0..lens.len()).find(|&i| lens[i + 1..].iter().any(|&later| later > lens[i])).map(|i| i as u32)
     }
 
     fn unavailable(&self, volume: u32) -> Result<MemberMap, MapError> {
-        self.map(MapEnd::HeaderUnavailable { volume, offset: self.header_at }, Streams::default(), Vec::new())
+        let end = MapEnd::HeaderUnavailable { volume, offset: self.header_at, suspect: self.suspect() };
+        self.map(end, Streams::default(), Vec::new())
     }
 
     /// The volume holding archive offset `at`, the offset in it and the bytes left in it from there.
@@ -1017,17 +1011,12 @@ impl SevenZipWalker {
                 }
                 Phase::Volumes => {
                     let end = self.header_at + self.header_len;
+                    // Volume sizes are not checked here: 7-Zip writes splits of several sizes, and a volume that
+                    // lost bytes shifts the header, which then fails its CRC.
                     if self.lens.iter().fold(0u64, |a, &l| a.saturating_add(l)) >= end {
-                        if let Some(map) = self.short_volume(self.lens.len() - 1)? {
-                            return Ok(Poll::Ready(map));
-                        }
                         self.start_job(self.header_at, self.header_len)?;
                         self.phase = Phase::NextHeader;
                         continue;
-                    }
-                    // Every volume before the one now needed is a full piece of the split, as long as the first.
-                    if let Some(map) = self.short_volume(self.lens.len())? {
-                        return Ok(Poll::Ready(map));
                     }
                     let index = self.lens.len() as u32;
                     match self.open(input, cx, index)? {
