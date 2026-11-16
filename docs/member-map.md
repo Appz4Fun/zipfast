@@ -192,8 +192,9 @@ back into it. Archive offsets run over the volumes in order; `MapPiece::volume`,
 The walker is checked against archives written by 7-Zip (`tests/fixtures/7z`, from the rarinfo test suite):
 store, split, solid LZMA, 7zAES over Copy and LZMA, LZMA-encoded and encrypted headers.
 
-A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuses 7z (`NotArchive`), and
-`probe` reports `Packing::Unknown`.
+A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuses 7z (`NotArchive`); `probe`
+reports `Packing::SevenZip` from the signature header (see [probing](probe.md)). Decoding folders is
+[7z extraction](7z-extract.md).
 
 Members: one `MapMember` per file entry, in header order. `raw_name` is the name's UTF-16LE bytes as stored and
 `name` its decoding; `is_dir` follows 7-Zip's empty-stream and empty-file bits: an entry without a stream that is
