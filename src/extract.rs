@@ -2714,6 +2714,9 @@ fn history_failure(cause: Option<&HistoryFailure>) -> RarFailure {
 struct Run<'a, 'r, 'c> {
     opts: &'a Options,
     password: Option<&'a str>,
+    /// The password as given, empty included: an empty password is still an attempt for RAR 3.x encryption, which
+    /// has no check value, so the member decrypts to garbage and fails its checksum, as UnRAR `-p-` reports.
+    rar4_password: Option<&'a str>,
     reports: &'r mut Reports<'c>,
     order: u64,
     /// the rename attempts this run has left
@@ -2979,6 +2982,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
         Self {
             opts,
             password: password.filter(|s| !s.is_empty()),
+            rar4_password: password,
             reports,
             order: 0,
             rename_budget: RenameBudget::default(),
@@ -3322,7 +3326,12 @@ impl Run<'_, '_, '_> {
             Some((RarFailure::Unsupported(reason), "unsupported RAR4 payload feature"))
         } else if let Some(Err(e)) = crypt {
             Some((RarFailure::crypt(e, ctx.scope()), "encrypted (password required)"))
-        } else if h.encrypted && (self.password.is_none() || (h.format == RarFormat::Rar5 && h.crypt.is_none())) {
+        } else if h.encrypted
+            && match h.format {
+                RarFormat::Rar4 => self.rar4_password.is_none(),
+                RarFormat::Rar5 => self.password.is_none() || h.crypt.is_none(),
+            }
+        {
             Some((RarFailure::PasswordRequired { scope: ctx.scope() }, "encrypted (password required)"))
         } else if h.method != 0 && h.algorithm != 0 {
             let reason = RarUnsupported::CompressionAlgorithm { algorithm: h.algorithm, method: h.method };
@@ -3439,7 +3448,7 @@ impl Run<'_, '_, '_> {
         h: &FileHeader,
     ) -> Option<crate::error::RarResult<PendingCipher>> {
         let salt = h.rar4.and_then(|raw| raw.salt).filter(|_| h.encrypted)?;
-        let password = self.password?;
+        let password = self.rar4_password?;
         let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
         Some(match self.rar4_keys.keys(password, &salt, cancel.as_ref()) {
             Ok((key, iv)) => {

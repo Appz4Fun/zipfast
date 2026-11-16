@@ -672,6 +672,8 @@ pub struct RarSession {
     issues: Vec<RarFailure>,
     usage: RarCatalogueUsage,
     password: String,
+    /// Whether a password was given at all: an empty one is still tried on RAR 3.x members.
+    password_given: bool,
     options: RarSessionOptions,
     token: Arc<selection::SessionToken>,
     invalid_binding: Option<Arc<RarFailure>>,
@@ -720,6 +722,7 @@ impl RarSession {
                 issues: Vec::new(),
                 usage: RarCatalogueUsage::default(),
                 password: String::new(),
+                password_given: false,
                 options: options.clone(),
                 token: Arc::new(selection::SessionToken { _private: 0 }),
                 invalid_binding: None,
@@ -742,6 +745,7 @@ impl RarSession {
                     .map_err(|source| RarFault::output(IoOperation::Metadata, None, None, source, false))?;
                 catalogue.output_identity = Some((metadata.dev(), metadata.ino()));
             }
+            catalogue.session.password_given = password.is_some();
             let password = password.unwrap_or_default();
             limit(password.len() as u64, catalogue.options.limits.capacity, RarResource::CatalogueCapacity)?;
             catalogue.session.password.try_reserve_exact(password.len()).map_err(|_| allocation())?;

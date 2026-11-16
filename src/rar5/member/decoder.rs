@@ -114,10 +114,8 @@ impl MemberMachine {
             let salt = crate::rar5::LegacyCrypt::stored_salt(stream.legacy).map_err(|reason| {
                 ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(reason))))
             })?;
-            let password = stream
-                .password
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+            // RAR 3.x has no check value, so an empty password is still an attempt.
+            let password = stream.password.ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
             let (key, iv) = super::controlled_legacy_keys(password, &salt, usage, control)?;
             context.password =
                 crate::error::RarPasswordEvidence::VerifierUnavailable(crate::error::RarVerifierUnavailable::Absent);

@@ -1239,3 +1239,31 @@ fn hosts_above_unix_and_old_revisions_list() {
     let old = extract::list(&fixtures().join("rar4-rar300/old_revision_rar300.rar")).unwrap();
     assert_eq!(old.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["one.txt;1", "two.txt"]);
 }
+
+/// An empty password is still an attempt on RAR 3.x members, which carry no check value: the member decrypts to garbage
+/// and fails its checksum, as UnRAR `-p-` reports ("Checksum error in the encrypted file"), rather than asking for a
+/// password. Giving no password at all still asks for one.
+#[test]
+fn rar4_empty_password_is_an_attempt() {
+    let archive = fixtures().join("rar4-rar300/per_file_rar300_password.rar");
+    for (password, want) in [(Some(""), "EncryptedIntegrity"), (None, "PasswordRequired")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outcomes = Vec::new();
+        let summary =
+            extract::run_rar_with_outcomes(&archive, &options(dir.path()), password, |o: &RarEntryOutcome| {
+                outcomes.push(format!("{:?}", o.outcome))
+            })
+            .unwrap();
+        assert_eq!(summary.failed, 1, "{password:?}: {outcomes:?}");
+        assert!(outcomes.iter().any(|o| o.contains(want)), "{password:?}: {outcomes:?}");
+
+        let mut session = RarSession::open(&archive, password, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let mut seen = Vec::new();
+        let summary = session
+            .extract_selected(&all, &options(dir.path()), RarDecodeLimits::default(), |o| seen.push(format!("{o:?}")))
+            .unwrap();
+        assert_eq!(summary.failed, 1, "session {password:?}: {seen:?}");
+        assert!(seen.iter().any(|o| o.contains(want)), "session {password:?}: {seen:?}");
+    }
+}
