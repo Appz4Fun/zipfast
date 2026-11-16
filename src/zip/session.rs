@@ -518,6 +518,7 @@ struct CanonicalEntry {
     source: CentralLocation,
     name: CanonicalName,
     raw_comment: Box<[u8]>,
+    raw_extra: Box<[u8]>,
     raw_aes: Option<AesFields>,
     raw_mtime_override: Option<ExtraMtime>,
     modified: Option<(i64, u32)>,
@@ -538,7 +539,7 @@ impl CanonicalEntry {
         record: CentralRecord,
         charge: impl FnOnce(usize) -> std::result::Result<(), DirectoryError>,
     ) -> std::result::Result<Self, DirectoryError> {
-        let CentralRecord { header, resolved, source, raw_name, raw_comment, known } = record;
+        let CentralRecord { header, resolved, source, raw_name, raw_comment, raw_extra, known } = record;
         let (mtime, nanos) = project_mtime(header, known.mtime_override);
         let name = match known.unicode_path {
             Some(path) => match String::from_utf8(path.into_vec()) {
@@ -570,6 +571,7 @@ impl CanonicalEntry {
             source,
             name,
             raw_comment,
+            raw_extra,
             raw_aes: known.aes,
             raw_mtime_override: known.mtime_override,
             modified: mtime.map(|seconds| (seconds, nanos)),
@@ -606,6 +608,13 @@ impl<'a> EntryMetadata<'a> {
     /// Available raw central comment.
     pub fn raw_comment(self) -> &'a [u8] {
         &self.entry.raw_comment
+    }
+
+    /// The whole raw central extra block, in wire order, including fields zipfast does not interpret (for example an
+    /// Info-ZIP Unicode path field it did not select). Every entry's block is a slice of the parsed central directory,
+    /// so together they are bounded by the session's 128 MiB directory limit.
+    pub fn raw_central_extra(self) -> &'a [u8] {
+        &self.entry.raw_extra
     }
 
     /// Original fixed central header, including raw DOS timestamps, attributes and sentinels.

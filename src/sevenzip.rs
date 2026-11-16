@@ -265,6 +265,7 @@ pub fn list_with_limits(first: &Path, password: Option<&str>, limits: &SevenZipL
                 attributes: (m.attributes != 0).then_some(m.attributes as u32 & 0xFFFF),
                 crc32: m.checks.and_then(|c| c.crc32),
                 method: folder.map_or(0, method_number),
+                method_name: folder.map(method_name),
                 dir: m.is_dir,
                 encrypted: m.encrypted,
                 solid: folder.is_some_and(|f| f.members > 1),
@@ -304,6 +305,90 @@ fn method_number(folder: &MapFolder) -> u8 {
         Some(CoderKind::Other(0x04F7_1101)) => 93,
         Some(CoderKind::Ppmd) => 98,
         Some(_) => 255,
+    }
+}
+
+/// The folder's method as 7-Zip's listing prints it: each coder's name and properties, last stored coder first,
+/// separated by spaces (`LZMA2:24 BCJ`, `LZMA:16 7zAES:19`), following 7-Zip's `CHandler::SetMethodToProp`.
+pub(crate) fn method_name(folder: &MapFolder) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(folder.coders.len());
+    for coder in folder.coders.iter().rev() {
+        let p = &coder.properties;
+        let mut s = String::from(match coder.kind {
+            CoderKind::Copy => "Copy",
+            CoderKind::Lzma => "LZMA",
+            CoderKind::Lzma2 => "LZMA2",
+            CoderKind::Ppmd => "PPMD",
+            CoderKind::Bzip2 => "BZip2",
+            CoderKind::Deflate => "Deflate",
+            CoderKind::Deflate64 => "Deflate64",
+            CoderKind::Aes => "7zAES",
+            CoderKind::Bcj => "BCJ",
+            CoderKind::Bcj2 => "BCJ2",
+            CoderKind::Delta => "Delta",
+            CoderKind::PowerPc => "PPC",
+            CoderKind::Ia64 => "IA64",
+            CoderKind::Arm => "ARM",
+            CoderKind::ArmThumb => "ARMT",
+            CoderKind::Arm64 => "ARM64",
+            CoderKind::Sparc => "SPARC",
+            CoderKind::RiscV => "RISCV",
+            CoderKind::Other(0x04F7_1101) => "ZSTD",
+            CoderKind::Other(_) => "",
+        });
+        match coder.kind {
+            CoderKind::Other(id) if id != 0x04F7_1101 => s = format!("{id:X}"),
+            CoderKind::Lzma if p.len() == 5 => {
+                let dict = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+                s.push(':');
+                s.push_str(&size_value(dict));
+                let d = u32::from(p[0]);
+                if d != 0x5D {
+                    let (lc, lp, pb) = (d % 9, (d / 9) % 5, d / 45);
+                    if lc != 3 {
+                        s.push_str(&format!(":lc{lc}"));
+                    }
+                    if lp != 0 {
+                        s.push_str(&format!(":lp{lp}"));
+                    }
+                    if pb != 2 {
+                        s.push_str(&format!(":pb{pb}"));
+                    }
+                }
+            }
+            CoderKind::Lzma2 if p.len() == 1 => {
+                let d = u32::from(p[0]);
+                s.push(':');
+                if d & 1 == 0 {
+                    s.push_str(&((d >> 1) + 12).to_string());
+                } else {
+                    s.push_str(&size_value(3u32.wrapping_shl((d >> 1) + 11)));
+                }
+            }
+            CoderKind::Ppmd if p.len() == 5 => {
+                let mem = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+                s.push_str(&format!(":o{}:mem{}", p[0], size_value(mem)));
+            }
+            CoderKind::Aes if !p.is_empty() => s.push_str(&format!(":{}", p[0] & 0x3F)),
+            CoderKind::Delta if p.len() == 1 => s.push_str(&format!(":{}", u32::from(p[0]) + 1)),
+            _ => {}
+        }
+        parts.push(s);
+    }
+    parts.join(" ")
+}
+
+/// 7-Zip's `GetStringForSizeValue`: a power of two as its exponent, else the size with an `m`, `k` or `b` suffix.
+fn size_value(val: u32) -> String {
+    if val.is_power_of_two() {
+        return val.trailing_zeros().to_string();
+    }
+    if val.is_multiple_of(1 << 20) {
+        format!("{}m", val >> 20)
+    } else if val.is_multiple_of(1 << 10) {
+        format!("{}k", val >> 10)
+    } else {
+        format!("{val}b")
     }
 }
 
@@ -422,4 +507,17 @@ fn check_header_bounds(map: &MemberMap, limits: &SevenZipLimits) -> std::result:
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod method_name_tests {
+    use super::size_value;
+
+    #[test]
+    fn sizes_follow_7zip() {
+        assert_eq!(size_value(1 << 24), "24");
+        assert_eq!(size_value(3 << 20), "3m");
+        assert_eq!(size_value(6 << 10), "6k");
+        assert_eq!(size_value(1000), "1000b");
+        assert_eq!(size_value(0), "0m");
+    }
 }

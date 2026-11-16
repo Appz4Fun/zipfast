@@ -825,6 +825,7 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
                 mtime: e.mtime,
                 crc32: (!dir).then_some(e.crc32),
                 method: e.method.min(255) as u8,
+                method_name: None,
                 dir,
                 encrypted,
                 solid: false,
