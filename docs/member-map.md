@@ -312,7 +312,7 @@ without an LZMA2 stage (`NotLzma2Folder`), or polling again (`AlreadyFinished`).
 |---|---|
 | `EndMarker { offset }` | the `0x00` end marker; `complete()` is true |
 | `RangeEnd { offset }` | the range ended at a chunk boundary without an end marker |
-| `Truncated { offset, partial }` | the range ended inside the chunk at `offset`; `partial` is that chunk when its header was read (its payload runs past the end, so a stored payload's first bytes are still there) |
+| `Truncated { offset, partial }` | the range ended inside the chunk at `offset`, or the source ended before the range did; `partial` is that chunk when its header was read (its payload runs past the end, so a stored payload's first bytes are still there) |
 | `Hole { chunk, offset }` | the source reported a hole at `offset`, inside the header of the chunk at `chunk` |
 | `MissingVolume { offset, volume }` | the volume holding that header is missing |
 | `Damaged { offset, damage }` | `BadControl(byte)` (`0x03..=0x7F`), `NoDictionaryReset` (first chunk), `MissingProps` (an LZMA chunk below `0xC0` first after a dictionary reset), `BadProps(byte)` (225 or more, or `lc + lp > 4`), `UnpackedOverflow` (past `expected_unpacked`, or past 2^64) |
@@ -320,7 +320,7 @@ without an LZMA2 stage (`NotLzma2Folder`), or polling again (`AlreadyFinished`).
 
 Mapping an output range: `Lzma2Index::plan(unpacked)` splits it into `Lzma2Piece`s in output order:
 `Stored { unpacked, packed, chunk }` (copy packed bytes `packed`), `Decode { unpacked, chunks, from }` (consecutive
-LZMA chunks; decode from chunk `from`, the last dictionary reset before them, to the end of `chunks` and drop the
+LZMA chunks, a new piece at every dictionary reset; decode from chunk `from`, the last dictionary reset before them, to the end of `chunks` and drop the
 output before `unpacked.start`; `from` is None when the index has no reset before them) and `Unindexed { unpacked }`
 (before a resumed start or past the end). `chunk_at(unpacked)`, `decode_start(chunk)` and `stored_bytes()` help
 callers choose. For a 7z folder, `Lzma2Stage::spans(folder, packed)` turns a packed range of the index into
@@ -336,9 +336,13 @@ headers. In memory: `decode_chunks(range, packed, packed_base, dict_prop, option
 `packed_base`, need only cover what the plan uses). `dict_prop` is the 7z coder's property byte
 (`Lzma2Stage::dict_prop`). `Lzma2DecodeOptions` bounds memory: the dictionary is the coder's shrunk to the run's
 output size, so a stated 4 GiB dictionary allocates only what the run can use, and is checked against
-`max_dictionary` (default 256 MiB); `max_output` (default 256 MiB) caps a run's output and any returned buffer.
-Failures are `Lzma2DecodeError`: `NotDictionaryReset`, `NotContiguous`, `BadDictionaryProp`, `Limit { bound, .. }`,
-`MissingPacked { offset }`, `Unindexed { unpacked }`, `Data { produced }`, `Decoder`.
+`max_dictionary` (default 256 MiB). `max_output` (default 256 MiB) caps the bytes returned in one buffer, not the
+output decoded and discarded before them; `max_streamed` (default 16 GiB, the 7z folder cap) caps what a run decodes
+from its dictionary reset, since 7-Zip and xz usually reset only at the start and a byte near the end of a large
+folder decodes through all of it, the discarded part through a 64 KiB buffer. `control` (a `SessionControl`)
+cancels the in-memory decodes between 64 KiB steps. Failures are `Lzma2DecodeError`: `NotDictionaryReset`,
+`NotContiguous`, `BadDictionaryProp`, `Limit { bound: Dictionary | Output | Streamed, .. }`, `MissingPacked
+{ offset }`, `Unindexed { unpacked }`, `Data { produced }`, `Decoder`, `Canceled`.
 
 7z folders: `MapFolder::lzma2_stage()` finds the LZMA2 coder whose input is a packed stream, following the bind
 pairs: a single LZMA2 coder, or the LZMA2 stage of a chain (BCJ, Delta or another filter over LZMA2). It gives the

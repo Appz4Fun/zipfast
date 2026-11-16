@@ -31,7 +31,7 @@
 //! dictionary reset before it ([`Lzma2Decoder`], [`Lzma2Index::read_range`]). See `docs/member-map.md`.
 
 use super::{MapFolder, MapInput, MemberMap, MemoryInput, Opened, PackedSpan, SourceInput, read_range};
-use crate::progressive::{FailureKind, ProgressiveFailure, RangeSource, VolumeRequest, VolumeSource};
+use crate::progressive::{FailureKind, ProgressiveFailure, RangeSource, SessionControl, VolumeRequest, VolumeSource};
 use std::{
     ffi::OsString,
     ops::Range,
@@ -498,13 +498,8 @@ impl Walker {
                     }
                     Fetched::NotYet => return Poll::Pending,
                     Fetched::Hole => self.end = Some(Lzma2End::Hole { chunk: self.pos, offset: at }),
-                    Fetched::Eof => {
-                        self.end = Some(if self.have == 0 {
-                            Lzma2End::RangeEnd { offset: self.pos }
-                        } else {
-                            Lzma2End::Truncated { offset: self.pos, partial: None }
-                        })
-                    }
+                    // The range said more bytes were there (`at < len`): the source ended early.
+                    Fetched::Eof => self.end = Some(Lzma2End::Truncated { offset: self.pos, partial: None }),
                     Fetched::Missing { volume } => {
                         self.end = Some(Lzma2End::MissingVolume { offset: self.pos, volume })
                     }
@@ -674,7 +669,7 @@ impl Lzma2Index {
 
     /// Splits output range `unpacked` into stored payloads to copy, LZMA runs to decode, and what the index does
     /// not cover, in output order. Stored pieces are cut at chunk boundaries; consecutive LZMA chunks form one
-    /// [`Lzma2Piece::Decode`].
+    /// [`Lzma2Piece::Decode`], and a chunk that resets the dictionary starts a new one.
     pub fn plan(&self, unpacked: Range<u64>) -> Vec<Lzma2Piece> {
         let mut pieces = Vec::new();
         let mut at = unpacked.start;
@@ -697,7 +692,9 @@ impl Lzma2Index {
                     pieces.push(Lzma2Piece::Stored { unpacked: at..to, packed: p..p + (to - at), chunk: i });
                 }
                 Lzma2ChunkKind::Lzma => match pieces.last_mut() {
-                    Some(Lzma2Piece::Decode { unpacked, chunks, .. }) if chunks.end == i => {
+                    Some(Lzma2Piece::Decode { unpacked, chunks, .. })
+                        if chunks.end == i && !c.reset.resets_dictionary() =>
+                    {
                         unpacked.end = to;
                         chunks.end = i + 1;
                     }
@@ -830,20 +827,44 @@ pub fn find_stored_chunk_chains(bytes: &[u8], links: usize) -> Vec<usize> {
 
 // ---- Decoding ----
 
-/// Bounds for decoding.
-#[derive(Clone, Debug)]
+/// Bounds and cancellation for decoding.
+#[derive(Clone)]
 pub struct Lzma2DecodeOptions {
     /// The largest dictionary allocated. The dictionary is the coder's (from the 7z property byte) shrunk to the
     /// run's output size, so a stated 4 GiB dictionary never allocates more than the run needs. Default 256 MiB.
     pub max_dictionary: u64,
     /// The most output returned in one buffer by [`Lzma2Index::decode_chunks`], [`Lzma2Index::decode_chunk`] and
-    /// [`Lzma2Index::read_range`], and the most a [`Lzma2Decoder`] run may produce. Default 256 MiB.
+    /// [`Lzma2Index::read_range`]: the bytes kept, not the output decoded and discarded before them. Default
+    /// 256 MiB.
     pub max_output: u64,
+    /// The most output a run may decode, from its dictionary reset to its end, kept or discarded (discarded output
+    /// streams through a 64 KiB buffer). A [`Lzma2Decoder`] run is checked against it. Default 16 GiB, the 7z folder
+    /// cap: 7-Zip and xz usually reset the dictionary only at the start, so a byte near the end of a large folder
+    /// decodes through the whole folder.
+    pub max_streamed: u64,
+    /// Cancels the in-memory decodes between 64 KiB steps ([`Lzma2DecodeError::Canceled`]).
+    pub control: SessionControl,
 }
 
 impl Default for Lzma2DecodeOptions {
     fn default() -> Self {
-        Self { max_dictionary: 256 << 20, max_output: 256 << 20 }
+        Self {
+            max_dictionary: 256 << 20,
+            max_output: 256 << 20,
+            max_streamed: 16 << 30,
+            control: SessionControl::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Lzma2DecodeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lzma2DecodeOptions")
+            .field("max_dictionary", &self.max_dictionary)
+            .field("max_output", &self.max_output)
+            .field("max_streamed", &self.max_streamed)
+            .field("canceled", &self.control.is_canceled())
+            .finish()
     }
 }
 
@@ -851,7 +872,10 @@ impl Default for Lzma2DecodeOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Lzma2Bound {
     Dictionary,
+    /// [`Lzma2DecodeOptions::max_output`]: bytes returned.
     Output,
+    /// [`Lzma2DecodeOptions::max_streamed`]: bytes decoded by a run.
+    Streamed,
 }
 
 /// A failure to decode LZMA2 chunks.
@@ -886,6 +910,8 @@ pub enum Lzma2DecodeError {
     },
     /// liblzma refused to set up a decoder.
     Decoder(String),
+    /// [`Lzma2DecodeOptions::control`] was canceled.
+    Canceled,
 }
 
 impl std::fmt::Display for Lzma2DecodeError {
@@ -901,6 +927,7 @@ impl std::fmt::Display for Lzma2DecodeError {
             Self::Unindexed { unpacked } => write!(f, "output offset {unpacked} is not indexed or decodable"),
             Self::Data { produced } => write!(f, "LZMA2 data does not decode (after {produced} output bytes)"),
             Self::Decoder(why) => write!(f, "LZMA2 decoder: {why}"),
+            Self::Canceled => write!(f, "LZMA2 decode canceled"),
         }
     }
 }
@@ -944,6 +971,9 @@ fn decode_run(
     let mut at = first.unpacked_offset;
     let mut consumed = 0;
     while !decoder.is_finished() {
+        if options.control.is_canceled() {
+            return Err(Lzma2DecodeError::Canceled);
+        }
         let step = decoder.decode(&input[consumed..], &mut scratch)?;
         consumed += step.consumed;
         let produced = &scratch[..step.produced];
@@ -994,7 +1024,7 @@ impl Lzma2Decoder {
     /// A decoder for `run`, consecutive chunks from an index whose first resets the dictionary. `dict_prop` is the
     /// 7z LZMA2 coder's property byte ([`Lzma2Stage::dict_prop`]); the dictionary allocated is the smaller of that
     /// and the run's output size, checked against `options.max_dictionary`. The run's output is checked against
-    /// `options.max_output`.
+    /// `options.max_streamed`; the decoder writes into the caller's buffers, so `max_output` does not apply.
     pub fn new(run: &[Lzma2Chunk], dict_prop: u8, options: &Lzma2DecodeOptions) -> Result<Self, Lzma2DecodeError> {
         let first = run.first().ok_or(Lzma2DecodeError::NotContiguous)?;
         if !first.reset.resets_dictionary() {
@@ -1011,7 +1041,7 @@ impl Lzma2Decoder {
         }
         let packed = run.iter().map(|c| c.packed_len).sum::<u64>();
         let unpacked = run.iter().map(|c| c.unpacked_len).sum::<u64>();
-        bound(Lzma2Bound::Output, options.max_output, unpacked)?;
+        bound(Lzma2Bound::Streamed, options.max_streamed, unpacked)?;
         let need = unpacked.max(4096);
         let prop = (0..=dict_prop).find(|&s| lzma2_dict(s) >= need).unwrap_or(dict_prop);
         bound(Lzma2Bound::Dictionary, options.max_dictionary, lzma2_dict(prop))?;
@@ -1139,7 +1169,7 @@ impl MapFolder {
             }
             let &[dict_prop] = coder.properties.as_slice() else { continue };
             let Some(stream) = self.packed_streams.iter().position(|&s| s == input) else { continue };
-            let start = self.pack_sizes[..stream].iter().try_fold(0u64, |a, &b| a.checked_add(b))?;
+            let start = self.pack_sizes.get(..stream)?.iter().try_fold(0u64, |a, &b| a.checked_add(b))?;
             let end = start.checked_add(*self.pack_sizes.get(stream)?)?;
             let unpacked_size = *self.unpack_sizes.get(usize::try_from(output).ok()?)?;
             let folder_output = !self.bind_pairs.iter().any(|&(_, out)| out == output);
@@ -1262,6 +1292,9 @@ mod tests {
             vec![0],
         );
         assert_eq!(aes.lzma2_stage(), None);
+        // More packed streams named than sizes recorded (a hand-built folder): no stage, no panic.
+        let short = folder(vec![coder(CoderKind::Lzma2, 0x21, vec![16])], vec![], vec![9, 9, 0]);
+        assert_eq!(short.lzma2_stage(), None);
         // Bad properties.
         let bad = folder(vec![coder(CoderKind::Lzma2, 0x21, vec![])], vec![], vec![0]);
         assert_eq!(bad.lzma2_stage(), None);

@@ -706,3 +706,99 @@ fn seven_zip_split_set_indexes_through_a_volume_source() {
     assert_eq!(cut.end, Lzma2End::MissingVolume { offset: in_memory.chunks[k].packed_offset, volume: gap });
     assert_eq!(cut.chunks, in_memory.chunks[..k]);
 }
+
+// ---- Regressions from review ----
+
+#[test]
+fn max_output_caps_bytes_kept_not_the_run_decoded_before_them() {
+    let data = mixed();
+    let packed = encode(&data);
+    let index = index(&packed);
+    // Output 800_000 lies in an LZMA chunk whose run starts at the stream's only dictionary reset, 0.
+    let i = index.chunk_at(800_000).unwrap();
+    assert_eq!(index.chunks[i].kind, Lzma2ChunkKind::Lzma);
+    assert_eq!(index.decode_start(i), Some(0));
+    assert!(index.chunks[i].unpacked().end > 500_000);
+    let small = Lzma2DecodeOptions { max_output: 500_000, ..opts() };
+    let got = index.read_range(800_000..800_100, &packed, 0, DICT_PROP, &small).unwrap();
+    assert_eq!(got, &data[800_000..800_100]);
+    let c = index.chunks[i];
+    if c.unpacked_len <= 500_000 {
+        assert_eq!(
+            index.decode_chunk(i, &packed, 0, DICT_PROP, &small).unwrap(),
+            &data[c.unpacked_offset as usize..c.unpacked().end as usize]
+        );
+    }
+    // The streamed bound is what caps the run.
+    let streamed = Lzma2DecodeOptions { max_streamed: 500_000, ..opts() };
+    assert!(matches!(
+        index.read_range(800_000..800_100, &packed, 0, DICT_PROP, &streamed),
+        Err(Lzma2DecodeError::Limit { bound: Lzma2Bound::Streamed, limit: 500_000, .. })
+    ));
+    assert_eq!(Lzma2DecodeOptions::default().max_streamed, 16 << 30);
+    // And cancellation stops it.
+    let canceled = opts();
+    canceled.control.cancel();
+    assert!(matches!(
+        index.read_range(800_000..800_100, &packed, 0, DICT_PROP, &canceled),
+        Err(Lzma2DecodeError::Canceled)
+    ));
+}
+
+#[test]
+fn a_volume_shorter_than_the_map_is_a_truncation_not_a_range_end() {
+    let archive = fixture();
+    let volumes: Vec<Vec<u8>> = archive.chunks(10_000).map(<[u8]>::to_vec).collect();
+    let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+    let map = MemberMap::from_memory(&refs, "set.7z.001", None).unwrap();
+    let full = map.lzma2_chunks(0, &refs, Lzma2IndexOptions::default()).unwrap();
+    let base = map.folders[0].packed[0].packed.start;
+    let k = full.chunks.iter().position(|c| (base + c.packed_offset) / 10_000 > 0).unwrap();
+    let at = base + full.chunks[k].packed_offset;
+    // The volume holding chunk k's header ends just before it.
+    let mut short = volumes.clone();
+    short[(at / 10_000) as usize].truncate((at % 10_000) as usize);
+    let refs: Vec<&[u8]> = short.iter().map(Vec::as_slice).collect();
+    let cut = map.lzma2_chunks(0, &refs, Lzma2IndexOptions::default()).unwrap();
+    assert_eq!(cut.chunks, full.chunks[..k]);
+    assert_eq!(cut.end, Lzma2End::Truncated { offset: full.chunks[k].packed_offset, partial: None });
+}
+
+#[test]
+fn plan_starts_a_new_decode_piece_at_each_dictionary_reset() {
+    // Two text streams back to back: an LZMA chunk directly before the second stream's dictionary reset.
+    let a = text(2_500_000, 3);
+    let b = text(200_000, 70);
+    let mut packed = encode(&a);
+    assert_eq!(packed.pop(), Some(0));
+    packed.extend(encode(&b));
+    let full = index(&packed);
+    let reset = full.chunk_at(a.len() as u64).unwrap();
+    assert!(reset >= 2 && full.chunks[reset].reset.resets_dictionary());
+    assert_eq!(full.chunks[reset - 1].kind, Lzma2ChunkKind::Lzma);
+    // Resume at the chunk before the reset: nothing before it is known.
+    let r = &full.chunks[reset - 1];
+    let start = Lzma2Position { packed: r.packed_offset, unpacked: r.unpacked_offset };
+    let resumed =
+        Lzma2Index::from_bytes(&packed, Lzma2IndexOptions { start: Lzma2Start::Resume(start), ..Default::default() });
+    assert_eq!(resumed.chunks, full.chunks[reset - 1..]);
+    let range = r.unpacked_offset..full.chunks[reset].unpacked().end;
+    let pieces = resumed.plan(range.clone());
+    assert_eq!(
+        pieces,
+        vec![
+            Lzma2Piece::Decode { unpacked: r.unpacked(), chunks: 0..1, from: None },
+            Lzma2Piece::Decode { unpacked: full.chunks[reset].unpacked(), chunks: 1..2, from: Some(1) },
+        ]
+    );
+    // The part after the reset decodes; the part before it cannot.
+    let after = full.chunks[reset].unpacked();
+    assert_eq!(
+        resumed.read_range(after.clone(), &packed, 0, DICT_PROP, &opts()).unwrap(),
+        &b[..after.end as usize - a.len()]
+    );
+    assert!(matches!(
+        resumed.read_range(range, &packed, 0, DICT_PROP, &opts()),
+        Err(Lzma2DecodeError::Unindexed { unpacked }) if unpacked == r.unpacked_offset
+    ));
+}
