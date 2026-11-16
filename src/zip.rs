@@ -80,6 +80,7 @@ const FLAG_UTF8: u16 = 0x0800;
 
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
+const METHOD_DEFLATE64: u16 = 9;
 const METHOD_BZIP2: u16 = 12;
 const METHOD_LZMA: u16 = 14;
 const METHOD_ZSTD: u16 = 93;
@@ -89,7 +90,10 @@ const FLAG_LZMA_EOS: u16 = 0x0002;
 
 /// Whether entries compressed with `method` can be read.
 fn supported(method: u16) -> bool {
-    matches!(method, METHOD_STORED | METHOD_DEFLATE | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ)
+    matches!(
+        method,
+        METHOD_STORED | METHOD_DEFLATE | METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ
+    )
 }
 
 const HOST_UNIX: u8 = 3;
@@ -511,7 +515,7 @@ fn read_entry(
                     }
                 }
             }
-            METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
+            METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
                 let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(decrypted)))?;
                 loop {
                     check()?;
@@ -585,7 +589,7 @@ fn read_entry(
                 }
             }
         }
-        METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
+        METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
             let packed = BufReader::with_capacity(1 << 20, CheckedInput { input: file.take(e.packed), cancel });
             let mut dec = stream_decoder(e, e.method, packed)?;
             loop {
@@ -634,6 +638,7 @@ impl<R: Read> Read for CheckedInput<'_, R> {
 /// A reader of an entry's data for the methods that have a stream decoder.
 fn stream_decoder<'a>(e: &ReadDescription<'_>, method: u16, packed: impl BufRead + 'a) -> Result<Box<dyn Read + 'a>> {
     Ok(match method {
+        METHOD_DEFLATE64 => Box::new(crate::inflate64::Inflate64Reader::new(packed)),
         METHOD_BZIP2 => Box::new(bzip2::bufread::MultiBzDecoder::new(packed)),
         METHOD_ZSTD => Box::new(zstd_decoder(packed)?),
         METHOD_XZ => {

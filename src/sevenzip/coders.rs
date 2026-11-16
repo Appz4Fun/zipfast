@@ -305,6 +305,7 @@ pub(crate) fn supported(kind: CoderKind) -> bool {
             | CoderKind::Lzma2
             | CoderKind::Bzip2
             | CoderKind::Deflate
+            | CoderKind::Deflate64
             | CoderKind::Aes
             | CoderKind::Bcj
             | CoderKind::Bcj2
@@ -422,6 +423,9 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
         CoderKind::Deflate => {
             Ok(Box::new(flate2::bufread::DeflateDecoder::new(BufReader::with_capacity(BUF, one(inputs)?))))
         }
+        CoderKind::Deflate64 => {
+            Ok(Box::new(crate::inflate64::Inflate64Reader::new(BufReader::with_capacity(BUF, one(inputs)?))))
+        }
         CoderKind::Bzip2 => {
             Ok(Box::new(bzip2::bufread::MultiBzDecoder::new(BufReader::with_capacity(BUF, one(inputs)?))))
         }
@@ -492,6 +496,16 @@ mod tests {
         let input = Exact::new(EmptyBlocks, u64::MAX, &cancel);
         let mut deflate = flate2::bufread::DeflateDecoder::new(BufReader::new(input));
         let error = deflate.read(&mut [0u8; 16]).unwrap_err();
+        assert!(matches!(Fault::of(error), Fault::Canceled));
+    }
+
+    #[test]
+    fn deflate64_looping_on_empty_blocks_still_sees_cancellation() {
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let input = Exact::new(EmptyBlocks, u64::MAX, &cancel);
+        let mut deflate64 = crate::inflate64::Inflate64Reader::new(BufReader::new(input));
+        let error = deflate64.read(&mut [0u8; 16]).unwrap_err();
         assert!(matches!(Fault::of(error), Fault::Canceled));
     }
 

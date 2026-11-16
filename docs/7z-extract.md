@@ -47,6 +47,7 @@ sessions read RAR only and refuse a 7z archive as before.
 | LZMA | `030101` | liblzma raw decoder; the dictionary is shrunk to the coder's output size |
 | LZMA2 | `21` | the same |
 | Deflate | `040108` | flate2 |
+| Deflate64 | `040109` | zipfast's own streaming inflater (`zipfast::inflate64`), 64 KiB window |
 | BZip2 | `040202` | the bzip2 crate (pure Rust backend), multi-stream |
 | Zstandard | `04F71101` | as the 7-Zip ZS fork writes it; zstd crate |
 | 7zAES | `06F10701` | AES-256-CBC, key from SHA-256 over `2^NumCyclesPower` rounds of salt, UTF-16LE password and counter |
@@ -58,10 +59,10 @@ sessions read RAR only and refuse a 7z archive as before.
 | Swap2, Swap4 | `020302`, `020304` | |
 
 Not decoded, refused before anything is written with `SevenZipError::UnsupportedCoder { id }`: PPMd (`030401`),
-Deflate64 (`040109`), RISC-V (`0B`) and any other id. Only folders holding a selected member are checked, so a filter
+RISC-V (`0B`) and any other id. Only folders holding a selected member are checked, so a filter
 can still take the rest of an archive.
 
-No new dependencies: liblzma, flate2, bzip2 and zstd were already used for ZIP, xz and tar.
+No new dependencies: liblzma, flate2, bzip2 and zstd were already used for ZIP, xz and tar, and Deflate64 is zipfast's own decoder.
 
 ## Folders
 
