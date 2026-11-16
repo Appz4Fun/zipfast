@@ -911,7 +911,7 @@ pub fn run_with_password(
         }
         let mut target = None;
         if opts.mode == Mode::Extract {
-            match open_target(opts, &rel, Some(e.size))? {
+            match open_target(opts, &rel, Some(e.size), &mut summary.renames)? {
                 Target::Write(out) => target = Some(out),
                 Target::Exists => {
                     report(&format!("{}: exists, skipped", e.name));

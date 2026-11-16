@@ -93,6 +93,8 @@ pub(super) struct Action {
     pub(super) controlled_output: bool,
     pub(super) raw_output: bool,
     pub(super) output_descriptor: Option<(usize, u64, u64, u32)>,
+    /// The rename a rename mode made while publishing the active member, for the run to report.
+    pub(super) renamed: Option<crate::extract::RenamedOutput>,
     pub(super) attempt_ceiling: u128,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) policy: Option<policy::FrozenPolicy>,
@@ -919,6 +921,7 @@ pub(super) fn factory<'a>(
             controlled_output: false,
             raw_output: false,
             output_descriptor: None,
+            renamed: None,
             attempt_ceiling,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             policy: None,

@@ -22,6 +22,11 @@ use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 impl RarSession {
     /// Extract in one ordered run with engine-bound decisions and lazy diagnostics.
     /// The report borrows this session and control, but not options or observer.
+    ///
+    /// A rename mode in `options.overwrite` (`Overwrite::RenameNew` or
+    /// `Overwrite::RenameExisting`) settles every conflict itself, as in
+    /// `extract_selected`: the control's `RarOverwriteMode` and the observer's
+    /// `overwrite` are not consulted.
     pub fn extract_selected_controlled<'a>(
         &'a mut self,
         selection: &RarSelection,
@@ -599,13 +604,16 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
         entry: &RarEntryIdentity,
         target: &Path,
         initial: Option<SourceStamp>,
-        _: Overwrite,
+        legacy: Overwrite,
     ) -> Result<bool, SelectedStop> {
         let Some(initial) = initial else {
             return Ok(true);
         };
         self.bind(target, initial)?;
+        // A rename mode in the options settles every conflict without the control's mode or the observer: the
+        // existing file is never replaced, only kept (`RenameNew`) or moved aside (`RenameExisting`).
         let decision = match self.control.overwrite {
+            _ if legacy.rename().is_some() => RarOverwriteDecision::Replace,
             RarOverwriteMode::Skip => RarOverwriteDecision::Skip,
             RarOverwriteMode::Always => RarOverwriteDecision::Replace,
             RarOverwriteMode::Ask => {

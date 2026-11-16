@@ -194,6 +194,8 @@ pub enum RarPolicyReason {
     ParentIsFile,
     TargetChanged,
     StageChanged,
+    /// A rename mode found every renamed name up to [`crate::extract::RENAME_LIMIT`] taken.
+    RenameExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

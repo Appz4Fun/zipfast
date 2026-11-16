@@ -833,7 +833,11 @@ impl StagedTar {
                 }
                 StagedMember::File { relative, name, temporary, size } => {
                     let Some(place) = checked_place(opts, &relative, &name, summary, report)? else { continue };
-                    if place.replace {
+                    if let Some(reserved) = place.reserved {
+                        // the rename mode's own empty file, created with O_EXCL a moment ago, takes the data
+                        replace(temporary, reserved.path())?;
+                        drop(reserved.into_parts());
+                    } else if place.replace {
                         replace(temporary, &place.path)?;
                     } else if let Err(error) = temporary.persist_noclobber(place.path) {
                         if opts.overwrite == Overwrite::Skip && error.error.kind() == io::ErrorKind::AlreadyExists {
@@ -859,7 +863,7 @@ fn checked_place(
     summary: &mut Summary,
     report: &mut impl FnMut(&str),
 ) -> Result<Option<Place>> {
-    match check_target(opts, relative, None)? {
+    match check_target(opts, relative, None, &mut summary.renames)? {
         Checked::Write(place) => Ok(Some(place)),
         Checked::Exists => {
             report(&format!("{name}: exists, skipped"));

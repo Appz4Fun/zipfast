@@ -168,6 +168,7 @@ fn mixed_members_keep_exact_reports_and_counts_in_extract_and_test() {
                     assert_eq!(names(&out), ["exists", "keep"]);
                     assert_eq!(fs::read(out.join("exists")).unwrap(), b"original exists");
                 }
+                (Mode::Extract, other) => unreachable!("{other:?} is not exercised here"),
             }
             assert_eq!(fs::read(out.join("keep")).unwrap(), b"original keep");
             if mode == Mode::Extract {

@@ -51,6 +51,9 @@ pub(crate) enum OutputError {
     Symlink(PathBuf),
     #[cfg(unix)]
     StageChanged(PathBuf),
+    /// Every renamed name for this path was taken.
+    #[cfg(unix)]
+    RenameExhausted(PathBuf),
 }
 
 impl OutputError {
@@ -61,6 +64,8 @@ impl OutputError {
             Self::Symlink(_) => io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way"),
             #[cfg(unix)]
             Self::StageChanged(_) => io::Error::other("the verified output stage changed"),
+            #[cfg(unix)]
+            Self::RenameExhausted(_) => io::Error::new(io::ErrorKind::AlreadyExists, "no free name to rename to"),
         }
     }
 
@@ -83,6 +88,11 @@ impl OutputError {
             Self::StageChanged(path) => RarFault::new(
                 RarFailure::Policy { reason: RarPolicyReason::StageChanged, path },
                 Error::Io(io::Error::other("the verified output stage changed")),
+            ),
+            #[cfg(unix)]
+            Self::RenameExhausted(path) => RarFault::new(
+                RarFailure::Policy { reason: RarPolicyReason::RenameExhausted, path },
+                Error::Io(io::Error::new(io::ErrorKind::AlreadyExists, "no free name to rename to")),
             ),
         }
     }
@@ -233,6 +243,31 @@ impl WriteFile {
         replace: bool,
         mut observe: impl FnMut(&File, bool),
     ) -> Result<(), OutputError> {
+        self.publish_selected_with(
+            |temporary, target| {
+                if replace {
+                    replace_detailed(temporary, target)?;
+                } else {
+                    temporary.persist_noclobber(target).map_err(|error| OutputError::Io {
+                        operation: IoOperation::Publish,
+                        path: Some(target.to_path_buf()),
+                        source: error.error,
+                    })?;
+                }
+                Ok(target.to_path_buf())
+            },
+            |file, published| observe(file, published.is_some()),
+        )
+    }
+
+    /// Publishes the verified stage with `publish`, which moves the stage's temporary name to the final path and
+    /// returns that path. `observe` sees the original descriptor and the final path on success, `None` on failure.
+    #[cfg(unix)]
+    pub(crate) fn publish_selected_with(
+        self,
+        publish: impl FnOnce(TempPath, &Path) -> Result<PathBuf, OutputError>,
+        observe: impl FnOnce(&File, Option<&Path>),
+    ) -> Result<(), OutputError> {
         let Self { file, pending } = self;
         let Some(PendingPath::Selected(mut stage, target)) = pending else {
             unreachable!("selected output has a stage");
@@ -241,18 +276,10 @@ impl WriteFile {
             return Err(OutputError::StageChanged(target));
         }
         let temporary = stage.path.take().expect("selected stage pathname");
-        let result = if replace {
-            replace_detailed(temporary, &target)
-        } else {
-            temporary.persist_noclobber(&target).map_err(|error| OutputError::Io {
-                operation: IoOperation::Publish,
-                path: Some(target),
-                source: error.error,
-            })
-        };
-        observe(&file, result.is_ok());
+        let result = publish(temporary, &target);
+        observe(&file, result.as_ref().ok().map(PathBuf::as_path));
         drop(file);
-        result
+        result.map(drop)
     }
 
     pub(crate) fn publish(self) -> Result<(), OutputError> {

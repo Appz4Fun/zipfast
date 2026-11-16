@@ -528,6 +528,7 @@ impl ProjectedReadSession {
         action.controlled_output = false;
         action.raw_output = false;
         action.output_descriptor = None;
+        action.renamed = None;
         action.active_record_charged = false;
         if let Err(fault) = context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1)) {
             return (Err(fault.into()), false, false);
@@ -589,6 +590,14 @@ impl ProjectedReadSession {
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             Err(ReadFault::UnsupportedIdentity.into())
         })();
+        // Report a rename at the destination as the caller spelled it, like the other runners.
+        if let Some(renamed) = context.action.as_mut().and_then(|a| a.renamed.as_mut()) {
+            let requested = options.dest.join(relative.path());
+            for path in std::iter::once(&mut renamed.path).chain(renamed.existing.as_mut()) {
+                *path = requested.with_file_name(path.file_name().unwrap_or_default());
+            }
+            renamed.requested = requested;
+        }
         if let Err(fault) = relative.finish(&context.ledger) {
             result = Err(match result {
                 Err(error) => error.merge_source_boundary(fault.into()),
@@ -802,6 +811,16 @@ impl ProjectedReadSession {
         observe: &mut impl ZipRunObserver,
     ) -> ZipReadResult<Evidence> {
         let projected::ProjectedOwner { file, source, entries, .. } = &mut self.owner;
+        if let Some(renamed) = context.action.as_mut().and_then(|a| a.renamed.take()) {
+            let mut scope =
+                ZipDiagnosticScope::from_parts(file, source, entries, options, context, state, cancel, Some(ordinal))?;
+            let result = observe
+                .observe(ZipRunEvent::MemberRenamed { ordinal: Some(ordinal as u64), renamed: &renamed }, &mut scope);
+            let evidence = scope.finish(result);
+            if evidence.failed() || evidence.observer_failed() {
+                return Ok(evidence);
+            }
+        }
         let event = match error {
             Some(error) => ZipRunEvent::MemberFailed { ordinal: ordinal as u64, name: &entries[ordinal].name, error },
             None if skipped => ZipRunEvent::MemberSkipped { ordinal: ordinal as u64, name: &entries[ordinal].name },

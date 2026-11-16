@@ -5,8 +5,16 @@ selected decoder, verifier, staged output owner and RAR5 solid history once.
 It adds ordered Skip/Always/Ask policy, one synchronous `RarExtractObserver`,
 and optional target-safe diagnostics. Existing `extract_selected`, Options,
 Overwrite, run summaries and native decoder support retain their behavior.
-RAR4 compressed solid history, Rename and command-line prompting are outside
-this API.
+RAR4 compressed solid history and command-line prompting are outside this API.
+
+`Options::overwrite` set to `Overwrite::RenameNew` or `Overwrite::RenameExisting`
+takes precedence over the control's mode: every conflict is settled by renaming,
+and `overwrite` is never called. The target is still bound and rechecked as for
+Always. `RenameExisting` moves the verified incumbent aside with a no-replace
+rename just before publishing; `RenameNew` publishes under the first free
+renamed name with no-replace renames. `RarRunSummary::renames` lists both. A new
+file published under a renamed name has no prepared diagnostic binding, so the
+guard skips its publication check; the stage it came from was checked.
 
 Create `RarExtractControl::new(Some(file), mode, limits)` with the exact
 already-open diagnostic File, or None. Construction performs no I/O, cloning

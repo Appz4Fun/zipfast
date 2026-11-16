@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarScope};
 
-use super::{Mode, Summary};
+use super::{Mode, RenamedOutput, Summary};
 
 /// One completion reported by a RAR bulk run.
 #[derive(Debug)]
@@ -98,6 +98,10 @@ pub struct RarRunSummary {
     /// Successfully opened volumes, including those opened before a terminal failure.
     pub volumes: u64,
     pub match_state: RarMatchState,
+    /// Members renamed by [`super::Overwrite::RenameNew`] or [`super::Overwrite::RenameExisting`], in the order the
+    /// names were claimed. A terminal error's `partial` keeps the renames made before it, including an existing file
+    /// moved aside for a member that then failed.
+    pub renames: Vec<RenamedOutput>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -199,6 +203,13 @@ pub(super) enum Reports<'a> {
 impl Reports<'_> {
     pub(super) fn typed(&self) -> bool {
         matches!(self, Self::Typed { .. })
+    }
+
+    pub(super) fn renames(&mut self) -> &mut Vec<RenamedOutput> {
+        match self {
+            Self::Legacy { summary, .. } => &mut summary.renames,
+            Self::Typed { summary, .. } => &mut summary.renames,
+        }
     }
 
     pub(super) fn encounter(

@@ -268,7 +268,9 @@ impl ProgressiveSession {
     }
     fn validate_options(options: &ProgressiveOptions) -> ProgressiveResult<()> {
         // a session chooses members by its own events; the whole-archive member filter doesn't apply here
-        if options.extract.select.is_some() {
+        // Nor do the rename modes: a session publishes at names it binds ahead of time and has no report to name a
+        // renamed file in. Both are refused before any source or output is touched.
+        if options.extract.select.is_some() || options.extract.overwrite.rename().is_some() {
             return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
         }
         let usage = Usage::new(options.limits.clone());
