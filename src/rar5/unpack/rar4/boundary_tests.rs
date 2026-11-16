@@ -441,16 +441,16 @@ fn enabled_observation_keeps_core_dynamic_storage_to_one_dictionary() {
 }
 
 #[test]
-fn probe_preserves_typed_ppm_and_vm_failure_observations() {
+fn probe_reports_truncated_ppm_and_filter_records_as_corrupt() {
     let packed = fixture!("ppm-marker").as_slice();
     let (d, out, error) = probe(packed.len(), 2, 65536, [packed]);
-    assert!(matches!(error, Rar4DecodeError::Unsupported(Rar4UnsupportedMode::Ppm)));
+    assert!(matches!(error, Rar4DecodeError::Malformed(_)), "{error:?}");
     assert!(out.is_empty());
     assert_eq!(events(&d).len(), 1);
-    assert_eq!((events(&d)[0].unwrap().kind, events(&d)[0].unwrap().at), (TraceKind::Mode { ppm: true }, 1));
+    assert_eq!(events(&d)[0].unwrap().kind, TraceKind::Mode { ppm: true });
     let packed = fixture!("vm-marker-after-prefix").as_slice();
     let (d, out, error) = probe(packed.len(), 2, 65536, [packed]);
-    assert!(matches!(error, Rar4DecodeError::Unsupported(Rar4UnsupportedMode::VmFilter)));
+    assert!(matches!(error, Rar4DecodeError::Malformed(_) | Rar4DecodeError::DecodedSize { .. }), "{error:?}");
     assert_eq!(out, b"A");
     assert!(events(&d).iter().flatten().any(|e| e.kind == TraceKind::VmFilter));
     assert!(!events(&d).iter().flatten().any(|e| matches!(e.kind, TraceKind::EndHint { .. })));

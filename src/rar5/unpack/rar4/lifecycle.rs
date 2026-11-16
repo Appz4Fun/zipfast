@@ -142,6 +142,10 @@ impl Rar4Decoder {
             if self.fed != self.packed {
                 return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
             }
+            self.drain_input(sink)?;
+            if !self.hold.is_empty() {
+                return Err(Rar4DecodeError::Malformed("RAR4 filter block runs past the member"));
+            }
             if self.in_tail && self.produced == self.expected {
                 // The member's data ends inside its end-of-file marker.
                 self.end_tail();
@@ -264,6 +268,9 @@ impl Rar4Decoder {
         self.low = 0;
         self.low_repeats = 0;
         self.saved_phase = Phase::Align;
+        self.ppm = None;
+        self.esc = 2;
+        self.filters.reset();
         self.start_frame(frame);
         Ok(())
     }
@@ -332,7 +339,11 @@ impl Rar4Decoder {
             | Phase::BuildBc
             | Phase::Lengths { .. }
             | Phase::LengthRun { .. }
-            | Phase::BuildTables => Phase::Align,
+            | Phase::BuildTables
+            | Phase::PpmInit
+            | Phase::PpmChar
+            | Phase::PpmEscape
+            | Phase::PpmVmCode { .. } => Phase::Align,
             _ => Phase::Token,
         };
         self.finish_tail(start);
@@ -356,6 +367,13 @@ impl Rar4Decoder {
         self.phase = if frame.unpacked == 0 { Phase::Complete } else { self.saved_phase };
         self.in_tail = false;
         self.boundary = None;
+        self.ppm_in.clear();
+        self.ppm_pos = 0;
+        self.carry.clear();
+        self.finishing = false;
+        self.vm_code.clear();
+        self.hold.clear();
+        self.filters.next_member();
         if self.track_boundary && frame.unpacked == 0 && frame.packed != 0 {
             self.in_tail = true;
             self.phase = self.saved_phase;

@@ -1032,9 +1032,8 @@ fn deferred_ppm_filter_and_same_file_truncation_keep_typed_failures() {
         d.feed(&next, &mut |_: &[u8]| Ok(())).unwrap();
         let c = d.finish_logical(&mut |_: &[u8]| Ok(())).unwrap();
         d.validate_defer(c).unwrap().commit();
-        assert!(
-            matches!(d.resume_boundary(&next),Err(Rar4DecodeError::Unsupported(actual)) if actual==if mode==0 {Rar4UnsupportedMode::Ppm}else{Rar4UnsupportedMode::VmFilter})
-        );
+        // a PPM block or a filter record where the end-of-file marker belongs never grants a boundary
+        assert!(d.resume_boundary(&next).is_err(), "mode {mode}");
         assert!(d.poisoned);
     }
     let mut v = Vector::default();

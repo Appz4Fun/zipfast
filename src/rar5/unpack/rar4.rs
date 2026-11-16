@@ -22,7 +22,9 @@
 use super::Sink;
 use crate::extract::Cancellation;
 
+mod filters;
 pub(crate) mod lifecycle;
+mod ppm;
 use lifecycle::Lifecycle;
 pub(crate) use lifecycle::{CoreBinding, CoreFrame};
 
@@ -33,7 +35,6 @@ pub(crate) enum Rar4FeedState {
 }
 #[derive(Debug, PartialEq)]
 pub(crate) enum Rar4UnsupportedMode {
-    Ppm,
     VmFilter,
 }
 #[derive(Debug)]
@@ -54,6 +55,9 @@ pub(crate) enum Rar4DecodeError {
 
 const CHUNK: usize = 65536;
 const OUTPUT: usize = 32768;
+/// PPM input decoded only while this much is buffered, until the member's data is all in: one character never
+/// reads more (a model of order 64 escapes at most 64 times, each normalizing at most 4 bytes).
+const PPM_LOOKAHEAD: usize = 4096;
 
 impl Rar4DecodeError {
     pub(crate) fn detailed(self, scope: crate::error::RarScope) -> crate::error::RarFault {
@@ -65,7 +69,6 @@ impl Rar4DecodeError {
         let (failure, legacy) = match self {
             Self::Unsupported(mode) => {
                 let label = match mode {
-                    Rar4UnsupportedMode::Ppm => "PPM payload",
                     Rar4UnsupportedMode::VmFilter => "VM/filter payload",
                 };
                 // This optional legacy label is bounded (at most 17 bytes) and
@@ -249,24 +252,81 @@ enum Phase {
     Align,
     Mode,
     Retain,
-    Bc { index: usize },
-    BcRun { index: usize },
+    Bc {
+        index: usize,
+    },
+    BcRun {
+        index: usize,
+    },
     BuildBc,
-    Lengths { index: usize },
-    LengthRun { index: usize, kind: u16 },
+    Lengths {
+        index: usize,
+    },
+    LengthRun {
+        index: usize,
+        kind: u16,
+    },
     BuildTables,
     Token,
     End,
     EndHint,
-    Length { index: usize, recent: Option<usize> },
-    LengthExtra { base: u64, bits: u8, recent: Option<usize> },
-    RecentLength { slot: usize },
-    Distance { length: u64 },
-    DistanceBits { length: u64, index: usize },
-    Low { length: u64, base: u64 },
-    Short { index: usize },
-    Copy { distance: u64, left: u64 },
+    Length {
+        index: usize,
+        recent: Option<usize>,
+    },
+    LengthExtra {
+        base: u64,
+        bits: u8,
+        recent: Option<usize>,
+    },
+    RecentLength {
+        slot: usize,
+    },
+    Distance {
+        length: u64,
+    },
+    DistanceBits {
+        length: u64,
+        index: usize,
+    },
+    Low {
+        length: u64,
+        base: u64,
+    },
+    Short {
+        index: usize,
+    },
+    Copy {
+        distance: u64,
+        left: u64,
+    },
+    /// symbol 257: a filter record follows
+    VmFirst,
+    VmLength {
+        first: u32,
+        wide: bool,
+    },
+    VmCode {
+        first: u32,
+        left: usize,
+    },
+    /// a PPM block's header
+    PpmInit,
+    PpmChar,
+    /// after the escape character
+    PpmEscape,
+    /// a filter record inside a PPM block
+    PpmVmCode {
+        first: u32,
+        left: usize,
+    },
     Complete,
+}
+
+impl Phase {
+    fn ppm(self) -> bool {
+        matches!(self, Phase::PpmInit | Phase::PpmChar | Phase::PpmEscape | Phase::PpmVmCode { .. })
+    }
 }
 
 pub(crate) struct Rar4Decoder {
@@ -304,6 +364,24 @@ pub(crate) struct Rar4Decoder {
     in_tail: bool,
     /// Where the next solid member starts: at a token, or at new tables.
     boundary: Option<Phase>,
+    /// the PPMd model, once a PPM block has started one; a solid stream keeps it
+    ppm: Option<Box<ppm::Ppm>>,
+    /// in PPM blocks, the byte that says what follows isn't a literal
+    esc: u8,
+    /// PPM input not decoded yet, and how much of it is
+    ppm_in: Vec<u8>,
+    ppm_pos: usize,
+    /// input a PPM block left when LZ blocks follow: read before any more is fed
+    carry: Vec<u8>,
+    /// the member's data is all in: PPM decodes to its end
+    finishing: bool,
+    /// the filters defined, and blocks waiting for their bytes
+    filters: filters::Filters,
+    /// a filter record's bytes as they arrive
+    vm_code: Vec<u8>,
+    /// decoded bytes held from the first waiting block's start until it can be filtered
+    hold: Vec<u8>,
+    hold_start: u64,
     #[cfg(test)]
     first_cross: Option<(u64, u64, u64)>,
     #[cfg(test)]
@@ -392,6 +470,16 @@ impl Rar4Decoder {
             track_boundary: false,
             in_tail: false,
             boundary: None,
+            ppm: None,
+            esc: 2,
+            ppm_in: Vec::new(),
+            ppm_pos: 0,
+            carry: Vec::new(),
+            finishing: false,
+            filters: filters::Filters::default(),
+            vm_code: Vec::new(),
+            hold: Vec::new(),
+            hold_start: 0,
             #[cfg(test)]
             first_cross: None,
             #[cfg(test)]
@@ -416,15 +504,7 @@ impl Rar4Decoder {
             if self.fed > self.packed {
                 return Err(Rar4DecodeError::PackedSize { expected: self.packed, actual: self.fed });
             }
-            let mut input = bytes;
-            loop {
-                match self.step_counted(&mut input, sink) {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(error) if self.in_tail && Self::tail_tolerates(&error) => self.end_tail(),
-                    Err(error) => return Err(error),
-                }
-            }
+            self.pump(bytes, sink)?;
             self.work.check()?;
             Ok(if matches!(self.phase, Phase::Complete) { Rar4FeedState::Complete } else { Rar4FeedState::NeedInput })
         })();
@@ -442,6 +522,46 @@ impl Rar4Decoder {
         self.finish_logical(sink)?;
         self.lifecycle = Lifecycle::Closed;
         self.finished = true;
+        Ok(())
+    }
+    /// Decodes as far as `bytes` (after anything a PPM block left) allows.
+    fn pump(&mut self, bytes: &[u8], sink: &mut dyn Sink) -> DecodeResult<()> {
+        let mut input = bytes;
+        loop {
+            self.run(&mut input, sink)?;
+            if self.carry.is_empty() || matches!(self.phase, Phase::Complete) {
+                self.carry.clear();
+                return Ok(());
+            }
+            // a PPM block ended: the LZ blocks after it read what it left, before anything fed later
+            let carry = std::mem::take(&mut self.carry);
+            let mut rest = carry.as_slice();
+            self.run(&mut rest, sink)?;
+            if !self.carry.is_empty() {
+                continue;
+            }
+            if !rest.is_empty() && !matches!(self.phase, Phase::Complete) {
+                return Err(Rar4DecodeError::State);
+            }
+            return Ok(());
+        }
+    }
+    fn run(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<()> {
+        loop {
+            match self.step_counted(input, sink) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(error) if self.in_tail && Self::tail_tolerates(&error) => self.end_tail(),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    /// The member's data is all in: decodes what PPM held back for lookahead.
+    pub(super) fn drain_input(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+        self.finishing = true;
+        if self.phase.ppm() || !self.carry.is_empty() {
+            self.pump(&[], sink)?;
+        }
         Ok(())
     }
     fn step_counted(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
@@ -475,12 +595,260 @@ impl Rar4Decoder {
         let index = (cursor & (self.dictionary.len() as u64 - 1)) as usize;
         self.dictionary[index] = byte;
         self.produced = next;
+        if let Some(block) = self.filters.pending.front()
+            && cursor >= block.start
+        {
+            // held until the block can be filtered
+            if self.hold.is_empty() {
+                self.hold_start = cursor;
+            }
+            self.hold.push(byte);
+            if cursor + 1 >= block.end() {
+                self.run_filters(sink)?;
+            }
+            return Ok(());
+        }
         self.output[self.filled] = byte;
         self.filled += 1;
         if self.filled == OUTPUT {
             self.flush(sink)?;
         }
         Ok(())
+    }
+    /// Filters every waiting block whose bytes are all decoded and writes it, with what lies between blocks.
+    fn run_filters(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+        let held_end = self.hold_start + self.hold.len() as u64;
+        while let Some(block) = self.filters.pending.front()
+            && block.end() <= held_end
+        {
+            let block = block.clone();
+            self.flush(sink)?;
+            if block.start < self.hold_start {
+                return Err(Rar4DecodeError::Malformed("RAR4 filter blocks overlap"));
+            }
+            let from = (block.start - self.hold_start) as usize;
+            if from != 0 {
+                sink.put(&self.hold[..from]).map_err(Rar4DecodeError::Sink)?;
+            }
+            let offset =
+                block.start.checked_sub(self.chain_base).ok_or(Rar4DecodeError::Malformed("RAR4 filter block"))?;
+            let mut data = self.hold[from..from + block.len].to_vec();
+            self.work.tick(block.len as u64)?;
+            data = filters::run(&block, data, offset).map_err(Rar4DecodeError::Malformed)?;
+            self.filters.pending.pop_front();
+            // a block filtered again in place runs the next filter on the first's output
+            while let Some(next) = self.filters.pending.front()
+                && next.start == block.start
+                && next.len == data.len()
+            {
+                let next = next.clone();
+                self.work.tick(next.len as u64)?;
+                data = filters::run(&next, data, offset).map_err(Rar4DecodeError::Malformed)?;
+                self.filters.pending.pop_front();
+            }
+            sink.put(&data).map_err(Rar4DecodeError::Sink)?;
+            self.hold.drain(..from + block.len);
+            self.hold_start = block.end();
+        }
+        // what is held before the next block (or all of it, when none waits) goes out plain
+        let plain = match self.filters.pending.front() {
+            Some(next) => next.start.saturating_sub(self.hold_start).min(self.hold.len() as u64) as usize,
+            None => self.hold.len(),
+        };
+        if plain != 0 {
+            self.flush(sink)?;
+            sink.put(&self.hold[..plain]).map_err(Rar4DecodeError::Sink)?;
+            self.hold.drain(..plain);
+            self.hold_start += plain as u64;
+        }
+        Ok(())
+    }
+    fn add_filter(&mut self, first: u32) -> DecodeResult<()> {
+        let at = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+        let code = std::mem::take(&mut self.vm_code);
+        self.work.tick(code.len() as u64)?;
+        self.filters.add(first, &code, at).map_err(|reason| {
+            if reason.contains("other than") {
+                Rar4DecodeError::Unsupported(Rar4UnsupportedMode::VmFilter)
+            } else {
+                Rar4DecodeError::Malformed(reason)
+            }
+        })
+    }
+    /// Copies a match inside a PPM block, as far as the member's output goes.
+    fn ppm_copy(&mut self, distance: u64, length: u64, sink: &mut dyn Sink) -> DecodeResult<()> {
+        let history = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+        if distance == 0 || distance > self.dictionary.len() as u64 || distance > history {
+            return Err(Rar4DecodeError::Malformed("match distance outside initialized history"));
+        }
+        let length = length.min(self.expected - self.produced);
+        self.work.tick(length)?;
+        for _ in 0..length {
+            let cursor = self.chain_base + self.produced;
+            let index = ((cursor - distance) & (self.dictionary.len() as u64 - 1)) as usize;
+            self.emit(self.dictionary[index], sink)?;
+        }
+        Ok(())
+    }
+    /// Past the member's last output byte in a PPM block.
+    fn ppm_output_done(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+        if self.produced == self.expected && !self.in_tail && self.lifecycle == Lifecycle::Active {
+            self.flush(sink)?;
+            if self.track_boundary {
+                self.in_tail = true;
+            } else {
+                self.saved_phase = Phase::Align;
+                self.phase = Phase::Complete;
+            }
+        }
+        Ok(())
+    }
+    /// One PPM step: a character, an escape, or a filter byte. False: more input is needed first.
+    fn ppm_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
+        if !input.is_empty() {
+            if self.ppm_pos > CHUNK {
+                self.ppm_in.drain(..self.ppm_pos);
+                self.ppm_pos = 0;
+            }
+            self.ppm_in
+                .try_reserve(input.len())
+                .map_err(|_| Rar4DecodeError::Allocation { requested: input.len() as u64 })?;
+            self.ppm_in.extend_from_slice(input);
+            *input = &[];
+        }
+        let available = self.ppm_in.len() - self.ppm_pos.min(self.ppm_in.len());
+        if available < PPM_LOOKAHEAD && !self.finishing {
+            return Ok(false);
+        }
+        if self.ppm_pos > self.ppm_in.len() + 8 {
+            return Err(Rar4DecodeError::Malformed("PPM data ends early"));
+        }
+        if available == 0 && self.in_tail {
+            self.end_tail();
+            return Ok(true);
+        }
+        let model = self.ppm.get_or_insert_with(Box::default);
+        let mut bits = ppm::Bits { data: &self.ppm_in, addr: self.ppm_pos, bit: 0 };
+        let mut esc = self.esc;
+        let mut next = || model.decode_char(&mut bits).ok_or(Rar4DecodeError::Malformed("PPM data"));
+        enum Then {
+            Byte(u8),
+            Escape,
+            Copy(u64, u64),
+            Vm(u32, usize),
+            VmByte(u8),
+            Tables,
+            FileEnd,
+            Nothing,
+        }
+        let then = match self.phase {
+            Phase::PpmInit => {
+                drop(next);
+                if !model.init(&mut bits, &mut esc) {
+                    return Err(Rar4DecodeError::Malformed("PPM block header"));
+                }
+                Then::Nothing
+            }
+            Phase::PpmChar => {
+                let ch = next()?;
+                if ch == esc { Then::Escape } else { Then::Byte(ch) }
+            }
+            Phase::PpmEscape => match next()? {
+                0 => Then::Tables,
+                2 => Then::FileEnd,
+                3 => {
+                    let first = u32::from(next()?);
+                    let len = match (first & 7) + 1 {
+                        7 => usize::from(next()?) + 7,
+                        8 => usize::from(next()?) * 256 + usize::from(next()?),
+                        n => n as usize,
+                    };
+                    Then::Vm(first, len)
+                }
+                4 => {
+                    let mut distance = 0u64;
+                    for _ in 0..3 {
+                        distance = (distance << 8) | u64::from(next()?);
+                    }
+                    let length = u64::from(next()?);
+                    Then::Copy(distance + 2, length + 32)
+                }
+                5 => Then::Copy(1, u64::from(next()?) + 4),
+                _ => Then::Byte(esc),
+            },
+            Phase::PpmVmCode { .. } => Then::VmByte(next()?),
+            _ => return Err(Rar4DecodeError::State),
+        };
+        self.ppm_pos = bits.addr;
+        self.esc = esc;
+        self.work.tick(1)?;
+        if self.in_tail {
+            // past the output only the end-of-file escape belongs to the member
+            match then {
+                Then::Escape => self.phase = Phase::PpmEscape,
+                Then::Tables => self.leave_ppm(),
+                Then::Nothing => self.phase = Phase::PpmChar,
+                _ => self.finish_tail(Phase::Align),
+            }
+            return Ok(true);
+        }
+        match then {
+            Then::Nothing => self.phase = Phase::PpmChar,
+            Then::Byte(byte) => {
+                self.emit(byte, sink)?;
+                self.phase = Phase::PpmChar;
+            }
+            Then::Escape => self.phase = Phase::PpmEscape,
+            Then::Copy(distance, length) => {
+                self.ppm_copy(distance, length, sink)?;
+                self.phase = Phase::PpmChar;
+            }
+            Then::Vm(first, len) => {
+                self.vm_code.clear();
+                self.vm_code
+                    .try_reserve_exact(len)
+                    .map_err(|_| Rar4DecodeError::Allocation { requested: len as u64 })?;
+                self.phase = Phase::PpmVmCode { first, left: len };
+                if len == 0 {
+                    return Err(Rar4DecodeError::Malformed("empty RAR4 filter record"));
+                }
+            }
+            Then::VmByte(byte) => {
+                let Phase::PpmVmCode { first, left } = self.phase else { return Err(Rar4DecodeError::State) };
+                self.vm_code.push(byte);
+                if left == 1 {
+                    self.add_filter(first)?;
+                    self.phase = Phase::PpmChar;
+                } else {
+                    self.phase = Phase::PpmVmCode { first, left: left - 1 };
+                }
+            }
+            Then::Tables => self.leave_ppm(),
+            Then::FileEnd => {
+                // the member ends in PPM: the next one starts on new tables (or a new PPM block)
+                if self.produced != self.expected {
+                    return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: self.produced });
+                }
+            }
+        }
+        self.ppm_output_done(sink)?;
+        if matches!(then, Then::FileEnd)
+            && self.lifecycle == Lifecycle::Active
+            && !matches!(self.phase, Phase::Complete)
+        {
+            self.finish_tail(Phase::Align);
+        }
+        Ok(true)
+    }
+    /// A PPM block ends: new LZ tables follow, read from where the PPM decoder stopped.
+    fn leave_ppm(&mut self) {
+        let start = self.ppm_pos.min(self.ppm_in.len());
+        self.carry.clear();
+        self.carry.extend_from_slice(&self.ppm_in[start..]);
+        self.ppm_in.clear();
+        self.ppm_pos = 0;
+        self.bits = Bits::default();
+        self.phase = Phase::Align;
     }
     fn symbol(&mut self, table: usize, input: &mut &[u8]) -> DecodeResult<Option<u16>> {
         if self.tables[table].used == 0 {
@@ -502,6 +870,14 @@ impl Rar4Decoder {
             }
         }
         Err(Rar4DecodeError::Malformed("undefined Huffman code"))
+    }
+    fn vm_record(&mut self, first: u32, len: usize) -> DecodeResult<Phase> {
+        if len == 0 {
+            return Err(Rar4DecodeError::Malformed("empty RAR4 filter record"));
+        }
+        self.vm_code.clear();
+        self.vm_code.try_reserve_exact(len).map_err(|_| Rar4DecodeError::Allocation { requested: len as u64 })?;
+        Ok(Phase::VmCode { first, left: len })
     }
     fn insert(&mut self, distance: u64) {
         self.recent.copy_within(0..3, 1);
@@ -548,6 +924,9 @@ impl Rar4Decoder {
         }
     }
     fn step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
+        if self.phase.ppm() {
+            return self.ppm_step(input, sink);
+        }
         self.work.tick(1)?;
         macro_rules! take {
             ($bits:expr) => {
@@ -571,11 +950,31 @@ impl Rar4Decoder {
                 self.phase = Phase::Mode;
             }
             Phase::Mode => {
-                if take!(1) != 0 {
+                // the block type bit belongs to a PPM block's own first byte: look, don't take
+                if self.bits.count == 0 {
+                    let Some((&byte, tail)) = input.split_first() else { return Ok(false) };
+                    *input = tail;
+                    self.bits.acc = u64::from(byte);
+                    self.bits.count = 8;
+                    #[cfg(test)]
+                    {
+                        self.bits.read_bytes += 1;
+                    }
+                }
+                if (self.bits.acc >> (self.bits.count - 1)) & 1 != 0 {
                     #[cfg(test)]
                     self.observe(tests::TraceKind::Mode { ppm: true });
-                    return Err(Rar4DecodeError::Unsupported(Rar4UnsupportedMode::Ppm));
+                    // the whole bytes the bit reader holds go back to the PPM decoder
+                    self.ppm_in.clear();
+                    self.ppm_pos = 0;
+                    for k in (0..self.bits.count / 8).rev() {
+                        self.ppm_in.push((self.bits.acc >> (8 * k)) as u8);
+                    }
+                    self.bits = Bits::default();
+                    self.phase = Phase::PpmInit;
+                    return Ok(true);
                 }
+                take!(1);
                 #[cfg(test)]
                 self.observe(tests::TraceKind::Mode { ppm: false });
                 self.phase = Phase::Retain;
@@ -673,7 +1072,7 @@ impl Rar4Decoder {
                         Phase::Token
                     }
                     256 => Phase::End,
-                    257 => return Err(Rar4DecodeError::Unsupported(Rar4UnsupportedMode::VmFilter)),
+                    257 => Phase::VmFirst,
                     258 => {
                         if self.last_length == 0 {
                             return Err(Rar4DecodeError::Malformed("repeat before a match"));
@@ -804,6 +1203,30 @@ impl Rar4Decoder {
                         self.phase = Phase::Complete;
                     }
                 }
+            }
+            Phase::VmFirst => {
+                let first = take!(8);
+                self.phase = match (first & 7) + 1 {
+                    7 => Phase::VmLength { first, wide: false },
+                    8 => Phase::VmLength { first, wide: true },
+                    n => self.vm_record(first, n as usize)?,
+                };
+            }
+            Phase::VmLength { first, wide } => {
+                let len = if wide { take!(16) as usize } else { take!(8) as usize + 7 };
+                self.phase = self.vm_record(first, len)?;
+            }
+            Phase::VmCode { first, left } => {
+                self.vm_code.push(take!(8) as u8);
+                self.phase = if left == 1 {
+                    self.add_filter(first)?;
+                    Phase::Token
+                } else {
+                    Phase::VmCode { first, left: left - 1 }
+                };
+            }
+            Phase::PpmInit | Phase::PpmChar | Phase::PpmEscape | Phase::PpmVmCode { .. } => {
+                return Err(Rar4DecodeError::State);
             }
             Phase::Complete => return Ok(false),
         }

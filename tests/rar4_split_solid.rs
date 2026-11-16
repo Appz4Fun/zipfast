@@ -176,6 +176,18 @@ fn cases() -> Vec<Case> {
             "in_rar4-archiver_win-encvol.rar",
         ),
         case(&["rar4/solid.rar"], None, "in_rarinfo_solid.rar"),
+        // PPMd variant H, with a solid member going on from the first one's model
+        case(&["rar4/latest_winrar.rar"], None, "in_rarinfo_latest_winrar.rar"),
+        // the six VM standard filters
+        case(&["rar4-rar300/rarvm_x86_e8_rar300.rar"], None, "in_rar300_rarvm_x86_e8_rar300.rar"),
+        case(&["rar4-rar300/rarvm_x86_e8e9_rar300.rar"], None, "in_rar300_rarvm_x86_e8e9_rar300.rar"),
+        case(&["rar4-rar300/rarvm_itanium_synthetic_rar300.rar"], None, "in_rar300_rarvm_itanium_synthetic_rar300.rar"),
+        case(&["rar4-rar300/rarvm_delta_4ch_rar300.rar"], None, "in_rar300_rarvm_delta_4ch_rar300.rar"),
+        case(&["rar4-rar300/rarvm_rgb_gradient_rar300.rar"], None, "in_rar300_rarvm_rgb_gradient_rar300.rar"),
+        case(&["rar4-rar300/rarvm_audio_stereo_rar300.rar"], None, "in_rar300_rarvm_audio_stereo_rar300.rar"),
+        // a solid PPMd stream, and an E8 filter whose block offset counts from its own member in a solid stream
+        case(&["rar4-rar300/ppmd_solid_rar300.rar"], None, "rars_ppmd_solid_rar300.rar"),
+        case(&["rar4-rar300/solid_e8_filter_member_offset.rar"], None, "rars_solid_e8_filter_member_offset.rar"),
         case(&["rar4-rar300/solid_simple_rar300.rar"], None, "in_rar300_solid_simple_rar300.rar"),
         case(&["rar4-rar300/solid_rar300.rar"], None, "in_rar300_solid_rar300.rar"),
         Case {
@@ -713,6 +725,14 @@ fn a_continuation_with_another_dictionary_or_salt_fails_typed() {
         let all = session.select(|_| true).unwrap();
         assert!(session.test_selected(&all, RarDecodeLimits::default(), |_| {}).unwrap().failed >= 1, "{mutation}");
     }
+/// A filter record inside a PPMd block: the member's CRC holds only if the filter ran.
+#[test]
+fn a_filter_inside_a_ppm_block_runs() {
+    let path = fixtures().join("rar4-rar300/ppmd_embedded_vm_filter.rar");
+    let tmp = tempfile::tempdir().unwrap();
+    let summary = extract::run(&path, &options(tmp.path()), |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(summary.files, 1);
 }
 
 /// The whole Prybar reference corpus, when `ZIPFAST_RAR4_CORPUS` names it: every archive UnRAR extracts must
@@ -725,8 +745,6 @@ fn prybar_corpus_matches_unrar() {
     };
     // Not supported yet, with the reason; each still must not extract anything UnRAR doesn't.
     let pending: &[(&str, &str)] = &[
-        ("in_rar300_rarvm_", "RAR 3.x VM standard filters"),
-        ("in_rarinfo_latest_winrar.rar", "PPMd variant H"),
         ("in_rar4-archiver_win-enchdr.rar", "encrypted headers"),
         ("in_rarinfo_dirlink_unix.rar", "symbolic links (a progressive session stops at the first)"),
     ];

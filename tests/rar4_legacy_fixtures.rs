@@ -153,10 +153,10 @@ fn latest_winrar_recovery_record_header_opens_and_lists() {
         assert_eq!(entry.solid(), index == 1);
         assert_eq!(rar4_unsupported(entry), None);
     }
-    // 1.txt is PPMd, which isn't decoded yet; 2.txt needs its history.
+    // 1.txt is a PPMd block; 2.txt goes on from its model.
     let all = session.select(|_| true).unwrap();
     let summary = session.test_selected(&all, RarDecodeLimits::default(), |_| {}).unwrap();
-    assert_eq!((summary.files, summary.failed), (0, 2));
+    assert_eq!((summary.files, summary.failed), (2, 0));
 }
 
 #[test]

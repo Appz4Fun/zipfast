@@ -13,5 +13,10 @@ RAR4 compatibility corpus carries the same files.
 | `solid_rar300.rar` | four files in one solid LZ stream |
 | `per_file_rar300_password.rar` | `hello.txt`, AES-128 encrypted and compressed; password `password` |
 | `rar4_junrar_password.rar` | `file1.txt` (`file1\n`), encrypted and compressed; password `junrar` |
+| `rarvm_{x86_e8,x86_e8e9,itanium_synthetic,delta_4ch,rgb_gradient,audio_stereo}_rar300.rar` | one file each through a VM standard filter |
+| `ppmd_solid_rar300.rar` | `solid_lorem_a.txt` and `solid_lorem_b.txt`, one solid PPMd stream |
+| `ppmd_embedded_vm_filter.rar` | a filter record inside a PPMd block |
+| `solid_e8_filter_member_offset.rar` | `lead.txt` then `tiny_e8e9.exe` through an E8E9 filter, solid |
+| `generic_delta_padding_mutation.rar` | a VM program that is none of the standard filters (refused) |
 
 `../rar4-unrar/` holds the SHA-256 of every file UnRAR 7.30 extracts from them.

@@ -417,8 +417,8 @@ fn truncated_corrupt_and_unsupported_payloads_never_publish() {
         assert!(
             match (&e.kind, case) {
                 (FailureKind::Truncated, 0) => true,
-                (FailureKind::Rar(f), 1 | 2 | 5) => matches!(f.as_ref(), zipfast::error::RarFailure::Integrity { .. }),
-                (FailureKind::Rar(f), 3 | 4) => matches!(f.as_ref(), zipfast::error::RarFailure::Unsupported(_)),
+                // a PPM block header the data cuts off is corrupt too
+                (FailureKind::Rar(f), 1..=5) => matches!(f.as_ref(), zipfast::error::RarFailure::Integrity { .. }),
                 _ => false,
             },
             "case{case}: {e:?}"

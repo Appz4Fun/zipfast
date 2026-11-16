@@ -84,17 +84,27 @@ fn real_bits_and_expected_size_are_required() {
     assert!(d.finish(&mut collect(&mut out)).is_err());
 }
 
+/// The first error a whole feed and finish of `packed` meets.
+fn first_error(d: &mut Rar4Decoder, packed: &[u8], out: &mut Vec<u8>) -> Rar4DecodeError {
+    let fed = d.feed(packed, &mut collect(out));
+    match fed {
+        Err(error) => error,
+        Ok(_) => d.finish(&mut collect(out)).unwrap_err(),
+    }
+}
+
+/// A PPM block header or filter record cut off by the end of the data fails as corrupt data.
+fn truncated_record(error: &Rar4DecodeError) -> bool {
+    matches!(error, Rar4DecodeError::Malformed(_) | Rar4DecodeError::DecodedSize { .. })
+}
+
 #[test]
-fn typed_modes_poison_decoder_and_preserve_prefix() {
-    for (packed, mode) in [
-        (fixture!("ppm-marker").as_slice(), Rar4UnsupportedMode::Ppm),
-        (fixture!("vm-marker-after-prefix").as_slice(), Rar4UnsupportedMode::VmFilter),
-    ] {
+fn truncated_ppm_and_filter_records_poison_decoder_and_preserve_prefix() {
+    for packed in [fixture!("ppm-marker").as_slice(), fixture!("vm-marker-after-prefix").as_slice()] {
         let mut d = decoder(packed.len(), 2);
         let mut out = Vec::new();
-        assert!(
-            matches!(d.feed(packed, &mut collect(&mut out)), Err(Rar4DecodeError::Unsupported(actual)) if actual == mode)
-        );
+        let error = first_error(&mut d, packed, &mut out);
+        assert!(truncated_record(&error), "{error:?}");
         assert!(d.feed(&[], &mut collect(&mut out)).is_err());
         assert!(d.finish(&mut collect(&mut out)).is_err());
         // A core may retain a bounded provisional chunk until finish. No success or invented suffix is allowed.
@@ -440,14 +450,15 @@ fn negative_outcomes_are_stable_at_every_split() {
             let first = d.feed(&packed[..split], &mut collect(&mut out));
             let error = match first {
                 Err(error) => error,
-                Ok(_) => d.feed(&packed[split..], &mut collect(&mut out)).err().unwrap(),
+                Ok(_) => first_error(&mut d, &packed[split..], &mut out),
             };
-            assert!(matches!(
-                (class, error),
-                (0, Rar4DecodeError::Unsupported(Rar4UnsupportedMode::Ppm))
-                    | (1, Rar4DecodeError::Unsupported(Rar4UnsupportedMode::VmFilter))
-                    | (2, Rar4DecodeError::Malformed(_))
-            ));
+            assert!(
+                match class {
+                    0 | 1 => truncated_record(&error),
+                    _ => matches!(error, Rar4DecodeError::Malformed(_)),
+                },
+                "{error:?}"
+            );
             assert!(d.poisoned);
             assert!(d.finish(&mut collect(&mut out)).is_err());
             assert!(out.is_empty() || out == b"A");
@@ -542,11 +553,6 @@ fn unsupported_label_refusal(mode: Rar4UnsupportedMode, label: &'static str) {
         crate::error::RarUnsupported::Rar4Feature(actual)) if *actual == label));
     assert!(matches!(legacy, crate::error::Error::Io(ref error)
         if error.kind() == std::io::ErrorKind::OutOfMemory));
-}
-
-#[test]
-fn ppm_legacy_label_allocation_refusal_preserves_typed_reason() {
-    unsupported_label_refusal(Rar4UnsupportedMode::Ppm, "PPM payload");
 }
 
 #[test]
