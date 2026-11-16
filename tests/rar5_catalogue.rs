@@ -308,10 +308,12 @@ fn required_missing_volume_and_optional_missing_volume_have_different_results() 
     assert!(matches!(failure.failure.as_ref(), RarFailure::Input { path: Some(path), .. } if path == &second));
     fs::remove_dir(&second).unwrap();
 
+    // A required volume that is missing ends the catalogue at the volume before it (as UnRAR, which reports it and
+    // goes on with what it has); a member split into it would fail on its own.
     write_volume(&first, main_block(false, None), &[], Some(true));
-    let failure = RarSession::open(&first, None, RarSessionOptions::default()).err().unwrap();
-    assert_eq!(failure.partial.volumes, 1);
-    assert!(matches!(failure.failure.as_ref(), RarFailure::MissingVolume { path } if path == &second));
+    let session = RarSession::open(&first, None, RarSessionOptions::default()).unwrap();
+    assert_eq!(session.archive().volume_count(), 1);
+    assert_eq!(session.archive().missing_volume(), Some(second.as_path()));
 }
 
 #[test]

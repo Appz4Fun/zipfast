@@ -909,11 +909,29 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
             };
         };
         if !next.exists() {
-            return if saw_end {
-                Err(RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into())
-            } else {
-                Ok(())
-            };
+            if !saw_end {
+                return Ok(());
+            }
+            // A file split into the missing volume fails on its own, as UnRAR reports it; what came before stands.
+            if run.pending.is_some() {
+                run.drain()?;
+                let mut p = run.pending.take().expect("pending member");
+                let failure = Arc::new(RarFailure::MissingVolume { path: next.clone() });
+                if !p.hidden && (!run.reports.typed() || (!p.failed && !p.passive)) {
+                    run.reports.failed(
+                        &p.context,
+                        Arc::clone(&failure),
+                        format_args!("missing volume {}", next.display()),
+                    )?;
+                }
+                p.discard();
+                run.stream = None;
+                run.rar4 = None;
+                return Ok(());
+            }
+            return Err(
+                RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into()
+            );
         }
         vol = Volume::open_detailed(&next, run.password)?;
         if vol.format() != format {

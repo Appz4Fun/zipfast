@@ -17,9 +17,11 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - RAR4 archives: bounded header listing and verification, extraction, and selected
   printing of Stored and compressed regular files of every unpack version (RAR 1.5's 15, RAR 2.0's 20/26
   with audio blocks, RAR 2.9's 29 with PPMd variant H and the VM standard filters), including files split
-  across `name.partN.rar` or `name.rar`/`name.r00` volumes, solid archives and AES-encrypted (`-p`) files,
-  through every entry point including progressive sessions. The catalogue retains unsupported member
-  metadata and reports typed payload exclusions.
+  across `name.partN.rar` or `name.rar`/`name.r00` volumes, solid archives, AES-encrypted (`-p`) files and
+  encrypted headers (`-hp`), through every entry point including progressive sessions. Unix symbolic links are
+  created on Unix when their target stays inside the destination. The catalogue retains unsupported member
+  metadata and reports typed payload exclusions, keeps names that aren't UTF-8 as UnRAR lists them, and ends at a
+  missing later volume, failing only the member split into it.
 - RAR 5.0 archives: listing, testing and extracting stored and compressed files (every method, solid archives,
   filters), including files split across `name.partNN.rar` or `name.rar`/`name.r00` volume sets, self-extracting
   stubs, CRC32 and BLAKE2sp checks, modification times and Unix permissions. Big files decode on several cores.
@@ -48,7 +50,7 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 
-Remaining RAR4 capabilities, links and ZIP PPMd are next.
+Remaining RAR4 capabilities, RAR 5.0 links and ZIP PPMd are next.
 
 ## Usage
 

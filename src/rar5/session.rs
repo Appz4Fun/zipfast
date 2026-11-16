@@ -107,9 +107,16 @@ pub struct RarArchiveMetadata {
     format: super::RarFormat,
     volumes: usize,
     orphan_continuations: u64,
+    missing_volume: Option<PathBuf>,
 }
 
 impl RarArchiveMetadata {
+    /// The next volume the set names when it wasn't found: the catalogue ends at the volume before it, and a member
+    /// split into it fails on its own ([`RarFailure::MissingVolume`]).
+    pub fn missing_volume(&self) -> Option<&Path> {
+        self.missing_volume.as_deref()
+    }
+
     pub fn format(&self) -> super::RarFormat {
         self.format
     }
@@ -971,10 +978,18 @@ impl Catalogue {
             let file = match open_read_only(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound && required == Some(true) => {
-                    return Err(RarFault::new(
-                        RarFailure::MissingVolume { path: path.clone() },
-                        Error::MissingVolume(path),
-                    ));
+                    // As UnRAR: the members before stand, and the one split into the missing volume fails.
+                    if std::mem::take(&mut self.pending) {
+                        let index = self.session.model.members.len() - 1;
+                        if self.session.model.members[index].issue.is_none() {
+                            let issue = RarFailure::MissingVolume { path: path.clone() };
+                            self.session.model.members[index].issue = self.retain_issue(Some(issue))?;
+                        }
+                    }
+                    self.owned_capacity = add(self.owned_capacity, path_bytes)?;
+                    self.session.archive.missing_volume = Some(path);
+                    self.update_capacity()?;
+                    break;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound && required == Some(false) => break,
                 Err(error) => return Err(RarFault::input(IoOperation::Open, Some(path), None, error)),
