@@ -914,8 +914,7 @@ fn prybar_corpus_matches_unrar() {
         return;
     };
     // Not supported yet, with the reason; each still must not extract anything UnRAR doesn't.
-    let pending: &[(&str, &str)] =
-        &[("in_rarinfo_dirlink_unix.rar", "symbolic links (a progressive session stops at the first)")];
+    let pending: &[(&str, &str)] = &[];
     let tmp = tempfile::tempdir().unwrap();
     let mut matched = Vec::new();
     let mut waiting = Vec::new();

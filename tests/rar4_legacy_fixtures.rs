@@ -175,9 +175,9 @@ fn unix_symlinks_owner_records_and_special_directory_modes_list_like_unrar() {
     assert_eq!(
         listed,
         [
-            ("emptydir/link", false, 0o120777, 1, Some("symbolic link")),
+            ("emptydir/link", false, 0o120777, 1, None),
             ("file", false, 0o100644, 1, None),
-            ("link", false, 0o120777, 1, Some("symbolic link")),
+            ("link", false, 0o120777, 1, None),
             ("emptydir", true, 0o040755, 1, None),
             ("nopermdir", true, 0o040000, 1, None),
             ("setuiddir", true, 0o044000, 1, None),
@@ -197,14 +197,158 @@ fn unix_symlinks_owner_records_and_special_directory_modes_list_like_unrar() {
     assert_eq!(bytes.len(), 8);
     assert_eq!(hash(&bytes), crc);
 
-    // Symbolic links keep their typed refusal and create nothing.
+    // Symbolic links are created as UnRAR creates them on Unix: `link -> emptydir`, `emptydir/link -> link`.
     let links = dir.path().join("links");
-    assert_eq!(controlled(&mut session, &links, |e| e.name().ends_with("link")), (0, 0, 2));
-    assert!(!links.join("link").exists() && !links.join("emptydir").exists());
+    assert_eq!(controlled(&mut session, &links, |e| e.name().ends_with("link")), (2, 0, 0));
+    assert_eq!(fs::read_link(links.join("link")).unwrap(), Path::new("emptydir"));
+    assert_eq!(fs::read_link(links.join("emptydir/link")).unwrap(), Path::new("link"));
 
     let all = session.select(|e| !e.is_directory()).unwrap();
     let summary = session.test_selected(&all, RarDecodeLimits::default(), |_| {}).unwrap();
-    assert_eq!((summary.files, summary.failed), (1, 2));
+    assert_eq!((summary.files, summary.failed), (3, 0));
+}
+
+fn link_member(name: &[u8], target: &[u8]) -> Vec<u8> {
+    header(0x74, 3, name, target, 0o120777, &[])
+}
+
+fn progressive(path: &Path, dest: &Path) -> Result<Vec<String>, zipfast::progressive::ProgressiveFailure> {
+    use std::task::{Context, Poll};
+    use zipfast::progressive::*;
+    let volume = (path.file_name().unwrap().to_owned(), fs::read(path).unwrap().into_boxed_slice());
+    let opts = ProgressiveOptions::new(options(dest), path.file_name().unwrap().to_owned());
+    let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
+    let waker = std::task::Waker::noop();
+    let mut outcomes = Vec::new();
+    loop {
+        match session.poll_event(&mut Context::from_waker(waker)) {
+            Poll::Pending => std::thread::yield_now(),
+            Poll::Ready(Ok(None)) => return Ok(outcomes),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(match outcome {
+                MemberOutcome::Verified(_) => "verified".into(),
+                MemberOutcome::Directory { .. } => "directory".into(),
+                MemberOutcome::Skipped(reason) => format!("skipped {reason:?}"),
+                _ => "other".into(),
+            }),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => return Err(failure),
+            Poll::Ready(Ok(Some(_))) => {}
+            Poll::Ready(Err(failure)) => return Err(failure),
+        }
+    }
+}
+
+/// `dirlink_unix.rar` through every route: the links UnRAR creates, the file and the directories.
+#[test]
+fn every_route_creates_the_unix_links_unrar_creates() {
+    let path = fixture("dirlink_unix.rar");
+    let dir = tempfile::tempdir().unwrap();
+    let check = |route: &str, out: &Path| {
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new("emptydir"), "{route}");
+        assert_eq!(fs::read_link(out.join("emptydir/link")).unwrap(), Path::new("link"), "{route}");
+        assert_eq!(fs::read(out.join("file")).unwrap().len(), 8, "{route}");
+        for d in ["emptydir", "nopermdir", "setuiddir", "stickydir"] {
+            assert!(fs::symlink_metadata(out.join(d)).unwrap().is_dir(), "{route}: {d}");
+        }
+    };
+    let out = dir.path().join("run");
+    let summary = extract::run(&path, &options(&out), |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    check("run", &out);
+    // a second run over the same output leaves the links alone: a link in the way is never written through
+    let again = extract::run(&path, &options(&out), |_| {}).unwrap();
+    assert_eq!(again.errors.len(), 2, "{:?}", again.errors);
+    check("run again", &out);
+
+    let out = dir.path().join("selected");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (3, 0));
+    check("selected", &out);
+
+    let out = dir.path().join("progressive");
+    let outcomes = progressive(&path, &out).unwrap();
+    assert_eq!(outcomes.iter().filter(|o| *o == "verified").count(), 3, "{outcomes:?}");
+    check("progressive", &out);
+}
+
+/// A link whose target is absolute or climbs out of the destination is refused on every route, and nothing is
+/// created for it; a link that stays inside is created beside it.
+#[test]
+fn links_leading_out_of_the_destination_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for (n, target) in
+        [&b"/etc/passwd"[..], b"../outside", b"a/../../outside", b"sub/../x", b""].into_iter().enumerate()
+    {
+        let path = dir.path().join(format!("{n}.rar"));
+        fs::write(&path, archive(&[link_member(b"bad", target), link_member(b"good", b"sub/x")])).unwrap();
+        let label = String::from_utf8_lossy(target);
+
+        let out = dir.path().join(format!("{n}-run"));
+        let mut failures = Vec::new();
+        extract::run_rar_with_outcomes(&path, &options(&out), None, |o: &RarEntryOutcome| {
+            if let extract::RarOutcome::Failed(failure) = &o.outcome {
+                failures.push((o.entry.name.clone(), format!("{failure:?}")));
+            }
+        })
+        .unwrap();
+        assert!(
+            failures.len() == 1 && failures[0].0 == "bad" && failures[0].1.contains("LinkTarget"),
+            "{label}: {failures:?}"
+        );
+        assert!(fs::symlink_metadata(out.join("bad")).is_err(), "{label}");
+        assert_eq!(fs::read_link(out.join("good")).unwrap(), Path::new("sub/x"));
+
+        let out = dir.path().join(format!("{n}-selected"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let mut failures = Vec::new();
+        let summary = session
+            .extract_selected(&all, &options(&out), RarDecodeLimits::default(), |o| {
+                if let extract::RarOutcome::Failed(failure) = &o.outcome {
+                    failures.push(format!("{failure:?}"));
+                }
+            })
+            .unwrap();
+        assert_eq!((summary.files, summary.failed), (1, 1), "{label}");
+        assert!(failures[0].contains("LinkTarget"), "{label}: {failures:?}");
+        assert!(fs::symlink_metadata(out.join("bad")).is_err(), "{label}");
+        assert_eq!(fs::read_link(out.join("good")).unwrap(), Path::new("sub/x"));
+
+        // a progressive session stops at an unsafe path, as it does for an unsafe name
+        let out = dir.path().join(format!("{n}-progressive"));
+        let failure = progressive(&path, &out).unwrap_err();
+        assert!(matches!(failure.kind, zipfast::progressive::FailureKind::UnsafePath), "{label}: {failure:?}");
+        assert!(fs::symlink_metadata(out.join("bad")).is_err(), "{label}");
+    }
+}
+
+/// A member below a link the archive created is not written through it.
+#[test]
+fn a_member_is_never_written_through_a_link_from_the_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    let inside = dir.path().join("out/real");
+    fs::create_dir_all(&inside).unwrap();
+    fs::write(
+        &path,
+        archive(&[link_member(b"alias", b"real"), header(0x74, 3, b"alias/file", b"data", 0o100644, &[])]),
+    )
+    .unwrap();
+    let out = dir.path().join("out");
+    // the whole-archive run stops there: a link among an output's folders is an unsafe path
+    let result = extract::run(&path, &options(&out), |_| {});
+    assert!(matches!(result, Err(zipfast::Error::UnsafePath(_))), "{result:?}");
+    assert_eq!(fs::read_link(out.join("alias")).unwrap(), Path::new("real"));
+    assert!(!inside.join("file").exists());
+
+    let out = dir.path().join("selected/out");
+    fs::create_dir_all(out.join("real")).unwrap();
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (1, 1));
+    assert!(!out.join("real/file").exists());
 }
 
 fn block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {

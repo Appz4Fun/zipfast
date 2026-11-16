@@ -204,6 +204,29 @@ impl OutputContext {
     ) -> ProgressiveResult<bool> {
         Policy { root: &self.root, usage: &self.usage }.check_target(target, source)
     }
+    /// Creates a symbolic link at `target` once its target text is checked ([`crate::extract::link`]), with the
+    /// same parent and target checks a file's publication makes. It replaces a file there only under
+    /// `Overwrite::Always`.
+    pub(crate) fn link(
+        &mut self,
+        target: &mut Target,
+        text: &[u8],
+        source: &mut crate::progressive::source::SourceDriver,
+    ) -> ProgressiveResult<()> {
+        let policy = Policy { root: &self.root, usage: &self.usage };
+        if !policy.check_target(target, source)? {
+            return Err(ProgressiveFailure::new(FailureKind::PublicationAuthorityRequired));
+        }
+        target.check_parent()?;
+        policy.prepare_parents(target, source)?;
+        target.check_parent()?;
+        policy.parents(&target.path)?;
+        if target_stamp(&target.path, target.directory)? != target.initial {
+            return Err(invalid());
+        }
+        let replace = target.initial.is_some() && matches!(self.root.overwrite, crate::extract::Overwrite::Always);
+        crate::extract::link::create(&target.path, text, replace).map_err(|e| out(OutputOperation::Publish, e, 0))
+    }
     pub(crate) fn directory(
         &mut self,
         member: MemberId,

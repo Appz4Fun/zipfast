@@ -232,6 +232,8 @@ pub struct ProgressiveSession {
     target: Option<Target>,
     member: Option<MemberId>,
     produced: u64,
+    /// the target of the symbolic link being decoded ([`Disposition::Link`])
+    link_text: Vec<u8>,
     remaining: u64,
     had_stage: bool,
     buffer: Vec<u8>,
@@ -250,6 +252,8 @@ enum Disposition {
     Test,
     Skip(crate::extract::RarSkipReason),
     Directory,
+    /// A RAR 4.x symbolic link: its target is decoded, checked and the link created in place of a file.
+    Link,
     /// A persistent session refused the member: its data is skipped without being read.
     #[cfg(feature = "persistent-partials")]
     Refused(crate::partial::RefusalReason),
@@ -361,6 +365,7 @@ impl ProgressiveSession {
             target: None,
             member: None,
             produced: 0,
+            link_text: Vec::new(),
             remaining: 0,
             had_stage: false,
             buffer,
@@ -571,6 +576,7 @@ impl ProgressiveSession {
                         usage: &self.usage,
                         control: &self.control,
                         produced: &mut self.produced,
+                        link: matches!(self.disposition, Disposition::Link).then_some(&mut self.link_text),
                         chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
                         failure: None,
                         fill: match self.options.hole_policy {
@@ -777,6 +783,7 @@ impl ProgressiveSession {
                                     usage: &self.usage,
                                     control: &self.control,
                                     produced: &mut self.produced,
+                                    link: matches!(self.disposition, Disposition::Link).then_some(&mut self.link_text),
                                     chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
                                     failure: None,
                                     fill: match self.options.hole_policy {
@@ -830,6 +837,7 @@ impl ProgressiveSession {
                                 usage: &self.usage,
                                 control: &self.control,
                                 produced: &mut self.produced,
+                                link: matches!(self.disposition, Disposition::Link).then_some(&mut self.link_text),
                                 chunk: self.options.limits.read_chunk.min(1 << 20) as usize,
                                 failure: None,
                                 fill: match self.options.hole_policy {
@@ -1107,6 +1115,15 @@ impl ProgressiveSession {
             #[cfg(not(feature = "persistent-partials"))]
             self.prepare_legacy_target(member, &header)?
         };
+        if header.is_rar4_symlink() && matches!(self.disposition, Disposition::Write) {
+            if header.unpacked_size > crate::extract::link::MAX_TARGET || !cfg!(unix) {
+                return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                    crate::error::RarFailure::Unsupported(crate::error::RarUnsupported::Rar4Feature("symbolic link")),
+                ))));
+            }
+            self.link_text.clear();
+            self.disposition = Disposition::Link;
+        }
         let context = crate::extract::EntryContext {
             entry: crate::extract::RarEntryIdentity {
                 index: Some(member.ordinal),
@@ -1117,7 +1134,7 @@ impl ProgressiveSession {
             password: crate::error::RarPasswordEvidence::NotEncrypted,
             renamed: None,
         };
-        let decode = matches!(self.disposition, Disposition::Write | Disposition::Test)
+        let decode = matches!(self.disposition, Disposition::Write | Disposition::Test | Disposition::Link)
             || (matches!(self.disposition, Disposition::Skip(_))
                 && self.solid_archive == Some(true)
                 && header.method != 0);
@@ -1461,6 +1478,27 @@ impl ProgressiveSession {
         if let Disposition::Skip(reason) = self.disposition {
             return self.finish_skip(reason);
         }
+        if matches!(self.disposition, Disposition::Link) {
+            let v = verification.ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+            let header = &self.model.members.last().expect("member").header;
+            let rel = crate::path::sanitize(&header.name, !header.is_unix())
+                .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
+            let text = std::mem::take(&mut self.link_text);
+            if !crate::extract::link::contained(&rel, &text) {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
+            let mut target = self.target.take().expect("target");
+            match self.output.as_mut().expect("output").link(&mut target, &text, &mut self.driver) {
+                Ok(()) => {}
+                Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
+                Err(e) => return Err(e),
+            }
+            self.phase = Phase::Header;
+            return Ok(ProgressiveEvent::MemberFinished {
+                member: self.member.take().unwrap(),
+                outcome: MemberOutcome::Verified(v),
+            });
+        }
         let mut outcome = if let Some(v) = verification {
             let stage = self.stage.as_mut().unwrap();
             let permit = stage.bind_verification(v.clone())?;
@@ -1509,6 +1547,8 @@ struct StageSink<'a> {
     usage: &'a Usage,
     control: &'a SessionControl,
     produced: &'a mut u64,
+    /// a symbolic link's target, gathered instead of written
+    link: Option<&'a mut Vec<u8>>,
     chunk: usize,
     failure: Option<ProgressiveFailure>,
     fill: HoleFill,
@@ -1522,6 +1562,11 @@ impl crate::rar5::unpack::Sink for StageSink<'_> {
             } else if let Some(stage) = &mut self.stage {
                 stage.write_at(*self.produced, &bytes[..n])
             } else {
+                if let Some(link) = self.link.as_deref_mut() {
+                    // more than a target may hold fails the size check or the target check
+                    let room = (crate::extract::link::MAX_TARGET as usize + 1).saturating_sub(link.len()).min(n);
+                    link.extend_from_slice(&bytes[..room]);
+                }
                 self.usage.charge(Resource::LogicalOutputBytes, n as u64).map(|()| n)
             };
             match result {

@@ -1035,7 +1035,7 @@ impl ProgressiveSession {
 /// (they create their directory), except a compressed RAR4 one, which the RAR4 path does not read.
 pub(super) fn refusal(header: &crate::rar5::FileHeader) -> Option<RefusalReason> {
     let rar4 = header.format == crate::rar5::RarFormat::Rar4;
-    if header.redirection.is_some() {
+    if header.redirection.is_some() || header.is_rar4_symlink() {
         Some(RefusalReason::Redirection)
     } else if header.encrypted && crate::partial::member_crypt(header).is_none() {
         // Encrypted stored members are admitted (their password is in the session options): RAR5 ones, and RAR4

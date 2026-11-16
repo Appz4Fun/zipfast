@@ -296,7 +296,9 @@ fn encrypted_headers_high_sizes_and_special_modes_have_typed_boundaries() {
     let error = RarSession::open(&path, None, RarSessionOptions::default()).err().unwrap();
     assert!(matches!(error.failure.as_ref(), RarFailure::PasswordRequired { .. }), "{error:?}");
 
-    for mode in [0o120777u32, 0o010644] {
+    // a FIFO is refused (a symbolic link is created: tests/rar4_legacy_fixtures.rs)
+    {
+        let mode = 0o010644u32;
         let mut file = member(b"link", b"target", 0, 0x30);
         edit_file_header(&mut file, |header| header[28..32].copy_from_slice(&mode.to_le_bytes()));
         fs::write(&path, archive(&[file])).unwrap();

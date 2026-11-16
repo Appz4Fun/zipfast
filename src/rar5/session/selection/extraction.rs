@@ -163,10 +163,18 @@ impl<'a> Extraction<'a> {
         let parent = relative.parent().expect("sanitized relative path");
         let target = hooks.target(self.options, &relative, self.options.flatten)?;
         let parent = if self.options.flatten { Path::new("") } else { parent };
+        let link = header.is_rar4_symlink();
+        if link && header.unpacked_size > crate::extract::link::MAX_TARGET {
+            return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::Rar4Feature("symbolic link"))).into());
+        }
         let initial = self.inspect_target(session, &target)?;
         hooks.before_path(index);
         if !hooks.replace(session, entry, &target, initial, self.options.overwrite)? {
             return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
+        }
+        if link {
+            let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
+            return self.link(run, session, index, &relative, parent, &target, initial, hooks);
         }
         let mut output = None;
         let mut sink = |chunk: &[u8]| {
@@ -321,6 +329,98 @@ impl<'a> Extraction<'a> {
             run.renames.push(RenamedOutput { requested: target.to_path_buf(), path, existing: None });
         }
         Ok(())
+    }
+
+    /// A RAR 4.x symbolic link: its target is decoded and checked like a file's data, then the link is created at
+    /// `target` when the target stays inside the destination ([`crate::extract::link`]). It replaces what is there
+    /// only as a file would, and is never written through a link.
+    #[allow(clippy::too_many_arguments)]
+    fn link(
+        &mut self,
+        run: &mut SelectedRun,
+        session: &mut RarSession,
+        index: usize,
+        relative: &Path,
+        parent: &Path,
+        target: &Path,
+        initial: Option<SourceStamp>,
+        hooks: &mut impl ExtractionHooks,
+    ) -> Result<RarOutcome, SelectedStop> {
+        use crate::extract::link;
+        let mut text = Vec::new();
+        let mut sink = |chunk: &[u8]| -> RarResult<()> {
+            let room = (link::MAX_TARGET as usize + 1).saturating_sub(text.len()).min(chunk.len());
+            text.extend_from_slice(&chunk[..room]);
+            Ok(())
+        };
+        let outcome = run.test(session, index, Some(&mut sink))?;
+        let RarOutcome::Verified { bytes, checks, .. } = outcome else {
+            return Ok(outcome);
+        };
+        if !link::contained(relative, &text) {
+            return Err(policy(RarPolicyReason::LinkTarget, target.to_path_buf()).into());
+        }
+        hooks.before_directories();
+        self.ensure_root().map_err(own_fault)?;
+        let directories = make_dirs_detailed(&self.options.dest, parent);
+        hooks.created(if directories.is_ok() { target.parent().expect("target parent") } else { &self.options.dest });
+        directories.map_err(own_fault)?;
+        check_cancel(&session.options.cancel).map_err(own_fault)?;
+        let mut sources = [0; VOLUME_WORDS];
+        mark_volumes(&mut sources, &session.model.parts[session.model.members[index].parts.clone()]);
+        check_volumes(session, &sources)?;
+        hooks.recheck(session, target, initial)?;
+        if self.inspect_target(session, target)? != initial {
+            return Err(policy(RarPolicyReason::TargetChanged, target.to_path_buf()).into());
+        }
+        let create = |path: &Path, replace: bool| link::create(path, &text, replace);
+        match (self.options.overwrite.rename(), initial) {
+            (Some(mode), Some(_)) => {
+                use crate::extract::{RenameError, RenameMode, RenamedOutput, claim_candidate, rename_noreplace};
+                hooks.before_publication(index, None);
+                let skip = |candidate: &Path| self.protect_source_name(session, candidate).is_err();
+                let refused = |error| {
+                    own_fault(match error {
+                        RenameError::Exhausted => policy_fault(RarPolicyReason::RenameExhausted, target.to_path_buf()),
+                        RenameError::Unsupported => {
+                            policy_fault(RarPolicyReason::RenameUnsupported, target.to_path_buf())
+                        }
+                        RenameError::Io(path, source) => {
+                            RarFault::output(IoOperation::Publish, Some(path), None, source, false)
+                        }
+                    })
+                };
+                match mode {
+                    // the existing file or folder moves aside; the link takes its name
+                    RenameMode::Existing(style) => {
+                        let moved = claim_candidate(target, style, &mut run.rename_budget, skip, |to| {
+                            rename_noreplace(target, to)
+                        })
+                        .map_err(refused)?;
+                        run.renames.push(RenamedOutput {
+                            requested: target.to_path_buf(),
+                            path: target.to_path_buf(),
+                            existing: Some(moved.0),
+                        });
+                        create(target, false).map_err(|source| output_fault(IoOperation::Publish, target, source))?;
+                    }
+                    // the link goes to the first free renamed name
+                    RenameMode::New(style) => {
+                        let (path, ()) = claim_candidate(target, style, &mut run.rename_budget, skip, |candidate| {
+                            create(candidate, false)
+                        })
+                        .map_err(refused)?;
+                        run.renames.push(RenamedOutput { requested: target.to_path_buf(), path, existing: None });
+                    }
+                }
+            }
+            _ => {
+                hooks.before_publication(index, initial);
+                create(target, initial.is_some())
+                    .map_err(|source| output_fault(IoOperation::Publish, target, source))?;
+            }
+        }
+        Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
     }
 
     fn ensure_root(&self) -> RarResult<()> {
