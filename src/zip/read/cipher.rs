@@ -191,6 +191,7 @@ impl<'a, 's, 'p> Admission<'a, 's, 'p> {
                     password.unwrap().len() as u64,
                     cipher == Some(CipherKind::Aes),
                     plan.crc.is_some() && !matches!(kind, InputKind::Aes { version: 2, .. }),
+                    plan.streaming && matches!(kind, InputKind::Aes { .. }),
                 )
             })?;
             Ok(key_len)
@@ -269,21 +270,7 @@ impl<'a, 's> PendingAes<'a, 's> {
             return checked(Err(ReadFault::InvalidPlan.into()), source, view);
         }
         let len = plan.ciphertext;
-        let keys = (|| -> Result<([u8; 66], usize, u64), ReadFault> {
-            io::canceled(Some(cancel))?;
-            let mut salt = [0; 16];
-            let mut verifier = [0; 2];
-            spool::read_exact(view, source, &mut salt[..key_len / 2], IoStage::Source, cancel)?;
-            spool::read_exact(view, source, &mut verifier, IoStage::Source, cancel)?;
-            let keys = derive_winzip_cancellable(password.as_bytes(), &salt[..key_len / 2], key_len, || {
-                io::canceled(Some(cancel))
-            })?
-            .ok_or(ReadFault::InvalidPlan)?;
-            if !bool::from(keys[2 * key_len..2 * key_len + 2].ct_eq(&verifier)) {
-                return Err(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes });
-            }
-            Ok((keys, key_len, len))
-        })();
+        let keys = aes_keys(view, source, password, key_len, cancel).map(|keys| (keys, key_len, len));
         let (keys, key_len, len) = match keys {
             Ok(v) => v,
             Err(e) => return checked(Err(e.into()), source, view),
@@ -408,6 +395,133 @@ impl AuthenticatedAes<'_, '_> {
                 Ok(()) => report.into(),
                 Err(e) => e.merge_cleanup(report),
             }),
+        };
+        checked(result, self.source, self.ledger)
+    }
+}
+
+/// Reads the salt and password verifier and derives the WinZip AES keys; a verifier mismatch is typed.
+fn aes_keys(
+    view: LedgerView<'_>,
+    source: &mut dyn CiphertextSource,
+    password: &str,
+    key_len: usize,
+    cancel: &Cancellation,
+) -> Result<[u8; 66], ReadFault> {
+    io::canceled(Some(cancel))?;
+    let mut salt = [0; 16];
+    let mut verifier = [0; 2];
+    spool::read_exact(view, source, &mut salt[..key_len / 2], IoStage::Source, cancel)?;
+    spool::read_exact(view, source, &mut verifier, IoStage::Source, cancel)?;
+    let keys =
+        derive_winzip_cancellable(password.as_bytes(), &salt[..key_len / 2], key_len, || io::canceled(Some(cancel)))?
+            .ok_or(ReadFault::InvalidPlan)?;
+    if !bool::from(keys[2 * key_len..2 * key_len + 2].ct_eq(&verifier)) {
+        return Err(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes });
+    }
+    Ok(keys)
+}
+
+/// WinZip AES read straight from the source into a provisional staged output, with no ciphertext spool.
+///
+/// The plaintext it yields is NOT authenticated until [`StreamingAes::finish`] compares the HMAC-SHA1 tag.
+/// Only the checked run builds one, and only when the sink is a staged output file that is published after a
+/// successful finish and deleted otherwise; no caller-visible sink ever sees these bytes.
+pub(super) struct StreamingAes<'a, 's> {
+    pub(super) ledger: LedgerView<'a>,
+    source: &'s mut dyn CiphertextSource,
+    pub(super) plan: budget::MemberPlan,
+    pub(super) crc_required: bool,
+    hmac: HmacSha1,
+    ctr: WinZipCtr,
+    remaining: u64,
+}
+impl<'a, 's> StreamingAes<'a, 's> {
+    #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
+    pub(super) fn open_admitted(admission: Admission<'a, 's, '_>, cancel: &Cancellation) -> ZipReadResult<Self> {
+        let Admission { ledger: view, source, plan, password, kind, key_len } = admission;
+        if !matches!(kind, InputKind::Aes { .. }) || !plan.streaming {
+            return checked(Err(ReadFault::InvalidPlan.into()), source, view);
+        }
+        let keys = match aes_keys(view, source, password, key_len, cancel) {
+            Ok(keys) => keys,
+            Err(e) => return checked(Err(e.into()), source, view),
+        };
+        Ok(Self {
+            ledger: view,
+            source,
+            plan,
+            crc_required: matches!(kind, InputKind::Aes { version: 1, .. }),
+            hmac: HmacSha1::new(&keys[key_len..2 * key_len]),
+            ctr: WinZipCtr::new(&keys[..key_len]).expect("validated AES key size"),
+            remaining: plan.ciphertext,
+        })
+    }
+    fn read_cipher(&mut self, out: &mut [u8], cancel: &Cancellation) -> Result<usize, ReadFault> {
+        io::canceled(Some(cancel))?;
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let count = out.len().min(io::WINDOW).min(self.remaining.min(io::WINDOW as u64) as usize);
+        if count == 0 {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let n = io::read(&self.ledger, true, self.source, IoStage::Source, 0, &mut out[..count], cancel)?;
+        if n == 0 {
+            return Err(ReadFault::Io {
+                stage: IoStage::Source,
+                operation: ReadIoOperation::Read,
+                offset: 0,
+                error: std::io::ErrorKind::UnexpectedEof.into(),
+            });
+        }
+        self.ledger.with_state(|s| s.encrypted.work(n as u64))?;
+        self.hmac.update(&out[..n]).ok_or(ReadFault::CounterOverflow)?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+    #[allow(clippy::result_large_err)]
+    pub(super) fn read_plain_chunk(&mut self, out: &mut [u8], cancel: &Cancellation) -> ZipReadResult<usize> {
+        let result = self.read_cipher(out, cancel).and_then(|n| {
+            self.ctr.apply(&mut out[..n]).ok_or(ReadFault::CounterOverflow)?;
+            Ok(n)
+        });
+        result.map_err(|e| self.ledger.with_state(|s| ZipReadError::from(e).with_usage(s.encrypted.usage, s.run.usage)))
+    }
+    /// Reads the tag and compares it. After a decode failure the rest of the ciphertext is hashed first, so a
+    /// tampered member reports [`ReadFault::AuthenticationFailed`] rather than whatever the codec tripped on.
+    fn authenticate(&mut self, drain: bool, cancel: &Cancellation) -> Result<(), ReadFault> {
+        if drain {
+            let mut scratch = [0u8; 4096];
+            while self.remaining > 0 {
+                self.read_cipher(&mut scratch, cancel)?;
+            }
+        } else if self.remaining != 0 {
+            return Err(ReadFault::CheckedFormat { reason: "ciphertext not fully consumed" });
+        }
+        let mut tag = [0; 10];
+        spool::read_exact(self.ledger, self.source, &mut tag, IoStage::Source, cancel)?;
+        let expected = self.hmac.finish();
+        if !bool::from(expected[..10].ct_eq(&tag)) {
+            return Err(ReadFault::AuthenticationFailed);
+        }
+        Ok(())
+    }
+    #[allow(clippy::result_large_err)]
+    pub(super) fn finish(mut self, result: ZipReadResult<()>) -> ZipReadResult<()> {
+        // The decode loop has returned; its cancellation was already observed, and a tag check is bounded work.
+        let cancel = Cancellation::default();
+        let decoded_wrong = |error: &ZipReadError| {
+            error.sink_fault().is_none()
+                && matches!(error.operation(), Some(ReadFault::Integrity { .. } | ReadFault::CheckedFormat { .. }))
+        };
+        let result = match result {
+            Ok(()) => self.authenticate(false, &cancel).map_err(ZipReadError::from),
+            Err(error) if decoded_wrong(&error) => match self.authenticate(true, &cancel) {
+                Err(ReadFault::AuthenticationFailed) => Err(ReadFault::AuthenticationFailed.into()),
+                _ => Err(error),
+            },
+            Err(error) => Err(error),
         };
         checked(result, self.source, self.ledger)
     }

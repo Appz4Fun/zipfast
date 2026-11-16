@@ -57,19 +57,61 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Where checked staged output ([`crate::zip::run_with_policy`], [`ZipReadStage`]) may be written.
+///
+/// The native backend proves private, ownership-checked creation and a no-replace publication with
+/// filesystem-specific guarantees, and only runs on local APFS (macOS) or ext4, XFS, Btrfs and tmpfs (Linux). The
+/// portable backend runs anywhere (ZFS, NFS, SMB, FUSE such as mergerfs/shfs, overlayfs, exFAT, HFS+, ...): a 0600
+/// temporary file in the target directory, a flush where supported, then a rename. It keeps every path, parent,
+/// target, overwrite and source check; `docs/zip-staged-output.md` lists exactly which guarantees it gives up.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StagedStorage {
+    /// Native where the destination filesystem is on the allow-list, portable elsewhere (the default).
+    #[default]
+    Auto,
+    /// Native only: a destination outside the allow-list fails with [`ReadFault::UnsupportedStorage`].
+    NativeOnly,
+    /// Portable everywhere, even on an allow-listed filesystem.
+    PortableOnly,
+}
+/// The backend one staged output was written through; see [`StagedStorage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StagedBackend {
+    Native,
+    Portable,
+}
 #[derive(Clone, Debug)]
 pub struct EncryptedReadOptions {
     limits: EncryptedReadLimits,
     temp_dir: Option<PathBuf>,
     lzma_memory_bytes: u64,
     zstd_window_log_max: u32,
+    staged_storage: StagedStorage,
+    /// Set only by the checked run before it plans: staged AES members stream instead of spooling.
+    stream_staged_aes: bool,
 }
 impl Default for EncryptedReadOptions {
     fn default() -> Self {
-        Self { limits: Default::default(), temp_dir: None, lzma_memory_bytes: 256 << 20, zstd_window_log_max: 27 }
+        Self {
+            limits: Default::default(),
+            temp_dir: None,
+            lzma_memory_bytes: 256 << 20,
+            zstd_window_log_max: 27,
+            staged_storage: StagedStorage::Auto,
+            stream_staged_aes: false,
+        }
     }
 }
 impl EncryptedReadOptions {
+    pub fn with_staged_storage(mut self, storage: StagedStorage) -> Self {
+        self.staged_storage = storage;
+        self
+    }
+    pub fn staged_storage(&self) -> StagedStorage {
+        self.staged_storage
+    }
     pub fn with_limits(mut self, limits: EncryptedReadLimits) -> Self {
         self.limits = limits;
         self
@@ -108,6 +150,8 @@ pub struct EncryptedReadOverrides {
     pub interrupted_retries: Option<u64>,
     pub create_attempts: Option<u64>,
     pub temp_dir: Option<PathBuf>,
+    /// Staged-output backend choice for contexts these overrides plan; see [`StagedStorage`].
+    pub staged_storage: StagedStorage,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -687,6 +731,7 @@ pub struct ZipRunReport {
     failed: u64,
     volumes: u64,
     decoded_bytes: u128,
+    portable_files: u64,
     usage: EncryptedReadUsage,
     run_usage: RunUsage,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -733,6 +778,16 @@ impl ZipRunReport {
     }
     pub fn decoded_bytes(&self) -> u128 {
         self.decoded_bytes
+    }
+    /// Files an extracting run published through the native staged backend ([`StagedBackend::Native`]): every
+    /// file not counted by [`Self::portable_files`]. Zero for a test run, which publishes nothing.
+    pub fn native_files(&self) -> u64 {
+        self.files - self.portable_files.min(self.files)
+    }
+    /// Files published through the portable staged backend ([`StagedBackend::Portable`]), with the weaker
+    /// guarantees [`StagedStorage`] describes. Zero when every destination was on the native allow-list.
+    pub fn portable_files(&self) -> u64 {
+        self.portable_files
     }
     pub fn usage(&self) -> EncryptedReadUsage {
         self.usage

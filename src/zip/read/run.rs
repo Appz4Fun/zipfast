@@ -303,6 +303,9 @@ impl ProjectedReadSession {
                     add(&mut report.skipped)?;
                 } else {
                     add(&mut report.files)?;
+                    if context.action.as_ref().and_then(|a| a.backend) == Some(StagedBackend::Portable) {
+                        add(&mut report.portable_files)?;
+                    }
                     report.decoded_bytes =
                         report.decoded_bytes.checked_add(bytes as u128).ok_or(ReadFault::CounterOverflow)?;
                 }
@@ -529,6 +532,7 @@ impl ProjectedReadSession {
         action.raw_output = false;
         action.output_descriptor = None;
         action.renamed = None;
+        action.backend = None;
         action.active_record_charged = false;
         if let Err(fault) = context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1)) {
             return (Err(fault.into()), false, false);
@@ -576,6 +580,7 @@ impl ProjectedReadSession {
                 let Some(mut stage) = stage else {
                     return Ok(true);
                 };
+                context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.backend = Some(stage.backend());
                 if let Err(error) =
                     self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel))
                 {
@@ -859,14 +864,15 @@ pub(crate) fn with_opened_policy(
     } else {
         ZipReadOutput::Discard
     };
-    let mut context = match EncryptedReadContext::for_projected(
-        &mut session,
+    let mut context = match EncryptedReadContext::for_owner_streaming(
+        &mut session.owner,
         ProjectedReadScope::AllRegular,
         None,
         output,
         password,
         overrides,
         cancel,
+        true,
     ) {
         Ok(c) => c,
         Err(error) => return Err(session.owner.reject(error)),
@@ -894,6 +900,7 @@ pub(crate) fn with_opened_context(
             } else {
                 ZipReadOutput::Discard
             };
+            context.options.stream_staged_aes = true;
             let result = projected::factory(
                 context,
                 false,

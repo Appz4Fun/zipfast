@@ -207,6 +207,58 @@ impl PreparedNamed {
         (clear, error)
     }
 }
+fn native_mut(named: &mut Option<Prepared>) -> Option<&mut PreparedNamed> {
+    match named.as_mut() {
+        Some(Prepared::Native(ready)) => Some(ready),
+        _ => None,
+    }
+}
+/// A prepared stage on either backend.
+pub(super) enum Prepared {
+    Native(PreparedNamed),
+    Portable(portable::PreparedPortable),
+}
+// Test control: treat every destination as outside the native allow-list.
+#[cfg(test)]
+thread_local! {pub(in crate::zip::read) static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };}
+/// Chooses the staged backend for one held parent: native where the filesystem is on the allow-list (and the
+/// caller allows it), the portable fallback where it is not and the caller allows that.
+fn select_backend(
+    ledger: &impl LedgerAccess,
+    parent: &parent::HeldParent,
+    encrypted: bool,
+    storage: StagedStorage,
+    cancel: &Cancellation,
+) -> Result<StagedBackend, ReadFault> {
+    if storage == StagedStorage::PortableOnly {
+        return Ok(StagedBackend::Portable);
+    }
+    let native = io::operation(
+        ledger,
+        encrypted,
+        RunCategory::StorageBackendOperations,
+        IoStage::Output,
+        ReadIoOperation::Stat,
+        Some(cancel),
+        || {
+            spool::syscall(ReadIoOperation::Stat, parent.file.as_raw_fd(), || {
+                #[cfg(test)]
+                if FORCE_UNSUPPORTED.with(|f| f.get()) {
+                    return Err(std::io::ErrorKind::Unsupported.into());
+                }
+                native_policy::backend(parent.file.as_raw_fd())
+            })
+        },
+    );
+    match native {
+        Ok(()) => Ok(StagedBackend::Native),
+        Err(ReadFault::Io { error, .. }) if error.kind() == std::io::ErrorKind::Unsupported => match storage {
+            StagedStorage::NativeOnly => Err(ReadFault::UnsupportedStorage),
+            _ => Ok(StagedBackend::Portable),
+        },
+        Err(fault) => Err(fault),
+    }
+}
 struct Preparing<'a> {
     ledger: LedgerView<'a>,
     encrypted: bool,
@@ -216,6 +268,7 @@ struct Preparing<'a> {
     inode: Option<named::NamedFile>,
     child: Option<policy::ChildPolicy>,
     snapshot: Option<policy::ParentPolicy>,
+    temp: Option<portable::PortableTemp>,
     parent_unbound: bool,
     parent_observed: Option<bool>,
     stage_unbound: bool,
@@ -236,6 +289,11 @@ impl Preparing<'_> {
             metadata_fault(&mut error, fault);
         }
         if let Some(parent) = self.parent.take() {
+            if let Some(mut temp) = self.temp.take() {
+                let (clear, report) = temp.retire(&self.ledger, &parent, self.encrypted, false);
+                self.storage_clear = clear;
+                merge(&mut error, report);
+            }
             let parent_ok = match self.parent_observed.take() {
                 Some(valid) => valid,
                 None => match parent.verify_cleanup_name(&self.ledger) {
@@ -320,7 +378,7 @@ fn acquire(
     cancel: &Cancellation,
     blocked: &mut Option<target::Refusal>,
     allow_blocked: bool,
-) -> ZipReadResult<Option<PreparedNamed>> {
+) -> ZipReadResult<Option<Prepared>> {
     ledger.with_state(|s| s.reserve(binding.encrypted, binding.bytes, 2))?;
     let mut preparing = Preparing {
         ledger,
@@ -331,6 +389,7 @@ fn acquire(
         inode: None,
         child: None,
         snapshot: None,
+        temp: None,
         parent_unbound: true,
         parent_observed: None,
         stage_unbound: true,
@@ -354,26 +413,21 @@ fn acquire(
             target::Target::Blocked(refusal) => return Err(refusal.fault().into()),
             _ => {}
         }
-        io::operation(
-            &ledger,
-            binding.encrypted,
-            RunCategory::StorageBackendOperations,
-            IoStage::Output,
-            ReadIoOperation::Stat,
-            Some(cancel),
-            || {
-                spool::syscall(ReadIoOperation::Stat, parent.file.as_raw_fd(), || {
-                    native_policy::backend(parent.file.as_raw_fd())
-                })
-            },
-        )
-        .map_err(|fault| match fault {
-            ReadFault::Io { error, .. } if error.kind() == std::io::ErrorKind::Unsupported => {
-                ReadFault::UnsupportedStorage
-            }
-            fault => fault,
-        })?;
         let tilde = !parent.target().to_bytes().contains(&b'~');
+        if select_backend(&ledger, parent, binding.encrypted, context.options.staged_storage, cancel)?
+            == StagedBackend::Portable
+        {
+            preparing.stage_unbound = false;
+            preparing.storage_clear = false;
+            match portable::PortableTemp::create(&ledger, parent, binding.encrypted, tilde, cancel) {
+                Ok(temp) => preparing.temp = Some(temp),
+                Err((error, clear)) => {
+                    preparing.storage_clear = clear;
+                    return Err(error);
+                }
+            }
+            return Ok(true);
+        }
         let (snapshot, child) = policy::probe(&ledger, &parent.file, frozen.uid, tilde, &mut scratch, cancel)?;
         preparing.snapshot = Some(snapshot);
         preparing.child = Some(child);
@@ -420,6 +474,17 @@ fn acquire(
         Ok(true)
     })();
     match result {
+        Ok(true) if preparing.temp.is_some() => {
+            let ready = portable::PreparedPortable {
+                parent: preparing.parent.take().unwrap(),
+                temp: preparing.temp.take().unwrap(),
+                mode: binding.mode,
+                mtime: binding.mtime,
+                overwrite: options.overwrite,
+            };
+            preparing.finished = true;
+            Ok(Some(Prepared::Portable(ready)))
+        }
         Ok(true) => {
             let ready = PreparedNamed {
                 parent: preparing.parent.take().unwrap(),
@@ -431,7 +496,7 @@ fn acquire(
                 overwrite: options.overwrite,
             };
             preparing.finished = true;
-            Ok(Some(ready))
+            Ok(Some(Prepared::Native(ready)))
         }
         Ok(false) => {
             // Skip is a successful no-storage outcome. Retire the held parent
@@ -505,9 +570,14 @@ impl ZipReadStage {
             (Err(error), Err(boundary)) => Err(error.merge_source_boundary(boundary)),
             (Ok(ready), Err(error)) => {
                 let mut error = error;
-                if let Some(mut ready) = ready {
-                    let file = ready.inode.file.take();
-                    let (clear, cleanup) = ready.cleanup(&token, file, binding.encrypted);
+                if let Some(ready) = ready {
+                    let (clear, cleanup) = match ready {
+                        Prepared::Native(mut ready) => {
+                            let file = ready.inode.file.take();
+                            ready.cleanup(&token, file, binding.encrypted)
+                        }
+                        Prepared::Portable(ready) => ready.cleanup(&token, None, binding.encrypted),
+                    };
                     if clear {
                         token.with_state(|s| s.release_bytes(binding.encrypted, binding.bytes));
                     }
@@ -520,11 +590,23 @@ impl ZipReadStage {
         };
         match result {
             Ok(None) => Ok(None),
-            Ok(Some(mut ready)) => {
-                let file = ready.inode.file.take().ok_or(ReadFault::InvalidPlan)?;
-                let identity = ready.inode.identity.ok_or(ReadFault::InvalidPlan)?;
+            Ok(Some(ready)) => {
+                let (file, identity, uid, named) = match ready {
+                    Prepared::Native(mut ready) => (
+                        ready.inode.file.take().ok_or(ReadFault::InvalidPlan)?,
+                        ready.inode.identity.ok_or(ReadFault::InvalidPlan)?,
+                        ready.child.uid,
+                        Prepared::Native(ready),
+                    ),
+                    Prepared::Portable(mut ready) => (
+                        ready.temp.file.take().ok_or(ReadFault::InvalidPlan)?,
+                        ready.temp.identity.ok_or(ReadFault::InvalidPlan)?,
+                        // SAFETY: geteuid has no failure mode or memory effects.
+                        unsafe { libc::geteuid() },
+                        Prepared::Portable(ready),
+                    ),
+                };
                 let handle = file_handle(&file);
-                let uid = ready.child.uid;
                 Ok(Some(Self {
                     file: Some(file),
                     reservation: OutputReservation {
@@ -541,7 +623,7 @@ impl ZipReadStage {
                     uid,
                     descriptor: (0, 0, 0, 0),
                     terminal: false,
-                    named: Some(ready),
+                    named: Some(named),
                 }))
             }
             Err(error) => {
@@ -573,8 +655,27 @@ impl ZipReadStage {
         if let Err(boundary) = self.source.observe(context, &mut source) {
             return self.finish_error_with_final_source(error.merge_source_boundary(boundary), context, &mut source);
         }
+        if let Some(ready) = self.take_portable() {
+            self.terminal = true;
+            let mut ready = ready;
+            ready.temp.file = self.file.take();
+            let (clear, cleanup) = ready.finish_unpublished(&self.reservation.ledger, self.reservation.encrypted, true);
+            if clear {
+                self.reservation
+                    .ledger
+                    .with_state(|s| s.release_bytes(self.reservation.encrypted, self.reservation.bytes));
+            }
+            self.reservation.retired = true;
+            if let Some(cleanup) = cleanup {
+                error = error.merge_cleanup_only(cleanup);
+            }
+            if let Err(boundary) = self.source.observe(context, &mut source) {
+                error = error.merge_source_boundary(boundary);
+            }
+            return self.usage(error);
+        }
         let reopened = (|| -> ZipReadResult<()> {
-            let ready = self.named.as_mut().ok_or(ReadFault::InvalidPlan)?;
+            let ready = native_mut(&mut self.named).ok_or(ReadFault::InvalidPlan)?;
             let mut scratch = policy::PolicyScratch::new(self.reservation.ledger.view())?;
             ready.directory.reopen_normal(
                 &self.reservation.ledger,
@@ -594,7 +695,7 @@ impl ZipReadStage {
             );
         }
         self.terminal = true;
-        let mut ready = self.named.take().unwrap();
+        let mut ready = self.take_native().unwrap();
         ready.inode.file = self.file.take();
         let (clear, cleanup) = ready.finish_unpublished(&self.reservation.ledger, self.reservation.encrypted, true);
         if clear {
@@ -622,8 +723,14 @@ impl ZipReadStage {
         error.with_usage(context.usage(), context.run_usage()).with_policy_usage(context.policy_metadata_usage())
     }
     pub(super) fn retire_named(&mut self) -> Option<ZipReadError> {
-        let ready = self.named.take()?;
-        let (clear, error) = ready.cleanup(&self.reservation.ledger, self.file.take(), self.reservation.encrypted);
+        let (clear, error) = match self.named.take()? {
+            Prepared::Portable(ready) => {
+                ready.cleanup(&self.reservation.ledger, self.file.take(), self.reservation.encrypted)
+            }
+            Prepared::Native(ready) => {
+                ready.cleanup(&self.reservation.ledger, self.file.take(), self.reservation.encrypted)
+            }
+        };
         if clear && !self.reservation.retired {
             self.reservation.ledger.with_state(|s| s.release_bytes(self.reservation.encrypted, self.reservation.bytes));
         }
@@ -644,8 +751,10 @@ impl ZipReadStage {
 /// name was taken, which fails only this member.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn publish_renamed(
-    ready: &PreparedNamed,
+    parent: &parent::HeldParent,
     dir: std::os::fd::RawFd,
+    stage_leaf: &CStr,
+    portable: bool,
     mode: crate::extract::RenameMode,
     existing: bool,
     ledger: &impl LedgerAccess,
@@ -656,17 +765,18 @@ fn publish_renamed(
     use crate::extract::{RenameMode, RenamedOutput, renamed_name};
     use std::os::unix::ffi::OsStrExt;
     let mut publisher = RenamePublisher {
-        parent: ready.parent.file.as_raw_fd(),
-        name: std::ffi::OsStr::from_bytes(ready.parent.target().to_bytes()),
+        parent: parent.file.as_raw_fd(),
+        name: std::ffi::OsStr::from_bytes(parent.target().to_bytes()),
         style: mode.style(),
         ledger,
         encrypted,
         cancel,
         charged: false,
+        portable,
     };
-    let leaf = ready.parent.target();
+    let leaf = parent.target();
     let named = |n: u32| {
-        let mut path = ready.parent.path().to_bytes().to_vec();
+        let mut path = parent.path().to_bytes().to_vec();
         path.push(b'/');
         path.extend_from_slice(leaf.to_bytes());
         let requested = PathBuf::from(std::ffi::OsStr::from_bytes(&path));
@@ -676,12 +786,12 @@ fn publish_renamed(
     match mode {
         RenameMode::New(_) => {
             if !existing {
-                match publisher.attempt(dir, ready.inode.leaf(), leaf)? {
+                match publisher.attempt(dir, stage_leaf, leaf)? {
                     Some(Err(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     result => return Ok(result),
                 }
             }
-            Ok(publisher.claim(dir, ready.inode.leaf())?.map(|claimed| {
+            Ok(publisher.claim(dir, stage_leaf)?.map(|claimed| {
                 claimed.map(|n| {
                     let (requested, path) = named(n);
                     *renamed = Some(RenamedOutput { requested, path, existing: None });
@@ -698,7 +808,7 @@ fn publish_renamed(
                 let (requested, moved) = named(n);
                 *renamed = Some(RenamedOutput { path: requested.clone(), requested, existing: Some(moved) });
             }
-            publisher.attempt(dir, ready.inode.leaf(), leaf)
+            publisher.attempt(dir, stage_leaf, leaf)
         }
     }
 }
@@ -711,6 +821,8 @@ struct RenamePublisher<'a, L> {
     encrypted: bool,
     cancel: &'a Cancellation,
     charged: bool,
+    /// Publish with the portable no-replace ladder instead of the native no-replace rename.
+    portable: bool,
 }
 
 #[allow(clippy::result_large_err)]
@@ -732,7 +844,11 @@ impl<L: LedgerAccess> RenamePublisher<'_, L> {
             self.ledger.with_state(|s| s.attempt(self.encrypted))?;
         }
         Ok(Some(spool::syscall(ReadIoOperation::Publish, self.parent, || {
-            native_policy::rename_file(from, from_leaf, self.parent, to, false)
+            if self.portable {
+                native_policy::rename_portable(from, from_leaf, self.parent, to, false)
+            } else {
+                native_policy::rename_file(from, from_leaf, self.parent, to, false)
+            }
         })))
     }
 
@@ -797,15 +913,19 @@ impl ZipReadStage {
         }
         context.verify_identity(self.source.owner)?;
         let action = context.action.as_ref().ok_or(ReadFault::InvalidPlan)?;
-        let ready = self.named.as_ref().ok_or(ReadFault::InvalidPlan)?;
+        let (ready_mode, ready_mtime) = match &self.named {
+            Some(Prepared::Native(ready)) => (ready.mode, ready.mtime),
+            Some(Prepared::Portable(ready)) => (ready.mode, ready.mtime),
+            None => return Err(ReadFault::InvalidPlan),
+        };
         if !action.controlled_output
             || action.raw_output
             || !action.consumed
             || !action.completed
             || action.output != budget::PlannedOutput::StagedFiles
             || self.reservation.written != self.reservation.bytes
-            || mode.map(|m| m & 0o777) != ready.mode.map(|m| m & 0o777)
-            || !same_time(mtime, ready.mtime)
+            || mode.map(|m| m & 0o777) != ready_mode.map(|m| m & 0o777)
+            || !same_time(mtime, ready_mtime)
             || self.file.as_ref().is_none_or(|file| file_handle(file) != self.reservation.handle)
         {
             return Err(ReadFault::InvalidPlan);
@@ -825,6 +945,9 @@ impl ZipReadStage {
         if let Err(fault) = self.validate_file(mode, mtime, context) {
             return Err(self.finish_error(fault.into(), context));
         }
+        if self.backend() == StagedBackend::Portable {
+            return self.publish_portable(cancel, context, final_check);
+        }
         let mut publication = PublicationState::NotPublished;
         let mut renamed = None;
         let mut exhausted = false;
@@ -832,7 +955,7 @@ impl ZipReadStage {
             let ledger = &self.reservation.ledger;
             let encrypted = self.reservation.encrypted;
             let mut scratch = policy::PolicyScratch::new(ledger.view())?;
-            let ready = self.named.as_mut().ok_or(ReadFault::InvalidPlan)?;
+            let ready = native_mut(&mut self.named).ok_or(ReadFault::InvalidPlan)?;
             let metadata = (|| -> ZipReadResult<()> {
                 ready.directory.reopen_normal(ledger, &ready.parent, encrypted, &mut scratch, cancel)?;
                 metadata::restore(
@@ -899,7 +1022,19 @@ impl ZipReadStage {
                     )
                 }),
                 Some(mode) => {
-                    match publish_renamed(ready, dir, mode, existing, ledger, encrypted, cancel, &mut renamed)? {
+                    let leaf = ready.inode.leaf();
+                    match publish_renamed(
+                        &ready.parent,
+                        dir,
+                        leaf,
+                        false,
+                        mode,
+                        existing,
+                        ledger,
+                        encrypted,
+                        cancel,
+                        &mut renamed,
+                    )? {
                         Some(result) => result,
                         None => {
                             exhausted = true;
@@ -944,7 +1079,7 @@ impl ZipReadStage {
                 self.reservation
                     .ledger
                     .with_state(|s| s.release_bytes(self.reservation.encrypted, self.reservation.bytes));
-                let ready = self.named.take().ok_or(ReadFault::InvalidPlan)?;
+                let ready = self.take_native().ok_or(ReadFault::InvalidPlan)?;
                 ready
                     .finish_published(&self.reservation.ledger, self.reservation.encrypted, cancel)
                     .map(|_| true)
@@ -952,7 +1087,7 @@ impl ZipReadStage {
             }
             Ok(false) => {
                 self.terminal = true;
-                let ready = self.named.take().ok_or(ReadFault::InvalidPlan)?;
+                let ready = self.take_native().ok_or(ReadFault::InvalidPlan)?;
                 let (clear, cleanup) =
                     ready.finish_unpublished(&self.reservation.ledger, self.reservation.encrypted, false);
                 if clear {
@@ -972,6 +1107,186 @@ impl ZipReadStage {
                     result => result,
                 };
                 result.map_err(|error| self.usage(error.with_publication(PublicationState::NotPublished, 0)))
+            }
+        }
+    }
+
+    /// [`Self::publish`] on the portable backend: the same final source and target checks and overwrite policy, then
+    /// one rename of the temporary file in the held parent.
+    fn publish_portable(
+        mut self,
+        cancel: &Cancellation,
+        context: &mut EncryptedReadContext,
+        mut final_check: impl FnMut(&mut EncryptedReadContext) -> ZipReadResult<()>,
+    ) -> ZipReadResult<bool> {
+        let mut publication = PublicationState::NotPublished;
+        let mut renamed = None;
+        let mut exhausted = false;
+        let result = (|| -> ZipReadResult<bool> {
+            let ledger = &self.reservation.ledger;
+            let encrypted = self.reservation.encrypted;
+            let ready = match self.named.as_mut() {
+                Some(Prepared::Portable(ready)) => ready,
+                _ => return Err(ReadFault::InvalidPlan.into()),
+            };
+            let metadata = ready
+                .restore(
+                    ledger,
+                    encrypted,
+                    self.file.as_ref().ok_or(ReadFault::InvalidPlan)?,
+                    self.reservation.bytes,
+                    cancel,
+                )
+                .map_err(ZipReadError::from);
+            boundary(metadata, self.source.observe(context, &mut final_check))?;
+            let closed =
+                ready.temp.close_for_publish(ledger, self.file.take().ok_or(ReadFault::InvalidPlan)?, encrypted);
+            if let Err(error) = closed {
+                return boundary(Err(error), self.source.observe(context, &mut final_check));
+            }
+            let eligible = (|| -> ZipReadResult<Option<bool>> {
+                ready.parent.verify_normal_name(ledger, encrypted, cancel)?;
+                let mut scratch = policy::PolicyScratch::new(ledger.view())?;
+                let frozen = context.action.as_ref().and_then(|a| a.policy.as_ref()).ok_or(ReadFault::InvalidPlan)?;
+                let target = target::inspect(
+                    ledger,
+                    &mut ready.parent,
+                    frozen,
+                    ready.overwrite,
+                    RunCategory::StageFinalization,
+                    &mut scratch,
+                    cancel,
+                )?;
+                match target {
+                    target::Target::Skip => Ok(None),
+                    target::Target::Blocked(refusal) => Err(refusal.fault().into()),
+                    target::Target::Existing => Ok(Some(true)),
+                    target::Target::Missing => Ok(Some(false)),
+                }
+            })();
+            let Some(existing) = boundary(eligible, self.source.observe(context, &mut final_check))? else {
+                return Ok(false);
+            };
+            ledger.with_state(|s| s.charge_category(RunCategory::StageFinalization, 1))?;
+            io::canceled(Some(cancel))?;
+            ledger.with_state(|s| s.attempt(encrypted))?;
+            let dir = ready.parent.file.as_raw_fd();
+            let moved = match ready.overwrite.rename() {
+                None => spool::syscall(ReadIoOperation::Publish, dir, || {
+                    native_policy::rename_portable(
+                        dir,
+                        ready.temp.leaf(),
+                        dir,
+                        ready.parent.target(),
+                        ready.overwrite == crate::extract::Overwrite::Always,
+                    )
+                }),
+                Some(mode) => {
+                    let leaf = ready.temp.leaf();
+                    match publish_renamed(
+                        &ready.parent,
+                        dir,
+                        leaf,
+                        true,
+                        mode,
+                        existing,
+                        ledger,
+                        encrypted,
+                        cancel,
+                        &mut renamed,
+                    )? {
+                        Some(result) => result,
+                        None => {
+                            exhausted = true;
+                            return Ok(false);
+                        }
+                    }
+                }
+            };
+            match moved {
+                Ok(()) => {
+                    publication = PublicationState::Published;
+                    ready.temp.published();
+                    Ok(true)
+                }
+                Err(error)
+                    if ready.overwrite == crate::extract::Overwrite::Skip
+                        && error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    Ok(false)
+                }
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        || error.raw_os_error() == Some(libc::EIO)
+                        || error.raw_os_error().is_none()
+                    {
+                        publication = PublicationState::Unknown;
+                    }
+                    Err(ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Publish, offset: 0, error }
+                        .into())
+                }
+            }
+        })();
+        if let Some(action) = context.action.as_mut() {
+            action.renamed = renamed;
+        }
+        match result {
+            Err(error) => Err(self.finish_error(error.with_publication(publication, 0), context)),
+            Ok(true) => {
+                self.terminal = true;
+                self.reservation.retired = true;
+                self.reservation
+                    .ledger
+                    .with_state(|s| s.release_bytes(self.reservation.encrypted, self.reservation.bytes));
+                let ready = self.take_portable().ok_or(ReadFault::InvalidPlan)?;
+                ready
+                    .finish_published(&self.reservation.ledger, self.reservation.encrypted)
+                    .map(|_| true)
+                    .map_err(|error| self.usage(error.with_publication(PublicationState::Published, 0)))
+            }
+            Ok(false) => {
+                self.terminal = true;
+                let ready = self.take_portable().ok_or(ReadFault::InvalidPlan)?;
+                let (clear, cleanup) =
+                    ready.finish_unpublished(&self.reservation.ledger, self.reservation.encrypted, false);
+                if clear {
+                    self.reservation
+                        .ledger
+                        .with_state(|s| s.release_bytes(self.reservation.encrypted, self.reservation.bytes));
+                }
+                self.reservation.retired = true;
+                let finality = self.source.observe(context, &mut final_check);
+                let result = boundary(cleanup.map_or(Ok(false), Err), finality);
+                if result.is_err() {
+                    self.reservation.ledger.with_state(|s| s.poisoned = true);
+                }
+                let result = match result {
+                    Ok(false) if exhausted => Err(ReadFault::CheckedFormat { reason: RENAME_EXHAUSTED }.into()),
+                    result => result,
+                };
+                result.map_err(|error| self.usage(error.with_publication(PublicationState::NotPublished, 0)))
+            }
+        }
+    }
+    /// The storage backend this stage writes through.
+    pub fn backend(&self) -> StagedBackend {
+        if matches!(self.named, Some(Prepared::Portable(_))) { StagedBackend::Portable } else { StagedBackend::Native }
+    }
+    fn take_native(&mut self) -> Option<PreparedNamed> {
+        match self.named.take() {
+            Some(Prepared::Native(ready)) => Some(ready),
+            other => {
+                self.named = other;
+                None
+            }
+        }
+    }
+    fn take_portable(&mut self) -> Option<portable::PreparedPortable> {
+        match self.named.take() {
+            Some(Prepared::Portable(ready)) => Some(ready),
+            other => {
+                self.named = other;
+                None
             }
         }
     }

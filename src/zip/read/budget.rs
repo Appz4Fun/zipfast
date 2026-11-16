@@ -224,8 +224,9 @@ impl EncryptedReadLedger {
         password: u64,
         aes: bool,
     ) -> Result<(), ReadFault> {
-        self.begin_member_with_crc(packed, decoded, ciphertext, password, aes, false)
+        self.begin_member_with_crc(packed, decoded, ciphertext, password, aes, false, false)
     }
+    #[allow(clippy::too_many_arguments)] // Flat declared geometry; one call site.
     pub(super) fn begin_member_with_crc(
         &mut self,
         packed: u64,
@@ -234,12 +235,15 @@ impl EncryptedReadLedger {
         password: u64,
         aes: bool,
         crc: bool,
+        streaming: bool,
     ) -> Result<(), ReadFault> {
         // Attempts and declared P are spent even when later policy/framing rejects the member.
         self.charge_member_attempt(packed)?;
         admit(ReadResource::MemberPackedBytes, self.limits.member_packed_bytes.into(), packed.into())?;
         admit(ReadResource::MemberDecodedBytes, self.limits.member_decoded_bytes.into(), decoded.into())?;
-        if aes && ciphertext > self.limits.ciphertext_memory_bytes {
+        // A streamed member holds no ciphertext: neither a memory snapshot nor a spool file.
+        let spooled = aes && !streaming && ciphertext > self.limits.ciphertext_memory_bytes;
+        if spooled {
             admit(ReadResource::MemberSpoolBytes, self.limits.member_spool_bytes.into(), ciphertext.into())?;
         }
         admit(ReadResource::PasswordBytes, self.limits.password_bytes.into(), password.into())?;
@@ -247,10 +251,9 @@ impl EncryptedReadLedger {
         self.usage.member_packed_bytes = packed;
         self.usage.member_decoded_bytes = 0;
         self.member_expected = decoded;
-        self.usage.member_spool_bytes =
-            if aes && ciphertext > self.limits.ciphertext_memory_bytes { ciphertext } else { 0 };
+        self.usage.member_spool_bytes = if spooled { ciphertext } else { 0 };
         self.usage.allocation_attempts = 0;
-        let disk = aes && ciphertext > self.limits.ciphertext_memory_bytes;
+        let disk = spooled;
         let io = u128::from(packed)
             .checked_add(if disk { product(ciphertext.into(), 3)? } else { 0 })
             .ok_or(ReadFault::CounterOverflow)?;
@@ -265,7 +268,7 @@ impl EncryptedReadLedger {
         } else {
             checked_sum(checked_sum(packed.into(), ciphertext.into())?, decoded.into())?
         };
-        if aes && !disk {
+        if aes && !disk && !streaming {
             admit(
                 ReadResource::ReaderCapacity,
                 self.limits.reader_capacity.into(),
@@ -412,6 +415,8 @@ pub(super) struct MemberPlan {
     pub(super) cipher: Option<CipherKind>,
     pub(super) crc: Option<u32>,
     pub(super) output: PlannedOutput,
+    /// WinZip AES streamed into a provisional staged output: no ciphertext spool, HMAC checked before publication.
+    pub(super) streaming: bool,
 }
 impl ActionPlan {
     fn bind_policy_geometry(&mut self, policy: PolicyGeometry) -> Result<u128, ReadFault> {
