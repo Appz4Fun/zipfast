@@ -61,9 +61,28 @@ queueing a second wake. Nothing busy-polls:
 Setting `poll_interval: None` leaves waking to a `GrowthNotifier`, for example one driven by fs-notify. Even then
 the idle deadline still wakes the session once, so a stall is reported rather than hanging.
 
-Each wake is charged to `ProgressiveLimits::provider_wakes` (default 1,048,576), and each retry to
-`source_requests`. At the default 250 ms interval, a set that stalls for a long time (but within the idle timeout)
-spends one wake per interval. Raise those limits, or the poll interval, for follows lasting days.
+### Per-wake cost and limits for long follows
+
+Every wake, whether from the timer or a notification, is charged to the session's cumulative budgets:
+
+| Wait | `provider_wakes` | `source_requests` | `source_bookkeeping` |
+|---|---|---|---|
+| Absent volume | 1 | 2 | 1 |
+| Read past the current end | 1 | 3 | 0 |
+
+These costs do not depend on how many volumes are declared. When the provider repeats its declaration unchanged
+(same epoch, same size), the session accepts the repeat in O(1). That is safe because the library provider never
+changes an entry without raising the epoch, and because the next admission and every publication still re-prove
+all bindings. Each protection query re-checks one declared volume, in rotation.
+
+With the defaults, `provider_wakes` (1,048,576) is the first limit a pure wait reaches. That is about 72 hours of
+waiting at the 250 ms interval, fewer if notifications add wakes. `source_requests` (4,194,304) and
+`source_bookkeeping` (64 Mi) also pay for the actual reading. For a follow of duration *T*, size the limits as:
+
+- `provider_wakes ≥ T / poll_interval`, plus the number of notifications you expect;
+- `source_requests ≥ 3 × provider_wakes`, plus what the archive itself needs.
+
+Alternatively, lengthen `poll_interval` and rely on a `GrowthNotifier` for prompt wakes.
 
 ## Strict publication: a growing native inventory
 
@@ -83,8 +102,9 @@ publication for early members. Declaring only existing, bound volumes keeps ever
 member publishes Strict as soon as it is verified, even while later volumes are still absent.
 
 Ordinary sessions keep frozen declarations for custom providers. A declaration grows in an ordinary session only
-when the provider proves it is library-owned, through the hidden `VolumeSource::library_growth`, whose
-`LibraryGrowth` token cannot be built outside the crate, and also opts in with `extends_protection`. Persistent
+when the boxed provider's concrete type is `GrowingFileVolumes`. The session checks this through
+`VolumeSource: Any`, the same way it recognises `ImmutableFileSource`. A wrapper that forwards every method of a
+`GrowingFileVolumes` is still a custom provider, and its growth is refused with `SourceChanged`. Persistent
 sessions (`new_partial`) accept the same growth through their existing opt-in and exclusions. A persistent session
 needs a Complete declaration when it starts, so create volume 0 (it may be empty) before calling `new_partial`.
 
@@ -111,6 +131,40 @@ is requested.
 
 To keep a downloader and the extractor apart entirely, extract to a directory that is not the download directory.
 
+Recorded output identities are never retired, even after the library discards a stage file. If the file system
+reuses such an inode for a volume created later, that volume is refused with `UnsafePath`. This fails closed and
+is rare. A separate output directory on another file system avoids it entirely.
+
+## Writer requirements
+
+The provider assumes an **append-only writer**: every byte below the current file size is final when it becomes
+visible. Writers that break this fail closed: a read sees bytes that are not yet the volume's, and the session
+reports `SourceChanged` (from the block checks or the length check), a RAR header or data checksum failure, or a
+malformed header. Writers known to break it:
+
+- **Preallocation.** For example aria2's default `--file-allocation=prealloc` (or `falloc`/`trunc`), or a
+  downloader that sizes the file first. The file reaches its final size at once, full of zeros.
+- **Out-of-order or segmented writes into the final file.** For example NZBGet with `DirectWrite=yes`, aria2 with
+  several connections per file, or BitTorrent clients, which write pieces wherever they land.
+- **Network file systems that report a size before the data is readable.** For example NFS or SMB clients with
+  attribute caching, or FUSE file systems that extend first and fill later.
+
+Settings that work:
+
+- NZBGet with `DirectWrite=no`, which assembles each file in order (or renames complete files; see below);
+- SABnzbd's normal in-order assembly;
+- aria2 with `--file-allocation=none` and one connection per file (`-x1 -s1`), or with completed files renamed in;
+- `curl` or `wget` writing sequentially;
+- any writer that only appends.
+
+Torrents should finish (or download to a staging directory) before extraction.
+
+**Writers that use a temporary name and rename on completion** are supported, but each volume only appears when it
+is complete. Until then the provider sees it as absent, and after `idle_timeout` it answers `Missing`
+(`MissingVolume`). Set `idle_timeout` comfortably longer than the slowest single volume takes to download. Use a
+`GrowthNotifier` (driven by a watcher on the directory) so each rename is noticed at once rather than at the next
+poll.
+
 ## Prefix stability: what is guaranteed
 
 Bytes already read must not change. The source checks this cheaply. It never rehashes everything on every read.
@@ -120,8 +174,9 @@ Bytes already read must not change. The source checks this cheaply. It never reh
   deletion, a replacement by rename (new inode, even with identical bytes) or a symlink swap is `SourceChanged`.
   The driver's native bindings repeat the path check at its own authority points.
 - **Length.** The length must never decrease. A truncation, or a read that ends before the observed length, is
-  `SourceChanged`. Every protection query also re-checks the length of every declared volume, so a volume the
-  session has already left is still checked whenever a later volume is admitted or a member is published.
+  `SourceChanged`. Volumes the session has already left are re-checked too:
+  - each protection query re-checks the identity, path and length of one declared volume, in rotation;
+  - all declared volumes are re-checked whenever a new one is declared.
 - **Content.** The source remembers a CRC-32 for every complete `check_block`-byte block (default 64 KiB) of what
   it has served. Bytes never served that fall in a gap are hashed from the file. That costs 4 bytes of memory per
   block, about 64 KiB per GiB.

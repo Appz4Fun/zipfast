@@ -457,6 +457,9 @@ fn an_output_published_where_a_later_volume_appears_is_never_read_as_input() {
 #[test]
 fn growth_is_still_refused_from_custom_providers_in_ordinary_sessions() {
     // The library-owned provider grows; a custom provider that only opts in keeps the frozen contract.
+    // It forwards everything a provider can say, and even shares the inner provider's address
+    // (`repr(transparent)`); ownership is the boxed concrete type, which a wrapper cannot forward.
+    #[repr(transparent)]
     struct Custom(GrowingFileVolumes);
     impl VolumeSource for Custom {
         fn volume(&mut self, r: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
@@ -492,6 +495,40 @@ fn growth_is_still_refused_from_custom_providers_in_ordinary_sessions() {
     );
     let failure = run.failure.expect("frozen declaration");
     assert!(matches!(failure.kind, FailureKind::SourceChanged), "{failure:?}");
+}
+
+#[test]
+fn a_long_wait_for_an_absent_volume_costs_constant_bookkeeping_per_wake() {
+    // 20,000 notify-driven wakes while volume 1 is absent, under a bookkeeping budget the old per-wake cost
+    // (about 220 units, growing with the declared volumes) would have exhausted 4 times over.
+    const WAKES: usize = 20_000;
+    let f = fixture();
+    let set = set();
+    fs::write(f.inputs.join(NAMES[0]), &set.volumes[0]).unwrap();
+    let provider = GrowingFileVolumes::new(f.inputs.join(NAMES[0]), growing(None, Duration::from_secs(600))).unwrap();
+    let notifier = provider.notifier();
+    let mut options = options(&f.dest);
+    options.limits.source_bookkeeping = 1_000_000;
+    options.limits.provider_wakes = 2 * WAKES as u64;
+    let mut session = ProgressiveSession::new(Box::new(provider), options).unwrap();
+    let inputs = f.inputs.clone();
+    let mut waits = 0;
+    let run = drive(
+        &mut session,
+        &f.dest,
+        Duration::from_secs(120),
+        || {
+            waits += 1;
+            if waits == WAKES {
+                fs::write(inputs.join(NAMES[1]), &set.volumes[1]).unwrap();
+                fs::write(inputs.join(NAMES[2]), &set.volumes[2]).unwrap();
+            }
+            notifier.notify();
+        },
+        |_| {},
+    );
+    assert_strict(&run, &set);
+    assert!(run.pending >= WAKES);
 }
 
 #[cfg(feature = "persistent-partials")]

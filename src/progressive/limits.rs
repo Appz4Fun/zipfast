@@ -232,6 +232,11 @@ impl Usage {
     pub(crate) fn charge(&self, resource: Resource, amount: u64) -> ProgressiveResult<()> {
         self.0.lock().unwrap().charge(resource, amount)
     }
+    /// What has been charged to `resource` so far.
+    #[cfg(test)]
+    pub(crate) fn used(&self, resource: Resource) -> u64 {
+        self.0.lock().unwrap().used[resource as usize]
+    }
     /// Tightens one budget mid-session, so a test can bound a single step.
     #[cfg_attr(
         not(feature = "persistent-partials"),

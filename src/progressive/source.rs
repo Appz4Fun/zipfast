@@ -78,7 +78,7 @@ pub enum RangeRead {
 }
 /// Called for every volume, including index zero. Wait parks until the supplied
 /// waker fires; waking before returning Wait is supported. Calls are serialized.
-pub trait VolumeSource: Send + 'static {
+pub trait VolumeSource: Send + std::any::Any + 'static {
     fn volume(&mut self, request: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer>;
     /// A declaration of structure only; this does not grant publication authority.
     ///
@@ -88,8 +88,9 @@ pub trait VolumeSource: Send + 'static {
         Ok(ProtectionDeclaration::Opaque)
     }
     /// Opts in to a growing Complete declaration; read once, when a persistent session starts. Ordinary sessions
-    /// ignore it, except for the library-owned [`super::GrowingFileVolumes`], whose growth an ordinary session
-    /// accepts after checking every appended path against every output file it created.
+    /// ignore it, except for the library-owned [`super::GrowingFileVolumes`] itself (recognised by its concrete type,
+    /// not by any method a wrapper could forward), whose growth an ordinary session accepts after checking every
+    /// appended path against every output file it created.
     ///
     /// When true, a persistent session (`ProgressiveSession::new_partial`, feature `persistent-partials`) also
     /// accepts a Complete declaration with a higher epoch that only appends volumes and auxiliary paths, every
@@ -99,21 +100,6 @@ pub trait VolumeSource: Send + 'static {
     /// A provider that opts in and never declares the index leaves the session waiting.
     fn extends_protection(&self) -> bool {
         false
-    }
-    /// Growth authority for ordinary sessions. Only zipfast's own providers ([`super::GrowingFileVolumes`]) can
-    /// answer it: [`LibraryGrowth`] cannot be constructed outside the crate.
-    #[doc(hidden)]
-    fn library_growth(&self) -> Option<LibraryGrowth> {
-        None
-    }
-}
-/// Proof that a provider is library-owned and may grow its Complete declaration in an ordinary session.
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct LibraryGrowth(());
-impl LibraryGrowth {
-    pub(crate) fn new() -> Self {
-        Self(())
     }
 }
 /// The caller owns availability and immutability leases. After NotYet, wake the
@@ -622,8 +608,9 @@ pub(crate) struct SourceDriver {
     replacements: Vec<(u32, SourceDriver)>,
     replacement_native: bool,
     external_handles: usize,
-    /// Whether a library-owned provider may grow its Complete declaration in this (ordinary) session.
-    ordinary_growth: bool,
+    /// Whether the boxed provider is the library-owned `GrowingFileVolumes`: its growth is accepted in an ordinary
+    /// session, and an unchanged re-declaration (same epoch, same counts) is accepted in O(1).
+    library_provider: bool,
     /// Native identities of every output file this ordinary session created; appended paths must not name one.
     outputs: std::collections::HashSet<super::output::native::Identity>,
 }
@@ -645,7 +632,8 @@ impl SourceDriver {
         usage.charge(Resource::NameBytes, first.capacity() as u64)?;
         usage.charge(Resource::MetadataBytes, first.capacity() as u64)?;
         let native = super::output::native::NativeProtection::new(&usage)?;
-        let ordinary_growth = provider.library_growth().is_some() && provider.extends_protection();
+        // Library ownership is the boxed provider's concrete type, which a wrapper cannot forward or forge.
+        let library_provider = (&*provider as &dyn std::any::Any).is::<super::GrowingFileVolumes>();
         Ok(Self {
             #[cfg(feature = "persistent-partials")]
             partial_exclusions: None,
@@ -680,7 +668,7 @@ impl SourceDriver {
             replacements: Vec::new(),
             replacement_native: false,
             external_handles: 0,
-            ordinary_growth,
+            library_provider,
             outputs: std::collections::HashSet::new(),
         })
     }
@@ -1447,6 +1435,15 @@ impl SourceDriver {
             return Err(ProgressiveFailure::new(FailureKind::Canceled));
         }
         let mut next = next?;
+        if !full && self.library_repeat(&next)? {
+            // The library provider never changes an entry without raising the epoch, so a same-epoch, same-size
+            // answer repeats the declaration the session enforces. Nothing is adopted and nothing is read here
+            // (this is a wait or an admission attempt): the admission and every authority point after it re-prove
+            // the bindings, so the per-wake cost stays independent of the declared volume count.
+            #[cfg(feature = "persistent-partials")]
+            self.check_partial_inputs()?;
+            return Ok(());
+        }
         if !full && self.sample_redeclaration(&next)? {
             // The provider repeated the declaration the session already validated and enforces. Nothing is
             // adopted from it, so only the bounded step recheck runs.
@@ -1619,6 +1616,20 @@ impl SourceDriver {
         }
         Ok(true)
     }
+    /// Whether the library-owned provider repeated the current Complete declaration (same epoch and sizes).
+    fn library_repeat(&mut self, next: &ProtectionDeclaration) -> ProgressiveResult<bool> {
+        if !self.library_provider {
+            return Ok(false);
+        }
+        self.usage.charge(Resource::SourceBookkeeping, 1)?;
+        Ok(matches!(
+            (&self.protection, next),
+            (
+                ProtectionDeclaration::Complete { epoch: a, inventory: x },
+                ProtectionDeclaration::Complete { epoch: b, inventory: y },
+            ) if a == b && x.volumes.len() == y.volumes.len() && x.auxiliary_paths.len() == y.auxiliary_paths.len()
+        ))
+    }
     /// The epoch of the current Complete declaration.
     #[cfg(feature = "persistent-partials")]
     pub(crate) fn protection_epoch(&self) -> Option<u64> {
@@ -1630,7 +1641,7 @@ impl SourceDriver {
     /// Whether a Complete declaration may grow: persistent sessions only, whose exclusions refuse any declared
     /// path that names an output, bundle or lock, and only when the provider opted in.
     ///
-    /// An ordinary session also accepts the growth of a library-owned provider ([`VolumeSource::library_growth`]).
+    /// An ordinary session also accepts the growth of the library-owned provider (a boxed `GrowingFileVolumes`).
     /// There every appended path is checked against every output file the session created, see
     /// [`Self::check_appended_outputs`].
     fn extendable(&self) -> bool {
@@ -1639,7 +1650,7 @@ impl SourceDriver {
             return self.extends;
         }
         // A retained driver is persistent: it grows only once its exclusions are installed.
-        self.ordinary_growth && self.retained.is_none()
+        self.library_provider && self.retained.is_none()
     }
     /// Whether this driver is an ordinary session growing a library-owned declaration.
     fn ordinary_extension(&self) -> bool {
@@ -1647,7 +1658,7 @@ impl SourceDriver {
         if self.partial_exclusions.is_some() {
             return false;
         }
-        self.ordinary_growth && self.retained.is_none()
+        self.library_provider && self.retained.is_none()
     }
     /// Records an output file this session created, so a later declaration cannot name it as an input.
     pub(crate) fn record_output(&mut self, identity: super::output::native::Identity) -> ProgressiveResult<()> {

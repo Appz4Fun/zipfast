@@ -22,7 +22,7 @@
 //! non-decreasing length and sampled block checksums, so an in-place rewrite, a truncation or a replacement fails
 //! closed with `SourceChanged`.
 use super::{
-    FailureKind, InputOperation, LibraryGrowth, ProgressiveFailure, ProgressiveResult, ProtectedPath, ProtectedVolume,
+    FailureKind, InputOperation, ProgressiveFailure, ProgressiveResult, ProtectedPath, ProtectedVolume,
     ProtectionDeclaration, ProtectionInventory, RangeRead, RangeSource, SourceId, SourceInfo, SourceLength,
     VolumeAnswer, VolumeBacking, VolumeRequest, VolumeSource,
 };
@@ -128,7 +128,7 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY);
     }
     options.open(path)
 }
@@ -601,6 +601,7 @@ pub struct GrowingFileVolumes {
     waiting: Option<(u32, Instant)>,
     pacer: Arc<Pacer>,
     next_check: usize,
+    scratch: Vec<u8>,
 }
 impl GrowingFileVolumes {
     /// `first` is the first volume's path; it need not exist yet.
@@ -619,6 +620,7 @@ impl GrowingFileVolumes {
             waiting: None,
             pacer: Pacer::new(),
             next_check: 0,
+            scratch: Vec::new(),
         })
     }
     /// The first volume's file name, which `ProgressiveOptions::first_name` must equal.
@@ -639,17 +641,19 @@ impl GrowingFileVolumes {
             Some(last) => crate::volume::next_volume_os(&last.name),
         }
     }
-    /// Re-checks every declared volume (identity, bound path, no truncation) and one sampled block.
+    /// Re-checks one declared volume per call, in rotation (identity, bound path, no truncation, and one sampled
+    /// block when sampling is on), so a protection query costs O(1) whatever the number of volumes. Every declared
+    /// volume is re-checked once per `volumes.len()` queries, and all of them whenever a new volume is declared.
     fn check_declared(&mut self) -> ProgressiveResult<()> {
-        for volume in &self.volumes {
-            volume.observe()?;
+        if self.volumes.is_empty() {
+            return Ok(());
         }
-        if self.options.check_every != 0 && !self.volumes.is_empty() {
-            let index = self.next_check % self.volumes.len();
-            self.next_check = (index + 1) % self.volumes.len();
-            let volume = &self.volumes[index];
-            let mut scratch = Vec::new();
-            lock(&volume.ledger).check_next(&volume.file, &mut scratch)?;
+        let index = self.next_check % self.volumes.len();
+        self.next_check = (index + 1) % self.volumes.len();
+        let volume = &self.volumes[index];
+        volume.observe()?;
+        if self.options.check_every != 0 {
+            lock(&volume.ledger).check_next(&volume.file, &mut self.scratch)?;
         }
         Ok(())
     }
@@ -668,6 +672,9 @@ impl GrowingFileVolumes {
         }
         if grew {
             self.epoch = self.epoch.checked_add(1).ok_or_else(contract)?;
+            for volume in &self.volumes {
+                volume.observe()?;
+            }
         }
         Ok(())
     }
@@ -759,9 +766,6 @@ impl VolumeSource for GrowingFileVolumes {
     fn extends_protection(&self) -> bool {
         true
     }
-    fn library_growth(&self) -> Option<LibraryGrowth> {
-        Some(LibraryGrowth::new())
-    }
 }
 
 #[cfg(test)]
@@ -833,5 +837,61 @@ mod tests {
         pacer.park(&waker, Some(Instant::now() + Duration::from_secs(3600))).unwrap();
         pacer.park(&waker, Some(Instant::now() + Duration::from_secs(3600))).unwrap();
         assert_eq!(lock(&pacer.0.state).parked.len(), 1);
+    }
+
+    /// Bookkeeping charged per wake while waiting for volume `declared`, after `declared` volumes were admitted.
+    fn wait_wake_cost(declared: usize) -> (u64, u64) {
+        use super::super::{ProgressiveLimits, Resource, SessionControl, source::SourceDriver};
+        let dir = tempfile::tempdir().unwrap();
+        let mut name = OsString::from("w.part01.rar");
+        let mut names = Vec::new();
+        for _ in 0..declared {
+            fs::write(dir.path().join(&name), b"x").unwrap();
+            names.push(name.clone());
+            name = crate::volume::next_volume_os(&name).unwrap();
+        }
+        names.push(name);
+        let growing = GrowingOptions { poll_interval: None, ..GrowingOptions::default() };
+        let provider = GrowingFileVolumes::new(dir.path().join(&names[0]), growing).unwrap();
+        let notifier = provider.notifier();
+        let mut driver = SourceDriver::new(
+            Box::new(provider),
+            names[0].clone(),
+            ProgressiveLimits::default(),
+            SessionControl::default(),
+        )
+        .unwrap();
+        let usage = driver.shared_usage();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut buf = [0u8; 1];
+        for (index, name) in names.iter().enumerate() {
+            if index > 0 {
+                driver.select_volume(VolumeRequest { index: index as u32, expected: name.clone() }).unwrap();
+            }
+            if index < declared {
+                assert!(driver.poll_step(&mut cx, &mut buf).is_ready(), "volume {index} opens");
+            }
+        }
+        assert!(driver.poll_step(&mut cx, &mut buf).is_pending(), "the absent volume waits");
+        let (bookkeeping, requests) = (usage.used(Resource::SourceBookkeeping), usage.used(Resource::SourceRequests));
+        const WAKES: u64 = 100;
+        for _ in 0..WAKES {
+            notifier.notify();
+            assert!(driver.poll_step(&mut cx, &mut buf).is_pending());
+        }
+        (
+            (usage.used(Resource::SourceBookkeeping) - bookkeeping) / WAKES,
+            (usage.used(Resource::SourceRequests) - requests) / WAKES,
+        )
+    }
+
+    #[test]
+    fn an_unchanged_wait_wake_costs_the_same_whatever_the_declared_volume_count() {
+        let (small, small_requests) = wait_wake_cost(2);
+        let (large, large_requests) = wait_wake_cost(40);
+        eprintln!("per wake: bookkeeping {small} / {large}, requests {small_requests} / {large_requests}");
+        assert_eq!(small, large, "per-wake bookkeeping must not grow with the declared volumes");
+        assert_eq!(small_requests, large_requests);
+        assert!(small <= 16, "{small} bookkeeping units per wake");
     }
 }
