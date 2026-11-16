@@ -26,8 +26,10 @@
 //! A [`VolumeMap`] lists the headers of one RAR volume read on its own, at any position in its set and possibly cut
 //! short ([`MemberMap::from_volume`], [`VolumeMapBuilder`]).
 //!
-//! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given), single-disk ZIP and split
-//! ZIP sets (`name.z01`, ..., `name.zip`, passed in that order) are mapped. Passwords and keys never appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
+//! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given), single-disk ZIP, split
+//! ZIP sets (`name.z01`, ..., `name.zip`, passed in that order) and 7z (single files and plain byte splits
+//! `.7z.001`, `.7z.002`, ..., including encoded and `-mhe` encrypted headers) are mapped. Passwords and keys never
+//! appear in a map; cipher parameters (salts, IVs, KDF counts, check values) do.
 //! See `docs/member-map.md`.
 //!
 //! [`MemberReader`] and [`extract_member_from`] stream a stored member's plaintext from any output offset, reading
@@ -35,6 +37,7 @@
 //! `docs/extract-member-from.md`.
 
 mod member_reader;
+mod sevenzip;
 pub(crate) mod zip;
 pub(crate) mod zip_split;
 
@@ -59,6 +62,8 @@ pub enum MapFormat {
     Rar4,
     Rar5,
     Zip,
+    /// 7z, a single file or a plain byte split (`.7z.001`, `.7z.002`, ...).
+    SevenZip,
 }
 
 /// How a mapped walk ended.
@@ -70,11 +75,21 @@ pub enum MapEnd {
     /// Volume `volume` (zero-based) was not available. Every earlier volume was read to its end header.
     MissingVolume { volume: u32 },
     /// Volume `volume` ended at `offset` before its headers did, for example a buffer holding only a volume's
-    /// first bytes. Pieces whose headers were read are listed even when their data lies past the end.
+    /// first bytes. Pieces whose headers were read are listed even when their data lies past the end. 7z: only
+    /// bytes that end inside the signature header.
     Truncated { volume: u32, offset: u64 },
     /// The header at `offset` in volume `volume` is damaged or unsupported, after volume 0's main header was read.
     /// The walk stops there; members and pieces whose headers came before it are listed.
     Damaged { volume: u32, offset: u64, reason: HeaderDamage },
+    /// 7z: the archive's header, at archive offset `offset` near the end of the set, is not in the bytes available.
+    /// Volume `volume` (zero-based) is missing, or ends before its advertised length (a cut set, where only the
+    /// first pieces are present). Nothing but the start header was read, so no members are listed.
+    ///
+    /// `suspect` is a hint, not a finding: the first volume opened that is shorter than a later one. A split cut at
+    /// one size makes only the last volume short, so that volume may have lost bytes (and the set may be complete
+    /// after all); but 7-Zip also writes splits of several sizes (`-v1000b -v2000b`), where it is honest. Which
+    /// volume was cut cannot be told from the lengths alone.
+    HeaderUnavailable { volume: u32, offset: u64, suspect: Option<u32> },
 }
 
 /// What is wrong with the header a walk stopped at ([`MapEnd::Damaged`], [`VolumeEnd::Damaged`]).
@@ -144,9 +159,138 @@ pub struct MemberMap {
     /// Whether the archive's final end header was seen. False exactly when `end` is not [`MapEnd::Complete`].
     pub complete: bool,
     pub end: MapEnd,
-    /// Volumes whose headers were read, counting a truncated last one.
+    /// Volumes whose headers were read, counting a truncated last one. 7z: volumes opened, which is every volume
+    /// of the set when the header was read.
     pub volumes: u32,
     pub members: Vec<MapMember>,
+    /// 7z: the archive's folders (its coded streams), in archive order. Empty for other formats.
+    pub folders: Vec<MapFolder>,
+}
+
+/// A 7z folder: one coded stream, the output of a chain of coders over one or more packed streams, holding the
+/// data of one or more members back to back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MapFolder {
+    /// Zero-based position among the archive's folders ([`FolderSlot::index`]).
+    pub index: u32,
+    /// The coders as stored. Their order is not the decoding order: follow [`Self::packed_streams`] and
+    /// [`Self::bind_pairs`]. 7-Zip stores 7zAES first, so LZMA over 7zAES is `[Aes, Lzma]` with bind pair `(1, 0)`
+    /// (the 7zAES output feeds the LZMA input) and the packed stream feeding input 0.
+    pub coders: Vec<MapCoder>,
+    /// Bind pairs as stored: `(in_index, out_index)`, coder input stream `in_index` is fed by coder output stream
+    /// `out_index`. Stream indexes count over all coders in order.
+    pub bind_pairs: Vec<(u64, u64)>,
+    /// The coder input streams fed by packed streams, in packed stream order.
+    pub packed_streams: Vec<u64>,
+    /// The size of each packed stream, in order.
+    pub pack_sizes: Vec<u64>,
+    /// The folder's packed bytes, all its packed streams back to back, cut at volume boundaries. `stream` counts
+    /// over that concatenation.
+    pub packed: Vec<PackedSpan>,
+    /// The size of every coder output stream, in stream order.
+    pub unpack_sizes: Vec<u64>,
+    /// The size of the folder's output, the one coder output stream not bound to an input.
+    pub unpacked_size: u64,
+    /// The CRC32 of the folder's output, when recorded.
+    pub crc32: Option<u32>,
+    /// How many members have their data in this folder.
+    pub members: u64,
+    /// The 7zAES parameters when a coder is 7zAES.
+    pub cipher: Option<CipherParams>,
+}
+
+/// One coder of a 7z folder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MapCoder {
+    pub kind: CoderKind,
+    /// The method id as stored, big-endian bytes read as a number (LZMA is 0x030101).
+    pub id: u64,
+    /// The coder properties as stored (LZMA: 5 bytes, LZMA2: 1 byte of dictionary size, 7zAES: cycles, salt, IV).
+    pub properties: Vec<u8>,
+    pub in_streams: u32,
+    pub out_streams: u32,
+}
+
+/// The method of a 7z coder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CoderKind {
+    /// 0x00.
+    Copy,
+    /// 0x030101.
+    Lzma,
+    /// 0x21.
+    Lzma2,
+    /// 0x030401.
+    Ppmd,
+    /// 0x040202.
+    Bzip2,
+    /// 0x040108.
+    Deflate,
+    /// 0x040109.
+    Deflate64,
+    /// 0x06F10701.
+    Aes,
+    /// x86 BCJ, 0x03030103.
+    Bcj,
+    /// 0x0303011B.
+    Bcj2,
+    /// 0x03.
+    Delta,
+    /// 0x03030205.
+    PowerPc,
+    /// 0x03030401.
+    Ia64,
+    /// 0x03030501.
+    Arm,
+    /// 0x03030701.
+    ArmThumb,
+    /// 0x0A.
+    Arm64,
+    /// 0x03030805.
+    Sparc,
+    /// 0x0B.
+    RiscV,
+    /// Any other method id, kept raw.
+    Other(u64),
+}
+
+impl CoderKind {
+    /// The kind of method id `id`.
+    pub fn from_id(id: u64) -> Self {
+        match id {
+            0x00 => Self::Copy,
+            0x03_0101 => Self::Lzma,
+            0x21 => Self::Lzma2,
+            0x03_0401 => Self::Ppmd,
+            0x04_0202 => Self::Bzip2,
+            0x04_0108 => Self::Deflate,
+            0x04_0109 => Self::Deflate64,
+            0x06F1_0701 => Self::Aes,
+            0x0303_0103 => Self::Bcj,
+            0x0303_011B => Self::Bcj2,
+            0x03 => Self::Delta,
+            0x0303_0205 => Self::PowerPc,
+            0x0303_0401 => Self::Ia64,
+            0x0303_0501 => Self::Arm,
+            0x0303_0701 => Self::ArmThumb,
+            0x0A => Self::Arm64,
+            0x0303_0805 => Self::Sparc,
+            0x0B => Self::RiscV,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// Where a 7z member's data sits: which folder, and where in the folder's output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FolderSlot {
+    /// Index into [`MemberMap::folders`].
+    pub index: u32,
+    /// Offset of the member's first byte in the folder's output (its substream position).
+    pub offset: u64,
 }
 
 /// How a member's data was packed.
@@ -158,6 +302,9 @@ pub enum MapMethod {
     /// Compressed. `id` is the format's own method number: RAR 5.0 levels 1 to 5, the RAR 4.x method byte
     /// (0x31 to 0x35), or the ZIP method number.
     Compressed { id: u16 },
+    /// 7z: coded by the folder's coder chain (anything but Copy, or 7zAES over Copy); see
+    /// [`MapMember::folder`] and [`MapFolder::coders`].
+    Coders,
 }
 
 /// How output offsets of a member relate to its packed stream, the concatenation of all its pieces' packed bytes.
@@ -205,6 +352,10 @@ pub enum CipherParams {
     ZipCrypto { check: u8 },
     /// WinZip AES in counter mode. `strength` is 1, 2 or 3 (AES-128, -192, -256).
     WinZipAes { strength: u8, vendor_version: u16, salt: Vec<u8>, verifier: [u8; 2] },
+    /// 7zAES: AES-256-CBC, key from SHA-256 over `2^num_cycles_power` rounds of the salt, the UTF-16LE password
+    /// and an 8-byte round counter (0x3F: no hashing, the key is the salt and password). `salt` is 0 to 16 bytes;
+    /// `iv` is the stored IV zero-padded to 16 bytes. No password check value is recorded.
+    SevenZipAes { num_cycles_power: u8, salt: Vec<u8>, iv: [u8; 16] },
 }
 
 /// Checksums a header declares. For a final piece or a member they cover the output; RAR intermediate parts
@@ -225,7 +376,8 @@ pub struct MapPiece {
     pub volume: u32,
     /// The packed data bytes in that volume.
     pub packed: Range<u64>,
-    /// The wire extent of the header (or ZIP local header) that announced them.
+    /// The wire extent of the header (or ZIP local header) that announced them. 7z: empty, at 0 (the archive's one
+    /// header describes every member).
     pub header: Range<u64>,
     /// Offset of `packed.start` within the member's packed stream (all pieces' packed bytes in order).
     pub stream_offset: u64,
@@ -347,7 +499,8 @@ pub struct PackedSpan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct MapMember {
-    /// Zero-based position among the archive's members.
+    /// Zero-based position among the archive's members. 7z: among the members listed, which leaves out anti items,
+    /// so it is not the raw file index of the 7z header.
     pub ordinal: u64,
     /// The name exactly as stored. For ZIP, the UTF-8 bytes of the decoded name.
     pub raw_name: Vec<u8>,
@@ -376,7 +529,13 @@ pub struct MapMember {
     pub unix_mode: Option<u32>,
     /// Whether the final piece was seen.
     pub complete: bool,
+    /// 7z members with [`OutputMapping::None`] (coded folders, and later members of a 7zAES folder) have no
+    /// pieces: their bytes are the folder's, listed once in `map.folders[slot.index].packed` (see
+    /// [`Self::folder`]), and their `packed_size` is 0.
     pub pieces: Vec<MapPiece>,
+    /// 7z: the folder holding the member's data and its offset there. None for members without data (directories
+    /// and empty files) and for other formats.
+    pub folder: Option<FolderSlot>,
 }
 
 fn floor_block(offset: u64) -> u64 {
@@ -501,7 +660,7 @@ pub enum MapError {
 impl std::fmt::Display for MapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotArchive => write!(f, "not a RAR or ZIP archive"),
+            Self::NotArchive => write!(f, "not a RAR, ZIP or 7z archive"),
             Self::MissingFirstVolume => write!(f, "the first volume is not available"),
             Self::PasswordRequired => write!(f, "encrypted headers need a password"),
             Self::WrongPassword => write!(f, "wrong password for the encrypted headers"),
@@ -811,6 +970,29 @@ pub(crate) fn read(
     Ok(got)
 }
 
+/// The name of the volume after `last`: [`crate::volume::next_volume_os`], or for a name ending in digits
+/// (`name.7z.001`) the same number of digits counting up, or else `last` with `.next` appended. Providers usually
+/// key on [`VolumeRequest::index`] instead.
+pub(crate) fn next_volume_name(last: &OsStr) -> OsString {
+    if let Some(next) = crate::volume::next_volume_os(last) {
+        return next;
+    }
+    if let Some(text) = last.to_str() {
+        let digits = text.bytes().rev().take_while(u8::is_ascii_digit).count();
+        let start = text.len() - digits;
+        if (1..=18).contains(&digits) && text[..start].ends_with('.') {
+            let n: u64 = text[start..].parse().unwrap_or(0);
+            let next = format!("{}{:0width$}", &text[..start], n + 1, width = digits);
+            if next.len() == text.len() {
+                return next.into();
+            }
+        }
+    }
+    let mut name = last.to_os_string();
+    name.push(".next");
+    name
+}
+
 /// How far from the end a ZIP end record is looked for: the record and a comment of up to 1 KiB.
 const TAIL_WINDOW: u64 = 22 + 1024;
 
@@ -835,6 +1017,7 @@ enum Engine {
     Rar(Box<crate::rar5::map::RarWalker>),
     Zip(Box<zip::ZipWalker>),
     ZipSplit(Box<zip_split::ZipSplitWalker>),
+    SevenZip(Box<sevenzip::SevenZipWalker>),
     Done,
 }
 
@@ -926,6 +1109,16 @@ impl Core {
                             if self.magic.len() < 4 {
                                 continue;
                             }
+                            if self.magic == sevenzip::MAGIC[..4] {
+                                if self.single {
+                                    return Poll::Ready(Err(MapError::NotArchive));
+                                }
+                                self.engine = Engine::SevenZip(Box::new(sevenzip::SevenZipWalker::new(
+                                    &self.options,
+                                    self.usage.clone(),
+                                )));
+                                continue;
+                            }
                             let split_start = self.magic == zip_split::SPLIT_MARKER
                                 || (self.magic == b"PK\x03\x04" && zip_split::is_split_name(&self.options.first_name));
                             if split_start && !self.single {
@@ -959,6 +1152,9 @@ impl Core {
                     self.engine = match format {
                         MapFormat::Zip => {
                             Engine::Zip(Box::new(zip::ZipWalker::new(self.usage.clone(), &self.options.limits)))
+                        }
+                        MapFormat::SevenZip => {
+                            Engine::SevenZip(Box::new(sevenzip::SevenZipWalker::new(&self.options, self.usage.clone())))
                         }
                         _ => self.rar(),
                     };
@@ -994,6 +1190,7 @@ impl Core {
                 Engine::Rar(walker) => return walker.poll(input, cx),
                 Engine::Zip(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
                 Engine::ZipSplit(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
+                Engine::SevenZip(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
                 Engine::Done => return Poll::Ready(Err(MapError::AlreadyFinished)),
             }
         }

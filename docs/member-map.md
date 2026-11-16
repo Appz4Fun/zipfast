@@ -7,14 +7,14 @@ data is skipped, never fetched. A caller that has lost part of one copy of a rel
 
 Mapped: RAR 5.0 and RAR 4.x (stored and compressed members, split across volumes, data encryption, and encrypted
 headers `-hp` when a password is given), single-disk ZIP and split ZIP sets (`.z01`, ..., `.zip`; every method is
-listed; stored, ZipCrypto and WinZip AES entries get output mappings, see [Split ZIP sets](#split-zip-sets)). 7z is not mapped yet; the types are format-neutral so it can be added (`MapFormat`,
-`CipherParams` and `OutputMapping` are `#[non_exhaustive]`).
+listed; stored, ZipCrypto and WinZip AES entries get output mappings, see [Split ZIP sets](#split-zip-sets)), and 7z
+(single files and plain byte splits `.7z.001`, `.7z.002`, ...; see [7z](#7z)).
 
 ## Building a map
 
-Format detection: a first volume starting with the spanning signature `PK\x07\x08`, or with a ZIP local header
-when the first name ends in `.z01`, is a split ZIP set. Otherwise a first volume starting with a ZIP local or end
-header is ZIP, one starting with `Rar!` is RAR.
+Format detection: a first volume starting with the 7z signature (`7z\xBC\xAF`) is 7z. One starting with the
+spanning signature `PK\x07\x08`, or with a ZIP local header when the first name ends in `.z01`, is a split ZIP set.
+Otherwise a first volume starting with a ZIP local or end header is ZIP, one starting with `Rar!` is RAR.
 Anything else (a self-extracting stub) is ZIP when its last 1,046 bytes hold a ZIP end-of-central-directory record,
 so a stored `.rar` inside a ZIP is not mistaken for the archive; otherwise the RAR scanner looks for a signature in
 the first MiB, reading 4 KiB at a time. Over a `VolumeSource` this tail check waits for the volume's last bytes.
@@ -38,6 +38,7 @@ How a walk ends is `MemberMap::end`:
 | `MissingVolume { volume }` | the volume source answered `Missing`, or the memory slice ended, after volume 0 |
 | `Truncated { volume, offset }` | the volume ended before its headers did; `offset` is the start of the header being read (the end of the signature when the bytes end inside the main header); pieces already announced are listed even when their data lies past the end |
 | `Damaged { volume, offset, reason }` | the header at `offset` in volume `volume` is damaged or unsupported (see below); members and pieces whose headers came before it are listed, a member split across it is `complete: false` |
+| `HeaderUnavailable { volume, offset, suspect }` | 7z: the archive's header at archive offset `offset` is not in the bytes available, because volume `volume` is missing or ends before its advertised length (a cut set); no members are listed. `suspect` is a hint only (see [7z](#7z)) |
 
 Failures are `MapError`: `NotArchive`, `MissingFirstVolume`, `PasswordRequired`, `WrongPassword`,
 `HeaderHole { volume, offset }` (a `RangeRead::Hole` inside header bytes; holes in member data are never reached),
@@ -65,18 +66,21 @@ salt in every header costs one derivation.
 
 ## The map
 
-`MemberMap { format, header_encrypted, header_cipher, complete, end, volumes, members }`.
+`MemberMap { format, header_encrypted, header_cipher, complete, end, volumes, members, folders }` (`folders` is
+empty except for 7z).
 
 `MapMember` carries the ordinal, `raw_name` (bytes as stored; for ZIP, the UTF-8 bytes of the decoded name) and
 `name` (decoded, when it decodes), `is_dir`,
 `unpacked_size`, `packed_size` (RAR: over the pieces seen; ZIP: the size the directory declares, also when only some
-pieces are present), `method` (`Stored` or `Compressed { id }` with the format's
-method number), `mapping`, `solid`, `encrypted`, `cipher`, final `checks` (once the final piece is seen), `mtime`,
-`dos_time` (RAR 4.x: the header's DOS date and time as stored, also when it is not a valid date and `mtime` is None;
-None for other formats), `attributes`, `unix_mode` and `complete`, and its `pieces`.
+pieces are present; 7z: see [7z](#7z)), `method` (`Stored`, `Compressed { id }` with the format's method number, or
+`Coders` for a 7z coded folder), `mapping`, `solid`, `encrypted`, `cipher`, final `checks` (once the final piece is
+seen), `mtime`, `dos_time` (RAR 4.x: the header's DOS date and time as stored, also when it is not a valid date and
+`mtime` is None; None for other formats), `attributes`, `unix_mode` and `complete`, its `pieces`, and `folder` (7z
+only: the folder and substream offset).
 
 `MapPiece` is one part header: `volume`, `packed` (data bytes in that volume), `header` (the header's wire extent,
-including the IV and padding of an encrypted header, or a ZIP local header with its name and extra field),
+including the IV and padding of an encrypted header, or a ZIP local header with its name and extra field; empty for
+7z),
 `stream_offset` (where `packed.start` falls in the member's packed stream, the concatenation of all its pieces),
 `out`, the part's own `checks` and `final_part`. RAR intermediate parts declare checks of their packed bytes; RAR 5.0
 encrypted members' checks are keyed with the password (`MapChecks::keyed`).
@@ -90,6 +94,7 @@ encrypted members' checks are keyed with the password (`MapChecks::keyed`).
 - `Rar4Legacy { unpack_version, salt }`: older RAR 4.x data encryption, or version 29 without a salt. Not mapped:
   `mapping` is `None` and `packed_spans` returns None.
 - `ZipCrypto { check }`: the byte the 12-byte encryption header decrypts to last.
+- `SevenZipAes { num_cycles_power, salt, iv }`: 7zAES (see [7z](#7z)).
 - `WinZipAes { strength, vendor_version, salt, verifier }`: read from the first bytes of the entry's data. An entry
   is WinZip AES when its method is 99 or it has an AES extra field, as the extractor decides; one without a valid
   extra field gets `cipher: None` and `mapping: None`.
@@ -163,6 +168,103 @@ from the end record. Hostile disk numbers (past the last volume) and offsets (pa
 directory offset that disagrees with the directory's position, a ZIP64 end record other than the one the locator
 points at) are `Malformed`; a local header offset past the end
 of an earlier volume reads as that volume being cut. A split set's `.zip` mapped on its own is `Unsupported`.
+
+## 7z
+
+A 7z set is one archive, possibly cut into plain byte pieces (`name.7z.001`, `name.7z.002`, ...) that concatenate
+back into it. Archive offsets run over the volumes in order; `MapPiece::volume`, `MapPiece::packed` and the
+`PackedSpan`s are per-volume, cut at volume boundaries. The walk reads only:
+
+1. the 32-byte signature header at offset 0 (its CRC is checked), which says where the next header is;
+2. the volumes' lengths, opening volumes in order until they reach the end of the next header (over a
+   `VolumeSource` later volumes are asked for by index, with names counting up the numeric extension:
+   `set.7z.001`, `set.7z.002`, ...). As for split ZIP sets, volumes stay open for the walk, at most
+   `ProgressiveLimits::volume_handles` of them (0 is a `Limit` failure); past that the volume used least recently is
+   closed and asked for again when the header reads need it, which must give the same length (`Source` failure
+   otherwise, and a volume missing the second time ends `HeaderUnavailable`);
+3. the next header (CRC checked), at the end of the set;
+4. for an encoded header (the usual case), its packed stream, decoded into the real header. LZMA and LZMA2 are
+   decoded with liblzma raw decoders from the coder properties, 7zAES with the key derived from
+   `MapOptions::password`, and Copy as is; the decoded size is the folder's recorded unpack size, charged to the
+   header byte budget before allocation, and the dictionary is shrunk to that size, so a stated 4 GiB dictionary
+   never allocates more than the header. The folder CRC is checked. Encoded headers may nest up to 4 deep.
+
+The walker is checked against archives written by 7-Zip (`tests/fixtures/7z`, from the rarinfo test suite):
+store, split, solid LZMA, 7zAES over Copy and LZMA, LZMA-encoded and encrypted headers.
+
+A plain byte split has no per-volume headers, so `MemberMap::from_volume` refuses 7z (`NotArchive`), and
+`probe` reports `Packing::Unknown`.
+
+Members: one `MapMember` per file entry, in header order. `raw_name` is the name's UTF-16LE bytes as stored and
+`name` its decoding; `is_dir` follows 7-Zip's empty-stream and empty-file bits: an entry without a stream that is
+not an empty file is a directory, an entry with a stream is always a file, and the attributes are not consulted.
+Anti items (deletion markers of update archives) are not listed, so `ordinal` counts the members listed and is not
+the raw file index of the 7z header. `mtime`
+and `attributes` are the header's, and `unix_mode` is set when the attribute's Unix extension bit (0x8000) is.
+`checks.crc32` is the substream CRC. `folder` is `Some(FolderSlot { index, offset })`: the folder in
+`MemberMap::folders` and the member's offset in that folder's output (its substream position). Directories and
+empty files have no folder and no pieces.
+
+Folders: `MemberMap::folders` lists every folder as a `MapFolder` with its coders as stored (`MapCoder { kind, id,
+properties, in_streams, out_streams }`, where `kind` is a `CoderKind` such as `Copy`, `Lzma`, `Lzma2`, `Aes`,
+`Bcj`, `Delta`, or `Other(id)` for an id it does not name), its bind pairs and packed stream indexes, the size of
+each packed stream, `packed` (all its packed streams back to back as per-volume `PackedSpan`s), every coder output
+size, `unpacked_size` (the unbound output), its CRC, how many members it holds and, when a coder is 7zAES, the
+`cipher`. The stored order is not the decoding order: follow the packed stream and the bind pairs. 7-Zip stores
+7zAES first, so LZMA over 7zAES is `[Aes, Lzma]` with bind pair `(1, 0)` (the 7zAES output feeds the LZMA input)
+and the packed stream feeding input 0; the walker and its mapping decisions do not depend on the order.
+
+The mapping depends on the folder:
+
+| folder | `method` | `mapping` | pieces |
+|---|---|---|---|
+| Copy coders only, one packed stream | `Stored` | `Direct` | the member's own bytes: packed stream start + `offset`, `unpacked_size` long, stream offsets from 0 |
+| 7zAES and Copy coders only, one packed stream; the member at `offset` 0 | `Stored` | `CbcBlocks` | the folder's ciphertext from its start, `unpacked_size` rounded up to 16 bytes; block 0 decrypts with `CipherParams::SevenZipAes::iv` |
+| 7zAES and Copy, a later member | `Stored` | `None` | none: use `map.folders[slot.index].packed` |
+| anything else (LZMA, LZMA2, BCJ, PPMd, 7zAES over LZMA, ...) | `Coders` | `None` | none: use `map.folders[slot.index].packed` (stream offsets over the folder's packed streams); `solid` when `offset` is not 0 |
+
+Members mapped `None` carry no pieces and `packed_size: 0`, so a solid folder of many thousand members split over
+hundreds of volumes lists its spans once, in its `MapFolder`, rather than once per member.
+
+So an LZMA2 member gives its folder's packed range (`map.folders[slot.index].packed`) and the folder's
+`unpacked_size`; the caller finds LZMA2 chunks in that range itself. A later member of a 7zAES folder can still be
+read from its `FolderSlot::offset` with the folder's spans: CBC decryption starts at any block given the block
+before it.
+
+`CipherParams::SevenZipAes { num_cycles_power, salt, iv }`: AES-256-CBC, key from SHA-256 over
+`2^num_cycles_power` rounds of the salt, the UTF-16LE password and an 8-byte little-endian round counter (0x3F: no
+hashing, the key is the salt and password zero-padded). `salt` is 0 to 16 bytes, `iv` the stored IV zero-padded to
+16. No password check value is recorded, so a wrong data password shows only in the member CRC.
+
+Encrypted headers (`-mhe`): the encoded header's folder has a 7zAES coder. Without a password (`None` or empty)
+the walk fails with `PasswordRequired`. A wrong password is `WrongPassword`: the decrypted bytes do not decode, fail
+the folder CRC, or do not start with a header id. `header_encrypted` and `header_cipher` describe it. The key
+derivation counts against `kdf_exponent` (the cycle power), `kdf_derivation_blocks` and `kdf_session_blocks` (one
+block per SHA-256 compression), and password sizes, and cancels with the `SessionControl`. Powers above 24 (other
+than 0x3F) are `Unsupported`, as in 7-Zip.
+
+Cut sets: the header is at the end, so a set with only its first pieces cannot be listed. When a volume the header
+needs is missing (or ends before its advertised length), the map ends `HeaderUnavailable { volume, offset, suspect }`
+with `complete: false`, `volumes` the volumes opened and no members or folders. Bytes that end inside the signature
+header are `Truncated { volume: 0, offset: 0 }`.
+
+Volume lengths are taken as they are: 7-Zip writes splits of one size and of several (`-v1000b -v2000b`, the last
+size repeating), so no length is wrong in itself. A volume in the middle that lost bytes shifts the header; when the
+volumes still reach it, the header fails its CRC (`Malformed`), and when they do not, the next volume is asked for.
+Only then, when that volume is missing, `suspect` names the first volume opened that is shorter than a later one:
+in a one-size split only the last volume may be short, so it may have lost bytes. It is a hint, never a finding,
+since a multi-size split has honest short volumes and which volume was cut cannot be told from lengths alone. An
+empty archive (next header size 0) is `Complete` with no members.
+
+Failures and budgets: every count in the header is an untrusted number and is checked against the bytes left in the
+header (each item takes at least a byte) before anything is allocated; files count against `entries` and
+`metadata_bytes`, folders, packed streams, substreams and pieces against `parts`, names against `name_bytes`, bytes
+read and decoded against `header_bytes`, and each open or read against `source_requests` (waits against
+`provider_wakes`). A bad signature or next header CRC, an inconsistent field, or packed streams running into the
+header are `Malformed` (CRC failures as a header `ChecksumMismatch`); external (out-of-header) folders or file
+properties, additional streams, alternative coder methods, a major version other than 0, and header coders other
+than Copy, LZMA, LZMA2 and 7zAES in a single chain are `Unsupported`. 7z damage is never `MapEnd::Damaged`: the
+header is one unit.
 
 ## Single-volume maps
 
@@ -260,8 +362,8 @@ exact:
 
 | mapping | used for | output byte `o` | `out` |
 |---|---|---|---|
-| `Direct` | plain stored RAR and ZIP | stream byte `o` | exact |
-| `CbcBlocks` | encrypted stored RAR (5.0 and 4.x) | stream byte `o`; block `k` needs block `k - 1` (the IV for block 0); padding maps to no output | exact when the size is known |
+| `Direct` | plain stored RAR and ZIP, 7z Copy folders | stream byte `o` | exact |
+| `CbcBlocks` | encrypted stored RAR (5.0 and 4.x), the first member of a 7z 7zAES-over-Copy folder | stream byte `o`; block `k` needs block `k - 1` (the IV for block 0); padding maps to no output | exact when the size is known |
 | `Counter { skip }` | WinZip AES stored | stream byte `o + skip` (after salt and verifier); the 10-byte authentication code maps to no output | exact |
 | `Sequential { skip }` | ZipCrypto stored | stream byte `o + skip`, but decrypting needs every earlier byte | None |
 | `None` | compressed | no mapping | None |

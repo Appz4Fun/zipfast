@@ -420,6 +420,109 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The largest 7zAES `NumCyclesPower` 7-Zip itself accepts.
+pub(crate) const SEVEN_ZIP_MAX_CYCLES_POWER: u8 = 24;
+
+/// Derives the 7zAES AES-256 key: SHA-256 over `2^num_cycles_power` rounds of `salt`, the UTF-16LE password and
+/// the round number as 8 little-endian bytes. A power of 0x3F means no hashing: the key is the salt followed by the
+/// password, zero-padded to 32 bytes. Every SHA-256 compression is charged to `control`. Powers above
+/// [`SEVEN_ZIP_MAX_CYCLES_POWER`] (other than 0x3F) and salts over 16 bytes are refused with None.
+pub(crate) fn derive_7z_key_controlled(
+    password: &str,
+    salt: &[u8],
+    num_cycles_power: u8,
+    control: &mut dyn KdfControl,
+) -> Option<std::result::Result<[u8; 32], KdfControlError>> {
+    if salt.len() > 16 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(salt.len() + password.len() * 2 + 8);
+    raw.extend_from_slice(salt);
+    for unit in password.encode_utf16() {
+        raw.extend_from_slice(&unit.to_le_bytes());
+    }
+    if num_cycles_power == 0x3F {
+        let mut key = [0u8; 32];
+        let n = raw.len().min(32);
+        key[..n].copy_from_slice(&raw[..n]);
+        return Some(Ok(key));
+    }
+    if num_cycles_power > SEVEN_ZIP_MAX_CYCLES_POWER {
+        return None;
+    }
+    let fixed = raw.len();
+    raw.extend_from_slice(&[0; 8]);
+    let mut state = SHA256_IV;
+    let mut block = [0u8; 64];
+    let mut fill = 0usize;
+    let mut total: u64 = 0;
+    for round in 0..1u64 << num_cycles_power {
+        raw[fixed..].copy_from_slice(&round.to_le_bytes());
+        let mut bytes = raw.as_slice();
+        total = total.wrapping_add(bytes.len() as u64);
+        while !bytes.is_empty() {
+            let take = (64 - fill).min(bytes.len());
+            block[fill..fill + take].copy_from_slice(&bytes[..take]);
+            fill += take;
+            bytes = &bytes[take..];
+            if fill == 64 {
+                if let Err(e) = control.charge(1) {
+                    return Some(Err(e));
+                }
+                sha256_compress(&mut state, &block);
+                fill = 0;
+            }
+        }
+    }
+    let mut tail = [0u8; 128];
+    tail[..fill].copy_from_slice(&block[..fill]);
+    tail[fill] = 0x80;
+    let bit_len = total.wrapping_mul(8);
+    let blocks = if fill < 56 { 1 } else { 2 };
+    tail[blocks * 64 - 8..blocks * 64].copy_from_slice(&bit_len.to_be_bytes());
+    for chunk in tail[..blocks * 64].as_chunks::<64>().0 {
+        if let Err(e) = control.charge(1) {
+            return Some(Err(e));
+        }
+        sha256_compress(&mut state, chunk);
+    }
+    let mut key = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        key[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    Some(Ok(key))
+}
+
+/// Derives the 7zAES key without budgets; see `derive_7z_key_controlled`. None for an unsupported cycle power or
+/// a salt over 16 bytes.
+pub fn derive_7z_key(password: &str, salt: &[u8], num_cycles_power: u8) -> Option<[u8; 32]> {
+    derive_7z_key_controlled(password, salt, num_cycles_power, &mut UnrestrictedKdf).map(|r| r.expect("unrestricted"))
+}
+
+#[cfg(test)]
+mod seven_zip_kdf_tests {
+    #[test]
+    fn matches_one_shot_sha256() {
+        let (password, salt) = ("pässwörd", [7u8; 9]);
+        for power in [0u8, 1, 3, 6] {
+            let mut all = Vec::new();
+            for round in 0..1u64 << power {
+                all.extend_from_slice(&salt);
+                for unit in password.encode_utf16() {
+                    all.extend_from_slice(&unit.to_le_bytes());
+                }
+                all.extend_from_slice(&round.to_le_bytes());
+            }
+            assert_eq!(super::derive_7z_key(password, &salt, power), Some(super::sha256(&all)), "power {power}");
+        }
+        let mut raw = [0u8; 32];
+        raw[..9].copy_from_slice(&salt);
+        raw[9..11].copy_from_slice(&[b'p', 0]);
+        assert_eq!(super::derive_7z_key("p", &salt, 0x3F), Some(raw));
+        assert_eq!(super::derive_7z_key("p", &salt, 25), None);
+    }
+}
+
 /// Precomputed inner/outer SHA-256 states after absorbing the 64-byte HMAC ipad and opad blocks.
 #[derive(Clone, Copy)]
 struct HmacSha256Key {

@@ -458,6 +458,8 @@ fn cipher_kind(params: &CipherParams) -> CipherKind {
         CipherParams::Rar4Legacy { .. } => CipherKind::Rar4Legacy,
         CipherParams::ZipCrypto { .. } => CipherKind::ZipCrypto,
         CipherParams::WinZipAes { strength, .. } => CipherKind::WinZipAes { strength: *strength },
+        // 7z is not probed (a 7z first article is `Packing::Unknown`).
+        CipherParams::SevenZipAes { .. } => CipherKind::Unknown,
     }
 }
 
@@ -534,7 +536,7 @@ fn decide(
     } else {
         match (c.method, c.encrypted) {
             (MapMethod::Compressed { .. }, _) if c.solid => Borrowable::No(NotBorrowable::Solid),
-            (MapMethod::Compressed { .. }, _) => Borrowable::No(NotBorrowable::Compressed),
+            (MapMethod::Compressed { .. } | MapMethod::Coders, _) => Borrowable::No(NotBorrowable::Compressed),
             (_, false) if header_encrypted => Borrowable::YesWithPassword(PasswordProof::Headers),
             (_, false) => Borrowable::Yes,
             (_, true) => match c.mapping {

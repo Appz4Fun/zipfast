@@ -6,7 +6,7 @@ output offset to its end. They read only the packed bytes that range needs, as
 
 The use case: a download of one copy of a release dies part way. The caller holds a persistent `PartialFile` whose
 output is valid up to `offset_reached`. Another copy has the same file packed differently: RAR 5.0 or RAR 4.x
-store, possibly encrypted, or ZIP. The caller maps that copy with `MemberMap`, fetches only the articles covering
+store, possibly encrypted, ZIP, or a 7z Copy or 7zAES-over-Copy folder. The caller maps that copy with `MemberMap`, fetches only the articles covering
 `[offset_reached, end)`, and streams the plaintext from `offset_reached` into the partial:
 
 ```rust,ignore
@@ -45,7 +45,7 @@ writer.finish()?;
 `MemberMap` is a public type, so a caller may build or edit one. The reader validates the member before reading:
 - pieces must be contiguous from stream offset 0, with ordered packed ranges and no offset overflow;
 - `encrypted` must agree with `mapping`, and `cipher` with `mapping` (a CBC member needs RAR 5.0 parameters with
-  an IV, or RAR 4.x parameters);
+  an IV, RAR 4.x parameters, or 7zAES parameters);
 - each `piece.out` must be the output range its stream range carries;
 - only the last piece may be `final_part`;
 - no piece may reach past the packed stream the mapping implies: `size` (plain), `size` rounded up to 16 (CBC),
@@ -64,6 +64,8 @@ inside a checked part or short of the member's size.
 | RAR 4.x stored, AES-128-CBC (unpack version 29 with a salt) | `CbcBlocks` | as RAR 5.0. Key and block-0 IV come from the password and salt |
 | WinZip AES stored (AE-1, AE-2, all strengths) | `Counter { skip }` | at ciphertext byte `out_offset`, with the counter set to that block (`out_offset / 16 + 1`, little-endian) |
 | ZipCrypto stored | `Sequential { skip }` | only at offset 0 (or at the end) |
+| 7z Copy folder (any member) | `Direct` | at stream byte `out_offset`; the pieces cover the member's own bytes |
+| 7z 7zAES over Copy, the folder's first member | `CbcBlocks` | as RAR 5.0, with the key from the 7zAES KDF and `CipherParams::SevenZipAes::iv` for block 0 |
 
 A CBC stream does not reset at volume boundaries, so an output offset is a stream offset, and pieces may be cut
 anywhere.
@@ -73,11 +75,12 @@ anywhere.
 Typed refusals (`ExtractFromError::Unsupported(UnsupportedRead::..)`):
 
 - `Compressed { id }`: compressed members. Restart points inside compressed data are future work.
+- `Coders`: 7z members of a coded folder (LZMA, LZMA2, filters and anything else but Copy or 7zAES over Copy).
 - `SequentialCipher`: ZipCrypto from an offset other than 0. Its keystream depends on all earlier plaintext.
 - `LegacyRar4Cipher`: RAR 4.x encryption other than AES-128 (an older unpack version, or version 29 without a
   salt).
 - `UnmappedCipher`: other encryption the map does not map (ZIP strong encryption, AES without a valid extra
-  field).
+  field, a 7zAES member that does not start its folder).
 - `UnknownSize`: no recorded unpacked size.
 
 Other refusals made at construction: `NoSuchMember`, `OffsetPastEnd`, `PasswordRequired`, and `IncompleteMember {
@@ -96,6 +99,10 @@ damage is `IncompleteMember`, while members whose headers all came before it rea
 - WinZip AES: the 2-byte password verifier gives `WrongPassword` (with a 1 in 65,536 chance of passing a wrong
   password).
 - ZipCrypto: the check byte gives `WrongPassword` (1 in 256).
+- 7zAES records no check value: as RAR 4.x, a wrong password shows only as a failed member CRC when the read
+  covers the whole member from offset 0 (`MemberBad`). A read from a mid-member offset with a wrong password
+  returns garbage without any error, so callers must verify that output themselves (for example
+  `PartialFile::poll_verify`).
 
 `MemberReader::password_verified()` (and `ExtractedFrom::password_verified`) is true when:
 - the member is not encrypted;
