@@ -882,13 +882,18 @@ fn nested_parent_preparation_refuses_symlinks_nondirectories_and_existing_output
         }
     }
 }
+/// Arms once genesis preparation asks for the member's anchor: the second lookup, after the session's own check
+/// for an anchor an earlier session left (adoption).
 struct ArmStore {
     inner: Anchors,
     armed: Arc<std::sync::atomic::AtomicBool>,
+    lookups: std::sync::atomic::AtomicUsize,
 }
 impl StateAnchorStore for ArmStore {
     fn current(&self, member: &MemberKey) -> PartialResult<Option<StateAnchor>> {
-        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if self.lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.inner.current(member)
     }
     fn compare_exchange(
@@ -926,7 +931,7 @@ fn held_parent_swap_in_provider_callback_is_rejected_before_output_effects() {
         }
     }));
     let mut partial = partial_options(&state);
-    partial.anchors = Arc::new(ArmStore { inner: Anchors::default(), armed });
+    partial.anchors = Arc::new(ArmStore { inner: Anchors::default(), armed, lookups: Default::default() });
     let mut session = ProgressiveSession::new_partial(Box::new(provider), options(&dest), partial).unwrap();
     let mut failed = false;
     for _ in 0..10000 {
@@ -3738,4 +3743,557 @@ fn provider_wait_commits_a_group_older_than_the_interval() {
     gate.0.lock().unwrap().take().unwrap().wake();
     let (_, _) = run_to_end(&mut session);
     assert_eq!(fs::read(dir.path().join("out/a.bin")).unwrap(), fixture.data[0]);
+}
+
+// Restart resume: a new persistent session over the same roots and anchor store adopts the members an earlier
+// session created, skips the finished ones without reading their data, and continues the member that was
+// mid-extraction from its committed `produced`.
+
+/// What a session reported, in event order.
+#[derive(Default)]
+struct Seen {
+    /// Adopted members: (member, committed produced, finished).
+    adopted: Vec<(MemberKey, u64, bool)>,
+    /// Handles of every member created or adopted.
+    files: Vec<(MemberKey, PartialFile)>,
+    holes: Vec<HoleReport>,
+    /// (member ordinal, outcome) of each finished member.
+    outcomes: Vec<(u64, MemberOutcome)>,
+    /// `logical_end` of the last `BytesWritten` of the newest member.
+    written: u64,
+    events: usize,
+}
+/// Polls until the session ends (true) or `stop` events were delivered (false). Panics on a failure.
+fn run_events(session: &mut ProgressiveSession, seen: &mut Seen, stop: Option<usize>) -> bool {
+    for _ in 0..1_000_000 {
+        if stop.is_some_and(|stop| seen.events >= stop) {
+            return false;
+        }
+        let event = match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => continue,
+            Poll::Ready(Ok(None)) => return true,
+            Poll::Ready(Ok(Some(event))) => event,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+        };
+        seen.events += 1;
+        match event {
+            ProgressiveEvent::PartialReady { member, .. } => {
+                seen.written = 0;
+                seen.files.push((member.clone(), session.partial_file(&member).unwrap()));
+            }
+            ProgressiveEvent::PartialAdopted { member, produced, finished, .. } => {
+                seen.written = produced;
+                seen.files.push((member.clone(), session.partial_file(&member).unwrap()));
+                seen.adopted.push((member, produced, finished));
+            }
+            ProgressiveEvent::BytesWritten { logical_end, .. } => seen.written = logical_end,
+            ProgressiveEvent::Hole(report) => seen.holes.push(report),
+            ProgressiveEvent::MemberFinished { outcome, .. } => {
+                let ordinal = seen.files.last().unwrap().0.ordinal();
+                seen.outcomes.push((ordinal, outcome));
+            }
+            ProgressiveEvent::SessionTerminated { failure, .. } => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    panic!("session did not finish")
+}
+/// Polls until one more event was delivered; false while the session runs.
+fn step(session: &mut ProgressiveSession, seen: &mut Seen) -> bool {
+    let stop = seen.events + 1;
+    run_events(session, seen, Some(stop))
+}
+/// The first failure of a session, as its partial error kind.
+fn run_failure(session: &mut ProgressiveSession) -> PartialErrorKind {
+    for _ in 0..1_000_000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Err(failure)) | Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
+                return match failure.kind {
+                    FailureKind::Partial(error) => error.kind,
+                    other => panic!("{other:?}"),
+                };
+            }
+            Poll::Ready(Ok(None)) => panic!("the session finished"),
+            _ => {}
+        }
+    }
+    panic!("session did not fail")
+}
+/// Drops `value` as a crash leaves it: an open group is not committed, so output written after its intent is not
+/// claimed by the anchored state. (Drop skips that commit while the thread unwinds.)
+fn crash<T>(value: T) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = value;
+        std::panic::resume_unwind(Box::new("simulated crash"));
+    }));
+}
+/// The ten-volume, two-member fixture with every byte available.
+fn whole_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    for source in fixture.volumes.iter_mut().flatten() {
+        source.holes.clear();
+    }
+    fixture
+}
+/// A session over `fixture` with 512-byte reads; `group` is `group_commit_bytes` (0 commits every write).
+fn resume_session(fixture: &mut Fixture, dir: &Path, anchors: &Arc<Anchors>, group: u64) -> ProgressiveSession {
+    let mut opts = options(&dir.join("out"));
+    opts.limits.read_chunk = 512;
+    let mut partial = partial_options(&dir.join("state"));
+    partial.anchors = anchors.clone();
+    partial.limits.group_commit_bytes = group;
+    ProgressiveSession::new_partial(Box::new(fixture.provider()), opts, partial).unwrap()
+}
+/// Output offset of a payload read of the plain fixture, and the member it belongs to.
+fn payload_read(fixture: &Fixture, volume: u32, at: u64) -> Option<(u64, u64)> {
+    let payload = &fixture.payloads[volume as usize];
+    payload.contains(&at).then(|| (volume as u64 / 5, (volume as u64 % 5) * 1400 + (at - payload.start)))
+}
+fn assert_ok_outcomes(seen: &Seen, members: usize) {
+    assert_eq!(seen.outcomes.len(), members);
+    for (_, outcome) in &seen.outcomes {
+        assert!(
+            matches!(outcome, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }),
+            "{:?}",
+            match outcome {
+                MemberOutcome::PersistentComplete { verdict, .. } => format!("{verdict:?}"),
+                _ => "not complete".into(),
+            }
+        );
+    }
+}
+
+#[test]
+fn restart_adopts_finished_members_and_resumes_the_mid_member_at_every_crash_point() {
+    let total = {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = resume_session(&mut whole_fixture(), dir.path(), &Arc::default(), 0);
+        let mut seen = Seen::default();
+        assert!(run_events(&mut session, &mut seen, None));
+        seen.events
+    };
+    let mut boundary = false;
+    let mut inside = false;
+    // Every commit syncs, so crash at every other event (at least one at a part boundary and inside a part).
+    for crash_at in (1..total).step_by(2) {
+        let dir = tempfile::tempdir().unwrap();
+        let anchors = Arc::new(Anchors::default());
+        let mut session = resume_session(&mut whole_fixture(), dir.path(), &anchors, 0);
+        let mut before = Seen::default();
+        assert!(!run_events(&mut session, &mut before, Some(crash_at)));
+        let finished_before: Vec<u64> = before.outcomes.iter().map(|(ordinal, _)| *ordinal).collect();
+        let created: Vec<MemberKey> = before.files.iter().map(|(key, _)| key.clone()).collect();
+        let written = before.written;
+        crash((session, std::mem::take(&mut before.files)));
+
+        let mut fixture = whole_fixture();
+        let mut session = resume_session(&mut fixture, dir.path(), &anchors, 0);
+        let mut after = Seen::default();
+        assert!(run_events(&mut session, &mut after, None), "crash at {crash_at}");
+        // A member whose `PartialReady` was not delivered yet may already exist: its genesis precedes the event.
+        assert!((created.len()..=created.len() + 1).contains(&after.adopted.len()), "crash at {crash_at}");
+        assert!(after.holes.is_empty());
+        assert_ok_outcomes(&after, 2);
+        for (member, name) in [(0, "a.bin"), (1, "b.bin")] {
+            assert_eq!(fs::read(dir.path().join("out").join(name)).unwrap(), fixture.data[member]);
+        }
+        for (key, produced, finished) in &after.adopted {
+            let ordinal = key.ordinal();
+            if finished_before.contains(&ordinal) {
+                assert!(*finished && *produced == 7000, "crash at {crash_at}");
+            } else if !created.contains(key) {
+                assert_eq!((*produced, *finished), (0, false), "crash at {crash_at}");
+            } else {
+                // Every write is committed (group_commit_bytes 0), so the newest member resumes where its last
+                // write ended; it may already have committed its canonical finish.
+                assert_eq!(*produced, written, "crash at {crash_at}");
+                assert!(!*finished || written == 7000);
+                boundary |= !finished && produced % 1400 == 0 && *produced > 0 && *produced < 7000;
+                inside |= produced % 1400 != 0;
+            }
+            for &(volume, at, _) in fixture.reads.lock().unwrap().iter() {
+                if let Some((member, out)) = payload_read(&fixture, volume, at)
+                    && member == ordinal
+                {
+                    assert!(!finished, "a finished member's data is never read again (crash at {crash_at})");
+                    assert!(out >= *produced, "read {out} below the resume point {produced} (crash at {crash_at})");
+                }
+            }
+        }
+        // Handles of adopted members verify Ok too.
+        for (_, file) in &mut after.files {
+            assert!(matches!(verify(file), Verdict::Ok { .. }));
+        }
+    }
+    assert!(boundary && inside, "resumed both at a part boundary and inside a part");
+}
+
+#[test]
+fn restart_re_extracts_an_uncommitted_group_tail_and_keeps_earlier_holes() {
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    // The holed fixture with grouped commits: a's hole 1300..2000 commits the group before it and then itself,
+    // and the writes after it stay in an open group.
+    let mut first = Fixture::new();
+    let mut session = resume_session(&mut first, dir.path(), &anchors, 64 << 20);
+    let mut before = Seen::default();
+    while before.written < 3000 {
+        assert!(!step(&mut session, &mut before));
+    }
+    assert!(!before.holes.is_empty() && before.holes.iter().all(|h| h.out.start >= 1300 && h.out.end <= 2000));
+    let (key, _) = &before.files[0];
+    let key = key.clone();
+    crash((session, std::mem::take(&mut before.files)));
+    // The written tail was never committed: the anchored state ends at the hole.
+    let latest = anchors.current(&key).unwrap().unwrap();
+    let state = PartialState::load(&dir.path().join("state"), &latest, &PartialLimits::default()).unwrap();
+    let probe = PartialFile::open(
+        state,
+        PartialOpenContext {
+            output_root: dir.path().join("out"),
+            state_root: dir.path().join("state"),
+            expected_member: key.clone(),
+            expected_anchor: latest,
+            protection: Fixture::new().provider().protection,
+            limits: PartialLimits::default(),
+            progressive_limits: ProgressiveLimits::default(),
+            anchors: anchors.clone(),
+            control: SessionControl::default(),
+            password: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(probe.remaining().unwrap(), vec![1300..7000]);
+    drop(probe.close().unwrap());
+
+    let mut fixture = whole_fixture();
+    let mut session = resume_session(&mut fixture, dir.path(), &anchors, 64 << 20);
+    let mut after = Seen::default();
+    assert!(run_events(&mut session, &mut after, None));
+    assert_eq!(after.adopted, vec![(key.clone(), 2000, false)]);
+    // The tail 2000..3000 was read and written again; nothing below the resume point was read.
+    let reads = fixture.reads.lock().unwrap().clone();
+    assert!(reads.iter().any(|&(v, at, _)| payload_read(&fixture, v, at) == Some((0, 2000))));
+    assert!(reads.iter().all(|&(v, at, _)| payload_read(&fixture, v, at).is_none_or(|(m, out)| m != 0 || out >= 2000)));
+    // The hole recorded before the crash stays a hole, and is filled afterwards.
+    assert!(matches!(&after.outcomes[0].1, MemberOutcome::PersistentPartial { .. }));
+    assert!(matches!(&after.outcomes[1].1, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }));
+    let (_, a) = after.files.iter_mut().find(|(k, _)| *k == key).unwrap();
+    assert_eq!(a.remaining().unwrap(), vec![1300..2000]);
+    assert!(matches!(verify(a), Verdict::Incomplete { .. }));
+    a.fill(1300, &fixture.data[0][1300..2000]).unwrap();
+    assert!(matches!(verify(a), Verdict::Ok { .. }));
+    for (member, name) in [(0, "a.bin"), (1, "b.bin")] {
+        assert_eq!(fs::read(dir.path().join("out").join(name)).unwrap(), fixture.data[member]);
+    }
+}
+
+#[test]
+fn a_crash_during_the_resumed_session_is_recoverable_too() {
+    for (first, second) in [(5, 6), (9, 20), (20, 8)] {
+        let dir = tempfile::tempdir().unwrap();
+        let anchors = Arc::new(Anchors::default());
+        let mut session = resume_session(&mut whole_fixture(), dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        assert!(!run_events(&mut session, &mut seen, Some(first)));
+        crash((session, std::mem::take(&mut seen.files)));
+        let mut session = resume_session(&mut whole_fixture(), dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        assert!(!run_events(&mut session, &mut seen, Some(second)));
+        assert!(!seen.adopted.is_empty());
+        crash((session, std::mem::take(&mut seen.files)));
+        let mut fixture = whole_fixture();
+        let mut session = resume_session(&mut fixture, dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        assert!(run_events(&mut session, &mut seen, None));
+        assert_ok_outcomes(&seen, 2);
+        for (member, name) in [(0, "a.bin"), (1, "b.bin")] {
+            assert_eq!(fs::read(dir.path().join("out").join(name)).unwrap(), fixture.data[member]);
+        }
+    }
+}
+
+#[test]
+fn adoption_refuses_a_different_archive_with_the_same_names_and_a_modified_output() {
+    // Crash inside b, after a finished.
+    let crashed = |dir: &Path, anchors: &Arc<Anchors>| {
+        let mut session = resume_session(&mut whole_fixture(), dir, anchors, 0);
+        let mut seen = Seen::default();
+        while seen.outcomes.is_empty() || seen.written < 3000 {
+            assert!(!step(&mut session, &mut seen));
+        }
+        crash((session, std::mem::take(&mut seen.files)));
+    };
+    // Another archive whose members have the same names (here a different modification time): its members are
+    // other members, so the existing outputs are neither adopted nor overwritten.
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    crashed(dir.path(), &anchors);
+    let a = fs::read(dir.path().join("out/a.bin")).unwrap();
+    let mut other = Fixture::configured(|_, spec| spec.mtime = Some(12345));
+    for source in other.volumes.iter_mut().flatten() {
+        source.holes.clear();
+    }
+    let mut session = resume_session(&mut other, dir.path(), &anchors, 0);
+    assert!(matches!(run_failure(&mut session), PartialErrorKind::AlreadyExists));
+    drop(session);
+    assert_eq!(fs::read(dir.path().join("out/a.bin")).unwrap(), a);
+    // The same archive still resumes.
+    let mut fixture = whole_fixture();
+    let mut session = resume_session(&mut fixture, dir.path(), &anchors, 0);
+    let mut seen = Seen::default();
+    assert!(run_events(&mut session, &mut seen, None));
+    assert_ok_outcomes(&seen, 2);
+
+    // An output changed behind the store's back is refused at its adoption.
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    crashed(dir.path(), &anchors);
+    let path = dir.path().join("out/a.bin");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[100] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    let mut session = resume_session(&mut whole_fixture(), dir.path(), &anchors, 0);
+    assert!(matches!(run_failure(&mut session), PartialErrorKind::OutputChanged));
+    drop(session);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn restart_resumes_under_a_growing_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let anchors = Arc::new(Anchors::default());
+    let start = |growing: &mut Growing| {
+        for source in growing.fixture.volumes.iter_mut().flatten() {
+            source.holes.clear();
+        }
+        let mut partial = partial_options(&dir.path().join("state"));
+        partial.anchors = anchors.clone();
+        partial.limits.group_commit_bytes = 0;
+        ProgressiveSession::new_partial(Box::new(growing.provider(Grow::OnRequest)), options(&dest), partial).unwrap()
+    };
+    // The first session knows five volumes, crashes inside a, before the declaration grows.
+    let mut growing = Growing::new();
+    let mut session = start(&mut growing);
+    let mut seen = Seen::default();
+    while seen.written < 2800 {
+        assert!(!step(&mut session, &mut seen));
+    }
+    crash((session, std::mem::take(&mut seen.files)));
+    // The restarted provider again starts with the first five volumes and declares the rest when asked.
+    let mut growing = Growing::new();
+    let mut session = start(&mut growing);
+    let mut seen = Seen::default();
+    assert!(run_events(&mut session, &mut seen, None));
+    assert_eq!(seen.adopted.len(), 1);
+    assert!(seen.adopted[0].1 >= 2800);
+    assert_eq!(growing.declared.lock().unwrap().epoch, 2);
+    assert_ok_outcomes(&seen, 2);
+    for (member, name) in [(0, "a.bin"), (1, "b.bin")] {
+        assert_eq!(fs::read(dest.join(name)).unwrap(), growing.fixture.data[member]);
+    }
+}
+
+#[test]
+fn encrypted_restart_resumes_at_every_crash_point() {
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let session = |dir: &Path, anchors: &Arc<Anchors>| {
+        let (provider, reads) = fixture.provider(&[]);
+        let mut opts = options(&dir.join("out"));
+        opts.set_password(Some("pw".into())).unwrap();
+        // 16-byte reads put resume points everywhere, including just past a part boundary that cuts a block.
+        opts.limits.read_chunk = 16;
+        let mut partial = partial_options(&dir.join("state"));
+        partial.anchors = anchors.clone();
+        partial.limits.group_commit_bytes = 0;
+        (ProgressiveSession::new_partial(Box::new(provider), opts, partial).unwrap(), reads)
+    };
+    let total = {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, _) = session(dir.path(), &Arc::default());
+        let mut seen = Seen::default();
+        assert!(run_events(&mut session, &mut seen, None));
+        seen.events
+    };
+    let mut straddled = false;
+    // Every commit syncs; crash at a spread of points, and at every point near the part boundaries.
+    for crash_at in (2..total).filter(|n| n % 11 == 0 || (60..72).contains(n) || (122..134).contains(n)) {
+        let dir = tempfile::tempdir().unwrap();
+        let anchors = Arc::new(Anchors::default());
+        let (mut first, _) = session(dir.path(), &anchors);
+        let mut before = Seen::default();
+        assert!(!run_events(&mut first, &mut before, Some(crash_at)));
+        let written = before.written;
+        crash((first, std::mem::take(&mut before.files)));
+        let (mut second, reads) = session(dir.path(), &anchors);
+        let mut after = Seen::default();
+        assert!(run_events(&mut second, &mut after, None), "crash at {crash_at}");
+        assert_eq!(after.adopted.len(), 1);
+        let (_, produced, finished) = after.adopted[0].clone();
+        assert_eq!(produced, written);
+        assert_ok_outcomes(&after, 1);
+        assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+        // Only the previous ciphertext block and the bytes after the resume point are read again.
+        for &(volume, at, _) in reads.lock().unwrap().iter() {
+            let payload = &fixture.payloads[volume as usize];
+            if payload.contains(&at) {
+                let stream = fixture.starts[volume as usize] + (at - payload.start);
+                assert!(!finished && produced < 3000 && stream + 16 >= produced, "crash at {crash_at}");
+            }
+        }
+        straddled |= CUTS.iter().any(|&cut| (produced as usize) > cut && (produced as usize) - 16 < cut);
+        drop(second);
+        let (_, mut file) = after.files.pop().unwrap();
+        assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    }
+    assert!(straddled, "a previous ciphertext block cut by a part boundary was read from two volumes");
+}
+
+#[test]
+fn a_wrong_fill_before_the_crash_is_judged_by_verification_not_the_resumed_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    // a's hole 1300..2000 is filled with one wrong byte, then the session dies inside a.
+    let mut session = resume_session(&mut Fixture::new(), dir.path(), &anchors, 0);
+    let mut seen = Seen::default();
+    while seen.written < 3500 {
+        assert!(!step(&mut session, &mut seen));
+    }
+    let mut fill = Fixture::new().data[0][1300..2000].to_vec();
+    fill[10] ^= 1;
+    seen.files[0].1.fill(1300, &fill).unwrap();
+    crash((session, std::mem::take(&mut seen.files)));
+    // The restart neither fails nor wedges: a verifies PartBad (the wrong byte is in part 0), b is extracted.
+    for _ in 0..2 {
+        let mut fixture = whole_fixture();
+        let mut session = resume_session(&mut fixture, dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        assert!(run_events(&mut session, &mut seen, None));
+        assert_eq!(seen.outcomes.len(), 2);
+        assert!(matches!(
+            &seen.outcomes[0].1,
+            MemberOutcome::PersistentComplete { verdict: Verdict::PartBad { part: 0, .. }, .. }
+        ));
+        assert!(matches!(&seen.outcomes[1].1, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }));
+        assert_eq!(fs::read(dir.path().join("out/b.bin")).unwrap(), fixture.data[1]);
+    }
+}
+
+#[test]
+fn damage_declared_on_bytes_the_resume_walk_skips_becomes_holes() {
+    // Crash inside a (the declared bytes lie before its resume point) and inside b (a is finished).
+    for (stop_in_b, written) in [(false, 3500), (true, 3500)] {
+        let dir = tempfile::tempdir().unwrap();
+        let anchors = Arc::new(Anchors::default());
+        let mut session = resume_session(&mut whole_fixture(), dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        while (stop_in_b && seen.outcomes.is_empty()) || seen.written < written {
+            assert!(!step(&mut session, &mut seen));
+        }
+        crash((session, std::mem::take(&mut seen.files)));
+        let mut fixture = whole_fixture();
+        let payload = fixture.payloads[1].clone();
+        let mut session = resume_session(&mut fixture, dir.path(), &anchors, 0);
+        let mut seen = Seen::default();
+        assert!(!step(&mut session, &mut seen));
+        // Volume 1 is not open yet: the damage is pending, and lies on a's part 1 (output 1410..1420).
+        let receipt = session.declare_hole(1, payload.start + 10..payload.start + 20).unwrap();
+        assert_eq!(receipt.pending.len(), 1);
+        assert!(run_events(&mut session, &mut seen, None));
+        let holes: Vec<_> = seen.holes.iter().map(|h| (h.out.clone(), h.cause.clone())).collect();
+        assert_eq!(holes, vec![(1410..1420, HoleCause::DeclaredBad)], "stop in b: {stop_in_b}");
+        assert!(matches!(&seen.outcomes[0].1, MemberOutcome::PersistentPartial { .. }));
+        let (_, a) = seen.files.iter_mut().find(|(k, _)| k.ordinal() == 0).unwrap();
+        assert_eq!(a.remaining().unwrap(), vec![1410..1420]);
+        a.fill(1410, &fixture.data[0][1410..1420]).unwrap();
+        assert!(matches!(verify(a), Verdict::Ok { .. }));
+    }
+}
+
+#[test]
+fn encrypted_damage_on_the_previous_ciphertext_block_makes_the_next_block_a_hole() {
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let session = |provider: Provider| {
+        let mut opts = options(&dir.path().join("out"));
+        opts.set_password(Some("pw".into())).unwrap();
+        opts.limits.read_chunk = 16;
+        let mut partial = partial_options(&dir.path().join("state"));
+        partial.anchors = anchors.clone();
+        partial.limits.group_commit_bytes = 0;
+        ProgressiveSession::new_partial(Box::new(provider), opts, partial).unwrap()
+    };
+    // Crash at produced 1008: the block before it, 992..1008, is cut by the volume boundary at 1001.
+    let mut first = session(fixture.provider(&[]).0);
+    let mut seen = Seen::default();
+    while seen.written < 1008 {
+        assert!(!step(&mut first, &mut seen));
+    }
+    assert_eq!(seen.written, 1008);
+    crash((first, std::mem::take(&mut seen.files)));
+    // The restart reads 992..1001 from volume 0, then waits for volume 1's bytes 1001..1008.
+    let (mut provider, _) = fixture.provider(&[]);
+    let gate = Arc::new(WaitGate::default());
+    provider.volumes[1].as_mut().unwrap().wait = Some((fixture.payloads[1].start, gate.clone()));
+    let mut second = session(provider);
+    let mut seen = Seen::default();
+    for _ in 0..100_000 {
+        if gate.0.lock().unwrap().is_some() {
+            break;
+        }
+        if let Poll::Ready(Ok(Some(ProgressiveEvent::PartialAdopted { member, .. }))) =
+            second.poll_event(&mut Context::from_waker(Waker::noop()))
+        {
+            seen.files.push((member.clone(), second.partial_file(&member).unwrap()));
+        }
+    }
+    assert!(gate.0.lock().unwrap().is_some(), "waiting inside the previous block");
+    // Damage on the half of the block already read.
+    let piece = fixture.packed(992..1001);
+    second.declare_hole(piece[0].0, piece[0].1.clone()).unwrap();
+    gate.0.lock().unwrap().take().unwrap().wake();
+    assert!(run_events(&mut second, &mut seen, None));
+    let (_, file) = seen.files.last_mut().unwrap();
+    let remaining = file.remaining().unwrap();
+    assert!(remaining.iter().any(|r| r.start <= 1008 && 1024 <= r.end), "{remaining:?}");
+    fill_plain(file, &fixture);
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+}
+
+#[test]
+fn encrypted_damage_declared_before_polling_on_the_previous_block_is_a_declared_hole() {
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let session = |provider: Provider| {
+        let mut opts = options(&dir.path().join("out"));
+        opts.set_password(Some("pw".into())).unwrap();
+        opts.limits.read_chunk = 16;
+        let mut partial = partial_options(&dir.path().join("state"));
+        partial.anchors = anchors.clone();
+        partial.limits.group_commit_bytes = 0;
+        ProgressiveSession::new_partial(Box::new(provider), opts, partial).unwrap()
+    };
+    let mut first = session(fixture.provider(&[]).0);
+    let mut seen = Seen::default();
+    while seen.written < 400 {
+        assert!(!step(&mut first, &mut seen));
+    }
+    assert_eq!(seen.written, 400);
+    crash((first, std::mem::take(&mut seen.files)));
+    // Before the restart reads anything, damage on ciphertext 384..388: the block the resume reads for its CBC
+    // state, from which the earlier session decrypted output 384..400.
+    let mut second = session(fixture.provider(&[]).0);
+    let piece = fixture.packed(384..388);
+    let receipt = second.declare_hole(piece[0].0, piece[0].1.clone()).unwrap();
+    assert_eq!(receipt.pending.len(), 1);
+    let mut seen = Seen::default();
+    assert!(run_events(&mut second, &mut seen, None));
+    assert_eq!(joined(&seen.holes), vec![(384..400, HoleCause::DeclaredBad), (400..416, HoleCause::CipherNeighbour)]);
+    let (_, file) = seen.files.last_mut().unwrap();
+    assert_eq!(file.remaining().unwrap(), vec![384..416]);
+    fill_plain(file, &fixture);
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
 }

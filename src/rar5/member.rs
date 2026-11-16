@@ -48,6 +48,16 @@ pub(crate) trait RecoverySink: Sink {
         Ok(())
     }
 }
+/// Where [`MemberMachine::resume_stored`] continues a stored member.
+#[cfg(feature = "persistent-partials")]
+pub(crate) struct StoredResume {
+    pub delivered: u64,
+    pub part_bytes: u64,
+    pub member: Option<(crate::crc32::Hasher, Option<crate::blake2sp::Blake2sp>)>,
+    pub part: Option<(crate::crc32::Hasher, Option<crate::blake2sp::Blake2sp>)>,
+    pub iv: Option<[u8; 16]>,
+    pub padding: usize,
+}
 pub(crate) struct StoredCipherPadding {
     pub(crate) size: u64,
     pub(crate) skipped: usize,
@@ -215,6 +225,8 @@ pub(crate) struct MemberMachine {
     failed: bool,
     pub(crate) missing: bool,
     part_missing: bool,
+    /// Resumed after a restart: check mismatches mark the part or member missing instead of failing.
+    resumed: bool,
 }
 impl MemberMachine {
     pub(crate) fn from_state(
@@ -239,6 +251,7 @@ impl MemberMachine {
             failed: false,
             missing: false,
             part_missing: false,
+            resumed: false,
         }
     }
     /// Treats bytes already fed as missing after the fact (caller-declared damage), exactly as a hole fed in
@@ -265,6 +278,73 @@ impl MemberMachine {
                 state.known = false;
             }
         }
+    }
+    /// Continues a stored member a previous session left at output offset `delivered`, without feeding the bytes
+    /// before it again. `part_bytes` are the current part's packed bytes before the resume point. `member` and
+    /// `part` are the hash states of the output already produced (whole member, and the current part's share);
+    /// `None` where that output has holes or fills, so the check is not judged while streaming, as after a hole.
+    /// `iv` is an encrypted member's previous ciphertext block (`None` when it is unavailable, which makes the next
+    /// block a hole), and `padding` the final padding bytes already behind the resume point.
+    ///
+    /// The machine starts the current part `part` first (it never saw the parts before it). Its checks of the
+    /// resumed member are judged leniently: a mismatch marks the part (or member) missing instead of failing, so
+    /// `poll_verify` reports it as `PartBad` or `Bad` from the output, and the session goes on with other members.
+    /// Output before the resume point may come from fills that were never streamed, so a mismatch there must not
+    /// end the session, as it would not without the restart.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn resume_stored(
+        &mut self,
+        part: &super::physical::PhysicalPart,
+        resume: StoredResume,
+    ) -> crate::progressive::ProgressiveResult<()> {
+        use crate::progressive::{FailureKind, ProgressiveFailure};
+        if self.failed || self.decoder.is_some() || self.delivered != 0 || self.part_bytes != 0 {
+            return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
+        }
+        self.begin_part(part);
+        self.resumed = true;
+        let checks = self.inner.as_mut().ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
+        match resume.member {
+            Some((crc, blake)) => {
+                checks.hasher = crc;
+                if checks.blake.is_some() {
+                    checks.blake = Some(blake.ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?);
+                }
+            }
+            None => self.missing = true,
+        }
+        checks.bytes = resume.delivered;
+        self.delivered = resume.delivered;
+        self.part_bytes = resume.part_bytes;
+        match resume.part {
+            Some((crc, blake)) => {
+                self.part_crc = crc;
+                if self.part_blake.is_some() {
+                    self.part_blake = blake;
+                    if self.part_blake.is_none() {
+                        self.part_missing = true;
+                    }
+                }
+            }
+            None => self.part_missing = true,
+        }
+        if let Some(cipher) = &mut self.cipher {
+            if !cipher.rem.is_empty() || cipher.recovery.is_some() {
+                return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
+            }
+            if let Some(padding) = &mut cipher.stored_padding {
+                padding.skipped = resume.padding;
+            }
+            let previous_known = match resume.iv {
+                Some(iv) => {
+                    cipher.iv = iv;
+                    true
+                }
+                None => false,
+            };
+            cipher.recovery = Some(CbcAvailability { block: [0; 16], used: 0, known: true, previous_known });
+        }
+        Ok(())
     }
     pub(crate) fn part_missing(&self) -> bool {
         self.part_missing
@@ -554,7 +634,12 @@ impl MemberMachine {
             return Ok(());
         }
         let key = self.cipher.as_ref().filter(|_| part.checks.keyed).and_then(PendingCipher::checksum_key);
-        verify_packed(&self.context, part.checks, self.part_crc.clone(), self.part_blake.take(), key)
+        let result = verify_packed(&self.context, part.checks, self.part_crc.clone(), self.part_blake.take(), key);
+        if result.is_err() && self.resumed {
+            self.part_missing = true;
+            return Ok(());
+        }
+        result
     }
     pub(crate) fn finish_member(
         &mut self,
@@ -584,12 +669,16 @@ impl MemberMachine {
             }
             return Ok(());
         }
-        self.inner
-            .as_mut()
-            .ok_or_else(|| {
-                crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::IncompleteOutput)
-            })?
-            .verify(&self.context, member.unpacked_size, checks.crc32, checks.blake2sp, key)
+        let inner = self.inner.as_mut().ok_or_else(|| {
+            crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::IncompleteOutput)
+        })?;
+        let bytes = inner.bytes;
+        let result = inner.verify(&self.context, member.unpacked_size, checks.crc32, checks.blake2sp, key);
+        if result.is_err() && self.resumed && member.unpacked_size.is_none_or(|n| n == bytes) {
+            self.missing = true;
+            return Ok(());
+        }
+        result
             .map_err(|e| crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::Rar(Box::new(e))))
     }
     pub(crate) fn finish_decode(&mut self, sink: &mut dyn Sink) -> crate::progressive::ProgressiveResult<()> {
@@ -1341,6 +1430,67 @@ mod tests {
             controlled_keys("secret", params, &usage, &control, context().scope()),
             Err(crate::progressive::ProgressiveFailure { kind: FailureKind::Canceled, .. })
         ));
+    }
+    /// A member resumed in a later part checks that part as the part declares, not as the first part did, and a
+    /// mismatch marks the part missing (verification reports it) instead of failing the machine.
+    #[cfg(feature = "persistent-partials")]
+    #[test]
+    fn resumed_member_checks_the_current_part_and_is_lenient() {
+        let data: Vec<u8> = (0..64u8).collect();
+        let mut right = crate::blake2sp::Blake2sp::new();
+        right.update(&data[32..48]);
+        let right = right.finish();
+        for (declared, missing) in [(right, false), ([7; 32], true)] {
+            let wire = super::super::FileWire {
+                legacy: None,
+                name: std::sync::Arc::new(b"f".to_vec()),
+                compression: 0,
+                extent: 0..0,
+            };
+            // Part 0 declares no BLAKE2sp; part 1 does.
+            let first = super::super::FileHeader {
+                name: "f".into(),
+                unpacked_size: 64,
+                packed_size: 32,
+                crc32: Some(crate::crc32::hash(&data[..32])),
+                block_flags: super::super::HFL_SPLIT_AFTER,
+                ..Default::default()
+            };
+            let second = super::super::FileHeader {
+                packed_size: 16,
+                crc32: Some(crate::crc32::hash(&data[32..48])),
+                blake2sp: Some(declared),
+                block_flags: super::super::HFL_SPLIT_BEFORE | super::super::HFL_SPLIT_AFTER,
+                ..first.clone()
+            };
+            let part = PhysicalPart::new(1, &second, None, &wire);
+            let usage = Usage::new(ProgressiveLimits::default());
+            let control = SessionControl::default();
+            let mut machine = MemberMachine::new(&first, context(), None, &usage, &control).unwrap();
+            let mut member_crc = crate::crc32::Hasher::new();
+            member_crc.update(&data[..36]);
+            let mut part_crc = crate::crc32::Hasher::new();
+            part_crc.update(&data[32..36]);
+            let mut part_blake = crate::blake2sp::Blake2sp::new();
+            part_blake.update(&data[32..36]);
+            machine
+                .resume_stored(
+                    &part,
+                    StoredResume {
+                        delivered: 36,
+                        part_bytes: 4,
+                        member: Some((member_crc, None)),
+                        part: Some((part_crc, Some(part_blake))),
+                        iv: None,
+                        padding: 0,
+                    },
+                )
+                .unwrap();
+            let mut sink = |_: &[u8]| Ok(());
+            machine.feed(&data[36..48], &mut sink).unwrap();
+            machine.finish_part(&part).unwrap();
+            assert_eq!(machine.part_missing(), missing, "declared {declared:?}");
+        }
     }
     #[test]
     fn stored_cbc_keeps_remainder_padding_and_inner_checks_across_non_aligned_parts() {

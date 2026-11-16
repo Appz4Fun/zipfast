@@ -77,6 +77,7 @@ struct Source {
     index: u32,
     bytes: Vec<u8>,
     holes: Vec<Range<u64>>,
+    reads: Arc<Mutex<Vec<(u32, u64)>>>,
 }
 impl RangeSource for Source {
     fn info(&self) -> SourceInfo {
@@ -91,6 +92,7 @@ impl RangeSource for Source {
         &[]
     }
     fn read_at(&mut self, at: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        self.reads.lock().unwrap().push((self.index, at));
         let mut end = (at + buf.len() as u64).min(self.bytes.len() as u64);
         for hole in &self.holes {
             if hole.start <= at && at < hole.end {
@@ -155,6 +157,8 @@ struct Set {
     /// Packed payload range of each part, per volume (one member part per volume for split sets).
     payloads: Vec<Range<u64>>,
     holes: Vec<Vec<Range<u64>>>,
+    /// (volume, offset) of every source read.
+    reads: Arc<Mutex<Vec<(u32, u64)>>>,
 }
 impl Set {
     /// One member, `gold`, split across volumes at `cuts` (output offsets).
@@ -179,7 +183,7 @@ impl Set {
             wire.extend(block(0x7b, 0x4000 | u16::from(!last), &[]));
             volumes.push(wire);
         }
-        Self { naming, holes: vec![Vec::new(); count], volumes, payloads }
+        Self { naming, holes: vec![Vec::new(); count], volumes, payloads, reads: Arc::default() }
     }
     /// One unsplit volume holding each `(name, data)` member in order.
     fn single(members: &[(&[u8], &[u8])]) -> Self {
@@ -192,7 +196,7 @@ impl Set {
             wire.extend(*data);
         }
         wire.extend(block(0x7b, 0x4000, &[]));
-        Self { naming: Naming::Old, volumes: vec![wire], payloads, holes: vec![Vec::new()] }
+        Self { naming: Naming::Old, volumes: vec![wire], payloads, holes: vec![Vec::new()], reads: Arc::default() }
     }
     /// Makes the source answer archive bytes `packed` of `volume` as a hole.
     fn hole(&mut self, volume: usize, packed: Range<u64>) {
@@ -222,7 +226,12 @@ impl Set {
                 .zip(&self.holes)
                 .enumerate()
                 .map(|(index, (bytes, holes))| {
-                    Some(Source { index: index as u32, bytes: bytes.clone(), holes: holes.clone() })
+                    Some(Source {
+                        index: index as u32,
+                        bytes: bytes.clone(),
+                        holes: holes.clone(),
+                        reads: self.reads.clone(),
+                    })
                 })
                 .collect(),
             protection: self.protection(),
@@ -550,7 +559,13 @@ fn refused(volume: Vec<u8>) -> PartialErrorKind {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out");
     let state = dir.path().join("state");
-    let set = Set { naming: Naming::Old, volumes: vec![volume], payloads: Vec::new(), holes: vec![Vec::new()] };
+    let set = Set {
+        naming: Naming::Old,
+        volumes: vec![volume],
+        payloads: Vec::new(),
+        holes: vec![Vec::new()],
+        reads: Arc::default(),
+    };
     let mut session = ProgressiveSession::new_partial(
         Box::new(set.provider()),
         options(&dest, set.naming.name(0)),
@@ -606,4 +621,124 @@ fn encrypted_compressed_and_header_encrypted_rar4_are_refused_before_effects() {
     // All-ones RAR4 size means unknown.
     let unknown = archive(file_header(b"u.bin", data.len(), u32::MAX as usize, hash(data), 0, 20, 0x30), data, 0);
     assert!(matches!(refused(unknown), PartialErrorKind::UnknownMemberSize));
+}
+
+/// Drops `value` as a crash leaves it: an open group is not committed. (Drop skips that commit while unwinding.)
+fn crash<T>(value: T) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = value;
+        std::panic::resume_unwind(Box::new("simulated crash"));
+    }));
+}
+/// A session over `set` under `dir` with 300-byte reads, committing every write.
+fn session(set: &Set, dir: &Path, anchors: &Arc<Anchors>) -> ProgressiveSession {
+    let mut opts = options(&dir.join("out"), set.naming.name(0));
+    opts.limits.read_chunk = 300;
+    let mut partial = partial_options(&dir.join("state"), anchors.clone());
+    partial.limits.group_commit_bytes = 0;
+    ProgressiveSession::new_partial(Box::new(set.provider()), opts, partial).unwrap()
+}
+#[derive(Default)]
+struct Seen {
+    events: usize,
+    written: u64,
+    files: Vec<(MemberKey, PartialFile)>,
+    adopted: Vec<(MemberKey, u64, bool)>,
+    outcomes: Vec<MemberOutcome>,
+}
+/// Polls until the session ends (true) or `stop` events were delivered (false).
+fn run(session: &mut ProgressiveSession, seen: &mut Seen, stop: Option<usize>) -> bool {
+    for _ in 0..1_000_000 {
+        if stop.is_some_and(|stop| seen.events >= stop) {
+            return false;
+        }
+        let event = match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => continue,
+            Poll::Ready(Ok(None)) => return true,
+            Poll::Ready(Ok(Some(event))) => event,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+        };
+        seen.events += 1;
+        match event {
+            ProgressiveEvent::PartialReady { member, .. } => {
+                seen.written = 0;
+                seen.files.push((member.clone(), session.partial_file(&member).unwrap()));
+            }
+            ProgressiveEvent::PartialAdopted { member, produced, finished, .. } => {
+                seen.written = produced;
+                seen.files.push((member.clone(), session.partial_file(&member).unwrap()));
+                seen.adopted.push((member, produced, finished));
+            }
+            ProgressiveEvent::BytesWritten { logical_end, .. } => seen.written = logical_end,
+            ProgressiveEvent::MemberFinished { outcome, .. } => seen.outcomes.push(outcome),
+            ProgressiveEvent::SessionTerminated { failure, .. } => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    panic!("session did not finish")
+}
+
+/// (output name, expected bytes) of each member of a set.
+type Members<'a> = Vec<(&'a str, &'a [u8])>;
+#[test]
+fn restart_resumes_split_and_multi_member_sets_at_every_crash_point() {
+    let gold = gold(4000);
+    let (x, y) = (gold[..1500].to_vec(), gold[1500..].to_vec());
+    let sets: [(Set, Members<'_>); 2] = [
+        (Set::split(Naming::Parts, &gold, &[1000, 2000, 3000]), vec![("big.bin", &gold)]),
+        (Set::single(&[(b"x.bin", &x), (b"y.bin", &y)]), vec![("x.bin", &x), ("y.bin", &y)]),
+    ];
+    for (set, members) in &sets {
+        let total = {
+            let dir = tempfile::tempdir().unwrap();
+            let mut seen = Seen::default();
+            assert!(run(&mut session(set, dir.path(), &Arc::default()), &mut seen, None));
+            seen.events
+        };
+        for crash_at in 1..total {
+            let dir = tempfile::tempdir().unwrap();
+            let anchors = Arc::new(Anchors::default());
+            let mut first = session(set, dir.path(), &anchors);
+            let mut before = Seen::default();
+            assert!(!run(&mut first, &mut before, Some(crash_at)));
+            let finished = before.outcomes.len();
+            let written = before.written;
+            let created: Vec<MemberKey> = before.files.iter().map(|(key, _)| key.clone()).collect();
+            crash((first, std::mem::take(&mut before.files)));
+            set.reads.lock().unwrap().clear();
+            let mut second = session(set, dir.path(), &anchors);
+            let mut after = Seen::default();
+            assert!(run(&mut second, &mut after, None), "crash at {crash_at}");
+            assert_eq!(after.outcomes.len(), members.len());
+            for outcome in &after.outcomes {
+                assert!(matches!(outcome, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }));
+            }
+            for (name, data) in members {
+                assert_eq!(fs::read(dir.path().join("out").join(name)).unwrap(), *data, "crash at {crash_at}");
+            }
+            for (index, (key, produced, done)) in after.adopted.iter().enumerate() {
+                if index < finished {
+                    assert!(*done, "crash at {crash_at}");
+                } else if !created.contains(key) {
+                    // Its genesis preceded a `PartialReady` the crash kept from being delivered.
+                    assert_eq!((*produced, *done), (0, false), "crash at {crash_at}");
+                } else {
+                    assert_eq!(*produced, written, "crash at {crash_at}");
+                }
+                // Output offset of every payload read of this member: none for a finished member, and none
+                // below the resume point otherwise.
+                let ordinal = key.ordinal() as usize;
+                for &(volume, at) in set.reads.lock().unwrap().iter() {
+                    let (payload, out) = if set.volumes.len() > 1 {
+                        (&set.payloads[volume as usize], volume as u64 * 1000)
+                    } else {
+                        (&set.payloads[ordinal], 0)
+                    };
+                    if payload.contains(&at) {
+                        assert!(!*done && out + (at - payload.start) >= *produced, "crash at {crash_at}");
+                    }
+                }
+            }
+        }
+    }
 }

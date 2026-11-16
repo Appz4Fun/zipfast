@@ -83,6 +83,33 @@ pub(crate) struct PreparedCreate {
     ready_bytes: Option<usize>,
     keys: Option<MemberKeys>,
 }
+/// Absolute output and state bundle paths of `member` at `relative` under the roots, as its genesis named them.
+pub(crate) fn member_paths(
+    output_root: &std::path::Path,
+    state_root: &std::path::Path,
+    relative: &std::path::Path,
+    member: &MemberKey,
+) -> PartialResult<(std::path::PathBuf, std::path::PathBuf)> {
+    native::validate_relative(relative)?;
+    let root = std::path::absolute(output_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+    let state = std::path::absolute(state_root).map_err(|e| io_error(OutputOperation::Metadata, e))?;
+    Ok((root.join(relative), state.join(native::bundle_name(member))))
+}
+/// What a session needs to adopt a member a previous session created.
+pub(crate) struct AdoptSpec {
+    pub member: MemberKey,
+    pub anchor: StateAnchor,
+    pub output_root: std::path::PathBuf,
+    pub state_root: std::path::PathBuf,
+    pub protection: crate::progressive::ProtectionDeclaration,
+    /// The member keys of an encrypted member, from the session's own derivation.
+    pub keys: Option<MemberKeys>,
+}
+/// Hash state of an adopted member's known output before its resume point; `None` where that output has holes.
+pub(crate) struct PrefixHashes {
+    pub member: Option<(crate::crc32::Hasher, Option<crate::blake2sp::Blake2sp>)>,
+    pub part: Option<(crate::crc32::Hasher, Option<crate::blake2sp::Blake2sp>)>,
+}
 pub(crate) struct PartialEventLease {
     _reservation: Reservation,
 }
@@ -1756,8 +1783,9 @@ impl PartialCore {
         let transaction = self.begin_transaction(&mut op, intent, valid, Vec::new())?;
         self.finish_transaction(&mut op, transaction)
     }
-    // Called only after the canonical MemberMachine has successfully finished.
-    // The acknowledged commit, not complete output coverage, grants finalization.
+    // Called only after the canonical MemberMachine has finished: successfully, or, for a member resumed after a
+    // restart, with check mismatches it left to verification (which then reports Bad or PartBad). The acknowledged
+    // commit, not complete output coverage, grants finalization; it never grants Verdict::Ok by itself.
     pub(crate) fn finish_member(&self) -> PartialResult<()> {
         let mut data = self.operation()?;
         self.check(&data)?;
@@ -1986,6 +2014,244 @@ impl PartialCore {
         ledger::Ledger { known: &mut op.snapshot.known, size, budget: &self.budget }.remaining()
     }
 }
+impl PartialCore {
+    /// Rebinds the member of `spec` under `budget` and rehashes its known output. `keys` are the member keys when
+    /// the caller already holds them (a session adopting a member); otherwise they are derived from the context
+    /// password, if any.
+    fn reopen(
+        spec: ReopenSpec,
+        budget: PartialBudget,
+        read_chunk: usize,
+        keys: Option<MemberKeys>,
+    ) -> PartialResult<Arc<Self>> {
+        let state = &spec.state;
+        let context = &spec.context;
+        let anchors = AnchorBinding::new(context.expected_member.clone(), context.anchors.clone());
+        let current = anchors.current()?.ok_or_else(|| err(PartialErrorKind::AnchorConflict))?;
+        if &current != state.anchor() {
+            return Err(err(PartialErrorKind::StateStale { latest: current }));
+        }
+        if current != context.expected_anchor {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));
+        }
+        canceled(&context.control)?;
+        let lease = budget.reserve(PartialResource::OpenPartials, 1)?;
+        let loaded = PartialState::load_budgeted(&context.state_root, &current, &budget)?;
+        if loaded.wire != state.wire {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));
+        }
+        let mut bundle = Bundle::open(&spec, &current, &budget)?;
+        let mut snapshot = bundle.snapshot(state)?;
+        let keys = match (keys, &snapshot.crypt, &context.password) {
+            (Some(keys), Some(_), _) => Some(keys),
+            (None, Some(params), Some(password)) => {
+                Some(MemberKeys::derive(password, params, &budget, &context.control)?)
+            }
+            _ => None,
+        };
+        // Derivation refuses a password that fails the check value, so with one the keys are proven. Keys handed
+        // over by a session passed the same check when the session derived them.
+        let keys_proven = snapshot.crypt.as_ref().is_some_and(|params| params.check.is_some());
+        let native = PersistentNative::reopen(&spec, &budget)?;
+        let before = stamp(&native)?;
+        rehash_known(&native, &budget, &context.control, read_chunk, &mut snapshot)?;
+        native.check(snapshot.head.size)?;
+        if stamp(&native)? != before {
+            return Err(err(PartialErrorKind::OutputChanged));
+        }
+        let ack = anchors.confirm_current(&current)?;
+        bundle.acknowledge(&current, &ack)?;
+        canceled(&context.control)?;
+        native.check(snapshot.head.size)?;
+        if stamp(&native)? != before {
+            return Err(err(PartialErrorKind::OutputChanged));
+        }
+        Ok(Arc::new(PartialCore {
+            native,
+            budget,
+            anchors,
+            control: spec.context.control,
+            read_chunk,
+            busy: AtomicBool::new(false),
+            data: Mutex::new(Some(CoreData {
+                bundle,
+                snapshot,
+                state: spec.state,
+                stamp: before,
+                uncertain: None,
+                pending_compaction: None,
+                verification: None,
+                part_results: None,
+                reopened: true,
+                group: None,
+            })),
+            keys,
+            keys_proven: AtomicBool::new(keys_proven),
+            _lease: lease,
+        }))
+    }
+    /// Adopts the member a previous session created under `member`, whose trusted anchor is `anchor`: loads that
+    /// state, rebinds the output and bundle (the native identities must be the recorded ones), and rehashes the
+    /// known output, all under the session's budget and exclusions. Nothing is written.
+    pub(crate) fn adopt(
+        spec: AdoptSpec,
+        options: CoreOptions,
+    ) -> PartialResult<(Arc<Self>, PartialState, PartialEventLease)> {
+        native::platform()?;
+        options.limits.validate()?;
+        canceled(&options.control)?;
+        if options.read_chunk == 0 {
+            return Err(err(PartialErrorKind::InvalidOptions));
+        }
+        let budget = PartialBudget::new(options.limits.clone(), options.usage, options.exclusions)?;
+        let event = budget.reserve(PartialResource::Events, 1)?;
+        let state = PartialState::load_budgeted(&spec.state_root, &spec.anchor, &budget)?;
+        if state.member() != &spec.member {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+        }
+        let context = PartialOpenContext {
+            output_root: spec.output_root,
+            state_root: spec.state_root,
+            expected_member: spec.member,
+            expected_anchor: spec.anchor,
+            protection: spec.protection,
+            limits: options.limits,
+            progressive_limits: crate::progressive::ProgressiveLimits::default(),
+            anchors: options.anchors,
+            control: options.control,
+            password: None,
+        };
+        let read_chunk = options.read_chunk.min(1_048_576) as usize;
+        let core = Self::reopen(ReopenSpec { state: state.clone(), context }, budget, read_chunk, spec.keys)?;
+        core.budget.metadata(state.wire.len() as u64)?;
+        Ok((core, state, PartialEventLease { _reservation: event }))
+    }
+    /// The committed resume point of an adopted member: its durable `produced`, whether its canonical finish is
+    /// committed, and its size.
+    pub(crate) fn resume_point(&self) -> PartialResult<(u64, bool, u64)> {
+        let op = self.operation()?;
+        self.check(&op)?;
+        let head = &op.snapshot.head;
+        Ok((head.produced, head.member_finished, head.size))
+    }
+    /// Refuses adoption unless the recorded member has this output path, name and size.
+    pub(crate) fn check_adopted(&self, relative: &std::path::Path, name: &[u8], size: u64) -> PartialResult<()> {
+        let op = self.operation()?;
+        let snapshot = &op.snapshot;
+        if snapshot.head.relative_output != relative || &*snapshot.name != name || snapshot.head.size != size {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+        }
+        Ok(())
+    }
+    /// Whether part `part` (with its header witness) is already recorded. A recorded part, or a witness at the same
+    /// archive position, that differs is a `BindingMismatch`: the archive is not the one the member came from.
+    pub(crate) fn recorded_part(&self, part: &PlainPart, witness: &HeaderWitness) -> PartialResult<bool> {
+        let op = self.operation()?;
+        let evidence = &op.snapshot.evidence;
+        let old = evidence.headers.iter().find(|old| old.volume == witness.volume && old.packed == witness.packed);
+        if old.is_some_and(|old| old != witness) {
+            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
+        }
+        match evidence.parts.iter().find(|old| old.ordinal == part.ordinal) {
+            Some(recorded) if recorded == part && old.is_some() => Ok(true),
+            Some(_) => Err(err(PartialErrorKind::BindingMismatch(BindingField::Source))),
+            None => Ok(false),
+        }
+    }
+    /// Hash state of the known output an adopted member resumes after, rebuilt from the output itself: the member
+    /// CRC32 of `0..at` (combined from the leaves the reopen rehash verified), its BLAKE2sp when `member_blake`
+    /// (read back), and the CRC32 and, when `part_blake`, BLAKE2sp of `part.start..at` (read back). A hash whose
+    /// range is not wholly known is `None`: those bytes are holes, so that check cannot be judged while streaming.
+    pub(crate) fn prefix_hashes(
+        &self,
+        at: u64,
+        part_start: u64,
+        member_blake: bool,
+        part_blake: bool,
+    ) -> PartialResult<PrefixHashes> {
+        let op = self.operation()?;
+        self.check(&op)?;
+        let snapshot = &op.snapshot;
+        if at != snapshot.head.produced || part_start > at {
+            return Err(malformed());
+        }
+        let part = part_start..at;
+        // Only output the extraction produced counts. A hole filled with alt bytes was never judged by a streaming
+        // check, and a wrong fill there must reach `poll_verify` as `Bad` or `PartBad`, as it does without a
+        // restart, rather than fail the resumed stream: a range with alt output, or overlapping a recorded hole,
+        // is not usable. Archive bytes a `fill_packed` wrote are recorded as original and cannot be told apart,
+        // so a resumed member's streaming checks never fail the session either (`MemberMachine::resume_stored`).
+        let covered = |range: &Range<u64>| {
+            if snapshot.holes.iter().any(|hole| hole.out.start < range.end && range.start < hole.out.end) {
+                return false;
+            }
+            let mut next = range.start;
+            for leaf in &snapshot.known[snapshot.known.partition_point(|leaf| leaf.range.end <= range.start)..] {
+                if next >= range.end || leaf.range.start > next {
+                    break;
+                }
+                if leaf.provenance != state::Provenance::Original {
+                    return false;
+                }
+                next = leaf.range.end;
+            }
+            next >= range.end
+        };
+        let member_known = covered(&(0..at));
+        let part_known = covered(&part);
+        let mut member_crc = None;
+        if member_known {
+            let mut combined = crate::crc32::Hasher::new();
+            for leaf in snapshot.known.iter().take_while(|leaf| leaf.range.end <= at) {
+                self.budget.usage.charge(Resource::VerifyWorkBytes, leaf.range.end - leaf.range.start)?;
+                combined.combine(&leaf.hasher);
+            }
+            member_crc = Some(combined);
+        }
+        let mut member_hash = (member_known && member_blake).then(crate::blake2sp::Blake2sp::new);
+        let mut part_crc = part_known.then(crate::crc32::Hasher::new);
+        let mut part_hash = (part_known && part_blake).then(crate::blake2sp::Blake2sp::new);
+        let from = if member_hash.is_some() { 0 } else { part.start };
+        if (member_hash.is_some() || part_crc.is_some()) && from < at {
+            if member_hash.is_some() || part_hash.is_some() {
+                self.budget.metadata(4096)?;
+            }
+            let mut buffer = self.budget.vector(self.read_chunk.min((at - from) as usize))?;
+            buffer.resize(self.read_chunk.min((at - from) as usize), 0);
+            let mut pos = from;
+            while pos < at {
+                canceled(&self.control)?;
+                let n = (at - pos).min(buffer.len() as u64) as usize;
+                self.budget.usage.charge(Resource::VerifyBytes, n as u64)?;
+                self.budget.usage.charge(Resource::VerifyWorkBytes, n as u64)?;
+                let count = crate::output::range::read_at(&self.native.output.file, pos, &mut buffer[..n])
+                    .map_err(|e| io_error(OutputOperation::Read, e))?;
+                if count == 0 {
+                    return Err(err(PartialErrorKind::OutputChanged));
+                }
+                let bytes = &buffer[..count];
+                if let Some(hash) = &mut member_hash {
+                    hash.update(bytes);
+                }
+                if pos + count as u64 > part.start {
+                    let skip = part.start.saturating_sub(pos) as usize;
+                    if let Some(crc) = &mut part_crc {
+                        crc.update(&bytes[skip..]);
+                    }
+                    if let Some(hash) = &mut part_hash {
+                        hash.update(&bytes[skip..]);
+                    }
+                }
+                pos += count as u64;
+            }
+            self.check(&op)?;
+        }
+        Ok(PrefixHashes {
+            member: member_crc.map(|crc| (crc, member_hash)),
+            part: part_crc.map(|crc| (crc, part_hash)),
+        })
+    }
+}
 impl Drop for PartialCore {
     /// The last owner gone: commit an open group if that still works, so output written since its intent is not
     /// re-extracted needlessly. A failure leaves the anchored state as it is, exactly as a crash would.
@@ -2017,74 +2283,11 @@ impl PartialFile {
         if state.member() != &context.expected_member {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
         }
-        let spec = ReopenSpec { state, context };
-        let state = &spec.state;
-        let context = &spec.context;
-        let anchors = AnchorBinding::new(context.expected_member.clone(), context.anchors.clone());
-        let current = anchors.current()?.ok_or_else(|| err(PartialErrorKind::AnchorConflict))?;
-        if &current != state.anchor() {
-            return Err(err(PartialErrorKind::StateStale { latest: current }));
-        }
-        if current != context.expected_anchor {
-            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));
-        }
-        canceled(&context.control)?;
         let read_chunk = context.progressive_limits.read_chunk.min(1_048_576) as usize;
         let usage = crate::progressive::Usage::new(context.progressive_limits.clone());
         let exclusions = Arc::new(PartialExclusions::new(usage.clone()));
         let budget = PartialBudget::new(context.limits.clone(), usage, exclusions)?;
-        let lease = budget.reserve(PartialResource::OpenPartials, 1)?;
-        let loaded = PartialState::load_budgeted(&context.state_root, &current, &budget)?;
-        if loaded.wire != state.wire {
-            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));
-        }
-        let mut bundle = Bundle::open(&spec, &current, &budget)?;
-        let mut snapshot = bundle.snapshot(state)?;
-        let keys = match (&snapshot.crypt, &context.password) {
-            (Some(params), Some(password)) => Some(MemberKeys::derive(password, params, &budget, &context.control)?),
-            _ => None,
-        };
-        // Derivation refuses a password that fails the check value, so with one the keys are proven.
-        let keys_proven = snapshot.crypt.as_ref().is_some_and(|params| params.check.is_some());
-        let native = PersistentNative::reopen(&spec, &budget)?;
-        let before = stamp(&native)?;
-        rehash_known(&native, &budget, &context.control, read_chunk, &mut snapshot)?;
-        native.check(snapshot.head.size)?;
-        if stamp(&native)? != before {
-            return Err(err(PartialErrorKind::OutputChanged));
-        }
-        let ack = anchors.confirm_current(&current)?;
-        bundle.acknowledge(&current, &ack)?;
-        canceled(&context.control)?;
-        native.check(snapshot.head.size)?;
-        if stamp(&native)? != before {
-            return Err(err(PartialErrorKind::OutputChanged));
-        }
-        Ok(Self {
-            core: Arc::new(PartialCore {
-                native,
-                budget,
-                anchors,
-                control: spec.context.control,
-                read_chunk,
-                busy: AtomicBool::new(false),
-                data: Mutex::new(Some(CoreData {
-                    bundle,
-                    snapshot,
-                    state: spec.state,
-                    stamp: before,
-                    uncertain: None,
-                    pending_compaction: None,
-                    verification: None,
-                    part_results: None,
-                    reopened: true,
-                    group: None,
-                })),
-                keys,
-                keys_proven: AtomicBool::new(keys_proven),
-                _lease: lease,
-            }),
-        })
+        PartialCore::reopen(ReopenSpec { state, context }, budget, read_chunk, None).map(|core| Self { core })
     }
     /// Fills observed holes after comparing every known overlap. Matching known bytes are unchanged.
     pub fn fill(&mut self, offset: u64, bytes: &[u8]) -> PartialResult<FillResult> {

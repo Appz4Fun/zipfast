@@ -1254,6 +1254,29 @@ impl SourceDriver {
         self.declared.iter().any(|(v, r)| *v == volume && r.start <= range.start && range.end <= r.end)
     }
     /// The volume being read (or about to be opened) and the packed offset of the next read within it.
+    /// Removes the declared damage on `range` of `volume` (bytes a resume walk skips without reading) and returns
+    /// it, so the caller can apply it to output already produced from those bytes.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn take_declared(&mut self, volume: u32, range: &std::ops::Range<u64>) -> Vec<std::ops::Range<u64>> {
+        let mut taken = Vec::new();
+        let mut kept = Vec::new();
+        for (v, r) in self.declared.drain(..) {
+            if v != volume || r.end <= range.start || range.end <= r.start {
+                kept.push((v, r));
+                continue;
+            }
+            taken.push(r.start.max(range.start)..r.end.min(range.end));
+            if r.start < range.start {
+                kept.push((v, r.start..range.start));
+            }
+            if range.end < r.end {
+                kept.push((v, range.end..r.end));
+            }
+        }
+        kept.sort_by_key(|(v, r)| (*v, r.start));
+        self.declared = kept;
+        taken
+    }
     #[cfg(feature = "persistent-partials")]
     pub(crate) fn position(&self) -> (u32, u64) {
         (self.request.index, if self.original.is_some() { self.cursor.offset() } else { 0 })
