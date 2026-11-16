@@ -97,8 +97,11 @@ pub struct CentralRecord {
     pub raw_name: Box<[u8]>,
     /// Available raw file comment bytes.
     pub raw_comment: Box<[u8]>,
-    /// The raw central extra block. It is a slice of the validated directory, so all records together hold at most
-    /// [`Limits::directory_bytes`](crate::Limits::directory_bytes) of it, and it is not charged to `extra_bytes`.
+    /// The raw central extra block. It is a slice of the validated directory, so the copies are bounded by
+    /// [`Limits::directory_bytes`](crate::Limits::directory_bytes), not by `extra_bytes`: they are not counted in
+    /// [`OwnershipUsage::extra_bytes`] or checked against `Limits::extra_bytes`. A failed allocation for the copy is
+    /// still reported as [`OwnershipKind::ExtraBytes`](crate::OwnershipKind::ExtraBytes), the kind for extra-field
+    /// bytes.
     pub raw_extra: Box<[u8]>,
     /// Caller-projected known extras.
     pub known: KnownExtras,
@@ -217,6 +220,7 @@ impl<'a> CentralView<'a> {
         let path = known.unicode_path.map(UnicodePathView::path_bytes);
         let name = reserve(OwnershipKind::NameBytes, self.raw_name().len())?;
         let comment = reserve(OwnershipKind::CommentBytes, self.raw_comment().len())?;
+        // Bounded by directory_bytes, not charged to extra_bytes; ExtraBytes only labels an allocation failure.
         let extra = reserve(OwnershipKind::ExtraBytes, self.raw_extra().len())?;
         let path = path
             .map(|bytes| reserve(OwnershipKind::ExtraBytes, bytes.len()).map(|buffer| (buffer, bytes)))
