@@ -388,7 +388,7 @@ fn decode_name(
     }
     let units = if lenient {
         // A port of unrar's EncodeFileName::Decode: it stops quietly where the encoded data runs out, copies runs from
-        // the raw name field (zero past its end), and decodes at most MAX_UNITS units.
+        // the raw name field up to its end, and decodes at most MAX_UNITS units.
         const MAX_UNITS: usize = 2048;
         let raw = |i: usize| encoded.get(i).copied().unwrap_or(0);
         let enc = &encoded[split + 1..];
@@ -417,11 +417,11 @@ fn decode_name(
                     at += 1;
                 }
                 2 => {
-                    if at + 1 >= enc.len() {
-                        break 'decode;
+                    // As unrar's switch-level break: an incomplete 16-bit op consumes nothing and decoding goes on.
+                    if at + 1 < enc.len() {
+                        units.push(u16::from_le_bytes([enc[at], enc[at + 1]]));
+                        at += 2;
                     }
-                    units.push(u16::from_le_bytes([enc[at], enc[at + 1]]));
-                    at += 2;
                 }
                 _ => {
                     let Some(&length) = enc.get(at) else { break 'decode };
@@ -435,7 +435,8 @@ fn decode_name(
                     };
                     let count = usize::from(length & 0x7f) + 2;
                     for _ in 0..count {
-                        if units.len() >= MAX_UNITS {
+                        // unrar's run stops at the end of the name field (and at its unit cap).
+                        if units.len() >= MAX_UNITS || units.len() >= encoded.len() {
                             break;
                         }
                         let byte = raw(units.len());
