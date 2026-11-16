@@ -263,7 +263,10 @@ impl HeaderParser {
             {
                 return Err(Error::BadChecksum("RAR4 header CRC".into()).into());
             }
-            if fields.at != bytes.len() && !self.map_lenient {
+            // Bytes past the parsed fields of a service header are its SubData (the recovery record's "Protect+"
+            // tag, the Unix owner names), which unrar keeps beside the header and this parser has no use for; the
+            // header CRC above still covers them. A file header has no such field, so only a map walk ignores them.
+            if fields.at != bytes.len() && !self.map_lenient && bytes[2] != 0x7a {
                 return Err(Error::Unsupported("RAR4 trailing header fields".into()).into());
             }
             let directory = flags & 0xe0 == 0xe0;
@@ -503,9 +506,16 @@ fn decode_name(
             .map_err(FileParseError::Progressive)?;
     }
     for scalar in char::decode_utf16(units) {
-        name.push(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?);
+        name.push(separator(scalar.map_err(|_| Error::Corrupt("RAR4 Unicode surrogate"))?));
     }
     Ok(name)
+}
+
+/// RAR 1.5 to 4.x names separate directories with a backslash whatever the host, and unrar reads both a backslash
+/// and a slash as a separator in them (`ConvertFileHeader`), so `dir\file` from a Unix rar lists as `dir/file`.
+/// Mapped here once, a name then splits the same way for every host; both are one byte, so lengths are unchanged.
+fn separator(c: char) -> char {
+    if c == '\\' { '/' } else { c }
 }
 
 /// A RAR4 name without (usable) Unicode encoding: the stored bytes must be UTF-8.
@@ -522,7 +532,7 @@ fn legacy_name(
             .charge(crate::progressive::Resource::MetadataBytes, (name.capacity() - value.len()) as u64)
             .map_err(FileParseError::Progressive)?;
     }
-    name.push_str(value);
+    name.extend(value.chars().map(separator));
     Ok(name)
 }
 

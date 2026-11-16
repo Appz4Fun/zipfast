@@ -112,7 +112,7 @@ impl<'a> Extraction<'a> {
         if member.issue.is_some() || header.redirection.is_some() {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
-        if header.name.contains('\u{fffe}') || std::str::from_utf8(&member.wire.name).is_err() {
+        if !projectable_name(header, &member.wire.name) {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
         let relative = hooks.project(header)?;
@@ -366,6 +366,15 @@ impl Drop for Extraction<'_> {
     fn drop(&mut self) {
         self.finalize();
     }
+}
+
+/// Whether a member's decoded name may become an output path, the same rule as whole-archive extraction: U+FFFE
+/// marks a RAR5 Unix name holding bytes that aren't UTF-8 (mapped into private-use characters), and a RAR5 wire
+/// name must itself be UTF-8. A RAR4 wire name is the legacy name, then for a Unicode name a NUL and the encoded
+/// UTF-16 stream, which need not be UTF-8; its decoded name is what the catalogue decoded and lists. Either way the
+/// name still goes through `sanitize` before it reaches the file system.
+pub(super) fn projectable_name(header: &FileHeader, wire_name: &[u8]) -> bool {
+    !header.name.contains('\u{fffe}') && (header.format != RarFormat::Rar5 || std::str::from_utf8(wire_name).is_ok())
 }
 
 // The controlled native path and optional inventory share this exact target

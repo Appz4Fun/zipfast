@@ -397,9 +397,7 @@ impl Guard {
                 if targets > c.limits.diagnostics.targets {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Targets));
                 }
-                if header.name.contains('\u{fffe}')
-                    || std::str::from_utf8(&session.model.members[index].wire.name).is_err()
-                {
+                if !super::super::extraction::projectable_name(header, &session.model.members[index].wire.name) {
                     return Err(RarDiagnosticFailure::ProjectionUnavailable { ordinal: index as u64 });
                 }
                 // Temporary projection capacity is charged while live, then released.
