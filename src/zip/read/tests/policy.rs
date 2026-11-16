@@ -414,6 +414,7 @@ fn frozen_policy_keeps_namespace_keys_after_inode_replacement_and_exact_configur
         protected_paths: [alias, missing].into_iter().collect(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     };
     let cancel = Cancellation::default();
     let mut session = ProjectedReadSession::open(&source, &cancel).unwrap();
@@ -490,6 +491,7 @@ fn frozen_relative_destination_cwd_and_context_first_teardown_are_exact() {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     };
     let binding = session.owner.source.as_ref().unwrap();
     let before = context.ledger.with_state(|s| s.live_fds);

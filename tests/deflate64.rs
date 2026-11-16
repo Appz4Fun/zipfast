@@ -69,6 +69,7 @@ fn opts(dest: &Path) -> Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     }
 }
 

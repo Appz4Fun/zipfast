@@ -65,6 +65,7 @@ pub fn options(dest: &Path, extract: bool) -> zipfast::extract::Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     }
 }
 

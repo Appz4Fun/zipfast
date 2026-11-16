@@ -39,6 +39,7 @@ fn options(dest: &Path, overwrite: Overwrite, select: MemberFilter) -> Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: Some(select),
+        windows_safe_names: false,
     }
 }
 

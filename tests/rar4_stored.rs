@@ -67,6 +67,7 @@ fn options(path: &std::path::Path, mode: Mode) -> Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     }
 }
 

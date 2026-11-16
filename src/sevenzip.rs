@@ -243,6 +243,22 @@ pub fn list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
 /// [`list`] under the caller's limits: of them, the header limits (folders, pack streams, coders, coder
 /// properties and entries) apply, since listing never decodes.
 pub fn list_with_limits(first: &Path, password: Option<&str>, limits: &SevenZipLimits) -> Result<Vec<Entry>> {
+    list_entries(first, password, limits, false)
+}
+
+/// [`list`], naming each entry as [`run`] with the same `options` would: with
+/// [`Options::windows_safe_names`](crate::extract::Options::windows_safe_names) the characters Windows refuses in a
+/// name (`<>:"|?*`) read as `_`.
+pub fn list_with_options(first: &Path, password: Option<&str>, options: &Options) -> Result<Vec<Entry>> {
+    list_entries(first, password, &SevenZipLimits::default(), options.windows_safe_names)
+}
+
+fn list_entries(
+    first: &Path,
+    password: Option<&str>,
+    limits: &SevenZipLimits,
+    windows_safe: bool,
+) -> Result<Vec<Entry>> {
     let map = open_map(first, password, &Cancellation::default(), limits)?;
     check_header_bounds(&map, limits)?;
     Ok(map
@@ -253,7 +269,10 @@ pub fn list_with_limits(first: &Path, password: Option<&str>, limits: &SevenZipL
             let first_in_folder = m.folder.is_some_and(|slot| slot.offset == 0);
             Entry {
                 mode: m.unix_mode,
-                name: member_name(m),
+                name: {
+                    let name = member_name(m);
+                    if windows_safe { crate::path::windows_safe_name(&name).into_owned() } else { name }
+                },
                 size: m.unpacked_size.unwrap_or(0),
                 // A folder's packed bytes are counted once, on its first member.
                 packed: match folder {

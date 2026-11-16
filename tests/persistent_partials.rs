@@ -202,6 +202,7 @@ fn options(dest: &Path) -> ProgressiveOptions {
             protected_paths: Default::default(),
             parallel_min: None,
             select: None,
+            windows_safe_names: false,
         },
         volume_name(0),
     );

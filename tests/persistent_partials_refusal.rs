@@ -170,6 +170,7 @@ fn extract_options(dest: &Path, first: OsString) -> ProgressiveOptions {
             protected_paths: Default::default(),
             parallel_min: None,
             select: None,
+            windows_safe_names: false,
         },
         first,
     )

@@ -148,6 +148,13 @@ pub struct Options {
     /// `RarFailure::Unsupported(RarUnsupported::MemberFilter)`, progressive and persistent-partial sessions with
     /// `FailureKind::InvalidCapability`, and `ZipReadStage::prepare_file` with `ReadFault::InvalidPlan`.
     pub select: Option<MemberFilter>,
+    /// Map the characters Windows refuses in a file name (`<>:"|?*`) to `_` in every member name, whatever system
+    /// made the archive, so output can land on NTFS, exFAT or an SMB share. Names written on Windows always get this.
+    ///
+    /// The whole-archive runners for 7z ([`crate::sevenzip::run`], and [`crate::sevenzip::list_with_options`] for
+    /// the names it lists), tar, legacy ZIP ([`crate::zip::run`]) and RAR ([`run`], [`run_with_password`],
+    /// [`run_rar_with_outcomes`]) honour it.
+    pub windows_safe_names: bool,
 }
 
 /// One member as a [`MemberFilter`] sees it.
@@ -208,6 +215,7 @@ impl MemberRef<'_> {
 ///     protected_paths: Default::default(),
 ///     parallel_min: None,
 ///     select: Some(MemberFilter::new(|m| m.is_dir || m.name.ends_with(".txt"))),
+///     windows_safe_names: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -2916,6 +2924,7 @@ fn rar_read_at(
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -3290,7 +3299,11 @@ impl Run<'_, '_, '_> {
         let rel = if self.selection.is_some() {
             PathBuf::new()
         } else {
-            match sanitize(output.as_deref().unwrap_or(&ctx.entry.name), !h.is_unix()) {
+            match crate::path::sanitize_with(
+                output.as_deref().unwrap_or(&ctx.entry.name),
+                !h.is_unix(),
+                self.opts.windows_safe_names,
+            ) {
                 Ok(rel) => rel,
                 Err(e) => {
                     let failure = RarFailure::Policy {
