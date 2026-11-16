@@ -233,11 +233,18 @@ pub(crate) fn run_reporting(
         .map_err(|(error, renames)| crate::extract::RunError::new(Error::from(error), renames))
 }
 
-/// The entries of a 7z archive, in archive order. Anti items are left out.
+/// The entries of a 7z archive, in archive order. Anti items are left out. Listing reads only the headers, so the
+/// header limits of [`SevenZipLimits::default`] apply and the decoding ones (`folder_bytes`, the coder-output total
+/// and `dictionary_bytes`) don't.
 pub fn list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
-    let limits = SevenZipLimits::default();
-    let map = open_map(first, password, &Cancellation::default(), &limits)?;
-    check_bounds(&map, &limits)?;
+    list_with_limits(first, password, &SevenZipLimits::default())
+}
+
+/// [`list`] under the caller's limits: of them, the header limits (folders, pack streams, coders, coder
+/// properties and entries) apply, since listing never decodes.
+pub fn list_with_limits(first: &Path, password: Option<&str>, limits: &SevenZipLimits) -> Result<Vec<Entry>> {
+    let map = open_map(first, password, &Cancellation::default(), limits)?;
+    check_header_bounds(&map, limits)?;
     Ok(map
         .members
         .iter()
@@ -371,8 +378,26 @@ pub(crate) fn open_map(
     }
 }
 
-/// Applies [`SevenZipLimits`] to the headers.
+/// Applies all of [`SevenZipLimits`] that the headers decide, decoding ones included.
 pub(crate) fn check_bounds(map: &MemberMap, limits: &SevenZipLimits) -> std::result::Result<(), SevenZipError> {
+    check_header_bounds(map, limits)?;
+    for folder in &map.folders {
+        if let Some(&largest) = folder.unpack_sizes.iter().chain([&folder.unpacked_size]).max()
+            && largest > limits.folder_bytes
+        {
+            return Err(limit(SevenZipLimit::FolderBytes, limits.folder_bytes, largest));
+        }
+        let total = folder.unpack_sizes.iter().fold(0u64, |a, &s| a.saturating_add(s));
+        let work = limits.folder_bytes.saturating_mul(4);
+        if total > work {
+            return Err(limit(SevenZipLimit::FolderCoderBytes, work, total));
+        }
+    }
+    Ok(())
+}
+
+/// The limits on the headers themselves, which listing applies too.
+fn check_header_bounds(map: &MemberMap, limits: &SevenZipLimits) -> std::result::Result<(), SevenZipError> {
     let folders = map.folders.len() as u64;
     if folders > limits.folders {
         return Err(limit(SevenZipLimit::Folders, limits.folders, folders));
@@ -394,16 +419,6 @@ pub(crate) fn check_bounds(map: &MemberMap, limits: &SevenZipLimits) -> std::res
             && props > limits.coder_properties
         {
             return Err(limit(SevenZipLimit::CoderProperties, limits.coder_properties, props));
-        }
-        if let Some(&largest) = folder.unpack_sizes.iter().chain([&folder.unpacked_size]).max()
-            && largest > limits.folder_bytes
-        {
-            return Err(limit(SevenZipLimit::FolderBytes, limits.folder_bytes, largest));
-        }
-        let total = folder.unpack_sizes.iter().fold(0u64, |a, &s| a.saturating_add(s));
-        let work = limits.folder_bytes.saturating_mul(4);
-        if total > work {
-            return Err(limit(SevenZipLimit::FolderCoderBytes, work, total));
         }
     }
     Ok(())

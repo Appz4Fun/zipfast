@@ -162,7 +162,9 @@ The crate's legacy `Error` keeps its variants (a test pins them), so the typed `
 - `folders` (4096), `pack_streams` (4096), `coders` per folder (32), `coder_properties` bytes per coder (64) and
   `entries` (65536, counting anti items, checked while the header is read).
 
-An archive past one fails with `SevenZipError::Limit { limit, max, attempted }` before anything is written. The
+An archive past one fails with `SevenZipError::Limit { limit, max, attempted }` before anything is written. Listing
+(`sevenzip::list`, or `list_with_limits` with the caller's limits) reads only headers, so only the header limits
+(folders, pack streams, coders, coder properties, entries) apply to it. The
 member map's own header budgets (`ProgressiveLimits`) apply as well.
 
 ## Split sets

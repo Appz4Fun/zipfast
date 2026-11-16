@@ -1071,3 +1071,34 @@ fn decrypted_headers_prove_the_password_so_bad_data_is_a_data_error() {
     assert!(!summary.errors.is_empty(), "the corrupt folder's members fail");
     assert!(!dir.path().join("o/text/a.txt").exists());
 }
+
+/// Listing reads only headers: decoding limits a caller lowers for a run never refuse a listing, header limits do.
+#[test]
+fn listing_applies_header_limits_only() {
+    let mut limits = SevenZipLimits::default();
+    limits.folder_bytes = 1;
+    limits.dictionary_bytes = 1;
+    let entries = sevenzip::list_with_limits(&fixture("solid.7z"), None, &limits).unwrap();
+    assert_eq!(entries.len(), sevenzip::list(&fixture("solid.7z"), None).unwrap().len());
+    // the same limits refuse decoding
+    let dir = tempfile::tempdir().unwrap();
+    let result = sevenzip::run(
+        &fixture("solid.7z"),
+        &opts(Mode::Test, dir.path()),
+        None,
+        &Cancellation::default(),
+        &limits,
+        |_| {},
+    );
+    assert!(
+        matches!(seven(&result), Some(SevenZipError::Limit { limit: SevenZipLimit::FolderBytes, .. })),
+        "{result:?}"
+    );
+    // a header limit still applies to a listing
+    limits.entries = 2;
+    let error = sevenzip::list_with_limits(&fixture("solid.7z"), None, &limits).unwrap_err();
+    assert!(
+        matches!(SevenZipError::of(&error), Some(SevenZipError::Limit { limit: SevenZipLimit::Entries, .. })),
+        "{error:?}"
+    );
+}
