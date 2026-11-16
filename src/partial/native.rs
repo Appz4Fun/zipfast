@@ -680,14 +680,14 @@ impl PersistentNative {
         Ok(())
     }
     pub(crate) fn sync(&self) -> PartialResult<()> {
-        self.output.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))
+        super::sync_file(&self.output.file).map_err(|e| io_error(OutputOperation::Flush, e))
     }
     pub(super) fn sync_parents(&self) -> PartialResult<()> {
         for file in [&self.root.held.file, &self.state_root.held.file, &self.bundle.held.file] {
-            file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))?;
+            super::sync_file(file).map_err(|e| io_error(OutputOperation::Flush, e))?;
         }
         for p in &self.parents {
-            p.held.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))?;
+            super::sync_file(&p.held.file).map_err(|e| io_error(OutputOperation::Flush, e))?;
         }
         Ok(())
     }
@@ -800,7 +800,7 @@ pub(super) fn prepare_parents(
         }
         let parent = held.iter().find(|d| Some(d.path.as_path()) == path.parent()).ok_or_else(malformed)?;
         mkdir_at(&parent.held.file, path.file_name().ok_or_else(malformed)?)?;
-        parent.held.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))?;
+        super::sync_file(&parent.held.file).map_err(|e| io_error(OutputOperation::Flush, e))?;
         let directory = Directory::open(path, &budget)?;
         budget.exclusions.bind(&directory.path, &directory.held.file)?;
         held.push(directory);

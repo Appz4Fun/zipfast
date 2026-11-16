@@ -135,6 +135,17 @@ impl std::ops::DerefMut for Operation<'_> {
         self.data.as_mut().unwrap()
     }
 }
+/// File and directory syncs issued by persistent partial output in this process (output, journal, pages and
+/// bundle directories; not the caller's anchor store). For benchmarks and diagnostics.
+static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub fn durable_sync_count() -> u64 {
+    SYNCS.load(Ordering::Relaxed)
+}
+fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    SYNCS.fetch_add(1, Ordering::Relaxed);
+    file.sync_all()
+}
 fn canceled(control: &SessionControl) -> PartialResult<()> {
     if control.is_canceled() { Err(err(PartialErrorKind::Canceled)) } else { Ok(()) }
 }

@@ -465,7 +465,7 @@ impl Bundle {
             self.budget.exclusions.retire(&path);
             self.files.retain(|f| f.name != name);
         }
-        self.directory.held.file.sync_all().map_err(|e| io_error(OutputOperation::Flush, e))
+        super::sync_file(&self.directory.held.file).map_err(|e| io_error(OutputOperation::Flush, e))
     }
 }
 
@@ -481,6 +481,7 @@ fn write_journal(file: &std::fs::File, name: &str, at: u64, bytes: &[u8]) -> std
     }
 }
 fn sync_journal(file: &std::fs::File, name: &str, directory: bool) -> std::io::Result<()> {
+    super::SYNCS.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     {
         super::tests::state::journal_sync(file, name, directory)
