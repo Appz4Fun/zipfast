@@ -345,7 +345,15 @@ impl ProgressiveSession {
         if !self.driver.replacement_retry_ready(cx)? {
             return Ok(Poll::Pending);
         }
-        self.driver.validate_current()?;
+        // Starting a verification is an authority point. A poll that continues the same job is a step, like a
+        // header or data step of extraction: it gets the bounded rotating recheck, so a job that polls once per
+        // replacement read does not cost polls x the whole inventory. Recording the verdict and publication run the
+        // full validation again.
+        if self.verify_job.is_some() {
+            self.driver.validate_step()?;
+        } else {
+            self.driver.validate_current()?;
+        }
         if !stage.holes.is_empty() || stage.size != Some(stage.produced) || stage.length != stage.produced {
             return Err(incomplete());
         }
