@@ -1,0 +1,482 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+//! `extract::run_with_policy`, the one entry point for every format: cancellation, live member events and every
+//! overwrite mode for ZIP, tar, lone compressed streams, RAR and 7z, and tar's own `tar::run_with_policy`.
+#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![allow(clippy::result_large_err)]
+mod common;
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use zipfast::extract::{self, Cancellation, Mode, Options, Overwrite, RenameStyle, RunEvent};
+use zipfast::zip::{ReadFault, ZipReadError};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    Zip,
+    Tar,
+    TarGz,
+    Gzip,
+    Rar,
+    SevenZip,
+}
+
+const FAMILIES: [Family; 6] = [Family::Zip, Family::Tar, Family::TarGz, Family::Gzip, Family::Rar, Family::SevenZip];
+
+const SEVEN_ZIP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/7z-extract");
+
+fn zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in members {
+        let crc = zipfast::crc32::hash(data);
+        let offset = out.len() as u32;
+        let common = |out: &mut Vec<u8>| {
+            out.extend(20u16.to_le_bytes());
+            out.extend(0x0800u16.to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+            out.extend(0x21u16.to_le_bytes());
+            out.extend(crc.to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+        };
+        out.extend(0x04034b50u32.to_le_bytes());
+        common(&mut out);
+        out.extend(name.as_bytes());
+        out.extend(*data);
+        central.extend(0x02014b50u32.to_le_bytes());
+        central.extend(0x0314u16.to_le_bytes());
+        common(&mut central);
+        central.extend([0; 6]);
+        central.extend((0o100644u32 << 16).to_le_bytes());
+        central.extend(offset.to_le_bytes());
+        central.extend(name.as_bytes());
+    }
+    let start = out.len() as u32;
+    out.extend(&central);
+    out.extend(0x06054b50u32.to_le_bytes());
+    out.extend([0; 4]);
+    out.extend((members.len() as u16).to_le_bytes());
+    out.extend((members.len() as u16).to_le_bytes());
+    out.extend((central.len() as u32).to_le_bytes());
+    out.extend(start.to_le_bytes());
+    out.extend([0; 2]);
+    out
+}
+
+fn tar_header(name: &str, size: usize, kind: u8) -> [u8; 512] {
+    let mut header = [0u8; 512];
+    header[..name.len()].copy_from_slice(name.as_bytes());
+    header[100..108].copy_from_slice(b"0000644\0");
+    header[108..116].copy_from_slice(b"0000000\0");
+    header[116..124].copy_from_slice(b"0000000\0");
+    header[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    header[136..148].copy_from_slice(b"14000000000\0");
+    header[148..156].copy_from_slice(b"        ");
+    header[156] = kind;
+    header[257..265].copy_from_slice(b"ustar\x0000");
+    let sum: u32 = header.iter().map(|&b| b as u32).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    header
+}
+
+/// A tar of regular files; a name ending in `@` becomes a symlink member (refused by the extractor).
+fn tar(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, data) in members {
+        match name.strip_suffix('@') {
+            Some(link) => out.extend(tar_header(link, 0, b'2')),
+            None => {
+                out.extend(tar_header(name, data.len(), b'0'));
+                out.extend(*data);
+            }
+        }
+        out.resize(out.len().next_multiple_of(512), 0);
+    }
+    out.resize(out.len() + 1024, 0);
+    out
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+fn rar(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let specs: Vec<_> = members.iter().map(|(name, data)| common::FileSpec::new(name, data)).collect();
+    common::archive(&specs)
+}
+
+/// Writes an archive of `family` holding `a.txt` = `first` and `b.txt` = `second` (7z: the fixture's
+/// `text/a.txt` and `text/b.txt`; a lone gzip stream holds only `first`, as `a.txt`). Returns its path and the
+/// member paths.
+fn archive(dir: &Path, family: Family, first: &[u8], second: &[u8]) -> (PathBuf, Vec<&'static str>) {
+    let members: [(&str, &[u8]); 2] = [("a.txt", first), ("b.txt", second)];
+    let (name, bytes, names) = match family {
+        Family::Zip => ("in.zip", zip(&members), vec!["a.txt", "b.txt"]),
+        Family::Tar => ("in.tar", tar(&members), vec!["a.txt", "b.txt"]),
+        Family::TarGz => ("in.tar.gz", gzip(&tar(&members)), vec!["a.txt", "b.txt"]),
+        Family::Gzip => ("a.txt.gz", gzip(first), vec!["a.txt"]),
+        Family::Rar => ("in.rar", rar(&members), vec!["a.txt", "b.txt"]),
+        Family::SevenZip => {
+            ("in.7z", fs::read(Path::new(SEVEN_ZIP).join("lzma2.7z")).unwrap(), vec!["text/a.txt", "text/b.txt"])
+        }
+    };
+    let path = dir.join(name);
+    fs::write(&path, bytes).unwrap();
+    (path, names)
+}
+
+fn options(dest: &Path, overwrite: Overwrite) -> Options {
+    Options {
+        mode: Mode::Extract,
+        dest: dest.to_path_buf(),
+        overwrite,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+    }
+}
+
+/// What a run delivered to its observer, in order.
+#[derive(Debug, Default)]
+struct Events {
+    /// `(kind, ordinal, name)` of member events
+    members: Vec<(&'static str, u64, String)>,
+    renamed: Vec<Option<u64>>,
+    lines: Vec<String>,
+    ended: bool,
+}
+
+fn run(
+    archive: &Path,
+    opts: &Options,
+    cancel: &Cancellation,
+    mut on: impl FnMut(&RunEvent<'_>),
+) -> (Result<extract::RunReport, ZipReadError>, Events) {
+    let mut events = Events::default();
+    let result = extract::run_with_policy(archive, opts, None, cancel, &Default::default(), |event: RunEvent<'_>| {
+        on(&event);
+        match event {
+            RunEvent::MemberSucceeded { ordinal, name, .. } => events.members.push(("ok", ordinal, name.to_owned())),
+            RunEvent::MemberSkipped { ordinal, name } => events.members.push(("skipped", ordinal, name.to_owned())),
+            RunEvent::MemberFailed { ordinal, name, .. } => events.members.push(("failed", ordinal, name.to_owned())),
+            RunEvent::MemberRenamed { ordinal, .. } => events.renamed.push(ordinal),
+            RunEvent::LegacyDiagnostic { message } => events.lines.push(message.to_owned()),
+            RunEvent::RunEnded { .. } => events.ended = true,
+            _ => {}
+        }
+        Ok(())
+    });
+    (result, events)
+}
+
+fn cancelled(result: &Result<extract::RunReport, ZipReadError>) -> bool {
+    matches!(result.as_ref().map_err(ZipReadError::operation), Err(Some(ReadFault::Cancelled)))
+}
+
+#[test]
+fn a_canceled_token_stops_every_format_before_anything_is_written() {
+    for family in FAMILIES {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = archive(dir.path(), family, b"one", b"two");
+        let out = dir.path().join("out");
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let (result, _) = run(&path, &options(&out, Overwrite::Skip), &cancel, |_| {});
+        assert!(cancelled(&result), "{family:?}: {result:?}");
+        assert!(!out.join("a.txt").exists() && !out.join("text/a.txt").exists(), "{family:?}");
+    }
+}
+
+#[test]
+fn cancellation_between_members_stops_every_format_with_a_typed_error() {
+    for family in FAMILIES.into_iter().filter(|&f| f != Family::Gzip) {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, names) = archive(dir.path(), family, b"one", b"two");
+        let out = dir.path().join("out");
+        // The first member already exists, so Skip passes it with an event (ZIP, tar) or a report line (RAR, 7z);
+        // canceling there stops the run before the second.
+        fs::create_dir_all(out.join(names[0]).parent().unwrap()).unwrap();
+        fs::write(out.join(names[0]), b"old").unwrap();
+        let cancel = Cancellation::default();
+        let (result, _) = run(&path, &options(&out, Overwrite::Skip), &cancel.clone(), |event| {
+            if matches!(event, RunEvent::MemberSkipped { .. } | RunEvent::LegacyDiagnostic { .. }) {
+                cancel.cancel();
+            }
+        });
+        assert!(cancelled(&result), "{family:?}: {result:?}");
+        assert_eq!(fs::read(out.join(names[0])).unwrap(), b"old", "{family:?}");
+        assert!(!out.join(names[1]).exists(), "{family:?}: the member after the cancellation was written");
+    }
+}
+
+/// A file of `n` MiB that compresses to almost nothing: the same compressed piece over and over, which every multi-
+/// stream decoder reads back to back.
+fn big_stream(codec: &str, mib: usize) -> Vec<u8> {
+    let piece = vec![0u8; 1 << 20];
+    let one = match codec {
+        "gz" => gzip(&piece),
+        "xz" => {
+            let mut e = liblzma::write::XzEncoder::new(Vec::new(), 1);
+            e.write_all(&piece).unwrap();
+            e.finish().unwrap()
+        }
+        "bz2" => {
+            let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+            e.write_all(&piece).unwrap();
+            e.finish().unwrap()
+        }
+        "zst" => zstd::encode_all(&piece[..], 1).unwrap(),
+        _ => unreachable!(),
+    };
+    one.repeat(mib)
+}
+
+/// Runs `path` and cancels from another thread as soon as anything appears in the destination, that is once the
+/// (only) member's output has been created and its data is being decoded into it.
+fn cancel_once_output_appears(path: &Path, out: &Path) -> Result<extract::RunReport, ZipReadError> {
+    cancel_once_output_appears_with(path, &options(out, Overwrite::Skip))
+}
+
+fn cancel_once_output_appears_with(path: &Path, opts: &Options) -> Result<extract::RunReport, ZipReadError> {
+    let out = &opts.dest;
+    let cancel = Cancellation::default();
+    let watcher = {
+        let (cancel, out) = (cancel.clone(), out.to_path_buf());
+        std::thread::spawn(move || {
+            for _ in 0..20_000 {
+                if fs::read_dir(&out).is_ok_and(|mut d| d.next().is_some()) {
+                    cancel.cancel();
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            false
+        })
+    };
+    let (result, _) = run(path, opts, &cancel, |_| {});
+    assert!(watcher.join().unwrap(), "the output never appeared");
+    result
+}
+
+#[test]
+fn every_stream_codec_is_canceled_mid_member() {
+    for codec in ["gz", "xz", "bz2", "zst"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("big.bin.{codec}"));
+        fs::write(&path, big_stream(codec, 512)).unwrap();
+        let out = dir.path().join("out");
+        let result = cancel_once_output_appears(&path, &out);
+        assert!(cancelled(&result), "{codec}: {result:?}");
+        assert!(!out.join("big.bin").exists(), "{codec}: a canceled member was published");
+    }
+}
+
+#[test]
+fn a_compressed_tar_is_canceled_mid_member() {
+    // One 512 MiB member of zeros: gzip members back to back decode as one stream.
+    let mib = 512;
+    let mut bytes = gzip(&tar_header("big.bin", mib << 20, b'0'));
+    bytes.extend(gzip(&vec![0u8; 1 << 20]).repeat(mib));
+    bytes.extend(gzip(&[0u8; 1024]));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.tar.gz");
+    fs::write(&path, bytes).unwrap();
+    let out = dir.path().join("out");
+    let result = cancel_once_output_appears(&path, &out);
+    assert!(cancelled(&result), "{result:?}");
+    assert!(!out.join("big.bin").exists(), "a canceled member was published");
+}
+
+#[test]
+fn tar_reports_members_live_with_their_ordinals() {
+    let dir = tempfile::tempdir().unwrap();
+    for gz in [false, true] {
+        let plain = tar(&[("a.txt", b"one"), ("link@", b""), ("b.txt", b"two"), ("c.txt", b"three")]);
+        let path = dir.path().join(if gz { "in.tar.gz" } else { "in.tar" });
+        fs::write(&path, if gz { gzip(&plain) } else { plain }).unwrap();
+        let out = dir.path().join(format!("out{gz}"));
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("b.txt"), b"old").unwrap();
+        let (result, events) = run(&path, &options(&out, Overwrite::Skip), &Cancellation::default(), |event| {
+            // A member is on disk when its success arrives.
+            if let RunEvent::MemberSucceeded { name, .. } = event {
+                assert!(out.join(name).exists(), "{name} reported before it was written");
+            }
+        });
+        let report = result.unwrap();
+        assert_eq!((report.files(), report.skipped(), report.failed()), (2, 1, 1));
+        let want = [("ok", 0, "a.txt"), ("failed", 1, "link"), ("skipped", 2, "b.txt"), ("ok", 3, "c.txt")];
+        let got: Vec<_> = events.members.iter().map(|(k, o, n)| (*k, *o, n.as_str())).collect();
+        if gz {
+            // A compressed tar publishes once the stream checks out: failures come as they are found, the rest after.
+            let mut sorted = got.clone();
+            sorted.sort_by_key(|e| e.1);
+            assert_eq!(sorted, want, "gz");
+        } else {
+            assert_eq!(got, want);
+        }
+        assert!(events.ended);
+    }
+    // A lone stream is member 0.
+    let (path, _) = archive(dir.path(), Family::Gzip, b"one", b"");
+    let (result, events) = run(&path, &options(&dir.path().join("lone"), Overwrite::Skip), &Default::default(), |_| {});
+    result.unwrap();
+    assert_eq!(events.members, [("ok", 0, "a.txt".to_owned())]);
+}
+
+#[test]
+fn tar_has_its_own_policy_entry_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = archive(dir.path(), Family::Tar, b"one", b"two");
+    let out = dir.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("a.txt"), b"old").unwrap();
+    let mut seen = Vec::new();
+    let report = zipfast::tar::run_with_policy(
+        &path,
+        &options(&out, Overwrite::RenameNew(RenameStyle::Underscore)),
+        &Cancellation::default(),
+        |event: RunEvent<'_>| {
+            match event {
+                RunEvent::MemberRenamed { ordinal, .. } => seen.push(format!("renamed {ordinal:?}")),
+                RunEvent::MemberSucceeded { ordinal, name, .. } => seen.push(format!("ok {ordinal} {name}")),
+                _ => {}
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(report.files(), 2);
+    assert_eq!(seen, ["renamed Some(0)", "ok 0 a.txt", "ok 1 b.txt"]);
+    assert_eq!(fs::read(out.join("a_1.txt")).unwrap(), b"one");
+    let canceled = Cancellation::default();
+    canceled.cancel();
+    let error =
+        zipfast::tar::run_with_policy(&path, &options(&out, Overwrite::Skip), &canceled, |_: RunEvent<'_>| Ok(()))
+            .unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::Cancelled)), "{error:?}");
+    // Anything else is not tar's.
+    let (zip_path, _) = archive(dir.path(), Family::Zip, b"one", b"two");
+    let error = zipfast::tar::run_with_policy(
+        &zip_path,
+        &options(&out, Overwrite::Skip),
+        &Default::default(),
+        |_: RunEvent<'_>| Ok(()),
+    )
+    .unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::Legacy(zipfast::Error::NotAnArchive))), "{error:?}");
+}
+
+#[test]
+fn every_overwrite_mode_in_every_format() {
+    let modes = [
+        Overwrite::Skip,
+        Overwrite::Always,
+        Overwrite::RenameNew(RenameStyle::Underscore),
+        Overwrite::RenameExisting(RenameStyle::Parenthesized),
+    ];
+    for family in FAMILIES {
+        for mode in modes {
+            let dir = tempfile::tempdir().unwrap();
+            let (path, names) = archive(dir.path(), family, b"one", b"two");
+            let out = dir.path().join("out");
+            let target = out.join(names[0]);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, b"old").unwrap();
+            // The 7z fixture's own text; the rest hold "one".
+            let new = (family != Family::SevenZip).then(|| b"one".to_vec());
+            let (result, events) = run(&path, &options(&out, mode), &Cancellation::default(), |_| {});
+            let report = result.unwrap_or_else(|e| panic!("{family:?} {mode:?}: {e:?}"));
+            let what = format!("{family:?} {mode:?}");
+            let stem = target.file_stem().unwrap().to_str().unwrap().to_owned();
+            let renamed_new = target.with_file_name(format!("{stem}_1.txt"));
+            let renamed_old = target.with_file_name(format!("{stem}(1).txt"));
+            let content = |p: &Path| fs::read(p).unwrap();
+            match mode {
+                Overwrite::Skip => {
+                    assert_eq!((report.skipped(), content(&target)), (1, b"old".to_vec()), "{what}");
+                }
+                Overwrite::Always => {
+                    assert_eq!(report.skipped(), 0, "{what}");
+                    assert_ne!(content(&target), b"old", "{what}");
+                    if let Some(new) = &new {
+                        assert_eq!(&content(&target), new, "{what}");
+                    }
+                }
+                Overwrite::RenameNew(_) => {
+                    assert_eq!(content(&target), b"old", "{what}");
+                    assert_ne!(content(&renamed_new), b"old", "{what}");
+                    assert_eq!(events.renamed.len(), 1, "{what}");
+                }
+                _ => {
+                    assert_eq!(content(&renamed_old), b"old", "{what}");
+                    assert_ne!(content(&target), b"old", "{what}");
+                    assert_eq!(events.renamed.len(), 1, "{what}");
+                }
+            }
+            assert_eq!(report.failed(), 0, "{what}");
+            assert_eq!(report.files() + report.skipped(), names.len() as u64, "{what}");
+            // ZIP and tar name the member a rename was for.
+            if matches!(family, Family::Zip | Family::Tar | Family::TarGz | Family::Gzip) {
+                assert!(events.renamed.iter().all(|o| *o == Some(0)), "{what}: {:?}", events.renamed);
+            }
+        }
+    }
+}
+
+#[test]
+fn rar_and_7z_runs_still_report_through_legacy_lines() {
+    for family in [Family::Rar, Family::SevenZip] {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, names) = archive(dir.path(), family, b"one", b"two");
+        let out = dir.path().join("out");
+        fs::create_dir_all(out.join(names[0]).parent().unwrap()).unwrap();
+        fs::write(out.join(names[0]), b"old").unwrap();
+        let (result, events) = run(&path, &options(&out, Overwrite::Skip), &Default::default(), |_| {});
+        let report = result.unwrap();
+        assert_eq!((report.files(), report.skipped()), (1, 1), "{family:?}");
+        assert!(events.lines.iter().any(|l| l.contains("exists, skipped")), "{family:?}: {:?}", events.lines);
+        assert!(events.ended);
+    }
+}
+
+#[test]
+fn a_rar_member_is_canceled_mid_member() {
+    let big = vec![5u8; 128 << 20];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.rar");
+    fs::write(&path, rar(&[("big.bin", &big)])).unwrap();
+    drop(big);
+    // One thread decodes through the member's sink; several copy a big stored part in parallel.
+    for threads in [Some(1), None] {
+        let out = dir.path().join(format!("out{threads:?}"));
+        let result = cancel_once_output_appears_with(&path, &Options { threads, ..options(&out, Overwrite::Skip) });
+        assert!(cancelled(&result), "{threads:?}: {result:?}");
+        assert!(!out.join("big.bin").exists(), "{threads:?}: a canceled member was published");
+    }
+}

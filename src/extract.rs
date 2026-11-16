@@ -458,6 +458,30 @@ pub(crate) struct RenameLog<'a> {
 pub(crate) trait LegacyReport {
     fn line(&mut self, line: &str);
     fn renamed(&mut self, _renamed: &RenamedOutput) {}
+    /// A rename made for the member at `ordinal` (its listing index), when the runner knows it.
+    fn renamed_member(&mut self, _ordinal: u64, renamed: &RenamedOutput) {
+        self.renamed(renamed)
+    }
+    /// A member finished, as soon as it did: from the runners that report members one by one (tar and lone
+    /// compressed streams).
+    fn member(&mut self, _member: LegacyMember<'_>) {}
+}
+
+/// How a member ended, for [`LegacyReport::member`]. `ordinal` is the member's listing index.
+pub(crate) enum LegacyMember<'a> {
+    Succeeded { ordinal: u64, name: &'a str, bytes: u64 },
+    Skipped { ordinal: u64, name: &'a str },
+    Failed { ordinal: u64, name: &'a str, error: Error },
+}
+
+/// The error a run stopped with when its [`Cancellation`] was triggered.
+pub(crate) fn canceled_error() -> Error {
+    Error::Io(io::Error::new(io::ErrorKind::ConnectionAborted, "operation canceled"))
+}
+
+/// Whether `error` is a run stopping for its [`Cancellation`] (see [`Cancellation::check_io`]).
+fn is_cancellation(error: &Error) -> bool {
+    matches!(error, Error::Io(e) if e.kind() == io::ErrorKind::ConnectionAborted)
 }
 
 impl<F: FnMut(&str)> LegacyReport for F {
@@ -844,7 +868,12 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                     saw_end = true;
                     break;
                 }
-                Block::File(h) => run.file_block(&mut vol, h, crypt)?,
+                Block::File(h) => {
+                    if run.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
+                        return Err(RarFault::new(RarFailure::Canceled, canceled_error()).into());
+                    }
+                    run.file_block(&mut vol, h, crypt)?
+                }
                 _ => {}
             }
         }
@@ -971,14 +1000,14 @@ impl LegacyRoute {
         report: &mut impl LegacyReport,
     ) -> std::result::Result<Summary, RunError> {
         match self {
-            Self::Tar => crate::tar::run_reporting(first, options, report),
+            Self::Tar => crate::tar::run_reporting_cancelable(first, options, Some(cancel), report),
             Self::SevenZip => {
                 let limits = crate::sevenzip::SevenZipLimits::default();
                 crate::sevenzip::run_reporting(first, options, password, cancel, &limits, report)
             }
             Self::Rar { signature, .. } => {
                 let mut reports = Reports::Legacy { summary: Summary::default(), callback: report };
-                let result = rar_run_shared_open(first, options, password, &mut reports, || {
+                let result = rar_run_shared_open(first, options, password, Some(cancel), &mut reports, || {
                     Volume::from_held_signature_detailed(first, signature, password)
                 });
                 let Reports::Legacy { summary, .. } = reports else { unreachable!() };
@@ -1645,7 +1674,58 @@ pub fn list_with_password(first: &Path, password: Option<&str>) -> Result<Vec<En
     }
 }
 
-/// Tests or extracts an archive, whatever its format.
+/// The events of a [`run_with_policy`] or [`run_with_context`] run, whatever the format.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use crate::zip::{ZipRunEvent as RunEvent, ZipRunObserver as RunObserver, ZipRunReport as RunReport};
+
+/// **The one entry point for every format**: tests or extracts a ZIP, tar (plain or compressed), lone compressed
+/// stream (`.gz`, `.xz`, `.bz2`, `.zst`), RAR4/RAR5 or 7z archive with one [`Options`], one [`Cancellation`] and
+/// one observer.
+///
+/// - The format comes from the file's content, never its name.
+/// - `cancel` reaches every format's inner loop: ZIP decoding and staging, tar headers and data, every stream
+///   codec, RAR members and their decoded data, 7z folders. A canceled run returns an error whose
+///   [`crate::zip::ZipReadError::operation`] is [`crate::zip::ReadFault::Cancelled`]; members finished before it
+///   stay published, the one in progress is not.
+/// - [`Options::overwrite`] (Skip, Always, RenameNew, RenameExisting) and [`Options::select`] apply to every format.
+/// - Observer events ([`RunEvent`]): ZIP and tar (including a lone compressed stream, ordinal 0) send
+///   `MemberSucceeded`, `MemberSkipped` and `MemberFailed` live, with the member's listing index, and
+///   `MemberRenamed` with `Some(ordinal)` just before. RAR and 7z send their report lines as `LegacyDiagnostic` as
+///   they happen, renames as `MemberRenamed { ordinal: None }`, and their failures as `LegacyError` at the end.
+///   Every run ends with `RunEnded`.
+/// - A wrong or missing password is [`crate::zip::ReadFault::PasswordRequired`] or `PasswordCheckFailed` for ZIP and
+///   7z; other non-ZIP failures are [`crate::zip::ReadFault::Legacy`] carrying the format's own [`Error`].
+///
+/// This is [`run_with_zip_policy`] under a format-neutral name; [`run_with_context`] is the same with a caller-owned
+/// [`crate::zip::EncryptedReadContext`] (its encrypted-ZIP budgets carry across runs).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)]
+pub fn run_with_policy(
+    first: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    overrides: &crate::zip::EncryptedReadOverrides,
+    observe: impl RunObserver,
+) -> crate::zip::ZipReadResult<RunReport> {
+    run_with_zip_policy(first, options, password, cancel, overrides, observe)
+}
+
+/// [`run_with_policy`] with a caller-owned encrypted-read context; see there. Same as [`run_with_zip_context`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)]
+pub fn run_with_context(
+    first: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    context: &mut crate::zip::EncryptedReadContext,
+    observe: impl RunObserver,
+) -> crate::zip::ZipReadResult<RunReport> {
+    run_with_zip_context(first, options, password, cancel, context, observe)
+}
+
+/// Tests or extracts an archive, whatever its format. Same as [`run_with_policy`], its format-neutral name.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
 pub fn run_with_zip_policy(
@@ -1668,6 +1748,7 @@ pub fn run_with_zip_policy(
         CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, cancel, observe),
     }
 }
+/// [`run_with_zip_policy`] with a caller-owned encrypted-read context. Same as [`run_with_context`].
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
 pub fn run_with_zip_context(
@@ -1692,7 +1773,7 @@ pub fn run_with_zip_context(
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
-fn legacy_zip_report(
+pub(crate) fn legacy_zip_report(
     route: LegacyRoute,
     first: &Path,
     options: &Options,
@@ -1727,6 +1808,21 @@ fn legacy_zip_report(
         fn renamed(&mut self, renamed: &RenamedOutput) {
             self.send(ZipRunEvent::MemberRenamed { ordinal: None, renamed });
         }
+        fn renamed_member(&mut self, ordinal: u64, renamed: &RenamedOutput) {
+            self.send(ZipRunEvent::MemberRenamed { ordinal: Some(ordinal), renamed });
+        }
+        fn member(&mut self, member: LegacyMember<'_>) {
+            match member {
+                LegacyMember::Succeeded { ordinal, name, bytes } => {
+                    self.send(ZipRunEvent::MemberSucceeded { ordinal, name, decoded_bytes: bytes })
+                }
+                LegacyMember::Skipped { ordinal, name } => self.send(ZipRunEvent::MemberSkipped { ordinal, name }),
+                LegacyMember::Failed { ordinal, name, error } => {
+                    let error = ZipReadError::from(ReadFault::Legacy(error));
+                    self.send(ZipRunEvent::MemberFailed { ordinal, name, error: &error });
+                }
+            }
+        }
     }
     let mut forward = Forward { observe: &mut observe, fault: None };
     // The renames have reached the observer as they were made, so a terminal error needn't carry them.
@@ -1735,7 +1831,13 @@ fn legacy_zip_report(
     let (report, summary, mut terminal) = match result {
         Ok(summary) => (ZipRunReport::from_legacy(&summary), Some(summary), None),
         Err(error) => {
-            let fault = if seven_zip { seven_zip_fault(error) } else { ReadFault::Legacy(error) };
+            let fault = if seven_zip {
+                seven_zip_fault(error)
+            } else if cancel.is_canceled() && is_cancellation(&error) {
+                ReadFault::Cancelled
+            } else {
+                ReadFault::Legacy(error)
+            };
             (ZipRunReport::default(), None, Some(ZipReadError::from(fault)))
         }
     };
@@ -1900,6 +2002,8 @@ pub(crate) struct Pending {
     mem: Option<Vec<u8>>,
     /// what each later RAR4 part must repeat: dictionary, unpack version, method and salt
     rar4_identity: Option<(u64, u8, u8, Option<[u8; 8]>)>,
+    /// stops the member as its data comes in
+    cancel: Option<Cancellation>,
 }
 
 impl std::ops::Deref for Pending {
@@ -1930,6 +2034,7 @@ impl Pending {
             place: None,
             mem: None,
             rar4_identity: h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)),
+            cancel: None,
         }
     }
 
@@ -1967,6 +2072,9 @@ impl Pending {
         mut chunk: &[u8],
         admit: impl FnOnce(&[u8]) -> crate::error::RarResult<()>,
     ) -> crate::error::RarResult<()> {
+        if self.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
+            return Err(RarFault::new(RarFailure::Canceled, canceled_error()));
+        }
         if let Some(cipher) = self.cipher.as_mut().filter(|cipher| cipher.stored_padding.is_some()) {
             chunk = cipher
                 .trim_stored(chunk, self.checks.bytes)
@@ -2475,6 +2583,8 @@ struct Run<'a, 'r, 'c> {
     selection: Option<RarSelection<'a>>,
     /// members with a first header seen so far: the next one's listing position
     members: u64,
+    /// checked before each member and as each member's data is decoded
+    cancel: Option<Cancellation>,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -2546,13 +2656,14 @@ fn rar_run_shared<'a>(
     password: Option<&str>,
     reports: &mut Reports<'a>,
 ) -> RunResult<()> {
-    rar_run_shared_open(first, opts, password, reports, || Volume::open_detailed(first, password))
+    rar_run_shared_open(first, opts, password, None, reports, || Volume::open_detailed(first, password))
 }
 
 fn rar_run_shared_open<'a>(
     first: &Path,
     opts: &Options,
     password: Option<&str>,
+    cancel: Option<&Cancellation>,
     reports: &mut Reports<'a>,
     open: impl FnOnce() -> crate::error::RarResult<Volume>,
 ) -> RunResult<()> {
@@ -2590,6 +2701,7 @@ fn rar_run_shared_open<'a>(
     // The hidden size knob tests decoding blocks on workers, which batching would bypass.
     let threads = if opts.parallel_min.is_some() { 1 } else { threads };
     let mut run = Run::new(&opts, password, reports, threads);
+    run.cancel = cancel.cloned();
     let walked = walk_rar(first_volume, &mut run).and_then(|()| run.drain());
     if walked.is_err() {
         // Retain the primary failure. Typed runs report each available genuine completion during cleanup.
@@ -2717,6 +2829,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             dirs: Dirs::default(),
             selection: None,
             members: 0,
+            cancel: None,
         }
     }
 }
@@ -2965,6 +3078,7 @@ impl Run<'_, '_, '_> {
             let mut p = Pending::new(h, ctx);
             p.passive = true;
             p.cipher = cipher;
+            p.cancel = self.cancel.clone();
             return self.begin_decoding(vol, h, p);
         }
         if h.split_after() {
@@ -3130,6 +3244,7 @@ impl Run<'_, '_, '_> {
         }
         let mut p = Pending::new(h, ctx);
         p.cipher = cipher;
+        p.cancel = self.cancel.clone();
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.place = place;
         self.begin_decoding(vol, h, p)
@@ -3719,6 +3834,12 @@ impl Run<'_, '_, '_> {
                 return Err(self.pending_terminal(&p, e));
             }
         };
+        // The copy threads don't poll the cancellation; a canceled member is dropped once its part is copied.
+        if self.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
+            drop(file);
+            p.discard();
+            return Err(self.pending_terminal(&p, RarFault::new(RarFailure::Canceled, canceled_error())));
+        }
         p.hasher.combine(&part);
         p.bytes =
             p.bytes.checked_add(h.packed_size).ok_or_else(|| self.pending_terminal(&p, RarFault::counter_limit()))?;
