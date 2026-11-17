@@ -20,6 +20,10 @@
 //! volume. A downloader holding the first and last bytes of a set's last volume (its first and last articles) can
 //! learn which members end there, with their final sizes and checks, and where the volume stands in its set, to
 //! match the set against another copy without the first volume.
+//!
+//! **Nothing here is verified.** Every field comes from the volume's own bytes, so a volume can claim any set's
+//! identity at no cost. Treat the result as a hint: confirm it with data checks (the members' CRCs or hashes over
+//! the bytes actually fetched) before using it as a twin or alternate key.
 use super::sevenzip::{self, TailSearch};
 use super::zip_split::{self, TailZip};
 use super::{MapChecks, MapError, MapFormat, MapMember, MapOptions, MemberMap, VolumeEnd, VolumeMap, VolumeMember};
@@ -203,10 +207,17 @@ fn canceled() -> MapError {
 ///   record and the whole central directory, which must lie on this volume ([`IdentityScope::WholeSet`]).
 /// - **7z**, a single archive or the last of `.7z.001`, `.7z.002`, ...: the last bytes, holding the archive header
 ///   and, for an encoded header, its packed stream. The signature header in the first volume, which says where the
-///   header is, is not needed: the header is found by its structure and checked, an encoded one by its CRC, and
-///   it also tells where the volume starts in the archive ([`SetFacts::SevenZip::archive_offset`]).
+///   header is, is not needed: the header is found by its structure. An encoded header is taken only when its
+///   folder states a CRC and its packed stream decodes to it; a plain header has no CRC there and is taken when it
+///   parses to the end and passes the whole-archive checks. The header also tells where the volume starts in the
+///   archive ([`SetFacts::SevenZip::archive_offset`]).
 ///
-/// Nothing in the bytes is trusted: offsets and counts are checked against the bytes held and the volume length,
+/// **The identity is an unverified hint.** It is what the volume says about itself, and a forged volume can claim
+/// another set's names, sizes and checks for free. Confirm it with data checks (member CRCs or hashes over the
+/// bytes fetched) before matching sets on it, for example as twin or alternate keys.
+///
+/// Nothing in the bytes is trusted for safety: offsets and counts are checked against the bytes held and the volume
+/// length (RAR parts whose header or data claim to run past the volume, and locator offsets past it, are dropped),
 /// and every [`MapOptions`] budget applies (header bytes, entries, names, KDF work), as does its cancellation.
 /// Headers encrypted with a password need [`MapOptions::password`]: a RAR volume without one gives its main facts
 /// only (RAR 4.x) or nothing ([`VolumeEnd::Locked`]); a 7z header without one is [`MapError::PasswordRequired`].
@@ -252,7 +263,15 @@ pub fn last_volume_identity(held: HeldVolume<'_>, options: MapOptions) -> Result
 }
 
 fn rar(held: HeldVolume<'_>, options: MapOptions) -> Result<LastVolumeIdentity, MapError> {
-    let volume = MemberMap::from_volume(held.head, options)?;
+    let mut volume = MemberMap::from_volume(held.head, options)?;
+    // A head may end before the data it announces, but nothing in the volume lies past its length: parts whose
+    // header or data claim to, and locator offsets past it, are dropped.
+    volume.members.retain(|m| m.header.end <= held.len && m.packed.end <= held.len);
+    if let Some(locator) = volume.locator
+        && (locator.quick_open.is_some_and(|o| o >= held.len) || locator.recovery.is_some_and(|o| o >= held.len))
+    {
+        volume.locator = None;
+    }
     let mut end_record = volume.end_record;
     let mut volume_number = volume.volume_number;
     let mut has_next = (volume.end == VolumeEnd::Complete).then_some(volume.has_next_volume);
@@ -364,6 +383,14 @@ fn rar5_end(tail: &[u8], start: u64) -> Option<RarEndRecord> {
             // An extra area; its size comes first and it follows the fields.
             at += vint(tail, at)?.1;
         }
+        if flags & 2 != 0 {
+            // A data area would follow the header, past the end of the volume: only an empty one fits.
+            let (data, k) = vint(tail, at)?;
+            if data != 0 {
+                return None;
+            }
+            at += k;
+        }
         let end_flags = vint(tail, at).map_or(0, |(f, _)| f);
         Some(RarEndRecord { flags: end_flags, data_crc: None, volume_number: None, offset: start + c as u64 })
     })
@@ -419,6 +446,20 @@ mod tests {
         let last = tail.len() - 1;
         tail[last] = 1;
         assert!(rar5_end(&tail, 100).is_none(), "the CRC covers the end flags");
+    }
+
+    #[test]
+    fn rar5_end_header_data_area() {
+        let header = |body: &[u8]| {
+            let mut h = crate::crc32::hash(body).to_le_bytes().to_vec();
+            h.extend_from_slice(body);
+            h
+        };
+        // Flags 0x2 (data area) with a data size of 0, then end flags 1: read past the data size.
+        let found = rar5_end(&header(&[4, 5, 2, 0, 1]), 0).unwrap();
+        assert_eq!(found.flags, 1);
+        // A nonzero data area cannot follow a header that ends the volume.
+        assert!(rar5_end(&header(&[4, 5, 2, 9, 1]), 0).is_none());
     }
 
     #[test]

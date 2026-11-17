@@ -509,12 +509,20 @@ earlier volumes' size, its index), the header range, whether it is encoded and e
 The 7z signature header, which says where the header is, lives in the first volume, so the header is found by its
 structure: 7-Zip writes the packed streams after the signature header and the header after them, so a candidate
 start fixes the volume's place in the archive. Encoded header (`0x17 0x06`) candidates within the last 4 KiB are
-tried nearest the end first and taken when they parse to the end of the bytes exactly and the packed stream decodes
-to its CRC; plain header (`0x01` then `0x02`, `0x04` or `0x05`) candidates, which have no CRC without the signature
+tried nearest the end first and taken when they parse to the end of the bytes exactly, the folder states a CRC
+(a candidate without one is never taken) and the packed stream decodes to it; plain header (`0x01` then `0x02`, `0x04` or `0x05`) candidates, which have no CRC without the signature
 header, are tried from the farthest in, at most 4096 of them, and taken when they parse to the end with at least one
-file and pass the whole-archive walk's checks. One budget covers the whole search. A RAR end header in the last
+file and pass the whole-archive walk's checks. Each candidate gets its own budget, so a bogus one that overspends
+is only not the header; all candidates together parse or decode at most 256 MiB of header bytes. A RAR end header in the last
 bytes is taken when it ends the bytes exactly, its CRC matches and it lies after the headers already read; it is not
 looked for when headers are encrypted.
+
+RAR parts whose header or data claim to run past the volume's length are dropped, as is a locator with an offset
+past it.
+
+**The identity is unverified.** Every field comes from the volume itself, so a forged volume can claim another set's
+names, sizes and checks for free. It is a hint: confirm it with data checks (member CRCs or hashes over the bytes
+fetched) before matching sets on it, for example as twin or alternate keys.
 
 Bytes needed further from the end than the tail held give `MapError::TailTooShort { from_end }` (for ZIP, at least
 the end records' window of 64 KiB and a bit, or the whole volume when shorter). A 7z header encrypted with `-mhe`

@@ -1372,6 +1372,8 @@ impl SevenZipWalker {
 const TAIL_ENCODED_WINDOW: usize = 4096;
 /// How many plain header (`0x01`) starts are tried at most.
 const TAIL_PLAIN_TRIES: usize = 4096;
+/// Header bytes all candidates together may parse or decode, beyond the one budget each candidate gets on its own.
+const TAIL_SEARCH_WORK: u64 = 256 << 20;
 
 /// A 7z header found at the end of a volume's last bytes, without the signature header.
 pub(crate) struct TailHeader {
@@ -1391,12 +1393,24 @@ pub(crate) enum TailSearch {
     /// A header start was found whose packed stream lies further from the end than the bytes held: the tail must
     /// hold this many bytes before the volume's end.
     NeedBytes(u64),
+    /// No candidate was taken. The failure of the candidate that got furthest (the one nearest a header), if any,
+    /// is kept to explain why.
     NotFound(Option<MapError>),
 }
 
-/// Whether a failure on a candidate header is final rather than a sign that the candidate was not the header.
+/// Whether a failure on a candidate header ends the search: the password is missing or wrong (a candidate gets as
+/// far as the key only after its structure parsed to the end and its packed stream was found), or the caller
+/// canceled. Anything else, budget failures included, means the candidate was not the header.
 fn final_failure(error: &MapError) -> bool {
-    matches!(error, MapError::PasswordRequired | MapError::WrongPassword | MapError::Limit { .. } | MapError::Source(_))
+    match error {
+        MapError::PasswordRequired | MapError::WrongPassword => true,
+        MapError::Source(failure) => matches!(failure.kind, FailureKind::Canceled),
+        _ => false,
+    }
+}
+
+fn canceled() -> MapError {
+    MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled)))
 }
 
 /// Finds the 7z header at the end of `tail`, the last bytes of a volume `len` bytes long, without the signature
@@ -1404,38 +1418,44 @@ fn final_failure(error: &MapError) -> bool {
 ///
 /// 7-Zip writes the packed streams right after the signature header and the header right after them (an encoded
 /// header's packed stream last of all), so a candidate start fixes where the volume sits in the archive. A
-/// candidate is taken when it parses to the end of the bytes exactly and, for an encoded header, its packed stream
-/// decodes to its CRC; a plain header has no CRC without the signature header, so its starts are tried from the
-/// farthest one in. Every count and offset in a candidate is checked as for a whole-archive walk.
+/// candidate is taken when it parses to the end of the bytes exactly and, for an encoded header, its folder states
+/// a CRC and its packed stream decodes to it; a plain header has no CRC without the signature header, so its starts
+/// are tried from the farthest one in. Every count and offset in a candidate is checked as for a whole-archive walk.
+///
+/// Each candidate gets its own budget, so a bogus candidate that overspends is only not the header; the work of all
+/// candidates together is bounded by [`TAIL_SEARCH_WORK`] and the candidate counts.
 pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<TailSearch, MapError> {
     let held = tail.len() as u64;
     if held > len || tail.len() < 2 {
         return Ok(TailSearch::NotFound(None));
     }
     let start = len - held;
-    // One budget for the whole search, so that hostile bytes full of candidates cannot multiply the work.
-    let usage = Usage::new(options.limits.clone());
-    let mut first_error = None;
+    let mut work = 0u64;
+    let mut last_error: Option<MapError> = None;
     let mut need: Option<u64> = None;
     // Encoded headers, nearest the end first: `0x17` then the packed stream info (`0x06`).
     let lowest = tail.len().saturating_sub(TAIL_ENCODED_WINDOW);
     for h in (lowest..tail.len() - 1).rev() {
-        if options.control.is_canceled() {
-            return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
-        }
         if tail[h] != ID_ENCODED_HEADER as u8 || tail[h + 1] != ID_PACK_INFO as u8 {
             continue;
         }
+        if options.control.is_canceled() {
+            return Err(canceled());
+        }
+        if work > TAIL_SEARCH_WORK {
+            break;
+        }
+        let usage = Usage::new(options.limits.clone());
         let mut reader = Reader::new(&tail[h + 1..], &usage);
-        let streams = match reader.streams_info() {
-            Ok(streams) => streams,
-            Err(Bad::Failure(failure)) => return Err(MapError::from_failure(0, failure)),
-            Err(_) => continue,
-        };
+        let parsed = reader.streams_info();
+        work += reader.pos as u64;
+        let Ok(streams) = parsed else { continue };
         if reader.remaining() != 0
             || streams.folders.len() != 1
             || streams.pack_sizes.len() != 1
             || streams.folders[0].packed_streams.len() != 1
+            // Without the signature header's CRC, the folder's is what proves the candidate.
+            || streams.folders[0].crc.is_none()
         {
             continue;
         }
@@ -1452,12 +1472,14 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
         if packed_len > h as u64 {
             // The packed stream starts before the bytes held (or before the volume: then it is not the header).
             if packed_len <= at {
-                need = Some(need.map_or(len - at + packed_len, |n| n.min(len - at + packed_len)));
+                let n = len - at + packed_len;
+                need = Some(need.map_or(n, |m| m.min(n)));
             }
             continue;
         }
         let packed = &tail[h - packed_len as usize..h];
-        let mut walker = SevenZipWalker::new(options, usage.clone());
+        work = work.saturating_add(packed_len).saturating_add(streams.folders[0].unpacked_size());
+        let mut walker = SevenZipWalker::new(options, usage);
         walker.lens = vec![archive_offset + len];
         walker.header_at = header_at;
         walker.header_len = len - at;
@@ -1485,9 +1507,7 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
             }
             Ok(None) => {}
             Err(e) if final_failure(&e) => return Err(e),
-            Err(e) => {
-                first_error.get_or_insert(e);
-            }
+            Err(e) => last_error = Some(e),
         }
     }
     // Plain headers, farthest first: `0x01` then archive properties, main streams or files.
@@ -1501,16 +1521,18 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
             continue;
         }
         tries += 1;
-        if tries > TAIL_PLAIN_TRIES {
+        if tries > TAIL_PLAIN_TRIES || work > TAIL_SEARCH_WORK {
             break;
         }
         if options.control.is_canceled() {
-            return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
+            return Err(canceled());
         }
+        let usage = Usage::new(options.limits.clone());
         let mut reader = Reader::new(&tail[h + 1..], &usage);
-        let (streams, files) = match reader.header() {
+        let parsed = reader.header();
+        work += reader.pos as u64;
+        let (streams, files) = match parsed {
             Ok(parsed) => parsed,
-            Err(Bad::Failure(failure)) => return Err(MapError::from_failure(0, failure)),
             Err(_) => continue,
         };
         if reader.remaining() != 0 || files.is_empty() {
@@ -1525,7 +1547,7 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
         if archive_offset.checked_add(len).is_none() {
             continue;
         }
-        let mut walker = SevenZipWalker::new(options, usage.clone());
+        let mut walker = SevenZipWalker::new(options, usage);
         walker.lens = vec![archive_offset + len];
         walker.header_at = header_at;
         walker.header_len = len - at;
@@ -1539,14 +1561,12 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
                 })));
             }
             Err(e) if final_failure(&e) => return Err(e),
-            Err(e) => {
-                first_error.get_or_insert(e);
-            }
+            Err(e) => last_error = Some(e),
         }
     }
     Ok(match need {
         Some(n) => TailSearch::NeedBytes(n),
-        None => TailSearch::NotFound(first_error),
+        None => TailSearch::NotFound(last_error),
     })
 }
 

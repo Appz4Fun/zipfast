@@ -358,3 +358,175 @@ fn a_canceled_walk_stops() {
     let result = last_volume_identity(HeldVolume::whole(&fixture("zip-split/stored.zip")), options);
     assert!(matches!(result, Err(MapError::Source(_))), "{result:?}");
 }
+
+// ---- Review follow-ups ----
+
+/// A 7z NUMBER.
+fn num(v: u64, out: &mut Vec<u8>) {
+    let mut n = 0;
+    while n < 8 && v >= 1u64 << (7 * (n + 1)) {
+        n += 1;
+    }
+    if n == 8 {
+        out.push(0xff);
+        out.extend_from_slice(&v.to_le_bytes());
+        return;
+    }
+    out.push(((0xff00u16 >> n) as u8) | (v >> (8 * n)) as u8);
+    out.extend_from_slice(&v.to_le_bytes()[..n]);
+}
+
+/// The unpack info of one Copy folder of `size` bytes, with its CRC when given.
+fn copy_folder(size: u64, crc: Option<u32>, out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C]);
+    num(size, out);
+    if let Some(crc) = crc {
+        out.extend_from_slice(&[0x0A, 0x01]);
+        out.extend_from_slice(&crc.to_le_bytes());
+    }
+    out.push(0x00);
+}
+
+/// A plain 7z header: one stored member `name` of `data`, its packed stream at pack position `pack_pos`.
+fn plain_header(name: &str, data: &[u8], pack_pos: u64) -> Vec<u8> {
+    let mut h = vec![0x01, 0x04, 0x06];
+    num(pack_pos, &mut h);
+    h.extend_from_slice(&[0x01, 0x09]);
+    num(data.len() as u64, &mut h);
+    h.push(0x00);
+    copy_folder(data.len() as u64, Some(crc32fast::hash(data)), &mut h);
+    h.push(0x00);
+    let mut names = vec![0x00];
+    for unit in name.encode_utf16() {
+        names.extend_from_slice(&unit.to_le_bytes());
+    }
+    names.extend_from_slice(&[0, 0]);
+    h.extend_from_slice(&[0x05, 0x01, 0x11]);
+    num(names.len() as u64, &mut h);
+    h.extend_from_slice(&names);
+    h.extend_from_slice(&[0x00, 0x00]);
+    h
+}
+
+/// A 7z archive: signature header, `data` as one Copy stream, then the header; encoded (a Copy folder over the plain
+/// header, with or without its CRC) when `encoded` is Some.
+fn seven(name: &str, data: &[u8], encoded: Option<bool>) -> Vec<u8> {
+    let plain = plain_header(name, data, 0);
+    let mut body = data.to_vec();
+    let header = match encoded {
+        None => plain,
+        Some(with_crc) => {
+            body.extend_from_slice(&plain);
+            let mut h = vec![0x17, 0x06];
+            num(data.len() as u64, &mut h);
+            h.extend_from_slice(&[0x01, 0x09]);
+            num(plain.len() as u64, &mut h);
+            h.push(0x00);
+            copy_folder(plain.len() as u64, with_crc.then(|| crc32fast::hash(&plain)), &mut h);
+            h.push(0x00);
+            h
+        }
+    };
+    let mut start = Vec::new();
+    start.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    start.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend_from_slice(&crc32fast::hash(&start).to_le_bytes());
+    out.extend_from_slice(&start);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&header);
+    out
+}
+
+fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+#[test]
+fn a_plain_header_after_megabytes_of_random_data_is_found() {
+    let data = noise(3 << 20, 0x5eed);
+    let archive = seven("big.bin", &data, None);
+    let full = MemberMap::from_memory(&[&archive], "big.7z", None).unwrap();
+    assert_eq!(map_keys(&full), vec![("big.bin".into(), data.len() as u64, crc32fast::hash(&data))]);
+    // The tail starts right after the signature header: every bogus candidate in the data is tried first.
+    let id = last_volume_identity(held(&archive, 0, archive.len() - 32), MapOptions::new("big.7z")).unwrap();
+    assert_eq!(identity_keys(&id), map_keys(&full));
+    let SetFacts::SevenZip { archive_offset, encoded, .. } = &id.set else { panic!() };
+    assert_eq!((*archive_offset, *encoded), (0, false));
+}
+
+#[test]
+fn random_tails_are_not_archives() {
+    for seed in 1..4 {
+        let bytes = noise(2 << 20, seed);
+        let result = last_volume_identity(HeldVolume::whole(&bytes), MapOptions::new("x.bin"));
+        assert!(matches!(result, Err(MapError::NotArchive)), "seed {seed}: {result:?}");
+    }
+}
+
+#[test]
+fn an_encoded_header_without_a_folder_crc_is_not_taken() {
+    let data = noise(5000, 9);
+    let with_crc = seven("a.bin", &data, Some(true));
+    assert_eq!(identity_keys(&identity(&with_crc[32..], "a.7z")).len(), 1);
+    let without = seven("a.bin", &data, Some(false));
+    // A whole-archive walk has the signature header's CRC; the tail does not.
+    assert!(MemberMap::from_memory(&[&without], "a.7z", None).unwrap().complete);
+    let result = last_volume_identity(HeldVolume::whole(&without[32..]), MapOptions::new("a.7z"));
+    assert!(matches!(result, Err(MapError::NotArchive)), "{result:?}");
+}
+
+#[test]
+fn a_rar_part_running_past_the_volume_is_dropped() {
+    let gold = noise(5000, 3);
+    let spec = FileSpec::new("a.bin", &gold);
+    let mut bytes = common::SIG.to_vec();
+    bytes.extend(common::main_block(true, Some(2)));
+    bytes.extend(common::file_block(&spec, &gold, crc32fast::hash(&gold), true, false));
+    // The volume is said to be 1000 bytes long, but the part's data runs to 5000 and more.
+    let head = &bytes[..200];
+    let id = last_volume_identity(HeldVolume::new(head, &[], 1000).unwrap(), MapOptions::new("a.part3.rar")).unwrap();
+    assert!(id.members.is_empty(), "{:?}", id.members);
+    let SetFacts::Rar { volume, .. } = &id.set else { panic!() };
+    assert!(volume.members.is_empty());
+    // With the true length it is listed.
+    let id =
+        last_volume_identity(HeldVolume::new(head, &[], bytes.len() as u64).unwrap(), MapOptions::new("a.part3.rar"))
+            .unwrap();
+    assert_eq!(identity_keys(&id), vec![("a.bin".into(), gold.len() as u64, crc32fast::hash(&gold))]);
+}
+
+#[test]
+fn a_rar5_locator_past_the_volume_is_dropped() {
+    let main_with_locator = |quick_open: u64| {
+        let mut record = vec![0x01, 0x01];
+        common::vint(quick_open, &mut record);
+        let mut extra = Vec::new();
+        common::vint(record.len() as u64, &mut extra);
+        extra.extend_from_slice(&record);
+        let mut fields = Vec::new();
+        common::vint(1 | 2, &mut fields);
+        common::vint(1, &mut fields);
+        common::block(1, 0, &fields, &extra, &[], false)
+    };
+    for (quick_open, kept) in [(10, true), (1 << 40, false)] {
+        let mut bytes = common::SIG.to_vec();
+        bytes.extend(main_with_locator(quick_open));
+        bytes.extend(common::end_block(false));
+        let id = identity(&bytes, "x.part2.rar");
+        let SetFacts::Rar { volume, .. } = &id.set else { panic!() };
+        assert_eq!(volume.locator.is_some(), kept, "{quick_open}: {:?}", volume.locator);
+        if kept {
+            assert_eq!(volume.locator.unwrap().quick_open, Some(10));
+        }
+    }
+}
