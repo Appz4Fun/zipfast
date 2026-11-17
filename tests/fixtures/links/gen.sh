@@ -37,4 +37,15 @@ mkdir lnx/sub
 touch -h -t 202001020304.05 lnx/sub lnx
 rm -f "$OUT/under-link-folder.7z"
 bsdtar --format 7zip --uid 0 --gid 0 -s '|^lnx|ln|' -cf "$OUT/under-link-folder.7z" real ln lnx/sub z.txt
+# xar: an escaping link and a folder that a link already in the destination stands in for
+cd "$WORK"
+mkdir -p xar/pre
+printf 'a\n' > xar/a.txt
+printf 'x\n' > xar/pre/x
+printf 'z\n' > xar/z.txt
+ln -s ../outside xar/up
+find xar -exec touch -h -t 202001020304.05 {} +
+cd xar
+rm -f "$OUT/pre-link.xar"
+bsdtar --format xar --uid 0 --gid 0 -cf "$OUT/pre-link.xar" a.txt up pre z.txt
 python3 -I "$OUT/crafted.py" "$OUT"

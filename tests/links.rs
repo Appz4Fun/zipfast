@@ -435,3 +435,28 @@ fn a_link_already_in_the_destination_fails_only_the_members_under_it() {
         assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "gz={gz}");
     }
 }
+
+/// xar goes through tar's link path: an escaping link, and the folder and file members under a link already in the
+/// destination, each fail alone, and the members after them still extract.
+#[test]
+fn xar_refusals_fail_only_their_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let dest = tmp.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    std::os::unix::fs::symlink("../outside", dest.join("pre")).unwrap();
+    let s = extract::run(&fixture("pre-link.xar"), &options(&dest, Mode::Extract, Overwrite::Always), |_| {}).unwrap();
+    assert_eq!(
+        s.errors,
+        [
+            "up: the link's target is absolute or leads out of the destination",
+            "pre: a symlink is in the way",
+            "pre/x: a symlink is in the way",
+        ]
+    );
+    assert_eq!(s.files, 2, "a.txt and z.txt");
+    assert!(fs::symlink_metadata(dest.join("up")).is_err());
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "written through the link");
+    assert_eq!(fs::read(dest.join("z.txt")).unwrap(), b"z\n");
+}
