@@ -28,8 +28,9 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - ZIP archives: stored, deflated, Deflate64, bzip2, LZMA, xz and zstd entries, ZIP64, self-extracting stubs, UTF-8 and code page 437 names,
   Unix permissions, and extended or NTFS timestamps. Checked streaming reads support ZipCrypto and WinZip AES
   (all strengths, AE-1/AE-2); see [checked ZIP reads](docs/zip-checked-reads.md) for policy, staging and legacy caps, and [staged output](docs/zip-staged-output.md) for the native and portable backends.
-- tar archives, plain or compressed with gzip, xz, zstd or bzip2 (`.tar.gz`, `.tgz`, `.tar.xz`, `.tar.zst`,
-  `.tar.bz2` and so on): POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
+- tar archives, plain or compressed with gzip, xz, zstd, bzip2, LZ4 (frames and legacy frames), Unix compress or
+  LZMA-alone (`.tar.gz`, `.tgz`, `.tar.xz`, `.tar.zst`, `.tar.bz2`, `.tar.lz4`, `.tar.Z`, `.tar.lzma` and so on),
+  each found by its first bytes whatever the name: POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
   sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
   compresses. xz files written in blocks (`xz -T0`) decode on several cores.
 - 7z archives (`.7z`, split `.7z.001`, ...): testing and extracting through the same entry points, options and
@@ -79,7 +80,7 @@ publication failure can leave earlier verified members in place.
 ### Library: one entry point for every format
 
 `extract::run_with_policy` (or `extract::run_with_context`, with a caller-owned `EncryptedReadContext`) tests or
-extracts ZIP, tar, lone `.gz`/`.xz`/`.bz2`/`.zst` streams, RAR4/RAR5 and 7z with one `Options`, one
+extracts ZIP, tar, lone `.gz`/`.xz`/`.bz2`/`.zst`/`.lz4`/`.Z`/`.lzma` streams, RAR4/RAR5 and 7z with one `Options`, one
 `Cancellation` and one observer of `extract::RunEvent`s. The format comes from the content. Cancellation reaches
 every format's inner loop and ends the run with `ReadFault::Cancelled`; `Overwrite` (Skip, Always, RenameNew,
 RenameExisting) and `Options::select` apply everywhere. Every format reports each member live with its listing index.
@@ -188,7 +189,7 @@ hold the linked file, and reports a link it had to leave behind.
   `MtimeOrigin::LocalWallClock` is MS-DOS date and time fields counted as if they were UTC: a ZIP without a time
   extra, and every RAR 4.x time. RAR 4.x's extended-time record only adds a second and a fraction to the local DOS
   time, as UnRAR reads it. 7-Zip prints a local wall-clock time as stored and converts a UTC time to local time.
-- A lone compressed file (`.gz`, `.xz`, `.bz2`, `.zst`) is extracted with the gzip `MTIME` when it holds one, and
+- A lone compressed file (`.gz`, `.xz`, `.bz2`, `.zst`, `.lz4`, `.Z`, `.lzma`) is extracted with the gzip `MTIME` when it holds one, and
   otherwise with the compressed file's own modification time, as 7-Zip, `gunzip -N`, `xz` and `bzip2` do. The listing
   shows only the gzip `MTIME`.
 - `mode` holds Unix mode bits: ZIP host 3, RAR 4.x host Unix, RAR 5.0 host Unix and tar.

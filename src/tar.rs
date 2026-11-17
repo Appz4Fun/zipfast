@@ -136,7 +136,7 @@ enum Source {
 impl Source {
     fn open(path: &Path, threads: usize, limit: Option<u64>, cancel: Option<Cancellation>) -> Result<Source> {
         let mut file = File::open(path)?;
-        let mut head = [0u8; 6];
+        let mut head = [0u8; stream::SNIFF_BYTES];
         let n = read_full(&mut file, &mut head)?;
         file.rewind()?;
         let len = file.metadata()?.len();
