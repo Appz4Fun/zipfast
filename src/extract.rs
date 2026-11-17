@@ -2709,6 +2709,8 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
         return Err(books.terminal(&p.context, e.detailed(false)));
     }
     if let Some(LinkOut { place, rel, target }) = p.link.take() {
+        // the target is the decoded data: reported with the outcome, refused or not
+        p.context.link = Some(crate::rar5::Redirection::UnixSymlink(String::from_utf8_lossy(&target).into_owned()));
         if !link::contained(&rel, &target) {
             let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path };
             return books.fail(&p.context, failure, blocked_message(&RarPolicyReason::LinkTarget));
@@ -4638,6 +4640,7 @@ mod tests {
             method: 0,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
             renamed: None,
+            link: None,
         }
     }
 

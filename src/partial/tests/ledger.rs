@@ -256,6 +256,7 @@ impl Fixture {
                     method: header.method,
                     password: crate::error::RarPasswordEvidence::NotEncrypted,
                     renamed: None,
+                    link: None,
                 };
                 machine = Some(MemberMachine::new(&header, context, None, &usage, &SessionControl::default()).unwrap());
                 member = Some(PhysicalMember::new(header, wire, 0, &part).unwrap());

@@ -444,3 +444,58 @@ fn vm_program_other_than_a_standard_filter_is_unsupported() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-rar300/generic_delta_padding_mutation.rar");
     legacy_unsupported(&path, "VM/filter payload");
 }
+
+/// A RAR 4.x symbolic link (Unix host, `S_IFLNK`) whose target is this member's data.
+fn link_member(name: &[u8], packed: &[u8], target: &[u8], method: u8) -> Vec<u8> {
+    let mut bytes = member(name, packed, target, 29, method, 0);
+    // the mode is the last four bytes before the name; the header CRC covers it
+    let header_len = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+    let mode = header_len - name.len() - 4;
+    bytes[mode..mode + 4].copy_from_slice(&0o120777u32.to_le_bytes());
+    let crc = hash(&bytes[2..header_len]) as u16;
+    bytes[..2].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+/// A compressed RAR 4.x symbolic link's target is its decoded data: it is placed, and reported with the outcome on
+/// RarSession extraction and testing and on the typed run, as a stored link's is.
+#[test]
+fn compressed_and_stored_rar4_links_report_their_decoded_targets() {
+    use zipfast::rar5::Redirection;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("links.rar");
+    let packed = include_bytes!("fixtures/rar4-lz/literal-a.packed");
+    fs::write(&path, archive(&[link_member(b"packed", packed, b"A", 0x33), link_member(b"stored", b"B", b"B", 0x30)]))
+        .unwrap();
+    let expected = [Some(Redirection::UnixSymlink("A".into())), Some(Redirection::UnixSymlink("B".into()))];
+    let verified = |events: &[(Option<Redirection>, bool)]| {
+        assert!(events.iter().all(|(_, ok)| *ok), "{events:?}");
+        events.iter().map(|(link, _)| link.clone()).collect::<Vec<_>>()
+    };
+    let event = |e: &extract::RarEntryOutcome| (e.link.clone(), matches!(e.outcome, RarOutcome::Verified { .. }));
+    for mode in [Mode::Extract, Mode::Test] {
+        let dest = tmp.path().join(format!("session-{mode:?}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let mut events = Vec::new();
+        match mode {
+            Mode::Extract => {
+                session.extract_selected(&all, &options(&dest, mode, 1), RarDecodeLimits::default(), |e| {
+                    events.push(event(e))
+                })
+            }
+            _ => session.test_selected(&all, RarDecodeLimits::default(), |e| events.push(event(e))),
+        }
+        .unwrap();
+        assert_eq!(verified(&events), expected, "session {mode:?}");
+        if mode == Mode::Extract {
+            assert_eq!(fs::read_link(dest.join("packed")).unwrap(), Path::new("A"));
+            assert_eq!(fs::read_link(dest.join("stored")).unwrap(), Path::new("B"));
+        }
+    }
+    let dest = tmp.path().join("typed");
+    let mut events = Vec::new();
+    extract::run_rar_with_outcomes(&path, &options(&dest, Mode::Extract, 1), None, |e| events.push(event(e))).unwrap();
+    assert_eq!(verified(&events), expected, "typed");
+    assert_eq!(fs::read_link(dest.join("packed")).unwrap(), Path::new("A"));
+}

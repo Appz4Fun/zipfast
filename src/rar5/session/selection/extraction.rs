@@ -394,7 +394,7 @@ impl<'a> Extraction<'a> {
                 (kind, 0, checks)
             }
             None => {
-                let (text, bytes, checks) = match self.rar4_link_text(run, session, index)? {
+                let (text, bytes, checks) = match rar4_link_text(run, session, index)? {
                     Ok(decoded) => decoded,
                     Err(outcome) => return Ok(outcome),
                 };
@@ -488,29 +488,6 @@ impl<'a> Extraction<'a> {
         let landed = placement?;
         link::placed(&self.options.dest, relative, &kind, &landed, &mut self.extracted);
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
-    }
-
-    /// A RAR 4.x symbolic link's target, decoded and checked like a file's data; or the member's outcome when it
-    /// did not verify.
-    #[allow(clippy::type_complexity)]
-    fn rar4_link_text(
-        &self,
-        run: &mut SelectedRun,
-        session: &mut RarSession,
-        index: usize,
-    ) -> Result<Result<(Vec<u8>, u64, RarVerification), RarOutcome>, SelectedStop> {
-        use crate::extract::link;
-        let mut text = Vec::new();
-        let mut sink = |chunk: &[u8]| -> RarResult<()> {
-            let room = (link::MAX_TARGET as usize + 1).saturating_sub(text.len()).min(chunk.len());
-            text.extend_from_slice(&chunk[..room]);
-            Ok(())
-        };
-        let outcome = run.test(session, index, Some(&mut sink))?;
-        let RarOutcome::Verified { bytes, checks, .. } = outcome else {
-            return Ok(Err(outcome));
-        };
-        Ok(Ok((text, bytes, checks)))
     }
 
     fn ensure_root(&self) -> RarResult<()> {
@@ -718,6 +695,29 @@ pub(super) fn project_target(
     target.push(&options.dest);
     target.push(selected_relative(relative, flatten));
     Ok(target)
+}
+
+/// A RAR 4.x symbolic link's target, decoded and checked like a file's data, and kept for the member's outcome; or
+/// the member's outcome when it did not verify.
+#[allow(clippy::type_complexity)]
+pub(super) fn rar4_link_text(
+    run: &mut SelectedRun,
+    session: &mut RarSession,
+    index: usize,
+) -> Result<Result<(Vec<u8>, u64, RarVerification), RarOutcome>, SelectedStop> {
+    use crate::extract::link;
+    let mut text = Vec::new();
+    let mut sink = |chunk: &[u8]| -> RarResult<()> {
+        let room = (link::MAX_TARGET as usize + 1).saturating_sub(text.len()).min(chunk.len());
+        text.extend_from_slice(&chunk[..room]);
+        Ok(())
+    };
+    let outcome = run.test(session, index, Some(&mut sink))?;
+    let RarOutcome::Verified { bytes, checks, .. } = outcome else {
+        return Ok(Err(outcome));
+    };
+    run.link = Some(Redirection::UnixSymlink(String::from_utf8_lossy(&text).into_owned()));
+    Ok(Ok((text, bytes, checks)))
 }
 
 pub(super) trait ExtractionHooks {

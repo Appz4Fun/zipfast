@@ -1218,6 +1218,7 @@ impl ProgressiveSession {
             method: header.method,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
             renamed: None,
+            link: None,
         };
         let decode = matches!(self.disposition, Disposition::Write | Disposition::Test | Disposition::Link)
             || (matches!(self.disposition, Disposition::Skip(_))
