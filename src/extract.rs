@@ -1127,6 +1127,15 @@ pub(crate) enum LegacyRoute {
 #[allow(clippy::result_large_err)]
 pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::ZipReadResult<CheckedRoute> {
     let (opened, head) = crate::zip::read::CheckedOpen::open(path, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
+    // A spanned set without its `.zip` has no central directory: it can only be read by walking local headers, which
+    // the checked guarantees don't cover. Fail closed rather than fall back to the legacy reader.
+    if crate::zip::is_headless_spanned(path) {
+        opened.retire()?;
+        return Err(crate::zip::ReadFault::Legacy(Error::Unsupported(
+            "split set without its .zip can't be read on the checked route".into(),
+        ))
+        .into());
+    }
     // A spanned set's `.zip` starts mid-member, whatever its head says: it reopens its volumes by path.
     if crate::zip::is_spanned(path) {
         opened.retire()?;

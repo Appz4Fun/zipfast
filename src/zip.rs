@@ -962,6 +962,12 @@ pub(crate) fn is_spanned(path: &Path) -> bool {
     spanned::is_spanned(path)
 }
 
+/// Whether `path` is the `.z01` of an Info-ZIP spanned set whose `.zip` is missing: read only by walking its local
+/// headers, on the unchecked routes ([`list`], [`run`]); the checked route refuses it.
+pub(crate) fn is_headless_spanned(path: &Path) -> bool {
+    spanned::Headless::open(path).is_some()
+}
+
 pub(crate) fn is_byte_split(path: &Path) -> bool {
     byte_split::is_split_set(path) || spanned::is_spanned(path)
 }

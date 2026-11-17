@@ -411,23 +411,12 @@ fn a_missing_zip_extracts_the_members_wholly_before_it() {
         );
         assert!(!out.join("c.bin").exists(), "marker={marker}");
         assert!(s.errors.iter().any(|e| e.contains("c.bin") && e.contains("part.zip")), "{:?}", s.errors);
-        // the checked route and inspection read it the same way
+        // the checked route refuses a set it could only walk (see a_lone_z01_is_refused_on_the_checked_route)
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            use zipfast::extract::Cancellation;
             let out = dir.path().join("checked");
-            let report = extract::run_with_policy(
-                &z01,
-                &options(&out, Mode::Extract),
-                None,
-                &Cancellation::default(),
-                &Default::default(),
-                |_: extract::RunEvent<'_>| Ok(()),
-            )
-            .unwrap();
-            assert_eq!(report.files(), 2, "marker={marker}");
-            assert_eq!(fs::read(out.join("b.bin")).unwrap(), b);
-            assert!(extract::inspect_cancelable(&z01, None, &Cancellation::default()).is_ok());
+            assert!(checked_rejects(&z01, &out), "marker={marker}");
+            assert!(no_files(&out), "marker={marker}");
         }
     }
 }
@@ -600,4 +589,43 @@ fn a_lone_multi_disk_zip_without_its_z01_takes_the_checked_route() {
     let zip = write_set(dir.path(), "lone", &set.volumes);
     let names: Vec<_> = extract::list(&zip).unwrap().into_iter().map(|e| e.name).collect();
     assert_eq!(names, ["a.bin", "b.bin"]);
+}
+
+/// A lone `.z01`, no `.zip` and nothing else beside it, can only be read by walking its local headers: the unchecked
+/// routes list and extract it as 7-Zip does, but the checked route refuses it with a clear error and writes nothing,
+/// as it did before sets could open without their `.zip`. It never falls back to the legacy reader.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_lone_z01_is_refused_on_the_checked_route() {
+    let a = data(3000, 1);
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];
+    let end = split_zip_builder::data_abs(&entries, 1, true) + 4;
+    for marker in [true, false] {
+        // everything up to the end of b.bin in the `.z01`; the directory would be in the `.zip`
+        let set = split_zip(&entries, &[end - usize::from(!marker) * 4], Layout { marker, zip64: false });
+        let dir = tempfile::tempdir().unwrap();
+        let z01 = dir.path().join("lone.z01");
+        fs::write(&z01, &set.volumes[0]).unwrap();
+        let out = dir.path().join("checked");
+        let error = extract::run_with_policy(
+            &z01,
+            &options(&out, Mode::Extract),
+            None,
+            &extract::Cancellation::default(),
+            &Default::default(),
+            |_: extract::RunEvent<'_>| Ok(()),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("marker={marker}: the checked route must refuse a lone .z01"));
+        assert!(format!("{error:?}").contains("without its .zip"), "marker={marker}: {error:?}");
+        assert!(no_files(&out), "marker={marker}");
+        // the unchecked routes walk it
+        let names: Vec<_> = extract::list(&z01).unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["a.bin", "b.bin"], "marker={marker}");
+        let out = dir.path().join("out");
+        let s = extract::run(&z01, &options(&out, Mode::Extract), |_| {}).unwrap();
+        assert_eq!(fs::read(out.join("a.bin")).unwrap(), a, "marker={marker}");
+        assert_eq!(fs::read(out.join("b.bin")).unwrap(), b"tail", "marker={marker}");
+        assert!(s.errors.iter().any(|e| e.contains("lone.zip")), "{:?}", s.errors);
+    }
 }
