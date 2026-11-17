@@ -28,6 +28,9 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - ZIP archives: stored, deflated, Deflate64, bzip2, LZMA, xz and zstd entries, ZIP64, self-extracting stubs, UTF-8 and code page 437 names,
   Unix permissions, and extended or NTFS timestamps. Checked streaming reads support ZipCrypto and WinZip AES
   (all strengths, AE-1/AE-2); see [checked ZIP reads](docs/zip-checked-reads.md) for policy, staging and legacy caps, and [staged output](docs/zip-staged-output.md) for the native and portable backends.
+  Split sets list, test and extract from their first file: raw byte splits (`name.zip.001`, ...) and Info-ZIP
+  spanned sets (`name.z01`, `name.z02`, ..., `name.zip`, from the `.zip` or the `.z01`), read as 7-Zip reads them;
+  a missing volume fails only the members whose bytes it holds.
 - tar archives, plain or compressed with gzip, xz, zstd, bzip2, LZ4 (frames and legacy frames), Unix compress or
   LZMA-alone (`.tar.gz`, `.tgz`, `.tar.xz`, `.tar.zst`, `.tar.bz2`, `.tar.lz4`, `.tar.Z`, `.tar.lzma` and so on),
   each found by its first bytes whatever the name: POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256

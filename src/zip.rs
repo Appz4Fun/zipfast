@@ -41,6 +41,7 @@ mod byte_split;
 pub mod create;
 pub mod read;
 pub mod recovery;
+mod spanned;
 pub use read::*;
 pub mod rewrite;
 mod session;
@@ -323,6 +324,9 @@ pub struct Archive {
     missing: Option<PathBuf>,
     /// The last entry's size is unknown: a streamed member whose descriptor is past the gap of `missing`.
     last_size_unknown: bool,
+    /// Where the absent pieces would be: past the end of a byte-split set cut short, or the disks of a spanned set
+    /// that are missing while its central directory is not. A member whose bytes reach one fails as missing it.
+    holes: Vec<std::ops::Range<u64>>,
     pub entries: Vec<ZipEntry>,
 }
 
@@ -332,6 +336,9 @@ impl Archive {
     }
 
     pub(crate) fn open_cancelable(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
+        if let Some(set) = spanned::Spanned::open(path)? {
+            return Self::open_spanned(set, cancel);
+        }
         let (mut file, len, pieces, missing) = match byte_split::ByteSplit::open(path)? {
             Some(split) => {
                 let pieces = split.paths().map(Path::to_path_buf).collect();
@@ -348,10 +355,81 @@ impl Archive {
         check_cancel(cancel)?;
         // A set cut short by a missing piece has no central directory: list the local headers before the gap.
         let (entries, last_size_unknown) = match missing {
-            Some(_) => byte_split::scan_local_headers(&mut file, len)?,
+            Some(_) => byte_split::scan_local_headers(&mut file, 0, len)?,
             None => (read_projected_legacy(&mut file, len, cancel)?.0, false),
         };
-        Ok(Archive { file, len, pieces, missing, last_size_unknown, entries })
+        let holes = if missing.is_some() { std::iter::once(len..u64::MAX).collect() } else { Vec::new() };
+        Ok(Archive { file, len, pieces, missing, last_size_unknown, holes, entries })
+    }
+
+    /// An Info-ZIP spanned set read as its disks concatenated, each entry's (disk, offset) made an offset there. With
+    /// a volume missing, the central directory is still read when its own disks are all there, as 7-Zip does: every
+    /// member is listed, and one whose bytes reach the missing volume fails as missing it. Otherwise the local
+    /// headers before the gap are listed.
+    fn open_spanned(set: spanned::Spanned, cancel: Option<&Cancellation>) -> Result<Archive> {
+        let pieces = set.volumes.clone();
+        let last = set.last_disk();
+        let directory_whole = set.volumes[set.directory_disk as usize..].iter().all(|v| spanned::is_regular(v));
+        if let Some(missing) = set.missing.clone().filter(|_| !directory_whole) {
+            let present = set.volumes.iter().take_while(|v| **v != missing).cloned().collect();
+            let mut split = byte_split::ByteSplit::from_volumes(present, 0)?;
+            let len = split.len();
+            // offsets in disk 0 count the spanning marker
+            let mut head = [0u8; 4];
+            let start =
+                if len >= 4 && split.read_exact(&mut head).is_ok() && head == *spanned::SPLIT_MARKER { 4 } else { 0 };
+            let mut file = byte_split::ArchiveSource::Split(split);
+            let (entries, last_size_unknown) = byte_split::scan_local_headers(&mut file, start, len)?;
+            let holes = std::iter::once(len..u64::MAX).collect();
+            return Ok(Archive { file, len, pieces, missing: Some(missing), last_size_unknown, holes, entries });
+        }
+        // an absent disk stands in at the set's split size: every numbered volume but the last has it
+        let nominal = set.volumes[..last as usize]
+            .iter()
+            .find_map(|v| std::fs::metadata(v).ok().filter(|m| m.is_file()).map(|m| m.len()))
+            .unwrap_or(0);
+        let mut split = byte_split::ByteSplit::from_volumes(set.volumes.clone(), nominal)?;
+        let len = split.len();
+        let holes = split.holes();
+        let starts: Vec<u64> = split.starts().collect();
+        let base = starts[set.directory_disk as usize];
+        let end_at = starts[last as usize] + set.end_at - base;
+        let parser = DirectoryParser::spanned_at_eocd(len - base, end_at, Limits::default(), crate::crc32::hash, |r| {
+            let disk = r.resolved().disk_start;
+            Ok((project_record(r)?, disk))
+        })
+        .map_err(directory_error)?;
+        let found = read_directory(&mut spanned::Window { inner: &mut split, base }, len - base, parser, cancel)?;
+        if found.prefix_shift != 0 {
+            return Err(Error::Corrupt("central directory offset"));
+        }
+        // The parser looks for the ZIP64 end record in the concatenation: it must be the one the locator names.
+        if let Some(record) = &found.zip64_end {
+            let at = set.zip64.filter(|(vol, _)| *vol >= set.directory_disk && *vol <= last);
+            if at.map(|(vol, off)| starts[vol as usize] + off - base) != Some(record.source.start) {
+                return Err(Error::Corrupt("ZIP64 end record"));
+            }
+        }
+        let mut entries = Vec::with_capacity(found.entries.len());
+        for (mut entry, disk) in found.entries {
+            check_cancel(cancel)?;
+            let start =
+                starts.get(disk as usize).filter(|_| disk <= last).ok_or(Error::Corrupt("ZIP local header disk"))?;
+            entry.local_at = start
+                .checked_add(entry.local_at)
+                .filter(|&at| at < len)
+                .ok_or(Error::Corrupt("local header offset"))?;
+            entries.push(entry);
+        }
+        Ok(Archive {
+            file: byte_split::ArchiveSource::Split(split),
+            len,
+            pieces,
+            missing: set.missing,
+            last_size_unknown: false,
+            holes,
+            entries,
+        })
     }
 
     /// Decodes the entry at a zero-based index and checks its integrity.
@@ -842,10 +920,16 @@ fn decode_invalid_name(
     Ok(name)
 }
 
-/// Whether `path` is the first piece of a raw byte-split set (`name.zip.001` with `name.zip.002` beside it), which
-/// [`list`], [`Archive::open`] and [`run`] read as the pieces concatenated, as 7-Zip does.
+/// Whether `path` is the first piece of a raw byte-split set (`name.zip.001` with `name.zip.002` beside it), or the
+/// `.zip` (or `.z01`) of an Info-ZIP spanned set (`name.z01`, ..., `name.zip`), which [`list`], [`Archive::open`]
+/// and [`run`] read as the pieces concatenated, as 7-Zip does.
+/// Whether `path` is the `.zip` (or `.z01`) of an Info-ZIP spanned set, whose `.zip` may start mid-member.
+pub(crate) fn is_spanned(path: &Path) -> bool {
+    spanned::is_spanned(path)
+}
+
 pub(crate) fn is_byte_split(path: &Path) -> bool {
-    byte_split::is_split_set(path)
+    byte_split::is_split_set(path) || spanned::is_spanned(path)
 }
 
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
@@ -1156,14 +1240,15 @@ pub(crate) fn run_renaming(
                     // The payload starts past the local header, its name and its extra field.
                     let crosses_gap = archive.missing.is_some()
                         && data_at(&mut archive.file, archive.len, &entry).map_or(true, |start| {
-                            // a streamed member also needs its descriptor before the end: 16 bytes, 24 with ZIP64 sizes
+                            // a streamed member also needs its descriptor: 16 bytes, 24 with ZIP64 sizes
                             let zip64 = e.packed >= u64::from(u32::MAX) || e.size >= u64::from(u32::MAX);
                             let descriptor = match (e.flags & 0x08 != 0, zip64) {
                                 (false, _) => 0,
                                 (true, false) => 16,
                                 (true, true) => 24,
                             };
-                            start.saturating_add(e.packed).saturating_add(descriptor) > archive.len
+                            let end = start.saturating_add(e.packed).saturating_add(descriptor);
+                            archive.holes.iter().any(|hole| e.local_at < hole.end && end > hole.start)
                         });
                     if let Some(missing) = archive.missing.as_ref().filter(|_| crosses_gap) {
                         fail(&mut summary, &mut report, &e.name, &Error::MissingVolume(missing.clone()).to_string());

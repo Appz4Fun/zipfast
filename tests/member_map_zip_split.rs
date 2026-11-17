@@ -19,11 +19,14 @@
 use std::{
     ffi::OsString,
     fs::File,
-    io::{Cursor, Write},
+    io::Write,
     ops::Range,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
+mod split_zip_builder;
+
+use split_zip_builder::*;
 use zipfast::map::*;
 use zipfast::progressive::{
     ProgressiveResult, RangeRead, RangeSource, SourceId, SourceInfo, SourceLength, VolumeAnswer, VolumeRequest,
@@ -32,10 +35,6 @@ use zipfast::progressive::{
 
 fn refs(volumes: &[Vec<u8>]) -> Vec<&[u8]> {
     volumes.iter().map(Vec::as_slice).collect()
-}
-
-fn data(len: usize, seed: usize) -> Vec<u8> {
-    (0..len).map(|i| ((i * 31 + seed) % 251) as u8).collect()
 }
 
 fn slice(volumes: &[Vec<u8>], spans: &[PackedSpan]) -> Vec<u8> {
@@ -67,166 +66,6 @@ fn assert_round_trips(member: &MapMember, volumes: &[Vec<u8>], gold: &[u8]) {
         let spans = member.packed_spans(range.clone()).unwrap();
         assert_eq!(slice(volumes, &spans), &gold[range.start as usize..range.end as usize], "range {range:?}");
     }
-}
-
-// ---- Building split sets ----
-
-#[derive(Clone)]
-struct Entry {
-    name: &'static str,
-    payload: Vec<u8>,
-    method: u16,
-    flags: u16,
-    extra: Vec<u8>,
-    crc: u32,
-    size: u32,
-}
-
-impl Entry {
-    fn stored(name: &'static str, payload: &[u8]) -> Self {
-        Self {
-            name,
-            payload: payload.to_vec(),
-            method: 0,
-            flags: 0,
-            extra: Vec::new(),
-            crc: crc32fast::hash(payload),
-            size: payload.len() as u32,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct Layout {
-    /// Start the first volume with the spanning signature.
-    marker: bool,
-    /// Store every disk number and offset in ZIP64 fields and end records.
-    zip64: bool,
-}
-
-/// A split set.
-struct Set {
-    volumes: Vec<Vec<u8>>,
-    /// Each entry's local header as (disk, offset).
-    locals: Vec<(u32, u64)>,
-    /// Where the central directory starts, as (disk, offset).
-    directory: (u32, u64),
-}
-
-/// Writes the entries as one stream (marker, local records, central directory, end records) and cuts it at the
-/// absolute stream offsets `cuts`. The end records must lie in the last volume.
-fn split_zip(entries: &[Entry], cuts: &[usize], layout: Layout) -> Set {
-    let at = |abs: usize| -> (u32, u64) {
-        let disk = cuts.iter().filter(|&&c| c <= abs).count();
-        let start = if disk == 0 { 0 } else { cuts[disk - 1] };
-        (disk as u32, (abs - start) as u64)
-    };
-    let mut out = Vec::new();
-    if layout.marker {
-        out.extend(b"PK\x07\x08");
-    }
-    let header = |sig: u32, e: &Entry, out: &mut Vec<u8>, extra_len: usize| {
-        out.extend(sig.to_le_bytes());
-        if sig == 0x0201_4b50 {
-            out.extend(((3u16 << 8) | 45).to_le_bytes());
-        }
-        out.extend(45u16.to_le_bytes());
-        out.extend(e.flags.to_le_bytes());
-        out.extend(e.method.to_le_bytes());
-        out.extend(0x6000u16.to_le_bytes());
-        out.extend(0x5a21u16.to_le_bytes());
-        out.extend(e.crc.to_le_bytes());
-        out.extend((e.payload.len() as u32).to_le_bytes());
-        out.extend(e.size.to_le_bytes());
-        out.extend((e.name.len() as u16).to_le_bytes());
-        out.extend((extra_len as u16).to_le_bytes());
-    };
-    let mut locals = Vec::new();
-    for e in entries {
-        locals.push(at(out.len()));
-        header(0x0403_4b50, e, &mut out, e.extra.len());
-        out.extend(e.name.as_bytes());
-        out.extend(&e.extra);
-        out.extend(&e.payload);
-        if e.flags & 8 != 0 {
-            out.extend(b"PK\x07\x08");
-            out.extend(e.crc.to_le_bytes());
-            out.extend((e.payload.len() as u32).to_le_bytes());
-            out.extend(e.size.to_le_bytes());
-        }
-    }
-    let cd_abs = out.len();
-    let last = cuts.len() as u32;
-    let mut on_last = 0u64;
-    for (e, &(disk, offset)) in entries.iter().zip(&locals) {
-        if at(out.len()).0 == last {
-            on_last += 1;
-        }
-        let mut extra = Vec::new();
-        if layout.zip64 {
-            extra.extend([1, 0, 12, 0]);
-            extra.extend(offset.to_le_bytes());
-            extra.extend(disk.to_le_bytes());
-        }
-        extra.extend(&e.extra);
-        header(0x0201_4b50, e, &mut out, extra.len());
-        out.extend(0u16.to_le_bytes()); // comment
-        out.extend((if layout.zip64 { 0xffff } else { disk as u16 }).to_le_bytes());
-        out.extend(0u16.to_le_bytes()); // internal attributes
-        out.extend((0o100644u32 << 16).to_le_bytes());
-        out.extend((if layout.zip64 { u32::MAX } else { offset as u32 }).to_le_bytes());
-        out.extend(e.name.as_bytes());
-        out.extend(&extra);
-    }
-    let cd_size = (out.len() - cd_abs) as u64;
-    let (dd, cd_off) = at(cd_abs);
-    let ends = out.len();
-    let n = entries.len() as u64;
-    if layout.zip64 {
-        let (_, record_off) = at(out.len());
-        out.extend(b"PK\x06\x06");
-        out.extend(44u64.to_le_bytes());
-        out.extend(45u16.to_le_bytes());
-        out.extend(45u16.to_le_bytes());
-        out.extend(last.to_le_bytes());
-        out.extend(dd.to_le_bytes());
-        out.extend(on_last.to_le_bytes());
-        out.extend(n.to_le_bytes());
-        out.extend(cd_size.to_le_bytes());
-        out.extend(cd_off.to_le_bytes());
-        out.extend(b"PK\x06\x07");
-        out.extend(last.to_le_bytes());
-        out.extend(record_off.to_le_bytes());
-        out.extend((last + 1).to_le_bytes());
-        out.extend(b"PK\x05\x06");
-        out.extend([0xff; 16]);
-    } else {
-        out.extend(b"PK\x05\x06");
-        out.extend((last as u16).to_le_bytes());
-        out.extend((dd as u16).to_le_bytes());
-        out.extend((on_last as u16).to_le_bytes());
-        out.extend((n as u16).to_le_bytes());
-        out.extend((cd_size as u32).to_le_bytes());
-        out.extend((cd_off as u32).to_le_bytes());
-    }
-    out.extend(0u16.to_le_bytes());
-    assert!(cuts.last().is_none_or(|&c| c <= ends), "the end records must lie in the last volume");
-    let mut volumes = Vec::new();
-    let mut start = 0;
-    for &c in cuts.iter().chain(std::iter::once(&out.len())) {
-        volumes.push(out[start..c].to_vec());
-        start = c;
-    }
-    Set { volumes, locals, directory: (dd, cd_off) }
-}
-
-/// Absolute stream offset of a member's data.
-fn data_abs(entries: &[Entry], index: usize, marker: bool) -> usize {
-    let mut at = if marker { 4 } else { 0 };
-    for e in &entries[..index] {
-        at += 30 + e.name.len() + e.extra.len() + e.payload.len() + if e.flags & 8 != 0 { 16 } else { 0 };
-    }
-    at + 30 + entries[index].name.len() + entries[index].extra.len()
 }
 
 fn map(set: &[Vec<u8>]) -> MemberMap {
@@ -352,49 +191,6 @@ fn local_headers_and_the_directory_may_cross_volume_boundaries() {
     }
 }
 
-fn winzip_aes_payload(plain: &[u8]) -> Vec<u8> {
-    use zipfast::zip::write::*;
-    let mut writer = ZipStreamWriter::new(Vec::new(), WriterOptions::default()).unwrap();
-    let options = EntryOptions {
-        name: EntryName::Utf8("aes.bin"),
-        method: Method::Stored,
-        modified: DosDateTime::default(),
-        extended_mtime: None,
-        permissions: Permissions::new(0o644).unwrap(),
-        comment: b"",
-    };
-    let request = WinZipAesRequest::new("pw", AesStrength::Aes256, AesVariant::Ae1).unwrap();
-    writer
-        .add_winzip_aes_file(
-            options,
-            &mut Cursor::new(plain),
-            InputLength::Exact(plain.len() as u64),
-            request,
-            |salt| {
-                salt.iter_mut().enumerate().for_each(|(i, b)| *b = i as u8 + 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-    let single = writer.finish().unwrap().sink;
-    let map = MemberMap::from_memory(&[&single], "aes.zip", None).unwrap();
-    let piece = &map.members[0].pieces[0];
-    single[piece.packed.start as usize..piece.packed.end as usize].to_vec()
-}
-
-fn aes_entry(plain: &[u8]) -> Entry {
-    let extra = [&[0x01, 0x99, 7, 0][..], &1u16.to_le_bytes(), b"AE", &[3], &0u16.to_le_bytes()].concat();
-    Entry {
-        name: "aes.bin",
-        payload: winzip_aes_payload(plain),
-        method: 99,
-        flags: 1,
-        extra,
-        crc: crc32fast::hash(plain),
-        size: plain.len() as u32,
-    }
-}
-
 #[test]
 fn winzip_aes_stored_crossing_boundaries_decrypts_from_the_spans() {
     let plain = data(6000, 5);
@@ -425,40 +221,6 @@ fn winzip_aes_stored_crossing_boundaries_decrypts_from_the_spans() {
             assert_eq!(out, &plain[at as usize..], "{cuts:?} at {at}");
         }
     }
-}
-
-/// Traditional PKWARE encryption of `plain` under `password`, with the 12-byte header ending in `check`.
-fn zipcrypto(password: &str, check: u8, plain: &[u8]) -> Vec<u8> {
-    let table: Vec<u32> = (0..256u32)
-        .map(|mut c| {
-            for _ in 0..8 {
-                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
-            }
-            c
-        })
-        .collect();
-    let crc = |c: u32, b: u8| table[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
-    let mut keys = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
-    let update = |keys: &mut [u32; 3], b: u8| {
-        keys[0] = crc(keys[0], b);
-        keys[1] = (keys[1].wrapping_add(keys[0] & 0xff)).wrapping_mul(134_775_813).wrapping_add(1);
-        keys[2] = crc(keys[2], (keys[1] >> 24) as u8);
-    };
-    for &b in password.as_bytes() {
-        update(&mut keys, b);
-    }
-    let mut header: Vec<u8> = (0..11).map(|i| i * 7 + 3).collect();
-    header.push(check);
-    header
-        .iter()
-        .chain(plain)
-        .map(|&p| {
-            let t = (keys[2] | 2) as u16;
-            let c = p ^ ((t.wrapping_mul(t ^ 1)) >> 8) as u8;
-            update(&mut keys, p);
-            c
-        })
-        .collect()
 }
 
 #[test]

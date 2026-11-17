@@ -25,6 +25,7 @@ The format comes from the file's content, never its name:
 | content | runner |
 |---|---|
 | ZIP (also with a self-extracting stub) | the checked ZIP reader ([checked ZIP reads](zip-checked-reads.md)) |
+| ZIP split into `name.zip.001`, ... or an Info-ZIP `name.z01`, ..., `name.zip` set | the ZIP runner, over the volumes concatenated |
 | tar, plain or gzip/xz/zstd/bzip2-compressed | the tar runner, also callable as `tar::run_with_policy` |
 | a lone `.gz`, `.xz`, `.zst` or `.bz2` that holds no tar | the tar runner, as one member (ordinal 0) |
 | RAR 5.0 and RAR 4.x, single or multi-volume | the RAR runner |

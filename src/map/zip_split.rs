@@ -1068,7 +1068,7 @@ enum Advanced {
 
 /// The offset in `tail` (the last bytes of a volume) of an end record whose comment ends exactly at the end, the
 /// latest one when several qualify.
-fn find_end(tail: &[u8]) -> Option<usize> {
+pub(crate) fn find_end(tail: &[u8]) -> Option<usize> {
     (0..=tail.len().checked_sub(END_LEN)?).rev().find(|&at| {
         tail[at..].starts_with(b"PK\x05\x06") && usize::from(le16(tail, at + 20)) == tail.len() - at - END_LEN
     })
