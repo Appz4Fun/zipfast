@@ -478,3 +478,42 @@ fn a_progressive_session_places_every_kind_and_stops_at_an_escape() {
     }
     assert_eq!(fs::metadata(&outside).unwrap().nlink(), 1);
 }
+
+/// A folder the run made or checked is never trusted past a rename that moved it aside under another spelling of
+/// its name: `A/B` (or `e` with a combining accent) is `a/b` (or `é`) on APFS, so the link `A/B -> .` takes the
+/// folder's place and `a/b/l -> ../../outside` would then sit one folder higher than its name says.
+#[test]
+fn a_moved_folder_is_never_trusted_under_another_spelling() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (nfd, upper, lower) in [(false, "A", "a"), (true, "e\u{301}", "\u{e9}")] {
+        if !common::folds_names(tmp.path(), nfd) {
+            eprintln!("skipped: this file system keeps {upper:?} and {lower:?} apart");
+            continue;
+        }
+        // the folder `lower/b` under its other spelling
+        let alias = if nfd { format!("{upper}/b") } else { format!("{upper}/B") };
+        let (dir_ab, file, escape) = (format!("{lower}/b"), format!("{lower}/b/x"), format!("{lower}/b/l"));
+        for threads in [1, 4] {
+            let case = tmp.path().join(format!("{nfd}-{threads}"));
+            fs::create_dir_all(case.join("outside")).unwrap();
+            let arc = write(
+                &case,
+                &[
+                    self::dir(lower),
+                    self::dir(&dir_ab),
+                    FileSpec::new(&file, b"x"),
+                    link(&alias, 1, "."),
+                    link(&escape, 1, "../../outside"),
+                ],
+            );
+            let dest = case.join("out");
+            let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore), threads);
+            let _ = extract::run(&arc, &opts, |_| {});
+            assert_eq!(
+                common::links_leading_out(&dest),
+                Vec::<std::path::PathBuf>::new(),
+                "nfd={nfd} threads={threads}"
+            );
+        }
+    }
+}

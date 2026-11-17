@@ -589,7 +589,7 @@ fn place_target(
         }
     }
     if let Some(mode) = rename {
-        return place_renamed(opts, target, rel, mode, dirs, log);
+        return place_renamed(opts, target, mode, dirs, log);
     }
     let metadata = |e| RarFault::output(IoOperation::Metadata, Some(target.clone()), None, e, false);
     Ok(match fs::symlink_metadata(&target) {
@@ -616,15 +616,14 @@ fn place_target(
 /// moves what is there, a file or a folder with its contents, to the first free renamed name with a no-replace rename
 /// and then creates the requested name with `O_EXCL` (7-Zip's `-aot`); it refuses a protected input, and a folder that
 /// holds one (the archive, say), since that would move it. A candidate that is a protected path is passed over.
-/// Nothing is ever replaced, and the file this returns is new and empty. A folder moved aside is forgotten by `dirs`,
-/// so a later member under its old name makes the folder again.
+/// Nothing is ever replaced, and the file this returns is new and empty. A folder moved aside makes `dirs` forget
+/// every folder (another spelling of a name may be the same folder), so each is looked at again.
 ///
 /// Running out of names (or of the run's rename attempts) and a file system that can't move without replacing are
 /// this member's failure ([`DetailedChecked::Blocked`]), not the run's.
 fn place_renamed(
     opts: &Options,
     target: PathBuf,
-    rel: &Path,
     mode: RenameMode,
     dirs: Option<&mut Dirs>,
     log: &mut RenameLog<'_>,
@@ -674,7 +673,7 @@ fn place_renamed(
             if meta.is_dir()
                 && let Some(dirs) = dirs
             {
-                dirs.forget(rel);
+                dirs.forget();
             }
             (log.record)(RenamedOutput {
                 requested: target.clone(),
@@ -3376,6 +3375,8 @@ impl Run<'_, '_, '_> {
                 }
             };
             let path = place.path.clone();
+            // the folders known so far are looked at again past a link
+            self.dirs.forget();
             if let Err(e) = link::publish(&self.opts.dest, rel, place, &kind, &mut self.landing.extracted) {
                 if let Some(why) = link::member_failure(&e) {
                     let failure = if e.kind() == io::ErrorKind::Unsupported {
@@ -3626,6 +3627,7 @@ impl Run<'_, '_, '_> {
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.place = place;
         if link && let Some(place) = p.place.take() {
+            self.dirs.forget();
             p.link = Some(LinkOut { place, rel, target: Vec::new() });
         }
         self.begin_decoding(vol, h, p)
@@ -4380,9 +4382,12 @@ pub fn archive_time(seconds: i64, nanos: u32) -> Option<SystemTime> {
 }
 
 impl Dirs {
-    /// Forgets the folder `rel` and everything under it, which a rename mode has moved away.
-    fn forget(&mut self, rel: &Path) {
-        self.known.retain(|path, _| !path.starts_with(rel));
+    /// Forgets every folder, after a rename mode moved one away (or a link was placed). Not only those under the
+    /// name moved: on a case-insensitive or normalizing file system (APFS, NTFS) `A/B` and `a/b`, or `é` and
+    /// `e` with a combining accent, can be one folder, so a name comparison can't tell which entries went with it.
+    /// Each folder is looked at again before it is trusted.
+    pub(crate) fn forget(&mut self) {
+        self.known.clear();
     }
 
     /// Records the path `rel` as used by this run. True when nothing this run wrote can be at `rel` under any

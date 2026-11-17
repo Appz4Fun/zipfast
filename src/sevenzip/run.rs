@@ -346,6 +346,8 @@ impl Run<'_> {
                 return Ok(false);
             }
             drop(temporary);
+            // the folders known so far are looked at again past a link
+            self.dirs.forget();
             if let Err(e) = crate::extract::link::publish(&self.opts.dest, &rel, place, &kind, &mut self.extracted) {
                 if let Some(why) = crate::extract::link::member_failure(&e) {
                     self.fail_at(ordinal, &name, why);

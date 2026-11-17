@@ -219,3 +219,38 @@ pub fn blake(data: &[u8]) -> [u8; 32] {
     h.update(data);
     h.finish()
 }
+
+/// Whether the file system holding `dir` takes `a` and `A`, or a precomposed `é` and `e` with a combining accent
+/// (`nfd`), as one name: APFS and NTFS by default. Tests of folder caching under such names skip elsewhere.
+pub fn folds_names(dir: &std::path::Path, nfd: bool) -> bool {
+    let (made, other) = if nfd { ("\u{e9}-probe", "e\u{301}-probe") } else { ("case-probe", "CASE-PROBE") };
+    let made = dir.join(made);
+    std::fs::write(&made, b"").unwrap();
+    let folds = std::fs::symlink_metadata(dir.join(other)).is_ok();
+    std::fs::remove_file(made).unwrap();
+    folds
+}
+
+/// Every symbolic link under `dest` that resolves outside it.
+pub fn links_leading_out(dest: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let root = std::fs::canonicalize(dest).unwrap();
+    let mut out = Vec::new();
+    let mut stack = vec![dest.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_symlink() {
+                if let Ok(resolved) = std::fs::canonicalize(&path)
+                    && !resolved.starts_with(&root)
+                {
+                    out.push(path);
+                }
+            } else if kind.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    out
+}

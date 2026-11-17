@@ -19,6 +19,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use zipfast::crc32::hash;
@@ -634,4 +636,38 @@ fn a_stored_mark_is_refused_and_never_merges_with_a_replacement_character() {
     .unwrap();
     assert!(failures.len() == 1 && failures[0].contains("NameEncoding"), "{failures:?}");
     assert_eq!(files_under(&out), [("a\u{fffd}".to_owned(), b"replacement".to_vec())]);
+}
+
+/// A folder the run made is never trusted past a rename that moved it aside under another spelling of its name: on
+/// APFS `A/B` (or `e` with a combining accent) is `a/b` (or `é`), so the link `A/B -> .` takes the folder's place and
+/// `a/b/l -> ../../outside` would sit one folder higher than its name says.
+#[test]
+fn a_moved_folder_is_never_trusted_under_another_spelling() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (nfd, upper, lower) in [(false, "A", "a"), (true, "e\u{301}", "\u{e9}")] {
+        if !common::folds_names(tmp.path(), nfd) {
+            eprintln!("skipped: this file system keeps {upper:?} and {lower:?} apart");
+            continue;
+        }
+        let alias = if nfd { format!("{upper}/b") } else { format!("{upper}/B") };
+        let case = tmp.path().join(format!("{nfd}"));
+        fs::create_dir_all(case.join("outside")).unwrap();
+        let path = case.join("a.rar");
+        let blocks = [
+            header(0x74, 3, format!("{lower}/b/x").as_bytes(), b"x", 0o100644, &[]),
+            link_member(alias.as_bytes(), b"."),
+            link_member(format!("{lower}/b/l").as_bytes(), b"../../outside"),
+        ];
+        fs::write(&path, archive(&blocks)).unwrap();
+        for threads in [1, 4] {
+            let dest = case.join(format!("out{threads}"));
+            let opts = Options {
+                overwrite: Overwrite::RenameExisting(zipfast::extract::RenameStyle::Underscore),
+                threads: Some(threads),
+                ..options(&dest)
+            };
+            let _ = extract::run(&path, &opts, |_| {});
+            assert_eq!(common::links_leading_out(&dest), Vec::<PathBuf>::new(), "nfd={nfd} threads={threads}");
+        }
+    }
 }
