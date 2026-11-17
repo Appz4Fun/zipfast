@@ -159,6 +159,10 @@ impl<R: BufRead> ZReader<R> {
                 self.max_code = if self.n_bits == self.max_bits { 1 << self.max_bits } else { (1 << self.n_bits) - 1 };
             }
             let Some(code) = self.code()? else { return Ok(()) };
+            // the width can pass the table's (9-bit files grow to 10), but no code may
+            if u32::from(code) >= 1 << self.max_bits {
+                return Err(bad("a compress (.Z) file is corrupt"));
+            }
             let Some(old) = self.old else {
                 if code >= 256 {
                     return Err(bad("a compress (.Z) file starts with an invalid code"));
@@ -178,7 +182,8 @@ impl<R: BufRead> ZReader<R> {
             let mut c = u32::from(code);
             let start = self.out.len();
             if c >= self.free {
-                if c > self.free {
+                // the one code not in the table yet is the next one, and only while there is room for it
+                if c > self.free || self.free >= 1 << self.max_bits {
                     return Err(bad("a compress (.Z) file is corrupt"));
                 }
                 self.out.push(self.fin);
@@ -229,6 +234,147 @@ impl<R: BufRead> Read for ZReader<R> {
             }
             if self.out.is_empty() {
                 return Ok(0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(bytes: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        ZReader::new(bytes).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Codes packed least significant bit first, at the given widths, without compress's group padding.
+    fn pack(codes: &[(u32, u32)]) -> Vec<u8> {
+        let (mut out, mut acc, mut bits) = (Vec::new(), 0u64, 0u32);
+        for &(code, width) in codes {
+            acc |= u64::from(code) << bits;
+            bits += width;
+            while bits >= 8 {
+                out.push(acc as u8);
+                acc >>= 8;
+                bits -= 8;
+            }
+        }
+        if bits > 0 {
+            out.push(acc as u8);
+        }
+        out
+    }
+
+    /// A 9-bit file whose table fills: the width grows to 10, and code 512 (past the table) is refused, not
+    /// taken as the next code to come.
+    #[test]
+    fn a_code_past_a_full_nine_bit_table_is_refused() {
+        for flags in [0x09u8, 0x89] {
+            let first = if flags & 0x80 != 0 { 257 } else { 256 };
+            // literals fill the table to 512, in 9 bits, then compress's group padding before 10-bit codes
+            let literals = 512 - first + 1;
+            let mut codes: Vec<(u32, u32)> = (0..literals).map(|i| ((i % 256) as u32, 9)).collect();
+            while !codes.len().is_multiple_of(8) {
+                codes.push((0, 9));
+            }
+            codes.extend([(512, 10), (512, 10), (512, 10)]);
+            let mut bytes = vec![0x1f, 0x9d, flags];
+            bytes.extend(pack(&codes));
+            let error = decode(&bytes).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{flags:#x}");
+        }
+    }
+
+    /// Literal codes that fill the table at `max_bits`, growing the width (with compress's group padding) as the
+    /// decoder will, then `tail` random codes at the last width: the edge where a full table meets bad codes.
+    fn filled(max_bits: u32, block: bool, tail: &mut dyn FnMut() -> u64, n: usize) -> Vec<u8> {
+        let (mut codes, mut since_align) = (Vec::new(), 0usize);
+        let (mut width, mut free, mut max_code) = (9u32, if block { 257u32 } else { 256 }, 511u32);
+        let emit = |code: u32, width: u32, codes: &mut Vec<(u32, u32)>, since: &mut usize| {
+            codes.push((code, width));
+            *since += 1;
+        };
+        let mut first = true;
+        while free < 1 << max_bits {
+            if free > max_code {
+                while !since_align.is_multiple_of(8) {
+                    emit(0, width, &mut codes, &mut since_align);
+                }
+                width += 1;
+                max_code = if width == max_bits { 1 << max_bits } else { (1 << width) - 1 };
+            }
+            emit(u32::from(tail() as u8), width, &mut codes, &mut since_align);
+            if !first {
+                free += 1;
+            }
+            first = false;
+        }
+        if free > max_code {
+            while !since_align.is_multiple_of(8) {
+                emit(0, width, &mut codes, &mut since_align);
+            }
+            width += 1;
+        }
+        // codes at the table's edge (the last entry, one past it) as often as random ones
+        for _ in 0..n {
+            let r = tail();
+            let code = match r % 4 {
+                0 => 1 << max_bits,
+                1 => (1 << max_bits) - 1,
+                _ => (r >> 8) as u32,
+            };
+            codes.push((code & ((1 << width) - 1), width));
+        }
+        let mut bytes = vec![0x1f, 0x9d, max_bits as u8 | if block { 0x80 } else { 0 }];
+        bytes.extend(pack(&codes));
+        bytes
+    }
+
+    /// Full tables at every width up to 12 bits, then random codes: errors or data, never a panic.
+    #[test]
+    fn random_codes_after_a_full_table_never_panic() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for bits in 9..=12u32 {
+            for block in [false, true] {
+                for _ in 0..50 {
+                    let bytes = filled(bits, block, &mut next, 64);
+                    let _ = decode(&bytes);
+                }
+            }
+        }
+    }
+
+    /// Random codes after every header compress writes: errors, never a panic.
+    #[test]
+    fn random_codes_at_every_width_never_panic() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for bits in 9..=16u8 {
+            for flags in [bits, bits | 0x80] {
+                for round in 0..200 {
+                    let len = (next() % 4096) as usize;
+                    let mut bytes = vec![0x1f, 0x9d, flags];
+                    // mostly small codes, so the table fills and the width grows before the stream goes wrong
+                    let small = round % 2 == 0;
+                    bytes.extend((0..len).map(|_| {
+                        let v = next() as u8;
+                        if small { v & 0x7f } else { v }
+                    }));
+                    let _ = decode(&bytes);
+                }
             }
         }
     }

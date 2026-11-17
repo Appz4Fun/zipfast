@@ -98,7 +98,7 @@ impl Codec {
             Codec::Bzip2 => Box::new(bzip2::bufread::MultiBzDecoder::new(r)),
             Codec::Lz4 => Box::new(lz4::Lz4Reader::new(r)),
             Codec::Compress => Box::new(lzw::ZReader::new(r)),
-            Codec::Lzma => Box::new(lzma_alone_decoder(r)?),
+            Codec::Lzma => Box::new(LzmaAlone(lzma_alone_decoder(r)?)),
         })
     }
 }
@@ -133,6 +133,20 @@ fn lzma_alone(head: &[u8]) -> bool {
         dict >= 4096 && (dict == low || dict == low * 3)
     };
     dict_ok && (size == u64::MAX || size < 1 << 48)
+}
+
+/// An LZMA-alone stream, which holds one stream and nothing after it: data past its end is refused, where xz would
+/// otherwise have to guess whether it was meant.
+struct LzmaAlone<R: BufRead>(liblzma::bufread::XzDecoder<R>);
+
+impl<R: BufRead> Read for LzmaAlone<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        if n == 0 && !buf.is_empty() && !self.0.get_mut().fill_buf()?.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "data follows the end of the LZMA stream"));
+        }
+        Ok(n)
+    }
 }
 
 fn lzma_alone_decoder<R: BufRead>(r: R) -> io::Result<liblzma::bufread::XzDecoder<R>> {

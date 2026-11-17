@@ -221,6 +221,24 @@ fn damaged_compress_streams_fail() {
     fails(&[0x1f, 0x9d, 0x90, 0x2c, 0x01], "an invalid first code");
     // 'a', then code 300 when the next free code is 257
     fails(&[0x1f, 0x9d, 0x90, 0x61, 0x58, 0x02], "a code past the table");
+    // the reviewer's case: 9-bit codes at most, 264 literals fill the table and the width grows to 10, then
+    // code 512, past the table, three times
+    let mut codes: Vec<(u32, u32)> = (0..264).map(|i| (i % 256, 9)).collect();
+    codes.extend([(512, 10), (512, 10), (512, 10)]);
+    let (mut packed, mut acc, mut bits) = (vec![0x1f, 0x9d, 0x09], 0u64, 0u32);
+    for (code, width) in codes {
+        acc |= u64::from(code) << bits;
+        bits += width;
+        while bits >= 8 {
+            packed.push(acc as u8);
+            acc >>= 8;
+            bits -= 8;
+        }
+    }
+    packed.push(acc as u8);
+    fails(&packed, "a code past a full 9-bit table");
+    packed[2] = 0x89;
+    fails(&packed, "the same in block mode");
 }
 
 #[test]
@@ -231,6 +249,10 @@ fn an_lzma_dictionary_past_the_memory_limit_is_refused() {
     b.extend_from_slice(&u64::MAX.to_le_bytes());
     b.extend_from_slice(&[0u8; 64]);
     fails(&b, "a 1.5 GiB dictionary");
+    // a stream with data after its end
+    let mut trailing = fs::read(fixtures().join("data.bin.lzma")).unwrap();
+    trailing.extend_from_slice(b"trailing junk");
+    fails(&trailing, "data after the LZMA stream");
     // and a stream whose data is damaged
     let mut lzma = fs::read(fixtures().join("data.bin.lzma")).unwrap();
     let mid = lzma.len() / 2;
