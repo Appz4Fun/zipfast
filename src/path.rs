@@ -48,7 +48,27 @@ pub(crate) fn rar_output_name(name: &str, rar4: bool) -> Option<std::borrow::Cow
 /// `windows_names`: the archive was made on Windows, so a backslash is a separator there and a drive letter or
 /// a reserved character means nothing on this side.
 pub fn sanitize(name: &str, windows_names: bool) -> Result<PathBuf> {
-    sanitize_fallible(name, windows_names).map_err(|_| Error::UnsafePath(name.to_string()))
+    sanitize_with(name, windows_names, false)
+}
+
+/// [`sanitize`], also mapping the characters Windows refuses in a name to `_` when `windows_safe` is set, whatever
+/// system made the archive (`Options::windows_safe_names`).
+pub(crate) fn sanitize_with(name: &str, windows_names: bool, windows_safe: bool) -> Result<PathBuf> {
+    sanitize_fallible_with(name, windows_names, windows_safe).map_err(|_| Error::UnsafePath(name.to_string()))
+}
+
+/// Whether Windows refuses `c` in a file name.
+fn windows_reserved(c: char) -> bool {
+    matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+}
+
+/// `name` with the characters Windows refuses in a file name mapped to `_`, separators and all else kept.
+pub(crate) fn windows_safe_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.contains(windows_reserved) {
+        name.chars().map(|c| if windows_reserved(c) { '_' } else { c }).collect::<String>().into()
+    } else {
+        name.into()
+    }
 }
 
 pub(crate) enum ProjectionError {
@@ -59,6 +79,14 @@ pub(crate) enum ProjectionError {
 // A single component traversal serves both the legacy and bounded RAR paths.
 // A normalized UTF-8 name never grows: replacement characters are all ASCII.
 pub(crate) fn sanitize_fallible(name: &str, windows_names: bool) -> std::result::Result<PathBuf, ProjectionError> {
+    sanitize_fallible_with(name, windows_names, false)
+}
+
+fn sanitize_fallible_with(
+    name: &str,
+    windows_names: bool,
+    windows_safe: bool,
+) -> std::result::Result<PathBuf, ProjectionError> {
     let mut out = String::new();
     out.try_reserve_exact(name.len()).map_err(ProjectionError::Allocation)?;
     for (i, part) in name.split(|c| c == '/' || (windows_names && c == '\\')).enumerate() {
@@ -75,11 +103,7 @@ pub(crate) fn sanitize_fallible(name: &str, windows_names: bool) -> std::result:
             out.push('/');
         }
         for c in part.chars() {
-            out.push(if (cfg!(windows) || windows_names) && matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
-                '_'
-            } else {
-                c
-            });
+            out.push(if (cfg!(windows) || windows_names || windows_safe) && windows_reserved(c) { '_' } else { c });
         }
     }
     let path = PathBuf::from(out);
@@ -152,5 +176,21 @@ mod tests {
         assert!(link_stays_inside(Path::new("a/b"), "../c"));
         assert!(!link_stays_inside(Path::new("a"), "../../c"));
         assert!(!link_stays_inside(Path::new(""), "/etc"));
+    }
+}
+
+#[cfg(test)]
+mod windows_safe_tests {
+    use super::*;
+
+    #[test]
+    fn windows_safe_maps_reserved_characters_on_any_host() {
+        let name = "dir/a<b>c:d\"e|f?g*h.txt";
+        assert_eq!(sanitize_with(name, false, true).unwrap(), PathBuf::from("dir/a_b_c_d_e_f_g_h.txt"));
+        if !cfg!(windows) {
+            assert_eq!(sanitize_with(name, false, false).unwrap(), PathBuf::from(name));
+        }
+        assert_eq!(windows_safe_name(name), "dir/a_b_c_d_e_f_g_h.txt");
+        assert!(matches!(windows_safe_name("plain/name"), std::borrow::Cow::Borrowed(_)));
     }
 }

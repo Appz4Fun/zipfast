@@ -1711,6 +1711,7 @@ mod tests {
                 protected_paths: Default::default(),
                 parallel_min: None,
                 select: None,
+                windows_safe_names: false,
             },
             "a.rar".into(),
         );
@@ -1830,6 +1831,7 @@ mod tests {
                     protected_paths: Default::default(),
                     parallel_min: None,
                     select: None,
+                    windows_safe_names: false,
                 },
                 "a.rar".into(),
             );

@@ -236,7 +236,7 @@ impl Run<'_> {
 
     /// Where a member is to go, or None when it is not written (already reported). Folders above it are made.
     fn place(&mut self, member: &MapMember, name: &str) -> Outcome<Option<(PathBuf, Option<Place>)>> {
-        let rel = match crate::path::sanitize(&name.replace('\\', "/"), false) {
+        let rel = match crate::path::sanitize_with(&name.replace('\\', "/"), false, self.opts.windows_safe_names) {
             Ok(rel) => rel,
             Err(e) => {
                 self.fail(name, &e.to_string());

@@ -1178,6 +1178,7 @@ fn direct_setup_output(
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     };
     (file, session, options, context)
 }

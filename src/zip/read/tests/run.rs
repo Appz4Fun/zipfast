@@ -34,6 +34,7 @@ pub(super) fn setup(
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     };
     let context = EncryptedReadContext::for_projected(
         &mut s,

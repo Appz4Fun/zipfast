@@ -272,6 +272,30 @@ impl ProjectedReadSession {
                             break;
                         }
                         if let Err(error) = self.directory(ordinal, options, cancel, context, false) {
+                            // A regular file on a folder's path fails that folder member alone, as with 7-Zip.
+                            #[cfg(any(target_os = "macos", target_os = "linux"))]
+                            if output::parent::nondirectory_parent(&error) && !context.ledger.with_state(|s| s.poisoned)
+                            {
+                                add(&mut report.failed)?;
+                                let error = error.with_member_local(true);
+                                let evidence = self.member_event(
+                                    ordinal,
+                                    false,
+                                    0,
+                                    Some(&error),
+                                    options,
+                                    cancel,
+                                    context,
+                                    diagnostics,
+                                    observe,
+                                )?;
+                                observer_failed = evidence.observer_failed();
+                                if evidence.failed() {
+                                    terminal = Some(evidence.merge(error));
+                                    break;
+                                }
+                                continue;
+                            }
                             terminal = Some(error);
                             break;
                         }

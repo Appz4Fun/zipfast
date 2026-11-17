@@ -494,10 +494,14 @@ impl SelectedRun {
         };
         let mut pending = Pending::new(header, context);
         if header.encrypted {
-            let Some(password) = Some(session.password.as_str()).filter(|pw| !pw.is_empty()) else {
+            let salt = header.rar4.and_then(|raw| raw.salt);
+            // RAR 3.x has no check value, so an empty password is still tried; RAR5 needs a real one.
+            let given = if salt.is_some() { session.password_given } else { !session.password.is_empty() };
+            if !given {
                 return Err(RarFailure::PasswordRequired { scope: pending.context().scope() });
-            };
-            if let Some(salt) = header.rar4.and_then(|raw| raw.salt) {
+            }
+            let password = session.password.as_str();
+            if let Some(salt) = salt {
                 let keys = self
                     .rar4_keys
                     .keys(password, &salt, Some(&session.options.cancel))

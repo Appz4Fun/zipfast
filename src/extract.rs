@@ -148,6 +148,13 @@ pub struct Options {
     /// `RarFailure::Unsupported(RarUnsupported::MemberFilter)`, progressive and persistent-partial sessions with
     /// `FailureKind::InvalidCapability`, and `ZipReadStage::prepare_file` with `ReadFault::InvalidPlan`.
     pub select: Option<MemberFilter>,
+    /// Map the characters Windows refuses in a file name (`<>:"|?*`) to `_` in every member name, whatever system
+    /// made the archive, so output can land on NTFS, exFAT or an SMB share. Names written on Windows always get this.
+    ///
+    /// The whole-archive runners for 7z ([`crate::sevenzip::run`], and [`crate::sevenzip::list_with_options`] for
+    /// the names it lists), tar, legacy ZIP ([`crate::zip::run`]) and RAR ([`run`], [`run_with_password`],
+    /// [`run_rar_with_outcomes`]) honour it.
+    pub windows_safe_names: bool,
 }
 
 /// One member as a [`MemberFilter`] sees it.
@@ -208,6 +215,7 @@ impl MemberRef<'_> {
 ///     protected_paths: Default::default(),
 ///     parallel_min: None,
 ///     select: Some(MemberFilter::new(|m| m.is_dir || m.name.ends_with(".txt"))),
+///     windows_safe_names: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -446,6 +454,7 @@ fn blocked_message(reason: &RarPolicyReason) -> &'static str {
         RarPolicyReason::RenameExhausted => "no free name to rename to",
         RarPolicyReason::RenameUnsupported => "the file system can't rename without replacing",
         RarPolicyReason::LinkTarget => "the link's target is absolute or leads out of the destination",
+        RarPolicyReason::ParentIsFile => "a file is in the way",
         _ => unreachable!("unexpected target policy"),
     }
 }
@@ -552,16 +561,30 @@ fn place_target(
 ) -> crate::error::RarResult<DetailedChecked> {
     let target = opts.dest.join(rel);
     let rename = opts.overwrite.rename();
+    // A file where a folder above the target should be fails only this member (and the others below it), as with
+    // 7-Zip; a symlinked folder still stops the run.
+    let parent_is_file =
+        |fault: &RarFault| matches!(*fault.failure, RarFailure::Policy { reason: RarPolicyReason::ParentIsFile, .. });
     if let Some(parent) = rel.parent() {
         match dirs.as_deref_mut() {
             Some(dirs) => {
-                make_dirs_known_detailed(&opts.dest, parent, dirs)?;
+                match make_dirs_known_detailed(&opts.dest, parent, dirs) {
+                    Err(fault) if parent_is_file(&fault) => {
+                        return Ok(DetailedChecked::Blocked(RarPolicyReason::ParentIsFile));
+                    }
+                    result => result?,
+                }
                 let first = dirs.note(rel);
                 if rename.is_none() && first && dirs.known.get(parent) == Some(&true) {
                     return Ok(DetailedChecked::Write(Place::new(target, false)));
                 }
             }
-            None => make_dirs_detailed(&opts.dest, parent)?,
+            None => match make_dirs_detailed(&opts.dest, parent) {
+                Err(fault) if parent_is_file(&fault) => {
+                    return Ok(DetailedChecked::Blocked(RarPolicyReason::ParentIsFile));
+                }
+                result => result?,
+            },
         }
     }
     if let Some(mode) = rename {
@@ -2714,6 +2737,9 @@ fn history_failure(cause: Option<&HistoryFailure>) -> RarFailure {
 struct Run<'a, 'r, 'c> {
     opts: &'a Options,
     password: Option<&'a str>,
+    /// The password as given, empty included: an empty password is still an attempt for RAR 3.x encryption, which
+    /// has no check value, so the member decrypts to garbage and fails its checksum, as UnRAR `-p-` reports.
+    rar4_password: Option<&'a str>,
     reports: &'r mut Reports<'c>,
     order: u64,
     /// the rename attempts this run has left
@@ -2913,6 +2939,7 @@ fn rar_read_at(
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -2979,6 +3006,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
         Self {
             opts,
             password: password.filter(|s| !s.is_empty()),
+            rar4_password: password,
             reports,
             order: 0,
             rename_budget: RenameBudget::default(),
@@ -3286,7 +3314,11 @@ impl Run<'_, '_, '_> {
         let rel = if self.selection.is_some() {
             PathBuf::new()
         } else {
-            match sanitize(output.as_deref().unwrap_or(&ctx.entry.name), !h.is_unix()) {
+            match crate::path::sanitize_with(
+                output.as_deref().unwrap_or(&ctx.entry.name),
+                !h.is_unix(),
+                self.opts.windows_safe_names,
+            ) {
                 Ok(rel) => rel,
                 Err(e) => {
                     let failure = RarFailure::Policy {
@@ -3322,7 +3354,12 @@ impl Run<'_, '_, '_> {
             Some((RarFailure::Unsupported(reason), "unsupported RAR4 payload feature"))
         } else if let Some(Err(e)) = crypt {
             Some((RarFailure::crypt(e, ctx.scope()), "encrypted (password required)"))
-        } else if h.encrypted && (self.password.is_none() || (h.format == RarFormat::Rar5 && h.crypt.is_none())) {
+        } else if h.encrypted
+            && match h.format {
+                RarFormat::Rar4 => self.rar4_password.is_none(),
+                RarFormat::Rar5 => self.password.is_none() || h.crypt.is_none(),
+            }
+        {
             Some((RarFailure::PasswordRequired { scope: ctx.scope() }, "encrypted (password required)"))
         } else if h.method != 0 && h.algorithm != 0 {
             let reason = RarUnsupported::CompressionAlgorithm { algorithm: h.algorithm, method: h.method };
@@ -3439,7 +3476,7 @@ impl Run<'_, '_, '_> {
         h: &FileHeader,
     ) -> Option<crate::error::RarResult<PendingCipher>> {
         let salt = h.rar4.and_then(|raw| raw.salt).filter(|_| h.encrypted)?;
-        let password = self.password?;
+        let password = self.rar4_password?;
         let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
         Some(match self.rar4_keys.keys(password, &salt, cancel.as_ref()) {
             Ok((key, iv)) => {

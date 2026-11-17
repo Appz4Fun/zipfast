@@ -581,6 +581,7 @@ impl RangeSource for GrowingFileSource {
 ///     protected_paths: Default::default(),
 ///     parallel_min: None,
 ///     select: None,
+///     windows_safe_names: false,
 /// };
 /// let options = ProgressiveOptions::new(extract, volumes.first_name().to_owned());
 /// let mut session = ProgressiveSession::new(Box::new(volumes), options)?;

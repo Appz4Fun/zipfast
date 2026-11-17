@@ -1012,10 +1012,8 @@ pub(crate) fn next_volume_name(last: &OsStr) -> OsString {
         let start = text.len() - digits;
         if (1..=18).contains(&digits) && text[..start].ends_with('.') {
             let n: u64 = text[start..].parse().unwrap_or(0);
-            let next = format!("{}{:0width$}", &text[..start], n + 1, width = digits);
-            if next.len() == text.len() {
-                return next.into();
-            }
+            // 7-Zip keeps counting past the zero-padded width: `x.7z.999` is followed by `x.7z.1000`.
+            return format!("{}{:0width$}", &text[..start], n + 1, width = digits).into();
         }
     }
     let mut name = last.to_os_string();
@@ -1366,5 +1364,20 @@ mod damage_tests {
             assert_eq!(HeaderDamage::of(&error), None, "{error:?}");
         }
         assert_eq!(HeaderDamage::of(&malformed(FailureKind::Malformed("why"))), Some(HeaderDamage::Malformed("why")));
+    }
+}
+
+#[cfg(test)]
+mod next_volume_name_tests {
+    use super::next_volume_name;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn numbered_volumes_grow_past_their_padding() {
+        assert_eq!(next_volume_name(OsStr::new("x.7z.001")), "x.7z.002");
+        assert_eq!(next_volume_name(OsStr::new("x.7z.099")), "x.7z.100");
+        assert_eq!(next_volume_name(OsStr::new("x.7z.999")), "x.7z.1000");
+        assert_eq!(next_volume_name(OsStr::new("x.7z.1000")), "x.7z.1001");
+        assert_eq!(next_volume_name(OsStr::new("x.7z.9999")), "x.7z.10000");
     }
 }

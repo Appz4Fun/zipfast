@@ -65,6 +65,7 @@ fn opts(mode: Mode, dest: &Path) -> Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     }
 }
 
@@ -520,6 +521,26 @@ fn the_hand_built_archive_extracts() {
     let summary = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
     assert_eq!((summary.files, summary.errors.len()), (2, 0));
     assert_eq!(fs::read(out.join("b/c.txt")).unwrap(), b"two");
+}
+
+#[test]
+fn windows_safe_names_map_reserved_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = "d:ir/a<b>c\"d|e?f*.txt";
+    let archive = write(dir.path(), &Built::default().archive(&[vec![(name, b"one")]]));
+    let out = dir.path().join("out");
+    let options = Options { windows_safe_names: true, ..opts(Mode::Extract, &out) };
+    let summary = extract::run(&archive, &options, |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (1, 0), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("d_ir/a_b_c_d_e_f_.txt")).unwrap(), b"one");
+    let listed = sevenzip::list_with_options(&archive, None, &options).unwrap();
+    assert_eq!(listed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["d_ir/a_b_c_d_e_f_.txt"]);
+    assert_eq!(sevenzip::list(&archive, None).unwrap()[0].name, name);
+    if !cfg!(windows) {
+        let raw = dir.path().join("raw");
+        extract::run(&archive, &opts(Mode::Extract, &raw), |_| {}).unwrap();
+        assert_eq!(fs::read(raw.join(name)).unwrap(), b"one");
+    }
 }
 
 #[test]

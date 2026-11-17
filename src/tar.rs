@@ -1279,7 +1279,7 @@ fn run_tar(
         if !label {
             summary.matched += 1;
         }
-        let rel = match sanitize(&m.name, false) {
+        let rel = match crate::path::sanitize_with(&m.name, false, opts.windows_safe_names) {
             Ok(rel) => rel,
             Err(e) => {
                 fail_member(summary, report, position, &m.name, &e.to_string(), e);

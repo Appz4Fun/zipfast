@@ -65,6 +65,7 @@ fn opts_for(dir: &std::path::Path) -> zipfast::extract::Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     }
 }
 

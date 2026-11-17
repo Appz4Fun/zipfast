@@ -209,6 +209,7 @@ fn options(dest: &Path, overwrite: Overwrite) -> Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     }
 }
 
@@ -874,5 +875,43 @@ fn progressive_sessions_refuse_the_rename_modes_before_anything() {
         let refused = ProgressiveSession::from_sealed_memory(vec![("a.rar".into(), bytes.into_boxed_slice())], opts);
         assert!(matches!(refused.err().unwrap().kind, FailureKind::InvalidCapability));
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn a_file_where_a_folder_should_be_fails_only_the_members_below_it() {
+    // `sub` is written as a file, so `sub/g` and `sub/deeper/h` find a file where their folder should be. Like 7-Zip,
+    // each runner fails just those members and goes on: `noext` after them is still extracted.
+    for runner in RUNNERS {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.bin");
+        let members: [(&str, &[u8]); 4] = [("sub", b"file"), ("sub/g", b"g"), ("sub/deeper/h", b"h"), ("noext", b"n")];
+        fs::write(&archive, build(runner.family(), &members)).unwrap();
+        let dest = dir.path().join("out");
+        let report = run(runner, &archive, &options(&dest, Overwrite::Always));
+        let context = format!("{runner:?}: {report:?}");
+        assert_eq!(report.terminal, None, "{context}");
+        assert_eq!((report.files, report.failed), (2, 2), "{context}");
+        let want: BTreeMap<String, Vec<u8>> =
+            [("sub".to_string(), b"file".to_vec()), ("noext".to_string(), b"n".to_vec())].into();
+        assert_eq!(tree(&dest), want, "{context}");
+    }
+}
+
+#[test]
+fn a_file_on_a_folder_members_path_fails_only_that_folder() {
+    // The checked ZIP runner makes folder members itself: `sub/` over the file `sub` fails that member alone.
+    for runner in [Runner::Policy(Family::Zip), Runner::Context(Family::Zip)] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.zip");
+        fs::write(&archive, zip(&[("sub", b"file"), ("sub/", b""), ("sub/inner/", b""), ("noext", b"n")])).unwrap();
+        let dest = dir.path().join("out");
+        let report = run(runner, &archive, &options(&dest, Overwrite::Always));
+        let context = format!("{runner:?}: {report:?}");
+        assert_eq!(report.terminal, None, "{context}");
+        assert_eq!((report.files, report.failed), (2, 2), "{context}");
+        let want: BTreeMap<String, Vec<u8>> =
+            [("sub".to_string(), b"file".to_vec()), ("noext".to_string(), b"n".to_vec())].into();
+        assert_eq!(tree(&dest), want, "{context}");
     }
 }

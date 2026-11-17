@@ -999,9 +999,8 @@ impl MemberMachine {
                 let salt = super::LegacyCrypt::stored_salt(legacy).map_err(|reason| {
                     ProgressiveFailure::new(FailureKind::Rar(Box::new(RarFailure::Unsupported(reason))))
                 })?;
-                let password = password
-                    .filter(|p| !p.is_empty())
-                    .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+                // RAR 3.x has no check value, so an empty password is still an attempt.
+                let password = password.ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
                 let (key, iv) = controlled_legacy_keys(password, &salt, usage, control)?;
                 context.password = crate::error::RarPasswordEvidence::VerifierUnavailable(
                     crate::error::RarVerifierUnavailable::Absent,
@@ -1325,6 +1324,7 @@ mod tests {
                     protected_paths: Default::default(),
                     parallel_min: None,
                     select: None,
+                    windows_safe_names: false,
                 },
                 "a.rar".into(),
             );
@@ -1655,6 +1655,7 @@ mod tests {
                 protected_paths: Default::default(),
                 parallel_min: None,
                 select: None,
+                windows_safe_names: false,
             };
             let run = crate::extract::run_with_password(
                 &fixtures.join(format!("testfile5{set}.part01.rar")),

@@ -94,6 +94,7 @@ pub(crate) fn main() -> ExitCode {
                 protected_paths: Default::default(),
                 parallel_min: None,
                 select: None,
+                windows_safe_names: false,
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }

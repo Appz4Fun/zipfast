@@ -21,6 +21,20 @@ use std::ffi::CStr;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 
+/// Why an archive-relative folder above a target is refused when it is a regular file or another nondirectory that is
+/// not a symlink. Nothing has been written or followed, so the run fails only the member (and those below it).
+pub(in crate::zip::read) const NONDIRECTORY_PARENT: &str = "archive-relative parent is not a directory";
+
+/// Whether `error` is only [`NONDIRECTORY_PARENT`], with no cleanup or boundary evidence riding on it.
+pub(in crate::zip::read) fn nondirectory_parent(error: &ZipReadError) -> bool {
+    matches!(error.operation(), Some(ReadFault::CheckedFormat { reason }) if *reason == NONDIRECTORY_PARENT)
+        && error.cleanup_errors().len() == 0
+        && error.source_change().is_none()
+        && error.sink_fault().is_none()
+        && error.diagnostic_fault().is_none()
+        && error.diagnostic_boundary_fault().is_none()
+}
+
 pub(in crate::zip::read) struct HeldParent {
     pub(in crate::zip::read) file: File,
     pub(in crate::zip::read) identity: FileIdentity,
@@ -297,9 +311,13 @@ pub(in crate::zip::read) fn open_parent(
                     Err(error) => Err(error),
                 }
             })?;
-            if observed.as_ref().is_some_and(|s| s.st_mode & libc::S_IFMT != libc::S_IFDIR) {
+            if let Some(kind) = observed.as_ref().map(|s| s.st_mode & libc::S_IFMT).filter(|&k| k != libc::S_IFDIR) {
                 return Err(ReadFault::CheckedFormat {
-                    reason: "archive-relative parent is a symlink or nondirectory",
+                    reason: if kind == libc::S_IFLNK {
+                        "archive-relative parent is a symlink"
+                    } else {
+                        NONDIRECTORY_PARENT
+                    },
                 }
                 .into());
             }
@@ -362,7 +380,11 @@ pub(in crate::zip::read) fn open_parent(
     match result {
         Ok((path, parent_end, identity)) => Ok(HeldParent { file: file.take().unwrap(), path, parent_end, identity }),
         Err(error) => {
-            ledger.with_state(|s| s.poisoned = true);
+            // A regular file where a folder should be is refused before anything is followed or written: the run
+            // can go on past it.
+            if !nondirectory_parent(&error) {
+                ledger.with_state(|s| s.poisoned = true);
+            }
             let closed = match file.take() {
                 Some(file) => close(ledger, file, false, RunCategory::PathSteps, false),
                 None => {

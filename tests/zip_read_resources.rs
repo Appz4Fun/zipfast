@@ -293,6 +293,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             protected_paths: Default::default(),
                             parallel_min: None,
                             select: None,
+                            windows_safe_names: false,
                         },
                         Some("password"),
                         |_| {},

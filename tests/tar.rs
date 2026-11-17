@@ -168,6 +168,7 @@ fn opts(mode: Mode, dest: &Path) -> Options {
         protected_paths: Default::default(),
         parallel_min: None,
         select: None,
+        windows_safe_names: false,
     }
 }
 
@@ -560,7 +561,10 @@ fn compressed_tar_preserves_order_for_conflicting_file_paths() {
     let archive = dir.join("archive.tar.gz");
     fs::write(&archive, gzip(&tar)).unwrap();
     let out = dir.join("out");
-    assert!(extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).is_err());
+    // `a/b` finds the file `a` where its folder should be: only that member fails, as with 7-Zip.
+    let summary = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (1, 1), "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("a file is in the way"), "{:?}", summary.errors);
     assert_eq!(fs::read(out.join("a")).unwrap(), b"First");
     assert_eq!(fs::read_dir(out).unwrap().count(), 1);
 }

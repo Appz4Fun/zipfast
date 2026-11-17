@@ -33,7 +33,7 @@ use crate::extract::{
     Cancellation, Entry, Meta, Mode, MtimeOrigin, Options, RenameLog, RunError, Summary, Target, finish_dirs,
     finish_file, make_dirs, open_target,
 };
-use crate::path::sanitize;
+use crate::path::sanitize_with;
 use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
 
@@ -946,7 +946,7 @@ pub(crate) fn run_renaming(
                 continue;
             }
             summary.matched += 1;
-            let rel = match sanitize(&e.name, e.host != HOST_UNIX) {
+            let rel = match sanitize_with(&e.name, e.host != HOST_UNIX, opts.windows_safe_names) {
                 Ok(rel) => rel,
                 Err(err) => {
                     fail(&mut summary, &mut report, &e.name, &err.to_string());
