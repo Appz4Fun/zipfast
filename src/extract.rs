@@ -2737,8 +2737,8 @@ fn history_failure(cause: Option<&HistoryFailure>) -> RarFailure {
 struct Run<'a, 'r, 'c> {
     opts: &'a Options,
     password: Option<&'a str>,
-    /// The password as given, empty included: an empty password is still an attempt for RAR 3.x encryption, which
-    /// has no check value, so the member decrypts to garbage and fails its checksum, as UnRAR `-p-` reports.
+    /// The password as given, empty included. zipfast treats an empty password as an attempt on RAR 3.x members
+    /// because they carry no check value: the member decrypts to garbage and fails its checksum.
     rar4_password: Option<&'a str>,
     reports: &'r mut Reports<'c>,
     order: u64,

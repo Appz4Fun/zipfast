@@ -1241,9 +1241,9 @@ fn hosts_above_unix_and_old_revisions_list() {
     assert_eq!(old.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["one.txt;1", "two.txt"]);
 }
 
-/// An empty password is still an attempt on RAR 3.x members, which carry no check value: the member decrypts to garbage
-/// and fails its checksum, as UnRAR `-p-` reports ("Checksum error in the encrypted file"), rather than asking for a
-/// password. Giving no password at all still asks for one.
+/// zipfast treats an empty password as an attempt on RAR 3.x members because they carry no check value: the member
+/// decrypts to garbage and fails its checksum (`EncryptedIntegrity`) rather than asking for a password. Giving no
+/// password at all still asks for one. (UnRAR's `-p-` is not an empty password: it sets the literal password "-".)
 #[test]
 fn rar4_empty_password_is_an_attempt() {
     let archive = fixtures().join("rar4-rar300/per_file_rar300_password.rar");
