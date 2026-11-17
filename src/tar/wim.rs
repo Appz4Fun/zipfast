@@ -56,6 +56,8 @@ const MAX_DEPTH: usize = 1024;
 const MAX_PATH_BYTES: u64 = 512 << 20;
 /// The largest reparse point (symbolic link) data taken.
 const MAX_REPARSE: u64 = 64 << 10;
+/// Named stream records read across an image (each entry may claim 65,535, and entries may share them).
+const MAX_STREAM_RECORDS: u64 = 1 << 22;
 /// Images taken.
 const MAX_IMAGES: u32 = 1 << 16;
 
@@ -459,6 +461,13 @@ pub(super) struct State {
     seen: HashSet<u64>,
     /// path bytes still to hand out
     path_budget: u64,
+    /// named stream records still to be read
+    streams_left: u64,
+    /// symbolic link targets already read, by their reparse data's SHA-1 and tag, so shared reparse data is decoded
+    /// once
+    targets: HashMap<([u8; 20], u32), String>,
+    /// reparse data decoded, for tests
+    reparse_reads: usize,
     /// the path of each hard link group's first file
     groups: HashMap<u64, String>,
     /// blobs handed out once already, and the bytes of shared data that may still be written again
@@ -533,6 +542,9 @@ pub(super) fn open(file: File, len: u64, image: u32) -> Result<State> {
         stack: Vec::new(),
         seen: HashSet::new(),
         path_budget: MAX_PATH_BYTES,
+        streams_left: MAX_STREAM_RECORDS,
+        targets: HashMap::new(),
+        reparse_reads: 0,
         groups: HashMap::new(),
         used: HashSet::new(),
         shared_left: len.saturating_mul(8).saturating_add(64 << 20),
@@ -630,6 +642,12 @@ impl State {
         // the named streams follow the entry, each at an 8-byte boundary
         let mut pos = end.next_multiple_of(8);
         let mut unnamed = Vec::new();
+        // charged before they are walked: entries may point their streams at the same records
+        self.streams_left = self
+            .streams_left
+            .checked_sub(u64::from(streams))
+            .ok_or(corrupt("a WIM image has too many named streams"))?;
+        let meta = &self.meta;
         for _ in 0..streams {
             let p = usize::try_from(pos).map_err(|_| bad())?;
             if p.checked_add(38).is_none_or(|e| e > meta.len()) {
@@ -683,10 +701,14 @@ impl State {
     /// The target of a symbolic link or junction's reparse data (without its 8-byte header, as WIM keeps it), with
     /// `/` for `\`. An absolute target keeps its leading `\??\` (as `/??/`), so the pipeline refuses it.
     fn reparse_target(&mut self, tag: u32, sha1: [u8; 20]) -> Result<String> {
+        if let Some(target) = self.targets.get(&(sha1, tag)) {
+            return Ok(target.clone());
+        }
         let bad = || corrupt("a WIM symbolic link's reparse data is damaged");
         let Some(b) = self.blobs.get(&sha1).copied() else {
             return Err(corrupt("a WIM file's data is missing from the lookup table"));
         };
+        self.reparse_reads += 1;
         let data = self.store.read_all(&b.res, sha1, MAX_REPARSE, "a WIM symbolic link's reparse data is too large")?;
         let fixed = if tag == TAG_SYMLINK { 12 } else { 8 };
         if data.len() < fixed {
@@ -698,7 +720,11 @@ impl State {
         let sub = names.get(sub_off..sub_off + sub_len).ok_or_else(bad)?;
         let target = utf16(sub);
         let target = target.replace('\\', "/");
-        Ok(if relative || target.starts_with('/') { target } else { format!("/{target}") })
+        let target = if relative || target.starts_with('/') { target } else { format!("/{target}") };
+        // the cached copy counts against the paths' budget
+        self.charge(target.len())?;
+        self.targets.insert((sha1, tag), target.clone());
+        Ok(target)
     }
 
     fn next_entry(&mut self) -> Result<Option<super::RandomMember>> {
@@ -1018,6 +1044,64 @@ mod tests {
             let m = meta(&[dentry(name, ATTR_DIRECTORY, 0, [0; 20], 0)], &[]);
             assert!(read(&wim(&[], &m, &[])).is_err(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn named_streams_shared_by_many_entries_are_read_only_so_often() {
+        // K folders, each holding one entry whose named streams are the same N records: the walk would read K * N
+        const N: u16 = u16::MAX;
+        let k = (MAX_STREAM_RECORDS / u64::from(N)) as usize + 2;
+        let folder_len = dentry("d0000", ATTR_DIRECTORY, 0, [0; 20], 0).len() as u64;
+        let child_len = dentry("f0000", 0x80, 0, [0; 20], 0).len() as u64;
+        // after the root's entries: the K children, then the shared records and an end marker
+        let children_at = FIRST + k as u64 * folder_len + 8;
+        let shared_at = children_at + k as u64 * child_len;
+        let mut folders = Vec::new();
+        let mut tail = Vec::new();
+        for i in 0..k {
+            let at = children_at + i as u64 * child_len;
+            folders.push(dentry(&format!("d{i:04}"), ATTR_DIRECTORY, at, [0; 20], 0));
+            let mut c = dentry(&format!("f{i:04}"), 0x80, 0, [0; 20], 0);
+            // the entry's length runs to the shared records, and it claims N of them
+            c[..8].copy_from_slice(&(shared_at - at).to_le_bytes());
+            c[96..98].copy_from_slice(&N.to_le_bytes());
+            tail.extend_from_slice(&c);
+        }
+        let mut record = [0u8; 40];
+        record[..8].copy_from_slice(&40u64.to_le_bytes());
+        for _ in 0..N {
+            tail.extend_from_slice(&record);
+        }
+        tail.extend_from_slice(&[0; 8]);
+        let m = meta(&folders, &tail);
+        let start = std::time::Instant::now();
+        let e = read(&wim(&[], &m, &[])).unwrap_err();
+        assert!(e.to_string().contains("too many named streams"), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn shared_reparse_data_is_decoded_once() {
+        // a relative symbolic link to "t": substitute name at 0, 2 bytes; print name after it; flags 1
+        let mut blob = Vec::new();
+        for v in [0u16, 2, 2, 2] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&[b't', 0, b't', 0]);
+        let links: Vec<Vec<u8>> = (0..2000)
+            .map(|i| dentry(&format!("l{i}"), ATTR_REPARSE_POINT, 0, sha1(&blob), u64::from(TAG_SYMLINK)))
+            .collect();
+        let w = wim(&[&blob], &meta(&links, &[]), &[]);
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&w).unwrap();
+        let mut state = open(f, w.len() as u64, 1).unwrap();
+        let mut n = 0;
+        while let Some((m, _)) = super::super::RandomAccess::next(&mut state).unwrap() {
+            assert_eq!((m.kind, m.link.as_str()), (Kind::Symlink, "t"));
+            n += 1;
+        }
+        assert_eq!((n, state.reparse_reads), (2000, 1));
     }
 
     #[test]
