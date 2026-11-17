@@ -43,6 +43,7 @@ mod ppmd8;
 pub mod probe;
 pub mod progressive;
 pub mod rar5;
+pub mod repack;
 pub mod sevenzip;
 pub mod stream;
 pub mod tar;

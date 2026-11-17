@@ -34,6 +34,10 @@ commands:
   t   test: read every file and check its checksum
   x   extract with full paths
   e   extract every file into the destination, without folders
+  repack [--mtime=N] [--level=N] [--nested] <archive> <output>
+      rewrite an ar archive as ar, or a tarball as a .tar.gz, byte-for-byte reproducibly:
+      sorted members, owner 0, normalised modes, every time N (default $SOURCE_DATE_EPOCH,
+      else 0), gzip level N (default 9); --nested also repacks .tar.gz members
 
 switches:
   -o+ overwrite files that already exist
@@ -50,6 +54,9 @@ pub(crate) fn main() -> ExitCode {
         early(format_args!("{USAGE}"));
         return ExitCode::from(2);
     };
+    if command == "repack" {
+        return repack(&args[1..]);
+    }
     let mut overwrite = Overwrite::Skip;
     let mut quiet = false;
     let mut threads = None;
@@ -100,6 +107,69 @@ pub(crate) fn main() -> ExitCode {
         }
         other => {
             early(format_args!("unknown command {other}\n{USAGE}"));
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn repack(args: &[String]) -> ExitCode {
+    let mut opts = crate::repack::RepackOptions::default();
+    let epoch = std::env::var("SOURCE_DATE_EPOCH").ok().filter(|v| !v.is_empty());
+    let mut mtime = epoch.as_deref().map(|v| ("SOURCE_DATE_EPOCH", v.to_string()));
+    let mut quiet = false;
+    let mut paths = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--nested" => opts.nested = true,
+            "-q" => quiet = true,
+            s if s.starts_with("--mtime=") => {
+                mtime = Some(("--mtime", s["--mtime=".len()..].trim_start_matches('@').to_string()))
+            }
+            s if s.starts_with("--level=") => match s["--level=".len()..].parse::<u32>() {
+                Ok(n) if n <= 9 => opts.level = n,
+                _ => {
+                    early(format_args!("bad switch {s}: give a deflate level from 0 to 9\n"));
+                    return ExitCode::from(2);
+                }
+            },
+            s if s.starts_with('-') && s.len() > 1 => {
+                early(format_args!("unknown switch {s}\n"));
+                return ExitCode::from(2);
+            }
+            s => paths.push(PathBuf::from(s)),
+        }
+    }
+    if let Some((from, value)) = mtime {
+        match value.parse::<u64>() {
+            Ok(t) => opts.mtime = t,
+            Err(_) => {
+                early(format_args!("bad {from} {value:?}: give whole seconds since 1970\n"));
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let [input, output] = paths.as_slice() else {
+        early(format_args!("{USAGE}"));
+        return ExitCode::from(2);
+    };
+    match crate::repack::repack(input, output, &opts) {
+        Ok(summary) => {
+            if !quiet {
+                let format = match summary.format {
+                    crate::repack::RepackFormat::Ar => "ar",
+                    crate::repack::RepackFormat::TarGz => "tar.gz",
+                };
+                let nested = if summary.nested > 0 {
+                    format!(", {} nested tarballs repacked", summary.nested)
+                } else {
+                    String::new()
+                };
+                println!("{}: {} members written as {format}{nested}", output.display(), summary.members);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", input.display());
             ExitCode::from(2)
         }
     }

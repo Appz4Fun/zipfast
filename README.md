@@ -91,6 +91,23 @@ For compressed TAR, extraction stages member payloads and archive-supplied direc
 stream passes verification. Pending payloads use temporary disk space. Members publish in archive order, so a
 publication failure can leave earlier verified members in place.
 
+### Deterministic repack
+
+```
+zipfast repack lib.a out.a                       # ar as GNU `ar D` writes it
+SOURCE_DATE_EPOCH=1700000000 zipfast repack --nested pkg.deb out.deb
+zipfast repack --mtime=0 --level=9 src.tar.xz out.tar.gz
+```
+
+`zipfast repack` (library: `zipfast::repack::repack`) rewrites an ar archive (`.a`, a `.deb`'s or `.ipk`'s outer
+layer) as ar, or any tarball the tar reader reads as a `.tar.gz`, so that the same members always give the same
+bytes: members sorted by name (a `.deb`'s `debian-binary` stays first), owner and group 0 with no names, every
+time `--mtime` (default `$SOURCE_DATE_EPOCH`, else 0), modes normalised (ar `644`; tar `755`/`644`/`777`), symbol
+tables rebuilt for the new order, and gzip with MTIME 0, no name, OS 3 and level 9. `--nested` also repacks
+`.tar.gz` members one level deep, charging their work to the same byte limit. Unsafe names, tar names given twice,
+paths through a symlink member, dangling hard links and thin archives are refused, the reader's limits apply,
+temporaries stay beside the output, and links on disk are never followed. Output is reproducible for a given zipfast build.
+
 ### Library: one entry point for every format
 
 `extract::run_with_policy` (or `extract::run_with_context`, with a caller-owned `EncryptedReadContext`) tests or
