@@ -264,12 +264,32 @@ fn encrypted_headers_without_the_password_extract_nothing() {
             ],
             Some("wrong"),
         ),
+        // UnRAR `-p-` tries the empty key on RAR 3.x headers: they decrypt to garbage and fail their CRC, exit 3
+        // ("Checksum error in the encrypted file"), Prybar's reference corpus for these four
+        (&["rar4/encrypted_headers.rar"], Some("")),
+        (&["rar4/secret-crypted-none.rar"], Some("")),
+        (
+            &["rar4-rar300/header_encrypted_multivol_rar300.rar", "rar4-rar300/header_encrypted_multivol_rar300.r00"],
+            Some(""),
+        ),
+        (
+            &[
+                "rar4-rar300/header_encrypted_newnaming_rar300.part01.rar",
+                "rar4-rar300/header_encrypted_newnaming_rar300.part02.rar",
+            ],
+            Some(""),
+        ),
     ];
     for (n, (volumes, password)) in archives.iter().enumerate() {
         let case = Case { volumes: paths(volumes), password: *password, want: Manifest::new() };
         let dest = tmp.path().join(format!("{n}-run"));
         assert!(extract::run_with_password(&first(&case), &options(&dest), case.password, |_| {}).is_err());
         assert!(tree(&dest).is_empty(), "{}", label(&case, "run"));
+        let listed = extract::list_with_password(&first(&case), case.password);
+        match case.password {
+            None => assert!(matches!(listed, Err(zipfast::Error::Encrypted)), "{listed:?}"),
+            Some(_) => assert!(matches!(listed, Err(ref e) if !matches!(e, zipfast::Error::Encrypted)), "{listed:?}"),
+        }
         let error = RarSession::open(&first(&case), case.password, RarSessionOptions::default()).err().unwrap();
         match case.password {
             None => assert!(matches!(error.failure.as_ref(), RarFailure::PasswordRequired { .. }), "{error:?}"),

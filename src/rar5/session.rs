@@ -746,13 +746,15 @@ impl RarSession {
                 catalogue.output_identity = Some((metadata.dev(), metadata.ino()));
             }
             catalogue.session.password_given = password.is_some();
+            let given = password;
             let password = password.unwrap_or_default();
             limit(password.len() as u64, catalogue.options.limits.capacity, RarResource::CatalogueCapacity)?;
             catalogue.session.password.try_reserve_exact(password.len()).map_err(|_| allocation())?;
             catalogue.session.password.push_str(password);
             catalogue.owned_capacity = catalogue.session.password.capacity() as u64;
             catalogue.update_capacity()?;
-            catalogue.scan(first, Some(password))
+            // None stays None: an empty password is tried on RAR 3.x encrypted headers, a missing one is not
+            catalogue.scan(first, given.map(|_| password))
         })();
         if let Err(fault) = result {
             let partial = RarRunSummary {

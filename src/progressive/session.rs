@@ -652,10 +652,10 @@ impl ProgressiveSession {
                     let (_, step) = self.parser.advance(&[])?;
                     let (offset, len) = match step {
                         ParserStep::LegacyKeyRequired { salt } => {
+                            // RAR 3.x headers have no check value: an empty password is still tried, as UnRAR -p- does
                             let password = self
                                 .options
                                 .password()
-                                .filter(|p| !p.is_empty())
                                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
                             let (key, iv) = crate::rar5::member::controlled_legacy_keys(
                                 password,

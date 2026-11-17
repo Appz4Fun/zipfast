@@ -356,7 +356,7 @@ impl RarWalker {
         let (key, iv) = match self.rar4_keys {
             Some((cached, key, iv)) if cached == salt => (key, iv),
             _ => {
-                let Some(password) = self.password.as_deref().filter(|p| !p.is_empty()) else {
+                let Some(password) = self.password.as_deref() else {
                     if self.single.is_some() {
                         // The salt that precedes the header has been read; the header starts at the salt.
                         let offset = self.header_start.unwrap_or(0);
@@ -423,7 +423,7 @@ impl RarWalker {
                         keyed_checks: params.tweaked_crc,
                     });
                 }
-                // An empty password is no password, as for RAR4.
+                // An empty password is no password for RAR5, which has a check value; RAR 3.x headers try it.
                 if self.single.is_some() && self.password.as_deref().is_none_or(str::is_empty) {
                     self.header_encrypted = Some(true);
                     return Ok(Some(self.finish_volume(VolumeEnd::Locked { offset: frame.extent.end })));

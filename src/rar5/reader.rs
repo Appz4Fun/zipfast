@@ -459,7 +459,9 @@ impl Volume {
             next,
             len,
             main: MainHeader::default(),
-            password: password.filter(|s| !s.is_empty()).map(str::to_owned),
+            // Kept as given: RAR 3.x headers have no check value, so an empty password is still tried on them, as
+            // UnRAR `-p-` does. RAR5 needs a non-empty one (`rar5_password`).
+            password: password.map(str::to_owned),
             header_key: None,
             legacy_keys: None,
             parser: None,
@@ -545,6 +547,11 @@ impl Volume {
 
     fn scope(&self) -> RarScope {
         RarScope::Header { volume: self.path.clone() }
+    }
+
+    /// The password for RAR5 header encryption: an empty one counts as none.
+    fn rar5_password(&self) -> Option<&str> {
+        self.password.as_deref().filter(|p| !p.is_empty())
     }
 
     fn password_required(&self) -> RarFault {
@@ -640,12 +647,12 @@ impl Volume {
                     if budget.is_some() && (!catalogue_main || self.header_key.is_some()) {
                         return Err(self.framing("unexpected RAR header encryption block", Error::Encrypted));
                     }
-                    if !detailed && self.password.is_none() {
+                    if !detailed && self.rar5_password().is_none() {
                         return Ok(Some((Block::Crypt, None, None)));
                     }
                     let crypt_fault = |e| RarFault::new(RarFailure::crypt(e, self.scope()), Error::Encrypted);
                     let params = frame.header_crypt.expect("encryption frame has its record").map_err(crypt_fault)?;
-                    let pw = self.password.as_deref().ok_or_else(|| self.password_required())?;
+                    let pw = self.rar5_password().ok_or_else(|| self.password_required())?;
                     if let Some(budget) = budget.as_deref_mut() {
                         budget.check()?;
                     }

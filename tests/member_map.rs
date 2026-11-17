@@ -1407,14 +1407,18 @@ fn rar4_volume_cut_inside_its_main_header_is_still_rar4() {
 }
 
 #[test]
-fn an_empty_password_locks_hp_volumes_in_both_formats() {
+fn an_empty_password_locks_rar5_hp_volumes_and_is_tried_on_rar4() {
     let rar5 = hp_archive(&data(700, 5));
     let map = vol(&rar5, "hp.rar", Some("")).unwrap();
     assert!(matches!(map.end, VolumeEnd::Locked { .. }), "{:?}", map.end);
     assert!(map.header_encrypted && map.members.is_empty());
     let gold = b"continuous CBC across two unaligned boundaries with arbitrary trailing padding";
     let rar4 = r4_aes(gold, true, &[29, 31, 20]);
-    let map = vol(&rar4[1], "a.part02.rar", Some("")).unwrap();
+    // RAR 3.x headers have no check value: the empty key is tried, as UnRAR -p- does, and its garbage fails the
+    // header CRC like any wrong password
+    let map = vol(&rar4[1], "a.part02.rar", Some(""));
+    assert!(matches!(map, Err(MapError::WrongPassword)), "{map:?}");
+    let map = vol(&rar4[1], "a.part02.rar", None).unwrap();
     assert_eq!(map.end, VolumeEnd::Locked { offset: 20 });
 }
 
