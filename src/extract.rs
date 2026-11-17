@@ -710,14 +710,30 @@ pub(crate) fn create_target(place: Place, size: Option<u64>) -> Result<Output> {
     create_target_detailed(place, size).map_err(crate::error::RarFault::into_legacy)
 }
 
+/// [`create_target`] for a sparse file: marked sparse where the file system needs asking, and never preallocated,
+/// which would fill its holes with real space.
+pub(crate) fn create_sparse_target(place: Place, size: Option<u64>) -> Result<Output> {
+    create_target_with(place, size, true).map_err(crate::error::RarFault::into_legacy)
+}
+
 pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::error::RarResult<Output> {
+    create_target_with(place, size, false)
+}
+
+fn create_target_with(place: Place, size: Option<u64>, sparse: bool) -> crate::error::RarResult<Output> {
     use crate::error::{IoOperation, RarFailure, RarFault, RarPolicyReason};
+    let preallocate = |file: &File| {
+        if sparse {
+            crate::output::mark_sparse(file);
+        } else if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
+            // one allocation up front keeps a big file in few extents; failure here is harmless
+            let _ = file.set_len(size);
+        }
+    };
     let create_fault = |e| RarFault::output(IoOperation::CreateFile, Some(place.path.clone()), None, e, false);
     if let Some(reserved) = place.reserved {
         let (file, path) = reserved.into_parts();
-        if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
-            let _ = file.set_len(size);
-        }
+        preallocate(&file);
         return Ok(Output::created(file, size, path));
     }
     let (file, staged) = if place.replace {
@@ -733,10 +749,7 @@ pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::
         let file = OpenOptions::new().write(true).create_new(true).open(&place.path).map_err(create_fault)?;
         (file, None)
     };
-    if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
-        // one allocation up front keeps a big file in few extents; failure here is harmless
-        let _ = file.set_len(size);
-    }
+    preallocate(&file);
     Ok(match staged {
         Some(path) => Output::staged(file, size, path, place.path),
         None => Output::created(file, size, place.path),
