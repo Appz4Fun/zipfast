@@ -34,6 +34,8 @@ use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{self, Codec};
 
+mod cpio;
+
 const BLOCK: usize = 512;
 /// Bytes moved per read.
 const BUF: usize = 4 << 20;
@@ -61,6 +63,12 @@ const SPARSE_MAX_RATIO: u64 = 1024;
 /// empty archive.
 pub fn sniff_tar(head: &[u8]) -> bool {
     (head.len() >= BLOCK && checksum_ok(&head[..BLOCK])) || (head.len() >= 2 * BLOCK && zero(&head[..2 * BLOCK]))
+}
+
+/// Whether the file starts with a cpio header (binary in either byte order, odc, newc or newc with checksums),
+/// which this module reads as it reads tar.
+pub fn sniff_cpio(head: &[u8]) -> bool {
+    cpio::sniff(head).is_some()
 }
 
 fn zero(b: &[u8]) -> bool {
@@ -213,6 +221,21 @@ impl Source {
         }
     }
 
+    /// Puts `bytes`, just read, back in front of what is left.
+    fn unread(&mut self, bytes: Vec<u8>) -> Result<()> {
+        match self {
+            Source::Plain { r, pos, .. } => {
+                r.seek_relative(-(bytes.len() as i64))?;
+                *pos -= bytes.len() as u64;
+            }
+            Source::Packed(r, _) => {
+                let rest = std::mem::replace(r, Box::new(io::empty()));
+                *r = Box::new(io::Cursor::new(bytes).chain(rest));
+            }
+        }
+        Ok(())
+    }
+
     fn codec(&self) -> Option<Codec> {
         match self {
             Source::Packed(_, c) => Some(*c),
@@ -299,6 +322,8 @@ struct Member {
     mode: u32,
     atime: Option<(i64, u32)>,
     ctime: Option<(i64, u32)>,
+    /// read from a cpio archive: its listing entry carries no tar metadata
+    cpio: bool,
     tar: Box<TarMetadata>,
     /// A sparse member's map: `size` is then the stored data only, and the file is `real_size` bytes long.
     sparse: Option<Box<SparseMap>>,
@@ -493,7 +518,7 @@ impl Member {
             mtime_origin: self.mtime.map(|_| MtimeOrigin::Utc),
             ctime: self.ctime,
             atime: self.atime,
-            tar: Some(self.tar),
+            tar: (!self.cpio).then_some(self.tar),
             attributes: None,
             name: self.name,
             size: if data { real_size } else { 0 },
@@ -666,6 +691,17 @@ struct Reader {
     /// What is left of the listing's budget for pax records and raw headers.
     meta_budget: MetaBudget,
     scratch: Vec<u8>,
+    /// set when the archive is cpio, not tar
+    cpio: Option<Box<cpio::State>>,
+    /// the checksum of the current member's data, in a newc archive with checksums
+    crc: Option<CpioCrc>,
+}
+
+/// A newc `070702` member's checksum: the sum of its data bytes, checked as the last of them is read.
+struct CpioCrc {
+    want: u32,
+    sum: u32,
+    left: u64,
 }
 
 impl Reader {
@@ -679,14 +715,20 @@ impl Reader {
         let mut first = vec![0u8; BLOCK];
         let n = src.read(&mut first)?;
         first.truncate(n);
+        let mut cpio = None;
         let mut content = if n == BLOCK && checksum_ok(&first) {
+            Some(Content::Tar)
+        } else if let Some(format) = cpio::sniff(&first) {
+            // cpio headers aren't blocks: what was read goes back, and members are read from the start
+            src.unread(std::mem::take(&mut first))?;
+            cpio = Some(Box::new(cpio::State::new(format)));
             Some(Content::Tar)
         } else if src.codec().is_some() {
             Some(Content::Single)
         } else {
             None
         };
-        if n == BLOCK && zero(&first) {
+        if n == BLOCK && cpio.is_none() && zero(&first) {
             // an empty archive is zero blocks and nothing else; a compressed file that only starts with zeros is
             // a file
             first.resize(EMPTY_MAX + 1, 0);
@@ -708,6 +750,8 @@ impl Reader {
             global: Pax::default(),
             meta_budget: MetaBudget::new(),
             scratch: vec![0; 64 << 10],
+            cpio,
+            crc: None,
         })
     }
 
@@ -743,6 +787,9 @@ impl Reader {
 
     /// The next member, after passing over whatever is left of the one before.
     fn next(&mut self) -> Result<Option<Member>> {
+        if self.cpio.is_some() {
+            return self.next_cpio();
+        }
         if self.unread > 0 {
             let n = std::mem::take(&mut self.unread);
             self.src.skip(n, &mut self.scratch)?;
@@ -847,6 +894,7 @@ impl Reader {
                 mode,
                 atime: p.atime,
                 ctime: p.ctime,
+                cpio: false,
                 tar: Box::new(TarMetadata {
                     magic: TarMagic::of(&h),
                     typeflag: h[156],
@@ -1022,6 +1070,13 @@ impl Reader {
             let want = left.min(buf.len() as u64) as usize;
             let got = self.src.read(&mut buf[..want])?;
             self.unread -= got as u64;
+            if let Some(crc) = &mut self.crc {
+                crc.sum = buf[..got].iter().fold(crc.sum, |s, &b| s.wrapping_add(u32::from(b)));
+                crc.left = crc.left.saturating_sub(got as u64);
+                if crc.left == 0 && crc.sum != crc.want {
+                    return Err(Error::Corrupt("a cpio member fails its checksum"));
+                }
+            }
             if got > 0 {
                 sink(&buf[..got])?;
             }
@@ -1269,7 +1324,7 @@ pub fn run_with_policy(
 fn is_tar_or_stream(path: &Path) -> Result<bool> {
     let mut head = [0u8; 2 * BLOCK];
     let n = read_full(&mut File::open(path)?, &mut head)?;
-    Ok(Codec::sniff(&head[..n]).is_some() || sniff_tar(&head[..n]))
+    Ok(Codec::sniff(&head[..n]).is_some() || sniff_tar(&head[..n]) || sniff_cpio(&head[..n]))
 }
 
 /// [`run`], reporting a rename mode's renames to `report` as they happen. A terminal error keeps them too.
@@ -1823,9 +1878,10 @@ fn run_tar(
                 Some(t) => out = Some(t),
                 None => continue,
             }
-        } else if let Source::Plain { .. } = reader.src {
-            // tar keeps no checksum of the data, so a test only has to find that all of it is there
-            let size = m.size + padding(m.size);
+        } else if let (Source::Plain { .. }, None) = (&reader.src, &reader.crc) {
+            // tar keeps no checksum of the data (nor does cpio, but for newc's own), so a test only has to find that
+            // all of it is there: the data and its padding, whichever format's
+            let size = reader.unread;
             match reader.src.skip(size, &mut reader.scratch) {
                 Ok(()) => {
                     reader.unread = 0;

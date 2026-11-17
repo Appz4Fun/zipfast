@@ -33,6 +33,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   each found by its first bytes whatever the name: POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
   sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
   compresses. xz files written in blocks (`xz -T0`) decode on several cores.
+- cpio archives, plain or compressed as tar can be: the binary format in either byte order, odc (`070707`), newc
+  (`070701`) and newc with checksums (`070702`, checked). They take tar's whole pipeline: containment, symbolic and
+  hard links, overwrite choices, listing and reads by index. A file's hard links come out as links to the name that
+  carried its data (the last one in newc, the first in the older formats); `TRAILER!!!` ends the archive.
 - 7z archives (`.7z`, split `.7z.001`, ...): testing and extracting through the same entry points, options and
   checks as the other formats. Copy, LZMA, LZMA2, Deflate, Deflate64, BZip2, Zstandard, PPMd, 7zAES (also with
   encrypted headers), BCJ, BCJ2, ARM, ARM64, ARMT, PPC, SPARC, IA64, Delta and Swap; solid folders stream without
