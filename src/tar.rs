@@ -2017,13 +2017,13 @@ pub(crate) struct RawMember {
 }
 
 /// The data of the member just handed out by [`walk_members`].
-pub(crate) struct MemberData<'a> {
+pub(crate) struct RepackData<'a> {
     reader: &'a mut Reader,
     member: &'a Member,
     buf: &'a mut [u8],
 }
 
-impl MemberData<'_> {
+impl RepackData<'_> {
     /// The file's bytes in order to `sink`, a sparse member's holes as zeros.
     pub(crate) fn read(self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
         let zeros = [0u8; 64 << 10];
@@ -2049,7 +2049,7 @@ impl MemberData<'_> {
 pub(crate) fn walk_members(
     path: &Path,
     limit: u64,
-    mut each: impl FnMut(RawMember, MemberData<'_>) -> Result<()>,
+    mut each: impl FnMut(RawMember, RepackData<'_>) -> Result<()>,
 ) -> Result<u64> {
     let mut reader = Reader::open_with_limit(path, 1, Some(limit), None)?;
     if matches!(reader.content, Content::Single) {
@@ -2086,7 +2086,7 @@ pub(crate) fn walk_members(
             size: if kind == RawKind::File { m.real_size() } else { 0 },
             device: (m.tar.device_major.unwrap_or(0), m.tar.device_minor.unwrap_or(0)),
         };
-        each(raw, MemberData { reader: &mut reader, member: &m, buf: &mut buf })?;
+        each(raw, RepackData { reader: &mut reader, member: &m, buf: &mut buf })?;
     }
     if reader.src.codec().is_some() {
         reader.drain(&mut buf)?;
