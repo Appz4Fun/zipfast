@@ -182,3 +182,21 @@ fn a_listing_cut_short_by_a_missing_piece_says_so() {
     // A whole single archive has no warning either.
     assert!(!extract::list_detailed(&first(), None).unwrap().unexpected_end());
 }
+
+#[test]
+fn streamed_members_before_a_gap_are_found_by_their_descriptors() {
+    let first = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zip-bytesplit-streamed/s.zip.001");
+    let listing = extract::list_detailed(&first, None).unwrap();
+    assert!(listing.unexpected_end());
+    let got: Vec<_> = listing.entries.iter().map(|e| (e.name.as_str(), e.size, e.packed)).collect();
+    assert_eq!(got, [("a.txt", 800, 26), ("b.txt", 5, 5), ("c.bin", 0, 11832)]);
+    let known: Vec<_> = listing.entries.iter().map(|e| (e.known_size(), e.size_unknown)).collect();
+    assert_eq!(known, [(Some(800), false), (Some(5), false), (None, true)]);
+    // Extraction checks each CRC before publishing: the two whole members come out, c.bin fails on the gap.
+    let dir = tempfile::tempdir().unwrap();
+    let result = extract::run(&first, &options(dir.path(), Mode::Extract), |_| {}).unwrap();
+    assert_eq!(result.files, 2, "{:?}", result.errors);
+    assert_eq!(fs::read(dir.path().join("b.txt")).unwrap().len(), 5);
+    assert!(result.errors.iter().any(|e| e.starts_with("c.bin: missing volume")), "{:?}", result.errors);
+    assert!(!dir.path().join("c.bin").exists());
+}

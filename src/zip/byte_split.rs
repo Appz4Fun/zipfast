@@ -193,14 +193,19 @@ impl Seek for ArchiveSource {
 }
 
 /// The members whose local headers lie before `len`, walking from offset 0, for a set cut short by a missing piece
-/// (no central directory to read): as 7-Zip lists such a set. The walk stops at anything but a local header, at a
-/// header whose sizes are only in a data descriptor, and after a member whose data runs past `len`.
+/// (no central directory to read): as 7-Zip lists such a set. A member whose sizes are only in a data descriptor
+/// (flag bit 3) is passed over by finding its signed descriptor, as 7-Zip's FindDescriptor does: the first
+/// `PK\x07\x08` whose compressed size equals the distance scanned (the ZIP64 form when the local header has ZIP64 sizes). The walk stops
+/// at anything but a local header and after a member whose data runs past `len`; a streamed one cut off that way
+/// gets the bytes left as its packed size and 0 as its size. Each byte is scanned at most once, so crafted input stays linear.
 pub(crate) fn scan_local_headers(
     source: &mut (impl Read + Seek),
     len: u64,
-) -> crate::error::Result<Vec<super::ZipEntry>> {
+) -> crate::error::Result<(Vec<super::ZipEntry>, bool)> {
     use zip_container::{LOCAL_HEADER_LEN, LocalHeader};
     let mut entries = Vec::new();
+    // The last entry is a streamed member whose descriptor lies past the end: its size is unknown.
+    let mut size_unknown = false;
     let mut at = 0u64;
     while at + LOCAL_HEADER_LEN as u64 <= len && entries.len() < 1_000_000 {
         let mut head = [0u8; LOCAL_HEADER_LEN];
@@ -213,10 +218,25 @@ pub(crate) fn scan_local_headers(
         }
         let mut raw = vec![0u8; usize::from(h.name_len)];
         source.read_exact(&mut raw)?;
-        let descriptor = h.flags & 0x08 != 0 && h.packed_size == 0;
-        if descriptor || h.packed_size == u32::MAX || h.unpacked_size == u32::MAX {
-            break;
-        }
+        let data_at = name_at + u64::from(h.name_len) + u64::from(h.extra_len);
+        let streamed = h.flags & 0x08 != 0;
+        let (crc32, packed, size, next) = if streamed {
+            match find_descriptor(source, data_at, len, h.packed_size == u32::MAX || h.unpacked_size == u32::MAX)? {
+                Some(d) => (d.crc32, d.packed, d.size, Some(data_at + d.packed + d.len)),
+                // The descriptor is past the gap: as 7-Zip, the packed size is what is left before it, the size is
+                // unknown (0), and the walk ends.
+                None => {
+                    size_unknown = true;
+                    (h.crc32, len.saturating_sub(data_at), 0, None)
+                }
+            }
+        } else {
+            if h.packed_size == u32::MAX || h.unpacked_size == u32::MAX {
+                break;
+            }
+            let packed = u64::from(h.packed_size);
+            (h.crc32, packed, u64::from(h.unpacked_size), Some(data_at + packed))
+        };
         let name = super::decode_name(&raw, h.flags & super::FLAG_UTF8 != 0)
             .unwrap_or_else(|_| String::from_utf8_lossy(&raw).into_owned());
         let mtime = super::dos_time(h.mod_time, h.mod_date);
@@ -224,21 +244,94 @@ pub(crate) fn scan_local_headers(
             name,
             flags: h.flags,
             method: h.method,
-            crc32: h.crc32,
-            packed: u64::from(h.packed_size),
-            size: u64::from(h.unpacked_size),
+            crc32,
+            packed,
+            size,
             local_at: at,
             mtime,
             mtime_origin: mtime.map(|_| crate::extract::MtimeOrigin::LocalWallClock),
             ..Default::default()
         });
-        let end = name_at + u64::from(h.name_len) + u64::from(h.extra_len) + u64::from(h.packed_size);
-        if end > len {
-            break;
+        match next {
+            Some(end) if end <= len => at = end,
+            _ => break,
         }
-        at = end;
     }
-    Ok(entries)
+    Ok((entries, size_unknown))
+}
+
+/// A data descriptor found after a streamed member's data.
+struct Descriptor {
+    crc32: u32,
+    packed: u64,
+    size: u64,
+    /// The descriptor's own length.
+    len: u64,
+}
+
+/// The first signed data descriptor after `data_at` whose compressed size is the distance from `data_at` to it,
+/// reading forward once in chunks.
+/// `zip64`: the local header carries ZIP64 sizes, so the descriptor's sizes are 8 bytes each.
+fn find_descriptor(
+    source: &mut (impl Read + Seek),
+    data_at: u64,
+    len: u64,
+    zip64: bool,
+) -> io::Result<Option<Descriptor>> {
+    const SIG: [u8; 4] = *b"PK\x07\x08";
+    const CHUNK: usize = 64 << 10;
+    const KEEP: usize = 23; // the longest descriptor (ZIP64, 24 bytes) less one byte
+    if data_at >= len {
+        return Ok(None);
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + KEEP);
+    // `base` is the archive offset of buf[0]; `checked` how many leading positions have been tried.
+    let (mut base, mut checked) = (data_at, 0usize);
+    let mut read_at = data_at;
+    source.seek(SeekFrom::Start(data_at))?;
+    loop {
+        let want = usize::try_from((len - read_at).min(CHUNK as u64)).unwrap_or(CHUNK);
+        let old = buf.len();
+        buf.resize(old + want, 0);
+        source.read_exact(&mut buf[old..])?;
+        read_at += want as u64;
+        let at_end = read_at >= len;
+        while checked + 4 <= buf.len() {
+            // A candidate needs its fields in the buffer, unless the archive ends first.
+            if !at_end && checked + KEEP >= buf.len() {
+                break;
+            }
+            let p = checked;
+            checked += 1;
+            if buf[p..p + 4] != SIG {
+                continue;
+            }
+            let distance = base + p as u64 - data_at;
+            let field = |at: usize, n: usize| buf.get(p + at..p + at + n);
+            let crc = field(4, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+            if let (false, Some(crc32), Some(c), Some(u)) = (zip64, crc, field(8, 4), field(12, 4)) {
+                let packed = u64::from(u32::from_le_bytes(c.try_into().unwrap()));
+                if packed == distance {
+                    let size = u64::from(u32::from_le_bytes(u.try_into().unwrap()));
+                    return Ok(Some(Descriptor { crc32, packed, size, len: 16 }));
+                }
+            }
+            if let (true, Some(crc32), Some(c), Some(u)) = (zip64, crc, field(8, 8), field(16, 8)) {
+                let packed = u64::from_le_bytes(c.try_into().unwrap());
+                if packed == distance {
+                    let size = u64::from_le_bytes(u.try_into().unwrap());
+                    return Ok(Some(Descriptor { crc32, packed, size, len: 24 }));
+                }
+            }
+        }
+        if at_end {
+            return Ok(None);
+        }
+        // Keep the positions not yet tried.
+        buf.drain(..checked);
+        base += checked as u64;
+        checked = 0;
+    }
 }
 
 #[cfg(test)]
@@ -298,5 +391,35 @@ mod tests {
         assert_eq!(next_piece(Path::new("d/a.zip.009")).unwrap(), Path::new("d/a.zip.010"));
         assert_eq!(next_piece(Path::new("d/a.zip.999")).unwrap(), Path::new("d/a.zip.1000"));
         assert!(next_piece(Path::new("a.zip")).is_none());
+    }
+
+    #[test]
+    fn descriptors_are_found_across_chunks_and_decoys() {
+        use std::io::Cursor;
+        // 100000 bytes of data full of decoy signatures with wrong sizes, then the real descriptor.
+        let mut data = Vec::new();
+        while data.len() < 100_000 {
+            data.extend(b"PK\x07\x08\0\0\0\0\x05\0\0\0\x05\0\0\0xx");
+        }
+        data.truncate(100_000);
+        let mut bytes = vec![0u8; 10];
+        bytes.extend(&data);
+        bytes.extend(b"PK\x07\x08");
+        bytes.extend(7u32.to_le_bytes());
+        bytes.extend(100_000u32.to_le_bytes());
+        bytes.extend(123_456u32.to_le_bytes());
+        let len = bytes.len() as u64;
+        let d = find_descriptor(&mut Cursor::new(&bytes), 10, len, false).unwrap().unwrap();
+        assert_eq!((d.crc32, d.packed, d.size, d.len), (7, 100_000, 123_456, 16));
+        // the ZIP64 form
+        let mut z = vec![1u8; 40];
+        z.extend(b"PK\x07\x08");
+        z.extend(9u32.to_le_bytes());
+        z.extend(40u64.to_le_bytes());
+        z.extend(41u64.to_le_bytes());
+        let d = find_descriptor(&mut Cursor::new(&z), 0, z.len() as u64, true).unwrap().unwrap();
+        assert_eq!((d.crc32, d.packed, d.size, d.len), (9, 40, 41, 24));
+        // none before the end
+        assert!(find_descriptor(&mut Cursor::new(&data), 0, data.len() as u64, false).unwrap().is_none());
     }
 }

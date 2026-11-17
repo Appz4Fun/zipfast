@@ -312,6 +312,8 @@ pub struct Archive {
     pieces: Vec<PathBuf>,
     /// The first absent piece of a byte-split set with a gap: `entries` are then the members found before it.
     missing: Option<PathBuf>,
+    /// The last entry's size is unknown: a streamed member whose descriptor is past the gap of `missing`.
+    last_size_unknown: bool,
     pub entries: Vec<ZipEntry>,
 }
 
@@ -336,11 +338,11 @@ impl Archive {
         };
         check_cancel(cancel)?;
         // A set cut short by a missing piece has no central directory: list the local headers before the gap.
-        let entries = match missing {
+        let (entries, last_size_unknown) = match missing {
             Some(_) => byte_split::scan_local_headers(&mut file, len)?,
-            None => read_projected_legacy(&mut file, len, cancel)?.0,
+            None => (read_projected_legacy(&mut file, len, cancel)?.0, false),
         };
-        Ok(Archive { file, len, pieces, missing, entries })
+        Ok(Archive { file, len, pieces, missing, last_size_unknown, entries })
     }
 
     /// Decodes the entry at a zero-based index and checks its integrity.
@@ -843,10 +845,12 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
 pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
     let archive = Archive::open(path)?;
     let missing_volume = archive.missing.clone();
+    let unknown_at = archive.last_size_unknown.then(|| archive.entries.len().wrapping_sub(1));
     let entries = archive
         .entries
         .into_iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(i, e)| {
             let dir = e.is_dir();
             let encrypted = e.encrypted();
             let link = e.is_link().then(|| Redirection::UnixSymlink(String::new()));
@@ -861,6 +865,7 @@ pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
                 attributes,
                 name: e.name,
                 size: e.size,
+                size_unknown: unknown_at == Some(i),
                 packed: e.packed,
                 mtime: e.mtime,
                 crc32: (!dir).then_some(e.crc32),
@@ -1035,8 +1040,16 @@ pub(crate) fn run_renaming(
                     // Data running past the end of a set cut short by a missing piece: that piece is the cause.
                     // The payload starts past the local header, its name and its extra field.
                     let crosses_gap = archive.missing.is_some()
-                        && data_at(&mut archive.file, archive.len, &entry)
-                            .map_or(true, |start| start.saturating_add(e.packed) > archive.len);
+                        && data_at(&mut archive.file, archive.len, &entry).map_or(true, |start| {
+                            // a streamed member also needs its descriptor before the end: 16 bytes, 24 with ZIP64 sizes
+                            let zip64 = e.packed >= u64::from(u32::MAX) || e.size >= u64::from(u32::MAX);
+                            let descriptor = match (e.flags & 0x08 != 0, zip64) {
+                                (false, _) => 0,
+                                (true, false) => 16,
+                                (true, true) => 24,
+                            };
+                            start.saturating_add(e.packed).saturating_add(descriptor) > archive.len
+                        });
                     if let Some(missing) = archive.missing.as_ref().filter(|_| crosses_gap) {
                         fail(&mut summary, &mut report, &e.name, &Error::MissingVolume(missing.clone()).to_string());
                         continue;

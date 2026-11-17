@@ -138,6 +138,7 @@ pub struct RarVolumeMetadata {
     encrypted_headers: bool,
     sfx_size: u64,
     end: Option<VolumeEnd>,
+    end_record: Option<super::RarEndRecord>,
     headers: std::ops::Range<usize>,
     comment: Option<usize>,
 }
@@ -181,6 +182,21 @@ impl RarVolumeMetadata {
 
     pub fn encrypted_headers(&self) -> bool {
         self.encrypted_headers
+    }
+
+    /// The end of archive header's flags, CRC, volume number and offset, when the volume has one.
+    pub fn end_record(&self) -> Option<super::RarEndRecord> {
+        self.end_record
+    }
+
+    /// RAR 5.0: the main header's locator record (quick open and recovery record offsets).
+    pub fn main_locator(&self) -> Option<super::RarLocator> {
+        self.main.locator
+    }
+
+    /// RAR 5.0: the main header's extra records in stored order.
+    pub fn main_extra_records(&self) -> &[super::RarExtraRecord] {
+        &self.main.extra_records
     }
 
     /// Whether the main header marks the archive solid (`MHD_SOLID`, `MHFL_SOLID`).
@@ -551,6 +567,11 @@ impl<'a> RarMember<'a> {
 
     pub fn redirection(&self) -> Option<&'a Redirection> {
         self.member.header.redirection.as_ref()
+    }
+
+    /// RAR 5.0: the file header's extra records in stored order, type and bytes.
+    pub fn extra_records(&self) -> &'a [super::RarExtraRecord] {
+        &self.member.header.extra_records
     }
 
     /// RAR 5.0: the redirection record's raw flags (0x1: the link target is a directory). Zero without one.
@@ -1046,12 +1067,18 @@ impl Catalogue {
                 match block {
                     Block::File(header) => {
                         let wire = wire.expect("catalogue file metadata includes the wire name");
-                        let listed = header.clone();
+                        let mut listed = header.clone();
+                        // Only the member keeps its extra records (RarMember::extra_records), charged to capacity.
+                        listed.extra_records = Vec::new();
+                        self.owned_capacity = add(self.owned_capacity, extra_records_bytes(&header.extra_records))?;
+                        self.update_capacity()?;
                         let raw_name = wire.name.clone();
                         self.add_part(volume_index, header, crypt, wire)?;
                         self.add_header(volume_index, listed, Some(raw_name))?;
                     }
-                    Block::Service(header) => {
+                    Block::Service(mut header) => {
+                        // a service header's extra records are not kept
+                        header.extra_records = Vec::new();
                         if comment.is_none() && header.name == "CMT" {
                             comment = Some(self.session.headers.len());
                         }
@@ -1070,6 +1097,7 @@ impl Catalogue {
                 volume.main.original_name.as_ref().map_or(0, |name| name.capacity() as u64),
                 volume.main.embedded_comment.as_ref().map_or(0, |block| block.capacity() as u64),
             )?;
+            let original = add(original, extra_records_bytes(&volume.main.extra_records))?;
             self.owned_capacity = add(self.owned_capacity, original)?;
             let metadata = RarVolumeMetadata {
                 format,
@@ -1077,6 +1105,7 @@ impl Catalogue {
                 encrypted_headers,
                 sfx_size: volume.sfx_size(),
                 end,
+                end_record: volume.end_record(),
                 headers: first_header..self.session.headers.len(),
                 comment,
             };
@@ -1292,6 +1321,12 @@ impl Catalogue {
         self.session.usage.capacity = capacity;
         Ok(())
     }
+}
+
+/// The heap bytes a header's extra records hold: the vector and each record's data.
+fn extra_records_bytes(records: &Vec<super::RarExtraRecord>) -> u64 {
+    (records.capacity() * size_of::<super::RarExtraRecord>() + records.iter().map(|r| r.data.capacity()).sum::<usize>())
+        as u64
 }
 
 fn target_name(header: &FileHeader) -> Option<&String> {
@@ -1677,7 +1712,12 @@ mod tests {
                 .model
                 .members
                 .iter()
-                .map(|row| row.header.name.capacity() + row.wire.name.capacity() + crate::rar5::RAW_NAME_OWNER_BYTES)
+                .map(|row| {
+                    row.header.name.capacity()
+                        + row.wire.name.capacity()
+                        + crate::rar5::RAW_NAME_OWNER_BYTES
+                        + extra_records_bytes(&row.header.extra_records) as usize
+                })
                 .sum::<usize>()
             + session
                 .headers

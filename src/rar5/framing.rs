@@ -68,6 +68,8 @@ pub(crate) struct PhysicalFrame {
     pub(crate) extent: Range<u64>,
     pub(crate) data_end: u64,
     pub(crate) header_crypt: Option<std::result::Result<crate::crypto::Rar5CryptParams, crate::crypto::Rar5CryptError>>,
+    /// The end of archive header's fields, for an end frame.
+    pub(crate) end_record: Option<super::RarEndRecord>,
 }
 #[allow(
     clippy::large_enum_variant,
@@ -554,6 +556,7 @@ impl HeaderParser {
             extent: self.at..header_end,
             data_end,
             header_crypt: None,
+            end_record: None,
         };
         frame.block = match kind {
             HEAD_MAIN => {
@@ -562,6 +565,7 @@ impl HeaderParser {
                 let volume_number =
                     if flags & MHFL_VOLNUMBER != 0 { f.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
                 let (original_name, original_time) = super::main_metadata(extra);
+                let extra_records = super::extra_records(extra);
                 Block::Main(MainHeader {
                     flags,
                     volume_number,
@@ -569,6 +573,8 @@ impl HeaderParser {
                     original_name,
                     original_time,
                     embedded_comment: None,
+                    locator: super::main_locator(&extra_records),
+                    extra_records,
                 })
             }
             HEAD_FILE | HEAD_SERVICE => {
@@ -594,6 +600,8 @@ impl HeaderParser {
                 let mut f = Cursor::new(fields);
                 let flags =
                     if self.catalogue { f.vint().map_err(|e| self.parse_fault(e))? } else { f.vint().unwrap_or(0) };
+                frame.end_record =
+                    Some(super::RarEndRecord { flags, data_crc: None, volume_number: None, offset: self.at });
                 Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0, volume_number: None }
             }
             _ => Block::Unknown,

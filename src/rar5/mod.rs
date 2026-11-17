@@ -58,6 +58,7 @@ pub const MHFL_SOLID: u64 = 0x0004;
 pub const MHFL_PROTECT: u64 = 0x0008;
 pub const MHFL_LOCK: u64 = 0x0010;
 /// Main header extra record: the original archive name and time.
+pub const MHEXTRA_LOCATOR: u64 = 0x01;
 pub const MHEXTRA_METADATA: u64 = 0x02;
 
 pub const FHFL_DIRECTORY: u64 = 0x0001;
@@ -158,6 +159,67 @@ pub struct MainHeader {
     /// RAR 2.x only (`MHD_COMMENT`): the comment block embedded in the main header, from its `COMM_HEAD` on, as
     /// stored. Kept by catalogues only.
     pub embedded_comment: Option<Vec<u8>>,
+    /// RAR 5.0 only: the locator record of the main header extra area, when present.
+    pub locator: Option<RarLocator>,
+    /// RAR 5.0 only: the main header's extra records in their stored order.
+    pub extra_records: Vec<RarExtraRecord>,
+}
+
+/// One record of a RAR 5.0 header's extra area, in stored order: its type and its bytes after the type.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct RarExtraRecord {
+    pub kind: u64,
+    pub data: Vec<u8>,
+}
+
+/// The RAR 5.0 main header locator record (type 0x01): where the quick open service header and the recovery record
+/// start, as offsets from the start of the main header. 7-Zip lists them in its `-slt` archive properties.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct RarLocator {
+    /// Raw flags: 0x1 the quick open offset is present, 0x2 the recovery record offset is.
+    pub flags: u64,
+    pub quick_open: Option<u64>,
+    pub recovery: Option<u64>,
+}
+
+/// The end of archive header as stored. RAR 5.0: its flags (0x1 more volumes follow). RAR 4.x: the header flags
+/// (`EARC_NEXT_VOLUME` 0x1, `EARC_DATACRC` 0x2, `EARC_REVSPACE` 0x4, `EARC_VOLNUMBER` 0x8) and the fields they add.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct RarEndRecord {
+    pub flags: u64,
+    /// RAR 4.x `EARC_DATACRC`: the CRC32 of the volume's data.
+    pub data_crc: Option<u32>,
+    /// RAR 4.x `EARC_VOLNUMBER`: the volume number.
+    pub volume_number: Option<u64>,
+    /// Where the header starts in the volume.
+    pub offset: u64,
+}
+
+/// The records of a RAR 5.0 extra area in stored order; stops at the first that does not parse.
+pub(crate) fn extra_records(extra: &[u8]) -> Vec<RarExtraRecord> {
+    let mut out = Vec::new();
+    let mut c = Cursor::new(extra);
+    while c.remaining() > 0 && out.len() < 64 {
+        let Ok(size) = c.vsize() else { break };
+        let Ok(record) = c.bytes(size) else { break };
+        let mut r = Cursor::new(record);
+        let Ok(kind) = r.vint() else { break };
+        out.push(RarExtraRecord { kind, data: record[r.pos()..].to_vec() });
+    }
+    out
+}
+
+/// The locator record of a RAR 5.0 main header extra area.
+pub(crate) fn main_locator(records: &[RarExtraRecord]) -> Option<RarLocator> {
+    let record = records.iter().find(|r| r.kind == MHEXTRA_LOCATOR)?;
+    let mut r = Cursor::new(&record.data);
+    let flags = r.vint().ok()?;
+    let quick_open = if flags & 1 != 0 { Some(r.vint().ok()?) } else { None };
+    let recovery = if flags & 2 != 0 { Some(r.vint().ok()?) } else { None };
+    Some(RarLocator { flags, quick_open, recovery })
 }
 
 /// A timestamp as a header stores it. `resolution_nanos` is the step the stored form can express: 2 s for an MS-DOS
@@ -295,6 +357,8 @@ pub struct FileHeader {
     /// RAR 5.0: the redirection record's flags as stored (0x1: the target is a directory, which 7-Zip lists as
     /// `:D`). Zero without the record.
     pub redirection_flags: u64,
+    /// RAR 5.0, catalogues only: the extra records in their stored order (7-Zip lists their types in that order).
+    pub extra_records: Vec<RarExtraRecord>,
     pub redirection: Option<Redirection>,
     /// set on an older revision of a file kept alongside the current one
     pub version: Option<u64>,
@@ -610,6 +674,9 @@ fn parse_file_extra(
     catalogue: bool,
     usage: Option<&crate::progressive::Usage>,
 ) -> std::result::Result<MemberCrypt, FileParseError> {
+    if catalogue {
+        f.extra_records = extra_records(extra);
+    }
     let mut crypt = None;
     let mut c = Cursor::new(extra);
     while c.remaining() > 0 {

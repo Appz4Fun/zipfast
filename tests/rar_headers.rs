@@ -482,3 +482,76 @@ fn redirection_flags_and_file_flags() {
     assert_eq!(members[1].rar5_file_flags().map(|f| f & 0x4), Some(0x4));
     assert_eq!(session.volume_paths().collect::<Vec<_>>(), [path.as_path()]);
 }
+
+#[test]
+fn rar5_extra_records_locator_and_end_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("records.rar");
+    // Main header with a locator (quick open at 0x40, recovery at 0x1234) then an unknown record type 9.
+    let mut extra = Vec::new();
+    for body in [vec![1u8, 3, 0x40, 0xb4, 0x24], vec![9u8, 0xaa]] {
+        vint(body.len() as u64, &mut extra);
+        extra.extend(body);
+    }
+    let mut fields = Vec::new();
+    vint(0, &mut fields);
+    let main = block(1, 0, &fields, &extra, &[], false);
+    // A file with a redirection record and then a version record: their order is kept.
+    let mut file_extra = Vec::new();
+    for body in [vec![5u8, 1, 0, 1, b't'], vec![4u8, 0, 7]] {
+        vint(body.len() as u64, &mut file_extra);
+        file_extra.extend(body);
+    }
+    let file = file_block(&FileSpec { extra: file_extra, ..FileSpec::new("link", b"") }, b"", 0, false, false);
+    let bytes = [SIG.to_vec(), main, file, end_block(false)].concat();
+    fs::write(&path, bytes).unwrap();
+    let session = RarSession::open(&path, None, single()).unwrap();
+    let volume = session.volumes().next().unwrap();
+    let locator = volume.main_locator().unwrap();
+    assert_eq!((locator.flags, locator.quick_open, locator.recovery), (3, Some(0x40), Some(0x1234)));
+    let kinds: Vec<_> = volume.main_extra_records().iter().map(|r| r.kind).collect();
+    assert_eq!(kinds, [1, 9]);
+    let member = session.entries().next().unwrap();
+    let records: Vec<_> = member.extra_records().iter().map(|r| (r.kind, r.data.clone())).collect();
+    assert_eq!(records, [(5, vec![1, 0, 1, b't']), (4, vec![0, 7])]);
+    let end = volume.end_record().unwrap();
+    assert_eq!((end.flags, end.data_crc, end.volume_number), (0, None, None));
+    assert!(end.offset > 0);
+}
+
+#[test]
+fn rar4_end_records_carry_flags_crc_and_volume_number() {
+    let session = RarSession::open(&fixtures().join("multi.part1.rar"), None, RarSessionOptions::default()).unwrap();
+    let ends: Vec<_> = session.volumes().map(|v| v.end_record().unwrap()).collect();
+    assert_eq!(ends.len(), 3);
+    for (i, end) in ends.iter().enumerate() {
+        assert_eq!(end.flags & 1 != 0, i < 2, "{end:?}");
+        assert_eq!(end.volume_number, (end.flags & 8 != 0).then_some(i as u64), "{end:?}");
+        assert_eq!(end.data_crc.is_some(), end.flags & 2 != 0, "{end:?}");
+    }
+}
+
+#[test]
+fn kept_extra_records_count_against_catalogue_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let build = |name: &str, extra_len: usize| {
+        let path = dir.path().join(name);
+        let mut body = vec![9u8];
+        body.extend(std::iter::repeat_n(0xaa, extra_len));
+        let mut extra = Vec::new();
+        vint(body.len() as u64, &mut extra);
+        extra.extend(body);
+        let file = file_block(&FileSpec { extra, ..FileSpec::new("f", b"") }, b"", 0, false, false);
+        fs::write(&path, [SIG.to_vec(), main_block(false, None), file, end_block(false)].concat()).unwrap();
+        path
+    };
+    let small = build("small.rar", 1);
+    let large = build("large.rar", 200_000);
+    let capacity = |path: &Path| RarSession::open(path, None, single()).unwrap().usage().capacity;
+    let (base, big) = (capacity(&small), capacity(&large));
+    assert!(big >= base + 199_000, "{base} -> {big}");
+    let mut options = single();
+    options.limits.capacity = base + 100_000;
+    assert!(RarSession::open(&small, None, options.clone()).is_ok());
+    assert!(RarSession::open(&large, None, options).is_err());
+}
