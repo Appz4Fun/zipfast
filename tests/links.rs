@@ -177,3 +177,101 @@ fn the_checked_zip_route_places_links_too() {
     assert!(fs::symlink_metadata(dest.join("up")).is_err());
     assert_eq!(fs::read(dest.join("ok.txt")).unwrap(), b"ok\n");
 }
+
+/// A ustar archive: (name, kind, data or link target).
+fn tar(members: &[(&str, u8, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &(name, kind, body) in members {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        let size = if kind == b'0' { body.len() } else { 0 };
+        let mut octal = |at: usize, width: usize, v: u64| {
+            h[at..at + width].copy_from_slice(format!("{v:0w$o}\0", w = width - 1).as_bytes());
+        };
+        octal(100, 8, if kind == b'5' { 0o755 } else { 0o644 });
+        octal(108, 8, 0);
+        octal(116, 8, 0);
+        octal(124, 12, size as u64);
+        octal(136, 12, 1_577_934_245);
+        h[156] = kind;
+        if kind != b'0' && kind != b'5' {
+            h[157..157 + body.len()].copy_from_slice(body);
+        }
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        out.extend(h);
+        if kind == b'0' {
+            out.extend(body);
+            out.resize(out.len().div_ceil(512) * 512, 0);
+        }
+    }
+    out.extend([0u8; 1024]);
+    out
+}
+
+#[test]
+fn rename_new_links_to_where_the_file_landed_not_the_old_file() {
+    use std::os::unix::fs::MetadataExt;
+    use zipfast::extract::RenameStyle;
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("a.tar");
+    fs::write(&archive, tar(&[("a.txt", b'0', b"new"), ("h", b'1', b"a.txt")])).unwrap();
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("a.txt"), b"SECRET").unwrap();
+    let opts = options(&dest, Mode::Extract, Overwrite::RenameNew(RenameStyle::Underscore));
+    let s = extract::run(&archive, &opts, |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"SECRET");
+    assert_eq!(fs::read(dest.join("a_1.txt")).unwrap(), b"new");
+    assert_eq!(fs::read(dest.join("h")).unwrap(), b"new");
+    assert_ne!(fs::metadata(dest.join("h")).unwrap().ino(), fs::metadata(dest.join("a.txt")).unwrap().ino());
+}
+
+#[test]
+fn rename_existing_never_links_through_a_symlink_that_replaced_a_folder() {
+    use std::os::unix::fs::MetadataExt;
+    use zipfast::extract::RenameStyle;
+    for gz in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("f"), b"OUTSIDE").unwrap();
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        std::os::unix::fs::symlink("../outside", dest.join("ext")).unwrap();
+        let bytes = tar(&[("d/", b'5', b""), ("d/f", b'0', b"mine"), ("d", b'2', b"ext"), ("h", b'1', b"d/f")]);
+        let archive = dir.path().join(if gz { "a.tgz" } else { "a.tar" });
+        if gz {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&bytes).unwrap();
+            fs::write(&archive, enc.finish().unwrap()).unwrap();
+        } else {
+            fs::write(&archive, bytes).unwrap();
+        }
+        let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore));
+        let _ = extract::run(&archive, &opts, |_| {});
+        let outside_ino = fs::metadata(outside.join("f")).unwrap().ino();
+        if let Ok(h) = fs::symlink_metadata(dest.join("h")) {
+            assert_ne!(h.ino(), outside_ino, "gz={gz}: h shares the outside file");
+        }
+        assert_eq!(fs::metadata(outside.join("f")).unwrap().nlink(), 1, "gz={gz}");
+        assert_eq!(fs::read(outside.join("f")).unwrap(), b"OUTSIDE");
+    }
+}
+
+#[test]
+fn testing_refuses_the_links_extracting_would_refuse() {
+    for name in ["escape.tar", "escape.zip"] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = extract::run(&fixture(name), &options(dir.path(), Mode::Test, Overwrite::Always), |_| {}).unwrap();
+        assert!(s.errors.len() >= 2 && s.errors.iter().all(|e| e.contains("leads out")), "{name}: {:?}", s.errors);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let s = extract::run(&fixture("hard-missing.tar"), &options(dir.path(), Mode::Test, Overwrite::Always), |_| {});
+    assert_eq!(s.unwrap().errors.len(), 1);
+}

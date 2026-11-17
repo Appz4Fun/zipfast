@@ -530,6 +530,11 @@ impl Run<'_> {
         let target = if take { self.place(member, name)? } else { None };
         let mut staged = match &target {
             Some((_, Some(place))) => Some(self.stage(place, size)?),
+            // testing a link: its target is held aside (in the system's temporary folder) to be checked
+            Some((_, None)) if is_link(member) => {
+                let (file, temporary) = tempfile::NamedTempFile::new().map_err(SevenZipError::Io)?.into_parts();
+                Some((temporary, Output::new(file, Some(size))))
+            }
             _ => None,
         };
         let mut crc = crc32fast::Hasher::new();
@@ -559,6 +564,16 @@ impl Run<'_> {
         }
         let Some((rel, place)) = target else { return Ok(()) };
         let Some(place) = place else {
+            // Testing a link checks its target as extracting would.
+            if let Some((temporary, output)) = staged.take() {
+                output.finish(|_| ()).map_err(SevenZipError::Io)?;
+                let text = std::fs::read(&temporary).map_err(SevenZipError::Io)?;
+                let kind = crate::extract::link::LinkKind::Symbolic(text);
+                if let Some(why) = crate::extract::link::refusal(&rel, &kind, &self.extracted) {
+                    self.fail(name, why);
+                    return Ok(());
+                }
+            }
             // Testing: checked, nothing to write; a folder with its own CRC vouches for it at its end.
             if active.defer {
                 active.tested.push((name.to_owned(), size, self.current));

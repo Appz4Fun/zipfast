@@ -723,9 +723,6 @@ impl ProjectedReadSession {
         if let Err(error) = read {
             return (Err(error), false, false);
         }
-        if options.mode != Mode::Extract {
-            return (Ok(()), false, false);
-        }
         let Ok(rel) = crate::path::sanitize_with(&name, host != 3, options.windows_safe_names) else {
             return refuse("invalid ZIP target name");
         };
@@ -733,8 +730,12 @@ impl ProjectedReadSession {
         let kind = link::LinkKind::Symbolic(text);
         // ZIP holds no hard links, so the run keeps no record of the files it wrote
         let mut extracted = link::Extracted::default();
+        // testing checks the target as extracting would
         if let Some(why) = link::refusal(&rel, &kind, &extracted) {
             return refuse(why);
+        }
+        if options.mode != Mode::Extract {
+            return (Ok(()), false, false);
         }
         let mut renamed = None;
         let mut budget = crate::extract::RenameBudget::default();

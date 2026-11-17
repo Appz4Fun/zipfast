@@ -1045,12 +1045,13 @@ pub(crate) fn run_renaming(
                     }
                     Ok(()) => {}
                 }
+                // testing checks the target as extracting would
+                let kind = crate::extract::link::LinkKind::Symbolic(text);
+                if let Some(why) = crate::extract::link::refusal(&rel, &kind, &extracted) {
+                    fail(&mut summary, &mut report, &e.name, why);
+                    continue;
+                }
                 if opts.mode == Mode::Extract {
-                    let kind = crate::extract::link::LinkKind::Symbolic(text);
-                    if let Some(why) = crate::extract::link::refusal(&rel, &kind, &extracted) {
-                        fail(&mut summary, &mut report, &e.name, why);
-                        continue;
-                    }
                     let mut log = RenameLog {
                         budget: &mut summary.rename_budget,
                         record: &mut |renamed| {

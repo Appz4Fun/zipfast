@@ -1064,8 +1064,14 @@ fn target(
     size: Option<u64>,
     summary: &mut Summary,
     report: &mut impl LegacyReport,
-) -> Result<Option<Output>> {
-    checked_place(opts, rel, (ordinal, name), summary, report)?.map(|place| create_target(place, size)).transpose()
+) -> Result<Option<(Output, PathBuf)>> {
+    let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(None) };
+    // where the data lands: a rename mode's reserved name, else the target
+    let landed = match &place.reserved {
+        Some(reserved) => reserved.path().to_path_buf(),
+        None => place.path.clone(),
+    };
+    Ok(Some((create_target(place, size)?, landed)))
 }
 
 /// How a member's data went: written whole, or the error that stopped it.
@@ -1104,6 +1110,10 @@ impl StagedTar {
                     let Some(place) = checked_place(opts, &relative, (ordinal, &name), summary, report)? else {
                         continue;
                     };
+                    let landed = match &place.reserved {
+                        Some(reserved) => reserved.path().to_path_buf(),
+                        None => place.path.clone(),
+                    };
                     if let Some(reserved) = place.reserved {
                         // the rename mode's own empty file, created with O_EXCL a moment ago, takes the data
                         replace(temporary, reserved.path())?;
@@ -1117,7 +1127,7 @@ impl StagedTar {
                         }
                         return Err(error.error.into());
                     }
-                    extracted.file(&relative);
+                    extracted.file(&opts.dest, &relative, &landed);
                     succeeded(summary, report, ordinal, &name, size);
                 }
             }
@@ -1137,7 +1147,8 @@ fn link_member(
     summary: &mut Summary,
     report: &mut impl LegacyReport,
 ) -> Result<()> {
-    if let Some(why) = link::refusal(rel, kind, extracted).filter(|_| opts.mode == Mode::Extract) {
+    // testing checks the target as extracting would
+    if let Some(why) = link::refusal(rel, kind, extracted) {
         fail_member(summary, report, ordinal, name, why, Error::UnsafePath(name.to_owned()));
         return Ok(());
     }
@@ -1150,6 +1161,12 @@ fn link_member(
                 return Ok(());
             }
             return Err(e.into());
+        }
+    }
+    if opts.mode != Mode::Extract {
+        match kind {
+            LinkKind::Hard(_) => extracted.tested(rel),
+            LinkKind::Symbolic(_) => extracted.replaced(rel),
         }
     }
     succeeded(summary, report, ordinal, name, 0);
@@ -1259,7 +1276,7 @@ fn run_single(
     if opts.mode == Mode::Extract {
         let rel = PathBuf::from(&name);
         match target(opts, &rel, (0, &name), None, summary, report)? {
-            Some(t) => out = Some(t),
+            Some((t, _)) => out = Some(t),
             None => return Ok(()),
         }
     }
@@ -1432,6 +1449,7 @@ fn run_tar(
             match reader.src.skip(size, &mut reader.scratch) {
                 Ok(()) => {
                     reader.unread = 0;
+                    extracted.tested(&rel);
                     succeeded(summary, report, position, &m.name, m.size);
                     continue;
                 }
@@ -1443,11 +1461,15 @@ fn run_tar(
             }
         }
         let size = m.size;
-        let wrote = out.is_some();
+        let (out, landed) = match out {
+            Some((out, landed)) => (Some(out), Some(landed)),
+            None => (None, None),
+        };
         match copy_out(out, &m.meta(), |sink| reader.read_data(size, buf, sink))? {
             Outcome::Done => {
-                if wrote {
-                    extracted.file(&rel);
+                match &landed {
+                    Some(landed) => extracted.file(&opts.dest, &rel, landed),
+                    None => extracted.tested(&rel),
                 }
                 succeeded(summary, report, position, &m.name, m.size)
             }
