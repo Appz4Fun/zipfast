@@ -2,7 +2,10 @@
 # Compatibility sweep: build archives with the system's real tools (bsdtar, Info-ZIP zip, ditto, gzip, bzip2, xz,
 # zstd, lz4, compress), extract each with a reference tool and with zipfast, and diff the two trees.
 #
-#   scripts/compat-sweep.sh [WORKDIR]        # default WORKDIR: ${TMPDIR:-/tmp}/zf-compat
+#   scripts/compat-sweep.sh [PARENT]         # default PARENT: ${TMPDIR:-/tmp}
+#
+# Everything is written to a fresh WORKDIR=PARENT/zf-compat.XXXXXX made with mktemp -d; nothing else under PARENT is
+# touched. The path is printed at the end; delete it when done.
 #
 # Env: ZIPFAST=path/to/zipfast (default: cargo build --release and use target/release/zipfast)
 #      BIG=1 also builds the one >4 GiB sparse-member case per family (slow, ~5 GiB of scratch while it runs)
@@ -11,15 +14,18 @@
 #      RAR4REF=dir with in/ and out/*.xstatus, out/*.sha256 written by UnRAR: compares zipfast's file bytes with them.
 # Output: WORKDIR/results.tsv (case, reference tool, status, symptom). Mismatch detail in WORKDIR/log/<case>.txt.
 set -u
-W=${1:-${TMPDIR:-/tmp}/zf-compat}
-W=$(mkdir -p "$W" && cd "$W" && pwd)
+PARENT=${1:-${TMPDIR:-/tmp}}
+[ -d "$PARENT" ] || { echo "compat-sweep: $PARENT is not a directory" >&2; exit 1; }
+W=$(mktemp -d "${PARENT%/}/zf-compat.XXXXXX") || exit 1
+W=$(cd "$W" && pwd) || exit 1
+case $W in ''|/) echo "compat-sweep: refusing work directory '$W'" >&2; exit 1 ;; esac
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 if [ -z "${ZIPFAST:-}" ]; then
   (cd "$HERE" && cargo build --release -q) || exit 1
   ZIPFAST=${CARGO_TARGET_DIR:-$HERE/target}/release/zipfast
 fi
 SRC=$W/src A=$W/arc X=$W/x LOG=$W/log
-chmod -R u+w "$W" 2>/dev/null; rm -rf "$SRC" "$A" "$X" "$LOG" "$W/ref7z"; mkdir -p "$SRC" "$A" "$X" "$LOG"
+mkdir -p "$SRC" "$A" "$X" "$LOG"
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # ---- source tree with tricky contents ----
@@ -236,3 +242,4 @@ for line in open(cases):
     rm(r); rm(z)
 PY
 column -t -s $'\t' "$W/results.tsv"
+echo "work directory: $W"
