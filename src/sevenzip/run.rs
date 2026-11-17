@@ -50,6 +50,8 @@ struct Staged {
     size: u64,
     /// its listing index, for the observer
     ordinal: u64,
+    /// A symbolic link at this destination-relative path: the staged data is its target.
+    link: Option<PathBuf>,
 }
 
 /// The folder being decoded.
@@ -85,6 +87,8 @@ struct Run<'a> {
     buf: Vec<u8>,
     /// the listing index of the member being handled
     current: u64,
+    /// files written so far (symbolic links only are placed; 7z hard links are stored as files)
+    extracted: crate::extract::link::Extracted,
 }
 
 pub(super) fn run(
@@ -136,6 +140,7 @@ pub(super) fn run(
         report,
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
+        extracted: Default::default(),
         active: None,
         password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],
@@ -251,7 +256,10 @@ impl Run<'_> {
         if let Some(kind) = member.unix_mode.map(|mode| mode & S_IFMT).filter(|&k| k != 0) {
             let why = match kind {
                 S_IFREG | S_IFDIR => None,
-                S_IFLNK => Some("links are not supported yet"),
+                S_IFLNK if member.unpacked_size.unwrap_or(0) > crate::extract::link::MAX_TARGET => {
+                    Some("the link's target is too long")
+                }
+                S_IFLNK => None,
                 _ => Some("devices and pipes are not extracted"),
             };
             if let Some(why) = why {
@@ -308,7 +316,8 @@ impl Run<'_> {
         if let Some(place) = place {
             let (temporary, output) = self.stage(&place, 0)?;
             output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
-            if !self.publish(Staged { temporary, place, name, size: 0, ordinal: self.current })? {
+            let link = is_link(member).then(|| rel.clone());
+            if !self.publish(Staged { temporary, place, name, size: 0, ordinal: self.current, link })? {
                 return Ok(());
             }
         } else {
@@ -327,7 +336,26 @@ impl Run<'_> {
     /// Gives a verified file its name: replacing what is there only when that was asked for, never through a link.
     /// False when it was not published (already reported).
     fn publish(&mut self, staged: Staged) -> Outcome<bool> {
-        let Staged { temporary, place, name, size, ordinal } = staged;
+        let Staged { temporary, place, name, size, ordinal, link } = staged;
+        if let Some(rel) = link {
+            // A symbolic link: its verified data is the target.
+            let text = std::fs::read(&temporary).map_err(SevenZipError::Io)?;
+            let kind = crate::extract::link::LinkKind::Symbolic(text);
+            if let Some(why) = crate::extract::link::refusal(&rel, &kind, &self.extracted) {
+                self.fail_at(ordinal, &name, why);
+                return Ok(false);
+            }
+            drop(temporary);
+            if let Err(e) = crate::extract::link::publish(&self.opts.dest, &rel, place, &kind, &mut self.extracted) {
+                if e.kind() == io::ErrorKind::Unsupported {
+                    self.fail_at(ordinal, &name, "links can't be created here");
+                    return Ok(false);
+                }
+                return Err(SevenZipError::Io(e));
+            }
+            self.succeeded(ordinal, &name, 0);
+            return Ok(true);
+        }
         if let Some(reserved) = place.reserved {
             // The rename mode's own empty file, created with O_EXCL when the member started, takes the data, as long
             // as the name still holds that file.
@@ -529,7 +557,7 @@ impl Run<'_> {
         if encrypted && member.checks.and_then(|c| c.crc32).is_some() {
             self.password_proven = true;
         }
-        let Some((_, place)) = target else { return Ok(()) };
+        let Some((rel, place)) = target else { return Ok(()) };
         let Some(place) = place else {
             // Testing: checked, nothing to write; a folder with its own CRC vouches for it at its end.
             if active.defer {
@@ -541,7 +569,8 @@ impl Run<'_> {
         };
         let (temporary, output) = staged.take().expect("a staged output");
         output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
-        let staged = Staged { temporary, place, name: name.to_owned(), size, ordinal: self.current };
+        let link = is_link(member).then_some(rel);
+        let staged = Staged { temporary, place, name: name.to_owned(), size, ordinal: self.current, link };
         if active.defer {
             active.staged.push(staged);
         } else {
@@ -562,4 +591,9 @@ impl Run<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether a member is a Unix symbolic link (`S_IFLNK` in the attributes' high bits).
+fn is_link(member: &MapMember) -> bool {
+    member.unix_mode.is_some_and(|mode| mode & S_IFMT == S_IFLNK)
 }
