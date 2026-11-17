@@ -33,6 +33,8 @@ pub(crate) struct ByteSplit {
     volumes: Vec<(PathBuf, u64)>,
     /// The piece currently open.
     open: Option<(usize, File)>,
+    /// The first missing piece, when a later one exists: the set is read up to the gap.
+    missing: Option<PathBuf>,
     len: u64,
     pos: u64,
 }
@@ -40,7 +42,7 @@ pub(crate) struct ByteSplit {
 impl ByteSplit {
     /// The set starting at `first` when it is the first volume of a byte-split set of two or more pieces: its name
     /// ends in a dot and digits counting from 1 (`.001`) and the next piece exists. None otherwise. A gap followed
-    /// by a later piece is a missing volume.
+    /// by a later piece ends the set at the gap, with [`Self::missing`] naming the absent piece.
     pub(crate) fn open(first: &Path) -> crate::error::Result<Option<Self>> {
         if !is_split_set(first) {
             return Ok(None);
@@ -48,6 +50,7 @@ impl ByteSplit {
         let mut volumes = Vec::new();
         let mut len = 0u64;
         let mut path = first.to_path_buf();
+        let mut missing = None;
         loop {
             let size = std::fs::metadata(&path)?.len();
             volumes.push((path.clone(), len));
@@ -58,7 +61,8 @@ impl ByteSplit {
                 for _ in 0..GAP_PROBE {
                     probe = next_piece(&probe).expect("digits");
                     if probe.is_file() {
-                        return Err(crate::error::Error::MissingVolume(next));
+                        missing = Some(next);
+                        break;
                     }
                 }
                 break;
@@ -68,11 +72,16 @@ impl ByteSplit {
             }
             path = next;
         }
-        Ok(Some(Self { volumes, open: None, len, pos: 0 }))
+        Ok(Some(Self { volumes, open: None, missing, len, pos: 0 }))
     }
 
     pub(crate) fn len(&self) -> u64 {
         self.len
+    }
+
+    /// The first absent piece of a set with a gap.
+    pub(crate) fn missing(&self) -> Option<&Path> {
+        self.missing.as_deref()
     }
 
     pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
@@ -93,9 +102,18 @@ fn next_piece(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(format!("{}{:0width$}", &name[..start], n + 1, width = digits)))
 }
 
-/// Whether `first` is the first piece of a set of two or more.
+/// Whether `first` is the first piece of a set of two or more (counting a set whose second piece is missing).
 pub(crate) fn is_split_set(first: &Path) -> bool {
-    is_first_piece(first) && next_piece(first).is_some_and(|p| p.is_file())
+    is_first_piece(first) && later_piece_exists(first)
+}
+
+/// Whether a piece after `path` exists: the next one, or one up to [`GAP_PROBE`] names further past a gap.
+fn later_piece_exists(path: &Path) -> bool {
+    let mut probe = path.to_path_buf();
+    (0..=GAP_PROBE).any(|_| {
+        probe = next_piece(&probe).expect("a piece name ends in digits");
+        probe.is_file()
+    })
 }
 
 /// Whether the file name ends in `.` and digits whose value is 1 (`x.zip.001`, `x.zip.01`).
@@ -174,6 +192,55 @@ impl Seek for ArchiveSource {
     }
 }
 
+/// The members whose local headers lie before `len`, walking from offset 0, for a set cut short by a missing piece
+/// (no central directory to read): as 7-Zip lists such a set. The walk stops at anything but a local header, at a
+/// header whose sizes are only in a data descriptor, and after a member whose data runs past `len`.
+pub(crate) fn scan_local_headers(
+    source: &mut (impl Read + Seek),
+    len: u64,
+) -> crate::error::Result<Vec<super::ZipEntry>> {
+    use zip_container::{LOCAL_HEADER_LEN, LocalHeader};
+    let mut entries = Vec::new();
+    let mut at = 0u64;
+    while at + LOCAL_HEADER_LEN as u64 <= len && entries.len() < 1_000_000 {
+        let mut head = [0u8; LOCAL_HEADER_LEN];
+        source.seek(SeekFrom::Start(at))?;
+        source.read_exact(&mut head)?;
+        let Ok(h) = LocalHeader::parse(&head) else { break };
+        let name_at = at + LOCAL_HEADER_LEN as u64;
+        if name_at + u64::from(h.name_len) > len {
+            break;
+        }
+        let mut raw = vec![0u8; usize::from(h.name_len)];
+        source.read_exact(&mut raw)?;
+        let descriptor = h.flags & 0x08 != 0 && h.packed_size == 0;
+        if descriptor || h.packed_size == u32::MAX || h.unpacked_size == u32::MAX {
+            break;
+        }
+        let name = super::decode_name(&raw, h.flags & super::FLAG_UTF8 != 0)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&raw).into_owned());
+        let mtime = super::dos_time(h.mod_time, h.mod_date);
+        entries.push(super::ZipEntry {
+            name,
+            flags: h.flags,
+            method: h.method,
+            crc32: h.crc32,
+            packed: u64::from(h.packed_size),
+            size: u64::from(h.unpacked_size),
+            local_at: at,
+            mtime,
+            mtime_origin: mtime.map(|_| crate::extract::MtimeOrigin::LocalWallClock),
+            ..Default::default()
+        });
+        let end = name_at + u64::from(h.name_len) + u64::from(h.extra_len) + u64::from(h.packed_size);
+        if end > len {
+            break;
+        }
+        at = end;
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,14 +284,13 @@ mod tests {
         let lone = tempfile::tempdir().unwrap();
         std::fs::write(lone.path().join("y.zip.001"), b"PK").unwrap();
         assert!(ByteSplit::open(&lone.path().join("y.zip.001")).unwrap().is_none());
-        // A missing middle piece is a missing volume, not a shorter archive.
+        // A missing middle piece ends the set at the gap and is named.
         std::fs::remove_file(dir.path().join("x.zip.002")).unwrap();
         std::fs::write(dir.path().join("x.zip.002"), b"").unwrap();
         std::fs::remove_file(dir.path().join("x.zip.003")).unwrap();
-        match ByteSplit::open(&dir.path().join("x.zip.001")) {
-            Err(crate::error::Error::MissingVolume(p)) => assert!(p.ends_with("x.zip.003")),
-            _ => panic!("missing volume expected"),
-        }
+        let split = ByteSplit::open(&dir.path().join("x.zip.001")).unwrap().unwrap();
+        assert!(split.missing().unwrap().ends_with("x.zip.003"));
+        assert_eq!((split.len(), split.paths().count()), (300, 2));
     }
 
     #[test]

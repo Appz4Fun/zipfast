@@ -245,7 +245,7 @@ impl Rar4Metadata {
 }
 
 /// The leading fields of a RAR 5.0 file encryption record (extra record 0x01), as stored. 7-Zip lists them in the
-/// method string: `AES:<kdf_count>`, then `:<flags>` when the flags are not zero (`AES:15:3`).
+/// method string as `AES:<kdf_count>:<flags>`, flags included even when they are 0 (`AES:15:3`, `AES:15:0`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub struct Rar5CryptRecord {

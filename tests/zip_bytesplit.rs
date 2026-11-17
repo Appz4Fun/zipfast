@@ -139,3 +139,45 @@ fn extracting_beside_the_set_never_overwrites_a_piece() {
     }
     assert_eq!(fs::read(dir.path().join("ok.txt")).unwrap(), b"fine");
 }
+
+#[test]
+fn a_missing_middle_piece_lists_and_extracts_what_comes_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = vec![b'a'; 700];
+    let b = vec![b'b'; 700];
+    let c = vec![b'c'; 700];
+    let zip = stored_zip(&[("a.txt", &a), ("b.txt", &b), ("c.txt", &c)]);
+    for (i, piece) in zip.chunks(1024).enumerate() {
+        fs::write(dir.path().join(format!("gap.zip.{:03}", i + 1)), piece).unwrap();
+    }
+    fs::remove_file(dir.path().join("gap.zip.002")).unwrap();
+    let first = dir.path().join("gap.zip.001");
+    // Like 7-Zip: the members whose headers come before the gap, the last one cut short.
+    assert_eq!(names(&extract::list(&first).unwrap()), [("a.txt", 700), ("b.txt", 700)]);
+    let out = dir.path().join("out");
+    let result = extract::run(&first, &options(&out, Mode::Extract), |_| {}).unwrap();
+    assert_eq!(result.files, 1, "{:?}", result.errors);
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), a);
+    assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
+    assert!(result.errors[0].starts_with("b.txt: missing volume") && result.errors[0].ends_with("gap.zip.002"));
+    assert!(result.errors[1].starts_with("missing volume"), "{:?}", result.errors);
+}
+
+#[test]
+fn a_listing_cut_short_by_a_missing_piece_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = stored_zip(&[("a.txt", &[b'a'; 700]), ("b.txt", &[b'b'; 700]), ("c.txt", &[b'c'; 700])]);
+    for (i, piece) in zip.chunks(1024).enumerate() {
+        fs::write(dir.path().join(format!("cut.zip.{:03}", i + 1)), piece).unwrap();
+    }
+    let whole = extract::list_detailed(&dir.path().join("cut.zip.001"), None).unwrap();
+    assert!(!whole.unexpected_end());
+    assert_eq!(whole.entries.len(), 3);
+    fs::remove_file(dir.path().join("cut.zip.002")).unwrap();
+    let cut = extract::list_detailed(&dir.path().join("cut.zip.001"), None).unwrap();
+    assert!(cut.unexpected_end());
+    assert!(cut.missing_volume.unwrap().ends_with("cut.zip.002"));
+    assert_eq!(names(&cut.entries), [("a.txt", 700), ("b.txt", 700)]);
+    // A whole single archive has no warning either.
+    assert!(!extract::list_detailed(&first(), None).unwrap().unexpected_end());
+}
