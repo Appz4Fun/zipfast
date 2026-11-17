@@ -46,6 +46,10 @@ const MAX_EXTENTS: usize = 1 << 16;
 /// count once each, so a few thousand files on one big extent can't turn a small image into terabytes.
 const MAX_DECLARED_RATIO: u64 = 4;
 const MAX_DECLARED_FREE: u64 = 64 << 20;
+/// What the paths handed out may come to in all, against the image's length: each folder's name is stored once
+/// but appears in every path below it.
+const MAX_PATHS_RATIO: u64 = 8;
+const MAX_PATHS_FREE: u64 = 64 << 20;
 
 fn corrupt(why: &'static str) -> Error {
     Error::Corrupt(why)
@@ -76,6 +80,9 @@ pub(super) struct State {
     file: File,
     entries: VecDeque<Entry>,
     names: Names,
+    /// bytes of paths handed out so far, and the most they may come to
+    paths: u64,
+    max_paths: u64,
 }
 
 /// Whether `file` holds an ISO 9660 image: "CD001" in its first volume descriptor.
@@ -515,7 +522,8 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
         entries.remove(at);
     }
     let entries = entries.into();
-    Ok(State { file, entries, names })
+    let max_paths = len.saturating_mul(MAX_PATHS_RATIO).saturating_add(MAX_PATHS_FREE);
+    Ok(State { file, entries, names, paths: 0, max_paths })
 }
 
 /// A file whose extents are all read: refused when they overlap one another, which no writer does and which
@@ -562,6 +570,11 @@ impl State {
     fn next_entry(&mut self) -> Result<Option<(Member, Option<Data>)>> {
         let Some(e) = self.entries.pop_front() else { return Ok(None) };
         let (path, raw_path) = self.names.path(e.name, "an ISO 9660 path is too long")?;
+        // folders' names repeat in every path below them: what all the paths come to is bounded as well
+        self.paths = self.paths.saturating_add(path.len() as u64);
+        if self.paths > self.max_paths {
+            return Err(corrupt("an ISO 9660 image's paths add up to far more than it holds"));
+        }
         let size: u64 = e.extents.iter().map(|&(_, l)| l).sum();
         let data = (e.kind == Kind::File).then(|| -> Result<Data> {
             Ok(Data { file: self.file.try_clone()?, extents: e.extents.into(), at: 0, fault: None })
@@ -688,6 +701,7 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         std::io::Write::write_all(&mut file, &img).unwrap();
         let mut state = open(file, img.len() as u64).unwrap();
+        let mut capped = open(state.file.try_clone().unwrap(), img.len() as u64).unwrap();
         assert!(state.names.bytes() < depth * 210 + files * 20, "{} bytes of names kept", state.names.bytes());
         let mut longest = 0;
         let mut count = 0;
@@ -697,6 +711,16 @@ mod tests {
         }
         assert_eq!(count, depth + files);
         assert!(longest > depth * 200, "{longest}");
+        // with the paths' bound lower than what they come to, the image fails partway rather than going on
+        capped.max_paths = 10 << 20;
+        let mut failed = false;
+        for _ in 0..depth + files {
+            if capped.next_entry().is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "the bound on paths in all");
     }
 
     /// A symbolic link component flagged CONTINUE goes on in the next one, even in the next SL entry.
