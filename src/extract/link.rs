@@ -266,6 +266,8 @@ fn stage_hard(dest: &Path, landed: &Landed, stage: &Path) -> io::Result<()> {
     }
     let std::path::Component::Normal(name) = last else { return Err(gone()) };
     let name = cstr(name.as_bytes())?;
+    // st_dev and st_ino differ in width between platforms
+    #[allow(clippy::unnecessary_cast)]
     let same = |m: &libc::stat| {
         (m.st_mode & libc::S_IFMT) == libc::S_IFREG && m.st_dev as u64 == landed.dev && m.st_ino as u64 == landed.ino
     };

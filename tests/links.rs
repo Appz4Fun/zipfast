@@ -212,23 +212,39 @@ fn tar(members: &[(&str, u8, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Writes `bytes` as a plain or gzip-compressed tar.
+fn write_tar(path: &Path, bytes: Vec<u8>, gz: bool) {
+    if gz {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&bytes).unwrap();
+        fs::write(path, enc.finish().unwrap()).unwrap();
+    } else {
+        fs::write(path, bytes).unwrap();
+    }
+}
+
 #[test]
 fn rename_new_links_to_where_the_file_landed_not_the_old_file() {
     use std::os::unix::fs::MetadataExt;
     use zipfast::extract::RenameStyle;
-    let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("a.tar");
-    fs::write(&archive, tar(&[("a.txt", b'0', b"new"), ("h", b'1', b"a.txt")])).unwrap();
-    let dest = dir.path().join("out");
-    fs::create_dir(&dest).unwrap();
-    fs::write(dest.join("a.txt"), b"SECRET").unwrap();
-    let opts = options(&dest, Mode::Extract, Overwrite::RenameNew(RenameStyle::Underscore));
-    let s = extract::run(&archive, &opts, |_| {}).unwrap();
-    assert!(s.errors.is_empty(), "{:?}", s.errors);
-    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"SECRET");
-    assert_eq!(fs::read(dest.join("a_1.txt")).unwrap(), b"new");
-    assert_eq!(fs::read(dest.join("h")).unwrap(), b"new");
-    assert_ne!(fs::metadata(dest.join("h")).unwrap().ino(), fs::metadata(dest.join("a.txt")).unwrap().ino());
+    for gz in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(if gz { "a.tgz" } else { "a.tar" });
+        write_tar(&archive, tar(&[("a.txt", b'0', b"new"), ("h", b'1', b"a.txt")]), gz);
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("a.txt"), b"SECRET").unwrap();
+        let opts = options(&dest, Mode::Extract, Overwrite::RenameNew(RenameStyle::Underscore));
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        assert!(s.errors.is_empty(), "gz={gz}: {:?}", s.errors);
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"SECRET", "gz={gz}");
+        assert_eq!(fs::read(dest.join("a_1.txt")).unwrap(), b"new", "gz={gz}");
+        assert_eq!(fs::read(dest.join("h")).unwrap(), b"new", "gz={gz}");
+        let h = fs::metadata(dest.join("h")).unwrap().ino();
+        assert_ne!(h, fs::metadata(dest.join("a.txt")).unwrap().ino(), "gz={gz}");
+        assert_eq!(fs::metadata(dest.join("a.txt")).unwrap().nlink(), 1, "gz={gz}");
+    }
 }
 
 #[test]
@@ -245,16 +261,13 @@ fn rename_existing_never_links_through_a_symlink_that_replaced_a_folder() {
         std::os::unix::fs::symlink("../outside", dest.join("ext")).unwrap();
         let bytes = tar(&[("d/", b'5', b""), ("d/f", b'0', b"mine"), ("d", b'2', b"ext"), ("h", b'1', b"d/f")]);
         let archive = dir.path().join(if gz { "a.tgz" } else { "a.tar" });
-        if gz {
-            use std::io::Write;
-            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            enc.write_all(&bytes).unwrap();
-            fs::write(&archive, enc.finish().unwrap()).unwrap();
-        } else {
-            fs::write(&archive, bytes).unwrap();
-        }
+        write_tar(&archive, bytes, gz);
         let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore));
-        let _ = extract::run(&archive, &opts, |_| {});
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        // the attack's setup happened: the folder moved aside and `d` is now the link to `ext`
+        assert_eq!(fs::read_link(dest.join("d")).unwrap(), Path::new("ext"), "gz={gz}");
+        assert_eq!(fs::read(dest.join("d_1/f")).unwrap(), b"mine", "gz={gz}");
+        assert_eq!(s.errors.len(), 1, "gz={gz}: only `h` fails: {:?}", s.errors);
         let outside_ino = fs::metadata(outside.join("f")).unwrap().ino();
         if let Ok(h) = fs::symlink_metadata(dest.join("h")) {
             assert_ne!(h.ino(), outside_ino, "gz={gz}: h shares the outside file");
