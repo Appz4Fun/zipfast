@@ -1712,7 +1712,12 @@ mod tests {
                 .model
                 .members
                 .iter()
-                .map(|row| row.header.name.capacity() + row.wire.name.capacity() + crate::rar5::RAW_NAME_OWNER_BYTES)
+                .map(|row| {
+                    row.header.name.capacity()
+                        + row.wire.name.capacity()
+                        + crate::rar5::RAW_NAME_OWNER_BYTES
+                        + extra_records_bytes(&row.header.extra_records) as usize
+                })
                 .sum::<usize>()
             + session
                 .headers
