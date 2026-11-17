@@ -86,6 +86,8 @@ const METHOD_BZIP2: u16 = 12;
 const METHOD_LZMA: u16 = 14;
 const METHOD_ZSTD: u16 = 93;
 const METHOD_XZ: u16 = 95;
+/// PPMd variant I revision 1, as 7-Zip writes it (`-mm=PPMd`)
+const METHOD_PPMD: u16 = 98;
 /// An LZMA entry ends with an end marker instead of at its stated size.
 const FLAG_LZMA_EOS: u16 = 0x0002;
 
@@ -93,7 +95,14 @@ const FLAG_LZMA_EOS: u16 = 0x0002;
 fn supported(method: u16) -> bool {
     matches!(
         method,
-        METHOD_STORED | METHOD_DEFLATE | METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ
+        METHOD_STORED
+            | METHOD_DEFLATE
+            | METHOD_DEFLATE64
+            | METHOD_BZIP2
+            | METHOD_LZMA
+            | METHOD_ZSTD
+            | METHOD_XZ
+            | METHOD_PPMD
     )
 }
 
@@ -541,7 +550,7 @@ fn read_entry(
                     }
                 }
             }
-            METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
+            METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ | METHOD_PPMD => {
                 let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(decrypted)))?;
                 loop {
                     check()?;
@@ -615,7 +624,7 @@ fn read_entry(
                 }
             }
         }
-        METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
+        METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ | METHOD_PPMD => {
             let packed = BufReader::with_capacity(1 << 20, CheckedInput { input: file.take(e.packed), cancel });
             let mut dec = stream_decoder(e, e.method, packed)?;
             loop {
@@ -667,6 +676,8 @@ fn stream_decoder<'a>(e: &ReadDescription<'_>, method: u16, packed: impl BufRead
         METHOD_DEFLATE64 => Box::new(crate::inflate64::Inflate64Reader::new(packed)),
         METHOD_BZIP2 => Box::new(bzip2::bufread::MultiBzDecoder::new(packed)),
         METHOD_ZSTD => Box::new(zstd_decoder(packed)?),
+        // the model's memory, which the stream's header asks for, is held to the LZMA dictionary limit
+        METHOD_PPMD => Box::new(crate::ppmd8::Reader::new(packed, LZMA_MEMORY_LIMIT)),
         METHOD_XZ => {
             let stream = liblzma::stream::Stream::new_stream_decoder(LZMA_MEMORY_LIMIT, liblzma::stream::CONCATENATED)
                 .map_err(|_| Error::Corrupt("xz data"))?;

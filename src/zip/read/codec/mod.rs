@@ -20,6 +20,7 @@ mod bzip2;
 mod deflate;
 mod deflate64;
 mod lzma;
+mod ppmd;
 mod xz;
 mod zstd;
 enum State {
@@ -28,6 +29,7 @@ enum State {
     Deflate64(deflate64::Decoder),
     Bzip(bzip2::Decoder),
     Lzma(lzma::Decoder),
+    Ppmd(ppmd::Decoder),
     Xz(xz::Decoder),
     Zstd(zstd::Decoder),
 }
@@ -50,6 +52,7 @@ impl Engine {
                 9 => State::Deflate64(deflate64::Decoder::new(options)?),
                 12 => State::Bzip(bzip2::Decoder::new(options)?),
                 14 => State::Lzma(lzma::Decoder::new(options)?),
+                98 => State::Ppmd(ppmd::Decoder::new(options)?),
                 95 => State::Xz(xz::Decoder::new(options)?),
                 93 => State::Zstd(zstd::Decoder::new(options)?),
                 _ => return Err(IntegrityReason::Decoder),
@@ -68,6 +71,7 @@ impl Engine {
             State::Deflate64(z) => z.step(input, output, last),
             State::Bzip(z) => z.step(input, output, last),
             State::Lzma(z) => z.step(input, output, last),
+            State::Ppmd(z) => z.step(input, output, last),
             State::Xz(z) => z.step(input, output, last),
             State::Zstd(z) => z.step(input, output, last),
         };
