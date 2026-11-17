@@ -56,6 +56,11 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   specification. Split sets (`.swm`) are refused too. Lookup table entries, metadata, entries, nesting and path
   bytes are bounded, resources may not overlap, and data shared by several files is written again only up to a
   multiple of the archive's size. The LZX decoder is the MIT-licensed `lzxd` crate, vendored and patched for WIM.
+- ISO 9660 images: Rock Ridge (names, symbolic links, modes, owners, times, relocated deep folders), else Joliet,
+  else plain names, and files of several extents. Every extent has to lie inside the image, a file's own extents
+  may not overlap, and its files may declare at most four times the image's length (plus 64 MiB); each folder is
+  read once (a loop is passed over), within bounds on depth, entries, folder bytes and Rock Ridge continuation
+  areas. zisofs-compressed files are reported, not extracted; UDF is not read.
 - cpio archives, plain or compressed as tar can be: the binary format in either byte order, odc (`070707`), newc
   (`070701`) and newc with checksums (`070702`, checked). They take tar's whole pipeline: containment, symbolic and
   hard links, overwrite choices, listing and reads by index. A file's hard links come out as links to the name that

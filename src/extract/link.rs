@@ -211,10 +211,36 @@ struct Landed {
 /// reaches a file outside the destination or one that was there before the run. Each records where the file landed
 /// and its device and inode; a hard link is made only to that same file, reached without following links. A test
 /// run records the names only.
+///
+/// The records are bounded: past [`MAX_RECORDED`] bytes of paths a file is no longer recorded, so a hard link to
+/// it fails as one to a file this run didn't extract. An archive of a million files whose paths repeat long folder
+/// names can't make this run hold gigabytes of paths.
 #[derive(Default)]
-pub(crate) struct Extracted(std::collections::HashMap<std::path::PathBuf, Option<Landed>>);
+pub(crate) struct Extracted {
+    records: std::collections::HashMap<std::path::PathBuf, Option<Landed>>,
+    bytes: usize,
+}
+
+/// The most bytes of paths [`Extracted`] holds, as much as a listing may.
+pub(crate) const MAX_RECORDED: usize = 64 << 20;
+
+/// What one record takes against [`MAX_RECORDED`]: its paths and a little for the table.
+fn cost(rel: &Path, landed: &Option<Landed>) -> usize {
+    rel.as_os_str().len() + landed.as_ref().map_or(0, |l| l.rel.as_os_str().len()) + 64
+}
 
 impl Extracted {
+    fn record(&mut self, rel: &Path, landed: Option<Landed>) {
+        if let Some(old) = self.records.remove(rel) {
+            self.bytes -= cost(rel, &old);
+        }
+        let c = cost(rel, &landed);
+        if self.bytes + c <= MAX_RECORDED {
+            self.bytes += c;
+            self.records.insert(rel.to_path_buf(), landed);
+        }
+    }
+
     /// The member at `rel` was written to `landed` (an absolute path under `dest`).
     pub(crate) fn file(&mut self, dest: &Path, rel: &Path, landed: &Path) {
         let record = std::fs::symlink_metadata(landed).ok().filter(|m| m.file_type().is_file()).and_then(|m| {
@@ -223,35 +249,41 @@ impl Extracted {
             Some(Landed { rel: landed, dev, ino })
         });
         match record {
-            Some(record) => {
-                self.0.insert(rel.to_path_buf(), Some(record));
-            }
+            Some(record) => self.record(rel, Some(record)),
             None => {
-                self.0.remove(rel);
+                if let Some(old) = self.records.remove(rel) {
+                    self.bytes -= cost(rel, &old);
+                }
             }
         }
     }
 
     /// A test run found the member at `rel` whole.
     pub(crate) fn tested(&mut self, rel: &Path) {
-        self.0.insert(rel.to_path_buf(), None);
+        self.record(rel, None);
     }
 
     /// Something other than a file this run wrote is now at `rel`: every record at or below it goes, by member
     /// path or by where it landed.
     pub(crate) fn replaced(&mut self, rel: &Path) {
-        self.0.retain(|name, landed| {
-            !name.starts_with(rel) && landed.as_ref().is_none_or(|landed| !landed.rel.starts_with(rel))
+        let mut freed = 0;
+        self.records.retain(|name, landed| {
+            let keep = !name.starts_with(rel) && landed.as_ref().is_none_or(|landed| !landed.rel.starts_with(rel));
+            if !keep {
+                freed += cost(name, landed);
+            }
+            keep
         });
+        self.bytes -= freed;
     }
 
     pub(crate) fn contains(&self, rel: &Path) -> bool {
-        self.0.contains_key(rel)
+        self.records.contains_key(rel)
     }
 
     /// The device and inode of the file the member at `rel` landed as, when it was extracted (not only tested).
     pub(crate) fn landed_identity(&self, rel: &Path) -> Option<(u64, u64)> {
-        self.0.get(rel).and_then(|landed| landed.as_ref()).map(|landed| (landed.dev, landed.ino))
+        self.records.get(rel).and_then(|landed| landed.as_ref()).map(|landed| (landed.dev, landed.ino))
     }
 }
 
@@ -339,7 +371,7 @@ fn make_charging(
     match kind {
         LinkKind::Symbolic(target) => create(path, target, replace, modified),
         LinkKind::Hard(source) | LinkKind::Copy(source) => {
-            let landed = extracted.0.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
+            let landed = extracted.records.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
             hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)), charge)
         }
     }
@@ -558,5 +590,25 @@ mod tests {
         assert!(!ok("link", ""));
         assert!(!ok("link", "a\0b"));
         assert!(!ok("link", &"a".repeat(4096)));
+    }
+
+    /// Past its byte bound a file is no longer recorded, and the bound is freed as records go.
+    #[test]
+    fn the_records_are_bounded() {
+        let mut e = Extracted::default();
+        let long = "d".repeat(60_000);
+        let mut n = 0;
+        while e.bytes + 60_100 <= MAX_RECORDED {
+            e.tested(Path::new(&format!("{long}/{n}")));
+            n += 1;
+        }
+        let late = format!("{long}/late");
+        e.tested(Path::new(&late));
+        assert!(!e.contains(Path::new(&late)), "past the bound");
+        assert!(e.bytes <= MAX_RECORDED);
+        e.replaced(Path::new(&long));
+        assert_eq!(e.bytes, 0);
+        e.tested(Path::new(&late));
+        assert!(e.contains(Path::new(&late)));
     }
 }
