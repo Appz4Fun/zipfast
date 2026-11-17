@@ -1088,8 +1088,8 @@ pub(crate) fn run_renaming(
                         }
                     };
                     if let Err(io) = crate::extract::link::publish(&opts.dest, &rel, place, &kind, &mut extracted) {
-                        if io.kind() == std::io::ErrorKind::Unsupported {
-                            fail(&mut summary, &mut report, &e.name, "links can't be created here");
+                        if let Some(why) = crate::extract::link::member_failure(&io) {
+                            fail(&mut summary, &mut report, &e.name, why);
                             continue;
                         }
                         finish_dirs(&mut summary);

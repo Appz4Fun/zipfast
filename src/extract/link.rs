@@ -14,8 +14,10 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Unix symbolic links stored as RAR 4.x members: a Unix-host member whose mode is `S_IFLNK`, its data the link's
-//! target. UnRAR creates them on Unix; so does every route here, within the destination only.
+//! Links from archives: symbolic links (RAR 4.x `S_IFLNK` members, RAR 5.0 Unix and Windows symbolic links and
+//! junctions, tar, ZIP and 7z) and hard links and file copies (tar, RAR 5.0). UnRAR creates them on Unix; so does
+//! every route here, within the destination only. A hard link or copy takes only a file the same run extracted,
+//! where it landed, reached without following a link and only while it is still that file.
 //!
 //! A target is taken only when it is relative and, read from the link's own folder, stays inside the destination.
 //! `..` may only lead the target: the folders it climbs out of are real ones (a member is never written through a
@@ -91,12 +93,71 @@ pub(crate) const UNSAFE_TARGET: &str = "the link's target is absolute or leads o
 /// The message for a hard link whose target is not a file this run extracted.
 pub(crate) const HARD_TARGET: &str = "the hard link's target is not a file extracted earlier in this run";
 
-/// A link member, for the tar, ZIP and 7z runners.
+/// The message for a hard link or file copy whose earlier file was changed or replaced since it was extracted.
+pub(crate) const TARGET_CHANGED: &str = "the hard link's target is no longer the file extracted earlier";
+/// The message for a link on a platform where links aren't created.
+pub(crate) const UNSUPPORTED: &str = "links can't be created here";
+
+/// A link member, for the tar, ZIP, 7z and RAR 5.0 runners.
+#[derive(Clone, Debug)]
 pub(crate) enum LinkKind {
     /// A symbolic link to these target bytes.
     Symbolic(Vec<u8>),
     /// A hard link to this earlier member, relative to the destination.
     Hard(std::path::PathBuf),
+    /// A copy of this earlier member (a RAR 5.0 file copy), relative to the destination.
+    Copy(std::path::PathBuf),
+}
+
+/// A RAR 5.0 redirection as a link member, or None for a kind this does not know. A Windows symbolic link or a
+/// junction becomes a symbolic link with its backslashes made slashes (an absolute one, `\??\C:\...`, then fails
+/// the target check). A hard link's or file copy's target is an earlier member's name, sanitized as member names
+/// are (`windows` for a Windows-host archive) and, with `flatten`, only its last component.
+pub(crate) fn from_rar5(
+    redirection: &crate::rar5::Redirection,
+    windows: bool,
+    windows_safe_names: bool,
+    flatten: bool,
+) -> Option<Result<LinkKind, crate::error::Error>> {
+    use crate::rar5::Redirection;
+    let member = |name: &str| {
+        crate::path::sanitize_with(name, windows, windows_safe_names)
+            .map(|rel| if flatten { std::path::PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel })
+    };
+    Some(match redirection {
+        Redirection::UnixSymlink(target) => Ok(LinkKind::Symbolic(target.as_bytes().to_vec())),
+        Redirection::WindowsSymlink(target) | Redirection::Junction(target) => {
+            Ok(LinkKind::Symbolic(target.replace('\\', "/").into_bytes()))
+        }
+        Redirection::HardLink(target) => member(target).map(LinkKind::Hard),
+        Redirection::FileCopy(target) => member(target).map(LinkKind::Copy),
+        Redirection::Unknown(_) => return None,
+    })
+}
+
+/// A failure that stops only its own member: a hard link's or copy's earlier file is gone or changed, or links
+/// can't be created here. Any other error placing a link is the run's.
+pub(crate) fn member_failure(error: &io::Error) -> Option<&'static str> {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return Some(UNSUPPORTED);
+    }
+    error.get_ref().and_then(|inner| inner.downcast_ref::<Refused>()).map(|refused| refused.0)
+}
+
+/// Why a link was refused while being placed, carried inside an `io::Error`.
+#[derive(Debug)]
+struct Refused(&'static str);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn refused(why: &'static str) -> io::Error {
+    io::Error::other(Refused(why))
 }
 
 /// Where an extracted file landed (a rename mode may have put it elsewhere than its name), and which file it was.
@@ -165,14 +226,15 @@ fn identity(_: &std::fs::Metadata) -> (u64, u64) {
 pub(crate) fn refusal(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Option<&'static str> {
     match kind {
         LinkKind::Symbolic(target) if !contained(rel, target) => Some(UNSAFE_TARGET),
-        LinkKind::Hard(target) if !extracted.contains(target) => Some(HARD_TARGET),
+        LinkKind::Hard(target) | LinkKind::Copy(target) if !extracted.contains(target) => Some(HARD_TARGET),
         _ => None,
     }
 }
 
 /// Places a checked link member: a symbolic link, or a hard link to the earlier member (a copy where the file
-/// system takes no hard link). `place` comes from the run's target check, so the overwrite choice, a rename mode
-/// and the refusal to write through a link in the way are already settled.
+/// system takes no hard link), or a copy of it. `place` comes from the run's target check, so the overwrite choice,
+/// a rename mode and the refusal to write through a link in the way are already settled. A rename mode's reserved
+/// file is replaced by the link, or removed when the link can't be made.
 pub(crate) fn publish(
     dest: &Path,
     rel: &Path,
@@ -180,25 +242,51 @@ pub(crate) fn publish(
     kind: &LinkKind,
     extracted: &mut Extracted,
 ) -> io::Result<()> {
-    let (path, replace) = match place.reserved {
-        Some(reserved) => (reserved.into_parts().1, true),
-        None => (place.path, place.replace),
+    let (path, replace) = match &place.reserved {
+        Some(reserved) => (reserved.path().to_path_buf(), true),
+        None => (place.path.clone(), place.replace),
     };
+    // on failure the reservation is dropped, which removes the empty file while it is still the one created
+    make(dest, kind, extracted, &path, replace)?;
+    if let Some(reserved) = place.reserved {
+        let _ = reserved.into_parts();
+    }
+    placed(dest, rel, kind, &path, extracted);
+    Ok(())
+}
+
+/// Makes the link `kind` at `path`, replacing what is there only with `replace`. Nothing is recorded: see
+/// [`placed`].
+pub(crate) fn make(dest: &Path, kind: &LinkKind, extracted: &Extracted, path: &Path, replace: bool) -> io::Result<()> {
     match kind {
-        LinkKind::Symbolic(target) => {
-            create(&path, target, replace)?;
+        LinkKind::Symbolic(target) => create(path, target, replace),
+        LinkKind::Hard(source) | LinkKind::Copy(source) => {
+            let landed = extracted.0.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
+            hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)))
+        }
+    }
+}
+
+/// Records a link member placed at `path` (an absolute path under `dest`) for the member at `rel`: a symbolic link
+/// ends the records at and below both names, and a hard link or copy is a file later hard links may take.
+pub(crate) fn placed(dest: &Path, rel: &Path, kind: &LinkKind, path: &Path, extracted: &mut Extracted) {
+    match kind {
+        LinkKind::Symbolic(_) => {
             extracted.replaced(rel);
             if let Ok(landed) = path.strip_prefix(dest) {
                 extracted.replaced(landed);
             }
         }
-        LinkKind::Hard(target) => {
-            let landed = extracted.0.get(target).cloned().flatten().ok_or_else(|| io::Error::other(HARD_TARGET))?;
-            hard(dest, &landed, &path, replace)?;
-            extracted.file(dest, rel, &path);
-        }
+        LinkKind::Hard(_) | LinkKind::Copy(_) => extracted.file(dest, rel, path),
     }
-    Ok(())
+}
+
+/// Records a link member a test run found sound.
+pub(crate) fn tested(rel: &Path, kind: &LinkKind, extracted: &mut Extracted) {
+    match kind {
+        LinkKind::Symbolic(_) => extracted.replaced(rel),
+        LinkKind::Hard(_) | LinkKind::Copy(_) => extracted.tested(rel),
+    }
 }
 
 static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -214,22 +302,35 @@ fn stage_beside(path: &Path) -> io::Result<std::path::PathBuf> {
     Ok(parent.join(stage))
 }
 
-/// A hard link at `path` to the file the earlier member landed as: reached from `dest` one folder at a time without
-/// following any link, and only when it is still that file (device and inode). A copy where linking fails, read
-/// through the same checked handle. The stage is created only where nothing is, and so is `path` without `replace`.
-fn hard(dest: &Path, landed: &Landed, path: &Path, replace: bool) -> io::Result<()> {
+/// A hard link at `path` to the file the earlier member landed as (or with `copy` a copy of it): reached from
+/// `dest` one folder at a time without following any link, and only when it is still that file (device and inode).
+/// A copy where linking fails, read through the same checked handle. The stage is created only where nothing is,
+/// and so is `path` without `replace`.
+fn hard(dest: &Path, landed: &Landed, path: &Path, replace: bool, copy: bool) -> io::Result<()> {
     let stage = stage_beside(path)?;
-    stage_hard(dest, landed, &stage)?;
+    stage_hard(dest, landed, &stage, copy)?;
     let placed = if replace {
         std::fs::rename(&stage, path)
     } else {
         std::fs::hard_link(&stage, path).or_else(|e| match e.kind() {
             io::ErrorKind::AlreadyExists => Err(e),
-            _ => copy_new(&mut std::fs::File::open(&stage)?, path),
+            _ => copy_new(&mut open_no_follow(&stage)?, path),
         })
     };
     let _ = std::fs::remove_file(&stage);
     placed
+}
+
+/// Opens `path` for reading, never through a symbolic link at its last component.
+fn open_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
 }
 
 /// Copies `from` into a new file at `to`, created only where nothing is.
@@ -244,11 +345,11 @@ fn copy_new(from: &mut std::fs::File, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn stage_hard(dest: &Path, landed: &Landed, stage: &Path) -> io::Result<()> {
+fn stage_hard(dest: &Path, landed: &Landed, stage: &Path, copy: bool) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    let gone = || io::Error::other("the hard link's target is no longer the file extracted earlier");
+    let gone = || refused(TARGET_CHANGED);
     let cstr = |b: &[u8]| CString::new(b).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
     let open_at = |dir: libc::c_int, name: &CString, flags: libc::c_int| -> io::Result<OwnedFd> {
         // SAFETY: a NUL-terminated name relative to an open directory (or the current directory).
@@ -278,7 +379,7 @@ fn stage_hard(dest: &Path, landed: &Landed, stage: &Path) -> io::Result<()> {
     }
     let to = cstr(stage.as_os_str().as_bytes())?;
     // SAFETY: flags 0 never follow a symbolic link at the source name, resolved within the checked directory.
-    let linked = unsafe { libc::linkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_FDCWD, to.as_ptr(), 0) } == 0;
+    let linked = !copy && unsafe { libc::linkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_FDCWD, to.as_ptr(), 0) } == 0;
     if linked {
         // the name could have been swapped between the check and the link: the staged link must be that file
         match std::fs::symlink_metadata(stage) {
@@ -299,12 +400,13 @@ fn stage_hard(dest: &Path, landed: &Landed, stage: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn stage_hard(dest: &Path, landed: &Landed, stage: &Path) -> io::Result<()> {
+fn stage_hard(dest: &Path, landed: &Landed, stage: &Path, copy: bool) -> io::Result<()> {
     let source = dest.join(&landed.rel);
-    if !std::fs::symlink_metadata(&source)?.file_type().is_file() {
-        return Err(io::Error::other("the hard link's target is no longer a file"));
+    if !std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file()) {
+        return Err(refused(TARGET_CHANGED));
     }
-    std::fs::hard_link(&source, stage).or_else(|_| copy_new(&mut std::fs::File::open(&source)?, stage))
+    let linked = !copy && std::fs::hard_link(&source, stage).is_ok();
+    if linked { Ok(()) } else { copy_new(&mut std::fs::File::open(&source)?, stage) }
 }
 
 #[cfg(test)]

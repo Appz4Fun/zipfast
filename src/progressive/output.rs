@@ -265,6 +265,8 @@ pub(crate) struct OutputContext {
     authority: Arc<Authority>,
     aftermath: ArtifactAftermath,
     directories: Vec<policy::Directory>,
+    /// the files this session published or tested: the files a RAR 5.0 hard link or file copy may take
+    pub(crate) extracted: crate::extract::link::Extracted,
 }
 struct Root {
     path: PathBuf,
@@ -321,6 +323,7 @@ impl OutputContext {
             authority: Arc::new(Authority { control }),
             aftermath: options.artifact_aftermath,
             directories: Vec::new(),
+            extracted: Default::default(),
         })
     }
     pub(crate) fn terminate(&self, mut stage: Stage, failure: ProgressiveFailure) -> Termination {

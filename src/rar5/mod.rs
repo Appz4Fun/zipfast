@@ -257,6 +257,21 @@ pub enum Redirection {
     Unknown(u64),
 }
 
+impl Redirection {
+    /// The redirection record's type: 1 Unix symbolic link, 2 Windows symbolic link, 3 junction, 4 hard link,
+    /// 5 file copy, or the unknown type as stored.
+    pub fn kind(&self) -> u64 {
+        match self {
+            Self::UnixSymlink(_) => 1,
+            Self::WindowsSymlink(_) => 2,
+            Self::Junction(_) => 3,
+            Self::HardLink(_) => 4,
+            Self::FileCopy(_) => 5,
+            Self::Unknown(kind) => *kind,
+        }
+    }
+}
+
 /// Archive format governing the member's wire fields and payload decoder.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RarFormat {

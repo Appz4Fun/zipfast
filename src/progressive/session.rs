@@ -241,6 +241,11 @@ pub struct ProgressiveSession {
     produced: u64,
     /// the target of the symbolic link being decoded ([`Disposition::Link`])
     link_text: Vec<u8>,
+    /// the RAR 5.0 redirection the member is, already checked: placed in place of a file, or recorded when tested
+    link_kind: Option<crate::extract::link::LinkKind>,
+    /// the members a test session found whole, by name: the files a tested hard link or copy may take (an
+    /// extracting session keeps its published files with its output)
+    tested: crate::extract::link::Extracted,
     remaining: u64,
     had_stage: bool,
     buffer: Vec<u8>,
@@ -374,6 +379,8 @@ impl ProgressiveSession {
             member: None,
             produced: 0,
             link_text: Vec::new(),
+            link_kind: None,
+            tested: Default::default(),
             remaining: 0,
             had_stage: false,
             buffer,
@@ -1122,18 +1129,34 @@ impl ProgressiveSession {
             crate::path::sanitize_fallible(&name, !header.is_unix())
                 .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
         }
+        // A RAR 5.0 redirection is checked as soon as its header is in: a symbolic link's target must stay inside
+        // the destination, and a hard link or file copy must take a file this session published or tested.
+        self.link_kind = None;
         if let Some(redirection) = header.redirection.as_ref().filter(|_| refusal.is_none()) {
-            let kind = match redirection {
-                crate::rar5::Redirection::UnixSymlink(_) => 1,
-                crate::rar5::Redirection::WindowsSymlink(_) => 2,
-                crate::rar5::Redirection::Junction(_) => 3,
-                crate::rar5::Redirection::HardLink(_) => 4,
-                crate::rar5::Redirection::FileCopy(_) => 5,
-                crate::rar5::Redirection::Unknown(kind) => *kind,
+            let unsupported = || {
+                ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
+                    crate::error::RarUnsupported::Redirection { kind: redirection.kind() },
+                ))))
             };
-            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
-                crate::error::RarUnsupported::Redirection { kind },
-            )))));
+            let extract = &self.options.extract;
+            match crate::extract::link::from_rar5(
+                redirection,
+                !header.is_unix(),
+                extract.windows_safe_names,
+                extract.flatten,
+            ) {
+                None => return Err(unsupported()),
+                Some(Err(_)) => return Err(ProgressiveFailure::new(FailureKind::UnsafePath)),
+                Some(Ok(_)) if !cfg!(unix) && extract.mode != crate::extract::Mode::Test => return Err(unsupported()),
+                Some(Ok(kind)) => {
+                    let rel = self.link_rel(&header)?;
+                    let extracted = self.output.as_ref().map_or(&self.tested, |output| &output.extracted);
+                    if crate::extract::link::refusal(&rel, &kind, extracted).is_some() {
+                        return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+                    }
+                    self.link_kind = Some(kind);
+                }
+            }
         }
         // A name mapped from bytes that aren't UTF-8 is written under its private-use characters
         // (`crate::path::rar_output_name`); one that can't be written one to one is refused, and so is any mapped
@@ -1175,7 +1198,9 @@ impl ProgressiveSession {
             #[cfg(not(feature = "persistent-partials"))]
             self.prepare_legacy_target(member, &header)?
         };
-        if header.is_rar4_symlink() && matches!(self.disposition, Disposition::Write) {
+        if self.link_kind.is_some() && matches!(self.disposition, Disposition::Write) {
+            self.disposition = Disposition::Link;
+        } else if header.is_rar4_symlink() && matches!(self.disposition, Disposition::Write) {
             if header.unpacked_size > crate::extract::link::MAX_TARGET || !cfg!(unix) {
                 return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
                     crate::error::RarFailure::Unsupported(crate::error::RarUnsupported::Rar4Feature("symbolic link")),
@@ -1311,6 +1336,18 @@ impl ProgressiveSession {
             self.phase = Phase::Verdict;
         }
         Ok(ProgressiveEvent::MemberStarted { member, name, size })
+    }
+    /// Where a link member goes, relative to the destination, as its target is checked: a flattened output drops
+    /// the member's folders.
+    fn link_rel(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<std::path::PathBuf> {
+        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        let rel = crate::path::sanitize(&name, !header.is_unix())
+            .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
+        Ok(if self.options.extract.flatten {
+            std::path::PathBuf::from(rel.file_name().ok_or_else(|| ProgressiveFailure::new(FailureKind::UnsafePath))?)
+        } else {
+            rel
+        })
     }
     fn prepare_legacy_target(
         &mut self,
@@ -1485,11 +1522,13 @@ impl ProgressiveSession {
             .blake2sp
             .map(ChecksumValue::Blake2sp)
             .or_else(|| checks.crc32.map(|c| ChecksumValue::Crc32(c.to_le_bytes())));
-        let verification = if let (Some(checksum), Some(_)) = (checksum, physical.unpacked_size) {
+        // a RAR 5.0 redirection has no data, so it has nothing to check when its header carries no checksum
+        let redirection = self.link_kind.is_some() && physical.unpacked_size == Some(0);
+        let verification = if let (true, Some(_)) = (checksum.is_some() || redirection, physical.unpacked_size) {
             Some(Verification {
                 inner_size: self.produced,
                 read_back: 0,
-                checksum: Some(checksum),
+                checksum,
                 replacement_revision: None,
                 caller: None,
                 size: CheckVerdict::Passed,
@@ -1532,6 +1571,16 @@ impl ProgressiveSession {
                     AuthenticationEvidence::NotApplicable
                 },
             };
+            // a tested file, or a tested hard link or copy, is one a later hard link or copy may take
+            let header = &self.model.members.last().expect("member").header;
+            if let Ok(rel) = self.link_rel(header) {
+                let extracted = self.output.as_mut().map_or(&mut self.tested, |output| &mut output.extracted);
+                match self.link_kind.take() {
+                    Some(kind) => crate::extract::link::tested(&rel, &kind, extracted),
+                    None if header.is_rar4_symlink() => extracted.replaced(&rel),
+                    None => extracted.tested(&rel),
+                }
+            }
             self.phase = Phase::Header;
             return Ok(ProgressiveEvent::MemberFinished {
                 member: self.member.take().unwrap(),
@@ -1544,23 +1593,19 @@ impl ProgressiveSession {
         if matches!(self.disposition, Disposition::Link) {
             let v = verification.ok_or_else(|| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
             let header = &self.model.members.last().expect("member").header;
-            let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
-            let rel = crate::path::sanitize(&name, !header.is_unix())
-                .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
-            // checked where the link goes: a flattened output drops the member's folders
-            let rel = if self.options.extract.flatten {
-                std::path::PathBuf::from(
-                    rel.file_name().ok_or_else(|| ProgressiveFailure::new(FailureKind::UnsafePath))?,
-                )
-            } else {
-                rel
+            let kind = match self.link_kind.take() {
+                Some(kind) => kind,
+                None => {
+                    let rel = self.link_rel(header)?;
+                    let text = std::mem::take(&mut self.link_text);
+                    if !crate::extract::link::contained(&rel, &text) {
+                        return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+                    }
+                    crate::extract::link::LinkKind::Symbolic(text)
+                }
             };
-            let text = std::mem::take(&mut self.link_text);
-            if !crate::extract::link::contained(&rel, &text) {
-                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
-            }
             let mut target = self.target.take().expect("target");
-            match self.output.as_mut().expect("output").link(&mut target, &text, &mut self.driver) {
+            match self.output.as_mut().expect("output").link(&mut target, &kind, &mut self.driver) {
                 Ok(()) => {}
                 Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
                 Err(e) => return Err(e),
@@ -1578,6 +1623,7 @@ impl ProgressiveSession {
                 Publication::Provisional => MemberOutcome::Provisional(self.stage.take().unwrap().into_artifact()),
                 Publication::Published { cleanup_failure: None } => {
                     self.stage.take();
+                    self.output.as_mut().expect("output").published(self.target.as_ref().expect("target"));
                     MemberOutcome::Verified(v)
                 }
                 Publication::Published { cleanup_failure: Some(failure) } => {

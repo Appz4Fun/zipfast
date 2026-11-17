@@ -1757,7 +1757,7 @@ fn task4b_directory_flatten_test_and_obstruction_policies() {
     assert_eq!(std::fs::read(tmp.path().join("dir")).unwrap(), b"preserve");
 }
 #[test]
-fn task4b_every_redirection_is_typed_and_creates_nothing() {
+fn task4b_every_redirection_is_placed_or_refused_typed() {
     for kind in [1, 2, 3, 4, 5, 99] {
         let tmp = tempfile::tempdir().unwrap();
         // Existing RAR5 redirection extra: type, kind, flags, UTF-8 target length/bytes.
@@ -1771,19 +1771,35 @@ fn task4b_every_redirection_is_typed_and_creates_nothing() {
             options(tmp.path()),
         )
         .unwrap();
+        let mut finished = false;
         loop {
             match poll(&mut s) {
                 Poll::Ready(Err(e)) => {
-                    assert!(
-                        matches!(e.kind, FailureKind::Rar(f) if matches!(*f, zipfast::error::RarFailure::Unsupported(zipfast::error::RarUnsupported::Redirection { kind: actual }) if actual == u64::from(kind)))
-                    );
+                    match kind {
+                        // a hard link or file copy of a file this session never extracted
+                        4 | 5 => assert!(matches!(e.kind, FailureKind::UnsafePath), "{kind}: {e:?}"),
+                        _ => assert!(
+                            matches!(e.kind, FailureKind::Rar(f) if matches!(*f, zipfast::error::RarFailure::Unsupported(zipfast::error::RarUnsupported::Redirection { kind: actual }) if actual == u64::from(kind))),
+                            "{kind}"
+                        ),
+                    }
                     break;
                 }
+                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished {
+                    outcome: MemberOutcome::Verified(_), ..
+                }))) => finished = true,
+                Poll::Ready(Ok(None)) => break,
                 Poll::Ready(Ok(Some(_))) | Poll::Pending => {}
-                _ => panic!("redirection refusal"),
             }
         }
-        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        if cfg!(unix) && (1..=3).contains(&kind) {
+            // a symbolic link to a name inside the destination
+            assert!(finished, "{kind}");
+            assert_eq!(std::fs::read_link(tmp.path().join("link")).unwrap(), std::path::Path::new("target"));
+        } else {
+            assert!(!finished, "{kind}");
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        }
     }
 }
 #[cfg(unix)]

@@ -215,6 +215,8 @@ pub enum RarPolicyReason {
     RenameUnsupported,
     /// A symbolic link member whose target is absolute or leads out of the destination.
     LinkTarget,
+    /// A hard link or file copy whose target is not a file extracted earlier in the run, or is no longer that file.
+    HardLinkTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -288,3 +288,31 @@ fn testing_refuses_the_links_extracting_would_refuse() {
     let s = extract::run(&fixture("hard-missing.tar"), &options(dir.path(), Mode::Test, Overwrite::Always), |_| {});
     assert_eq!(s.unwrap().errors.len(), 1);
 }
+
+#[test]
+fn a_changed_hard_link_target_fails_only_its_member_and_leaves_no_reserved_file() {
+    use zipfast::extract::RenameStyle;
+    for gz in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("h"), b"was here").unwrap();
+        // the file member `d` moves the folder holding `d/f` aside: `d/f` is no longer the file extracted
+        let bytes = tar(&[
+            ("d/", b'5', b""),
+            ("d/f", b'0', b"mine"),
+            ("d", b'0', b"file"),
+            ("h", b'1', b"d/f"),
+            ("z", b'0', b"z"),
+        ]);
+        let archive = dir.path().join(if gz { "a.tgz" } else { "a.tar" });
+        write_tar(&archive, bytes, gz);
+        let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore));
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        assert_eq!(s.errors.len(), 1, "gz={gz}: {:?}", s.errors);
+        assert!(s.errors[0].contains("no longer"), "gz={gz}: {:?}", s.errors);
+        assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "gz={gz}");
+        assert_eq!(fs::read(dest.join("h_1")).unwrap(), b"was here", "gz={gz}");
+        assert!(fs::symlink_metadata(dest.join("h")).is_err(), "gz={gz}: the reserved name is left behind");
+    }
+}

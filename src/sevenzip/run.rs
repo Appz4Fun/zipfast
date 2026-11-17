@@ -347,8 +347,8 @@ impl Run<'_> {
             }
             drop(temporary);
             if let Err(e) = crate::extract::link::publish(&self.opts.dest, &rel, place, &kind, &mut self.extracted) {
-                if e.kind() == io::ErrorKind::Unsupported {
-                    self.fail_at(ordinal, &name, "links can't be created here");
+                if let Some(why) = crate::extract::link::member_failure(&e) {
+                    self.fail_at(ordinal, &name, why);
                     return Ok(false);
                 }
                 return Err(SevenZipError::Io(e));

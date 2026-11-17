@@ -454,6 +454,7 @@ fn blocked_message(reason: &RarPolicyReason) -> &'static str {
         RarPolicyReason::RenameExhausted => "no free name to rename to",
         RarPolicyReason::RenameUnsupported => "the file system can't rename without replacing",
         RarPolicyReason::LinkTarget => "the link's target is absolute or leads out of the destination",
+        RarPolicyReason::HardLinkTarget => link::HARD_TARGET,
         RarPolicyReason::ParentIsFile => "a file is in the way",
         _ => unreachable!("unexpected target policy"),
     }
@@ -2548,10 +2549,32 @@ const GATHER_MAX: u64 = 1 << 20;
 
 const NEEDS_EARLIER: &str = "needs the files before it in this solid archive, which weren't decoded";
 
+/// The files a RAR run has placed, by reporting order, until each is verified: then it is one a RAR 5.0 hard link
+/// or file copy may take ([`link::Extracted`]). A test run records names only.
+#[derive(Default)]
+struct Landing {
+    /// each placed file's member path and where it lands (none when testing)
+    placed: HashMap<u64, (PathBuf, Option<PathBuf>)>,
+    extracted: link::Extracted,
+}
+
+impl Landing {
+    /// The member reported at `order` was verified: written whole, or tested.
+    fn verified(&mut self, dest: &Path, order: u64) {
+        match self.placed.remove(&order) {
+            Some((rel, Some(landed))) => self.extracted.file(dest, &rel, &landed),
+            Some((rel, None)) => self.extracted.tested(&rel),
+            None => {}
+        }
+    }
+}
+
 struct Books<'a, 'r> {
     reports: &'a mut Reports<'r>,
     batch: &'a mut Option<Batch>,
     mode: Mode,
+    landing: &'a mut Landing,
+    dest: &'a Path,
 }
 
 impl Books<'_, '_> {
@@ -2559,7 +2582,7 @@ impl Books<'_, '_> {
     fn catch_up(&mut self) -> RunResult<()> {
         let Some(batch) = self.batch.as_mut() else { return Ok(()) };
         let mode = self.mode;
-        batch.drain(&mut |done| apply_done(self.reports, mode, done))
+        batch.drain(&mut |done| apply_done(self.reports, mode, (self.landing, self.dest), done))
     }
 
     fn catch_up_for_completion(&mut self) -> RunResult<()> {
@@ -2609,7 +2632,7 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
         let Some(batch) = books.batch.as_mut() else {
             return Err(invariant("no file workers", Error::Io(std::io::Error::other("no file workers"))).into());
         };
-        return batch.submit(job, &mut |done| apply_done(books.reports, books.mode, done));
+        return batch.submit(job, &mut |done| apply_done(books.reports, books.mode, (books.landing, books.dest), done));
     }
     if p.passive {
         return Ok(());
@@ -2664,7 +2687,9 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
                 books.terminal(&p.context, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false))
             );
         }
+        link::placed(books.dest, &rel, &link::LinkKind::Symbolic(target), &path, &mut books.landing.extracted);
     }
+    books.landing.verified(books.dest, p.context.entry.order);
     let drained = if books.reports.typed() { books.catch_up_for_completion() } else { Ok(()) };
     if drained.is_err() && !matches!(drained, Err(RunFault::Reported { .. })) {
         return drained;
@@ -2788,15 +2813,23 @@ struct Run<'a, 'r, 'c> {
     selection: Option<RarSelection<'a>>,
     /// members with a first header seen so far: the next one's listing position
     members: u64,
+    /// the files placed and extracted so far, for RAR 5.0 hard links and file copies
+    landing: Landing,
     /// checked before each member and as each member's data is decoded
     cancel: Option<Cancellation>,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
-fn apply_done(reports: &mut Reports<'_>, mode: Mode, done: Done) -> RunResult<()> {
+fn apply_done(
+    reports: &mut Reports<'_>,
+    mode: Mode,
+    (landing, dest): (&mut Landing, &Path),
+    done: Done,
+) -> RunResult<()> {
     let ctx = &done.context;
     match done.outcome {
         Outcome::Done { bytes, size_checked, crc32_checked, blake2sp_checked } => {
+            landing.verified(dest, ctx.entry.order);
             reports.verified(ctx, bytes, ctx.checks(size_checked, crc32_checked, blake2sp_checked), mode)
         }
         Outcome::Failed { reason, legacy } => reports.failed(ctx, Arc::from(reason), legacy),
@@ -3042,6 +3075,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             dirs: Dirs::default(),
             selection: None,
             members: 0,
+            landing: Landing::default(),
             cancel: None,
         }
     }
@@ -3056,7 +3090,8 @@ impl Run<'_, '_, '_> {
 
     fn drain_batch(&mut self) -> RunResult<()> {
         let Some(mut batch) = self.batch.take() else { return Ok(()) };
-        let result = batch.drain(&mut |done| apply_done(self.reports, self.opts.mode, done));
+        let result = batch
+            .drain(&mut |done| apply_done(self.reports, self.opts.mode, (&mut self.landing, &self.opts.dest), done));
         self.batch = Some(batch);
         self.batch_paths.clear();
         result
@@ -3091,7 +3126,14 @@ impl Run<'_, '_, '_> {
         if self.reports.typed() {
             let _ = self.drain_solid();
         }
-        Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode }.terminal(ctx, fault)
+        Books {
+            reports: self.reports,
+            batch: &mut self.batch,
+            mode: self.opts.mode,
+            landing: &mut self.landing,
+            dest: &self.opts.dest,
+        }
+        .terminal(ctx, fault)
     }
 
     fn pending_terminal(&mut self, pending: &Pending, fault: RarFault) -> RunFault {
@@ -3154,7 +3196,9 @@ impl Run<'_, '_, '_> {
             },
         };
         let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads, self.cancel.clone()));
-        batch.submit(job, &mut |done| apply_done(self.reports, self.opts.mode, done))
+        batch.submit(job, &mut |done| {
+            apply_done(self.reports, self.opts.mode, (&mut self.landing, &self.opts.dest), done)
+        })
     }
 
     fn file_block(&mut self, vol: &mut Volume, mut h: FileHeader, crypt: MemberCrypt) -> RunResult<()> {
@@ -3269,6 +3313,100 @@ impl Run<'_, '_, '_> {
             p.hidden = true;
         }
         Ok(())
+    }
+
+    /// A RAR 5.0 redirection: a symbolic link (Unix or Windows, or a junction) whose target must stay inside the
+    /// destination, or a hard link or file copy of a file this run extracted earlier ([`link`]). It has no data.
+    /// Everything before it finishes first, so the files it may take are recorded and reports keep archive order.
+    fn rar5_link(
+        &mut self,
+        vol: &mut Volume,
+        h: &FileHeader,
+        mut ctx: EntryContext,
+        rel: &Path,
+        kind: std::result::Result<link::LinkKind, Error>,
+    ) -> RunResult<()> {
+        self.drain()?;
+        let refusal = match &kind {
+            Ok(kind) => link::refusal(rel, kind, &self.landing.extracted),
+            Err(_) => Some(link::HARD_TARGET),
+        };
+        if let Some(why) = refusal {
+            let reason = match kind {
+                Ok(link::LinkKind::Symbolic(_)) => RarPolicyReason::LinkTarget,
+                _ => RarPolicyReason::HardLinkTarget,
+            };
+            let failure = RarFailure::Policy { reason, path: self.opts.dest.join(rel) };
+            let cause = self.fail_in_order(&ctx, failure, why)?;
+            return self.past_link(vol, h, ctx, Some(cause));
+        }
+        let kind = kind.expect("refused above");
+        if self.opts.mode == Mode::Extract {
+            if !cfg!(unix) {
+                let failure = RarFailure::Unsupported(RarUnsupported::Redirection { kind: redirection_kind(h) });
+                let cause = self.fail_in_order(&ctx, failure, link::UNSUPPORTED)?;
+                return self.past_link(vol, h, ctx, Some(cause));
+            }
+            let mut renamed = None;
+            let order = ctx.entry.order;
+            let mut log = RenameLog {
+                budget: &mut self.rename_budget,
+                record: &mut |r| {
+                    renamed = Some(r.clone());
+                    self.reports.renamed_at(order, r)
+                },
+            };
+            let checked = check_target_detailed(self.opts, rel, Some(&mut self.dirs), &mut log);
+            ctx.renamed = renamed;
+            let place = match checked.map_err(|e| self.terminal(&ctx, e))? {
+                DetailedChecked::Write(place) => place,
+                DetailedChecked::Exists => {
+                    self.reports.skipped(&ctx, RarSkipReason::ExistingTarget)?;
+                    return self.past_link(vol, h, ctx, None);
+                }
+                DetailedChecked::Declined => {
+                    self.reports.skipped(&ctx, RarSkipReason::Declined)?;
+                    return self.past_link(vol, h, ctx, None);
+                }
+                DetailedChecked::Blocked(reason) => {
+                    let message = blocked_message(&reason);
+                    let failure = RarFailure::Policy { reason, path: self.opts.dest.join(rel) };
+                    let cause = self.fail_in_order(&ctx, failure, message)?;
+                    return self.past_link(vol, h, ctx, Some(cause));
+                }
+            };
+            let path = place.path.clone();
+            if let Err(e) = link::publish(&self.opts.dest, rel, place, &kind, &mut self.landing.extracted) {
+                if let Some(why) = link::member_failure(&e) {
+                    let failure = if e.kind() == io::ErrorKind::Unsupported {
+                        RarFailure::Unsupported(RarUnsupported::Redirection { kind: redirection_kind(h) })
+                    } else {
+                        RarFailure::Policy { reason: RarPolicyReason::HardLinkTarget, path }
+                    };
+                    let cause = self.fail_in_order(&ctx, failure, why)?;
+                    return self.past_link(vol, h, ctx, Some(cause));
+                }
+                return Err(self.terminal(&ctx, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false)));
+            }
+        } else {
+            link::tested(rel, &kind, &mut self.landing.extracted);
+        }
+        self.reports.verified(&ctx, 0, ctx.checks(false, false, false), self.opts.mode)?;
+        self.past_link(vol, h, ctx, None)
+    }
+
+    /// Moves past a redirection. One without data leaves a solid stream's history as it was, as UnRAR does.
+    fn past_link(
+        &mut self,
+        vol: &mut Volume,
+        h: &FileHeader,
+        ctx: EntryContext,
+        failure: Option<Arc<RarFailure>>,
+    ) -> RunResult<()> {
+        if h.packed_size == 0 && !h.split_after() {
+            return Ok(());
+        }
+        self.pass_over(vol, h, ctx, None, failure)
     }
 
     /// Decodes usable passive history in a solid archive.
@@ -3389,15 +3527,15 @@ impl Run<'_, '_, '_> {
             let cause = self.fail_in_order(&ctx, failure, why)?;
             return self.pass_over(vol, h, ctx, None, Some(cause));
         }
+        // a member decoded to a caller's sink is never a link placed or checked here
+        if let Some(redirection) = h.redirection.as_ref().filter(|_| self.selection.is_none())
+            && let Some(kind) =
+                link::from_rar5(redirection, !h.is_unix(), self.opts.windows_safe_names, self.opts.flatten)
+        {
+            return self.rar5_link(vol, h, ctx, &rel, kind);
+        }
         if let Some(link) = &h.redirection {
-            let kind = match link {
-                Redirection::UnixSymlink(_) => 1,
-                Redirection::WindowsSymlink(_) => 2,
-                Redirection::Junction(_) => 3,
-                Redirection::HardLink(_) => 4,
-                Redirection::FileCopy(_) => 5,
-                Redirection::Unknown(kind) => *kind,
-            };
+            let kind = link.kind();
             let reason = RarFailure::Unsupported(RarUnsupported::Redirection { kind });
             let cause = self.fail_in_order(&ctx, reason, format_args!("links are not supported yet ({link:?})"))?;
             return self.pass_over(vol, h, ctx, None, Some(cause));
@@ -3469,6 +3607,13 @@ impl Run<'_, '_, '_> {
         } else {
             None
         };
+        // a file a later hard link or file copy may take, once it is verified
+        if self.selection.is_none() && !h.is_rar4_symlink() {
+            let landed = place.as_ref().map(|place| place.path.clone());
+            if self.opts.mode == Mode::Test || landed.is_some() {
+                self.landing.placed.insert(ctx.entry.order, (rel.clone(), landed));
+            }
+        }
         if self.goes_to_batch(vol, h) {
             if self.opts.mode == Mode::Extract {
                 self.batch_paths.insert(key);
@@ -3518,7 +3663,13 @@ impl Run<'_, '_, '_> {
             // every queued file holds its output open
             let most = if self.opts.mode == Mode::Extract { MAX_OPEN_QUEUED } else { MAX_TESTED_QUEUED };
             if self.queued.len() >= most {
-                let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
+                let mut books = Books {
+                    reports: self.reports,
+                    batch: &mut self.batch,
+                    mode: self.opts.mode,
+                    landing: &mut self.landing,
+                    dest: &self.opts.dest,
+                };
                 let caught_up = with_route(&mut self.queued, &mut books, |sink| u.catch_up(most as u64 / 2, sink));
                 match caught_up {
                     Ok(()) => {}
@@ -3678,7 +3829,13 @@ impl Run<'_, '_, '_> {
         }
         self.queued.push_back((p, Checks::from(h)));
         let mut stream = self.stream.take();
-        let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
+        let mut books = Books {
+            reports: self.reports,
+            batch: &mut self.batch,
+            mode: self.opts.mode,
+            landing: &mut self.landing,
+            dest: &self.opts.dest,
+        };
         let queued = &mut self.queued;
         vol.read_fast(false);
         let read = vol.read_data_detailed(h.data_at, h.packed_size, |piece, range| {
@@ -3709,7 +3866,13 @@ impl Run<'_, '_, '_> {
             Err(ReadDataError::Input(fault)) => {
                 let context = self.queued.back().and_then(|(p, _)| (!p.passive).then(|| p.context.clone()));
                 if let Some(u) = stream.as_mut() {
-                    let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
+                    let mut books = Books {
+                        reports: self.reports,
+                        batch: &mut self.batch,
+                        mode: self.opts.mode,
+                        landing: &mut self.landing,
+                        dest: &self.opts.dest,
+                    };
                     let waited = with_route(&mut self.queued, &mut books, |sink| u.wait(sink));
                     if let Err(RouteError::Decoder(e)) = waited
                         && decoding_error(&e)
@@ -3740,7 +3903,13 @@ impl Run<'_, '_, '_> {
             return Ok(());
         }
         let Some(mut u) = self.stream.take() else { return self.fail_queued(None, None) };
-        let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
+        let mut books = Books {
+            reports: self.reports,
+            batch: &mut self.batch,
+            mode: self.opts.mode,
+            landing: &mut self.landing,
+            dest: &self.opts.dest,
+        };
         let finished = with_route(&mut self.queued, &mut books, |sink| u.finish(sink));
         match finished {
             Ok(()) => {
@@ -4029,7 +4198,13 @@ impl Run<'_, '_, '_> {
     /// A file's last part is in: checks it whole and finishes it.
     fn finish_file_checks(&mut self, h: &FileHeader, p: Pending) -> RunResult<()> {
         check_and_finish(
-            &mut Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode },
+            &mut Books {
+                reports: self.reports,
+                batch: &mut self.batch,
+                mode: self.opts.mode,
+                landing: &mut self.landing,
+                dest: &self.opts.dest,
+            },
             &Checks::from(h),
             p,
         )
@@ -4314,6 +4489,11 @@ pub(crate) fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarRe
         }
     }
     Ok(())
+}
+
+/// The RAR 5.0 redirection type of `h`'s record (0 without one).
+fn redirection_kind(h: &FileHeader) -> u64 {
+    h.redirection.as_ref().map_or(0, Redirection::kind)
 }
 
 #[cfg(test)]
