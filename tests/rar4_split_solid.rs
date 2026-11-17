@@ -192,6 +192,17 @@ fn cases() -> Vec<Case> {
         case(&["rar4-rar300/ppmd_solid_rar300.rar"], None, "rars_ppmd_solid_rar300.rar"),
         case(&["rar4-rar300/solid_e8_filter_member_offset.rar"], None, "rars_solid_e8_filter_member_offset.rar"),
         case(&["rar4-rar300/solid_simple_rar300.rar"], None, "in_rar300_solid_simple_rar300.rar"),
+        // solid_simple_rar300.rar with its headers patched (see the fixtures README): members from MacOS (host 4)
+        // and BeOS (host 5), and an old file revision (LHD_VERSION) stored as `one.txt;1`, written under that name
+        case(&["rar4-rar300/hosts_macos_beos_rar300.rar"], None, "in_rar300_solid_simple_rar300.rar"),
+        Case {
+            volumes: paths(&["rar4-rar300/old_revision_rar300.rar"]),
+            password: None,
+            want: unrar_manifest("in_rar300_solid_simple_rar300.rar")
+                .into_iter()
+                .map(|(name, expect)| (if name == "one.txt" { "one.txt;1".to_owned() } else { name }, expect))
+                .collect(),
+        },
         case(&["rar4-rar300/solid_rar300.rar"], None, "in_rar300_solid_rar300.rar"),
         Case {
             volumes: paths(&["rar4-rar300/per_file_rar300_password.rar"]),
@@ -1217,4 +1228,14 @@ fn a_rar_2_x_set_declared_complete_ends_after_its_last_declared_volume() {
     assert!(problems.is_empty(), "{problems:?}");
     assert_eq!(fs::read(dest.join("x.txt")).unwrap(), x);
     assert_eq!(fs::read(dest.join("y.txt")).unwrap(), y);
+}
+
+/// Listing shows members from hosts above Unix with no Unix mode, and an old file revision under its stored name.
+#[test]
+fn hosts_above_unix_and_old_revisions_list() {
+    let hosts = extract::list(&fixtures().join("rar4-rar300/hosts_macos_beos_rar300.rar")).unwrap();
+    let got: Vec<_> = hosts.iter().map(|e| (e.name.as_str(), e.mode)).collect();
+    assert_eq!(got, [("one.txt", None), ("two.txt", None)]);
+    let old = extract::list(&fixtures().join("rar4-rar300/old_revision_rar300.rar")).unwrap();
+    assert_eq!(old.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["one.txt;1", "two.txt"]);
 }

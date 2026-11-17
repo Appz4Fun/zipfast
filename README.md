@@ -283,8 +283,9 @@ is still truncated, and a session following growing files waits for more. A
 filter block reaching into the next solid member, which UnRAR would keep
 waiting, is refused as corrupt: its bytes are the first member's output.
 RAR 1.5 and 2.0 encryption, symbolic
-links, special files, old file revisions, and unsupported host attributes retain
-explicit exclusions. Encrypted headers,
+links and special files retain explicit exclusions. Members from hosts above
+Unix (MacOS, BeOS) are plain files with no mode, and old file revisions are
+written under their stored name, `;n` suffix included (UnRAR `-ver`). Encrypted headers,
 old embedded comments and legacy service layouts stop catalogue construction.
 The existing catalogue, selected decode and spool limits apply to RAR4.
 Catalogue opening reserves a conservative temporary capacity allowance of

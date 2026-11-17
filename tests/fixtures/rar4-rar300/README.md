@@ -21,4 +21,12 @@ RAR4 compatibility corpus carries the same files.
 | `generic_delta_padding_mutation.rar` | a VM program that is none of the standard filters (refused) |
 | `with_comment_rar300.rar` | stored `hello.txt` and a RAR 3.x archive comment (a compressed `CMT` service header) |
 
+Made here from `solid_simple_rar300.rar` by patching file headers and recomputing each header CRC (CRC-32 of the
+header from its type byte on, low 16 bits):
+
+| file | patch |
+|---|---|
+| `hosts_macos_beos_rar300.rar` | host OS of `one.txt` set to 4 (MacOS) and of `two.txt` to 5 (BeOS) |
+| `old_revision_rar300.rar` | `one.txt` flagged as an old file revision (`LHD_VERSION`, 0x800) and renamed `one.txt;1` |
+
 `../rar4-unrar/` holds the SHA-256 of every file UnRAR 7.30 extracts from them.

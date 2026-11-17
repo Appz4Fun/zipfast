@@ -226,10 +226,9 @@ impl Rar4Metadata {
             "compression method"
         } else if !matches!(self.unpack_version, 15 | 20 | 26 | 29) {
             "unpack version"
-        } else if self.flags & 0x800 != 0 {
-            "old file revision"
-        } else if self.host > 3 {
-            "host attributes"
+        // A host above Unix (MacOS 4, BeOS 5, or later) is a plain member with no mode (its host is normalized to 2,
+        // neither Unix nor Windows). An old file revision (LHD_VERSION) is written under its stored name, `;n` suffix
+        // included, as UnRAR does with `-ver`.
         } else if self.host == 3 && !matches!(attributes & 0o170000, 0 | 0o100000 | 0o040000 | 0o120000) {
             "special file"
         } else if self.host == 3
