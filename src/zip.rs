@@ -835,8 +835,15 @@ pub(crate) fn is_byte_split(path: &Path) -> bool {
 }
 
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
+    list_detailed(path).map(|listing| listing.entries)
+}
+
+/// [`list`], also saying whether the archive ended unexpectedly: a byte-split set cut short by a missing piece,
+/// listed from the local headers before the gap.
+pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
     let archive = Archive::open(path)?;
-    Ok(archive
+    let missing_volume = archive.missing.clone();
+    let entries = archive
         .entries
         .into_iter()
         .map(|e| {
@@ -865,7 +872,8 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
                 link,
             }
         })
-        .collect())
+        .collect();
+    Ok(crate::extract::Listing { entries, missing_volume })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1022,8 +1030,10 @@ pub(crate) fn run_renaming(
                 Err(err) => {
                     drop(target);
                     // Data running past the end of a set cut short by a missing piece: that piece is the cause.
-                    let crosses_gap =
-                        e.local_at.saturating_add(e.packed).saturating_add(LOCAL_HEADER_LEN as u64) > archive.len;
+                    // The payload starts past the local header, its name and its extra field.
+                    let crosses_gap = archive.missing.is_some()
+                        && data_at(&mut archive.file, archive.len, &entry)
+                            .map_or(true, |start| start.saturating_add(e.packed) > archive.len);
                     if let Some(missing) = archive.missing.as_ref().filter(|_| crosses_gap) {
                         fail(&mut summary, &mut report, &e.name, &Error::MissingVolume(missing.clone()).to_string());
                         continue;

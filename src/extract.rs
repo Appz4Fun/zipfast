@@ -1740,6 +1740,38 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
     Ok(Inspection::Other(entries))
 }
 
+/// A listing with what went wrong while reading it short of failing: [`list_detailed`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Listing {
+    pub entries: Vec<Entry>,
+    /// The archive ended unexpectedly because this volume is missing: a byte-split ZIP (`.zip.001`) with a gap,
+    /// whose `entries` are those found before it. 7-Zip prints "Unexpected end of archive" and exits nonzero here.
+    pub missing_volume: Option<PathBuf>,
+}
+
+impl Listing {
+    /// Whether the archive ended before it should have (7-Zip's "Unexpected end of archive").
+    pub fn unexpected_end(&self) -> bool {
+        self.missing_volume.is_some()
+    }
+}
+
+/// [`list_with_password`], with the listing's warnings.
+pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
+    let whole = |entries| Listing { entries, missing_volume: None };
+    match sniff(first)? {
+        Format::Zip => return crate::zip::list_detailed(first),
+        Format::Tar => return crate::tar::list(first).map(whole),
+        Format::SevenZip => return crate::sevenzip::list(first, password).map(whole),
+        Format::Other => {}
+    }
+    match rar_list(first, password) {
+        Err(Error::NotAnArchive) => crate::zip::list_detailed(first),
+        other => other.map(whole),
+    }
+}
+
 /// The entries of an archive, whatever its format.
 pub fn list(first: &Path) -> Result<Vec<Entry>> {
     list_with_password(first, None)
