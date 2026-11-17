@@ -184,6 +184,7 @@ mod tests {
                 method: 3,
                 password: crate::error::RarPasswordEvidence::NotEncrypted,
                 renamed: None,
+                link: None,
             };
             let result = MemberMachine::new_rar4(
                 &header,
@@ -230,6 +231,7 @@ mod tests {
             method: 3,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
             renamed: None,
+            link: None,
         };
         let frame = CoreFrame {
             ordinal: 0,

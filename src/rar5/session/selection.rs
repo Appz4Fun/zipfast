@@ -103,7 +103,28 @@ impl RarSession {
         limits: RarDecodeLimits,
         on_entry: impl FnMut(&RarEntryOutcome),
     ) -> Result<RarRunSummary, RarRunError> {
-        self.execute_selected(selection, limits, |run, session, index| run.test(session, index, None), on_entry)
+        self.execute_selected(
+            selection,
+            limits,
+            |run, session, index| {
+                if session.model.members[index].header.is_rar4_symlink() {
+                    // a symbolic link's target is its data: kept for the outcome
+                    return extraction::rar4_link_text(run, session, index)
+                        .map_err(|stop| match stop {
+                            SelectedStop::Native(failure) => failure,
+                            _ => unreachable!("testing has no control stops"),
+                        })
+                        .map(|decoded| {
+                            decoded.map_or_else(
+                                |outcome| outcome,
+                                |(_, bytes, checks)| RarOutcome::Verified { bytes, checks, output: RarOutput::Tested },
+                            )
+                        });
+                }
+                run.test(session, index, None)
+            },
+            on_entry,
+        )
     }
 
     #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
@@ -157,6 +178,7 @@ impl RarSession {
                     cause,
                 })?;
                 let method = self.model.members[index].header.method;
+                run.link = None;
                 let result = driver.member(&mut run, self, index, &entry);
                 // a member makes at most one rename; it goes out with the member's own outcome too
                 let renamed = run.renames.last().cloned();
@@ -169,7 +191,8 @@ impl RarSession {
                 if let Err(fault) = count_outcome(&mut summary, &outcome) {
                     return Err(DriverError::Native(run_error(summary, Some(entry), Arc::from(fault.failure))));
                 }
-                let event = RarEntryOutcome { entry, method, outcome, renamed };
+                let link = run.link.take();
+                let event = RarEntryOutcome { entry, method, outcome, renamed, link };
                 let callback = driver.entry(&event, self);
                 if let Some(failure) = terminal {
                     return Err(DriverError::Native(run_error(summary, Some(event.entry), failure)));
@@ -322,6 +345,8 @@ fn count_outcome(summary: &mut RarRunSummary, outcome: &RarOutcome) -> RarResult
 struct SelectedRun {
     /// Renames the member being extracted made, moved to the run's summary after it.
     renames: Vec<crate::extract::RenamedOutput>,
+    /// The decoded target of the RAR 4.x symbolic link being extracted or tested, reported with its outcome.
+    link: Option<Redirection>,
     /// the rename attempts this run has left
     rename_budget: crate::extract::RenameBudget,
     limits: RarDecodeLimits,
@@ -351,6 +376,7 @@ impl SelectedRun {
         decrypted.try_reserve_exact(CHUNK + 15).map_err(|_| allocation())?;
         Ok(Self {
             renames: Vec::new(),
+            link: None,
             rename_budget: Default::default(),
             limits,
             packed: 0,
@@ -531,6 +557,7 @@ impl SelectedRun {
             method: header.method,
             password: RarPasswordEvidence::NotEncrypted,
             renamed: None,
+            link: None,
         };
         let mut pending = Pending::new(header, context);
         if header.encrypted {

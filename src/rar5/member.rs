@@ -1058,6 +1058,7 @@ mod tests {
             method: 0,
             password: crate::error::RarPasswordEvidence::NotEncrypted,
             renamed: None,
+            link: None,
         }
     }
     fn recovery_fixture(size: usize) -> (super::super::FileHeader, Vec<u8>, Vec<u8>) {

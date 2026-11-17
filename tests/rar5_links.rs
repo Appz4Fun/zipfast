@@ -517,3 +517,47 @@ fn a_moved_folder_is_never_trusted_under_another_spelling() {
         }
     }
 }
+
+/// A symbolic link takes the archived modification time on itself (as `lutimes`), never on what it points to, on
+/// the legacy run, the typed run and RarSession, whether it lands where nothing was or replaces a file.
+#[test]
+fn symbolic_links_take_the_archived_time_without_following() {
+    use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let file = FileSpec { mtime: Some(1_500_000_000), ..FileSpec::new("f", b"data") };
+    let arc = write(tmp.path(), &[file, link("sym", 1, "f"), link("d/sym", 1, "../f")]);
+    let check = |dest: &Path, how: &str| {
+        for name in ["sym", "d/sym"] {
+            let m = fs::symlink_metadata(dest.join(name)).unwrap();
+            assert!(m.file_type().is_symlink(), "{how} {name}");
+            assert_eq!(m.mtime(), 1_700_000_000, "{how} {name}: the link's own time");
+        }
+        assert_eq!(fs::metadata(dest.join("f")).unwrap().mtime(), 1_500_000_000, "{how}: the target keeps its own");
+    };
+    for incumbent in [false, true] {
+        let prepare = |name: &str| {
+            let dest = tmp.path().join(format!("{name}-{incumbent}"));
+            if incumbent {
+                fs::create_dir_all(dest.join("d")).unwrap();
+                fs::write(dest.join("sym"), b"old").unwrap();
+                fs::write(dest.join("d/sym"), b"old").unwrap();
+            }
+            dest
+        };
+        let dest = prepare("legacy");
+        let s = extract::run(&arc, &options(&dest, Mode::Extract, Overwrite::Always, 1), |_| {}).unwrap();
+        assert!(s.errors.is_empty(), "{:?}", s.errors);
+        check(&dest, "legacy");
+        let dest = prepare("typed");
+        extract::run_rar_with_outcomes(&arc, &options(&dest, Mode::Extract, Overwrite::Always, 1), None, |_| {})
+            .unwrap();
+        check(&dest, "typed");
+        let dest = prepare("session");
+        let mut session = RarSession::open(&arc, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let opts = options(&dest, Mode::Extract, Overwrite::Always, 1);
+        let s = session.extract_selected(&all, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(s.failed, 0);
+        check(&dest, "session");
+    }
+}

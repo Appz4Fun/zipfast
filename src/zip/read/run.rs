@@ -715,6 +715,7 @@ impl ProjectedReadSession {
             return refuse("the link's target is too long");
         }
         let (name, host) = (e.name.clone(), e.host);
+        let modified = e.mtime.and_then(|seconds| crate::extract::archive_time(seconds, e.nanos));
         let mut text = Vec::new();
         let read = self.owner.read_checked_kind(ordinal, password, link::MAX_TARGET, cancel, context, true, |chunk| {
             text.extend_from_slice(chunk);
@@ -750,7 +751,7 @@ impl ProjectedReadSession {
             Ok(crate::extract::Checked::Blocked(why)) => return refuse(why),
             Err(error) => return (Err(ReadFault::Legacy(error).into()), false, false),
         };
-        match link::publish(&options.dest, &rel, place, &kind, &mut extracted) {
+        match link::publish(&options.dest, &rel, place, &kind, modified, &mut extracted) {
             Ok(()) => (Ok(()), false, false),
             Err(error) if let Some(why) = link::member_failure(&error) => refuse(why),
             Err(error) => (

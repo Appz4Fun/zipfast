@@ -38,6 +38,13 @@ pub struct RarEntryOutcome {
     /// This field was added after the rename modes; the struct is `#[non_exhaustive]`, so callers outside the crate
     /// could never build or exhaustively destructure it, and the addition doesn't break them.
     pub renamed: Option<RenamedOutput>,
+    /// A RAR 4.x symbolic link's target, once its data was decoded and verified: stored, compressed or encrypted
+    /// alike, since the target is the member's data (as [`crate::rar5::Redirection::UnixSymlink`], bytes that
+    /// aren't UTF-8 replaced). It comes with the outcome even when the link was then refused. It is filled by
+    /// [`crate::rar5::session::RarSession`] extraction (plain and controlled) and testing, and by the legacy and
+    /// typed runs when extracting; a legacy or typed test run doesn't keep the data. A RAR 5.0 redirection's target
+    /// is in its header, so it is in the listing ([`crate::extract::Entry::link`]) and not repeated here.
+    pub link: Option<crate::rar5::Redirection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +164,8 @@ pub(crate) struct EntryContext {
     pub(crate) password: RarPasswordEvidence,
     /// the rename a rename mode made for this member, reported with its outcome
     pub(crate) renamed: Option<RenamedOutput>,
+    /// a RAR 4.x symbolic link's decoded target, reported with its outcome
+    pub(crate) link: Option<crate::rar5::Redirection>,
 }
 
 impl EntryContext {
@@ -169,7 +178,13 @@ impl EntryContext {
     }
 
     pub(crate) fn event(&self, outcome: RarOutcome) -> RarEntryOutcome {
-        RarEntryOutcome { entry: self.entry.clone(), method: self.method, outcome, renamed: self.renamed.clone() }
+        RarEntryOutcome {
+            entry: self.entry.clone(),
+            method: self.method,
+            outcome,
+            renamed: self.renamed.clone(),
+            link: self.link.clone(),
+        }
     }
 
     pub(crate) fn checks(&self, size_checked: bool, crc32_checked: bool, blake2sp_checked: bool) -> RarVerification {
@@ -281,7 +296,7 @@ impl<'a> Reports<'a> {
             _ => None,
         };
         let entry = RarEntryIdentity { index, order: position, name };
-        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted, renamed: None })
+        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted, renamed: None, link: None })
     }
 
     /// A member the run's filter didn't take: it keeps its listing index, so later members' indexes still match a
@@ -299,7 +314,7 @@ impl<'a> Reports<'a> {
             }
         };
         let entry = RarEntryIdentity { index, order, name };
-        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted, renamed: None })
+        Ok(EntryContext { entry, method, password: RarPasswordEvidence::NotEncrypted, renamed: None, link: None })
     }
 
     pub(super) fn volume(&mut self) -> RunResult<()> {

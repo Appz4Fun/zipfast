@@ -1171,7 +1171,14 @@ pub(crate) fn run_renaming(
                             continue;
                         }
                     };
-                    if let Err(io) = crate::extract::link::publish(&opts.dest, &rel, place, &kind, &mut extracted) {
+                    if let Err(io) = crate::extract::link::publish(
+                        &opts.dest,
+                        &rel,
+                        place,
+                        &kind,
+                        e.meta().modified(),
+                        &mut extracted,
+                    ) {
                         if let Some(why) = crate::extract::link::member_failure(&io) {
                             fail(&mut summary, &mut report, &e.name, why);
                             continue;

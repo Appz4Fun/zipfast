@@ -14,7 +14,7 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-use super::super::extraction::{DirectoryOutput, Extraction, ExtractionHooks};
+use super::super::extraction::{DirectoryOutput, Extraction, ExtractionHooks, PlacedLink};
 use super::*;
 use crate::extract::{Options, Overwrite};
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
@@ -656,6 +656,9 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
     }
     fn published(&mut self, index: usize, target: &Path, held: &File, published: bool) {
         self.control.capture_published(index, target, held, published);
+    }
+    fn linked(&mut self, index: usize, target: &Path, landed: Option<&Path>, placed: PlacedLink) {
+        self.control.capture_linked(index, target, landed, placed);
     }
 }
 

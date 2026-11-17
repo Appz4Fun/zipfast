@@ -15,6 +15,7 @@
 // rights and limitations under the RPL.
 
 use super::*;
+use crate::rar5::session::selection::extraction::PlacedLink;
 use std::ffi::OsStr;
 use std::mem::MaybeUninit;
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
@@ -315,6 +316,18 @@ impl RarExtractControl {
         }
         let mut attempts = 0;
         let result = self.with_guard(|guard, c| guard.published(c, index, target, held, &mut attempts));
+        if let Err(f) = result {
+            self.mute(f);
+        }
+    }
+    /// A link member the engine placed at `landed` (None when nothing was placed) is the engine's own change, as a
+    /// published file is: see [`Guard::linked`].
+    pub(super) fn capture_linked(&mut self, index: usize, target: &Path, landed: Option<&Path>, placed: PlacedLink) {
+        if !self.guard.prepared || self.failure.is_some() {
+            return;
+        }
+        let mut attempts = 0;
+        let result = self.with_guard(|guard, c| guard.linked(c, index, target, landed, placed, &mut attempts));
         if let Err(f) = result {
             self.mute(f);
         }
@@ -822,6 +835,134 @@ impl Guard {
         if !found {
             return Err(RarDiagnosticFailure::PublicationUnverified { ordinal: index as u64 });
         }
+        Ok(())
+    }
+    /// Takes a link member the engine placed as its own change, as [`Self::published`] does for a file. There is no
+    /// held stage to compare with, so the object at the target is checked to be what was placed, seen without
+    /// following a link: a symbolic link with the target's length, or a regular file for a hard link or copy, and
+    /// never the diagnostic file. Only then do the bindings at the target, any reached through a symbolic link just
+    /// placed there, and a hard link's earlier file (its link count and ctime alone) take the new observation. Every
+    /// other binding stays strict.
+    #[allow(clippy::too_many_arguments)]
+    fn linked(
+        &mut self,
+        c: &mut RarExtractControl,
+        index: usize,
+        target: &Path,
+        landed: Option<&Path>,
+        placed: PlacedLink,
+        attempts: &mut u64,
+    ) -> Result<(), RarDiagnosticFailure> {
+        let ordinal = index as u64;
+        let pending = self.pending_unlink.take().filter(|pending| pending.index == index);
+        let prepared = self.pending_publication.take() == Some(index);
+        let at_target = landed == Some(target);
+        let cwd = cwd(c, attempts)?;
+        let target = project_bytes(c, &cwd, target, Path::new(""))?;
+        let alias = |r: &Record| {
+            if r.leaf {
+                RarDiagnosticFailure::AliasTarget { ordinal: r.ordinal.expect("selected ordinal") }
+            } else {
+                RarDiagnosticFailure::AliasAncestor { ordinal: r.ordinal }
+            }
+        };
+        let mut stamp = None;
+        if at_target {
+            for r in &self.records {
+                comparison_work(c, r.path.len(), target.len())?;
+                if r.leaf
+                    && !r.follow
+                    && r.ordinal == Some(ordinal)
+                    && as_path(&r.path[..r.path.len() - 1]) == as_path(&target)
+                {
+                    stamp = self.observe(c, &r.path, attempts, false)?;
+                    break;
+                }
+            }
+            let now = stamp.ok_or(RarDiagnosticFailure::PublicationUnverified { ordinal })?;
+            if self.identity == Some(now.identity()) {
+                return Err(RarDiagnosticFailure::AliasTarget { ordinal });
+            }
+            let fits = match placed {
+                PlacedLink::Symbolic { len } => now.mode & libc::S_IFMT == libc::S_IFLNK && now.len == len,
+                PlacedLink::Hard { .. } | PlacedLink::Copy => now.regular(),
+            };
+            if !fits {
+                return Err(RarDiagnosticFailure::PublicationUnverified { ordinal });
+            }
+        }
+        let symbolic = matches!(placed, PlacedLink::Symbolic { .. });
+        let source = match placed {
+            PlacedLink::Hard { source } => source,
+            _ => None,
+        };
+        for i in 0..self.records.len() {
+            comparison_work(c, self.records[i].path.len(), target.len())?;
+            let r = &self.records[i];
+            let path = as_path(&r.path[..r.path.len() - 1]);
+            if let Some(stamp) = stamp.filter(|_| path == as_path(&target)) {
+                let now = self.observe(c, &r.path, attempts, r.follow)?;
+                if now.is_some_and(|s| Some(s.identity()) == self.identity) {
+                    return Err(alias(r));
+                }
+                // followed, a symbolic link leads wherever its target does; anything else is the placed object
+                if (!r.follow || !symbolic) && now != Some(stamp) {
+                    return Err(RarDiagnosticFailure::PublicationUnverified { ordinal });
+                }
+                self.records[i].expected = now;
+            } else if stamp.is_some() && symbolic && path.starts_with(as_path(&target)) {
+                // a later member's path now runs through the symbolic link just placed
+                let now = self.observe(c, &r.path, attempts, r.follow)?;
+                if now.is_some_and(|s| Some(s.identity()) == self.identity) {
+                    return Err(alias(r));
+                }
+                self.records[i].expected = now;
+            } else if prepared && stamp.is_some() && r.follow && r.expected.is_none() {
+                let now = self.observe(c, &r.path, attempts, true)?;
+                if now.is_some_and(|s| Some(s.identity()) == self.identity) {
+                    return Err(alias(r));
+                }
+                if symbolic || now == stamp {
+                    self.records[i].expected = now;
+                } else if now.is_some() {
+                    return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
+                }
+            } else if let Some(old) = r.expected.filter(|old| old.regular() && source == Some(old.identity())) {
+                // A hard link (or its stage, removed again) adds a name to the earlier file: only its link count,
+                // by at most one, and its ctime may change.
+                let now = self
+                    .observe(c, &r.path, attempts, r.follow)?
+                    .ok_or(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal })?;
+                let permitted = Stamp { ctime: now.ctime, links: now.links, ..old };
+                let counted = now.links == old.links || Some(now.links) == old.links.checked_add(1);
+                if now != permitted || !counted {
+                    return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
+                }
+                self.records[i].expected = Some(now);
+            } else if let Some(pending) = pending.filter(|pending| {
+                stamp.is_some() && r.expected.is_some_and(|old| old.identity() == pending.old.identity())
+            }) {
+                let now = self
+                    .observe(c, &r.path, attempts, r.follow)?
+                    .ok_or(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal })?;
+                let permitted = Stamp {
+                    ctime: now.ctime,
+                    links: pending.old.links.checked_sub(1).ok_or(RarDiagnosticFailure::CounterOverflow)?,
+                    ..pending.old
+                };
+                let follows_placed = r.follow && Some(now) == stamp;
+                if r.expected != Some(pending.old) || (!follows_placed && now != permitted) {
+                    return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
+                }
+                self.records[i].expected = Some(now);
+            }
+        }
+        c.usage.diagnostics.capacity = c
+            .usage
+            .diagnostics
+            .capacity
+            .checked_sub(target.capacity() as u64)
+            .ok_or(RarDiagnosticFailure::CounterOverflow)?;
         Ok(())
     }
 }
