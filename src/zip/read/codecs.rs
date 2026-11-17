@@ -265,7 +265,7 @@ pub(super) fn decode(
         {
             return Err(ReadFault::InvalidPlan.into());
         }
-        if !matches!(method, 0 | 8 | 9 | 12 | 14 | 95 | 93) {
+        if !matches!(method, 0 | 8 | 9 | 12 | 14 | 95 | 93 | 98) {
             return Err(ReadFault::UnsupportedMethod { method }.into());
         }
         step_charge(workspace.ledger, encrypted, cancel)?;
