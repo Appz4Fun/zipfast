@@ -108,7 +108,8 @@ fn standalone(path: &Path, dest: &Path, name: &str, expected: &[u8], packed: usi
     let entry = &listed[0];
     assert_eq!(entry.name, name);
     assert_eq!((entry.size, entry.packed, entry.method), (expected.len() as u64, packed as u64, 8));
-    // The listing takes the first header's MTIME (Unix time, 0 for none); extraction does not restore it.
+    // The listing takes the first header's MTIME (Unix time, 0 for none). Extraction restores it as 7-Zip and
+    // gunzip -N do, and with no MTIME gives the file the archive's own time.
     let wire = fs::read(path).unwrap();
     let mtime = u32::from_le_bytes(wire[4..8].try_into().unwrap());
     let mtime = (mtime != 0).then_some(i64::from(mtime));
@@ -120,7 +121,9 @@ fn standalone(path: &Path, dest: &Path, name: &str, expected: &[u8], packed: usi
     let entry = SelectedEntry::open(path, 0, None, (expected.len().max(packed)) as u64).unwrap();
     assert_eq!(entry.name(), name);
     assert_eq!(entry.relative_path().unwrap(), Path::new(name));
-    assert_eq!((entry.modified(), entry.unix_mode()), (None, None));
+    let own = fs::metadata(path).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let modified = mtime.map_or((own.as_secs() as i64, own.subsec_nanos()), |seconds| (seconds, 0));
+    assert_eq!((entry.modified(), entry.unix_mode()), (Some(modified), None));
     let mut output = Vec::new();
     entry
         .read(None, |chunk| {
