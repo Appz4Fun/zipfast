@@ -179,9 +179,83 @@ pub(super) struct State {
     queue: VecDeque<Member>,
     /// for each file with more than one link (by device and inode): the name that carried its data
     owners: HashMap<(u64, u64), String>,
-    /// links read before any carried data, in archive order, with their key
-    waiting: Vec<((u64, u64), Member)>,
+    /// links read before any carried data, by device and inode, each list in archive order
+    waiting: HashMap<(u64, u64), Vec<Waiting>>,
+    waiting_count: usize,
+    /// the next waiting link's place in the archive, so the ones never resolved come out in order
+    seq: u64,
     link_bytes: usize,
+}
+
+/// A link read before any carried its file's data: only what it takes to hand it out later, as a link or (at the
+/// end, for the first of a file that never carried data) as an empty file.
+struct Waiting {
+    seq: u64,
+    name: String,
+    raw_name: Option<Vec<u8>>,
+    mode: u32,
+    mtime: i64,
+    uid: u64,
+    gid: u64,
+}
+
+impl Waiting {
+    /// What one takes in the bookkeeping, its name included, against [`MAX_LINK_BYTES`].
+    fn cost(&self) -> usize {
+        std::mem::size_of::<Self>() + self.name.len() + self.raw_name.as_ref().map_or(0, Vec::len)
+    }
+
+    fn into_member(self, kind: Kind, link: String) -> Member {
+        let mut m = cpio_member(self.name, self.raw_name, kind, link, 0, (self.mtime, self.mode), (self.uid, self.gid));
+        m.size = 0;
+        m
+    }
+}
+
+/// A member as the cpio reader hands it out.
+fn cpio_member(
+    name: String,
+    raw_name: Option<Vec<u8>>,
+    kind: Kind,
+    link: String,
+    size: u64,
+    (mtime, mode): (i64, u32),
+    (uid, gid): (u64, u64),
+) -> Member {
+    let typeflag = match kind {
+        Kind::File => b'0',
+        Kind::Dir => b'5',
+        Kind::Symlink => b'2',
+        Kind::HardLink => b'1',
+        Kind::Other(t) => t,
+    };
+    Member {
+        name,
+        raw_name,
+        link,
+        size: if matches!(kind, Kind::File) { size } else { 0 },
+        kind,
+        mtime: Some(mtime),
+        nanos: 0,
+        mode: mode & 0o7777,
+        atime: None,
+        ctime: None,
+        cpio: true,
+        tar: Box::new(TarMetadata {
+            magic: TarMagic::Other,
+            typeflag,
+            user: None,
+            group: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            device_major: None,
+            device_minor: None,
+            pax_header_name: None,
+            pax_records: Vec::new(),
+            pax_records_truncated: false,
+            header: None,
+        }),
+    }
 }
 
 impl State {
@@ -191,14 +265,17 @@ impl State {
             ended: false,
             queue: VecDeque::new(),
             owners: HashMap::new(),
-            waiting: Vec::new(),
+            waiting: HashMap::new(),
+            waiting_count: 0,
+            seq: 0,
             link_bytes: 0,
         }
     }
 
-    fn charge(&mut self, name: &str) -> Result<()> {
-        self.link_bytes += name.len() + 64;
-        if self.link_bytes > MAX_LINK_BYTES || self.owners.len() + self.waiting.len() >= MAX_LINK_ENTRIES {
+    /// Counts `bytes` more of bookkeeping (a hash table entry's overhead included) against the caps.
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.link_bytes += bytes + 32;
+        if self.link_bytes > MAX_LINK_BYTES || self.owners.len() + self.waiting_count >= MAX_LINK_ENTRIES {
             return Err(Error::Corrupt("a cpio archive has too many hard links"));
         }
         Ok(())
@@ -206,24 +283,19 @@ impl State {
 
     /// Hands out the links still waiting for data at the end: the first as an empty file, the rest as links to it.
     fn flush(&mut self) {
-        let mut firsts: HashMap<(u64, u64), String> = HashMap::new();
-        for (key, mut m) in std::mem::take(&mut self.waiting) {
-            if let Some(first) = firsts.get(&key) {
-                m.kind = Kind::HardLink;
-                m.link = first.clone();
-            } else {
-                firsts.insert(key, m.name.clone());
-            }
-            self.queue.push_back(m);
+        let mut out: Vec<(u64, Member)> = Vec::with_capacity(self.waiting_count);
+        for (_, links) in std::mem::take(&mut self.waiting) {
+            let mut links = links.into_iter();
+            let Some(first) = links.next() else { continue };
+            let target = first.name.clone();
+            out.push((first.seq, first.into_member(Kind::File, String::new())));
+            out.extend(links.map(|l| (l.seq, l.into_member(Kind::HardLink, target.clone()))));
         }
+        self.waiting_count = 0;
+        // each file's first link comes before its others, so archive order keeps every link after its target
+        out.sort_unstable_by_key(|(seq, _)| *seq);
+        self.queue.extend(out.into_iter().map(|(_, m)| m));
     }
-}
-
-fn hard_link(mut m: Member, target: &str) -> Member {
-    m.kind = Kind::HardLink;
-    m.link = target.to_owned();
-    m.size = 0;
-    m
 }
 
 impl Reader {
@@ -315,62 +387,38 @@ impl Reader {
             } else {
                 self.unread = h.filesize + data_pad;
             }
-            let typeflag = match kind {
-                Kind::File => b'0',
-                Kind::Dir => b'5',
-                Kind::Symlink => b'2',
-                Kind::HardLink => b'1',
-                Kind::Other(t) => t,
-            };
-            let m = Member {
-                name: decoded,
-                raw_name,
-                link,
-                size: if matches!(kind, Kind::File) { size } else { 0 },
-                kind,
-                mtime: Some(h.mtime),
-                nanos: 0,
-                mode: h.mode & 0o7777,
-                atime: None,
-                ctime: None,
-                cpio: true,
-                tar: Box::new(TarMetadata {
-                    magic: TarMagic::Other,
-                    typeflag,
-                    user: None,
-                    group: None,
-                    uid: Some(h.uid),
-                    gid: Some(h.gid),
-                    device_major: None,
-                    device_minor: None,
-                    pax_header_name: None,
-                    pax_records: Vec::new(),
-                    pax_records_truncated: false,
-                    header: None,
-                }),
-            };
             if kind == Kind::File && h.nlink > 1 && h.ino != 0 {
                 let key = (h.dev, h.ino);
                 let state = self.cpio.as_mut().expect("a cpio reader");
                 if let Some(owner) = state.owners.get(&key) {
                     // the data is already out under another name: this one links to it, and its copy is passed over
-                    return Ok(Some(hard_link(m, &owner.clone())));
+                    let owner = owner.clone();
+                    let m = cpio_member(decoded, raw_name, Kind::HardLink, owner, 0, (h.mtime, h.mode), (h.uid, h.gid));
+                    return Ok(Some(m));
                 }
                 if h.filesize == 0 {
-                    state.charge(&m.name)?;
-                    state.waiting.push((key, m));
+                    let seq = state.seq;
+                    state.seq += 1;
+                    let waiting =
+                        Waiting { seq, name: decoded, raw_name, mode: h.mode, mtime: h.mtime, uid: h.uid, gid: h.gid };
+                    state.charge(waiting.cost())?;
+                    state.waiting.entry(key).or_default().push(waiting);
+                    state.waiting_count += 1;
                     continue;
                 }
-                state.charge(&m.name)?;
-                state.owners.insert(key, m.name.clone());
-                // the names that came before without data link to this one, after it
-                let (before, rest): (Vec<_>, Vec<_>) =
-                    std::mem::take(&mut state.waiting).into_iter().partition(|(k, _)| *k == key);
-                state.waiting = rest;
-                for (_, earlier) in before {
-                    state.queue.push_back(hard_link(earlier, &m.name));
+                state.charge(std::mem::size_of::<((u64, u64), String)>() + decoded.len())?;
+                state.owners.insert(key, decoded.clone());
+                // the names that came before without data link to this one, after it: only this file's
+                if let Some(before) = state.waiting.remove(&key) {
+                    state.waiting_count -= before.len();
+                    // their bookkeeping is freed: only the owner's name stays
+                    state.link_bytes -= before.iter().map(|w| w.cost() + 32).sum::<usize>();
+                    for earlier in before {
+                        state.queue.push_back(earlier.into_member(Kind::HardLink, decoded.clone()));
+                    }
                 }
             }
+            let m = cpio_member(decoded, raw_name, kind, link, size, (h.mtime, h.mode), (h.uid, h.gid));
             if matches!(format, Format::Newc { crc: true }) && kind == Kind::File {
                 self.crc = Some(super::CpioCrc { want: h.check, sum: 0, left: h.filesize });
             }

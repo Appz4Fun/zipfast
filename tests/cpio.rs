@@ -303,3 +303,60 @@ fn the_format_is_found_by_its_magic() {
         assert!(extract::list(&path).unwrap().len() >= 8, "{fixture}");
     }
 }
+
+/// Many links waiting for data that never comes, and as many files whose data comes with their only other link:
+/// each member is handled on its own, so the reading stays linear (it used to rescan every waiting link for each
+/// file, quadratic in their number). A generous bound, far above linear time and far below quadratic.
+#[test]
+fn many_waiting_links_are_read_in_linear_time() {
+    const N: u32 = 50_000;
+    let mut parts = Vec::with_capacity(2 * N as usize);
+    for i in 0..N {
+        // waits for data under an inode no other member has
+        parts.push(newc(&format!("w{i}"), 0o100644, 1_000_000 + i, 2, b"", false));
+        // carries its own data, its other link never coming
+        parts.push(newc(&format!("d{i}"), 0o100644, 10 + i, 2, b"x", false));
+    }
+    let bytes = archive(&parts);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.cpio");
+    fs::write(&path, &bytes).unwrap();
+    let start = std::time::Instant::now();
+    let listing = extract::list(&path).unwrap();
+    let took = start.elapsed();
+    assert_eq!(listing.len(), 2 * N as usize);
+    // the waiting ones come out at the end, in archive order, each an empty file of its own
+    assert_eq!(listing[N as usize].name, "w0");
+    assert_eq!(listing.last().unwrap().name, format!("w{}", N - 1));
+    assert!(listing[N as usize..].iter().all(|e| e.link.is_none() && e.size == 0));
+    assert!(took < std::time::Duration::from_secs(15), "{took:?}");
+}
+
+/// A file's links waiting for data come out as links to the member that carries it, right after it, and the
+/// links of a file that never carries data as an empty file and links to it, in archive order.
+#[test]
+fn waiting_links_resolve_to_their_own_file_only() {
+    let bytes = archive(&[
+        newc("a1", 0o100644, 5, 3, b"", false),
+        newc("b1", 0o100644, 6, 2, b"", false),
+        newc("a2", 0o100644, 5, 3, b"", false),
+        newc("a3", 0o100644, 5, 3, b"data", false),
+        newc("b2", 0o100644, 6, 2, b"", false),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.cpio");
+    fs::write(&path, &bytes).unwrap();
+    let listing = extract::list(&path).unwrap();
+    let shown: Vec<(String, Option<String>)> = listing
+        .iter()
+        .map(|e| {
+            let link = e.link.as_ref().map(|l| format!("{l:?}"));
+            (e.name.clone(), link)
+        })
+        .collect();
+    let names: Vec<&str> = shown.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["a3", "a1", "a2", "b1", "b2"]);
+    assert!(shown[0].1.is_none() && shown[3].1.is_none(), "{shown:?}");
+    assert!(shown[1].1.as_deref().unwrap().contains("a3") && shown[2].1.as_deref().unwrap().contains("a3"));
+    assert!(shown[4].1.as_deref().unwrap().contains("b1"), "{shown:?}");
+}
