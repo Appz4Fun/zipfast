@@ -687,7 +687,8 @@ fn dos_timestamp(bits: u32) -> Option<i64> {
     if day == 0 || day > days {
         return None;
     }
-    crate::zip::dos_time(bits as u16, date)
+    // RAR 4.x DOS times, the extended-time records built on them included, are local wall clock, as UnRAR reads them
+    crate::zip::dos_time(bits as u16, date).map(crate::localtime::local_to_utc)
 }
 
 fn admit_name(usage: Option<&crate::progressive::Usage>, len: usize) -> std::result::Result<(), FileParseError> {

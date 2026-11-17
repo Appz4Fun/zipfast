@@ -164,7 +164,7 @@ fn unicode_names_preserve_raw_fields_and_bounded_decoding() {
         assert_eq!(entry.rar4_metadata().unwrap().dos_time, 0x50221884);
         assert_eq!(entry.host_os(), 1);
         assert_eq!(entry.attributes(), 0o100644);
-        assert_eq!(entry.modified(), Some((1_577_934_248, 0)));
+        assert_eq!(entry.modified(), Some((zipfast::extract::local_wall_clock_to_utc(1_577_934_248), 0)));
         assert_eq!(entry.rar5_compression_info(), None);
         assert_eq!(entry.unrar_name(), None);
     }
@@ -258,7 +258,10 @@ fn stored_size_modes_and_extended_times_are_verified() {
     edit_file_header(&mut file, |_| {});
     fs::write(&path, archive(&[file])).unwrap();
     let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
-    assert_eq!(session.entries().next().unwrap().modified(), Some((1_577_934_248, 838_860_800)));
+    assert_eq!(
+        session.entries().next().unwrap().modified(),
+        Some((zipfast::extract::local_wall_clock_to_utc(1_577_934_248), 838_860_800))
+    );
     let all = session.select(|_| true).unwrap();
     let out = dir.path().join("out");
     session.extract_selected(&all, &options(&out, Mode::Extract), RarDecodeLimits::default(), |_| {}).unwrap();

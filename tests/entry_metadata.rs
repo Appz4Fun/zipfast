@@ -140,7 +140,7 @@ fn zip_mtime_origin_follows_the_field_that_supplied_the_time() {
     assert_eq!(
         times,
         [
-            ("dos", Some(DOS_AS_UTC), Some(MtimeOrigin::LocalWallClock)),
+            ("dos", Some(zipfast::extract::local_wall_clock_to_utc(DOS_AS_UTC)), Some(MtimeOrigin::LocalWallClock)),
             ("ut", Some(1_600_000_000), Some(MtimeOrigin::Utc)),
             ("ntfs", Some(1_700_000_000), Some(MtimeOrigin::Utc)),
             ("ntfs-then-ut", Some(1_600_000_000), Some(MtimeOrigin::Utc)),
@@ -280,9 +280,9 @@ fn rar4_times_are_local_wall_clock_even_with_extended_time() {
     let ext = [0x00, 0xe2, 0x34, 0x12];
     let members = [r4_member("plain", b"a", 2, A, None), r4_member("precise", b"b", 2, A, Some(&ext))];
     let entries = list(dir.path(), "times.rar", &r4_archive(0, false, &members));
-    assert_eq!(entries[0].mtime, Some(DOS_AS_UTC));
+    assert_eq!(entries[0].mtime, Some(zipfast::extract::local_wall_clock_to_utc(DOS_AS_UTC)));
     assert_eq!(entries[0].mtime_origin, Some(MtimeOrigin::LocalWallClock));
-    assert_eq!(entries[1].mtime, Some(DOS_AS_UTC + 1));
+    assert_eq!(entries[1].mtime, Some(zipfast::extract::local_wall_clock_to_utc(DOS_AS_UTC) + 1));
     assert_eq!(entries[1].mtime_origin, Some(MtimeOrigin::LocalWallClock));
 }
 

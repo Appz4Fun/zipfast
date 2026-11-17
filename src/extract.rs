@@ -743,21 +743,28 @@ pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::
     })
 }
 
+/// The UTC instant of `wall`, a local wall-clock time written as if it were Unix seconds in UTC, in this machine's
+/// local time zone: what an MS-DOS date and time reads as. For tests that pin such times.
+#[doc(hidden)]
+pub fn local_wall_clock_to_utc(wall: i64) -> i64 {
+    crate::localtime::local_to_utc(wall)
+}
+
 /// Which clock an [`Entry::mtime`] was read from.
 ///
-/// Every `mtime` is a count of seconds since 1970-01-01 00:00:00, but only a
-/// `Utc` one is a true Unix timestamp. A `LocalWallClock` one is the stored
-/// date and time fields, which carry no time zone, counted as if they were UTC:
-/// formatting it as UTC gives back the wall-clock time the archiver recorded.
-/// 7-Zip and UnRAR print such a time as stored and convert a UTC time to local
-/// time.
+/// Every `mtime` is a Unix timestamp. A `Utc` one was stored as one. A
+/// `LocalWallClock` one comes from MS-DOS date and time fields, which carry no
+/// time zone: as Info-ZIP unzip, 7-Zip, libarchive and UnRAR do, they are read
+/// as wall-clock time in this machine's local time zone and converted to UTC
+/// (a time in a daylight-saving gap or overlap resolves as `mktime` does), so
+/// formatting it in local time gives back the stored fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum MtimeOrigin {
     /// A Unix timestamp: ZIP extended-timestamp (0x5455) and NTFS (0x000a)
     /// extras, RAR 5.0, tar and the gzip `MTIME` field.
     Utc,
-    /// MS-DOS date and time fields read as UTC: ZIP without a time extra and
-    /// RAR 4.x, including its extended-time precision record.
+    /// MS-DOS date and time fields read as local wall-clock time: ZIP without
+    /// a time extra and RAR 4.x, including its extended-time precision record.
     LocalWallClock,
 }
 

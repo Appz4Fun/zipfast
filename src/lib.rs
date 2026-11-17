@@ -33,6 +33,7 @@ pub mod crypto;
 pub mod error;
 pub mod extract;
 pub mod inflate64;
+mod localtime;
 pub mod map;
 mod output;
 #[cfg(feature = "persistent-partials")]

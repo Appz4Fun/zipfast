@@ -291,7 +291,7 @@ fn rewrite_can_opt_into_central_ut_without_changing_ordinary_timestamps() {
     let filetime = Some(ExtraMtime::NtfsFiletime(ntfs_ticks));
     let ut_time = Some((1_700_000_000, 0));
     let ntfs_time = Some((1_700_000_002, 123_456_700));
-    let dos_time = Some((315_532_800, 0)); // 1980-01-01 UTC.
+    let dos_time = Some((zipfast::extract::local_wall_clock_to_utc(315_532_800), 0)); // 1980-01-01 local time.
     let cases = [
         ("UT then NTFS", [&ut[..], &ntfs].concat(), filetime, ntfs_time, unix, ut_time),
         ("NTFS then UT", [&ntfs[..], &ut].concat(), unix, ut_time, unix, ut_time),

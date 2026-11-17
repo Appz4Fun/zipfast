@@ -1752,7 +1752,7 @@ fn rar4_dos_time_is_exposed_even_when_invalid() {
     let map = vol(&bytes, "old.rar", None).unwrap();
     let [a, b] = map.members.as_slice() else { panic!("{:?}", map.members) };
     assert_eq!(a.dos_time, Some(valid));
-    assert_eq!(a.mtime, Some((1_577_934_248, 0)));
+    assert_eq!(a.mtime, Some((zipfast::extract::local_wall_clock_to_utc(1_577_934_248), 0)));
     assert_eq!(b.dos_time, Some(invalid));
     assert_eq!(b.mtime, None);
     let map = MemberMap::from_memory(&[&bytes], "old.rar", None).unwrap();
