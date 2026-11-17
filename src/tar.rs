@@ -35,6 +35,7 @@ use crate::rar5::Redirection;
 use crate::stream::{self, Codec};
 
 mod cpio;
+mod xar;
 
 const BLOCK: usize = 512;
 /// Bytes moved per read.
@@ -69,6 +70,11 @@ pub fn sniff_tar(head: &[u8]) -> bool {
 /// which this module reads as it reads tar.
 pub fn sniff_cpio(head: &[u8]) -> bool {
     cpio::sniff(head).is_some()
+}
+
+/// Whether the file starts with a xar header (`.xar`, a macOS `.pkg`), which this module reads as it reads tar.
+pub fn sniff_xar(head: &[u8]) -> bool {
+    head.len() >= 28 && head.starts_with(xar::MAGIC) && u16::from_be_bytes([head[4], head[5]]) >= 28
 }
 
 fn zero(b: &[u8]) -> bool {
@@ -695,6 +701,9 @@ struct Reader {
     cpio: Option<Box<cpio::State>>,
     /// the checksum of the current member's data, in a newc archive with checksums
     crc: Option<CpioCrc>,
+    /// set when the archive is xar: its files, and the current one's data
+    xar: Option<Box<xar::State>>,
+    member_data: Option<xar::Data>,
 }
 
 /// A newc `070702` member's checksum: the sum of its data bytes, checked as the last of them is read.
@@ -716,7 +725,14 @@ impl Reader {
         let n = src.read(&mut first)?;
         first.truncate(n);
         let mut cpio = None;
+        let mut xar = None;
+        let plain = matches!(src, Source::Plain { .. });
         let mut content = if n == BLOCK && checksum_ok(&first) {
+            Some(Content::Tar)
+        } else if plain && sniff_xar(&first) {
+            // xar data is read where the table of contents puts it, from the file itself
+            xar = Some(Box::new(xar::open(File::open(path)?, std::fs::metadata(path)?.len())?));
+            first.clear();
             Some(Content::Tar)
         } else if let Some(format) = cpio::sniff(&first) {
             // cpio headers aren't blocks: what was read goes back, and members are read from the start
@@ -728,7 +744,7 @@ impl Reader {
         } else {
             None
         };
-        if n == BLOCK && cpio.is_none() && zero(&first) {
+        if n == BLOCK && cpio.is_none() && xar.is_none() && zero(&first) {
             // an empty archive is zero blocks and nothing else; a compressed file that only starts with zeros is
             // a file
             first.resize(EMPTY_MAX + 1, 0);
@@ -752,6 +768,8 @@ impl Reader {
             scratch: vec![0; 64 << 10],
             cpio,
             crc: None,
+            xar,
+            member_data: None,
         })
     }
 
@@ -789,6 +807,12 @@ impl Reader {
     fn next(&mut self) -> Result<Option<Member>> {
         if self.cpio.is_some() {
             return self.next_cpio();
+        }
+        if let Some(state) = &mut self.xar {
+            self.member_data = None;
+            let Some((member, data)) = state.next()? else { return Ok(None) };
+            self.member_data = data;
+            return Ok(Some(member));
         }
         if self.unread > 0 {
             let n = std::mem::take(&mut self.unread);
@@ -1068,8 +1092,17 @@ impl Reader {
         let mut left = size;
         while left > 0 {
             let want = left.min(buf.len() as u64) as usize;
-            let got = self.src.read(&mut buf[..want])?;
-            self.unread -= got as u64;
+            let got = match &mut self.member_data {
+                Some(data) => match read_full(data, &mut buf[..want]) {
+                    Ok(n) => n,
+                    Err(e) => return Err(data.fault.take().map_or_else(|| read_error(e), Error::Corrupt)),
+                },
+                None => {
+                    let got = self.src.read(&mut buf[..want])?;
+                    self.unread -= got as u64;
+                    got
+                }
+            };
             if let Some(crc) = &mut self.crc {
                 crc.sum = buf[..got].iter().fold(crc.sum, |s, &b| s.wrapping_add(u32::from(b)));
                 crc.left = crc.left.saturating_sub(got as u64);
@@ -1324,7 +1357,8 @@ pub fn run_with_policy(
 fn is_tar_or_stream(path: &Path) -> Result<bool> {
     let mut head = [0u8; 2 * BLOCK];
     let n = read_full(&mut File::open(path)?, &mut head)?;
-    Ok(Codec::sniff(&head[..n]).is_some() || sniff_tar(&head[..n]) || sniff_cpio(&head[..n]))
+    let head = &head[..n];
+    Ok(Codec::sniff(head).is_some() || sniff_tar(head) || sniff_cpio(head) || sniff_xar(head))
 }
 
 /// [`run`], reporting a rename mode's renames to `report` as they happen. A terminal error keeps them too.
@@ -1878,7 +1912,8 @@ fn run_tar(
                 Some(t) => out = Some(t),
                 None => continue,
             }
-        } else if let (Source::Plain { .. }, None) = (&reader.src, &reader.crc) {
+        } else if let (Source::Plain { .. }, true) = (&reader.src, reader.crc.is_none() && reader.member_data.is_none())
+        {
             // tar keeps no checksum of the data (nor does cpio, but for newc's own), so a test only has to find that
             // all of it is there: the data and its padding, whichever format's
             let size = reader.unread;

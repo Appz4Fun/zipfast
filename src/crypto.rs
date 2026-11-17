@@ -2152,3 +2152,143 @@ mod tests {
         assert_eq!(decrypt_cbc(&k256, &iv, &ct).unwrap(), msg);
     }
 }
+
+/// SHA-1 for checking stored digests (xar's per-file checksums), not for keys.
+#[derive(Clone)]
+pub(crate) struct Sha1Digest(Sha1);
+
+impl Sha1Digest {
+    pub(crate) fn new() -> Self {
+        Self(Sha1::new())
+    }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    pub(crate) fn finalize(&self) -> [u8; 20] {
+        self.0.finalize_bytes()
+    }
+}
+
+/// MD5 (RFC 1321), for checking stored digests (xar's per-file checksums), not for anything secret.
+#[derive(Clone)]
+pub(crate) struct Md5 {
+    state: [u32; 4],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_len: u64,
+}
+
+impl Md5 {
+    pub(crate) fn new() -> Self {
+        Self { state: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476], buf: [0; 64], buf_len: 0, total_len: 0 }
+    }
+
+    fn compress(state: &mut [u32; 4], chunk: &[u8; 64]) {
+        const S: [u32; 64] = [
+            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
+            14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10,
+            15, 21, 6, 10, 15, 21,
+        ];
+        let mut m = [0u32; 16];
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            m[i] = u32::from_le_bytes(*word);
+        }
+        let [mut a, mut b, mut c, mut d] = *state;
+        for (i, &shift) in S.iter().enumerate() {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            // K[i] = floor(abs(sin(i + 1)) * 2^32)
+            let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
+            let rotated = a.wrapping_add(f).wrapping_add(k).wrapping_add(m[g]).rotate_left(shift);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(rotated);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    }
+
+    pub(crate) fn update(&mut self, mut data: &[u8]) {
+        self.total_len += data.len() as u64;
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len < 64 {
+                return;
+            }
+            let buf = self.buf;
+            Self::compress(&mut self.state, &buf);
+            self.buf_len = 0;
+        }
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            Self::compress(&mut self.state, block);
+        }
+        self.buf[..rest.len()].copy_from_slice(rest);
+        self.buf_len = rest.len();
+    }
+
+    pub(crate) fn finalize(&self) -> [u8; 16] {
+        let mut state = self.state;
+        let mut tail = [0u8; 128];
+        tail[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
+        tail[self.buf_len] = 0x80;
+        let len = if self.buf_len < 56 { 64 } else { 128 };
+        tail[len - 8..len].copy_from_slice(&(self.total_len * 8).to_le_bytes());
+        for block in tail[..len].as_chunks::<64>().0 {
+            Self::compress(&mut state, block);
+        }
+        let mut out = [0u8; 16];
+        for (i, w) in state.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn md5_and_sha1_match_their_references_in_any_pieces() {
+        let md5 = |d: &[u8]| {
+            let mut h = Md5::new();
+            h.update(d);
+            hex(&h.finalize())
+        };
+        assert_eq!(md5(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            md5(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+        let mut sha = Sha1Digest::new();
+        sha.update(b"abc");
+        assert_eq!(hex(&sha.finalize()), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        let long: Vec<u8> = (0..1000u32).map(|i| (i * 31 + 7) as u8).collect();
+        let whole = md5(&long);
+        for cut in [1, 63, 64, 65, 200] {
+            let mut h = Md5::new();
+            for piece in long.chunks(cut) {
+                h.update(piece);
+            }
+            assert_eq!(hex(&h.finalize()), whole, "{cut}");
+        }
+    }
+}

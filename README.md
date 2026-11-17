@@ -36,6 +36,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   each found by its first bytes whatever the name: POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
   sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
   compresses. xz files written in blocks (`xz -T0`) decode on several cores.
+- xar archives (`.xar`, and the outer layer of a macOS `.pkg`): file data stored or compressed with gzip, bzip2,
+  xz or LZMA, each file's extracted checksum (SHA-1, MD5 or SHA-256) and the table of contents' own checksum checked.
+  The XML table of contents is read with bounds on its size, nesting, file count and path length, and no entity is
+  expanded but XML's own five. Members take tar's pipeline, links included.
 - cpio archives, plain or compressed as tar can be: the binary format in either byte order, odc (`070707`), newc
   (`070701`) and newc with checksums (`070702`, checked). They take tar's whole pipeline: containment, symbolic and
   hard links, overwrite choices, listing and reads by index. A file's hard links come out as links to the name that
