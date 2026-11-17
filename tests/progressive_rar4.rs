@@ -361,7 +361,8 @@ fn volume_set_format_cannot_change_after_a_complete_member() {
 #[test]
 fn unsupported_rar4_features_do_not_enter_rar5_decoder() {
     // versions 15, 20, 26 and 29 decode; RAR 1.3 (10) and anything past 2.9 don't
-    for (flags, version, method) in [(0, 29, 0x36), (0, 10, 0x30), (0, 36, 0x31), (4, 29, 0x30), (0x800, 20, 0x30)] {
+    // (an old file revision, flag 0x800, now decodes under its stored name; RAR 2.0 encryption is still refused)
+    for (flags, version, method) in [(0, 29, 0x36), (0, 10, 0x30), (0, 36, 0x31), (4, 29, 0x30), (4, 20, 0x30)] {
         let dir = tempfile::tempdir().unwrap();
         let mut file = member(b"one", b"payload", flags, method);
         file[24] = version;
