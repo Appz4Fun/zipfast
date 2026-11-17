@@ -378,6 +378,7 @@ impl State {
             atime: None,
             ctime: None,
             cpio: true,
+            sparse: None,
             tar: Box::new(TarMetadata {
                 magic: TarMagic::Other,
                 typeflag,
