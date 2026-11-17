@@ -298,6 +298,7 @@ fn list_entries(
                     .unix_mode
                     .is_some_and(|mode| mode & 0o170000 == 0o120000)
                     .then(|| crate::rar5::Redirection::UnixSymlink(String::new())),
+                version: None,
             }
         })
         .collect())

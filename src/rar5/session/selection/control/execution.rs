@@ -45,14 +45,10 @@ impl RarSession {
             if Arc::ptr_eq(&self.token, &selection.token) {
                 control.prepare(self, selection, options);
             }
-            let mut driver = Driver {
-                extraction: Extraction::new(options),
-                control,
-                observer,
-                retained: 0,
-                event_bytes: 0,
-                source_paths: Vec::new(),
-            };
+            let mut extraction = Extraction::new(options);
+            extraction.versions = selection.takes_versions();
+            let mut driver =
+                Driver { extraction, control, observer, retained: 0, event_bytes: 0, source_paths: Vec::new() };
             let result = self.execute_driver(selection, decode, &mut driver);
             // I2: only the incumbent drain body is exempt from the new control ceilings.
             driver.control.close_parent();
@@ -510,7 +506,8 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
     fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop> {
         self.control.native_charge(RarResource::ExtractControlWork, linear_work(header.name.len(), 8)?)?;
         self.reserve(header.name.len())?;
-        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        // an older revision gets this far only when the selection includes revisions: it is written as `name;N`
+        let name = header.output_name_as(true).unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         let relative = crate::path::sanitize_fallible(&name, !header.is_unix()).map_err(|e| match e {
             crate::path::ProjectionError::Allocation(e) => SelectedStop::Control(RarExtractControlError::Allocation(e)),
             crate::path::ProjectionError::Unsafe => SelectedStop::Native(Arc::new(RarFailure::Policy {

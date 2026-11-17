@@ -554,6 +554,7 @@ impl Member {
             encrypted: false,
             solid: false,
             link,
+            version: None,
         }
     }
 }
@@ -1325,6 +1326,7 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
             encrypted: false,
             solid: false,
             link: None,
+            version: None,
         }]);
     }
     let mut out = Vec::new();

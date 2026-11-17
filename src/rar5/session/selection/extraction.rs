@@ -49,12 +49,15 @@ impl RarSession {
             return Err(member_filter_refused(self));
         }
         let mut extraction = Extraction::new(options);
+        extraction.versions = selection.takes_versions();
         self.execute_selected(selection, limits, |run, session, index| extraction.member(run, session, index), on_entry)
     }
 }
 
 pub(super) struct Extraction<'a> {
     options: &'a Options,
+    /// older file revisions are written, as `name;N` ([`RarSelection::with_versions`])
+    pub(super) versions: bool,
     dirs: Vec<DirectoryOutput>,
     /// the files this run published, where each landed: the files a hard link or file copy may take
     extracted: crate::extract::link::Extracted,
@@ -69,7 +72,7 @@ pub(super) struct DirectoryOutput {
 
 impl<'a> Extraction<'a> {
     pub(super) fn new(options: &'a Options) -> Self {
-        Self { options, dirs: Vec::new(), extracted: Default::default() }
+        Self { options, versions: false, dirs: Vec::new(), extracted: Default::default() }
     }
 
     fn member(
@@ -113,7 +116,7 @@ impl<'a> Extraction<'a> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
         let member = &session.model.members[index];
         let header = &member.header;
-        if let Some(version) = header.version {
+        if let Some(version) = header.version.filter(|_| !self.versions) {
             return Ok(RarOutcome::Skipped(RarSkipReason::OlderVersion(version)));
         }
         let link = match &header.redirection {
@@ -787,7 +790,8 @@ pub(super) enum PlacedLink {
 struct LegacyHooks;
 impl ExtractionHooks for LegacyHooks {
     fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop> {
-        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        // an older revision gets this far only when the selection includes revisions: it is written as `name;N`
+        let name = header.output_name_as(true).unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         sanitize(&name, !header.is_unix())
             .map_err(|_| policy(RarPolicyReason::UnsafePath, PathBuf::from(&header.name)).into())
     }

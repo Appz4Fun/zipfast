@@ -170,6 +170,10 @@ pub struct MemberRef<'a> {
     pub is_dir: bool,
     /// Zero-based position of the member in what [`list`] returns for the same archive.
     pub ordinal: u64,
+    /// A RAR 5.0 older file revision's version number (`rar -ver`), as [`Entry::version`]; `None` for every other
+    /// member and format. Such members are offered to the filter whether or not [`MemberFilter::with_versions`]
+    /// takes them.
+    pub version: Option<u64>,
 }
 
 impl MemberRef<'_> {
@@ -223,6 +227,8 @@ impl MemberRef<'_> {
 pub struct MemberFilter {
     filter: Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>,
     start: Option<StartHook>,
+    /// extract RAR 5.0 older file revisions too ([`MemberFilter::with_versions`])
+    versions: bool,
 }
 
 /// The hook [`MemberFilter::on_start`] keeps.
@@ -249,7 +255,7 @@ pub enum StartDecision {
 
 impl MemberFilter {
     pub fn new(filter: impl Fn(&MemberRef<'_>) -> bool + Send + Sync + 'static) -> Self {
-        Self { filter: Arc::new(filter), start: None }
+        Self { filter: Arc::new(filter), start: None, versions: false }
     }
 
     /// A filter that takes every member, for use with [`MemberFilter::on_start`] alone.
@@ -271,6 +277,23 @@ impl MemberFilter {
         self
     }
 
+    /// Also extracts the older file revisions a RAR 5.0 archive keeps (`rar -ver`), as UnRAR's `x -ver` does: each
+    /// under its name with `;` and its version number appended (`notes.txt;2`, [`Entry::version`]), beside the
+    /// current file. Without it an extracting RAR run skips them ([`RarSkipReason::OlderVersion`]), as UnRAR does
+    /// without `-ver`. The filter itself still decides which members are taken: [`MemberRef::version`] says which
+    /// revision each one is, so `|m| m.version.is_none_or(|v| v == 2)` takes the current files and revision 2. Only
+    /// whole-archive RAR runs read it; other formats keep no revisions. For [`crate::rar5::session::RarSession`]
+    /// see [`crate::rar5::session::RarSelection::with_versions`].
+    pub fn with_versions(mut self) -> Self {
+        self.versions = true;
+        self
+    }
+
+    /// Whether [`MemberFilter::with_versions`] was asked for.
+    pub fn takes_versions(&self) -> bool {
+        self.versions
+    }
+
     /// Whether the filter takes `member`.
     pub fn selects(&self, member: &MemberRef<'_>) -> bool {
         (self.filter)(member)
@@ -284,7 +307,7 @@ impl MemberFilter {
 
 impl From<Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>> for MemberFilter {
     fn from(filter: Arc<dyn Fn(&MemberRef<'_>) -> bool + Send + Sync>) -> Self {
-        Self { filter, start: None }
+        Self { filter, start: None, versions: false }
     }
 }
 
@@ -297,7 +320,21 @@ impl std::fmt::Debug for MemberFilter {
 impl Options {
     /// Whether a run takes this member: always without a filter.
     pub(crate) fn selects(&self, name: &str, raw_name: Option<&[u8]>, is_dir: bool, ordinal: u64) -> bool {
-        self.select.as_ref().is_none_or(|filter| filter.selects(&MemberRef { name, raw_name, is_dir, ordinal }))
+        self.select
+            .as_ref()
+            .is_none_or(|filter| filter.selects(&MemberRef { name, raw_name, is_dir, ordinal, version: None }))
+    }
+
+    /// [`Self::selects`] for a RAR member, which may be an older file revision.
+    pub(crate) fn selects_revision(&self, name: &str, is_dir: bool, ordinal: u64, version: Option<u64>) -> bool {
+        self.select
+            .as_ref()
+            .is_none_or(|filter| filter.selects(&MemberRef { name, raw_name: None, is_dir, ordinal, version }))
+    }
+
+    /// Whether an extracting RAR run writes older file revisions ([`MemberFilter::with_versions`]).
+    pub(crate) fn takes_versions(&self) -> bool {
+        self.select.as_ref().is_some_and(MemberFilter::takes_versions)
     }
 
     pub(crate) fn protecting(&self, input: &Path) -> Result<Cow<'_, Self>> {
@@ -790,7 +827,7 @@ pub enum MtimeOrigin {
 
 /// One entry for a listing.
 ///
-/// `mode`, `mtime_origin`, `ctime`, `atime`, `tar`, `size_unknown` and `attributes` are additive in this unpublished
+/// `mode`, `mtime_origin`, `ctime`, `atime`, `tar`, `size_unknown`, `attributes` and `version` are additive in this unpublished
 /// 0.1 API; downstream struct literals must supply them (`None` when the
 /// archive holds no such metadata).
 #[derive(Clone, Debug)]
@@ -834,9 +871,18 @@ pub struct Entry {
     pub encrypted: bool,
     pub solid: bool,
     pub link: Option<Redirection>,
+    /// RAR 5.0: an older file revision's version number, from its version record (`rar -ver`); `None` for the
+    /// current file, a record holding 0 (as UnRAR reads it), and every other format. [`Entry::display_name`] is the
+    /// name UnRAR shows for it.
+    pub version: Option<u64>,
 }
 
 impl Entry {
+    /// The name as UnRAR shows it: an older revision's version number appended after `;` (`notes.txt;2`), the name
+    /// [`MemberFilter::with_versions`] writes it under.
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        crate::rar5::version_name(&self.name, self.version)
+    }
     /// The size, or None when it is unknown ([`Entry::size_unknown`]).
     pub fn known_size(&self) -> Option<u64> {
         (!self.size_unknown).then_some(self.size)
@@ -2179,6 +2225,7 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
             encrypted: h.encrypted,
             solid: h.solid,
             link: h.redirection,
+            version: h.version,
         });
         Ok(())
     })?;
@@ -3252,7 +3299,7 @@ impl Run<'_, '_, '_> {
         } else {
             let ordinal = self.members;
             self.members = ordinal.checked_add(1).ok_or_else(RarFault::counter_limit)?;
-            self.opts.selects(&name, None, h.is_dir(), ordinal)
+            self.opts.selects_revision(&name, h.is_dir(), ordinal, h.version)
         };
         if !selected {
             return self.unselected_block(vol, h, name, continuation);
@@ -3492,6 +3539,7 @@ impl Run<'_, '_, '_> {
     ) -> RunResult<()> {
         if let Some(v) = h.version
             && self.opts.mode == Mode::Extract
+            && !self.opts.takes_versions()
         {
             self.drain()?;
             self.reports.skipped(&ctx, RarSkipReason::OlderVersion(v))?;
@@ -3501,6 +3549,11 @@ impl Run<'_, '_, '_> {
         // be written one to one is refused (`crate::path::rar_output_name`).
         // (`h.name` was moved into `ctx`)
         let output = crate::path::rar_output_name(&ctx.entry.name, h.format == RarFormat::Rar4);
+        // an older revision taken by `with_versions` is named `name;N`, tested or written, as UnRAR's `-ver` names it
+        let output = match (output, h.version.filter(|_| self.opts.takes_versions())) {
+            (Some(name), Some(version)) => Some(std::borrow::Cow::Owned(format!("{name};{version}"))),
+            (output, _) => output,
+        };
         if self.opts.mode == Mode::Extract && output.is_none() {
             let cause = self.fail_in_order(
                 &ctx,

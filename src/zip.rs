@@ -1001,6 +1001,7 @@ pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
                 encrypted,
                 solid: false,
                 link,
+                version: None,
             }
         })
         .collect();
