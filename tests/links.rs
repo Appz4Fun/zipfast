@@ -353,3 +353,19 @@ fn a_moved_folder_is_never_trusted_under_another_spelling() {
         }
     }
 }
+
+/// A symbolic link takes its archived time on itself, not the time it was made.
+#[test]
+fn symbolic_links_keep_their_archived_time() {
+    use std::os::unix::fs::MetadataExt;
+    let day_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 86_400;
+    for name in ["bsdtar.tar", "bsdtar.tgz", "infozip.zip", "ditto.zip", "7z.7z"] {
+        let dir = tempfile::tempdir().unwrap();
+        extract::run(&fixture(name), &options(dir.path(), Mode::Extract, Overwrite::Always), |_| {}).unwrap();
+        for link in ["ln_file", "ln_dir", "chain"] {
+            let m = fs::symlink_metadata(dir.path().join(link)).unwrap();
+            assert!(m.file_type().is_symlink());
+            assert!(m.mtime() < day_ago, "{name} {link}: {}", m.mtime());
+        }
+    }
+}

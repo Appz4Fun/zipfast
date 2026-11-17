@@ -418,7 +418,8 @@ impl<'a> Extraction<'a> {
             return Err(policy(RarPolicyReason::TargetChanged, target.to_path_buf()).into());
         }
         let dest = &self.options.dest;
-        let create = |path: &Path, replace: bool| link::make(dest, &kind, &self.extracted, path, replace);
+        let modified = Meta::from(&session.model.members[index].header).modified();
+        let create = |path: &Path, replace: bool| link::make(dest, &kind, &self.extracted, path, replace, modified);
         // a hard link's or copy's earlier file gone or changed fails this member only
         let failed = |path: &Path, source: io::Error| -> Arc<RarFailure> {
             match link::member_failure(&source) {

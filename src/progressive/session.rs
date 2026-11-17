@@ -1604,8 +1604,9 @@ impl ProgressiveSession {
                     crate::extract::link::LinkKind::Symbolic(text)
                 }
             };
+            let modified = crate::extract::Meta::from(header).modified();
             let mut target = self.target.take().expect("target");
-            match self.output.as_mut().expect("output").link(&mut target, &kind, &mut self.driver) {
+            match self.output.as_mut().expect("output").link(&mut target, &kind, modified, &mut self.driver) {
                 Ok(()) => {}
                 Err(e) if matches!(e.kind, FailureKind::PublicationAuthorityRequired) => return self.stop(e),
                 Err(e) => return Err(e),

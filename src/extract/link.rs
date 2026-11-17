@@ -26,6 +26,7 @@
 
 use std::io;
 use std::path::Path;
+use std::time::SystemTime;
 
 /// The longest target taken, in bytes (`PATH_MAX` less its NUL).
 pub(crate) const MAX_TARGET: u64 = 4095;
@@ -52,14 +53,19 @@ pub(crate) fn contained(rel: &Path, target: &[u8]) -> bool {
     true
 }
 
-/// Creates the link at `path`. With `replace` the file there is replaced in one rename, which never follows a link;
+/// Creates the link at `path`, with the archived `modified` time when there is one (set on the link itself, best
+/// effort, as `lutimes` does). With `replace` the file there is replaced in one rename, which never follows a link;
 /// without, the link is only created where nothing is.
 #[cfg(unix)]
-pub(crate) fn create(path: &Path, target: &[u8], replace: bool) -> io::Result<()> {
+pub(crate) fn create(path: &Path, target: &[u8], replace: bool, modified: Option<SystemTime>) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let target = std::ffi::OsStr::from_bytes(target);
     if !replace {
-        return std::os::unix::fs::symlink(target, path);
+        std::os::unix::fs::symlink(target, path)?;
+        if let Some(at) = modified {
+            set_link_time(path, at);
+        }
+        return Ok(());
     }
     let parent = path.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let name = path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -75,6 +81,9 @@ pub(crate) fn create(path: &Path, target: &[u8], replace: bool) -> io::Result<()
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
+        if let Some(at) = modified {
+            set_link_time(&stage, at);
+        }
         return std::fs::rename(&stage, path).inspect_err(|_| {
             let _ = std::fs::remove_file(&stage);
         });
@@ -84,8 +93,38 @@ pub(crate) fn create(path: &Path, target: &[u8], replace: bool) -> io::Result<()
 
 /// Links are created on Unix only.
 #[cfg(not(unix))]
-pub(crate) fn create(_: &Path, _: &[u8], _: bool) -> io::Result<()> {
+pub(crate) fn create(_: &Path, _: &[u8], _: bool, _: Option<SystemTime>) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Sets the modification time of the symbolic link at `path` itself, never what it points to (`utimensat` with
+/// `AT_SYMLINK_NOFOLLOW`, as `lutimes`), leaving its access time. Best effort, as a file's times are.
+#[cfg(unix)]
+fn set_link_time(path: &Path, at: SystemTime) {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(modified) = timespec(at) else { return };
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+    let times = [libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as libc::c_long }, modified];
+    // SAFETY: a NUL-terminated path and two timespecs; the flag never follows a link at the last component.
+    let _ = unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+}
+
+/// `at` as a timespec, before 1970 too; None when it doesn't fit.
+#[cfg(unix)]
+#[allow(clippy::useless_conversion, reason = "time_t is 32 bits on some Unix targets")]
+fn timespec(at: SystemTime) -> Option<libc::timespec> {
+    let (seconds, nanos) = match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => (i64::try_from(after.as_secs()).ok()?, after.subsec_nanos()),
+        Err(before) => {
+            let before = before.duration();
+            let seconds = i64::try_from(before.as_secs()).ok()?;
+            match before.subsec_nanos() {
+                0 => (seconds.checked_neg()?, 0),
+                n => (seconds.checked_neg()?.checked_sub(1)?, 1_000_000_000 - n),
+            }
+        }
+    };
+    Some(libc::timespec { tv_sec: seconds.try_into().ok()?, tv_nsec: nanos as libc::c_long })
 }
 
 /// The message for a link whose target is absolute or leads out of the destination.
@@ -245,9 +284,10 @@ pub(crate) fn publish(
     rel: &Path,
     place: super::Place,
     kind: &LinkKind,
+    modified: Option<SystemTime>,
     extracted: &mut Extracted,
 ) -> io::Result<()> {
-    publish_charging(dest, rel, place, kind, extracted, &mut || Ok(()))
+    publish_charging(dest, rel, place, kind, modified, extracted, &mut || Ok(()))
 }
 
 /// [`publish`], asking `charge` first whenever the link has to be made as a copy, which writes every byte of the
@@ -257,6 +297,7 @@ pub(crate) fn publish_charging(
     rel: &Path,
     place: super::Place,
     kind: &LinkKind,
+    modified: Option<SystemTime>,
     extracted: &mut Extracted,
     charge: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
@@ -265,7 +306,7 @@ pub(crate) fn publish_charging(
         None => (place.path.clone(), place.replace),
     };
     // on failure the reservation is dropped, which removes the empty file while it is still the one created
-    make_charging(dest, kind, extracted, &path, replace, charge)?;
+    make_charging(dest, kind, extracted, &path, replace, modified, charge)?;
     if let Some(reserved) = place.reserved {
         let _ = reserved.into_parts();
     }
@@ -273,10 +314,17 @@ pub(crate) fn publish_charging(
     Ok(())
 }
 
-/// Makes the link `kind` at `path`, replacing what is there only with `replace`. Nothing is recorded: see
-/// [`placed`].
-pub(crate) fn make(dest: &Path, kind: &LinkKind, extracted: &Extracted, path: &Path, replace: bool) -> io::Result<()> {
-    make_charging(dest, kind, extracted, path, replace, &mut || Ok(()))
+/// Makes the link `kind` at `path`, replacing what is there only with `replace`. A symbolic link takes the archived
+/// `modified` time; a hard link is the earlier file, with its own time. Nothing is recorded: see [`placed`].
+pub(crate) fn make(
+    dest: &Path,
+    kind: &LinkKind,
+    extracted: &Extracted,
+    path: &Path,
+    replace: bool,
+    modified: Option<SystemTime>,
+) -> io::Result<()> {
+    make_charging(dest, kind, extracted, path, replace, modified, &mut || Ok(()))
 }
 
 fn make_charging(
@@ -285,10 +333,11 @@ fn make_charging(
     extracted: &Extracted,
     path: &Path,
     replace: bool,
+    modified: Option<SystemTime>,
     charge: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     match kind {
-        LinkKind::Symbolic(target) => create(path, target, replace),
+        LinkKind::Symbolic(target) => create(path, target, replace, modified),
         LinkKind::Hard(source) | LinkKind::Copy(source) => {
             let landed = extracted.0.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
             hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)), charge)

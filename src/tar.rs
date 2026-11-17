@@ -1536,7 +1536,7 @@ enum Outcome {
 
 enum StagedMember {
     Directory { relative: PathBuf, meta: Meta, ordinal: u64, name: String },
-    Link { relative: PathBuf, name: String, kind: LinkKind, ordinal: u64 },
+    Link { relative: PathBuf, name: String, kind: LinkKind, ordinal: u64, meta: Meta },
     File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64, holes: u64, ordinal: u64 },
 }
 
@@ -1557,8 +1557,9 @@ impl StagedTar {
         let mut extracted = Extracted::default();
         for member in self.members {
             match member {
-                StagedMember::Link { relative, name, kind, ordinal } => {
-                    link_member(opts, &relative, (ordinal, &name), &kind, (&mut extracted, holes), summary, report)?;
+                StagedMember::Link { relative, name, kind, ordinal, meta } => {
+                    let member = (ordinal, name.as_str(), &meta);
+                    link_member(opts, &relative, member, &kind, (&mut extracted, holes), summary, report)?;
                 }
                 StagedMember::Directory { relative, meta, ordinal, name } => {
                     make_dirs(&opts.dest, &relative)?;
@@ -1601,7 +1602,7 @@ impl StagedTar {
 fn link_member(
     opts: &Options,
     rel: &Path,
-    (ordinal, name): (u64, &str),
+    (ordinal, name, meta): (u64, &str, &Meta),
     kind: &LinkKind,
     (extracted, holes): (&mut Extracted, &mut HoleBudget),
     summary: &mut Summary,
@@ -1618,7 +1619,7 @@ fn link_member(
             LinkKind::Hard(target) | LinkKind::Copy(target) => holes.copy(target),
             LinkKind::Symbolic(_) => Ok(()),
         };
-        if let Err(e) = link::publish_charging(&opts.dest, rel, place, kind, extracted, &mut copy) {
+        if let Err(e) = link::publish_charging(&opts.dest, rel, place, kind, meta.modified(), extracted, &mut copy) {
             if e.kind() == io::ErrorKind::FileTooLarge {
                 fail_member(summary, report, ordinal, name, HOLE_COPY, Error::Unsupported(HOLE_COPY.to_owned()));
                 return Ok(());
@@ -1877,9 +1878,17 @@ fn run_tar(
                 };
                 if let Some(staged) = &mut staged {
                     staged.budget.record(&m.name)?;
-                    staged.members.push(StagedMember::Link { relative: rel, name: m.name, kind, ordinal: position });
+                    let meta = m.meta();
+                    staged.members.push(StagedMember::Link {
+                        relative: rel,
+                        name: m.name,
+                        kind,
+                        ordinal: position,
+                        meta,
+                    });
                 } else {
-                    link_member(opts, &rel, (position, &m.name), &kind, (&mut extracted, &mut holes), summary, report)?;
+                    let member = (position, m.name.as_str(), &m.meta());
+                    link_member(opts, &rel, member, &kind, (&mut extracted, &mut holes), summary, report)?;
                 }
                 continue;
             }

@@ -52,6 +52,8 @@ struct Staged {
     ordinal: u64,
     /// A symbolic link at this destination-relative path: the staged data is its target.
     link: Option<PathBuf>,
+    /// the archived modification time, for a symbolic link
+    modified: Option<std::time::SystemTime>,
 }
 
 /// The folder being decoded.
@@ -317,7 +319,15 @@ impl Run<'_> {
             let (temporary, output) = self.stage(&place, 0)?;
             output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
             let link = is_link(member).then(|| rel.clone());
-            if !self.publish(Staged { temporary, place, name, size: 0, ordinal: self.current, link })? {
+            if !self.publish(Staged {
+                temporary,
+                place,
+                name,
+                size: 0,
+                ordinal: self.current,
+                link,
+                modified: meta(member).modified(),
+            })? {
                 return Ok(());
             }
         } else {
@@ -336,7 +346,7 @@ impl Run<'_> {
     /// Gives a verified file its name: replacing what is there only when that was asked for, never through a link.
     /// False when it was not published (already reported).
     fn publish(&mut self, staged: Staged) -> Outcome<bool> {
-        let Staged { temporary, place, name, size, ordinal, link } = staged;
+        let Staged { temporary, place, name, size, ordinal, link, modified } = staged;
         if let Some(rel) = link {
             // A symbolic link: its verified data is the target.
             let text = std::fs::read(&temporary).map_err(SevenZipError::Io)?;
@@ -348,7 +358,9 @@ impl Run<'_> {
             drop(temporary);
             // the folders known so far are looked at again past a link
             self.dirs.forget();
-            if let Err(e) = crate::extract::link::publish(&self.opts.dest, &rel, place, &kind, &mut self.extracted) {
+            if let Err(e) =
+                crate::extract::link::publish(&self.opts.dest, &rel, place, &kind, modified, &mut self.extracted)
+            {
                 if let Some(why) = crate::extract::link::member_failure(&e) {
                     self.fail_at(ordinal, &name, why);
                     return Ok(false);
@@ -587,7 +599,15 @@ impl Run<'_> {
         let (temporary, output) = staged.take().expect("a staged output");
         output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
         let link = is_link(member).then_some(rel);
-        let staged = Staged { temporary, place, name: name.to_owned(), size, ordinal: self.current, link };
+        let staged = Staged {
+            temporary,
+            place,
+            name: name.to_owned(),
+            size,
+            ordinal: self.current,
+            link,
+            modified: meta(member).modified(),
+        };
         if active.defer {
             active.staged.push(staged);
         } else {

@@ -353,6 +353,13 @@ pub(crate) struct Meta {
     pub mode: Option<u32>,
 }
 
+impl Meta {
+    /// The archived modification time, when there is one that fits.
+    pub(crate) fn modified(&self) -> Option<SystemTime> {
+        self.mtime.and_then(|seconds| archive_time(seconds, self.nanos))
+    }
+}
+
 impl From<&FileHeader> for Meta {
     fn from(h: &FileHeader) -> Self {
         Meta { mtime: h.mtime, nanos: h.mtime_nanos, mode: h.is_unix().then_some(h.attributes as u32) }
@@ -2711,7 +2718,7 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
             Some(reserved) => (reserved.into_parts().1, true),
             None => (place.path, place.replace),
         };
-        if let Err(e) = link::create(&path, &target, replace) {
+        if let Err(e) = link::create(&path, &target, replace, c.meta.modified()) {
             return Err(
                 books.terminal(&p.context, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false))
             );
@@ -3407,7 +3414,9 @@ impl Run<'_, '_, '_> {
             let path = place.path.clone();
             // the folders known so far are looked at again past a link
             self.dirs.forget();
-            if let Err(e) = link::publish(&self.opts.dest, rel, place, &kind, &mut self.landing.extracted) {
+            if let Err(e) =
+                link::publish(&self.opts.dest, rel, place, &kind, Meta::from(h).modified(), &mut self.landing.extracted)
+            {
                 if let Some(why) = link::member_failure(&e) {
                     let failure = if e.kind() == io::ErrorKind::Unsupported {
                         RarFailure::Unsupported(RarUnsupported::Redirection { kind: redirection_kind(h) })

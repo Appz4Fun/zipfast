@@ -221,6 +221,7 @@ impl OutputContext {
         &mut self,
         target: &mut Target,
         kind: &crate::extract::link::LinkKind,
+        modified: Option<std::time::SystemTime>,
         source: &mut crate::progressive::source::SourceDriver,
     ) -> ProgressiveResult<()> {
         use crate::extract::link;
@@ -237,10 +238,14 @@ impl OutputContext {
         }
         let replace = target.initial.is_some() && matches!(self.root.overwrite, crate::extract::Overwrite::Always);
         let root = &self.root.path;
-        link::make(root, kind, &self.extracted, &target.path, replace).map_err(|e| match link::member_failure(&e) {
-            Some(_) if e.kind() != std::io::ErrorKind::Unsupported => ProgressiveFailure::new(FailureKind::UnsafePath),
-            _ => out(OutputOperation::Publish, e, 0),
-        })?;
+        link::make(root, kind, &self.extracted, &target.path, replace, modified).map_err(
+            |e| match link::member_failure(&e) {
+                Some(_) if e.kind() != std::io::ErrorKind::Unsupported => {
+                    ProgressiveFailure::new(FailureKind::UnsafePath)
+                }
+                _ => out(OutputOperation::Publish, e, 0),
+            },
+        )?;
         let rel = target.path.strip_prefix(root).map_err(|_| invalid())?.to_path_buf();
         link::placed(root, &rel, kind, &target.path, &mut self.extracted);
         Ok(())
