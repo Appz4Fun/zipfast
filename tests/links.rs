@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 use zipfast::extract::{self, Mode, Options, Overwrite};
 
+const HARD_TARGET: &str = "the hard link's target is not a file extracted earlier in this run";
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/links").join(name)
 }
@@ -269,7 +271,9 @@ fn rename_existing_never_links_through_a_symlink_that_replaced_a_folder() {
         // the attack's setup happened: the folder moved aside and `d` is now the link to `ext`
         assert_eq!(fs::read_link(dest.join("d")).unwrap(), Path::new("ext"), "gz={gz}");
         assert_eq!(fs::read(dest.join("d_1/f")).unwrap(), b"mine", "gz={gz}");
-        assert_eq!(s.errors.len(), 1, "gz={gz}: only `h` fails: {:?}", s.errors);
+        // refused as a file no longer recorded, before any device and inode check: the link replaced the folder,
+        // so every record under it went (#189)
+        assert_eq!(s.errors, [format!("h: {HARD_TARGET}")], "gz={gz}");
         let outside_ino = fs::metadata(outside.join("f")).unwrap().ino();
         if let Ok(h) = fs::symlink_metadata(dest.join("h")) {
             assert_ne!(h.ino(), outside_ino, "gz={gz}: h shares the outside file");

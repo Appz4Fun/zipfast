@@ -183,7 +183,10 @@ fn rename_existing_never_links_through_a_symlink_that_replaced_a_folder() {
     let s = extract::run(&arc, &opts, |_| {}).unwrap();
     assert_eq!(fs::read_link(dest.join("d")).unwrap(), Path::new("ext"));
     assert_eq!(fs::read(dest.join("d_1/f")).unwrap(), b"mine");
-    assert_eq!(s.errors.len(), 2, "only `h` and `c` fail: {:?}", s.errors);
+    // refused as files no longer recorded, before any device and inode check: the link replaced the folder, so
+    // every record under it went (#189)
+    let why = "the hard link's target is not a file extracted earlier in this run";
+    assert_eq!(s.errors, [format!("h: {why}"), format!("c: {why}")]);
     assert!(fs::symlink_metadata(dest.join("h")).is_err() && fs::symlink_metadata(dest.join("c")).is_err());
     assert_eq!(fs::metadata(outside.join("f")).unwrap().nlink(), 1);
 }

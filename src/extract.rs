@@ -3631,16 +3631,13 @@ impl Run<'_, '_, '_> {
                 self.drain()?;
             }
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
-                match make_dirs_known_detailed(&self.opts.dest, &rel, &mut self.dirs) {
-                    // a link where a folder should be fails only this member
-                    Err(fault) if is_symlink_policy(&fault) => {
-                        let why = blocked_message(&RarPolicyReason::Symlink);
-                        let failure =
-                            RarFailure::Policy { reason: RarPolicyReason::Symlink, path: self.opts.dest.join(&rel) };
-                        self.fail_in_order(&ctx, failure, why)?;
-                        return Ok(());
-                    }
-                    made => made.map_err(|e| self.terminal(&ctx, e))?,
+                // a link or a file where a folder should be fails only this member, as it does a file member
+                let made = member_blocked(make_dirs_known_detailed(&self.opts.dest, &rel, &mut self.dirs));
+                if let Some(reason) = made.map_err(|e| self.terminal(&ctx, e))? {
+                    let why = blocked_message(&reason);
+                    let failure = RarFailure::Policy { reason, path: self.opts.dest.join(&rel) };
+                    self.fail_in_order(&ctx, failure, why)?;
+                    return Ok(());
                 }
                 self.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
             }
@@ -4604,19 +4601,15 @@ fn make_dirs_known_detailed(root: &Path, rel: &Path, dirs: &mut Dirs) -> crate::
     Ok(())
 }
 
-/// Creates a folder member's folders, `rel` under `root`, one at a time, never passing through a link. A link
-/// where one of them should be (placed earlier in the run, say) fails only that member: nothing is made through it,
-/// and the reason comes back. Any other error, a file in the way included, is the run's.
+/// Creates a folder member's folders, `rel` under `root`, one at a time, never passing through a link. A link or a
+/// file where one of them should be (placed earlier in the run, say) fails only that member, as it does a file
+/// member: nothing is made through it or over it, and the reason comes back. Any other error is the run's.
 pub(crate) fn make_member_dirs(root: &Path, rel: &Path) -> Result<Option<&'static str>> {
-    match make_dirs_detailed(root, rel) {
-        Ok(()) => Ok(None),
-        Err(fault) if is_symlink_policy(&fault) => Ok(Some(blocked_message(&RarPolicyReason::Symlink))),
+    match member_blocked(make_dirs_detailed(root, rel)) {
+        Ok(None) => Ok(None),
+        Ok(Some(reason)) => Ok(Some(blocked_message(&reason))),
         Err(fault) => Err(fault.into_legacy()),
     }
-}
-
-fn is_symlink_policy(fault: &RarFault) -> bool {
-    matches!(*fault.failure, RarFailure::Policy { reason: RarPolicyReason::Symlink, .. })
 }
 
 pub(crate) fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarResult<()> {
