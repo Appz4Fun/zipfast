@@ -243,10 +243,21 @@ fn at_or_below<'a, V>(map: &'a BTreeMap<PathBuf, V>, prefix: &'a Path) -> impl I
         .take_while(move |(k, _)| k.starts_with(prefix))
 }
 
+/// Whether `rel` is a normalised member path, as [`crate::path::sanitize`] makes them: plain components only, no
+/// `.`, `..`, empty component, root or trailing separator. Paths compare component by component, so `a/`, `a//b`
+/// or `a/./b` would find the record of `a` or `a/b` while their bytes differ.
+fn normalised(rel: &Path) -> bool {
+    use std::path::Component;
+    rel.components().all(|c| matches!(c, Component::Normal(_)))
+        && (cfg!(not(unix)) || rel.components().collect::<PathBuf>().as_os_str() == rel.as_os_str())
+}
+
 impl Extracted {
     fn forget(&mut self, rel: &Path) {
-        let Some(old) = self.records.remove(rel) else { return };
-        self.bytes -= cost(rel, &old);
+        // the record's own key, which is what was charged: never another spelling of it
+        let Some((key, old)) = self.records.remove_entry(rel) else { return };
+        let rel = key.as_path();
+        self.bytes = self.bytes.saturating_sub(cost(rel, &old));
         if let Some(l) = old
             && let Some(members) = self.landed.get_mut(&l.rel)
         {
@@ -258,10 +269,12 @@ impl Extracted {
     }
 
     fn record(&mut self, rel: &Path, landed: Option<Landed>) {
+        debug_assert!(normalised(rel), "record of an unnormalised path {rel:?}");
+        debug_assert!(landed.as_ref().is_none_or(|l| normalised(&l.rel)), "unnormalised landing {rel:?}");
         self.forget(rel);
         let c = cost(rel, &landed);
-        if self.bytes + c <= MAX_RECORDED {
-            self.bytes += c;
+        if let Some(bytes) = self.bytes.checked_add(c).filter(|&b| b <= MAX_RECORDED) {
+            self.bytes = bytes;
             if let Some(l) = &landed {
                 self.landed.entry(l.rel.clone()).or_default().push(rel.to_path_buf());
             }
@@ -271,6 +284,7 @@ impl Extracted {
 
     /// The member at `rel` was written to `landed` (an absolute path under `dest`).
     pub(crate) fn file(&mut self, dest: &Path, rel: &Path, landed: &Path) {
+        debug_assert!(normalised(rel), "record of an unnormalised path {rel:?}");
         let record = std::fs::symlink_metadata(landed).ok().filter(|m| m.file_type().is_file()).and_then(|m| {
             let landed = landed.strip_prefix(dest).ok()?.to_path_buf();
             let (dev, ino) = identity(&m);
@@ -653,6 +667,114 @@ mod tests {
         assert_eq!(e.landed.len(), 1);
         e.replaced(Path::new(""));
         assert!(e.records.is_empty() && e.landed.is_empty() && e.bytes == 0);
+    }
+
+    /// The plain reference for [`Extracted`]: every record in a list, each replacement a scan of all of them, and
+    /// "at or below" spelled out component by component.
+    #[derive(Default)]
+    struct Linear {
+        records: Vec<(PathBuf, Option<PathBuf>)>,
+    }
+
+    fn below(path: &Path, prefix: &Path) -> bool {
+        let (path, prefix): (Vec<_>, Vec<_>) = (path.components().collect(), prefix.components().collect());
+        path.len() >= prefix.len() && path[..prefix.len()] == prefix[..]
+    }
+
+    impl Linear {
+        fn forget(&mut self, rel: &Path) {
+            self.records.retain(|(m, _)| m != rel);
+        }
+
+        fn record(&mut self, rel: &Path, landed: Option<PathBuf>) {
+            self.forget(rel);
+            self.records.push((rel.to_path_buf(), landed));
+        }
+
+        fn replaced(&mut self, rel: &Path) {
+            self.records.retain(|(m, l)| !below(m, rel) && !l.as_deref().is_some_and(|l| below(l, rel)));
+        }
+
+        fn bytes(&self) -> usize {
+            self.records
+                .iter()
+                .map(|(m, l)| cost(m, &l.as_ref().map(|l| Landed { rel: l.clone(), dev: 1, ino: 2 })))
+                .sum()
+        }
+    }
+
+    /// Random records, forgets and replacements, over names that sort between a folder and what is below it (`a b`,
+    /// `a.b` and `ab` beside `a` and `a/b`), agree with the linear reference after every step: the same records,
+    /// the same index of where each landed, and the same byte count.
+    #[test]
+    fn replacement_matches_a_linear_scan() {
+        const PARTS: [&str; 8] = ["a", "a b", "a.b", "ab", "a/b", "b", "a-", "a0"];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let path = |next: &mut dyn FnMut(usize) -> usize| {
+            let parts: Vec<&str> = (0..1 + next(3)).map(|_| PARTS[next(PARTS.len())]).collect();
+            PathBuf::from(parts.join("/"))
+        };
+        for _ in 0..200 {
+            let (mut e, mut reference) = (Extracted::default(), Linear::default());
+            for _ in 0..60 {
+                let rel = path(&mut next);
+                match next(5) {
+                    0 => {
+                        e.tested(&rel);
+                        reference.record(&rel, None);
+                    }
+                    1 | 2 => {
+                        let landed = if next(2) == 0 { rel.clone() } else { path(&mut next) };
+                        e.record(&rel, Some(Landed { rel: landed.clone(), dev: 1, ino: 2 }));
+                        reference.record(&rel, Some(landed));
+                    }
+                    3 => {
+                        e.forget(&rel);
+                        reference.forget(&rel);
+                    }
+                    _ => {
+                        e.replaced(&rel);
+                        reference.replaced(&rel);
+                    }
+                }
+                let mut want: Vec<_> = reference.records.iter().map(|(m, _)| m.clone()).collect();
+                want.sort();
+                assert_eq!(e.records.keys().cloned().collect::<Vec<_>>(), want);
+                for (m, l) in &reference.records {
+                    assert_eq!(e.records[m].as_ref().map(|l| &l.rel), l.as_ref(), "{m:?}");
+                }
+                let mut index: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+                for (m, l) in &reference.records {
+                    if let Some(l) = l {
+                        index.entry(l.clone()).or_default().push(m.clone());
+                    }
+                }
+                let mut landed = e.landed.clone();
+                landed.values_mut().for_each(|members| members.sort());
+                index.values_mut().for_each(|members| members.sort());
+                assert_eq!(landed, index);
+                assert_eq!(e.bytes, reference.bytes());
+            }
+        }
+    }
+
+    /// A key spelled with a trailing separator or a `.` is refused in a debug build: such a path finds another
+    /// spelling's record, and its byte count would drift.
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn unnormalised_keys_are_refused() {
+        assert!(normalised(Path::new("a/b c/d.e")));
+        for bad in ["a/", "a//b", "a/./b", "./a", "a/..", "/a"] {
+            assert!(!normalised(Path::new(bad)), "{bad}");
+            let caught = std::panic::catch_unwind(|| Extracted::default().tested(Path::new(bad)));
+            assert!(caught.is_err(), "{bad}");
+        }
     }
 
     /// 100,000 files and as many links placed beside them: each replacement visits only what it removes, so the
