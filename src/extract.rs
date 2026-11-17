@@ -1040,7 +1040,10 @@ fn classify_head(head: &[u8]) -> Format {
         Format::SevenZip
     } else if crate::zip::sniff(head) {
         Format::Zip
-    } else if crate::stream::Codec::sniff(head).is_some() || crate::tar::sniff_tar(head) || crate::tar::sniff_cpio(head)
+    } else if crate::stream::Codec::sniff(head).is_some()
+        || crate::tar::sniff_tar(head)
+        || crate::tar::sniff_cpio(head)
+        || crate::tar::sniff_xar(head)
     {
         Format::Tar
     } else {
