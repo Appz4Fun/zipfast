@@ -242,12 +242,25 @@ pub(crate) fn publish(
     kind: &LinkKind,
     extracted: &mut Extracted,
 ) -> io::Result<()> {
+    publish_charging(dest, rel, place, kind, extracted, &mut || Ok(()))
+}
+
+/// [`publish`], asking `charge` first whenever the link has to be made as a copy, which writes every byte of the
+/// target, holes included: an error from it fails the link instead.
+pub(crate) fn publish_charging(
+    dest: &Path,
+    rel: &Path,
+    place: super::Place,
+    kind: &LinkKind,
+    extracted: &mut Extracted,
+    charge: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     let (path, replace) = match &place.reserved {
         Some(reserved) => (reserved.path().to_path_buf(), true),
         None => (place.path.clone(), place.replace),
     };
     // on failure the reservation is dropped, which removes the empty file while it is still the one created
-    make(dest, kind, extracted, &path, replace)?;
+    make_charging(dest, kind, extracted, &path, replace, charge)?;
     if let Some(reserved) = place.reserved {
         let _ = reserved.into_parts();
     }
@@ -258,11 +271,22 @@ pub(crate) fn publish(
 /// Makes the link `kind` at `path`, replacing what is there only with `replace`. Nothing is recorded: see
 /// [`placed`].
 pub(crate) fn make(dest: &Path, kind: &LinkKind, extracted: &Extracted, path: &Path, replace: bool) -> io::Result<()> {
+    make_charging(dest, kind, extracted, path, replace, &mut || Ok(()))
+}
+
+fn make_charging(
+    dest: &Path,
+    kind: &LinkKind,
+    extracted: &Extracted,
+    path: &Path,
+    replace: bool,
+    charge: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     match kind {
         LinkKind::Symbolic(target) => create(path, target, replace),
         LinkKind::Hard(source) | LinkKind::Copy(source) => {
             let landed = extracted.0.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
-            hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)))
+            hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)), charge)
         }
     }
 }
@@ -306,19 +330,52 @@ fn stage_beside(path: &Path) -> io::Result<std::path::PathBuf> {
 /// `dest` one folder at a time without following any link, and only when it is still that file (device and inode).
 /// A copy where linking fails, read through the same checked handle. The stage is created only where nothing is,
 /// and so is `path` without `replace`.
-fn hard(dest: &Path, landed: &Landed, path: &Path, replace: bool, copy: bool) -> io::Result<()> {
+fn hard(
+    dest: &Path,
+    landed: &Landed,
+    path: &Path,
+    replace: bool,
+    copy: bool,
+    charge: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     let stage = stage_beside(path)?;
-    stage_hard(dest, landed, &stage, copy)?;
+    let copied = stage_hard(dest, landed, &stage, copy, charge)?;
     let placed = if replace {
         std::fs::rename(&stage, path)
     } else {
-        std::fs::hard_link(&stage, path).or_else(|e| match e.kind() {
+        linked(&stage, path).or_else(|e| match e.kind() {
             io::ErrorKind::AlreadyExists => Err(e),
-            _ => copy_new(&mut open_no_follow(&stage)?, path),
+            _ => {
+                // a stage that is already a copy was charged for
+                if !copied {
+                    charge()?;
+                }
+                copy_new(&mut open_no_follow(&stage)?, path)
+            }
         })
     };
     let _ = std::fs::remove_file(&stage);
     placed
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes every hard link on this thread fail, as on FAT or exFAT, so the copy is taken instead.
+    pub(crate) static NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn no_hard_links() -> bool {
+    #[cfg(test)]
+    return NO_HARD_LINKS.with(|n| n.get());
+    #[cfg(not(test))]
+    false
+}
+
+fn linked(from: &Path, to: &Path) -> io::Result<()> {
+    if no_hard_links() {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
+    std::fs::hard_link(from, to)
 }
 
 /// Opens `path` for reading, never through a symbolic link at its last component.
@@ -344,8 +401,15 @@ fn copy_new(from: &mut std::fs::File, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Links (with `copy`, or where linking fails, copies) the landed file to `stage`; true when it copied.
 #[cfg(unix)]
-fn stage_hard(dest: &Path, landed: &Landed, stage: &Path, copy: bool) -> io::Result<()> {
+fn stage_hard(
+    dest: &Path,
+    landed: &Landed,
+    stage: &Path,
+    copy: bool,
+    charge: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -379,11 +443,13 @@ fn stage_hard(dest: &Path, landed: &Landed, stage: &Path, copy: bool) -> io::Res
     }
     let to = cstr(stage.as_os_str().as_bytes())?;
     // SAFETY: flags 0 never follow a symbolic link at the source name, resolved within the checked directory.
-    let linked = !copy && unsafe { libc::linkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_FDCWD, to.as_ptr(), 0) } == 0;
+    let linked = !copy
+        && !no_hard_links()
+        && unsafe { libc::linkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_FDCWD, to.as_ptr(), 0) } == 0;
     if linked {
         // the name could have been swapped between the check and the link: the staged link must be that file
         match std::fs::symlink_metadata(stage) {
-            Ok(m) if identity(&m) == (landed.dev, landed.ino) => return Ok(()),
+            Ok(m) if identity(&m) == (landed.dev, landed.ino) => return Ok(false),
             _ => {
                 let _ = std::fs::remove_file(stage);
                 return Err(gone());
@@ -396,17 +462,27 @@ fn stage_hard(dest: &Path, landed: &Landed, stage: &Path, copy: bool) -> io::Res
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || !same(&st) {
         return Err(gone());
     }
-    copy_new(&mut std::fs::File::from(fd), stage)
+    charge()?;
+    copy_new(&mut std::fs::File::from(fd), stage).map(|()| true)
 }
 
 #[cfg(not(unix))]
-fn stage_hard(dest: &Path, landed: &Landed, stage: &Path, copy: bool) -> io::Result<()> {
+fn stage_hard(
+    dest: &Path,
+    landed: &Landed,
+    stage: &Path,
+    copy: bool,
+    charge: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<bool> {
     let source = dest.join(&landed.rel);
     if !std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file()) {
         return Err(refused(TARGET_CHANGED));
     }
-    let linked = !copy && std::fs::hard_link(&source, stage).is_ok();
-    if linked { Ok(()) } else { copy_new(&mut std::fs::File::open(&source)?, stage) }
+    if !copy && linked(&source, stage).is_ok() {
+        return Ok(false);
+    }
+    charge()?;
+    copy_new(&mut std::fs::File::open(&source)?, stage).map(|()| true)
 }
 
 #[cfg(test)]

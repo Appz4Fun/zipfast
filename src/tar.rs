@@ -1365,16 +1365,44 @@ fn target(
     Ok(Some((output, landed)))
 }
 
+/// Why a hard link to a sparse file fails where it would have to be a copy past the run's budget of holes.
+const HOLE_COPY: &str = "the hard link would have to copy a sparse file, and its holes pass the archive's budget of \
+                         holes: refused as a bomb";
+
 /// The holes a whole run may make: 1 GiB, plus 1024 times the data each sparse member stores. Without it, many
 /// members each under [`SPARSE_MAX_RATIO`] would add up to a bomb (a thousand 1.5 KiB members claiming 1 GiB each)
 /// on a file system that keeps no holes. Extraction and testing share it; a read by index has its own byte limit.
 struct HoleBudget {
     left: u64,
+    /// the holes in each sparse file extracted so far, by member path: a hard link to one that has to be made as a
+    /// copy writes them all as data, and is charged for them
+    extracted: std::collections::HashMap<PathBuf, u64>,
 }
 
 impl HoleBudget {
     fn new() -> Self {
-        HoleBudget { left: SPARSE_FREE_SIZE }
+        HoleBudget { left: SPARSE_FREE_SIZE, extracted: Default::default() }
+    }
+
+    /// The member at `rel` was extracted with `holes` bytes of holes (none for a file that isn't sparse).
+    fn extracted(&mut self, rel: &Path, holes: u64) {
+        if holes > 0 {
+            self.extracted.insert(rel.to_path_buf(), holes);
+        } else {
+            self.extracted.remove(rel);
+        }
+    }
+
+    /// Charges a copy of the file at `target` (a hard link that couldn't be made) for its holes.
+    fn copy(&mut self, target: &Path) -> io::Result<()> {
+        let holes = self.extracted.get(target).copied().unwrap_or(0);
+        match self.left.checked_sub(holes) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(io::Error::new(io::ErrorKind::FileTooLarge, HOLE_COPY)),
+        }
     }
 
     /// Takes a sparse member's holes from what is left, or says why it is refused, leaving the budget as it was.
@@ -1404,7 +1432,7 @@ enum Outcome {
 enum StagedMember {
     Directory { relative: PathBuf, meta: Meta, ordinal: u64, name: String },
     Link { relative: PathBuf, name: String, kind: LinkKind, ordinal: u64 },
-    File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64, ordinal: u64 },
+    File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64, holes: u64, ordinal: u64 },
 }
 
 #[derive(Default)]
@@ -1414,19 +1442,25 @@ struct StagedTar {
 }
 
 impl StagedTar {
-    fn publish(self, opts: &Options, summary: &mut Summary, report: &mut impl LegacyReport) -> Result<()> {
+    fn publish(
+        self,
+        opts: &Options,
+        holes: &mut HoleBudget,
+        summary: &mut Summary,
+        report: &mut impl LegacyReport,
+    ) -> Result<()> {
         let mut extracted = Extracted::default();
         for member in self.members {
             match member {
                 StagedMember::Link { relative, name, kind, ordinal } => {
-                    link_member(opts, &relative, (ordinal, &name), &kind, &mut extracted, summary, report)?;
+                    link_member(opts, &relative, (ordinal, &name), &kind, (&mut extracted, holes), summary, report)?;
                 }
                 StagedMember::Directory { relative, meta, ordinal, name } => {
                     make_dirs(&opts.dest, &relative)?;
                     summary.dir_meta.push((opts.dest.join(relative), meta));
                     folder(summary, report, ordinal, &name);
                 }
-                StagedMember::File { relative, name, temporary, size, ordinal } => {
+                StagedMember::File { relative, name, temporary, size, holes: file_holes, ordinal } => {
                     let Some(place) = checked_place(opts, &relative, (ordinal, &name), summary, report)? else {
                         continue;
                     };
@@ -1448,6 +1482,7 @@ impl StagedTar {
                         return Err(error.error.into());
                     }
                     extracted.file(&opts.dest, &relative, &landed);
+                    holes.extracted(&relative, file_holes);
                     succeeded(summary, report, ordinal, &name, size);
                 }
             }
@@ -1463,7 +1498,7 @@ fn link_member(
     rel: &Path,
     (ordinal, name): (u64, &str),
     kind: &LinkKind,
-    extracted: &mut Extracted,
+    (extracted, holes): (&mut Extracted, &mut HoleBudget),
     summary: &mut Summary,
     report: &mut impl LegacyReport,
 ) -> Result<()> {
@@ -1474,7 +1509,15 @@ fn link_member(
     }
     if opts.mode == Mode::Extract {
         let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(()) };
-        if let Err(e) = link::publish(&opts.dest, rel, place, kind, extracted) {
+        let mut copy = || match kind {
+            LinkKind::Hard(target) | LinkKind::Copy(target) => holes.copy(target),
+            LinkKind::Symbolic(_) => Ok(()),
+        };
+        if let Err(e) = link::publish_charging(&opts.dest, rel, place, kind, extracted, &mut copy) {
+            if e.kind() == io::ErrorKind::FileTooLarge {
+                fail_member(summary, report, ordinal, name, HOLE_COPY, Error::Unsupported(HOLE_COPY.to_owned()));
+                return Ok(());
+            }
             if !cfg!(unix) || e.kind() == io::ErrorKind::Unsupported {
                 let why = link::UNSUPPORTED;
                 fail_member(summary, report, ordinal, name, why, Error::Unsupported(why.to_owned()));
@@ -1646,7 +1689,7 @@ fn run_tar(
                     }
                 }
                 if let Some(staged) = staged {
-                    staged.publish(opts, summary, report)?;
+                    staged.publish(opts, &mut holes, summary, report)?;
                 }
                 return Ok(());
             }
@@ -1725,7 +1768,7 @@ fn run_tar(
                     staged.budget.record(&m.name)?;
                     staged.members.push(StagedMember::Link { relative: rel, name: m.name, kind, ordinal: position });
                 } else {
-                    link_member(opts, &rel, (position, &m.name), &kind, &mut extracted, summary, report)?;
+                    link_member(opts, &rel, (position, &m.name), &kind, (&mut extracted, &mut holes), summary, report)?;
                 }
                 continue;
             }
@@ -1756,9 +1799,10 @@ fn run_tar(
             let output = Output::new(file, Some(m.real_size()));
             match copy_out(Some(output), &m.meta(), |sink| reader.read_member(&m, buf, sink))? {
                 Outcome::Done => {
-                    let size = m.real_size();
+                    let (size, holes) = (m.real_size(), m.real_size() - m.size);
                     let name = m.name;
-                    staged.members.push(StagedMember::File { relative: rel, name, temporary, size, ordinal: position });
+                    let file = StagedMember::File { relative: rel, name, temporary, size, holes, ordinal: position };
+                    staged.members.push(file);
                 }
                 Outcome::Archive(error) => {
                     fail_member(summary, report, position, &m.name, &error.to_string(), error);
@@ -1797,7 +1841,10 @@ fn run_tar(
         match copy_out(out, &m.meta(), |sink| reader.read_member(&m, buf, sink))? {
             Outcome::Done => {
                 match &landed {
-                    Some(landed) => extracted.file(&opts.dest, &rel, landed),
+                    Some(landed) => {
+                        extracted.file(&opts.dest, &rel, landed);
+                        holes.extracted(&rel, m.real_size() - m.size);
+                    }
                     None => extracted.tested(&rel),
                 }
                 succeeded(summary, report, position, &m.name, m.real_size())
@@ -1813,6 +1860,111 @@ fn run_tar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ustar header block for `name`.
+    fn test_header(name: &str, kind: u8, size: u64, link: &str) -> [u8; BLOCK] {
+        let mut h = [0u8; BLOCK];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        let octal = |h: &mut [u8; BLOCK], at: usize, width: usize, v: u64| {
+            h[at..at + width].copy_from_slice(format!("{v:0w$o}\0", w = width - 1).as_bytes());
+        };
+        octal(&mut h, 100, 8, 0o644);
+        octal(&mut h, 108, 8, 0);
+        octal(&mut h, 116, 8, 0);
+        octal(&mut h, 124, 12, size);
+        octal(&mut h, 136, 12, 0);
+        h[156] = kind;
+        h[157..157 + link.len()].copy_from_slice(link.as_bytes());
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        h
+    }
+
+    /// A pax 0.1 sparse member: one byte of data at the very end of a file `real` bytes long.
+    fn test_sparse(name: &str, real: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (k, v) in [
+            ("GNU.sparse.name", name.to_owned()),
+            ("GNU.sparse.size", real.to_string()),
+            ("GNU.sparse.map", format!("{},1", real - 1)),
+        ] {
+            let tail = format!(" {k}={v}\n");
+            let mut n = tail.len() + 1;
+            while format!("{n}{tail}").len() != n {
+                n += 1;
+            }
+            body.extend_from_slice(format!("{n}{tail}").as_bytes());
+        }
+        let mut out = test_header("PaxHeaders/x", b'x', body.len() as u64, "").to_vec();
+        body.resize(body.len().div_ceil(BLOCK) * BLOCK, 0);
+        out.extend(body);
+        out.extend(test_header("GNUSparseFile.0/x", b'0', 1, ""));
+        let mut data = vec![0u8; BLOCK];
+        data[0] = b'z';
+        out.extend(data);
+        out
+    }
+
+    /// Where hard links fail (FAT, exFAT), each link to a sparse file is a copy that writes its holes as data: the
+    /// copies are charged to the run's budget of holes, and refused one by one once it is spent.
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_copied_in_place_of_linking_are_charged_for_holes() {
+        use std::io::Write;
+        const MIB: u64 = 1 << 20;
+        // 1 GiB + 1 KiB allowed for "big"'s one byte, less its holes: 20 MiB left
+        let big = SPARSE_FREE_SIZE - 20 * MIB + 1025;
+        let mut tar = test_sparse("big", big);
+        // 8 MiB of holes: 12 MiB and 1 KiB left, enough for one copy of "s"
+        tar.extend(test_sparse("s", 8 * MIB + 1));
+        for i in 0..5 {
+            tar.extend(test_header(&format!("h{i}"), b'1', 0, "s"));
+        }
+        tar.extend(test_header("after.txt", b'0', 5, ""));
+        let mut after = b"after".to_vec();
+        after.resize(BLOCK, 0);
+        tar.extend(after);
+        tar.extend([0u8; 2 * BLOCK]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        let tgz = gz.finish().unwrap();
+        link::NO_HARD_LINKS.with(|n| n.set(true));
+        for (name, bytes) in [("c.tar", tar), ("c.tgz", tgz)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let dest = dir.path().join("out");
+            let opts = Options {
+                mode: Mode::Extract,
+                dest: dest.clone(),
+                overwrite: Overwrite::Skip,
+                flatten: false,
+                threads: None,
+                protected_paths: Default::default(),
+                parallel_min: None,
+                select: None,
+                windows_safe_names: false,
+            };
+            let s = run(&path, &opts, |_| {}).unwrap();
+            assert_eq!(s.errors.len(), 4, "{name}: {:?}", s.errors);
+            assert!(s.errors.iter().all(|e| e.contains("would have to copy a sparse file")), "{name}: {:?}", s.errors);
+            assert_eq!(s.files, 4, "{name}: big, s, h0, after.txt");
+            let h0 = std::fs::read(dest.join("h0")).unwrap();
+            assert_eq!(h0.len() as u64, 8 * MIB + 1, "{name}");
+            assert_eq!(h0.last(), Some(&b'z'));
+            use std::os::unix::fs::MetadataExt;
+            let ino = |n: &str| std::fs::metadata(dest.join(n)).unwrap().ino();
+            assert_ne!(ino("h0"), ino("s"), "{name}: a copy, not a link");
+            for i in 1..5 {
+                assert!(!dest.join(format!("h{i}")).exists(), "{name}: h{i}");
+            }
+            assert_eq!(std::fs::read(dest.join("after.txt")).unwrap(), b"after", "{name}");
+        }
+        link::NO_HARD_LINKS.with(|n| n.set(false));
+    }
 
     #[test]
     fn numbers() {
