@@ -213,15 +213,17 @@ impl OutputContext {
     ) -> ProgressiveResult<bool> {
         Policy { root: &self.root, usage: &self.usage }.check_target(target, source)
     }
-    /// Creates a symbolic link at `target` once its target text is checked ([`crate::extract::link`]), with the
-    /// same parent and target checks a file's publication makes. It replaces a file there only under
-    /// `Overwrite::Always`.
+    /// Creates a link at `target` once it is checked ([`crate::extract::link`]): a symbolic link, or a hard link or
+    /// copy of a file this session published, with the same parent and target checks a file's publication makes.
+    /// It replaces a file there only under `Overwrite::Always`. A hard link's or copy's earlier file gone or
+    /// changed is an unsafe path.
     pub(crate) fn link(
         &mut self,
         target: &mut Target,
-        text: &[u8],
+        kind: &crate::extract::link::LinkKind,
         source: &mut crate::progressive::source::SourceDriver,
     ) -> ProgressiveResult<()> {
+        use crate::extract::link;
         let policy = Policy { root: &self.root, usage: &self.usage };
         if !policy.check_target(target, source)? {
             return Err(ProgressiveFailure::new(FailureKind::PublicationAuthorityRequired));
@@ -234,7 +236,21 @@ impl OutputContext {
             return Err(invalid());
         }
         let replace = target.initial.is_some() && matches!(self.root.overwrite, crate::extract::Overwrite::Always);
-        crate::extract::link::create(&target.path, text, replace).map_err(|e| out(OutputOperation::Publish, e, 0))
+        let root = &self.root.path;
+        link::make(root, kind, &self.extracted, &target.path, replace).map_err(|e| match link::member_failure(&e) {
+            Some(_) if e.kind() != std::io::ErrorKind::Unsupported => ProgressiveFailure::new(FailureKind::UnsafePath),
+            _ => out(OutputOperation::Publish, e, 0),
+        })?;
+        let rel = target.path.strip_prefix(root).map_err(|_| invalid())?.to_path_buf();
+        link::placed(root, &rel, kind, &target.path, &mut self.extracted);
+        Ok(())
+    }
+    /// The file published at `target` is one a later hard link or file copy may take.
+    pub(crate) fn published(&mut self, target: &Target) {
+        if let Ok(rel) = target.path.strip_prefix(&self.root.path) {
+            let rel = rel.to_path_buf();
+            self.extracted.file(&self.root.path, &rel, &target.path);
+        }
     }
     pub(crate) fn directory(
         &mut self,

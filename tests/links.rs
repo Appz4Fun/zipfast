@@ -17,6 +17,8 @@
 //! Symbolic and hard links from tar, ZIP and 7z: placed only inside the destination, never followed.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -287,4 +289,67 @@ fn testing_refuses_the_links_extracting_would_refuse() {
     let dir = tempfile::tempdir().unwrap();
     let s = extract::run(&fixture("hard-missing.tar"), &options(dir.path(), Mode::Test, Overwrite::Always), |_| {});
     assert_eq!(s.unwrap().errors.len(), 1);
+}
+
+#[test]
+fn a_changed_hard_link_target_fails_only_its_member_and_leaves_no_reserved_file() {
+    use zipfast::extract::RenameStyle;
+    for gz in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("h"), b"was here").unwrap();
+        // the file member `d` moves the folder holding `d/f` aside: `d/f` is no longer the file extracted
+        let bytes = tar(&[
+            ("d/", b'5', b""),
+            ("d/f", b'0', b"mine"),
+            ("d", b'0', b"file"),
+            ("h", b'1', b"d/f"),
+            ("z", b'0', b"z"),
+        ]);
+        let archive = dir.path().join(if gz { "a.tgz" } else { "a.tar" });
+        write_tar(&archive, bytes, gz);
+        let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore));
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        assert_eq!(s.errors.len(), 1, "gz={gz}: {:?}", s.errors);
+        assert!(s.errors[0].contains("no longer"), "gz={gz}: {:?}", s.errors);
+        assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "gz={gz}");
+        assert_eq!(fs::read(dest.join("h_1")).unwrap(), b"was here", "gz={gz}");
+        assert!(fs::symlink_metadata(dest.join("h")).is_err(), "gz={gz}: the reserved name is left behind");
+    }
+}
+
+/// A folder is never trusted past a rename that moved it aside under another spelling of its name: on APFS `A/B`
+/// (or `e` with a combining accent) is `a/b` (or `é`), so the link `A/B -> .` takes the folder's place and
+/// `a/b/l -> ../../outside` would sit one folder higher than its name says.
+#[test]
+fn a_moved_folder_is_never_trusted_under_another_spelling() {
+    use zipfast::extract::RenameStyle;
+    let tmp = tempfile::tempdir().unwrap();
+    for (nfd, upper, lower) in [(false, "A", "a"), (true, "e\u{301}", "\u{e9}")] {
+        if !common::folds_names(tmp.path(), nfd) {
+            eprintln!("skipped: this file system keeps {upper:?} and {lower:?} apart");
+            continue;
+        }
+        let alias = if nfd { format!("{upper}/b") } else { format!("{upper}/B") };
+        let (dir_a, dir_ab, file, escape) =
+            (format!("{lower}/"), format!("{lower}/b/"), format!("{lower}/b/x"), format!("{lower}/b/l"));
+        for gz in [false, true] {
+            let case = tmp.path().join(format!("{nfd}-{gz}"));
+            fs::create_dir_all(case.join("outside")).unwrap();
+            let bytes = tar(&[
+                (dir_a.as_str(), b'5', b""),
+                (dir_ab.as_str(), b'5', b""),
+                (file.as_str(), b'0', b"x"),
+                (alias.as_str(), b'2', b"."),
+                (escape.as_str(), b'2', b"../../outside"),
+            ]);
+            let archive = case.join(if gz { "a.tgz" } else { "a.tar" });
+            write_tar(&archive, bytes, gz);
+            let dest = case.join("out");
+            let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore));
+            let _ = extract::run(&archive, &opts, |_| {});
+            assert_eq!(common::links_leading_out(&dest), Vec::<PathBuf>::new(), "nfd={nfd} gz={gz}");
+        }
+    }
 }

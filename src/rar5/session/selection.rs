@@ -16,7 +16,7 @@
 
 use crate::batch::{self, PositionReadError, read_at_detailed};
 use crate::blake2sp::Blake2sp;
-use crate::error::RarInternal;
+use crate::error::{RarInternal, RarPolicyReason};
 use crate::extract::{
     EntryContext, Pending, RarEntryIdentity, RarEntryOutcome, RarMatchState, RarOutcome, RarOutput, RarVerification,
 };
@@ -295,6 +295,12 @@ fn member_filter_refused(session: &RarSession) -> RarRunError {
     run_error(session.summary(0), None, Arc::new(RarFailure::Unsupported(RarUnsupported::MemberFilter)))
 }
 
+/// A member's name as a path relative to the destination, as a test run checks links against it.
+fn tested_name(header: &FileHeader) -> Option<PathBuf> {
+    let name = header.output_name()?;
+    crate::path::sanitize_with(&name, !header.is_unix(), false).ok()
+}
+
 fn run_error(partial: RarRunSummary, entry: Option<RarEntryIdentity>, failure: Arc<RarFailure>) -> RarRunError {
     RarRunError { partial, entry, failure, partial_member_bytes: 0 }
 }
@@ -329,6 +335,8 @@ struct SelectedRun {
     rar4: Option<Rar4Decoder>,
     /// RAR 3.x keys already derived for the session's password, by salt
     rar4_keys: crate::crypto::Rar4KeyCache,
+    /// the members this run found whole, by name: the files a tested hard link or file copy may take
+    tested: crate::extract::link::Extracted,
     history_volumes: VolumeSet,
     buffer: Vec<u8>,
     decrypted: Vec<u8>,
@@ -353,6 +361,7 @@ impl SelectedRun {
             decoder: None,
             rar4: None,
             rar4_keys: Default::default(),
+            tested: Default::default(),
             history_volumes: [0; VOLUME_WORDS],
             buffer,
             decrypted,
@@ -370,17 +379,7 @@ impl SelectedRun {
         if member.header.is_dir() || member.header.redirection.is_some() {
             let outcome = match (member.issue, &member.header.redirection) {
                 (Some(issue), _) => RarOutcome::Failed(Arc::new(copy_catalogue_issue(&session.issues[issue]))),
-                (None, Some(link)) => {
-                    let kind = match link {
-                        Redirection::UnixSymlink(_) => 1,
-                        Redirection::WindowsSymlink(_) => 2,
-                        Redirection::Junction(_) => 3,
-                        Redirection::HardLink(_) => 4,
-                        Redirection::FileCopy(_) => 5,
-                        Redirection::Unknown(kind) => *kind,
-                    };
-                    RarOutcome::Failed(Arc::new(RarFailure::Unsupported(RarUnsupported::Redirection { kind })))
-                }
+                (None, Some(link)) => self.test_link(&member.header, link),
                 (None, None) => RarOutcome::Directory,
             };
             let mut volumes = [0; VOLUME_WORDS];
@@ -419,7 +418,13 @@ impl SelectedRun {
             self.next = index + 1;
         }
         match self.decode(session, index, compressed, output) {
-            Ok((bytes, checks)) => Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Tested }),
+            Ok((bytes, checks)) => {
+                let header = &session.model.members[index].header;
+                if let Some(rel) = tested_name(header) {
+                    if header.is_rar4_symlink() { self.tested.replaced(&rel) } else { self.tested.tested(&rel) }
+                }
+                Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Tested })
+            }
             Err(failure) if is_terminal(&failure) => Err(failure),
             Err(failure) => {
                 if compressed {
@@ -430,6 +435,41 @@ impl SelectedRun {
                 Ok(RarOutcome::Failed(failure))
             }
         }
+    }
+
+    /// A RAR 5.0 redirection, tested: a symbolic link's target must stay inside the destination, and a hard link or
+    /// file copy must take a member this run found whole, as extracting checks them ([`crate::extract::link`]).
+    fn test_link(&mut self, header: &FileHeader, link: &Redirection) -> RarOutcome {
+        use crate::extract::link::{self, LinkKind};
+        let windows = !header.is_unix();
+        let Some(kind) = link::from_rar5(link, windows, false, false) else {
+            return RarOutcome::Failed(Arc::new(RarFailure::Unsupported(RarUnsupported::Redirection {
+                kind: link.kind(),
+            })));
+        };
+        let Some(rel) = tested_name(header) else {
+            let path = PathBuf::from(&header.name);
+            return RarOutcome::Failed(Arc::new(RarFailure::Policy { reason: RarPolicyReason::UnsafePath, path }));
+        };
+        let refused = match &kind {
+            Ok(kind) => link::refusal(&rel, kind, &self.tested).is_some(),
+            Err(_) => true,
+        };
+        if refused {
+            let reason = match kind {
+                Ok(LinkKind::Symbolic(_)) => RarPolicyReason::LinkTarget,
+                _ => RarPolicyReason::HardLinkTarget,
+            };
+            return RarOutcome::Failed(Arc::new(RarFailure::Policy { reason, path: rel }));
+        }
+        link::tested(&rel, &kind.expect("refused above"), &mut self.tested);
+        let checks = RarVerification {
+            size_checked: false,
+            crc32_checked: false,
+            blake2sp_checked: false,
+            password: RarPasswordEvidence::NotEncrypted,
+        };
+        RarOutcome::Verified { bytes: 0, checks, output: RarOutput::Tested }
     }
 
     fn decode(

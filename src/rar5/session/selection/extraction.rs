@@ -56,6 +56,8 @@ impl RarSession {
 pub(super) struct Extraction<'a> {
     options: &'a Options,
     dirs: Vec<DirectoryOutput>,
+    /// the files this run published, where each landed: the files a hard link or file copy may take
+    extracted: crate::extract::link::Extracted,
 }
 
 pub(super) struct DirectoryOutput {
@@ -67,7 +69,7 @@ pub(super) struct DirectoryOutput {
 
 impl<'a> Extraction<'a> {
     pub(super) fn new(options: &'a Options) -> Self {
-        Self { options, dirs: Vec::new() }
+        Self { options, dirs: Vec::new(), extracted: Default::default() }
     }
 
     fn member(
@@ -114,7 +116,16 @@ impl<'a> Extraction<'a> {
         if let Some(version) = header.version {
             return Ok(RarOutcome::Skipped(RarSkipReason::OlderVersion(version)));
         }
-        if member.issue.is_some() || header.redirection.is_some() {
+        let link = match &header.redirection {
+            Some(redirection) if member.issue.is_none() => crate::extract::link::from_rar5(
+                redirection,
+                !header.is_unix(),
+                self.options.windows_safe_names,
+                self.options.flatten,
+            ),
+            _ => None,
+        };
+        if link.is_none() && (member.issue.is_some() || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
         if !projectable_name(header, &member.wire.name) {
@@ -163,8 +174,26 @@ impl<'a> Extraction<'a> {
         let parent = relative.parent().expect("sanitized relative path");
         let target = hooks.target(self.options, &relative, self.options.flatten)?;
         let parent = if self.options.flatten { Path::new("") } else { parent };
-        let link = header.is_rar4_symlink();
-        if link && header.unpacked_size > crate::extract::link::MAX_TARGET {
+        // a RAR 5.0 redirection's target is checked before anything is touched
+        let link = match link {
+            Some(Ok(kind)) => {
+                let selected = selected_relative(&relative, self.options.flatten);
+                match crate::extract::link::refusal(selected, &kind, &self.extracted) {
+                    None => Some(Some(kind)),
+                    Some(_) => {
+                        let reason = match kind {
+                            crate::extract::link::LinkKind::Symbolic(_) => RarPolicyReason::LinkTarget,
+                            _ => RarPolicyReason::HardLinkTarget,
+                        };
+                        return Err(policy(reason, target).into());
+                    }
+                }
+            }
+            Some(Err(_)) => return Err(policy(RarPolicyReason::HardLinkTarget, target).into()),
+            None if header.is_rar4_symlink() => Some(None),
+            None => None,
+        };
+        if matches!(link, Some(None)) && header.unpacked_size > crate::extract::link::MAX_TARGET {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::Rar4Feature("symbolic link"))).into());
         }
         let initial = self.inspect_target(session, &target)?;
@@ -172,9 +201,9 @@ impl<'a> Extraction<'a> {
         if !hooks.replace(session, entry, &target, initial, self.options.overwrite)? {
             return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
         }
-        if link {
+        if let Some(kind) = link {
             let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
-            return self.link(run, session, index, &relative, parent, &target, initial, hooks);
+            return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind);
         }
         let mut output = None;
         let mut sink = |chunk: &[u8]| {
@@ -221,8 +250,10 @@ impl<'a> Extraction<'a> {
         if self.stage_stamp(&file.file, &target)? != stage_stamp {
             return Err(policy(RarPolicyReason::StageChanged, target).into());
         }
+        let selected = selected_relative(&relative, self.options.flatten).to_path_buf();
         if let Some(mode) = self.options.overwrite.rename() {
-            self.publish_renamed(run, session, index, file, &target, initial, mode, hooks)?;
+            let landed = self.publish_renamed(run, session, index, file, &target, initial, mode, hooks)?;
+            self.extracted.file(&self.options.dest, &selected, &landed);
             return Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written });
         }
         hooks.before_publication(index, initial);
@@ -234,6 +265,7 @@ impl<'a> Extraction<'a> {
             file.publish_selected(initial.is_some())
         }
         .map_err(|error| own_fault(error.detailed(false)))?;
+        self.extracted.file(&self.options.dest, &selected, &target);
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
     }
 
@@ -256,7 +288,7 @@ impl<'a> Extraction<'a> {
         initial: Option<SourceStamp>,
         mode: crate::extract::RenameMode,
         hooks: &mut impl ExtractionHooks,
-    ) -> Result<(), SelectedStop> {
+    ) -> Result<PathBuf, SelectedStop> {
         use crate::extract::{RenameError, RenameMode, RenamedOutput, claim_candidate, rename_noreplace};
         use crate::output::OutputError;
         let skip = |candidate: &Path| self.protect_source_name(session, candidate).is_err();
@@ -326,14 +358,17 @@ impl<'a> Extraction<'a> {
         )
         .map_err(|error| own_fault(error.detailed(false)))?;
         if let Some(path) = chosen {
-            run.renames.push(RenamedOutput { requested: target.to_path_buf(), path, existing: None });
+            run.renames.push(RenamedOutput { requested: target.to_path_buf(), path: path.clone(), existing: None });
+            return Ok(path);
         }
-        Ok(())
+        Ok(target.to_path_buf())
     }
 
-    /// A RAR 4.x symbolic link: its target is decoded and checked like a file's data, then the link is created at
-    /// `target` when the target stays inside the destination ([`crate::extract::link`]). It replaces what is there
-    /// only as a file would, and is never written through a link.
+    /// A link member: a RAR 5.0 redirection already checked (`kind`), or a RAR 4.x symbolic link (`None`), whose
+    /// target is decoded and checked like a file's data. The link is created at `target` when a symbolic link's
+    /// target stays inside the destination, or a hard link or file copy takes a file this run published
+    /// ([`crate::extract::link`]). It replaces what is there only as a file would, and is never written through a
+    /// link.
     #[allow(clippy::too_many_arguments)]
     fn link(
         &mut self,
@@ -345,21 +380,30 @@ impl<'a> Extraction<'a> {
         target: &Path,
         initial: Option<SourceStamp>,
         hooks: &mut impl ExtractionHooks,
+        kind: Option<crate::extract::link::LinkKind>,
     ) -> Result<RarOutcome, SelectedStop> {
         use crate::extract::link;
-        let mut text = Vec::new();
-        let mut sink = |chunk: &[u8]| -> RarResult<()> {
-            let room = (link::MAX_TARGET as usize + 1).saturating_sub(text.len()).min(chunk.len());
-            text.extend_from_slice(&chunk[..room]);
-            Ok(())
+        let (kind, bytes, checks) = match kind {
+            Some(kind) => {
+                let checks = RarVerification {
+                    size_checked: false,
+                    crc32_checked: false,
+                    blake2sp_checked: false,
+                    password: crate::error::RarPasswordEvidence::NotEncrypted,
+                };
+                (kind, 0, checks)
+            }
+            None => {
+                let (text, bytes, checks) = match self.rar4_link_text(run, session, index)? {
+                    Ok(decoded) => decoded,
+                    Err(outcome) => return Ok(outcome),
+                };
+                if !link::contained(relative, &text) {
+                    return Err(policy(RarPolicyReason::LinkTarget, target.to_path_buf()).into());
+                }
+                (link::LinkKind::Symbolic(text), bytes, checks)
+            }
         };
-        let outcome = run.test(session, index, Some(&mut sink))?;
-        let RarOutcome::Verified { bytes, checks, .. } = outcome else {
-            return Ok(outcome);
-        };
-        if !link::contained(relative, &text) {
-            return Err(policy(RarPolicyReason::LinkTarget, target.to_path_buf()).into());
-        }
         hooks.before_directories();
         self.ensure_root().map_err(own_fault)?;
         let directories = make_dirs_detailed(&self.options.dest, parent);
@@ -373,22 +417,32 @@ impl<'a> Extraction<'a> {
         if self.inspect_target(session, target)? != initial {
             return Err(policy(RarPolicyReason::TargetChanged, target.to_path_buf()).into());
         }
-        let create = |path: &Path, replace: bool| link::create(path, &text, replace);
+        let dest = &self.options.dest;
+        let create = |path: &Path, replace: bool| link::make(dest, &kind, &self.extracted, path, replace);
+        // a hard link's or copy's earlier file gone or changed fails this member only
+        let failed = |path: &Path, source: io::Error| -> Arc<RarFailure> {
+            match link::member_failure(&source) {
+                Some(_) if source.kind() == io::ErrorKind::Unsupported => {
+                    Arc::new(RarFailure::Unsupported(RarUnsupported::Rar4Feature("symbolic link")))
+                }
+                Some(_) => policy(RarPolicyReason::HardLinkTarget, path.to_path_buf()),
+                None => output_fault(IoOperation::Publish, path, source),
+            }
+        };
+        let landed;
         match (self.options.overwrite.rename(), initial) {
             (Some(mode), Some(_)) => {
                 use crate::extract::{RenameError, RenameMode, RenamedOutput, claim_candidate, rename_noreplace};
                 hooks.before_publication(index, None);
                 let skip = |candidate: &Path| self.protect_source_name(session, candidate).is_err();
-                let refused = |error| {
-                    own_fault(match error {
-                        RenameError::Exhausted => policy_fault(RarPolicyReason::RenameExhausted, target.to_path_buf()),
-                        RenameError::Unsupported => {
-                            policy_fault(RarPolicyReason::RenameUnsupported, target.to_path_buf())
-                        }
-                        RenameError::Io(path, source) => {
-                            RarFault::output(IoOperation::Publish, Some(path), None, source, false)
-                        }
-                    })
+                let refused = |error| match error {
+                    RenameError::Exhausted => {
+                        own_fault(policy_fault(RarPolicyReason::RenameExhausted, target.to_path_buf()))
+                    }
+                    RenameError::Unsupported => {
+                        own_fault(policy_fault(RarPolicyReason::RenameUnsupported, target.to_path_buf()))
+                    }
+                    RenameError::Io(path, source) => failed(&path, source),
                 };
                 match mode {
                     // the existing file or folder moves aside; the link takes its name
@@ -402,7 +456,8 @@ impl<'a> Extraction<'a> {
                             path: target.to_path_buf(),
                             existing: Some(moved.0),
                         });
-                        create(target, false).map_err(|source| output_fault(IoOperation::Publish, target, source))?;
+                        create(target, false).map_err(|source| failed(target, source))?;
+                        landed = target.to_path_buf();
                     }
                     // the link goes to the first free renamed name
                     RenameMode::New(style) => {
@@ -410,17 +465,46 @@ impl<'a> Extraction<'a> {
                             create(candidate, false)
                         })
                         .map_err(refused)?;
-                        run.renames.push(RenamedOutput { requested: target.to_path_buf(), path, existing: None });
+                        run.renames.push(RenamedOutput {
+                            requested: target.to_path_buf(),
+                            path: path.clone(),
+                            existing: None,
+                        });
+                        landed = path;
                     }
                 }
             }
             _ => {
                 hooks.before_publication(index, initial);
-                create(target, initial.is_some())
-                    .map_err(|source| output_fault(IoOperation::Publish, target, source))?;
+                create(target, initial.is_some()).map_err(|source| failed(target, source))?;
+                landed = target.to_path_buf();
             }
         }
+        link::placed(&self.options.dest, relative, &kind, &landed, &mut self.extracted);
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
+    }
+
+    /// A RAR 4.x symbolic link's target, decoded and checked like a file's data; or the member's outcome when it
+    /// did not verify.
+    #[allow(clippy::type_complexity)]
+    fn rar4_link_text(
+        &self,
+        run: &mut SelectedRun,
+        session: &mut RarSession,
+        index: usize,
+    ) -> Result<Result<(Vec<u8>, u64, RarVerification), RarOutcome>, SelectedStop> {
+        use crate::extract::link;
+        let mut text = Vec::new();
+        let mut sink = |chunk: &[u8]| -> RarResult<()> {
+            let room = (link::MAX_TARGET as usize + 1).saturating_sub(text.len()).min(chunk.len());
+            text.extend_from_slice(&chunk[..room]);
+            Ok(())
+        };
+        let outcome = run.test(session, index, Some(&mut sink))?;
+        let RarOutcome::Verified { bytes, checks, .. } = outcome else {
+            return Ok(Err(outcome));
+        };
+        Ok(Ok((text, bytes, checks)))
     }
 
     fn ensure_root(&self) -> RarResult<()> {

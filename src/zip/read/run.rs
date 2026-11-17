@@ -752,7 +752,7 @@ impl ProjectedReadSession {
         };
         match link::publish(&options.dest, &rel, place, &kind, &mut extracted) {
             Ok(()) => (Ok(()), false, false),
-            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => refuse("links can't be created here"),
+            Err(error) if let Some(why) = link::member_failure(&error) => refuse(why),
             Err(error) => (
                 Err(ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Publish, offset: 0, error }
                     .into()),

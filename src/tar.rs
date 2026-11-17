@@ -1156,18 +1156,20 @@ fn link_member(
         let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(()) };
         if let Err(e) = link::publish(&opts.dest, rel, place, kind, extracted) {
             if !cfg!(unix) || e.kind() == io::ErrorKind::Unsupported {
-                let why = "links can't be created here";
+                let why = link::UNSUPPORTED;
                 fail_member(summary, report, ordinal, name, why, Error::Unsupported(why.to_owned()));
+                return Ok(());
+            }
+            // the earlier file changed since it was extracted: this member fails, the run goes on
+            if let Some(why) = link::member_failure(&e) {
+                fail_member(summary, report, ordinal, name, why, Error::UnsafePath(name.to_owned()));
                 return Ok(());
             }
             return Err(e.into());
         }
     }
     if opts.mode != Mode::Extract {
-        match kind {
-            LinkKind::Hard(_) => extracted.tested(rel),
-            LinkKind::Symbolic(_) => extracted.replaced(rel),
-        }
+        link::tested(rel, kind, extracted);
     }
     succeeded(summary, report, ordinal, name, 0);
     Ok(())
