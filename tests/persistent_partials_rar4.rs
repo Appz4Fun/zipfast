@@ -978,3 +978,139 @@ fn rar4_aes_stored_member_with_a_wrong_password_fails_its_crc_and_publishes_noth
     let out = dir.path().join("out").join("movie.mkv");
     assert!(fs::read(&out).ok().is_none_or(|bytes| bytes != gold));
 }
+
+/// A session over 200 members: each member's core is released once it finished and its handle was taken, so
+/// neither the state page budget nor the descriptors held (`open_files`) grow with the number of members.
+#[test]
+fn a_session_with_200_members_releases_finished_members() {
+    let data: Vec<(Vec<u8>, Vec<u8>)> = (0..200).map(|i| (format!("m{i:03}.bin").into_bytes(), gold(64 + i))).collect();
+    let members: Vec<(&[u8], &[u8])> = data.iter().map(|(n, d)| (n.as_slice(), d.as_slice())).collect();
+    let set = Set::single(&members);
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options(&dir.path().join("out"), set.naming.name(0)),
+        {
+            // Caps that hold two members at a time: 200 pass only if each finished member's pages, descriptors
+            // and lease come back.
+            let mut partial = partial_options(&dir.path().join("state"), Arc::default());
+            partial.limits.state_pages = 8;
+            partial.limits.open_files = 14;
+            partial.limits.open_partials = 2;
+            partial
+        },
+    )
+    .unwrap();
+    let mut held: Option<(MemberKey, PartialFile)> = None;
+    let mut released: Vec<MemberKey> = Vec::new();
+    let mut finished = 0;
+    // (protection path bytes, metadata bytes) charged to the session after the 10th member.
+    let mut after_ten = None;
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => continue,
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                held = Some((member.clone(), session.partial_file(&member).unwrap()));
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => {
+                assert!(matches!(outcome, MemberOutcome::PersistentComplete { verdict: Verdict::Ok { .. }, .. }));
+                let (key, file) = held.take().unwrap();
+                // While a handle lives, the session hands out more; once the last is dropped the core is gone.
+                let again = session.partial_file(&key).unwrap();
+                drop((file, again));
+                released.push(key);
+                finished += 1;
+                let used = |resource| session.resource_usage(resource).used;
+                if finished == 10 {
+                    after_ten = Some((used(Resource::ProtectionPathBytes), used(Resource::MetadataBytes)));
+                }
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(finished, 200);
+    // A released member's memory charges come back: protection paths are flat, and metadata grows only by the
+    // progressive walk's own per-member bookkeeping (names, parts, frames: under 4 KB a member, as in any
+    // session), not by the ~22 KB a member's core charges.
+    let (paths, metadata) = after_ten.unwrap();
+    assert_eq!(session.resource_usage(Resource::ProtectionPathBytes).used, paths);
+    let growth = session.resource_usage(Resource::MetadataBytes).used - metadata;
+    assert!(growth < 190 * 4096, "metadata grew {growth} bytes over 190 members");
+    // The caps above bound the descriptors and pages held at any time (a process-wide descriptor count is not
+    // used: tests running in parallel open their own).
+    let Err(error) = session.partial_file(&released[0]) else { panic!("a released member has no core left") };
+    assert!(matches!(error.kind, PartialErrorKind::BindingMismatch(BindingField::Member)), "{error:?}");
+    for (name, bytes) in &data {
+        assert_eq!(fs::read(dir.path().join("out").join(std::str::from_utf8(name).unwrap())).unwrap(), *bytes);
+    }
+}
+
+/// Damage declared on a released member's bytes is reported under `released`, never as harmless `unmapped`
+/// bytes, and the member can then be reopened and the damage declared there.
+#[test]
+fn damage_on_a_released_member_is_reported_as_released() {
+    let (x, y) = (gold(1500), gold(900));
+    let set = Set::single(&[(b"x.bin", &x), (b"y.bin", &y)]);
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options(&dir.path().join("out"), set.naming.name(0)),
+        partial_options(&dir.path().join("state"), anchors.clone()),
+    )
+    .unwrap();
+    let mut first: Option<(MemberKey, PartialFile)> = None;
+    let mut released = None;
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => continue,
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) if first.is_none() => {
+                first = Some((member.clone(), session.partial_file(&member).unwrap()));
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) if released.is_none() => {
+                // Closing the only handle releases the member; keep its state to reopen it.
+                let (key, file) = first.take().unwrap();
+                released = Some((key, file.close().unwrap()));
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    let (key, state) = released.unwrap();
+    let payload = set.payloads[0].clone();
+    let damaged = payload.start + 100..payload.start + 200;
+    let receipt = session.declare_hole(0, damaged.clone()).unwrap();
+    assert!(receipt.holes.is_empty());
+    assert!(receipt.unmapped.is_empty(), "{:?}", receipt.unmapped);
+    assert_eq!(receipt.released.len(), 1);
+    assert_eq!(receipt.released[0].0, key);
+    assert_eq!((receipt.released[0].1.volume, receipt.released[0].1.range.clone()), (0, damaged.clone()));
+    // Header bytes stay unmapped.
+    let header = session.declare_hole(0, 0..8).unwrap();
+    assert!(header.released.is_empty() && !header.unmapped.is_empty());
+    drop(session);
+    let expected_anchor = anchors.current(&key).unwrap().unwrap();
+    let mut file = PartialFile::open(
+        partial_state::roundtrip(&state),
+        PartialOpenContext {
+            output_root: dir.path().join("out"),
+            state_root: dir.path().join("state"),
+            expected_member: key,
+            expected_anchor,
+            protection: set.protection(),
+            limits: PartialLimits::default(),
+            progressive_limits: ProgressiveLimits::default(),
+            anchors,
+            control: SessionControl::default(),
+            password: None,
+        },
+    )
+    .unwrap();
+    let holes = file.declare_hole(0, damaged).unwrap();
+    assert_eq!(holes.iter().map(|h| h.out.clone()).collect::<Vec<_>>(), vec![100..200]);
+}

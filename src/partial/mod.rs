@@ -291,7 +291,8 @@ impl PartialCore {
         if checks.size != spec.size || options.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        let budget = PartialBudget::new(options.limits, options.usage, options.exclusions)?;
+        // The member's memory charges go back to the session when its core (or a failed genesis) is gone.
+        let budget = PartialBudget::new(options.limits, options.usage.scoped(), options.exclusions)?;
         let lease = budget.reserve(PartialResource::OpenPartials, 1)?;
         let _event = budget.reserve(PartialResource::Events, 1)?;
         budget.usage.charge(Resource::NameBytes, spec.name.len() as u64)?;
@@ -1683,6 +1684,14 @@ impl PartialCore {
     /// Whether any proven part of this member lies in `range` of `volume`. Checked without taking the
     /// operation or touching the output, so unrelated members never fail a declaration; a member busy in another
     /// operation answers true and is then tried for real.
+    /// Packed ranges of every part recorded so far, for a session that releases this core.
+    pub(crate) fn packed_parts(&self) -> Vec<PackedSpan> {
+        self.data
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(Vec::new, |data| data.snapshot.evidence.parts.iter().map(|part| part.packed.clone()).collect())
+    }
     pub(crate) fn touches(&self, volume: u32, range: &Range<u64>) -> bool {
         self.data.lock().unwrap().as_ref().is_none_or(|data| {
             data.snapshot.evidence.parts.iter().any(|part| {
@@ -2207,7 +2216,7 @@ impl PartialCore {
         if options.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
-        let budget = PartialBudget::new(options.limits.clone(), options.usage, options.exclusions)?;
+        let budget = PartialBudget::new(options.limits.clone(), options.usage.scoped(), options.exclusions)?;
         let event = budget.reserve(PartialResource::Events, 1)?;
         let state = PartialState::load_budgeted(&spec.state_root, &spec.anchor, &budget)?;
         if state.member() != &spec.member {
@@ -2361,6 +2370,7 @@ impl Drop for PartialCore {
     /// re-extracted needlessly. A failure leaves the anchored state as it is, exactly as a crash would.
     /// Skipped while the thread is panicking: the commit syncs files and calls the caller's anchor store, and a
     /// second panic during unwinding would abort the process. The anchored state then stays as after a crash.
+    /// Then the member's exclusions are retired.
     fn drop(&mut self) {
         if std::thread::panicking() {
             return;
@@ -2371,6 +2381,8 @@ impl Drop for PartialCore {
         {
             let _ = self.flush_group(&mut data);
         }
+        // Nothing of this member is written any more: its exclusions go (their charges with the budget).
+        self.budget.exclusions.retire_member(&self.native.output_path, &self.native.bundle.path);
     }
 }
 impl PartialFile {
