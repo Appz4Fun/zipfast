@@ -314,11 +314,13 @@ fn a_symlink_at_the_target_is_never_written_through() {
     let summary = extract::run(&fixture("lzma.7z"), &always, |_| {}).unwrap();
     assert_eq!(summary.errors, ["text/a.txt: a symlink is in the way"]);
     assert_eq!(fs::read(&victim).unwrap(), b"keep");
-    // A linked folder is refused too.
+    // A linked folder is refused too: each member under it fails alone.
     let out2 = dir.path().join("out2");
     fs::create_dir_all(&out2).unwrap();
     std::os::unix::fs::symlink(dir.path(), out2.join("text")).unwrap();
-    assert!(extract::run(&fixture("lzma.7z"), &opts(Mode::Extract, &out2), |_| {}).is_err());
+    let summary = extract::run(&fixture("lzma.7z"), &opts(Mode::Extract, &out2), |_| {}).unwrap();
+    assert!(!summary.errors.is_empty(), "{:?}", summary.errors);
+    assert!(summary.errors.iter().all(|e| e.starts_with("text/") && e.ends_with("a symlink is in the way")));
     assert!(!dir.path().join("a.txt").exists());
 }
 

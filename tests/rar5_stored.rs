@@ -158,8 +158,9 @@ fn never_writes_through_a_link() {
     let outside = dir.join("outside");
     fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, out.join("d")).unwrap();
-    let r = extract::run(&arc, &opts(&out), |_| {});
-    assert!(r.is_err());
+    // only the member under the link fails
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!(s.errors, ["d/f: a symlink is in the way"]);
     assert!(!outside.join("f").exists());
 }
 
@@ -174,8 +175,8 @@ fn never_writes_through_a_link_below_a_folder_it_made() {
     let outside = dir.join("outside");
     fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, out.join("a/b")).unwrap();
-    let r = extract::run(&arc, &opts(&out), |_| {});
-    assert!(r.is_err());
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!(s.errors, ["a/b/c/f: a symlink is in the way"]);
     assert_eq!(fs::read(out.join("a/x")).unwrap(), b"x");
     assert!(!outside.join("c").exists());
 }
