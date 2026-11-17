@@ -1869,8 +1869,10 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
 #[non_exhaustive]
 pub struct Listing {
     pub entries: Vec<Entry>,
-    /// The archive ended unexpectedly because this volume is missing: a byte-split ZIP (`.zip.001`) with a gap,
-    /// whose `entries` are those found before it. 7-Zip prints "Unexpected end of archive" and exits nonzero here.
+    /// The archive ended unexpectedly because this volume is missing: a byte-split ZIP (`.zip.001`) with a gap, or
+    /// an Info-ZIP spanned set without its `.zip`, whose `entries` are those found before it; or a spanned set
+    /// missing another volume, whose `entries` are all those its central directory lists. 7-Zip prints "Unexpected
+    /// end of archive" (or "Missing volume") and exits nonzero here.
     pub missing_volume: Option<PathBuf>,
 }
 

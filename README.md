@@ -30,7 +30,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   (all strengths, AE-1/AE-2); see [checked ZIP reads](docs/zip-checked-reads.md) for policy, staging and legacy caps, and [staged output](docs/zip-staged-output.md) for the native and portable backends.
   Split sets list, test and extract from their first file: raw byte splits (`name.zip.001`, ...) and Info-ZIP
   spanned sets (`name.z01`, `name.z02`, ..., `name.zip`, from the `.zip` or the `.z01`), read as 7-Zip reads them;
-  a missing volume fails only the members whose bytes it holds.
+  a missing volume fails only the members whose bytes it holds. As in 7-Zip, a spanned set opens from whatever
+  volumes are there: without its `.zip` the members are found by walking the local headers from the `.z01`, and
+  without its `.z01` the members starting on it fail while the rest extract. Unlike 7-Zip, a member cut short by a
+  missing volume is never written in part: zipfast only publishes data whose size and CRC it has checked.
 - tar archives, plain or compressed with gzip, xz, zstd, bzip2, LZ4 (frames and legacy frames), Unix compress or
   LZMA-alone (`.tar.gz`, `.tgz`, `.tar.xz`, `.tar.zst`, `.tar.bz2`, `.tar.lz4`, `.tar.Z`, `.tar.lzma` and so on),
   each found by its first bytes whatever the name: POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256

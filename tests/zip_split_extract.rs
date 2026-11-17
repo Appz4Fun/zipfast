@@ -344,3 +344,219 @@ fn a_fifo_in_place_of_a_volume_is_refused_without_blocking() {
         }
     }
 }
+
+/// Copies a real set into `dir` as `stem.*`, leaving out the volumes with the extensions in `skip`.
+fn copy_set_without(set: &str, dir: &Path, stem: &str, skip: &[&str]) {
+    for ext in ["z01", "z02", "zip"] {
+        let from = fixture(&format!("{set}.{ext}"));
+        if from.is_file() && !skip.contains(&ext) {
+            fs::copy(&from, dir.join(format!("{stem}.{ext}"))).unwrap();
+        }
+    }
+}
+
+/// Expected 7-Zip 26.06 results for the real sets with their `.zip` removed, opened from the `.z01`: only the first
+/// member's local header is reachable (each one crosses into the `.zip`), it is listed, and it is never extracted.
+#[test]
+fn a_missing_zip_lists_the_local_headers_from_the_z01() {
+    // (set, name, size, packed, CRC, size unknown)
+    for (set, name, size, packed, crc, unknown) in [
+        ("stored", "a.bin", 140_000, 140_000, 0x329A_E6F9, false),
+        ("deflated", "c.txt", 93_336, 70_626, 0x80C0_5F59, false),
+        // a data descriptor past the gap: 7-Zip lists no size and the bytes up to the gap as packed
+        ("crypt", "s.bin", 0, 65_497, 0x02E5_71C8, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        copy_set_without(set, dir.path(), "nz", &["zip"]);
+        let z01 = dir.path().join("nz.z01");
+        let detailed = extract::list_detailed(&z01, Some("password")).unwrap();
+        assert!(detailed.unexpected_end(), "{set}");
+        assert_eq!(detailed.missing_volume.as_deref(), Some(dir.path().join("nz.zip").as_path()), "{set}");
+        let got: Vec<_> =
+            detailed.entries.iter().map(|e| (e.name.as_str(), e.size, e.packed, e.crc32, e.size_unknown)).collect();
+        assert_eq!(got, [(name, size, packed, Some(crc), unknown)], "{set}");
+        let out = dir.path().join("out");
+        let s = extract::run_with_password(&z01, &options(&out, Mode::Extract), Some("password"), |_| {}).unwrap();
+        assert!(s.errors.iter().any(|e| e.contains(name) && e.contains("nz.zip")), "{set}: {:?}", s.errors);
+        assert_eq!(s.files, 0, "{set}");
+        // nothing partial is published (7-Zip writes what it could read)
+        assert!(!out.join(name).exists(), "{set}");
+    }
+}
+
+#[test]
+fn a_missing_zip_extracts_the_members_wholly_before_it() {
+    let a = data(3000, 1);
+    let b = data(500, 2);
+    let c = data(4000, 3);
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", &b), Entry::stored("c.bin", &c)];
+    // a.bin crosses into `.z02`, b.bin is whole there, c.bin crosses into the `.zip`
+    let cuts =
+        [split_zip_builder::data_abs(&entries, 0, true) + 1000, split_zip_builder::data_abs(&entries, 2, true) + 10];
+    for marker in [true, false] {
+        let set = split_zip(&entries, &cuts.map(|c| c - usize::from(!marker) * 4), Layout { marker, zip64: false });
+        let dir = tempfile::tempdir().unwrap();
+        let zip = write_set(dir.path(), "part", &set.volumes);
+        fs::remove_file(&zip).unwrap();
+        let z01 = dir.path().join("part.z01");
+        let detailed = extract::list_detailed(&z01, None).unwrap();
+        assert_eq!(detailed.missing_volume.as_deref(), Some(zip.as_path()), "marker={marker}");
+        let names: Vec<_> = detailed.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a.bin", "b.bin", "c.bin"], "marker={marker}");
+        let out = dir.path().join("out");
+        let s = extract::run(&z01, &options(&out, Mode::Extract), |_| {}).unwrap();
+        assert_eq!(
+            (fs::read(out.join("a.bin")).unwrap(), fs::read(out.join("b.bin")).unwrap()),
+            (a.clone(), b.clone())
+        );
+        assert!(!out.join("c.bin").exists(), "marker={marker}");
+        assert!(s.errors.iter().any(|e| e.contains("c.bin") && e.contains("part.zip")), "{:?}", s.errors);
+        // the checked route and inspection read it the same way
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use zipfast::extract::Cancellation;
+            let out = dir.path().join("checked");
+            let report = extract::run_with_policy(
+                &z01,
+                &options(&out, Mode::Extract),
+                None,
+                &Cancellation::default(),
+                &Default::default(),
+                |_: extract::RunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(report.files(), 2, "marker={marker}");
+            assert_eq!(fs::read(out.join("b.bin")).unwrap(), b);
+            assert!(extract::inspect_cancelable(&z01, None, &Cancellation::default()).is_ok());
+        }
+    }
+}
+
+#[test]
+fn a_missing_numbered_volume_and_zip_end_the_walk_at_the_first_gap() {
+    let a = data(3000, 1);
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];
+    let start = split_zip_builder::data_abs(&entries, 0, true);
+    let set = split_zip(&entries, &[start + 1000, start + 2000, start + 2500], Layout { marker: true, zip64: false });
+    let dir = tempfile::tempdir().unwrap();
+    let zip = write_set(dir.path(), "gap", &set.volumes);
+    fs::remove_file(&zip).unwrap();
+    fs::remove_file(dir.path().join("gap.z02")).unwrap();
+    // `.z03` is there, so `.z02` is the gap
+    let detailed = extract::list_detailed(&dir.path().join("gap.z01"), None).unwrap();
+    assert_eq!(detailed.missing_volume.as_deref(), Some(dir.path().join("gap.z02").as_path()));
+    assert_eq!(detailed.entries.len(), 1);
+    // with `.z03` gone too, nothing says the set had more numbered volumes: the `.zip` is what's missing
+    fs::remove_file(dir.path().join("gap.z03")).unwrap();
+    let detailed = extract::list_detailed(&dir.path().join("gap.z01"), None).unwrap();
+    assert_eq!(detailed.missing_volume.as_deref(), Some(zip.as_path()));
+}
+
+#[test]
+fn a_lone_archive_named_z01_stays_a_lone_archive() {
+    let set = split_zip(&[Entry::stored("only.txt", b"only")], &[], Layout::default());
+    let dir = tempfile::tempdir().unwrap();
+    let z01 = dir.path().join("lone.z01");
+    fs::write(&z01, &set.volumes[0]).unwrap();
+    let detailed = extract::list_detailed(&z01, None).unwrap();
+    assert!(!detailed.unexpected_end());
+    assert_eq!(detailed.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["only.txt"]);
+}
+
+/// Expected 7-Zip 26.06 results for the real sets with their `.z01` removed: the directory in the `.zip` lists every
+/// member; those starting on disk 0 fail as missing the `.z01` ("Unavailable data"), the rest extract.
+#[test]
+fn a_missing_z01_lists_every_member_and_fails_those_on_disk_0() {
+    for (set, lost, whole) in
+        [("stored", "a.bin", Some("dir/b.txt")), ("deflated", "c.txt", Some("dir/b.txt")), ("crypt", "s.bin", None)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        copy_set_without(set, dir.path(), "n1", &["z01"]);
+        let zip = dir.path().join("n1.zip");
+        assert_eq!(listed(&zip), reference_owned(set), "{set}");
+        let detailed = extract::list_detailed(&zip, None).unwrap();
+        assert_eq!(detailed.missing_volume.as_deref(), Some(dir.path().join("n1.z01").as_path()), "{set}");
+        let out = dir.path().join("out");
+        let s = extract::run_with_password(&zip, &options(&out, Mode::Extract), Some("password"), |_| {}).unwrap();
+        assert!(s.errors.iter().any(|e| e.starts_with(lost) && e.contains("n1.z01")), "{set}: {:?}", s.errors);
+        assert!(!out.join(lost).exists(), "{set}");
+        if let Some(whole) = whole {
+            assert!(s.errors.iter().all(|e| !e.contains(whole)), "{set}: {:?}", s.errors);
+            assert_eq!(fs::read(out.join(whole)).unwrap(), b"hello split zip\n".repeat(40), "{set}");
+        }
+        // the library read fails the same way, without reading anything
+        let mut archive = zipfast::zip::Archive::open(&zip).unwrap();
+        let index = archive.entries.iter().position(|e| e.name == lost).unwrap();
+        let err = archive.read_at(index, Some("password"), u64::MAX, |_| Ok(())).unwrap_err();
+        assert!(matches!(err, zipfast::Error::MissingVolume(ref p) if p.ends_with("n1.z01")), "{set}: {err}");
+    }
+}
+
+/// A `.z01` gone with a `.z02` there: members on disk 0 fail, members starting on `.z02` read across the hole's
+/// nominal size correctly.
+#[test]
+fn a_missing_z01_with_later_numbered_volumes_reads_the_rest() {
+    let a = data(3000, 1);
+    let b = data(1500, 2);
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", &b), Entry::stored("c.bin", b"tail")];
+    let start = split_zip_builder::data_abs(&entries, 0, true);
+    // a.bin within `.z01`, b.bin starts on `.z02` and crosses into `.z03`, c.bin crosses into the `.zip`
+    let b_start = split_zip_builder::data_abs(&entries, 1, true);
+    let set =
+        split_zip(&entries, &[start + 3000, b_start + 500, b_start + 1500 + 20], Layout { marker: true, zip64: false });
+    assert_eq!(set.locals[1].0, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let zip = write_set(dir.path(), "z1", &set.volumes);
+    fs::remove_file(dir.path().join("z1.z01")).unwrap();
+    let out = dir.path().join("out");
+    let s = extract::run(&zip, &options(&out, Mode::Extract), |_| {}).unwrap();
+    assert!(s.errors.iter().any(|e| e.starts_with("a.bin") && e.contains("z1.z01")), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("b.bin")).unwrap(), b);
+    assert_eq!(fs::read(out.join("c.bin")).unwrap(), b"tail");
+}
+
+/// A crafted directory offset on the absent disk is never trusted: the member fails as missing, the archive opens.
+#[test]
+fn a_member_on_an_absent_disk_with_a_wild_offset_still_fails_alone() {
+    let a = data(3000, 1);
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];
+    let start = split_zip_builder::data_abs(&entries, 0, true);
+    let set = split_zip(&entries, &[start + 1000], Layout { marker: true, zip64: false });
+    let dir = tempfile::tempdir().unwrap();
+    let zip = write_set(dir.path(), "w", &set.volumes);
+    fs::remove_file(dir.path().join("w.z01")).unwrap();
+    // point a.bin's directory record (the first) at a huge offset on disk 0
+    let mut last = fs::read(&zip).unwrap();
+    let central = last.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    last[central + 42..central + 46].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+    fs::write(&zip, last).unwrap();
+    let out = dir.path().join("out");
+    let s = extract::run(&zip, &options(&out, Mode::Extract), |_| {}).unwrap();
+    assert!(s.errors.iter().any(|e| e.starts_with("a.bin") && e.contains("w.z01")), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("b.bin")).unwrap(), b"tail");
+}
+
+/// An end record whose comment puts it at the very start of the first window read: the ZIP64 locator before it is
+/// still found, with and without the `.z01`.
+#[test]
+fn a_long_comment_keeps_the_zip64_locator_in_view() {
+    let a = data(3000, 1);
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];
+    let start = split_zip_builder::data_abs(&entries, 0, true);
+    for comment in [4070usize, 4090, 65_535] {
+        let set = split_zip(&entries, &[start + 1000], Layout { marker: true, zip64: true });
+        let dir = tempfile::tempdir().unwrap();
+        let zip = write_set(dir.path(), "c", &set.volumes);
+        let mut last = fs::read(&zip).unwrap();
+        let n = last.len();
+        last[n - 2..].copy_from_slice(&(comment as u16).to_le_bytes());
+        last.extend(std::iter::repeat_n(b'#', comment));
+        fs::write(&zip, last).unwrap();
+        let names: Vec<_> = extract::list(&zip).unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["a.bin", "b.bin"], "comment={comment}");
+        fs::remove_file(dir.path().join("c.z01")).unwrap();
+        let s = extract::run(&zip, &options(&dir.path().join("out"), Mode::Extract), |_| {}).unwrap();
+        assert!(s.errors.iter().any(|e| e.starts_with("a.bin") && e.contains("c.z01")), "{:?}", s.errors);
+        assert_eq!(fs::read(dir.path().join("out/b.bin")).unwrap(), b"tail", "comment={comment}");
+    }
+}
