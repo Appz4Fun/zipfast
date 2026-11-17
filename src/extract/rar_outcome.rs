@@ -44,6 +44,11 @@ pub struct RarEntryOutcome {
     /// [`crate::rar5::session::RarSession`] extraction (plain and controlled) and testing, and by the legacy and
     /// typed runs when extracting; a legacy or typed test run doesn't keep the data. A RAR 5.0 redirection's target
     /// is in its header, so it is in the listing ([`crate::extract::Entry::link`]) and not repeated here.
+    ///
+    /// **Untrusted.** These are the archive's bytes, unchecked: they can be absolute, climb out with `..`, and hold
+    /// control characters, newlines or terminal escape sequences, so escape them before printing them to a terminal
+    /// or a log. Only the first 4096 bytes are kept, so a longer target comes cut off there (and such a link is never
+    /// placed).
     pub link: Option<crate::rar5::Redirection>,
 }
 

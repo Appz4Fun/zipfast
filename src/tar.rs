@@ -27,7 +27,7 @@ use crate::extract::link::{self, Extracted, LinkKind};
 use crate::extract::{
     Cancellation, Checked, Entry, LegacyMember, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options,
     Overwrite, Place, RenameLog, RunError, Summary, check_target, create_sparse_target, create_target, finish_dirs,
-    finish_file, make_dirs,
+    finish_file, make_member_dirs,
 };
 use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
@@ -1609,7 +1609,10 @@ impl StagedTar {
                     link_member(opts, &relative, member, &kind, (&mut extracted, holes), summary, report)?;
                 }
                 StagedMember::Directory { relative, meta, ordinal, name } => {
-                    make_dirs(&opts.dest, &relative)?;
+                    if let Some(why) = make_member_dirs(&opts.dest, &relative)? {
+                        fail_member(summary, report, ordinal, &name, why, Error::UnsafePath(name.clone()));
+                        continue;
+                    }
                     summary.dir_meta.push((opts.dest.join(relative), meta));
                     folder(summary, report, ordinal, &name);
                 }
@@ -1737,6 +1740,8 @@ fn staging_parent(destination: &Path, relative: &Path) -> Result<PathBuf> {
             let next = directory.join(component);
             match std::fs::symlink_metadata(&next) {
                 Ok(metadata) if metadata.is_dir() => directory = next,
+                // never staged through a link: the member fails when it is placed, and the run goes on
+                Ok(metadata) if metadata.file_type().is_symlink() => break,
                 Ok(_) => return Err(Error::UnsafePath(next.display().to_string())),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => break,
                 Err(error) => return Err(error.into()),
@@ -1901,7 +1906,10 @@ fn run_tar(
                         });
                         continue;
                     }
-                    make_dirs(&opts.dest, &rel)?;
+                    if let Some(why) = make_member_dirs(&opts.dest, &rel)? {
+                        fail_member(summary, report, position, &m.name, why, Error::UnsafePath(m.name.clone()));
+                        continue;
+                    }
                     summary.dir_meta.push((opts.dest.join(&rel), m.meta()));
                 }
                 folder(summary, report, position, &m.name);

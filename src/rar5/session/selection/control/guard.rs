@@ -81,6 +81,18 @@ pub(super) fn stat_at(fd: libc::c_int, path: &[u8]) -> io::Result<Option<Stamp>>
 pub(super) fn stat_at_flags(fd: libc::c_int, path: &[u8], flags: libc::c_int) -> io::Result<Option<Stamp>> {
     stat_at_probe(fd, path, flags, true)
 }
+/// Whether the symbolic link at `path` (NUL-terminated, relative to `fd`) reads back as exactly `expected`, read
+/// with `readlinkat` into a buffer on the stack. A target longer than any link placed here never matches.
+fn link_reads_at(fd: libc::c_int, path: &[u8], expected: &[u8]) -> io::Result<bool> {
+    let mut buf = [0u8; crate::extract::link::MAX_TARGET as usize + 1];
+    let n = unsafe { libc::readlinkat(fd, path.as_ptr().cast(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // a full buffer may have been cut short, so it never matches
+    let n = n as usize;
+    Ok(n < buf.len() && buf[..n] == *expected)
+}
 fn stat_at_probe(fd: libc::c_int, path: &[u8], flags: libc::c_int, missing_parent: bool) -> io::Result<Option<Stamp>> {
     let mut out = MaybeUninit::uninit();
     let result = unsafe { libc::fstatat(fd, path.as_ptr().cast(), out.as_mut_ptr(), flags) };
@@ -322,7 +334,13 @@ impl RarExtractControl {
     }
     /// A link member the engine placed at `landed` (None when nothing was placed) is the engine's own change, as a
     /// published file is: see [`Guard::linked`].
-    pub(super) fn capture_linked(&mut self, index: usize, target: &Path, landed: Option<&Path>, placed: PlacedLink) {
+    pub(super) fn capture_linked(
+        &mut self,
+        index: usize,
+        target: &Path,
+        landed: Option<&Path>,
+        placed: PlacedLink<'_>,
+    ) {
         if !self.guard.prepared || self.failure.is_some() {
             return;
         }
@@ -542,6 +560,21 @@ impl Guard {
                 if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW },
                 !follow,
             ) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result.map_err(metadata),
+            }
+        }
+    }
+    fn link_reads(
+        &self,
+        c: &mut RarExtractControl,
+        path: &[u8],
+        expected: &[u8],
+        attempts: &mut u64,
+    ) -> Result<bool, RarDiagnosticFailure> {
+        loop {
+            c.proof_io(attempts)?;
+            match link_reads_at(self.anchor.as_ref().expect("guard anchor").as_raw_fd(), anchored(path), expected) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 result => return result.map_err(metadata),
             }
@@ -841,7 +874,7 @@ impl Guard {
     }
     /// Takes a link member the engine placed as its own change, as [`Self::published`] does for a file. There is no
     /// held stage to compare with, so the object at the target is checked to be what was placed, seen without
-    /// following a link: a symbolic link with the target's length, or a regular file for a hard link or copy, and
+    /// following a link: a symbolic link whose target (read back with `readlinkat`) is the bytes placed, or a regular file for a hard link or copy, and
     /// never the diagnostic file. Only then do the bindings at the target, any reached through a symbolic link just
     /// placed there, and a hard link's earlier file (its link count and ctime alone) take the new observation. Every
     /// other binding stays strict.
@@ -852,7 +885,7 @@ impl Guard {
         index: usize,
         target: &Path,
         landed: Option<&Path>,
-        placed: PlacedLink,
+        placed: PlacedLink<'_>,
         attempts: &mut u64,
     ) -> Result<(), RarDiagnosticFailure> {
         let ordinal = index as u64;
@@ -870,7 +903,8 @@ impl Guard {
         };
         let mut stamp = None;
         if at_target {
-            for r in &self.records {
+            let mut at = None;
+            for (i, r) in self.records.iter().enumerate() {
                 comparison_work(c, r.path.len(), target.len())?;
                 if r.leaf
                     && !r.follow
@@ -878,6 +912,7 @@ impl Guard {
                     && as_path(&r.path[..r.path.len() - 1]) == as_path(&target)
                 {
                     stamp = self.observe(c, &r.path, attempts, false)?;
+                    at = Some(i);
                     break;
                 }
             }
@@ -886,7 +921,18 @@ impl Guard {
                 return Err(RarDiagnosticFailure::AliasTarget { ordinal });
             }
             let fits = match placed {
-                PlacedLink::Symbolic { len } => now.mode & libc::S_IFMT == libc::S_IFLNK && now.len == len,
+                // the link must read back as the very target placed, not only one of its length
+                PlacedLink::Symbolic { target: placed } => {
+                    now.mode & libc::S_IFMT == libc::S_IFLNK
+                        && now.len == placed.len() as u64
+                        && match at {
+                            Some(i) => {
+                                c.proof_work(placed.len() as u64)?;
+                                self.link_reads(c, &self.records[i].path, placed, attempts)?
+                            }
+                            None => false,
+                        }
+                }
                 PlacedLink::Hard { .. } | PlacedLink::Copy => now.regular(),
             };
             if !fits {
@@ -1033,6 +1079,20 @@ fn anchored(path: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_link_reads_back_only_as_its_exact_target() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("abc", dir.path().join("l")).unwrap();
+        std::fs::write(dir.path().join("f"), b"abc").unwrap();
+        let fd = File::open(dir.path()).unwrap();
+        let at = |path: &[u8], expected: &[u8]| link_reads_at(fd.as_raw_fd(), path, expected);
+        assert!(at(b"l\0", b"abc").unwrap());
+        // the same length is not enough
+        assert!(!at(b"l\0", b"abd").unwrap());
+        assert!(!at(b"l\0", b"ab").unwrap());
+        assert!(at(b"f\0", b"abc").is_err(), "a regular file is no link");
+    }
     #[test]
     fn optional_reservation_refusal_retains_owned_cause_and_has_no_allocation_in_cleanup() {
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Ask, RarExtractControlLimits::default());

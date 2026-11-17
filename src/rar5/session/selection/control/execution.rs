@@ -654,7 +654,7 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
     fn published(&mut self, index: usize, target: &Path, held: &File, published: bool) {
         self.control.capture_published(index, target, held, published);
     }
-    fn linked(&mut self, index: usize, target: &Path, landed: Option<&Path>, placed: PlacedLink) {
+    fn linked(&mut self, index: usize, target: &Path, landed: Option<&Path>, placed: PlacedLink<'_>) {
         self.control.capture_linked(index, target, landed, placed);
     }
 }

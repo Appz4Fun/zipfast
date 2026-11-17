@@ -308,7 +308,10 @@ impl Run<'_> {
         let Some((rel, place)) = self.place(member, &name)? else { return Ok(()) };
         if member.is_dir {
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
-                crate::extract::make_dirs(&self.opts.dest, &rel).map_err(legacy_error)?;
+                if let Some(why) = crate::extract::make_member_dirs(&self.opts.dest, &rel).map_err(legacy_error)? {
+                    self.fail(&name, why);
+                    return Ok(());
+                }
                 self.summary.dir_meta.push((self.opts.dest.join(&rel), meta(member)));
             }
             self.summary.dirs += 1;

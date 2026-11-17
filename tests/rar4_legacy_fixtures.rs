@@ -372,22 +372,27 @@ fn a_member_is_never_written_through_a_link_from_the_archive() {
     fs::create_dir_all(&inside).unwrap();
     fs::write(
         &path,
-        archive(&[link_member(b"alias", b"real"), header(0x74, 3, b"alias/file", b"data", 0o100644, &[])]),
+        archive(&[
+            link_member(b"alias", b"real"),
+            header(0x74, 3, b"alias/file", b"data", 0o100644, &[]),
+            header(0x74, 3, b"after", b"after", 0o100644, &[]),
+        ]),
     )
     .unwrap();
     let out = dir.path().join("out");
-    // the whole-archive run stops there: a link among an output's folders is an unsafe path
-    let result = extract::run(&path, &options(&out), |_| {});
-    assert!(matches!(result, Err(zipfast::Error::UnsafePath(_))), "{result:?}");
+    // only that member fails in the whole-archive run too: a link among its folders is in the way
+    let summary = extract::run(&path, &options(&out), |_| {}).unwrap();
+    assert_eq!(summary.errors, ["alias/file: a symlink is in the way"]);
     assert_eq!(fs::read_link(out.join("alias")).unwrap(), Path::new("real"));
     assert!(!inside.join("file").exists());
+    assert_eq!(fs::read(out.join("after")).unwrap(), b"after");
 
     let out = dir.path().join("selected/out");
     fs::create_dir_all(out.join("real")).unwrap();
     let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
     let all = session.select(|_| true).unwrap();
     let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
-    assert_eq!((summary.files, summary.failed), (1, 1));
+    assert_eq!((summary.files, summary.failed), (2, 1));
     assert!(!out.join("real/file").exists());
 }
 

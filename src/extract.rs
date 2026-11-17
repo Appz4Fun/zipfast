@@ -606,30 +606,25 @@ fn place_target(
 ) -> crate::error::RarResult<DetailedChecked> {
     let target = opts.dest.join(rel);
     let rename = opts.overwrite.rename();
-    // A file where a folder above the target should be fails only this member (and the others below it), as with
-    // 7-Zip; a symlinked folder still stops the run.
-    let parent_is_file =
-        |fault: &RarFault| matches!(*fault.failure, RarFailure::Policy { reason: RarPolicyReason::ParentIsFile, .. });
+    // A file or a link where a folder above the target should be (a link placed earlier, say, or one a rename mode
+    // swapped in for a folder) fails only this member and the others below it, as with 7-Zip: nothing is written
+    // through it, and the run goes on.
     if let Some(parent) = rel.parent() {
         match dirs.as_deref_mut() {
             Some(dirs) => {
-                match make_dirs_known_detailed(&opts.dest, parent, dirs) {
-                    Err(fault) if parent_is_file(&fault) => {
-                        return Ok(DetailedChecked::Blocked(RarPolicyReason::ParentIsFile));
-                    }
-                    result => result?,
+                if let Some(reason) = member_blocked(make_dirs_known_detailed(&opts.dest, parent, dirs))? {
+                    return Ok(DetailedChecked::Blocked(reason));
                 }
                 let first = dirs.note(rel);
                 if rename.is_none() && first && dirs.known.get(parent) == Some(&true) {
                     return Ok(DetailedChecked::Write(Place::new(target, false)));
                 }
             }
-            None => match make_dirs_detailed(&opts.dest, parent) {
-                Err(fault) if parent_is_file(&fault) => {
-                    return Ok(DetailedChecked::Blocked(RarPolicyReason::ParentIsFile));
+            None => {
+                if let Some(reason) = member_blocked(make_dirs_detailed(&opts.dest, parent))? {
+                    return Ok(DetailedChecked::Blocked(reason));
                 }
-                result => result?,
-            },
+            }
         }
     }
     if let Some(mode) = rename {
@@ -650,6 +645,20 @@ fn place_target(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DetailedChecked::Write(Place::new(target, false)),
         Err(e) => return Err(metadata(e)),
     })
+}
+
+/// Making a member's folders: a file ([`RarPolicyReason::ParentIsFile`]) or a link ([`RarPolicyReason::Symlink`])
+/// where a folder should be is that member's failure, returned as its reason; any other error is the run's.
+fn member_blocked(made: crate::error::RarResult<()>) -> crate::error::RarResult<Option<RarPolicyReason>> {
+    match made {
+        Ok(()) => Ok(None),
+        Err(fault) => match *fault.failure {
+            RarFailure::Policy {
+                reason: reason @ (RarPolicyReason::ParentIsFile | RarPolicyReason::Symlink), ..
+            } => Ok(Some(reason)),
+            _ => Err(fault),
+        },
+    }
 }
 
 /// Claims the output file for a rename mode, whose parent folders are already made and checked.
@@ -870,6 +879,15 @@ pub struct Entry {
     pub dir: bool,
     pub encrypted: bool,
     pub solid: bool,
+    /// What a link member points at: a symbolic link's target, or a hard link's (tar, RAR 5.0) or file copy's
+    /// (RAR 5.0) earlier member name.
+    ///
+    /// **Untrusted.** The target is taken from the archive as stored, only decoded as UTF-8 (invalid bytes become
+    /// U+FFFD); nothing here checks it. It can be absolute, climb out with `..`, and hold control characters,
+    /// newlines or terminal escape sequences, so escape it before printing it to a terminal or a log, and never
+    /// follow it. A ZIP target longer than 4095 bytes (or encrypted, or in a method this crate can't decode) is left
+    /// empty, as is every 7z target (a listing doesn't decode member data). Extracting places a symbolic link only
+    /// when its target is at most 4095 bytes and stays inside the destination.
     pub link: Option<Redirection>,
     /// RAR 5.0: an older file revision's version number, from its version record (`rar -ver`); `None` for the
     /// current file, a record holding 0 (as UnRAR reads it), and every other format. [`Entry::display_name`] is the
@@ -3608,7 +3626,17 @@ impl Run<'_, '_, '_> {
                 self.drain()?;
             }
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
-                make_dirs_known_detailed(&self.opts.dest, &rel, &mut self.dirs).map_err(|e| self.terminal(&ctx, e))?;
+                match make_dirs_known_detailed(&self.opts.dest, &rel, &mut self.dirs) {
+                    // a link where a folder should be fails only this member
+                    Err(fault) if is_symlink_policy(&fault) => {
+                        let why = blocked_message(&RarPolicyReason::Symlink);
+                        let failure =
+                            RarFailure::Policy { reason: RarPolicyReason::Symlink, path: self.opts.dest.join(&rel) };
+                        self.fail_in_order(&ctx, failure, why)?;
+                        return Ok(());
+                    }
+                    made => made.map_err(|e| self.terminal(&ctx, e))?,
+                }
                 self.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
             }
             return self.reports.directory(&ctx);
@@ -4571,9 +4599,19 @@ fn make_dirs_known_detailed(root: &Path, rel: &Path, dirs: &mut Dirs) -> crate::
     Ok(())
 }
 
-/// Creates `rel` under `root` one folder at a time, refusing to pass through a link.
-pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
-    make_dirs_detailed(root, rel).map_err(RarFault::into_legacy)
+/// Creates a folder member's folders, `rel` under `root`, one at a time, never passing through a link. A link
+/// where one of them should be (placed earlier in the run, say) fails only that member: nothing is made through it,
+/// and the reason comes back. Any other error, a file in the way included, is the run's.
+pub(crate) fn make_member_dirs(root: &Path, rel: &Path) -> Result<Option<&'static str>> {
+    match make_dirs_detailed(root, rel) {
+        Ok(()) => Ok(None),
+        Err(fault) if is_symlink_policy(&fault) => Ok(Some(blocked_message(&RarPolicyReason::Symlink))),
+        Err(fault) => Err(fault.into_legacy()),
+    }
+}
+
+fn is_symlink_policy(fault: &RarFault) -> bool {
+    matches!(*fault.failure, RarFailure::Policy { reason: RarPolicyReason::Symlink, .. })
 }
 
 pub(crate) fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarResult<()> {

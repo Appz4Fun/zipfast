@@ -22,4 +22,30 @@ rm -f "$OUT/infozip.zip" "$OUT/7z.7z"
 zip -qry -X "$OUT/infozip.zip" dir ln_file ln_dir chain
 ditto -c -k --norsrc --noextattr --noacl . "$OUT/ditto.zip"
 "$SZ" a -bso0 -bsp0 -snl -mx=1 "$OUT/7z.7z" dir ln_file ln_dir chain
+# a member under a linked folder in the middle of a 7z (libarchive moves folders to the end; -s names lnx ln)
+cd "$WORK"
+mkdir -p mid/real mid/lnx
+printf 'a\n' > mid/a.txt
+printf 'evil\n' > mid/lnx/evil.txt
+printf 'z\n' > mid/z.txt
+ln -s real mid/ln
+find mid -exec touch -h -t 202001020304.05 {} +
+cd mid
+rm -f "$OUT/under-link-middle.7z"
+bsdtar --format 7zip --uid 0 --gid 0 -s '|^lnx|ln|' -cf "$OUT/under-link-middle.7z" a.txt real ln lnx/evil.txt z.txt
+mkdir lnx/sub
+touch -h -t 202001020304.05 lnx/sub lnx
+rm -f "$OUT/under-link-folder.7z"
+bsdtar --format 7zip --uid 0 --gid 0 -s '|^lnx|ln|' -cf "$OUT/under-link-folder.7z" real ln lnx/sub z.txt
+# xar: an escaping link and a folder that a link already in the destination stands in for
+cd "$WORK"
+mkdir -p xar/pre
+printf 'a\n' > xar/a.txt
+printf 'x\n' > xar/pre/x
+printf 'z\n' > xar/z.txt
+ln -s ../outside xar/up
+find xar -exec touch -h -t 202001020304.05 {} +
+cd xar
+rm -f "$OUT/pre-link.xar"
+bsdtar --format xar --uid 0 --gid 0 -cf "$OUT/pre-link.xar" a.txt up pre z.txt
 python3 -I "$OUT/crafted.py" "$OUT"
