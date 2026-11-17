@@ -711,6 +711,9 @@ impl ProjectedReadSession {
         }
         self.check_source(context)?;
         let entry = &self.owner.entries[ordinal];
+        if crate::path::names_root(&entry.name) {
+            return Ok(());
+        }
         let relative = policy::PolicyPath::normalized(&context.ledger, &entry.name, entry.host != 3, cancel).map_err(
             |failure| match failure {
                 policy::PathFailure::Unsafe => ReadFault::CheckedFormat { reason: "invalid ZIP directory name" },
