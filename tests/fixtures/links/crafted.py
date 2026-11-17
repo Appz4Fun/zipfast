@@ -53,3 +53,23 @@ with zipfile.ZipFile(f"{out}/under-link.zip", "w") as z:
     z.writestr("real/", b"")
     zsym(z, "ln", "real")
     z.writestr("ln/evil.txt", b"evil\n")
+
+# A member under a linked folder in the middle: it alone fails, the ones around it still extract.
+tar("under-link-middle.tar", [
+    ("file", "a.txt", b"a\n"),
+    ("dir", "real/", None),
+    ("sym", "ln", "real"),
+    ("file", "ln/evil.txt", b"evil\n"),
+    ("file", "z.txt", b"z\n"),
+])
+with zipfile.ZipFile(f"{out}/under-link-middle.zip", "w") as z:
+    for path, data in [("a.txt", b"a\n"), ("real/", b"")]:
+        z.writestr(zipfile.ZipInfo(path, (2020, 1, 2, 3, 4, 6)), data)
+    zsym(z, "ln", "real")
+    for path, data in [("ln/evil.txt", b"evil\n"), ("z.txt", b"z\n")]:
+        z.writestr(zipfile.ZipInfo(path, (2020, 1, 2, 3, 4, 6)), data)
+with zipfile.ZipFile(f"{out}/under-link-folder.zip", "w") as z:
+    z.writestr(zipfile.ZipInfo("real/", (2020, 1, 2, 3, 4, 6)), b"")
+    zsym(z, "ln", "real")
+    for path, data in [("ln/sub/", b""), ("z.txt", b"z\n")]:
+        z.writestr(zipfile.ZipInfo(path, (2020, 1, 2, 3, 4, 6)), data)

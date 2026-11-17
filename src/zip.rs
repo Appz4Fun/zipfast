@@ -31,7 +31,7 @@ use zip_container::{
 use crate::error::{Error, Result};
 use crate::extract::{
     Cancellation, Entry, Meta, Mode, MtimeOrigin, Options, RenameLog, RunError, Summary, Target, finish_dirs,
-    finish_file, make_dirs, open_target,
+    finish_file, open_target,
 };
 use crate::path::sanitize_with;
 use crate::rar5::Redirection;
@@ -1134,7 +1134,10 @@ pub(crate) fn run_renaming(
             let rel = if opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
             if e.is_dir() {
                 if opts.mode == Mode::Extract && !opts.flatten {
-                    make_dirs(&opts.dest, &rel)?;
+                    if let Some(why) = crate::extract::make_member_dirs(&opts.dest, &rel)? {
+                        fail(&mut summary, &mut report, &e.name, why);
+                        continue;
+                    }
                     summary.dir_meta.push((opts.dest.join(&rel), e.meta()));
                 }
                 summary.dirs += 1;

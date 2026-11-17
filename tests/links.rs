@@ -369,3 +369,69 @@ fn symbolic_links_keep_their_archived_time() {
         }
     }
 }
+
+/// A member under a link placed earlier in the run fails alone: nothing is written through the link, the members
+/// after it still extract, and the run counts that one failure.
+#[test]
+fn a_member_under_a_linked_folder_fails_only_itself() {
+    let tgz = tempfile::tempdir().unwrap();
+    let gz = tgz.path().join("under-link-middle.tgz");
+    write_tar(&gz, fs::read(fixture("under-link-middle.tar")).unwrap(), true);
+    for archive in
+        [fixture("under-link-middle.tar"), gz, fixture("under-link-middle.zip"), fixture("under-link-middle.7z")]
+    {
+        let name = archive.file_name().unwrap().to_string_lossy().into_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let s = extract::run(&archive, &options(dir.path(), Mode::Extract, Overwrite::Always), |_| {}).unwrap();
+        assert_eq!(s.errors, ["ln/evil.txt: a symlink is in the way"], "{name}");
+        assert_eq!(s.files, 3, "{name}: a.txt, ln and z.txt");
+        assert_eq!(link(&dir.path().join("ln")), "real", "{name}");
+        assert!(!dir.path().join("real/evil.txt").exists(), "{name}: written through the link");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"a\n", "{name}");
+        assert_eq!(fs::read(dir.path().join("z.txt")).unwrap(), b"z\n", "{name}");
+    }
+}
+
+/// A folder member under a link fails alone too, and nothing is made through the link.
+#[test]
+fn a_folder_member_under_a_link_fails_only_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut archives = vec![fixture("under-link-folder.zip"), fixture("under-link-folder.7z")];
+    for gz in [false, true] {
+        let archive = tmp.path().join(if gz { "folder.tgz" } else { "folder.tar" });
+        let bytes =
+            tar(&[("real/", b'5', b""), ("ln", b'2', b"real"), ("ln/sub/", b'5', b""), ("z.txt", b'0', b"z\n")]);
+        write_tar(&archive, bytes, gz);
+        archives.push(archive);
+    }
+    for archive in archives {
+        let name = archive.file_name().unwrap().to_string_lossy().into_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let s = extract::run(&archive, &options(dir.path(), Mode::Extract, Overwrite::Always), |_| {}).unwrap();
+        assert_eq!(s.errors.len(), 1, "{name}: {:?}", s.errors);
+        assert!(s.errors[0].starts_with("ln/sub") && s.errors[0].ends_with("a symlink is in the way"), "{name}");
+        assert!(!dir.path().join("real/sub").exists(), "{name}: made through the link");
+        assert_eq!(fs::read(dir.path().join("z.txt")).unwrap(), b"z\n", "{name}");
+    }
+}
+
+/// A link that was in the destination before the run fails only the members under it, whether the tar is read in
+/// place or staged first (a compressed one).
+#[test]
+fn a_link_already_in_the_destination_fails_only_the_members_under_it() {
+    for gz in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let dest = tmp.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        std::os::unix::fs::symlink("../outside", dest.join("pre")).unwrap();
+        let archive = tmp.path().join(if gz { "a.tgz" } else { "a.tar" });
+        write_tar(&archive, tar(&[("a", b'0', b"a"), ("pre/x", b'0', b"x"), ("z", b'0', b"z")]), gz);
+        let s = extract::run(&archive, &options(&dest, Mode::Extract, Overwrite::Always), |_| {}).unwrap();
+        assert_eq!(s.errors, ["pre/x: a symlink is in the way"], "gz={gz}");
+        assert_eq!(s.files, 2, "gz={gz}");
+        assert!(!outside.join("x").exists(), "gz={gz}: written through the link");
+        assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "gz={gz}");
+    }
+}

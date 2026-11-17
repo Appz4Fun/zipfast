@@ -561,3 +561,63 @@ fn symbolic_links_take_the_archived_time_without_following() {
         check(&dest, "session");
     }
 }
+
+/// A member under a link placed earlier in the run (a folder link, or one a rename mode swapped in for a moved
+/// folder) fails alone: nothing is written or made through the link, the members after it still extract on the
+/// legacy and typed runs, and the run counts that one failure.
+#[test]
+fn a_member_under_a_linked_folder_fails_only_itself() {
+    let cases: [(&str, Vec<FileSpec<'_>>, Overwrite, &str); 4] = [
+        (
+            "file",
+            vec![FileSpec::new("a", b"a"), dir("real"), link("ln", 1, "real"), FileSpec::new("ln/evil", b"e")],
+            Overwrite::Always,
+            "ln/evil",
+        ),
+        (
+            "folder",
+            vec![FileSpec::new("a", b"a"), dir("real"), link("ln", 1, "real"), dir("ln/sub")],
+            Overwrite::Always,
+            "ln/sub",
+        ),
+        (
+            "link",
+            vec![FileSpec::new("a", b"a"), dir("real"), link("ln", 1, "real"), link("ln/l", 1, "x")],
+            Overwrite::Always,
+            "ln/l",
+        ),
+        (
+            "moved",
+            vec![dir("real"), FileSpec::new("real/a", b"a"), link("real", 1, "e"), FileSpec::new("real/b", b"b")],
+            Overwrite::RenameExisting(RenameStyle::Underscore),
+            "real/b",
+        ),
+    ];
+    for (case, mut files, overwrite, refused) in cases {
+        files.push(FileSpec::new("z", b"z"));
+        for threads in [1, 4] {
+            let tmp = tempfile::tempdir().unwrap();
+            let arc = write(tmp.path(), &files);
+            let dest = tmp.path().join("out");
+            fs::create_dir_all(dest.join("e")).unwrap();
+            let opts = options(&dest, Mode::Extract, overwrite, threads);
+            let s = extract::run(&arc, &opts, |_| {}).unwrap();
+            assert_eq!(s.errors, [format!("{refused}: a symlink is in the way")], "{case} threads={threads}");
+            assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "{case} threads={threads}");
+            assert_eq!(fs::read_dir(dest.join("e")).unwrap().count(), 0, "{case}: written through the link");
+            assert!(fs::read_dir(dest.join("real")).is_ok_and(|d| d.count() == 0), "{case}: written through the link");
+
+            // the typed run reports the same single failure and goes on to `z`
+            let tmp = tempfile::tempdir().unwrap();
+            let arc = write(tmp.path(), &files);
+            let dest = tmp.path().join("out");
+            fs::create_dir_all(dest.join("e")).unwrap();
+            let mut events = Vec::new();
+            let opts = options(&dest, Mode::Extract, overwrite, threads);
+            let summary = extract::run_rar_with_outcomes(&arc, &opts, None, |e| events.push(event(e))).unwrap();
+            assert_eq!(summary.failed, 1, "{case} threads={threads}: {events:?}");
+            assert_eq!(failed(&events), [3], "{case} threads={threads}: {events:?}");
+            assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "{case} threads={threads}");
+        }
+    }
+}
