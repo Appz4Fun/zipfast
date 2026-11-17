@@ -43,6 +43,14 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   them by. Files may not share heap data.
   The XML table of contents is read with bounds on its size, nesting, file count and path length, and no entity is
   expanded but XML's own five. Members take tar's pipeline, links included.
+- WIM (Windows Imaging) files, found by their magic: stored, XPRESS (Huffman) and LZX resources in chunks, each
+  blob checked against its SHA-1 before the file it fills is published. Image 1 is extracted;
+  `tar::list_wim_image` lists another and `tar::wim_info` reads the header (GUID, image count, compression).
+  Folders, names, timestamps, hard links, and symbolic links and junctions (as symbolic links, only when they stay
+  inside the destination) take tar's pipeline. LZMS and solid resources are refused: LZMS has no public
+  specification. Split sets (`.swm`) are refused too. Lookup table entries, metadata, entries, nesting and path
+  bytes are bounded, resources may not overlap, and data shared by several files is written again only up to a
+  multiple of the archive's size. The LZX decoder is the MIT-licensed `lzxd` crate, vendored and patched for WIM.
 - cpio archives, plain or compressed as tar can be: the binary format in either byte order, odc (`070707`), newc
   (`070701`) and newc with checksums (`070702`, checked). They take tar's whole pipeline: containment, symbolic and
   hard links, overwrite choices, listing and reads by index. A file's hard links come out as links to the name that

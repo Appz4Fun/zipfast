@@ -36,7 +36,10 @@ use crate::stream::{self, Codec};
 
 mod cpio;
 mod table;
+mod wim;
 mod xar;
+
+pub use wim::WimInfo;
 
 /// A member's data read from its own place in the file (xar, ISO 9660), not from the archive's stream.
 trait MemberData: Read {
@@ -91,6 +94,28 @@ pub fn sniff_cpio(head: &[u8]) -> bool {
 /// Whether the file starts with a xar header (`.xar`, a macOS `.pkg`), which this module reads as it reads tar.
 pub fn sniff_xar(head: &[u8]) -> bool {
     head.len() >= 28 && head.starts_with(xar::MAGIC) && u16::from_be_bytes([head[4], head[5]]) >= 28
+}
+
+/// Whether the file starts with a WIM (Windows Imaging) header, which this module reads as it reads tar.
+pub fn sniff_wim(head: &[u8]) -> bool {
+    wim::sniff(head)
+}
+
+/// What the header of the WIM file at `path` says: its GUID, image count and compression.
+pub fn wim_info(path: &Path) -> Result<WimInfo> {
+    wim::info(&File::open(path)?)
+}
+
+/// Lists image `image` (from 1) of the WIM file at `path`; [`list`] and extraction take image 1.
+pub fn list_wim_image(path: &Path, image: u32) -> Result<Vec<Entry>> {
+    let mut head = [0u8; 16];
+    let n = read_full(&mut File::open(path)?, &mut head)?;
+    if !sniff_wim(&head[..n]) {
+        return Err(Error::NotAnArchive);
+    }
+    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None)?;
+    reader.random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), image)?));
+    list_members(reader)
 }
 
 fn zero(b: &[u8]) -> bool {
@@ -728,7 +753,7 @@ struct Reader {
     cpio: Option<Box<cpio::State>>,
     /// the checksum of the current member's data, in a newc archive with checksums
     crc: Option<CpioCrc>,
-    /// set when the archive is read from a table (xar): its members, and the current one's data
+    /// set when the archive is read from a table (xar, WIM): its members, and the current one's data
     random: Option<Box<dyn RandomAccess>>,
     member_data: Option<Box<dyn MemberData>>,
 }
@@ -759,6 +784,11 @@ impl Reader {
         } else if plain && sniff_xar(&first) {
             // xar data is read where the table of contents puts it, from the file itself
             random = Some(Box::new(xar::open(File::open(path)?, std::fs::metadata(path)?.len())?));
+            first.clear();
+            Some(Content::Tar)
+        } else if plain && sniff_wim(&first) {
+            // WIM data is read where the lookup table puts it, from the file itself; image 1 is the one taken
+            random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), 1)?));
             first.clear();
             Some(Content::Tar)
         } else if let Some(format) = cpio::sniff(&first) {
@@ -1339,6 +1369,11 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
             version: None,
         }]);
     }
+    list_members(reader)
+}
+
+/// Lists what is left of `reader`'s members.
+fn list_members(mut reader: Reader) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
     let mut budget = ListingBudget::default();
     while let Some(m) = reader.next()? {
@@ -1386,7 +1421,7 @@ fn is_tar_or_stream(path: &Path) -> Result<bool> {
     let mut head = [0u8; 2 * BLOCK];
     let n = read_full(&mut File::open(path)?, &mut head)?;
     let head = &head[..n];
-    Ok(Codec::sniff(head).is_some() || sniff_tar(head) || sniff_cpio(head) || sniff_xar(head))
+    Ok(Codec::sniff(head).is_some() || sniff_tar(head) || sniff_cpio(head) || sniff_xar(head) || sniff_wim(head))
 }
 
 /// [`run`], reporting a rename mode's renames to `report` as they happen. A terminal error keeps them too.
