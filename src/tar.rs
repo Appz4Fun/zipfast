@@ -1981,6 +1981,108 @@ fn run_tar(
     }
 }
 
+/// What a member is, as the repacker writes it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawKind {
+    File,
+    Dir,
+    Symlink,
+    HardLink,
+    CharDevice,
+    BlockDevice,
+    Fifo,
+}
+
+/// A member as the repacker sees it: the stored name's own bytes, its link target, kind and mode, the length of the
+/// file it makes (a sparse member's holes included) and a device's numbers. Times and owners are left out on
+/// purpose: a repack replaces them.
+#[derive(Clone, Debug)]
+pub(crate) struct RawMember {
+    pub name: Vec<u8>,
+    pub link: Vec<u8>,
+    pub kind: RawKind,
+    pub mode: u32,
+    pub size: u64,
+    pub device: (u64, u64),
+}
+
+/// The data of the member just handed out by [`walk_members`].
+pub(crate) struct MemberData<'a> {
+    reader: &'a mut Reader,
+    member: &'a Member,
+    buf: &'a mut [u8],
+}
+
+impl MemberData<'_> {
+    /// The file's bytes in order to `sink`, a sparse member's holes as zeros.
+    pub(crate) fn read(self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let zeros = [0u8; 64 << 10];
+        self.reader.read_member(self.member, self.buf, &mut |piece| match piece {
+            Piece::Data(d) => sink(d),
+            Piece::Hole(mut left) => {
+                while left > 0 {
+                    let n = left.min(zeros.len() as u64) as usize;
+                    sink(&zeros[..n])?;
+                    left -= n as u64;
+                }
+                Ok(())
+            }
+        })
+    }
+}
+
+/// Every member of a tar or cpio archive, plain or compressed, in stored order, with the listing's limits: at most
+/// `limit` decoded bytes from a compressed stream, the listing's entry and name budget, and the sparse bomb check.
+/// A volume label is passed over; a member this crate cannot write again (a multi-volume continuation, a socket)
+/// fails the walk. A lone compressed file is not an archive here.
+pub(crate) fn walk_members(
+    path: &Path,
+    limit: u64,
+    mut each: impl FnMut(RawMember, MemberData<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut reader = Reader::open_with_limit(path, 1, Some(limit), None)?;
+    if matches!(reader.content, Content::Single) {
+        return Err(Error::NotAnArchive);
+    }
+    let mut budget = ListingBudget::default();
+    let mut buf = vec![0u8; BUF];
+    while let Some(m) = reader.next()? {
+        let kind = match m.kind {
+            Kind::File => RawKind::File,
+            Kind::Dir => RawKind::Dir,
+            Kind::Symlink => RawKind::Symlink,
+            Kind::HardLink => RawKind::HardLink,
+            Kind::Other(b'V') => continue,
+            Kind::Other(b'3') => RawKind::CharDevice,
+            Kind::Other(b'4') => RawKind::BlockDevice,
+            Kind::Other(b'6') => RawKind::Fifo,
+            Kind::Other(t) => {
+                return Err(Error::Unsupported(format!(
+                    "tar member {:?} has type {:?}, which a repack cannot write again",
+                    m.name, t as char
+                )));
+            }
+        };
+        if let Some(why) = m.sparse_refusal() {
+            return Err(Error::Unsupported(why.into()));
+        }
+        budget.record(&m.name)?;
+        let raw = RawMember {
+            name: m.raw_name.clone().unwrap_or_else(|| m.name.clone().into_bytes()),
+            link: m.link.clone().into_bytes(),
+            kind,
+            mode: m.mode,
+            size: if kind == RawKind::File { m.real_size() } else { 0 },
+            device: (m.tar.device_major.unwrap_or(0), m.tar.device_minor.unwrap_or(0)),
+        };
+        each(raw, MemberData { reader: &mut reader, member: &m, buf: &mut buf })?;
+    }
+    if reader.src.codec().is_some() {
+        reader.drain(&mut buf)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
