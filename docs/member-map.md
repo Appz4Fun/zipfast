@@ -511,9 +511,11 @@ structure: 7-Zip writes the packed streams after the signature header and the he
 start fixes the volume's place in the archive. Encoded header (`0x17 0x06`) candidates within the last 4 KiB are
 tried nearest the end first and taken when they parse to the end of the bytes exactly, the folder states a CRC
 (a candidate without one is never taken) and the packed stream decodes to it; plain header (`0x01` then `0x02`, `0x04` or `0x05`) candidates, which have no CRC without the signature
-header, are tried from the farthest in, at most 4096 of them, and taken when they parse to the end with at least one
+header, are tried from the farthest in, and taken when they parse to the end with at least one
 file and pass the whole-archive walk's checks. Each candidate gets its own budget, so a bogus one that overspends
-is only not the header; all candidates together parse or decode at most 256 MiB of header bytes. A RAR end header in the last
+is only not the header. All candidates together spend at most 256 Mi units of work: one per byte parsed or
+decoded, and one per length passed over unread, so a stated length costs nothing to skip. A search that spends
+it before taking a candidate is `MapError::TailSearchExhausted`, not `NotArchive`. A RAR end header in the last
 bytes is taken when it ends the bytes exactly, its CRC matches and it lies after the headers already read; it is not
 looked for when headers are encrypted.
 

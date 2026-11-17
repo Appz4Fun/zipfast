@@ -530,3 +530,40 @@ fn a_rar5_locator_past_the_volume_is_dropped() {
         }
     }
 }
+
+#[test]
+fn a_plain_header_after_sixty_megabytes_of_random_data_is_found() {
+    let data = noise(60 << 20, 0x60);
+    let archive = seven("huge.bin", &data, None);
+    let id = last_volume_identity(held(&archive, 0, archive.len() - 32), MapOptions::new("huge.7z")).unwrap();
+    assert_eq!(identity_keys(&id), vec![("huge.bin".into(), data.len() as u64, crc32fast::hash(&data))]);
+}
+
+#[test]
+fn candidates_that_spend_the_search_bound_are_reported_as_such() {
+    // Plain header starts that each claim 100,000 files, with a file property list that runs to the header's end
+    // marker on the last byte (one property skipping over the later starts): every one passes the structure check
+    // and builds its entries before failing, so the search's work bound runs out.
+    let len = 1usize << 20;
+    let mut tail = vec![0u8; len];
+    for k in 0..40 {
+        let at = k * 1000;
+        let mut claim = vec![0x01, 0x05];
+        num(100_000, &mut claim);
+        claim.push(0x19);
+        // The property runs from after its size field to the two end markers.
+        let mut size_field = Vec::new();
+        num(0, &mut size_field);
+        let mut size = (len - 2 - (at + claim.len() + 4)) as u64;
+        size_field.clear();
+        num(size, &mut size_field);
+        size += 4 - size_field.len() as u64;
+        size_field.clear();
+        num(size, &mut size_field);
+        assert_eq!(at + claim.len() + size_field.len() + size as usize, len - 2);
+        claim.extend_from_slice(&size_field);
+        tail[at..at + claim.len()].copy_from_slice(&claim);
+    }
+    let result = last_volume_identity(HeldVolume::new(&[], &tail, tail.len() as u64).unwrap(), MapOptions::new("x"));
+    assert!(matches!(result, Err(MapError::TailSearchExhausted)), "{result:?}");
+}

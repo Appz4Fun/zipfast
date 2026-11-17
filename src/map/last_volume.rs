@@ -224,7 +224,8 @@ fn canceled() -> MapError {
 ///
 /// When the bytes needed for a ZIP directory or a 7z encoded header lie further from the end than the tail held,
 /// the result is [`MapError::TailTooShort`] with how many bytes before the end the tail must hold. Bytes of no
-/// format named here are [`MapError::NotArchive`].
+/// format named here are [`MapError::NotArchive`]. A 7z header search that spends its work bound (256 Mi parse
+/// steps over all candidates) before taking one is [`MapError::TailSearchExhausted`].
 pub fn last_volume_identity(held: HeldVolume<'_>, options: MapOptions) -> Result<LastVolumeIdentity, MapError> {
     if options.control.is_canceled() {
         return Err(canceled());
@@ -246,6 +247,7 @@ pub fn last_volume_identity(held: HeldVolume<'_>, options: MapOptions) -> Result
     match sevenzip::from_tail(held.tail, held.len, &options)? {
         TailSearch::Found(found) => return Ok(seven(*found)),
         TailSearch::NeedBytes(n) => need = Some(need.map_or(n, |m: u64| m.min(n))),
+        TailSearch::Exhausted => seven_error = Some(MapError::TailSearchExhausted),
         TailSearch::NotFound(error) => seven_error = error,
     }
     // A self-extracting stub before a RAR volume.

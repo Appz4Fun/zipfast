@@ -227,11 +227,31 @@ struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     usage: &'a Usage,
+    /// Parse work done, shared with sub-readers: one per byte read singly, the length of a slice taken to be used,
+    /// one for a slice skipped. Offsets advanced over skipped bytes cost nothing, so a stated length cannot make a
+    /// parse look expensive; the tail search bounds its candidates by this.
+    steps: std::rc::Rc<std::cell::Cell<u64>>,
+    /// Reading a candidate header found at the end of a volume's bytes, which must end exactly where they do: the
+    /// file list's structure is checked to run to that end before any entry is built.
+    tail: bool,
 }
 
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8], usage: &'a Usage) -> Self {
-        Self { buf, pos: 0, usage }
+        Self { buf, pos: 0, usage, steps: Default::default(), tail: false }
+    }
+
+    /// A reader over `buf`, a slice of this one's, sharing its step count.
+    fn sub(&self, buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0, usage: self.usage, steps: self.steps.clone(), tail: false }
+    }
+
+    fn step(&self, n: u64) {
+        self.steps.set(self.steps.get().saturating_add(n));
+    }
+
+    fn steps(&self) -> u64 {
+        self.steps.get()
     }
 
     fn remaining(&self) -> usize {
@@ -241,10 +261,25 @@ impl<'a> Reader<'a> {
     fn byte(&mut self) -> Parsed<u8> {
         let b = *self.buf.get(self.pos).ok_or(Bad::Malformed("7z header ends early"))?;
         self.pos += 1;
+        self.step(1);
         Ok(b)
     }
 
+    /// `n` bytes to be used: charged `n` steps.
     fn bytes(&mut self, n: u64) -> Parsed<&'a [u8]> {
+        let out = self.slice(n)?;
+        self.step(out.len() as u64);
+        Ok(out)
+    }
+
+    /// `n` bytes passed over unread: one step.
+    fn skip(&mut self, n: u64) -> Parsed<&'a [u8]> {
+        let out = self.slice(n)?;
+        self.step(1);
+        Ok(out)
+    }
+
+    fn slice(&mut self, n: u64) -> Parsed<&'a [u8]> {
         let n =
             usize::try_from(n).ok().filter(|&n| n <= self.remaining()).ok_or(Bad::Malformed("7z header ends early"))?;
         let out = &self.buf[self.pos..self.pos + n];
@@ -293,6 +328,7 @@ impl<'a> Reader<'a> {
 
     fn bits(&mut self, n: usize) -> Parsed<Vec<bool>> {
         let bytes = self.bytes(n.div_ceil(8) as u64)?;
+        self.step(n as u64);
         Ok((0..n).map(|i| bytes[i / 8] & (0x80 >> (i % 8)) != 0).collect())
     }
 
@@ -476,7 +512,7 @@ impl<'a> Reader<'a> {
                 digests = Some(self.digests(n)?);
             } else {
                 let size = self.number()?;
-                self.bytes(size)?;
+                self.skip(size)?;
             }
             id = self.number()?;
         }
@@ -533,12 +569,30 @@ impl<'a> Reader<'a> {
         let n = self.number()?;
         self.usage.check(Resource::Entries, n)?;
         let n = usize::try_from(n).map_err(|_| Bad::Malformed("7z file count"))?;
+        if self.tail {
+            // A tail candidate is noise until shown otherwise: its file properties must chain to the header's end
+            // marker on the last byte, each file must have a byte behind it, and only then are entries built.
+            if n > self.remaining() {
+                return Err(Bad::Malformed("7z item count exceeds the header"));
+            }
+            let mut dry = self.sub(self.buf);
+            dry.pos = self.pos;
+            while dry.number()? != ID_END {
+                let size = dry.number()?;
+                dry.skip(size)?;
+            }
+            if dry.number()? != ID_END || dry.remaining() != 0 {
+                return Err(Bad::Malformed("7z files do not end the header"));
+            }
+        }
         self.usage.charge(Resource::Entries, n as u64)?;
         let per = std::mem::size_of::<FileEntry>() + std::mem::size_of::<MapMember>();
         self.usage.charge(Resource::MetadataBytes, (n as u64).saturating_mul(per as u64))?;
         let mut files = Vec::new();
         files.try_reserve_exact(n).map_err(|_| Bad::Malformed("7z file count"))?;
         files.resize_with(n, FileEntry::default);
+        // The entries are built whatever the bytes hold: work by the bytes allocated.
+        self.step((n as u64).saturating_mul(per as u64 + 1));
         let mut empty_stream = vec![false; n];
         let mut empty_file: Vec<bool> = Vec::new();
         let mut anti: Vec<bool> = Vec::new();
@@ -548,7 +602,8 @@ impl<'a> Reader<'a> {
                 break;
             }
             let size = self.number()?;
-            let mut sub = Reader::new(self.bytes(size)?, self.usage);
+            let slice = self.skip(size)?;
+            let mut sub = self.sub(slice);
             match id {
                 ID_EMPTY_STREAM => {
                     empty_stream = sub.bits(n)?;
@@ -618,7 +673,7 @@ impl<'a> Reader<'a> {
         if id == ID_ARCHIVE_PROPERTIES {
             while self.number()? != ID_END {
                 let size = self.number()?;
-                self.bytes(size)?;
+                self.skip(size)?;
             }
             id = self.number()?;
         }
@@ -1370,9 +1425,11 @@ impl SevenZipWalker {
 /// How far from the end an encoded header (`0x17`) is looked for. An encoded header lists one folder of a few
 /// coders: well under 1 KiB.
 const TAIL_ENCODED_WINDOW: usize = 4096;
-/// How many plain header (`0x01`) starts are tried at most.
-const TAIL_PLAIN_TRIES: usize = 4096;
-/// Header bytes all candidates together may parse or decode, beyond the one budget each candidate gets on its own.
+/// How many plain header (`0x01`) starts are tried at most. Random data has about three in 64 KiB, so this covers
+/// the header budget's 64 MiB of it many times over; the work bound below is what limits hostile bytes.
+const TAIL_PLAIN_TRIES: usize = 1 << 20;
+/// Parse steps ([`Reader`]) and bytes decoded all candidates together may spend, beyond the one budget each
+/// candidate gets on its own.
 const TAIL_SEARCH_WORK: u64 = 256 << 20;
 
 /// A 7z header found at the end of a volume's last bytes, without the signature header.
@@ -1393,6 +1450,8 @@ pub(crate) enum TailSearch {
     /// A header start was found whose packed stream lies further from the end than the bytes held: the tail must
     /// hold this many bytes before the volume's end.
     NeedBytes(u64),
+    /// The search spent its work bound before a candidate was taken.
+    Exhausted,
     /// No candidate was taken. The failure of the candidate that got furthest (the one nearest a header), if any,
     /// is kept to explain why.
     NotFound(Option<MapError>),
@@ -1443,12 +1502,12 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
             return Err(canceled());
         }
         if work > TAIL_SEARCH_WORK {
-            break;
+            return Ok(TailSearch::Exhausted);
         }
         let usage = Usage::new(options.limits.clone());
         let mut reader = Reader::new(&tail[h + 1..], &usage);
         let parsed = reader.streams_info();
-        work += reader.pos as u64;
+        work = work.saturating_add(reader.steps());
         let Ok(streams) = parsed else { continue };
         if reader.remaining() != 0
             || streams.folders.len() != 1
@@ -1522,15 +1581,19 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
         }
         tries += 1;
         if tries > TAIL_PLAIN_TRIES || work > TAIL_SEARCH_WORK {
-            break;
+            return Ok(match need {
+                Some(n) => TailSearch::NeedBytes(n),
+                None => TailSearch::Exhausted,
+            });
         }
         if options.control.is_canceled() {
             return Err(canceled());
         }
         let usage = Usage::new(options.limits.clone());
         let mut reader = Reader::new(&tail[h + 1..], &usage);
+        reader.tail = true;
         let parsed = reader.header();
-        work += reader.pos as u64;
+        work = work.saturating_add(reader.steps());
         let (streams, files) = match parsed {
             Ok(parsed) => parsed,
             Err(_) => continue,

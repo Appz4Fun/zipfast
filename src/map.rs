@@ -697,6 +697,9 @@ pub enum MapError {
     /// [`last_volume_identity`]: the bytes needed lie further from the volume's end than the tail held. The tail
     /// must hold at least `from_end` bytes before the end.
     TailTooShort { from_end: u64 },
+    /// [`last_volume_identity`]: looking for a 7z header at the end of the bytes spent its work bound before
+    /// taking a candidate. The bytes may hold one behind more noise than the search reads through.
+    TailSearchExhausted,
 }
 
 impl std::fmt::Display for MapError {
@@ -718,6 +721,7 @@ impl std::fmt::Display for MapError {
             Self::MissingDirectory { volume } => {
                 write!(f, "split ZIP directory or end record not available (volume {volume})")
             }
+            Self::TailSearchExhausted => write!(f, "the 7z header search spent its work bound"),
             Self::TailTooShort { from_end } => {
                 write!(f, "the volume's last {from_end} bytes are needed")
             }
