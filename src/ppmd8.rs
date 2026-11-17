@@ -95,6 +95,24 @@ fn hi_flag_4(sym: u32) -> u8 {
     hi_bits_4(hi_bits_prepare(sym)) as u8
 }
 
+/// `size` zero bytes, or None when the allocator can't supply them. The allocator hands over zeroed pages
+/// without the decoder touching each one, so a header that asks for 256 MiB in front of a few bytes of garbage costs
+/// address space, not resident memory.
+fn zeroed_heap(size: usize) -> Option<Vec<u8>> {
+    if size == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(size).ok()?;
+    // SAFETY: the layout is nonzero in size and passed its size check.
+    let allocation = unsafe { std::alloc::alloc_zeroed(layout) };
+    if allocation.is_null() {
+        return None;
+    }
+    // SAFETY: the global allocator returned `size` initialized bytes with u8 alignment; the Vec frees them with
+    // the same layout.
+    Some(unsafe { Vec::from_raw_parts(allocation, size, size) })
+}
+
 pub(crate) struct Ppmd8 {
     heap: Vec<u8>,
     /// set when a heap access fell outside it: the stream is damaged (or the port wrong); decoding stops
@@ -139,9 +157,7 @@ impl Ppmd8 {
     pub(crate) fn new(size: u32, max_order: u32, restore_method: u32) -> Option<Box<Self>> {
         let align_offset = 4u32.wrapping_sub(size) & 3;
         let total = (align_offset + size) as usize;
-        let mut heap = Vec::new();
-        heap.try_reserve_exact(total).ok()?;
-        heap.resize(total, 0);
+        let heap = zeroed_heap(total)?;
         let mut p = Box::new(Ppmd8 {
             heap,
             broken: false,
