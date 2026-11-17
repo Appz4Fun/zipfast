@@ -53,13 +53,15 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
 }
 
-/// The `.zip` of the set `path` belongs to: `path` itself when it is a regular `.zip` (whether it is a set's last
-/// volume is for its end record and the numbered volumes beside it to say: its `.z01` may be the one missing), or
-/// the `.zip` beside a `.z01` given instead. None for anything else.
+/// The `.zip` of the set `path` belongs to: `path` itself when it is a `.zip` with a regular `.z01` beside it, or the
+/// `.zip` beside a `.z01` given instead. None for anything else. A `.zip` without its `.z01` is never read as a set,
+/// though 7-Zip reads one: nothing but the `.zip`'s own end record would then say it is part of a set, and a hostile
+/// lone `.zip` could claim so to leave the checked route for the split reader.
 pub(crate) fn last_volume(path: &Path) -> Option<PathBuf> {
     let ext = path.extension()?.to_str()?;
     if ext.eq_ignore_ascii_case("zip") {
-        is_regular(path).then(|| path.to_path_buf())
+        let first = Path::new(&split_volume_name(path.as_os_str(), 0, false)).to_path_buf();
+        (is_regular(path) && is_regular(&first)).then(|| path.to_path_buf())
     } else if ext.eq_ignore_ascii_case("z01") {
         let last = Path::new(&split_volume_name(path.as_os_str(), 0, true)).to_path_buf();
         is_regular(&last).then_some(last)
@@ -145,8 +147,9 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Whether `path` is the `.zip` (or the `.z01`) of a spanned set: an end record naming more than one disk (a lone
-/// `.zip` with a stray `.z01` beside it stays a lone archive), or a `.z01` whose `.zip` is missing ([`Headless`]).
+/// Whether `path` is the `.zip` (or the `.z01`) of a spanned set: a `.z01` beside it and an end record naming more
+/// than one disk (a lone `.zip` with a stray `.z01` beside it stays a lone archive), or a `.z01` whose `.zip` is
+/// missing ([`Headless`]).
 pub(crate) fn is_spanned(path: &Path) -> bool {
     matches!(Spanned::open(path), Ok(Some(_))) || Headless::open(path).is_some()
 }
@@ -166,10 +169,10 @@ pub(crate) struct Spanned {
 }
 
 impl Spanned {
-    /// The set whose `.zip` (or `.z01`) is `path`, or None when `path` is not one: no end record ending at its end
-    /// (trailing bytes, damage), or one naming a single disk (a lone archive, whether or not a `.z01` is beside it).
-    /// Each of those is left to the single-file reader. Only once the end record names more than one disk is a fault
-    /// the set's; the `.z01` and other numbered volumes may then be missing, but not all of them.
+    /// The set whose `.zip` (or `.z01`) is `path`, or None when `path` is not one: no `.z01` beside it, no end record
+    /// ending at its end (trailing bytes, damage), or one naming a single disk (a lone archive that happens to have a
+    /// `.z01` beside it). Each of those is left to the single-file reader. Only once the end record names more than
+    /// one disk is a fault the set's; numbered volumes after the `.z01` may then be missing.
     pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
         let Some(last) = last_volume(path) else { return Ok(None) };
         let Ok(mut file) = open_regular(&last) else { return Ok(None) };
@@ -213,11 +216,6 @@ impl Spanned {
         let mut volumes: Vec<PathBuf> =
             (0..disk).map(|i| PathBuf::from(split_volume_name(last.as_os_str(), i, false))).collect();
         volumes.push(last.clone());
-        // A `.zip` with no numbered volume beside it is no set to recover: it stays a lone file, so the checked route
-        // still rejects its multi-disk end record instead of handing it to the split reader.
-        if !volumes[..disk as usize].iter().any(|v| is_regular(v)) {
-            return Ok(None);
-        }
         let missing = volumes.iter().find(|v| !is_regular(v)).cloned();
         let zip64 = locator.map(|(at, _)| at);
         let directory_disk = match (le16(record, 6), zip64) {
