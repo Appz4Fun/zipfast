@@ -258,12 +258,12 @@ fn names_that_leave_the_destination_are_refused() {
     let files = format!(
         "{}<file id=\"2\"><name>..</name><type>directory</type>{}</file>{}",
         stored(1, "../evil", 0, b"x", None),
-        stored(3, "inner", 0, b"x", None),
-        stored(4, "ok", 0, b"x", None)
+        stored(3, "inner", 1, b"x", None),
+        stored(4, "ok", 2, b"x", None)
     );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.xar");
-    fs::write(&path, xar(&toc(&files), b"x")).unwrap();
+    fs::write(&path, xar(&toc(&files), b"xxx")).unwrap();
     let out = dir.path().join("out");
     let s = extract::run(&path, &opts(Mode::Extract, &out), |_| {}).unwrap();
     assert!(s.errors.iter().any(|e| e.contains("../evil")), "{:?}", s.errors);
@@ -297,4 +297,73 @@ fn damaged_archives_never_panic() {
         let _ = extract::list(&path);
         let _ = extract::run(&path, &opts(Mode::Test, dir.path()), |_| {});
     }
+}
+
+/// Files pointing at one heap range would decode the same bytes once each: refused.
+#[test]
+fn files_sharing_heap_data_are_refused() {
+    let files = format!("{}{}", stored(1, "a", 0, b"alpha", None), stored(2, "b", 2, b"pha", None));
+    fails(&xar(&toc(&files), b"alpha"), "share heap data");
+    let same = format!("{}{}", stored(1, "a", 0, b"alpha", None), stored(2, "b", 0, b"alpha", None));
+    fails(&xar(&toc(&same), b"alpha"), "share heap data");
+}
+
+fn link(id: u32, name: &str, to: u32) -> String {
+    format!("<file id=\"{id}\"><name>{name}</name><type link=\"{to}\">hardlink</type></file>")
+}
+
+/// h1 links to h2, which links to t, listed before t: both come out as links to t, after it. A link to an id
+/// nobody has, or a loop of links, fails with that link alone.
+#[cfg(unix)]
+#[test]
+fn chains_of_hard_links_resolve_to_the_file() {
+    use std::os::unix::fs::MetadataExt;
+    let original = "<file id=\"3\"><name>t</name><type link=\"original\">hardlink</type><data><length>5</length>\
+                    <offset>0</offset><size>5</size><encoding style=\"application/octet-stream\"/></data></file>";
+    let files = format!(
+        "{}{}{original}{}{}{}",
+        link(1, "h1", 2),
+        link(2, "h2", 3),
+        link(4, "lost", 99),
+        link(5, "x", 6),
+        link(6, "y", 5)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l.xar");
+    fs::write(&path, xar(&toc(&files), b"alpha")).unwrap();
+    let out = dir.path().join("out");
+    let s = extract::run(&path, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    let ino = |n: &str| fs::metadata(out.join(n)).unwrap().ino();
+    assert_eq!(fs::read(out.join("h1")).unwrap(), b"alpha", "{:?}", s.errors);
+    assert_eq!(ino("h1"), ino("t"));
+    assert_eq!(ino("h2"), ino("t"));
+    assert_eq!(s.errors.len(), 3, "{:?}", s.errors);
+    for name in ["lost", "x", "y"] {
+        assert!(s.errors.iter().any(|e| e.starts_with(name)), "{name}: {:?}", s.errors);
+    }
+    // the listing names the file each link comes to
+    let listing = extract::list(&path).unwrap();
+    let names: Vec<&str> = listing.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(&names[..3], ["t", "h1", "h2"]);
+}
+
+/// SHA-512 extracted checksums are checked too.
+#[test]
+fn sha512_checksums_are_checked() {
+    // SHA-512 of "alpha", from Python's hashlib
+    let digest = "ba3ce58667ca9b12b3c0cdcc4da57f9962aeca7065c43a7d9c027332fdb9f0bbcf69004286880fe3d8f3fd8f03ddffd7485fd94c9d3a38618ea10691d8d6a7fa";
+    let file = |sum: &str| {
+        format!(
+            "<file id=\"1\"><name>a</name><type>file</type><data><length>5</length><offset>0</offset><size>5</size>\
+             <encoding style=\"application/octet-stream\"/><extracted-checksum style=\"sha512\">{sum}</extracted-checksum>\
+             </data></file>"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ok.xar");
+    fs::write(&path, xar(&toc(&file(digest)), b"alpha")).unwrap();
+    let s = extract::run(&path, &opts(Mode::Test, dir.path()), |_| {}).unwrap();
+    assert!(s.errors.is_empty() && s.files == 1, "{:?}", s.errors);
+    let wrong = format!("{}0", &digest[..127]);
+    fails(&xar(&toc(&file(&wrong)), b"alpha"), "checksum");
 }

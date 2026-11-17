@@ -17,7 +17,9 @@
 //! xar archives (`.xar`, and the outer layer of a macOS `.pkg`), read as tar members so they take tar's whole
 //! pipeline. A xar file is a header, a zlib-compressed XML table of contents, and a heap: each file's data sits at
 //! an offset in the heap, stored or compressed with gzip (zlib), bzip2, xz or LZMA, with a checksum of the data
-//! as extracted that is checked as it is read.
+//! as extracted that is checked as it is read (SHA-1, MD5, SHA-256, SHA-512). A file with no such checksum or another
+//! kind, and a table of contents whose header names none (algorithm 0) or an unknown one, are read unchecked:
+//! xar gives nothing else to check them by. Files may not share heap ranges, so no data is decoded twice.
 //!
 //! The table of contents is read by a small XML reader bounded in size and nesting, which expands no entity but
 //! the five XML defines and character references, and refuses a document type declaration.
@@ -60,6 +62,7 @@ enum Digest {
     Sha1(Vec<u8>),
     Md5(Vec<u8>),
     Sha256(Vec<u8>),
+    Sha512(Vec<u8>),
 }
 
 /// One file of the table of contents.
@@ -68,12 +71,16 @@ struct Entry {
     id: Option<String>,
     /// the <file> this one sits in, which comes before it
     parent: Option<usize>,
+    /// its own name; the full path is built only as the file is handed out, from its folders' names
     path: String,
     raw_path: Option<Vec<u8>>,
     kind: Option<String>,
     /// the `link` attribute of `type`: "original" for a hard link's first name, else the id it links to
     hard: Option<String>,
+    /// a symbolic link's target
     target: Option<String>,
+    /// a hard link's file (chains followed to the file that holds the data), or why there is none
+    link_to: Option<std::result::Result<usize, String>>,
     mode: Option<u32>,
     uid: Option<u64>,
     gid: Option<u64>,
@@ -91,7 +98,9 @@ pub(super) struct State {
     file: File,
     heap: u64,
     len: u64,
-    entries: VecDeque<Entry>,
+    entries: Vec<Entry>,
+    /// the order to hand them out in: the table's, with hard links moved after the file they link to
+    order: VecDeque<usize>,
 }
 
 /// Reads the header and table of contents of the xar archive at `file`, `len` bytes long.
@@ -126,7 +135,7 @@ pub(super) fn open(mut file: File, len: u64) -> Result<State> {
     if toc.len() as u64 != toc_size {
         return Err(corrupt("a xar table of contents has the wrong size"));
     }
-    let (entries, toc_sum, toc_style) = parse_toc(&toc)?;
+    let (entries, order, toc_sum, toc_style) = parse_toc(&toc)?;
     // algorithm 3 is "other": named after the header, or only in the TOC's own <checksum style="...">
     if alg == 3 && alg_name.is_empty() {
         alg_name = toc_style.unwrap_or_default();
@@ -137,6 +146,7 @@ pub(super) fn open(mut file: File, len: u64) -> Result<State> {
             (1, _) => Some(Digest::Sha1(Vec::new())),
             (2, _) => Some(Digest::Md5(Vec::new())),
             (3, "sha256") => Some(Digest::Sha256(Vec::new())),
+            (3, "sha512") => Some(Digest::Sha512(Vec::new())),
             _ => None,
         };
         if let Some(kind) = digest {
@@ -154,7 +164,7 @@ pub(super) fn open(mut file: File, len: u64) -> Result<State> {
             }
         }
     }
-    Ok(State { file, heap, len, entries: entries.into() })
+    Ok(State { file, heap, len, entries, order: order.into() })
 }
 
 fn read_at(file: &mut File, at: u64, buf: &mut [u8]) -> Result<()> {
@@ -168,6 +178,7 @@ enum Hasher {
     Sha1(crate::crypto::Sha1Digest),
     Md5(crate::crypto::Md5),
     Sha256(crate::crypto::Sha256),
+    Sha512(crate::crypto::Sha512),
 }
 
 impl Hasher {
@@ -176,6 +187,7 @@ impl Hasher {
             Digest::Sha1(_) => Hasher::Sha1(crate::crypto::Sha1Digest::new()),
             Digest::Md5(_) => Hasher::Md5(crate::crypto::Md5::new()),
             Digest::Sha256(_) => Hasher::Sha256(crate::crypto::Sha256::new()),
+            Digest::Sha512(_) => Hasher::Sha512(crate::crypto::Sha512::new()),
         }
     }
 
@@ -184,6 +196,7 @@ impl Hasher {
             Hasher::Sha1(h) => h.update(data),
             Hasher::Md5(h) => h.update(data),
             Hasher::Sha256(h) => h.update(data),
+            Hasher::Sha512(h) => h.update(data),
         }
     }
 
@@ -192,6 +205,7 @@ impl Hasher {
             Hasher::Sha1(h) => h.finalize().to_vec(),
             Hasher::Md5(h) => h.finalize().to_vec(),
             Hasher::Sha256(h) => h.finalize().to_vec(),
+            Hasher::Sha512(h) => h.finalize().to_vec(),
         }
     }
 }
@@ -270,8 +284,46 @@ impl Read for Data {
 
 impl State {
     /// The next file as a member, and a reader of its data when it has any.
+    /// The full path of file `i`: its folders' names and its own, joined.
+    fn path(&self, i: usize) -> Result<(String, Option<Vec<u8>>)> {
+        let mut chain = vec![i];
+        while let Some(p) = self.entries[*chain.last().expect("one")].parent {
+            chain.push(p);
+        }
+        let len: usize = chain.iter().map(|&j| self.entries[j].path.len() + 1).sum();
+        if len > MAX_PATH {
+            return Err(corrupt("a xar file's path is too long"));
+        }
+        let names: Vec<&Entry> = chain.iter().rev().map(|&j| &self.entries[j]).collect();
+        let path = names.iter().map(|e| e.path.as_str()).collect::<Vec<_>>().join("/");
+        // the stored bytes, kept when some name isn't UTF-8
+        let raw = names.iter().any(|e| e.raw_path.is_some()).then(|| {
+            let parts: Vec<&[u8]> = names.iter().map(|e| e.raw_path.as_deref().unwrap_or(e.path.as_bytes())).collect();
+            parts.join(&b'/')
+        });
+        Ok((path, raw))
+    }
+
     pub(super) fn next(&mut self) -> Result<Option<(Member, Option<Data>)>> {
-        let Some(e) = self.entries.pop_front() else { return Ok(None) };
+        let Some(i) = self.order.pop_front() else { return Ok(None) };
+        let (path, raw_path) = self.path(i)?;
+        let link_target = match self.entries[i].link_to.take() {
+            Some(Ok(t)) => Some(self.path(t)?.0),
+            // a link that leads nowhere fails as a link to a file this run didn't extract
+            Some(Err(why)) => Some(why),
+            None => None,
+        };
+        // what the file says beyond its name and folder is needed once, here
+        let e = std::mem::take(&mut self.entries[i]);
+        self.entries[i].path = e.path.clone();
+        self.entries[i].raw_path = e.raw_path.clone();
+        self.entries[i].parent = e.parent;
+        let mut e = e;
+        e.path = path;
+        e.raw_path = raw_path;
+        if link_target.is_some() {
+            e.target = link_target;
+        }
         let kind = match (e.kind.as_deref(), e.hard.as_deref()) {
             (Some("directory"), _) => Kind::Dir,
             (Some("symlink"), _) => Kind::Symlink,
@@ -310,7 +362,7 @@ impl State {
             };
             let hasher = e.digest.as_ref().map(|d| {
                 let want = match d {
-                    Digest::Sha1(w) | Digest::Md5(w) | Digest::Sha256(w) => w.clone(),
+                    Digest::Sha1(w) | Digest::Md5(w) | Digest::Sha256(w) | Digest::Sha512(w) => w.clone(),
                 };
                 (Hasher::of(d), want)
             });
@@ -414,10 +466,11 @@ fn hex(text: &str) -> Option<Vec<u8>> {
     (0..t.len()).step_by(2).map(|i| u8::from_str_radix(t.get(i..i + 2)?, 16).ok()).collect()
 }
 
-/// The files of a table of contents, in its order (each folder before what is in it), with their full paths and
-/// hard links resolved to paths; and where the table's own checksum is kept in the heap.
+/// The files of a table of contents with their own names and folders, the order to hand them out in (each folder
+/// before what is in it, each hard link after its file), where the table's own checksum is kept in the heap, and
+/// the style it names.
 #[allow(clippy::type_complexity)]
-fn parse_toc(toc: &[u8]) -> Result<(Vec<Entry>, Option<(u64, u64)>, Option<String>)> {
+fn parse_toc(toc: &[u8]) -> Result<(Vec<Entry>, Vec<usize>, Option<(u64, u64)>, Option<String>)> {
     let mut xml = xml::Reader::new(toc);
     // the open elements' names; for each open <file>, its index in `entries`
     let mut stack: Vec<String> = Vec::new();
@@ -545,10 +598,11 @@ fn parse_toc(toc: &[u8]) -> Result<(Vec<Entry>, Option<(u64, u64)>, Option<Strin
                             Some("sha1") if digest.len() == 20 => Some(Digest::Sha1(digest)),
                             Some("md5") if digest.len() == 16 => Some(Digest::Md5(digest)),
                             Some("sha256") if digest.len() == 32 => Some(Digest::Sha256(digest)),
-                            Some("sha1" | "md5" | "sha256") => {
+                            Some("sha512") if digest.len() == 64 => Some(Digest::Sha512(digest)),
+                            Some("sha1" | "md5" | "sha256" | "sha512") => {
                                 return Err(corrupt("a xar file's checksum has the wrong length"));
                             }
-                            // other digests (sha512, ...) are not checked
+                            // other digests (sha224, sha384, ...) are not checked
                             _ => None,
                         };
                     }
@@ -560,51 +614,64 @@ fn parse_toc(toc: &[u8]) -> Result<(Vec<Entry>, Option<(u64, u64)>, Option<Strin
     if !stack.is_empty() {
         return Err(corrupt("a xar table of contents is cut short"));
     }
-    // full paths: each file's parent is the <file> it sits in, which comes before it
-    for i in 0..entries.len() {
-        if let Some(p) = entries[i].parent {
-            if entries[p].path.len() + entries[i].path.len() >= MAX_PATH {
-                return Err(corrupt("a xar file's path is too long"));
-            }
-            let full = format!("{}/{}", entries[p].path, entries[i].path);
-            entries[i].path = full;
-        }
-    }
     let by_id: HashMap<String, usize> =
         entries.iter().enumerate().filter_map(|(i, e)| Some((e.id.clone()?, i))).collect();
-    // a hard link may come before the file it links to (macOS xar does that): it moves to just after it
+    let link_id = |e: &Entry| -> Option<String> {
+        (e.kind.as_deref() == Some("hardlink")).then(|| e.hard.clone()).flatten().filter(|h| h != "original")
+    };
+    // a hard link names another file's id, which may be a link itself: the chain is followed to the file that
+    // holds the data, and the link moves to just after it (macOS xar can list a link before its original)
     let mut after: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut deferred = vec![false; entries.len()];
     for i in 0..entries.len() {
-        if entries[i].kind.as_deref() == Some("hardlink")
-            && let Some(&t) = entries[i].hard.as_deref().filter(|h| *h != "original").and_then(|id| by_id.get(id))
+        let Some(mut id) = link_id(&entries[i]) else { continue };
+        let mut hops = 0;
+        let resolved = loop {
+            let Some(&t) = by_id.get(&id) else { break Err(format!("xar file id {id}")) };
+            match link_id(&entries[t]) {
+                Some(next) if hops < 64 && t != i => {
+                    id = next;
+                    hops += 1;
+                }
+                Some(_) => break Err(format!("xar file id {id}")),
+                None => break Ok(t),
+            }
+        };
+        if let Ok(t) = resolved
+            && t > i
         {
-            entries[i].target = Some(entries[t].path.clone());
-            if t > i {
-                after.entry(t).or_default().push(i);
-                deferred[i] = true;
-            }
+            after.entry(t).or_default().push(i);
+            deferred[i] = true;
         }
+        entries[i].link_to = Some(resolved);
     }
-    if !after.is_empty() {
-        let mut slots: Vec<Option<Entry>> = entries.into_iter().map(Some).collect();
-        let mut ordered = Vec::with_capacity(slots.len());
-        for i in 0..slots.len() {
-            if deferred[i] {
-                continue;
-            }
-            ordered.extend(slots[i].take());
-            for &j in after.get(&i).map(Vec::as_slice).unwrap_or(&[]) {
-                ordered.extend(slots[j].take());
-            }
+    let mut order = Vec::with_capacity(entries.len());
+    for (i, &moved) in deferred.iter().enumerate() {
+        if moved {
+            continue;
         }
-        entries = ordered;
+        order.push(i);
+        order.extend(after.get(&i).map(Vec::as_slice).unwrap_or(&[]));
+    }
+    // each file's data has a heap range of its own: files sharing one would decode the same bytes over and over
+    let mut ranges: Vec<(u64, u64)> = entries
+        .iter()
+        .filter(|e| link_id(e).is_none() && matches!(e.kind.as_deref(), Some("file" | "hardlink") | None))
+        .filter_map(|e| e.data)
+        .filter(|&(_, length, _)| length > 0)
+        .map(|(offset, length, _)| (offset, length))
+        .collect();
+    ranges.sort_unstable();
+    for w in ranges.windows(2) {
+        if w[0].0.checked_add(w[0].1).is_none_or(|end| end > w[1].0) {
+            return Err(corrupt("xar files share heap data"));
+        }
     }
     let toc_sum = match toc_sum {
         (Some(o), Some(s)) => Some((o, s)),
         _ => None,
     };
-    Ok((entries, toc_sum, toc_style))
+    Ok((entries, order, toc_sum, toc_style))
 }
 
 /// A small XML reader for xar's table of contents: elements, attributes, text and CDATA, the five predefined
@@ -778,6 +845,32 @@ mod tests {
         assert!(read("<!DOCTYPE a [<!ENTITY e \"boom\">]><a>&e;</a>").is_err());
         assert!(read("<a>&e;</a>").is_err());
         assert!(read("<a b=c></a>").is_err());
+    }
+
+    /// A folder with a 60,000-byte name and thousands of files in it: each name is kept once, and a full path is
+    /// built only as its file is handed out, so the table costs what it holds, not names times files.
+    #[test]
+    fn paths_are_built_one_at_a_time() {
+        let long = "n".repeat(60_000);
+        let mut toc = format!("<xar><toc><file id=\"0\"><name>{long}</name><type>directory</type>");
+        let n = 5_000;
+        for i in 0..n {
+            toc.push_str(&format!("<file id=\"{}\"><name>c{i}</name><type>file</type></file>", i + 1));
+        }
+        toc.push_str("</file></toc></xar>");
+        let (entries, order, _, _) = parse_toc(toc.as_bytes()).unwrap();
+        let kept: usize = entries.iter().map(|e| e.path.len()).sum();
+        assert!(kept < 60_000 + 10 * n, "{kept} bytes of names kept");
+        let file = tempfile::tempfile().unwrap();
+        let mut state = State { file, heap: 0, len: 0, entries, order: order.into() };
+        let mut count = 0;
+        while let Some((m, _)) = state.next().unwrap() {
+            if count > 0 {
+                assert!(m.name.starts_with(&long) && m.name.len() < 60_010);
+            }
+            count += 1;
+        }
+        assert_eq!(count, n + 1);
     }
 
     #[test]
