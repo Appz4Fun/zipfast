@@ -28,6 +28,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read};
 
+use super::table::{self, Names};
 use super::{Kind, Member, TarMagic, TarMetadata};
 use crate::error::{Error, Result};
 
@@ -37,8 +38,6 @@ const MAX_TOC: u64 = 64 << 20;
 const MAX_DEPTH: usize = 256;
 /// The most files a table of contents may list (each takes a few hundred bytes while the archive is read).
 const MAX_FILES: usize = 1 << 18;
-/// The longest full path a file may have, its folders' names included.
-const MAX_PATH: usize = 64 << 10;
 const MAX_TEXT: usize = 1 << 20;
 
 pub(super) const MAGIC: &[u8; 4] = b"xar!";
@@ -99,6 +98,8 @@ pub(super) struct State {
     heap: u64,
     len: u64,
     entries: Vec<Entry>,
+    /// every file's own name and folder, its full path built only as it is handed out
+    names: Names,
     /// the order to hand them out in: the table's, with hard links moved after the file they link to
     order: VecDeque<usize>,
 }
@@ -135,7 +136,7 @@ pub(super) fn open(mut file: File, len: u64) -> Result<State> {
     if toc.len() as u64 != toc_size {
         return Err(corrupt("a xar table of contents has the wrong size"));
     }
-    let (entries, order, toc_sum, toc_style) = parse_toc(&toc)?;
+    let (mut entries, order, toc_sum, toc_style) = parse_toc(&toc)?;
     // algorithm 3 is "other": named after the header, or only in the TOC's own <checksum style="...">
     if alg == 3 && alg_name.is_empty() {
         alg_name = toc_style.unwrap_or_default();
@@ -164,7 +165,11 @@ pub(super) fn open(mut file: File, len: u64) -> Result<State> {
             }
         }
     }
-    Ok(State { file, heap, len, entries, order: order.into() })
+    let mut names = Names::default();
+    for e in &mut entries {
+        names.push(std::mem::take(&mut e.path), e.raw_path.take(), e.parent);
+    }
+    Ok(State { file, heap, len, entries, names, order: order.into() })
 }
 
 fn read_at(file: &mut File, at: u64, buf: &mut [u8]) -> Result<()> {
@@ -284,27 +289,11 @@ impl Read for Data {
 
 impl State {
     /// The next file as a member, and a reader of its data when it has any.
-    /// The full path of file `i`: its folders' names and its own, joined.
     fn path(&self, i: usize) -> Result<(String, Option<Vec<u8>>)> {
-        let mut chain = vec![i];
-        while let Some(p) = self.entries[*chain.last().expect("one")].parent {
-            chain.push(p);
-        }
-        let len: usize = chain.iter().map(|&j| self.entries[j].path.len() + 1).sum();
-        if len > MAX_PATH {
-            return Err(corrupt("a xar file's path is too long"));
-        }
-        let names: Vec<&Entry> = chain.iter().rev().map(|&j| &self.entries[j]).collect();
-        let path = names.iter().map(|e| e.path.as_str()).collect::<Vec<_>>().join("/");
-        // the stored bytes, kept when some name isn't UTF-8
-        let raw = names.iter().any(|e| e.raw_path.is_some()).then(|| {
-            let parts: Vec<&[u8]> = names.iter().map(|e| e.raw_path.as_deref().unwrap_or(e.path.as_bytes())).collect();
-            parts.join(&b'/')
-        });
-        Ok((path, raw))
+        self.names.path(i, "a xar file's path is too long")
     }
 
-    pub(super) fn next(&mut self) -> Result<Option<(Member, Option<Data>)>> {
+    fn next_entry(&mut self) -> Result<Option<(Member, Option<Data>)>> {
         let Some(i) = self.order.pop_front() else { return Ok(None) };
         let (path, raw_path) = self.path(i)?;
         let link_target = match self.entries[i].link_to.take() {
@@ -314,11 +303,7 @@ impl State {
             None => None,
         };
         // what the file says beyond its name and folder is needed once, here
-        let e = std::mem::take(&mut self.entries[i]);
-        self.entries[i].path = e.path.clone();
-        self.entries[i].raw_path = e.raw_path.clone();
-        self.entries[i].parent = e.parent;
-        let mut e = e;
+        let mut e = std::mem::take(&mut self.entries[i]);
         e.path = path;
         e.raw_path = raw_path;
         if link_target.is_some() {
@@ -661,12 +646,7 @@ fn parse_toc(toc: &[u8]) -> Result<(Vec<Entry>, Vec<usize>, Option<(u64, u64)>, 
         .filter(|&(_, length, _)| length > 0)
         .map(|(offset, length, _)| (offset, length))
         .collect();
-    ranges.sort_unstable();
-    for w in ranges.windows(2) {
-        if w[0].0.checked_add(w[0].1).is_none_or(|end| end > w[1].0) {
-            return Err(corrupt("xar files share heap data"));
-        }
-    }
+    table::disjoint(&mut ranges, "xar files share heap data")?;
     let toc_sum = match toc_sum {
         (Some(o), Some(s)) => Some((o, s)),
         _ => None,
@@ -817,6 +797,18 @@ mod xml {
     }
 }
 
+impl super::MemberData for Data {
+    fn fault(&mut self) -> Option<&'static str> {
+        self.fault.take()
+    }
+}
+
+impl super::RandomAccess for State {
+    fn next(&mut self) -> Result<Option<super::RandomMember>> {
+        Ok(self.next_entry()?.map(|(m, d)| (m, d.map(|d| Box::new(d) as Box<dyn super::MemberData>))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,13 +850,16 @@ mod tests {
             toc.push_str(&format!("<file id=\"{}\"><name>c{i}</name><type>file</type></file>", i + 1));
         }
         toc.push_str("</file></toc></xar>");
-        let (entries, order, _, _) = parse_toc(toc.as_bytes()).unwrap();
-        let kept: usize = entries.iter().map(|e| e.path.len()).sum();
-        assert!(kept < 60_000 + 10 * n, "{kept} bytes of names kept");
+        let (mut entries, order, _, _) = parse_toc(toc.as_bytes()).unwrap();
+        let mut names = Names::default();
+        for e in &mut entries {
+            names.push(std::mem::take(&mut e.path), e.raw_path.take(), e.parent);
+        }
+        assert!(names.bytes() < 60_000 + 10 * n, "{} bytes of names kept", names.bytes());
         let file = tempfile::tempfile().unwrap();
-        let mut state = State { file, heap: 0, len: 0, entries, order: order.into() };
+        let mut state = State { file, heap: 0, len: 0, entries, names, order: order.into() };
         let mut count = 0;
-        while let Some((m, _)) = state.next().unwrap() {
+        while let Some((m, _)) = state.next_entry().unwrap() {
             if count > 0 {
                 assert!(m.name.starts_with(&long) && m.name.len() < 60_010);
             }

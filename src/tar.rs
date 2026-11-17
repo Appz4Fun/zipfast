@@ -35,7 +35,23 @@ use crate::rar5::Redirection;
 use crate::stream::{self, Codec};
 
 mod cpio;
+mod table;
 mod xar;
+
+/// A member's data read from its own place in the file (xar, ISO 9660), not from the archive's stream.
+trait MemberData: Read {
+    /// Why the last read failed, when it was the data's own fault (a checksum, a size).
+    fn fault(&mut self) -> Option<&'static str>;
+}
+
+/// An archive whose members are found by a table read first (xar's TOC, an ISO 9660 image's folders), each with
+/// its data where the table puts it.
+trait RandomAccess {
+    fn next(&mut self) -> Result<Option<RandomMember>>;
+}
+
+/// A member of a [`RandomAccess`] archive, and a reader of its data when it has any.
+type RandomMember = (Member, Option<Box<dyn MemberData>>);
 
 const BLOCK: usize = 512;
 /// Bytes moved per read.
@@ -701,9 +717,9 @@ struct Reader {
     cpio: Option<Box<cpio::State>>,
     /// the checksum of the current member's data, in a newc archive with checksums
     crc: Option<CpioCrc>,
-    /// set when the archive is xar: its files, and the current one's data
-    xar: Option<Box<xar::State>>,
-    member_data: Option<xar::Data>,
+    /// set when the archive is read from a table (xar): its members, and the current one's data
+    random: Option<Box<dyn RandomAccess>>,
+    member_data: Option<Box<dyn MemberData>>,
 }
 
 /// A newc `070702` member's checksum: the sum of its data bytes, checked as the last of them is read.
@@ -725,13 +741,13 @@ impl Reader {
         let n = src.read(&mut first)?;
         first.truncate(n);
         let mut cpio = None;
-        let mut xar = None;
+        let mut random: Option<Box<dyn RandomAccess>> = None;
         let plain = matches!(src, Source::Plain { .. });
         let mut content = if n == BLOCK && checksum_ok(&first) {
             Some(Content::Tar)
         } else if plain && sniff_xar(&first) {
             // xar data is read where the table of contents puts it, from the file itself
-            xar = Some(Box::new(xar::open(File::open(path)?, std::fs::metadata(path)?.len())?));
+            random = Some(Box::new(xar::open(File::open(path)?, std::fs::metadata(path)?.len())?));
             first.clear();
             Some(Content::Tar)
         } else if let Some(format) = cpio::sniff(&first) {
@@ -744,7 +760,7 @@ impl Reader {
         } else {
             None
         };
-        if n == BLOCK && cpio.is_none() && xar.is_none() && zero(&first) {
+        if n == BLOCK && cpio.is_none() && random.is_none() && zero(&first) {
             // an empty archive is zero blocks and nothing else; a compressed file that only starts with zeros is
             // a file
             first.resize(EMPTY_MAX + 1, 0);
@@ -768,7 +784,7 @@ impl Reader {
             scratch: vec![0; 64 << 10],
             cpio,
             crc: None,
-            xar,
+            random,
             member_data: None,
         })
     }
@@ -808,7 +824,7 @@ impl Reader {
         if self.cpio.is_some() {
             return self.next_cpio();
         }
-        if let Some(state) = &mut self.xar {
+        if let Some(state) = &mut self.random {
             self.member_data = None;
             let Some((member, data)) = state.next()? else { return Ok(None) };
             self.member_data = data;
@@ -1095,7 +1111,7 @@ impl Reader {
             let got = match &mut self.member_data {
                 Some(data) => match read_full(data, &mut buf[..want]) {
                     Ok(n) => n,
-                    Err(e) => return Err(data.fault.take().map_or_else(|| read_error(e), Error::Corrupt)),
+                    Err(e) => return Err(data.fault().map_or_else(|| read_error(e), Error::Corrupt)),
                 },
                 None => {
                     let got = self.src.read(&mut buf[..want])?;
