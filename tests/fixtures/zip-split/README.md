@@ -1,7 +1,8 @@
 # Real Info-ZIP split sets
 
 Split (spanned) ZIP sets written by Info-ZIP, used by `tests/member_map_zip_split.rs` as ground truth for split ZIP
-member maps.
+member maps, and by `tests/zip_split_extract.rs`, whose expected listings and contents are 7-Zip 26.06's
+(`7z l -slt`, `7z x -ppassword`).
 
 Writer: `zip -v` reports "This is Zip 3.0 (July 5th 2008), by Info-ZIP, with modifications by Apple Inc."
 (`/usr/bin/zip` on macOS).

@@ -1026,6 +1026,10 @@ enum Format {
 const HEAD_PROBE_BYTES: usize = 1024;
 
 fn sniff(path: &Path) -> Result<Format> {
+    // a spanned set's `.zip` (or `.z01`) starts where the disk before it stopped, often mid-member
+    if crate::zip::is_spanned(path) {
+        return Ok(Format::Zip);
+    }
     let mut head = [0u8; HEAD_PROBE_BYTES];
     let n = crate::tar::read_full(&mut File::open(path)?, &mut head)?;
     Ok(classify_head(&head[..n]))
@@ -1055,7 +1059,8 @@ pub(crate) enum CheckedRoute {
 pub(crate) enum LegacyRoute {
     Tar,
     SevenZip,
-    /// A raw byte-split ZIP (`name.zip.001`, `name.zip.002`, ...), read as the pieces concatenated.
+    /// A raw byte-split ZIP (`name.zip.001`, `name.zip.002`, ...) or an Info-ZIP spanned set (`name.z01`, ...,
+    /// `name.zip`), read as the pieces concatenated.
     SplitZip,
     Rar {
         signature: crate::rar5::reader::HeldSignature,
@@ -1065,6 +1070,11 @@ pub(crate) enum LegacyRoute {
 #[allow(clippy::result_large_err)]
 pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::ZipReadResult<CheckedRoute> {
     let (opened, head) = crate::zip::read::CheckedOpen::open(path, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
+    // A spanned set's `.zip` starts mid-member, whatever its head says: it reopens its volumes by path.
+    if crate::zip::is_spanned(path) {
+        opened.retire()?;
+        return Ok(CheckedRoute::Legacy(LegacyRoute::SplitZip));
+    }
     match classify_head(&head) {
         Format::Zip if crate::zip::is_byte_split(path) => {
             // The checked reader holds one source file; a byte-split set reopens its pieces by path.
@@ -1118,6 +1128,9 @@ impl LegacyRoute {
             }
             Self::SplitZip => {
                 cancel.check_io().map_err(Error::from)?;
+                if options.mode == Mode::Extract {
+                    fs::create_dir_all(&options.dest).map_err(Error::from)?;
+                }
                 crate::zip::run_renaming(first, options, password, |line: &str| report.line(line))
             }
             Self::Rar { signature, .. } => {
@@ -1421,7 +1434,7 @@ impl SelectedEntry {
             }
             CheckedRoute::Legacy(LegacyRoute::SplitZip) => {
                 return Err(ReadFault::Legacy(Error::Unsupported(
-                    "reading one entry of a byte-split ZIP on its own".into(),
+                    "reading one entry of a split ZIP on its own".into(),
                 ))
                 .into());
             }
@@ -1760,7 +1773,7 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
     let mut source = InspectionSource::open(first, cancel)?;
     let mut head = [0; HEAD_PROBE_BYTES];
     let n = source.read_probe(&mut head, cancel)?;
-    let format = classify_head(&head[..n]);
+    let format = if crate::zip::is_spanned(first) { Format::Zip } else { classify_head(&head[..n]) };
     cancel.check_io().map_err(Error::from)?;
     let entries = match format {
         // A byte-split set (`.zip.001`) has no single source for a ZIP read session: list it as a whole.

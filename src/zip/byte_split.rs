@@ -75,8 +75,46 @@ impl ByteSplit {
         Ok(Some(Self { volumes, open: None, missing, len, pos: 0 }))
     }
 
+    /// The volumes `paths` read as one file, in order: the disks of an Info-ZIP spanned set ([`super::spanned`]). An
+    /// absent volume stands in as a hole of `nominal` bytes (the set's split size), so the disks after it keep
+    /// consistent offsets; reading the hole fails, naming the volume. [`Self::holes`] says where they are.
+    pub(crate) fn from_volumes(paths: Vec<PathBuf>, nominal: u64) -> crate::error::Result<Self> {
+        let mut volumes = Vec::with_capacity(paths.len());
+        let mut missing = None;
+        let mut len = 0u64;
+        for path in paths {
+            let size = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    missing.get_or_insert_with(|| path.clone());
+                    nominal
+                }
+                Err(e) => return Err(e.into()),
+            };
+            volumes.push((path, len));
+            len = len.checked_add(size).ok_or_else(|| io::Error::other("split archive size overflows"))?;
+        }
+        Ok(Self { volumes, open: None, missing, len, pos: 0 })
+    }
+
+    /// The ranges of the volumes that are absent.
+    pub(crate) fn holes(&self) -> Vec<std::ops::Range<u64>> {
+        let ends = self.volumes.iter().skip(1).map(|(_, start)| *start).chain([self.len]);
+        self.volumes
+            .iter()
+            .zip(ends)
+            .filter(|((path, _), _)| !path.is_file())
+            .map(|((_, start), end)| *start..end)
+            .collect()
+    }
+
     pub(crate) fn len(&self) -> u64 {
         self.len
+    }
+
+    /// The offset each volume starts at.
+    pub(crate) fn starts(&self) -> impl Iterator<Item = u64> + '_ {
+        self.volumes.iter().map(|(_, start)| *start)
     }
 
     /// The first absent piece of a set with a gap.
@@ -192,7 +230,7 @@ impl Seek for ArchiveSource {
     }
 }
 
-/// The members whose local headers lie before `len`, walking from offset 0, for a set cut short by a missing piece
+/// The members whose local headers lie before `len`, walking from `start` (0, or past a spanned set's marker), for a set cut short by a missing piece
 /// (no central directory to read): as 7-Zip lists such a set. A member whose sizes are only in a data descriptor
 /// (flag bit 3) is passed over by finding its signed descriptor, as 7-Zip's FindDescriptor does: the first
 /// `PK\x07\x08` whose compressed size equals the distance scanned (the ZIP64 form when the local header has ZIP64 sizes). The walk stops
@@ -200,13 +238,14 @@ impl Seek for ArchiveSource {
 /// gets the bytes left as its packed size and 0 as its size. Each byte is scanned at most once, so crafted input stays linear.
 pub(crate) fn scan_local_headers(
     source: &mut (impl Read + Seek),
+    start: u64,
     len: u64,
 ) -> crate::error::Result<(Vec<super::ZipEntry>, bool)> {
     use zip_container::{LOCAL_HEADER_LEN, LocalHeader};
     let mut entries = Vec::new();
     // The last entry is a streamed member whose descriptor lies past the end: its size is unknown.
     let mut size_unknown = false;
-    let mut at = 0u64;
+    let mut at = start;
     while at + LOCAL_HEADER_LEN as u64 <= len && entries.len() < 1_000_000 {
         let mut head = [0u8; LOCAL_HEADER_LEN];
         source.seek(SeekFrom::Start(at))?;
