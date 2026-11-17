@@ -289,6 +289,40 @@ struct Member {
 
 /// Most pax records kept for a listing per member.
 const MAX_PAX_RECORDS: usize = 256;
+/// Bytes of pax records and raw headers kept across a whole listing.
+const META_BUDGET: usize = 64 << 20;
+
+/// The listing-wide budget for [`TarMetadata::pax_records`] and [`TarMetadata::header`]: past it, members keep
+/// neither.
+struct MetaBudget {
+    left: usize,
+    /// Whether the last [`Self::take`] kept its records.
+    kept: bool,
+}
+
+impl MetaBudget {
+    fn new() -> Self {
+        Self { left: META_BUDGET, kept: true }
+    }
+
+    /// Charges a member's records; false (and nothing charged) when they don't fit. No records always fit.
+    fn take(&mut self, records: &[(String, Vec<u8>)]) -> bool {
+        let cost: usize = records.iter().map(|(k, v)| k.len() + v.len() + 2 * std::mem::size_of::<Vec<u8>>()).sum();
+        self.kept = cost <= self.left;
+        if self.kept {
+            self.left -= cost;
+        }
+        self.kept
+    }
+
+    fn take_header(&mut self) -> bool {
+        let fits = self.left >= BLOCK;
+        if fits {
+            self.left -= BLOCK;
+        }
+        fits
+    }
+}
 
 /// Which header layout a tar member uses, from its magic field (bytes 257..265).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -335,10 +369,13 @@ pub struct TarMetadata {
     pub device_minor: Option<u64>,
     /// The name field of the member's own pax extended header (`PaxHeader/name`), when it has one.
     pub pax_header_name: Option<String>,
-    /// The member's own pax records (not global ones) in order, as key and raw value; at most 256 are kept.
+    /// The member's own pax records (not global ones) in order, as key and raw value; at most 256 are kept per
+    /// member, and none once the listing's 64 MiB budget for records and headers is spent.
     pub pax_records: Vec<(String, Vec<u8>)>,
-    /// The member's header block exactly as stored.
-    pub header: Box<[u8; BLOCK]>,
+    /// The member had pax records that the listing's budget left out of `pax_records`.
+    pub pax_records_truncated: bool,
+    /// The member's header block exactly as stored; None once the listing's budget is spent.
+    pub header: Option<Box<[u8; BLOCK]>>,
 }
 
 impl Member {
@@ -384,10 +421,12 @@ struct Pax {
     mtime: Option<(i64, u32)>,
     atime: Option<(i64, u32)>,
     ctime: Option<(i64, u32)>,
-    uname: Option<String>,
-    gname: Option<String>,
-    uid: Option<u64>,
-    gid: Option<u64>,
+    /// Owner fields: None when no record set them, `Some(None)` when an empty record deleted them (the header's
+    /// field applies again, not a global record's).
+    uname: Option<Option<String>>,
+    gname: Option<Option<String>>,
+    uid: Option<Option<u64>>,
+    gid: Option<Option<u64>>,
     sparse: bool,
     /// Every record, in order, as stored.
     records: Vec<(String, Vec<u8>)>,
@@ -414,14 +453,20 @@ impl Pax {
             if self.records.len() < MAX_PAX_RECORDS {
                 self.records.push((name_of(key), value.to_vec()));
             }
-            let id = || std::str::from_utf8(value).ok().and_then(|s| s.parse().ok());
+            let id = || -> Result<Option<u64>> {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()).map(Some).ok_or_else(bad)
+            };
+            let owner = || (!value.is_empty()).then(|| name_of(value));
             match key {
                 b"atime" => self.atime = parse_time(value),
                 b"ctime" => self.ctime = parse_time(value),
-                b"uname" => self.uname = Some(name_of(value)),
-                b"gname" => self.gname = Some(name_of(value)),
-                b"uid" => self.uid = id(),
-                b"gid" => self.gid = id(),
+                b"uname" => self.uname = Some(owner()),
+                b"gname" => self.gname = Some(owner()),
+                b"uid" => self.uid = Some(id()?),
+                b"gid" => self.gid = Some(id()?),
                 b"path" => self.path = Some(name_of(value)),
                 b"linkpath" => self.linkpath = Some(name_of(value)),
                 b"size" => {
@@ -492,6 +537,8 @@ struct Reader {
     /// data and padding of the current member not read yet
     unread: u64,
     global: Pax,
+    /// What is left of the listing's budget for pax records and raw headers.
+    meta_budget: MetaBudget,
     scratch: Vec<u8>,
 }
 
@@ -527,7 +574,15 @@ impl Reader {
             }
         }
         let Some(content) = content else { return Err(Error::NotAnArchive) };
-        Ok(Reader { src, content, first: Some(first), unread: 0, global: Pax::default(), scratch: vec![0; 64 << 10] })
+        Ok(Reader {
+            src,
+            content,
+            first: Some(first),
+            unread: 0,
+            global: Pax::default(),
+            meta_budget: MetaBudget::new(),
+            scratch: vec![0; 64 << 10],
+        })
     }
 
     /// The next header block, or None at the end of the archive: a zero block, or the end of the data exactly at
@@ -670,15 +725,16 @@ impl Reader {
                 tar: Box::new(TarMetadata {
                     magic: TarMagic::of(&h),
                     typeflag: h[156],
-                    user: p.uname.clone().or_else(|| (h[257] != 0).then(|| name_of(text(&h[265..297])))),
-                    group: p.gname.clone().or_else(|| (h[257] != 0).then(|| name_of(text(&h[297..329])))),
-                    uid: p.uid.or_else(|| number(&h[108..116]).and_then(|v| u64::try_from(v).ok())),
-                    gid: p.gid.or_else(|| number(&h[116..124]).and_then(|v| u64::try_from(v).ok())),
+                    user: p.uname.clone().flatten().or_else(|| (h[257] != 0).then(|| name_of(text(&h[265..297])))),
+                    group: p.gname.clone().flatten().or_else(|| (h[257] != 0).then(|| name_of(text(&h[297..329])))),
+                    uid: p.uid.flatten().or_else(|| number(&h[108..116]).and_then(|v| u64::try_from(v).ok())),
+                    gid: p.gid.flatten().or_else(|| number(&h[116..124]).and_then(|v| u64::try_from(v).ok())),
                     device_major: number(&h[329..337]).and_then(|v| u64::try_from(v).ok()).filter(|_| h[257] != 0),
                     device_minor: number(&h[337..345]).and_then(|v| u64::try_from(v).ok()).filter(|_| h[257] != 0),
                     pax_header_name,
-                    pax_records: p.records,
-                    header: Box::new(h),
+                    pax_records_truncated: !self.meta_budget.take(&p.records),
+                    pax_records: if self.meta_budget.kept { p.records } else { Vec::new() },
+                    header: self.meta_budget.take_header().then(|| Box::new(h)),
                 }),
             }));
         }
@@ -1359,6 +1415,42 @@ mod tests {
         // a time whose borrowed second doesn't fit is dropped, not wrapped
         assert_eq!(parse_time(b"-9223372036854775808.1"), None);
         assert_eq!(parse_time(b"-9223372036854775808"), Some((i64::MIN, 0)));
+    }
+
+    fn record(k: &str, v: &str) -> String {
+        let body = format!(" {k}={v}\n");
+        let mut n = body.len() + 1;
+        while format!("{n}{body}").len() != n {
+            n += 1;
+        }
+        format!("{n}{body}")
+    }
+
+    #[test]
+    fn an_empty_owner_record_deletes_the_global_one() {
+        let mut global = Pax::default();
+        global.parse(format!("{}{}", record("uid", "7"), record("uname", "g")).as_bytes()).unwrap();
+        let mut local = Pax::default();
+        local.parse(format!("{}{}", record("uid", ""), record("uname", "")).as_bytes()).unwrap();
+        let p = local.over(&global);
+        // deleted: neither the global value nor anything else, so the header's field applies
+        assert_eq!((p.uid, p.uname), (Some(None), Some(None)));
+        let p = Pax::default().over(&global);
+        assert_eq!((p.uid, p.uname.clone()), (Some(Some(7)), Some(Some("g".to_string()))));
+        // an unreadable id is damage, not a reason to fall back
+        assert!(Pax::default().parse(record("gid", "x1").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn the_metadata_budget_spans_the_listing() {
+        let mut budget = MetaBudget { left: 3 * BLOCK, kept: true };
+        let big = vec![("comment".to_string(), vec![0; 2 * BLOCK])];
+        assert!(budget.take(&big));
+        assert!(!budget.take(&big), "a second member's records no longer fit");
+        assert!(budget.take(&[]));
+        assert!(!budget.take_header() || budget.left < BLOCK);
+        let mut spent = MetaBudget { left: BLOCK - 1, kept: true };
+        assert!(!spent.take_header());
     }
 
     #[test]
