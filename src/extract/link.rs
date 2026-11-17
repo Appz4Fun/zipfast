@@ -24,8 +24,9 @@
 //! link), so where it lands is known before the link exists. Past them the target only descends, through folders or
 //! through links that were each checked the same way, so no chain of links leads out either.
 
+use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// The longest target taken, in bytes (`PATH_MAX` less its NUL).
@@ -215,28 +216,55 @@ struct Landed {
 /// The records are bounded: past [`MAX_RECORDED`] bytes of paths a file is no longer recorded, so a hard link to
 /// it fails as one to a file this run didn't extract. An archive of a million files whose paths repeat long folder
 /// names can't make this run hold gigabytes of paths.
+///
+/// Both the records and an index of where each file landed are ordered by path, component by component, so the
+/// records at or below a path are one range of each: [`Extracted::replaced`] visits only what it removes, however
+/// many records there are and however many links are placed.
 #[derive(Default)]
 pub(crate) struct Extracted {
-    records: std::collections::HashMap<std::path::PathBuf, Option<Landed>>,
+    records: BTreeMap<PathBuf, Option<Landed>>,
+    /// where each extracted file landed, and the members that landed there
+    landed: BTreeMap<PathBuf, Vec<PathBuf>>,
     bytes: usize,
 }
 
 /// The most bytes of paths [`Extracted`] holds, as much as a listing may.
 pub(crate) const MAX_RECORDED: usize = 64 << 20;
 
-/// What one record takes against [`MAX_RECORDED`]: its paths and a little for the table.
+/// What one record takes against [`MAX_RECORDED`]: its paths (the member's twice when the index of where it
+/// landed holds it too) and a little for the tables.
 fn cost(rel: &Path, landed: &Option<Landed>) -> usize {
-    rel.as_os_str().len() + landed.as_ref().map_or(0, |l| l.rel.as_os_str().len()) + 64
+    rel.as_os_str().len() + landed.as_ref().map_or(0, |l| l.rel.as_os_str().len() + rel.as_os_str().len()) + 96
+}
+
+/// The keys of `map` at or below `prefix`: one range, as paths order component by component.
+fn at_or_below<'a, V>(map: &'a BTreeMap<PathBuf, V>, prefix: &'a Path) -> impl Iterator<Item = (&'a PathBuf, &'a V)> {
+    map.range::<Path, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
+        .take_while(move |(k, _)| k.starts_with(prefix))
 }
 
 impl Extracted {
-    fn record(&mut self, rel: &Path, landed: Option<Landed>) {
-        if let Some(old) = self.records.remove(rel) {
-            self.bytes -= cost(rel, &old);
+    fn forget(&mut self, rel: &Path) {
+        let Some(old) = self.records.remove(rel) else { return };
+        self.bytes -= cost(rel, &old);
+        if let Some(l) = old
+            && let Some(members) = self.landed.get_mut(&l.rel)
+        {
+            members.retain(|m| m != rel);
+            if members.is_empty() {
+                self.landed.remove(&l.rel);
+            }
         }
+    }
+
+    fn record(&mut self, rel: &Path, landed: Option<Landed>) {
+        self.forget(rel);
         let c = cost(rel, &landed);
         if self.bytes + c <= MAX_RECORDED {
             self.bytes += c;
+            if let Some(l) = &landed {
+                self.landed.entry(l.rel.clone()).or_default().push(rel.to_path_buf());
+            }
             self.records.insert(rel.to_path_buf(), landed);
         }
     }
@@ -250,11 +278,7 @@ impl Extracted {
         });
         match record {
             Some(record) => self.record(rel, Some(record)),
-            None => {
-                if let Some(old) = self.records.remove(rel) {
-                    self.bytes -= cost(rel, &old);
-                }
-            }
+            None => self.forget(rel),
         }
     }
 
@@ -266,15 +290,11 @@ impl Extracted {
     /// Something other than a file this run wrote is now at `rel`: every record at or below it goes, by member
     /// path or by where it landed.
     pub(crate) fn replaced(&mut self, rel: &Path) {
-        let mut freed = 0;
-        self.records.retain(|name, landed| {
-            let keep = !name.starts_with(rel) && landed.as_ref().is_none_or(|landed| !landed.rel.starts_with(rel));
-            if !keep {
-                freed += cost(name, landed);
-            }
-            keep
-        });
-        self.bytes -= freed;
+        let mut gone: Vec<PathBuf> = at_or_below(&self.records, rel).map(|(k, _)| k.clone()).collect();
+        gone.extend(at_or_below(&self.landed, rel).flat_map(|(_, members)| members.iter().cloned()));
+        for member in gone {
+            self.forget(&member);
+        }
     }
 
     pub(crate) fn contains(&self, rel: &Path) -> bool {
@@ -610,5 +630,47 @@ mod tests {
         assert_eq!(e.bytes, 0);
         e.tested(Path::new(&late));
         assert!(e.contains(Path::new(&late)));
+    }
+
+    fn landed_at(rel: &str) -> Option<Landed> {
+        Some(Landed { rel: PathBuf::from(rel), dev: 1, ino: 2 })
+    }
+
+    /// A replacement takes every record at or below its path, by member path or by where the file landed, and
+    /// nothing beside it ("a b" and "ab" are not below "a").
+    #[test]
+    fn a_replacement_takes_what_is_below_it_and_nothing_beside() {
+        let mut e = Extracted::default();
+        for name in ["a", "a/b", "a/b/c", "a b", "ab", "b"] {
+            e.tested(Path::new(name));
+        }
+        // "x" landed (a rename mode) at "a/renamed"
+        e.record(Path::new("x"), landed_at("a/renamed"));
+        e.record(Path::new("y"), landed_at("ab/y"));
+        e.replaced(Path::new("a"));
+        let left: Vec<&str> = e.records.keys().map(|k| k.to_str().unwrap()).collect();
+        assert_eq!(left, ["a b", "ab", "b", "y"]);
+        assert_eq!(e.landed.len(), 1);
+        e.replaced(Path::new(""));
+        assert!(e.records.is_empty() && e.landed.is_empty() && e.bytes == 0);
+    }
+
+    /// 100,000 files and as many links placed beside them: each replacement visits only what it removes, so the
+    /// run stays linear (a scan of every record per link was quadratic). A bound far above linear time.
+    #[test]
+    fn many_links_among_many_files_stay_linear() {
+        let mut e = Extracted::default();
+        let n = 100_000;
+        for i in 0..n {
+            e.record(Path::new(&format!("d{}/f{i}", i % 100)), landed_at(&format!("d{}/f{i}", i % 100)));
+        }
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            e.replaced(Path::new(&format!("d{}/link{i}", i % 100)));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+        assert_eq!(e.records.len(), n);
+        e.replaced(Path::new("d7"));
+        assert_eq!(e.records.len(), n - n / 100);
     }
 }
