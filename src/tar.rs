@@ -26,7 +26,8 @@ use crate::error::{Error, Result};
 use crate::extract::link::{self, Extracted, LinkKind};
 use crate::extract::{
     Cancellation, Checked, Entry, LegacyMember, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options,
-    Overwrite, Place, RenameLog, RunError, Summary, check_target, create_target, finish_dirs, finish_file, make_dirs,
+    Overwrite, Place, RenameLog, RunError, Summary, check_target, create_sparse_target, create_target, finish_dirs,
+    finish_file, make_dirs,
 };
 use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
@@ -42,6 +43,19 @@ const COMPRESSED_LIST_LIMIT: u64 = 8 << 30;
 /// The most zero bytes an empty archive is taken to be: GNU tar pads one to 10 KiB, other writers to whole
 /// records of up to this much.
 const EMPTY_MAX: usize = 1 << 20;
+/// The most pieces of data a sparse member's map may list. GNU tar starts a new map entry for every run of data,
+/// so a real file needs about one per extent; this is far beyond that but keeps a hostile map to a few MiB.
+const MAX_SPARSE_ENTRIES: usize = 1 << 18;
+/// The most bytes a sparse map stored outside the headers may take: pax 1.0's in the data area, padding included,
+/// or old GNU's extension blocks. A map in pax records is held to the records' own 1 MiB.
+const MAX_SPARSE_MAP_BYTES: u64 = 8 << 20;
+/// A sparse member may always make a file this long...
+const SPARSE_FREE_SIZE: u64 = 1 << 30;
+/// ...or this many times its stored data, whichever is more. A real sparse file (a VM image, a database) stores far
+/// more than a thousandth of itself; a few KiB claiming a TiB is a bomb, and on a file system without holes (HFS+,
+/// FAT, exFAT, or NTFS when the file can't be marked sparse) its holes would take real space. Such a member fails
+/// on its own, whatever the route, and the members after it are still read.
+const SPARSE_MAX_RATIO: u64 = 1024;
 
 /// Whether the file starts with a tar header: a block whose checksum adds up, or the two zero blocks that make an
 /// empty archive.
@@ -286,6 +300,74 @@ struct Member {
     atime: Option<(i64, u32)>,
     ctime: Option<(i64, u32)>,
     tar: Box<TarMetadata>,
+    /// A sparse member's map: `size` is then the stored data only, and the file is `real_size` bytes long.
+    sparse: Option<Box<SparseMap>>,
+}
+
+/// Where a sparse member's stored data goes in the file: every byte not in a piece is a hole (zeros).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SparseMap {
+    real_size: u64,
+    /// (offset, length) pieces, sorted and not overlapping, each inside `real_size`; their lengths add up to the
+    /// member's stored size
+    pieces: Vec<(u64, u64)>,
+}
+
+impl SparseMap {
+    /// Checks a map read from the archive against the file's size and the stored data's size.
+    fn checked(real_size: u64, pieces: Vec<(u64, u64)>, stored: u64) -> Result<Box<SparseMap>> {
+        let bad = |why| Err(Error::Corrupt(why));
+        if pieces.len() > MAX_SPARSE_ENTRIES {
+            return bad("a sparse map has too many entries");
+        }
+        let (mut end, mut total) = (0u64, 0u64);
+        for &(offset, len) in &pieces {
+            if offset < end {
+                return bad("a sparse map's entries are out of order or overlap");
+            }
+            end = match offset.checked_add(len) {
+                Some(e) if e <= real_size => e,
+                _ => return bad("a sparse map's entry lies past the end of the file"),
+            };
+            total += len;
+        }
+        if total != stored {
+            return bad("a sparse map's entries don't add up to the stored data");
+        }
+        Ok(Box::new(SparseMap { real_size, pieces }))
+    }
+}
+
+/// A piece of a member's data on its way out: bytes, or a run of zeros left as a hole where the file system can.
+enum Piece<'a> {
+    Data(&'a [u8]),
+    Hole(u64),
+}
+
+/// The GNU sparse records of a member's own pax header, in whichever of the 0.0, 0.1 and 1.0 forms it uses.
+#[derive(Clone, Debug, Default)]
+struct SparsePax {
+    major: Option<u64>,
+    minor: Option<u64>,
+    /// `GNU.sparse.name`: the member's real name (its header holds a made-up `GNUSparseFile.<pid>/` one)
+    name: Option<String>,
+    /// `GNU.sparse.realsize` (1.0) or `GNU.sparse.size` (0.x)
+    real_size: Option<u64>,
+    /// `GNU.sparse.map` (0.1): "offset,length,offset,length,..."
+    map: Option<Vec<u8>>,
+    /// `GNU.sparse.offset` and `GNU.sparse.numbytes` records in turn (0.0)
+    pairs: Vec<(u64, Option<u64>)>,
+}
+
+/// Sets a sparse record's value, which a second record may repeat but not change.
+fn once<T: PartialEq>(slot: &mut Option<T>, value: T) -> Result<()> {
+    match slot {
+        Some(old) if *old != value => Err(Error::Corrupt("a sparse member's pax records conflict")),
+        _ => {
+            *slot = Some(value);
+            Ok(())
+        }
+    }
 }
 
 /// Most pax records kept for a listing per member.
@@ -384,7 +466,22 @@ impl Member {
         Meta { mtime: self.mtime, nanos: self.nanos, mode: Some(self.mode) }
     }
 
+    /// The length of the file the member makes: its sparse size, or its stored size.
+    fn real_size(&self) -> u64 {
+        self.sparse.as_ref().map_or(self.size, |s| s.real_size)
+    }
+
+    /// Why a sparse member is refused: it would make a file far larger than its stored data warrants.
+    fn sparse_refusal(&self) -> Option<&'static str> {
+        let map = self.sparse.as_ref()?;
+        let most = SPARSE_FREE_SIZE.max(self.size.saturating_mul(SPARSE_MAX_RATIO));
+        (map.real_size > most).then_some(
+            "a sparse member's real size is more than 1 GiB and 1024 times its stored data: refused as a bomb",
+        )
+    }
+
     fn into_entry(self) -> Entry {
+        let real_size = self.real_size();
         let link = match self.kind {
             Kind::Symlink => Some(Redirection::UnixSymlink(self.link)),
             Kind::HardLink => Some(Redirection::HardLink(self.link)),
@@ -399,7 +496,7 @@ impl Member {
             tar: Some(self.tar),
             attributes: None,
             name: self.name,
-            size: if data { self.size } else { 0 },
+            size: if data { real_size } else { 0 },
             size_unknown: false,
             packed: if data { self.size } else { 0 },
             mtime: self.mtime,
@@ -430,6 +527,7 @@ struct Pax {
     uid: Option<Option<u64>>,
     gid: Option<Option<u64>>,
     sparse: bool,
+    gnu_sparse: SparsePax,
     /// Every record, in order, as stored.
     records: Vec<(String, Vec<u8>)>,
 }
@@ -475,7 +573,31 @@ impl Pax {
                     self.size = Some(std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()).ok_or_else(bad)?)
                 }
                 b"mtime" => self.mtime = parse_time(value),
-                k if k.starts_with(b"GNU.sparse.") => self.sparse = true,
+                k if k.starts_with(b"GNU.sparse.") => {
+                    self.sparse = true;
+                    let num = || -> Result<u64> {
+                        std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()).ok_or_else(bad)
+                    };
+                    let g = &mut self.gnu_sparse;
+                    match &k[11..] {
+                        b"major" => once(&mut g.major, num()?)?,
+                        b"minor" => once(&mut g.minor, num()?)?,
+                        b"name" => once(&mut g.name, name_of(value))?,
+                        b"realsize" | b"size" => once(&mut g.real_size, num()?)?,
+                        b"map" => once(&mut g.map, value.to_vec())?,
+                        b"offset" => {
+                            if g.pairs.len() >= MAX_SPARSE_ENTRIES {
+                                return Err(Error::Corrupt("a sparse map has too many entries"));
+                            }
+                            g.pairs.push((num()?, None));
+                        }
+                        b"numbytes" => match g.pairs.last_mut() {
+                            Some((_, len @ None)) => *len = Some(num()?),
+                            _ => return Err(Error::Corrupt("a sparse map's numbytes has no offset before it")),
+                        },
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -495,7 +617,9 @@ impl Pax {
             gname: self.gname.clone().or_else(|| under.gname.clone()),
             uid: self.uid.or(under.uid),
             gid: self.gid.or(under.gid),
-            sparse: self.sparse || under.sparse,
+            // a sparse map belongs to one member: a global record can't give one
+            sparse: self.sparse,
+            gnu_sparse: self.gnu_sparse.clone(),
             // only the member's own records
             records: self.records.clone(),
         }
@@ -655,6 +779,8 @@ impl Reader {
                     self.global.linkpath = None;
                     self.global.size = None;
                     self.global.records.clear();
+                    self.global.sparse = false;
+                    self.global.gnu_sparse = SparsePax::default();
                     continue;
                 }
                 _ => {}
@@ -668,7 +794,8 @@ impl Reader {
                     name = [prefix, b"/", &name].concat();
                 }
             }
-            let (name, raw_name) = match p.path.clone() {
+            let real_name = if p.sparse { p.gnu_sparse.name.clone() } else { None };
+            let (name, raw_name) = match real_name.or_else(|| p.path.clone()) {
                 Some(path) => (path, None),
                 None => {
                     let stored = long_name.unwrap_or(name);
@@ -677,7 +804,7 @@ impl Reader {
                 }
             };
             let link = p.linkpath.clone().or(long_link).unwrap_or_else(|| name_of(text(&h[157..257])));
-            let size = p.size.unwrap_or(size);
+            let mut size = p.size.unwrap_or(size);
             // the size with its padding has to be a number too
             if size > u64::MAX - BLOCK as u64 {
                 return Err(Error::Corrupt("a tar member's size is impossible"));
@@ -692,24 +819,20 @@ impl Reader {
                 b'5' | b'D' => Kind::Dir,
                 b'1' => Kind::HardLink,
                 b'2' => Kind::Symlink,
+                // an old GNU sparse member; its map shares the header with a ustar name prefix, so a ustar one is
+                // not understood
+                b'S' if !ustar => Kind::File,
                 b'3' | b'4' | b'6' | b'S' | b'M' | b'V' => Kind::Other(kind),
-                _ if p.sparse => Kind::Other(b'S'),
                 // POSIX: a type this reader doesn't know is read as a regular file
                 _ => Kind::File,
             };
-            // an old GNU sparse member's map can go on in extension blocks between the header and the data;
-            // they are passed over so the member after it is still found
-            if h[156] == b'S' && &h[257..263] != b"ustar\0" && h[482] != 0 {
-                loop {
-                    let mut ext = [0u8; BLOCK];
-                    if self.src.read(&mut ext)? < BLOCK {
-                        return Err(Error::Truncated);
-                    }
-                    if ext[504] == 0 {
-                        break;
-                    }
-                }
-            }
+            let sparse = if h[156] == b'S' && !ustar {
+                Some(self.old_gnu_sparse(&h, size)?)
+            } else if p.sparse && kind == Kind::File {
+                Some(self.pax_sparse(&p.gnu_sparse, &mut size)?)
+            } else {
+                None
+            };
             // links and folders carry no data, whatever the size field says, except GNU's dump folders
             let has_data = !matches!(kind, Kind::HardLink | Kind::Symlink) && !(kind == Kind::Dir && h[156] == b'5');
             self.unread = if has_data { size + padding(size) } else { 0 };
@@ -738,8 +861,158 @@ impl Reader {
                     pax_records: if self.meta_budget.kept { p.records } else { Vec::new() },
                     header: self.meta_budget.take_header().then(|| Box::new(h)),
                 }),
+                sparse,
             }));
         }
+    }
+
+    /// An old GNU sparse member's map: four entries in the header, then as many extension blocks of 21 as the
+    /// header and each block flag, between the header and the data.
+    fn old_gnu_sparse(&mut self, h: &[u8; BLOCK], stored: u64) -> Result<Box<SparseMap>> {
+        let mut pieces = Vec::new();
+        let mut take = |entries: &[u8]| -> Result<()> {
+            for e in entries.as_chunks::<24>().0 {
+                // an entry with no offset ends the list
+                if text(&e[..12]).is_empty() {
+                    break;
+                }
+                let field = |f: &[u8]| number(f).and_then(|v| u64::try_from(v).ok());
+                let (Some(offset), Some(len)) = (field(&e[..12]), field(&e[12..])) else {
+                    return Err(Error::Corrupt("a sparse map entry is unreadable"));
+                };
+                if pieces.len() >= MAX_SPARSE_ENTRIES {
+                    return Err(Error::Corrupt("a sparse map has too many entries"));
+                }
+                pieces.push((offset, len));
+            }
+            Ok(())
+        };
+        take(&h[386..482])?;
+        let mut more = h[482] != 0;
+        let mut map_bytes = 0u64;
+        while more {
+            map_bytes += BLOCK as u64;
+            if map_bytes > MAX_SPARSE_MAP_BYTES {
+                return Err(Error::Corrupt("a sparse map is too long"));
+            }
+            let mut ext = [0u8; BLOCK];
+            if self.src.read(&mut ext)? < BLOCK {
+                return Err(Error::Truncated);
+            }
+            take(&ext[..504])?;
+            more = ext[504] != 0;
+        }
+        let real_size = number(&h[483..495]).and_then(|v| u64::try_from(v).ok());
+        let real_size = real_size.unwrap_or_else(|| pieces.last().map_or(stored, |&(o, l)| o.saturating_add(l)));
+        SparseMap::checked(real_size, pieces, stored)
+    }
+
+    /// A pax sparse member's map: from its records (0.0, 0.1), or from the start of its data (1.0), which is then
+    /// taken off `size`.
+    fn pax_sparse(&mut self, g: &SparsePax, size: &mut u64) -> Result<Box<SparseMap>> {
+        let bad = |why| Error::Corrupt(why);
+        let pieces = if g.major == Some(1) {
+            if g.minor.is_some_and(|m| m != 0) {
+                return Err(Error::Unsupported("a pax sparse format newer than 1.0".into()));
+            }
+            self.sparse_map_in_data(size)?
+        } else if g.major.is_some_and(|m| m != 0) {
+            return Err(Error::Unsupported("a pax sparse format newer than 1.0".into()));
+        } else if let Some(map) = &g.map {
+            let numbers = map
+                .split(|&b| b == b',')
+                .filter(|n| !n.is_empty())
+                .map(|n| std::str::from_utf8(n).ok().and_then(|s| s.parse::<u64>().ok()))
+                .collect::<Option<Vec<u64>>>()
+                .ok_or_else(|| bad("a sparse map is unreadable"))?;
+            if numbers.len() % 2 != 0 {
+                return Err(bad("a sparse map has an offset without a length"));
+            }
+            if numbers.len() / 2 > MAX_SPARSE_ENTRIES {
+                return Err(bad("a sparse map has too many entries"));
+            }
+            numbers.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect()
+        } else if !g.pairs.is_empty() {
+            g.pairs
+                .iter()
+                .map(|&(o, l)| l.map(|l| (o, l)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| bad("a sparse map's offset has no numbytes after it"))?
+        } else {
+            return Err(bad("a pax sparse member has no map"));
+        };
+        let real_size = match g.real_size {
+            Some(r) => r,
+            None => pieces.last().map_or(*size, |&(o, l)| o.saturating_add(l)),
+        };
+        SparseMap::checked(real_size, pieces, *size)
+    }
+
+    /// The pax 1.0 map at the start of the data: decimal numbers, one a line (the count, then an offset and a
+    /// length for each entry), padded with zeros to a whole block.
+    fn sparse_map_in_data(&mut self, size: &mut u64) -> Result<Vec<(u64, u64)>> {
+        let bad = || Error::Corrupt("a sparse map is unreadable");
+        let mut block = [0u8; BLOCK];
+        let mut used = BLOCK;
+        let mut consumed = 0u64;
+        let mut next_number = |src: &mut Source| -> Result<u64> {
+            let mut v: u64 = 0;
+            let mut digits = 0;
+            loop {
+                if used == BLOCK {
+                    consumed += BLOCK as u64;
+                    if consumed > MAX_SPARSE_MAP_BYTES || consumed > *size {
+                        return Err(Error::Corrupt("a sparse map is too long"));
+                    }
+                    if src.read(&mut block)? < BLOCK {
+                        return Err(Error::Truncated);
+                    }
+                    used = 0;
+                }
+                let b = block[used];
+                used += 1;
+                match b {
+                    b'0'..=b'9' if digits < 20 => {
+                        v = v.checked_mul(10).and_then(|v| v.checked_add(u64::from(b - b'0'))).ok_or_else(bad)?;
+                        digits += 1;
+                    }
+                    b'\n' if digits > 0 => return Ok(v),
+                    _ => return Err(bad()),
+                }
+            }
+        };
+        let count = next_number(&mut self.src)?;
+        if count > MAX_SPARSE_ENTRIES as u64 {
+            return Err(Error::Corrupt("a sparse map has too many entries"));
+        }
+        let mut pieces = Vec::new();
+        for _ in 0..count {
+            let offset = next_number(&mut self.src)?;
+            let len = next_number(&mut self.src)?;
+            pieces.push((offset, len));
+        }
+        // the rest of the last block is padding
+        *size -= consumed;
+        Ok(pieces)
+    }
+
+    /// The current member's data in file order, holes included, to `sink`.
+    fn read_member(&mut self, m: &Member, buf: &mut [u8], sink: &mut dyn FnMut(Piece) -> Result<()>) -> Result<()> {
+        let Some(map) = &m.sparse else {
+            return self.read_data(m.size, buf, &mut |d| sink(Piece::Data(d)));
+        };
+        let mut at = 0u64;
+        for &(offset, len) in &map.pieces {
+            if offset > at {
+                sink(Piece::Hole(offset - at))?;
+            }
+            self.read_data(len, buf, &mut |d| sink(Piece::Data(d)))?;
+            at = offset + len;
+        }
+        if map.real_size > at {
+            sink(Piece::Hole(map.real_size - at))?;
+        }
+        Ok(())
     }
 
     /// The current member's data, in pieces, to `sink`. Reads exactly its size and leaves the padding for later.
@@ -790,7 +1063,8 @@ pub(crate) struct Selected {
     reader: Reader,
     path: PathBuf,
     pub name: String,
-    size: Option<u64>,
+    /// the member, or None for a lone compressed file
+    member: Option<Box<Member>>,
     pub meta: Meta,
 }
 
@@ -804,7 +1078,7 @@ impl Selected {
                     name: single_name(codec, path),
                     reader,
                     path: path.to_path_buf(),
-                    size: None,
+                    member: None,
                     meta: single_meta(path),
                 });
             }
@@ -818,15 +1092,19 @@ impl Selected {
                     if member.kind != Kind::File {
                         return Err(Error::Unsupported("the selected tar member is not a regular file".into()));
                     }
-                    if member.size > limit {
+                    // a sparse member counts at its full size: its holes come out as zeros
+                    if member.real_size() > limit {
                         return Err(Error::Unsupported("the selected member exceeds the byte limit".into()));
+                    }
+                    if let Some(why) = member.sparse_refusal() {
+                        return Err(Error::Unsupported(why.into()));
                     }
                     let meta = member.meta();
                     return Ok(Self {
                         reader,
                         path: path.to_path_buf(),
-                        name: member.name,
-                        size: Some(member.size),
+                        name: member.name.clone(),
+                        member: Some(Box::new(member)),
                         meta,
                     });
                 }
@@ -842,8 +1120,19 @@ impl Selected {
 
     pub(crate) fn read(mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
         let mut buf = vec![0; BUF];
-        if let Some(size) = self.size {
-            self.reader.read_data(size, &mut buf, sink)?;
+        if let Some(member) = self.member.take() {
+            let zeros = [0u8; 64 << 10];
+            self.reader.read_member(&member, &mut buf, &mut |piece| match piece {
+                Piece::Data(data) => sink(data),
+                Piece::Hole(mut left) => {
+                    while left > 0 {
+                        let n = left.min(zeros.len() as u64) as usize;
+                        sink(&zeros[..n])?;
+                        left -= n as u64;
+                    }
+                    Ok(())
+                }
+            })?;
             if self.reader.src.codec().is_some() {
                 self.reader.drain(&mut buf)?;
             }
@@ -1061,7 +1350,7 @@ fn target(
     opts: &Options,
     rel: &Path,
     (ordinal, name): (u64, &str),
-    size: Option<u64>,
+    (size, sparse): (Option<u64>, bool),
     summary: &mut Summary,
     report: &mut impl LegacyReport,
 ) -> Result<Option<(Output, PathBuf)>> {
@@ -1071,7 +1360,38 @@ fn target(
         Some(reserved) => reserved.path().to_path_buf(),
         None => place.path.clone(),
     };
-    Ok(Some((create_target(place, size)?, landed)))
+    // a sparse file is marked sparse where that needs asking, and not preallocated, so its holes stay holes
+    let output = if sparse { create_sparse_target(place, size)? } else { create_target(place, size)? };
+    Ok(Some((output, landed)))
+}
+
+/// The holes a whole run may make: 1 GiB, plus 1024 times the data each sparse member stores. Without it, many
+/// members each under [`SPARSE_MAX_RATIO`] would add up to a bomb (a thousand 1.5 KiB members claiming 1 GiB each)
+/// on a file system that keeps no holes. Extraction and testing share it; a read by index has its own byte limit.
+struct HoleBudget {
+    left: u64,
+}
+
+impl HoleBudget {
+    fn new() -> Self {
+        HoleBudget { left: SPARSE_FREE_SIZE }
+    }
+
+    /// Takes a sparse member's holes from what is left, or says why it is refused, leaving the budget as it was.
+    fn take(&mut self, m: &Member) -> Option<&'static str> {
+        let map = m.sparse.as_ref()?;
+        let allowed = self.left.saturating_add(m.size.saturating_mul(SPARSE_MAX_RATIO));
+        match allowed.checked_sub(map.real_size.saturating_sub(m.size)) {
+            Some(left) => {
+                self.left = left;
+                None
+            }
+            None => Some(
+                "the archive's sparse members together claim more than 1 GiB of holes plus 1024 times their stored \
+                 data: refused as a bomb",
+            ),
+        }
+    }
 }
 
 /// How a member's data went: written whole, or the error that stopped it.
@@ -1229,14 +1549,17 @@ fn staging_parent(destination: &Path, relative: &Path) -> Result<PathBuf> {
 fn copy_out(
     mut target: Option<Output>,
     meta: &Meta,
-    read: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
+    read: impl FnOnce(&mut dyn FnMut(Piece) -> Result<()>) -> Result<()>,
 ) -> Result<Outcome> {
     // write errors are kept apart from read errors so the two can be told apart afterwards
     let mut write_error: Option<io::Error> = None;
     let read = {
-        let mut sink = |chunk: &[u8]| -> Result<()> {
+        let mut sink = |piece: Piece| -> Result<()> {
             if let Some(out) = target.as_mut()
-                && let Err(e) = out.write(chunk)
+                && let Err(e) = match piece {
+                    Piece::Data(chunk) => out.write(chunk),
+                    Piece::Hole(len) => out.write_hole(len),
+                }
             {
                 write_error = Some(e);
                 return Err(Error::Corrupt("write failed"));
@@ -1277,14 +1600,14 @@ fn run_single(
     let mut out = None;
     if opts.mode == Mode::Extract {
         let rel = PathBuf::from(&name);
-        match target(opts, &rel, (0, &name), None, summary, report)? {
+        match target(opts, &rel, (0, &name), (None, false), summary, report)? {
             Some((t, _)) => out = Some(t),
             None => return Ok(()),
         }
     }
     let mut total = 0u64;
     let outcome = copy_out(out, &single_meta(path), |sink| {
-        total = reader.read_single(buf, sink)?;
+        total = reader.read_single(buf, &mut |data| sink(Piece::Data(data)))?;
         Ok(())
     })?;
     match outcome {
@@ -1306,6 +1629,7 @@ fn run_tar(
     let mut extracted = Extracted::default();
     // the next member's position in a listing, which leaves out volume labels
     let mut ordinal = 0u64;
+    let mut holes = HoleBudget::new();
     loop {
         let m = match reader.next() {
             Ok(Some(m)) => m,
@@ -1381,7 +1705,7 @@ fn run_tar(
                 folder(summary, report, position, &m.name);
                 continue;
             }
-            Kind::File => None,
+            Kind::File => m.sparse_refusal().or_else(|| holes.take(&m)),
             Kind::Symlink | Kind::HardLink => {
                 let kind = if m.kind == Kind::Symlink {
                     LinkKind::Symbolic(m.link.clone().into_bytes())
@@ -1406,7 +1730,7 @@ fn run_tar(
                 continue;
             }
             Kind::Other(b'V') => continue,
-            Kind::Other(b'S') => Some("sparse files are not supported yet"),
+            Kind::Other(b'S') => Some("an old GNU sparse member in a ustar header is not understood"),
             Kind::Other(b'M') => Some("multi-volume tar archives are not supported yet"),
             Kind::Other(_) => Some("devices and pipes are not extracted"),
         };
@@ -1426,10 +1750,14 @@ fn run_tar(
             }
             staged.budget.record(&m.name)?;
             let (file, temporary) = temporary(&parent)?.into_parts();
-            let output = Output::new(file, Some(m.size));
-            match copy_out(Some(output), &m.meta(), |sink| reader.read_data(m.size, buf, sink))? {
+            if m.sparse.is_some() {
+                crate::output::mark_sparse(&file);
+            }
+            let output = Output::new(file, Some(m.real_size()));
+            match copy_out(Some(output), &m.meta(), |sink| reader.read_member(&m, buf, sink))? {
                 Outcome::Done => {
-                    let (name, size) = (m.name, m.size);
+                    let size = m.real_size();
+                    let name = m.name;
                     staged.members.push(StagedMember::File { relative: rel, name, temporary, size, ordinal: position });
                 }
                 Outcome::Archive(error) => {
@@ -1441,7 +1769,7 @@ fn run_tar(
         }
         let mut out = None;
         if opts.mode == Mode::Extract {
-            match target(opts, &rel, (position, &m.name), Some(m.size), summary, report)? {
+            match target(opts, &rel, (position, &m.name), (Some(m.real_size()), m.sparse.is_some()), summary, report)? {
                 Some(t) => out = Some(t),
                 None => continue,
             }
@@ -1452,7 +1780,7 @@ fn run_tar(
                 Ok(()) => {
                     reader.unread = 0;
                     extracted.tested(&rel);
-                    succeeded(summary, report, position, &m.name, m.size);
+                    succeeded(summary, report, position, &m.name, m.real_size());
                     continue;
                 }
                 Err(Error::Io(e)) => return Err(Error::Io(e)),
@@ -1462,18 +1790,17 @@ fn run_tar(
                 }
             }
         }
-        let size = m.size;
         let (out, landed) = match out {
             Some((out, landed)) => (Some(out), Some(landed)),
             None => (None, None),
         };
-        match copy_out(out, &m.meta(), |sink| reader.read_data(size, buf, sink))? {
+        match copy_out(out, &m.meta(), |sink| reader.read_member(&m, buf, sink))? {
             Outcome::Done => {
                 match &landed {
                     Some(landed) => extracted.file(&opts.dest, &rel, landed),
                     None => extracted.tested(&rel),
                 }
-                succeeded(summary, report, position, &m.name, m.size)
+                succeeded(summary, report, position, &m.name, m.real_size())
             }
             Outcome::Archive(e) => {
                 fail_member(summary, report, position, &m.name, &e.to_string(), e);

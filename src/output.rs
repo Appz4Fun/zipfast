@@ -18,7 +18,7 @@
 //! next stretch is decoded; a small one is written directly.
 
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -253,10 +253,13 @@ enum Inner {
 }
 
 struct Background {
-    tx: Option<SyncSender<Vec<u8>>>,
+    /// Each message is a hole to pass over (bytes left unwritten), then data to write after it.
+    tx: Option<SyncSender<(u64, Vec<u8>)>>,
     /// emptied buffers coming back for reuse
     spare: Receiver<Vec<u8>>,
     cur: Vec<u8>,
+    /// bytes to pass over before `cur`
+    hole: u64,
     handle: Option<JoinHandle<Result<File, WriterFailure>>>,
 }
 
@@ -348,14 +351,15 @@ impl Output {
         if size.is_some_and(|s| s < BACKGROUND_MIN) {
             return Output { inner: Inner::Direct(file), pending: None };
         }
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(DEPTH);
+        let (tx, rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(DEPTH);
         let (back, spare) = mpsc::channel::<Vec<u8>>();
         // the file moves to the thread only if the thread starts; otherwise it is written directly
         let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(file)));
         let theirs = std::sync::Arc::clone(&slot);
         let spawned = thread::Builder::new().name("zipfast-write".into()).spawn(move || {
             let mut file = theirs.lock().ok().and_then(|mut f| f.take()).ok_or(WriterFailure::MissingFile)?;
-            for mut buf in rx {
+            for (hole, mut buf) in rx {
+                skip_hole(&mut file, hole).map_err(WriterFailure::Io)?;
                 file.write_all(&buf).map_err(WriterFailure::Io)?;
                 buf.clear();
                 let _ = back.send(buf);
@@ -369,6 +373,7 @@ impl Output {
                     tx: Some(tx),
                     spare,
                     cur: Vec::with_capacity(CHUNK),
+                    hole: 0,
                     handle: Some(handle),
                 }),
             },
@@ -425,12 +430,27 @@ impl Output {
         }
     }
 
+    /// Leaves the next `len` bytes unwritten: the file position moves past them and the file is at least that long,
+    /// so a file system that keeps holes keeps one, and the bytes read as zeros.
+    pub(crate) fn write_hole(&mut self, len: u64) -> io::Result<()> {
+        match &mut self.inner {
+            Inner::Direct(file) => skip_hole(file, len),
+            Inner::Background(b) => {
+                if !b.cur.is_empty() {
+                    b.send().map_err(WriterFailure::into_legacy)?;
+                }
+                b.hole = b.hole.checked_add(len).ok_or_else(|| io::Error::other("hole too long"))?;
+                Ok(())
+            }
+        }
+    }
+
     /// Waits for pending writes and hands the file and its cleanup guard to a positional writer.
     pub(crate) fn handoff_detailed(self) -> Result<WriteFile, OutputError> {
         let file = (|| match self.inner {
             Inner::Direct(file) => Ok(file),
             Inner::Background(mut b) => {
-                if !b.cur.is_empty() {
+                if !b.cur.is_empty() || b.hole > 0 {
                     b.send()?;
                 }
                 b.tx = None;
@@ -459,11 +479,66 @@ impl Output {
     }
 }
 
+/// Asks the file system to keep `file`'s holes as holes, where it has to be asked: NTFS fills a hole in a file not
+/// marked sparse with real zeros. Elsewhere holes are kept where the file system can keep them, with nothing to
+/// ask. Best effort: when it fails, the holes come out as zeros, which the sparse size cap keeps bounded.
+#[cfg(windows)]
+pub(crate) fn mark_sparse(file: &File) {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            device: *mut c_void,
+            code: u32,
+            input: *const c_void,
+            input_len: u32,
+            output: *mut c_void,
+            output_len: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+    }
+    let mut returned = 0u32;
+    // SAFETY: the handle is open for as long as `file` is borrowed; FSCTL_SET_SPARSE with no input buffer sets the
+    // flag, takes no output buffer, and `returned` outlives the synchronous call.
+    let _ = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle().cast(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+}
+
+#[cfg(not(windows))]
+pub(crate) fn mark_sparse(_file: &File) {}
+
+/// Moves the file position `len` bytes on without writing, and lengthens the file to there, so a hole at the end
+/// is kept too. A file system that keeps holes stores none of it; any other reads it back as zeros.
+fn skip_hole(file: &mut File, len: u64) -> io::Result<()> {
+    if len > 0 {
+        let len = i64::try_from(len).map_err(|_| io::Error::other("hole too long"))?;
+        let at = file.seek(SeekFrom::Current(len))?;
+        if file.metadata()?.len() < at {
+            file.set_len(at)?;
+        }
+    }
+    Ok(())
+}
+
 impl Background {
     fn send(&mut self) -> Result<(), WriterFailure> {
         let next = self.spare.try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK));
         let full = std::mem::replace(&mut self.cur, next);
-        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(full).is_ok());
+        let hole = std::mem::take(&mut self.hole);
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send((hole, full)).is_ok());
         if sent {
             return Ok(());
         }
@@ -511,6 +586,25 @@ mod tests {
             assert!(back == data, "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn holes_read_as_zeros_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, size) in [("small", Some(10)), ("big", None)] {
+            let path = dir.path().join(name);
+            let mut out = Output::new(File::create(&path).unwrap(), size);
+            out.write(b"ab").unwrap();
+            out.write_hole(3 * CHUNK as u64).unwrap();
+            out.write(b"cd").unwrap();
+            out.write_hole(5).unwrap();
+            out.finish(|_| {}).unwrap();
+            let back = fs::read(&path).unwrap();
+            let mut want = b"ab".to_vec();
+            want.resize(2 + 3 * CHUNK, 0);
+            want.extend_from_slice(b"cd\0\0\0\0\0");
+            assert!(back == want, "{name}");
+        }
     }
 
     #[cfg(unix)]
