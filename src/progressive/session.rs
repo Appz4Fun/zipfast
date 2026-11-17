@@ -1179,6 +1179,19 @@ impl ProgressiveSession {
         let refused: Option<Disposition> = None;
         self.disposition = if let Some(refused) = refused {
             refused
+        } else if let Some(version) = header.version.filter(|_| self.options.extract.mode != crate::extract::Mode::Test)
+        {
+            // An older file revision is skipped, a folder too, as every route skips it unless revisions are asked
+            // for (a progressive session never asks).
+            if header.is_dir()
+                && (header.split_after()
+                    || header.packed_size != 0
+                    || header.size_unknown()
+                    || header.unpacked_size != 0)
+            {
+                return Err(ProgressiveFailure::new(FailureKind::Malformed("directory payload or continuation")));
+            }
+            Disposition::Skip(crate::extract::RarSkipReason::OlderVersion(version))
         } else if header.is_dir() {
             if header.split_after() || header.packed_size != 0 || header.size_unknown() || header.unpacked_size != 0 {
                 return Err(ProgressiveFailure::new(FailureKind::Malformed("directory payload or continuation")));
@@ -1186,8 +1199,6 @@ impl ProgressiveSession {
             Disposition::Directory
         } else if self.options.extract.mode == crate::extract::Mode::Test {
             Disposition::Test
-        } else if let Some(version) = header.version {
-            Disposition::Skip(crate::extract::RarSkipReason::OlderVersion(version))
         } else {
             #[cfg(feature = "persistent-partials")]
             if self.partial.is_some() {

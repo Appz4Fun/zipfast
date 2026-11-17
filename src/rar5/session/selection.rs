@@ -186,6 +186,7 @@ impl RarSession {
         let mut run = SelectedRun::new(limits).map_err(|fault| {
             DriverError::Native(run_error(std::mem::take(&mut summary), None, Arc::from(fault.failure)))
         })?;
+        run.versions = selection.versions;
         for (word, mut bits) in selection.bits.iter().copied().enumerate() {
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
@@ -336,9 +337,10 @@ fn member_filter_refused(session: &RarSession) -> RarRunError {
     run_error(session.summary(0), None, Arc::new(RarFailure::Unsupported(RarUnsupported::MemberFilter)))
 }
 
-/// A member's name as a path relative to the destination, as a test run checks links against it.
-fn tested_name(header: &FileHeader) -> Option<PathBuf> {
-    let name = header.output_name()?;
+/// A member's name as a path relative to the destination, as a test run checks links against it: `name;N` for an
+/// older revision when the selection includes them, as extracting names it.
+fn tested_name(header: &FileHeader, versions: bool) -> Option<PathBuf> {
+    let name = header.output_name_as(versions)?;
     crate::path::sanitize_with(&name, !header.is_unix(), false).ok()
 }
 
@@ -380,6 +382,8 @@ struct SelectedRun {
     rar4_keys: crate::crypto::Rar4KeyCache,
     /// the members this run found whole, by name: the files a tested hard link or file copy may take
     tested: crate::extract::link::Extracted,
+    /// the selection includes older file revisions: they are named `name;N` ([`RarSelection::with_versions`])
+    versions: bool,
     history_volumes: VolumeSet,
     buffer: Vec<u8>,
     decrypted: Vec<u8>,
@@ -406,6 +410,7 @@ impl SelectedRun {
             rar4: None,
             rar4_keys: Default::default(),
             tested: Default::default(),
+            versions: false,
             history_volumes: [0; VOLUME_WORDS],
             buffer,
             decrypted,
@@ -464,7 +469,7 @@ impl SelectedRun {
         match self.decode(session, index, compressed, output) {
             Ok((bytes, checks)) => {
                 let header = &session.model.members[index].header;
-                if let Some(rel) = tested_name(header) {
+                if let Some(rel) = tested_name(header, self.versions) {
                     if header.is_rar4_symlink() { self.tested.replaced(&rel) } else { self.tested.tested(&rel) }
                 }
                 Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Tested })
@@ -491,7 +496,7 @@ impl SelectedRun {
                 kind: link.kind(),
             })));
         };
-        let Some(rel) = tested_name(header) else {
+        let Some(rel) = tested_name(header, self.versions) else {
             let path = PathBuf::from(&header.name);
             return RarOutcome::Failed(Arc::new(RarFailure::Policy { reason: RarPolicyReason::UnsafePath, path }));
         };

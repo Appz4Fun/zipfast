@@ -478,11 +478,17 @@ impl FileHeader {
         self.host_os == 1
     }
 
-    /// The name this member is written under; see [`crate::path::rar_output_name`]. An older revision (RAR 5.0
-    /// version record) is written under its [`Self::display_name`], `name;N`, as UnRAR's `-ver` writes it.
+    /// The name this member is written under; see [`crate::path::rar_output_name`].
     pub(crate) fn output_name(&self) -> Option<std::borrow::Cow<'_, str>> {
-        let name = crate::path::rar_output_name(&self.name, self.format == RarFormat::Rar4)?;
-        Some(match self.version {
+        crate::path::rar_output_name(&self.name, self.format == RarFormat::Rar4)
+    }
+
+    /// [`Self::output_name`], or for an older revision (RAR 5.0 version record) taken by a run that includes them
+    /// (`versions`), its [`Self::display_name`]: `name;N`, as UnRAR's `-ver` writes it. Every route, testing and
+    /// extracting alike, names a revision `name;N` exactly when it includes revisions.
+    pub(crate) fn output_name_as(&self, versions: bool) -> Option<std::borrow::Cow<'_, str>> {
+        let name = self.output_name()?;
+        Some(match self.version.filter(|_| versions) {
             Some(version) => std::borrow::Cow::Owned(format!("{name};{version}")),
             None => name,
         })

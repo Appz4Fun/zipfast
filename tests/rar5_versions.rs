@@ -166,3 +166,94 @@ fn rar_session_extracts_selected_revisions_on_request() {
     assert_eq!((s.files, s.skipped, s.failed), (2, 0, 0));
     assert_eq!(files(&out), named(&[("notes.txt;1", b"first"), ("notes.txt;2", b"second")]));
 }
+
+/// A folder kept as an older revision is skipped by a progressive session, which never takes revisions, as every
+/// other route skips it by default: no `dir;1` (nor `dir`) is made for it.
+#[test]
+fn a_progressive_session_skips_a_versioned_folder() {
+    use std::task::{Context, Poll};
+    use zipfast::progressive::*;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("folder.rar");
+    fs::write(
+        &path,
+        archive(&[
+            FileSpec { dir: true, unix_mode: Some(0o755), extra: version(1), ..FileSpec::new("old", b"") },
+            FileSpec { extra: version(1), ..FileSpec::new("notes.txt", b"first") },
+            FileSpec::new("notes.txt", b"current"),
+        ]),
+    )
+    .unwrap();
+    let out = tmp.path().join("out");
+    let volume = (std::ffi::OsString::from("folder.rar"), fs::read(&path).unwrap().into_boxed_slice());
+    let opts = ProgressiveOptions::new(options(&out, Mode::Extract, None), "folder.rar".into());
+    let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
+    let mut outcomes = Vec::new();
+    loop {
+        match session.poll_event(&mut Context::from_waker(std::task::Waker::noop())) {
+            Poll::Pending => std::thread::yield_now(),
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(match outcome {
+                MemberOutcome::Verified(_) => "verified".to_owned(),
+                MemberOutcome::Directory { .. } => "directory".to_owned(),
+                MemberOutcome::Skipped(reason) => format!("skipped {reason:?}"),
+                _ => "other".to_owned(),
+            }),
+            Poll::Ready(Ok(Some(_))) => {}
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+        }
+    }
+    assert_eq!(outcomes, ["skipped OlderVersion(1)", "skipped OlderVersion(1)", "verified"]);
+    assert_eq!(files(&out), named(&[("notes.txt", b"current")]));
+}
+
+/// Every route names a revision `name;N` exactly when it includes revisions, testing as extracting: a hard link
+/// to `notes.txt` after only a revision of it passes a test run that leaves revisions out (where the revision is
+/// `notes.txt`) and fails one that takes them (where it is `notes.txt;1`), on the whole-archive run and on
+/// `RarSession` alike.
+#[test]
+fn test_runs_name_revisions_as_extraction_does_on_every_route() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("link.rar");
+    let mut redirect = Vec::new();
+    for v in [5u64, 4, 0, 9] {
+        common::vint(v, &mut redirect);
+    }
+    redirect.extend(b"notes.txt");
+    let mut extra = Vec::new();
+    common::vint(redirect.len() as u64, &mut extra);
+    extra.extend(redirect);
+    fs::write(
+        &path,
+        archive(&[
+            FileSpec { extra: version(1), ..FileSpec::new("notes.txt", b"first") },
+            FileSpec { extra, unix_mode: Some(0o120777), ..FileSpec::new("h", b"") },
+        ]),
+    )
+    .unwrap();
+    for versions in [false, true] {
+        let select = versions.then(|| MemberFilter::all().with_versions());
+        let mut failed = Vec::new();
+        extract::run_rar_with_outcomes(&path, &options(tmp.path(), Mode::Test, select), None, |o| {
+            if let RarOutcome::Failed(_) = o.outcome {
+                failed.push(o.entry.order);
+            }
+        })
+        .unwrap();
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let mut all = session.select(|_| true).unwrap();
+        if versions {
+            all = all.with_versions();
+        }
+        let mut session_failed = Vec::new();
+        session
+            .test_selected(&all, RarDecodeLimits::default(), |o| {
+                if let RarOutcome::Failed(_) = o.outcome {
+                    session_failed.push(o.entry.order);
+                }
+            })
+            .unwrap();
+        let expected: &[u64] = if versions { &[1] } else { &[] };
+        assert_eq!((failed.as_slice(), session_failed.as_slice()), (expected, expected), "versions={versions}");
+    }
+}

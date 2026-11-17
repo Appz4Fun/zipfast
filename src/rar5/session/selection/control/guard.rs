@@ -417,7 +417,9 @@ impl Guard {
                 if checked(c.usage.diagnostics.capacity, header.name.len() as u64)? > c.limits.diagnostics.capacity {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
                 }
-                let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+                let name = header
+                    .output_name_as(selection.takes_versions())
+                    .unwrap_or(std::borrow::Cow::Borrowed(&header.name));
                 let relative = crate::path::sanitize_fallible(&name, !header.is_unix()).map_err(|e| match e {
                     crate::path::ProjectionError::Unsafe => {
                         RarDiagnosticFailure::ProjectionUnavailable { ordinal: index as u64 }

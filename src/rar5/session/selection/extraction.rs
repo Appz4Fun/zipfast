@@ -790,7 +790,8 @@ pub(super) enum PlacedLink {
 struct LegacyHooks;
 impl ExtractionHooks for LegacyHooks {
     fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop> {
-        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        // an older revision gets this far only when the selection includes revisions: it is written as `name;N`
+        let name = header.output_name_as(true).unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         sanitize(&name, !header.is_unix())
             .map_err(|_| policy(RarPolicyReason::UnsafePath, PathBuf::from(&header.name)).into())
     }

@@ -3549,8 +3549,8 @@ impl Run<'_, '_, '_> {
         // be written one to one is refused (`crate::path::rar_output_name`).
         // (`h.name` was moved into `ctx`)
         let output = crate::path::rar_output_name(&ctx.entry.name, h.format == RarFormat::Rar4);
-        // an older revision taken by `with_versions` is written as `name;N`, as UnRAR's `-ver` writes it
-        let output = match (output, h.version.filter(|_| self.opts.mode == Mode::Extract)) {
+        // an older revision taken by `with_versions` is named `name;N`, tested or written, as UnRAR's `-ver` names it
+        let output = match (output, h.version.filter(|_| self.opts.takes_versions())) {
             (Some(name), Some(version)) => Some(std::borrow::Cow::Owned(format!("{name};{version}"))),
             (output, _) => output,
         };
