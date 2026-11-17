@@ -824,9 +824,10 @@ fn mixed_all_record_geometry_paths_spools_outputs_and_override_intersections() {
     let b = c.ledger.with_state(|s| s.run_bounds());
     assert_eq!(b.records, 5);
     assert_eq!(b.path_steps, 4 * q + 24);
-    assert_eq!(b.io_bytes, 70025 + 60 + 210000 + 16);
-    assert_eq!(b.source_seeks, 4);
-    assert_eq!(b.temporary_groups, 3);
+    // the link's data is read like a regular member's (its target)
+    assert_eq!(b.io_bytes, 70025 + 60 + 210000 + 16 + 30);
+    assert_eq!(b.source_seeks, 6);
+    assert_eq!(b.temporary_groups, 4);
     assert_eq!(b.directory_finalization, 36);
     assert_eq!(b.live_spool_bytes, 70009);
     assert_eq!(c.bootstrap_usage().configuration_bytes(), 3);

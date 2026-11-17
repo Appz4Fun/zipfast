@@ -844,17 +844,47 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
 /// [`list`], also saying whether the archive ended unexpectedly: a byte-split set cut short by a missing piece,
 /// listed from the local headers before the gap.
 pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
-    let archive = Archive::open(path)?;
+    let mut archive = Archive::open(path)?;
     let missing_volume = archive.missing.clone();
+    // A symbolic link's target is its data: read for a listing when it is small, stored or deflated, and not
+    // encrypted; otherwise left empty.
+    let mut targets = Vec::with_capacity(archive.entries.len());
+    let mut buf = vec![0u8; BUF];
+    for e in &archive.entries {
+        let mut text = Vec::new();
+        if e.is_link()
+            && !e.encrypted()
+            && e.size <= crate::extract::link::MAX_TARGET
+            && supported(e.effective_method())
+        {
+            let read = read_entry(
+                &mut archive.file,
+                archive.len,
+                &e.read_description(),
+                None,
+                &mut buf,
+                &mut |b| {
+                    text.extend_from_slice(b);
+                    Ok(())
+                },
+                None,
+            );
+            if read.is_err() {
+                text.clear();
+            }
+        }
+        targets.push(text);
+    }
     let unknown_at = archive.last_size_unknown.then(|| archive.entries.len().wrapping_sub(1));
     let entries = archive
         .entries
         .into_iter()
+        .zip(targets)
         .enumerate()
-        .map(|(i, e)| {
+        .map(|(i, (e, target))| {
             let dir = e.is_dir();
             let encrypted = e.encrypted();
-            let link = e.is_link().then(|| Redirection::UnixSymlink(String::new()));
+            let link = e.is_link().then(|| Redirection::UnixSymlink(String::from_utf8_lossy(&target).into_owned()));
             let mode = e.unix_mode();
             let attributes = e.windows_attributes();
             Entry {
@@ -945,6 +975,8 @@ pub(crate) fn run_renaming(
         report(&line);
         summary.errors.push(line);
     }
+    // ZIP holds no hard links: only symbolic ones are placed, and they never replace a file the run relies on.
+    let mut extracted = crate::extract::link::Extracted::default();
     // A run that stops early still says which files a rename mode renamed or moved aside.
     let result = (|| -> Result<()> {
         for (ordinal, e) in entries.iter().enumerate() {
@@ -976,13 +1008,83 @@ pub(crate) fn run_renaming(
                 Some("encrypted (password required)".to_string())
             } else if !supported(eff_method) {
                 Some(format!("compression method {} is not supported yet", eff_method))
-            } else if e.is_link() {
-                Some("links are not supported yet".to_string())
+            } else if e.is_link() && e.size > crate::extract::link::MAX_TARGET {
+                Some("the link's target is too long".to_string())
             } else {
                 None
             };
             if let Some(why) = refuse {
                 fail(&mut summary, &mut report, &e.name, &why);
+                continue;
+            }
+            if e.is_link() {
+                // The target is the member's data: read and checked whole before anything is placed.
+                let mut text = Vec::new();
+                let entry = e.read_description();
+                let limit = crate::extract::link::MAX_TARGET as usize;
+                let read = read_entry(
+                    &mut archive.file,
+                    archive.len,
+                    &entry,
+                    password,
+                    &mut buf,
+                    &mut |chunk| {
+                        if text.len() + chunk.len() > limit {
+                            return Err(Error::Corrupt("the link's target is too long"));
+                        }
+                        text.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                    None,
+                );
+                match read {
+                    Err(Error::Io(io)) if io.kind() != std::io::ErrorKind::UnexpectedEof => return Err(Error::Io(io)),
+                    Err(err) => {
+                        fail(&mut summary, &mut report, &e.name, &err.to_string());
+                        continue;
+                    }
+                    Ok(()) => {}
+                }
+                if opts.mode == Mode::Extract {
+                    let kind = crate::extract::link::LinkKind::Symbolic(text);
+                    if let Some(why) = crate::extract::link::refusal(&rel, &kind, &extracted) {
+                        fail(&mut summary, &mut report, &e.name, why);
+                        continue;
+                    }
+                    let mut log = RenameLog {
+                        budget: &mut summary.rename_budget,
+                        record: &mut |renamed| {
+                            report(&renamed.line());
+                            summary.renames.push(renamed);
+                        },
+                    };
+                    let place = match crate::extract::check_target(opts, &rel, None, &mut log)? {
+                        crate::extract::Checked::Write(place) => place,
+                        crate::extract::Checked::Exists => {
+                            report(&format!("{}: exists, skipped", e.name));
+                            summary.skipped += 1;
+                            continue;
+                        }
+                        crate::extract::Checked::Declined => {
+                            report(&format!("{}: declined, skipped", e.name));
+                            summary.skipped += 1;
+                            continue;
+                        }
+                        crate::extract::Checked::Blocked(why) => {
+                            fail(&mut summary, &mut report, &e.name, why);
+                            continue;
+                        }
+                    };
+                    if let Err(io) = crate::extract::link::publish(&opts.dest, &rel, place, &kind, &mut extracted) {
+                        if io.kind() == std::io::ErrorKind::Unsupported {
+                            fail(&mut summary, &mut report, &e.name, "links can't be created here");
+                            continue;
+                        }
+                        finish_dirs(&mut summary);
+                        return Err(Error::Io(io));
+                    }
+                }
+                summary.files += 1;
                 continue;
             }
             let mut target = None;
