@@ -216,6 +216,16 @@ The x86 builds are made on an x86-64 machine and the Apple ones on an Apple sili
 makes just one. A tuned build uses its processor's instructions everywhere, the Rust runtime included, so on a
 processor that lacks them it stops on an illegal instruction.
 
+## Compatibility sweep
+
+`scripts/compat-sweep.sh [PARENT]` builds archives with the real tools on the machine (bsdtar in every format and
+filter, Info-ZIP `zip` with each option, `ditto`, and bare gzip, bzip2, xz, lzma, zstd, lz4 and compress files),
+extracts each with a reference tool and with zipfast, and diffs the trees: bytes, names, file, folder or link type,
+link targets, mtimes within 2 s and modes. It works only in a fresh `mktemp -d` directory under PARENT (default `$TMPDIR`) and prints its path.
+Results go to `WORKDIR/results.tsv`, details to `WORKDIR/log/`.
+`REF7Z=<dir with a Linux amd64 7z>` adds archives written and extracted by 7-Zip in Docker; `RAR4REF=<dir>` compares
+against UnRAR's checksums for a RAR4 corpus; `BIG=1` adds one member over 4 GiB per family. Delete WORKDIR after.
+
 ## Sources
 
 ZIP follows PKWARE's published APPNOTE. tar follows the POSIX ustar and pax interchange formats and GNU tar's
