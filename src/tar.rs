@@ -23,6 +23,7 @@ use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::extract::link::{self, Extracted, LinkKind};
 use crate::extract::{
     Cancellation, Checked, Entry, LegacyMember, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options,
     Overwrite, Place, RenameLog, RunError, Summary, check_target, create_target, finish_dirs, finish_file, make_dirs,
@@ -1076,6 +1077,7 @@ enum Outcome {
 
 enum StagedMember {
     Directory { relative: PathBuf, meta: Meta, ordinal: u64, name: String },
+    Link { relative: PathBuf, name: String, kind: LinkKind, ordinal: u64 },
     File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64, ordinal: u64 },
 }
 
@@ -1087,8 +1089,12 @@ struct StagedTar {
 
 impl StagedTar {
     fn publish(self, opts: &Options, summary: &mut Summary, report: &mut impl LegacyReport) -> Result<()> {
+        let mut extracted = Extracted::default();
         for member in self.members {
             match member {
+                StagedMember::Link { relative, name, kind, ordinal } => {
+                    link_member(opts, &relative, (ordinal, &name), &kind, &mut extracted, summary, report)?;
+                }
                 StagedMember::Directory { relative, meta, ordinal, name } => {
                     make_dirs(&opts.dest, &relative)?;
                     summary.dir_meta.push((opts.dest.join(relative), meta));
@@ -1111,12 +1117,43 @@ impl StagedTar {
                         }
                         return Err(error.error.into());
                     }
+                    extracted.file(&relative);
                     succeeded(summary, report, ordinal, &name, size);
                 }
             }
         }
         Ok(())
     }
+}
+
+/// A link member: refused when its target is unsafe (or, for a hard link, not a file this run extracted), else
+/// placed under the run's overwrite choice. Testing only checks the target.
+fn link_member(
+    opts: &Options,
+    rel: &Path,
+    (ordinal, name): (u64, &str),
+    kind: &LinkKind,
+    extracted: &mut Extracted,
+    summary: &mut Summary,
+    report: &mut impl LegacyReport,
+) -> Result<()> {
+    if let Some(why) = link::refusal(rel, kind, extracted).filter(|_| opts.mode == Mode::Extract) {
+        fail_member(summary, report, ordinal, name, why, Error::UnsafePath(name.to_owned()));
+        return Ok(());
+    }
+    if opts.mode == Mode::Extract {
+        let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(()) };
+        if let Err(e) = link::publish(&opts.dest, rel, place, kind, extracted) {
+            if !cfg!(unix) || e.kind() == io::ErrorKind::Unsupported {
+                let why = "links can't be created here";
+                fail_member(summary, report, ordinal, name, why, Error::Unsupported(why.to_owned()));
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+    }
+    succeeded(summary, report, ordinal, name, 0);
+    Ok(())
 }
 
 fn checked_place(
@@ -1246,6 +1283,8 @@ fn run_tar(
     report: &mut impl LegacyReport,
 ) -> Result<()> {
     let mut staged = (opts.mode == Mode::Extract && reader.src.codec().is_some()).then(StagedTar::default);
+    // the files written so far, for hard links (a staged run tracks them as it publishes)
+    let mut extracted = Extracted::default();
     // the next member's position in a listing, which leaves out volume labels
     let mut ordinal = 0u64;
     loop {
@@ -1324,7 +1363,29 @@ fn run_tar(
                 continue;
             }
             Kind::File => None,
-            Kind::Symlink | Kind::HardLink => Some("links are not supported yet"),
+            Kind::Symlink | Kind::HardLink => {
+                let kind = if m.kind == Kind::Symlink {
+                    LinkKind::Symbolic(m.link.clone().into_bytes())
+                } else {
+                    match crate::path::sanitize_with(&m.link, false, opts.windows_safe_names) {
+                        Ok(target) if opts.flatten => {
+                            LinkKind::Hard(PathBuf::from(target.file_name().unwrap_or_default()))
+                        }
+                        Ok(target) => LinkKind::Hard(target),
+                        Err(e) => {
+                            fail_member(summary, report, position, &m.name, link::HARD_TARGET, e);
+                            continue;
+                        }
+                    }
+                };
+                if let Some(staged) = &mut staged {
+                    staged.budget.record(&m.name)?;
+                    staged.members.push(StagedMember::Link { relative: rel, name: m.name, kind, ordinal: position });
+                } else {
+                    link_member(opts, &rel, (position, &m.name), &kind, &mut extracted, summary, report)?;
+                }
+                continue;
+            }
             Kind::Other(b'V') => continue,
             Kind::Other(b'S') => Some("sparse files are not supported yet"),
             Kind::Other(b'M') => Some("multi-volume tar archives are not supported yet"),
@@ -1382,8 +1443,14 @@ fn run_tar(
             }
         }
         let size = m.size;
+        let wrote = out.is_some();
         match copy_out(out, &m.meta(), |sink| reader.read_data(size, buf, sink))? {
-            Outcome::Done => succeeded(summary, report, position, &m.name, m.size),
+            Outcome::Done => {
+                if wrote {
+                    extracted.file(&rel);
+                }
+                succeeded(summary, report, position, &m.name, m.size)
+            }
             Outcome::Archive(e) => {
                 fail_member(summary, report, position, &m.name, &e.to_string(), e);
                 return Ok(());

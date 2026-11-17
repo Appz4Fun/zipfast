@@ -86,6 +86,125 @@ pub(crate) fn create(_: &Path, _: &[u8], _: bool) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+/// The message for a link whose target is absolute or leads out of the destination.
+pub(crate) const UNSAFE_TARGET: &str = "the link's target is absolute or leads out of the destination";
+/// The message for a hard link whose target is not a file this run extracted.
+pub(crate) const HARD_TARGET: &str = "the hard link's target is not a file extracted earlier in this run";
+
+/// A link member, for the tar, ZIP and 7z runners.
+pub(crate) enum LinkKind {
+    /// A symbolic link to these target bytes.
+    Symbolic(Vec<u8>),
+    /// A hard link to this earlier member, relative to the destination.
+    Hard(std::path::PathBuf),
+}
+
+/// The regular files a run has extracted, relative to the destination: the only targets a hard link may take, so
+/// it never reaches a file outside the destination or one that was there before the run.
+#[derive(Default)]
+pub(crate) struct Extracted(std::collections::HashSet<std::path::PathBuf>);
+
+impl Extracted {
+    pub(crate) fn file(&mut self, rel: &Path) {
+        self.0.insert(rel.to_path_buf());
+    }
+
+    /// Something other than a file this run wrote is now at `rel`.
+    pub(crate) fn replaced(&mut self, rel: &Path) {
+        self.0.remove(rel);
+    }
+
+    pub(crate) fn contains(&self, rel: &Path) -> bool {
+        self.0.contains(rel)
+    }
+}
+
+/// Why a link member is refused before anything is written, or None when it may be placed at `rel`.
+pub(crate) fn refusal(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Option<&'static str> {
+    match kind {
+        LinkKind::Symbolic(target) if !contained(rel, target) => Some(UNSAFE_TARGET),
+        LinkKind::Hard(target) if !extracted.contains(target) => Some(HARD_TARGET),
+        _ => None,
+    }
+}
+
+/// Places a checked link member: a symbolic link, or a hard link to the earlier member (a copy where the file
+/// system takes no hard link). `place` comes from the run's target check, so the overwrite choice, a rename mode
+/// and the refusal to write through a link in the way are already settled.
+pub(crate) fn publish(
+    dest: &Path,
+    rel: &Path,
+    place: super::Place,
+    kind: &LinkKind,
+    extracted: &mut Extracted,
+) -> io::Result<()> {
+    let (path, replace) = match place.reserved {
+        Some(reserved) => (reserved.into_parts().1, true),
+        None => (place.path, place.replace),
+    };
+    match kind {
+        LinkKind::Symbolic(target) => {
+            create(&path, target, replace)?;
+            extracted.replaced(rel);
+        }
+        LinkKind::Hard(target) => {
+            hard(&dest.join(target), &path, replace)?;
+            extracted.file(rel);
+        }
+    }
+    Ok(())
+}
+
+/// A hard link at `path` to the file `source`, never following a link at `source`; a copy where linking fails.
+fn hard(source: &Path, path: &Path, replace: bool) -> io::Result<()> {
+    if !std::fs::symlink_metadata(source)?.file_type().is_file() {
+        return Err(io::Error::other("the hard link's target is no longer a file"));
+    }
+    let parent = path.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let name = path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut stage = std::ffi::OsString::from(".");
+    stage.push(name);
+    stage.push(format!(".{}-{n}.zipfast-hardlink", std::process::id()));
+    let stage = parent.join(stage);
+    if link_no_follow(source, &stage).is_err() {
+        // a copy, made without following a link at either end
+        let mut from = std::fs::File::open(source)?;
+        let mut to = std::fs::OpenOptions::new().write(true).create_new(true).open(&stage)?;
+        if let Err(e) = io::copy(&mut from, &mut to) {
+            let _ = std::fs::remove_file(&stage);
+            return Err(e);
+        }
+    }
+    let placed = if replace {
+        std::fs::rename(&stage, path)
+    } else {
+        // only where nothing is: a hard link of the staged name, then the stage goes
+        std::fs::hard_link(&stage, path).or_else(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => Err(e),
+            _ => std::fs::copy(&stage, path).map(|_| ()),
+        })
+    };
+    let _ = std::fs::remove_file(&stage);
+    placed
+}
+
+#[cfg(unix)]
+fn link_no_follow(source: &Path, path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: both are NUL-terminated paths; flags 0 never follow a symbolic link at `from`.
+    let r = unsafe { libc::linkat(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), 0) };
+    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(not(unix))]
+fn link_no_follow(source: &Path, path: &Path) -> io::Result<()> {
+    std::fs::hard_link(source, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
