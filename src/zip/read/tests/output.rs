@@ -2074,6 +2074,7 @@ fn linux_actual_parent_access_default_acl_gid_and_mode_parity_survive_private_st
             protected_paths: Default::default(),
             parallel_min: None,
             select: None,
+            windows_safe_names: false,
         };
         let mut context = EncryptedReadContext::for_projected(
             &mut session,
