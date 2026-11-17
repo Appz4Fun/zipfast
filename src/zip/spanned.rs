@@ -55,13 +55,36 @@ pub(crate) fn last_volume(path: &Path) -> Option<PathBuf> {
     let ext = path.extension()?.to_str()?;
     if ext.eq_ignore_ascii_case("zip") {
         let first = Path::new(&split_volume_name(path.as_os_str(), 0, false)).to_path_buf();
-        first.is_file().then(|| path.to_path_buf())
+        is_regular(&first).then(|| path.to_path_buf())
     } else if ext.eq_ignore_ascii_case("z01") {
         let last = Path::new(&split_volume_name(path.as_os_str(), 0, true)).to_path_buf();
-        last.is_file().then_some(last)
+        is_regular(&last).then_some(last)
     } else {
         None
     }
+}
+
+/// Whether `path` is a regular file (following a symbolic link): a FIFO, device or folder where a volume should be
+/// counts as missing.
+pub(crate) fn is_regular(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// Opens `path` for reading only when it is a regular file, checked on the open handle. On Unix the open doesn't
+/// wait: a FIFO with no writer, put where a volume should be, is refused instead of blocking the open.
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a regular file", path.display())));
+    }
+    Ok(file)
 }
 
 /// Whether `path` is the `.zip` (or the `.z01`) of a spanned set: a `.z01` beside it, and an end record naming more
@@ -85,17 +108,19 @@ pub(crate) struct Spanned {
 }
 
 impl Spanned {
-    /// The set whose `.zip` (or `.z01`) is `path`, or None when `path` is not one or its end record names a single
-    /// disk (a lone archive that happens to have a `.z01` beside it).
+    /// The set whose `.zip` (or `.z01`) is `path`, or None when `path` is not one: no `.z01` beside it, no end record
+    /// ending at its end (trailing bytes, damage), or one naming a single disk (a lone archive that happens to have a
+    /// `.z01` beside it). Each of those is left to the single-file reader. Only once the end record names more than
+    /// one disk is a fault the set's.
     pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
         let Some(last) = last_volume(path) else { return Ok(None) };
-        let mut file = File::open(&last)?;
+        let Ok(mut file) = open_regular(&last) else { return Ok(None) };
         let len = file.metadata()?.len();
         let span = len.min(TAIL_MAX);
         let mut tail = vec![0u8; span as usize];
         file.seek(SeekFrom::Start(len - span))?;
         file.read_exact(&mut tail)?;
-        let Some(at) = find_end(&tail) else { return Err(Error::Corrupt("split ZIP end record")) };
+        let Some(at) = find_end(&tail) else { return Ok(None) };
         let record = &tail[at..at + END_LEN];
         let locator = at
             .checked_sub(LOCATOR_LEN)
@@ -103,8 +128,9 @@ impl Spanned {
             .filter(|l| l.starts_with(b"PK\x06\x07"))
             .map(|l| ((le32(l, 4), le64(l, 8)), le32(l, 16)));
         let disk = match (le16(record, 4), locator) {
-            (0xffff, Some((_, total))) => total.checked_sub(1).ok_or(Error::Corrupt("ZIP64 end locator disk count"))?,
-            (0xffff, None) => return Err(Error::Corrupt("ZIP64 end locator")),
+            (0xffff, Some((_, total))) if total > 1 => total - 1,
+            // a ZIP64 archive of one disk, or a locator that names no disk count: not a set
+            (0xffff, _) => return Ok(None),
             (disk, _) => u32::from(disk),
         };
         if disk == 0 {
@@ -119,13 +145,13 @@ impl Spanned {
         let mut volumes: Vec<PathBuf> =
             (0..disk).map(|i| PathBuf::from(split_volume_name(last.as_os_str(), i, false))).collect();
         volumes.push(last.clone());
-        let missing = volumes.iter().find(|v| !v.is_file()).cloned();
+        let missing = volumes.iter().find(|v| !is_regular(v)).cloned();
         let zip64 = locator.map(|(at, _)| at);
         let directory_disk = match (le16(record, 6), zip64) {
             (0xffff, Some((vol, off))) => {
                 let path = &volumes[vol as usize];
                 let mut end = [0u8; END64_LEN];
-                let read = File::open(path).and_then(|mut f| {
+                let read = open_regular(path).and_then(|mut f| {
                     f.seek(SeekFrom::Start(off))?;
                     f.read_exact(&mut end)
                 });

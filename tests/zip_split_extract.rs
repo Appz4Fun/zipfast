@@ -286,3 +286,61 @@ fn a_lone_zip_with_a_stray_z01_beside_it_stays_a_lone_archive() {
     assert!(s.errors.is_empty(), "{:?}", s.errors);
     assert_eq!((s.volumes, fs::read(out.join("only.txt")).unwrap()), (1, b"only".to_vec()));
 }
+
+#[test]
+fn a_lone_zip_with_trailing_bytes_and_a_stray_z01_still_opens() {
+    // No end record ends exactly at the end of the `.zip`: it is no set's last volume, and the single-file reader,
+    // which allows trailing bytes, reads it as before.
+    let set = split_zip(&[Entry::stored("only.txt", b"only")], &[], Layout::default());
+    let dir = tempfile::tempdir().unwrap();
+    let zip = dir.path().join("lone.zip");
+    let mut bytes = set.volumes[0].clone();
+    bytes.extend(b"JUNKJUNK");
+    fs::write(&zip, &bytes).unwrap();
+    let alone: Vec<_> = extract::list(&zip).unwrap().into_iter().map(|e| e.name).collect();
+    fs::write(dir.path().join("lone.z01"), b"not a volume").unwrap();
+    let beside: Vec<_> = extract::list(&zip).unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!((alone.as_slice(), beside.as_slice()), (&["only.txt".to_owned()][..], &["only.txt".to_owned()][..]));
+    let out = dir.path().join("out");
+    let s = extract::run(&zip, &options(&out, Mode::Extract), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+}
+
+/// A FIFO with no writer where a volume should be is never opened: listing doesn't block on it.
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_place_of_a_volume_is_refused_without_blocking() {
+    let a = data(3000, 1);
+    let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];
+    let start = split_zip_builder::data_abs(&entries, 0, true);
+    let cuts = [start + 1000, start + 2000];
+    for zip64 in [false, true] {
+        let set = split_zip(&entries, &cuts, Layout { marker: true, zip64 });
+        let dir = tempfile::tempdir().unwrap();
+        let zip = write_set(dir.path(), "fifo", &set.volumes);
+        // the ZIP64 locator names disk 2 (the `.zip`); make the middle volume a FIFO, and for the ZIP64 case also
+        // point the locator at it
+        let z02 = dir.path().join("fifo.z02");
+        fs::remove_file(&z02).unwrap();
+        let name = std::ffi::CString::new(z02.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        if zip64 {
+            let mut last = fs::read(&zip).unwrap();
+            let locator = last.len() - 22 - 20;
+            assert_eq!(&last[locator..locator + 4], b"PK\x06\x07");
+            last[locator + 4..locator + 8].copy_from_slice(&1u32.to_le_bytes());
+            fs::write(&zip, last).unwrap();
+        }
+        let (done, wait) = std::sync::mpsc::channel();
+        let path = zip.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(extract::list_detailed(&path, None).map(|l| (l.entries.len(), l.unexpected_end())));
+        });
+        let listed = wait.recv_timeout(std::time::Duration::from_secs(20)).expect("listing blocked on the FIFO");
+        // the FIFO counts as a missing volume (or the ZIP64 record it was to hold can't be read): never a hang
+        if let Ok((_, unexpected_end)) = listed {
+            assert!(unexpected_end, "zip64={zip64}");
+        }
+    }
+}

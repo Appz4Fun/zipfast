@@ -83,8 +83,13 @@ impl ByteSplit {
         let mut missing = None;
         let mut len = 0u64;
         for path in paths {
+            // anything but a regular file (gone, or a FIFO or device put there) is a missing volume
             let size = match std::fs::metadata(&path) {
-                Ok(meta) => meta.len(),
+                Ok(meta) if meta.is_file() => meta.len(),
+                Ok(_) => {
+                    missing.get_or_insert_with(|| path.clone());
+                    nominal
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     missing.get_or_insert_with(|| path.clone());
                     nominal
@@ -103,7 +108,7 @@ impl ByteSplit {
         self.volumes
             .iter()
             .zip(ends)
-            .filter(|((path, _), _)| !path.is_file())
+            .filter(|((path, _), _)| !super::spanned::is_regular(path))
             .map(|((_, start), end)| *start..end)
             .collect()
     }
@@ -173,7 +178,7 @@ impl Read for ByteSplit {
         if self.open.as_ref().is_none_or(|(i, _)| *i != index) {
             self.open = None;
             let path = &self.volumes[index].0;
-            let file = File::open(path).map_err(|e| {
+            let file = super::spanned::open_regular(path).map_err(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
                     io::Error::new(e.kind(), format!("missing volume {}", path.display()))
                 } else {

@@ -369,7 +369,7 @@ impl Archive {
     fn open_spanned(set: spanned::Spanned, cancel: Option<&Cancellation>) -> Result<Archive> {
         let pieces = set.volumes.clone();
         let last = set.last_disk();
-        let directory_whole = set.volumes[set.directory_disk as usize..].iter().all(|v| v.is_file());
+        let directory_whole = set.volumes[set.directory_disk as usize..].iter().all(|v| spanned::is_regular(v));
         if let Some(missing) = set.missing.clone().filter(|_| !directory_whole) {
             let present = set.volumes.iter().take_while(|v| **v != missing).cloned().collect();
             let mut split = byte_split::ByteSplit::from_volumes(present, 0)?;
@@ -384,8 +384,10 @@ impl Archive {
             return Ok(Archive { file, len, pieces, missing: Some(missing), last_size_unknown, holes, entries });
         }
         // an absent disk stands in at the set's split size: every numbered volume but the last has it
-        let nominal =
-            set.volumes[..last as usize].iter().find_map(|v| std::fs::metadata(v).ok().map(|m| m.len())).unwrap_or(0);
+        let nominal = set.volumes[..last as usize]
+            .iter()
+            .find_map(|v| std::fs::metadata(v).ok().filter(|m| m.is_file()).map(|m| m.len()))
+            .unwrap_or(0);
         let mut split = byte_split::ByteSplit::from_volumes(set.volumes.clone(), nominal)?;
         let len = split.len();
         let holes = split.holes();
