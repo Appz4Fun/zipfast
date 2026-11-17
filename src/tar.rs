@@ -1530,6 +1530,12 @@ fn link_member(
             }
             return Err(e.into());
         }
+        // the link's own path now holds the target's holes too, so a link to this link is charged the same
+        let link_holes = match kind {
+            LinkKind::Hard(target) | LinkKind::Copy(target) => holes.extracted.get(target).copied().unwrap_or(0),
+            LinkKind::Symbolic(_) => 0,
+        };
+        holes.extracted(rel, link_holes);
     }
     if opts.mode != Mode::Extract {
         link::tested(rel, kind, extracted);
@@ -1913,6 +1919,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hard_links_copied_in_place_of_linking_are_charged_for_holes() {
+        copies_are_charged(false);
+    }
+
+    /// The same through a chain of links, each to the one before: every copy is charged the first file's holes.
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_hard_links_copied_is_charged_as_direct_links_are() {
+        copies_are_charged(true);
+    }
+
+    #[cfg(unix)]
+    fn copies_are_charged(chained: bool) {
         use std::io::Write;
         const MIB: u64 = 1 << 20;
         // 1 GiB + 1 KiB allowed for "big"'s one byte, less its holes: 20 MiB left
@@ -1920,8 +1938,10 @@ mod tests {
         let mut tar = test_sparse("big", big);
         // 8 MiB of holes: 12 MiB and 1 KiB left, enough for one copy of "s"
         tar.extend(test_sparse("s", 8 * MIB + 1));
+        // direct links to "s", and when `chained`, each to the one before it
         for i in 0..5 {
-            tar.extend(test_header(&format!("h{i}"), b'1', 0, "s"));
+            let target = if chained && i > 0 { format!("h{}", i - 1) } else { "s".to_owned() };
+            tar.extend(test_header(&format!("h{i}"), b'1', 0, &target));
         }
         tar.extend(test_header("after.txt", b'0', 5, ""));
         let mut after = b"after".to_vec();
@@ -1949,8 +1969,15 @@ mod tests {
                 windows_safe_names: false,
             };
             let s = run(&path, &opts, |_| {}).unwrap();
-            assert_eq!(s.errors.len(), 4, "{name}: {:?}", s.errors);
-            assert!(s.errors.iter().all(|e| e.contains("would have to copy a sparse file")), "{name}: {:?}", s.errors);
+            assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);
+            let over = |e: &String| e.contains("would have to copy a sparse file");
+            if chained {
+                // h1 is refused; h2 to h4 then link to names that were never placed
+                assert!(s.errors[0].starts_with("h1") && over(&s.errors[0]), "{name}: {:?}", s.errors);
+                assert!(s.errors[1..].iter().all(|e| e.contains(link::HARD_TARGET)), "{name}: {:?}", s.errors);
+            } else {
+                assert!(s.errors.iter().all(over), "{name}: {:?}", s.errors);
+            }
             assert_eq!(s.files, 4, "{name}: big, s, h0, after.txt");
             let h0 = std::fs::read(dest.join("h0")).unwrap();
             assert_eq!(h0.len() as u64, 8 * MIB + 1, "{name}");
