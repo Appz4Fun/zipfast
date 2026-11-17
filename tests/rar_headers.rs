@@ -530,3 +530,28 @@ fn rar4_end_records_carry_flags_crc_and_volume_number() {
         assert_eq!(end.data_crc.is_some(), end.flags & 2 != 0, "{end:?}");
     }
 }
+
+#[test]
+fn kept_extra_records_count_against_catalogue_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let build = |name: &str, extra_len: usize| {
+        let path = dir.path().join(name);
+        let mut body = vec![9u8];
+        body.extend(std::iter::repeat_n(0xaa, extra_len));
+        let mut extra = Vec::new();
+        vint(body.len() as u64, &mut extra);
+        extra.extend(body);
+        let file = file_block(&FileSpec { extra, ..FileSpec::new("f", b"") }, b"", 0, false, false);
+        fs::write(&path, [SIG.to_vec(), main_block(false, None), file, end_block(false)].concat()).unwrap();
+        path
+    };
+    let small = build("small.rar", 1);
+    let large = build("large.rar", 200_000);
+    let capacity = |path: &Path| RarSession::open(path, None, single()).unwrap().usage().capacity;
+    let (base, big) = (capacity(&small), capacity(&large));
+    assert!(big >= base + 199_000, "{base} -> {big}");
+    let mut options = single();
+    options.limits.capacity = base + 100_000;
+    assert!(RarSession::open(&small, None, options.clone()).is_ok());
+    assert!(RarSession::open(&large, None, options).is_err());
+}

@@ -569,12 +569,12 @@ impl<'a> RarMember<'a> {
         self.member.header.redirection.as_ref()
     }
 
-    /// RAR 5.0: the redirection record's raw flags (0x1: the link target is a directory). Zero without one.
     /// RAR 5.0: the file header's extra records in stored order, type and bytes.
     pub fn extra_records(&self) -> &'a [super::RarExtraRecord] {
         &self.member.header.extra_records
     }
 
+    /// RAR 5.0: the redirection record's raw flags (0x1: the link target is a directory). Zero without one.
     pub fn redirection_flags(&self) -> u64 {
         self.member.header.redirection_flags
     }
@@ -1067,12 +1067,18 @@ impl Catalogue {
                 match block {
                     Block::File(header) => {
                         let wire = wire.expect("catalogue file metadata includes the wire name");
-                        let listed = header.clone();
+                        let mut listed = header.clone();
+                        // Only the member keeps its extra records (RarMember::extra_records), charged to capacity.
+                        listed.extra_records = Vec::new();
+                        self.owned_capacity = add(self.owned_capacity, extra_records_bytes(&header.extra_records))?;
+                        self.update_capacity()?;
                         let raw_name = wire.name.clone();
                         self.add_part(volume_index, header, crypt, wire)?;
                         self.add_header(volume_index, listed, Some(raw_name))?;
                     }
-                    Block::Service(header) => {
+                    Block::Service(mut header) => {
+                        // a service header's extra records are not kept
+                        header.extra_records = Vec::new();
                         if comment.is_none() && header.name == "CMT" {
                             comment = Some(self.session.headers.len());
                         }
@@ -1091,6 +1097,7 @@ impl Catalogue {
                 volume.main.original_name.as_ref().map_or(0, |name| name.capacity() as u64),
                 volume.main.embedded_comment.as_ref().map_or(0, |block| block.capacity() as u64),
             )?;
+            let original = add(original, extra_records_bytes(&volume.main.extra_records))?;
             self.owned_capacity = add(self.owned_capacity, original)?;
             let metadata = RarVolumeMetadata {
                 format,
@@ -1314,6 +1321,12 @@ impl Catalogue {
         self.session.usage.capacity = capacity;
         Ok(())
     }
+}
+
+/// The heap bytes a header's extra records hold: the vector and each record's data.
+fn extra_records_bytes(records: &Vec<super::RarExtraRecord>) -> u64 {
+    (records.capacity() * size_of::<super::RarExtraRecord>() + records.iter().map(|r| r.data.capacity()).sum::<usize>())
+        as u64
 }
 
 fn target_name(header: &FileHeader) -> Option<&String> {
