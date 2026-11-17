@@ -209,6 +209,11 @@ impl Extracted {
     pub(crate) fn contains(&self, rel: &Path) -> bool {
         self.0.contains_key(rel)
     }
+
+    /// The device and inode of the file the member at `rel` landed as, when it was extracted (not only tested).
+    pub(crate) fn landed_identity(&self, rel: &Path) -> Option<(u64, u64)> {
+        self.0.get(rel).and_then(|landed| landed.as_ref()).map(|landed| (landed.dev, landed.ino))
+    }
 }
 
 #[cfg(unix)]

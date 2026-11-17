@@ -2099,3 +2099,123 @@ fn controlled_extraction_refuses_the_whole_archive_member_filter_before_anything
     );
     assert_eq!(report.finish().outcome.unwrap().files, 1);
 }
+
+/// A RAR 5.0 redirection record (extra type 5): kind, flags, target.
+fn redirection(kind: u64, target: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    for v in [5, kind, 0, target.len() as u64] {
+        vint(v, &mut body);
+    }
+    body.extend(target.as_bytes());
+    let mut extra = Vec::new();
+    vint(body.len() as u64, &mut extra);
+    extra.extend(body);
+    extra
+}
+fn link_spec<'a>(name: &'a str, kind: u64, target: &str) -> FileSpec<'a> {
+    FileSpec { extra: redirection(kind, target), unix_mode: Some(0o120777), ..FileSpec::new(name, b"") }
+}
+
+/// Links the engine places (symbolic, hard, file copy) are its own changes, as written files are: diagnostics to a
+/// regular file inside the output tree stay available after each one, through to the terminal report.
+#[test]
+fn placed_links_keep_regular_diagnostics_inside_the_output_tree() {
+    struct Log;
+    impl RarExtractObserver for Log {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            Ok(RarOverwriteDecision::Replace)
+        }
+        fn entry(&mut self, entry: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            let line = format!("{}\n", entry.entry.name);
+            let state = diagnostic.snapshot().state;
+            diagnostic
+                .writer()
+                .unwrap_or_else(|| panic!("muted at {}: {state:?}", entry.entry.name))
+                .write_all(line.as_bytes())
+                .unwrap();
+        }
+    }
+    let names = ["d/f", "sym", "d/up", "hard", "copy", "dirlink", "after"];
+    for (always, precreate) in [(true, false), (true, true), (false, false)] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("links.rar");
+        fs::write(
+            &source,
+            archive(&[
+                FileSpec::new("d/f", b"data"),
+                link_spec("sym", 1, "d/f"),
+                link_spec("d/up", 1, "../d/f"),
+                link_spec("hard", 4, "d/f"),
+                link_spec("copy", 5, "d/f"),
+                link_spec("dirlink", 1, "d"),
+                FileSpec::new("after", b"after"),
+            ]),
+        )
+        .unwrap();
+        let dest = d.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        if precreate {
+            // incumbents the links replace
+            for name in ["sym", "hard", "copy"] {
+                fs::write(dest.join(name), b"old").unwrap();
+            }
+        }
+        let log = dest.join("err.log");
+        let diagnostic = OpenOptions::new().create_new(true).append(true).open(&log).unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mode = if always { RarOverwriteMode::Always } else { RarOverwriteMode::Ask };
+        let mut control = RarExtractControl::new(Some(diagnostic), mode, RarExtractControlLimits::default());
+        let mut report = session.extract_selected_controlled(
+            &selected,
+            &options(&dest),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Log,
+        );
+        let summary = report.outcome().as_ref().unwrap();
+        assert_eq!((summary.files, summary.failed), (7, 0), "{summary:?}");
+        assert!(report.diagnostic_failure().is_none(), "{:?}", report.diagnostic_failure());
+        report.diagnostic().writer().expect("terminal diagnostics after links").write_all(b"summary\n").unwrap();
+        assert!(report.finish().diagnostic_failure.is_none());
+        let mut expected: String = names.iter().map(|n| format!("{n}\n")).collect();
+        expected.push_str("summary\n");
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected);
+        assert_eq!(fs::read_link(dest.join("sym")).unwrap(), Path::new("d/f"));
+        assert_eq!(fs::read(dest.join("hard")).unwrap(), b"data");
+        assert_eq!(fs::read(dest.join("copy")).unwrap(), b"data");
+    }
+}
+
+/// The guard still refuses a change it did not make: a link swapped for a hard link to the log after placement.
+#[test]
+fn a_placed_link_rebound_to_the_log_still_revokes_diagnostics() {
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("links.rar");
+    fs::write(&source, archive(&[FileSpec::new("f", b"data"), link_spec("sym", 1, "f")])).unwrap();
+    let dest = d.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    let log = dest.join("err.log");
+    let diagnostic = OpenOptions::new().create_new(true).append(true).open(&log).unwrap();
+    let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let mut control =
+        RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Always, RarExtractControlLimits::default());
+    let mut report = session.extract_selected_controlled(
+        &selected,
+        &options(&dest),
+        RarDecodeLimits::default(),
+        &mut control,
+        &mut Quiet,
+    );
+    assert_eq!(report.outcome().as_ref().unwrap().files, 2);
+    assert!(report.diagnostic_failure().is_none(), "{:?}", report.diagnostic_failure());
+    fs::remove_file(dest.join("sym")).unwrap();
+    fs::hard_link(&log, dest.join("sym")).unwrap();
+    assert!(report.diagnostic().writer().is_none());
+    assert!(report.diagnostic_failure().is_some());
+}

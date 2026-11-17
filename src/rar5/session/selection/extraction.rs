@@ -429,57 +429,62 @@ impl<'a> Extraction<'a> {
                 None => output_fault(IoOperation::Publish, path, source),
             }
         };
-        let landed;
-        match (self.options.overwrite.rename(), initial) {
-            (Some(mode), Some(_)) => {
-                use crate::extract::{RenameError, RenameMode, RenamedOutput, claim_candidate, rename_noreplace};
-                hooks.before_publication(index, None);
-                let skip = |candidate: &Path| self.protect_source_name(session, candidate).is_err();
-                let refused = |error| match error {
-                    RenameError::Exhausted => {
-                        own_fault(policy_fault(RarPolicyReason::RenameExhausted, target.to_path_buf()))
-                    }
-                    RenameError::Unsupported => {
-                        own_fault(policy_fault(RarPolicyReason::RenameUnsupported, target.to_path_buf()))
-                    }
-                    RenameError::Io(path, source) => failed(&path, source),
-                };
-                match mode {
-                    // the existing file or folder moves aside; the link takes its name
-                    RenameMode::Existing(style) => {
-                        let moved = claim_candidate(target, style, &mut run.rename_budget, skip, |to| {
-                            rename_noreplace(target, to)
-                        })
-                        .map_err(refused)?;
-                        run.renames.push(RenamedOutput {
-                            requested: target.to_path_buf(),
-                            path: target.to_path_buf(),
-                            existing: Some(moved.0),
-                        });
-                        create(target, false).map_err(|source| failed(target, source))?;
-                        landed = target.to_path_buf();
-                    }
-                    // the link goes to the first free renamed name
-                    RenameMode::New(style) => {
-                        let (path, ()) = claim_candidate(target, style, &mut run.rename_budget, skip, |candidate| {
-                            create(candidate, false)
-                        })
-                        .map_err(refused)?;
-                        run.renames.push(RenamedOutput {
-                            requested: target.to_path_buf(),
-                            path: path.clone(),
-                            existing: None,
-                        });
-                        landed = path;
-                    }
+        // what is placed, so the diagnostic guard takes it as this run's own change
+        let placed = match &kind {
+            link::LinkKind::Symbolic(text) => PlacedLink::Symbolic { len: text.len() as u64 },
+            link::LinkKind::Hard(source) => PlacedLink::Hard { source: self.extracted.landed_identity(source) },
+            link::LinkKind::Copy(_) => PlacedLink::Copy,
+        };
+        let rename = self.options.overwrite.rename().filter(|_| initial.is_some());
+        hooks.before_publication(index, if rename.is_some() { None } else { initial });
+        let placement = (|| -> Result<PathBuf, Arc<RarFailure>> {
+            use crate::extract::{RenameError, RenameMode, RenamedOutput, claim_candidate, rename_noreplace};
+            let Some(mode) = rename else {
+                create(target, initial.is_some()).map_err(|source| failed(target, source))?;
+                return Ok(target.to_path_buf());
+            };
+            let skip = |candidate: &Path| self.protect_source_name(session, candidate).is_err();
+            let refused = |error| match error {
+                RenameError::Exhausted => {
+                    own_fault(policy_fault(RarPolicyReason::RenameExhausted, target.to_path_buf()))
+                }
+                RenameError::Unsupported => {
+                    own_fault(policy_fault(RarPolicyReason::RenameUnsupported, target.to_path_buf()))
+                }
+                RenameError::Io(path, source) => failed(&path, source),
+            };
+            match mode {
+                // the existing file or folder moves aside; the link takes its name
+                RenameMode::Existing(style) => {
+                    let moved =
+                        claim_candidate(target, style, &mut run.rename_budget, skip, |to| rename_noreplace(target, to))
+                            .map_err(refused)?;
+                    run.renames.push(RenamedOutput {
+                        requested: target.to_path_buf(),
+                        path: target.to_path_buf(),
+                        existing: Some(moved.0),
+                    });
+                    create(target, false).map_err(|source| failed(target, source))?;
+                    Ok(target.to_path_buf())
+                }
+                // the link goes to the first free renamed name
+                RenameMode::New(style) => {
+                    let (path, ()) = claim_candidate(target, style, &mut run.rename_budget, skip, |candidate| {
+                        create(candidate, false)
+                    })
+                    .map_err(refused)?;
+                    run.renames.push(RenamedOutput {
+                        requested: target.to_path_buf(),
+                        path: path.clone(),
+                        existing: None,
+                    });
+                    Ok(path)
                 }
             }
-            _ => {
-                hooks.before_publication(index, initial);
-                create(target, initial.is_some()).map_err(|source| failed(target, source))?;
-                landed = target.to_path_buf();
-            }
-        }
+        })();
+        // also after a failure: staging a hard link may have touched the earlier file
+        hooks.linked(index, target, placement.as_deref().ok(), placed);
+        let landed = placement?;
         link::placed(&self.options.dest, relative, &kind, &landed, &mut self.extracted);
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
     }
@@ -764,6 +769,19 @@ pub(super) trait ExtractionHooks {
     fn directory_committed(&mut self) {}
     fn stage(&mut self, _index: usize, _stamp: SourceStamp) {}
     fn published(&mut self, _index: usize, _target: &Path, _held: &File, _published: bool) {}
+    /// A link member was placed at `landed` for `target` (None: nothing was placed).
+    fn linked(&mut self, _index: usize, _target: &Path, _landed: Option<&Path>, _placed: PlacedLink) {}
+}
+
+/// What a link member placed, as the diagnostic guard checks it.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PlacedLink {
+    /// A symbolic link whose target is this many bytes.
+    Symbolic { len: u64 },
+    /// A hard link to the file this run extracted with this device and inode (a copy where linking fails).
+    Hard { source: Option<(u64, u64)> },
+    /// A copy of a file this run extracted.
+    Copy,
 }
 struct LegacyHooks;
 impl ExtractionHooks for LegacyHooks {
