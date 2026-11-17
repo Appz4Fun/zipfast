@@ -327,6 +327,9 @@ pub struct Archive {
     /// Where the absent pieces would be: past the end of a byte-split set cut short, or the disks of a spanned set
     /// that are missing while its central directory is not. A member whose bytes reach one fails as missing it.
     holes: Vec<std::ops::Range<u64>>,
+    /// For each entry of a spanned set whose local header is on an absent disk, that disk's volume: such a member
+    /// is never read, and fails as missing it. Empty when no entry is.
+    lost: Vec<Option<PathBuf>>,
     pub entries: Vec<ZipEntry>,
 }
 
@@ -338,6 +341,11 @@ impl Archive {
     pub(crate) fn open_cancelable(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
         if let Some(set) = spanned::Spanned::open(path)? {
             return Self::open_spanned(set, cancel);
+        }
+        if let Some(set) = spanned::Headless::open(path) {
+            check_cancel(cancel)?;
+            let pieces = set.volumes.clone();
+            return Self::open_local_walk(pieces, set.volumes, set.missing);
         }
         let (mut file, len, pieces, missing) = match byte_split::ByteSplit::open(path)? {
             Some(split) => {
@@ -359,7 +367,27 @@ impl Archive {
             None => (read_projected_legacy(&mut file, len, cancel)?.0, false),
         };
         let holes = if missing.is_some() { std::iter::once(len..u64::MAX).collect() } else { Vec::new() };
-        Ok(Archive { file, len, pieces, missing, last_size_unknown, holes, entries })
+        Ok(Archive { file, len, pieces, missing, last_size_unknown, holes, lost: Vec::new(), entries })
+    }
+
+    /// The `present` disks of a spanned set read as one, up to the absent volume `missing`, with no central directory
+    /// to read: the members are those whose local headers lie before the gap, as for a byte-split set cut short.
+    fn open_local_walk(pieces: Vec<PathBuf>, present: Vec<PathBuf>, missing: PathBuf) -> Result<Archive> {
+        let mut split = byte_split::ByteSplit::from_volumes(present, 0)?;
+        let len = split.len();
+        // offsets in disk 0 count the spanning marker
+        let mut head = [0u8; 4];
+        let start =
+            if len >= 4 && split.read_exact(&mut head).is_ok() && head == *spanned::SPLIT_MARKER { 4 } else { 0 };
+        let mut file = byte_split::ArchiveSource::Split(split);
+        let (entries, last_size_unknown) = byte_split::scan_local_headers(&mut file, start, len)?;
+        let holes = std::iter::once(len..u64::MAX).collect();
+        Ok(Archive { file, len, pieces, missing: Some(missing), last_size_unknown, holes, lost: Vec::new(), entries })
+    }
+
+    /// The absent volume the entry at `index` starts on, if any: it can't be read at all.
+    fn lost_volume(&self, index: usize) -> Option<&Path> {
+        self.lost.get(index).and_then(Option::as_deref)
     }
 
     /// An Info-ZIP spanned set read as its disks concatenated, each entry's (disk, offset) made an offset there. With
@@ -372,16 +400,7 @@ impl Archive {
         let directory_whole = set.volumes[set.directory_disk as usize..].iter().all(|v| spanned::is_regular(v));
         if let Some(missing) = set.missing.clone().filter(|_| !directory_whole) {
             let present = set.volumes.iter().take_while(|v| **v != missing).cloned().collect();
-            let mut split = byte_split::ByteSplit::from_volumes(present, 0)?;
-            let len = split.len();
-            // offsets in disk 0 count the spanning marker
-            let mut head = [0u8; 4];
-            let start =
-                if len >= 4 && split.read_exact(&mut head).is_ok() && head == *spanned::SPLIT_MARKER { 4 } else { 0 };
-            let mut file = byte_split::ArchiveSource::Split(split);
-            let (entries, last_size_unknown) = byte_split::scan_local_headers(&mut file, start, len)?;
-            let holes = std::iter::once(len..u64::MAX).collect();
-            return Ok(Archive { file, len, pieces, missing: Some(missing), last_size_unknown, holes, entries });
+            return Self::open_local_walk(pieces, present, missing);
         }
         // an absent disk stands in at the set's split size: every numbered volume but the last has it
         let nominal = set.volumes[..last as usize]
@@ -411,10 +430,21 @@ impl Archive {
             }
         }
         let mut entries = Vec::with_capacity(found.entries.len());
+        let mut lost = Vec::new();
+        let absent: Vec<bool> = set.volumes.iter().map(|v| set.missing.is_some() && !spanned::is_regular(v)).collect();
         for (mut entry, disk) in found.entries {
             check_cancel(cancel)?;
             let start =
                 starts.get(disk as usize).filter(|_| disk <= last).ok_or(Error::Corrupt("ZIP local header disk"))?;
+            // A member starting on an absent disk is listed, as 7-Zip lists it, but never read: the hole there has
+            // only a nominal size, so its offset can't be trusted to land in it.
+            if absent[disk as usize] {
+                lost.resize(entries.len(), None);
+                lost.push(Some(set.volumes[disk as usize].clone()));
+                entry.local_at = *start;
+                entries.push(entry);
+                continue;
+            }
             entry.local_at = start
                 .checked_add(entry.local_at)
                 .filter(|&at| at < len)
@@ -428,6 +458,7 @@ impl Archive {
             missing: set.missing,
             last_size_unknown: false,
             holes,
+            lost,
             entries,
         })
     }
@@ -461,6 +492,9 @@ impl Archive {
         mut sink: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
         self.selected_entry(index, limit)?;
+        if let Some(volume) = self.lost_volume(index) {
+            return Err(Error::MissingVolume(volume.to_path_buf()));
+        }
         let entry = self.entries[index].read_description();
         let mut buffer = vec![0; BUF];
         read_entry(&mut self.file, self.len, &entry, password, &mut buffer, &mut sink, cancel)
@@ -928,6 +962,12 @@ pub(crate) fn is_spanned(path: &Path) -> bool {
     spanned::is_spanned(path)
 }
 
+/// Whether `path` is the `.z01` of an Info-ZIP spanned set whose `.zip` is missing: read only by walking its local
+/// headers, on the unchecked routes ([`list`], [`run`]); the checked route refuses it.
+pub(crate) fn is_headless_spanned(path: &Path) -> bool {
+    spanned::Headless::open(path).is_some()
+}
+
 pub(crate) fn is_byte_split(path: &Path) -> bool {
     byte_split::is_split_set(path) || spanned::is_spanned(path)
 }
@@ -945,9 +985,10 @@ pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
     // encrypted; otherwise left empty.
     let mut targets = Vec::with_capacity(archive.entries.len());
     let mut buf = vec![0u8; BUF];
-    for e in &archive.entries {
+    for (index, e) in archive.entries.iter().enumerate() {
         let mut text = Vec::new();
         if e.is_link()
+            && archive.lost_volume(index).is_none()
             && !e.encrypted()
             && e.size <= crate::extract::link::MAX_TARGET
             && supported(e.effective_method())
@@ -1100,7 +1141,9 @@ pub(crate) fn run_renaming(
                 continue;
             }
             let eff_method = e.effective_method();
-            let refuse = if e.encrypted() && password.is_none() {
+            let refuse = if let Some(volume) = archive.lost_volume(ordinal) {
+                Some(Error::MissingVolume(volume.to_path_buf()).to_string())
+            } else if e.encrypted() && password.is_none() {
                 Some("encrypted (password required)".to_string())
             } else if !supported(eff_method) {
                 Some(format!("compression method {} is not supported yet", eff_method))

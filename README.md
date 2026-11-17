@@ -30,7 +30,12 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   (all strengths, AE-1/AE-2); see [checked ZIP reads](docs/zip-checked-reads.md) for policy, staging and legacy caps, and [staged output](docs/zip-staged-output.md) for the native and portable backends.
   Split sets list, test and extract from their first file: raw byte splits (`name.zip.001`, ...) and Info-ZIP
   spanned sets (`name.z01`, `name.z02`, ..., `name.zip`, from the `.zip` or the `.z01`), read as 7-Zip reads them;
-  a missing volume fails only the members whose bytes it holds.
+  a missing volume fails only the members whose bytes it holds. As in 7-Zip, a spanned set without its `.zip` opens from the `.z01`
+  by walking the local headers, and members wholly before the gap extract: on the unchecked `extract::run` and
+  `list` only, without the checked guarantees; the checked route refuses such a set. Unlike 7-Zip, a set missing its `.z01`
+  is rejected: without the first volume, nothing but the `.zip`'s own end record says it belongs to a set, which a
+  hostile lone `.zip` could claim to get around the checked reader. Also unlike 7-Zip, a member cut short by a
+  missing volume is never written in part: zipfast only publishes data whose size and CRC it has checked.
 - tar archives, plain or compressed with gzip, xz, zstd, bzip2, LZ4 (frames and legacy frames), Unix compress or
   LZMA-alone (`.tar.gz`, `.tgz`, `.tar.xz`, `.tar.zst`, `.tar.bz2`, `.tar.lz4`, `.tar.Z`, `.tar.lzma` and so on),
   each found by its first bytes whatever the name: POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256

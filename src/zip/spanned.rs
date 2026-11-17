@@ -36,6 +36,10 @@ const END64_LEN: usize = 56;
 const TAIL_MAX: u64 = (END_LEN + u16::MAX as usize + LOCATOR_LEN) as u64;
 /// The most disks a set may have.
 const MAX_DISKS: u32 = 100_000;
+/// How many names past an absent numbered volume are probed for a later one, when the `.zip` is missing too.
+const GAP_PROBE: u32 = 16;
+/// How much of a `.zip`'s end is read first for its end record: enough unless it has a long comment.
+const TAIL_FIRST: u64 = 4096;
 /// The spanning signature a set's first volume starts with; offsets in disk 0 count it.
 pub(crate) const SPLIT_MARKER: &[u8; 4] = b"PK\x07\x08";
 
@@ -49,18 +53,74 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
 }
 
-/// The `.zip` of the set `path` belongs to: `path` itself when it is a `.zip` with a `.z01` beside it, or the `.zip`
-/// beside a `.z01` given instead. None for anything else.
+/// The `.zip` of the set `path` belongs to: `path` itself when it is a `.zip` with a regular `.z01` beside it, or the
+/// `.zip` beside a `.z01` given instead. None for anything else. A `.zip` without its `.z01` is never read as a set,
+/// though 7-Zip reads one: nothing but the `.zip`'s own end record would then say it is part of a set, and a hostile
+/// lone `.zip` could claim so to leave the checked route for the split reader.
 pub(crate) fn last_volume(path: &Path) -> Option<PathBuf> {
     let ext = path.extension()?.to_str()?;
     if ext.eq_ignore_ascii_case("zip") {
         let first = Path::new(&split_volume_name(path.as_os_str(), 0, false)).to_path_buf();
-        is_regular(&first).then(|| path.to_path_buf())
+        (is_regular(path) && is_regular(&first)).then(|| path.to_path_buf())
     } else if ext.eq_ignore_ascii_case("z01") {
         let last = Path::new(&split_volume_name(path.as_os_str(), 0, true)).to_path_buf();
         is_regular(&last).then_some(last)
     } else {
         None
+    }
+}
+
+/// The volumes present of a set whose `.zip` is missing, opened from its `.z01`: there is no end record, so the set
+/// can only be read by walking its local headers, as 7-Zip does.
+pub(crate) struct Headless {
+    /// `.z01`, `.z02`, ... up to the first absent one.
+    pub volumes: Vec<PathBuf>,
+    /// The first absent volume: the `.zip`, unless a later numbered volume shows a numbered one is missing first.
+    pub missing: PathBuf,
+}
+
+impl Headless {
+    /// The set whose `.z01` is `path` when its `.zip` is absent (or not a regular file). The `.z01` must be a regular
+    /// file starting with the spanning signature, or with a local header and no end record ending at its end (a
+    /// lone archive named `.z01` stays one).
+    pub(crate) fn open(path: &Path) -> Option<Self> {
+        let ext = path.extension()?.to_str()?;
+        if !ext.eq_ignore_ascii_case("z01") {
+            return None;
+        }
+        let last = PathBuf::from(split_volume_name(path.as_os_str(), 0, true));
+        if is_regular(&last) {
+            return None;
+        }
+        let mut file = open_regular(path).ok()?;
+        let mut head = [0u8; 4];
+        file.read_exact(&mut head).ok()?;
+        if head != *SPLIT_MARKER {
+            if head != *b"PK\x03\x04" {
+                return None;
+            }
+            let len = file.metadata().ok()?.len();
+            let span = len.min(TAIL_MAX);
+            let mut tail = vec![0u8; span as usize];
+            file.seek(SeekFrom::Start(len - span)).ok()?;
+            file.read_exact(&mut tail).ok()?;
+            if find_end(&tail).is_some() {
+                return None;
+            }
+        }
+        let name = |i: u32| PathBuf::from(split_volume_name(path.as_os_str(), i, false));
+        let mut volumes = vec![path.to_path_buf()];
+        while volumes.len() < MAX_DISKS as usize {
+            let next = name(volumes.len() as u32);
+            if !is_regular(&next) {
+                break;
+            }
+            volumes.push(next);
+        }
+        let gap = volumes.len() as u32;
+        // a later numbered volume makes the first absent one the gap; otherwise the set ends at its absent `.zip`
+        let later = (gap + 1..gap.saturating_add(GAP_PROBE).min(MAX_DISKS)).any(|i| is_regular(&name(i)));
+        Some(Self { volumes, missing: if later { name(gap) } else { last } })
     }
 }
 
@@ -87,10 +147,11 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Whether `path` is the `.zip` (or the `.z01`) of a spanned set: a `.z01` beside it, and an end record naming more
-/// than one disk. A lone `.zip` with a stray `.z01` beside it stays a lone archive.
+/// Whether `path` is the `.zip` (or the `.z01`) of a spanned set: a `.z01` beside it and an end record naming more
+/// than one disk (a lone `.zip` with a stray `.z01` beside it stays a lone archive), or a `.z01` whose `.zip` is
+/// missing ([`Headless`]).
 pub(crate) fn is_spanned(path: &Path) -> bool {
-    last_volume(path).is_some() && matches!(Spanned::open(path), Ok(Some(_)))
+    matches!(Spanned::open(path), Ok(Some(_))) || Headless::open(path).is_some()
 }
 
 /// A spanned set, found from its end record.
@@ -111,16 +172,26 @@ impl Spanned {
     /// The set whose `.zip` (or `.z01`) is `path`, or None when `path` is not one: no `.z01` beside it, no end record
     /// ending at its end (trailing bytes, damage), or one naming a single disk (a lone archive that happens to have a
     /// `.z01` beside it). Each of those is left to the single-file reader. Only once the end record names more than
-    /// one disk is a fault the set's.
+    /// one disk is a fault the set's; numbered volumes after the `.z01` may then be missing.
     pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
         let Some(last) = last_volume(path) else { return Ok(None) };
         let Ok(mut file) = open_regular(&last) else { return Ok(None) };
         let len = file.metadata()?.len();
-        let span = len.min(TAIL_MAX);
+        // most archives end with a short (or no) comment: read a little first, the longest tail only when needed
+        let mut span = len.min(TAIL_FIRST);
         let mut tail = vec![0u8; span as usize];
         file.seek(SeekFrom::Start(len - span))?;
         file.read_exact(&mut tail)?;
-        let Some(at) = find_end(&tail) else { return Ok(None) };
+        let mut found = find_end(&tail);
+        // past a short window, also when the ZIP64 locator before the record could be cut off
+        if found.is_none_or(|at| at < LOCATOR_LEN) && len > span {
+            span = len.min(TAIL_MAX);
+            tail = vec![0u8; span as usize];
+            file.seek(SeekFrom::Start(len - span))?;
+            file.read_exact(&mut tail)?;
+            found = find_end(&tail);
+        }
+        let Some(at) = found else { return Ok(None) };
         let record = &tail[at..at + END_LEN];
         let locator = at
             .checked_sub(LOCATOR_LEN)
