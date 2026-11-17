@@ -45,14 +45,10 @@ impl RarSession {
             if Arc::ptr_eq(&self.token, &selection.token) {
                 control.prepare(self, selection, options);
             }
-            let mut driver = Driver {
-                extraction: Extraction::new(options),
-                control,
-                observer,
-                retained: 0,
-                event_bytes: 0,
-                source_paths: Vec::new(),
-            };
+            let mut extraction = Extraction::new(options);
+            extraction.versions = selection.takes_versions();
+            let mut driver =
+                Driver { extraction, control, observer, retained: 0, event_bytes: 0, source_paths: Vec::new() };
             let result = self.execute_driver(selection, decode, &mut driver);
             // I2: only the incumbent drain body is exempt from the new control ceilings.
             driver.control.close_parent();

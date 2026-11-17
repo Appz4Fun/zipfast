@@ -246,6 +246,14 @@ impl MainHeader {
     }
 }
 
+/// `name` with an older revision's `version` appended after `;`, as UnRAR names a RAR 5.0 file version.
+pub fn version_name(name: &str, version: Option<u64>) -> std::borrow::Cow<'_, str> {
+    match version {
+        Some(version) => std::borrow::Cow::Owned(format!("{name};{version}")),
+        None => std::borrow::Cow::Borrowed(name),
+    }
+}
+
 /// How a file system object is to be recreated other than as a regular file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Redirection {
@@ -375,7 +383,8 @@ pub struct FileHeader {
     /// RAR 5.0, catalogues only: the extra records in their stored order (7-Zip lists their types in that order).
     pub extra_records: Vec<RarExtraRecord>,
     pub redirection: Option<Redirection>,
-    /// set on an older revision of a file kept alongside the current one
+    /// RAR 5.0: set on an older revision of a file kept alongside the current one (`rar -ver`), from the version
+    /// record. A record holding 0 is no version, as UnRAR reads it.
     pub version: Option<u64>,
     /// A service header's SubData: the stream name of an `STM` header, the `Protect+` tag of a RAR 4.x `RR`, and
     /// so on. Empty for file headers.
@@ -469,9 +478,19 @@ impl FileHeader {
         self.host_os == 1
     }
 
-    /// The name this member is written under; see [`crate::path::rar_output_name`].
+    /// The name this member is written under; see [`crate::path::rar_output_name`]. An older revision (RAR 5.0
+    /// version record) is written under its [`Self::display_name`], `name;N`, as UnRAR's `-ver` writes it.
     pub(crate) fn output_name(&self) -> Option<std::borrow::Cow<'_, str>> {
-        crate::path::rar_output_name(&self.name, self.format == RarFormat::Rar4)
+        let name = crate::path::rar_output_name(&self.name, self.format == RarFormat::Rar4)?;
+        Some(match self.version {
+            Some(version) => std::borrow::Cow::Owned(format!("{name};{version}")),
+            None => name,
+        })
+    }
+
+    /// The name as UnRAR shows it: an older revision's version number appended after `;` (`notes.txt;2`).
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        version_name(&self.name, self.version)
     }
 
     /// A RAR 4.x Unix symbolic link: a Unix-host member whose mode is `S_IFLNK`. Its data is the link's target.
@@ -721,7 +740,8 @@ fn parse_file_extra(
             FHEXTRA_HTIME => parse_htime(f, &mut r)?,
             FHEXTRA_VERSION => {
                 let _flags = r.vint()?;
-                f.version = Some(r.vint()?);
+                // UnRAR takes a version of 0 as no version (arcread.cpp)
+                f.version = Some(r.vint()?).filter(|&v| v != 0);
             }
             FHEXTRA_REDIR => {
                 let kind = r.vint()?;

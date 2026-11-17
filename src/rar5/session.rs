@@ -589,6 +589,12 @@ impl<'a> RarMember<'a> {
         self.member.header.version
     }
 
+    /// The name as UnRAR shows it: an older revision's version number appended after `;` (`notes.txt;2`), the name
+    /// [`super::RarSelection::with_versions`] extracts it under.
+    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+        self.member.header.display_name()
+    }
+
     pub fn modified(&self) -> Option<(i64, u32)> {
         let header = &self.member.header;
         header.mtime.map(|seconds| (seconds, header.mtime_nanos))

@@ -48,6 +48,24 @@ pub struct RarSelection {
     token: Arc<SessionToken>,
     bits: Vec<u64>,
     matched: u64,
+    /// extraction writes the selected older file revisions ([`RarSelection::with_versions`])
+    versions: bool,
+}
+
+impl RarSelection {
+    /// Extracts the selected older file revisions (RAR 5.0 version records, `rar -ver`) too, as UnRAR's `x -ver`
+    /// does: each under its [`RarMember::display_name`], the name with `;` and its version number appended
+    /// (`notes.txt;2`). Without it [`RarSession::extract_selected`] and `extract_selected_controlled` skip them
+    /// ([`RarSkipReason::OlderVersion`]) even when selected. Testing always checks them.
+    pub fn with_versions(mut self) -> Self {
+        self.versions = true;
+        self
+    }
+
+    /// Whether [`RarSelection::with_versions`] was asked for.
+    pub fn takes_versions(&self) -> bool {
+        self.versions
+    }
 }
 
 /// Cumulative packed and decoded work, and the maximum decoder window.
@@ -89,7 +107,7 @@ impl RarSession {
                 }
             }
             check_cancel(&self.options.cancel)?;
-            Ok(RarSelection { token: Arc::clone(&self.token), bits, matched })
+            Ok(RarSelection { token: Arc::clone(&self.token), bits, matched, versions: false })
         })();
         result.map_err(|fault: RarFault| run_error(self.summary(0), None, Arc::from(fault.failure)))
     }
