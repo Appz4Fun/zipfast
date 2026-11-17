@@ -37,8 +37,10 @@
 //!
 //! The input is hostile: names that are absolute or climb with `..` are refused, a hard link must name an earlier
 //! member, the tar reader's limits apply (decoded bytes, entry count, name bytes, sparse bombs), and nothing is
-//! read through or written to a link on disk. Symlink members are kept as data and never followed. The output is
-//! staged beside the target and renamed over it, refusing a symlink in its place.
+//! read through or written to a link on disk. Symlink members are kept as data and never followed, and a tar member
+//! whose path passes through a symlink member is refused, as is a tar file or link name given twice (a folder given
+//! twice is written once). The output and every temporary are made beside the target, and the output is renamed
+//! over it, refusing a symlink in its place.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -102,13 +104,13 @@ pub fn repack(input: &Path, output: &Path, opts: &RepackOptions) -> Result<Repac
 /// Repacks an ar archive.
 pub fn repack_ar(input: &Path, output: &Path, opts: &RepackOptions) -> Result<RepackSummary> {
     check(opts)?;
-    staged(output, |out| ar::repack(input, out, opts))
+    staged(output, |out, scratch| ar::repack(input, out, opts, &mut Budget { left: opts.limit }, scratch))
 }
 
 /// Repacks a tar archive (plain, compressed, or cpio) as a gzipped tar.
 pub fn repack_tar_gz(input: &Path, output: &Path, opts: &RepackOptions) -> Result<RepackSummary> {
     check(opts)?;
-    staged(output, |out| tarball::repack(input, out, opts))
+    staged(output, |out, scratch| tarball::repack(input, out, opts, &mut Budget { left: opts.limit }, scratch))
 }
 
 fn check(opts: &RepackOptions) -> Result<()> {
@@ -148,8 +150,12 @@ fn open_input(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// Writes through a temporary beside `output`, then renames it over `output`, refusing a symlink there.
-fn staged(output: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<RepackSummary>) -> Result<RepackSummary> {
+/// Writes through a temporary beside `output`, then renames it over `output`, refusing a symlink there. `write`
+/// also gets the output's folder, where every other temporary goes.
+fn staged(
+    output: &Path,
+    write: impl FnOnce(&mut BufWriter<File>, &Path) -> Result<RepackSummary>,
+) -> Result<RepackSummary> {
     let parent = match output.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -157,7 +163,7 @@ fn staged(output: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<Repa
     let temp = temporary(parent)?;
     let (file, path) = temp.into_parts();
     let mut out = BufWriter::with_capacity(1 << 20, file);
-    let summary = write(&mut out)?;
+    let summary = write(&mut out, parent)?;
     let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
     file.sync_all()?;
     drop(file);
@@ -165,7 +171,8 @@ fn staged(output: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Result<Repa
     Ok(summary)
 }
 
-/// Bytes counted against [`RepackOptions::limit`].
+/// Bytes counted against [`RepackOptions::limit`]: every member byte read (holes included), every byte a
+/// compressed tar stream decodes to, symbol and name tables, and all of that again inside nested tarballs.
 struct Budget {
     left: u64,
 }
@@ -187,15 +194,21 @@ fn nested_name(name: &[u8]) -> bool {
 }
 
 /// Repacks the tarball in `data` (a file read from its start), returning the repacked bytes in a new temporary
-/// file, or `None` when it is not a tarball. Nested tarballs are not opened again.
-fn repack_nested(data: &mut File, opts: &RepackOptions, budget: &mut Budget) -> Result<Option<(File, u64)>> {
-    let mut inner = tempfile::NamedTempFile::new()?;
+/// file in `scratch`, or `None` when it is not a tarball. Nested tarballs are not opened again. Whatever the inner
+/// repack reads and decodes is charged to `budget`, then the repacked bytes as well.
+fn repack_nested(
+    data: &mut File,
+    opts: &RepackOptions,
+    budget: &mut Budget,
+    scratch: &Path,
+) -> Result<Option<(File, u64)>> {
+    let mut inner = temporary(scratch)?;
     data.seek(SeekFrom::Start(0))?;
     io::copy(data, inner.as_file_mut())?;
     inner.as_file_mut().flush()?;
-    let inner_opts = RepackOptions { nested: false, limit: budget.left, ..opts.clone() };
-    let mut out = BufWriter::new(tempfile::tempfile()?);
-    match tarball::repack(inner.path(), &mut out, &inner_opts) {
+    let inner_opts = RepackOptions { nested: false, ..opts.clone() };
+    let mut out = BufWriter::new(tempfile::tempfile_in(scratch)?);
+    match tarball::repack(inner.path(), &mut out, &inner_opts, budget, scratch) {
         Ok(_) => {}
         Err(Error::NotAnArchive) => return Ok(None),
         Err(e) => return Err(e),

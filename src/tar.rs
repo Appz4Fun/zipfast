@@ -159,8 +159,14 @@ fn name_of(bytes: &[u8]) -> String {
 /// Where the archive's bytes come from: the file itself, which can be skipped through, or a compressed stream,
 /// which has to be read.
 enum Source {
-    Plain { r: BufReader<File>, len: u64, pos: u64, cancel: Option<Cancellation> },
-    Packed(Box<dyn Read>, Codec),
+    Plain {
+        r: BufReader<File>,
+        len: u64,
+        pos: u64,
+        cancel: Option<Cancellation>,
+    },
+    /// the decoder, its codec, and how many decoded bytes have been read from it
+    Packed(Box<dyn Read>, Codec, u64),
 }
 
 impl Source {
@@ -177,7 +183,7 @@ impl Source {
         // loops on its input without producing output still stops.
         let Some(limit) = limit.or(cancel.as_ref().map(|_| u64::MAX)) else {
             let reader = BufReader::with_capacity(1 << 20, file);
-            return Ok(Source::Packed(codec.open(reader, threads).map_err(read_error)?, codec));
+            return Ok(Source::Packed(codec.open(reader, threads).map_err(read_error)?, codec, 0));
         };
         if len > limit {
             return Err(Error::Unsupported("compressed stream exceeds the input byte limit".into()));
@@ -195,7 +201,7 @@ impl Source {
             cancel,
             message: "compressed stream exceeds the decoded byte limit",
         };
-        Ok(Source::Packed(Box::new(decoded), codec))
+        Ok(Source::Packed(Box::new(decoded), codec, 0))
     }
 
     /// Fills `buf` unless the stream ends first; returns how much was read.
@@ -209,7 +215,11 @@ impl Source {
                 *pos += n as u64;
                 n
             }
-            Source::Packed(r, _) => read_full(r, buf).map_err(read_error)?,
+            Source::Packed(r, _, decoded) => {
+                let n = read_full(r, buf).map_err(read_error)?;
+                *decoded += n as u64;
+                n
+            }
         };
         Ok(n)
     }
@@ -250,7 +260,7 @@ impl Source {
                 r.seek_relative(-(bytes.len() as i64))?;
                 *pos -= bytes.len() as u64;
             }
-            Source::Packed(r, _) => {
+            Source::Packed(r, _, _) => {
                 let rest = std::mem::replace(r, Box::new(io::empty()));
                 *r = Box::new(io::Cursor::new(bytes).chain(rest));
             }
@@ -260,7 +270,7 @@ impl Source {
 
     fn codec(&self) -> Option<Codec> {
         match self {
-            Source::Packed(_, c) => Some(*c),
+            Source::Packed(_, c, _) => Some(*c),
             Source::Plain { .. } => None,
         }
     }
@@ -2034,12 +2044,13 @@ impl MemberData<'_> {
 /// Every member of a tar or cpio archive, plain or compressed, in stored order, with the listing's limits: at most
 /// `limit` decoded bytes from a compressed stream, the listing's entry and name budget, and the sparse bomb check.
 /// A volume label is passed over; a member this crate cannot write again (a multi-volume continuation, a socket)
-/// fails the walk. A lone compressed file is not an archive here.
+/// fails the walk. A lone compressed file is not an archive here. Returns the bytes the walk cost: the file's
+/// length, or for a compressed stream every byte decoded, whichever is more.
 pub(crate) fn walk_members(
     path: &Path,
     limit: u64,
     mut each: impl FnMut(RawMember, MemberData<'_>) -> Result<()>,
-) -> Result<()> {
+) -> Result<u64> {
     let mut reader = Reader::open_with_limit(path, 1, Some(limit), None)?;
     if matches!(reader.content, Content::Single) {
         return Err(Error::NotAnArchive);
@@ -2080,7 +2091,11 @@ pub(crate) fn walk_members(
     if reader.src.codec().is_some() {
         reader.drain(&mut buf)?;
     }
-    Ok(())
+    let len = std::fs::metadata(path)?.len();
+    Ok(match reader.src {
+        Source::Packed(_, _, decoded) => decoded.max(len),
+        Source::Plain { .. } => len,
+    })
 }
 
 #[cfg(test)]

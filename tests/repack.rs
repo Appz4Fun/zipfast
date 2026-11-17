@@ -551,3 +551,135 @@ fn ar_lists_and_prints_the_output_as_the_input() {
         }
     }
 }
+
+// ---------------------------------------------------------------- review fixes
+
+/// A BSD archive whose `__.SYMDEF` has `entries` entries, the i-th naming the string at `strx(i)` in a table holding
+/// one `name_len`-byte name, every entry pointing at the one member.
+fn bsd_symdef_ar(entries: usize, name_len: usize, strx: impl Fn(usize) -> u32) -> Vec<u8> {
+    let strings: Vec<u8> = [vec![b's'; name_len], vec![0u8; 8 - name_len % 8]].concat();
+    let symdef_name = b"__.SYMDEF\0\0\0";
+    let data_len = 4 + 8 * entries + 4 + strings.len();
+    let member_at = 8 + 60 + symdef_name.len() + data_len;
+    let member_at = member_at.next_multiple_of(2);
+    let mut out = b"!<arch>\n".to_vec();
+    out.extend(ar_header(b"#1/12", 0, 0, 0o100644, symdef_name.len() + data_len));
+    out.extend(symdef_name);
+    out.extend(((8 * entries) as u32).to_le_bytes());
+    for i in 0..entries {
+        out.extend(strx(i).to_le_bytes());
+        out.extend((member_at as u32).to_le_bytes());
+    }
+    out.extend((strings.len() as u32).to_le_bytes());
+    out.extend(&strings);
+    pad(&mut out);
+    assert_eq!(out.len(), member_at);
+    out.extend(ar_header(b"a.o", 0, 0, 0o100644, OBJ_A.len()));
+    out.extend(OBJ_A);
+    pad(&mut out);
+    out
+}
+
+#[test]
+fn bsd_symbol_table_names_are_resolved_once_and_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = RepackOptions::default();
+    // 200k entries all naming one 1 MiB name: one copy, and the rebuilt table holds the name once
+    let shared = write(dir.path(), "shared.a", &bsd_symdef_ar(200_000, 1 << 20, |_| 0));
+    let started = std::time::Instant::now();
+    repack(&shared, &dir.path().join("shared.out"), &opts).unwrap();
+    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+    let out_len = std::fs::metadata(dir.path().join("shared.out")).unwrap().len();
+    assert!(out_len < 8 << 20, "rebuilt archive is {out_len} bytes");
+    // entries naming every byte of the name: each is a different suffix, so the copies hit the cap
+    let suffixes = write(dir.path(), "suffixes.a", &bsd_symdef_ar(200_000, 1 << 20, |i| i as u32));
+    assert!(matches!(repack(&suffixes, &dir.path().join("suffixes.out"), &opts), Err(Error::Unsupported(_))));
+}
+
+#[test]
+fn nested_repacks_are_charged_to_the_byte_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    // each nested tarball is about a KiB packed and a MiB unpacked
+    let inner = gzip(&tar(&[T::File("zeros", 0o644, &vec![0u8; 1 << 20])], &ALICE), 0, "", 9);
+    assert!(inner.len() < 8 << 10);
+    let names: Vec<String> = (0..20).map(|i| format!("n{i:02}.tgz")).collect();
+    let members: Vec<T<'_>> = names.iter().map(|n| T::File(n, 0o644, &inner)).collect();
+    let outer = write(dir.path(), "outer.tar", &tar(&members, &ALICE));
+    let limit = 10 << 20;
+    let flat = RepackOptions { limit, ..RepackOptions::default() };
+    repack(&outer, &dir.path().join("flat.out"), &flat).unwrap();
+    let nested = RepackOptions { limit, nested: true, ..RepackOptions::default() };
+    assert!(matches!(repack(&outer, &dir.path().join("nested.out"), &nested), Err(Error::Unsupported(_))));
+    let roomy = RepackOptions { limit: 100 << 20, nested: true, ..RepackOptions::default() };
+    assert_eq!(repack(&outer, &dir.path().join("roomy.out"), &roomy).unwrap().nested, 20);
+}
+
+#[test]
+fn tar_names_given_twice_are_refused_but_folders_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = RepackOptions::default();
+    let retarget = tar(&[T::File("b", 0o644, b"first"), T::Hard("c", "b"), T::File("b", 0o644, b"second")], &ALICE);
+    let i = write(dir.path(), "retarget.tar", &retarget);
+    assert!(matches!(repack(&i, &dir.path().join("o"), &opts), Err(Error::Corrupt(_))));
+    let spelled = tar(&[T::File("./x", 0o644, b"1"), T::File("x", 0o644, b"2")], &ALICE);
+    let i = write(dir.path(), "spelled.tar", &spelled);
+    assert!(matches!(repack(&i, &dir.path().join("o"), &opts), Err(Error::Corrupt(_))));
+    let file_and_dir = tar(&[T::File("x", 0o644, b"1"), T::Dir("x/", 0o755)], &ALICE);
+    let i = write(dir.path(), "file-and-dir.tar", &file_and_dir);
+    assert!(matches!(repack(&i, &dir.path().join("o"), &opts), Err(Error::Corrupt(_))));
+    let folders = tar(&[T::Dir("a", 0o755), T::File("a/f", 0o644, b"f"), T::Dir("./a/", 0o700)], &ALICE);
+    let i = write(dir.path(), "folders.tar", &folders);
+    let o = dir.path().join("folders.out");
+    assert_eq!(repack(&i, &o, &opts).unwrap().members, 2);
+    let names: Vec<String> = zipfast::tar::list(&o).unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, ["a/", "a/f"]);
+}
+
+#[test]
+fn tar_paths_through_a_symlink_member_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = RepackOptions::default();
+    for (name, members) in [
+        ("plain", vec![T::Sym("x", "/etc"), T::File("x/passwd", 0o644, b"root::0:0")]),
+        ("spelled", vec![T::File("./x/y/z", 0o644, b"z"), T::Sym("./x/y", "/tmp")]),
+    ] {
+        let i = write(dir.path(), name, &tar(&members, &ALICE));
+        assert!(matches!(repack(&i, &dir.path().join("o"), &opts), Err(Error::UnsafePath(_))), "{name}");
+    }
+    // a symlink beside a folder of a longer name is fine
+    let ok = tar(&[T::Sym("x", "y"), T::File("xy/z", 0o644, b"z")], &ALICE);
+    let i = write(dir.path(), "ok.tar", &ok);
+    repack(&i, &dir.path().join("ok.out"), &opts).unwrap();
+}
+
+#[test]
+fn ar_names_with_a_newline_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = RepackOptions::default();
+    for (name, bytes) in [
+        ("plain", plain_ar(&[("a\nb.o", OBJ_A)], 0, 0)),
+        ("bsd", bsd_ar(&[("a long name with\na newline.o", OBJ_A)], 0, 0)),
+        ("gnu-field", plain_ar(&[("ab\ncdefghijklm/", OBJ_A)], 0, 0)),
+    ] {
+        let i = write(dir.path(), name, &bytes);
+        assert!(matches!(repack(&i, &dir.path().join("o"), &opts), Err(Error::UnsafePath(_))), "{name}");
+    }
+}
+
+#[test]
+fn temporaries_go_beside_the_output_and_are_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let input =
+        write(dir.path(), "in.deb", &plain_ar(&[("debian-binary", b"2.0\n"), ("data.tar.gz", &tree_a())], 1, 1));
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let opts = RepackOptions { nested: true, ..RepackOptions::default() };
+    repack(&input, &out_dir.join("x.deb"), &opts).unwrap();
+    let left: Vec<_> = std::fs::read_dir(&out_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["x.deb"]);
+    // a failed repack leaves nothing behind either
+    let bad = write(dir.path(), "bad.tar", &tar(&[T::File("x", 0o644, b"1"), T::File("x", 0o644, b"2")], &ALICE));
+    assert!(repack(&bad, &out_dir.join("bad.tar.gz"), &opts).is_err());
+    let left: Vec<_> = std::fs::read_dir(&out_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["x.deb"]);
+}

@@ -54,22 +54,42 @@ struct Group {
     mode: u32,
 }
 
-pub(super) fn repack(input: &Path, out: &mut dyn Write, opts: &RepackOptions) -> Result<RepackSummary> {
+/// Repacks the tarball at `input` into `out`, charging what it reads and decodes to `budget` and keeping its
+/// temporaries in `scratch`.
+pub(super) fn repack(
+    input: &Path,
+    out: &mut dyn Write,
+    opts: &RepackOptions,
+    budget: &mut Budget,
+    scratch: &Path,
+) -> Result<RepackSummary> {
     drop(open_input(input)?);
-    let mut budget = Budget { left: opts.limit };
-    let mut spool = BufWriter::with_capacity(1 << 20, tempfile::tempfile()?);
+    let mut spool = BufWriter::with_capacity(1 << 20, tempfile::tempfile_in(scratch)?);
     let mut spooled = 0u64;
     let mut members = Vec::new();
     let mut groups: Vec<Group> = Vec::new();
-    // a hard link names the member it links to by its stored name; the latest member of that name counts
+    // every path given so far, by its parts, and whether it was a folder
+    let mut seen: HashMap<Vec<u8>, bool> = HashMap::new();
+    // a hard link names the member it links to by its stored name
     let mut by_name: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut nested = 0u64;
-    walk_members(input, opts.limit, |raw, data| {
+    let limit = budget.left;
+    let decoded = walk_members(input, limit, |raw, data| {
         if unsafe_name(&raw.name) {
             return Err(Error::UnsafePath(lossy(&raw.name)));
         }
         if raw.link.contains(&0) {
             return Err(Error::Corrupt("a tar link target holds a NUL"));
+        }
+        let path = key(&raw.name);
+        let dir = raw.kind == RawKind::Dir;
+        match seen.insert(path.clone(), dir) {
+            // a folder given again (tar of overlapping paths) is written once
+            Some(true) if dir => return Ok(()),
+            // Anything else given twice is refused: which one wins would depend on order, and a hard link to the
+            // name could not say which one it meant.
+            Some(_) => return Err(Error::Corrupt("a tar archive names a member twice")),
+            None => {}
         }
         let mut name = raw.name;
         let mut group = None;
@@ -84,13 +104,13 @@ pub(super) fn repack(input: &Path, out: &mut dyn Write, opts: &RepackOptions) ->
                 budget.take(raw.size)?;
                 let offset = spooled;
                 let len = if opts.nested && nested_name(&name) {
-                    let mut whole = tempfile::tempfile()?;
+                    let mut whole = tempfile::tempfile_in(scratch)?;
                     {
                         let mut w = BufWriter::new(&mut whole);
                         data.read(&mut |d| w.write_all(d).map_err(Error::Io))?;
                         w.flush()?;
                     }
-                    let (mut from, len) = match repack_nested(&mut whole, opts, &mut budget)? {
+                    let (mut from, len) = match repack_nested(&mut whole, opts, budget, scratch)? {
                         Some(repacked) => {
                             nested += 1;
                             repacked
@@ -116,23 +136,37 @@ pub(super) fn repack(input: &Path, out: &mut dyn Write, opts: &RepackOptions) ->
                 spooled += len;
                 groups.push(Group { offset, len, mode: raw.mode });
                 group = Some(groups.len() - 1);
-                by_name.insert(name.clone(), groups.len() - 1);
+                by_name.insert(path, groups.len() - 1);
             }
             RawKind::HardLink => {
-                let Some(&g) = by_name.get(&raw.link) else {
+                let Some(&g) = by_name.get(&key(&raw.link)) else {
                     return Err(Error::Corrupt("a tar hard link names no earlier file"));
                 };
                 group = Some(g);
-                by_name.insert(name.clone(), g);
+                by_name.insert(path, g);
             }
             RawKind::Symlink | RawKind::CharDevice | RawKind::BlockDevice | RawKind::Fifo => {}
         }
         members.push(Member { name, link: raw.link, kind: raw.kind, device: raw.device, group });
         Ok(())
     })?;
+    budget.take(decoded)?;
     let mut spool = spool.into_inner().map_err(|e| Error::Io(e.into_error()))?;
 
-    // stable, so two members of the same name keep their order
+    // Sorted, a symlink `x` comes before `x/passwd`, and an extractor that follows it would write outside; so no
+    // member's path may pass through a symlink member.
+    let symlinks: std::collections::HashSet<Vec<u8>> =
+        members.iter().filter(|m| m.kind == RawKind::Symlink).map(|m| key(&m.name)).collect();
+    if !symlinks.is_empty() {
+        for m in &members {
+            let path = key(&m.name);
+            let through = path.iter().enumerate().any(|(i, &b)| b == b'/' && symlinks.contains(&path[..i]));
+            if through {
+                return Err(Error::UnsafePath(lossy(&m.name)));
+            }
+        }
+    }
+
     members.sort_by(|a, b| a.name.cmp(&b.name));
 
     let gz = GzBuilder::new().mtime(0).operating_system(GZIP_OS_UNIX).write(out, Compression::new(opts.level));
@@ -267,6 +301,18 @@ impl<W: Write> Finish for flate2::write::GzEncoder<W> {
         inner.flush()?;
         Ok(())
     }
+}
+
+/// A path by its parts, without empty or `.` parts: `./a//b/` and `a/b` are the same path.
+fn key(name: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len());
+    for part in name.split(|&b| b == b'/').filter(|p| !p.is_empty() && *p != b".") {
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    out
 }
 
 /// A name split into a ustar prefix and name, or `None` when it fits neither way.

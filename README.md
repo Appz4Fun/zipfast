@@ -104,8 +104,9 @@ layer) as ar, or any tarball the tar reader reads as a `.tar.gz`, so that the sa
 bytes: members sorted by name (a `.deb`'s `debian-binary` stays first), owner and group 0 with no names, every
 time `--mtime` (default `$SOURCE_DATE_EPOCH`, else 0), modes normalised (ar `644`; tar `755`/`644`/`777`), symbol
 tables rebuilt for the new order, and gzip with MTIME 0, no name, OS 3 and level 9. `--nested` also repacks
-`.tar.gz` members one level deep. Unsafe names, dangling hard links and thin archives are refused, the reader's
-limits apply, and links on disk are never followed. Output is reproducible for a given zipfast build.
+`.tar.gz` members one level deep, charging their work to the same byte limit. Unsafe names, tar names given twice,
+paths through a symlink member, dangling hard links and thin archives are refused, the reader's limits apply,
+temporaries stay beside the output, and links on disk are never followed. Output is reproducible for a given zipfast build.
 
 ### Library: one entry point for every format
 

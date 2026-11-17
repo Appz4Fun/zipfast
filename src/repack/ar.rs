@@ -65,7 +65,10 @@ struct Symtab {
     name: Vec<u8>,
     /// a BSD table's byte order
     big: bool,
-    entries: Vec<(Vec<u8>, u64)>,
+    /// each distinct symbol name once
+    names: Vec<Vec<u8>>,
+    /// (index into `names`, member header offset in the input)
+    entries: Vec<(usize, u64)>,
 }
 
 enum Data {
@@ -83,10 +86,17 @@ struct Member {
     data: Data,
 }
 
-pub(super) fn repack(input: &Path, out: &mut dyn Write, opts: &RepackOptions) -> Result<RepackSummary> {
+/// Repacks the ar archive at `input` into `out`, charging what it reads to `budget` and keeping its temporaries in
+/// `scratch`.
+pub(super) fn repack(
+    input: &Path,
+    out: &mut dyn Write,
+    opts: &RepackOptions,
+    budget: &mut Budget,
+    scratch: &Path,
+) -> Result<RepackSummary> {
     let mut file = open_input(input)?;
     let len = file.metadata()?.len();
-    let mut budget = Budget { left: opts.limit };
     let mut magic = [0u8; 8];
     if crate::tar::read_full(&mut file, &mut magic)? < 8 || magic != *MAGIC {
         if magic == *THIN {
@@ -191,17 +201,23 @@ pub(super) fn repack(input: &Path, out: &mut dyn Write, opts: &RepackOptions) ->
             set_symtab(kind, &name, read_table(&mut file, data_at, size)?)?;
             continue;
         }
-        if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0) {
+        if name.is_empty()
+            || name == b"."
+            || name == b".."
+            || name.contains(&b'/')
+            || name.contains(&0)
+            || name.contains(&b'\n')
+        {
             return Err(Error::UnsafePath(lossy(&name)));
         }
         listing.record(&lossy(&name))?;
         budget.take(size)?;
         let mut member = Member { name, header_at, size, data: Data::Input(data_at) };
         if opts.nested && nested_name(&member.name) {
-            let mut whole = tempfile::tempfile()?;
+            let mut whole = tempfile::tempfile_in(scratch)?;
             file.seek(SeekFrom::Start(data_at))?;
             copy_exact(&mut file, &mut whole, size)?;
-            if let Some((repacked, len)) = repack_nested(&mut whole, opts, &mut budget)? {
+            if let Some((repacked, len)) = repack_nested(&mut whole, opts, budget, scratch)? {
                 member.data = Data::Temp(repacked);
                 member.size = len;
                 nested += 1;
@@ -314,7 +330,9 @@ fn bsd_name(at: u64, name: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (format!("#1/{}", bytes.len()).into_bytes(), bytes)
 }
 
-/// Reads a symbol table's (symbol, member header offset) pairs.
+/// Reads a symbol table's (symbol, member header offset) pairs. Each distinct name is copied once, and the bytes
+/// copied are held to [`MAX_TABLE`]: a BSD table may point every entry at the same long name, or at every byte of
+/// one, and copying per entry would take the table's size squared.
 fn parse_symtab(kind: SymKind, name: &[u8], data: &[u8]) -> Result<Symtab> {
     let bad = || Error::Corrupt("an ar symbol table is damaged");
     let width = kind.width();
@@ -325,26 +343,41 @@ fn parse_symtab(kind: SymKind, name: &[u8], data: &[u8]) -> Result<Symtab> {
             v | (u64::from(x) << shift)
         }))
     };
-    let symbol = |strings: &[u8], at: u64| -> Option<Vec<u8>> {
-        let rest = strings.get(usize::try_from(at).ok()?..)?;
-        let end = rest.iter().position(|&b| b == 0)?;
-        Some(rest[..end].to_vec())
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut interned: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut copied = 0u64;
+    // the name starting at `at` in `strings`, as an index into `names`
+    let mut symbol = |strings: &[u8], at: u64| -> Result<usize> {
+        let rest = usize::try_from(at).ok().and_then(|at| strings.get(at..)).ok_or_else(bad)?;
+        let end = rest.iter().position(|&b| b == 0).ok_or_else(bad)?;
+        copied += end as u64 + 1;
+        if copied > MAX_TABLE {
+            return Err(Error::Unsupported("an ar symbol table's names are too large".into()));
+        }
+        let name = &rest[..end];
+        if let Some(&i) = interned.get(name) {
+            return Ok(i);
+        }
+        names.push(name.to_vec());
+        interned.insert(name.to_vec(), names.len() - 1);
+        Ok(names.len() - 1)
     };
     let mut entries = Vec::new();
     let big = match kind {
-        // GNU: a big-endian count, then that many member offsets, then as many NUL-ended names
+        // GNU: a big-endian count, then that many member offsets, then as many NUL-ended names, one after another
         SymKind::Gnu32 | SymKind::Gnu64 => {
             let n = get(0, true).ok_or_else(bad)?;
             if n > (data.len() / width) as u64 {
                 return Err(bad());
             }
             let n = n as usize;
-            let mut names = data.get((n + 1) * width..).ok_or_else(bad)?;
+            let strings = data.get((n + 1) * width..).ok_or_else(bad)?;
+            let mut at = 0u64;
             for i in 0..n {
                 let offset = get((i + 1) * width, true).ok_or_else(bad)?;
-                let name = symbol(names, 0).ok_or_else(bad)?;
-                names = &names[name.len() + 1..];
-                entries.push((name, offset));
+                let index = symbol(strings, at)?;
+                entries.push((index, offset));
+                at += strings[at as usize..].iter().position(|&b| b == 0).ok_or_else(bad)? as u64 + 1;
             }
             true
         }
@@ -365,16 +398,26 @@ fn parse_symtab(kind: SymKind, name: &[u8], data: &[u8]) -> Result<Symtab> {
             };
             let strings_at = width + (n as usize) * 2 * width + width;
             let strings = &data[strings_at..strings_at + strsize as usize];
+            // entries sharing a name offset share its resolution
+            let mut resolved: HashMap<u64, usize> = HashMap::new();
             for i in 0..n as usize {
                 let at = width + i * 2 * width;
                 let strx = get(at, big).ok_or_else(bad)?;
                 let offset = get(at + width, big).ok_or_else(bad)?;
-                entries.push((symbol(strings, strx).ok_or_else(bad)?, offset));
+                let index = match resolved.get(&strx) {
+                    Some(&index) => index,
+                    None => {
+                        let index = symbol(strings, strx)?;
+                        resolved.insert(strx, index);
+                        index
+                    }
+                };
+                entries.push((index, offset));
             }
             big
         }
     };
-    Ok(Symtab { kind, name: name.to_vec(), big, entries })
+    Ok(Symtab { kind, name: name.to_vec(), big, names, entries })
 }
 
 impl SymKind {
@@ -384,8 +427,13 @@ impl SymKind {
 }
 
 impl Symtab {
+    /// The names a rebuilt table holds: one per entry for GNU (at most the input's own names, which lie one after
+    /// another), each distinct name once for BSD, NULs included.
     fn names_len(&self) -> u64 {
-        self.entries.iter().map(|(n, _)| n.len() as u64 + 1).sum()
+        match self.kind {
+            SymKind::Gnu32 | SymKind::Gnu64 => self.entries.iter().map(|&(n, _)| self.names[n].len() as u64 + 1).sum(),
+            SymKind::Bsd32 | SymKind::Bsd64 => self.names.iter().map(|n| n.len() as u64 + 1).sum(),
+        }
     }
 
     /// The length of the table [`Symtab::rebuild`] writes, which does not depend on where members land.
@@ -399,16 +447,17 @@ impl Symtab {
     }
 
     /// The table written afresh with every member offset moved to where that member's header now is, its entries
-    /// in a fixed order (GNU by member then name, BSD by name then member) whatever order the input had.
+    /// in a fixed order (GNU by member then name, BSD by name then member) whatever order the input had. A BSD
+    /// table holds each distinct name once, in name order.
     fn rebuild(&self, moved: &HashMap<u64, u64>) -> Result<Vec<u8>> {
         let width = self.kind.width();
         let mut entries = Vec::with_capacity(self.entries.len());
-        for (name, old) in &self.entries {
-            let new = moved.get(old).copied().ok_or(Error::Corrupt("an ar symbol table points at no member"))?;
+        for &(name, old) in &self.entries {
+            let new = moved.get(&old).copied().ok_or(Error::Corrupt("an ar symbol table points at no member"))?;
             if width == 4 && new > u64::from(u32::MAX) {
                 return Err(Error::Unsupported("an ar archive too large for its 32-bit symbol table".into()));
             }
-            entries.push((name.as_slice(), new));
+            entries.push((self.names[name].as_slice(), new, name));
         }
         let big = self.big;
         let mut out = Vec::with_capacity(self.rebuilt_len() as usize);
@@ -424,28 +473,34 @@ impl Symtab {
             SymKind::Gnu32 | SymKind::Gnu64 => {
                 entries.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                 put(&mut out, entries.len() as u64);
-                for &(_, offset) in &entries {
+                for &(_, offset, _) in &entries {
                     put(&mut out, offset);
                 }
-                for &(name, _) in &entries {
+                for &(name, _, _) in &entries {
                     out.extend_from_slice(name);
                     out.push(0);
                 }
             }
             SymKind::Bsd32 | SymKind::Bsd64 => {
-                entries.sort();
+                entries.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+                let mut order: Vec<usize> = (0..self.names.len()).collect();
+                order.sort_by(|&a, &b| self.names[a].cmp(&self.names[b]));
+                let mut strx = vec![0u64; self.names.len()];
+                let mut at = 0u64;
+                for &i in &order {
+                    strx[i] = at;
+                    at += self.names[i].len() as u64 + 1;
+                }
                 put(&mut out, (2 * width * entries.len()) as u64);
-                let mut strx = 0u64;
-                for &(name, offset) in &entries {
-                    put(&mut out, strx);
+                for &(_, offset, name) in &entries {
+                    put(&mut out, strx[name]);
                     put(&mut out, offset);
-                    strx += name.len() as u64 + 1;
                 }
                 let strsize = self.names_len().next_multiple_of(8);
                 put(&mut out, strsize);
                 let start = out.len();
-                for &(name, _) in &entries {
-                    out.extend_from_slice(name);
+                for &i in &order {
+                    out.extend_from_slice(&self.names[i]);
                     out.push(0);
                 }
                 out.resize(start + strsize as usize, 0);
