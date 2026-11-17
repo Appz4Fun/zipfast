@@ -1097,6 +1097,7 @@ fn classify_head(head: &[u8]) -> Format {
         || crate::tar::sniff_tar(head)
         || crate::tar::sniff_cpio(head)
         || crate::tar::sniff_xar(head)
+        || crate::tar::sniff_wim(head)
     {
         Format::Tar
     } else {
