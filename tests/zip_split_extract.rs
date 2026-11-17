@@ -463,33 +463,30 @@ fn a_lone_archive_named_z01_stays_a_lone_archive() {
     assert_eq!(detailed.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["only.txt"]);
 }
 
-/// Expected 7-Zip 26.06 results for the real sets with their `.z01` removed: the directory in the `.zip` lists every
-/// member; those starting on disk 0 fail as missing the `.z01` ("Unavailable data"), the rest extract.
+/// Expected 7-Zip 26.06 results for the real three-volume set with its `.z01` removed: the directory in the `.zip`
+/// lists every member; those starting on disk 0 fail as missing the `.z01` ("Unavailable data"), the rest extract.
+/// (A two-volume set without its `.z01` is a lone `.zip` with no set to recover: see
+/// [`a_lone_multi_disk_zip_with_no_numbered_volume_takes_the_checked_route`].)
 #[test]
 fn a_missing_z01_lists_every_member_and_fails_those_on_disk_0() {
-    for (set, lost, whole) in
-        [("stored", "a.bin", Some("dir/b.txt")), ("deflated", "c.txt", Some("dir/b.txt")), ("crypt", "s.bin", None)]
-    {
-        let dir = tempfile::tempdir().unwrap();
-        copy_set_without(set, dir.path(), "n1", &["z01"]);
-        let zip = dir.path().join("n1.zip");
-        assert_eq!(listed(&zip), reference_owned(set), "{set}");
-        let detailed = extract::list_detailed(&zip, None).unwrap();
-        assert_eq!(detailed.missing_volume.as_deref(), Some(dir.path().join("n1.z01").as_path()), "{set}");
-        let out = dir.path().join("out");
-        let s = extract::run_with_password(&zip, &options(&out, Mode::Extract), Some("password"), |_| {}).unwrap();
-        assert!(s.errors.iter().any(|e| e.starts_with(lost) && e.contains("n1.z01")), "{set}: {:?}", s.errors);
-        assert!(!out.join(lost).exists(), "{set}");
-        if let Some(whole) = whole {
-            assert!(s.errors.iter().all(|e| !e.contains(whole)), "{set}: {:?}", s.errors);
-            assert_eq!(fs::read(out.join(whole)).unwrap(), b"hello split zip\n".repeat(40), "{set}");
-        }
-        // the library read fails the same way, without reading anything
-        let mut archive = zipfast::zip::Archive::open(&zip).unwrap();
-        let index = archive.entries.iter().position(|e| e.name == lost).unwrap();
-        let err = archive.read_at(index, Some("password"), u64::MAX, |_| Ok(())).unwrap_err();
-        assert!(matches!(err, zipfast::Error::MissingVolume(ref p) if p.ends_with("n1.z01")), "{set}: {err}");
-    }
+    let dir = tempfile::tempdir().unwrap();
+    copy_set_without("stored", dir.path(), "n1", &["z01"]);
+    let zip = dir.path().join("n1.zip");
+    assert_eq!(listed(&zip), reference_owned("stored"));
+    let detailed = extract::list_detailed(&zip, None).unwrap();
+    assert_eq!(detailed.missing_volume.as_deref(), Some(dir.path().join("n1.z01").as_path()));
+    let out = dir.path().join("out");
+    let s = extract::run(&zip, &options(&out, Mode::Extract), |_| {}).unwrap();
+    // a.bin starts on disk 0; dir/b.txt is whole in the `.zip`
+    assert!(s.errors.iter().any(|e| e.starts_with("a.bin") && e.contains("n1.z01")), "{:?}", s.errors);
+    assert!(!out.join("a.bin").exists());
+    assert!(s.errors.iter().all(|e| !e.contains("dir/b.txt")), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("dir/b.txt")).unwrap(), b"hello split zip\n".repeat(40));
+    // the library read fails the same way, without reading anything
+    let mut archive = zipfast::zip::Archive::open(&zip).unwrap();
+    let index = archive.entries.iter().position(|e| e.name == "a.bin").unwrap();
+    let err = archive.read_at(index, None, u64::MAX, |_| Ok(())).unwrap_err();
+    assert!(matches!(err, zipfast::Error::MissingVolume(ref p) if p.ends_with("n1.z01")), "{err}");
 }
 
 /// A `.z01` gone with a `.z02` there: members on disk 0 fail, members starting on `.z02` read across the hole's
@@ -521,7 +518,7 @@ fn a_member_on_an_absent_disk_with_a_wild_offset_still_fails_alone() {
     let a = data(3000, 1);
     let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];
     let start = split_zip_builder::data_abs(&entries, 0, true);
-    let set = split_zip(&entries, &[start + 1000], Layout { marker: true, zip64: false });
+    let set = split_zip(&entries, &[start + 1000, start + 2000], Layout { marker: true, zip64: false });
     let dir = tempfile::tempdir().unwrap();
     let zip = write_set(dir.path(), "w", &set.volumes);
     fs::remove_file(dir.path().join("w.z01")).unwrap();
@@ -544,7 +541,7 @@ fn a_long_comment_keeps_the_zip64_locator_in_view() {
     let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];
     let start = split_zip_builder::data_abs(&entries, 0, true);
     for comment in [4070usize, 4090, 65_535] {
-        let set = split_zip(&entries, &[start + 1000], Layout { marker: true, zip64: true });
+        let set = split_zip(&entries, &[start + 1000, start + 2000], Layout { marker: true, zip64: true });
         let dir = tempfile::tempdir().unwrap();
         let zip = write_set(dir.path(), "c", &set.volumes);
         let mut last = fs::read(&zip).unwrap();
@@ -559,4 +556,35 @@ fn a_long_comment_keeps_the_zip64_locator_in_view() {
         assert!(s.errors.iter().any(|e| e.starts_with("a.bin") && e.contains("c.z01")), "{:?}", s.errors);
         assert_eq!(fs::read(dir.path().join("out/b.bin")).unwrap(), b"tail", "comment={comment}");
     }
+}
+
+/// A single `.zip` whose end record says it is disk 1 (directory and entries on disk 1), with no numbered volume
+/// beside it, is not a set: the checked route reads it and rejects the multi-disk end record, as before split sets
+/// could open without their `.z01`. It must never fall back to the legacy split reader.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_lone_multi_disk_zip_with_no_numbered_volume_takes_the_checked_route() {
+    use zipfast::extract::Cancellation;
+    let entries = [Entry::stored("a.bin", b"payload"), Entry::stored("b.bin", b"tail")];
+    // disk 0 holds only the spanning marker: every local header, the directory and the end record are on disk 1
+    let set = split_zip(&entries, &[4], Layout { marker: true, zip64: false });
+    assert_eq!((set.locals[0].0, set.directory.0), (1, 1));
+    let dir = tempfile::tempdir().unwrap();
+    let zip = dir.path().join("lone.zip");
+    fs::write(&zip, &set.volumes[1]).unwrap();
+    let out = dir.path().join("out");
+    let checked = extract::run_with_policy(
+        &zip,
+        &options(&out, Mode::Extract),
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |_: extract::RunEvent<'_>| Ok(()),
+    );
+    assert!(checked.is_err(), "a lone multi-disk .zip must be rejected by the checked route");
+    assert!(!out.join("a.bin").exists() && !out.join("b.bin").exists());
+    // with a `.z01` beside it, it is the last volume of a set again
+    fs::write(dir.path().join("lone.z01"), &set.volumes[0]).unwrap();
+    let names: Vec<_> = extract::list(&zip).unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, ["a.bin", "b.bin"]);
 }

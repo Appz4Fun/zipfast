@@ -54,8 +54,8 @@ fn le64(b: &[u8], at: usize) -> u64 {
 }
 
 /// The `.zip` of the set `path` belongs to: `path` itself when it is a regular `.zip` (whether it is a set's last
-/// volume is for its end record to say: its `.z01` may be the volume that is missing), or the `.zip` beside a `.z01`
-/// given instead. None for anything else.
+/// volume is for its end record and the numbered volumes beside it to say: its `.z01` may be the one missing), or
+/// the `.zip` beside a `.z01` given instead. None for anything else.
 pub(crate) fn last_volume(path: &Path) -> Option<PathBuf> {
     let ext = path.extension()?.to_str()?;
     if ext.eq_ignore_ascii_case("zip") {
@@ -169,7 +169,7 @@ impl Spanned {
     /// The set whose `.zip` (or `.z01`) is `path`, or None when `path` is not one: no end record ending at its end
     /// (trailing bytes, damage), or one naming a single disk (a lone archive, whether or not a `.z01` is beside it).
     /// Each of those is left to the single-file reader. Only once the end record names more than one disk is a fault
-    /// the set's; the `.z01` and any other numbered volume may then be missing.
+    /// the set's; the `.z01` and other numbered volumes may then be missing, but not all of them.
     pub(crate) fn open(path: &Path) -> Result<Option<Self>> {
         let Some(last) = last_volume(path) else { return Ok(None) };
         let Ok(mut file) = open_regular(&last) else { return Ok(None) };
@@ -213,6 +213,11 @@ impl Spanned {
         let mut volumes: Vec<PathBuf> =
             (0..disk).map(|i| PathBuf::from(split_volume_name(last.as_os_str(), i, false))).collect();
         volumes.push(last.clone());
+        // A `.zip` with no numbered volume beside it is no set to recover: it stays a lone file, so the checked route
+        // still rejects its multi-disk end record instead of handing it to the split reader.
+        if !volumes[..disk as usize].iter().any(|v| is_regular(v)) {
+            return Ok(None);
+        }
         let missing = volumes.iter().find(|v| !is_regular(v)).cloned();
         let zip64 = locator.map(|(at, _)| at);
         let directory_disk = match (le16(record, 6), zip64) {
