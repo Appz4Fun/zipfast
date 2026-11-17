@@ -296,7 +296,7 @@ mod unix {
         assert_eq!(selected.name(), "one\\two");
         assert_eq!(selected.relative_path(), Path::new("one/two"));
         assert_eq!(selected.unix_mode(), None);
-        assert_eq!(selected.modified(), Some((1_577_934_246, 0)));
+        assert_eq!(selected.modified(), Some((zipfast::extract::local_wall_clock_to_utc(1_577_934_246), 0)));
         selected.read(None, |_| panic!("empty entry should not call sink")).unwrap();
     }
 

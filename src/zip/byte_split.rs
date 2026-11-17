@@ -239,7 +239,7 @@ pub(crate) fn scan_local_headers(
         };
         let name = super::decode_name(&raw, h.flags & super::FLAG_UTF8 != 0)
             .unwrap_or_else(|_| String::from_utf8_lossy(&raw).into_owned());
-        let mtime = super::dos_time(h.mod_time, h.mod_date);
+        let mtime = super::dos_time(h.mod_time, h.mod_date).map(crate::localtime::local_to_utc);
         entries.push(super::ZipEntry {
             name,
             flags: h.flags,

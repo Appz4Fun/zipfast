@@ -413,7 +413,7 @@ fn dos_extended_and_ntfs_timestamps() {
     let fast = open_fast(&fixture.bytes).unwrap();
     let (view, _, _) = open_view(&fixture);
     for (i, (mtime, nanos, dos)) in [
-        (Some(1_577_934_246), 0, Some((2020, 1, 2, 3, 4, 6))),
+        (Some(zipfast::extract::local_wall_clock_to_utc(1_577_934_246)), 0, Some((2020, 1, 2, 3, 4, 6))),
         (Some(-123), 0, Some((2020, 1, 2, 3, 4, 6))),
         (Some(42), 123_456_700, Some((2020, 1, 2, 3, 4, 6))),
         (Some(-123), 0, Some((2020, 1, 2, 3, 4, 6))),

@@ -741,7 +741,7 @@ fn project_mtime(header: CentralHeader, mtime_override: Option<ExtraMtime>) -> (
             (Some((ticks / 10_000_000) as i64 - 11_644_473_600), ((ticks % 10_000_000) * 100) as u32)
         }
         Some(ExtraMtime::UnixSeconds(seconds)) => (Some(i64::from(seconds)), 0),
-        None => (dos_time(header.mod_time, header.mod_date), 0),
+        None => (dos_time(header.mod_time, header.mod_date).map(crate::localtime::local_to_utc), 0),
     }
 }
 
@@ -756,7 +756,8 @@ fn project_aes(aes: Option<AesFields>) -> Option<(u8, u16, u16)> {
         .map(|fields| (fields.strength, fields.vendor_version, fields.method))
 }
 
-/// MS-DOS date and time, which carry no time zone: read as UTC.
+/// MS-DOS date and time, which carry no time zone, as wall-clock seconds written as if UTC; readers convert them with
+/// [`crate::localtime::local_to_utc`].
 pub(crate) fn dos_time(time: u16, date: u16) -> Option<i64> {
     let (year, month, day) = (1980 + i64::from(date >> 9), i64::from((date >> 5) & 15), i64::from(date & 31));
     let (hour, min, sec) = (i64::from(time >> 11), i64::from((time >> 5) & 63), i64::from(time & 31) * 2);
