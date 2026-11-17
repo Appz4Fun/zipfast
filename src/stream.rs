@@ -14,7 +14,8 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Compressed streams: gzip, xz, zstd and bzip2, found by their magic bytes. Each wraps a tar archive or a single
+//! Compressed streams: gzip, xz, zstd, bzip2, LZ4, Unix compress (`.Z`) and LZMA-alone (`.lzma`), found by their
+//! magic bytes. Each wraps a tar archive or a single
 //! file; the tar reader decides which.
 
 use std::fs::File;
@@ -24,6 +25,8 @@ use std::path::Path;
 use flate2::bufread::MultiGzDecoder;
 
 pub mod gzip;
+mod lz4;
+mod lzw;
 
 pub(crate) const LZMA_MEMORY_LIMIT: u64 = 256 << 20;
 const ZSTD_WINDOW_LOG_LIMIT: u32 = 27;
@@ -34,6 +37,12 @@ pub enum Codec {
     Xz,
     Zstd,
     Bzip2,
+    /// the LZ4 frame format, legacy frames included
+    Lz4,
+    /// Unix `compress`: LZW, `.Z`
+    Compress,
+    /// LZMA-alone, the format of `lzma` and `xz --format=lzma`
+    Lzma,
 }
 
 impl Codec {
@@ -50,6 +59,12 @@ impl Codec {
             Some(Codec::Zstd)
         } else if head.len() >= 4 && head.starts_with(b"BZh") && (b'1'..=b'9').contains(&head[3]) {
             Some(Codec::Bzip2)
+        } else if head.starts_with(&[0x04, 0x22, 0x4d, 0x18]) || head.starts_with(&[0x02, 0x21, 0x4c, 0x18]) {
+            Some(Codec::Lz4)
+        } else if head.len() >= 3 && head.starts_with(&[0x1f, 0x9d]) && (9..=16).contains(&(head[2] & 0x1f)) {
+            Some(Codec::Compress)
+        } else if lzma_alone(head) {
+            Some(Codec::Lzma)
         } else {
             None
         }
@@ -62,6 +77,10 @@ impl Codec {
             Codec::Xz => &[(".txz", ".tar"), (".xz", "")],
             Codec::Zstd => &[(".tzst", ".tar"), (".zstd", ""), (".zst", "")],
             Codec::Bzip2 => &[(".tbz2", ".tar"), (".tbz", ".tar"), (".bzip2", ""), (".bz2", ""), (".bz", "")],
+            Codec::Lz4 => &[(".tlz4", ".tar"), (".lz4", "")],
+            // ".z" in lower case, as names are compared
+            Codec::Compress => &[(".taz", ".tar"), (".tz", ".tar"), (".z", "")],
+            Codec::Lzma => &[(".tlzma", ".tar"), (".tlz", ".tar"), (".lzma", "")],
         }
     }
 
@@ -77,6 +96,9 @@ impl Codec {
             Codec::Xz => Box::new(XzStreams { inner: Some(xz_decoder(r, threads)?), threads }),
             Codec::Zstd => Box::new(zstd_decoder(r)?),
             Codec::Bzip2 => Box::new(bzip2::bufread::MultiBzDecoder::new(r)),
+            Codec::Lz4 => Box::new(lz4::Lz4Reader::new(r)),
+            Codec::Compress => Box::new(lzw::ZReader::new(r)),
+            Codec::Lzma => Box::new(LzmaAlone(lzma_alone_decoder(r)?)),
         })
     }
 }
@@ -85,6 +107,51 @@ pub(crate) fn zstd_decoder<R: BufRead>(reader: R) -> io::Result<zstd::stream::re
     let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)?;
     decoder.window_log_max(ZSTD_WINDOW_LOG_LIMIT)?;
     Ok(decoder)
+}
+
+/// The most bytes [`Codec::sniff`] looks at.
+pub(crate) const SNIFF_BYTES: usize = 13;
+
+/// Whether `head` starts like an LZMA-alone file, which has no magic: a properties byte (lc, lp and pb), a
+/// dictionary size, and the decoded size or all ones for unknown. The dictionary size has to be one `lzma` and xz
+/// write (2^n or 2^n + 2^(n-1), at least 4 KiB) and the size has to be unknown or below 2^48, which no tar header or
+/// other archive's start matches.
+fn lzma_alone(head: &[u8]) -> bool {
+    if head.len() < 13 || head[0] >= 9 * 5 * 5 {
+        return false;
+    }
+    let props = head[0];
+    // liblzma takes lc + lp up to 4 only
+    let (lc, lp) = (props % 9, props / 9 % 5);
+    if lc + lp > 4 {
+        return false;
+    }
+    let dict = u32::from_le_bytes([head[1], head[2], head[3], head[4]]);
+    let size = u64::from_le_bytes(head[5..13].try_into().expect("8 bytes"));
+    let dict_ok = dict == u32::MAX || {
+        let low = dict.isolate_lowest_one();
+        dict >= 4096 && (dict == low || dict == low * 3)
+    };
+    dict_ok && (size == u64::MAX || size < 1 << 48)
+}
+
+/// An LZMA-alone stream, which holds one stream and nothing after it: data past its end is refused, where xz would
+/// otherwise have to guess whether it was meant.
+struct LzmaAlone<R: BufRead>(liblzma::bufread::XzDecoder<R>);
+
+impl<R: BufRead> Read for LzmaAlone<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        if n == 0 && !buf.is_empty() && !self.0.get_mut().fill_buf()?.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "data follows the end of the LZMA stream"));
+        }
+        Ok(n)
+    }
+}
+
+fn lzma_alone_decoder<R: BufRead>(r: R) -> io::Result<liblzma::bufread::XzDecoder<R>> {
+    let stream = liblzma::stream::Stream::new_lzma_decoder(LZMA_MEMORY_LIMIT).map_err(io::Error::other)?;
+    Ok(liblzma::bufread::XzDecoder::new_stream(r, stream))
 }
 
 fn xz_decoder<R: BufRead>(r: R, threads: usize) -> io::Result<liblzma::bufread::XzDecoder<R>> {
@@ -196,5 +263,22 @@ mod tests {
         assert_eq!(Codec::sniff(b"BZh91AY"), Some(Codec::Bzip2));
         assert_eq!(Codec::sniff(b"BZh0"), None);
         assert_eq!(Codec::sniff(b"Rar!\x1a\x07"), None);
+        assert_eq!(Codec::sniff(&[0x04, 0x22, 0x4d, 0x18, 0x64]), Some(Codec::Lz4));
+        assert_eq!(Codec::sniff(&[0x02, 0x21, 0x4c, 0x18, 0]), Some(Codec::Lz4));
+        assert_eq!(Codec::sniff(&[0x1f, 0x9d, 0x90]), Some(Codec::Compress));
+        assert_eq!(Codec::sniff(&[0x1f, 0x9d, 0x88]), None, "8-bit codes");
+        let lzma = |dict: u32, size: u64| [&[0x5d][..], &dict.to_le_bytes(), &size.to_le_bytes()].concat();
+        assert_eq!(Codec::sniff(&lzma(1 << 23, u64::MAX)), Some(Codec::Lzma));
+        assert_eq!(Codec::sniff(&lzma(3 << 20, 12345)), Some(Codec::Lzma));
+        assert_eq!(Codec::sniff(&lzma(5 << 20, 12345)), None, "not a dictionary size lzma writes");
+        assert_eq!(Codec::sniff(&lzma(1 << 23, 1 << 50)), None, "an impossible size");
+        assert_eq!(Codec::sniff(&lzma(1 << 23, u64::MAX)[..12]), None, "too short to tell");
+        // a tar header: a name, then NUL padding
+        let mut tar = [0u8; 13];
+        tar[..5].copy_from_slice(b"a.txt");
+        assert_eq!(Codec::sniff(&tar), None);
+        tar = [0u8; 13];
+        tar[0] = b'a';
+        assert_eq!(Codec::sniff(&tar), None);
     }
 }
