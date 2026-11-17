@@ -48,6 +48,8 @@ struct Single {
     multi_volume: bool,
     new_naming: bool,
     has_next_volume: bool,
+    locator: Option<super::RarLocator>,
+    end_record: Option<super::RarEndRecord>,
     members: Vec<VolumeMember>,
 }
 
@@ -187,6 +189,8 @@ impl RarWalker {
             multi_volume: single.multi_volume,
             new_naming: single.new_naming,
             has_next_volume: single.has_next_volume,
+            locator: single.locator,
+            end_record: single.end_record,
             solid: self.solid_archive.unwrap_or(false),
             header_encrypted: self.header_encrypted.unwrap_or(false),
             header_cipher: self.header_cipher.clone(),
@@ -490,6 +494,7 @@ impl RarWalker {
                         volume_number.map(u32::try_from).transpose().map_err(|_| self.malformed("volume number"))?;
                     let single = self.single.as_mut().expect("single-volume mode");
                     single.has_next_volume = more_volumes;
+                    single.end_record = frame.end_record;
                     // Only a volume of a set has a meaningful number; a stray one in a non-volume archive is ignored.
                     if let Some(number) = number.filter(|_| single.multi_volume) {
                         // RAR 2.x first volumes lack MHD_FIRSTVOLUME: a number of 0 makes the volume first. A first
@@ -633,6 +638,7 @@ impl RarWalker {
         let single = self.single.as_mut().expect("single-volume mode");
         single.main_read = true;
         single.multi_volume = main.is_volume();
+        single.locator = main.locator;
         match format {
             RarFormat::Rar5 => {
                 single.volume_number = volume_number;

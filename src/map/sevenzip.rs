@@ -227,11 +227,31 @@ struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     usage: &'a Usage,
+    /// Parse work done, shared with sub-readers: one per byte read singly, the length of a slice taken to be used,
+    /// one for a slice skipped. Offsets advanced over skipped bytes cost nothing, so a stated length cannot make a
+    /// parse look expensive; the tail search bounds its candidates by this.
+    steps: std::rc::Rc<std::cell::Cell<u64>>,
+    /// Reading a candidate header found at the end of a volume's bytes, which must end exactly where they do: the
+    /// file list's structure is checked to run to that end before any entry is built.
+    tail: bool,
 }
 
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8], usage: &'a Usage) -> Self {
-        Self { buf, pos: 0, usage }
+        Self { buf, pos: 0, usage, steps: Default::default(), tail: false }
+    }
+
+    /// A reader over `buf`, a slice of this one's, sharing its step count.
+    fn sub(&self, buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0, usage: self.usage, steps: self.steps.clone(), tail: false }
+    }
+
+    fn step(&self, n: u64) {
+        self.steps.set(self.steps.get().saturating_add(n));
+    }
+
+    fn steps(&self) -> u64 {
+        self.steps.get()
     }
 
     fn remaining(&self) -> usize {
@@ -241,10 +261,25 @@ impl<'a> Reader<'a> {
     fn byte(&mut self) -> Parsed<u8> {
         let b = *self.buf.get(self.pos).ok_or(Bad::Malformed("7z header ends early"))?;
         self.pos += 1;
+        self.step(1);
         Ok(b)
     }
 
+    /// `n` bytes to be used: charged `n` steps.
     fn bytes(&mut self, n: u64) -> Parsed<&'a [u8]> {
+        let out = self.slice(n)?;
+        self.step(out.len() as u64);
+        Ok(out)
+    }
+
+    /// `n` bytes passed over unread: one step.
+    fn skip(&mut self, n: u64) -> Parsed<&'a [u8]> {
+        let out = self.slice(n)?;
+        self.step(1);
+        Ok(out)
+    }
+
+    fn slice(&mut self, n: u64) -> Parsed<&'a [u8]> {
         let n =
             usize::try_from(n).ok().filter(|&n| n <= self.remaining()).ok_or(Bad::Malformed("7z header ends early"))?;
         let out = &self.buf[self.pos..self.pos + n];
@@ -293,6 +328,7 @@ impl<'a> Reader<'a> {
 
     fn bits(&mut self, n: usize) -> Parsed<Vec<bool>> {
         let bytes = self.bytes(n.div_ceil(8) as u64)?;
+        self.step(n as u64);
         Ok((0..n).map(|i| bytes[i / 8] & (0x80 >> (i % 8)) != 0).collect())
     }
 
@@ -476,7 +512,7 @@ impl<'a> Reader<'a> {
                 digests = Some(self.digests(n)?);
             } else {
                 let size = self.number()?;
-                self.bytes(size)?;
+                self.skip(size)?;
             }
             id = self.number()?;
         }
@@ -533,12 +569,30 @@ impl<'a> Reader<'a> {
         let n = self.number()?;
         self.usage.check(Resource::Entries, n)?;
         let n = usize::try_from(n).map_err(|_| Bad::Malformed("7z file count"))?;
+        if self.tail {
+            // A tail candidate is noise until shown otherwise: its file properties must chain to the header's end
+            // marker on the last byte, each file must have a byte behind it, and only then are entries built.
+            if n > self.remaining() {
+                return Err(Bad::Malformed("7z item count exceeds the header"));
+            }
+            let mut dry = self.sub(self.buf);
+            dry.pos = self.pos;
+            while dry.number()? != ID_END {
+                let size = dry.number()?;
+                dry.skip(size)?;
+            }
+            if dry.number()? != ID_END || dry.remaining() != 0 {
+                return Err(Bad::Malformed("7z files do not end the header"));
+            }
+        }
         self.usage.charge(Resource::Entries, n as u64)?;
         let per = std::mem::size_of::<FileEntry>() + std::mem::size_of::<MapMember>();
         self.usage.charge(Resource::MetadataBytes, (n as u64).saturating_mul(per as u64))?;
         let mut files = Vec::new();
         files.try_reserve_exact(n).map_err(|_| Bad::Malformed("7z file count"))?;
         files.resize_with(n, FileEntry::default);
+        // The entries are built whatever the bytes hold: work by the bytes allocated.
+        self.step((n as u64).saturating_mul(per as u64 + 1));
         let mut empty_stream = vec![false; n];
         let mut empty_file: Vec<bool> = Vec::new();
         let mut anti: Vec<bool> = Vec::new();
@@ -548,7 +602,8 @@ impl<'a> Reader<'a> {
                 break;
             }
             let size = self.number()?;
-            let mut sub = Reader::new(self.bytes(size)?, self.usage);
+            let slice = self.skip(size)?;
+            let mut sub = self.sub(slice);
             match id {
                 ID_EMPTY_STREAM => {
                     empty_stream = sub.bits(n)?;
@@ -618,7 +673,7 @@ impl<'a> Reader<'a> {
         if id == ID_ARCHIVE_PROPERTIES {
             while self.number()? != ID_END {
                 let size = self.number()?;
-                self.bytes(size)?;
+                self.skip(size)?;
             }
             id = self.number()?;
         }
@@ -1365,6 +1420,229 @@ impl SevenZipWalker {
         }
         Ok((folders, members))
     }
+}
+
+/// How far from the end an encoded header (`0x17`) is looked for. An encoded header lists one folder of a few
+/// coders: well under 1 KiB.
+const TAIL_ENCODED_WINDOW: usize = 4096;
+/// How many plain header (`0x01`) starts are tried at most. Random data has about three in 64 KiB, so this covers
+/// the header budget's 64 MiB of it many times over; the work bound below is what limits hostile bytes.
+const TAIL_PLAIN_TRIES: usize = 1 << 20;
+/// Parse steps ([`Reader`]) and bytes decoded all candidates together may spend, beyond the one budget each
+/// candidate gets on its own.
+const TAIL_SEARCH_WORK: u64 = 256 << 20;
+
+/// A 7z header found at the end of a volume's last bytes, without the signature header.
+pub(crate) struct TailHeader {
+    /// The members, without pieces (offsets before this volume are unknown) and without folders.
+    pub(crate) map: MemberMap,
+    /// The header's bytes in the volume: it runs to the volume's end.
+    pub(crate) header: Range<u64>,
+    /// Where the volume starts in the archive (the concatenation of the split's volumes).
+    pub(crate) archive_offset: u64,
+    /// The header was encoded (`kEncodedHeader`).
+    pub(crate) encoded: bool,
+}
+
+/// What looking for a 7z header at the end of a volume gave.
+pub(crate) enum TailSearch {
+    Found(Box<TailHeader>),
+    /// A header start was found whose packed stream lies further from the end than the bytes held: the tail must
+    /// hold this many bytes before the volume's end.
+    NeedBytes(u64),
+    /// The search spent its work bound before a candidate was taken.
+    Exhausted,
+    /// No candidate was taken. The failure of the candidate that got furthest (the one nearest a header), if any,
+    /// is kept to explain why.
+    NotFound(Option<MapError>),
+}
+
+/// Whether a failure on a candidate header ends the search: the password is missing or wrong (a candidate gets as
+/// far as the key only after its structure parsed to the end and its packed stream was found), or the caller
+/// canceled. Anything else, budget failures included, means the candidate was not the header.
+fn final_failure(error: &MapError) -> bool {
+    match error {
+        MapError::PasswordRequired | MapError::WrongPassword => true,
+        MapError::Source(failure) => matches!(failure.kind, FailureKind::Canceled),
+        _ => false,
+    }
+}
+
+fn canceled() -> MapError {
+    MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled)))
+}
+
+/// Finds the 7z header at the end of `tail`, the last bytes of a volume `len` bytes long, without the signature
+/// header that says where it is: the archive's header ends the last volume.
+///
+/// 7-Zip writes the packed streams right after the signature header and the header right after them (an encoded
+/// header's packed stream last of all), so a candidate start fixes where the volume sits in the archive. A
+/// candidate is taken when it parses to the end of the bytes exactly and, for an encoded header, its folder states
+/// a CRC and its packed stream decodes to it; a plain header has no CRC without the signature header, so its starts
+/// are tried from the farthest one in. Every count and offset in a candidate is checked as for a whole-archive walk.
+///
+/// Each candidate gets its own budget, so a bogus candidate that overspends is only not the header; the work of all
+/// candidates together is bounded by [`TAIL_SEARCH_WORK`] and the candidate counts.
+pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<TailSearch, MapError> {
+    let held = tail.len() as u64;
+    if held > len || tail.len() < 2 {
+        return Ok(TailSearch::NotFound(None));
+    }
+    let start = len - held;
+    let mut work = 0u64;
+    let mut last_error: Option<MapError> = None;
+    let mut need: Option<u64> = None;
+    // Encoded headers, nearest the end first: `0x17` then the packed stream info (`0x06`).
+    let lowest = tail.len().saturating_sub(TAIL_ENCODED_WINDOW);
+    for h in (lowest..tail.len() - 1).rev() {
+        if tail[h] != ID_ENCODED_HEADER as u8 || tail[h + 1] != ID_PACK_INFO as u8 {
+            continue;
+        }
+        if options.control.is_canceled() {
+            return Err(canceled());
+        }
+        if work > TAIL_SEARCH_WORK {
+            return Ok(TailSearch::Exhausted);
+        }
+        let usage = Usage::new(options.limits.clone());
+        let mut reader = Reader::new(&tail[h + 1..], &usage);
+        let parsed = reader.streams_info();
+        work = work.saturating_add(reader.steps());
+        let Ok(streams) = parsed else { continue };
+        if reader.remaining() != 0
+            || streams.folders.len() != 1
+            || streams.pack_sizes.len() != 1
+            || streams.folders[0].packed_streams.len() != 1
+            // Without the signature header's CRC, the folder's is what proves the candidate.
+            || streams.folders[0].crc.is_none()
+        {
+            continue;
+        }
+        let packed_len = streams.pack_sizes[0];
+        let at = start + h as u64;
+        let Some(header_at) = SIGNATURE_LEN.checked_add(streams.pack_pos).and_then(|p| p.checked_add(packed_len))
+        else {
+            continue;
+        };
+        let Some(archive_offset) = header_at.checked_sub(at) else { continue };
+        if archive_offset.checked_add(len).is_none() {
+            continue;
+        }
+        if packed_len > h as u64 {
+            // The packed stream starts before the bytes held (or before the volume: then it is not the header).
+            if packed_len <= at {
+                let n = len - at + packed_len;
+                need = Some(need.map_or(n, |m| m.min(n)));
+            }
+            continue;
+        }
+        let packed = &tail[h - packed_len as usize..h];
+        work = work.saturating_add(packed_len).saturating_add(streams.folders[0].unpacked_size());
+        let mut walker = SevenZipWalker::new(options, usage);
+        walker.lens = vec![archive_offset + len];
+        walker.header_at = header_at;
+        walker.header_len = len - at;
+        walker.depth = 1;
+        if let Some(aes) = streams.folders[0].aes() {
+            walker.header_encrypted = true;
+            walker.header_cipher = aes_params(&aes.properties);
+        }
+        let result = walker.decode(&streams, packed, options).and_then(|decoded| {
+            match decoded.first().map(|&b| u64::from(b)) {
+                Some(ID_HEADER) => walker.header(&decoded, true),
+                // A nested encoded header (or noise) is not taken from a tail.
+                _ if walker.header_encrypted => Err(MapError::WrongPassword),
+                _ => Err(unsupported(0, "7z nested encoded header in a volume tail")),
+            }
+        });
+        match result {
+            Ok(Some(map)) => {
+                return Ok(TailSearch::Found(Box::new(TailHeader {
+                    map: strip(map),
+                    header: at..len,
+                    archive_offset,
+                    encoded: true,
+                })));
+            }
+            Ok(None) => {}
+            Err(e) if final_failure(&e) => return Err(e),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    // Plain headers, farthest first: `0x01` then archive properties, main streams or files.
+    let budget = usize::try_from(options.limits.header_bytes).unwrap_or(usize::MAX);
+    let lowest = tail.len().saturating_sub(budget);
+    let mut tries = 0usize;
+    for h in lowest..tail.len() - 1 {
+        if tail[h] != ID_HEADER as u8
+            || ![ID_ARCHIVE_PROPERTIES, ID_MAIN_STREAMS, ID_FILES].contains(&u64::from(tail[h + 1]))
+        {
+            continue;
+        }
+        tries += 1;
+        if tries > TAIL_PLAIN_TRIES || work > TAIL_SEARCH_WORK {
+            return Ok(match need {
+                Some(n) => TailSearch::NeedBytes(n),
+                None => TailSearch::Exhausted,
+            });
+        }
+        if options.control.is_canceled() {
+            return Err(canceled());
+        }
+        let usage = Usage::new(options.limits.clone());
+        let mut reader = Reader::new(&tail[h + 1..], &usage);
+        reader.tail = true;
+        let parsed = reader.header();
+        work = work.saturating_add(reader.steps());
+        let (streams, files) = match parsed {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        if reader.remaining() != 0 || files.is_empty() {
+            continue;
+        }
+        let at = start + h as u64;
+        let packed = streams.pack_sizes.iter().try_fold(0u64, |a, &s| a.checked_add(s));
+        let Some(header_at) = packed.and_then(|p| SIGNATURE_LEN.checked_add(streams.pack_pos)?.checked_add(p)) else {
+            continue;
+        };
+        let Some(archive_offset) = header_at.checked_sub(at) else { continue };
+        if archive_offset.checked_add(len).is_none() {
+            continue;
+        }
+        let mut walker = SevenZipWalker::new(options, usage);
+        walker.lens = vec![archive_offset + len];
+        walker.header_at = header_at;
+        walker.header_len = len - at;
+        match walker.map(MapEnd::Complete, streams, files) {
+            Ok(map) => {
+                return Ok(TailSearch::Found(Box::new(TailHeader {
+                    map: strip(map),
+                    header: at..len,
+                    archive_offset,
+                    encoded: false,
+                })));
+            }
+            Err(e) if final_failure(&e) => return Err(e),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Ok(match need {
+        Some(n) => TailSearch::NeedBytes(n),
+        None => TailSearch::NotFound(last_error),
+    })
+}
+
+/// A tail map's members without pieces or folder slots: their archive offsets are relative to a volume whose
+/// position was inferred, and earlier volumes' lengths are unknown.
+fn strip(mut map: MemberMap) -> MemberMap {
+    for member in &mut map.members {
+        member.pieces.clear();
+        member.folder = None;
+    }
+    map.folders.clear();
+    map.volumes = 0;
+    map
 }
 
 /// A Windows FILETIME (100 ns units since 1601) as seconds and nanoseconds since 1970.

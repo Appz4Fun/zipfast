@@ -1073,3 +1073,132 @@ pub(crate) fn find_end(tail: &[u8]) -> Option<usize> {
         tail[at..].starts_with(b"PK\x05\x06") && usize::from(le16(tail, at + 20)) == tail.len() - at - END_LEN
     })
 }
+
+/// What a ZIP end of central directory record at the end of a volume says, for [`from_tail`].
+pub(crate) struct TailDirectory {
+    pub(crate) members: Vec<MapMember>,
+    /// The disk holding the end record: the set's last, zero-based.
+    pub(crate) last: u32,
+    /// The classic end record's offset in the volume.
+    pub(crate) end_at: u64,
+    /// The central directory's bytes in the volume.
+    pub(crate) directory: std::ops::Range<u64>,
+    pub(crate) zip64: bool,
+    pub(crate) comment: Vec<u8>,
+}
+
+/// What looking for a ZIP directory at the end of a volume gave.
+pub(crate) enum TailZip {
+    Found(Box<TailDirectory>),
+    /// The directory starts further from the end than the bytes held: the tail must hold this many bytes before
+    /// the volume's end.
+    NeedBytes(u64),
+    NotFound,
+}
+
+/// Reads the central directory of a ZIP (or of a split set's last volume, `.zip`) from `tail`, the last bytes of a
+/// volume `len` bytes long. The end record must end the volume and the directory must lie on that volume: a
+/// directory starting on an earlier volume is [`MapError::MissingDirectory`] with that volume.
+pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<TailZip, MapError> {
+    let held = tail.len() as u64;
+    if held > len {
+        return Ok(TailZip::NotFound);
+    }
+    let start = len - held;
+    let window = &tail[tail.len() - tail.len().min(TAIL_MAX as usize)..];
+    let window_start = len - window.len() as u64;
+    let Some(at) = find_end(window) else { return Ok(TailZip::NotFound) };
+    let record = &window[at..at + END_LEN];
+    let comment = window[at + END_LEN..].to_vec();
+    let end_at = window_start + at as u64;
+    let locator = at
+        .checked_sub(LOCATOR_LEN)
+        .map(|l| &window[l..at])
+        .filter(|l| l.starts_with(b"PK\x06\x07"))
+        .map(|l| (Pos { vol: le32(l, 4), off: le64(l, 8) }, le32(l, 16)));
+    let disk16 = le16(record, 4);
+    let last = match (disk16, locator) {
+        (0xffff, Some((_, total))) => {
+            total.checked_sub(1).ok_or_else(|| malformed(0, "ZIP64 end locator disk count"))?
+        }
+        (0xffff, None) => return Err(malformed(0, "ZIP64 end locator")),
+        (disk, _) => u32::from(disk),
+    };
+    if locator.is_some_and(|(record, total)| u64::from(total) != u64::from(last) + 1 || record.vol > last) {
+        return Err(malformed(last, "ZIP64 end locator disk count"));
+    }
+    let dd16 = le16(record, 6);
+    let directory_disk = match (dd16, locator) {
+        (0xffff, None) => return Err(malformed(last, "ZIP64 end locator")),
+        (0xffff, Some((at, _))) => {
+            if at.vol != last {
+                return Err(MapError::MissingDirectory { volume: at.vol });
+            }
+            let off = at.off;
+            if off.checked_add(END64_LEN as u64).is_none_or(|end| end > end_at) {
+                return Err(malformed(last, "ZIP64 end record"));
+            }
+            if off < start {
+                return Ok(TailZip::NeedBytes(len - off));
+            }
+            let record = &tail[(off - start) as usize..][..END64_LEN];
+            if &record[..4] != b"PK\x06\x06" || le32(record, 16) != last {
+                return Err(malformed(last, "ZIP64 end record"));
+            }
+            le32(record, 20)
+        }
+        (disk, _) => u32::from(disk),
+    };
+    if directory_disk > last {
+        return Err(malformed(last, "central directory disk"));
+    }
+    if directory_disk != last {
+        return Err(MapError::MissingDirectory { volume: directory_disk });
+    }
+    let limits = zip_limits(&options.limits);
+    let usage = Usage::new(options.limits.clone());
+    let mut parser = DirectoryParser::spanned_at_eocd(len, end_at, limits, crate::crc32::hash, project)
+        .map_err(|e| directory_error(e, &limits, last))?;
+    while let Some(range) = parser.next_read().map_err(|e| directory_error(e, &limits, last))? {
+        if options.control.is_canceled() {
+            return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
+        }
+        if range.start < start {
+            // The parser reads the end records' window (up to 64 KiB and a bit) before the directory.
+            return Ok(TailZip::NeedBytes(len - range.start));
+        }
+        let from = (range.start - start) as usize;
+        let n = (range.end - range.start).min(CHUNK as u64) as usize;
+        let bytes = tail.get(from..from + n).ok_or_else(|| malformed(last, "ZIP directory source range"))?;
+        usage.charge(Resource::HeaderBytes, n as u64).map_err(|e| MapError::from_failure(last, e))?;
+        parser.supply(range.start, bytes).map_err(|e| directory_error(e, &limits, last))?;
+    }
+    let found = parser.finish().map_err(|e| directory_error(e, &limits, last))?;
+    if found.prefix_shift != 0 {
+        return Err(malformed(last, "central directory offset"));
+    }
+    if let Some(record) = &found.zip64_end {
+        let at = locator.filter(|(at, _)| at.vol == last).map(|(at, _)| at.off);
+        if at != Some(record.source.start) {
+            return Err(malformed(last, "ZIP64 end record"));
+        }
+    }
+    if found.entries.iter().any(|e| e.disk > last) {
+        return Err(malformed(last, "ZIP local header disk"));
+    }
+    usage.charge(Resource::Entries, found.entries.len() as u64).map_err(|e| MapError::from_failure(last, e))?;
+    let mut members = Vec::new();
+    members.try_reserve_exact(found.entries.len()).map_err(|_| malformed(last, "ZIP directory allocation"))?;
+    for (i, e) in found.entries.iter().enumerate() {
+        members.push(zip_member(&usage, i as u64, &e.entry, None, None, Vec::new(), true)?);
+    }
+    let directory = found.directory_range.clone();
+    Ok(TailZip::Found(Box::new(TailDirectory {
+        members,
+        last,
+        end_at,
+        directory,
+        zip64: found.zip64_end.is_some(),
+        comment,
+    })))
+}
