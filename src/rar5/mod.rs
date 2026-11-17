@@ -255,6 +255,10 @@ pub fn version_name(name: &str, version: Option<u64>) -> std::borrow::Cow<'_, st
 }
 
 /// How a file system object is to be recreated other than as a regular file.
+///
+/// **Untrusted.** Each target is the archive's bytes as stored, only decoded as UTF-8 (invalid bytes become U+FFFD):
+/// it can be absolute, climb out with `..`, and hold control characters, newlines or terminal escape sequences.
+/// Escape it before printing it to a terminal or a log, and never follow it. See [`crate::extract::Entry::link`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Redirection {
     UnixSymlink(String),

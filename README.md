@@ -76,7 +76,10 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   member, says whether it is stored, compressed, data-encrypted or behind encrypted headers, and whether its bytes
   can be borrowed; see [probing](docs/probe.md).
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
-  refused.
+  refused. A refused member fails alone and the run goes on: a link whose target leads out, and a member whose path
+  runs through a link (one placed earlier in the run, or one a rename mode swapped in for a moved folder).
+- Link targets in listings (`Entry::link`) and outcomes are the archive's bytes, unchecked: they can hold control
+  characters and terminal escapes, so escape them before printing.
 
 Remaining RAR4 capabilities, RAR 5.0 links and ZIP PPMd are next.
 

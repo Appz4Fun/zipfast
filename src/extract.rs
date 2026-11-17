@@ -879,6 +879,15 @@ pub struct Entry {
     pub dir: bool,
     pub encrypted: bool,
     pub solid: bool,
+    /// What a link member points at: a symbolic link's target, or a hard link's (tar, RAR 5.0) or file copy's
+    /// (RAR 5.0) earlier member name.
+    ///
+    /// **Untrusted.** The target is taken from the archive as stored, only decoded as UTF-8 (invalid bytes become
+    /// U+FFFD); nothing here checks it. It can be absolute, climb out with `..`, and hold control characters,
+    /// newlines or terminal escape sequences, so escape it before printing it to a terminal or a log, and never
+    /// follow it. A ZIP target longer than 4095 bytes (or encrypted, or in a method this crate can't decode) is left
+    /// empty, as is every 7z target (a listing doesn't decode member data). Extracting places a symbolic link only
+    /// when its target is at most 4095 bytes and stays inside the destination.
     pub link: Option<Redirection>,
     /// RAR 5.0: an older file revision's version number, from its version record (`rar -ver`); `None` for the
     /// current file, a record holding 0 (as UnRAR reads it), and every other format. [`Entry::display_name`] is the
