@@ -1035,8 +1035,11 @@ pub(crate) fn run_renaming(
                     // Data running past the end of a set cut short by a missing piece: that piece is the cause.
                     // The payload starts past the local header, its name and its extra field.
                     let crosses_gap = archive.missing.is_some()
-                        && data_at(&mut archive.file, archive.len, &entry)
-                            .map_or(true, |start| start.saturating_add(e.packed) > archive.len);
+                        && data_at(&mut archive.file, archive.len, &entry).map_or(true, |start| {
+                            // a streamed member also needs its descriptor (16 bytes) before the end
+                            let descriptor = if e.flags & 0x08 != 0 { 16 } else { 0 };
+                            start.saturating_add(e.packed).saturating_add(descriptor) > archive.len
+                        });
                     if let Some(missing) = archive.missing.as_ref().filter(|_| crosses_gap) {
                         fail(&mut summary, &mut report, &e.name, &Error::MissingVolume(missing.clone()).to_string());
                         continue;
