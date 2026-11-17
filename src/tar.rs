@@ -803,7 +803,7 @@ impl Selected {
                     reader,
                     path: path.to_path_buf(),
                     size: None,
-                    meta: Meta::default(),
+                    meta: single_meta(path),
                 });
             }
         } else {
@@ -859,6 +859,20 @@ fn padding(size: u64) -> u64 {
 /// The name a lone compressed file comes out as: the one in its gzip header, or the archive's own name without
 /// its compression ending. Either is cleaned the way a member's name is, and only its last part is kept: a stored
 /// name is a file name, never a place to write to.
+/// The time a lone compressed file comes out with, as gunzip -N, xz, bzip2 and 7-Zip give it: the gzip header's
+/// MTIME when it holds one, otherwise the compressed file's own modification time.
+fn single_meta(path: &Path) -> Meta {
+    let own = || {
+        let at = std::fs::metadata(path).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some((i64::try_from(at.as_secs()).ok()?, at.subsec_nanos()))
+    };
+    let (mtime, nanos) = match stream::gzip_mtime(path).map(|s| (s, 0)).or_else(own) {
+        Some((s, n)) => (Some(s), n),
+        None => (None, 0),
+    };
+    Meta { mtime, nanos, ..Meta::default() }
+}
+
 fn single_name(codec: Codec, path: &Path) -> String {
     let clean = |name: &str| {
         let last = name.rsplit(['/', '\\']).find(|s| !s.is_empty() && *s != "." && *s != "..")?;
@@ -1211,7 +1225,7 @@ fn run_single(
         }
     }
     let mut total = 0u64;
-    let outcome = copy_out(out, &Meta::default(), |sink| {
+    let outcome = copy_out(out, &single_meta(path), |sink| {
         total = reader.read_single(buf, sink)?;
         Ok(())
     })?;

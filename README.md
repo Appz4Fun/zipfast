@@ -188,6 +188,9 @@ hold the linked file, and reports a link it had to leave behind.
   `MtimeOrigin::LocalWallClock` is MS-DOS date and time fields counted as if they were UTC: a ZIP without a time
   extra, and every RAR 4.x time. RAR 4.x's extended-time record only adds a second and a fraction to the local DOS
   time, as UnRAR reads it. 7-Zip prints a local wall-clock time as stored and converts a UTC time to local time.
+- A lone compressed file (`.gz`, `.xz`, `.bz2`, `.zst`) is extracted with the gzip `MTIME` when it holds one, and
+  otherwise with the compressed file's own modification time, as 7-Zip, `gunzip -N`, `xz` and `bzip2` do. The listing
+  shows only the gzip `MTIME`.
 - `mode` holds Unix mode bits: ZIP host 3, RAR 4.x host Unix, RAR 5.0 host Unix and tar.
 - `attributes` holds raw Windows attribute bits (`FILE_ATTRIBUTE_*`, the source of 7-Zip's `D R H S A` column):
   the low 16 bits of a ZIP entry's external attributes for hosts 0 (FAT), 6 (HPFS), 10 and 11 (NTFS) and 14 (VFAT),

@@ -1006,3 +1006,28 @@ fn a_volume_label_is_checked_without_a_filter_and_never_offered_to_one() {
     assert_eq!((s.matched, s.files, s.errors.len()), (1, 1, 0), "{:?}", s.errors);
     assert_eq!(*seen.lock().unwrap(), [(0, "f".to_string())]);
 }
+
+#[test]
+fn a_lone_compressed_file_keeps_the_gzip_time_or_the_archive_time() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dir = tmp("single-mtime");
+    let mtime = |p: &Path| fs::metadata(p).unwrap().modified().unwrap();
+    // a gzip header's MTIME is the file's time, as gunzip -N and 7-Zip restore it
+    let mut enc = flate2::GzBuilder::new().mtime(1_000_000_000).write(Vec::new(), Compression::fast());
+    enc.write_all(b"timed").unwrap();
+    let archive = dir.join("timed.gz");
+    fs::write(&archive, enc.finish().unwrap()).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert_eq!(mtime(&out.join("timed")), UNIX_EPOCH + Duration::from_secs(1_000_000_000));
+    // no time stored: the compressed file's own, as xz, bzip2 and 7-Zip give it
+    let archive = dir.join("plain.xz");
+    fs::write(&archive, xz(b"plain")).unwrap();
+    let at = UNIX_EPOCH + Duration::from_secs(1_200_000_000);
+    fs::File::options().write(true).open(&archive).unwrap().set_modified(at).unwrap();
+    let s = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert_eq!(mtime(&out.join("plain")), at);
+    fs::remove_dir_all(&dir).unwrap();
+}
