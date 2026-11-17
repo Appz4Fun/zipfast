@@ -64,6 +64,7 @@ impl HeaderParser {
             extent: self.at..data_at,
             data_end,
             header_crypt: None,
+            end_record: None,
         };
         frame.block = match kind {
             0x73 => {
@@ -154,6 +155,16 @@ impl HeaderParser {
                     .then(|| header.get(at..at + 2))
                     .flatten()
                     .map(|n| u64::from(u16::from_le_bytes([n[0], n[1]])));
+                let data_crc = (flags & 2 != 0)
+                    .then(|| header.get(7..11))
+                    .flatten()
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                frame.end_record = Some(crate::rar5::RarEndRecord {
+                    flags: u64::from(flags),
+                    data_crc,
+                    volume_number,
+                    offset: self.at,
+                });
                 Block::End { more_volumes: flags & 1 != 0, volume_number }
             }
             // Old comment, AV, old subblock, old recovery record and sign blocks hold no members. A map walk skips

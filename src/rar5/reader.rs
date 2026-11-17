@@ -330,6 +330,8 @@ pub struct Volume {
     format: RarFormat,
     /// Bytes before the signature: a self-extracting module or other prefix.
     sfx: u64,
+    /// The end of archive header's fields, once it is read.
+    end_record: Option<super::RarEndRecord>,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
@@ -464,6 +466,7 @@ impl Volume {
             legacy_keys: None,
             parser: None,
             format,
+            end_record: None,
             sfx: next.saturating_sub(match format {
                 RarFormat::Rar5 => SIGNATURE.len(),
                 RarFormat::Rar4 => SIGNATURE_V4.len(),
@@ -533,6 +536,10 @@ impl Volume {
 
     pub(super) fn encrypted_headers(&self) -> bool {
         self.header_key.is_some() || self.legacy_keys.is_some()
+    }
+
+    pub(super) fn end_record(&self) -> Option<super::RarEndRecord> {
+        self.end_record
     }
 
     pub(super) fn sfx_size(&self) -> u64 {
@@ -657,6 +664,7 @@ impl Volume {
                 }
                 if matches!(frame.block, Block::End { .. }) {
                     self.next = self.len;
+                    self.end_record = frame.end_record;
                 }
                 if self.format == RarFormat::Rar4 && matches!(frame.block, Block::Unknown) {
                     continue;
@@ -814,6 +822,7 @@ mod tests {
             parser: None,
             format: RarFormat::Rar5,
             sfx: 0,
+            end_record: None,
         };
         let (send, recv) = sync_channel(1);
         let (spare, _) = channel();
@@ -852,6 +861,7 @@ mod tests {
             parser: None,
             format: RarFormat::Rar5,
             sfx: 0,
+            end_record: None,
         };
         let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
         else {

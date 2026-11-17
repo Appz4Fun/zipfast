@@ -138,6 +138,7 @@ pub struct RarVolumeMetadata {
     encrypted_headers: bool,
     sfx_size: u64,
     end: Option<VolumeEnd>,
+    end_record: Option<super::RarEndRecord>,
     headers: std::ops::Range<usize>,
     comment: Option<usize>,
 }
@@ -181,6 +182,21 @@ impl RarVolumeMetadata {
 
     pub fn encrypted_headers(&self) -> bool {
         self.encrypted_headers
+    }
+
+    /// The end of archive header's flags, CRC, volume number and offset, when the volume has one.
+    pub fn end_record(&self) -> Option<super::RarEndRecord> {
+        self.end_record
+    }
+
+    /// RAR 5.0: the main header's locator record (quick open and recovery record offsets).
+    pub fn main_locator(&self) -> Option<super::RarLocator> {
+        self.main.locator
+    }
+
+    /// RAR 5.0: the main header's extra records in stored order.
+    pub fn main_extra_records(&self) -> &[super::RarExtraRecord] {
+        &self.main.extra_records
     }
 
     /// Whether the main header marks the archive solid (`MHD_SOLID`, `MHFL_SOLID`).
@@ -554,6 +570,11 @@ impl<'a> RarMember<'a> {
     }
 
     /// RAR 5.0: the redirection record's raw flags (0x1: the link target is a directory). Zero without one.
+    /// RAR 5.0: the file header's extra records in stored order, type and bytes.
+    pub fn extra_records(&self) -> &'a [super::RarExtraRecord] {
+        &self.member.header.extra_records
+    }
+
     pub fn redirection_flags(&self) -> u64 {
         self.member.header.redirection_flags
     }
@@ -1077,6 +1098,7 @@ impl Catalogue {
                 encrypted_headers,
                 sfx_size: volume.sfx_size(),
                 end,
+                end_record: volume.end_record(),
                 headers: first_header..self.session.headers.len(),
                 comment,
             };
