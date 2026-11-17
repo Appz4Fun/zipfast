@@ -411,6 +411,10 @@ with `Locked { offset }`, `header_encrypted: true`, the header cipher parameters
 volume facts; RAR 4.x keeps its main header in the clear, so its facts are known. Members whose data is encrypted
 but whose headers are not are listed with their `cipher`.
 
+`VolumeMap::locator` is the RAR 5.0 main header's locator record (quick open and recovery record offsets) and
+`VolumeMap::end_record` the end header as stored (`RarEndRecord`: flags, RAR 4.x data CRC and volume number, offset),
+when it was reached.
+
 `VolumeMember` carries `raw_name` and `name`, `is_dir`, `unpacked_size` (every part header records the whole
 member's), `packed_size` and `packed` (this part's data bytes in this volume), `header` (the header's wire extent),
 `split_before` (continues from the previous volume), `split_after` (continues in the next), `method`, `mapping`,
@@ -483,3 +487,35 @@ any byte. Restart points inside compressed data (decoder checkpoints) are future
 
 Only pieces present in the map are covered. For a map with `complete: false`, compare the returned `stream` ranges
 with the request to see what the missing volumes still have to supply.
+
+## Identity from the last volume
+
+`map::last_volume_identity(held, options)` reads a set's identity from its last volume alone, without the first
+volume, so a downloader can match a set against another copy from its tail. `HeldVolume` names the bytes held: the
+volume's first bytes, its last bytes, or both (`HeldVolume::new(head, tail, len)`; `HeldVolume::whole(bytes)`).
+
+| format | bytes needed | `members` (`scope`) |
+|---|---|---|
+| RAR 4.x / 5.0 | the first bytes (one article usually covers the headers), read as `from_volume` reads them; the last bytes add the end header when the first bytes stop before it | members whose last part is here, with the final size and checks from their header even when their data runs past the bytes held (`EndingHere`) |
+| ZIP, single-disk or a split set's `.zip` | the last bytes: the end records and the whole central directory, which must lie on this volume (else `MissingDirectory`) | every member of the set (`WholeSet`) |
+| 7z, one archive or the last `.7z.NNN` | the last bytes: the header and, for an encoded header, its packed stream | every member (`WholeSet`) |
+
+`LastVolumeIdentity { format, scope, volume_number, is_last, volumes, members, set }`. `IdentityMember` carries the
+raw and decoded name, `is_dir`, `unpacked_size`, final `checks`, `encrypted`, `split_before` (RAR) and `mtime`.
+`SetFacts` holds the format's facts: RAR the `VolumeMap` and the `RarEndRecord`; ZIP the end record's offset, the
+directory range, ZIP64 and the comment; 7z `archive_offset` (where the volume starts in the archive: with the
+earlier volumes' size, its index), the header range, whether it is encoded and encrypted.
+
+The 7z signature header, which says where the header is, lives in the first volume, so the header is found by its
+structure: 7-Zip writes the packed streams after the signature header and the header after them, so a candidate
+start fixes the volume's place in the archive. Encoded header (`0x17 0x06`) candidates within the last 4 KiB are
+tried nearest the end first and taken when they parse to the end of the bytes exactly and the packed stream decodes
+to its CRC; plain header (`0x01` then `0x02`, `0x04` or `0x05`) candidates, which have no CRC without the signature
+header, are tried from the farthest in, at most 4096 of them, and taken when they parse to the end with at least one
+file and pass the whole-archive walk's checks. One budget covers the whole search. A RAR end header in the last
+bytes is taken when it ends the bytes exactly, its CRC matches and it lies after the headers already read; it is not
+looked for when headers are encrypted.
+
+Bytes needed further from the end than the tail held give `MapError::TailTooShort { from_end }` (for ZIP, at least
+the end records' window of 64 KiB and a bit, or the whole volume when shorter). A 7z header encrypted with `-mhe`
+needs the password (`PasswordRequired`, `WrongPassword`). Bytes of no format named here are `NotArchive`.

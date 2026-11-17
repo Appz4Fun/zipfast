@@ -1367,6 +1367,201 @@ impl SevenZipWalker {
     }
 }
 
+/// How far from the end an encoded header (`0x17`) is looked for. An encoded header lists one folder of a few
+/// coders: well under 1 KiB.
+const TAIL_ENCODED_WINDOW: usize = 4096;
+/// How many plain header (`0x01`) starts are tried at most.
+const TAIL_PLAIN_TRIES: usize = 4096;
+
+/// A 7z header found at the end of a volume's last bytes, without the signature header.
+pub(crate) struct TailHeader {
+    /// The members, without pieces (offsets before this volume are unknown) and without folders.
+    pub(crate) map: MemberMap,
+    /// The header's bytes in the volume: it runs to the volume's end.
+    pub(crate) header: Range<u64>,
+    /// Where the volume starts in the archive (the concatenation of the split's volumes).
+    pub(crate) archive_offset: u64,
+    /// The header was encoded (`kEncodedHeader`).
+    pub(crate) encoded: bool,
+}
+
+/// What looking for a 7z header at the end of a volume gave.
+pub(crate) enum TailSearch {
+    Found(Box<TailHeader>),
+    /// A header start was found whose packed stream lies further from the end than the bytes held: the tail must
+    /// hold this many bytes before the volume's end.
+    NeedBytes(u64),
+    NotFound(Option<MapError>),
+}
+
+/// Whether a failure on a candidate header is final rather than a sign that the candidate was not the header.
+fn final_failure(error: &MapError) -> bool {
+    matches!(error, MapError::PasswordRequired | MapError::WrongPassword | MapError::Limit { .. } | MapError::Source(_))
+}
+
+/// Finds the 7z header at the end of `tail`, the last bytes of a volume `len` bytes long, without the signature
+/// header that says where it is: the archive's header ends the last volume.
+///
+/// 7-Zip writes the packed streams right after the signature header and the header right after them (an encoded
+/// header's packed stream last of all), so a candidate start fixes where the volume sits in the archive. A
+/// candidate is taken when it parses to the end of the bytes exactly and, for an encoded header, its packed stream
+/// decodes to its CRC; a plain header has no CRC without the signature header, so its starts are tried from the
+/// farthest one in. Every count and offset in a candidate is checked as for a whole-archive walk.
+pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<TailSearch, MapError> {
+    let held = tail.len() as u64;
+    if held > len || tail.len() < 2 {
+        return Ok(TailSearch::NotFound(None));
+    }
+    let start = len - held;
+    // One budget for the whole search, so that hostile bytes full of candidates cannot multiply the work.
+    let usage = Usage::new(options.limits.clone());
+    let mut first_error = None;
+    let mut need: Option<u64> = None;
+    // Encoded headers, nearest the end first: `0x17` then the packed stream info (`0x06`).
+    let lowest = tail.len().saturating_sub(TAIL_ENCODED_WINDOW);
+    for h in (lowest..tail.len() - 1).rev() {
+        if options.control.is_canceled() {
+            return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
+        }
+        if tail[h] != ID_ENCODED_HEADER as u8 || tail[h + 1] != ID_PACK_INFO as u8 {
+            continue;
+        }
+        let mut reader = Reader::new(&tail[h + 1..], &usage);
+        let streams = match reader.streams_info() {
+            Ok(streams) => streams,
+            Err(Bad::Failure(failure)) => return Err(MapError::from_failure(0, failure)),
+            Err(_) => continue,
+        };
+        if reader.remaining() != 0
+            || streams.folders.len() != 1
+            || streams.pack_sizes.len() != 1
+            || streams.folders[0].packed_streams.len() != 1
+        {
+            continue;
+        }
+        let packed_len = streams.pack_sizes[0];
+        let at = start + h as u64;
+        let Some(header_at) = SIGNATURE_LEN.checked_add(streams.pack_pos).and_then(|p| p.checked_add(packed_len))
+        else {
+            continue;
+        };
+        let Some(archive_offset) = header_at.checked_sub(at) else { continue };
+        if archive_offset.checked_add(len).is_none() {
+            continue;
+        }
+        if packed_len > h as u64 {
+            // The packed stream starts before the bytes held (or before the volume: then it is not the header).
+            if packed_len <= at {
+                need = Some(need.map_or(len - at + packed_len, |n| n.min(len - at + packed_len)));
+            }
+            continue;
+        }
+        let packed = &tail[h - packed_len as usize..h];
+        let mut walker = SevenZipWalker::new(options, usage.clone());
+        walker.lens = vec![archive_offset + len];
+        walker.header_at = header_at;
+        walker.header_len = len - at;
+        walker.depth = 1;
+        if let Some(aes) = streams.folders[0].aes() {
+            walker.header_encrypted = true;
+            walker.header_cipher = aes_params(&aes.properties);
+        }
+        let result = walker.decode(&streams, packed, options).and_then(|decoded| {
+            match decoded.first().map(|&b| u64::from(b)) {
+                Some(ID_HEADER) => walker.header(&decoded, true),
+                // A nested encoded header (or noise) is not taken from a tail.
+                _ if walker.header_encrypted => Err(MapError::WrongPassword),
+                _ => Err(unsupported(0, "7z nested encoded header in a volume tail")),
+            }
+        });
+        match result {
+            Ok(Some(map)) => {
+                return Ok(TailSearch::Found(Box::new(TailHeader {
+                    map: strip(map),
+                    header: at..len,
+                    archive_offset,
+                    encoded: true,
+                })));
+            }
+            Ok(None) => {}
+            Err(e) if final_failure(&e) => return Err(e),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    // Plain headers, farthest first: `0x01` then archive properties, main streams or files.
+    let budget = usize::try_from(options.limits.header_bytes).unwrap_or(usize::MAX);
+    let lowest = tail.len().saturating_sub(budget);
+    let mut tries = 0usize;
+    for h in lowest..tail.len() - 1 {
+        if tail[h] != ID_HEADER as u8
+            || ![ID_ARCHIVE_PROPERTIES, ID_MAIN_STREAMS, ID_FILES].contains(&u64::from(tail[h + 1]))
+        {
+            continue;
+        }
+        tries += 1;
+        if tries > TAIL_PLAIN_TRIES {
+            break;
+        }
+        if options.control.is_canceled() {
+            return Err(MapError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
+        }
+        let mut reader = Reader::new(&tail[h + 1..], &usage);
+        let (streams, files) = match reader.header() {
+            Ok(parsed) => parsed,
+            Err(Bad::Failure(failure)) => return Err(MapError::from_failure(0, failure)),
+            Err(_) => continue,
+        };
+        if reader.remaining() != 0 || files.is_empty() {
+            continue;
+        }
+        let at = start + h as u64;
+        let packed = streams.pack_sizes.iter().try_fold(0u64, |a, &s| a.checked_add(s));
+        let Some(header_at) = packed.and_then(|p| SIGNATURE_LEN.checked_add(streams.pack_pos)?.checked_add(p)) else {
+            continue;
+        };
+        let Some(archive_offset) = header_at.checked_sub(at) else { continue };
+        if archive_offset.checked_add(len).is_none() {
+            continue;
+        }
+        let mut walker = SevenZipWalker::new(options, usage.clone());
+        walker.lens = vec![archive_offset + len];
+        walker.header_at = header_at;
+        walker.header_len = len - at;
+        match walker.map(MapEnd::Complete, streams, files) {
+            Ok(map) => {
+                return Ok(TailSearch::Found(Box::new(TailHeader {
+                    map: strip(map),
+                    header: at..len,
+                    archive_offset,
+                    encoded: false,
+                })));
+            }
+            Err(e) if final_failure(&e) => return Err(e),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    Ok(match need {
+        Some(n) => TailSearch::NeedBytes(n),
+        None => TailSearch::NotFound(first_error),
+    })
+}
+
+/// A tail map's members without pieces or folder slots: their archive offsets are relative to a volume whose
+/// position was inferred, and earlier volumes' lengths are unknown.
+fn strip(mut map: MemberMap) -> MemberMap {
+    for member in &mut map.members {
+        member.pieces.clear();
+        member.folder = None;
+    }
+    map.folders.clear();
+    map.volumes = 0;
+    map
+}
+
 /// A Windows FILETIME (100 ns units since 1601) as seconds and nanoseconds since 1970.
 fn filetime(ticks: u64) -> (i64, u32) {
     const EPOCH_DIFF: i64 = 11_644_473_600;

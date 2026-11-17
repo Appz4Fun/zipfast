@@ -26,6 +26,9 @@
 //! A [`VolumeMap`] lists the headers of one RAR volume read on its own, at any position in its set and possibly cut
 //! short ([`MemberMap::from_volume`], [`VolumeMapBuilder`]).
 //!
+//! [`last_volume_identity`] reads a set's identity from its last volume alone, from its first and last bytes: the
+//! members that end there with their final sizes and checks, the volume's place in its set and the end record.
+//!
 //! RAR 5.0 and RAR 4.x (including headers encrypted with `-hp` when a password is given), single-disk ZIP, split
 //! ZIP sets (`name.z01`, ..., `name.zip`, passed in that order) and 7z (single files and plain byte splits
 //! `.7z.001`, `.7z.002`, ..., including encoded and `-mhe` encrypted headers) are mapped. Passwords and keys never
@@ -40,12 +43,14 @@
 //! only the packed bytes that offset needs, for example to fill the rest of a partial output from another copy. See
 //! `docs/extract-member-from.md`.
 
+mod last_volume;
 mod lzma2;
 mod member_reader;
 pub(crate) mod sevenzip;
 pub(crate) mod zip;
 pub(crate) mod zip_split;
 
+pub use last_volume::{HeldVolume, IdentityMember, IdentityScope, LastVolumeIdentity, SetFacts, last_volume_identity};
 pub use lzma2::{
     LZMA2_MAX_LZMA_UNPACKED, LZMA2_MAX_PAYLOAD, Lzma2Bound, Lzma2Chunk, Lzma2ChunkKind, Lzma2Damage, Lzma2DecodeError,
     Lzma2DecodeOptions, Lzma2Decoder, Lzma2End, Lzma2Error, Lzma2Index, Lzma2IndexBuilder, Lzma2IndexOptions,
@@ -441,6 +446,10 @@ pub struct VolumeMap {
     pub new_naming: bool,
     /// The end header's "not last volume" flag. False when the end header was not reached.
     pub has_next_volume: bool,
+    /// RAR 5.0: the main header's locator record (quick open and recovery record offsets), when it has one.
+    pub locator: Option<crate::rar5::RarLocator>,
+    /// The end header as stored, when it was reached.
+    pub end_record: Option<crate::rar5::RarEndRecord>,
     /// Whether the archive is solid (the main header's flag).
     pub solid: bool,
     /// Whether the headers are encrypted (RAR `-hp`).
@@ -685,6 +694,9 @@ pub enum MapError {
     /// available: the volume is missing or cut short. `volume` is the zero-based index looked at: in memory, the last
     /// slice; through a source whose last volume is missing, the first of the indexes in a row without a volume.
     MissingDirectory { volume: u32 },
+    /// [`last_volume_identity`]: the bytes needed lie further from the volume's end than the tail held. The tail
+    /// must hold at least `from_end` bytes before the end.
+    TailTooShort { from_end: u64 },
 }
 
 impl std::fmt::Display for MapError {
@@ -705,6 +717,9 @@ impl std::fmt::Display for MapError {
             Self::AlreadyFinished => write!(f, "map already returned"),
             Self::MissingDirectory { volume } => {
                 write!(f, "split ZIP directory or end record not available (volume {volume})")
+            }
+            Self::TailTooShort { from_end } => {
+                write!(f, "the volume's last {from_end} bytes are needed")
             }
         }
     }
