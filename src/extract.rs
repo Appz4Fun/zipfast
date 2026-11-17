@@ -1102,8 +1102,13 @@ fn sniff(path: &Path) -> Result<Format> {
         return Ok(Format::Zip);
     }
     let mut head = [0u8; HEAD_PROBE_BYTES];
-    let n = crate::tar::read_full(&mut File::open(path)?, &mut head)?;
-    Ok(classify_head(&head[..n]))
+    let mut file = File::open(path)?;
+    let n = crate::tar::read_full(&mut file, &mut head)?;
+    match classify_head(&head[..n]) {
+        // an ISO 9660 image says so 32 KiB in, past the probe
+        Format::Other if crate::tar::sniff_iso(&file) => Ok(Format::Tar),
+        format => Ok(format),
+    }
 }
 
 fn classify_head(head: &[u8]) -> Format {

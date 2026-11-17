@@ -35,13 +35,14 @@ use crate::rar5::Redirection;
 use crate::stream::{self, Codec};
 
 mod cpio;
+mod iso;
 mod table;
 mod wim;
 mod xar;
 
 pub use wim::WimInfo;
 
-/// A member's data read from its own place in the file (xar, ISO 9660), not from the archive's stream.
+/// A member's data read from its own place in the file (xar, WIM, ISO 9660), not from the archive's stream.
 trait MemberData: Read {
     /// Why the last read failed, when it was the data's own fault (a checksum, a size).
     fn fault(&mut self) -> Option<&'static str>;
@@ -116,6 +117,11 @@ pub fn list_wim_image(path: &Path, image: u32) -> Result<Vec<Entry>> {
     let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None)?;
     reader.random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), image)?));
     list_members(reader)
+}
+
+/// Whether `file` is an ISO 9660 image: "CD001" in the volume descriptor 32 KiB in.
+pub fn sniff_iso(file: &File) -> bool {
+    iso::sniff(file)
 }
 
 fn zero(b: &[u8]) -> bool {
@@ -753,7 +759,8 @@ struct Reader {
     cpio: Option<Box<cpio::State>>,
     /// the checksum of the current member's data, in a newc archive with checksums
     crc: Option<CpioCrc>,
-    /// set when the archive is read from a table (xar, WIM): its members, and the current one's data
+    /// set when the archive is read from a table (xar's TOC, a WIM's lookup table, an ISO 9660 image's folders):
+    /// its members, and the current one's data
     random: Option<Box<dyn RandomAccess>>,
     member_data: Option<Box<dyn MemberData>>,
 }
@@ -789,6 +796,11 @@ impl Reader {
         } else if plain && sniff_wim(&first) {
             // WIM data is read where the lookup table puts it, from the file itself; image 1 is the one taken
             random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), 1)?));
+            first.clear();
+            Some(Content::Tar)
+        } else if plain && n == BLOCK && iso::sniff(&File::open(path)?) {
+            // an ISO 9660 image: its tree is read from the volume descriptors 32 KiB in
+            random = Some(Box::new(iso::open(File::open(path)?, std::fs::metadata(path)?.len())?));
             first.clear();
             Some(Content::Tar)
         } else if let Some(format) = cpio::sniff(&first) {
@@ -1419,9 +1431,15 @@ pub fn run_with_policy(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_tar_or_stream(path: &Path) -> Result<bool> {
     let mut head = [0u8; 2 * BLOCK];
-    let n = read_full(&mut File::open(path)?, &mut head)?;
+    let mut file = File::open(path)?;
+    let n = read_full(&mut file, &mut head)?;
     let head = &head[..n];
-    Ok(Codec::sniff(head).is_some() || sniff_tar(head) || sniff_cpio(head) || sniff_xar(head) || sniff_wim(head))
+    Ok(Codec::sniff(head).is_some()
+        || sniff_tar(head)
+        || sniff_cpio(head)
+        || sniff_xar(head)
+        || sniff_wim(head)
+        || sniff_iso(&file))
 }
 
 /// [`run`], reporting a rename mode's renames to `report` as they happen. A terminal error keeps them too.
