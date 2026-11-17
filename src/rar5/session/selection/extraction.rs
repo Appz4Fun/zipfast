@@ -435,7 +435,7 @@ impl<'a> Extraction<'a> {
         };
         // what is placed, so the diagnostic guard takes it as this run's own change
         let placed = match &kind {
-            link::LinkKind::Symbolic(text) => PlacedLink::Symbolic { len: text.len() as u64 },
+            link::LinkKind::Symbolic(text) => PlacedLink::Symbolic { target: text },
             link::LinkKind::Hard(source) => PlacedLink::Hard { source: self.extracted.landed_identity(source) },
             link::LinkKind::Copy(_) => PlacedLink::Copy,
         };
@@ -774,14 +774,14 @@ pub(super) trait ExtractionHooks {
     fn stage(&mut self, _index: usize, _stamp: SourceStamp) {}
     fn published(&mut self, _index: usize, _target: &Path, _held: &File, _published: bool) {}
     /// A link member was placed at `landed` for `target` (None: nothing was placed).
-    fn linked(&mut self, _index: usize, _target: &Path, _landed: Option<&Path>, _placed: PlacedLink) {}
+    fn linked(&mut self, _index: usize, _target: &Path, _landed: Option<&Path>, _placed: PlacedLink<'_>) {}
 }
 
 /// What a link member placed, as the diagnostic guard checks it.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum PlacedLink {
-    /// A symbolic link whose target is this many bytes.
-    Symbolic { len: u64 },
+pub(super) enum PlacedLink<'a> {
+    /// A symbolic link to these target bytes.
+    Symbolic { target: &'a [u8] },
     /// A hard link to the file this run extracted with this device and inode (a copy where linking fails).
     Hard { source: Option<(u64, u64)> },
     /// A copy of a file this run extracted.
