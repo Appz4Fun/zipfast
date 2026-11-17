@@ -292,7 +292,12 @@ fn list_entries(
                 dir: m.is_dir,
                 encrypted: m.encrypted,
                 solid: folder.is_some_and(|f| f.members > 1),
-                link: None,
+                // A Unix symbolic link (S_IFLNK): its target is in the member's data, which a listing does not
+                // decode, so it is left empty here.
+                link: m
+                    .unix_mode
+                    .is_some_and(|mode| mode & 0o170000 == 0o120000)
+                    .then(|| crate::rar5::Redirection::UnixSymlink(String::new())),
             }
         })
         .collect())

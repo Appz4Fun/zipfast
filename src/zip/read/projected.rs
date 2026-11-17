@@ -358,11 +358,25 @@ impl ProjectedOwner {
         max_bytes: u64,
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
+        sink: impl FnMut(&[u8]) -> ZipSinkResult<()>,
+    ) -> ZipReadResult<()> {
+        self.read_checked_kind(index, password, max_bytes, cancel, context, false, sink)
+    }
+    /// [`Self::read_checked`], also reading a symbolic link member's data (its target) when `link` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_checked_kind(
+        &mut self,
+        index: usize,
+        password: Option<&str>,
+        max_bytes: u64,
+        cancel: &Cancellation,
+        context: &mut EncryptedReadContext,
+        link: bool,
         mut sink: impl FnMut(&[u8]) -> ZipSinkResult<()>,
     ) -> ZipReadResult<()> {
         context.verify_identity(self.identity)?;
         let e = self.entries.get(index).ok_or(ReadFault::InvalidPlan)?;
-        if e.is_dir() || e.is_link() {
+        if e.is_dir() || e.is_link() && !link {
             return Err(ReadFault::CheckedFormat { reason: "selected ZIP entry is not a regular file" }.into());
         }
         self.proof()?;
@@ -780,9 +794,8 @@ pub(super) fn factory<'a>(
             g.directories = add(g.directories, 1)?;
             continue;
         }
-        if link {
-            continue;
-        }
+        // A symbolic link's target is read and checked like a regular member's data (it is then placed, not staged).
+        let _ = link;
         g.regular = add(g.regular, 1)?;
         g.packed = add(g.packed, e.packed.into())?;
         g.decoded = add(g.decoded, e.size.into())?;

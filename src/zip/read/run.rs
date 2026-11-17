@@ -585,7 +585,7 @@ impl ProjectedReadSession {
         let max = action.caller_max.unwrap_or(u64::MAX);
         let e = &self.owner.entries[ordinal];
         if e.is_link() {
-            return (Err(ReadFault::CheckedFormat { reason: "links are not supported yet" }.into()), false, true);
+            return self.link_member(ordinal, options, password, cancel, context);
         }
         let relative = match policy::PolicyPath::normalized(&context.ledger, &e.name, e.host != 3, cancel) {
             Ok(path) => path,
@@ -694,6 +694,70 @@ impl ProjectedReadSession {
                     .with_policy_usage(context.policy_metadata_usage())),
                 false,
                 local_refusal,
+            ),
+        }
+    }
+    /// A Unix symbolic link member (`S_IFLNK` in the external attributes): its data, read and checked whole, is the
+    /// target. It is placed only when the target stays inside the destination, under the overwrite choice, never
+    /// through a link in the way; an unsafe target fails only this member.
+    fn link_member(
+        &mut self,
+        ordinal: usize,
+        options: &Options,
+        password: Option<&str>,
+        cancel: &Cancellation,
+        context: &mut EncryptedReadContext,
+    ) -> (ZipReadResult<()>, bool, bool) {
+        use crate::extract::link;
+        let refuse = |reason: &'static str| (Err(ReadFault::CheckedFormat { reason }.into()), false, true);
+        let e = &self.owner.entries[ordinal];
+        if e.size > link::MAX_TARGET {
+            return refuse("the link's target is too long");
+        }
+        let (name, host) = (e.name.clone(), e.host);
+        let mut text = Vec::new();
+        let read = self.owner.read_checked_kind(ordinal, password, link::MAX_TARGET, cancel, context, true, |chunk| {
+            text.extend_from_slice(chunk);
+            Ok(())
+        });
+        if let Err(error) = read {
+            return (Err(error), false, false);
+        }
+        let Ok(rel) = crate::path::sanitize_with(&name, host != 3, options.windows_safe_names) else {
+            return refuse("invalid ZIP target name");
+        };
+        let rel = if options.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+        let kind = link::LinkKind::Symbolic(text);
+        // ZIP holds no hard links, so the run keeps no record of the files it wrote
+        let mut extracted = link::Extracted::default();
+        // testing checks the target as extracting would
+        if let Some(why) = link::refusal(&rel, &kind, &extracted) {
+            return refuse(why);
+        }
+        if options.mode != Mode::Extract {
+            return (Ok(()), false, false);
+        }
+        let mut renamed = None;
+        let mut budget = crate::extract::RenameBudget::default();
+        let mut log = crate::extract::RenameLog { budget: &mut budget, record: &mut |r| renamed = Some(r) };
+        let checked = crate::extract::check_target(options, &rel, None, &mut log);
+        if let Some(action) = context.action.as_mut() {
+            action.renamed = renamed;
+        }
+        let place = match checked {
+            Ok(crate::extract::Checked::Write(place)) => place,
+            Ok(crate::extract::Checked::Exists | crate::extract::Checked::Declined) => return (Ok(()), true, false),
+            Ok(crate::extract::Checked::Blocked(why)) => return refuse(why),
+            Err(error) => return (Err(ReadFault::Legacy(error).into()), false, false),
+        };
+        match link::publish(&options.dest, &rel, place, &kind, &mut extracted) {
+            Ok(()) => (Ok(()), false, false),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => refuse("links can't be created here"),
+            Err(error) => (
+                Err(ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Publish, offset: 0, error }
+                    .into()),
+                false,
+                false,
             ),
         }
     }

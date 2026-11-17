@@ -23,6 +23,7 @@ use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::extract::link::{self, Extracted, LinkKind};
 use crate::extract::{
     Cancellation, Checked, Entry, LegacyMember, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options,
     Overwrite, Place, RenameLog, RunError, Summary, check_target, create_target, finish_dirs, finish_file, make_dirs,
@@ -1063,8 +1064,14 @@ fn target(
     size: Option<u64>,
     summary: &mut Summary,
     report: &mut impl LegacyReport,
-) -> Result<Option<Output>> {
-    checked_place(opts, rel, (ordinal, name), summary, report)?.map(|place| create_target(place, size)).transpose()
+) -> Result<Option<(Output, PathBuf)>> {
+    let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(None) };
+    // where the data lands: a rename mode's reserved name, else the target
+    let landed = match &place.reserved {
+        Some(reserved) => reserved.path().to_path_buf(),
+        None => place.path.clone(),
+    };
+    Ok(Some((create_target(place, size)?, landed)))
 }
 
 /// How a member's data went: written whole, or the error that stopped it.
@@ -1076,6 +1083,7 @@ enum Outcome {
 
 enum StagedMember {
     Directory { relative: PathBuf, meta: Meta, ordinal: u64, name: String },
+    Link { relative: PathBuf, name: String, kind: LinkKind, ordinal: u64 },
     File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64, ordinal: u64 },
 }
 
@@ -1087,8 +1095,12 @@ struct StagedTar {
 
 impl StagedTar {
     fn publish(self, opts: &Options, summary: &mut Summary, report: &mut impl LegacyReport) -> Result<()> {
+        let mut extracted = Extracted::default();
         for member in self.members {
             match member {
+                StagedMember::Link { relative, name, kind, ordinal } => {
+                    link_member(opts, &relative, (ordinal, &name), &kind, &mut extracted, summary, report)?;
+                }
                 StagedMember::Directory { relative, meta, ordinal, name } => {
                     make_dirs(&opts.dest, &relative)?;
                     summary.dir_meta.push((opts.dest.join(relative), meta));
@@ -1097,6 +1109,10 @@ impl StagedTar {
                 StagedMember::File { relative, name, temporary, size, ordinal } => {
                     let Some(place) = checked_place(opts, &relative, (ordinal, &name), summary, report)? else {
                         continue;
+                    };
+                    let landed = match &place.reserved {
+                        Some(reserved) => reserved.path().to_path_buf(),
+                        None => place.path.clone(),
                     };
                     if let Some(reserved) = place.reserved {
                         // the rename mode's own empty file, created with O_EXCL a moment ago, takes the data
@@ -1111,12 +1127,50 @@ impl StagedTar {
                         }
                         return Err(error.error.into());
                     }
+                    extracted.file(&opts.dest, &relative, &landed);
                     succeeded(summary, report, ordinal, &name, size);
                 }
             }
         }
         Ok(())
     }
+}
+
+/// A link member: refused when its target is unsafe (or, for a hard link, not a file this run extracted), else
+/// placed under the run's overwrite choice. Testing only checks the target.
+fn link_member(
+    opts: &Options,
+    rel: &Path,
+    (ordinal, name): (u64, &str),
+    kind: &LinkKind,
+    extracted: &mut Extracted,
+    summary: &mut Summary,
+    report: &mut impl LegacyReport,
+) -> Result<()> {
+    // testing checks the target as extracting would
+    if let Some(why) = link::refusal(rel, kind, extracted) {
+        fail_member(summary, report, ordinal, name, why, Error::UnsafePath(name.to_owned()));
+        return Ok(());
+    }
+    if opts.mode == Mode::Extract {
+        let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(()) };
+        if let Err(e) = link::publish(&opts.dest, rel, place, kind, extracted) {
+            if !cfg!(unix) || e.kind() == io::ErrorKind::Unsupported {
+                let why = "links can't be created here";
+                fail_member(summary, report, ordinal, name, why, Error::Unsupported(why.to_owned()));
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+    }
+    if opts.mode != Mode::Extract {
+        match kind {
+            LinkKind::Hard(_) => extracted.tested(rel),
+            LinkKind::Symbolic(_) => extracted.replaced(rel),
+        }
+    }
+    succeeded(summary, report, ordinal, name, 0);
+    Ok(())
 }
 
 fn checked_place(
@@ -1222,7 +1276,7 @@ fn run_single(
     if opts.mode == Mode::Extract {
         let rel = PathBuf::from(&name);
         match target(opts, &rel, (0, &name), None, summary, report)? {
-            Some(t) => out = Some(t),
+            Some((t, _)) => out = Some(t),
             None => return Ok(()),
         }
     }
@@ -1246,6 +1300,8 @@ fn run_tar(
     report: &mut impl LegacyReport,
 ) -> Result<()> {
     let mut staged = (opts.mode == Mode::Extract && reader.src.codec().is_some()).then(StagedTar::default);
+    // the files written so far, for hard links (a staged run tracks them as it publishes)
+    let mut extracted = Extracted::default();
     // the next member's position in a listing, which leaves out volume labels
     let mut ordinal = 0u64;
     loop {
@@ -1324,7 +1380,29 @@ fn run_tar(
                 continue;
             }
             Kind::File => None,
-            Kind::Symlink | Kind::HardLink => Some("links are not supported yet"),
+            Kind::Symlink | Kind::HardLink => {
+                let kind = if m.kind == Kind::Symlink {
+                    LinkKind::Symbolic(m.link.clone().into_bytes())
+                } else {
+                    match crate::path::sanitize_with(&m.link, false, opts.windows_safe_names) {
+                        Ok(target) if opts.flatten => {
+                            LinkKind::Hard(PathBuf::from(target.file_name().unwrap_or_default()))
+                        }
+                        Ok(target) => LinkKind::Hard(target),
+                        Err(e) => {
+                            fail_member(summary, report, position, &m.name, link::HARD_TARGET, e);
+                            continue;
+                        }
+                    }
+                };
+                if let Some(staged) = &mut staged {
+                    staged.budget.record(&m.name)?;
+                    staged.members.push(StagedMember::Link { relative: rel, name: m.name, kind, ordinal: position });
+                } else {
+                    link_member(opts, &rel, (position, &m.name), &kind, &mut extracted, summary, report)?;
+                }
+                continue;
+            }
             Kind::Other(b'V') => continue,
             Kind::Other(b'S') => Some("sparse files are not supported yet"),
             Kind::Other(b'M') => Some("multi-volume tar archives are not supported yet"),
@@ -1371,6 +1449,7 @@ fn run_tar(
             match reader.src.skip(size, &mut reader.scratch) {
                 Ok(()) => {
                     reader.unread = 0;
+                    extracted.tested(&rel);
                     succeeded(summary, report, position, &m.name, m.size);
                     continue;
                 }
@@ -1382,8 +1461,18 @@ fn run_tar(
             }
         }
         let size = m.size;
+        let (out, landed) = match out {
+            Some((out, landed)) => (Some(out), Some(landed)),
+            None => (None, None),
+        };
         match copy_out(out, &m.meta(), |sink| reader.read_data(size, buf, sink))? {
-            Outcome::Done => succeeded(summary, report, position, &m.name, m.size),
+            Outcome::Done => {
+                match &landed {
+                    Some(landed) => extracted.file(&opts.dest, &rel, landed),
+                    None => extracted.tested(&rel),
+                }
+                succeeded(summary, report, position, &m.name, m.size)
+            }
             Outcome::Archive(e) => {
                 fail_member(summary, report, position, &m.name, &e.to_string(), e);
                 return Ok(());

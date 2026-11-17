@@ -313,7 +313,7 @@ fn escaping_paths_are_refused() {
 }
 
 #[test]
-fn encrypted_unknown_methods_and_links_are_refused() {
+fn encrypted_and_unknown_methods_are_refused_and_links_tested() {
     let dir = tmp("refuse");
     let arc = dir.join("a.zip");
     fs::write(
@@ -326,8 +326,9 @@ fn encrypted_unknown_methods_and_links_are_refused() {
         ]),
     )
     .unwrap();
+    // a symbolic link's target is read and checked like data; extracting places it (tests/links.rs)
     let s = extract::run(&arc, &test_opts(&dir), |_| {}).unwrap();
-    assert_eq!((s.files, s.errors.len()), (1, 3));
+    assert_eq!((s.files, s.errors.len()), (2, 2));
 }
 
 #[test]
