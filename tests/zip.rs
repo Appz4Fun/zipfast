@@ -886,3 +886,17 @@ fn a_member_filter_chooses_which_zip_entries_are_tested_and_extracted() {
         assert_eq!(report(policy), (1, 0, 0, 1));
     }
 }
+
+#[test]
+fn a_dot_folder_entry_stands_for_the_destination() {
+    // bsdtar and Windows tar.exe write "./" first when zipping the current directory.
+    let dir = tmp("dot-root");
+    let arc = dir.join("in.zip");
+    let dot = Z { mode: Some(0o040755), ..Z::new("./", b"") };
+    fs::write(&arc, zip(&[dot, Z::new("./a.txt", b"hello")])).unwrap();
+    let out = dir.join("out");
+    let result = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"hello");
+    fs::remove_dir_all(&dir).unwrap();
+}

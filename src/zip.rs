@@ -946,6 +946,9 @@ pub(crate) fn run_renaming(
                 continue;
             }
             summary.matched += 1;
+            if e.is_dir() && crate::path::names_root(&e.name) {
+                continue;
+            }
             let rel = match sanitize_with(&e.name, e.host != HOST_UNIX, opts.windows_safe_names) {
                 Ok(rel) => rel,
                 Err(err) => {
