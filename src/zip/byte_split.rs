@@ -201,9 +201,11 @@ impl Seek for ArchiveSource {
 pub(crate) fn scan_local_headers(
     source: &mut (impl Read + Seek),
     len: u64,
-) -> crate::error::Result<Vec<super::ZipEntry>> {
+) -> crate::error::Result<(Vec<super::ZipEntry>, bool)> {
     use zip_container::{LOCAL_HEADER_LEN, LocalHeader};
     let mut entries = Vec::new();
+    // The last entry is a streamed member whose descriptor lies past the end: its size is unknown.
+    let mut size_unknown = false;
     let mut at = 0u64;
     while at + LOCAL_HEADER_LEN as u64 <= len && entries.len() < 1_000_000 {
         let mut head = [0u8; LOCAL_HEADER_LEN];
@@ -223,7 +225,10 @@ pub(crate) fn scan_local_headers(
                 Some(d) => (d.crc32, d.packed, d.size, Some(data_at + d.packed + d.len)),
                 // The descriptor is past the gap: as 7-Zip, the packed size is what is left before it, the size is
                 // unknown (0), and the walk ends.
-                None => (h.crc32, len.saturating_sub(data_at), 0, None),
+                None => {
+                    size_unknown = true;
+                    (h.crc32, len.saturating_sub(data_at), 0, None)
+                }
             }
         } else {
             if h.packed_size == u32::MAX || h.unpacked_size == u32::MAX {
@@ -252,7 +257,7 @@ pub(crate) fn scan_local_headers(
             _ => break,
         }
     }
-    Ok(entries)
+    Ok((entries, size_unknown))
 }
 
 /// A data descriptor found after a streamed member's data.

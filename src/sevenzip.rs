@@ -274,6 +274,7 @@ fn list_entries(
                     if windows_safe { crate::path::windows_safe_name(&name).into_owned() } else { name }
                 },
                 size: m.unpacked_size.unwrap_or(0),
+                size_unknown: false,
                 // A folder's packed bytes are counted once, on its first member.
                 packed: match folder {
                     Some(f) if first_in_folder => f.pack_sizes.iter().sum(),

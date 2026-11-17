@@ -763,7 +763,7 @@ pub enum MtimeOrigin {
 
 /// One entry for a listing.
 ///
-/// `mode`, `mtime_origin`, `ctime`, `atime`, `tar` and `attributes` are additive in this unpublished
+/// `mode`, `mtime_origin`, `ctime`, `atime`, `tar`, `size_unknown` and `attributes` are additive in this unpublished
 /// 0.1 API; downstream struct literals must supply them (`None` when the
 /// archive holds no such metadata).
 #[derive(Clone, Debug)]
@@ -772,6 +772,9 @@ pub struct Entry {
     pub mode: Option<u32>,
     pub name: String,
     pub size: u64,
+    /// The size is unknown, and `size` is 0 in its place: a streamed ZIP member whose data descriptor lies past
+    /// the gap of a byte-split set cut short by a missing piece (7-Zip leaves Size blank). See [`Entry::known_size`].
+    pub size_unknown: bool,
     pub packed: u64,
     /// Seconds since 1970; see `mtime_origin` for the clock it was read from.
     pub mtime: Option<i64>,
@@ -804,6 +807,13 @@ pub struct Entry {
     pub encrypted: bool,
     pub solid: bool,
     pub link: Option<Redirection>,
+}
+
+impl Entry {
+    /// The size, or None when it is unknown ([`Entry::size_unknown`]).
+    pub fn known_size(&self) -> Option<u64> {
+        (!self.size_unknown).then_some(self.size)
+    }
 }
 
 #[derive(Default)]
@@ -2115,6 +2125,7 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
             attributes: h.windows_attributes(),
             name: h.name,
             size: h.unpacked_size,
+            size_unknown: false,
             packed: h.packed_size,
             mtime: h.mtime,
             crc32,

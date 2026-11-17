@@ -399,6 +399,7 @@ impl Member {
             attributes: None,
             name: self.name,
             size: if data { self.size } else { 0 },
+            size_unknown: false,
             packed: if data { self.size } else { 0 },
             mtime: self.mtime,
             crc32: None,
@@ -913,6 +914,7 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         let mtime = if gzip { stream::gzip_mtime(path) } else { None };
         return Ok(vec![Entry {
             mode: None,
+            size_unknown: false,
             mtime_origin: mtime.map(|_| MtimeOrigin::Utc),
             ctime: None,
             atime: None,

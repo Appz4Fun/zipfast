@@ -190,6 +190,8 @@ fn streamed_members_before_a_gap_are_found_by_their_descriptors() {
     assert!(listing.unexpected_end());
     let got: Vec<_> = listing.entries.iter().map(|e| (e.name.as_str(), e.size, e.packed)).collect();
     assert_eq!(got, [("a.txt", 800, 26), ("b.txt", 5, 5), ("c.bin", 0, 11832)]);
+    let known: Vec<_> = listing.entries.iter().map(|e| (e.known_size(), e.size_unknown)).collect();
+    assert_eq!(known, [(Some(800), false), (Some(5), false), (None, true)]);
     // Extraction checks each CRC before publishing: the two whole members come out, c.bin fails on the gap.
     let dir = tempfile::tempdir().unwrap();
     let result = extract::run(&first, &options(dir.path(), Mode::Extract), |_| {}).unwrap();
