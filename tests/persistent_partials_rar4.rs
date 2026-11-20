@@ -1406,18 +1406,21 @@ fn scattered_holes_in_an_encrypted_member_cost_the_same_however_many_came_before
 }
 
 /// RustyGet patches holes inline: on each `Hole` event it refills that range with `refill_from_packed` while the
-/// session goes on. Each refill re-judges the parts it may complete, combining the CRCs of their known leaves.
-/// That combine used to be charged as if it re-read every byte under those leaves, so every 1 MiB patch cost the
-/// whole verified output before it in `VerifyWorkBytes`; now a patch costs about the bytes it patches.
+/// session goes on. Each refill re-judges the part checks it may complete. Part results used to be dropped by
+/// every streaming write, and each leaf combine charged at the leaf's length, so every patch re-combined (and was
+/// charged for) every complete part before it. Now untouched parts keep their results: a patch costs about its
+/// own bytes, and later patches, with more verified output behind them, cost no more than early ones.
 #[test]
 fn an_inline_patch_costs_verify_work_for_its_own_bytes_only() {
     const MIB: usize = 1 << 20;
-    let gold = gold(80 * MIB);
-    let mut set = Set::split(Naming::Old, &gold, &[32 * MIB, 72 * MIB]);
-    let p1 = set.payloads[1].clone();
-    for k in 0..10u64 {
-        let s = p1.start + k * 4 * MIB as u64;
-        set.hole(1, s..s + MIB as u64);
+    const VOLUMES: usize = 12;
+    let gold = gold(VOLUMES * 4 * MIB);
+    let cuts: Vec<usize> = (1..VOLUMES).map(|v| v * 4 * MIB).collect();
+    let mut set = Set::split(Naming::Old, &gold, &cuts);
+    // A 256 KiB hole in every volume from the third on: each patch comes after one more complete part.
+    for v in 2..VOLUMES {
+        let p = set.payloads[v].clone();
+        set.hole(v, p.start + MIB as u64..p.start + MIB as u64 + 256 * 1024);
     }
     let dir = tempfile::tempdir().unwrap();
     let anchors = Arc::new(Anchors::default());
@@ -1427,7 +1430,7 @@ fn an_inline_patch_costs_verify_work_for_its_own_bytes_only() {
         partial_options(&dir.path().join("state"), anchors.clone()),
     )
     .unwrap();
-    let (mut files, mut patches) = (Vec::new(), 0);
+    let (mut files, mut costs) = (Vec::new(), Vec::new());
     loop {
         match session.poll_event(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
@@ -1440,9 +1443,9 @@ fn an_inline_patch_costs_verify_work_for_its_own_bytes_only() {
                 files[0].refill_from_packed(span.volume, span.range.clone(), &mut reader).unwrap();
                 let cost = session.resource_usage(Resource::VerifyWorkBytes).used - before;
                 let patched = span.range.end - span.range.start;
-                // The patched bytes are hashed once; combining part checks is a fixed cost per leaf.
-                assert!(cost <= 2 * patched + (1 << 20), "a {patched}-byte patch cost {cost} bytes of verify work");
-                patches += 1;
+                // The patched bytes are hashed (and compared) once; nothing scales with the member.
+                assert!(cost <= 2 * patched + 16 * 1024, "a {patched}-byte patch cost {cost} bytes of verify work");
+                costs.push(cost);
             }
             Poll::Ready(Ok(None)) => break,
             Poll::Ready(Err(e)) => panic!("{e:?}"),
@@ -1450,7 +1453,9 @@ fn an_inline_patch_costs_verify_work_for_its_own_bytes_only() {
             _ => {}
         }
     }
-    assert!(patches >= 10, "{patches} patches");
+    assert!(costs.len() >= VOLUMES - 2, "{} patches", costs.len());
+    let (first, last) = (costs[0], *costs.last().unwrap());
+    assert!(last <= first + 1024, "the first patch cost {first} and the last {last} after more verified output");
     let file = &mut files[0];
     assert!(file.remaining().unwrap().is_empty());
     assert!(matches!(verify(file), Verdict::Ok { .. }));

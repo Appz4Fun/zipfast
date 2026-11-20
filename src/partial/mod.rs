@@ -1249,9 +1249,22 @@ impl PartialCore {
         if mode == FillMode::Original {
             op.snapshot.head.produced = end;
         }
-        // Part results and verification are keyed by revision, which a group does not advance.
+        // Part results and verification are keyed by revision, which a group does not advance. A part check depends
+        // only on the known leaves inside its range, and this write only added leaves where output was unknown, so
+        // the result of every part it did not touch still holds: keep those, and give each touched part an empty
+        // range so `Verification::after` judges it again. Otherwise every refill after a streaming write would
+        // re-combine every complete part of the member.
+        let mut parts = self.part_results(op);
+        for part in &mut parts {
+            if plan.unknown.iter().any(|w| w.start < part.range.end && part.range.start < w.end) {
+                part.range = 0..0;
+            }
+        }
         op.verification = None;
         op.part_results = None;
+        if !parts.is_empty() {
+            self.keep_part_results(op, parts)?;
+        }
         let group = op.group.as_mut().unwrap();
         group.bytes = group.bytes.saturating_add(total);
         if group.bytes >= self.budget.limits.group_commit_bytes
@@ -1295,10 +1308,15 @@ impl PartialCore {
                 e
             })?;
             op.bundle.acknowledge(intent.anchor(), &ack)?;
+            // Opening a group advances the revision but changes no leaf: part results carry over.
+            let carried = self.part_results(op);
             op.state = intent.clone();
             op.snapshot.head = head;
             op.uncertain = None;
             op.group = Some(Group { intent: intent.clone(), bytes: 0, opened: std::time::Instant::now() });
+            if !carried.is_empty() {
+                self.keep_part_results(op, carried)?;
+            }
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             tests::state::checkpoint("intent-cas");
             self.check(op).map_err(|mut e| {
@@ -1717,8 +1735,17 @@ impl PartialCore {
             );
             intent.cipher = valid.cipher.clone();
         }
+        // The hole only changed leaves inside `affected`: every part check outside it still holds across this
+        // transaction. Touched parts get an empty range, so they are judged again.
+        let mut carried = self.part_results(&mut data);
+        for part in &mut carried {
+            if affected.start < part.range.end && part.range.start < affected.end {
+                part.range = 0..0;
+            }
+        }
         let transaction = self.begin_transaction(&mut data, intent, valid, vec![affected])?;
-        self.finish_transaction(&mut data, transaction)
+        self.finish_transaction(&mut data, transaction)?;
+        if carried.is_empty() { Ok(()) } else { self.keep_part_results(&mut data, carried) }
     }
     /// Whether any proven part of this member lies in `range` of `volume`. Checked without taking the
     /// operation or touching the output, so unrelated members never fail a declaration; a member busy in another
@@ -1988,10 +2015,22 @@ impl PartialCore {
             {
                 return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
             }
+            // Evidence only grows by new parts after the last one, so results of the parts already recorded still
+            // hold (`Verification::after` matches them by index, ordinal, volume and range). The final part is judged
+            // against the member checks, which an update may fill in, so it is always judged again.
+            let mut carried = self.part_results(&mut data);
+            for (part, evidence) in carried.iter_mut().zip(&evidence.parts) {
+                if evidence.final_part {
+                    part.range = 0..0;
+                }
+            }
             data.snapshot.evidence = evidence;
             data.snapshot.head.checks = checks;
             data.verification = None;
             data.part_results = None;
+            if !carried.is_empty() {
+                self.keep_part_results(&mut data, carried)?;
+            }
             return Ok(());
         }
         self.reconcile(&mut data)?;

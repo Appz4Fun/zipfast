@@ -59,10 +59,10 @@ fn complete(snapshot: &Snapshot, range: &Range<u64>) -> bool {
     }
     at >= range.end
 }
-/// Work charged to `VerifyWorkBytes` for combining one known leaf's CRC into a range check. A combine costs the
-/// same however long the leaf is (the leaf was hashed once, when it was written), so it is charged at most this
-/// much, not the leaf's length: otherwise every refill that re-judges a part would be charged as if it re-read
-/// every byte the member already holds. A leaf shorter than this is charged its length.
+/// Work charged to `VerifyWorkBytes` for combining one known leaf's CRC into a range check. A combine does not
+/// read the leaf's bytes again (they were hashed once, when written), so it is charged at most this much rather
+/// than the leaf's length. A leaf shorter than this is charged its length. Part results are kept for parts a
+/// write did not touch, so a refill combines only the leaves of the parts it changes.
 pub(super) const CRC_COMBINE_WORK: u64 = 64;
 fn crc(
     snapshot: &Snapshot,
