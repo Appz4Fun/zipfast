@@ -137,15 +137,23 @@ pub(super) fn packed_spans(
     snapshot: &Snapshot,
     out: &Range<u64>,
 ) -> PartialResult<Vec<PackedSpan>> {
+    let mut spans = budget.vector(packed_span_count(snapshot, out))?;
+    push_packed_spans(snapshot, out, &mut spans);
+    Ok(spans)
+}
+/// How many spans [`packed_spans`] returns for `out`.
+pub(super) fn packed_span_count(snapshot: &Snapshot, out: &Range<u64>) -> usize {
     let stream = stream_for(snapshot, out);
-    let count = parts_with_stream(snapshot)
+    parts_with_stream(snapshot)
         .filter(|(part, start)| {
             let end = start + (part.packed.range.end - part.packed.range.start);
             stream.start < end && *start < stream.end
         })
-        .count();
-    budget.metadata((count * std::mem::size_of::<PackedSpan>()) as u64)?;
-    let mut spans = budget.vector(count)?;
+        .count()
+}
+/// Appends the spans of `out` to `spans`, which the caller sized and charged.
+pub(super) fn push_packed_spans(snapshot: &Snapshot, out: &Range<u64>, spans: &mut Vec<PackedSpan>) {
+    let stream = stream_for(snapshot, out);
     for (part, start) in parts_with_stream(snapshot) {
         let end = start + (part.packed.range.end - part.packed.range.start);
         let a = stream.start.max(start);
@@ -157,7 +165,6 @@ pub(super) fn packed_spans(
             });
         }
     }
-    Ok(spans)
 }
 /// Whether output `range` (clipped to produced output) has bytes that are not known with archive authority.
 /// With `alt`, alt output counts as unresolved too.

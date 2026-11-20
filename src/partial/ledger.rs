@@ -25,6 +25,24 @@ pub(super) struct Ledger<'a> {
 pub(super) struct FillPlan {
     pub unknown: Vec<Range<u64>>,
 }
+/// Calls `f` with each piece of `range` that no leaf of `known` (sorted, disjoint) covers, in order.
+fn for_each_unknown(known: &[KnownLeaf], range: Range<u64>, mut f: impl FnMut(Range<u64>)) {
+    let first = known.partition_point(|leaf| leaf.range.end <= range.start);
+    let mut at = range.start;
+    for leaf in known[first..].iter().take_while(|leaf| leaf.range.start < range.end) {
+        if leaf.range.end <= at {
+            continue;
+        }
+        if at < leaf.range.start {
+            f(at..leaf.range.start);
+        }
+        at = at.max(leaf.range.end.min(range.end));
+    }
+    if at < range.end {
+        f(at..range.end);
+    }
+}
+
 impl Ledger<'_> {
     pub fn plan_fill(&self, range: Range<u64>) -> PartialResult<FillPlan> {
         // Leaves are sorted and disjoint: start at the first one ending after the range start.
@@ -86,6 +104,14 @@ impl Ledger<'_> {
     pub fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         Ok(self.plan_fill(0..self.size)?.unknown)
     }
+    /// Checks the member's unknown ranges against `ProgressiveLimits::hole_intervals`, as [`Self::remaining`]
+    /// does, without building the list.
+    pub fn check_intervals(&self) -> PartialResult<()> {
+        let mut count = 0u64;
+        for_each_unknown(self.known, 0..self.size, |_| count += 1);
+        self.budget.usage.check(Resource::HoleIntervals, count)?;
+        Ok(())
+    }
 }
 
 // Physical rereads rebuild fragment hashers; CRC values are never split algebraically.
@@ -116,20 +142,36 @@ impl PartialCore {
         }
         Ok(KnownLeaf { range, crc: hasher.clone().finalize(), hasher, provenance: leaf.provenance, _lease: lease })
     }
+    /// The recorded holes trimmed to what is still unknown: each report split into the unknown pieces of its
+    /// output, with their packed spans. The result replaces `snapshot.holes`, so only growth past the old list is
+    /// charged for good (a fill splitting a hole); the copy built alongside the old list is a lease for this call.
     pub(super) fn remaining_reports(&self, snapshot: &mut Snapshot) -> PartialResult<Vec<HoleReport>> {
-        let mut count = 0usize;
+        let report_bytes = |spans: usize| std::mem::size_of::<HoleReport>() + spans * std::mem::size_of::<PackedSpan>();
+        let known = &snapshot.known;
+        let (mut count, mut bytes) = (0usize, 0usize);
         for report in &snapshot.holes {
-            let plan = Ledger { known: &mut snapshot.known, size: snapshot.head.size, budget: &self.budget }
-                .plan_fill(report.out.clone())?;
-            count = count.checked_add(plan.unknown.len()).ok_or_else(malformed)?;
+            for_each_unknown(known, report.out.clone(), |out| {
+                count += 1;
+                bytes += report_bytes(super::cipher::packed_span_count(snapshot, &out));
+            });
         }
         self.budget.usage.check(Resource::HoleIntervals, count as u64)?;
-        let mut reports = self.budget.vector(count)?;
+        let old: usize = snapshot.holes.iter().map(|h| report_bytes(h.packed.len())).sum();
+        if bytes > old {
+            self.budget.metadata((bytes - old) as u64)?;
+        }
+        let _copy = self.budget.metadata_lease(bytes as u64)?;
+        let mut reports = Vec::new();
+        reports.try_reserve_exact(count).map_err(|_| malformed())?;
         for report in &snapshot.holes {
-            let plan = Ledger { known: &mut snapshot.known, size: snapshot.head.size, budget: &self.budget }
-                .plan_fill(report.out.clone())?;
-            for out in plan.unknown {
-                let packed = super::cipher::packed_spans(&self.budget, snapshot, &out)?;
+            let mut failed = false;
+            for_each_unknown(known, report.out.clone(), |out| {
+                let mut packed = Vec::new();
+                if packed.try_reserve_exact(super::cipher::packed_span_count(snapshot, &out)).is_err() {
+                    failed = true;
+                    return;
+                }
+                super::cipher::push_packed_spans(snapshot, &out, &mut packed);
                 reports.push(HoleReport {
                     id: report.id,
                     revision: report.revision,
@@ -139,6 +181,9 @@ impl PartialCore {
                     packed,
                     cause: report.cause.clone(),
                 });
+            });
+            if failed {
+                return Err(malformed());
             }
         }
         Ok(reports)

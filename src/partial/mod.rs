@@ -1001,7 +1001,7 @@ impl PartialCore {
         }
         ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }
             .commit_fill(&plan, &leaves)?;
-        ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }.remaining()?;
+        ledger::Ledger { known: &mut commit.known, size: commit.head.size, budget: &self.budget }.check_intervals()?;
         // Retain only still-unknown observed spans, including exact packed mappings.
         commit.holes = self.remaining_reports(&mut commit)?;
         if commit.crypt.is_some() {
@@ -1327,7 +1327,7 @@ impl PartialCore {
                 cipher::prune(&self.budget, &mut op.snapshot)?;
             }
             ledger::Ledger { known: &mut op.snapshot.known, size: op.snapshot.head.size, budget: &self.budget }
-                .remaining()?;
+                .check_intervals()?;
             let mut lease = Lease::empty(&self.budget.usage, Resource::MetadataBytes);
             let (refs, mut files) = op.bundle.encode_refs(&op.snapshot, &mut lease)?;
             let commit_head = |intent: &PartialState, op: &CoreData| -> PartialResult<state::CommittedState> {
@@ -1659,7 +1659,7 @@ impl PartialCore {
         valid.known = intent.known.clone();
         valid.head.produced = valid.head.produced.max(report.out.end);
         intent.head.produced = valid.head.produced;
-        ledger::Ledger { known: &mut intent.known, size: intent.head.size, budget: &self.budget }.remaining()?;
+        ledger::Ledger { known: &mut intent.known, size: intent.head.size, budget: &self.budget }.check_intervals()?;
         let affected = report.out.clone();
         // A source answers at most one read buffer per Hole, so one unread range arrives as many holes in a row.
         // A hole that continues the last recorded one (same cause, next output, packed bytes running on in the
