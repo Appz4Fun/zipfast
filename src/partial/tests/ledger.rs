@@ -639,3 +639,59 @@ fn declared_damage_persists_cause_and_legacy_pages_decode_as_missing() {
     let without = validity(state::encode_pages(&missing_only, &file.core.budget).unwrap().0);
     assert_eq!(with_causes - without, op.snapshot.holes.len());
 }
+
+/// A hole that continues the last recorded one extends that record, so a run of holes from one unread range is
+/// stored once; a gap, or a hole of another cause, still starts a new record.
+#[test]
+fn contiguous_holes_are_stored_as_one_record() {
+    let f = Fixture::new(4096, false, true, false);
+    let file = f.create();
+    for start in (0..1024).step_by(128) {
+        f.hole(&file, start..start + 128);
+    }
+    let holes = file.core.operation().unwrap().snapshot.holes.clone();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0].out, 0..1024);
+    assert_eq!(holes[0].packed.len(), 1);
+    assert_eq!(holes[0].packed[0].range.end - holes[0].packed[0].range.start, 1024);
+}
+
+#[test]
+fn a_hole_across_a_volume_boundary_extends_the_record_and_keeps_both_spans() {
+    // Split: the member's parts lie in different volumes, so one run of holes spans two packed ranges.
+    let f = Fixture::new(4096, true, true, false);
+    let file = f.create();
+    let boundary = f.evidence.parts[0].out.end;
+    f.hole(&file, 0..boundary - 10);
+    f.hole(&file, boundary - 10..boundary + 10);
+    let holes = file.core.operation().unwrap().snapshot.holes.clone();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0].out, 0..boundary + 10);
+    assert_eq!(holes[0].packed.len(), 2, "one span per volume");
+    assert_eq!(holes[0].packed, f.report(&file, 0..boundary + 10).packed);
+}
+
+/// Holes scattered between written data (missing articles through a set) can't be stored as one record. Recording
+/// one must still cost the same however many holes came before it: rebuilding the hole list on each commit used to
+/// charge a full copy of it every time, so the cost of a hole grew with the number of earlier holes.
+#[test]
+fn a_scattered_hole_costs_the_same_however_many_holes_came_before() {
+    const STEP: usize = 32;
+    const HOLES: usize = 300;
+    let f = Fixture::new(STEP * (HOLES + 1), false, true, false);
+    let file = f.create();
+    // Signed: compaction can hand leased memory back in the middle of a hole.
+    let used = || file.core.budget.usage.snapshot(Resource::MetadataBytes).used as i64;
+    let mut costs = Vec::new();
+    for i in 0..HOLES {
+        let at = (i * STEP) as u64;
+        let before = used();
+        f.hole(&file, at..at + 16);
+        costs.push(used() - before);
+        file.core.write_original(at + 16, &f.data[i * STEP + 16..(i + 1) * STEP]).unwrap();
+    }
+    let early = costs[10..20].iter().sum::<i64>() / 10;
+    let late = costs[HOLES - 10..].iter().sum::<i64>() / 10;
+    assert!(late <= early + 64, "a hole cost {early} bytes after 10 holes and {late} after {}", HOLES - 10);
+    assert_eq!(file.core.operation().unwrap().snapshot.holes.len(), HOLES, "separate holes stay separate");
+}

@@ -1304,3 +1304,103 @@ fn a_restarted_session_that_keeps_the_option_resumes_at_every_crash_point() {
         }
     }
 }
+
+/// RustyGet's case: the whole data area of a large middle volume is answered as holes, one read buffer per Hole.
+/// Each hole used to be charged a copy of the member's whole known-output index, so the session ran out of
+/// MetadataBytes; now the session finishes within the default limits, the stored holes collapse to one range, and
+/// a refill from the repaired volume verifies.
+#[test]
+fn a_volume_answered_entirely_as_holes_stays_within_default_limits_and_refills() {
+    const MIB: usize = 1 << 20;
+    // 16 MiB of output before the holes: the old per-hole charge grew with it.
+    let gold = gold(127 * MIB);
+    let mut set = Set::split(Naming::Old, &gold, &[16 * MIB, 126 * MIB]);
+    let p1 = set.payloads[1].clone();
+    set.hole(1, p1.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options(&dir.path().join("out"), set.naming.name(0)),
+        partial_options(&dir.path().join("state"), anchors.clone()),
+    )
+    .unwrap();
+    let (mut holes, mut files, mut at_tenth) = (0usize, Vec::new(), 0);
+    let mut last = 0;
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(_)))) => {
+                holes += 1;
+                last = session.resource_usage(Resource::MetadataBytes).used;
+                if holes == 10 {
+                    at_tenth = last;
+                }
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    // One Hole per read buffer, so the 110 MiB range arrives as about 110 holes.
+    assert!(holes >= 100, "{holes} holes");
+    // Each hole used to cost a copy of the member's known-output index, more with every MiB already produced;
+    // now a hole adds a small, fixed amount of bookkeeping.
+    let per_hole = (last - at_tenth) / (holes as u64 - 10);
+    assert!(per_hole < 8 << 10, "{per_hole} metadata bytes per hole");
+    let metadata = session.resource_usage(Resource::MetadataBytes);
+    assert!(metadata.used < metadata.limit / 16, "{metadata:?}");
+    let file = &mut files[0];
+    assert_eq!(file.remaining().unwrap(), vec![16 * MIB as u64..126 * MIB as u64]);
+    let mut reader = std::io::Cursor::new(set.volumes[1].clone());
+    file.refill_from_packed(1, 0..set.volumes[1].len() as u64, &mut reader).unwrap();
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold);
+}
+
+/// Holes scattered through an encrypted member keep the ciphertext block before each one (CBC needs it later), so
+/// each hole also updates the kept-block list. Recording one must still cost the same however many came before:
+/// the list's copy for each transaction used to be charged for good, so the cost of a hole grew with the number of
+/// earlier holes until the session ran out of MetadataBytes.
+#[test]
+fn scattered_holes_in_an_encrypted_member_cost_the_same_however_many_came_before() {
+    const RANGES: u64 = 150;
+    let gold = gold(RANGES as usize * 2048);
+    let mut set = Set::aes_split(Naming::Old, &gold, &[gold.len()], "secret");
+    let p0 = set.payloads[0].clone();
+    for i in 0..RANGES {
+        // 40 bytes, not on a 16-byte block boundary, like a missing article.
+        let start = p0.start + i * 2048 + 5;
+        set.hole(0, start..start + 40);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut session = session_with(&set, dir.path(), &anchors, Some("secret"));
+    let mut costs = Vec::new();
+    let mut last = session.resource_usage(Resource::MetadataBytes).used as i64;
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(_)))) => {
+                let now = session.resource_usage(Resource::MetadataBytes).used as i64;
+                costs.push(now - last);
+                last = now;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) => {
+                last = session.resource_usage(Resource::MetadataBytes).used as i64;
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    assert!(costs.len() as u64 >= RANGES, "{} hole events", costs.len());
+    let window = 30;
+    let early = costs[10..10 + window].iter().sum::<i64>() / window as i64;
+    let late = costs[costs.len() - window..].iter().sum::<i64>() / window as i64;
+    assert!(late <= early + 512, "a hole cost {early} bytes early and {late} late, after {} holes", costs.len());
+}

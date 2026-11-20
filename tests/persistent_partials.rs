@@ -4324,3 +4324,93 @@ fn encrypted_damage_declared_before_polling_on_the_previous_block_is_a_declared_
     fill_plain(file, &fixture);
     assert!(matches!(verify(file), Verdict::Ok { .. }));
 }
+
+/// RustyGet's case on RAR 5.0: a stored member whose middle volume's whole data area (110 MiB) is answered as
+/// holes, one read buffer per Hole. The session finishes within the default limits, each hole costs a small fixed
+/// amount of metadata however much output came before it, and a refill from the repaired volume verifies.
+#[test]
+fn a_rar5_volume_answered_entirely_as_holes_stays_within_default_limits_and_refills() {
+    const MIB: usize = 1 << 20;
+    let data: Vec<u8> = (0..127 * MIB).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let bounds = [0, 16 * MIB, 126 * MIB, 127 * MIB];
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let (mut volumes, mut bytes_of, mut payloads) = (Vec::new(), Vec::new(), Vec::new());
+    for index in 0..3 {
+        let out = bounds[index]..bounds[index + 1];
+        let last = index == 2;
+        let spec = common::FileSpec::new("big.bin", &data);
+        let scope = if last { data.as_slice() } else { &data[out.clone()] };
+        let file = common::file_block(&spec, &data[out.clone()], crc32fast::hash(scope), index != 0, !last);
+        let mut bytes = common::SIG.to_vec();
+        bytes.extend(common::main_block(true, Some(index as u64)));
+        let start = bytes.len() + file.len() - out.len();
+        payloads.push(start as u64..(start + out.len()) as u64);
+        bytes.extend(file);
+        bytes.extend(common::end_block(!last));
+        bytes_of.push(bytes.clone());
+        volumes.push(Some(Source {
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backing_hook: Arc::new(Mutex::new(None)),
+            index: index as u32,
+            bytes,
+            holes: if index == 1 { vec![payloads[1].clone()] } else { Vec::new() },
+            reads: reads.clone(),
+            backing: Vec::new(),
+            hook: Arc::new(Mutex::new(None)),
+            wait: None,
+        }));
+    }
+    let provider = Provider {
+        volumes,
+        protection: ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory {
+                volumes: (0..3)
+                    .map(|index| ProtectedVolume { index, name: volume_name(index), backing: VolumeBacking::NonFile })
+                    .collect(),
+                auxiliary_paths: Vec::new(),
+            },
+        },
+        wait: None,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        protection_hook: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(provider),
+        options(&dir.path().join("out")),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    let (mut holes, mut files, mut at_tenth, mut last) = (0usize, Vec::new(), 0, 0);
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(_)))) => {
+                holes += 1;
+                last = session.resource_usage(Resource::MetadataBytes).used;
+                if holes == 10 {
+                    at_tenth = last;
+                }
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    assert!(holes >= 100, "{holes} holes");
+    let per_hole = (last - at_tenth) / (holes as u64 - 10);
+    assert!(per_hole < 8 << 10, "{per_hole} metadata bytes per hole");
+    let metadata = session.resource_usage(Resource::MetadataBytes);
+    assert!(metadata.used < metadata.limit / 16, "{metadata:?}");
+    let file = &mut files[0];
+    assert_eq!(file.remaining().unwrap(), vec![16 * MIB as u64..126 * MIB as u64]);
+    let mut reader = std::io::Cursor::new(bytes_of[1].clone());
+    file.refill_from_packed(1, 0..bytes_of[1].len() as u64, &mut reader).unwrap();
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), data);
+}
