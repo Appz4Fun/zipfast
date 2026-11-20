@@ -69,3 +69,40 @@ The adapter accepts these measured metadata costs while retaining bounded
 memory and streaming throughput. Historical builds and downstream pins
 remain available. Immutable sessions and final caller measurements have
 separate gates; this result does not complete Phase 2.
+
+## Reproducing the directory measurements
+
+`examples/zip_directory_bench` rebuilds the five directory fixtures above and
+measures every reader in the workspace on them:
+
+```text
+cargo run --release --example zip_directory_bench -- <work dir> [rounds] [word ...]
+```
+
+It writes `short-20k`, `rich-prefix-20k`, `short-zip64-200k`,
+`rich-zip64-200k` and `unicode-zip64-200k` into `<work dir>` once (about
+330 MiB in all) and reuses them. For each it reports the central directory
+size, the median and fastest of `rounds` opens, and the peak heap allocation
+of one open, for `fast` (`zipfast::zip::Archive::open`), `container`
+(`zip_container::DirectoryParser`, Zipfast profile, positioned reads),
+`view-slice` (`zipview::ZipReader` on the archive in memory) and
+`view-index` (`zipview::ZipIndexOpener`, positioned reads). A word such as
+`200k` or `container` narrows the run. Before timing, every reader's names
+and local offsets are checked against what the generator wrote; zipfast
+reports Unicode Path names and prefix-shifted offsets, zipview the raw names
+and stored offsets, as `docs/zip-parser-parity.md` describes.
+
+The fixtures match the table above: peak allocations for `fast` reproduce the
+Candidate column. Open times for `fast` do not. Since #173, `Archive::open`
+converts each member's DOS time from local time with one `mktime` call per
+member, which the measured revision did not do; on macOS that adds about
+2 microseconds per member. Compare `fast` peak allocation against the
+Candidate column; `fast` open times are not comparable, and the table has no
+figures for the other readers.
+
+The generator lives in `examples/zip_directory_bench/shapes.rs`.
+`tests/zip_directory_shapes.rs` uses it at test sizes (70,000 short members
+for a real ZIP64 count, and 3,000-member rich, prefixed and Unicode shapes)
+to check that all four readers agree member by member. It drives the
+zip-container parser in 64 KiB reads so records split across range
+boundaries.
