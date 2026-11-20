@@ -888,10 +888,13 @@ impl PartialCore {
         // Packed bytes carry archive authority: alt leaves that differ are collected here and rewritten below.
         let (corrected, confirmed) = self.compare_known(op, offset, bytes, mode)?;
         let mut base = Vec::new();
+        let mut _base_lease = None;
         if !corrected.is_empty() {
             let (mut scratch, _scratch) = self.clone_snapshot(&op.snapshot)?;
             for bad in &corrected {
-                scratch.known = self.invalidate(&scratch, bad)?;
+                let (known, lease) = self.invalidate(&scratch, bad)?;
+                scratch.known = known;
+                _base_lease = Some(lease);
             }
             base = scratch.known;
         }
@@ -1635,9 +1638,6 @@ impl PartialCore {
         {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
         }
-        self.budget
-            .usage
-            .check(Resource::HoleIntervals, data.snapshot.holes.len().checked_add(1).ok_or_else(malformed)? as u64)?;
         // The packed spans must be exactly those of the output range (block-widened for encrypted members).
         if report.packed != cipher::packed_spans(&self.budget, &data.snapshot, &report.out)?
             || data.snapshot.holes.iter().any(|h| h.id == report.id)
@@ -1650,25 +1650,58 @@ impl PartialCore {
         {
             return Err(err(PartialErrorKind::IncompleteOutput));
         }
-        intent.known = self.invalidate(&data.snapshot, &report.out)?;
-        self.budget.metadata((intent.known.len() * std::mem::size_of::<state::KnownLeaf>()) as u64)?;
+        // Every copy below replaces a vector the snapshot already holds, so it is charged only while this
+        // transaction runs: a hole costs what the state keeps for it, not a copy of the whole member's index.
+        let (known, mut lease) = self.invalidate(&data.snapshot, &report.out)?;
+        intent.known = known;
+        lease
+            .absorb(self.budget.metadata_lease((intent.known.len() * std::mem::size_of::<state::KnownLeaf>()) as u64)?);
         valid.known = intent.known.clone();
         valid.head.produced = valid.head.produced.max(report.out.end);
         intent.head.produced = valid.head.produced;
         ledger::Ledger { known: &mut intent.known, size: intent.head.size, budget: &self.budget }.remaining()?;
-        self.budget.metadata(
-            (std::mem::size_of::<HoleReport>() + report.packed.len() * std::mem::size_of::<PackedSpan>()) as u64,
-        )?;
-        valid.holes.try_reserve_exact(1).map_err(|_| malformed())?;
         let affected = report.out.clone();
-        valid.holes.push(report);
-        self.budget.metadata(
-            valid
-                .holes
-                .iter()
-                .map(|h| std::mem::size_of::<HoleReport>() + h.packed.len() * std::mem::size_of::<PackedSpan>())
-                .sum::<usize>() as u64,
-        )?;
+        // A source answers at most one read buffer per Hole, so one unread range arrives as many holes in a row.
+        // A hole that continues the last recorded one (same cause, next output, packed bytes running on in the
+        // same volume) extends that record, so a contiguous range keeps one record whatever its length. The
+        // event delivered for this hole is unchanged.
+        let continues = valid.holes.last().is_some_and(|last| {
+            last.cause == report.cause
+                && last.out.end == report.out.start
+                && match (last.packed.last(), report.packed.first()) {
+                    (Some(a), Some(b)) => a.volume == b.volume && a.range.end == b.range.start,
+                    _ => false,
+                }
+        });
+        if continues {
+            let last = valid.holes.last_mut().expect("checked above");
+            self.budget.metadata(((report.packed.len() - 1) * std::mem::size_of::<PackedSpan>()) as u64)?;
+            last.packed.try_reserve_exact(report.packed.len() - 1).map_err(|_| malformed())?;
+            last.out.end = report.out.end;
+            let mut spans = report.packed.into_iter();
+            let first = spans.next().expect("checked above");
+            last.packed.last_mut().expect("checked above").range.end = first.range.end;
+            last.packed.extend(spans);
+        } else {
+            self.budget.usage.check(
+                Resource::HoleIntervals,
+                data.snapshot.holes.len().checked_add(1).ok_or_else(malformed)? as u64,
+            )?;
+            self.budget.metadata(
+                (std::mem::size_of::<HoleReport>() + report.packed.len() * std::mem::size_of::<PackedSpan>()) as u64,
+            )?;
+            valid.holes.try_reserve_exact(1).map_err(|_| malformed())?;
+            valid.holes.push(report);
+        }
+        lease.absorb(
+            self.budget.metadata_lease(
+                valid
+                    .holes
+                    .iter()
+                    .map(|h| std::mem::size_of::<HoleReport>() + h.packed.len() * std::mem::size_of::<PackedSpan>())
+                    .sum::<usize>() as u64,
+            )?,
+        );
         intent.holes = valid.holes.clone();
         if !blocks.is_empty() {
             cipher::merge(&self.budget, &mut valid.cipher, blocks)?;

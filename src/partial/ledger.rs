@@ -143,7 +143,13 @@ impl PartialCore {
         }
         Ok(reports)
     }
-    pub(super) fn invalidate(&self, snapshot: &Snapshot, range: &Range<u64>) -> PartialResult<Vec<KnownLeaf>> {
+    /// The known leaves of `snapshot` with `range` cut out. The new vector's charge lasts as long as the returned
+    /// lease: it replaces the snapshot's vector, so hold the lease while both exist.
+    pub(super) fn invalidate(
+        &self,
+        snapshot: &Snapshot,
+        range: &Range<u64>,
+    ) -> PartialResult<(Vec<KnownLeaf>, crate::progressive::Lease)> {
         let count = snapshot
             .known
             .iter()
@@ -156,7 +162,7 @@ impl PartialCore {
             })
             .sum::<usize>();
         self.budget.limits.check(PartialResource::CrcLeaves, count as u64)?;
-        let mut known = self.budget.vector(count)?;
+        let (mut known, vector_lease) = self.budget.leased_vector(count)?;
         for leaf in &snapshot.known {
             if leaf.range.end <= range.start || leaf.range.start >= range.end {
                 known.push(leaf.clone());
@@ -175,6 +181,6 @@ impl PartialCore {
                 known.push(self.fragment(leaf, range.end..leaf.range.end, lease)?);
             }
         }
-        Ok(known)
+        Ok((known, vector_lease))
     }
 }

@@ -639,3 +639,34 @@ fn declared_damage_persists_cause_and_legacy_pages_decode_as_missing() {
     let without = validity(state::encode_pages(&missing_only, &file.core.budget).unwrap().0);
     assert_eq!(with_causes - without, op.snapshot.holes.len());
 }
+
+/// A hole that continues the last recorded one extends that record, so a run of holes from one unread range is
+/// stored once; a gap, or a hole of another cause, still starts a new record.
+#[test]
+fn contiguous_holes_are_stored_as_one_record() {
+    let f = Fixture::new(4096, false, true, false);
+    let file = f.create();
+    for start in (0..1024).step_by(128) {
+        f.hole(&file, start..start + 128);
+    }
+    let holes = file.core.operation().unwrap().snapshot.holes.clone();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0].out, 0..1024);
+    assert_eq!(holes[0].packed.len(), 1);
+    assert_eq!(holes[0].packed[0].range.end - holes[0].packed[0].range.start, 1024);
+}
+
+#[test]
+fn a_hole_across_a_volume_boundary_extends_the_record_and_keeps_both_spans() {
+    // Split: the member's parts lie in different volumes, so one run of holes spans two packed ranges.
+    let f = Fixture::new(4096, true, true, false);
+    let file = f.create();
+    let boundary = f.evidence.parts[0].out.end;
+    f.hole(&file, 0..boundary - 10);
+    f.hole(&file, boundary - 10..boundary + 10);
+    let holes = file.core.operation().unwrap().snapshot.holes.clone();
+    assert_eq!(holes.len(), 1, "{holes:?}");
+    assert_eq!(holes[0].out, 0..boundary + 10);
+    assert_eq!(holes[0].packed.len(), 2, "one span per volume");
+    assert_eq!(holes[0].packed, f.report(&file, 0..boundary + 10).packed);
+}
