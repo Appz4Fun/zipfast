@@ -51,7 +51,8 @@ const TZ_CHECK_EVERY: u32 = 256;
 /// hour is converted by adding the offset. An hour whose ends differ holds a daylight-saving change, and every time
 /// in it goes to the platform. So does every time in an hour whose ends the platform can't convert.
 ///
-/// The offsets are kept for one value of `TZ` and dropped when it changes, since the platform reads `TZ` too. `TZ` is
+/// The offsets are kept for one value of `TZ` and dropped when it changes, since `mktime` reads `TZ` on Unix
+/// (Windows ignores it, so there the check only costs a read). `TZ` is
 /// read again before converting a new hour and after every [`TZ_CHECK_EVERY`] conversions from memory, so a change
 /// to it takes effect within that many conversions.
 #[derive(Default)]
