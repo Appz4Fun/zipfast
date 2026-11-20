@@ -749,7 +749,10 @@ impl PartialCore {
         if valid.cipher == op.snapshot.cipher {
             return Ok(());
         }
-        self.budget.metadata((valid.cipher.len() * std::mem::size_of::<state::CipherBlock>()) as u64)?;
+        // A copy of the kept list for the intent, charged while the transaction runs; `merge` already charged the
+        // blocks added.
+        let _copy =
+            self.budget.metadata_lease((valid.cipher.len() * std::mem::size_of::<state::CipherBlock>()) as u64)?;
         intent.cipher = valid.cipher.clone();
         op.verification = None;
         let transaction = self.begin_transaction(op, intent, valid, Vec::new())?;
@@ -1708,7 +1711,10 @@ impl PartialCore {
         }
         let forgot = cipher::forget(&self.budget, &mut valid.cipher, damaged)?;
         if !blocks.is_empty() || forgot {
-            self.budget.metadata((valid.cipher.len() * std::mem::size_of::<state::CipherBlock>()) as u64)?;
+            // A copy of the kept list for the intent; `merge` already charged the blocks this hole added.
+            lease.absorb(
+                self.budget.metadata_lease((valid.cipher.len() * std::mem::size_of::<state::CipherBlock>()) as u64)?,
+            );
             intent.cipher = valid.cipher.clone();
         }
         let transaction = self.begin_transaction(&mut data, intent, valid, vec![affected])?;

@@ -1361,3 +1361,46 @@ fn a_volume_answered_entirely_as_holes_stays_within_default_limits_and_refills()
     assert!(matches!(verify(file), Verdict::Ok { .. }));
     assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold);
 }
+
+/// Holes scattered through an encrypted member keep the ciphertext block before each one (CBC needs it later), so
+/// each hole also updates the kept-block list. Recording one must still cost the same however many came before:
+/// the list's copy for each transaction used to be charged for good, so the cost of a hole grew with the number of
+/// earlier holes until the session ran out of MetadataBytes.
+#[test]
+fn scattered_holes_in_an_encrypted_member_cost_the_same_however_many_came_before() {
+    const RANGES: u64 = 150;
+    let gold = gold(RANGES as usize * 2048);
+    let mut set = Set::aes_split(Naming::Old, &gold, &[gold.len()], "secret");
+    let p0 = set.payloads[0].clone();
+    for i in 0..RANGES {
+        // 40 bytes, not on a 16-byte block boundary, like a missing article.
+        let start = p0.start + i * 2048 + 5;
+        set.hole(0, start..start + 40);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut session = session_with(&set, dir.path(), &anchors, Some("secret"));
+    let mut costs = Vec::new();
+    let mut last = session.resource_usage(Resource::MetadataBytes).used as i64;
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(_)))) => {
+                let now = session.resource_usage(Resource::MetadataBytes).used as i64;
+                costs.push(now - last);
+                last = now;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::BytesWritten { .. }))) => {
+                last = session.resource_usage(Resource::MetadataBytes).used as i64;
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    assert!(costs.len() as u64 >= RANGES, "{} hole events", costs.len());
+    let window = 30;
+    let early = costs[10..10 + window].iter().sum::<i64>() / window as i64;
+    let late = costs[costs.len() - window..].iter().sum::<i64>() / window as i64;
+    assert!(late <= early + 512, "a hole cost {early} bytes early and {late} late, after {} holes", costs.len());
+}
