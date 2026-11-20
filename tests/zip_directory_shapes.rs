@@ -16,8 +16,9 @@
 
 //! Every reader in the workspace agrees on directories far larger than the
 //! parity fixtures: a real ZIP64 member count, long names, private extras,
-//! comments, Unicode Path extras and a self-extractor prefix, each spanning
-//! many parser reads. The archives come from the generator behind
+//! comments, Unicode Path extras and a self-extractor prefix. The
+//! zip-container parser is also driven in 64 KiB reads, so each directory
+//! spans many reads with records split across them. The archives come from the generator behind
 //! `examples/zip_directory_bench`, at sizes a test can afford.
 
 #[path = "../examples/zip_directory_bench/shapes.rs"]
@@ -72,14 +73,17 @@ fn check_readers(shape: &Shape) {
         assert_eq!(payload, members[index].payload, "{}: fast payload {index}", shape.label);
     }
 
-    let mut parser = DirectoryParser::new(bytes.len() as u64, Profile::Zipfast, Limits::default()).unwrap();
+    // Small reads split records across range boundaries; the default limit would take the directory in one read.
+    const RANGE: u64 = 64 * 1024;
+    let limits = Limits { range_bytes: RANGE, ..Limits::default() };
+    let mut parser = DirectoryParser::new(bytes.len() as u64, Profile::Zipfast, limits).unwrap();
     let mut reads = 0;
     while let Some(range) = parser.next_read().unwrap() {
         reads += 1;
         parser.supply(range.start, slice(&bytes, &range)).unwrap();
     }
     let directory = parser.finish().unwrap();
-    assert!(reads >= 1);
+    assert!(reads as u64 > written.directory_len / RANGE, "{}: {reads} reads for the directory", shape.label);
     let central = written.directory_at + shape.prefix..written.directory_at + shape.prefix + written.directory_len;
     assert_eq!(directory.directory_range, central, "{}: container directory range", shape.label);
     assert_eq!(directory.entries.len(), shape.count, "{}: container count", shape.label);

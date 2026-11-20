@@ -96,10 +96,13 @@ The fixtures match the table above: peak allocations for `fast` reproduce the
 Candidate column. Open times for `fast` do not. Since #173, `Archive::open`
 converts each member's DOS time from local time with one `mktime` call per
 member, which the measured revision did not do; on macOS that adds about
-2 microseconds per member. Compare peak allocation and the other readers
-against the table, not `fast` open times.
+2 microseconds per member. Compare `fast` peak allocation against the
+Candidate column; `fast` open times are not comparable, and the table has no
+figures for the other readers.
 
 The generator lives in `examples/zip_directory_bench/shapes.rs`.
 `tests/zip_directory_shapes.rs` uses it at test sizes (70,000 short members
 for a real ZIP64 count, and 3,000-member rich, prefixed and Unicode shapes)
-to check that all four readers agree member by member.
+to check that all four readers agree member by member. It drives the
+zip-container parser in 64 KiB reads so records split across range
+boundaries.
