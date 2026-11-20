@@ -2355,7 +2355,10 @@ impl PartialCore {
         if member_known {
             let mut combined = crate::crc32::Hasher::new();
             for leaf in snapshot.known.iter().take_while(|leaf| leaf.range.end <= at) {
-                self.budget.usage.charge(Resource::VerifyWorkBytes, leaf.range.end - leaf.range.start)?;
+                self.budget.usage.charge(
+                    Resource::VerifyWorkBytes,
+                    (leaf.range.end - leaf.range.start).min(verify::CRC_COMBINE_WORK),
+                )?;
                 combined.combine(&leaf.hasher);
             }
             member_crc = Some(combined);

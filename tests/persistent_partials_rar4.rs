@@ -1404,3 +1404,55 @@ fn scattered_holes_in_an_encrypted_member_cost_the_same_however_many_came_before
     let late = costs[costs.len() - window..].iter().sum::<i64>() / window as i64;
     assert!(late <= early + 512, "a hole cost {early} bytes early and {late} late, after {} holes", costs.len());
 }
+
+/// RustyGet patches holes inline: on each `Hole` event it refills that range with `refill_from_packed` while the
+/// session goes on. Each refill re-judges the parts it may complete, combining the CRCs of their known leaves.
+/// That combine used to be charged as if it re-read every byte under those leaves, so every 1 MiB patch cost the
+/// whole verified output before it in `VerifyWorkBytes`; now a patch costs about the bytes it patches.
+#[test]
+fn an_inline_patch_costs_verify_work_for_its_own_bytes_only() {
+    const MIB: usize = 1 << 20;
+    let gold = gold(80 * MIB);
+    let mut set = Set::split(Naming::Old, &gold, &[32 * MIB, 72 * MIB]);
+    let p1 = set.payloads[1].clone();
+    for k in 0..10u64 {
+        let s = p1.start + k * 4 * MIB as u64;
+        set.hole(1, s..s + MIB as u64);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options(&dir.path().join("out"), set.naming.name(0)),
+        partial_options(&dir.path().join("state"), anchors.clone()),
+    )
+    .unwrap();
+    let (mut files, mut patches) = (Vec::new(), 0);
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => {
+                let before = session.resource_usage(Resource::VerifyWorkBytes).used;
+                let span = report.packed[0].clone();
+                let mut reader = std::io::Cursor::new(set.volumes[span.volume as usize].clone());
+                files[0].refill_from_packed(span.volume, span.range.clone(), &mut reader).unwrap();
+                let cost = session.resource_usage(Resource::VerifyWorkBytes).used - before;
+                let patched = span.range.end - span.range.start;
+                // The patched bytes are hashed once; combining part checks is a fixed cost per leaf.
+                assert!(cost <= 2 * patched + (1 << 20), "a {patched}-byte patch cost {cost} bytes of verify work");
+                patches += 1;
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    assert!(patches >= 10, "{patches} patches");
+    let file = &mut files[0];
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold);
+}
