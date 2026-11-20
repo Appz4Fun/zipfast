@@ -1257,3 +1257,50 @@ fn opting_in_never_skips_the_member_check_in_the_final_part() {
     assert!(failure.contains("FinalChecks { crc32: true"), "{failure}");
     assert!(run.outcomes.is_empty(), "{:?}", described(&run.outcomes));
 }
+
+/// [`session`] with [`ProgressiveOptions::rar4_unknown_part_crc`] set.
+fn session_unknown_part_crc(set: &Set, dir: &Path, anchors: &Arc<Anchors>) -> ProgressiveSession {
+    let mut opts = options(&dir.join("out"), set.naming.name(0));
+    opts.rar4_unknown_part_crc = true;
+    opts.limits.read_chunk = 300;
+    let mut partial = partial_options(&dir.join("state"), anchors.clone());
+    partial.limits.group_commit_bytes = 0;
+    ProgressiveSession::new_partial(Box::new(set.provider()), opts, partial).unwrap()
+}
+
+#[test]
+fn a_restarted_session_that_keeps_the_option_resumes_at_every_crash_point() {
+    for holes in [false, true] {
+        let gold = gold(3000);
+        let mut set = Set::split(Naming::Old, &gold, &[1000, 2000]);
+        zero_part_crc(&mut set, 1);
+        if holes {
+            let p1 = set.payloads[1].clone();
+            set.hole(1, p1.start + 100..p1.start + 400);
+        }
+        let total = {
+            let dir = tempfile::tempdir().unwrap();
+            let mut seen = Seen::default();
+            assert!(run(&mut session_unknown_part_crc(&set, dir.path(), &Arc::default()), &mut seen, None));
+            seen.events
+        };
+        for crash_at in 1..total {
+            let dir = tempfile::tempdir().unwrap();
+            let anchors = Arc::new(Anchors::default());
+            let mut first = session_unknown_part_crc(&set, dir.path(), &anchors);
+            let mut before = Seen::default();
+            assert!(!run(&mut first, &mut before, Some(crash_at)));
+            crash((first, std::mem::take(&mut before.files)));
+            let mut second = session_unknown_part_crc(&set, dir.path(), &anchors);
+            let mut after = Seen::default();
+            assert!(run(&mut second, &mut after, None), "crash at {crash_at}, holes {holes}");
+            let outcomes = described(&after.outcomes);
+            if holes {
+                assert_eq!(outcomes, ["partial"], "crash at {crash_at}");
+            } else {
+                assert_eq!(outcomes, ["complete, verified"], "crash at {crash_at}");
+                assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold, "crash at {crash_at}");
+            }
+        }
+    }
+}
