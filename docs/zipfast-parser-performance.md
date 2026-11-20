@@ -81,7 +81,7 @@ cargo run --release --example zip_directory_bench -- <work dir> [rounds] [word .
 
 It writes `short-20k`, `rich-prefix-20k`, `short-zip64-200k`,
 `rich-zip64-200k` and `unicode-zip64-200k` into `<work dir>` once (about
-600 MiB in all) and reuses them. For each it reports the central directory
+330 MiB in all) and reuses them. For each it reports the central directory
 size, the median and fastest of `rounds` opens, and the peak heap allocation
 of one open, for `fast` (`zipfast::zip::Archive::open`), `container`
 (`zip_container::DirectoryParser`, Zipfast profile, positioned reads),
@@ -91,6 +91,13 @@ of one open, for `fast` (`zipfast::zip::Archive::open`), `container`
 and local offsets are checked against what the generator wrote; zipfast
 reports Unicode Path names and prefix-shifted offsets, zipview the raw names
 and stored offsets, as `docs/zip-parser-parity.md` describes.
+
+The fixtures match the table above: peak allocations for `fast` reproduce the
+Candidate column. Open times for `fast` do not. Since #173, `Archive::open`
+converts each member's DOS time from local time with one `mktime` call per
+member, which the measured revision did not do; on macOS that adds about
+2 microseconds per member. Compare peak allocation and the other readers
+against the table, not `fast` open times.
 
 The generator lives in `examples/zip_directory_bench/shapes.rs`.
 `tests/zip_directory_shapes.rs` uses it at test sizes (70,000 short members

@@ -17,9 +17,10 @@
 //! Writes ZIP archives with large central directories: the shapes measured in
 //! `docs/zipfast-parser-performance.md`.
 //!
-//! Each archive holds `count` stored members. The first two are both named
-//! `duplicate.bin` and hold `first` and `second`; every later member holds its
-//! index as four little-endian bytes. A shape varies the names and the central
+//! Each archive holds `count` stored members. The first two share a name
+//! (`duplicate.bin`, or member 0's long name in the unicode shape) and hold
+//! `first` and `second`; every later member holds its index as four
+//! little-endian bytes. A shape varies the names and the central
 //! metadata:
 //!
 //! - short: 9-byte names (`e00000002`), no extra fields or comments.

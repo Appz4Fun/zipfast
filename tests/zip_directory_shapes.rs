@@ -106,7 +106,7 @@ fn check_readers(shape: &Shape) {
         assert_eq!(entry.crc32(), member.crc32, "{}: view crc {index}", shape.label);
         assert_eq!(entry.local_header_offset(), member.local_at, "{}: view offset {index}", shape.label);
     }
-    // Duplicate names resolve to the first in central order, as every reader agrees.
+    // zipview resolves a duplicate name to the first member in central order.
     let duplicate = std::str::from_utf8(&members[0].raw_name).unwrap();
     assert_eq!(view.by_name(duplicate).map(|e| e.local_header_offset()), Some(members[0].local_at));
     for index in [1, shape.count - 1] {
