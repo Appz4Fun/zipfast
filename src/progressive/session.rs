@@ -336,7 +336,8 @@ impl ProgressiveSession {
         usage.charge(Resource::MetadataBytes, (options.first_name.capacity() as u64).saturating_mul(3))?;
         usage.charge(Resource::NameBytes, (options.first_name.capacity() as u64).saturating_mul(3))?;
         let expected = options.first_name.clone();
-        let parser = HeaderParser::from_start(expected.clone().into(), usage.clone());
+        let mut parser = HeaderParser::from_start(expected.clone().into(), usage.clone());
+        parser.set_rar4_unknown_part_crc(options.rar4_unknown_part_crc);
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(chunk as usize)
@@ -555,6 +556,7 @@ impl ProgressiveSession {
                     self.driver.select_volume(VolumeRequest { index: self.volume, expected: self.expected.clone() })?;
                     self.usage.charge(Resource::MetadataBytes, self.expected.capacity() as u64)?;
                     self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone());
+                    self.parser.set_rar4_unknown_part_crc(self.options.rar4_unknown_part_crc);
                     self.cursor = 0;
                     self.main_seen = false;
                     self.phase = Phase::Header;
