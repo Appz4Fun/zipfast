@@ -122,6 +122,9 @@ pub(crate) struct HeaderParser {
     legacy_headers: bool,
     /// Map walks only (see [`HeaderParser::lenient_map`]). Sessions, catalogues and extraction never set it.
     map_lenient: bool,
+    /// Progressive sessions that opted in through [`crate::progressive::ProgressiveOptions::rar4_unknown_part_crc`]:
+    /// a RAR 4.x file part that continues into the next volume and stores 0 as its CRC has no part check.
+    rar4_unknown_part_crc: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -150,10 +153,15 @@ impl HeaderParser {
             rar4_main: None,
             legacy_headers: false,
             map_lenient: false,
+            rar4_unknown_part_crc: false,
         }
     }
     pub(crate) fn format(&self) -> RarFormat {
         self.format
+    }
+    /// See [`crate::progressive::ProgressiveOptions::rar4_unknown_part_crc`].
+    pub(crate) fn set_rar4_unknown_part_crc(&mut self, on: bool) {
+        self.rar4_unknown_part_crc = on;
     }
     pub(crate) fn set_format(&mut self, format: RarFormat) {
         self.format = format;

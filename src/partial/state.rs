@@ -1085,7 +1085,7 @@ pub(super) fn validate_evidence(
             || header.unpacked_size != size
             || header.data_at != part.packed.range.start
             || header.packed_size != part.packed.range.end - part.packed.range.start
-            || header.crc32 != part.crc32
+            || (header.crc32 != part.crc32 && !rar4_unknown_part_crc(&header, part.crc32))
             || header.blake2sp != part.blake2sp
             || header.split_after() == part.final_part
         {
@@ -1093,6 +1093,16 @@ pub(super) fn validate_evidence(
         }
     }
     Ok(crypt)
+}
+
+/// A part recorded with no CRC by a session that opted in to
+/// [`crate::progressive::ProgressiveOptions::rar4_unknown_part_crc`]: its header, re-read here without that option,
+/// shows the 0 the caller stored. Only a RAR 4.x part that continues into the next volume qualifies.
+fn rar4_unknown_part_crc(header: &crate::rar5::FileHeader, recorded: Option<u32>) -> bool {
+    header.format == crate::rar5::RarFormat::Rar4
+        && header.split_after()
+        && header.crc32 == Some(0)
+        && recorded.is_none()
 }
 
 impl serde::Serialize for PartialState {

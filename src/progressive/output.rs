@@ -68,6 +68,16 @@ pub struct ProgressiveOptions {
     pub hole_policy: HolePolicy,
     pub artifact_aftermath: ArtifactAftermath,
     pub recovery_publication: RecoveryPublication,
+    /// Off by default. When true, a RAR 4.x file part that continues into the next volume and stores 0 as its CRC
+    /// is read as having no part check, as a RAR 5.0 part without a data CRC is. This lets a caller present a
+    /// volume it rebuilt before it has every packed byte, reporting the missing ranges as
+    /// [`super::RangeRead::Hole`] and patching them later: RAR 4.x stores a CRC of each part's packed bytes in
+    /// every part but the last, which the caller can't know yet.
+    ///
+    /// The member's own check, the CRC in its final part over the whole unpacked file, still runs, and so does
+    /// [`crate::partial::PartialFile::poll_verify`] after a refill. A part whose real CRC happens to be 0 also loses
+    /// its part check when this is on. With it off, a part CRC that does not match is an error as before.
+    pub rar4_unknown_part_crc: bool,
     password: Option<String>,
 }
 impl ProgressiveOptions {
@@ -79,6 +89,7 @@ impl ProgressiveOptions {
             hole_policy: HolePolicy::default(),
             artifact_aftermath: ArtifactAftermath::default(),
             recovery_publication: RecoveryPublication::default(),
+            rar4_unknown_part_crc: false,
             password: None,
         }
     }
@@ -108,6 +119,7 @@ impl std::fmt::Debug for ProgressiveOptions {
             .field("limits", &self.limits)
             .field("hole_policy", &self.hole_policy)
             .field("artifact_aftermath", &self.artifact_aftermath)
+            .field("rar4_unknown_part_crc", &self.rar4_unknown_part_crc)
             .field("recovery_publication", &self.recovery_publication)
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .finish()

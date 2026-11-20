@@ -1115,3 +1115,192 @@ fn damage_on_a_released_member_is_reported_as_released() {
     let holes = file.declare_hole(0, damaged).unwrap();
     assert_eq!(holes.iter().map(|h| h.out.clone()).collect::<Vec<_>>(), vec![100..200]);
 }
+
+/// Stores 0 as the file header CRC of `volume`'s part, as a caller that rebuilt the volume before knowing its packed
+/// bytes does, and re-seals the header's own CRC.
+fn zero_part_crc(set: &mut Set, volume: usize) {
+    // signature (7) + main header (13): the file header starts at 20; its CRC field follows the 7-byte block
+    // header, packed and unpacked sizes and the host byte.
+    let start = SIG.len() + 13;
+    let wire = &mut set.volumes[volume];
+    assert_eq!(wire[start + 2], 0x74);
+    let size = u16::from_le_bytes([wire[start + 5], wire[start + 6]]) as usize;
+    wire[start + 16..start + 20].copy_from_slice(&0u32.to_le_bytes());
+    let crc = hash(&wire[start + 2..start + size]) as u16;
+    wire[start..start + 2].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Every event of a persistent session over `set`, ending with the error that stopped it, if any.
+fn events_with(set: &Set, unknown_part_crc: bool) -> (Run, Option<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut options = options(&dir.path().join("out"), set.naming.name(0));
+    options.rar4_unknown_part_crc = unknown_part_crc;
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options,
+        partial_options(&dir.path().join("state"), anchors.clone()),
+    )
+    .unwrap();
+    let (mut holes, mut parts, mut files, mut outcomes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut failure = None;
+    for _ in 0..100_000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push((member.clone(), session.partial_file(&member).unwrap()))
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => holes.push(report),
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartVerified { check, .. }))) => {
+                assert_eq!(check.crc32, CheckResult::Passed);
+                parts.push((check.part, check.volume));
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(outcome),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure: f, .. }))) => {
+                failure = Some(format!("{f:?}"));
+            }
+            Poll::Ready(Err(e)) => {
+                failure = Some(format!("{e:?}"));
+                break;
+            }
+            Poll::Ready(Ok(None)) => break,
+            _ => {}
+        }
+    }
+    let protection = set.protection();
+    (Run { dir, session, holes, parts, files, outcomes, anchors, protection }, failure)
+}
+
+/// Three volumes of 1000 bytes; the middle part stores 0 for its CRC and output 1100..1400 is a hole in it.
+fn unknown_middle_crc() -> (Vec<u8>, Set) {
+    let gold = gold(3000);
+    let mut set = Set::split(Naming::Old, &gold, &[1000, 2000]);
+    zero_part_crc(&mut set, 1);
+    let p1 = set.payloads[1].clone();
+    set.hole(1, p1.start + 100..p1.start + 400);
+    (gold, set)
+}
+
+fn described(outcomes: &[MemberOutcome]) -> Vec<&'static str> {
+    outcomes.iter().map(describe).collect()
+}
+
+fn refill_volume(file: &mut PartialFile, set: &Set, volume: usize) -> PackedFillResult {
+    let mut reader = std::io::Cursor::new(set.volumes[volume].clone());
+    file.refill_from_packed(volume as u32, 0..set.volumes[volume].len() as u64, &mut reader).unwrap()
+}
+
+#[test]
+fn an_opted_in_middle_part_with_an_unknown_crc_extracts_with_holes_and_verifies_after_refill() {
+    let (gold, set) = unknown_middle_crc();
+    let (mut run, failure) = events_with(&set, true);
+    assert_eq!(failure, None);
+    let p1 = set.payloads[1].clone();
+    assert_eq!(reports(&run.holes), vec![(1100..1400, vec![(1, p1.start + 100..p1.start + 400)], HoleCause::Missing)]);
+    // The first part is checked as it is produced; the middle part has no check to run.
+    assert_eq!(run.parts, vec![(0, 0)]);
+    assert!(matches!(run.outcomes[..], [MemberOutcome::PersistentPartial { .. }]), "{:?}", described(&run.outcomes));
+    let file = &mut run.files[0].1;
+    let Verdict::Incomplete { parts, .. } = verify(file) else { panic!("holes remain") };
+    assert_eq!(
+        parts.iter().map(|p| (p.volume, p.crc32.clone())).collect::<Vec<_>>(),
+        [(0, CheckResult::Passed), (1, CheckResult::Missing), (2, CheckResult::Pending)]
+    );
+    let refilled = refill_volume(file, &set, 1);
+    assert_eq!(refilled.applied, vec![1100..1400]);
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(file), Verdict::Ok { .. }), "the member CRC in the final part verifies the whole file");
+    assert_eq!(fs::read(run.out().join("big.bin")).unwrap(), gold);
+}
+
+#[test]
+fn an_unknown_part_crc_survives_reopening_the_state() {
+    let (gold, set) = unknown_middle_crc();
+    let (run, failure) = events_with(&set, true);
+    assert_eq!(failure, None);
+    let (dir, mut file) = reopen(run, 0).unwrap();
+    refill_volume(&mut file, &set, 1);
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold);
+}
+
+#[test]
+fn an_opted_in_part_still_fails_its_member_check_when_the_bytes_are_wrong() {
+    let (gold, set) = unknown_middle_crc();
+    let (mut run, _) = events_with(&set, true);
+    let file = &mut run.files[0].1;
+    let mut wrong = gold[1100..1400].to_vec();
+    wrong[7] ^= 1;
+    file.fill(1100, &wrong).unwrap();
+    assert!(matches!(verify(file), Verdict::Bad { which: ChecksumAlgorithm::Crc32, .. }), "member CRC catches it");
+}
+
+#[test]
+fn without_opting_in_a_zero_part_crc_is_a_part_crc_mismatch() {
+    let gold = gold(3000);
+    let mut set = Set::split(Naming::Old, &gold, &[1000, 2000]);
+    zero_part_crc(&mut set, 1);
+    let (run, failure) = events_with(&set, false);
+    let failure = failure.expect("the default is unchanged: the part CRC is checked");
+    assert!(failure.contains("volume_index: Some(1)"), "{failure}");
+    assert!(failure.contains("PackedPiece { crc32: true"), "{failure}");
+    assert!(run.outcomes.is_empty(), "{:?}", described(&run.outcomes));
+}
+
+#[test]
+fn opting_in_never_skips_the_member_check_in_the_final_part() {
+    let gold = gold(3000);
+    let mut set = Set::split(Naming::Old, &gold, &[1000, 2000]);
+    zero_part_crc(&mut set, 2);
+    let (run, failure) = events_with(&set, true);
+    let failure = failure.expect("the final part's CRC is the member check");
+    assert!(failure.contains("volume_index: Some(2)"), "{failure}");
+    assert!(failure.contains("FinalChecks { crc32: true"), "{failure}");
+    assert!(run.outcomes.is_empty(), "{:?}", described(&run.outcomes));
+}
+
+/// [`session`] with [`ProgressiveOptions::rar4_unknown_part_crc`] set.
+fn session_unknown_part_crc(set: &Set, dir: &Path, anchors: &Arc<Anchors>) -> ProgressiveSession {
+    let mut opts = options(&dir.join("out"), set.naming.name(0));
+    opts.rar4_unknown_part_crc = true;
+    opts.limits.read_chunk = 300;
+    let mut partial = partial_options(&dir.join("state"), anchors.clone());
+    partial.limits.group_commit_bytes = 0;
+    ProgressiveSession::new_partial(Box::new(set.provider()), opts, partial).unwrap()
+}
+
+#[test]
+fn a_restarted_session_that_keeps_the_option_resumes_at_every_crash_point() {
+    for holes in [false, true] {
+        let gold = gold(3000);
+        let mut set = Set::split(Naming::Old, &gold, &[1000, 2000]);
+        zero_part_crc(&mut set, 1);
+        if holes {
+            let p1 = set.payloads[1].clone();
+            set.hole(1, p1.start + 100..p1.start + 400);
+        }
+        let total = {
+            let dir = tempfile::tempdir().unwrap();
+            let mut seen = Seen::default();
+            assert!(run(&mut session_unknown_part_crc(&set, dir.path(), &Arc::default()), &mut seen, None));
+            seen.events
+        };
+        for crash_at in 1..total {
+            let dir = tempfile::tempdir().unwrap();
+            let anchors = Arc::new(Anchors::default());
+            let mut first = session_unknown_part_crc(&set, dir.path(), &anchors);
+            let mut before = Seen::default();
+            assert!(!run(&mut first, &mut before, Some(crash_at)));
+            crash((first, std::mem::take(&mut before.files)));
+            let mut second = session_unknown_part_crc(&set, dir.path(), &anchors);
+            let mut after = Seen::default();
+            assert!(run(&mut second, &mut after, None), "crash at {crash_at}, holes {holes}");
+            let outcomes = described(&after.outcomes);
+            if holes {
+                assert_eq!(outcomes, ["partial"], "crash at {crash_at}");
+            } else {
+                assert_eq!(outcomes, ["complete, verified"], "crash at {crash_at}");
+                assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold, "crash at {crash_at}");
+            }
+        }
+    }
+}
