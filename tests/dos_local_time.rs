@@ -181,6 +181,54 @@ fn zip_dos_times_are_unchanged_in_utc() {
     }
 }
 
+/// Members every two minutes from 00:00 to 05:00 on both 2024 Chicago change days. zipfast remembers the zone's
+/// offset per hour, so this checks that no hour borrows its neighbour's offset across a change.
+fn change_day_members() -> Vec<(String, (u16, u16))> {
+    let mut members = Vec::new();
+    for (month, day) in [(3, 10), (11, 3)] {
+        for minute in (0..5 * 60).step_by(2) {
+            let (hour, minute) = (minute / 60, minute % 60);
+            members.push((format!("{month:02}-{day:02}-{hour:02}{minute:02}"), dos(2024, month, day, hour, minute)));
+        }
+    }
+    members
+}
+
+#[test]
+fn zip_dos_times_take_the_right_offset_on_each_side_of_a_change() {
+    if !in_zone("zip_dos_times_take_the_right_offset_on_each_side_of_a_change", "America/Chicago") {
+        return;
+    }
+    let named = change_day_members();
+    let members: Vec<(&str, &[u8], u16, u16)> =
+        named.iter().map(|(n, (t, d))| (n.as_str(), &b"x"[..], *t, *d)).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("t.zip");
+    fs::write(&archive, zip(&members)).unwrap();
+    let hour = 3600;
+    let listed = times(&archive);
+    assert_eq!(listed.len(), named.len());
+    for (name, listed, on_disk) in listed {
+        assert_eq!(listed, on_disk, "{name}: listing and extraction agree");
+        let (month, rest) = name.split_at(2);
+        let day: i64 = rest[1..3].parse().unwrap();
+        let (h, m): (i64, i64) = (rest[4..6].parse().unwrap(), rest[6..8].parse().unwrap());
+        let offset = listed - wall(2024, month.parse().unwrap(), day, h, m);
+        // Standard time is UTC-6, daylight time UTC-5. In the hour that is skipped (March 02:xx) or repeated
+        // (November 01:xx), mktime may resolve either way.
+        let expected: &[i64] = match (month, h) {
+            ("03", 0..=1) => &[6 * hour],
+            ("03", 2) => &[5 * hour, 6 * hour],
+            ("03", _) => &[5 * hour],
+            ("11", 0) => &[5 * hour],
+            ("11", 1) => &[5 * hour, 6 * hour],
+            ("11", _) => &[6 * hour],
+            _ => unreachable!(),
+        };
+        assert!(expected.contains(&offset), "{name}: offset {offset} s, expected one of {expected:?}");
+    }
+}
+
 /// RAR 4.x DOS times are local wall clock too: the same archive lists one zone offset later in Chicago than in UTC.
 #[test]
 fn rar4_dos_times_follow_the_local_zone() {

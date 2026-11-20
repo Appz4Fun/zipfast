@@ -93,12 +93,26 @@ reports Unicode Path names and prefix-shifted offsets, zipview the raw names
 and stored offsets, as `docs/zip-parser-parity.md` describes.
 
 The fixtures match the table above: peak allocations for `fast` reproduce the
-Candidate column. Open times for `fast` do not. Since #173, `Archive::open`
-converts each member's DOS time from local time with one `mktime` call per
-member, which the measured revision did not do; on macOS that adds about
-2 microseconds per member. Compare `fast` peak allocation against the
-Candidate column; `fast` open times are not comparable, and the table has no
-figures for the other readers.
+Candidate column. Open times for `fast` include work the measured revision
+did not do: since #173, `Archive::open` converts each member's DOS time from
+local time. The platform call for that (`mktime`) costs about 2 microseconds
+on macOS, so `src/localtime.rs` remembers the zone's offset per wall-clock
+hour and calls the platform only for a new hour, an hour holding a
+daylight-saving change, or after `TZ` changes. Without that cache, a
+200k-member directory took about 400 ms to open. With it, on the same Apple
+M4:
+
+| Fixture | `fast` open, ms | Candidate open, ms (table above) |
+| --- | ---: | ---: |
+| Short 20k | 1.07 | 0.945 |
+| Rich prefixed 20k | 1.80 | 2.654 |
+| Short 200k | 10.65 | 8.849 |
+| Rich 200k | 19.94 | 21.694 |
+| Unicode 200k | 20.15 | 28.224 |
+
+These are medians of five opens from a warm OS cache, run under a different
+toolchain from the table, so treat the comparison as approximate. The table
+has no figures for the other readers.
 
 The generator lives in `examples/zip_directory_bench/shapes.rs`.
 `tests/zip_directory_shapes.rs` uses it at test sizes (70,000 short members
