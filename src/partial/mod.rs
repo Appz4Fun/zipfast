@@ -496,7 +496,9 @@ impl PartialCore {
         self.check(&op)?;
         if !self.grouping() {
             self.reconcile(&mut op)?;
-            self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
+            // The result's copy of the state lives as long as the call does.
+            let _result_lease =
+                self.budget.metadata_lease(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
             return Ok((self.write_data(&mut op, offset, bytes, FillMode::Alt)?.applied, true));
         }
         if op.group.is_none() {
@@ -548,7 +550,9 @@ impl PartialCore {
         self.check(&op)?;
         self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
-        self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
+        // The result's copy of the state lives as long as the call does.
+        let _result_lease =
+            self.budget.metadata_lease(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
         let applied = self.write_data(&mut op, offset, bytes, FillMode::Alt)?.applied;
         self.fill_result(&mut op, applied)
     }
@@ -564,7 +568,9 @@ impl PartialCore {
         self.check(&op)?;
         self.flush_group(&mut op)?;
         self.reconcile(&mut op)?;
-        self.budget.metadata(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
+        // The result's copy of the state lives as long as the call does.
+        let _result_lease =
+            self.budget.metadata_lease(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
         let keys = match (&op.snapshot.crypt, &self.keys) {
             (None, _) => None,
             (Some(_), Some(keys)) => Some(keys),
@@ -573,7 +579,7 @@ impl PartialCore {
         let limit = cipher::stream_produced(&op.snapshot);
         let parts = op.snapshot.evidence.parts.len();
         // (packed bytes, ciphertext stream offset); the stream is the output for a plain member.
-        let mut segments: Vec<(Range<u64>, u64)> = self.budget.vector(parts)?;
+        let (mut segments, _segments_lease): (Vec<(Range<u64>, u64)>, _) = self.budget.leased_vector(parts)?;
         for (part, stream) in cipher::parts_with_stream(&op.snapshot).filter(|(p, _)| p.packed.volume == volume) {
             let start = offset.max(part.packed.range.start);
             let stop = end.min(part.packed.range.end);
@@ -586,7 +592,7 @@ impl PartialCore {
                 segments.push((start..start + (at_end - at), at));
             }
         }
-        let mut unmapped = self.budget.vector(segments.len() + 1)?;
+        let (mut unmapped, _unmapped_lease) = self.budget.leased_vector(segments.len() + 1)?;
         let mut at = offset;
         for (packed, _) in &segments {
             if at < packed.start {
@@ -636,7 +642,7 @@ impl PartialCore {
             }
             error
         };
-        let mut decryptions = self.budget.vector(segments.len())?;
+        let (mut decryptions, _decryptions_lease) = self.budget.leased_vector(segments.len())?;
         for (packed, stream) in &segments {
             let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
             decryptions.push(match keys {
@@ -840,7 +846,7 @@ impl PartialCore {
         Ok(targets)
     }
     fn fill_result(&self, op: &mut CoreData, applied: Vec<Range<u64>>) -> PartialResult<FillResult> {
-        let mut part_checks = self.budget.vector(op.snapshot.evidence.parts.len())?;
+        let (mut part_checks, _part_checks_lease) = self.budget.leased_vector(op.snapshot.evidence.parts.len())?;
         if op.verification.as_ref().is_none_or(|v| v.revision != op.snapshot.head.revision) {
             let previous = self.part_results(op);
             op.verification =
@@ -948,7 +954,8 @@ impl PartialCore {
             PartialResource::CrcLeaves,
             op.snapshot.known.len().checked_add(count).ok_or_else(malformed)? as u64,
         )?;
-        let mut leaves = self.budget.vector(count)?;
+        // A transient list: the known index's growth is charged where these join it.
+        let (mut leaves, _leaves_lease) = self.budget.leased_vector(count)?;
         for range in &plan.unknown {
             let mut at = range.start;
             while at < range.end {
@@ -2523,7 +2530,9 @@ impl PartialFile {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
         let targets = self.core.refill_targets(volume, &range)?;
-        let mut buffer = self.core.budget.vector(chunk)?;
+        // The read buffer lives only for this call: charge it while it does. RustyGet refills one hole range per
+        // call, so a charge for good here cost a whole buffer per hole.
+        let (mut buffer, _buffer_lease) = self.core.budget.leased_vector(chunk)?;
         let mut total: Option<PackedFillResult> = None;
         fn merge(total: &mut Option<PackedFillResult>, step: PackedFillResult) {
             *total = Some(match total.take() {

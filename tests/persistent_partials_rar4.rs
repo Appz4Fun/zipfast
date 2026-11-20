@@ -1461,3 +1461,89 @@ fn an_inline_patch_costs_verify_work_for_its_own_bytes_only() {
     assert!(matches!(verify(file), Verdict::Ok { .. }));
     assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold);
 }
+
+/// RustyGet's inline patching: three dead middle volumes are answered entirely as holes, one read buffer per
+/// Hole, and once a volume's holes are all reported each hole range is refilled with its own `refill_from_packed`
+/// call while the session keeps extracting. Output grows between the refills.
+fn inline_refills_of_dead_volumes(volumes: usize, volume_mib: usize) {
+    const MIB: usize = 1 << 20;
+    let gold = gold(volumes * volume_mib * MIB);
+    let cuts: Vec<usize> = (1..volumes).map(|v| v * volume_mib * MIB).collect();
+    let mut set = Set::split(Naming::Old, &gold, &cuts);
+    let dead = [volumes * 7 / 23, volumes * 13 / 23, volumes * 14 / 23];
+    for &d in &dead {
+        let p = set.payloads[d].clone();
+        set.hole(d, p);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        options(&dir.path().join("out"), set.naming.name(0)),
+        partial_options(&dir.path().join("state"), anchors.clone()),
+    )
+    .unwrap();
+    let used = |s: &ProgressiveSession| s.resource_usage(Resource::MetadataBytes).used;
+    let mut files: Vec<PartialFile> = Vec::new();
+    // Hole ranges reported per volume, and the bytes they cover.
+    let mut pending: Vec<Vec<PackedSpan>> = vec![Vec::new(); volumes];
+    let mut seen = vec![0u64; volumes];
+    let mut ready: Vec<usize> = Vec::new();
+    let (mut calls, mut refill_cost) = (0u64, 0i64);
+    loop {
+        let event = session.poll_event(&mut Context::from_waker(Waker::noop()));
+        for d in ready.drain(..) {
+            let spans: Vec<PackedSpan> = std::mem::take(&mut pending[d]);
+            for span in spans {
+                let before = used(&session) as i64;
+                let mut reader = std::io::Cursor::new(set.volumes[d].as_slice());
+                files[0].refill_from_packed(span.volume, span.range.clone(), &mut reader).unwrap();
+                refill_cost += used(&session) as i64 - before;
+                calls += 1;
+            }
+        }
+        match event {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => {
+                for span in &report.packed {
+                    let v = span.volume as usize;
+                    seen[v] += span.range.end - span.range.start;
+                    pending[v].push(span.clone());
+                    if seen[v] == set.payloads[v].end - set.payloads[v].start {
+                        ready.push(v);
+                    }
+                }
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    assert!(calls as usize >= 3 * volume_mib, "{calls} refills: one per hole, a hole per read buffer");
+    // A refill of a hole range costs metadata for the bytes it adds to the known index (about 1 KiB per MiB),
+    // not a read buffer or a copy of anything that grows with the member.
+    let per_call = refill_cost / calls as i64;
+    assert!(per_call < 8 << 10, "a 1 MiB refill cost {per_call} metadata bytes");
+    let metadata = session.resource_usage(Resource::MetadataBytes);
+    assert!(metadata.used < metadata.limit / 4, "{metadata:?}");
+    let file = &mut files[0];
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold);
+}
+
+#[test]
+fn dead_volumes_refilled_inline_one_hole_at_a_time_cost_metadata_for_their_bytes_only() {
+    inline_refills_of_dead_volumes(23, 8);
+}
+
+/// [`inline_refills_of_dead_volumes`] at RustyGet's scale: about 2 GB in 23 volumes of 88 MiB, 264 holes and
+/// refills. Slow; run with `cargo test --release -- --ignored`.
+#[test]
+#[ignore]
+fn dead_volumes_refilled_inline_at_full_scale_stay_within_default_limits() {
+    inline_refills_of_dead_volumes(23, 88);
+}
