@@ -2016,8 +2016,8 @@ impl PartialCore {
                 return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
             }
             // Evidence only grows by new parts after the last one, so results of the parts already recorded still
-            // hold (`Verification::after` matches them by index, ordinal, volume and range). The final part is judged
-            // against the member checks, which an update may fill in, so it is always judged again.
+            // hold (`Verification::after` matches them by index, ordinal, volume and range). The final part's range
+            // is the whole member, so it is judged again, as any write would make it.
             let mut carried = self.part_results(&mut data);
             for (part, evidence) in carried.iter_mut().zip(&evidence.parts) {
                 if evidence.final_part {
@@ -2112,9 +2112,14 @@ impl PartialCore {
         Ok(())
     }
     /// Keeps part results across a committed transaction that left every known leaf as it was.
+    /// The results are only a cache: if their lease is refused they are dropped, never failing a step that already
+    /// took effect.
     fn keep_part_results(&self, data: &mut CoreData, parts: Vec<PartCheck>) -> PartialResult<()> {
-        let lease = self.budget.metadata_lease((parts.capacity() * std::mem::size_of::<PartCheck>()) as u64)?;
-        data.part_results = Some((data.snapshot.head.revision, parts, lease));
+        data.part_results = self
+            .budget
+            .metadata_lease((parts.capacity() * std::mem::size_of::<PartCheck>()) as u64)
+            .ok()
+            .map(|lease| (data.snapshot.head.revision, parts, lease));
         Ok(())
     }
     /// Part CRC results valid for the current known leaves, if any are kept.
