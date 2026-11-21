@@ -880,3 +880,46 @@ fn a_restart_needs_a_state_reset() {
     let out = index.decode_with_dictionary(0..1, &packed, 0, DICT_PROP, b"ignored", &opts()).unwrap();
     assert_eq!(out, plain[..c.unpacked_len as usize]);
 }
+
+/// Only the dictionary's last dictionary-size bytes are used: with a 256 KiB dictionary on a stream longer than
+/// that, a restart from the whole known plaintext still decodes right.
+#[test]
+fn a_restart_uses_only_the_last_dictionary_size_bytes() {
+    const SMALL_PROP: u8 = 12; // 256 KiB
+    let plain = mixed();
+    let mut opts_l = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
+    opts_l.dict_size(256 << 10);
+    let mut filters = liblzma::stream::Filters::new();
+    filters.lzma2(&opts_l);
+    let mut stream = liblzma::stream::Stream::new_raw_encoder(&filters).unwrap();
+    let mut packed = Vec::with_capacity(plain.len() + 4096);
+    stream.process_vec(&plain, &mut packed, liblzma::stream::Action::Finish).unwrap();
+    while stream.process_vec(&[], &mut packed, liblzma::stream::Action::Finish).unwrap()
+        != liblzma::stream::Status::StreamEnd
+    {
+        packed.reserve(1 << 16);
+    }
+    let index = index(&packed);
+    let i = index.chunks.iter().position(|c| c.reset == Lzma2Reset::State).expect("a state reset");
+    let c = index.chunks[i];
+    assert!(c.unpacked_offset > 256 << 10, "the known plaintext is longer than the dictionary");
+    let out = index
+        .decode_with_dictionary(i..i + 1, &packed, 0, SMALL_PROP, &plain[..c.unpacked_offset as usize], &opts())
+        .unwrap();
+    assert_eq!(out, plain[c.unpacked().start as usize..c.unpacked().end as usize]);
+}
+
+/// Packed bytes that disagree with the index (a size field one short) fail as data, never panic.
+#[test]
+fn packed_bytes_that_disagree_with_the_index_fail_as_data() {
+    let plain = mixed();
+    let packed = encode(&plain);
+    let index = index(&packed);
+    let i = index.chunks.iter().position(|c| c.reset == Lzma2Reset::State).unwrap();
+    let c = index.chunks[i];
+    let mut bad = packed.clone();
+    let at = c.packed_offset as usize + 4;
+    bad[at] = bad[at].wrapping_sub(1);
+    let r = index.decode_with_dictionary(i..i + 1, &bad, 0, DICT_PROP, &plain[..c.unpacked_offset as usize], &opts());
+    assert!(r.is_err() || r.as_ref().unwrap() != &plain[c.unpacked().start as usize..c.unpacked().end as usize]);
+}

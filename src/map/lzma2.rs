@@ -815,15 +815,41 @@ impl Lzma2Index {
             stream.extend_from_slice(&[0xC0 | (hdr[0] & 0x1F), hdr[1], hdr[2], hdr[3], hdr[4], props]);
         }
         stream.extend_from_slice(&input[header..]);
-        // Index the made-up stream and decode it, keeping the run's output.
+        // The made-up stream's chunks, from the index rather than re-read from the bytes: bytes that disagree with
+        // the index then fail in the decoder (Data), never in the walk.
         let mut synthetic = Vec::with_capacity(run.len() + dict.len() / 65_536 + 1);
-        let (mut pos, mut out) = (0usize, 0u64);
-        while pos < stream.len() {
-            let c = parse_chunk(&stream[pos..pos + 6.min(stream.len() - pos)], pos as u64, out);
-            pos += c.packed_len as usize;
-            out += c.unpacked_len;
-            synthetic.push(c);
+        let (mut pos, mut out) = (0u64, 0u64);
+        for (i, piece) in dict.chunks(65_536).enumerate() {
+            let len = piece.len() as u64;
+            synthetic.push(Lzma2Chunk {
+                packed_offset: pos,
+                packed_len: 3 + len,
+                unpacked_offset: out,
+                unpacked_len: len,
+                kind: Lzma2ChunkKind::Stored,
+                reset: if i == 0 { Lzma2Reset::Dict } else { Lzma2Reset::None },
+                props: None,
+            });
+            pos += 3 + len;
+            out += len;
         }
+        let grown = 6 - first.header_len();
+        synthetic.push(Lzma2Chunk {
+            packed_offset: pos,
+            packed_len: first.packed_len + grown,
+            unpacked_offset: out,
+            unpacked_len: first.unpacked_len,
+            kind: Lzma2ChunkKind::Lzma,
+            reset: if dict.is_empty() { Lzma2Reset::DictStateProps } else { Lzma2Reset::StateProps },
+            props: Some(props),
+        });
+        let shift_packed = pos + grown - first.packed_offset;
+        let shift_out = out - first.unpacked_offset;
+        synthetic.extend(run[1..].iter().map(|c| Lzma2Chunk {
+            packed_offset: c.packed_offset + shift_packed,
+            unpacked_offset: c.unpacked_offset + shift_out,
+            ..*c
+        }));
         let total = run.iter().map(|c| c.unpacked_len).sum::<u64>();
         let skip = dict.len() as u64;
         decode_run(&synthetic, &stream, 0, dict_prop, options, skip..skip + total)
