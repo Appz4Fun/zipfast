@@ -249,3 +249,38 @@ fn plaintext_that_ends_soon_after_the_hole_still_restarts() {
         assert_eq!(out.0, plain[r.output_offset as usize..]);
     }
 }
+
+/// A block that the known plaintext ends inside teaches nothing: restarting at it with the state its first tokens
+/// would have set would apply them twice. Block A sets three distances; block B's first match sets the fourth and a
+/// later repeat uses the oldest. With the plaintext ending inside B, the restart at B must decode B right.
+#[test]
+fn a_block_cut_by_the_end_of_the_plaintext_leaves_the_state_alone() {
+    use zipfast::rar5::testenc::{self, Op};
+    let lits = |n: usize, seed: u8| (0..n).map(move |i| Op::Lit(seed.wrapping_add((i * 37) as u8)));
+    let p: Vec<Op> = lits(200, 1).collect();
+    let a: Vec<Op> = lits(32, 90).chain([Op::Match(4, 1), Op::Match(4, 2), Op::Match(4, 3)]).collect();
+    let b: Vec<Op> =
+        [Op::Match(4, 5)].into_iter().chain(lits(20, 170)).chain([Op::Rep(3, 4)]).chain(lits(40, 30)).collect();
+    let blocks = [testenc::tuned_block(&p, false), testenc::tuned_block(&a, false), testenc::tuned_block(&b, true)];
+    let packed = blocks.concat();
+    let window = window_for(128 << 10, None, false).unwrap();
+    let plain = decode_unsized(window, &packed);
+    let b_start = 200 + 32 + 12;
+    let after = &packed[blocks[0].len()..];
+    let r = resync(after, 0, &plain[..b_start + 9], window, 200..201).unwrap();
+    assert_eq!(r.output_offset, b_start as u64, "{r:?}");
+    let mut u = Unpacker::resume_at(window, &r, 0, &plain, None).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&after[r.packed_offset..], &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0, plain[b_start..]);
+}
+
+fn decode_unsized(window: zipfast::rar5::unpack::Window, packed: &[u8]) -> Vec<u8> {
+    let mut u = Unpacker::new(window).unwrap();
+    u.reset(None);
+    let mut out = Collect(Vec::new());
+    u.feed(packed, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    out.0
+}

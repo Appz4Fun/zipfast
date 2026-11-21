@@ -15,8 +15,9 @@ u.finish(&mut sink)?;
 
 1. **Find a block.** It scans the packed bytes after the hole for a block header whose checksum holds and whose tables and symbols decode to the block's end. A block that reuses the previous block's tables can't be the first, because the hole erased them.
 2. **Find its output offset.** It decodes that block without a window, then searches the known plaintext within `expected` for one of the block's literal runs: the first of at least 8 bytes, or failing that 4, that fits no more than 64 places. That gives the candidate offsets. At each candidate, every literal and every copy must reproduce the plaintext.
-   - **When a block can't be pinned:** for example it has no such literal run, or all its runs fit too many places. It is skipped, and the expected range moves on by that block's output (widened for operations of unknown length), so `expected` keeps describing where the next block starts.
-   - **Scan limit:** the scan stops after 256 blocks.
+   - **When a block is passed:** either its literals can't pin it (it has no such run among its first 16, or they fit too many places), or every candidate contradicts the plaintext. The block is skipped, and the expected range moves on by its output (widened for operations of unknown length), so `expected` keeps describing where the next block starts.
+   - **Limits:** the scan stops after 256 blocks. One call also has a work budget of about a second of comparisons and probed bytes, and runs out with `ResyncError::Exhausted`. Long runs of one byte, or literals that recur everywhere, make each check costly.
+   - **Partial checks:** each block is checked on a copy of the learned state, and only a block checked to its end changes it.
 3. **Recover the erased state.** The hole erased the decoder's state: the four last match distances and the last length.
    - **While checking:** a repeat that uses an erased distance takes the one distance, up to 4 MiB back, whose copy reproduces the plaintext.
    - **For the restart:** such an inferred distance is never trusted. The state counts as known only once matches in the blocks read have set all four distances, plus the last length.
@@ -38,13 +39,13 @@ u.finish(&mut sink)?;
 - **`ResyncError::NotFound`:** no block decodes to the plaintext in the range. Either the plaintext or the range is wrong, or a filter that started before the hole covers the output.
 - **`ResyncError::Filter { packed_offset, output_offset }`:** a block after the hole starts a filter (E8, ARM or delta) once its offset is pinned. `packed_offset` and `output_offset` are where that block starts. Its output differs from the plaintext until the filter runs, so look again from packed bytes after the filtered output. Filters are for executables and rarely occur in video.
 - **`ResyncError::Ambiguous`:** a block fits the plaintext at more than one offset. Narrow `expected`.
+- **`ResyncError::Exhausted`:** the work budget ran out first. Narrow `expected`, or look again from later packed bytes.
 
 ## Checked against
 
 - **rar 7.30 output (`-ma5 -m3`):**
   - 3 MB of text with a 128 KiB dictionary;
   - 4 MB of video-like data, which rar compressed by 0.3%, so the blocks are mostly literals.
-
   - the text again, split into 400 KB volumes, with the parts' data areas joined.
 
   Holes at three places in each restart and decode the rest exactly. The test reads those sets when present (`ZIPFAST_RAR5_RESYNC_SETS`).

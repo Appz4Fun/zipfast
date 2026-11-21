@@ -8,15 +8,35 @@
 //! [`Unpacker::resume_at`] then starts a decoder at that block with the plaintext before it as its window, so decoding
 //! goes on from the recipient's own packed bytes.
 
-use super::parallel::{FilterFields, Packed, tokenize};
+use super::parallel::{BUDGET, FilterFields, Packed, SLACK, tokenize};
 use super::{Bits, Huff, Lengths, PAD, Slot, Tables, Tok, Unpacker, Window, block_header, read_lengths};
 use crate::error::Result;
 use std::ops::Range;
 
 /// The farthest back a match distance the hole erased is looked for in the plaintext.
 const SEARCH: u64 = 4 << 20;
-/// The most blocks read ahead to learn the decoder's state.
+/// The most blocks read ahead to learn the decoder's state, and the most blocks the scan probes.
 const MAX_BLOCKS: usize = 256;
+/// The most block steps all the read-aheads of one call take together.
+const MAX_STEPS: usize = 4 * MAX_BLOCKS;
+/// The most byte comparisons, and bytes probed, one call spends: about a second of work.
+const WORK: u64 = 1 << 30;
+/// The most literal runs of one block tried as anchors.
+const MAX_RUNS: usize = 16;
+
+/// What one [`resync`] call may still spend.
+struct Work {
+    left: u64,
+    steps: usize,
+}
+
+impl Work {
+    /// Spends `n`; false once the budget is gone.
+    fn spend(&mut self, n: u64) -> bool {
+        self.left = self.left.saturating_sub(n);
+        self.left > 0
+    }
+}
 
 /// Where and how decoding can restart after a hole: see [`resync`].
 #[derive(Clone, Debug)]
@@ -29,8 +49,8 @@ pub struct Resync {
     /// the hole up to `output_offset`).
     pub verified: Range<u64>,
     /// Whether the decoder's whole state was learned from the blocks read ahead (every one of the four last match
-    /// distances set by a match in them, and the last length). When `false` the packed bytes ran out first; decoding
-    /// still restarts, and a match that uses an unknown distance fails (a distance of 0) or decodes wrong, which the
+    /// distances set by a match in them, and the last length). When `false` the packed bytes, the known plaintext or
+    /// the block budget ran out first; decoding still restarts at the first block past what was checked, and a match that uses an unknown distance fails (a distance of 0) or decodes wrong, which the
     /// member's size or CRC catches.
     pub complete: bool,
     history: [u64; 4],
@@ -51,6 +71,9 @@ pub enum ResyncError {
     /// A block decodes to the plaintext at more than one offset in the expected range (repeated content): narrow
     /// `expected`.
     Ambiguous,
+    /// The search spent its work budget (about a second: long runs of one byte, or literals that recur everywhere,
+    /// make each check costly) before finding a restart: narrow `expected`, or look again from later packed bytes.
+    Exhausted,
 }
 
 impl std::fmt::Display for ResyncError {
@@ -61,6 +84,7 @@ impl std::fmt::Display for ResyncError {
                 write!(f, "a RAR 5.0 block at packed offset {packed_offset} (output {output_offset}) starts a filter")
             }
             Self::Ambiguous => f.write_str("a RAR 5.0 block decodes to the plaintext at more than one offset"),
+            Self::Exhausted => f.write_str("the RAR 5.0 resync spent its work budget"),
         }
     }
 }
@@ -105,8 +129,11 @@ struct Block {
 
 /// The block at `at`, if its header checks and its payload decodes to the end; `prev` are the code lengths a block
 /// without tables is read with.
-fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff) -> Option<Block> {
+fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff, work: &mut Work) -> Option<Block> {
     let (header, payload, flags) = block_header(packed.get(at..)?).ok()??;
+    if !work.spend(payload as u64) {
+        return None;
+    }
     let end = at.checked_add(header)?.checked_add(payload)?;
     // Read in place when the padding past the payload is there (a false header can claim megabytes: no copy for it).
     let copy;
@@ -126,9 +153,9 @@ fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff) -> Op
     let mut tables = Tables::empty();
     tables.build(&lens).ok()?;
     let (mut packed_toks, mut filters, mut lits): (Vec<Packed>, Vec<FilterFields>, Vec<u8>) = Default::default();
-    if tokenize(buf, bits.pos(), end_bits, &tables, (&mut packed_toks, &mut filters, &mut lits), usize::MAX)
-        .ok()?
-        .is_some()
+    // The main decoder's bound on a block's tokens: a block that would take more is not one rar wrote.
+    let budget = payload.saturating_mul(BUDGET).saturating_add(SLACK);
+    if tokenize(buf, bits.pos(), end_bits, &tables, (&mut packed_toks, &mut filters, &mut lits), budget).ok()?.is_some()
     {
         return None;
     }
@@ -170,9 +197,19 @@ fn len_of(tok: &Tok, st: &State) -> u32 {
 }
 
 /// The one distance (up to `limit` back) whose copy reproduces the plaintext at `at`, if exactly one does.
-fn infer(known: &Known<'_>, at: u64, len: u32, limit: u64) -> Option<u64> {
+fn infer(known: &Known<'_>, at: u64, len: u32, limit: u64, work: &mut Work) -> Option<u64> {
     let mut found = None;
     for d in 1..=limit.min(at.saturating_sub(known.base)) {
+        // A cheap first-byte test before the full copy; every distance tried costs.
+        if !work.spend(1) || known.get(at) != known.get(at - d) {
+            if work.left == 0 {
+                return None;
+            }
+            continue;
+        }
+        if !work.spend(u64::from(len)) {
+            return None;
+        }
         if known.copies(at, d, len) {
             if found.is_some() {
                 return None;
@@ -185,7 +222,7 @@ fn infer(known: &Known<'_>, at: u64, len: u32, limit: u64) -> Option<u64> {
 
 /// Checks `block`, decoded at output offset `at` with state `st`, against the plaintext, learning the state it
 /// uses. Distances the hole erased are taken from the plaintext when exactly one fits.
-fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u64) -> Sim {
+fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u64, work: &mut Work) -> Sim {
     let (mut p, mut li) = (at, 0usize);
     let limit = window.min(SEARCH);
     for tok in &block.toks {
@@ -213,7 +250,7 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             Tok::Rep { .. } | Tok::Last if p + u64::from(len_of(tok, st)) > known.end() => return Sim::Short,
             Tok::Rep { k, len } => {
                 let k = usize::from(k) & 3;
-                let Some(h) = st.hist[k].or_else(|| infer(known, p, len, limit).map(|d| (d, true))) else {
+                let Some(h) = st.hist[k].or_else(|| infer(known, p, len, limit, work).map(|d| (d, true))) else {
                     return Sim::Mismatch;
                 };
                 st.hist.copy_within(0..k, 1);
@@ -222,7 +259,7 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             }
             Tok::Last => {
                 let Some(len) = st.last else { return Sim::Mismatch };
-                let Some(h) = st.hist[0].or_else(|| infer(known, p, len, limit).map(|d| (d, true))) else {
+                let Some(h) = st.hist[0].or_else(|| infer(known, p, len, limit, work).map(|d| (d, true))) else {
                     return Sim::Mismatch;
                 };
                 st.hist[0] = Some(h);
@@ -230,6 +267,9 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             }
         };
         if p + u64::from(len) > known.end() {
+            return Sim::Short;
+        }
+        if !work.spend(u64::from(len)) {
             return Sim::Short;
         }
         if !known.copies(p, dist, len) {
@@ -265,7 +305,7 @@ const MAX_LEN: u64 = 0x1101;
 /// Output offsets in `expected` the block fits at, found by searching the known plaintext for one of its literal runs
 /// (the first of at least 8 bytes, or failing that 4, that fits no more than 64 places). None for a block whose
 /// literals cannot pin its offset.
-fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>) -> Option<Vec<u64>> {
+fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>, work: &mut Work) -> Option<Vec<u64>> {
     let mut runs = Vec::new();
     let (mut before, mut li) = (0u64, 0usize);
     for tok in &block.toks {
@@ -282,7 +322,7 @@ fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>) -> Option
     }
     let long = runs.iter().filter(|(_, l)| l.len() >= 8);
     let short = runs.iter().filter(|(_, l)| (4..8).contains(&l.len()));
-    for &(before, lits) in long.chain(short) {
+    for &(before, lits) in long.chain(short).take(MAX_RUNS) {
         let lo = expected.start.saturating_add(before).max(known.base);
         let hi = expected.end.saturating_add(before).min(known.end());
         if lo >= hi {
@@ -290,6 +330,9 @@ fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>) -> Option
         }
         let from = (lo - known.base) as usize;
         let to = ((hi - known.base) as usize + lits.len() - 1).min(known.bytes.len());
+        if !work.spend((to - from) as u64) {
+            return None;
+        }
         let mut found = Vec::new();
         let mut too_many = false;
         for (i, w) in known.bytes[from..to].windows(lits.len()).enumerate() {
@@ -331,6 +374,7 @@ pub fn resync(
 ) -> std::result::Result<Resync, ResyncError> {
     let known = Known { base: known_base, bytes: known };
     let mut pre = Huff::new();
+    let mut work = Work { left: WORK, steps: 0 };
     // Blocks found but not pinned move the expected range on by their output.
     let (mut shift, mut slack) = (0u64, 0u64);
     let mut blocks = 0;
@@ -339,28 +383,40 @@ pub fn resync(
         if packed[at] & 0x80 == 0 {
             continue;
         }
-        let Some(first) = probe(packed, at, None, &mut pre) else { continue };
+        let Some(first) = probe(packed, at, None, &mut pre, &mut work) else {
+            if work.left == 0 {
+                return Err(ResyncError::Exhausted);
+            }
+            continue;
+        };
         blocks += 1;
         if blocks > MAX_BLOCKS {
             break;
         }
         let range = expected.start.saturating_add(shift)..expected.end.saturating_add(shift + slack);
-        let Some(starts) = candidates(&first, &known, &range) else {
+        let moved = |shift: &mut u64, slack: &mut u64| {
             if let Some((len, extra)) = known_len(&first) {
-                shift += len;
-                slack += extra;
+                *shift += len;
+                *slack += extra;
             }
+        };
+        let Some(starts) = candidates(&first, &known, &range, &mut work) else {
+            if work.left == 0 {
+                return Err(ResyncError::Exhausted);
+            }
+            moved(&mut shift, &mut slack);
             continue;
         };
         // Every offset the block fits at is followed through the read-ahead; exactly one may hold.
         let mut found = None;
         for start in starts {
-            let result = match follow(packed, at, &first, start, &known, window, &mut pre) {
+            let result = match follow(packed, at, &first, start, &known, window, &mut pre, &mut work) {
                 Follow::Restart(r) => Ok(r),
                 Follow::Filter { packed_offset, output_offset } => {
                     Err(ResyncError::Filter { packed_offset, output_offset })
                 }
                 Follow::Mismatch => continue,
+                Follow::Exhausted => return Err(ResyncError::Exhausted),
             };
             if found.is_some() {
                 return Err(ResyncError::Ambiguous);
@@ -370,6 +426,8 @@ pub fn resync(
         if let Some(result) = found {
             return result;
         }
+        // Pinned but contradicted everywhere: the block is passed, and so is its output.
+        moved(&mut shift, &mut slack);
     }
     Err(ResyncError::NotFound)
 }
@@ -378,10 +436,12 @@ enum Follow {
     Restart(Resync),
     Filter { packed_offset: usize, output_offset: u64 },
     Mismatch,
+    Exhausted,
 }
 
 /// Follows blocks from `first` (at packed offset `at`, output offset `start`), checking each against the plaintext,
 /// until the decoder's state is known or the blocks run out.
+#[allow(clippy::too_many_arguments)]
 fn follow(
     packed: &[u8],
     at: usize,
@@ -390,14 +450,22 @@ fn follow(
     known: &Known<'_>,
     window: Window,
     pre: &mut Huff,
+    work: &mut Work,
 ) -> Follow {
     let mut st = State { hist: [None; 4], last: None };
     let (mut pos, mut out) = (at, start);
     let mut owned;
     let mut block = first;
     for _ in 0..MAX_BLOCKS {
-        match simulate(block, out, known, &mut st, window.size) {
+        work.steps += 1;
+        if work.steps > MAX_STEPS || work.left == 0 {
+            return Follow::Exhausted;
+        }
+        // On a copy of the state: a block that is not wholly checked teaches nothing.
+        let mut trial = st;
+        match simulate(block, out, known, &mut trial, window.size, work) {
             Sim::Matches(n) => {
+                st = trial;
                 out += n;
                 pos += block.len;
             }
@@ -408,7 +476,7 @@ fn follow(
             Sim::Short if out > start => return restart(pos, start, out, &st, &block.lens),
             Sim::Short => return Follow::Mismatch,
         }
-        let next = if block.last { None } else { probe(packed, pos, Some(&block.lens), pre) };
+        let next = if block.last { None } else { probe(packed, pos, Some(&block.lens), pre, work) };
         if st.complete() || next.is_none() {
             let lens = next.as_ref().map_or_else(|| block.lens.clone(), |n| n.lens.clone());
             return restart(pos, start, out, &st, &lens);
