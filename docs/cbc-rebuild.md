@@ -27,7 +27,7 @@ let ciphertext = zipfast::crypto::rebuild_cbc(&key, &previous_block, &plaintext,
 
 ## From a hole to the call
 
-`cbc_rebuild_span(hole, stream_len)` turns an article hole (stream offsets) into what to pass:
+`cbc_rebuild_span(hole, stream_len)` turns an article hole (stream offsets) into what to pass. `stream_len` is the stream's plaintext (unpacked) length, not its packed size, which is rounded up to 16:
 
 - **`range`:** the hole widened to whole blocks, plus one intact block after it.
 - **`previous_at`:** where the previous 16 bytes start, or None to use the IV.
@@ -35,7 +35,7 @@ let ciphertext = zipfast::crypto::rebuild_cbc(&key, &previous_block, &plaintext,
 - **`stream_end`**
 
 ```rust
-let span = zipfast::crypto::cbc_rebuild_span(hole, member_len);
+let span = zipfast::crypto::cbc_rebuild_span(hole, unpacked_len);
 let previous = match span.previous_at { Some(at) => stream_bytes(at..at + 16), None => iv };
 let check = span.check.clone().map(|c| ((c.start - span.range.start) as usize, stream_bytes(c)));
 let ciphertext = zipfast::crypto::rebuild_cbc(&key, &previous, &plaintext(span.range.clone()), span.stream_end, check.as_ref().map(|(o, b)| (*o, b.as_slice())))?;
