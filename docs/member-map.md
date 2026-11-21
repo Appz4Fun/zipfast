@@ -333,14 +333,27 @@ the run's packed bytes and writing exactly its output, and fails with `Data` whe
 headers. In memory: `decode_chunks(range, packed, packed_base, dict_prop, options)` (a run from a reset),
 `decode_chunk(i, ...)` (one chunk's output, decoded from its reset while discarding earlier output) and
 `read_range(unpacked, ...)` (stored pieces copied, LZMA pieces decoded; `packed`, whose byte 0 is packed offset
-`packed_base`, need only cover what the plan uses). `dict_prop` is the 7z coder's property byte
+`packed_base`, need only cover what the plan uses).
+
+Restarting after a hole: `decode_with_dictionary(range, packed, packed_base, dict_prop, dictionary, options)` decodes
+a run whose first chunk resets the LZMA state (control `0xA0` and up) without the chunks before it, from a dictionary
+the caller supplies. That is the output just before the chunk, known from another copy of the file, so decoding can
+resume past lost chunks instead of from the last dictionary reset. Only the dictionary's last bytes, as many as the
+coder's dictionary size, are used. A chunk that does not set its own LZMA props takes them from the last chunk that
+did (`props_for(i)`). A chunk that also resets the dictionary decodes as `decode_chunks`. A chunk that continues the
+LZMA state cannot restart (`NotStateReset`). It works by feeding liblzma the dictionary as stored chunks, the first
+resetting the dictionary, followed by the chunk with props set and the rest as they are, and dropping the
+dictionary's echo from the output. A wrong dictionary decodes to wrong bytes or fails with `Data`, so check the
+result against the file's CRC.
+
+`dict_prop` is the 7z coder's property byte
 (`Lzma2Stage::dict_prop`). `Lzma2DecodeOptions` bounds memory: the dictionary is the coder's shrunk to the run's
 output size, so a stated 4 GiB dictionary allocates only what the run can use, and is checked against
 `max_dictionary` (default 256 MiB). `max_output` (default 256 MiB) caps the bytes returned in one buffer, not the
 output decoded and discarded before them; `max_streamed` (default 16 GiB, the 7z folder cap) caps what a run decodes
 from its dictionary reset, since 7-Zip and xz usually reset only at the start and a byte near the end of a large
 folder decodes through all of it, the discarded part through a 64 KiB buffer. `control` (a `SessionControl`)
-cancels the in-memory decodes between 64 KiB steps. Failures are `Lzma2DecodeError`: `NotDictionaryReset`,
+cancels the in-memory decodes between 64 KiB steps. Failures are `Lzma2DecodeError`: `NotDictionaryReset`, `NotStateReset`,
 `NotContiguous`, `BadDictionaryProp`, `Limit { bound: Dictionary | Output | Streamed, .. }`, `MissingPacked
 { offset }`, `Unindexed { unpacked }`, `Data { produced }`, `Decoder`, `Canceled`.
 
