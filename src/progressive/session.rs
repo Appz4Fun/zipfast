@@ -199,12 +199,11 @@ enum Phase {
     NextVolume,
     Done,
 }
-/// A serialized, caller-driven extraction session. Delivered artifacts outlive it.
 /// The longest `Hole` answer a persistent session accepts in one read (see `SourceDriver::allow_long_hole`):
 /// 256 MiB, or less where a usize is smaller.
 #[cfg(feature = "persistent-partials")]
 const LONG_HOLE: u64 = if usize::MAX as u64 > (256 << 20) { 256 << 20 } else { usize::MAX as u64 };
-
+/// A serialized, caller-driven extraction session. Delivered artifacts outlive it.
 pub struct ProgressiveSession {
     #[cfg(feature = "persistent-partials")]
     partial: Option<partial::Persistent>,
