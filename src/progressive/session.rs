@@ -796,6 +796,12 @@ impl ProgressiveSession {
                         continue;
                     }
                     let n = self.read_len(self.remaining.min(self.buffer.len() as u64) as usize, work);
+                    // A persistent session records a hole without buffering it, so the source may answer one
+                    // longer than the buffer, up to the end of this part: one record and one event per range.
+                    #[cfg(feature = "persistent-partials")]
+                    if self.partial_active() {
+                        self.driver.allow_long_hole(self.remaining);
+                    }
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
                         Poll::Pending => {
                             self.parked_read = Some(n);

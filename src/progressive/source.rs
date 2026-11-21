@@ -72,9 +72,19 @@ pub enum VolumeAnswer {
 /// Filled commits only the reported nonempty prefix; Hole is permanent within
 /// this generation. Mixed statuses must be split across separate calls.
 pub enum RangeRead {
-    Filled { count: usize },
+    Filled {
+        count: usize,
+    },
     NotYet,
-    Hole { len: u64 },
+    /// `len` unreadable bytes from the requested offset. Normally at most the buffer's length. A persistent
+    /// session (`ProgressiveSession::new_partial`) reading a member's data also accepts a longer one, up to the
+    /// end of that member's packed data in the volume (never past the volume's length or the next range declared
+    /// with `declare_hole`), and records it as one hole and one `Hole` event; a longer answer anywhere else is a
+    /// `SourceContract` failure. So a source that knows a whole range is lost (a dead volume, say) can answer it
+    /// once instead of once per buffer.
+    Hole {
+        len: u64,
+    },
 }
 /// Called for every volume, including index zero. Wait parks until the supplied
 /// waker fires; waking before returning Wait is supported. Calls are serialized.
@@ -401,6 +411,9 @@ struct RangeOperation<'a> {
     control: &'a SessionControl,
     usage: &'a mut Usage,
     verify: bool,
+    /// The longest `Hole` the source may answer for this read, when the session allows one longer than the
+    /// buffer (0: no longer than the buffer). See [`SourceDriver::allow_long_hole`].
+    hole_max: u64,
     #[cfg(feature = "persistent-partials")]
     exclusions: Option<&'a crate::partial::PartialExclusions>,
     #[cfg(feature = "persistent-partials")]
@@ -417,6 +430,8 @@ enum Overlay {
 struct PendingPartialRead {
     offset: u64,
     requested: u64,
+    /// The longest hole allowed for the read, as [`RangeOperation::hole_max`] resolved against `requested`.
+    hole_max: u64,
     answer: RangeRead,
     bytes: Vec<u8>,
 }
@@ -470,7 +485,7 @@ fn poll_available(
         }
         let pending = op.pending.take().unwrap();
         buf[..pending.bytes.len()].copy_from_slice(&pending.bytes);
-        return accept_available(original, op, pending.offset, pending.requested, pending.answer);
+        return accept_available(original, op, pending.offset, pending.requested, pending.hole_max, pending.answer);
     }
     let length = original.live.length.value();
     if offset == length {
@@ -487,6 +502,8 @@ fn poll_available(
         return Ok(Poll::Pending);
     }
     let count = (length - offset).min(buf.len() as u64);
+    // A hole may run past the buffer when the session allows it, but never past the volume's current length.
+    let hole_max = op.hole_max.min(length - offset).max(count);
     op.usage.check(Resource::ReadChunk, count)?;
     op.usage.charge(Resource::SourceRequests, 1)?;
     op.gate.arm();
@@ -510,24 +527,25 @@ fn poll_available(
     if !matches!(answer, RangeRead::NotYet) && !partial_read_stable(original, &mut op)? {
         let n = match answer {
             RangeRead::Filled { count: n } if n > 0 && n <= count as usize => n,
-            RangeRead::Hole { len } if len > 0 && len <= count => 0,
+            RangeRead::Hole { len } if len > 0 && len <= hole_max => 0,
             _ => return Err(contract()),
         };
         op.usage.charge(Resource::MetadataBytes, n as u64)?;
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(n).map_err(|_| contract())?;
         bytes.extend_from_slice(&buf[..n]);
-        *op.pending = Some(PendingPartialRead { offset, requested: count, answer, bytes });
+        *op.pending = Some(PendingPartialRead { offset, requested: count, hole_max, answer, bytes });
         op.gate.notify(false);
         return Ok(Poll::Pending);
     }
-    accept_available(original, op, offset, count, answer)
+    accept_available(original, op, offset, count, hole_max, answer)
 }
 fn accept_available(
     original: &mut OriginalSource,
     op: RangeOperation<'_>,
     offset: u64,
     count: u64,
+    hole_max: u64,
     answer: RangeRead,
 ) -> ProgressiveResult<Poll<SourceStep>> {
     let step = match answer {
@@ -555,7 +573,7 @@ fn accept_available(
             SourceStep::Filled { offset, count: n }
         }
         RangeRead::Hole { len } => {
-            if len == 0 || len > count {
+            if len == 0 || len > hole_max {
                 return Err(contract());
             }
             let end = offset.checked_add(len).ok_or_else(contract)?;
@@ -569,6 +587,8 @@ fn accept_available(
     Ok(Poll::Ready(step))
 }
 pub(crate) struct SourceDriver {
+    /// The longest `Hole` the next read may be answered with, set by [`Self::allow_long_hole`] (0: the buffer).
+    hole_allowance: u64,
     #[cfg(feature = "persistent-partials")]
     partial_exclusions: Option<Arc<crate::partial::PartialExclusions>>,
     /// Whether the provider opted in to a growing declaration (`VolumeSource::extends_protection`).
@@ -644,6 +664,7 @@ impl SourceDriver {
         // Library ownership is the boxed provider's concrete type, which a wrapper cannot forward or forge.
         let library_provider = (&*provider as &dyn std::any::Any).is::<super::GrowingFileVolumes>();
         Ok(Self {
+            hole_allowance: 0,
             #[cfg(feature = "persistent-partials")]
             partial_exclusions: None,
             #[cfg(feature = "persistent-partials")]
@@ -953,6 +974,21 @@ impl SourceDriver {
         self.cursor = CheckedCursor::new(0);
         Ok(())
     }
+    /// Lets the next [`Self::poll_step`] accept a `Hole` of up to `max` bytes from the source, even when that is
+    /// longer than the buffer: the session sets it to the bytes left of the part it is reading, so one answer can
+    /// cover a whole unread range. It never reaches past the volume's length or the next declared damage, and it
+    /// applies to that one read only.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn allow_long_hole(&mut self, max: u64) {
+        self.hole_allowance = max;
+    }
+    /// Start of the next caller-declared range in the current volume at or after the cursor, if any.
+    #[cfg(feature = "persistent-partials")]
+    fn next_declared_start(&self) -> Option<u64> {
+        let volume = self.request.index;
+        let offset = self.cursor.offset();
+        self.declared.iter().find(|(v, r)| *v == volume && r.end > offset).map(|(_, r)| r.start)
+    }
     pub(crate) fn poll_step(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<ProgressiveResult<SourceStep>> {
         self.poll_step_counted(cx, buf, false)
     }
@@ -1096,13 +1132,26 @@ impl SourceDriver {
                 return Err(canceled());
             }
         }
+        // A hole longer than the buffer is allowed for this read only, and not for verification reads.
+        let hole_max = if verify { 0 } else { std::mem::take(&mut self.hole_allowance) };
+        #[cfg(feature = "persistent-partials")]
+        let mut hole_max = hole_max;
         #[cfg(feature = "persistent-partials")]
         let buf = if verify || self.pending_partial_read.is_some() {
             buf
         } else {
-            match self.declared_overlay(buf.len())? {
+            let full = buf.len();
+            match self.declared_overlay(full)? {
                 Overlay::Hole(step) => return Ok(Poll::Ready(Ok(step))),
-                Overlay::Limit(n) => &mut buf[..n],
+                Overlay::Limit(n) => {
+                    // Declared damage ahead: the source's answer must stop before it, holes included.
+                    if n < full {
+                        hole_max = 0;
+                    } else if let Some(start) = self.next_declared_start() {
+                        hole_max = hole_max.min(start.saturating_sub(self.cursor.offset()));
+                    }
+                    &mut buf[..n]
+                }
             }
         };
         #[cfg(feature = "persistent-partials")]
@@ -1118,6 +1167,7 @@ impl SourceDriver {
                 control: &self.control,
                 usage: &mut self.usage,
                 verify,
+                hole_max,
                 #[cfg(feature = "persistent-partials")]
                 exclusions: self.partial_exclusions.as_deref(),
                 #[cfg(feature = "persistent-partials")]
@@ -2319,6 +2369,7 @@ mod partial_callback_tests {
         let mut pending = pending_answer.then(|| PendingPartialRead {
             offset: 0,
             requested: 4,
+            hole_max: 4,
             answer: RangeRead::Filled { count: 4 },
             bytes: b"data".to_vec(),
         });
@@ -2333,6 +2384,7 @@ mod partial_callback_tests {
                 control: &control,
                 usage: &mut usage,
                 verify: false,
+                hole_max: 0,
                 exclusions: Some(&exclusions),
                 pending: &mut pending,
                 native: None,

@@ -80,6 +80,8 @@ struct Source {
     reads: Arc<Mutex<Vec<(u32, u64)>>>,
     /// Answers every other read `NotYet`, as a volume still downloading does.
     slow: bool,
+    /// Answers each hole whole, from the read offset to its end, rather than capped at the buffer.
+    long_holes: bool,
     ticks: usize,
 }
 impl RangeSource for Source {
@@ -105,7 +107,8 @@ impl RangeSource for Source {
         let mut end = (at + buf.len() as u64).min(self.bytes.len() as u64);
         for hole in &self.holes {
             if hole.start <= at && at < hole.end {
-                return Ok(RangeRead::Hole { len: (hole.end - at).min(buf.len() as u64) });
+                let len = if self.long_holes { hole.end - at } else { (hole.end - at).min(buf.len() as u64) };
+                return Ok(RangeRead::Hole { len });
             }
             if hole.start > at {
                 end = end.min(hole.start);
@@ -177,6 +180,8 @@ struct Set {
     reads: Arc<Mutex<Vec<(u32, u64)>>>,
     /// Whether the provider and its sources answer as a set still downloading.
     slow: bool,
+    /// Whether sources answer each hole whole (see [`Source::long_holes`]).
+    long_holes: bool,
 }
 impl Set {
     /// One member, `gold`, split across volumes at `cuts` (output offsets).
@@ -201,7 +206,15 @@ impl Set {
             wire.extend(block(0x7b, 0x4000 | u16::from(!last), &[]));
             volumes.push(wire);
         }
-        Self { naming, holes: vec![Vec::new(); count], volumes, payloads, reads: Arc::default(), slow: false }
+        Self {
+            naming,
+            holes: vec![Vec::new(); count],
+            volumes,
+            payloads,
+            reads: Arc::default(),
+            slow: false,
+            long_holes: false,
+        }
     }
     /// One unsplit volume holding each `(name, data)` member in order.
     fn single(members: &[(&[u8], &[u8])]) -> Self {
@@ -221,6 +234,7 @@ impl Set {
             holes: vec![Vec::new()],
             reads: Arc::default(),
             slow: false,
+            long_holes: false,
         }
     }
     /// One RAR4 stored member, `gold`, AES-encrypted with `password` (plain headers, salt present), its ciphertext
@@ -250,7 +264,15 @@ impl Set {
             wire.extend(block(0x7b, 0x4000 | u16::from(!last), &[]));
             volumes.push(wire);
         }
-        Self { naming, holes: vec![Vec::new(); cuts.len()], volumes, payloads, reads: Arc::default(), slow: false }
+        Self {
+            naming,
+            holes: vec![Vec::new(); cuts.len()],
+            volumes,
+            payloads,
+            reads: Arc::default(),
+            slow: false,
+            long_holes: false,
+        }
     }
     /// Makes the source answer archive bytes `packed` of `volume` as a hole.
     fn hole(&mut self, volume: usize, packed: Range<u64>) {
@@ -286,6 +308,7 @@ impl Set {
                         holes: holes.clone(),
                         reads: self.reads.clone(),
                         slow: self.slow,
+                        long_holes: self.long_holes,
                         ticks: 0,
                     })
                 })
@@ -626,6 +649,7 @@ fn refused_member(volume: Vec<u8>) -> RefusalReason {
         holes: vec![Vec::new()],
         reads: Arc::default(),
         slow: false,
+        long_holes: false,
     };
     let mut session = ProgressiveSession::new_partial(
         Box::new(set.provider()),
@@ -663,6 +687,7 @@ fn refused(volume: Vec<u8>) -> PartialErrorKind {
         holes: vec![Vec::new()],
         reads: Arc::default(),
         slow: false,
+        long_holes: false,
     };
     let mut session = ProgressiveSession::new_partial(
         Box::new(set.provider()),
@@ -1575,4 +1600,131 @@ fn encrypted_dead_volumes_refilled_inline_one_hole_at_a_time_cost_metadata_for_t
 fn dead_volumes_refilled_inline_at_full_scale_stay_within_default_limits() {
     inline_refills_of_dead_volumes(23, 88, None);
     inline_refills_of_dead_volumes(23, 88, Some("secret"));
+}
+
+/// Runs a three-volume set whose middle volume's whole data area is one hole and returns the `Hole` events, the
+/// session's final MetadataBytes, the member state's sequence (one per durable transaction), the member's handle and
+/// the session's directory.
+fn dead_middle_volume(
+    set: &Set,
+    password: Option<&str>,
+) -> (Vec<HoleReport>, u64, u64, PartialFile, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(&dir.path().join("out"), set.naming.name(0));
+    opts.set_password(password.map(String::from)).unwrap();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(set.provider()),
+        opts,
+        partial_options(&dir.path().join("state"), Arc::default()),
+    )
+    .unwrap();
+    let (mut holes, mut files) = (Vec::new(), Vec::new());
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => holes.push(report),
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    let used = session.resource_usage(Resource::MetadataBytes).used;
+    let file = files.pop().unwrap();
+    let sequence = file.state().unwrap().anchor().sequence();
+    (holes, used, sequence, file, dir)
+}
+
+/// RustyGet's dead volume, answered once: the source answers the middle volume's whole data area (92 MiB) with one
+/// `RangeRead::Hole`, longer than any read buffer. The session records it as one hole and one event, without the
+/// per-event journal bookkeeping of one answer per buffer, and refilling it in pieces verifies.
+#[test]
+fn a_dead_volume_answered_with_one_hole_is_one_record_and_one_event_and_refills_in_pieces() {
+    const MIB: usize = 1 << 20;
+    for password in [None, Some("secret")] {
+        let gold = gold(110 * MIB);
+        let mut set = match password {
+            None => Set::split(Naming::Old, &gold, &[8 * MIB, 100 * MIB]),
+            Some(p) => Set::aes_split(Naming::Old, &gold, &[8 * MIB, 92 * MIB, 10 * MIB], p),
+        };
+        let p1 = set.payloads[1].clone();
+        set.hole(1, p1.clone());
+        let (buffered, buffered_used, buffered_sequence, _, _) = dead_middle_volume(&set, password);
+        set.long_holes = true;
+        let (holes, used, sequence, mut file, dir) = dead_middle_volume(&set, password);
+        // One event for the dead volume's range (an encrypted member also reports the next volume's first block,
+        // whose previous ciphertext block is in the dead volume).
+        let dead: Vec<_> = holes.iter().filter(|h| h.packed.iter().any(|s| s.volume == 1)).collect();
+        assert_eq!(dead.len(), 1, "{password:?}: {holes:?}");
+        assert_eq!(dead[0].packed, vec![PackedSpan { volume: 1, range: p1.clone() }], "{password:?}");
+        assert!(holes.len() <= 2, "{password:?}: {holes:?}");
+        assert!(buffered.len() >= 92, "{password:?}: {} events one buffer per Hole", buffered.len());
+        // One buffer per Hole commits a transaction per event; one answer commits once.
+        assert!(
+            sequence + 80 < buffered_sequence,
+            "{password:?}: {sequence} transactions, {buffered_sequence} buffered"
+        );
+        assert!(used < buffered_used, "{password:?}: {used} metadata bytes, {buffered_used} buffered");
+        // One unknown output range: the next volume's first block, if reported, adjoins the dead range.
+        assert_eq!(file.remaining().unwrap().len(), 1, "{password:?}");
+        // Refill the dead volume in 7 MiB pieces, then whatever the next volume's first block still needs.
+        let volume = set.volumes[1].clone();
+        let mut at = 0;
+        while at < volume.len() as u64 {
+            let end = (at + 7 * MIB as u64).min(volume.len() as u64);
+            file.refill_from_packed(1, at..end, &mut std::io::Cursor::new(volume.as_slice())).unwrap();
+            at = end;
+        }
+        for hole in holes.iter().filter(|h| h.packed.iter().all(|s| s.volume != 1)) {
+            let span = &hole.packed[0];
+            let bytes = set.volumes[span.volume as usize].as_slice();
+            file.refill_from_packed(span.volume, span.range.clone(), &mut std::io::Cursor::new(bytes)).unwrap();
+        }
+        assert!(file.remaining().unwrap().is_empty(), "{password:?}");
+        assert!(matches!(verify(&mut file), Verdict::Ok { .. }), "{password:?}");
+        let name = if password.is_some() { "movie.mkv" } else { "big.bin" };
+        assert_eq!(fs::read(dir.path().join("out").join(name)).unwrap(), gold, "{password:?}");
+    }
+}
+
+/// A `Hole` longer than the buffer is accepted only by a persistent session reading member data: an ordinary
+/// session still fails it as a source contract violation.
+#[test]
+fn an_ordinary_session_still_refuses_a_hole_longer_than_its_buffer() {
+    let gold = gold(3 << 20);
+    let mut set = Set::split(Naming::Old, &gold, &[1 << 20, 2 << 20]);
+    set.long_holes = true;
+    let p1 = set.payloads[1].clone();
+    set.hole(1, p1);
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(&dir.path().join("out"), set.naming.name(0));
+    opts.limits.read_chunk = 4096;
+    let mut session = ProgressiveSession::new(Box::new(set.provider()), opts).unwrap();
+    let failure = loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => break format!("{failure:?}"),
+            Poll::Ready(Err(e)) => break format!("{e:?}"),
+            Poll::Ready(Ok(None)) => panic!("finished"),
+            _ => {}
+        }
+    };
+    assert!(failure.contains("SourceContract"), "{failure}");
+}
+
+/// A persistent session accepts a long `Hole` only up to the end of the part it is reading: an answer that runs
+/// past it (here past the volume's end) is still a source contract violation.
+#[test]
+fn a_persistent_session_refuses_a_hole_past_the_end_of_the_part() {
+    let gold = gold(3 << 20);
+    let mut set = Set::split(Naming::Old, &gold, &[1 << 20, 2 << 20]);
+    set.long_holes = true;
+    let p1 = set.payloads[1].clone();
+    let end = set.volumes[1].len() as u64 + 100;
+    set.hole(1, p1.start..end);
+    let (run, failure) = events_with(&set, false);
+    let failure = failure.expect("the long hole is refused");
+    assert!(failure.contains("SourceContract"), "{failure}");
+    assert!(run.holes.is_empty(), "{:?}", run.holes);
 }

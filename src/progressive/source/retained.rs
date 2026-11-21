@@ -485,6 +485,7 @@ impl SourceDriver {
                 control: &control,
                 usage: &mut usage,
                 verify: matches!(read.purpose, OriginalReadPurpose::Refill),
+                hole_max: 0,
                 #[cfg(feature = "persistent-partials")]
                 exclusions: exclusions.as_deref(),
                 #[cfg(feature = "persistent-partials")]
