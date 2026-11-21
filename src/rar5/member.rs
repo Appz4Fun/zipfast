@@ -445,7 +445,9 @@ impl MemberMachine {
         }
         // Extraction admits the bounded scratch before entering this producer.
         // A feed can complete up to one retained CBC block in addition to len.
-        if self.cipher.is_some() && len.checked_add(16).is_none_or(|n| n > self.scratch.capacity()) {
+        // A hole decrypts nothing (every block it touches is unknown), so only data needs scratch.
+        let decrypted = if data.is_some() { len } else { 0 };
+        if self.cipher.is_some() && decrypted.checked_add(16).is_none_or(|n| n > self.scratch.capacity()) {
             return Err(ProgressiveFailure::new(FailureKind::InvalidCapability));
         }
         let result = (|| -> Result<()> {

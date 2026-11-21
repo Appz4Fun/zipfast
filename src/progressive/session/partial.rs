@@ -999,8 +999,11 @@ impl ProgressiveSession {
             failure: None,
         };
         let machine = self.machine.as_mut().unwrap();
-        machine.reserve_progressive_scratch(count, &self.usage)?;
-        let result = machine.feed_stored(hole.is_none().then_some(&self.buffer[..count]), count, &mut sink);
+        // A hole decrypts nothing, so it needs no scratch whatever its length (a source may answer one longer than
+        // the read buffer).
+        machine.reserve_progressive_scratch(if hole.is_some() { 0 } else { count }, &self.usage)?;
+        let data = if hole.is_none() { Some(&self.buffer[..count]) } else { None };
+        let result = machine.feed_stored(data, count, &mut sink);
         let written = sink.written;
         if let Some(error) = sink.failure {
             return Err(error);
