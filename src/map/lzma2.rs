@@ -843,11 +843,9 @@ impl Lzma2Index {
             reset: if dict.is_empty() { Lzma2Reset::DictStateProps } else { Lzma2Reset::StateProps },
             props: Some(props),
         });
-        let shift_packed = pos + grown - first.packed_offset;
-        let shift_out = out - first.unpacked_offset;
         synthetic.extend(run[1..].iter().map(|c| Lzma2Chunk {
-            packed_offset: c.packed_offset + shift_packed,
-            unpacked_offset: c.unpacked_offset + shift_out,
+            packed_offset: pos + grown + (c.packed_offset - first.packed_offset),
+            unpacked_offset: out + (c.unpacked_offset - first.unpacked_offset),
             ..*c
         }));
         let total = run.iter().map(|c| c.unpacked_len).sum::<u64>();
