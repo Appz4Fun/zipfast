@@ -24,11 +24,13 @@ pub(crate) mod physical;
 pub mod reader;
 pub mod session;
 pub(crate) mod source;
+pub mod tail;
 #[doc(hidden)]
 pub mod testenc;
 pub mod unpack;
 mod unrar_name;
 
+pub use tail::{RebuiltTail, TailDoubt, rebuild_volume_tail};
 pub use unrar_name::{unrar_name, unrar_name_to_string};
 
 use crate::error::{Error, Result};
