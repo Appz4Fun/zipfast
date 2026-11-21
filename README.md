@@ -84,6 +84,9 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   its exact length, the bytes after the last file's packed data (quick open data, end of archive header, padding) exactly
   as rar wrote them, and whether that is certain, so a rebuilt volume passes par2; see
   [RAR 5.0 volume tails](docs/rar5-volume-tail.md).
+- Rebuilding encrypted stored data (`zipfast::crypto::rebuild_cbc`): the exact AES-CBC ciphertext of a RAR 5.0, 7z or
+  RAR 3.x/4.x encrypted stored member for a range of its plaintext, from the previous ciphertext block, checked
+  against the intact bytes after it; see [rebuilding encrypted data](docs/cbc-rebuild.md).
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused. A refused member fails alone and the run goes on: a link whose target leads out, and a member whose path
   runs through a link (one placed earlier in the run, or one a rename mode swapped in for a moved folder).

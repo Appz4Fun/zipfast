@@ -232,6 +232,81 @@ pub fn decrypt_cbc(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Why [`rebuild_cbc`] refused or rejected a rebuild.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CbcRebuildError {
+    /// The key is not 16, 24 or 32 bytes.
+    KeyLength,
+    /// The plaintext is not a whole number of 16-byte blocks and does not end the stream.
+    Unaligned,
+    /// The intact ciphertext given to check against does not overlap the rebuilt range.
+    NoOverlap,
+    /// The rebuilt ciphertext differs from the intact ciphertext at this byte of the rebuilt range: the key, the
+    /// plaintext or the previous ciphertext block is wrong.
+    Mismatch { at: usize },
+}
+
+impl std::fmt::Display for CbcRebuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeyLength => f.write_str("AES key is not 16, 24 or 32 bytes"),
+            Self::Unaligned => f.write_str("plaintext is not whole AES blocks and does not end the stream"),
+            Self::NoOverlap => f.write_str("intact ciphertext does not overlap the rebuilt range"),
+            Self::Mismatch { at } => write!(f, "rebuilt ciphertext differs from the intact ciphertext at byte {at}"),
+        }
+    }
+}
+
+impl std::error::Error for CbcRebuildError {}
+
+/// Rebuilds the exact AES-CBC ciphertext of an encrypted stored member for a range of its plaintext, so a range
+/// lost from the archive can be written back from plaintext supplied by another copy.
+///
+/// * `key`: the member's AES key: [`derive_rar5_key`] for RAR 5.0 (salt and count from [`rar5_record_params`] of
+///   the file's encryption record), [`derive_7z_key`] for 7z AES, [`derive_rar4_key_iv`] for RAR 3.x/4.x.
+/// * `previous`: the ciphertext block just before the range, or the IV when the range starts the stream (RAR 5.0:
+///   the file header's IV; 7z: the folder's IV, one per folder; RAR 3.x/4.x: the IV derived with the key). CBC runs
+///   on across a RAR volume boundary, so the previous block may be the last one of the previous volume.
+/// * `plaintext`: the member's output from a 16-byte-aligned offset of its stream (for a stored member the stream is
+///   the output).
+/// * `stream_end`: whether the range runs to the end of the member. Its last partial block is then padded with zero
+///   bytes before encryption, as rar 7.30 (RAR 5.0) and 7-Zip write it; otherwise `plaintext` must be whole blocks.
+///   (RAR 3.x/4.x padding could not be checked against rar, which no longer writes that format.)
+/// * `intact`: optionally `(offset, ciphertext)`: archive bytes that survive at `offset` within the rebuilt range.
+///   The overlap must match, which proves the key, the plaintext and the previous block. Give the first intact
+///   block after the hole.
+pub fn rebuild_cbc(
+    key: &[u8],
+    previous: &[u8; 16],
+    plaintext: &[u8],
+    stream_end: bool,
+    intact: Option<(usize, &[u8])>,
+) -> Result<Vec<u8>, CbcRebuildError> {
+    if !matches!(key.len(), 16 | 24 | 32) {
+        return Err(CbcRebuildError::KeyLength);
+    }
+    let rem = plaintext.len() % 16;
+    if rem != 0 && !stream_end {
+        return Err(CbcRebuildError::Unaligned);
+    }
+    let mut padded = Vec::with_capacity(plaintext.len() + 16);
+    padded.extend_from_slice(plaintext);
+    if rem != 0 {
+        padded.resize(plaintext.len() + 16 - rem, 0);
+    }
+    let rebuilt = encrypt_cbc(key, previous, &padded).ok_or(CbcRebuildError::KeyLength)?;
+    if let Some((offset, bytes)) = intact {
+        let end = offset.saturating_add(bytes.len()).min(rebuilt.len());
+        if bytes.is_empty() || offset >= end {
+            return Err(CbcRebuildError::NoOverlap);
+        }
+        if let Some(at) = rebuilt[offset..end].iter().zip(bytes).position(|(a, b)| a != b) {
+            return Err(CbcRebuildError::Mismatch { at: offset + at });
+        }
+    }
+    Ok(rebuilt)
+}
+
 /// Encrypts AES-CBC plaintext (`data` must be a multiple of 16 bytes).
 pub fn encrypt_cbc(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
     let cipher = AesKey::new(key)?;
