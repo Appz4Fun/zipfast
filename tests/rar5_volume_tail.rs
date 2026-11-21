@@ -323,7 +323,8 @@ fn a_small_piece_depends_on_the_quick_open_mode() {
         let rebuilt = rebuild_volume_tail_with(&v.head(), v.len, Some(v.more), Some(mode)).unwrap();
         assert!(rebuilt.exact, "{mode:?}: {:?}", rebuilt.doubt);
         assert_eq!(whole(&rebuilt), unhex(v.tail), "{mode:?}");
-        // The other mode's bytes are not claimed exact.
+        // The other mode's bytes differ, and the volume's length cannot always tell: a supplied mode is trusted, so
+        // take it from the set (`quick_open_mode`), never guess it.
         let other = if mode == QuickOpenMode::All { QuickOpenMode::LargeFiles } else { QuickOpenMode::All };
         let wrong = rebuild_volume_tail_with(&v.head(), v.len, Some(v.more), Some(other)).unwrap();
         assert_ne!(whole(&wrong), unhex(v.tail), "{mode:?}");
@@ -332,4 +333,15 @@ fn a_small_piece_depends_on_the_quick_open_mode() {
     let rebuilt = rebuild_volume_tail(&v.head(), v.len, Some(false)).unwrap();
     assert!(rebuilt.exact, "{:?}", rebuilt.doubt);
     assert_eq!(whole(&rebuilt), unhex(v.tail));
+}
+
+/// A middle volume whose last surviving file ends in it may have lost a later file header with the tail: rebuilt from
+/// a start that stops after that file, the result is doubted, and from the whole volume it is exact.
+#[test]
+fn a_middle_volume_ending_with_a_whole_file_is_doubted_from_its_start_alone() {
+    let v = QO_TWO_FILES;
+    let first_end = v.headers[2].0;
+    let rebuilt = rebuild_volume_tail(&v.head()[..first_end], v.len, Some(true)).unwrap();
+    assert!(!rebuilt.exact);
+    assert_eq!(rebuilt.offset, first_end as u64);
 }
