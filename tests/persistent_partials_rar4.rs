@@ -1545,7 +1545,9 @@ fn inline_refills_of_dead_volumes(volumes: usize, volume_mib: usize, password: O
     let mean = |c: &[i64]| c.iter().sum::<i64>() / c.len() as i64;
     let per_call = mean(&costs);
     assert!(per_call < 12 << 10, "a 1 MiB refill cost {per_call} metadata bytes");
-    let (early, late) = (mean(&costs[..8]), mean(&costs[costs.len() - 8..]));
+    // Refills that found nothing left to fill cost nothing; compare the ones that filled.
+    let filled: Vec<i64> = costs.iter().copied().filter(|&c| c > 0).collect();
+    let (early, late) = (mean(&filled[..8]), mean(&filled[filled.len() - 8..]));
     assert!(late <= early + 2048, "refills cost {early} metadata bytes early and {late} late");
     let metadata = session.resource_usage(Resource::MetadataBytes);
     assert!(metadata.used < metadata.limit / 4, "{metadata:?}");
