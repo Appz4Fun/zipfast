@@ -274,6 +274,8 @@ pub(super) struct Decrypted {
     pub plain: Vec<u8>,
     pub runs: Vec<(u64, Range<usize>)>,
     pub undecryptable: Vec<Range<u64>>,
+    /// Charge for `plain`, held as long as it lives: the buffer is freed when the fill ends.
+    _lease: Option<crate::progressive::Lease>,
 }
 /// Decrypts ciphertext `supply` starting at stream offset `at` into produced output, using the header IV for
 /// stream offset 0 and otherwise the previous ciphertext block from the supply or the kept blocks. The block right
@@ -289,7 +291,7 @@ pub(super) fn decrypt(
     let size = snapshot.head.size;
     let limit = stream_produced(snapshot);
     let end = (at + supply.len() as u64).min(limit);
-    let mut result = Decrypted { plain: Vec::new(), runs: Vec::new(), undecryptable: Vec::new() };
+    let mut result = Decrypted { plain: Vec::new(), runs: Vec::new(), undecryptable: Vec::new(), _lease: None };
     if at >= end {
         return Ok(result);
     }
@@ -300,7 +302,9 @@ pub(super) fn decrypt(
     // Bookkeeping follows the runs and intervals produced, not the blocks visited: a fill over mostly known output
     // costs what a plain fill does.
     budget.usage.charge(Resource::SourceBookkeeping, 1)?;
-    result.plain = budget.vector((last.min(size) - first.min(size)) as usize)?;
+    let (plain, lease) = budget.leased_vector((last.min(size) - first.min(size)) as usize)?;
+    result.plain = plain;
+    result._lease = Some(lease);
     let mut run: Option<(u64, usize)> = None;
     let mut previous = if first == 0 {
         Some(CipherBlock { offset: 0, have: 0..16, bytes: keys.iv.unwrap_or(crypt.iv) })
@@ -385,11 +389,16 @@ pub(super) fn keep(
     }
     Ok(blocks)
 }
-/// Produced output runs that are holes or alt output, in order.
-pub(super) fn unresolved_runs(budget: &PartialBudget, snapshot: &Snapshot) -> PartialResult<Vec<Range<u64>>> {
+/// Produced output runs that are holes or alt output, in order. The list is charged to the returned lease, held as
+/// long as the caller keeps the list.
+pub(super) fn unresolved_runs(
+    budget: &PartialBudget,
+    snapshot: &Snapshot,
+) -> PartialResult<(Vec<Range<u64>>, crate::progressive::Lease)> {
     let produced = snapshot.head.produced;
     budget.usage.charge(Resource::SourceBookkeeping, snapshot.known.len() as u64)?;
     let mut runs: Vec<Range<u64>> = Vec::new();
+    let mut lease = budget.metadata_lease(0)?;
     let mut push = |range: Range<u64>| -> PartialResult<()> {
         if range.start >= range.end {
             return Ok(());
@@ -398,7 +407,7 @@ pub(super) fn unresolved_runs(budget: &PartialBudget, snapshot: &Snapshot) -> Pa
             Some(last) if last.end == range.start => last.end = range.end,
             _ => {
                 budget.usage.check(Resource::HoleIntervals, runs.len() as u64 + 1)?;
-                budget.metadata(std::mem::size_of::<Range<u64>>() as u64)?;
+                lease.absorb(budget.metadata_lease(std::mem::size_of::<Range<u64>>() as u64)?);
                 runs.try_reserve(1).map_err(|_| malformed())?;
                 runs.push(range);
             }
@@ -417,5 +426,5 @@ pub(super) fn unresolved_runs(budget: &PartialBudget, snapshot: &Snapshot) -> Pa
         at = leaf.range.end;
     }
     push(at..produced)?;
-    Ok(runs)
+    Ok((runs, lease))
 }

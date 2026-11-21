@@ -351,8 +351,10 @@ impl Bundle {
         let (mut refs, list) = self.budget.leased_vector(pages.len())?;
         lease.absorb(list);
         let total: usize = pages.iter().map(|(_, bytes)| bytes.len()).sum();
-        let cache_lease = self.budget.metadata_lease(total as u64)?;
-        let mut cache = self.budget.vector(pages.len())?;
+        // The cache replaces the previous one: its list and bytes are charged while it lives.
+        let mut cache_lease = self.budget.metadata_lease(total as u64)?;
+        let (mut cache, list) = self.budget.leased_vector(pages.len())?;
+        cache_lease.absorb(list);
         let mut files = Vec::new();
         files.try_reserve_exact(pages.len()).map_err(|_| malformed())?;
         for (index, (kind, bytes)) in pages.into_iter().enumerate() {
