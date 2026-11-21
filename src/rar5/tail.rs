@@ -6,7 +6,8 @@
 //! * the quick open service header (`QO`), when the main header's locator says there is one. Its data caches an
 //!   exact copy of every file header in the volume, each with its distance back from the service header;
 //! * the end of archive header, whose one flag says whether more volumes follow;
-//! * zero padding up to the volume's length (rar reserves room for the quick open data before it knows its size).
+//! * zero padding up to the volume's length (rar reserves room for the quick open data before it knows its size),
+//!   returned as a count.
 //!
 //! [`rebuild_volume_tail`] produces those bytes as rar writes them and says whether the result is certain to match
 //! the original ([`RebuiltTail::exact`]), so a caller claims a par2-clean volume only when it is.
@@ -35,16 +36,22 @@ const ARCHIVE_RECOVERY: u64 = 0x8;
 const EXTRA_LOCATOR: u64 = 1;
 const LOCATOR_QUICK_OPEN: u64 = 0x1;
 const LOCATOR_RECOVERY: u64 = 0x2;
+/// The most zero padding a rebuilt middle volume may end with and still be called exact.
+const MAX_PADDING: u64 = 64;
 
 /// The rebuilt end of a volume.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebuiltTail {
     /// Offset in the volume where [`Self::bytes`] start: the end of the last file's packed data.
     pub offset: u64,
-    /// The volume's bytes from `offset` to its length.
+    /// The volume's headers from `offset`: the quick open data, if any, and the end of archive header.
     pub bytes: Vec<u8>,
-    /// Whether the bytes are certain to be the ones rar wrote. When `false`, [`Self::doubt`] says why.
+    /// Zero bytes that follow `bytes` up to the volume's length (rar reserves room for the quick open data before
+    /// it knows its size). Not held in memory: write this many zeros after `bytes`.
+    pub padding: u64,
+    /// Whether `bytes` and `padding` are certain to be what rar wrote. When `false`, [`Self::doubt`] says why.
     pub exact: bool,
+    /// Why the result might differ from the original, when it is not [`Self::exact`].
     pub doubt: Option<TailDoubt>,
 }
 
@@ -57,9 +64,12 @@ pub enum TailDoubt {
     /// The locator puts the quick open header somewhere other than right after the last file's data: something the
     /// surviving bytes do not show lies in between.
     QuickOpenElsewhere,
-    /// There is no quick open header and the tail does not end exactly at the volume's length: padding or headers
-    /// not shown by the surviving bytes.
+    /// The padding is not what rar leaves: any at all without quick open data or after the last volume's, or more
+    /// than the few bytes rar reserves after a middle volume's. So the volume's length is wrong, or it holds headers
+    /// the surviving bytes do not show.
     UnexpectedPadding,
+    /// The caller said no volumes follow, but the volume's last file continues in the next one.
+    MoreVolumesContradicted,
     /// The quick open data is too large for the field widths seen in rar's output.
     LargeQuickOpen,
     /// Bytes the caller supplied past [`RebuiltTail::offset`] differ from the rebuilt ones.
@@ -78,8 +88,9 @@ struct FileHead<'a> {
 ///
 /// `head` is the surviving start of the volume: at least through the last file header in it (the packed data need
 /// not be there). Bytes beyond the end of that file's data, if any, are compared with the rebuilt ones.
-/// `volume_len` is the volume's full length (from the NZB or the par2 set). `more_volumes` says whether volumes
-/// follow this one; `None` infers it from the last file header (a file that continues means more volumes).
+/// `volume_len` is the volume's exact length in bytes: from the par2 file description or the yEnc `=ybegin size=`,
+/// not from the NZB, whose segment sizes count encoded articles. `more_volumes` says whether volumes follow this one;
+/// `None` infers it from the last file header (a file that continues means more volumes).
 ///
 /// Fails with [`Error::NotAnArchive`] for anything but a RAR 5.0 volume starting at offset 0,
 /// [`Error::Truncated`] when `head` ends before a file header does, and [`Error::Unsupported`] for encrypted headers
@@ -139,6 +150,10 @@ pub fn rebuild_volume_tail(head: &[u8], volume_len: u64, more_volumes: Option<bo
     let last = files.last().expect("a file header was found");
     let mut doubt = None;
     let more = match more_volumes {
+        Some(false) if last.split_after => {
+            doubt = Some(TailDoubt::MoreVolumesContradicted);
+            false
+        }
         Some(more) => more,
         None if last.split_after => true,
         None => {
@@ -163,17 +178,19 @@ pub fn rebuild_volume_tail(head: &[u8], volume_len: u64, more_volumes: Option<bo
     let Some(padding) = volume_len.checked_sub(used) else {
         return Err(Error::Corrupt("the volume is shorter than its headers"));
     };
-    if quick_open.is_none() && padding != 0 {
+    // rar ends a volume without quick open data, and the last volume, right after the end of archive header, and
+    // leaves at most a few bytes after a middle volume's (6 to 15 in its output).
+    if padding != 0 && (quick_open.is_none() || !more) || padding > MAX_PADDING {
         doubt = doubt.or(Some(TailDoubt::UnexpectedPadding));
     }
-    bytes.resize(bytes.len() + usize::try_from(padding).map_err(|_| Error::Corrupt("volume length"))?, 0);
     if head.len() > tail_at {
         let supplied = &head[tail_at..];
-        if supplied.len() > bytes.len() || supplied != &bytes[..supplied.len()] {
+        let (headers, zeros) = supplied.split_at(supplied.len().min(bytes.len()));
+        if headers != &bytes[..headers.len()] || zeros.len() as u64 > padding || zeros.iter().any(|&b| b != 0) {
             doubt = doubt.or(Some(TailDoubt::DiffersFromSupplied));
         }
     }
-    Ok(RebuiltTail { offset: tail_at as u64, bytes, exact: doubt.is_none(), doubt })
+    Ok(RebuiltTail { offset: tail_at as u64, bytes, padding, exact: doubt.is_none(), doubt })
 }
 
 /// The block at `pos`: (type, header flags, data size, the header's fields after the size, offset after the
@@ -203,10 +220,10 @@ fn block(head: &[u8], pos: usize) -> Result<Option<(u64, u64, u64, &[u8], usize)
     Ok(Some((kind, flags, data, body, end)))
 }
 
-/// Archive flags and the locator record (its flags and quick open offset) of a main header's fields.
 /// A main header's locator record: its flags and the quick open header's offset from the main header.
 type Locator = (u64, Option<u64>);
 
+/// Archive flags and the locator record of a main header's fields.
 fn main_header(flags: u64, body: &[u8]) -> Result<(u64, Option<Locator>)> {
     let mut c = Cursor::new(body);
     let archive_flags = c.vint()?;

@@ -1,6 +1,13 @@
 //! Rebuilding the end of a RAR 5.0 volume byte for byte (`zipfast::rar5::rebuild_volume_tail`).
 
-use zipfast::rar5::{TailDoubt, rebuild_volume_tail};
+use zipfast::rar5::{RebuiltTail, TailDoubt, rebuild_volume_tail};
+
+/// The rebuilt bytes from the tail's offset to the volume's end: headers, then the padding zeros.
+fn whole(tail: &RebuiltTail) -> Vec<u8> {
+    let mut out = tail.bytes.clone();
+    out.resize(out.len() + tail.padding as usize, 0);
+    out
+}
 
 /// Volume sets made by rar 7.30, outside the repository: `ZIPFAST_RAR5_TAIL_SETS`, or the default fixtures path.
 fn sets() -> Option<std::path::PathBuf> {
@@ -36,11 +43,28 @@ fn every_volume_of_the_rar_made_sets_rebuilds_byte_for_byte() {
             }
             let rebuilt = rebuilt.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let offset = rebuilt.offset as usize;
-            assert_eq!(rebuilt.bytes, bytes[offset..], "{}", path.display());
+            assert_eq!(whole(&rebuilt), bytes[offset..], "{}", path.display());
             assert!(rebuilt.exact, "{}: {:?}", path.display(), rebuilt.doubt);
             // Lost from the end of the last file's data: the same bytes from the surviving start.
             let cut = rebuild_volume_tail(&bytes[..offset], bytes.len() as u64, more).unwrap();
             assert_eq!(cut, rebuilt, "{}", path.display());
+            checked += 1;
+        }
+    }
+    // Volumes of a 3 GB member, kept as their first and last 4 KiB: rar's default quick open mode still caches the
+    // header of a member this large, and its file header's padded fields are copied as they are.
+    let slices = dir.with_file_name("rar5-tail-big").join("slices");
+    if slices.is_dir() {
+        for name in ["big-default-01", "big-default-08", "big-default-16", "big-qoplus-08", "big-qoplus-16"] {
+            let head = std::fs::read(slices.join(format!("{name}.head"))).unwrap();
+            let end = std::fs::read(slices.join(format!("{name}.tail"))).unwrap();
+            let len: u64 = std::fs::read_to_string(slices.join(format!("{name}.len"))).unwrap().trim().parse().unwrap();
+            let more = Some(!name.ends_with("-16"));
+            let rebuilt = rebuild_volume_tail(&head, len, more).unwrap();
+            assert!(rebuilt.exact, "{name}: {:?}", rebuilt.doubt);
+            let tail = whole(&rebuilt);
+            assert_eq!(tail, end[end.len() - tail.len()..], "{name}");
+            assert_eq!(rebuilt.offset + tail.len() as u64, len, "{name}");
             checked += 1;
         }
     }
@@ -134,8 +158,11 @@ fn rar_made_volume_ends_rebuild_byte_for_byte() {
     ] {
         let rebuilt = rebuild_volume_tail(&v.head(), v.len, Some(v.more)).unwrap();
         assert_eq!(rebuilt.offset, v.tail_at as u64, "{name}");
-        assert_eq!(rebuilt.bytes, unhex(v.tail), "{name}");
+        assert_eq!(whole(&rebuilt), unhex(v.tail), "{name}");
         assert!(rebuilt.exact, "{name}: {:?}", rebuilt.doubt);
+        // The usual loss: the surviving bytes end inside the last file's packed data.
+        let cut = rebuild_volume_tail(&v.head()[..v.tail_at - 1000], v.len, Some(v.more)).unwrap();
+        assert_eq!(cut, rebuilt, "{name}");
         // A file that continues in the next volume says more volumes follow without being told.
         if v.more {
             assert_eq!(rebuild_volume_tail(&v.head(), v.len, None).unwrap(), rebuilt, "{name}");
@@ -148,7 +175,7 @@ fn rar_made_volume_ends_rebuild_byte_for_byte() {
 fn an_inferred_last_volume_is_not_claimed_exact() {
     let v = QO_PASSWORD_LAST;
     let rebuilt = rebuild_volume_tail(&v.head(), v.len, None).unwrap();
-    assert_eq!(rebuilt.bytes, unhex(v.tail));
+    assert_eq!(whole(&rebuilt), unhex(v.tail));
     assert!(!rebuilt.exact);
     assert_eq!(rebuilt.doubt, Some(TailDoubt::MoreVolumesInferred));
 }
@@ -164,7 +191,23 @@ fn a_rebuild_that_cannot_be_certain_says_why() {
     head.extend(&tail);
     let rebuilt = rebuild_volume_tail(&head, v.len, Some(true)).unwrap();
     assert_eq!(rebuilt.doubt, Some(TailDoubt::DiffersFromSupplied));
-    assert_eq!(rebuilt.bytes, unhex(v.tail), "the rebuilt bytes are still rar's");
+    assert_eq!(whole(&rebuilt), unhex(v.tail), "the rebuilt bytes are still rar's");
+
+    // A wrong length: padding after the last volume's end header, or far more than rar reserves after a middle one.
+    let v = QO_PASSWORD_LAST;
+    let rebuilt = rebuild_volume_tail(&v.head(), v.len + 3, Some(false)).unwrap();
+    assert_eq!(rebuilt.doubt, Some(TailDoubt::UnexpectedPadding));
+    let v = QO_MIDDLE;
+    let rebuilt = rebuild_volume_tail(&v.head(), v.len + 100, Some(true)).unwrap();
+    assert_eq!(rebuilt.doubt, Some(TailDoubt::UnexpectedPadding));
+    // An untrusted length as large as it gets: the padding is a count, never allocated.
+    let rebuilt = rebuild_volume_tail(&v.head(), u64::MAX, Some(true)).unwrap();
+    assert_eq!(rebuilt.doubt, Some(TailDoubt::UnexpectedPadding));
+    assert_eq!(rebuilt.padding, u64::MAX - v.tail_at as u64 - rebuilt.bytes.len() as u64);
+
+    // Told no volumes follow, although the last file continues in the next one.
+    let rebuilt = rebuild_volume_tail(&v.head(), v.len, Some(false)).unwrap();
+    assert_eq!(rebuilt.doubt, Some(TailDoubt::MoreVolumesContradicted));
 
     let v = NO_QO_MIDDLE;
     let rebuilt = rebuild_volume_tail(&v.head(), v.len + 16, Some(true)).unwrap();

@@ -81,7 +81,7 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   member, says whether it is stored, compressed, data-encrypted or behind encrypted headers, and whether its bytes
   can be borrowed; see [probing](docs/probe.md).
 - Rebuilding a lost RAR 5.0 volume end (`zipfast::rar5::rebuild_volume_tail`): from a volume's surviving start and
-  its length, the bytes after the last file's packed data (quick open data, end of archive header, padding) exactly
+  its exact length, the bytes after the last file's packed data (quick open data, end of archive header, padding) exactly
   as rar wrote them, and whether that is certain, so a rebuilt volume passes par2; see
   [RAR 5.0 volume tails](docs/rar5-volume-tail.md).
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
