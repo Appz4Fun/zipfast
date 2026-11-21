@@ -1464,12 +1464,18 @@ fn an_inline_patch_costs_verify_work_for_its_own_bytes_only() {
 
 /// RustyGet's inline patching: three dead middle volumes are answered entirely as holes, one read buffer per
 /// Hole, and once a volume's holes are all reported each hole range is refilled with its own `refill_from_packed`
-/// call while the session keeps extracting. Output grows between the refills.
-fn inline_refills_of_dead_volumes(volumes: usize, volume_mib: usize) {
+/// call while the session keeps extracting. Output grows between the refills. With `password` the member is RAR4
+/// AES, so every refill also decrypts.
+fn inline_refills_of_dead_volumes(volumes: usize, volume_mib: usize, password: Option<&str>) {
     const MIB: usize = 1 << 20;
     let gold = gold(volumes * volume_mib * MIB);
-    let cuts: Vec<usize> = (1..volumes).map(|v| v * volume_mib * MIB).collect();
-    let mut set = Set::split(Naming::Old, &gold, &cuts);
+    let mut set = match password {
+        None => {
+            let cuts: Vec<usize> = (1..volumes).map(|v| v * volume_mib * MIB).collect();
+            Set::split(Naming::Old, &gold, &cuts)
+        }
+        Some(password) => Set::aes_split(Naming::Old, &gold, &vec![volume_mib * MIB; volumes], password),
+    };
     let dead = [volumes * 7 / 23, volumes * 13 / 23, volumes * 14 / 23];
     for &d in &dead {
         let p = set.payloads[d].clone();
@@ -1477,29 +1483,39 @@ fn inline_refills_of_dead_volumes(volumes: usize, volume_mib: usize) {
     }
     let dir = tempfile::tempdir().unwrap();
     let anchors = Arc::new(Anchors::default());
+    let mut opts = options(&dir.path().join("out"), set.naming.name(0));
+    opts.set_password(password.map(String::from)).unwrap();
     let mut session = ProgressiveSession::new_partial(
         Box::new(set.provider()),
-        options(&dir.path().join("out"), set.naming.name(0)),
+        opts,
         partial_options(&dir.path().join("state"), anchors.clone()),
     )
     .unwrap();
-    let used = |s: &ProgressiveSession| s.resource_usage(Resource::MetadataBytes).used;
+    let used = |s: &ProgressiveSession| s.resource_usage(Resource::MetadataBytes).used as i64;
     let mut files: Vec<PartialFile> = Vec::new();
-    // Hole ranges reported per volume, and the bytes they cover.
+    // Hole spans reported per volume not yet refilled, and the bytes reported per volume.
     let mut pending: Vec<Vec<PackedSpan>> = vec![Vec::new(); volumes];
     let mut seen = vec![0u64; volumes];
-    let mut ready: Vec<usize> = Vec::new();
-    let (mut calls, mut refill_cost) = (0u64, 0i64);
+    let mut costs = Vec::new();
+    let mut refill = |files: &mut Vec<PartialFile>, session: &ProgressiveSession, spans: Vec<PackedSpan>| {
+        for span in spans {
+            let before = used(session);
+            let mut reader = std::io::Cursor::new(set.volumes[span.volume as usize].as_slice());
+            files[0].refill_from_packed(span.volume, span.range.clone(), &mut reader).unwrap();
+            costs.push(used(session) - before);
+        }
+    };
     loop {
         let event = session.poll_event(&mut Context::from_waker(Waker::noop()));
-        for d in ready.drain(..) {
-            let spans: Vec<PackedSpan> = std::mem::take(&mut pending[d]);
-            for span in spans {
-                let before = used(&session) as i64;
-                let mut reader = std::io::Cursor::new(set.volumes[d].as_slice());
-                files[0].refill_from_packed(span.volume, span.range.clone(), &mut reader).unwrap();
-                refill_cost += used(&session) as i64 - before;
-                calls += 1;
+        // A volume is patched once all its holes are reported; an encrypted member's neighbour-block report can
+        // come later, and is patched on the next poll.
+        for v in 0..volumes {
+            // An encrypted member also reports the next volume's first block (its previous block is in this
+            // volume): wait for it, so the refill keeps the ciphertext block it needs.
+            let neighbour = password.is_none() || v + 1 == volumes || seen[v + 1] > 0;
+            if !pending[v].is_empty() && neighbour && seen[v] >= set.payloads[v].end - set.payloads[v].start {
+                let spans = std::mem::take(&mut pending[v]);
+                refill(&mut files, &session, spans);
             }
         }
         match event {
@@ -1511,9 +1527,6 @@ fn inline_refills_of_dead_volumes(volumes: usize, volume_mib: usize) {
                     let v = span.volume as usize;
                     seen[v] += span.range.end - span.range.start;
                     pending[v].push(span.clone());
-                    if seen[v] == set.payloads[v].end - set.payloads[v].start {
-                        ready.push(v);
-                    }
                 }
             }
             Poll::Ready(Ok(None)) => break,
@@ -1522,28 +1535,42 @@ fn inline_refills_of_dead_volumes(volumes: usize, volume_mib: usize) {
             _ => {}
         }
     }
-    assert!(calls as usize >= 3 * volume_mib, "{calls} refills: one per hole, a hole per read buffer");
-    // A refill of a hole range costs metadata for the bytes it adds to the known index (about 1 KiB per MiB),
-    // not a read buffer or a copy of anything that grows with the member.
-    let per_call = refill_cost / calls as i64;
-    assert!(per_call < 8 << 10, "a 1 MiB refill cost {per_call} metadata bytes");
+    for spans in std::mem::take(&mut pending) {
+        refill(&mut files, &session, spans);
+    }
+    drop(refill);
+    assert!(costs.len() >= 3 * volume_mib, "{} refills: one per hole, a hole per read buffer", costs.len());
+    // A refill of a hole range costs metadata for the bytes it adds to the known index (a few KiB per MiB), not a
+    // read or decryption buffer, nor anything that grows with the member, its holes or earlier refills.
+    let mean = |c: &[i64]| c.iter().sum::<i64>() / c.len() as i64;
+    let per_call = mean(&costs);
+    assert!(per_call < 12 << 10, "a 1 MiB refill cost {per_call} metadata bytes");
+    let (early, late) = (mean(&costs[..8]), mean(&costs[costs.len() - 8..]));
+    assert!(late <= early + 2048, "refills cost {early} metadata bytes early and {late} late");
     let metadata = session.resource_usage(Resource::MetadataBytes);
     assert!(metadata.used < metadata.limit / 4, "{metadata:?}");
     let file = &mut files[0];
     assert!(file.remaining().unwrap().is_empty());
     assert!(matches!(verify(file), Verdict::Ok { .. }));
-    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), gold);
+    let name = if password.is_some() { "movie.mkv" } else { "big.bin" };
+    assert_eq!(fs::read(dir.path().join("out").join(name)).unwrap(), gold);
 }
 
 #[test]
 fn dead_volumes_refilled_inline_one_hole_at_a_time_cost_metadata_for_their_bytes_only() {
-    inline_refills_of_dead_volumes(23, 8);
+    inline_refills_of_dead_volumes(23, 8, None);
+}
+
+#[test]
+fn encrypted_dead_volumes_refilled_inline_one_hole_at_a_time_cost_metadata_for_their_bytes_only() {
+    inline_refills_of_dead_volumes(23, 8, Some("secret"));
 }
 
 /// [`inline_refills_of_dead_volumes`] at RustyGet's scale: about 2 GB in 23 volumes of 88 MiB, 264 holes and
-/// refills. Slow; run with `cargo test --release -- --ignored`.
+/// refills, plain and encrypted. Slow and about 9 GB of memory; run with `cargo test --release -- --ignored`.
 #[test]
 #[ignore]
 fn dead_volumes_refilled_inline_at_full_scale_stay_within_default_limits() {
-    inline_refills_of_dead_volumes(23, 88);
+    inline_refills_of_dead_volumes(23, 88, None);
+    inline_refills_of_dead_volumes(23, 88, Some("secret"));
 }

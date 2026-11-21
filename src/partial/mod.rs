@@ -781,7 +781,7 @@ impl PartialCore {
         let produced = snapshot.head.produced;
         let mut targets: Vec<Range<u64>> = Vec::new();
         if snapshot.crypt.is_some() {
-            let runs = cipher::unresolved_runs(&self.budget, snapshot)?;
+            let (runs, _runs_lease) = cipher::unresolved_runs(&self.budget, snapshot)?;
             let total = cipher::stream_total(snapshot);
             let back = if self.keys.is_some() && !self.keys_proven.load(Ordering::Acquire) { 32 } else { 16 };
             for (part, stream) in cipher::parts_with_stream(snapshot).filter(|(p, _)| p.packed.volume == volume) {
