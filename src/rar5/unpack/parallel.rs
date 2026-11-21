@@ -190,7 +190,7 @@ impl Packed {
 /// Short codes can stand for far more tokens than that; past it the worker stops and the calling thread decodes the
 /// rest of the block itself.
 pub(super) const BUDGET: usize = 4;
-const SLACK: usize = 1 << 20;
+pub(super) const SLACK: usize = 1 << 20;
 
 pub(super) struct Pool {
     jobs: Option<mpsc::Sender<Job>>,
