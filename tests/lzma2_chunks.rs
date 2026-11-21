@@ -802,3 +802,81 @@ fn plan_starts_a_new_decode_piece_at_each_dictionary_reset() {
         Err(Lzma2DecodeError::Unindexed { unpacked }) if unpacked == r.unpacked_offset
     ));
 }
+
+/// RustyGet's restart: the chunks before a state reset are lost, but the plaintext before it is known (another copy
+/// of the file). Decoding from that chunk with the known plaintext as the dictionary gives the same output as
+/// decoding from the start, for every state reset in the stream, with or without its own props.
+#[test]
+fn a_state_reset_restarts_with_a_supplied_dictionary() {
+    let plain = mixed();
+    let packed = encode(&plain);
+    let index = index(&packed);
+    let restarts: Vec<usize> = (0..index.chunks.len())
+        .filter(|&i| matches!(index.chunks[i].reset, Lzma2Reset::State | Lzma2Reset::StateProps))
+        .collect();
+    assert!(!restarts.is_empty(), "the mixed stream has state resets after its stored chunks");
+    for &i in &restarts {
+        let c = index.chunks[i];
+        let end = (i + 3).min(index.chunks.len());
+        let out_end = index.chunks[end - 1].unpacked().end;
+        let dictionary = &plain[..c.unpacked_offset as usize];
+        let out = index.decode_with_dictionary(i..end, &packed, 0, DICT_PROP, dictionary, &opts()).unwrap();
+        assert_eq!(out, plain[c.unpacked_offset as usize..out_end as usize], "chunk {i} ({:?})", c.reset);
+        // Only the packed bytes from that chunk on are needed.
+        let from = &packed[c.packed_offset as usize..];
+        let again =
+            index.decode_with_dictionary(i..end, from, c.packed_offset, DICT_PROP, dictionary, &opts()).unwrap();
+        assert_eq!(again, out);
+    }
+    // The same chunk with its own props (`0xC0`, as an encoder that changes props mid-stream writes it): rewrite its
+    // header in the stream, index again and restart there.
+    let i = restarts[0];
+    let c = index.chunks[i];
+    let props = index.props_for(i).unwrap();
+    let at = c.packed_offset as usize;
+    let mut with_props = packed[..at].to_vec();
+    with_props.push(0xC0 | (packed[at] & 0x1F));
+    with_props.extend_from_slice(&packed[at + 1..at + 5]);
+    with_props.push(props);
+    with_props.extend_from_slice(&packed[at + 5..]);
+    let rewritten = self::index(&with_props);
+    assert_eq!(rewritten.chunks[i].reset, Lzma2Reset::StateProps);
+    let end = (i + 3).min(rewritten.chunks.len());
+    let out_end = rewritten.chunks[end - 1].unpacked().end as usize;
+    let out = rewritten
+        .decode_with_dictionary(i..end, &with_props, 0, DICT_PROP, &plain[..c.unpacked_offset as usize], &opts())
+        .unwrap();
+    assert_eq!(out, plain[c.unpacked_offset as usize..out_end]);
+    // A wrong dictionary does not give the file's bytes back.
+    let c = index.chunks[i];
+    let mut wrong = plain[..c.unpacked_offset as usize].to_vec();
+    let at = wrong.len() - 1000;
+    wrong[at..].iter_mut().for_each(|b| *b ^= 0x5a);
+    let out = index.decode_with_dictionary(i..i + 1, &packed, 0, DICT_PROP, &wrong, &opts());
+    assert!(out.map_or(true, |o| o != plain[c.unpacked().start as usize..c.unpacked().end as usize]));
+}
+
+#[test]
+fn a_restart_needs_a_state_reset() {
+    let plain = text(3_000_000, 4);
+    let packed = encode(&plain);
+    let index = index(&packed);
+    // A chunk that continues the LZMA state cannot restart.
+    let i = index.chunks.iter().position(|c| c.reset == Lzma2Reset::None && c.kind == Lzma2ChunkKind::Lzma);
+    if let Some(i) = i {
+        let c = index.chunks[i];
+        let r = index.decode_with_dictionary(
+            i..i + 1,
+            &packed,
+            0,
+            DICT_PROP,
+            &plain[..c.unpacked_offset as usize],
+            &opts(),
+        );
+        assert!(matches!(r, Err(Lzma2DecodeError::NotStateReset { .. })), "{r:?}");
+    }
+    // The first chunk resets the dictionary: the supplied one is not needed.
+    let c = index.chunks[0];
+    let out = index.decode_with_dictionary(0..1, &packed, 0, DICT_PROP, b"ignored", &opts()).unwrap();
+    assert_eq!(out, plain[..c.unpacked_len as usize]);
+}

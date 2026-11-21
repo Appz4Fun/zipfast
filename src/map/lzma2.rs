@@ -747,6 +747,89 @@ impl Lzma2Index {
         decode_run(&self.chunks[from..=chunk], packed, packed_base, dict_prop, options, target.unpacked())
     }
 
+    /// The LZMA props byte in effect for chunk `chunk`: its own, or the last one set before it. None when no chunk
+    /// up to it sets props (a resumed walk).
+    pub fn props_for(&self, chunk: usize) -> Option<u8> {
+        self.chunks.get(..=chunk)?.iter().rev().find_map(|c| c.props)
+    }
+
+    /// Decodes chunks `chunks` from a state reset, with the dictionary supplied by the caller instead of decoded from
+    /// the last dictionary reset: the plaintext before the first chunk's output is known (from another copy of the
+    /// file, say), so decoding can restart after a hole without the chunks before it.
+    ///
+    /// The first chunk must reset the LZMA state (`0xA0` and up); one that also resets the dictionary needs no
+    /// dictionary and decodes as in [`Self::decode_chunks`]. `dictionary` is the output just before that chunk, up to
+    /// its offset; only its last bytes, as many as the coder's dictionary size (`dict_prop`), are used. The LZMA
+    /// props of a chunk that does not set them come from the last chunk that did ([`Self::props_for`]). `packed`
+    /// (byte 0 at `packed_base`) must cover the chunks. Returns their output; a wrong dictionary decodes to wrong
+    /// bytes or fails with [`Lzma2DecodeError::Data`], so check the result (the file's CRC).
+    pub fn decode_with_dictionary(
+        &self,
+        chunks: Range<usize>,
+        packed: &[u8],
+        packed_base: u64,
+        dict_prop: u8,
+        dictionary: &[u8],
+        options: &Lzma2DecodeOptions,
+    ) -> Result<Vec<u8>, Lzma2DecodeError> {
+        let start = chunks.start;
+        let run = self.chunks.get(chunks.clone()).ok_or(Lzma2DecodeError::NotContiguous)?;
+        let first = *run.first().ok_or(Lzma2DecodeError::NotContiguous)?;
+        if first.reset.resets_dictionary() {
+            return self.decode_chunks(chunks, packed, packed_base, dict_prop, options);
+        }
+        let props = match first.reset {
+            Lzma2Reset::State | Lzma2Reset::StateProps if first.kind == Lzma2ChunkKind::Lzma => self.props_for(start),
+            _ => None,
+        }
+        .ok_or(Lzma2DecodeError::NotStateReset { offset: first.packed_offset })?;
+        if dict_prop > 40 {
+            return Err(Lzma2DecodeError::BadDictionaryProp(dict_prop));
+        }
+        let last = run.last().expect("nonempty");
+        let input = slice(packed, packed_base, first.packed_offset..last.packed().end)?;
+        // The dictionary as stored chunks (the first resets the dictionary), then the first chunk with its control
+        // byte setting props so the decoder starts the LZMA state from them, then the rest as they are.
+        let keep = dictionary.len().min(usize::try_from(lzma2_dict(dict_prop)).unwrap_or(usize::MAX));
+        let dict = &dictionary[dictionary.len() - keep..];
+        bound(Lzma2Bound::Dictionary, options.max_dictionary, dict.len() as u64)?;
+        let mut stream = Vec::new();
+        stream.try_reserve_exact(dict.len() + dict.len() / 65_536 * 3 + 3 + input.len() + 1).map_err(|_| {
+            Lzma2DecodeError::Limit {
+                bound: Lzma2Bound::Output,
+                limit: options.max_output,
+                attempted: dict.len() as u64,
+            }
+        })?;
+        for (i, piece) in dict.chunks(65_536).enumerate() {
+            let size = piece.len() - 1;
+            stream.extend_from_slice(&[if i == 0 { 0x01 } else { 0x02 }, (size >> 8) as u8, size as u8]);
+            stream.extend_from_slice(piece);
+        }
+        let header = first.header_len() as usize;
+        let hdr = &input[..header];
+        if dict.is_empty() {
+            // No dictionary: the chunk must not refer back, so it starts the stream with a dictionary reset.
+            stream.extend_from_slice(&[0xE0 | (hdr[0] & 0x1F), hdr[1], hdr[2], hdr[3], hdr[4], props]);
+        } else {
+            stream.extend_from_slice(&[0xC0 | (hdr[0] & 0x1F), hdr[1], hdr[2], hdr[3], hdr[4], props]);
+        }
+        stream.extend_from_slice(&input[header..]);
+        // Index the made-up stream and decode it, keeping the run's output.
+        let mut synthetic = Vec::with_capacity(run.len() + dict.len() / 65_536 + 1);
+        let (mut pos, mut out) = (0usize, 0u64);
+        while pos < stream.len() {
+            let c = parse_chunk(&stream[pos..pos + 6.min(stream.len() - pos)], pos as u64, out);
+            pos += c.packed_len as usize;
+            out += c.unpacked_len;
+            synthetic.push(c);
+        }
+        let total = run.iter().map(|c| c.unpacked_len).sum::<u64>();
+        let skip = dict.len() as u64;
+        decode_run(&synthetic, &stream, 0, dict_prop, options, skip..skip + total)
+            .and_then(|out| check_output(out, total))
+    }
+
     /// Output range `unpacked`: stored payloads copied from `packed`, LZMA runs decoded from their dictionary reset
     /// (streaming, keeping only the wanted bytes). `packed` (byte 0 at `packed_base`) must cover the packed bytes
     /// the [`Self::plan`] pieces need, including the runs from each `from` chunk. Fails with
@@ -886,6 +969,11 @@ pub enum Lzma2DecodeError {
     NotDictionaryReset {
         offset: u64,
     },
+    /// [`Lzma2Index::decode_with_dictionary`] cannot start at the chunk at packed offset `offset`: it resets neither
+    /// the dictionary nor the LZMA state (or no chunk before it set the LZMA props).
+    NotStateReset {
+        offset: u64,
+    },
     /// The chunks given are not consecutive, or out of range.
     NotContiguous,
     /// The 7z LZMA2 property byte is above 40.
@@ -918,6 +1006,7 @@ impl std::fmt::Display for Lzma2DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotDictionaryReset { offset } => write!(f, "LZMA2 chunk at {offset} does not reset the dictionary"),
+            Self::NotStateReset { offset } => write!(f, "LZMA2 chunk at {offset} does not reset the LZMA state"),
             Self::NotContiguous => write!(f, "LZMA2 chunks are not consecutive"),
             Self::BadDictionaryProp(b) => write!(f, "bad LZMA2 dictionary property {b}"),
             Self::Limit { bound, limit, attempted } => {
