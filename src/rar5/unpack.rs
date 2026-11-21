@@ -29,8 +29,10 @@ use std::sync::Arc;
 
 mod crc;
 mod parallel;
+mod resync;
 use super::reader::Piece;
 use parallel::{Boundary, Done, Job, OWN, Packed, Part, Pool, Slot, block_bytes};
+pub use resync::{Resync, ResyncError, resync};
 
 /// Where decoded output goes.
 pub trait Sink {
