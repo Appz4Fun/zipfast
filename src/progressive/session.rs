@@ -200,6 +200,11 @@ enum Phase {
     Done,
 }
 /// A serialized, caller-driven extraction session. Delivered artifacts outlive it.
+/// The longest `Hole` answer a persistent session accepts in one read (see `SourceDriver::allow_long_hole`):
+/// 256 MiB, or less where a usize is smaller.
+#[cfg(feature = "persistent-partials")]
+const LONG_HOLE: u64 = if usize::MAX as u64 > (256 << 20) { 256 << 20 } else { usize::MAX as u64 };
+
 pub struct ProgressiveSession {
     #[cfg(feature = "persistent-partials")]
     partial: Option<partial::Persistent>,
@@ -798,9 +803,11 @@ impl ProgressiveSession {
                     let n = self.read_len(self.remaining.min(self.buffer.len() as u64) as usize, work);
                     // A persistent session records a hole without buffering it, so the source may answer one
                     // longer than the buffer, up to the end of this part: one record and one event per range.
+                    // At most LONG_HOLE per answer, so recording one (a pass over its blocks when encrypted)
+                    // stays a bounded step between cancellation checks, and its length fits a usize.
                     #[cfg(feature = "persistent-partials")]
                     if self.partial_active() {
-                        self.driver.allow_long_hole(self.remaining);
+                        self.driver.allow_long_hole(self.remaining.min(LONG_HOLE));
                     }
                     match self.driver.poll_step(cx, &mut self.buffer[..n]) {
                         Poll::Pending => {

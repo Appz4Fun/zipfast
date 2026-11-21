@@ -77,10 +77,11 @@ pub enum RangeRead {
     },
     NotYet,
     /// `len` unreadable bytes from the requested offset. Normally at most the buffer's length. A persistent
-    /// session (`ProgressiveSession::new_partial`) reading a member's data also accepts a longer one, up to the
-    /// end of that member's packed data in the volume (never past the volume's length or the next range declared
-    /// with `declare_hole`), and records it as one hole and one `Hole` event; a longer answer anywhere else is a
-    /// `SourceContract` failure. So a source that knows a whole range is lost (a dead volume, say) can answer it
+    /// session (`ProgressiveSession::new_partial`) extracting a member's data also accepts a longer one, up to the
+    /// end of that member's packed data in the volume and at most 256 MiB, and not past the next range declared
+    /// with `declare_hole`, and records it as one hole and one `Hole` event. A longer answer inside the volume is
+    /// accepted up to that limit and the rest is read again; one past the volume's length, or longer than the
+    /// buffer anywhere else, is a `SourceContract` failure. So a source that knows a whole range is lost (a dead volume, say) can answer it
     /// once instead of once per buffer.
     Hole {
         len: u64,
@@ -432,6 +433,10 @@ struct PendingPartialRead {
     requested: u64,
     /// The longest hole allowed for the read, as [`RangeOperation::hole_max`] resolved against `requested`.
     hole_max: u64,
+    /// Whether the read allowed a long hole, so a longer one inside the volume is trimmed rather than refused.
+    long: bool,
+    /// The volume's length when the read was made.
+    length: u64,
     answer: RangeRead,
     bytes: Vec<u8>,
 }
@@ -485,7 +490,8 @@ fn poll_available(
         }
         let pending = op.pending.take().unwrap();
         buf[..pending.bytes.len()].copy_from_slice(&pending.bytes);
-        return accept_available(original, op, pending.offset, pending.requested, pending.hole_max, pending.answer);
+        let limits = HoleLimits { max: pending.hole_max, long: pending.long, length: pending.length };
+        return accept_available(original, op, pending.offset, pending.requested, limits, pending.answer);
     }
     let length = original.live.length.value();
     if offset == length {
@@ -504,6 +510,7 @@ fn poll_available(
     let count = (length - offset).min(buf.len() as u64);
     // A hole may run past the buffer when the session allows it, but never past the volume's current length.
     let hole_max = op.hole_max.min(length - offset).max(count);
+    let limits = HoleLimits { max: hole_max, long: op.hole_max > 0, length };
     op.usage.check(Resource::ReadChunk, count)?;
     op.usage.charge(Resource::SourceRequests, 1)?;
     op.gate.arm();
@@ -527,25 +534,51 @@ fn poll_available(
     if !matches!(answer, RangeRead::NotYet) && !partial_read_stable(original, &mut op)? {
         let n = match answer {
             RangeRead::Filled { count: n } if n > 0 && n <= count as usize => n,
-            RangeRead::Hole { len } if len > 0 && len <= hole_max => 0,
+            RangeRead::Hole { len } if len > 0 && limits.accepts(offset, len).is_some() => 0,
             _ => return Err(contract()),
         };
         op.usage.charge(Resource::MetadataBytes, n as u64)?;
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(n).map_err(|_| contract())?;
         bytes.extend_from_slice(&buf[..n]);
-        *op.pending = Some(PendingPartialRead { offset, requested: count, hole_max, answer, bytes });
+        *op.pending =
+            Some(PendingPartialRead { offset, requested: count, hole_max, long: limits.long, length, answer, bytes });
         op.gate.notify(false);
         return Ok(Poll::Pending);
     }
-    accept_available(original, op, offset, count, hole_max, answer)
+    accept_available(original, op, offset, count, limits, answer)
+}
+/// How long a `Hole` answer to one read may be.
+#[derive(Clone, Copy)]
+struct HoleLimits {
+    /// The longest hole accepted as answered (at least the buffer).
+    max: u64,
+    /// Whether the session allowed a long hole: a longer answer inside the volume is then trimmed to `max` (the rest
+    /// is read again), since the source cannot see where the part ends or what the caller declared.
+    long: bool,
+    /// The volume's length.
+    length: u64,
+}
+impl HoleLimits {
+    /// The hole length to accept for an answer of `len` at `offset`, or `None` if the answer breaks the contract.
+    fn accepts(&self, offset: u64, len: u64) -> Option<u64> {
+        if len == 0 {
+            None
+        } else if len <= self.max {
+            Some(len)
+        } else if self.long && len <= self.length.saturating_sub(offset) {
+            Some(self.max)
+        } else {
+            None
+        }
+    }
 }
 fn accept_available(
     original: &mut OriginalSource,
     op: RangeOperation<'_>,
     offset: u64,
     count: u64,
-    hole_max: u64,
+    limits: HoleLimits,
     answer: RangeRead,
 ) -> ProgressiveResult<Poll<SourceStep>> {
     let step = match answer {
@@ -573,9 +606,7 @@ fn accept_available(
             SourceStep::Filled { offset, count: n }
         }
         RangeRead::Hole { len } => {
-            if len == 0 || len > hole_max {
-                return Err(contract());
-            }
+            let len = limits.accepts(offset, len).ok_or_else(contract)?;
             let end = offset.checked_add(len).ok_or_else(contract)?;
             op.usage.charge(Resource::SourceBytes, len)?;
             original.remember_hole(offset, end, op.usage)?;
@@ -1299,9 +1330,11 @@ impl SourceDriver {
         if range.is_empty() || volume < index || (volume == index && range.start < cursor) {
             return Err(contract());
         }
+        // A held answer covers its buffer, or a hole up to its allowance: damage declared inside it would be
+        // swallowed when it is accepted.
         if let Some(pending) = &self.pending_partial_read
             && volume == index
-            && range.start < pending.offset.saturating_add(pending.requested)
+            && range.start < pending.offset.saturating_add(pending.requested.max(pending.hole_max))
         {
             return Err(ProgressiveFailure::new(FailureKind::Partial(Box::new(crate::partial::PartialError::new(
                 crate::partial::PartialErrorKind::Busy,
@@ -2370,6 +2403,8 @@ mod partial_callback_tests {
             offset: 0,
             requested: 4,
             hole_max: 4,
+            long: false,
+            length: 4,
             answer: RangeRead::Filled { count: 4 },
             bytes: b"data".to_vec(),
         });

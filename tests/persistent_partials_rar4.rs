@@ -1713,10 +1713,10 @@ fn an_ordinary_session_still_refuses_a_hole_longer_than_its_buffer() {
     assert!(failure.contains("SourceContract"), "{failure}");
 }
 
-/// A persistent session accepts a long `Hole` only up to the end of the part it is reading: an answer that runs
-/// past it (here past the volume's end) is still a source contract violation.
+/// A long `Hole` inside the volume is trimmed to the part, but one that runs past the volume's end is still a
+/// source contract violation.
 #[test]
-fn a_persistent_session_refuses_a_hole_past_the_end_of_the_part() {
+fn a_persistent_session_refuses_a_hole_past_the_end_of_the_volume() {
     let gold = gold(3 << 20);
     let mut set = Set::split(Naming::Old, &gold, &[1 << 20, 2 << 20]);
     set.long_holes = true;

@@ -43,6 +43,11 @@ struct Source {
     hook: ReadHook,
     wait: Option<(u64, Arc<WaitGate>)>,
     reads: Arc<Mutex<Vec<(u32, u64, usize)>>>,
+    /// Answers each hole whole, from the read offset to its end, rather than capped at the buffer; and, when
+    /// `slow`, every other read `NotYet` first.
+    long_holes: bool,
+    slow: bool,
+    ticks: usize,
 }
 impl RangeSource for Source {
     fn info(&self) -> SourceInfo {
@@ -60,6 +65,11 @@ impl RangeSource for Source {
         &self.backing
     }
     fn read_at(&mut self, at: u64, buf: &mut [u8], cx: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
+        self.ticks += 1;
+        if self.slow && self.ticks % 2 == 1 {
+            cx.waker().wake_by_ref();
+            return Ok(RangeRead::NotYet);
+        }
         self.reads.lock().unwrap().push((self.index, at, buf.len()));
         if self.wait.as_ref().is_some_and(|(offset, _)| *offset == at) {
             let (_, gate) = self.wait.take().unwrap();
@@ -74,7 +84,8 @@ impl RangeSource for Source {
         let mut end = (at + buf.len() as u64).min(self.bytes.len() as u64);
         for hole in &self.holes {
             if hole.start <= at && at < hole.end {
-                return Ok(RangeRead::Hole { len: (hole.end - at).min(buf.len() as u64) });
+                let len = if self.long_holes { hole.end - at } else { (hole.end - at).min(buf.len() as u64) };
+                return Ok(RangeRead::Hole { len });
             }
             if hole.start > at {
                 end = end.min(hole.start);
@@ -161,6 +172,9 @@ impl Fixture {
             volumes.push(Some(Source {
                 generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 backing_hook: Arc::new(Mutex::new(None)),
+                long_holes: false,
+                slow: false,
+                ticks: 0,
                 index: index as u32,
                 bytes,
                 holes,
@@ -2448,6 +2462,9 @@ impl Encrypted {
                 Some(Source {
                     generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     backing_hook: Arc::new(Mutex::new(None)),
+                    long_holes: false,
+                    slow: false,
+                    ticks: 0,
                     index: index as u32,
                     bytes: self.volumes[index].clone(),
                     holes,
@@ -4351,6 +4368,9 @@ fn a_rar5_volume_answered_entirely_as_holes_stays_within_default_limits_and_refi
         volumes.push(Some(Source {
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             backing_hook: Arc::new(Mutex::new(None)),
+            long_holes: false,
+            slow: false,
+            ticks: 0,
             index: index as u32,
             bytes,
             holes: if index == 1 { vec![payloads[1].clone()] } else { Vec::new() },
@@ -4412,5 +4432,124 @@ fn a_rar5_volume_answered_entirely_as_holes_stays_within_default_limits_and_refi
     file.refill_from_packed(1, 0..bytes_of[1].len() as u64, &mut reader).unwrap();
     assert!(file.remaining().unwrap().is_empty());
     assert!(matches!(verify(file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), data);
+}
+
+/// A RAR5 set (4, 40 and 1 MiB of output) whose middle volume's whole data area is a hole its source answers whole;
+/// `slow` answers every other read `NotYet` first, and `declared` (relative to the dead data area) is declared with
+/// `declare_hole` before the session reads it. Returns the `Hole` events, the handle, the dead volume's bytes, the
+/// output and the session's directory.
+fn long_hole_rar5(
+    slow: bool,
+    declared: Option<Range<u64>>,
+) -> (Vec<HoleReport>, PartialFile, Vec<u8>, Range<u64>, Vec<u8>, tempfile::TempDir) {
+    const MIB: usize = 1 << 20;
+    let data: Vec<u8> = (0..45 * MIB).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let bounds = [0, 4 * MIB, 44 * MIB, 45 * MIB];
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let (mut volumes, mut bytes_of, mut payloads) = (Vec::new(), Vec::new(), Vec::new());
+    for index in 0..3 {
+        let out = bounds[index]..bounds[index + 1];
+        let last = index == 2;
+        let spec = common::FileSpec::new("big.bin", &data);
+        let scope = if last { data.as_slice() } else { &data[out.clone()] };
+        let file = common::file_block(&spec, &data[out.clone()], crc32fast::hash(scope), index != 0, !last);
+        let mut bytes = common::SIG.to_vec();
+        bytes.extend(common::main_block(true, Some(index as u64)));
+        let start = bytes.len() + file.len() - out.len();
+        payloads.push(start as u64..(start + out.len()) as u64);
+        bytes.extend(file);
+        bytes.extend(common::end_block(!last));
+        bytes_of.push(bytes.clone());
+        volumes.push(Some(Source {
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backing_hook: Arc::new(Mutex::new(None)),
+            long_holes: true,
+            slow,
+            ticks: 0,
+            index: index as u32,
+            bytes,
+            holes: if index == 1 { vec![payloads[1].clone()] } else { Vec::new() },
+            reads: reads.clone(),
+            backing: Vec::new(),
+            hook: Arc::new(Mutex::new(None)),
+            wait: None,
+        }));
+    }
+    let provider = Provider {
+        volumes,
+        protection: ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory {
+                volumes: (0..3)
+                    .map(|index| ProtectedVolume { index, name: volume_name(index), backing: VolumeBacking::NonFile })
+                    .collect(),
+                auxiliary_paths: Vec::new(),
+            },
+        },
+        wait: None,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        protection_hook: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(provider),
+        options(&dir.path().join("out")),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    if let Some(range) = declared {
+        let p1 = payloads[1].start;
+        session.declare_hole(1, p1 + range.start..p1 + range.end).unwrap();
+    }
+    let (mut holes, mut files) = (Vec::new(), Vec::new());
+    loop {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => holes.push(report),
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => panic!("{failure:?}"),
+            _ => {}
+        }
+    }
+    (holes, files.pop().unwrap(), bytes_of[1].clone(), payloads[1].clone(), data, dir)
+}
+
+/// RAR5, a fast and a slow (still downloading) source: the dead middle volume answered with one `Hole` is one
+/// event, and refilling it in pieces verifies.
+#[test]
+fn a_rar5_dead_volume_answered_with_one_hole_is_one_event_and_refills_in_pieces() {
+    for slow in [false, true] {
+        let (holes, mut file, volume, payload, data, dir) = long_hole_rar5(slow, None);
+        assert_eq!(holes.len(), 1, "slow {slow}: {holes:?}");
+        assert_eq!(holes[0].packed, vec![PackedSpan { volume: 1, range: payload }], "slow {slow}");
+        let mut at = 0;
+        while at < volume.len() as u64 {
+            let end = (at + (5 << 20)).min(volume.len() as u64);
+            file.refill_from_packed(1, at..end, &mut std::io::Cursor::new(volume.as_slice())).unwrap();
+            at = end;
+        }
+        assert!(file.remaining().unwrap().is_empty(), "slow {slow}");
+        assert!(matches!(verify(&mut file), Verdict::Ok { .. }), "slow {slow}");
+        assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), data, "slow {slow}");
+    }
+}
+
+/// Damage declared inside the dead range splits the source's one answer: the hole is accepted up to the declared
+/// range (the source cannot see it), the declared range is a `DeclaredBad` hole, and the rest is read again.
+#[test]
+fn a_long_hole_stops_at_damage_declared_inside_it() {
+    let (holes, mut file, volume, payload, data, dir) = long_hole_rar5(false, Some((10 << 20)..(11 << 20)));
+    let causes: Vec<_> = holes.iter().map(|h| h.cause.clone()).collect();
+    assert_eq!(causes, [HoleCause::Missing, HoleCause::DeclaredBad, HoleCause::Missing], "{holes:?}");
+    let p = payload.start;
+    let spans: Vec<_> = holes.iter().map(|h| h.packed[0].range.clone()).collect();
+    assert_eq!(spans, [p..p + (10 << 20), p + (10 << 20)..p + (11 << 20), p + (11 << 20)..payload.end]);
+    file.refill_from_packed(1, 0..volume.len() as u64, &mut std::io::Cursor::new(volume.as_slice())).unwrap();
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
     assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), data);
 }
