@@ -231,9 +231,6 @@ pub fn rebuild_volume_tail_with(
         Ok((bytes, skipped, large))
     };
     let fits = |bytes: &[u8]| (tail_at as u64).checked_add(bytes.len() as u64).is_some_and(|end| end <= volume_len);
-    if more && !last.split_after && head.len() <= tail_at {
-        doubt = doubt.or(Some(TailDoubt::LastFileEnds));
-    }
     let small = quick_open.is_some() && files.iter().any(|f| f.data <= SMALL_PIECE);
     let (bytes, skipped, large) = match mode {
         Some(mode) => build(mode)?,
@@ -271,6 +268,11 @@ pub fn rebuild_volume_tail_with(
     // still leave some), so more than that means the length is wrong or headers are missing.
     if padding != 0 && !more || padding > MAX_PADDING.saturating_add(skipped) {
         doubt = doubt.or(Some(TailDoubt::UnexpectedPadding));
+    }
+    // A middle volume whose last surviving file ends in it may have lost a later header: only supplied bytes past
+    // that file covering a whole header (its CRC and size, compared below) rule that out.
+    if more && !last.split_after && head.len().saturating_sub(tail_at) < bytes.len().min(8) {
+        doubt = doubt.or(Some(TailDoubt::LastFileEnds));
     }
     if head.len() > tail_at {
         let supplied = &head[tail_at..];

@@ -344,4 +344,7 @@ fn a_middle_volume_ending_with_a_whole_file_is_doubted_from_its_start_alone() {
     let rebuilt = rebuild_volume_tail(&v.head()[..first_end], v.len, Some(true)).unwrap();
     assert!(!rebuilt.exact);
     assert_eq!(rebuilt.offset, first_end as u64);
+    // A few supplied bytes past it (less than a header) prove nothing either.
+    let rebuilt = rebuild_volume_tail(&v.head()[..first_end + 4], v.len, Some(true)).unwrap();
+    assert!(!rebuilt.exact, "{:?}", rebuilt.doubt);
 }
