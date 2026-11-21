@@ -1,6 +1,6 @@
 //! Restarting the RAR 5.0 decoder after a hole in a compressed member (`zipfast::rar5::unpack::resync`).
 
-use zipfast::rar5::unpack::{Sink, Unpacker, resync, window_for};
+use zipfast::rar5::unpack::{ResyncError, Sink, Unpacker, resync, window_for};
 
 fn vint(b: &[u8], mut i: usize) -> (u64, usize) {
     let (mut v, mut s) = (0u64, 0);
@@ -75,10 +75,15 @@ fn a_rar_made_member_restarts_after_a_hole() {
         eprintln!("skipped: no rar-made sets (set ZIPFAST_RAR5_RESYNC_SETS)");
         return;
     };
-    for (archive, plain) in [("text.rar", "text.txt"), ("video.rar", "video.mkv")] {
-        let archive = std::fs::read(dir.join(archive)).unwrap();
+    let joined = || {
+        let parts: Vec<_> =
+            (1..=4).map(|i| member(&std::fs::read(dir.join(format!("textvol.part{i}.rar"))).unwrap())).collect();
+        (parts.iter().flat_map(|p| p.0.clone()).collect::<Vec<u8>>(), parts[0].1, parts[0].2)
+    };
+    for (archive, plain) in [("text.rar", "text.txt"), ("video.rar", "video.mkv"), ("textvol", "text.txt")] {
         let plain = std::fs::read(dir.join(plain)).unwrap();
-        let (packed, size, dict) = member(&archive);
+        let (packed, size, dict) =
+            if archive == "textvol" { joined() } else { member(&std::fs::read(dir.join(archive)).unwrap()) };
         assert_eq!(size as usize, plain.len());
         let window = window_for(dict, Some(size), false).unwrap();
         for hole in [100_000usize, 400_000, 900_000] {
@@ -157,8 +162,8 @@ fn the_restart_point_must_decode_to_the_known_plaintext() {
     let after = &packed[packed.len() / 2..];
     let other: Vec<u8> = plain.iter().map(|b| b ^ 0x20).collect();
     assert!(resync(after, 0, &other, window, 0..plain.len() as u64).is_err());
-    // Only the plaintext from 100,000 on is given.
-    let base = 100_000u64;
+    // Only the plaintext from 10,000 on is given: it still covers the 128 KiB window before the restart.
+    let base = 10_000u64;
     let r = resync(after, base, &plain[base as usize..], window, base..plain.len() as u64).unwrap();
     let mut u = Unpacker::resume_at(window, &r, base, &plain[base as usize..], Some(plain.len() as u64)).unwrap();
     let mut out = Collect(Vec::new());
@@ -167,8 +172,8 @@ fn the_restart_point_must_decode_to_the_known_plaintext() {
     assert_eq!(out.0, plain[r.output_offset as usize..]);
 }
 
-/// A block after the hole that starts a filter is reported: its output differs from the plaintext until the filter
-/// runs.
+/// A block after the hole that starts a filter, once its literals have pinned its offset, is reported with its packed
+/// and output offsets: its output differs from the plaintext until the filter runs.
 #[test]
 fn a_filter_after_the_hole_is_reported() {
     use zipfast::rar5::testenc::{self, Op};
@@ -176,11 +181,44 @@ fn a_filter_after_the_hole_is_reported() {
     let mut ops = testenc::lz(&plain[..150_000], 1 << 17, 16);
     let first = testenc::tuned_block(&ops, false).len();
     let split = ops.len();
+    // The second block: 64 literals, then the filter, then the rest as literals.
+    ops.extend(plain[150_000..150_064].iter().map(|&b| Op::Lit(b)));
     ops.push(Op::Filter { start: 0, len: 1_000, kind: 0, channels: 1 });
-    ops.extend(plain[150_000..].iter().map(|&b| Op::Lit(b)));
-    // Two blocks: the plain one, then one that starts with the filter. The hole takes all of the first.
+    ops.extend(plain[150_064..].iter().map(|&b| Op::Lit(b)));
     let packed = testenc::tuned_stream(&ops, split);
     let window = window_for(128 << 10, Some(plain.len() as u64), false).unwrap();
     let r = resync(&packed[first..], 0, &plain, window, 140_000..160_000);
-    assert!(matches!(r, Err(zipfast::rar5::unpack::ResyncError::Filter { .. })), "{r:?}");
+    assert_eq!(r.unwrap_err(), ResyncError::Filter { packed_offset: 0, output_offset: 150_000 });
+}
+
+/// Repeated content: the hole falls in the second of two copies of a stretch longer than the window, so a block in
+/// it decodes to the plaintext at both copies. The restart is refused until `expected` says which.
+#[test]
+fn a_block_that_fits_two_places_is_ambiguous() {
+    use zipfast::rar5::testenc;
+    let a = sample(60_000);
+    let b: Vec<u8> = sample(400_000).iter().map(|x| x.rotate_left(3)).collect();
+    let c = sample(30_000);
+    let plain = [a.as_slice(), &b, &b, &c].concat();
+    let packed = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let window = window_for(128 << 10, Some(plain.len() as u64), false).unwrap();
+    // A hole well inside the second copy: more than a window past its start, so nothing it reads back from leaves it.
+    let hole = packed.len() * 7 / 10;
+    let after = &packed[hole..];
+    assert_eq!(resync(after, 0, &plain, window, 0..plain.len() as u64).unwrap_err(), ResyncError::Ambiguous);
+    let second = (60_000 + 400_000) as u64..plain.len() as u64;
+    let r = resync(after, 0, &plain, window, second).unwrap();
+    let mut u = Unpacker::resume_at(window, &r, 0, &plain, Some(plain.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&after[r.packed_offset..], &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0, plain[r.output_offset as usize..]);
+}
+
+#[test]
+fn crc32_combine_joins_a_prefix_and_a_resumed_part() {
+    let data = sample(10_000);
+    let (a, b) = data.split_at(3_333);
+    let joined = zipfast::crc32::combine(zipfast::crc32::hash(a), zipfast::crc32::hash(b), b.len() as u64);
+    assert_eq!(joined, zipfast::crc32::hash(&data));
 }

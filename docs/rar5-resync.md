@@ -14,24 +14,28 @@ u.finish(&mut sink)?;
 ## How it finds the restart
 
 1. **Find a block.** It scans the packed bytes after the hole for a block header whose checksum holds and whose tables and symbols decode to the block's end. A block that reuses the previous block's tables can't be the first, because the hole erased them.
-2. **Find its output offset.** It decodes that block without a window, then matches the result against the known plaintext at the offsets in `expected`. The block's first literals pick the candidates, and every literal and every copy must reproduce the plaintext.
-3. **Recover the erased state.** The hole erased the decoder's state: the four last match distances and the last length. A repeat that uses an erased distance takes the one distance, up to 4 MiB back, whose copy reproduces the plaintext. The last length comes from the operations that follow.
+2. **Find its output offset.** It decodes that block without a window, then searches the known plaintext within `expected` for the block's first literals. That gives the candidate offsets. A block whose literals can't pin its offset is skipped: one with no literal run before an operation of unknown length, or one whose literals fit more than 64 places. At each candidate, every literal and every copy must reproduce the plaintext.
+3. **Recover the erased state.** The hole erased the decoder's state: the four last match distances and the last length.
+   - **While checking:** a repeat that uses an erased distance takes the one distance, up to 4 MiB back, whose copy reproduces the plaintext.
+   - **For the restart:** such an inferred distance is never trusted. The state counts as known only once matches in the blocks read have set all four distances, plus the last length.
 4. **Read ahead until the state is known.** Each block read is checked the same way. Decoding restarts at the block after the last one read.
    - **`Resync::verified`:** the output those read-ahead blocks decoded to, proven equal to the plaintext.
-   - **`complete`:** false when a distance never appeared before the packed bytes ran out. Decoding still restarts; a later match that uses that distance decodes wrong, and the member's CRC catches it.
+   - **`complete`:** false when the packed bytes ran out first. Decoding still restarts. A later match that uses an unknown distance fails (as a distance of 0) or decodes wrong, and the member's size or CRC catches it.
+5. **Rule out other offsets.** Every candidate offset is followed through the read-ahead, and exactly one must hold. Content that repeats beyond the window can fit two places; that gives `ResyncError::Ambiguous`.
 
 ## Inputs
 
 - **`packed`:** the member's packed bytes after the hole, across volumes and in order.
 - **`known_base`, `known`:** the known plaintext, at member output offsets `known_base..`. It must cover the restart block and, for the window, as far back as the member's dictionary reaches (or the member's start).
 - **`window`:** from `window_for(dictionary, size, false)`. The dictionary comes from the file header.
-- **`expected`:** where the first block after the hole may start in the output, estimated from the hole's position and the packing ratio. A wide range only costs scanning time.
+- **`expected`:** where the first block after the hole may start in the output, estimated from the hole's position and the packing ratio. Keep it as narrow as the estimate allows: a wide range over content that repeats can make a block fit twice (`Ambiguous`).
 
 ## Output and errors
 
-- **`resume_at`:** gives a decoder that writes the member's output from `Resync::output_offset` on. The CRC32 it hands a sink covers only that output, so combine it with the CRC of the plaintext before it to check the member's CRC.
+- **`resume_at`:** gives a decoder that writes the member's output from `Resync::output_offset` on. The CRC32 it hands a sink covers only that output. Combine it with the CRC of the plaintext before it, using `zipfast::crc32::combine(prefix_crc, resumed_crc, resumed_len)`, and check the result against the member's CRC.
 - **`ResyncError::NotFound`:** no block decodes to the plaintext in the range. Either the plaintext or the range is wrong, or a filter that started before the hole covers the output.
-- **`ResyncError::Filter { output_offset }`:** a block after the hole starts a filter (E8, ARM or delta). Its output differs from the plaintext until the filter runs, so look again from packed bytes after it. Filters are for executables and rarely occur in video.
+- **`ResyncError::Filter { packed_offset, output_offset }`:** a block after the hole starts a filter (E8, ARM or delta) once its offset is pinned. `packed_offset` and `output_offset` are where that block starts. Its output differs from the plaintext until the filter runs, so look again from packed bytes after the filtered output. Filters are for executables and rarely occur in video.
+- **`ResyncError::Ambiguous`:** a block fits the plaintext at more than one offset. Narrow `expected`.
 
 ## Checked against
 
@@ -39,7 +43,13 @@ u.finish(&mut sink)?;
   - 3 MB of text with a 128 KiB dictionary;
   - 4 MB of video-like data, which rar compressed by 0.3%, so the blocks are mostly literals.
 
+  - the text again, split into 400 KB volumes, with the parts' data areas joined.
+
   Holes at three places in each restart and decode the rest exactly. The test reads those sets when present (`ZIPFAST_RAR5_RESYNC_SETS`).
-- **Committed tests:** the test encoder's streams restart after holes, from full or partial plaintext. Wrong plaintext finds nothing, and a filter after the hole is reported.
+- **Committed tests:**
+  - the test encoder's streams restart after holes, from full or partial plaintext;
+  - wrong plaintext finds nothing;
+  - a filter after the hole is reported with its offsets;
+  - repeated content is `Ambiguous` until `expected` is narrowed.
 
 RAR 4.x is not covered.

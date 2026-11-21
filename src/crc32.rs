@@ -59,6 +59,14 @@ impl Hasher {
     }
 }
 
+/// The CRC-32 of two byte strings one after the other, from the CRC of the first (`first`) and the CRC and length of
+/// the second (`second`, `second_len`).
+pub fn combine(first: u32, second: u32, second_len: u64) -> u32 {
+    let mut a = Hasher::from_parts(first, 0);
+    a.combine(&Hasher::from_parts(second, second_len));
+    a.finalize()
+}
+
 /// The CRC-32 of `bytes`.
 pub fn hash(bytes: &[u8]) -> u32 {
     update(0, bytes)

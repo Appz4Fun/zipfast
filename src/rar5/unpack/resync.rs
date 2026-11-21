@@ -28,9 +28,10 @@ pub struct Resync {
     /// Output the blocks read ahead decoded to, proven equal to the known plaintext (from the first block found after
     /// the hole up to `output_offset`).
     pub verified: Range<u64>,
-    /// Whether the decoder's whole state was learned. When `false` some of the four last match distances never
-    /// appeared before the packed bytes ran out; decoding still restarts, and a match that uses one of them decodes
-    /// wrong (the member's CRC then fails).
+    /// Whether the decoder's whole state was learned from the blocks read ahead (every one of the four last match
+    /// distances set by a match in them, and the last length). When `false` the packed bytes ran out first; decoding
+    /// still restarts, and a match that uses an unknown distance fails (a distance of 0) or decodes wrong, which the
+    /// member's size or CRC catches.
     pub complete: bool,
     history: [u64; 4],
     last_len: u32,
@@ -43,16 +44,23 @@ pub enum ResyncError {
     /// No block in the packed bytes decodes to the known plaintext at an offset in the expected range: the plaintext
     /// differs, the range is wrong, or a filter that started before the hole covers the output.
     NotFound,
-    /// A block after the hole starts a filter (at this output offset): its output differs from the plaintext until
-    /// the filter runs, so look again from packed bytes after it.
-    Filter { output_offset: u64 },
+    /// A block after the hole (at `packed_offset` in the packed bytes, starting at output offset `output_offset`)
+    /// starts a filter: its output differs from the plaintext until the filter runs. Look again from packed bytes
+    /// after the filtered output.
+    Filter { packed_offset: usize, output_offset: u64 },
+    /// A block decodes to the plaintext at more than one offset in the expected range (repeated content): narrow
+    /// `expected`.
+    Ambiguous,
 }
 
 impl std::fmt::Display for ResyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => f.write_str("no RAR 5.0 block after the hole decodes to the known plaintext"),
-            Self::Filter { output_offset } => write!(f, "a RAR 5.0 filter starts at output offset {output_offset}"),
+            Self::Filter { packed_offset, output_offset } => {
+                write!(f, "a RAR 5.0 block at packed offset {packed_offset} (output {output_offset}) starts a filter")
+            }
+            Self::Ambiguous => f.write_str("a RAR 5.0 block decodes to the plaintext at more than one offset"),
         }
     }
 }
@@ -116,15 +124,17 @@ fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff) -> Op
 }
 
 /// The decoder state the hole erased, as far as it is known.
+/// The decoder state the hole erased, as far as it is known. A distance taken from the plaintext (`inferred`) is
+/// never trusted for the restart: the state is complete only once matches in the blocks read have set all four.
 #[derive(Clone, Copy)]
 struct State {
-    hist: [Option<u64>; 4],
+    hist: [Option<(u64, bool)>; 4],
     last: Option<u32>,
 }
 
 impl State {
     fn complete(&self) -> bool {
-        self.hist.iter().all(Option::is_some) && self.last.is_some()
+        self.hist.iter().all(|h| matches!(h, Some((_, false)))) && self.last.is_some()
     }
 }
 
@@ -169,21 +179,25 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             Tok::Filter { .. } => return Sim::Filter,
             Tok::Match { len, dist } => {
                 st.hist.copy_within(0..3, 1);
-                st.hist[0] = Some(dist);
+                st.hist[0] = Some((dist, false));
                 (len, dist)
             }
             Tok::Rep { k, len } => {
                 let k = usize::from(k) & 3;
-                let Some(d) = st.hist[k].or_else(|| infer(known, p, len, limit)) else { return Sim::Mismatch };
+                let Some(h) = st.hist[k].or_else(|| infer(known, p, len, limit).map(|d| (d, true))) else {
+                    return Sim::Mismatch;
+                };
                 st.hist.copy_within(0..k, 1);
-                st.hist[0] = Some(d);
-                (len, d)
+                st.hist[0] = Some(h);
+                (len, h.0)
             }
             Tok::Last => {
                 let Some(len) = st.last else { return Sim::Mismatch };
-                let Some(d) = st.hist[0].or_else(|| infer(known, p, len, limit)) else { return Sim::Mismatch };
-                st.hist[0] = Some(d);
-                (len, d)
+                let Some(h) = st.hist[0].or_else(|| infer(known, p, len, limit).map(|d| (d, true))) else {
+                    return Sim::Mismatch;
+                };
+                st.hist[0] = Some(h);
+                (len, h.0)
             }
         };
         if !known.copies(p, dist, len) {
@@ -195,23 +209,45 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
     Sim::Matches(p - at)
 }
 
-/// Output offsets in `expected` the block's first literals fit at (every offset when it has none to anchor on).
-fn candidates(block: &Block, known: &Known<'_>, expected: Range<u64>) -> Vec<u64> {
-    // The first literal run, and how much output comes before it (unknown once a `Last` comes first).
+/// The most offsets one block's first literals may fit at before it is skipped as uninformative.
+const MAX_CANDIDATES: usize = 64;
+
+/// Output offsets in `expected` the block's first literals fit at, found by searching the known plaintext for them.
+/// None for a block whose output offset its literals cannot pin (no literal run before an operation of unknown
+/// length, or too many places it fits).
+fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>) -> Option<Vec<u64>> {
+    // The first literal run, and how much output comes before it (unknown once a `Last` or a filter comes first).
     let mut before = 0u64;
     let mut anchor = None;
     for tok in &block.toks {
         match *tok {
             Tok::Lits(n) => {
-                anchor = Some((before, &block.lits[..(n as usize).min(32)]));
+                anchor = Some(&block.lits[..(n as usize).min(32).min(block.lits.len())]);
                 break;
             }
             Tok::Match { len, .. } | Tok::Rep { len, .. } => before += u64::from(len),
             _ => break,
         }
     }
-    let Some((before, lits)) = anchor.filter(|(_, l)| !l.is_empty()) else { return expected.collect() };
-    expected.filter(|&o| lits.iter().enumerate().all(|(i, &b)| known.get(o + before + i as u64) == Some(b))).collect()
+    let lits = anchor.filter(|l| l.len() >= 4)?;
+    // The anchor's possible places, clamped to the known plaintext.
+    let lo = expected.start.saturating_add(before).max(known.base);
+    let hi = expected.end.saturating_add(before).min(known.base + known.bytes.len() as u64);
+    if lo >= hi {
+        return Some(Vec::new());
+    }
+    let from = (lo - known.base) as usize;
+    let to = ((hi - known.base) as usize + lits.len() - 1).min(known.bytes.len());
+    let mut found = Vec::new();
+    for (i, w) in known.bytes[from..to].windows(lits.len()).enumerate() {
+        if w == lits {
+            if found.len() == MAX_CANDIDATES {
+                return None;
+            }
+            found.push(lo + i as u64 - before);
+        }
+    }
+    Some(found)
 }
 
 /// Finds where decoding of a RAR 5.0 compressed member can restart after a hole.
@@ -243,43 +279,77 @@ pub fn resync(
             continue;
         }
         let Some(first) = probe(packed, at, None, &mut pre) else { continue };
-        for start in candidates(&first, &known, expected.clone()) {
-            let mut st = State { hist: [None; 4], last: None };
-            let (mut pos, mut out) = (at, start);
-            let mut block = Some(first_clone(&first));
-            for _ in 0..MAX_BLOCKS {
-                let Some(b) = block.take() else { break };
-                match simulate(&b, out, &known, &mut st, window.size) {
-                    Sim::Matches(n) => {
-                        out += n;
-                        pos += b.len;
-                    }
-                    Sim::Filter => return Err(ResyncError::Filter { output_offset: out }),
-                    Sim::Mismatch => break,
+        let Some(starts) = candidates(&first, &known, &expected) else { continue };
+        // Every offset the block fits at is followed through the read-ahead; exactly one must hold.
+        let mut found: Option<Resync> = None;
+        for start in starts {
+            match follow(packed, at, &first, start, &known, window, &mut pre) {
+                Follow::Restart(r) if found.is_some() => {
+                    let _ = r;
+                    return Err(ResyncError::Ambiguous);
                 }
-                let next = if b.last { None } else { probe(packed, pos, Some(&b.lens), &mut pre) };
-                if st.complete() || next.is_none() {
-                    let complete = st.complete();
-                    let lens = next.as_ref().map_or_else(|| b.lens.clone(), |n| n.lens.clone());
-                    return Ok(Resync {
-                        packed_offset: pos,
-                        output_offset: out,
-                        verified: start..out,
-                        complete,
-                        history: st.hist.map(|d| d.unwrap_or(0)),
-                        last_len: st.last.unwrap_or(0),
-                        lens,
-                    });
+                Follow::Restart(r) => found = Some(r),
+                Follow::Filter { packed_offset, output_offset } => {
+                    return Err(ResyncError::Filter { packed_offset, output_offset });
                 }
-                block = next;
+                Follow::Mismatch => {}
             }
+        }
+        if let Some(r) = found {
+            return Ok(r);
         }
     }
     Err(ResyncError::NotFound)
 }
 
-fn first_clone(b: &Block) -> Block {
-    Block { len: b.len, toks: b.toks.clone(), lits: b.lits.clone(), lens: b.lens.clone(), last: b.last }
+enum Follow {
+    Restart(Resync),
+    Filter { packed_offset: usize, output_offset: u64 },
+    Mismatch,
+}
+
+/// Follows blocks from `first` (at packed offset `at`, output offset `start`), checking each against the plaintext,
+/// until the decoder's state is known or the blocks run out.
+fn follow(
+    packed: &[u8],
+    at: usize,
+    first: &Block,
+    start: u64,
+    known: &Known<'_>,
+    window: Window,
+    pre: &mut Huff,
+) -> Follow {
+    let mut st = State { hist: [None; 4], last: None };
+    let (mut pos, mut out) = (at, start);
+    let mut owned;
+    let mut block = first;
+    for _ in 0..MAX_BLOCKS {
+        match simulate(block, out, known, &mut st, window.size) {
+            Sim::Matches(n) => {
+                out += n;
+                pos += block.len;
+            }
+            // The block's offset is pinned by its literals before the filter, or by the blocks before it.
+            Sim::Filter => return Follow::Filter { packed_offset: pos, output_offset: out },
+            Sim::Mismatch => return Follow::Mismatch,
+        }
+        let next = if block.last { None } else { probe(packed, pos, Some(&block.lens), pre) };
+        if st.complete() || next.is_none() {
+            let lens = next.as_ref().map_or_else(|| block.lens.clone(), |n| n.lens.clone());
+            return Follow::Restart(Resync {
+                packed_offset: pos,
+                output_offset: out,
+                verified: start..out,
+                complete: st.complete(),
+                history: st.hist.map(|h| h.filter(|&(_, inferred)| !inferred).map_or(0, |(d, _)| d)),
+                last_len: st.last.unwrap_or(0),
+                lens,
+            });
+        }
+        owned = next.expect("checked above");
+        block = &owned;
+    }
+    Follow::Mismatch
 }
 
 impl Unpacker {
@@ -287,7 +357,7 @@ impl Unpacker {
     /// [`Resync::output_offset`], and its state is what [`resync`] learned. Feed it the packed bytes from
     /// [`Resync::packed_offset`] on; it writes the member's output from `output_offset` on. `size` is the member's
     /// whole output size. The CRC32 a sink is given covers only that output, so check the member's CRC by combining
-    /// it with the CRC of the plaintext before (`crate::crc32::combine`).
+    /// it with the CRC of the plaintext before ([`crate::crc32::combine`]).
     pub fn resume_at(
         window: Window,
         resync: &Resync,
