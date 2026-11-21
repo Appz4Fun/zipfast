@@ -88,7 +88,10 @@ fn a_rar_made_member_restarts_after_a_hole() {
         let window = window_for(dict, Some(size), false).unwrap();
         for hole in [100_000usize, 400_000, 900_000] {
             let after = &packed[hole + 30_000..];
-            let r = resync(after, 0, &plain, window, 0..plain.len() as u64).unwrap();
+            // A narrow estimate from the packing ratio (64 KiB either side), as a caller would make it.
+            let est = ((hole + 30_000) as u64 * size) / packed.len() as u64;
+            let expected = est.saturating_sub(64 << 10)..(est + (64 << 10)).min(size);
+            let r = resync(after, 0, &plain, window, expected).unwrap();
             eprintln!(
                 "hole {hole}: restart at packed +{} output {} verified {:?} complete {}",
                 r.packed_offset, r.output_offset, r.verified, r.complete
@@ -221,4 +224,28 @@ fn crc32_combine_joins_a_prefix_and_a_resumed_part() {
     let (a, b) = data.split_at(3_333);
     let joined = zipfast::crc32::combine(zipfast::crc32::hash(a), zipfast::crc32::hash(b), b.len() as u64);
     assert_eq!(joined, zipfast::crc32::hash(&data));
+}
+
+/// Plaintext that ends soon after the hole still gives a restart: the blocks it covers are checked, and decoding
+/// restarts at the first one past it with what they taught (possibly not the whole state).
+#[test]
+fn plaintext_that_ends_soon_after_the_hole_still_restarts() {
+    use zipfast::rar5::testenc;
+    let plain = sample(600_000);
+    let packed = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let window = window_for(128 << 10, Some(plain.len() as u64), false).unwrap();
+    let after = &packed[packed.len() / 2..];
+    let full = resync(after, 0, &plain, window, 0..plain.len() as u64).unwrap();
+    // Only up to 60,000 bytes past the first block found (about one block more).
+    let known = &plain[..(full.verified.start + 60_000) as usize];
+    let r = resync(after, 0, known, window, 0..known.len() as u64).unwrap();
+    assert_eq!(r.verified.start, full.verified.start);
+    assert!(r.output_offset <= known.len() as u64 + 70_000, "{r:?}");
+    let mut u = Unpacker::resume_at(window, &r, 0, known, Some(plain.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&after[r.packed_offset..], &mut out).unwrap();
+    if r.complete {
+        u.finish(&mut out).unwrap();
+        assert_eq!(out.0, plain[r.output_offset as usize..]);
+    }
 }

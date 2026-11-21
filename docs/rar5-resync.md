@@ -14,21 +14,23 @@ u.finish(&mut sink)?;
 ## How it finds the restart
 
 1. **Find a block.** It scans the packed bytes after the hole for a block header whose checksum holds and whose tables and symbols decode to the block's end. A block that reuses the previous block's tables can't be the first, because the hole erased them.
-2. **Find its output offset.** It decodes that block without a window, then searches the known plaintext within `expected` for the block's first literals. That gives the candidate offsets. A block whose literals can't pin its offset is skipped: one with no literal run before an operation of unknown length, or one whose literals fit more than 64 places. At each candidate, every literal and every copy must reproduce the plaintext.
+2. **Find its output offset.** It decodes that block without a window, then searches the known plaintext within `expected` for one of the block's literal runs: the first of at least 8 bytes, or failing that 4, that fits no more than 64 places. That gives the candidate offsets. At each candidate, every literal and every copy must reproduce the plaintext.
+   - **When a block can't be pinned:** for example it has no such literal run, or all its runs fit too many places. It is skipped, and the expected range moves on by that block's output (widened for operations of unknown length), so `expected` keeps describing where the next block starts.
+   - **Scan limit:** the scan stops after 256 blocks.
 3. **Recover the erased state.** The hole erased the decoder's state: the four last match distances and the last length.
    - **While checking:** a repeat that uses an erased distance takes the one distance, up to 4 MiB back, whose copy reproduces the plaintext.
    - **For the restart:** such an inferred distance is never trusted. The state counts as known only once matches in the blocks read have set all four distances, plus the last length.
 4. **Read ahead until the state is known.** Each block read is checked the same way. Decoding restarts at the block after the last one read.
    - **`Resync::verified`:** the output those read-ahead blocks decoded to, proven equal to the plaintext.
-   - **`complete`:** false when the packed bytes ran out first. Decoding still restarts. A later match that uses an unknown distance fails (as a distance of 0) or decodes wrong, and the member's size or CRC catches it.
+   - **`complete`:** false when the packed bytes, the known plaintext or the 256-block budget ran out first. In that case decoding restarts at the first block past what was checked. Decoding still restarts. A later match that uses an unknown distance fails (as a distance of 0) or decodes wrong, and the member's size or CRC catches it.
 5. **Rule out other offsets.** Every candidate offset is followed through the read-ahead, and exactly one must hold. Content that repeats beyond the window can fit two places; that gives `ResyncError::Ambiguous`.
 
 ## Inputs
 
 - **`packed`:** the member's packed bytes after the hole, across volumes and in order.
-- **`known_base`, `known`:** the known plaintext, at member output offsets `known_base..`. It must cover the restart block and, for the window, as far back as the member's dictionary reaches (or the member's start).
+- **`known_base`, `known`:** the known plaintext, at member output offsets `known_base..`. It must cover at least the first block after the hole and, for the window, as far back as the member's dictionary reaches (or the member's start). The more it covers past the hole, the more blocks can be checked.
 - **`window`:** from `window_for(dictionary, size, false)`. The dictionary comes from the file header.
-- **`expected`:** where the first block after the hole may start in the output, estimated from the hole's position and the packing ratio. Keep it as narrow as the estimate allows: a wide range over content that repeats can make a block fit twice (`Ambiguous`).
+- **`expected`:** where the first block after the hole may start in the output, estimated from the hole's position and the packing ratio. A ±64 KiB estimate works on rar's output. Keep it as narrow as the estimate allows: the scan costs time in proportion to its width, and a wide range over content that repeats can make a block fit twice (`Ambiguous`).
 
 ## Output and errors
 

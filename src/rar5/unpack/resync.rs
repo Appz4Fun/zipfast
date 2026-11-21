@@ -77,8 +77,12 @@ impl Known<'_> {
     fn get(&self, at: u64) -> Option<u8> {
         at.checked_sub(self.base).and_then(|i| usize::try_from(i).ok()).and_then(|i| self.bytes.get(i).copied())
     }
+    /// The first output offset past the known plaintext.
+    fn end(&self) -> u64 {
+        self.base.saturating_add(self.bytes.len() as u64)
+    }
     /// Whether a copy of `len` bytes from `dist` back, at output offset `at`, reproduces the plaintext (byte by byte,
-    /// so a copy may overlap its own output).
+    /// so a copy may overlap its own output). Both ends must be known.
     fn copies(&self, at: u64, dist: u64, len: u32) -> bool {
         dist != 0
             && at.checked_sub(dist).is_some()
@@ -104,16 +108,25 @@ struct Block {
 fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff) -> Option<Block> {
     let (header, payload, flags) = block_header(packed.get(at..)?).ok()??;
     let end = at.checked_add(header)?.checked_add(payload)?;
-    let mut buf = packed.get(at + header..end)?.to_vec();
-    buf.resize(payload + PAD, 0);
+    // Read in place when the padding past the payload is there (a false header can claim megabytes: no copy for it).
+    let copy;
+    let buf: &[u8] = match packed.get(at + header..end.checked_add(PAD)?) {
+        Some(slice) => slice,
+        None => {
+            let mut v = packed.get(at + header..end)?.to_vec();
+            v.resize(payload + PAD, 0);
+            copy = v;
+            &copy
+        }
+    };
     let valid_bits = usize::from(flags & 7) + 1;
     let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
-    let mut bits = Bits::new(&buf);
+    let mut bits = Bits::new(buf);
     let lens = if flags & 0x80 != 0 { read_lengths(pre, &mut bits, end_bits).ok()? } else { *prev? };
     let mut tables = Tables::empty();
     tables.build(&lens).ok()?;
     let (mut packed_toks, mut filters, mut lits): (Vec<Packed>, Vec<FilterFields>, Vec<u8>) = Default::default();
-    if tokenize(&buf, bits.pos(), end_bits, &tables, (&mut packed_toks, &mut filters, &mut lits), usize::MAX)
+    if tokenize(buf, bits.pos(), end_bits, &tables, (&mut packed_toks, &mut filters, &mut lits), usize::MAX)
         .ok()?
         .is_some()
     {
@@ -123,7 +136,6 @@ fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff) -> Op
     Some(Block { len: end - at, toks, lits, lens: Box::new(lens), last: flags & 0x40 != 0 })
 }
 
-/// The decoder state the hole erased, as far as it is known.
 /// The decoder state the hole erased, as far as it is known. A distance taken from the plaintext (`inferred`) is
 /// never trusted for the restart: the state is complete only once matches in the blocks read have set all four.
 #[derive(Clone, Copy)]
@@ -141,8 +153,20 @@ impl State {
 enum Sim {
     /// The block decodes to the plaintext; this much output.
     Matches(u64),
+    /// The block contradicts the plaintext.
     Mismatch,
+    /// The block's output runs past the known plaintext before contradicting it.
+    Short,
     Filter,
+}
+
+/// The length an operation copies (a `Last` the last length, 0 while unknown).
+fn len_of(tok: &Tok, st: &State) -> u32 {
+    match *tok {
+        Tok::Rep { len, .. } | Tok::Match { len, .. } => len,
+        Tok::Last => st.last.unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// The one distance (up to `limit` back) whose copy reproduces the plaintext at `at`, if exactly one does.
@@ -169,8 +193,12 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             Tok::Lits(n) => {
                 let n = n as usize;
                 let Some(lits) = block.lits.get(li..li + n) else { return Sim::Mismatch };
-                if lits.iter().enumerate().any(|(i, &b)| known.get(p + i as u64) != Some(b)) {
-                    return Sim::Mismatch;
+                for (i, &b) in lits.iter().enumerate() {
+                    match known.get(p + i as u64) {
+                        Some(k) if k != b => return Sim::Mismatch,
+                        Some(_) => {}
+                        None => return Sim::Short,
+                    }
                 }
                 li += n;
                 p += n as u64;
@@ -182,6 +210,7 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
                 st.hist[0] = Some((dist, false));
                 (len, dist)
             }
+            Tok::Rep { .. } | Tok::Last if p + u64::from(len_of(tok, st)) > known.end() => return Sim::Short,
             Tok::Rep { k, len } => {
                 let k = usize::from(k) & 3;
                 let Some(h) = st.hist[k].or_else(|| infer(known, p, len, limit).map(|d| (d, true))) else {
@@ -200,6 +229,9 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
                 (len, h.0)
             }
         };
+        if p + u64::from(len) > known.end() {
+            return Sim::Short;
+        }
         if !known.copies(p, dist, len) {
             return Sim::Mismatch;
         }
@@ -212,42 +244,68 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
 /// The most offsets one block's first literals may fit at before it is skipped as uninformative.
 const MAX_CANDIDATES: usize = 64;
 
-/// Output offsets in `expected` the block's first literals fit at, found by searching the known plaintext for them.
-/// None for a block whose output offset its literals cannot pin (no literal run before an operation of unknown
-/// length, or too many places it fits).
+/// The block's output length as far as it is known without the state (a `Last` copies the last length, unknown
+/// here: each counts as up to `MAX_LEN` more), or None for a block that starts a filter.
+fn known_len(block: &Block) -> Option<(u64, u64)> {
+    let (mut len, mut slack) = (0u64, 0u64);
+    for tok in &block.toks {
+        match *tok {
+            Tok::Lits(n) => len += u64::from(n),
+            Tok::Match { len: l, .. } | Tok::Rep { len: l, .. } => len += u64::from(l),
+            Tok::Last => slack += MAX_LEN,
+            Tok::Filter { .. } => return None,
+        }
+    }
+    Some((len, slack))
+}
+
+/// The longest copy RAR 5.0 makes.
+const MAX_LEN: u64 = 0x1101;
+
+/// Output offsets in `expected` the block fits at, found by searching the known plaintext for one of its literal runs
+/// (the first of at least 8 bytes, or failing that 4, that fits no more than 64 places). None for a block whose
+/// literals cannot pin its offset.
 fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>) -> Option<Vec<u64>> {
-    // The first literal run, and how much output comes before it (unknown once a `Last` or a filter comes first).
-    let mut before = 0u64;
-    let mut anchor = None;
+    let mut runs = Vec::new();
+    let (mut before, mut li) = (0u64, 0usize);
     for tok in &block.toks {
         match *tok {
             Tok::Lits(n) => {
-                anchor = Some(&block.lits[..(n as usize).min(32).min(block.lits.len())]);
-                break;
+                let n = (n as usize).min(block.lits.len() - li);
+                runs.push((before, &block.lits[li..li + n.min(32)]));
+                li += n;
+                before += n as u64;
             }
             Tok::Match { len, .. } | Tok::Rep { len, .. } => before += u64::from(len),
             _ => break,
         }
     }
-    let lits = anchor.filter(|l| l.len() >= 4)?;
-    // The anchor's possible places, clamped to the known plaintext.
-    let lo = expected.start.saturating_add(before).max(known.base);
-    let hi = expected.end.saturating_add(before).min(known.base + known.bytes.len() as u64);
-    if lo >= hi {
-        return Some(Vec::new());
-    }
-    let from = (lo - known.base) as usize;
-    let to = ((hi - known.base) as usize + lits.len() - 1).min(known.bytes.len());
-    let mut found = Vec::new();
-    for (i, w) in known.bytes[from..to].windows(lits.len()).enumerate() {
-        if w == lits {
-            if found.len() == MAX_CANDIDATES {
-                return None;
+    let long = runs.iter().filter(|(_, l)| l.len() >= 8);
+    let short = runs.iter().filter(|(_, l)| (4..8).contains(&l.len()));
+    for &(before, lits) in long.chain(short) {
+        let lo = expected.start.saturating_add(before).max(known.base);
+        let hi = expected.end.saturating_add(before).min(known.end());
+        if lo >= hi {
+            return Some(Vec::new());
+        }
+        let from = (lo - known.base) as usize;
+        let to = ((hi - known.base) as usize + lits.len() - 1).min(known.bytes.len());
+        let mut found = Vec::new();
+        let mut too_many = false;
+        for (i, w) in known.bytes[from..to].windows(lits.len()).enumerate() {
+            if w == lits {
+                if found.len() == MAX_CANDIDATES {
+                    too_many = true;
+                    break;
+                }
+                found.push(lo + i as u64 - before);
             }
-            found.push(lo + i as u64 - before);
+        }
+        if !too_many {
+            return Some(found);
         }
     }
-    Some(found)
+    None
 }
 
 /// Finds where decoding of a RAR 5.0 compressed member can restart after a hole.
@@ -273,30 +331,44 @@ pub fn resync(
 ) -> std::result::Result<Resync, ResyncError> {
     let known = Known { base: known_base, bytes: known };
     let mut pre = Huff::new();
+    // Blocks found but not pinned move the expected range on by their output.
+    let (mut shift, mut slack) = (0u64, 0u64);
+    let mut blocks = 0;
     for at in 0..packed.len() {
         // A block with its own tables (one without them needs the tables the hole erased).
         if packed[at] & 0x80 == 0 {
             continue;
         }
         let Some(first) = probe(packed, at, None, &mut pre) else { continue };
-        let Some(starts) = candidates(&first, &known, &expected) else { continue };
-        // Every offset the block fits at is followed through the read-ahead; exactly one must hold.
-        let mut found: Option<Resync> = None;
-        for start in starts {
-            match follow(packed, at, &first, start, &known, window, &mut pre) {
-                Follow::Restart(r) if found.is_some() => {
-                    let _ = r;
-                    return Err(ResyncError::Ambiguous);
-                }
-                Follow::Restart(r) => found = Some(r),
-                Follow::Filter { packed_offset, output_offset } => {
-                    return Err(ResyncError::Filter { packed_offset, output_offset });
-                }
-                Follow::Mismatch => {}
-            }
+        blocks += 1;
+        if blocks > MAX_BLOCKS {
+            break;
         }
-        if let Some(r) = found {
-            return Ok(r);
+        let range = expected.start.saturating_add(shift)..expected.end.saturating_add(shift + slack);
+        let Some(starts) = candidates(&first, &known, &range) else {
+            if let Some((len, extra)) = known_len(&first) {
+                shift += len;
+                slack += extra;
+            }
+            continue;
+        };
+        // Every offset the block fits at is followed through the read-ahead; exactly one may hold.
+        let mut found = None;
+        for start in starts {
+            let result = match follow(packed, at, &first, start, &known, window, &mut pre) {
+                Follow::Restart(r) => Ok(r),
+                Follow::Filter { packed_offset, output_offset } => {
+                    Err(ResyncError::Filter { packed_offset, output_offset })
+                }
+                Follow::Mismatch => continue,
+            };
+            if found.is_some() {
+                return Err(ResyncError::Ambiguous);
+            }
+            found = Some(result);
+        }
+        if let Some(result) = found {
+            return result;
         }
     }
     Err(ResyncError::NotFound)
@@ -332,24 +404,32 @@ fn follow(
             // The block's offset is pinned by its literals before the filter, or by the blocks before it.
             Sim::Filter => return Follow::Filter { packed_offset: pos, output_offset: out },
             Sim::Mismatch => return Follow::Mismatch,
+            // The plaintext ends first: restart at this block with what was learned, if a block was checked.
+            Sim::Short if out > start => return restart(pos, start, out, &st, &block.lens),
+            Sim::Short => return Follow::Mismatch,
         }
         let next = if block.last { None } else { probe(packed, pos, Some(&block.lens), pre) };
         if st.complete() || next.is_none() {
             let lens = next.as_ref().map_or_else(|| block.lens.clone(), |n| n.lens.clone());
-            return Follow::Restart(Resync {
-                packed_offset: pos,
-                output_offset: out,
-                verified: start..out,
-                complete: st.complete(),
-                history: st.hist.map(|h| h.filter(|&(_, inferred)| !inferred).map_or(0, |(d, _)| d)),
-                last_len: st.last.unwrap_or(0),
-                lens,
-            });
+            return restart(pos, start, out, &st, &lens);
         }
         owned = next.expect("checked above");
         block = &owned;
     }
-    Follow::Mismatch
+    // The block budget ran out with the state still unknown: restart at the next block anyway.
+    restart(pos, start, out, &st, &block.lens)
+}
+
+fn restart(pos: usize, start: u64, out: u64, st: &State, lens: &Lengths) -> Follow {
+    Follow::Restart(Resync {
+        packed_offset: pos,
+        output_offset: out,
+        verified: start..out,
+        complete: st.complete(),
+        history: st.hist.map(|h| h.filter(|&(_, inferred)| !inferred).map_or(0, |(d, _)| d)),
+        last_len: st.last.unwrap_or(0),
+        lens: Box::new(*lens),
+    })
 }
 
 impl Unpacker {
