@@ -232,6 +232,113 @@ pub fn decrypt_cbc(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Why [`rebuild_cbc`] refused or rejected a rebuild.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CbcRebuildError {
+    /// The key is not 16, 24 or 32 bytes.
+    KeyLength,
+    /// The plaintext is not a whole number of 16-byte blocks and does not end the stream.
+    Unaligned,
+    /// The intact ciphertext given to check against does not overlap the rebuilt range.
+    NoOverlap,
+    /// The rebuilt ciphertext differs from the intact ciphertext at this byte of the rebuilt range: the key, the
+    /// plaintext or the previous ciphertext block is wrong.
+    Mismatch { at: usize },
+}
+
+impl std::fmt::Display for CbcRebuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeyLength => f.write_str("AES key is not 16, 24 or 32 bytes"),
+            Self::Unaligned => f.write_str("plaintext is not whole AES blocks and does not end the stream"),
+            Self::NoOverlap => f.write_str("intact ciphertext does not overlap the rebuilt range"),
+            Self::Mismatch { at } => write!(f, "rebuilt ciphertext differs from the intact ciphertext at byte {at}"),
+        }
+    }
+}
+
+impl std::error::Error for CbcRebuildError {}
+
+/// Rebuilds the exact AES-CBC ciphertext of an encrypted stored member for a range of its plaintext, so a range
+/// lost from the archive can be written back from plaintext supplied by another copy.
+///
+/// * `key`: the member's AES key: [`derive_rar5_key`] for RAR 5.0 (salt and count from [`rar5_record_params`] of
+///   the file's encryption record), [`derive_7z_key`] for 7z AES, [`derive_rar4_key_iv`] for RAR 3.x/4.x.
+/// * `previous`: the 16 ciphertext bytes just before the range, or the IV when the range starts the stream (RAR 5.0:
+///   the file header's IV; 7z: the folder's IV, one per folder; RAR 3.x/4.x: the IV derived with the key).
+/// * `plaintext`: the stream's plaintext from a 16-byte-aligned offset. The stream is a RAR member's packed data
+///   across all its volumes' data areas taken together (a volume's part is rarely a multiple of 16 bytes, so blocks
+///   and the previous 16 bytes can straddle a volume boundary), or a 7z folder's unpacked stream (several files in a
+///   solid stored folder share one stream). For a stored member it is the output. [`cbc_rebuild_span`] turns a hole
+///   into the aligned range to rebuild.
+/// * `stream_end`: whether the range runs to the end of the stream (the RAR member, the 7z folder). Its last partial
+///   block is then padded with zero bytes before encryption, as rar 7.30 (RAR 5.0) and 7-Zip write it; otherwise
+///   `plaintext` must be whole blocks. (RAR 3.x/4.x padding could not be checked against rar, which no longer writes
+///   that format.)
+/// * `intact`: optionally `(offset, ciphertext)`: archive bytes that survive at `offset` within the rebuilt range.
+///   The overlap must match. CBC makes a block depend only on the plaintext up to it, so a match proves the key, the
+///   previous bytes and the plaintext up to the overlap: give bytes at or after the hole's end (the first intact
+///   block after it), whose plaintext `plaintext` must include. A range that ends the stream has nothing after it to
+///   check.
+pub fn rebuild_cbc(
+    key: &[u8],
+    previous: &[u8; 16],
+    plaintext: &[u8],
+    stream_end: bool,
+    intact: Option<(usize, &[u8])>,
+) -> Result<Vec<u8>, CbcRebuildError> {
+    if !matches!(key.len(), 16 | 24 | 32) {
+        return Err(CbcRebuildError::KeyLength);
+    }
+    let rem = plaintext.len() % 16;
+    if rem != 0 && !stream_end {
+        return Err(CbcRebuildError::Unaligned);
+    }
+    let mut padded = Vec::with_capacity(plaintext.len() + 16);
+    padded.extend_from_slice(plaintext);
+    if rem != 0 {
+        padded.resize(plaintext.len() + 16 - rem, 0);
+    }
+    let rebuilt = encrypt_cbc(key, previous, &padded).ok_or(CbcRebuildError::KeyLength)?;
+    if let Some((offset, bytes)) = intact {
+        let end = offset.saturating_add(bytes.len()).min(rebuilt.len());
+        if bytes.is_empty() || offset >= end {
+            return Err(CbcRebuildError::NoOverlap);
+        }
+        if let Some(at) = rebuilt[offset..end].iter().zip(bytes).position(|(a, b)| a != b) {
+            return Err(CbcRebuildError::Mismatch { at: offset + at });
+        }
+    }
+    Ok(rebuilt)
+}
+
+/// What to rebuild with [`rebuild_cbc`] for a hole in a CBC stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CbcSpan {
+    /// The stream range to rebuild: the hole widened to whole blocks, plus one intact block after it to check
+    /// against when the stream has one. Pass the plaintext of this range.
+    pub range: std::ops::Range<u64>,
+    /// Where the previous 16 bytes start (`range.start - 16`), or None when the range starts the stream (use the IV).
+    pub previous_at: Option<u64>,
+    /// The intact bytes after the hole within `range`, as stream offsets: pass them as `intact`, at
+    /// `check.start - range.start`. None when the hole reaches the stream's end.
+    pub check: Option<std::ops::Range<u64>>,
+    /// Whether `range` ends the stream (pass as `stream_end`).
+    pub stream_end: bool,
+}
+
+/// The aligned range to rebuild for a hole (`hole`, stream offsets) in a CBC stream of `stream_len` bytes (its
+/// plaintext length; the packed stream is that rounded up to 16).
+pub fn cbc_rebuild_span(hole: std::ops::Range<u64>, stream_len: u64) -> CbcSpan {
+    let end = hole.end.min(stream_len);
+    let start = hole.start.min(end) / 16 * 16;
+    let block_end = end.div_ceil(16) * 16;
+    // One more block to check against, unless the hole reaches the end.
+    let range_end = if block_end >= stream_len { stream_len } else { (block_end + 16).min(stream_len) };
+    let check = (end < stream_len).then_some(end..range_end);
+    CbcSpan { range: start..range_end, previous_at: start.checked_sub(16), check, stream_end: range_end == stream_len }
+}
+
 /// Encrypts AES-CBC plaintext (`data` must be a multiple of 16 bytes).
 pub fn encrypt_cbc(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
     let cipher = AesKey::new(key)?;
