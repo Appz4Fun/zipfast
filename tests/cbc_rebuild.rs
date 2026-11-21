@@ -1,6 +1,6 @@
 //! Rebuilding the AES-CBC ciphertext of an encrypted stored member from its plaintext (`zipfast::crypto::rebuild_cbc`).
 
-use zipfast::crypto::{CbcRebuildError, derive_7z_key, derive_rar5_key, rebuild_cbc};
+use zipfast::crypto::{CbcRebuildError, CbcSpan, cbc_rebuild_span, derive_7z_key, derive_rar5_key, rebuild_cbc};
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
@@ -64,4 +64,61 @@ fn a_wrong_key_plaintext_or_block_is_caught_by_the_intact_overlap() {
     );
     assert_eq!(rebuild_cbc(&rar5_key(), &previous, &PLAIN[16..40], false, None), Err(CbcRebuildError::Unaligned));
     assert_eq!(rebuild_cbc(&[0; 20], &previous, &PLAIN[16..48], false, None), Err(CbcRebuildError::KeyLength));
+}
+
+/// An arbitrary hole (bytes 20..37 of the 55-byte stream, as a lost article would be) rebuilt through
+/// `cbc_rebuild_span`: widened to blocks 16..48 plus the check bytes up to 64, from the previous 16 bytes, and
+/// checked against the intact bytes after the hole.
+#[test]
+fn a_hole_widens_to_blocks_with_a_check_after_it() {
+    let data = unhex(RAR5_DATA);
+    let span = cbc_rebuild_span(20..37, PLAIN.len() as u64);
+    assert_eq!(span, CbcSpan { range: 16..55, previous_at: Some(0), check: Some(37..55), stream_end: true });
+    let previous: [u8; 16] = data[..16].try_into().unwrap();
+    let check = span.check.clone().unwrap();
+    let intact = &data[check.start as usize..check.end as usize];
+    let rebuilt = rebuild_cbc(
+        &rar5_key(),
+        &previous,
+        &PLAIN[span.range.start as usize..span.range.end as usize],
+        span.stream_end,
+        Some(((check.start - span.range.start) as usize, intact)),
+    )
+    .unwrap();
+    assert_eq!(rebuilt, data[16..]);
+    // A hole in the first block uses the IV; one reaching the end has nothing to check.
+    assert_eq!(
+        cbc_rebuild_span(3..9, 55),
+        CbcSpan { range: 0..32, previous_at: None, check: Some(9..32), stream_end: false }
+    );
+    assert_eq!(
+        cbc_rebuild_span(40..55, 55),
+        CbcSpan { range: 32..55, previous_at: Some(16), check: None, stream_end: true }
+    );
+}
+
+/// Edges: an intact slice overlapping part of the range, longer than it, or not block-aligned; a stream that ends
+/// on a block boundary gets no extra block; empty plaintext at the end is empty; a 7z range in the middle of a
+/// folder's stream.
+#[test]
+fn overlap_and_padding_edges() {
+    let data = unhex(RAR5_DATA);
+    let previous: [u8; 16] = data[..16].try_into().unwrap();
+    let key = rar5_key();
+    // Overlap only the last 5 bytes of the range, from an unaligned offset, with a slice running past it.
+    assert!(rebuild_cbc(&key, &previous, &PLAIN[16..48], false, Some((27, &data[43..64]))).is_ok());
+    let mut bad = data[43..64].to_vec();
+    bad[2] ^= 1;
+    assert_eq!(
+        rebuild_cbc(&key, &previous, &PLAIN[16..48], false, Some((27, &bad))),
+        Err(CbcRebuildError::Mismatch { at: 29 })
+    );
+    // 32 bytes ending the stream: two blocks, no padding block.
+    assert_eq!(rebuild_cbc(&key, &previous, &PLAIN[16..48], true, None).unwrap().len(), 32);
+    assert_eq!(rebuild_cbc(&key, &previous, &[], true, None).unwrap(), Vec::<u8>::new());
+    // 7z, the folder's second and third blocks from its first.
+    let seven = unhex(SEVEN_DATA);
+    let key7 = derive_7z_key("secret", &[], 19).unwrap();
+    let prev7: [u8; 16] = seven[..16].try_into().unwrap();
+    assert_eq!(rebuild_cbc(&key7, &prev7, &PLAIN[16..48], false, Some((16, &seven[32..48]))).unwrap(), seven[16..48]);
 }
