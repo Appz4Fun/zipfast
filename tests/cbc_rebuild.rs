@@ -67,8 +67,8 @@ fn a_wrong_key_plaintext_or_block_is_caught_by_the_intact_overlap() {
 }
 
 /// An arbitrary hole (bytes 20..37 of the 55-byte stream, as a lost article would be) rebuilt through
-/// `cbc_rebuild_span`: widened to blocks 16..48 plus the check bytes up to 64, from the previous 16 bytes, and
-/// checked against the intact bytes after the hole.
+/// `cbc_rebuild_span`: widened to 16..55 (to the stream's end) from the previous 16 bytes, and checked against the
+/// intact bytes 37..55 after the hole.
 #[test]
 fn a_hole_widens_to_blocks_with_a_check_after_it() {
     let data = unhex(RAR5_DATA);
@@ -94,6 +94,19 @@ fn a_hole_widens_to_blocks_with_a_check_after_it() {
     assert_eq!(
         cbc_rebuild_span(40..55, 55),
         CbcSpan { range: 32..55, previous_at: Some(16), check: None, stream_end: true }
+    );
+    // A stream ending on a block boundary, a hole of exactly one block, and a hole in the padding past the plaintext.
+    assert_eq!(
+        cbc_rebuild_span(20..37, 48),
+        CbcSpan { range: 16..48, previous_at: Some(0), check: Some(37..48), stream_end: true }
+    );
+    assert_eq!(
+        cbc_rebuild_span(0..16, 64),
+        CbcSpan { range: 0..32, previous_at: None, check: Some(16..32), stream_end: false }
+    );
+    assert_eq!(
+        cbc_rebuild_span(60..64, 55),
+        CbcSpan { range: 48..55, previous_at: Some(32), check: None, stream_end: true }
     );
 }
 
