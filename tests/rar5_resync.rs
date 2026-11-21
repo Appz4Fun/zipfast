@@ -284,3 +284,31 @@ fn decode_unsized(window: zipfast::rar5::unpack::Window, packed: &[u8]) -> Vec<u
     u.finish(&mut out).unwrap();
     out.0
 }
+
+/// Megabytes of junk before the first block (a hole answered with garbage, or false block headers claiming large
+/// payloads) do not use up the work budget: only bytes actually decoded count.
+#[test]
+fn junk_before_the_first_block_does_not_exhaust_the_budget() {
+    use zipfast::rar5::testenc;
+    let plain = sample(300_000);
+    let packed = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let window = window_for(128 << 10, Some(plain.len() as u64), false).unwrap();
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut input: Vec<u8> = (0..2_000_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let junk = input.len();
+    input.extend_from_slice(&packed[packed.len() / 2..]);
+    let r = resync(&input, 0, &plain, window, 0..plain.len() as u64).unwrap();
+    assert!(r.packed_offset > junk);
+    let mut u = Unpacker::resume_at(window, &r, 0, &plain, Some(plain.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&input[r.packed_offset..], &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0, plain[r.output_offset as usize..]);
+}

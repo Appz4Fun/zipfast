@@ -121,7 +121,9 @@ impl Known<'_> {
 /// code lengths.
 struct Block {
     len: usize,
-    toks: Vec<Tok>,
+    /// The operations as the tokenizer packs them (8 bytes each, within its memory bound), and their filter fields.
+    toks: Vec<Packed>,
+    filters: Vec<FilterFields>,
     lits: Vec<u8>,
     lens: Box<Lengths>,
     last: bool,
@@ -131,9 +133,6 @@ struct Block {
 /// without tables is read with.
 fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff, work: &mut Work) -> Option<Block> {
     let (header, payload, flags) = block_header(packed.get(at..)?).ok()??;
-    if !work.spend(payload as u64) {
-        return None;
-    }
     let end = at.checked_add(header)?.checked_add(payload)?;
     // Read in place when the padding past the payload is there (a false header can claim megabytes: no copy for it).
     let copy;
@@ -152,6 +151,10 @@ fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff, work:
     let lens = if flags & 0x80 != 0 { read_lengths(pre, &mut bits, end_bits).ok()? } else { *prev? };
     let mut tables = Tables::empty();
     tables.build(&lens).ok()?;
+    // Decoding the symbols is the work that grows with the payload: charge the bytes that are there.
+    if !work.spend(payload.min(packed.len() - at) as u64) {
+        return None;
+    }
     let (mut packed_toks, mut filters, mut lits): (Vec<Packed>, Vec<FilterFields>, Vec<u8>) = Default::default();
     // The main decoder's bound on a block's tokens: a block that would take more is not one rar wrote.
     let budget = payload.saturating_mul(BUDGET).saturating_add(SLACK);
@@ -159,8 +162,7 @@ fn probe(packed: &[u8], at: usize, prev: Option<&Lengths>, pre: &mut Huff, work:
     {
         return None;
     }
-    let toks = packed_toks.into_iter().map(|p| p.get(&filters)).collect();
-    Some(Block { len: end - at, toks, lits, lens: Box::new(lens), last: flags & 0x40 != 0 })
+    Some(Block { len: end - at, toks: packed_toks, filters, lits, lens: Box::new(lens), last: flags & 0x40 != 0 })
 }
 
 /// The decoder state the hole erased, as far as it is known. A distance taken from the plaintext (`inferred`) is
@@ -185,6 +187,8 @@ enum Sim {
     /// The block's output runs past the known plaintext before contradicting it.
     Short,
     Filter,
+    /// The work budget ran out before the block was decided.
+    Exhausted,
 }
 
 /// The length an operation copies (a `Last` the last length, 0 while unknown).
@@ -197,27 +201,28 @@ fn len_of(tok: &Tok, st: &State) -> u32 {
 }
 
 /// The one distance (up to `limit` back) whose copy reproduces the plaintext at `at`, if exactly one does.
-fn infer(known: &Known<'_>, at: u64, len: u32, limit: u64, work: &mut Work) -> Option<u64> {
+/// `Err` when the work budget runs out first.
+fn infer(known: &Known<'_>, at: u64, len: u32, limit: u64, work: &mut Work) -> std::result::Result<Option<u64>, ()> {
     let mut found = None;
     for d in 1..=limit.min(at.saturating_sub(known.base)) {
         // A cheap first-byte test before the full copy; every distance tried costs.
-        if !work.spend(1) || known.get(at) != known.get(at - d) {
-            if work.left == 0 {
-                return None;
-            }
+        if !work.spend(1) {
+            return Err(());
+        }
+        if known.get(at) != known.get(at - d) {
             continue;
         }
         if !work.spend(u64::from(len)) {
-            return None;
+            return Err(());
         }
         if known.copies(at, d, len) {
             if found.is_some() {
-                return None;
+                return Ok(None);
             }
             found = Some(d);
         }
     }
-    found
+    Ok(found)
 }
 
 /// Checks `block`, decoded at output offset `at` with state `st`, against the plaintext, learning the state it
@@ -225,11 +230,15 @@ fn infer(known: &Known<'_>, at: u64, len: u32, limit: u64, work: &mut Work) -> O
 fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u64, work: &mut Work) -> Sim {
     let (mut p, mut li) = (at, 0usize);
     let limit = window.min(SEARCH);
-    for tok in &block.toks {
+    for tok in block.toks.iter().map(|p| p.get(&block.filters)) {
+        let tok = &tok;
         let (len, dist) = match *tok {
             Tok::Lits(n) => {
                 let n = n as usize;
                 let Some(lits) = block.lits.get(li..li + n) else { return Sim::Mismatch };
+                if !work.spend(n as u64) {
+                    return Sim::Exhausted;
+                }
                 for (i, &b) in lits.iter().enumerate() {
                     match known.get(p + i as u64) {
                         Some(k) if k != b => return Sim::Mismatch,
@@ -250,8 +259,13 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             Tok::Rep { .. } | Tok::Last if p + u64::from(len_of(tok, st)) > known.end() => return Sim::Short,
             Tok::Rep { k, len } => {
                 let k = usize::from(k) & 3;
-                let Some(h) = st.hist[k].or_else(|| infer(known, p, len, limit, work).map(|d| (d, true))) else {
-                    return Sim::Mismatch;
+                let h = match st.hist[k] {
+                    Some(h) => h,
+                    None => match infer(known, p, len, limit, work) {
+                        Ok(Some(d)) => (d, true),
+                        Ok(None) => return Sim::Mismatch,
+                        Err(()) => return Sim::Exhausted,
+                    },
                 };
                 st.hist.copy_within(0..k, 1);
                 st.hist[0] = Some(h);
@@ -259,8 +273,13 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             }
             Tok::Last => {
                 let Some(len) = st.last else { return Sim::Mismatch };
-                let Some(h) = st.hist[0].or_else(|| infer(known, p, len, limit, work).map(|d| (d, true))) else {
-                    return Sim::Mismatch;
+                let h = match st.hist[0] {
+                    Some(h) => h,
+                    None => match infer(known, p, len, limit, work) {
+                        Ok(Some(d)) => (d, true),
+                        Ok(None) => return Sim::Mismatch,
+                        Err(()) => return Sim::Exhausted,
+                    },
                 };
                 st.hist[0] = Some(h);
                 (len, h.0)
@@ -270,7 +289,7 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
             return Sim::Short;
         }
         if !work.spend(u64::from(len)) {
-            return Sim::Short;
+            return Sim::Exhausted;
         }
         if !known.copies(p, dist, len) {
             return Sim::Mismatch;
@@ -288,7 +307,8 @@ const MAX_CANDIDATES: usize = 64;
 /// here: each counts as up to `MAX_LEN` more), or None for a block that starts a filter.
 fn known_len(block: &Block) -> Option<(u64, u64)> {
     let (mut len, mut slack) = (0u64, 0u64);
-    for tok in &block.toks {
+    for tok in block.toks.iter().map(|p| p.get(&block.filters)) {
+        let tok = &tok;
         match *tok {
             Tok::Lits(n) => len += u64::from(n),
             Tok::Match { len: l, .. } | Tok::Rep { len: l, .. } => len += u64::from(l),
@@ -308,7 +328,8 @@ const MAX_LEN: u64 = 0x1101;
 fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>, work: &mut Work) -> Option<Vec<u64>> {
     let mut runs = Vec::new();
     let (mut before, mut li) = (0u64, 0usize);
-    for tok in &block.toks {
+    for tok in block.toks.iter().map(|p| p.get(&block.filters)) {
+        let tok = &tok;
         match *tok {
             Tok::Lits(n) => {
                 let n = (n as usize).min(block.lits.len() - li);
@@ -475,8 +496,12 @@ fn follow(
             // The plaintext ends first: restart at this block with what was learned, if a block was checked.
             Sim::Short if out > start => return restart(pos, start, out, &st, &block.lens),
             Sim::Short => return Follow::Mismatch,
+            Sim::Exhausted => return Follow::Exhausted,
         }
         let next = if block.last { None } else { probe(packed, pos, Some(&block.lens), pre, work) };
+        if work.left == 0 {
+            return Follow::Exhausted;
+        }
         if st.complete() || next.is_none() {
             let lens = next.as_ref().map_or_else(|| block.lens.clone(), |n| n.lens.clone());
             return restart(pos, start, out, &st, &lens);
