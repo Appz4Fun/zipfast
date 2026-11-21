@@ -1,6 +1,8 @@
 //! Rebuilding the end of a RAR 5.0 volume byte for byte (`zipfast::rar5::rebuild_volume_tail`).
 
-use zipfast::rar5::{RebuiltTail, TailDoubt, rebuild_volume_tail};
+use zipfast::rar5::{
+    QuickOpenMode, RebuiltTail, TailDoubt, quick_open_mode, rebuild_volume_tail, rebuild_volume_tail_with,
+};
 
 /// The rebuilt bytes from the tail's offset to the volume's end: headers, then the padding zeros.
 fn whole(tail: &RebuiltTail) -> Vec<u8> {
@@ -17,6 +19,12 @@ fn sets() -> Option<std::path::PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+/// Where a volume's tail starts, as the rebuild finds it from the whole volume.
+fn rebuild_offset(bytes: &[u8]) -> usize {
+    rebuild_volume_tail_with(bytes, bytes.len() as u64, None, Some(QuickOpenMode::All))
+        .map_or(bytes.len(), |t| t.offset as usize)
+}
+
 /// Every volume of every rar-made set: cut after the last file's data and rebuilt, it matches the original byte for
 /// byte, and the result says when it cannot be certain.
 #[test]
@@ -25,7 +33,7 @@ fn every_volume_of_the_rar_made_sets_rebuilds_byte_for_byte() {
         eprintln!("skipped: no rar-made sets (set ZIPFAST_RAR5_TAIL_SETS)");
         return;
     };
-    let mut checked = 0;
+    let (mut checked, mut unsure) = (0, 0);
     let mut sets: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
     sets.sort();
     for set in sets {
@@ -33,10 +41,33 @@ fn every_volume_of_the_rar_made_sets_rebuilds_byte_for_byte() {
         let mut volumes: Vec<_> = std::fs::read_dir(&set).unwrap().map(|e| e.unwrap().path()).collect();
         volumes.sort();
         let count = volumes.len();
+        // The set's quick open mode, as a caller learns it from any intact volume of the set.
+        let mode = volumes.iter().find_map(|v| quick_open_mode(&std::fs::read(v).unwrap()));
+        if name.contains("default") && name.starts_with("small") || name == "nfo-first-default" {
+            assert_eq!(mode, Some(QuickOpenMode::LargeFiles), "{name}");
+        }
+        if name.ends_with("qoplus") && (name.starts_with("small") || name.starts_with("nfo")) {
+            assert_eq!(mode, Some(QuickOpenMode::All), "{name}");
+        }
         for (index, path) in volumes.iter().enumerate() {
             let bytes = std::fs::read(path).unwrap();
             let more = Some(index + 1 < count);
-            let rebuilt = rebuild_volume_tail(&bytes, bytes.len() as u64, more);
+            // Without the mode the rebuild may doubt, but never claims exact bytes that are wrong.
+            if let Ok(guess) =
+                rebuild_volume_tail(&bytes[..bytes.len().min(rebuild_offset(&bytes))], bytes.len() as u64, more)
+            {
+                if guess.exact {
+                    assert_eq!(
+                        whole(&guess),
+                        bytes[guess.offset as usize..],
+                        "{}: exact without the mode",
+                        path.display()
+                    );
+                } else if guess.doubt == Some(TailDoubt::QuickOpenMode) {
+                    unsure += 1;
+                }
+            }
+            let rebuilt = rebuild_volume_tail_with(&bytes, bytes.len() as u64, more, mode);
             if name == "hp" || name == "rr" {
                 assert!(rebuilt.is_err(), "{}: {rebuilt:?}", path.display());
                 continue;
@@ -46,7 +77,7 @@ fn every_volume_of_the_rar_made_sets_rebuilds_byte_for_byte() {
             assert_eq!(whole(&rebuilt), bytes[offset..], "{}", path.display());
             assert!(rebuilt.exact, "{}: {:?}", path.display(), rebuilt.doubt);
             // Lost from the end of the last file's data: the same bytes from the surviving start.
-            let cut = rebuild_volume_tail(&bytes[..offset], bytes.len() as u64, more).unwrap();
+            let cut = rebuild_volume_tail_with(&bytes[..offset], bytes.len() as u64, more, mode).unwrap();
             assert_eq!(cut, rebuilt, "{}", path.display());
             checked += 1;
         }
@@ -55,7 +86,9 @@ fn every_volume_of_the_rar_made_sets_rebuilds_byte_for_byte() {
     // header of a member this large, and its file header's padded fields are copied as they are.
     let slices = dir.with_file_name("rar5-tail-big").join("slices");
     if slices.is_dir() {
-        for name in ["big-default-01", "big-default-08", "big-default-16", "big-qoplus-08", "big-qoplus-16"] {
+        for name in
+            ["big-default-01", "big-default-08", "big-default-16", "big-qoplus-01", "big-qoplus-08", "big-qoplus-16"]
+        {
             let head = std::fs::read(slices.join(format!("{name}.head"))).unwrap();
             let end = std::fs::read(slices.join(format!("{name}.tail"))).unwrap();
             let len: u64 = std::fs::read_to_string(slices.join(format!("{name}.len"))).unwrap().trim().parse().unwrap();
@@ -68,7 +101,7 @@ fn every_volume_of_the_rar_made_sets_rebuilds_byte_for_byte() {
             checked += 1;
         }
     }
-    eprintln!("{checked} volumes rebuilt");
+    eprintln!("{checked} volumes rebuilt; {unsure} needed the quick open mode");
     assert!(checked > 0);
 }
 
@@ -148,6 +181,42 @@ const QO_PASSWORD_LAST: Vector = Vector {
     more: false,
 };
 
+/// `small-piece-default/set.part2.rar` (rar 7.30).
+const SMALL_PIECE_DEFAULT: Vector = Vector {
+    headers: &[
+        (8, "254a451b0d0105080301070101e79e868000"),
+        (26, "ae21770725020b0bc5820604aba10ca48302c9d1b1ba80000105612e6d6b760a03134c13016b203d5406"),
+        (98697, "76f74cfa2502130bbc9b0004f09309a4830267b116de80000105622e6d6b760a03134c13016b4c82ab06"),
+    ],
+    len: 102400,
+    tail_at: 102255,
+    tail: "59850f640e0306b40000b4000080000102514f441dda942f00d59e062aae21770725020b0bc5820604aba10ca48302c9d1b1ba80000105612e6d6b760a03134c13016b203d54068b47512603050401000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    more: true,
+};
+/// `small-piece-qoplus/set.part2.rar` (rar 7.30).
+const SMALL_PIECE_QO_PLUS: Vector = Vector {
+    headers: &[
+        (8, "254a451b0d0105080301070101e79e868000"),
+        (26, "ae21770725020b0bc5820604aba10ca48302c9d1b1ba80000105612e6d6b760a03134c13016b203d5406"),
+        (98697, "76f74cfa2502130bbc9b0004f09309a4830267b116de80000105622e6d6b760a03134c13016b4c82ab06"),
+    ],
+    len: 102400,
+    tail_at: 102255,
+    tail: "167035640e0306e70000e7000080000102514f441dda942f00d59e062aae21770725020b0bc5820604aba10ca48302c9d1b1ba80000105612e6d6b760a03134c13016b203d540616514e8b2e00e61b2a76f74cfa2502130bbc9b0004f09309a4830267b116de80000105622e6d6b760a03134c13016b4c82ab068b47512603050401000000000000000000000000000000",
+    more: true,
+};
+/// `small-last-default/set.part3.rar` (rar 7.30).
+const SMALL_LAST_DEFAULT: Vector = Vector {
+    headers: &[
+        (8, "a38191bd0d01050803020701018080808000"),
+        (26, "8fee97552e020b0be48f00048bcd0ca48302d8faad548000010e73686f72742d7461696c2e6d6b760a03134c13016b985c7607"),
+    ],
+    len: 2105,
+    tail_at: 2097,
+    tail: "1d77565103050400",
+    more: false,
+};
+
 #[test]
 fn rar_made_volume_ends_rebuild_byte_for_byte() {
     for (name, v) in [
@@ -210,7 +279,7 @@ fn a_rebuild_that_cannot_be_certain_says_why() {
     assert_eq!(rebuilt.doubt, Some(TailDoubt::MoreVolumesContradicted));
 
     let v = NO_QO_MIDDLE;
-    let rebuilt = rebuild_volume_tail(&v.head(), v.len + 16, Some(true)).unwrap();
+    let rebuilt = rebuild_volume_tail(&v.head(), v.len + 100, Some(true)).unwrap();
     assert_eq!(rebuilt.doubt, Some(TailDoubt::UnexpectedPadding));
 
     // The volume's second file header is lost too (zeros where it was): the locator puts the quick open header
@@ -240,4 +309,27 @@ fn volumes_that_cannot_be_rebuilt_are_refused() {
     assert!(matches!(rebuild_volume_tail(b"Rar!\x1a\x07\x00", 100, None), Err(zipfast::Error::NotAnArchive)));
     let v = QO_MIDDLE;
     assert!(matches!(rebuild_volume_tail(&v.head()[..40], v.len, None), Err(zipfast::Error::Truncated)));
+}
+
+/// rar's default quick open mode skips the header of a file with 4096 bytes of packed data or less in the volume,
+/// and `-qo+` caches it: a volume ending with such a piece (here b.mkv's first 3516 bytes) has two possible tails.
+/// Without the set's mode the rebuild doubts; with it, both are exact. A last volume holding only a small piece has
+/// no quick open data in default mode, and its zero locator offset says so.
+#[test]
+fn a_small_piece_depends_on_the_quick_open_mode() {
+    for (v, mode) in [(SMALL_PIECE_DEFAULT, QuickOpenMode::LargeFiles), (SMALL_PIECE_QO_PLUS, QuickOpenMode::All)] {
+        let guess = rebuild_volume_tail(&v.head(), v.len, Some(v.more)).unwrap();
+        assert_eq!(guess.doubt, Some(TailDoubt::QuickOpenMode), "{mode:?}");
+        let rebuilt = rebuild_volume_tail_with(&v.head(), v.len, Some(v.more), Some(mode)).unwrap();
+        assert!(rebuilt.exact, "{mode:?}: {:?}", rebuilt.doubt);
+        assert_eq!(whole(&rebuilt), unhex(v.tail), "{mode:?}");
+        // The other mode's bytes are not claimed exact.
+        let other = if mode == QuickOpenMode::All { QuickOpenMode::LargeFiles } else { QuickOpenMode::All };
+        let wrong = rebuild_volume_tail_with(&v.head(), v.len, Some(v.more), Some(other)).unwrap();
+        assert_ne!(whole(&wrong), unhex(v.tail), "{mode:?}");
+    }
+    let v = SMALL_LAST_DEFAULT;
+    let rebuilt = rebuild_volume_tail(&v.head(), v.len, Some(false)).unwrap();
+    assert!(rebuilt.exact, "{:?}", rebuilt.doubt);
+    assert_eq!(whole(&rebuilt), unhex(v.tail));
 }

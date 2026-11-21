@@ -4,7 +4,9 @@
 //! data of the volume's last file is derivable from the volume's own headers and its length:
 //!
 //! * the quick open service header (`QO`), when the main header's locator says there is one. Its data caches an
-//!   exact copy of every file header in the volume, each with its distance back from the service header;
+//!   exact copy of file headers in the volume, each with its distance back from the service header: with `-qo+`
+//!   every one ([`QuickOpenMode::All`]), and by default only those whose packed data in the volume is more than
+//!   4096 bytes ([`QuickOpenMode::LargeFiles`]); with none to cache there is no service header;
 //! * the end of archive header, whose one flag says whether more volumes follow;
 //! * zero padding up to the volume's length (rar reserves room for the quick open data before it knows its size),
 //!   returned as a count.
@@ -13,7 +15,7 @@
 //! the original ([`RebuiltTail::exact`]), so a caller claims a par2-clean volume only when it is.
 //!
 //! Written from the RAR 5.0 archive format description and checked against volume sets made by rar 7.30
-//! (`-ma5 -m0 -v`, with and without `-qo`, with `-p`, several files per volume).
+//! (`-ma5 -m0 -v`; quick open off, on and default; `-p`; several files per volume, small and large pieces).
 
 use super::Cursor;
 use crate::error::{Error, Result};
@@ -36,8 +38,21 @@ const ARCHIVE_RECOVERY: u64 = 0x8;
 const EXTRA_LOCATOR: u64 = 1;
 const LOCATOR_QUICK_OPEN: u64 = 0x1;
 const LOCATOR_RECOVERY: u64 = 0x2;
-/// The most zero padding a rebuilt middle volume may end with and still be called exact.
+/// The most zero padding a rebuilt middle volume may end with and still be called exact, beyond the room of
+/// headers the quick open data skips.
 const MAX_PADDING: u64 = 64;
+/// rar's default quick open mode caches a file header only when the file has more than this much packed data in
+/// the volume (rar 7.30: 4096 skipped, 4097 cached).
+const SMALL_PIECE: u64 = 4096;
+
+/// Which file headers rar caches in a volume's quick open data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuickOpenMode {
+    /// Every file header (`-qo+`).
+    All,
+    /// Only files with more than 4096 bytes of packed data in the volume (rar's default `-qo`).
+    LargeFiles,
+}
 
 /// The rebuilt end of a volume.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,14 +79,18 @@ pub enum TailDoubt {
     /// The locator puts the quick open header somewhere other than right after the last file's data: something the
     /// surviving bytes do not show lies in between.
     QuickOpenElsewhere,
-    /// The padding is not what rar leaves: any at all without quick open data or after the last volume's, or more
-    /// than the few bytes rar reserves after a middle volume's. So the volume's length is wrong, or it holds headers
-    /// the surviving bytes do not show.
+    /// The padding is not what rar usually leaves: any after the last volume's end header, or after a middle
+    /// volume's more than the room of skipped quick open records plus 64 bytes. So the volume's length is wrong, it
+    /// holds headers the surviving bytes do not show, or rar reserved unusually much (it can, with many small files,
+    /// links or extra file times): a doubt, not a certain mismatch.
     UnexpectedPadding,
     /// The caller said no volumes follow, but the volume's last file continues in the next one.
     MoreVolumesContradicted,
     /// The quick open data is too large for the field widths seen in rar's output.
     LargeQuickOpen,
+    /// The volume has files with 4096 bytes of packed data or less, which only `-qo+` caches, and the set's quick
+    /// open mode is not known: the bytes assume rar's default. Pass the mode (see [`quick_open_mode`]) to be sure.
+    QuickOpenMode,
     /// Bytes the caller supplied past [`RebuiltTail::offset`] differ from the rebuilt ones.
     DiffersFromSupplied,
 }
@@ -82,6 +101,14 @@ struct FileHead<'a> {
     bytes: &'a [u8],
     host_os: u64,
     split_after: bool,
+    /// Packed data of the file in this volume.
+    data: u64,
+}
+
+impl FileHead<'_> {
+    fn cached(&self, mode: QuickOpenMode) -> bool {
+        mode == QuickOpenMode::All || self.data > SMALL_PIECE
+    }
 }
 
 /// Rebuilds the bytes of a RAR 5.0 volume after its last file's packed data.
@@ -96,7 +123,22 @@ struct FileHead<'a> {
 /// [`Error::Truncated`] when `head` ends before a file header does, and [`Error::Unsupported`] for encrypted headers
 /// (each header starts with a random IV, so no rebuild can match) or a recovery record (its data covers the whole
 /// volume).
+///
+/// When the volume holds a file with 4096 bytes of packed data or less, the bytes depend on the set's quick open mode,
+/// which the volume's start does not show: see [`rebuild_volume_tail_with`].
 pub fn rebuild_volume_tail(head: &[u8], volume_len: u64, more_volumes: Option<bool>) -> Result<RebuiltTail> {
+    rebuild_volume_tail_with(head, volume_len, more_volumes, None)
+}
+
+/// [`rebuild_volume_tail`] with the set's quick open mode, when known (from an intact volume of the same set, with
+/// [`quick_open_mode`]). With `None`, a volume holding small files is rebuilt in the one mode that fits its length,
+/// or, if both fit, in rar's default mode with [`TailDoubt::QuickOpenMode`].
+pub fn rebuild_volume_tail_with(
+    head: &[u8],
+    volume_len: u64,
+    more_volumes: Option<bool>,
+    mode: Option<QuickOpenMode>,
+) -> Result<RebuiltTail> {
     if head.len() < SIGNATURE.len() || &head[..SIGNATURE.len()] != SIGNATURE {
         return Err(Error::NotAnArchive);
     }
@@ -132,7 +174,7 @@ pub fn rebuild_volume_tail(head: &[u8], volume_len: u64, more_volumes: Option<bo
             HEAD_CRYPT => return Err(Error::Unsupported("encrypted RAR 5.0 headers cannot be rebuilt exactly".into())),
             HEAD_FILE if saw_main => {
                 let (host_os, split_after) = file_header(flags, body)?;
-                files.push(FileHead { at: pos, bytes: &head[pos..end], host_os, split_after });
+                files.push(FileHead { at: pos, bytes: &head[pos..end], host_os, split_after, data: data_size });
             }
             HEAD_SERVICE | HEAD_ENDARC if !files.is_empty() => break pos,
             _ => return Err(Error::Unsupported(format!("RAR 5.0 header type {kind} before the volume's tail"))),
@@ -161,26 +203,61 @@ pub fn rebuild_volume_tail(head: &[u8], volume_len: u64, more_volumes: Option<bo
             false
         }
     };
-    let mut bytes = Vec::new();
+    // The headers in each quick open mode, and the room a skipped header leaves as padding.
+    let build = |mode: QuickOpenMode| -> Result<(Vec<u8>, u64, bool)> {
+        let mut bytes = Vec::new();
+        let mut large = false;
+        let mut skipped = 0;
+        if quick_open.is_some() {
+            let cached: Vec<&FileHead<'_>> = files.iter().filter(|f| f.cached(mode)).collect();
+            skipped = files.iter().filter(|f| !f.cached(mode)).map(|f| record(f, tail_at).len() as u64).sum();
+            // With nothing to cache rar writes no service header (and a zero locator offset).
+            if !cached.is_empty() {
+                let (header, too_large) = quick_open_header(&cached, files.last().map_or(0, |f| f.host_os), tail_at);
+                large = too_large;
+                bytes.extend(header);
+            }
+        }
+        bytes.extend(end_of_archive(more));
+        Ok((bytes, skipped, large))
+    };
+    let fits = |bytes: &[u8]| (tail_at as u64).checked_add(bytes.len() as u64).is_some_and(|end| end <= volume_len);
+    let small = quick_open.is_some() && files.iter().any(|f| f.data <= SMALL_PIECE);
+    let (bytes, skipped, large) = match mode {
+        Some(mode) => build(mode)?,
+        None if !small => build(QuickOpenMode::All)?,
+        None => {
+            let all = build(QuickOpenMode::All)?;
+            let default = build(QuickOpenMode::LargeFiles)?;
+            let none_cached = quick_open == Some(0);
+            if none_cached || (fits(&default.0) && !fits(&all.0)) {
+                default
+            } else if fits(&all.0) && !fits(&default.0) {
+                all
+            } else {
+                doubt = doubt.or(Some(TailDoubt::QuickOpenMode));
+                default
+            }
+        }
+    };
+    if large {
+        doubt = doubt.or(Some(TailDoubt::LargeQuickOpen));
+    }
     if let Some(offset) = quick_open {
-        let qo_at = (main_at as u64).checked_add(offset).ok_or(Error::Corrupt("quick open offset"))?;
-        if qo_at != tail_at as u64 {
+        // The locator names the service header's offset from the main header, or 0 when there is none.
+        let expected = if bytes.len() > 8 { (tail_at - main_at) as u64 } else { 0 };
+        if offset != expected {
             doubt = doubt.or(Some(TailDoubt::QuickOpenElsewhere));
         }
-        let (header, large) = quick_open_header(&files, tail_at)?;
-        if large {
-            doubt = doubt.or(Some(TailDoubt::LargeQuickOpen));
-        }
-        bytes.extend(header);
     }
-    bytes.extend(end_of_archive(more));
     let used = (tail_at as u64).checked_add(bytes.len() as u64).ok_or(Error::Corrupt("volume length"))?;
     let Some(padding) = volume_len.checked_sub(used) else {
         return Err(Error::Corrupt("the volume is shorter than its headers"));
     };
-    // rar ends a volume without quick open data, and the last volume, right after the end of archive header, and
-    // leaves at most a few bytes after a middle volume's (6 to 15 in its output).
-    if padding != 0 && (quick_open.is_none() || !more) || padding > MAX_PADDING {
+    // rar ends the last volume right after its end of archive header. A middle volume ends with what rar reserved
+    // and did not use: the room of skipped headers and a few bytes more (with no quick open data at all, rar can
+    // still leave some), so more than that means the length is wrong or headers are missing.
+    if padding != 0 && !more || padding > MAX_PADDING.saturating_add(skipped) {
         doubt = doubt.or(Some(TailDoubt::UnexpectedPadding));
     }
     if head.len() > tail_at {
@@ -288,24 +365,27 @@ fn header(fields: &[u8]) -> Vec<u8> {
     out
 }
 
+/// One quick open record caching `file`, for a service header at `at`: CRC32, size, flags, distance back, header
+/// size, the header's bytes.
+fn record(file: &FileHead<'_>, at: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    vint(&mut body, 0, 1); // flags
+    vint(&mut body, (at - file.at) as u64, 1); // distance back to the cached header
+    vint(&mut body, file.bytes.len() as u64, 1);
+    body.extend_from_slice(file.bytes);
+    let mut sized = Vec::new();
+    vint(&mut sized, body.len() as u64, 1);
+    sized.extend(body);
+    let mut out = crate::crc32::hash(&sized).to_le_bytes().to_vec();
+    out.extend(sized);
+    out
+}
+
 /// The quick open service header at `at` with its data, caching each of `files`; and whether its data is larger
 /// than the two-byte size fields seen in rar's output.
-fn quick_open_header(files: &[FileHead<'_>], at: usize) -> Result<(Vec<u8>, bool)> {
-    let mut data = Vec::new();
-    for file in files {
-        let mut record = Vec::new();
-        vint(&mut record, 0, 1); // flags
-        vint(&mut record, (at - file.at) as u64, 1); // distance back to the cached header
-        vint(&mut record, file.bytes.len() as u64, 1);
-        record.extend_from_slice(file.bytes);
-        let mut sized = Vec::new();
-        vint(&mut sized, record.len() as u64, 1);
-        sized.extend(record);
-        data.extend(crate::crc32::hash(&sized).to_le_bytes());
-        data.extend(sized);
-    }
+fn quick_open_header(files: &[&FileHead<'_>], host_os: u64, at: usize) -> (Vec<u8>, bool) {
+    let data: Vec<u8> = files.iter().flat_map(|f| record(f, at)).collect();
     let large = data.len() >= 1 << 14;
-    let host_os = files.last().map_or(0, |f| f.host_os);
     let mut fields = Vec::new();
     vint(&mut fields, HEAD_SERVICE, 1);
     vint(&mut fields, FLAG_DATA | 0x4, 1); // data area, skip if unknown
@@ -319,7 +399,56 @@ fn quick_open_header(files: &[FileHead<'_>], at: usize) -> Result<(Vec<u8>, bool
     fields.extend_from_slice(b"QO");
     let mut out = header(&fields);
     out.extend(data);
-    Ok((out, large))
+    (out, large)
+}
+
+/// The quick open mode of a set, from one of its intact volumes: `Some` when the volume holds a file with 4096 bytes
+/// of packed data or less (rar's default skips its header, `-qo+` caches it), `None` when it shows nothing either way
+/// (no small file, no quick open data, or a volume this cannot read).
+pub fn quick_open_mode(volume: &[u8]) -> Option<QuickOpenMode> {
+    if volume.len() < SIGNATURE.len() || &volume[..SIGNATURE.len()] != SIGNATURE {
+        return None;
+    }
+    let mut pos = SIGNATURE.len();
+    let mut small = Vec::new();
+    let mut has_quick_open = false;
+    loop {
+        let (kind, _flags, data_size, body, end) = block(volume, pos).ok()??;
+        match kind {
+            HEAD_MAIN => has_quick_open = main_header(_flags, body).ok()?.1.is_some_and(|(_, o)| o.is_some()),
+            HEAD_FILE if data_size <= SMALL_PIECE => small.push(pos),
+            HEAD_FILE => {}
+            HEAD_SERVICE if has_quick_open => {
+                // The quick open data: does any record cache a small file's header?
+                let data = volume.get(end..end.checked_add(usize::try_from(data_size).ok()?)?)?;
+                let mut cached = Vec::new();
+                let mut c = Cursor::new(data);
+                while c.remaining() > 0 {
+                    c.u32().ok()?;
+                    let size = c.vsize().ok()?;
+                    let mut r = Cursor::new(c.bytes(size).ok()?);
+                    r.vint().ok()?;
+                    let back = usize::try_from(r.vint().ok()?).ok()?;
+                    cached.push(pos.checked_sub(back)?);
+                }
+                if small.is_empty() {
+                    return None;
+                }
+                let all = small.iter().all(|at| cached.contains(at));
+                let none = small.iter().all(|at| !cached.contains(at));
+                return match (all, none) {
+                    (true, false) => Some(QuickOpenMode::All),
+                    (false, true) => Some(QuickOpenMode::LargeFiles),
+                    _ => None,
+                };
+            }
+            // No service header before the end: small files exist and nothing cached them (default mode), or
+            // there is no quick open data.
+            HEAD_ENDARC => return (has_quick_open && !small.is_empty()).then_some(QuickOpenMode::LargeFiles),
+            _ => return None,
+        }
+        pos = end.checked_add(usize::try_from(data_size).ok()?)?;
+    }
 }
 
 /// The end of archive header, with "more volumes" set when `more`.
