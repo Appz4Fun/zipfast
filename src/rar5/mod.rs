@@ -17,7 +17,9 @@
 //! RAR 5.0 archive blocks, read from the published archive layout: the signature, the main header, file and service
 //! headers with their extra records, and the end of archive header.
 
+pub mod frame;
 pub(crate) mod framing;
+pub mod head;
 pub(crate) mod map;
 pub(crate) mod member;
 pub(crate) mod physical;
@@ -30,6 +32,7 @@ pub mod testenc;
 pub mod unpack;
 mod unrar_name;
 
+pub use head::{CachedHeader, HeadDoubt, HeadOptions, RebuiltHead, rebuild_volume_head};
 pub use tail::{QuickOpenMode, RebuiltTail, TailDoubt, quick_open_mode, rebuild_volume_tail, rebuild_volume_tail_with};
 pub use unrar_name::{unrar_name, unrar_name_to_string};
 

@@ -18,6 +18,7 @@
 //! (`-ma5 -m0 -v`; quick open off, on and default; `-p`; several files per volume, small and large pieces).
 
 use super::Cursor;
+use super::frame::{end_of_archive, put_vint_min as vint, seal_header as header};
 use crate::error::{Error, Result};
 
 const SIGNATURE: &[u8; 8] = b"Rar!\x1a\x07\x01\x00";
@@ -354,31 +355,6 @@ fn file_header(flags: u64, body: &[u8]) -> Result<(u64, bool)> {
     Ok((host_os, flags & FLAG_SPLIT_AFTER != 0))
 }
 
-/// `value` as a RAR vint, written in at least `min` bytes (rar pads some fields with continuation bytes).
-fn vint(out: &mut Vec<u8>, mut value: u64, min: usize) {
-    let mut written = 0;
-    loop {
-        let low = (value & 0x7f) as u8;
-        value >>= 7;
-        written += 1;
-        if value == 0 && written >= min {
-            out.push(low);
-            return;
-        }
-        out.push(low | 0x80);
-    }
-}
-
-/// A header block: CRC32, size, then `fields`.
-fn header(fields: &[u8]) -> Vec<u8> {
-    let mut sized = Vec::with_capacity(fields.len() + 6);
-    vint(&mut sized, fields.len() as u64, 1);
-    sized.extend_from_slice(fields);
-    let mut out = crate::crc32::hash(&sized).to_le_bytes().to_vec();
-    out.extend(sized);
-    out
-}
-
 /// One quick open record caching `file`, for a service header at `at`: CRC32, size, flags, distance back, header
 /// size, the header's bytes.
 fn record(file: &FileHead<'_>, at: usize) -> Vec<u8> {
@@ -463,15 +439,6 @@ pub fn quick_open_mode(volume: &[u8]) -> Option<QuickOpenMode> {
         }
         pos = end.checked_add(usize::try_from(data_size).ok()?)?;
     }
-}
-
-/// The end of archive header, with "more volumes" set when `more`.
-fn end_of_archive(more: bool) -> Vec<u8> {
-    let mut fields = Vec::new();
-    vint(&mut fields, HEAD_ENDARC, 1);
-    vint(&mut fields, 0x4, 1); // skip if unknown
-    vint(&mut fields, u64::from(more), 1);
-    header(&fields)
 }
 
 #[cfg(test)]
