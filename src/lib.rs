@@ -52,6 +52,9 @@ pub mod zip;
 
 pub use error::{Error, Result};
 pub use output::STAGED_PREFIX;
+/// The workspace's read-only, allocation-bounded ZIP container reader, for ZIP data held in memory or read through
+/// a range callback (indexes, password checks, entry reads); `zipfast::zip` reads ZIP files on disk.
+pub use zipview;
 
 mod cli;
 
