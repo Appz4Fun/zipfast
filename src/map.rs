@@ -1079,6 +1079,8 @@ struct Core {
     tail_at: u64,
     /// Map one RAR volume on its own ([`VolumeMap`]) instead of a whole archive.
     single: bool,
+    /// A 7z walk's header key, kept once the walk ends: (cycle power, salt, key).
+    seven_zip_key: Option<(u8, Vec<u8>, [u8; 32])>,
 }
 
 impl Core {
@@ -1093,6 +1095,7 @@ impl Core {
             tail: Vec::new(),
             tail_at: 0,
             single,
+            seven_zip_key: None,
         }
     }
 
@@ -1117,6 +1120,9 @@ impl Core {
     fn poll(&mut self, input: &mut dyn MapInput, cx: &mut Context<'_>) -> Poll<Result<Walked, MapError>> {
         let result = self.poll_inner(input, cx);
         if matches!(result, Poll::Ready(_)) {
+            if let Engine::SevenZip(walker) = &self.engine {
+                self.seven_zip_key = walker.header_key().cloned();
+            }
             self.engine = Engine::Done;
         }
         result
@@ -1313,6 +1319,11 @@ impl MapBuilder {
 
     pub fn poll_map(&mut self, cx: &mut Context<'_>) -> Poll<Result<MemberMap, MapError>> {
         self.core.poll_map(&mut self.input, cx)
+    }
+
+    /// A 7z archive's header key once the header was decrypted: (cycle power, salt, key).
+    pub(crate) fn seven_zip_header_key(&self) -> Option<&(u8, Vec<u8>, [u8; 32])> {
+        self.core.seven_zip_key.as_ref()
     }
 }
 

@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use super::coders::{self, Fault, Keys};
 use super::source::VolumeSet;
-use super::{SevenZipError, SevenZipLimits, check_bounds, member_name, open_map};
+use super::{SevenZipError, SevenZipLimits, check_bounds, member_name, open_map_keyed};
 use crate::extract::{
     Cancellation, Checked, Dirs, LegacyMember, LegacyReport, Meta, Mode, Options, Overwrite, Place, RenameLog,
     RenamedOutput, Summary,
@@ -102,7 +102,11 @@ pub(super) fn run(
     report: &mut dyn LegacyReport,
 ) -> std::result::Result<Summary, (SevenZipError, Vec<RenamedOutput>)> {
     let early = |e| (e, Vec::new());
-    let map = open_map(first, password, cancel, limits).map_err(early)?;
+    let (map, header_key) = open_map_keyed(first, password, cancel, limits).map_err(early)?;
+    let mut keys = Keys::new(password);
+    if let Some((cycles, salt, key)) = header_key {
+        keys.seed(cycles, salt, key);
+    }
     check_bounds(&map, limits).map_err(early)?;
     let selected: Vec<bool> = map
         .members
@@ -136,7 +140,7 @@ pub(super) fn run(
         opts: &opts,
         map: &map,
         set,
-        keys: Keys::new(password),
+        keys,
         limits,
         cancel,
         report,

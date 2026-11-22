@@ -804,6 +804,9 @@ pub(crate) struct SevenZipWalker {
     header_crc: u32,
     header_encrypted: bool,
     header_cipher: Option<CipherParams>,
+    /// The key the encoded header was decrypted with: (cycle power, salt, key). A 7z extraction reuses it for
+    /// folders with the same parameters instead of deriving it again.
+    header_key: Option<(u8, Vec<u8>, [u8; 32])>,
     depth: u32,
     /// Volumes kept open on the input, least recently used first, at most `handles` of them.
     kept: Vec<u32>,
@@ -820,6 +823,7 @@ impl SevenZipWalker {
             phase: Phase::Signature,
             job: None,
             parked: None,
+            header_key: None,
             buffer: Vec::new(),
             header_at: 0,
             header_len: 0,
@@ -1203,7 +1207,9 @@ impl SevenZipWalker {
                 };
                 let password =
                     options.password.as_deref().filter(|p| !p.is_empty()).ok_or(MapError::PasswordRequired)?;
-                Some(self.derive(password, &salt, num_cycles_power, options, volume)?)
+                let key = self.derive(password, &salt, num_cycles_power, options, volume)?;
+                self.header_key = Some((num_cycles_power, salt, key));
+                Some(key)
             }
         };
         match decode_folder(folder, packed, key.as_ref(), &self.usage).map_err(|e| e.into_map(volume))? {
@@ -1211,6 +1217,11 @@ impl SevenZipWalker {
             None if key.is_some() => Err(MapError::WrongPassword),
             None => Err(malformed(volume, "7z encoded header does not decode")),
         }
+    }
+
+    /// The key the encoded header was decrypted with, as (cycle power, salt, key); see `header_key`.
+    pub(crate) fn header_key(&self) -> Option<&(u8, Vec<u8>, [u8; 32])> {
+        self.header_key.as_ref()
     }
 
     fn derive(

@@ -518,7 +518,7 @@ fn winzip_ctr_xor(cipher: &AesKey, counter: &mut [u8; 16], bytes: &mut [u8]) {
 mod sha256;
 
 #[cfg(test)]
-use sha256::SHA256_COMPRESSIONS;
+pub(crate) use sha256::SHA256_COMPRESSIONS;
 #[doc(hidden)]
 pub use sha256::sha256_backend;
 use sha256::{SHA256_IV, sha256_compress};
