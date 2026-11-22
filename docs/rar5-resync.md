@@ -102,7 +102,10 @@ u.feed(&packed[n.resync.packed_offset..], &mut sink)?;
   The deadline is checked during long literal searches, on every block followed, and before a result is given, so
   no result comes after it.
 - **Solid streams:** offsets are in the plaintext's coordinates, the solid stream's for a later member. Resume
-  with that member's start (`resume_in_stream`).
+  with that member's start (`resume_in_stream`). A follow from a later member's start covers that member only: the
+  decoder held earlier members' output unfiltered, and their filters were never seen. So when the window reaches
+  before the member's start, the resumed decoder refuses a copy from there into output no known plaintext checks,
+  unless the member's start is the stream's start (offset 0).
 
 Measured on z-fixtures (release, one thread, M4; plaintext only up to the target; every restart followed from the
 member's start, window checked, guarded and resumed exactly):
@@ -141,6 +144,8 @@ past the target. Prybar's layered search over `resync` took about 25 s and lande
     the resumed decoder, as is the same copy starting one byte before the end of the known plaintext; more than a
     step's share of unpinnable blocks at the estimate is searched past, as are blocks inside output a delta filter
     declared before the given packed bytes changed; a deadline that passes during a long follow gives `Exhausted`;
+    a later solid member resumed from its start refuses a copy, after the target, from an earlier member's filtered
+    output;
   - with `ZIPFAST_Z_FIXTURES`, `resync_near` on F03/F05/F06 at several targets (guarded, exact, under 1 s in release).
 
 RAR 4.x is not covered.

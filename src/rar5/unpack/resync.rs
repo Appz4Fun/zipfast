@@ -607,6 +607,9 @@ pub struct ResyncNear {
     /// plaintext's start): no filter the follow did not see can have changed output a match after the restart copies
     /// from. When false, the resumed decoder refuses (as [`crate::Error::BadChecksum`]) a match that copies from
     /// before the anchor plus a filter's length into output no known plaintext checks, rather than risk wrong output.
+    /// For a later member of a solid stream, a follow from that member's start covers only that member: when earlier
+    /// members lie within the window, [`Unpacker::resume_in_stream`] refuses copies from before the member's start
+    /// into unchecked output the same way.
     pub window_checked: bool,
 }
 
@@ -1124,8 +1127,9 @@ impl Unpacker {
         let mut check_end = offset.saturating_add(MAX_FILTER_LEN).min(member_end);
         // A guarded restart (every filter that can reach past it was seen) needs no plaintext past it; what there is
         // is still checked.
-        // ... as is a restart followed from the member's start, before which no filter can be declared.
-        if resync.guarded || (resync.floor > 0 && resync.verified.start <= member_start) {
+        // ... as is a restart followed from the member's start: a filter covers output of its own member only.
+        let from_member_start = resync.floor > 0 && resync.verified.start <= member_start;
+        if resync.guarded || from_member_start {
             check_end = check_end.min(known_end.max(offset));
         }
         if known_base > offset || known_end < check_end {
@@ -1165,11 +1169,22 @@ impl Unpacker {
         u.sp = offset;
         u.file_base = member_start;
         u.emitted = offset - member_start;
-        // Matches into output nothing checks may not copy from before the floor (see `Resync::floor`); a follow
-        // from the member's start saw every filter there is.
-        if resync.floor > 0 && resync.verified.start > member_start {
-            u.floor = resync.floor.min(offset);
-            u.floor_from = check_end;
+        // Matches into output nothing checks may not copy from before the floor (see `Resync::floor`). A follow from
+        // the member's start saw every filter of this member; when earlier members of a solid stream lie within the
+        // window, their filters were never seen (and the decoder held their output unfiltered), so the floor is
+        // the member's start, unless it is the stream's start.
+        if resync.floor > 0 {
+            let floor = if !from_member_start {
+                resync.floor.min(offset)
+            } else if member_start > 0 && offset.saturating_sub(window.reach) < member_start {
+                member_start
+            } else {
+                0
+            };
+            if floor > 0 {
+                u.floor = floor;
+                u.floor_from = check_end;
+            }
         }
         u.history = resync.history;
         u.last_len = resync.last_len;

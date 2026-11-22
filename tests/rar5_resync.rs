@@ -929,3 +929,57 @@ fn resync_near_gives_no_result_after_its_deadline() {
     let late = resync_near(&packed, 0, known, window, target, &options);
     assert!(matches!(late, Err(NearError::Exhausted { .. })), "{late:?}");
 }
+
+/// A solid stream: the first member has an E8 filter near its end, and the second copies from that filtered output
+/// after the target. Resumed from the second member's start, the follow saw none of the first member's filters, so
+/// the copy (which the decoder makes from the unfiltered window) must be refused rather than written from the
+/// filtered plaintext.
+#[test]
+fn a_later_solid_member_resumed_from_its_start_refuses_a_copy_from_an_earlier_members_filtered_output() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops_a = testenc::lz(&sample(200_000), 1 << 17, 16);
+    let filter_at = testenc::model(&ops_a).len() as u64;
+    ops_a.push(Op::Filter { start: 0, len: 20_000, kind: 1, channels: 0 });
+    for k in 0..4_000u32 {
+        ops_a.extend([0xe8, (k % 251) as u8, 0x10, 0, 0].map(Op::Lit));
+    }
+    ops_a.extend(testenc::lz(&sample(300_000)[250_000..], 1 << 17, 16));
+    let a_len = testenc::model(&ops_a).len() as u64;
+    let b_head: Vec<u8> = sample(150_000).into_iter().rev().collect();
+    let mut ops_b = testenc::lz(&b_head, 1 << 17, 16);
+    let copy_at = a_len + b_head.len() as u64;
+    // A copy from the first member's filtered output, starting at a call's opcode.
+    ops_b.push(Op::Match(3_000, copy_at - (filter_at + 10_000)));
+    ops_b.extend(testenc::lz(&sample(400_000)[300_000..], 1 << 17, 16));
+    let first = testenc::tuned_stream(&ops_a, 2_000);
+    let second = testenc::tuned_stream(&ops_b, 2_000);
+    let window = window_for(1 << 20, Some(1 << 20), true).unwrap();
+    // The stream's output: the first member, then the second.
+    let mut u = Unpacker::new(window).unwrap();
+    u.reset(Some(a_len));
+    let mut out = Collect(Vec::new());
+    u.feed(&first, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    // (The second member's copy reaches into the first, so its length is counted, not modelled.)
+    let b_len = b_head.len() as u64 + 3_000 + 100_000;
+    u.next_file(Some(b_len));
+    u.feed(&second, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    let stream = out.0;
+    let (lo, at) = ((filter_at + 10_000) as usize, copy_at as usize);
+    assert_ne!(stream[at..at + 3_000], stream[lo..lo + 3_000], "the copy reads the window's unfiltered bytes");
+    assert_eq!(stream[lo], 0xe8);
+    // Resumed from the second member's start (estimate 0 on its packed bytes), the target just before the copy.
+    let target = copy_at - 20_000;
+    let known = &stream[..target as usize];
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&second, 0, known, window, target, &options).unwrap();
+    assert_eq!(n.anchor, a_len, "followed from the second member's start: {n:?}");
+    let mut u = Unpacker::resume_in_stream(window, &n.resync, a_len, 0, known, Some(b_len)).unwrap();
+    let mut out = Collect(Vec::new());
+    let result = u.feed(&second[n.resync.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+    let err = result.expect_err("a copy from an earlier member's filtered output must not pass").to_string();
+    assert!(err.contains("before the window checked"), "{err}");
+    let good = (copy_at - n.resync.output_offset) as usize;
+    assert!(out.0.len() <= good && out.0 == stream[n.resync.output_offset as usize..][..out.0.len()]);
+}
