@@ -31,13 +31,15 @@ u.finish(&mut sink)?;
 - **`packed`:** the member's packed bytes after the hole, across volumes and in order.
 - **`known_base`, `known`:** the known plaintext, at member output offsets `known_base..`. It must cover at least the first block after the hole and, for the window, as far back as the member's dictionary reaches (or the member's start). The more it covers past the hole, the more blocks can be checked.
 - **`window`:** from `window_for(dictionary, size, false)`. The dictionary comes from the file header.
-- **`expected`:** where the first block after the hole may start in the output, estimated from the hole's position and the packing ratio. A ±64 KiB estimate works on rar's output. Keep it as narrow as the estimate allows: the scan costs time in proportion to its width, and a wide range over content that repeats can make a block fit twice (`Ambiguous`).
+- **`expected`:** where the first block after the hole may start in the output, estimated from the hole's position and the packing ratio. A ±64 KiB estimate works on rar's output (about 50-90 ms per call on video). Keep it as narrow as the estimate allows: the scan costs time in proportion to its width, and a wide range over content that repeats can make a block fit twice (`Ambiguous`). Over repetitive text or binaries a wide range spends the work budget (`Exhausted`) call after call: RustyGet measured 12 retries and 20 s for a 1.5 MB hole with a wide range, restarting about 20 MB of output later. Estimate the restart from the packed position (hole end × unpacked size / packed size) and keep ±64 KiB around it; after `Exhausted`, move the packed start on by a block or two (16 KiB) and the range with it.
 
 ## Output and errors
 
 - **`resume_at`:** gives a decoder that writes the member's output from `Resync::output_offset` on. The CRC32 it hands a sink covers only that output. Combine it with the CRC of the plaintext before it, using `zipfast::crc32::combine(prefix_crc, resumed_crc, resumed_len)`, and check the result against the member's CRC.
+  - **Filters the hole erased:** a filter declared in a lost block can cover output after the restart, and the resumed decoder cannot see it. So it checks its output against the known plaintext until it is 4 MiB (a filter's longest length) past the restart, or at the member's end, and reports a difference as `Error::BadChecksum` before the bytes reach the sink. Resync again from packed bytes past that point. `known` must cover that window, or `resume_at` fails; past it no plaintext is needed.
+  - **Encrypted members:** the decrypted packed bytes run on past the last block to the AES block end. The resumed decoder stops at the block flagged last and ignores them, as a normal extraction does.
 - **`ResyncError::NotFound`:** no block decodes to the plaintext in the range. Either the plaintext or the range is wrong, or a filter that started before the hole covers the output.
-- **`ResyncError::Filter { packed_offset, output_offset }`:** a block after the hole starts a filter (E8, ARM or delta) once its offset is pinned. `packed_offset` and `output_offset` are where that block starts. Its output differs from the plaintext until the filter runs, so look again from packed bytes after the filtered output. Filters are for executables and rarely occur in video.
+- **`ResyncError::Filter { packed_offset, output_offset, output_end }`:** a block after the hole starts a filter (E8, ARM or delta) once its offset is pinned. `packed_offset` and `output_offset` are where that block starts, and `output_end` is where the filter's output ends. Its output differs from the plaintext until the filter runs, so look again with `expected` past `output_end`, from packed bytes after that block. Filters are for executables and rarely occur in video.
 - **`ResyncError::Ambiguous`:** a block fits the plaintext at more than one offset. Narrow `expected`.
 - **`ResyncError::Exhausted`:** the work budget ran out first. Narrow `expected`, or look again from later packed bytes.
 
@@ -52,7 +54,9 @@ u.finish(&mut sink)?;
 - **Committed tests:**
   - the test encoder's streams restart after holes, from full or partial plaintext;
   - wrong plaintext finds nothing;
-  - a filter after the hole is reported with its offsets;
+  - a filter after the hole is reported with its offsets and its output end;
+  - a filter declared in the lost block, covering output after the restart, is an error rather than wrong output;
+  - the AES padding after a resumed member's last block is ignored;
   - repeated content is `Ambiguous` until `expected` is narrowed.
 
 RAR 4.x is not covered.

@@ -679,6 +679,14 @@ pub struct Unpacker {
     input: Vec<u8>,
     /// a whole block copied out with zero padding after it, when nothing follows it to pad it
     padded: Vec<u8>,
+    /// set by [`Unpacker::resume_at`]: the bytes after the block flagged last are the encrypted stream's padding, not
+    /// packed data, so feeding stops there
+    stop_at_last: bool,
+    /// the block flagged last has been decoded and `stop_at_last` is set: later bytes are dropped
+    ended: bool,
+    /// set by [`Unpacker::resume_at`]: known plaintext the output must equal until it is past the reach of any filter
+    /// declared before the restart; a difference is an error before the bytes reach the sink
+    verify: Option<Box<Verify>>,
     /// worker threads for big files; 0 decodes everything on the calling thread
     threads: usize,
     /// the smallest file decoded on workers
@@ -855,6 +863,9 @@ impl Unpacker {
             scratch_delta: Vec::new(),
             input: Vec::new(),
             padded: Vec::new(),
+            stop_at_last: false,
+            ended: false,
+            verify: None,
             threads: default_threads(),
             parallel_min: PARALLEL_MIN,
             parallel: false,
@@ -935,6 +946,8 @@ impl Unpacker {
         debug_assert!(self.parallel, "queued files are decoded on the workers");
         let boundary = Boundary { size, truncated: !self.input.is_empty() };
         self.input.clear();
+        // a resumed file stopped taking input at its last block; this file's blocks come next
+        self.ended = false;
         let at = self.batch.buf.len();
         self.batch.parts.push(Part {
             at,
@@ -969,6 +982,10 @@ impl Unpacker {
         self.size_failure = None;
         self.filters.clear();
         self.input.clear();
+        // a resumed member ended at its last block; the next file of the solid stream has its own blocks, and the
+        // known plaintext was the earlier file's
+        self.ended = false;
+        self.verify = None;
         self.parallel = self.wants_parallel();
     }
 
@@ -986,6 +1003,8 @@ impl Unpacker {
         self.tables_ready = false;
         self.history = [0; 4];
         self.last_len = 0;
+        // ordinary decoding again, until resume_at says otherwise
+        self.stop_at_last = false;
         self.next_file(size);
     }
 
@@ -1189,6 +1208,8 @@ impl Unpacker {
         }
         self.check_end(sink)?;
         sink.put(&[])?;
+        // the known plaintext a resumed file was checked against was that file's
+        self.verify = None;
         self.crc.reset();
         self.files_begun += 1;
         self.file_base = self.sp;
@@ -1366,6 +1387,9 @@ impl Unpacker {
         mut piece: Option<(&Arc<Piece>, usize)>,
         sink: &mut dyn Sink,
     ) -> Result<()> {
+        if self.ended {
+            return Ok(());
+        }
         // finish the block an earlier call left incomplete
         while !self.input.is_empty() {
             let flags = self.input[0];
@@ -1394,6 +1418,11 @@ impl Unpacker {
                 block.clear();
                 self.input = block;
                 result?;
+                if self.stop_at_last && flags & 0x40 != 0 {
+                    self.ended = true;
+                    self.input.clear();
+                    return Ok(());
+                }
             }
         }
         let mut at = 0;
@@ -1418,6 +1447,11 @@ impl Unpacker {
                 let result = self.block(&padded, None, payload, flags, sink);
                 self.padded = padded;
                 result?;
+            }
+            if self.stop_at_last && flags & 0x40 != 0 {
+                self.ended = true;
+                self.input.clear();
+                return Ok(());
             }
             at = end;
         }
@@ -1666,6 +1700,7 @@ impl Unpacker {
             let at = ((self.file_base + self.emitted) & self.mask) as usize;
             let n = ((to - self.emitted) as usize).min(self.window.len() - at);
             let bytes = &self.window[at..at + n];
+            check_known(self.verify.as_deref(), self.emitted, bytes)?;
             sink.put(bytes)?;
             if hashing {
                 // SAFETY: what goes to the helper stays in place until it is hashed: `keep_clear` waits for a
@@ -1675,8 +1710,16 @@ impl Unpacker {
             }
             self.emitted += n as u64;
         }
+        self.drop_verified();
         self.keep_clear();
         Ok(())
+    }
+
+    /// Lets go of the known plaintext once the output is past it.
+    fn drop_verified(&mut self) {
+        if self.verify.as_ref().is_some_and(|v| self.emitted >= v.end) {
+            self.verify = None;
+        }
     }
 
     /// Waits for the hashing of output that decoding up to the next emit could write over. Up to then, nothing is
@@ -1701,15 +1744,42 @@ impl Unpacker {
             at = 0;
         }
         apply_filter(f, &mut data, &mut self.scratch_delta);
-        let sent = sink.put(&data);
+        let sent = check_known(self.verify.as_deref(), f.start, &data).and_then(|()| sink.put(&data));
         if sent.is_ok() && sink.wants_crc() {
             data = self.crc.owned(self.file_base + f.start, data);
         }
         self.scratch = data;
         sent?;
         self.emitted += f.len;
+        self.drop_verified();
         self.keep_clear();
         Ok(())
+    }
+}
+
+/// Known plaintext a resumed decoder's output is checked against: output offsets `end - bytes.len()..end`.
+pub(crate) struct Verify {
+    pub(crate) end: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Checks output `bytes` at output offset `at` against the known plaintext, where they overlap.
+fn check_known(verify: Option<&Verify>, at: u64, bytes: &[u8]) -> Result<()> {
+    let Some(v) = verify else { return Ok(()) };
+    let start = v.end - v.bytes.len() as u64;
+    let (lo, hi) = (at.max(start), (at + bytes.len() as u64).min(v.end));
+    if lo >= hi {
+        return Ok(());
+    }
+    let out = &bytes[(lo - at) as usize..(hi - at) as usize];
+    let known = &v.bytes[(lo - start) as usize..(hi - start) as usize];
+    match out.iter().zip(known).position(|(a, b)| a != b) {
+        None => Ok(()),
+        Some(i) => Err(Error::BadChecksum(format!(
+            "resumed RAR 5.0 output differs from the known plaintext at output offset {} (a filter declared before \
+             the restart covers it: resync again from later packed bytes)",
+            lo + i as u64
+        ))),
     }
 }
 
