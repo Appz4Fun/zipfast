@@ -279,7 +279,7 @@ fn rebuild_into(
     article: &mut [u8],
     covered: &mut [bool],
     notes: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), Z1Error> {
     let n = plain.len() as u64;
     let span = cbc_rebuild_span(hole.clone(), n);
     let previous: [u8; 16] = match span.previous_at {
@@ -318,7 +318,8 @@ fn rebuild_into(
             let whole = text.len() / 16 * 16;
             let mut prev = previous;
             if whole > 0 {
-                let bytes = rebuild_cbc(key, &previous, &text[..whole], false, None).map_err(|e| format!("{e:?}"))?;
+                let bytes = rebuild_cbc(key, &previous, &text[..whole], false, None)
+                    .map_err(|e| Z1Error::Failed(format!("{e:?}")))?;
                 prev = bytes[whole - 16..].try_into().unwrap();
                 place(&bytes, span.range.start, article, covered);
             }
@@ -334,8 +335,10 @@ fn rebuild_into(
                 })
                 .collect();
             if pad > 3 {
-                notes.push(format!("final block: {pad} random padding bytes, not rebuildable"));
-                return Ok(());
+                // The final block's article bytes stay unrebuilt: the member's data is not recovered.
+                return Err(Z1Error::Unsupported(format!(
+                    "final block: {pad} random padding bytes, too many to search for"
+                )));
             }
             // CRC32 is affine: crc(base ^ x) = crc(base) ^ crc(x) ^ crc(0). Precompute each bit's effect.
             let mut base = article.to_vec();
@@ -379,10 +382,26 @@ fn rebuild_into(
                     place(&blk, block_at, article, covered);
                     Ok(())
                 }
-                None => Err(format!("no {pad}-byte padding gives the article CRC32")),
+                None => Err(Z1Error::Failed(format!("no {pad}-byte padding gives the article CRC32"))),
             }
         }
-        Err(e) => Err(format!("{e:?}")),
+        Err(e) => Err(Z1Error::Failed(format!("{e:?}"))),
+    }
+}
+
+/// Why [`rebuild_into`] could not rebuild a hole's member data.
+enum Z1Error {
+    /// Z1 does not cover this case (reported as n/a, never as a pass).
+    Unsupported(String),
+    Failed(String),
+}
+
+impl Z1Error {
+    fn outcome(self, what: &str) -> Outcome {
+        match self {
+            Z1Error::Unsupported(e) => Outcome::Na(format!("{what}: {e}")),
+            Z1Error::Failed(e) => Outcome::Fail(format!("{what}: {e}")),
+        }
     }
 }
 
@@ -424,7 +443,7 @@ fn z1_rar(set: &Set<'_>, hole: &Hole) -> Outcome {
         if let Err(e) =
             rebuild_into(&key, iv, &stream, plain, false, h.clone(), hole, &mut article, &mut covered, &mut notes)
         {
-            fail!("{name}: {e}");
+            return e.outcome(&name);
         }
         if data_members(set).len() > 1 {
             notes.push(format!("{name} stream {}..{}", h.start, h.end));
@@ -450,7 +469,7 @@ fn z1_7z(set: &Set<'_>, hole: &Hole) -> Outcome {
         let plain = folder_plain(set, folder.index);
         let key = derive_7z_key(set.password, &salt, num_cycles_power).expect("key");
         if let Err(e) = rebuild_into(&key, iv, &stream, &plain, true, h, hole, &mut article, &mut covered, &mut notes) {
-            fail!("folder {}: {e}", folder.index);
+            return e.outcome(&format!("folder {}", folder.index));
         }
     }
     finish_z1(&article, original, &covered, notes)
