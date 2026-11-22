@@ -9,8 +9,10 @@
 //! goes on from the recipient's own packed bytes.
 
 use super::parallel::{BUDGET, FilterFields, Packed, SLACK, tokenize};
-use super::{Bits, Huff, Lengths, PAD, Slot, Tables, Tok, Unpacker, Window, block_header, read_lengths};
-use crate::error::Result;
+use super::{
+    Bits, Huff, Lengths, MAX_FILTER_LEN, PAD, Slot, Tables, Tok, Unpacker, Verify, Window, block_header, read_lengths,
+};
+use crate::error::{Error, Result};
 use std::ops::Range;
 
 /// The farthest back a match distance the hole erased is looked for in the plaintext.
@@ -67,7 +69,7 @@ pub enum ResyncError {
     /// A block after the hole (at `packed_offset` in the packed bytes, starting at output offset `output_offset`)
     /// starts a filter: its output differs from the plaintext until the filter runs. Look again from packed bytes
     /// after the filtered output.
-    Filter { packed_offset: usize, output_offset: u64 },
+    Filter { packed_offset: usize, output_offset: u64, output_end: u64 },
     /// A block decodes to the plaintext at more than one offset in the expected range (repeated content): narrow
     /// `expected`.
     Ambiguous,
@@ -80,8 +82,11 @@ impl std::fmt::Display for ResyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => f.write_str("no RAR 5.0 block after the hole decodes to the known plaintext"),
-            Self::Filter { packed_offset, output_offset } => {
-                write!(f, "a RAR 5.0 block at packed offset {packed_offset} (output {output_offset}) starts a filter")
+            Self::Filter { packed_offset, output_offset, output_end } => {
+                write!(
+                    f,
+                    "a RAR 5.0 block at packed offset {packed_offset} (output {output_offset}) starts a filter over output up to {output_end}"
+                )
             }
             Self::Ambiguous => f.write_str("a RAR 5.0 block decodes to the plaintext at more than one offset"),
             Self::Exhausted => f.write_str("the RAR 5.0 resync spent its work budget"),
@@ -186,7 +191,8 @@ enum Sim {
     Mismatch,
     /// The block's output runs past the known plaintext before contradicting it.
     Short,
-    Filter,
+    /// The block starts a filter over output up to `output_end`.
+    Filter(u64),
     /// The work budget ran out before the block was decided.
     Exhausted,
 }
@@ -250,7 +256,7 @@ fn simulate(block: &Block, at: u64, known: &Known<'_>, st: &mut State, window: u
                 p += n as u64;
                 continue;
             }
-            Tok::Filter { .. } => return Sim::Filter,
+            Tok::Filter { offset, len, .. } => return Sim::Filter(p + offset + len),
             Tok::Match { len, dist } => {
                 st.hist.copy_within(0..3, 1);
                 st.hist[0] = Some((dist, false));
@@ -433,8 +439,8 @@ pub fn resync(
         for start in starts {
             let result = match follow(packed, at, &first, start, &known, window, &mut pre, &mut work) {
                 Follow::Restart(r) => Ok(r),
-                Follow::Filter { packed_offset, output_offset } => {
-                    Err(ResyncError::Filter { packed_offset, output_offset })
+                Follow::Filter { packed_offset, output_offset, output_end } => {
+                    Err(ResyncError::Filter { packed_offset, output_offset, output_end })
                 }
                 Follow::Mismatch => continue,
                 Follow::Exhausted => return Err(ResyncError::Exhausted),
@@ -455,7 +461,7 @@ pub fn resync(
 
 enum Follow {
     Restart(Resync),
-    Filter { packed_offset: usize, output_offset: u64 },
+    Filter { packed_offset: usize, output_offset: u64, output_end: u64 },
     Mismatch,
     Exhausted,
 }
@@ -491,7 +497,7 @@ fn follow(
                 pos += block.len;
             }
             // The block's offset is pinned by its literals before the filter, or by the blocks before it.
-            Sim::Filter => return Follow::Filter { packed_offset: pos, output_offset: out },
+            Sim::Filter(output_end) => return Follow::Filter { packed_offset: pos, output_offset: out, output_end },
             Sim::Mismatch => return Follow::Mismatch,
             // The plaintext ends first: restart at this block with what was learned, if a block was checked.
             Sim::Short if out > start => return restart(pos, start, out, &st, &block.lens),
@@ -531,6 +537,13 @@ impl Unpacker {
     /// [`Resync::packed_offset`] on; it writes the member's output from `output_offset` on. `size` is the member's
     /// whole output size. The CRC32 a sink is given covers only that output, so check the member's CRC by combining
     /// it with the CRC of the plaintext before ([`crate::crc32::combine`]).
+    ///
+    /// A filter declared in a block the hole erased can cover output after the restart; this decoder cannot see it
+    /// and would write that output unfiltered. So the output is checked against `known` until it is past the longest
+    /// reach such a filter can have (a filter's 4 MiB length past the restart, or the member's end), and a difference
+    /// is an error ([`crate::Error::BadChecksum`]) before those bytes reach the sink: resync again from packed bytes
+    /// past it. After that window no plaintext is needed. `known` must cover the window, or this fails (with no
+    /// `size`, the window ends where `known` does, at the latest).
     pub fn resume_at(
         window: Window,
         resync: &Resync,
@@ -538,9 +551,22 @@ impl Unpacker {
         known: &[u8],
         size: Option<u64>,
     ) -> Result<Self> {
+        let offset = resync.output_offset;
+        let known_end = known_base.saturating_add(known.len() as u64);
+        // A member of unknown size may end where the known plaintext does.
+        let check_end = offset.saturating_add(MAX_FILTER_LEN).min(size.unwrap_or(known_end));
+        if known_base > offset || known_end < check_end {
+            return Err(Error::Unsupported(format!(
+                "resuming RAR 5.0 output at {offset} needs known plaintext for {offset}..{check_end} to check it \
+                 against filters declared before the restart; given {known_base}..{known_end}"
+            )));
+        }
         let mut u = Unpacker::new(window)?;
         u.reset(size);
-        let offset = resync.output_offset;
+        if check_end > offset {
+            let bytes = known[(offset - known_base) as usize..(check_end - known_base) as usize].to_vec();
+            u.verify = Some(Box::new(Verify { end: check_end, bytes }));
+        }
         let from = offset.saturating_sub(u.reach).max(known_base);
         for f in from..offset {
             if let Some(&b) = usize::try_from(f - known_base).ok().and_then(|i| known.get(i)) {
@@ -555,6 +581,8 @@ impl Unpacker {
         u.slot = Slot::filled(Some(*resync.lens));
         u.built = None;
         u.tables_ready = true;
+        // a resumed member's packed bytes run on to the encryption's block end: stop at the block flagged last
+        u.stop_at_last = true;
         Ok(u)
     }
 }

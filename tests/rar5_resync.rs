@@ -191,7 +191,7 @@ fn a_filter_after_the_hole_is_reported() {
     let packed = testenc::tuned_stream(&ops, split);
     let window = window_for(128 << 10, Some(plain.len() as u64), false).unwrap();
     let r = resync(&packed[first..], 0, &plain, window, 140_000..160_000);
-    assert_eq!(r.unwrap_err(), ResyncError::Filter { packed_offset: 0, output_offset: 150_000 });
+    assert_eq!(r.unwrap_err(), ResyncError::Filter { packed_offset: 0, output_offset: 150_000, output_end: 151_064 });
 }
 
 /// Repeated content: the hole falls in the second of two copies of a stretch longer than the window, so a block in
@@ -241,7 +241,9 @@ fn plaintext_that_ends_soon_after_the_hole_still_restarts() {
     let r = resync(after, 0, known, window, 0..known.len() as u64).unwrap();
     assert_eq!(r.verified.start, full.verified.start);
     assert!(r.output_offset <= known.len() as u64 + 70_000, "{r:?}");
-    let mut u = Unpacker::resume_at(window, &r, 0, known, Some(plain.len() as u64)).unwrap();
+    // Resuming needs the plaintext past the restart to check it against filters the hole may have erased.
+    assert!(Unpacker::resume_at(window, &r, 0, known, Some(plain.len() as u64)).is_err());
+    let mut u = Unpacker::resume_at(window, &r, 0, &plain, Some(plain.len() as u64)).unwrap();
     let mut out = Collect(Vec::new());
     u.feed(&after[r.packed_offset..], &mut out).unwrap();
     if r.complete {
@@ -311,4 +313,61 @@ fn junk_before_the_first_block_does_not_exhaust_the_budget() {
     u.feed(&input[r.packed_offset..], &mut out).unwrap();
     u.finish(&mut out).unwrap();
     assert_eq!(out.0, plain[r.output_offset as usize..]);
+}
+
+/// A resumed member's packed bytes run on past its last block to the encryption's block end (CBC padding, up to 15
+/// bytes): decoding stops at the block flagged last and ignores them, as a normal extraction trims them.
+#[test]
+fn a_resumed_member_ignores_the_encryption_padding_after_its_last_block() {
+    use zipfast::rar5::testenc;
+    let plain = sample(300_000);
+    let packed = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let window = window_for(128 << 10, Some(plain.len() as u64), false).unwrap();
+    let hole = packed.len() / 2;
+    let after = &packed[hole + 1_000..];
+    let r = resync(after, 0, &plain, window, 0..plain.len() as u64).unwrap();
+    let mut padded = after[r.packed_offset..].to_vec();
+    padded.extend_from_slice(&[0xa5; 13]);
+    let mut u = Unpacker::resume_at(window, &r, 0, &plain, Some(plain.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&padded, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0, plain[r.output_offset as usize..]);
+}
+
+/// A filter declared in the block the hole erased covers output past the restart. The resumed decoder cannot see it
+/// and writes that output unfiltered; the check against the known plaintext turns that into an error before the
+/// bytes reach the sink. Here an x86 (E8) filter changes 4 bytes 150 KB after the restart, after blocks that match.
+#[test]
+fn a_filter_declared_in_the_lost_block_is_an_error_after_the_restart() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut plain = sample(400_000);
+    for b in plain.iter_mut().filter(|b| **b == 0xe8) {
+        *b = 0xe9;
+    }
+    plain[250_000..250_005].copy_from_slice(&[0xe8, 0x10, 0, 0, 0]);
+    let mut ops = testenc::lz(&plain[..100_000], 1 << 17, 16);
+    let at = ops.len();
+    ops.push(Op::Filter { start: 0, len: 200_000, kind: 1, channels: 0 });
+    ops.extend(testenc::lz(&plain[100_000..], 1 << 17, 16));
+    const PER: usize = 2_000;
+    let packed = testenc::tuned_stream(&ops, PER);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    // What the member decodes to, with the filter applied: the plaintext a donor would supply.
+    let truth = decode(window, &packed, plain.len() as u64);
+    assert_ne!(truth[250_001..250_005], plain[250_001..250_005], "the filter changes the operand");
+    // Lose exactly the block holding the filter record.
+    let chunks: Vec<&[Op]> = ops.chunks(PER).collect();
+    let block = at / PER;
+    let start: usize = chunks[..block].iter().map(|c| testenc::tuned_block(c, false).len()).sum();
+    let end = start + testenc::tuned_block(chunks[block], false).len();
+    let after = &packed[end..];
+    let r = resync(after, 0, &truth, window, 0..truth.len() as u64).unwrap();
+    assert!(r.output_offset < 250_000, "the restart is inside the filter, before the changed bytes: {r:?}");
+    let mut u = Unpacker::resume_at(window, &r, 0, &truth, Some(truth.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    let result = u.feed(&after[r.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+    let err = result.expect_err("the unfiltered output must not pass").to_string();
+    assert!(err.contains("output offset 25000"), "{err}");
+    assert!(out.0.len() as u64 + r.output_offset <= 250_001, "no wrong byte reached the sink");
 }

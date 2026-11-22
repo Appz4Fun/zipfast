@@ -341,7 +341,7 @@ the caller supplies. That is the output just before the chunk, known from anothe
 resume past lost chunks instead of from the last dictionary reset. Only the dictionary's last bytes, as many as the
 coder's dictionary size, are used. A chunk that does not set its own LZMA props takes them from the last chunk that
 did (`props_for(i)`). A chunk that also resets the dictionary decodes as `decode_chunks`. A chunk that continues the
-LZMA state cannot restart (`NotStateReset`). It works by feeding liblzma the dictionary as stored chunks, the first
+LZMA state cannot restart (`NotStateReset`), so a hole inside a run of LZMA chunks with no state reset costs the donor everything up to the next reset (about 4 MB with `-md1m` in RustyGet's tests, up to one `-mmt` block). It works by feeding liblzma the dictionary as stored chunks, the first
 resetting the dictionary, followed by the chunk with props set and the rest as they are, and dropping the
 dictionary's echo from the output. A wrong dictionary decodes to wrong bytes or fails with `Data`, so check the
 result against the file's CRC.
