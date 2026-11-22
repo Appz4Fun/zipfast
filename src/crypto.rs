@@ -15,7 +15,8 @@
 // rights and limitations under the RPL.
 
 //! Pure-Rust cryptographic primitives for archive password verification and decryption:
-//! - FIPS 197 AES-128, AES-192, and AES-256 (CBC and WinZip CTR modes)
+//! - FIPS 197 AES-128, AES-192, and AES-256 (CBC and WinZip CTR modes), with the ARMv8 AES instructions or x86
+//!   AES-NI where the processor has them (picked at run time; `ZIPFAST_AES=scalar` forces the portable rounds)
 //! - FIPS 180-4 SHA-256, one-shot ([`sha256`]) or incremental ([`Sha256`]), with the ARMv8 SHA2 instructions where
 //!   the processor has them; the 7zAES and RAR 5.0 KDFs use the same rounds
 //! - RAR 5.0 PBKDF2-HMAC-SHA256 key derivation, `PasswordCheck` verification, tweaked CRC32, and `-hp` header decryption
@@ -26,7 +27,19 @@
 #[derive(Clone, Copy)]
 pub struct AesKey {
     enc_rk: [[u8; 16]; 15],
+    /// The equivalent-inverse-cipher keys the hardware decryption rounds take (see [`aes_hw`]).
+    dec_rk: [[u8; 16]; 15],
     rounds: usize,
+    backend: aes_hw::Backend,
+}
+
+mod aes_hw;
+
+/// The name of the AES implementation this process uses: `"arm-aes"`, `"x86-aes-ni"` or `"scalar"`.
+/// `ZIPFAST_AES=scalar`, read once at the first key, forces the portable one.
+#[doc(hidden)]
+pub fn aes_backend() -> &'static str {
+    aes_hw::Backend::current().name()
 }
 
 const SBOX: [u8; 256] = [
@@ -137,10 +150,48 @@ impl AesKey {
                 enc_rk[r][c * 4..c * 4 + 4].copy_from_slice(&w[r * 4 + c].to_be_bytes());
             }
         }
-        Some(Self { enc_rk, rounds: nr })
+        let mut dec_rk = [[0u8; 16]; 15];
+        dec_rk[0] = enc_rk[nr];
+        for i in 1..nr {
+            dec_rk[i] = enc_rk[nr - i];
+            inv_mix_columns(&mut dec_rk[i]);
+        }
+        dec_rk[nr] = enc_rk[0];
+        Some(Self { enc_rk, dec_rk, rounds: nr, backend: aes_hw::Backend::current() })
+    }
+
+    /// The same key run by `backend` (tests compare every backend the processor has).
+    #[cfg(test)]
+    pub(crate) fn with_backend(mut self, backend: aes_hw::Backend) -> Self {
+        self.backend = backend;
+        self
     }
 
     pub fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        match self.backend {
+            aes_hw::Backend::Scalar => self.encrypt_scalar(block),
+            // SAFETY: an `ArmAes` is only made once the instructions have been found
+            #[cfg(target_arch = "aarch64")]
+            aes_hw::Backend::ArmAes => unsafe { aes_hw::arm::encrypt(&self.enc_rk, self.rounds, block) },
+            // SAFETY: an `X86AesNi` is only made once the instructions have been found
+            #[cfg(target_arch = "x86_64")]
+            aes_hw::Backend::X86AesNi => unsafe { aes_hw::x86::encrypt(&self.enc_rk, self.rounds, block) },
+        }
+    }
+
+    pub fn decrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        match self.backend {
+            aes_hw::Backend::Scalar => self.decrypt_scalar(block),
+            // SAFETY: an `ArmAes` is only made once the instructions have been found
+            #[cfg(target_arch = "aarch64")]
+            aes_hw::Backend::ArmAes => unsafe { aes_hw::arm::decrypt(&self.dec_rk, self.rounds, block) },
+            // SAFETY: an `X86AesNi` is only made once the instructions have been found
+            #[cfg(target_arch = "x86_64")]
+            aes_hw::Backend::X86AesNi => unsafe { aes_hw::x86::decrypt(&self.dec_rk, self.rounds, block) },
+        }
+    }
+
+    fn encrypt_scalar(&self, block: &[u8; 16]) -> [u8; 16] {
         let mut s = *block;
         for (b, &k) in s.iter_mut().zip(&self.enc_rk[0]) {
             *b ^= k;
@@ -172,7 +223,7 @@ impl AesKey {
         s
     }
 
-    pub fn decrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+    fn decrypt_scalar(&self, block: &[u8; 16]) -> [u8; 16] {
         let mut s = *block;
         for (b, &k) in s.iter_mut().zip(&self.enc_rk[self.rounds]) {
             *b ^= k;
@@ -199,6 +250,17 @@ impl AesKey {
 
     /// Decrypts 16-byte aligned blocks in place using AES-CBC and updates `iv` to the last ciphertext block.
     pub fn decrypt_cbc_in_place(&self, iv: &mut [u8; 16], data: &mut [u8]) {
+        match self.backend {
+            aes_hw::Backend::Scalar => {}
+            // SAFETY: an `ArmAes` is only made once the instructions have been found
+            #[cfg(target_arch = "aarch64")]
+            aes_hw::Backend::ArmAes => return unsafe { aes_hw::arm::decrypt_cbc(&self.dec_rk, self.rounds, iv, data) },
+            // SAFETY: an `X86AesNi` is only made once the instructions have been found
+            #[cfg(target_arch = "x86_64")]
+            aes_hw::Backend::X86AesNi => {
+                return unsafe { aes_hw::x86::decrypt_cbc(&self.dec_rk, self.rounds, iv, data) };
+            }
+        }
         for chunk in data.as_chunks_mut::<16>().0 {
             let ct = *chunk;
             let mut plain = self.decrypt_block(&ct);
@@ -219,16 +281,8 @@ pub fn decrypt_cbc(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
     if n == 0 {
         return Some(Vec::new());
     }
-    let mut out = Vec::with_capacity(n);
-    let mut prev = *iv;
-    for chunk in data.get(..n)?.as_chunks::<16>().0 {
-        let mut plain = cipher.decrypt_block(chunk);
-        for (p, &iv_b) in plain.iter_mut().zip(&prev) {
-            *p ^= iv_b;
-        }
-        out.extend_from_slice(&plain);
-        prev = *chunk;
-    }
+    let mut out = data.get(..n)?.to_vec();
+    cipher.decrypt_cbc_in_place(&mut iv.clone(), &mut out);
     Some(out)
 }
 
@@ -2681,6 +2735,73 @@ mod digest_tests {
                 h.update(piece);
             }
             assert_eq!(hex(&h.finalize()), whole, "{cut}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod aes_backend_tests {
+    use super::aes_hw::Backend;
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// FIPS 197 appendix C, on every backend this processor has.
+    #[test]
+    fn every_backend_matches_the_fips_197_vectors() {
+        let plain: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
+        let cases = [
+            ("000102030405060708090a0b0c0d0e0f", "69c4e0d86a7b0430d8cdb78070b4c55a"),
+            ("000102030405060708090a0b0c0d0e0f1011121314151617", "dda97ca4864cdfe06eaf70a0ec0d7191"),
+            ("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "8ea2b7ca516745bfeafc49904b496089"),
+        ];
+        for backend in Backend::available() {
+            for (key, ct) in cases {
+                let k = AesKey::new(&hex(key)).unwrap().with_backend(backend);
+                let ct: [u8; 16] = hex(ct).try_into().unwrap();
+                assert_eq!(k.encrypt_block(&plain), ct, "{backend:?} encrypt, key {key}");
+                assert_eq!(k.decrypt_block(&ct), plain, "{backend:?} decrypt, key {key}");
+            }
+        }
+    }
+
+    /// CBC over lengths that cover the eight-block groups and every remainder, against the portable rounds.
+    #[test]
+    fn every_backend_decrypts_cbc_like_the_portable_one() {
+        let data: Vec<u8> = (0..16 * 37u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for key_len in [16, 24, 32] {
+            let key: Vec<u8> = (0..key_len as u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect();
+            let scalar = AesKey::new(&key).unwrap().with_backend(Backend::Scalar);
+            for backend in Backend::available() {
+                let k = AesKey::new(&key).unwrap().with_backend(backend);
+                for blocks in [0usize, 1, 7, 8, 9, 16, 17, 37] {
+                    let (mut want_iv, mut got_iv) = ([0x11u8; 16], [0x11u8; 16]);
+                    let mut want = data[..blocks * 16].to_vec();
+                    let mut got = want.clone();
+                    scalar.decrypt_cbc_in_place(&mut want_iv, &mut want);
+                    k.decrypt_cbc_in_place(&mut got_iv, &mut got);
+                    assert_eq!(got, want, "{backend:?} key {key_len} blocks {blocks}");
+                    assert_eq!(got_iv, want_iv, "{backend:?} key {key_len} blocks {blocks}: chained IV");
+                    // decrypting what encrypt_cbc made gives the plaintext back
+                    let ct = encrypt_cbc(&key, &[3; 16], &data[..blocks * 16]).unwrap();
+                    let mut back = ct.clone();
+                    k.decrypt_cbc_in_place(&mut [3; 16], &mut back);
+                    assert_eq!(back, &data[..blocks * 16], "{backend:?} key {key_len} blocks {blocks}: round trip");
+                }
+            }
+        }
+    }
+
+    /// A trailing partial block is left alone, as the portable loop leaves it.
+    #[test]
+    fn every_backend_leaves_a_partial_tail_block_alone() {
+        for backend in Backend::available() {
+            let k = AesKey::new(&[9; 32]).unwrap().with_backend(backend);
+            let mut data = vec![0xabu8; 16 * 9 + 5];
+            k.decrypt_cbc_in_place(&mut [0; 16], &mut data);
+            assert_eq!(&data[16 * 9..], &[0xab; 5], "{backend:?}");
         }
     }
 }
