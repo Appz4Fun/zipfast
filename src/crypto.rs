@@ -537,12 +537,23 @@ pub(crate) fn derive_7z_key_controlled(
     num_cycles_power: u8,
     control: &mut dyn KdfControl,
 ) -> Option<std::result::Result<[u8; 32], KdfControlError>> {
+    let units: Vec<u16> = password.encode_utf16().collect();
+    derive_7z_key_units(&units, salt, num_cycles_power, control)
+}
+
+/// [`derive_7z_key_controlled`] over the password's UTF-16 code units as given.
+fn derive_7z_key_units(
+    units: &[u16],
+    salt: &[u8],
+    num_cycles_power: u8,
+    control: &mut dyn KdfControl,
+) -> Option<std::result::Result<[u8; 32], KdfControlError>> {
     if salt.len() > 16 {
         return None;
     }
-    let mut raw = Vec::with_capacity(salt.len() + password.len() * 2 + 8);
+    let mut raw = Vec::with_capacity(salt.len() + units.len() * 2 + 8);
     raw.extend_from_slice(salt);
-    for unit in password.encode_utf16() {
+    for unit in units {
         raw.extend_from_slice(&unit.to_le_bytes());
     }
     if num_cycles_power == 0x3F {
@@ -601,6 +612,13 @@ pub(crate) fn derive_7z_key_controlled(
 /// a salt over 16 bytes.
 pub fn derive_7z_key(password: &str, salt: &[u8], num_cycles_power: u8) -> Option<[u8; 32]> {
     derive_7z_key_controlled(password, salt, num_cycles_power, &mut UnrestrictedKdf).map(|r| r.expect("unrestricted"))
+}
+
+/// [`derive_7z_key`] for a password given as UTF-16 code units, hashed exactly as given (little-endian, unpaired
+/// surrogates included). For a password that is not valid UTF-8 the caller chooses how its bytes become units;
+/// `derive_7z_key` is this over `password.encode_utf16()`.
+pub fn derive_7z_key_utf16(password: &[u16], salt: &[u8], num_cycles_power: u8) -> Option<[u8; 32]> {
+    derive_7z_key_units(password, salt, num_cycles_power, &mut UnrestrictedKdf).map(|r| r.expect("unrestricted"))
 }
 
 #[cfg(test)]
@@ -752,10 +770,15 @@ impl Rar5PasswordCheck {
     }
 
     pub fn accepts(&self, password: &str) -> bool {
+        self.accepts_bytes(password.as_bytes())
+    }
+
+    /// [`accepts`](Self::accepts) for a password given as raw bytes, hashed exactly as given.
+    pub fn accepts_bytes(&self, password: &[u8]) -> bool {
         if self.kdf_count > 24 {
             return false;
         }
-        let keyed = HmacSha256Key::new(password.as_bytes());
+        let keyed = HmacSha256Key::new(password);
         let mut salt_block = [0u8; 20];
         salt_block[..16].copy_from_slice(&self.salt);
         salt_block[16..20].copy_from_slice(&1u32.to_be_bytes());
@@ -912,10 +935,12 @@ pub(crate) fn derive_rar5_keys(
     salt: &[u8; 16],
     check: Option<([u8; 8], [u8; 4])>,
 ) -> std::result::Result<Rar5Keys, Rar5CryptError> {
-    derive_rar5_keys_impl(password, kdf_count, salt, check, &mut UnrestrictedKdf).map_err(|error| match error {
-        ControlledKdfError::Crypt(error) => error,
-        ControlledKdfError::Control(_) => unreachable!("unrestricted legacy derivation"),
-    })
+    derive_rar5_keys_impl(password.as_bytes(), kdf_count, salt, check, &mut UnrestrictedKdf).map_err(
+        |error| match error {
+            ControlledKdfError::Crypt(error) => error,
+            ControlledKdfError::Control(_) => unreachable!("unrestricted legacy derivation"),
+        },
+    )
 }
 
 #[allow(dead_code, reason = "private progressive producer; legacy wrapper uses the same derivation core")]
@@ -960,11 +985,11 @@ pub(crate) fn derive_rar5_keys_controlled(
             Ok(())
         }
     }
-    derive_rar5_keys_impl(password, kdf_count, salt, check, &mut Derivation { control, blocks: 0 })
+    derive_rar5_keys_impl(password.as_bytes(), kdf_count, salt, check, &mut Derivation { control, blocks: 0 })
 }
 
 fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
-    password: &str,
+    password: &[u8],
     kdf_count: u8,
     salt: &[u8; 16],
     check: Option<([u8; 8], [u8; 4])>,
@@ -978,7 +1003,7 @@ fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
     // Setup always hashes the two ipad/opad blocks. No password buffer is allocated.
     let normalization = if password.len() > 64 { (password.len() as u64 + 9).div_ceil(64) } else { 0 };
     control.charge(normalization + 2).map_err(ControlledKdfError::Control)?;
-    let keyed = HmacSha256Key::new(password.as_bytes());
+    let keyed = HmacSha256Key::new(password);
     let mut salt_block = [0u8; 20];
     salt_block[..16].copy_from_slice(salt);
     salt_block[16..20].copy_from_slice(&1u32.to_be_bytes());
@@ -1027,6 +1052,30 @@ fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
         None => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::Absent),
     };
     Ok(Rar5Keys { key, hash_key, evidence })
+}
+
+/// [`derive_rar5_key_and_hash_key`] for a password given as raw bytes, hashed exactly as given. RAR 5.0 keys
+/// PBKDF2 with the password's UTF-8 bytes, so for a `&str` this is the same as `derive_rar5_key_and_hash_key`;
+/// bytes that are not valid UTF-8 are used unchanged.
+pub fn derive_rar5_key_and_hash_key_bytes(
+    password: &[u8],
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+) -> Option<([u8; 32], [u8; 32])> {
+    derive_rar5_keys_impl(password, kdf_count, salt, check, &mut UnrestrictedKdf)
+        .ok()
+        .map(|keys| (keys.key, keys.hash_key))
+}
+
+/// [`derive_rar5_key`] for a password given as raw bytes; see [`derive_rar5_key_and_hash_key_bytes`].
+pub fn derive_rar5_key_bytes(
+    password: &[u8],
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+) -> Option<[u8; 32]> {
+    derive_rar5_key_and_hash_key_bytes(password, kdf_count, salt, check).map(|(k, _)| k)
 }
 
 /// Derives the RAR5 32-byte AES-256 key from `password`, `kdf_count`, and `salt`.
@@ -1206,6 +1255,14 @@ impl Sha1 {
 
 /// Derives the RAR4 (`SetKey30`) 16-byte AES-128 key and 16-byte IV from `password` and `salt`.
 pub fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
+    let units: Vec<u16> = password.encode_utf16().collect();
+    derive_rar4_key_iv_impl(&units, salt, &mut UnrestrictedKdf).expect("unrestricted RAR4 derivation")
+}
+
+/// [`derive_rar4_key_iv`] for a password given as UTF-16 code units, hashed exactly as given (little-endian,
+/// unpaired surrogates included). For a password that is not valid UTF-8 the caller chooses how its bytes become
+/// units; `derive_rar4_key_iv` is this over `password.encode_utf16()`.
+pub fn derive_rar4_key_iv_utf16(password: &[u16], salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
     derive_rar4_key_iv_impl(password, salt, &mut UnrestrictedKdf).expect("unrestricted RAR4 derivation")
 }
 
@@ -1239,7 +1296,8 @@ impl Rar4KeyCache {
                 }
             }
         }
-        let (key, iv) = derive_rar4_key_iv_impl(password, salt, &mut Cancelable(cancel))?;
+        let units: Vec<u16> = password.encode_utf16().collect();
+        let (key, iv) = derive_rar4_key_iv_impl(&units, salt, &mut Cancelable(cancel))?;
         if self.keys.len() == Self::KEPT {
             self.keys.remove(0);
         }
@@ -1281,16 +1339,17 @@ pub(crate) fn derive_rar4_key_iv_controlled(
             Ok(())
         }
     }
-    derive_rar4_key_iv_impl(password, salt, &mut Derivation { control, blocks: 0 })
+    let units: Vec<u16> = password.encode_utf16().collect();
+    derive_rar4_key_iv_impl(&units, salt, &mut Derivation { control, blocks: 0 })
 }
 
 fn derive_rar4_key_iv_impl<C: KdfControl + ?Sized>(
-    password: &str,
+    password: &[u16],
     salt: &[u8; 8],
     control: &mut C,
 ) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
     let mut raw = Vec::with_capacity(password.len() * 2 + 8);
-    for ch in password.encode_utf16() {
+    for ch in password {
         raw.extend_from_slice(&ch.to_le_bytes());
     }
     raw.extend_from_slice(salt);
