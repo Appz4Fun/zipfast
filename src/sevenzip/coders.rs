@@ -270,6 +270,13 @@ impl Keys {
         Self { password: password.filter(|p| !p.is_empty()).map(str::to_owned), cache: HashMap::new() }
     }
 
+    /// Remembers a key derived elsewhere (the encrypted header's) for folders with the same parameters.
+    pub(crate) fn seed(&mut self, cycles: u8, salt: Vec<u8>, key: [u8; 32]) {
+        if self.password.is_some() {
+            self.cache.insert((cycles, salt), key);
+        }
+    }
+
     fn key(&mut self, cycles: u8, salt: &[u8], cancel: &Cancellation) -> Result<[u8; 32], SevenZipError> {
         if let Some(key) = self.cache.get(&(cycles, salt.to_vec())) {
             return Ok(*key);

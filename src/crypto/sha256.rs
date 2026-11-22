@@ -97,7 +97,7 @@ pub(super) const SHA256_IV: [u32; 8] =
 #[cfg(test)]
 thread_local! {
     /// Compressions run on this thread, for tests that check what a KDF charges.
-    pub(super) static SHA256_COMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static SHA256_COMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A SHA-256 compression function.

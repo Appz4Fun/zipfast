@@ -440,6 +440,20 @@ pub(crate) fn open_map(
     cancel: &Cancellation,
     limits: &SevenZipLimits,
 ) -> std::result::Result<MemberMap, SevenZipError> {
+    open_map_keyed(first, password, cancel, limits).map(|(map, _)| map)
+}
+
+/// A 7z header key: (cycle power, salt, key).
+pub(crate) type HeaderKey = (u8, Vec<u8>, [u8; 32]);
+
+/// [`open_map`], also returning the key an encrypted header was decrypted with, so that folders with the same
+/// key parameters need no second derivation (up to 2^24 SHA-256 rounds).
+pub(crate) fn open_map_keyed(
+    first: &Path,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+) -> std::result::Result<(MemberMap, Option<HeaderKey>), SevenZipError> {
     if cancel.is_canceled() {
         return Err(SevenZipError::Canceled);
     }
@@ -458,6 +472,7 @@ pub(crate) fn open_map(
         Poll::Ready(result) => result,
         Poll::Pending => unreachable!("files never wait"),
     };
+    let key = builder.seven_zip_header_key().cloned();
     let map = map.map_err(|e| match e {
         MapError::PasswordRequired => SevenZipError::PasswordRequired,
         MapError::WrongPassword => SevenZipError::WrongPassword,
@@ -477,7 +492,7 @@ pub(crate) fn open_map(
         return Err(SevenZipError::Map(MapError::NotArchive));
     }
     match map.end {
-        MapEnd::Complete => Ok(map),
+        MapEnd::Complete => Ok((map, key)),
         MapEnd::HeaderUnavailable { volume, .. } => {
             let set = source::VolumeSet::new(first, volume + 1);
             let path = set.paths()[volume as usize].clone();
@@ -548,5 +563,49 @@ mod method_name_tests {
         assert_eq!(size_value(6 << 10), "6k");
         assert_eq!(size_value(1000), "1000b");
         assert_eq!(size_value(0), "0m");
+    }
+}
+
+#[cfg(test)]
+mod header_key_tests {
+    use super::*;
+    use crate::crypto::SHA256_COMPRESSIONS;
+    use crate::extract::{Mode, Options, Overwrite};
+
+    fn compressions(f: impl FnOnce()) -> u64 {
+        SHA256_COMPRESSIONS.with(|c| c.set(0));
+        f();
+        SHA256_COMPRESSIONS.with(|c| c.get())
+    }
+
+    /// An archive with encrypted headers and data derives its key once: the folders reuse the header's key.
+    #[test]
+    fn an_encrypted_header_key_is_derived_once_per_run() {
+        let first = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/7z-extract/aes_hdr.7z"));
+        let limits = SevenZipLimits::default();
+        let cancel = Cancellation::default();
+        let map_only = compressions(|| {
+            let (_, key) = open_map_keyed(first, Some("password"), &cancel, &limits).unwrap();
+            assert!(key.is_some(), "the header key is handed on");
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options {
+            mode: Mode::Test,
+            dest: dir.path().to_path_buf(),
+            overwrite: Overwrite::Skip,
+            flatten: false,
+            threads: None,
+            protected_paths: Default::default(),
+            parallel_min: None,
+            select: None,
+            windows_safe_names: false,
+        };
+        let whole = compressions(|| {
+            let summary = run(first, &options, Some("password"), &cancel, &limits, |_| {}).unwrap();
+            assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        });
+        // One derivation is 2^cycles rounds of a few blocks each; the run adds only a few blocks of its own.
+        assert!(map_only > 1 << 16, "{map_only}");
+        assert!(whole < map_only + map_only / 4, "the run derived the key again: {whole} vs {map_only}");
     }
 }
