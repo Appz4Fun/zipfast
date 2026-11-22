@@ -371,3 +371,29 @@ fn a_filter_declared_in_the_lost_block_is_an_error_after_the_restart() {
     assert!(err.contains("output offset 25000"), "{err}");
     assert!(out.0.len() as u64 + r.output_offset <= 250_001, "no wrong byte reached the sink");
 }
+
+/// A resumed file of a solid stream goes on into the next file: after the earlier file's last block (and its AES
+/// padding) the decoder takes the next file's blocks with its window and state.
+#[test]
+fn a_resumed_solid_file_continues_into_the_next() {
+    use zipfast::rar5::testenc::{self, Op};
+    let plain = sample(300_000);
+    let (a, b) = plain.split_at(200_000);
+    let first = testenc::tuned_stream(&testenc::lz(a, 1 << 17, 16), 2_000);
+    // The second file as literals: its blocks need nothing from the first but the decoder carrying on.
+    let second = testenc::tuned_stream(&b.iter().map(|&x| Op::Lit(x)).collect::<Vec<_>>(), 2_000);
+    let window = window_for(128 << 10, Some(a.len() as u64), true).unwrap();
+    let after = &first[first.len() / 2..];
+    let r = resync(after, 0, a, window, 0..a.len() as u64).unwrap();
+    let mut u = Unpacker::resume_at(window, &r, 0, a, Some(a.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    let padded = |bytes: &[u8]| [bytes, &[0x5a; 11][..]].concat();
+    u.feed(&padded(&after[r.packed_offset..]), &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0, a[r.output_offset as usize..]);
+    let mut out = Collect(Vec::new());
+    u.next_file(Some(b.len() as u64));
+    u.feed(&padded(&second), &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0, b, "the next file decodes after the resumed one");
+}

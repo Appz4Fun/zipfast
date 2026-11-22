@@ -980,6 +980,10 @@ impl Unpacker {
         self.size_failure = None;
         self.filters.clear();
         self.input.clear();
+        // a resumed member ended at its last block; the next file of the solid stream has its own blocks, and the
+        // known plaintext was the earlier file's
+        self.ended = false;
+        self.verify = None;
         self.parallel = self.wants_parallel();
     }
 
