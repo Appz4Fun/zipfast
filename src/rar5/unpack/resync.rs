@@ -81,6 +81,10 @@ pub struct Resync {
     /// Every filter that can cover output after the restart was seen ([`resync_near`]): the restart lies a filter's
     /// longest length past the first block checked, so no filter declared before that block reaches it.
     guarded: bool,
+    /// [`resync_near`]: output before this offset may have been changed by a filter declared before the first block
+    /// checked, which the follow never saw (0 for [`resync`]). The resumed decoder refuses a match that copies from
+    /// there into output no known plaintext checks.
+    floor: u64,
 }
 
 /// A filter a [`resync_near`] follow decoded past: output offsets `start..start + len` (in the plaintext's
@@ -395,6 +399,9 @@ fn known_len(block: &Block) -> Option<(u64, u64)> {
     Some((len, slack))
 }
 
+/// How much plaintext one piece of a literal search covers between deadline checks.
+const CHUNK: usize = 1 << 20;
+
 /// The longest copy RAR 5.0 makes.
 const MAX_LEN: u64 = 0x1101;
 
@@ -432,14 +439,23 @@ fn candidates(block: &Block, known: &Known<'_>, expected: &Range<u64>, work: &mu
         }
         let mut found = Vec::new();
         let mut too_many = false;
-        find(&known.bytes[from..to], lits, |i| {
-            if found.len() == MAX_CANDIDATES {
-                too_many = true;
-                return false;
+        // In pieces of 1 MiB (overlapping by the run's length), so a deadline is noticed during a long scan.
+        let mut piece = from;
+        while piece < to && !too_many {
+            if work.late() {
+                return None;
             }
-            found.push(lo + i as u64 - before);
-            true
-        });
+            let end = (piece + CHUNK + lits.len() - 1).min(to);
+            find(&known.bytes[piece..end], lits, |i| {
+                if found.len() == MAX_CANDIDATES {
+                    too_many = true;
+                    return false;
+                }
+                found.push(lo + (piece - from + i) as u64 - before);
+                true
+            });
+            piece += CHUNK;
+        }
         if !too_many {
             return Some(found);
         }
@@ -587,6 +603,11 @@ pub struct ResyncNear {
     pub work: u64,
     /// Time spent.
     pub elapsed: std::time::Duration,
+    /// Whether the decoding checked from the anchor covers the restart's whole match window (or starts at the
+    /// plaintext's start): no filter the follow did not see can have changed output a match after the restart copies
+    /// from. When false, the resumed decoder refuses (as [`crate::Error::BadChecksum`]) a match that copies from
+    /// before the anchor plus a filter's length into output no known plaintext checks, rather than risk wrong output.
+    pub window_checked: bool,
 }
 
 /// Why [`resync_near`] found no restart.
@@ -656,39 +677,73 @@ pub fn resync_near(
     let known = Known { base: known_base, bytes: &known[..(target - known_base) as usize] };
     let mut pre = Huff::new();
     let est = options.estimate.unwrap_or(packed.len()).min(packed.len());
-    let done = |(r, anchor, from): (Resync, u64, usize), work: &Work| ResyncNear {
-        back: target - r.output_offset,
-        anchor,
-        searched_from: from,
-        work: options.work - work.left,
-        elapsed: started.elapsed(),
-        resync: r,
+    let checked =
+        |r: &Resync, anchor: u64| anchor <= known_base || r.floor <= r.output_offset.saturating_sub(window.reach);
+    let done = |(r, anchor, from): (Resync, u64, usize), work: &mut Work| {
+        // A result found after the deadline is not given: the caller's time is up.
+        if work.late() {
+            return Err(NearError::Exhausted { lowest: from });
+        }
+        Ok(ResyncNear {
+            back: target - r.output_offset,
+            anchor,
+            searched_from: from,
+            work: options.work - work.left,
+            elapsed: started.elapsed(),
+            window_checked: checked(&r, anchor),
+            resync: r,
+        })
     };
-    // A guarded restart first: an anchor a filter's longest length before the target, followed to it.
     let mut fallback: Option<(Resync, u64, usize)> = None;
+    let keep = |found: (Resync, u64, usize), fallback: &mut Option<(Resync, u64, usize)>| {
+        if fallback.as_ref().is_none_or(|f| found.0.output_offset > f.0.output_offset) {
+            *fallback = Some(found);
+        }
+    };
+    if options.guard {
+        // Best: an anchor that covers the restart's whole match window, so nothing the decoder copies from can hold
+        // output of a filter the follow did not see: the window's reach plus a filter's length before the target, or
+        // the plaintext's start when the window reaches back that far (a member's start, where no filter can be
+        // declared before).
+        let cover = target.checked_sub(window.reach.saturating_add(MAX_FILTER_LEN)).filter(|&l| l > known_base);
+        let found = match cover {
+            Some(l) => search_near(packed, &known, window, l, est, &mut pre, &mut work),
+            None => search_near(packed, &known, window, known_base + 1, 0, &mut pre, &mut work),
+        };
+        match found {
+            Ok(found) if checked(&found.0, found.1) && (found.0.guarded || found.1 <= known_base) => {
+                return done(found, &mut work);
+            }
+            Ok(found) => keep(found, &mut fallback),
+            Err(NearError::NotFound { .. }) => {}
+            Err(e) => return fallback.map_or(Err(e), |f| done(f, &mut work)),
+        }
+    }
+    // Then a guarded restart: an anchor a filter's longest length before the target, followed to it.
     let mut limit = target.checked_sub(MAX_FILTER_LEN).filter(|_| options.guard);
     // A restart can only be at a block start: when one block covers much output, the restart falls before the
     // anchor plus a filter's length, so the anchor is looked for that much before the restart instead (twice).
     for _ in 0..3 {
         let Some(l) = limit.filter(|&l| l > known_base) else { break };
         match search_near(packed, &known, window, l, est, &mut pre, &mut work) {
-            Ok(found) if found.0.guarded => return Ok(done(found, &work)),
+            Ok(found) if found.0.guarded => return done(found, &mut work),
             Ok(found) => {
                 limit = found.0.output_offset.checked_sub(MAX_FILTER_LEN).filter(|&next| next < l);
-                if fallback.as_ref().is_none_or(|f| found.0.output_offset > f.0.output_offset) {
-                    fallback = Some(found);
-                }
+                keep(found, &mut fallback);
             }
             Err(NearError::NotFound { .. }) => break,
-            Err(e) => return fallback.map(|f| done(f, &work)).ok_or(e),
+            Err(e) => return fallback.map_or(Err(e), |f| done(f, &mut work)),
         }
+    }
+    if let Some(f) = fallback.take_if(|f| f.0.guarded) {
+        return done(f, &mut work);
     }
     match search_near(packed, &known, window, target, est, &mut pre, &mut work) {
         Ok(found) => {
             let better = fallback.as_ref().is_none_or(|f| found.0.output_offset >= f.0.output_offset);
-            Ok(done(if better { found } else { fallback.expect("checked") }, &work))
+            done(if better { found } else { fallback.expect("checked") }, &mut work)
         }
-        Err(e) => fallback.map(|f| done(f, &work)).ok_or(e),
+        Err(e) => fallback.map_or(Err(e), |f| done(f, &mut work)),
     }
 }
 
@@ -704,82 +759,127 @@ fn search_near(
     pre: &mut Huff,
     work: &mut Work,
 ) -> std::result::Result<(Resync, u64, usize), NearError> {
-    // Packed bytes from `scanned` on were searched already.
+    // Packed bytes from `scanned` on were searched already, but for the intervals in `pending`: a step that pinned
+    // its share of blocks leaves the rest of its interval for after the steps back.
     let mut scanned = packed.len();
+    let mut pending = Vec::new();
     let mut margin: usize = 16 << 10;
+    let mut range;
     loop {
         let from = est.saturating_sub(margin);
         let span = (margin as u64).saturating_mul(SPAN_PER_MARGIN).max(1 << 20);
-        let range = anchor_max.saturating_sub(span).max(known.base)..anchor_max;
-        let (mut at, mut pinned, mut misses) = (from, 0, 0);
-        while at < scanned && pinned < NEAR_BLOCKS && misses < NEAR_MISSES {
-            if work.late() {
-                return Err(NearError::Exhausted { lowest: from });
-            }
-            if packed[at] & 0x80 == 0 {
-                at += 1;
-                continue;
-            }
-            let Some(block) = probe(packed, at, None, pre, work) else {
-                if work.left == 0 {
-                    return Err(NearError::Exhausted { lowest: from });
-                }
-                at += 1;
-                continue;
-            };
-            pinned += 1;
-            let starts = match candidates(&block, known, &range, work) {
-                None if work.left == 0 => return Err(NearError::Exhausted { lowest: from }),
-                // Literals that recur too often to pin the block: the next block may do.
-                None => Vec::new(),
-                Some(v) if v.is_empty() => {
-                    // Not near the limit: earlier (the estimate was early, so follow it from there), or past it.
-                    match candidates(&block, known, &(known.base..range.start), work) {
-                        None if work.left == 0 => return Err(NearError::Exhausted { lowest: from }),
-                        Some(v) if !v.is_empty() => {
-                            misses = 0;
-                            v
-                        }
-                        // Past the limit, as every later block is then.
-                        _ => {
-                            misses += 1;
-                            Vec::new()
-                        }
-                    }
-                }
-                Some(v) => {
-                    misses = 0;
-                    v
-                }
-            };
-            // Every offset the block fits at is followed to the target; exactly one may hold.
-            let mut found = None;
-            let mut ambiguous = false;
-            for start in starts {
-                match follow_near(packed, at, &block, start, known, window, pre, work) {
-                    Follow::Restart(r) => {
-                        if found.is_some() {
-                            ambiguous = true;
-                            break;
-                        }
-                        found = Some((r, start, from));
-                    }
-                    Follow::Filter { .. } | Follow::Mismatch => {}
-                    Follow::Exhausted => return Err(NearError::Exhausted { lowest: from }),
-                }
-            }
-            match found {
-                Some(found) if !ambiguous => return Ok(found),
-                // Byte by byte, as `resync` scans: a false header that happens to decode must not hide a block.
-                _ => at += 1,
-            }
+        range = anchor_max.saturating_sub(span).max(known.base)..anchor_max;
+        match scan_blocks(packed, known, window, &range, from, from..scanned, NEAR_BLOCKS, pre, work)? {
+            Scan::Found(found) => return Ok(found),
+            Scan::Capped(at) => pending.push(at..scanned),
+            Scan::Done => {}
         }
         scanned = from;
         if from == 0 {
-            return Err(NearError::NotFound { lowest: 0 });
+            break;
         }
         margin = margin.saturating_mul(4);
     }
+    // The intervals left over, nearest the estimate first, with the widest range, until the budget runs out.
+    while let Some(rest) = pending.pop() {
+        if let Scan::Found(found) = scan_blocks(packed, known, window, &range, rest.start, rest, usize::MAX, pre, work)?
+        {
+            return Ok(found);
+        }
+    }
+    Err(NearError::NotFound { lowest: 0 })
+}
+
+enum Scan {
+    Found((Resync, u64, usize)),
+    /// `cap` blocks were pinned without a restart; the interval's bytes from this offset on were not searched.
+    Capped(usize),
+    Done,
+}
+
+/// Looks through the blocks in `span` of `packed` for one that pins at an output offset in `range` (or before it)
+/// and follows it to the target; stops after `cap` blocks are tried, or after a few blocks in a row lie past the
+/// range. `from` labels the result and errors.
+#[allow(clippy::too_many_arguments)]
+fn scan_blocks(
+    packed: &[u8],
+    known: &Known<'_>,
+    window: Window,
+    range: &Range<u64>,
+    from: usize,
+    span: Range<usize>,
+    cap: usize,
+    pre: &mut Huff,
+    work: &mut Work,
+) -> std::result::Result<Scan, NearError> {
+    let exhausted = Err(NearError::Exhausted { lowest: from });
+    let (mut at, mut pinned, mut misses) = (span.start, 0, 0);
+    while at < span.end && misses < NEAR_MISSES {
+        if pinned >= cap {
+            return Ok(Scan::Capped(at));
+        }
+        if work.late() {
+            return exhausted;
+        }
+        if packed[at] & 0x80 == 0 {
+            at += 1;
+            continue;
+        }
+        let Some(block) = probe(packed, at, None, pre, work) else {
+            if work.left == 0 {
+                return exhausted;
+            }
+            at += 1;
+            continue;
+        };
+        pinned += 1;
+        let starts = match candidates(&block, known, range, work) {
+            None if work.late() => return exhausted,
+            // Literals that recur too often to pin the block: the next block may do.
+            None => Vec::new(),
+            Some(v) if v.is_empty() => {
+                // Not near the limit: earlier (the estimate was early, so follow it from there), or past it.
+                match candidates(&block, known, &(known.base..range.start), work) {
+                    None if work.late() => return exhausted,
+                    Some(v) if !v.is_empty() => {
+                        misses = 0;
+                        v
+                    }
+                    // Past the limit, as every later block is then.
+                    _ => {
+                        misses += 1;
+                        Vec::new()
+                    }
+                }
+            }
+            Some(v) => {
+                misses = 0;
+                v
+            }
+        };
+        // Every offset the block fits at is followed to the target; exactly one may hold.
+        let mut found = None;
+        let mut ambiguous = false;
+        for start in starts {
+            match follow_near(packed, at, &block, start, known, window, pre, work) {
+                Follow::Restart(r) => {
+                    if found.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    found = Some((r, start, from));
+                }
+                Follow::Filter { .. } | Follow::Mismatch => {}
+                Follow::Exhausted => return exhausted,
+            }
+        }
+        match found {
+            Some(found) if !ambiguous => return Ok(Scan::Found(found)),
+            // Byte by byte, as `resync` scans: a false header that happens to decode must not hide a block.
+            _ => at += 1,
+        }
+    }
+    Ok(Scan::Done)
 }
 
 /// A place a [`follow_near`] may restart at: a block start past every filter seen, with the state there.
@@ -830,7 +930,7 @@ fn follow_near(
     };
     loop {
         work.steps += 1;
-        if (work.steps.is_multiple_of(64) && work.late()) || work.left == 0 {
+        if work.late() {
             return Follow::Exhausted;
         }
         note(pos, out, &st, &block.lens, &seen, &mut any, &mut guarded);
@@ -861,12 +961,17 @@ fn follow_near(
         owned = next;
         block = &owned;
     }
+    if work.late() {
+        return Follow::Exhausted;
+    }
     let is_guarded = guarded.is_some();
     let Some(c) = guarded.or(any) else { return Follow::Mismatch };
     // Only filters the restart's window reaches matter to it.
     let reach = c.out.saturating_sub(window.reach);
     let filters = seen[..c.seen].iter().filter(|f| f.start + f.len > reach).copied().collect();
-    Follow::Restart(resync_at(c.pos, start, c.out, &c.st, &c.lens, filters, is_guarded))
+    // A filter declared before the anchor (`start`) may have changed output up to a filter's longest length past it.
+    let floor = start.saturating_add(MAX_FILTER_LEN).min(c.out);
+    Follow::Restart(resync_at(c.pos, start, c.out, &c.st, &c.lens, filters, is_guarded, floor))
 }
 
 enum Follow {
@@ -931,9 +1036,10 @@ fn follow(
 }
 
 fn restart(pos: usize, start: u64, out: u64, st: &State, lens: &Lengths) -> Follow {
-    Follow::Restart(resync_at(pos, start, out, st, lens, Vec::new(), false))
+    Follow::Restart(resync_at(pos, start, out, st, lens, Vec::new(), false, 0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resync_at(
     pos: usize,
     start: u64,
@@ -942,6 +1048,7 @@ fn resync_at(
     lens: &Lengths,
     filters: Vec<SeenFilter>,
     guarded: bool,
+    floor: u64,
 ) -> Resync {
     {
         Resync {
@@ -954,6 +1061,7 @@ fn resync_at(
             lens: Box::new(*lens),
             filters,
             guarded,
+            floor,
         }
     }
 }
@@ -1011,7 +1119,8 @@ impl Unpacker {
         let mut check_end = offset.saturating_add(MAX_FILTER_LEN).min(member_end);
         // A guarded restart (every filter that can reach past it was seen) needs no plaintext past it; what there is
         // is still checked.
-        if resync.guarded {
+        // ... as is a restart followed from the member's start, before which no filter can be declared.
+        if resync.guarded || (resync.floor > 0 && resync.verified.start <= member_start) {
             check_end = check_end.min(known_end.max(offset));
         }
         if known_base > offset || known_end < check_end {
@@ -1051,6 +1160,12 @@ impl Unpacker {
         u.sp = offset;
         u.file_base = member_start;
         u.emitted = offset - member_start;
+        // Matches into output nothing checks may not copy from before the floor (see `Resync::floor`); a follow
+        // from the member's start saw every filter there is.
+        if resync.floor > 0 && resync.verified.start > member_start {
+            u.floor = resync.floor.min(offset);
+            u.floor_from = check_end;
+        }
         u.history = resync.history;
         u.last_len = resync.last_len;
         u.slot = Slot::filled(Some(*resync.lens));

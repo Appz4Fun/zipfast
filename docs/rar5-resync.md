@@ -77,28 +77,39 @@ u.feed(&packed[n.resync.packed_offset..], &mut sink)?;
   plaintext it copies into the window. Without that, a match after the restart that copies from filtered output
   decodes wrong.
 - **Guarded restarts (`NearOptions::guard`, default true):** a restart checked from a filter's longest length
-  (4 MiB) before it is `guarded()`. No filter declared before the anchor can reach it, assuming rar declares a
-  filter in the block its output starts in, as it does. `resume_in_stream` then needs no plaintext past the restart,
-  which a handover does not have. It still checks what plaintext there is. The search looks for such an anchor
-  first, and gives the closest unguarded restart when there is none (the target is within 4 MiB of the plaintext's
-  start). Resuming an unguarded restart needs plaintext past it, as with `resync`.
+  (4 MiB) before it is `guarded()`. No filter declared before the anchor can cover output after it, assuming rar
+  declares a filter in the block its output starts in, as it does. `resume_in_stream` then needs no plaintext past
+  the restart, which a handover does not have. It still checks what plaintext there is. A restart followed from the
+  member's start counts as guarded too.
+- **The match window (`ResyncNear::window_checked`):** a match after the restart may copy from anywhere in the
+  window, up to the dictionary size back. Output a filter changed there must be undone before the decoder copies
+  from it, and only filters the follow saw can be undone. So the search first looks for an anchor that covers the
+  restart's whole window: the window's reach plus 4 MiB before the target, or the plaintext's start when the window
+  reaches back that far. The plaintext's start is a member's start in a handover, where nothing can be declared
+  before. Following from there is cheap, since decoding without a window is a byte comparison. Failing that, it
+  falls back to a guarded anchor with `window_checked: false`. The resumed decoder then refuses, as
+  `Error::BadChecksum`, a match that copies from before the anchor plus 4 MiB into output no known plaintext checks.
+  That is an error, never silently wrong output. Failing that too, it gives the closest restart, which needs
+  plaintext past it to resume.
 - **Block granularity:** a restart is a block start. One rar block can cover megabytes of very compressible output:
   in `mixed.mkv` (z-fixtures F05/F06) a single block covers output 14.2 MB to 22.0 MB, so every target in it
   restarts at 14.2 MB.
-- **Result:** `ResyncNear { resync, back, anchor, searched_from, work, elapsed }`.
+- **Result:** `ResyncNear { resync, back, anchor, searched_from, work, elapsed, window_checked }`.
 - **Errors:** `NearError::NotFound { lowest }` means no block pinned before the target from packed offset `lowest`
   on. `NearError::Exhausted { lowest }` means the work budget (default 2^30, about a second) or the deadline ran out.
+  The deadline is checked during long literal searches, on every block followed, and before a result is given, so
+  no result comes after it.
 - **Solid streams:** offsets are in the plaintext's coordinates, the solid stream's for a later member. Resume
   with that member's start (`resume_in_stream`).
 
-Measured on z-fixtures (release, one thread, M4; plaintext only up to the target; every restart guarded and
-resumed exactly):
+Measured on z-fixtures (release, one thread, M4; plaintext only up to the target; every restart followed from the
+member's start, window checked, guarded and resumed exactly):
 
 | set | target | restart (back) | time |
 |---|---|---|---|
-| F03 video (-m3) | 5 / 12 / 20 / 25 MB | 13 / 9 / 4.4 / 1.1 KB back | 10 / 58 / 109 / 138 ms |
-| F05 mixed (-m5) | 5 / 12 / 20 / 25 MB | 13 KB / 127 KB / 5.75 MB (block) / 11 KB back | 9 / 26 / 159 / 232 ms |
-| F06 mixed -hp (-m3) | 5 / 12 / 20 / 25 MB | 13 KB / 127 KB / 5.80 MB (block) / 14 KB back | 9 / 27 / 157 / 218 ms |
+| F03 video (-m3) | 5 / 12 / 20 / 25 MB | 13 / 9 / 4.4 / 1.1 KB back | 4 / 10 / 17 / 27 ms |
+| F05 mixed (-m5) | 5 / 12 / 20 / 25 MB | 13 KB / 127 KB / 5.75 MB (block) / 11 KB back | 4 / 30 / 61 / 66 ms |
+| F06 mixed -hp (-m3) | 5 / 12 / 20 / 25 MB | 13 KB / 127 KB / 5.80 MB (block) / 14 KB back | 4 / 30 / 62 / 65 ms |
 
 Before (`resync` with a packing-ratio estimate at the F06 20 MB target), every width up to the whole member was
 `NotFound` or `Exhausted` (22 ms to 1.6 s per call). The estimate (packed 10.78 MB) decodes to output about 22.8 MB,
@@ -124,6 +135,9 @@ past the target. Prybar's layered search over `resync` took about 25 s and lande
     start), reports a spent budget and plaintext that is not the member's, decodes past a filter and undoes it in
     the resumed window (a later copy from the filtered output decodes exactly), finds a restart in a solid second
     member, and a guarded restart resumes with plaintext only up to the target;
+  - with a 16 MiB dictionary, a copy after the target from output a filter before the anchor changed is refused by
+    the resumed decoder; more than a step's share of unpinnable blocks at the estimate is searched past; a deadline
+    that passes during a long follow gives `Exhausted`;
   - with `ZIPFAST_Z_FIXTURES`, `resync_near` on F03/F05/F06 at several targets (guarded, exact, under 1 s in release).
 
 RAR 4.x is not covered.

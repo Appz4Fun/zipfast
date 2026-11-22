@@ -688,10 +688,20 @@ fn a_guarded_resync_near_resumes_without_plaintext_past_the_target() {
         resumed(window, &n.resync, 0, known, plain.len() as u64, &packed),
         plain[n.resync.output_offset as usize..]
     );
-    // Within 4 MiB of the plaintext's start nothing can be guarded: such a restart needs plaintext past it.
+    // Within 4 MiB of the plaintext's start the follow starts at the member's start, before which no filter can be
+    // declared: that restart resumes with plaintext only up to the target too.
     let early = &plain[..1_000_000];
     let e = near(&packed, early, window, 1_000_000, true);
-    assert!(!e.resync.guarded() && e.back < 200_000, "{e:?}");
+    assert!(e.anchor == 0 && e.window_checked && e.back < 200_000, "{e:?}");
+    assert_eq!(
+        resumed(window, &e.resync, 0, early, plain.len() as u64, &packed),
+        plain[e.resync.output_offset as usize..]
+    );
+    // Without the member's first blocks such a restart is not guarded: it needs plaintext past it.
+    let cut = &packed[packed.len() / 40..];
+    let options = NearOptions { estimate: Some(cut.len() / 10), ..Default::default() };
+    let e = resync_near(cut, 0, early, window, 1_000_000, &options).unwrap();
+    assert!(!e.resync.guarded() && !e.window_checked && e.anchor > 0, "{e:?}");
     assert!(Unpacker::resume_in_stream(window, &e.resync, 0, 0, early, Some(plain.len() as u64)).is_err());
 }
 
@@ -765,4 +775,99 @@ fn resync_near_on_the_z_fixtures() {
             );
         }
     }
+}
+
+/// A dictionary over 4 MiB: a filter's output lies before the anchor (unseen by the follow) but inside the restart's
+/// match window, and a copy after the target reads it. The resumed decoder must refuse that copy rather than write
+/// the filtered bytes where the window held them unfiltered.
+#[test]
+fn a_resumed_decoder_refuses_a_copy_from_output_an_unseen_filter_changed() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops = spread(2 << 20);
+    let filter_at = testenc::model(&ops).len() as u64;
+    ops.push(Op::Filter { start: 0, len: 20_000, kind: 1, channels: 0 });
+    // Calls whose operands the E8 filter rewrites.
+    for k in 0..4_000u32 {
+        ops.extend([0xe8, (k % 251) as u8, 0x10, 0, 0].map(Op::Lit));
+    }
+    ops.extend(spread(9 << 20));
+    let before_copy = testenc::model(&ops).len() as u64;
+    let target = before_copy - 50_000;
+    // After the target: a copy from inside the filter's output, 8+ MiB back.
+    ops.push(Op::Match(3_000, before_copy - (filter_at + 10_000)));
+    ops.extend(spread(200_000));
+    let packed = testenc::tuned_stream(&ops, 4_000);
+    let size = testenc::model(&ops).len() as u64;
+    let window = window_for(16 << 20, Some(size), false).unwrap();
+    let truth = decode(window, &packed, size);
+    let (lo, hi) = (filter_at as usize + 10_000, filter_at as usize + 13_000);
+    assert_eq!(
+        truth[before_copy as usize..before_copy as usize + 3_000],
+        testenc::model(&ops)[lo..hi],
+        "the copy reads unfiltered bytes"
+    );
+    assert_ne!(truth[lo..hi], testenc::model(&ops)[lo..hi], "which the filter changed in the output");
+    // The packed bytes from about 4 MiB of output on: the member's first blocks (and the filter's) are not given.
+    let cut = packed.len() * 4 / 11;
+    let known = &truth[..target as usize];
+    let options = NearOptions { estimate: Some((packed.len() - cut) * 6 / 10), ..Default::default() };
+    let n = resync_near(&packed[cut..], 0, known, window, target, &options).unwrap();
+    assert!(n.resync.guarded() && !n.window_checked, "{n:?}");
+    assert!(n.anchor > filter_at + 20_000, "the filter is before the anchor: {n:?}");
+    let mut u = Unpacker::resume_in_stream(window, &n.resync, 0, 0, known, Some(size)).unwrap();
+    let mut out = Collect(Vec::new());
+    let result = u.feed(&packed[cut + n.resync.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+    let err = result.expect_err("a copy from output an unseen filter changed must not pass").to_string();
+    assert!(err.contains("before the window checked"), "{err}");
+    let good = (before_copy - n.resync.output_offset) as usize;
+    assert!(
+        out.0.len() <= good + 3_000
+            && out.0[..good.min(out.0.len())] == truth[n.resync.output_offset as usize..][..good.min(out.0.len())]
+    );
+}
+
+/// More than a step's share of blocks that cannot pin, right at the estimate: the rest of the interval is still
+/// searched, and a later block pins.
+#[test]
+fn resync_near_searches_past_many_unpinnable_blocks() {
+    use zipfast::rar5::testenc::{self, Op};
+    let pattern = b"abcdefghijklmnop";
+    let mut ops: Vec<Op> = (0..70 * 500).map(|i| Op::Lit(pattern[i % 16])).collect();
+    let tail = sample(200_000);
+    ops.extend(testenc::lz(&tail, 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 500);
+    let plain = testenc::model(&ops);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let target = plain.len() as u64 - 20_000;
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed, 0, &plain[..target as usize], window, target, &options).unwrap();
+    assert!(n.resync.output_offset <= target && n.back < 40_000, "{n:?}");
+    assert_eq!(
+        resumed(window, &n.resync, 0, &plain, plain.len() as u64, &packed),
+        plain[n.resync.output_offset as usize..]
+    );
+}
+
+/// A deadline that passes while the follow decodes a long way is honoured: no result is given after it.
+#[test]
+fn resync_near_gives_no_result_after_its_deadline() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops = testenc::lz(&sample(100_000), 1 << 17, 16);
+    for _ in 0..10_000 {
+        ops.push(Op::Lit(b'A'));
+        ops.push(Op::Match(4_000, 1));
+    }
+    let tail: Vec<u8> = sample(100_000).into_iter().rev().collect();
+    ops.extend(testenc::lz(&tail, 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 2_000);
+    let plain = testenc::model(&ops);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let target = plain.len() as u64 - 20_000;
+    let known = &plain[..target as usize];
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed, 0, known, window, target, &options).unwrap();
+    assert!(n.anchor < 100_000, "the follow covers the long run: {n:?}");
+    let options = NearOptions { estimate: Some(0), guard: false, deadline: Some(n.elapsed / 8), ..Default::default() };
+    let late = resync_near(&packed, 0, known, window, target, &options);
+    assert!(matches!(late, Err(NearError::Exhausted { .. })), "{late:?}");
 }
