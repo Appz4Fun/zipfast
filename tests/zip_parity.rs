@@ -23,8 +23,8 @@ use std::io::Write;
 use std::ops::Range;
 
 use fixture::{Fixture, Member, build, extra};
+use zipfast::zipview::{PasswordCheck, ZipEntry, ZipIndex, ZipIndexOpener, ZipReadError, ZipReader};
 use zipfast::{error::Error, zip::Archive};
-use zipview::{PasswordCheck, ZipEntry, ZipIndex, ZipIndexOpener, ZipReadError, ZipReader};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Read {

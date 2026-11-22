@@ -42,6 +42,8 @@ liblzma = { version = "0.4.9", features = ["parallel", "static"] }
 subtle = "2.6"
 tempfile = "3.27"
 zip-container = { version = "0.1.0", path = "crates/zip-container" }
+# Re-exported as `zipfast::zipview` so dependents need only zipfast for in-memory and range ZIP reads.
+zipview = { version = "0.1.0", path = "crates/zipview" }
 zstd = "0.14.3"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
@@ -65,4 +67,3 @@ panic = "abort"
 
 [dev-dependencies]
 flate2 = "1"
-zipview = { path = "crates/zipview" }
