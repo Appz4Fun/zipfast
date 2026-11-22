@@ -19,6 +19,8 @@
 #![doc = include_str!("../../docs/persistent-partials.md")]
 mod anchor;
 mod cipher;
+mod held;
+pub use held::{HeldOptions, HeldOutput, HeldScan, HeldSkip, load_held};
 mod journal;
 mod ledger;
 mod limits;
@@ -2201,6 +2203,16 @@ impl PartialCore {
         self.budget.metadata(op.state.wire.len() as u64)?;
         Ok(op.state.clone())
     }
+    fn held_output(&self) -> PartialResult<HeldOutput> {
+        let mut op = self.operation()?;
+        self.check(&op)?;
+        self.flush_group(&mut op)?;
+        if op.uncertain.is_some() {
+            // After an uncertain group commit the snapshot is not conservative: rebuild it from the store.
+            self.reconcile(&mut op)?;
+        }
+        Ok(held::held_from_snapshot(&op.snapshot, self.output_path().to_path_buf()))
+    }
     fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         let mut op = self.operation()?;
         self.check(&op)?;
@@ -2629,6 +2641,14 @@ impl PartialFile {
     }
     pub fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         self.core.remaining()
+    }
+    /// What this member's output already holds: the output path, the member's identity (name, size, plaintext
+    /// checks where known) and the output ranges known good, for reuse by another copy of the release (see
+    /// [`HeldOutput`]). Commits an open group first, as [`remaining`](Self::remaining) does, so writes made
+    /// through this handle so far count. [`load_held`] reads the same from a closed state directory, without the
+    /// archive or its binding.
+    pub fn held_output(&self) -> PartialResult<HeldOutput> {
+        self.core.held_output()
     }
     /// Declares archive bytes of `volume` bad after they were extracted, for example when an article's CRC
     /// fails late. Output this member produced from those bytes becomes `DeclaredBad` holes again (returned,

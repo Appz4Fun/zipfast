@@ -268,3 +268,56 @@ Durability: the abandon is one transaction. A crash leaves the state before it (
 
 Encrypted members (RAR5 AES-256-CBC): the produced prefix ends on a block boundary, and the tail is filled with plaintext, so no ciphertext, IV or key is needed for it. The abandoned hole's packed spans list only the archive bytes the recorded parts hold. `fill_packed` and `refill_from_packed` still work on holes in the produced prefix.
 
+## Held output
+
+When a downloader switches to another copy of the release, the output the first copy already extracted can rebuild
+the second copy's articles locally instead of downloading them. Two calls say what that output holds:
+
+- `PartialFile::held_output()` on a live handle. It commits an open group first (as `remaining()` does), and after
+  an uncertain commit it rebuilds from the anchored state, so the answer is never more than is durable.
+- `partial::load_held(state_root, output_root, &HeldOptions)` on a state directory no session owns. It needs
+  neither the archive, nor the password, nor the anchor store, nor the original binding: each bundle's output path
+  is `output_root` joined with the relative path its state records, so the output tree may have been moved as a
+  whole.
+
+Both return a `HeldOutput`:
+
+| field | meaning |
+|---|---|
+| `output_path`, `relative_output` | the output file, absolute and relative to the output root |
+| `member`, `name`, `size` | the member the state belongs to: its `MemberKey`, its name as the archive stores it, its unpacked size |
+| `checks` | plaintext `MemberChecks` when known: the archive's, or those supplied to `abandon_tail`. `None` until the extraction has read them, and for an encrypted RAR 5.0 member whose checks are keyed with the password |
+| `finished` | the extraction reached the end, or the tail was abandoned |
+| `good` | output ranges known good, sorted and disjoint: written, committed and not inside any hole (declared bad, missing, cipher neighbour, abandoned tail). Plaintext filled from another copy counts once committed |
+
+`good` and `remaining()` together tile `[0, size)`.
+
+`load_held` returns a `HeldScan`: `held`, one `HeldOutput` per readable bundle, and `skipped`, each unreadable bundle
+with its `PartialError`. Only a failure to list `state_root` itself is an error. It is read-only: it never writes,
+creates, renames, compacts or deletes, and never takes a bundle over.
+
+- A bundle a session holds is skipped with `Busy`. Each bundle's `lock` file is probed with a shared, non-blocking
+  advisory lock while it is read, so a session opening that bundle at the same moment gets `Busy` and can retry.
+- Without the anchor store, the newest record (highest sequence) is used. That is safe: an intent record marks the
+  output it may change unknown, and a commit record is written only after its output was synced, so no record
+  claims bytes the output does not hold. A record that fails its checksum (or is too short to carry one) is
+  ignored, since a record torn by a crash was never anchored. When two records share the newest sequence, only
+  output both call good is returned, and leaves they share count once against `CrcLeaves`.
+- Any other damage skips the bundle: a record whose checksum holds but which has an unknown version or a malformed
+  field, a missing or corrupt page the newest record names, a record of another member. An older record is never
+  used in its place, since a newer one may have taken output back.
+- Every file is opened read-only, without following a symbolic link and without blocking, so a state directory on
+  read-only media or owned by another user can be read. A FIFO or any other non-regular file in place of `lock`, a
+  record or a page skips the bundle with `UnsafePath` instead of stalling.
+- The output file must be a regular file (`UnsafePath` otherwise; a missing one is an `Io` error). When it is not
+  the file the state was written for (another inode, as after a copy across file systems, or another length), every
+  good range is re-read and kept only where its recorded CRC-32 still matches. `HeldOptions::rehash` re-reads
+  always, at the cost of reading all held output.
+- `HeldOptions::limits` bounds each bundle's read, including its total record count and bytes (`journal_records`,
+  `journal_bytes`, every record file counted, torn ones included); a bundle over a bound is skipped with
+  `PartialErrorKind::Limit`. The defaults read any state a session with default limits wrote.
+  Directory entries whose names are not bundle names are ignored.
+
+To reuse held output in the other copy's own partial, fill its holes from the held file with `fill`, `fill_writer`
+or `fill_from` over `good`; the member's checks at the end prove the result.
+
