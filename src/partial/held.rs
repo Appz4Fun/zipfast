@@ -58,8 +58,10 @@ pub struct HeldOutput {
 /// Options for [`load_held`].
 #[derive(Clone, Debug, Default)]
 pub struct HeldOptions {
-    /// Bounds on reading each bundle (record and page sizes and counts, metadata). The defaults read any state a
-    /// session with default limits wrote.
+    /// Bounds on reading each bundle: record and page sizes and counts, the bundle's total record count and bytes
+    /// (`journal_records`, `journal_bytes`, counting every record file, torn ones included), leaves and metadata.
+    /// A bundle over a bound is skipped with `PartialErrorKind::Limit`. The defaults read any state a session with
+    /// default limits wrote.
     pub limits: PartialLimits,
     /// Re-read every good range of every output file and keep only ranges whose CRC-32 still matches the one the
     /// state recorded. Costs a read of all held output. Without it, ranges are rehashed only for an output file
@@ -219,12 +221,18 @@ fn held_bundle(bundle_path: &Path, name: &str, output_root: &Path, options: &Hel
     let budget = PartialBudget::new(options.limits.clone(), usage.clone(), Arc::new(PartialExclusions::new(usage)))?;
     // Every record that decodes, with its sequence.
     let mut records = Vec::new();
+    // The bundle's records count against `journal_records` and `journal_bytes` as a session's own read of the
+    // bundle charges them (torn ones included); the charges last for the whole read.
+    let mut charges = Vec::new();
     for entry in std::fs::read_dir(bundle_path).map_err(|e| io_error(OutputOperation::Read, e))? {
         let entry = entry.map_err(|e| io_error(OutputOperation::Read, e))?;
         let file_name = entry.file_name();
         let Some(record) = file_name.to_str().filter(|n| n.starts_with("r-")) else { continue };
         // Gone since the listing (a session retired it): nothing to read.
         let Some(file) = open_regular(&bundle_path.join(record))? else { continue };
+        let len = file.metadata().map_err(|e| io_error(OutputOperation::Metadata, e))?.len();
+        charges.push(budget.reserve(PartialResource::JournalRecords, 1)?);
+        charges.push(budget.reserve(PartialResource::JournalBytes, len)?);
         let wire = state::read_bounded(&file, options.limits.state_wire_bytes as usize, &budget)?;
         // A record torn by a crash during its write (too short for its checksum, or failing it) was never
         // anchored: ignore it. Anything else wrong with a record whose checksum holds (an unknown version, a

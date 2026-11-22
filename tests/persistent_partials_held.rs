@@ -563,3 +563,33 @@ fn tied_newest_records_charge_their_shared_leaves_once() {
     assert!(scanned.skipped.is_empty(), "{:?}", scanned.skipped);
     assert_eq!(scanned.held[0].good, live.good);
 }
+
+#[test]
+fn a_bundle_over_the_journal_limits_is_skipped_with_the_limit() {
+    let (dir, live, bundle) = closed_primary();
+    let records = std::fs::read_dir(&bundle)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_str().unwrap().starts_with("r-"))
+        .count();
+    if records < 2 {
+        // A second record (a tie of the newest) so a one-record bound is exceeded.
+        let (_, bytes) = newest_record(&bundle);
+        write_record(&bundle, bytes, |b| b[19] ^= 0x55);
+    }
+    let with = |limits: PartialLimits| {
+        load_held(&dir.path().join("state"), &dir.path().join("out"), &HeldOptions { limits, rehash: false }).unwrap()
+    };
+    for (what, limits, resource) in [
+        ("records", PartialLimits { journal_records: 1, ..PartialLimits::default() }, PartialResource::JournalRecords),
+        ("bytes", PartialLimits { journal_bytes: 0, ..PartialLimits::default() }, PartialResource::JournalBytes),
+    ] {
+        let scanned = with(limits);
+        assert!(scanned.held.is_empty(), "{what}");
+        assert!(
+            matches!(&scanned.skipped[0].error.kind, PartialErrorKind::Limit { resource: r, .. } if *r == resource),
+            "{what}: {:?}",
+            scanned.skipped
+        );
+    }
+    assert_eq!(with(PartialLimits::default()).held[0].good, live.good);
+}

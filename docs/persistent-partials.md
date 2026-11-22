@@ -313,7 +313,9 @@ creates, renames, compacts or deletes, and never takes a bundle over.
   the file the state was written for (another inode, as after a copy across file systems, or another length), every
   good range is re-read and kept only where its recorded CRC-32 still matches. `HeldOptions::rehash` re-reads
   always, at the cost of reading all held output.
-- `HeldOptions::limits` bounds each bundle's read; the defaults read any state a session with default limits wrote.
+- `HeldOptions::limits` bounds each bundle's read, including its total record count and bytes (`journal_records`,
+  `journal_bytes`, every record file counted, torn ones included); a bundle over a bound is skipped with
+  `PartialErrorKind::Limit`. The defaults read any state a session with default limits wrote.
   Directory entries whose names are not bundle names are ignored.
 
 To reuse held output in the other copy's own partial, fill its holes from the held file with `fill`, `fill_writer`
