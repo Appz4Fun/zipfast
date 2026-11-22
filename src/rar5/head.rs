@@ -29,6 +29,10 @@ use crate::error::{Error, Result};
 /// How far before the end of the given bytes the end of archive header is looked for: rar pads a middle volume
 /// with fewer zeros than this after it.
 const END_SCAN: usize = 4096;
+/// The longest end of archive and quick open service headers looked at: rar's are 4 and about 15 bytes. Bounding
+/// them bounds the checksum work of the backward scans to a small multiple of the tail's length, whatever it holds.
+const MAX_END_HEADER: u64 = 64;
+const MAX_QUICK_OPEN_HEADER: u64 = 256;
 /// Compression information bit of a file that continues the solid stream.
 const SOLID_FILE: u64 = 0x40;
 
@@ -41,8 +45,8 @@ pub struct HeadOptions<'a> {
     pub volume: Option<u64>,
     /// The start of any intact volume of the same set, through at least its main header. Its archive flags (solid,
     /// locked), extra records and locator field width are the set's: with it the main header is certain. Without
-    /// it they are inferred from the cached file headers ([`HeadDoubt::ArchiveFlagsInferred`] when they do not
-    /// show whether the archive is solid; a locked archive, `-k`, is not detectable that way).
+    /// it they are inferred from the cached file headers, and the result always carries
+    /// [`HeadDoubt::ArchiveFlagsInferred`]: a locked archive (`-k`) is not detectable that way.
     pub sibling: Option<&'a [u8]>,
 }
 
@@ -89,8 +93,9 @@ pub enum HeadDoubt {
     VolumeNumberInferred,
     /// [`HeadOptions::volume`] says 0, but the volume's first file continues from a previous volume.
     VolumeNumberContradicted,
-    /// No sibling was given and the cached file headers do not show whether the archive is solid: it was taken as
-    /// not solid.
+    /// No sibling was given: the archive flags were inferred. The lock flag (`-k`) shows only in the main header, so
+    /// this is said whenever there is no sibling; the archive is taken as unlocked, and as solid only when a cached
+    /// file continues the solid stream.
     ArchiveFlagsInferred,
     /// Something the quick open data does not copy lies between headers it does: a file whose header rar's default
     /// quick open mode skips (4096 bytes of packed data or less), an archive comment or another service header. The
@@ -165,10 +170,10 @@ pub fn rebuild_volume_head(tail: &[u8], volume_len: u64, options: &HeadOptions<'
             (t.for_volume(volume), width)
         }
         None => {
+            // The lock flag (`-k`) shows nowhere but in the main header, so without a sibling the archive flags are
+            // never certain: solidity may show in the cached headers, the lock never does.
             let solid = solidity(&headers);
-            if solid.is_none() {
-                doubt = doubt.or(Some(HeadDoubt::ArchiveFlagsInferred));
-            }
+            doubt = doubt.or(Some(HeadDoubt::ArchiveFlagsInferred));
             let flags = super::MHFL_VOLUME | if solid == Some(true) { super::MHFL_SOLID } else { 0 };
             let main = MainHeader {
                 header_flags: super::HFL_EXTRA | 0x4,
@@ -216,7 +221,7 @@ fn end_header(tail: &[u8]) -> Option<(usize, bool)> {
     let from = tail.len().saturating_sub(END_SCAN);
     let last_nonzero = tail.iter().rposition(|&b| b != 0)?;
     (from..=last_nonzero).rev().find_map(|at| {
-        let b = read_block(tail, at).ok()??;
+        let b = small_block(tail, at, MAX_END_HEADER)?;
         if b.kind != super::HEAD_END || b.data_len != 0 || tail[b.header_end..].iter().any(|&c| c != 0) {
             return None;
         }
@@ -224,6 +229,23 @@ fn end_header(tail: &[u8]) -> Option<(usize, bool)> {
         let flags = c.vint().ok()?;
         Some((at, flags & super::EOAFL_MORE_VOLUMES != 0))
     })
+}
+
+/// The block at `at` when its header claims at most `max` bytes (only then is its checksum computed).
+fn small_block(tail: &[u8], at: usize, max: u64) -> Option<frame::Block> {
+    let (size, _) = read_vint(tail, at.checked_add(4)?)?;
+    if size > max {
+        return None;
+    }
+    #[cfg(test)]
+    HASHED.with(|h| h.set(h.get() + size));
+    read_block(tail, at).ok()?
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Header bytes the scans checksummed, for the test bounding their work.
+    static HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The quick open service header whose data ends where the end header starts: its offset and its data's.
@@ -252,7 +274,10 @@ fn quick_open(tail: &[u8], end_at: usize) -> Result<(usize, usize)> {
         if (end as u64).checked_add(data) != Some(end_at as u64) {
             continue;
         }
-        let Ok(Some(b)) = read_block(tail, at) else { continue };
+        if size > MAX_QUICK_OPEN_HEADER {
+            continue;
+        }
+        let Some(b) = small_block(tail, at, MAX_QUICK_OPEN_HEADER) else { continue };
         return match service_name(&tail[b.fields.clone()]) {
             Some(b"QO") => Ok((at, b.header_end)),
             Some(b"RR") => Err(Error::Unsupported("a RAR 5.0 recovery record cannot be rebuilt".into())),
@@ -371,5 +396,35 @@ fn sibling_main(sibling: &[u8]) -> Result<MainHeader> {
         }
         Some(_) => MainHeader::parse(&sibling[sig..]),
         None => Err(Error::Truncated),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tail with a sound end header and, before it, thousands of fake service headers each claiming a header that
+    /// runs up to the end header: the scans checksum a bounded amount, not each overlapping suffix again.
+    #[test]
+    fn hostile_tails_cost_linear_checksum_work() {
+        let mut tail = vec![0x11u8; 128 << 10];
+        let end = frame::end_of_archive(true);
+        let end_at = tail.len();
+        // Every 16 bytes: CRC, size (a 3-byte vint), type 3, flags 2 (data area), data size, so that the header
+        // and its data end exactly where the end header starts.
+        for at in (0..end_at - 64).step_by(16) {
+            let data = 1u64;
+            let size = (end_at - (at + 4 + 3)) as u64 - data;
+            let mut v = Vec::new();
+            frame::put_vint_min(&mut v, size, 3);
+            tail[at + 4..at + 7].copy_from_slice(&v);
+            tail[at + 7..at + 10].copy_from_slice(&[3, 2, data as u8]);
+        }
+        tail.extend_from_slice(&end);
+        HASHED.with(|h| h.set(0));
+        let result = rebuild_volume_head(&tail, tail.len() as u64, &HeadOptions { volume: Some(1), sibling: None });
+        assert!(matches!(result, Err(Error::Unsupported(_))), "{result:?}");
+        let hashed = HASHED.with(|h| h.get());
+        assert!(hashed <= 4 * tail.len() as u64, "{hashed} header bytes checksummed for a {}-byte tail", tail.len());
     }
 }

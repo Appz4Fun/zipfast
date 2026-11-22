@@ -244,3 +244,44 @@ fn patched_headers_reseal() {
     assert_eq!(rar4::FileHeader::parse(&large).unwrap().packed_size, 5 << 32);
     assert_eq!(rar4::read_block(&large, 0).unwrap().unwrap().data_len, 5 << 32);
 }
+
+/// RAR 2.x headers with an embedded comment: the main header's checksum covers its first 13 bytes, a file header's
+/// its fields before the comment. Written that way they read back, and zipfast's own map walk accepts them.
+#[test]
+fn rar2_commented_headers_are_checksummed_over_what_precedes_the_comment() {
+    let comment = rar4::block(0x75, 0, b"\x05\x00\x0f\x30\x00\x00hello").unwrap();
+    let mut main = rar4::MainHeader::new(rar4::MHD_COMMENT);
+    main.rest = comment.clone();
+    let main_bytes = main.encode().unwrap();
+    assert_eq!(u16::from_le_bytes([main_bytes[0], main_bytes[1]]), zipfast::crc32::hash(&main_bytes[2..13]) as u16);
+    assert_eq!(rar4::MainHeader::parse(&main_bytes).unwrap(), main);
+    let data = b"commented member data";
+    let mut file = rar4::FileHeader::parse(&stored("a.bin", data, data, 0, zipfast::crc32::hash(data))).unwrap();
+    file.flags |= rar4::LHD_COMMENT;
+    file.rest = b"\x05\x00\x0f\x30\x00\x00file comment".to_vec();
+    let file_bytes = file.encode().unwrap();
+    let fields_end = file_bytes.len() - file.rest.len();
+    assert_eq!(
+        u16::from_le_bytes([file_bytes[0], file_bytes[1]]),
+        zipfast::crc32::hash(&file_bytes[2..fields_end]) as u16
+    );
+    assert_eq!(rar4::FileHeader::parse(&file_bytes).unwrap(), file);
+    // The comment is not covered: changing it leaves the header readable.
+    let mut other = file_bytes.clone();
+    *other.last_mut().unwrap() ^= 0xff;
+    assert!(rar4::read_block(&other, 0).unwrap().is_some());
+    // A checksum over the whole header is not what RAR 2.x writes.
+    let mut whole = main_bytes.clone();
+    let crc = zipfast::crc32::hash(&whole[2..]) as u16;
+    whole[..2].copy_from_slice(&crc.to_le_bytes());
+    assert!(rar4::read_block(&whole, 0).is_err());
+    // zipfast's map walk reads the archive.
+    let mut bytes = rar4::MARKER.to_vec();
+    bytes.extend(&main_bytes);
+    bytes.extend(&file_bytes);
+    bytes.extend_from_slice(data);
+    bytes.extend(rar4::EndOfArchive::new(false).encode().unwrap());
+    let map = zipfast::map::MemberMap::from_volume(&bytes, zipfast::map::MapOptions::new("old.rar")).unwrap();
+    assert_eq!(map.end, zipfast::map::VolumeEnd::Complete);
+    assert_eq!(map.members.len(), 1);
+}

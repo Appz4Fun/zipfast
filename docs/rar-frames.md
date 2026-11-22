@@ -20,7 +20,7 @@ Every written block reads back with zipfast's own reader, and the main and end h
 | API | does |
 |---|---|
 | `MARKER` | the 7-byte marker block |
-| `header_crc(block) -> Option<u16>`, `seal(&mut block)` | the 16-bit header checksum: the low 16 bits of the CRC32 of the header from `HEAD_TYPE` to `HEAD_SIZE` |
+| `header_crc(block) -> Option<u16>`, `seal(&mut block)` | the 16-bit header checksum: the low 16 bits of the CRC32 of the header from `HEAD_TYPE` to `HEAD_SIZE`; for RAR 2.x headers holding a comment, only what precedes it (a main header with `MHD_COMMENT`: its first 13 bytes; a file header with `LHD_COMMENT`: its fields through name, salt and extended time), as RAR 2.x writes and UnRAR checks |
 | `block(head_type, flags, fields)` | any header from its fields, `HEAD_SIZE` and `HEAD_CRC` filled in |
 | `read_block(bytes, at)` | one block: type, flags, `head_size`, `header_end`, `data_len` (a file header's packed size with its high 32 bits, or `ADD_SIZE`); checksum checked |
 | `MainHeader::{new, parse, encode}` | the main header (volume, solid, new numbering, first volume, ...; the reserved fields and an encryption version byte kept) |
@@ -58,16 +58,16 @@ if head.exact {
 `HeadOptions`:
 
 - **`volume`**: the volume's number, 0-based, from its name. Nothing else in the volume's start says it. Without it, a volume starting with a whole file is taken for the first (`VolumeNumberInferred`), and one starting inside a file is refused.
-- **`sibling`**: the start of any intact volume of the same set, through its main header. The set's archive flags (solid, locked), the main header's other extra records and the locator field's width come from it, so the main header is certain. Without it, the archive flags are inferred from the cached file headers (a file continuing the solid stream shows a solid archive; a file other than the first without that bit shows a non-solid one) and the locator width from where the first cached header starts. A locked archive (`-k`) does not show that way.
+- **`sibling`**: the start of any intact volume of the same set, through its main header. The set's archive flags (solid, locked), the main header's other extra records and the locator field's width come from it, so the main header is certain. Without it, the archive flags are inferred from the cached file headers (a file continuing the solid stream shows a solid archive; a file other than the first without that bit shows a non-solid one) and the locator width from where the first cached header starts, and the result is never claimed exact: a locked archive (`-k`) does not show that way.
 
 When the result is not certain, `doubt` says why:
 
 - **`VolumeNumberInferred`**, **`VolumeNumberContradicted`** (volume 0, but its first file continues from a previous volume).
-- **`ArchiveFlagsInferred`**: no sibling, and the cached headers do not show whether the archive is solid (a volume holding one file). The bytes assume it is not.
+- **`ArchiveFlagsInferred`**: no sibling was given. The lock flag (`-k`) shows only in the main header, so without a sibling the archive flags are never certain, even when the cached headers show whether the archive is solid. The bytes assume an unlocked archive (and a non-solid one unless a cached file continues the solid stream).
 - **`UncachedHeaders`**: something the quick open data does not copy lies between headers it does. rar's default quick open mode skips files with 4096 bytes of packed data or less in the volume; an archive comment or another service header also does. The listed headers are still exact.
 - **`MainHeaderSize`**: the rebuilt main header does not end where the first cached header starts, and nothing fits between: the main header holds records neither the sibling nor the default layout has.
 
-Refused: a tail not ending in a RAR 5.0 end header (`NotAnArchive`); no quick open header right before the end header, as in `-qo-` sets, `-hp` sets (every header is encrypted), a recovery record (`-rr`) or a default-mode volume with nothing cached (`Unsupported`); quick open records failing their CRC32 or placing headers impossibly (`Corrupt`). Hostile input never panics; the work is linear in the tail's length.
+Refused: a tail not ending in a RAR 5.0 end header (`NotAnArchive`); no quick open header right before the end header, as in `-qo-` sets, `-hp` sets (every header is encrypted), a recovery record (`-rr`) or a default-mode volume with nothing cached (`Unsupported`); quick open records failing their CRC32 or placing headers impossibly (`Corrupt`). Hostile input never panics, and the work is linear in the tail's length: the backward scans checksum only headers claiming at most 64 bytes (end header) or 256 bytes (quick open header), so overlapping fake headers cannot make them re-hash the tail.
 
 Compared with RustyGet's `head_from_tail`, this also rebuilds sets whose locator field has another width (rar pads it to two bytes more than the volume size takes, so 5 bytes in 100 KB volumes and 6 in 5 MB ones), keeps the sibling's archive flags and extra records instead of refusing solid archives, lists every cached header, and reports why a result is uncertain instead of returning nothing.
 

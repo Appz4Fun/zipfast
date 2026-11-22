@@ -17,6 +17,7 @@
 //! `rar5::rebuild_volume_head`: a RAR 5.0 volume's start rebuilt from its quick open record.
 
 use zipfast::Error;
+use zipfast::rar5::frame::MainHeader;
 use zipfast::rar5::{HeadDoubt, HeadOptions, rebuild_volume_head};
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -152,11 +153,24 @@ fn rar_made_volume_heads_rebuild_byte_for_byte() {
 
 #[test]
 fn without_a_sibling_the_main_header_is_inferred() {
-    // Two files, the second not solid: the archive is not solid, and the bytes are certain.
+    // Two files, the second not solid: the archive is not solid, and the bytes are rar's. But a locked archive's
+    // (`-k`) tail is the same: the lock shows only in the main header, so without a sibling nothing is certain.
     let v = QO_TWO_FILES;
     let head = rebuild_volume_head(&v.tail(), v.len, &HeadOptions { volume: Some(v.volume), sibling: None }).unwrap();
     assert_eq!(head.bytes, v.head());
+    assert_eq!(head.doubt, Some(HeadDoubt::ArchiveFlagsInferred));
+    assert!(!head.exact);
+    // With a sibling from a locked set the same tail gives the locked main header, certain.
+    let mut locked = MainHeader::parse(&v.sibling()[8..]).unwrap();
+    locked.archive_flags |= 0x10;
+    let mut sibling = b"Rar!\x1a\x07\x01\x00".to_vec();
+    sibling.extend(locked.encode());
+    let head = rebuild_volume_head(&v.tail(), v.len, &HeadOptions { volume: Some(v.volume), sibling: Some(&sibling) })
+        .unwrap();
     assert!(head.exact, "{:?}", head.doubt);
+    assert_eq!(head.main.archive_flags & 0x10, 0x10);
+    assert_eq!(head.bytes.len(), v.head().len());
+    assert_ne!(head.bytes, v.head());
     // One file: whether the archive is solid does not show. The bytes are rar's, but not claimed certain.
     let v = QO_MIDDLE;
     let head = rebuild_volume_head(&v.tail(), v.len, &HeadOptions { volume: Some(v.volume), sibling: None }).unwrap();

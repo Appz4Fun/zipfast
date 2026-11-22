@@ -52,6 +52,8 @@ pub const MHD_ENCRYPTVER: u16 = 0x0200;
 pub const LHD_SPLIT_BEFORE: u16 = 0x0001;
 pub const LHD_SPLIT_AFTER: u16 = 0x0002;
 pub const LHD_PASSWORD: u16 = 0x0004;
+/// A RAR 2.x file comment follows the header's fields (inside the header).
+pub const LHD_COMMENT: u16 = 0x0008;
 pub const LHD_SOLID: u16 = 0x0010;
 pub const LHD_DIRECTORY: u16 = 0x00e0;
 pub const LHD_LARGE: u16 = 0x0100;
@@ -66,11 +68,49 @@ pub const EARC_REVSPACE: u16 = 0x0004;
 pub const EARC_VOLNUMBER: u16 = 0x0008;
 
 /// The 16-bit checksum of the header at the start of `block`: the low 16 bits of the CRC32 of its bytes from
-/// `HEAD_TYPE` to `HEAD_SIZE`. `None` when `block` is shorter than its `HEAD_SIZE` says, or that is under 7.
+/// `HEAD_TYPE` to `HEAD_SIZE`, except for RAR 2.x headers holding a comment, whose checksum covers only what precedes
+/// it (as RAR 2.x writes and UnRAR checks): a main header with [`MHD_COMMENT`] its first 13 bytes, a file header
+/// with [`LHD_COMMENT`] its fields up to the end of the name, salt and extended time. `None` when `block` is shorter
+/// than its `HEAD_SIZE` says, or that is under 7, or a commented file header's fields run past it.
 pub fn header_crc(block: &[u8]) -> Option<u16> {
     let size = usize::from(u16::from_le_bytes(block.get(5..7)?.try_into().ok()?));
     (size >= 7).then_some(())?;
-    Some(crate::crc32::hash(block.get(2..size)?) as u16)
+    let header = block.get(..size)?;
+    let flags = u16::from_le_bytes([header[3], header[4]]);
+    let end = match header[2] {
+        HEAD_MAIN if flags & MHD_COMMENT != 0 => size.min(13),
+        HEAD_FILE if flags & LHD_COMMENT != 0 => file_fields_end(header, flags).ok()?,
+        _ => size,
+    };
+    Some(crate::crc32::hash(&header[2..end]) as u16)
+}
+
+/// Where a file header's parsed fields end: after its name, salt and extended time.
+fn file_fields_end(header: &[u8], flags: u16) -> Result<usize> {
+    let mut f = Fields { bytes: header, at: 7 + 19 };
+    let name_len = usize::from(f.u16()?);
+    f.u32()?; // attributes
+    if flags & LHD_LARGE != 0 {
+        f.take(8)?;
+    }
+    f.take(name_len)?;
+    if flags & LHD_SALT != 0 {
+        f.take(8)?;
+    }
+    if flags & LHD_EXTTIME != 0 {
+        let times = f.u16()?;
+        for index in 0..4u16 {
+            let mode = (times >> ((3 - index) * 4)) & 15;
+            if mode & 8 == 0 {
+                continue;
+            }
+            if index != 0 {
+                f.u32()?;
+            }
+            f.take(usize::from(mode & 3))?;
+        }
+    }
+    Ok(f.at)
 }
 
 /// Sets `HEAD_CRC` of the header at the start of `block` from its contents, after a field was patched.
@@ -161,7 +201,8 @@ pub struct MainHeader {
     pub pos_av: u32,
     /// The encryption version byte present under [`MHD_ENCRYPTVER`].
     pub encrypt_version: Option<u8>,
-    /// Bytes after the known fields (an old in-header comment under [`MHD_COMMENT`]), kept as they are.
+    /// Bytes after the known fields (a RAR 2.x comment block under [`MHD_COMMENT`], which the header checksum does
+    /// not cover), kept as they are.
     pub rest: Vec<u8>,
 }
 
@@ -229,7 +270,8 @@ pub struct FileHeader {
     pub salt: Option<[u8; 8]>,
     /// The extended time field present under [`LHD_EXTTIME`], whole (its 16-bit flags and the times).
     pub ext_time: Option<Vec<u8>>,
-    /// Bytes after the known fields, kept as they are: a service header's SubData (the recovery record's tag).
+    /// Bytes after the known fields, kept as they are: a service header's SubData (the recovery record's tag), or
+    /// a RAR 2.x file comment under [`LHD_COMMENT`] (not covered by the header checksum).
     pub rest: Vec<u8>,
 }
 
