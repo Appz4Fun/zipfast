@@ -42,7 +42,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Two full test runs (without and with persistent-partials) take 25-45 minutes on the hosted runners
+    # (tests/persistent_partials.rs alone ran 21 minutes in one); at 30 the second was cancelled on main and on most
+    # PRs, and once at 45.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # Rust 1.100.0
