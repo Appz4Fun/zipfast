@@ -32,7 +32,7 @@ mod parallel;
 mod resync;
 use super::reader::Piece;
 use parallel::{Boundary, Done, Job, OWN, Packed, Part, Pool, Slot, block_bytes};
-pub use resync::{Resync, ResyncError, resync};
+pub use resync::{NearError, NearOptions, Resync, ResyncError, ResyncNear, resync, resync_near};
 
 /// Where decoded output goes.
 pub trait Sink {
@@ -2359,6 +2359,75 @@ fn apply_filter(f: Filter, data: &mut Vec<u8>, spare: &mut Vec<u8>) {
                     let q = ((f.start + j as u64) / 4) as u32;
                     let v = (v.wrapping_sub(q) & 0x00ff_ffff) | 0xeb00_0000;
                     data[j..j + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                j += 4;
+            }
+        }
+    }
+}
+
+/// Undoes `apply_filter` on `data`, the output of a filter of `kind` at file-relative output position `start`:
+/// gives back the bytes the decoder's window held. Where E8 operands could come from more than one stored value
+/// (which rar never writes), the bytes are left as they are.
+fn unapply_filter(kind: FilterKind, start: u64, data: &mut [u8]) {
+    let n = data.len();
+    match kind {
+        FilterKind::Delta(channels) => {
+            let channels = usize::from(channels.max(1));
+            let mut stored = vec![0u8; n];
+            let mut s = 0;
+            for c in 0..channels {
+                let mut acc = 0u8;
+                for &out in data.iter().skip(c).step_by(channels) {
+                    stored[s] = acc.wrapping_sub(out);
+                    acc = out;
+                    s += 1;
+                }
+            }
+            data.copy_from_slice(&stored);
+        }
+        FilterKind::E8 | FilterKind::E8E9 => {
+            let e9 = kind == FilterKind::E8E9;
+            let forward = |a: u32, pos: u32| {
+                if a & 0x8000_0000 != 0 {
+                    if a.wrapping_add(pos) & 0x8000_0000 == 0 { a.wrapping_add(0x100_0000) } else { a }
+                } else if a < 0x100_0000 {
+                    a.wrapping_sub(pos)
+                } else {
+                    a
+                }
+            };
+            let mut j = 0;
+            while j + 4 < n {
+                j = find_call(data, j, n - 4, e9);
+                if j + 4 >= n {
+                    break;
+                }
+                let p = j + 1;
+                let pos = ((start + p as u64) % 0x100_0000) as u32;
+                let v = u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
+                let mut found = None;
+                let mut many = false;
+                for a in [v.wrapping_add(pos), v.wrapping_sub(0x100_0000), v] {
+                    if forward(a, pos) == v && found != Some(a) {
+                        many |= found.is_some();
+                        found = Some(a);
+                    }
+                }
+                if let (Some(a), false) = (found, many) {
+                    data[p..p + 4].copy_from_slice(&a.to_le_bytes());
+                }
+                j = p + 4;
+            }
+        }
+        FilterKind::Arm => {
+            let mut j = 0;
+            while j + 3 < n {
+                if data[j + 3] == 0xeb {
+                    let v = u32::from_le_bytes(data[j..j + 4].try_into().unwrap()) & 0x00ff_ffff;
+                    let q = ((start + j as u64) / 4) as u32;
+                    let a = (v.wrapping_add(q) & 0x00ff_ffff) | 0xeb00_0000;
+                    data[j..j + 4].copy_from_slice(&a.to_le_bytes());
                 }
                 j += 4;
             }
