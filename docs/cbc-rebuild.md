@@ -20,7 +20,9 @@ let ciphertext = zipfast::crypto::rebuild_cbc(&key, &previous_block, &plaintext,
 - **The plaintext,** starting at a 16-byte-aligned offset of the stream. For a stored member, the stream is the output. The stream is:
   - **RAR:** the member's packed data across all its volumes' data areas taken together. A volume's part is rarely a multiple of 16 bytes (rar 7.30 split a 100,000-byte member into 19,753-byte parts), so offsets count from the member's start, and blocks and the previous 16 bytes can straddle a volume boundary.
   - **7z:** the folder's unpacked stream. Several files in a solid stored folder share one stream.
-- **`stream_end`:** whether the range reaches the end of the stream (the RAR member, or the 7z folder). If it does, its last partial block is padded with zero bytes, as rar and 7-Zip write it. Otherwise the plaintext must be whole blocks.
+- **`stream_end`:** whether the range reaches the end of the stream (the RAR member, or the 7z folder). Otherwise the plaintext must be whole blocks. A range that ends the stream in a partial block has padding the plaintext does not give:
+  - **RAR 5.0:** rar fills the padding with random bytes (rar 7.00 did; a rar 7.30 sample happened to have zeros). `rebuild_cbc` returns `CbcRebuildError::FinalPadding { pad }` instead of guessing. Rebuild the whole blocks before it (`stream_end` false, plaintext cut to a multiple of 16), then the last block with `rebuild_final_block`, which tries every padding value of up to 3 bytes until your check accepts the block's ciphertext (for example the article's CRC32 over the rebuilt bytes). With more padding bytes the last block cannot be rebuilt from the plaintext.
+  - **7z AES:** 7-Zip pads with zero bytes. Use `rebuild_cbc_zero_padded`.
 - **`intact`:** optional. Archive bytes that survive within the range, given as `(offset, ciphertext)`. The overlap must match, and a mismatch is reported with its position. In CBC a block depends only on the plaintext up to it, so a match proves the key, the previous bytes and the plaintext only up to the overlap.
   - **Where to take it from:** at or after the hole's end, for example the first intact block after the hole. Its plaintext must be inside `plaintext`.
   - **At the stream's end:** a range that ends the stream has nothing after it to check.
@@ -43,7 +45,7 @@ let ciphertext = zipfast::crypto::rebuild_cbc(&key, &previous, &plaintext(span.r
 
 ## Checked against
 
-- rar 7.30 (`-ma5 -m0 -p`): a member's whole ciphertext, including the zero-padded final block, and a lost middle range, rebuilt from the plaintext.
+- rar 7.30 (`-ma5 -m0 -p`): a member's whole blocks and a lost middle range, rebuilt from the plaintext. The final block's padding is refused (see `stream_end`); `rebuild_final_block` finds a non-zero 2-byte padding from a check.
 - 7-Zip (`-mx0 -p`): a folder's whole packed stream.
 
 The test vectors are in `tests/cbc_rebuild.rs`.

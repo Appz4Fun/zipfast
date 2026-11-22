@@ -244,6 +244,10 @@ pub enum CbcRebuildError {
     /// The rebuilt ciphertext differs from the intact ciphertext at this byte of the rebuilt range: the key, the
     /// plaintext or the previous ciphertext block is wrong.
     Mismatch { at: usize },
+    /// The stream ends in a partial block whose padding is not known. RAR 5.0 fills it with random bytes, so zero
+    /// padding would rebuild the wrong last block. Rebuild the whole blocks before it (pass them with `stream_end`
+    /// false), then the last one with [`rebuild_final_block`] or from another source of its padding.
+    FinalPadding { pad: usize },
 }
 
 impl std::fmt::Display for CbcRebuildError {
@@ -253,6 +257,9 @@ impl std::fmt::Display for CbcRebuildError {
             Self::Unaligned => f.write_str("plaintext is not whole AES blocks and does not end the stream"),
             Self::NoOverlap => f.write_str("intact ciphertext does not overlap the rebuilt range"),
             Self::Mismatch { at } => write!(f, "rebuilt ciphertext differs from the intact ciphertext at byte {at}"),
+            Self::FinalPadding { pad } => {
+                write!(f, "the final block's {pad} padding bytes are not known (RAR 5.0 pads with random bytes)")
+            }
         }
     }
 }
@@ -281,6 +288,73 @@ impl std::error::Error for CbcRebuildError {}
 ///   block after it), whose plaintext `plaintext` must include. A range that ends the stream has nothing after it to
 ///   check.
 pub fn rebuild_cbc(
+    key: &[u8],
+    previous: &[u8; 16],
+    plaintext: &[u8],
+    stream_end: bool,
+    intact: Option<(usize, &[u8])>,
+) -> Result<Vec<u8>, CbcRebuildError> {
+    let rem = plaintext.len() % 16;
+    if rem != 0 && stream_end {
+        // RAR 5.0 pads the last block with random bytes, which cannot be rebuilt from the plaintext.
+        return Err(CbcRebuildError::FinalPadding { pad: 16 - rem });
+    }
+    rebuild_blocks(key, previous, plaintext, stream_end, intact)
+}
+
+/// [`rebuild_cbc`] for a stream whose final partial block is padded with zero bytes, as 7-Zip writes it (7z AES).
+/// Do not use it for RAR 5.0: rar pads with random bytes.
+pub fn rebuild_cbc_zero_padded(
+    key: &[u8],
+    previous: &[u8; 16],
+    plaintext: &[u8],
+    stream_end: bool,
+    intact: Option<(usize, &[u8])>,
+) -> Result<Vec<u8>, CbcRebuildError> {
+    rebuild_blocks(key, previous, plaintext, stream_end, intact)
+}
+
+/// Rebuilds a stream's final partial block from its plaintext, when its padding is known to be one of `pad` bytes
+/// chosen freely (RAR 5.0's random padding, up to 3 bytes), by trying every padding value until `accept` takes the
+/// block's ciphertext (16 bytes). Use it with a check the rest of the stream gives, such as a CRC32 of the whole
+/// article computed over the rebuilt blocks before it and this block. Returns the 16-byte block, or None when no
+/// padding value is accepted or `pad` is 0 or more than 3 (2^24 tries is the most this is for).
+pub fn rebuild_final_block(
+    key: &[u8],
+    previous: &[u8; 16],
+    partial: &[u8],
+    mut accept: impl FnMut(&[u8; 16]) -> bool,
+) -> Option<[u8; 16]> {
+    let rem = partial.len();
+    if !(1..16).contains(&rem) {
+        return None;
+    }
+    let pad = 16 - rem;
+    if pad > 3 {
+        return None;
+    }
+    let cipher = AesKey::new(key)?;
+    let tries = 1u32 << (8 * pad);
+    for v in 0..tries {
+        let mut block = [0u8; 16];
+        block[..rem].copy_from_slice(partial);
+        // the padding counts up, most significant byte first
+        for (i, b) in block[rem..].iter_mut().enumerate() {
+            *b = (v >> (8 * (pad - 1 - i))) as u8;
+        }
+        let mut x = block;
+        for (b, &p) in x.iter_mut().zip(previous) {
+            *b ^= p;
+        }
+        let enc = cipher.encrypt_block(&x);
+        if accept(&enc) {
+            return Some(enc);
+        }
+    }
+    None
+}
+
+fn rebuild_blocks(
     key: &[u8],
     previous: &[u8; 16],
     plaintext: &[u8],

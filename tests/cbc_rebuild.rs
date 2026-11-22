@@ -1,6 +1,9 @@
 //! Rebuilding the AES-CBC ciphertext of an encrypted stored member from its plaintext (`zipfast::crypto::rebuild_cbc`).
 
-use zipfast::crypto::{CbcRebuildError, CbcSpan, cbc_rebuild_span, derive_7z_key, derive_rar5_key, rebuild_cbc};
+use zipfast::crypto::{
+    CbcRebuildError, CbcSpan, cbc_rebuild_span, derive_7z_key, derive_rar5_key, encrypt_cbc, rebuild_cbc,
+    rebuild_cbc_zero_padded, rebuild_final_block,
+};
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
@@ -22,19 +25,41 @@ fn rar5_key() -> [u8; 32] {
     derive_rar5_key("secret", RAR5_KDF, &unhex(RAR5_SALT).try_into().unwrap(), None).unwrap()
 }
 
-/// The whole member, from the header IV, with its zero-padded last block: rar's bytes exactly.
+/// A RAR 5.0 member whose last block is partial has unknown padding (random in rar): `rebuild_cbc` refuses rather
+/// than zero-padding. Its whole blocks rebuild byte for byte from the header IV.
 #[test]
-fn a_rar5_member_rebuilds_byte_for_byte_from_its_plaintext() {
+fn a_rar5_member_refuses_an_unknown_final_padding_and_rebuilds_its_whole_blocks() {
     let iv: [u8; 16] = unhex(RAR5_IV).try_into().unwrap();
-    let rebuilt = rebuild_cbc(&rar5_key(), &iv, PLAIN, true, None).unwrap();
-    assert_eq!(rebuilt, unhex(RAR5_DATA));
+    assert_eq!(rebuild_cbc(&rar5_key(), &iv, PLAIN, true, None), Err(CbcRebuildError::FinalPadding { pad: 9 }));
+    let data = unhex(RAR5_DATA);
+    assert_eq!(rebuild_cbc(&rar5_key(), &iv, &PLAIN[..48], false, None).unwrap(), data[..48]);
+}
+
+/// The final partial block with 2 padding bytes (14 plaintext bytes in it) is found by trying padding values
+/// until the block's ciphertext is the one the check accepts; a wrong accept finds nothing; 9 bytes is refused.
+#[test]
+fn a_final_block_with_two_padding_bytes_is_found_by_trying_the_padding() {
+    let key = rar5_key();
+    let iv: [u8; 16] = unhex(RAR5_IV).try_into().unwrap();
+    let plain = &PLAIN[..30];
+    // Encrypt with padding 0x9c 0xee (not zero), as rar's random padding would be.
+    let mut padded = plain.to_vec();
+    padded.extend_from_slice(&[0x9c, 0xee]);
+    let truth = encrypt_cbc(&key, &iv, &padded).unwrap();
+    let prefix = rebuild_cbc(&key, &iv, &PLAIN[..16], false, None).unwrap();
+    let found = rebuild_final_block(&key, prefix[..16].try_into().unwrap(), &plain[16..], |b| b[..] == truth[16..32])
+        .expect("the padding is one of 2^24 values");
+    assert_eq!(found[..], truth[16..32]);
+    assert!(rebuild_final_block(&key, prefix[..16].try_into().unwrap(), &plain[16..], |_| false).is_none());
+    // 9 padding bytes: too many to try.
+    assert!(rebuild_final_block(&key, &iv, &PLAIN[48..], |_| true).is_none());
 }
 
 #[test]
 fn a_7z_aes_folder_rebuilds_byte_for_byte_from_its_plaintext() {
     let key = derive_7z_key("secret", &[], 19).unwrap();
     let iv: [u8; 16] = unhex(SEVEN_IV).try_into().unwrap();
-    assert_eq!(rebuild_cbc(&key, &iv, PLAIN, true, None).unwrap(), unhex(SEVEN_DATA));
+    assert_eq!(rebuild_cbc_zero_padded(&key, &iv, PLAIN, true, None).unwrap(), unhex(SEVEN_DATA));
 }
 
 /// A lost middle block (bytes 16..32) rebuilt from the plaintext and the ciphertext block before it, checked
@@ -45,9 +70,12 @@ fn a_lost_middle_range_rebuilds_from_the_previous_block_and_checks_the_next() {
     let previous: [u8; 16] = data[..16].try_into().unwrap();
     let rebuilt = rebuild_cbc(&rar5_key(), &previous, &PLAIN[16..48], false, Some((16, &data[32..48]))).unwrap();
     assert_eq!(rebuilt, data[16..48]);
-    // The last block of the member, reaching the end: zero padding.
+    // The last block of the member is partial: its padding is unknown, so it is refused.
     let previous: [u8; 16] = data[32..48].try_into().unwrap();
-    assert_eq!(rebuild_cbc(&rar5_key(), &previous, &PLAIN[48..], true, None).unwrap(), data[48..]);
+    assert_eq!(
+        rebuild_cbc(&rar5_key(), &previous, &PLAIN[48..], true, None),
+        Err(CbcRebuildError::FinalPadding { pad: 9 })
+    );
 }
 
 #[test]
@@ -77,15 +105,18 @@ fn a_hole_widens_to_blocks_with_a_check_after_it() {
     let previous: [u8; 16] = data[..16].try_into().unwrap();
     let check = span.check.clone().unwrap();
     let intact = &data[check.start as usize..check.end as usize];
+    // The range reaches the stream's end on a partial block: the rebuild before the final block is what this checks.
     let rebuilt = rebuild_cbc(
         &rar5_key(),
         &previous,
         &PLAIN[span.range.start as usize..span.range.end as usize],
-        span.stream_end,
+        false,
         Some(((check.start - span.range.start) as usize, intact)),
-    )
-    .unwrap();
-    assert_eq!(rebuilt, data[16..]);
+    );
+    assert_eq!(rebuilt, Err(CbcRebuildError::Unaligned));
+    // With the partial block left to its padding: the rebuild of the whole blocks before it.
+    let whole = rebuild_cbc(&rar5_key(), &previous, &PLAIN[16..48], false, None).unwrap();
+    assert_eq!(whole, data[16..48]);
     // A hole in the first block uses the IV; one reaching the end has nothing to check.
     assert_eq!(
         cbc_rebuild_span(3..9, 55),
