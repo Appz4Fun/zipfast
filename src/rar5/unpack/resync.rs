@@ -769,7 +769,7 @@ fn search_near(
         let from = est.saturating_sub(margin);
         let span = (margin as u64).saturating_mul(SPAN_PER_MARGIN).max(1 << 20);
         range = anchor_max.saturating_sub(span).max(known.base)..anchor_max;
-        match scan_blocks(packed, known, window, &range, from, from..scanned, NEAR_BLOCKS, pre, work)? {
+        match scan_blocks(packed, known, window, &range, from, from..scanned, NEAR_BLOCKS, NEAR_MISSES, pre, work)? {
             Scan::Found(found) => return Ok(found),
             Scan::Capped(at) => pending.push(at..scanned),
             Scan::Done => {}
@@ -780,10 +780,12 @@ fn search_near(
         }
         margin = margin.saturating_mul(4);
     }
-    // The intervals left over, nearest the estimate first, with the widest range, until the budget runs out.
+    // The intervals left over, with the widest range, every block of them, until the budget runs out: blocks
+    // whose literals are not in the plaintext may be past the target, or inside output a filter declared before
+    // them changed, so a run of them proves nothing here.
     while let Some(rest) = pending.pop() {
-        if let Scan::Found(found) = scan_blocks(packed, known, window, &range, rest.start, rest, usize::MAX, pre, work)?
-        {
+        let found = scan_blocks(packed, known, window, &range, rest.start, rest, usize::MAX, usize::MAX, pre, work)?;
+        if let Scan::Found(found) = found {
             return Ok(found);
         }
     }
@@ -792,14 +794,16 @@ fn search_near(
 
 enum Scan {
     Found((Resync, u64, usize)),
-    /// `cap` blocks were pinned without a restart; the interval's bytes from this offset on were not searched.
+    /// `cap` blocks were tried, or `misses` blocks in a row were not in the plaintext, without a restart; the
+    /// interval's bytes from this offset on were not searched.
     Capped(usize),
     Done,
 }
 
 /// Looks through the blocks in `span` of `packed` for one that pins at an output offset in `range` (or before it)
-/// and follows it to the target; stops after `cap` blocks are tried, or after a few blocks in a row lie past the
-/// range. `from` labels the result and errors.
+/// and follows it to the target; stops after `cap` blocks are tried, or after `max_misses` blocks in a row whose
+/// literals are not in the plaintext (most likely past the target, but possibly inside output a filter changed, so
+/// the rest is kept for a later pass). `from` labels the result and errors.
 #[allow(clippy::too_many_arguments)]
 fn scan_blocks(
     packed: &[u8],
@@ -809,13 +813,14 @@ fn scan_blocks(
     from: usize,
     span: Range<usize>,
     cap: usize,
+    max_misses: usize,
     pre: &mut Huff,
     work: &mut Work,
 ) -> std::result::Result<Scan, NearError> {
     let exhausted = Err(NearError::Exhausted { lowest: from });
     let (mut at, mut pinned, mut misses) = (span.start, 0, 0);
-    while at < span.end && misses < NEAR_MISSES {
-        if pinned >= cap {
+    while at < span.end {
+        if pinned >= cap || misses >= max_misses {
             return Ok(Scan::Capped(at));
         }
         if work.late() {

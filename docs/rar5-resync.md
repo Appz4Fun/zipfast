@@ -65,8 +65,9 @@ u.feed(&packed[n.resync.packed_offset..], &mut sink)?;
 ```
 
 - **How:** starting a little before `estimate` and moving back geometrically (16 KiB, 64 KiB, ... before it), it
-  looks for a block whose literals pin it to the plaintext before the target. A block found nowhere in it is past
-  the target. From that anchor it decodes forward without a window, checking every block against the plaintext and
+  looks for a block whose literals pin it to the plaintext before the target. A few blocks in a row found nowhere
+  in it are most likely past the target, so the step moves back. Blocks inside output a filter changed miss too, so
+  the rest of such a step is searched after the steps back, as is the rest of a step that tried its share of blocks. From that anchor it decodes forward without a window, checking every block against the plaintext and
   learning the decoder's state. It does not stop when the state is known; it goes on to the last block that starts
   at or before the target and restarts there. So the restart is within one block of the target, whatever packing
   ratio the content between has (rar's ratio varies from 1:1 to over 15:1 inside one mixed member, which makes a
@@ -88,7 +89,8 @@ u.feed(&packed[n.resync.packed_offset..], &mut sink)?;
   reaches back that far. The plaintext's start is a member's start in a handover, where nothing can be declared
   before. Following from there is cheap, since decoding without a window is a byte comparison. Failing that, it
   falls back to a guarded anchor with `window_checked: false`. The resumed decoder then refuses, as
-  `Error::BadChecksum`, a match that copies from before the anchor plus 4 MiB into output no known plaintext checks.
+  `Error::BadChecksum`, a match that copies from before the anchor plus 4 MiB and writes any byte where no known
+  plaintext checks it (one that starts just before that boundary and runs past it included).
   That is an error, never silently wrong output. Failing that too, it gives the closest restart, which needs
   plaintext past it to resume.
 - **Block granularity:** a restart is a block start. One rar block can cover megabytes of very compressible output:
@@ -136,8 +138,9 @@ past the target. Prybar's layered search over `resync` took about 25 s and lande
     the resumed window (a later copy from the filtered output decodes exactly), finds a restart in a solid second
     member, and a guarded restart resumes with plaintext only up to the target;
   - with a 16 MiB dictionary, a copy after the target from output a filter before the anchor changed is refused by
-    the resumed decoder; more than a step's share of unpinnable blocks at the estimate is searched past; a deadline
-    that passes during a long follow gives `Exhausted`;
+    the resumed decoder, as is the same copy starting one byte before the end of the known plaintext; more than a
+    step's share of unpinnable blocks at the estimate is searched past, as are blocks inside output a delta filter
+    declared before the given packed bytes changed; a deadline that passes during a long follow gives `Exhausted`;
   - with `ZIPFAST_Z_FIXTURES`, `resync_near` on F03/F05/F06 at several targets (guarded, exact, under 1 s in release).
 
 RAR 4.x is not covered.

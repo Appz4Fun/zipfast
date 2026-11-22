@@ -777,11 +777,10 @@ fn resync_near_on_the_z_fixtures() {
     }
 }
 
-/// A dictionary over 4 MiB: a filter's output lies before the anchor (unseen by the follow) but inside the restart's
-/// match window, and a copy after the target reads it. The resumed decoder must refuse that copy rather than write
-/// the filtered bytes where the window held them unfiltered.
-#[test]
-fn a_resumed_decoder_refuses_a_copy_from_output_an_unseen_filter_changed() {
+/// A stream with a 16 MiB dictionary: an E8 filter's output at about 2 MiB, then 9 MiB more, then (at
+/// `before_copy`) a 3,000-byte copy from inside the filter's output, starting at a call's opcode. Returns the packed
+/// stream, its decoded output, the window, the filter's start and `before_copy`.
+fn unseen_filter_stream() -> (Vec<u8>, Vec<u8>, zipfast::rar5::unpack::Window, u64, u64) {
     use zipfast::rar5::testenc::{self, Op};
     let mut ops = spread(2 << 20);
     let filter_at = testenc::model(&ops).len() as u64;
@@ -792,38 +791,97 @@ fn a_resumed_decoder_refuses_a_copy_from_output_an_unseen_filter_changed() {
     }
     ops.extend(spread(9 << 20));
     let before_copy = testenc::model(&ops).len() as u64;
-    let target = before_copy - 50_000;
-    // After the target: a copy from inside the filter's output, 8+ MiB back.
     ops.push(Op::Match(3_000, before_copy - (filter_at + 10_000)));
     ops.extend(spread(200_000));
     let packed = testenc::tuned_stream(&ops, 4_000);
-    let size = testenc::model(&ops).len() as u64;
-    let window = window_for(16 << 20, Some(size), false).unwrap();
-    let truth = decode(window, &packed, size);
+    let unfiltered = testenc::model(&ops);
+    let window = window_for(16 << 20, Some(unfiltered.len() as u64), false).unwrap();
+    let truth = decode(window, &packed, unfiltered.len() as u64);
     let (lo, hi) = (filter_at as usize + 10_000, filter_at as usize + 13_000);
     assert_eq!(
         truth[before_copy as usize..before_copy as usize + 3_000],
-        testenc::model(&ops)[lo..hi],
+        unfiltered[lo..hi],
         "the copy reads unfiltered bytes"
     );
-    assert_ne!(truth[lo..hi], testenc::model(&ops)[lo..hi], "which the filter changed in the output");
-    // The packed bytes from about 4 MiB of output on: the member's first blocks (and the filter's) are not given.
+    assert_ne!(truth[lo..hi], unfiltered[lo..hi], "which the filter changed in the output");
+    assert_eq!(truth[lo], 0xe8, "the copy starts at a call's opcode, which the filter leaves");
+    (packed, truth, window, filter_at, before_copy)
+}
+
+/// Resumes `resync_near` at `target` from packed bytes that start at about 4 MiB of output (the member's first
+/// blocks and the filter's are not given), with the plaintext only up to the target. Returns the result and the
+/// restart's output offset.
+fn resume_past_unseen_filter(
+    packed: &[u8],
+    truth: &[u8],
+    window: zipfast::rar5::unpack::Window,
+    filter_at: u64,
+    target: u64,
+) -> (zipfast::Result<()>, Vec<u8>, u64) {
     let cut = packed.len() * 4 / 11;
     let known = &truth[..target as usize];
     let options = NearOptions { estimate: Some((packed.len() - cut) * 6 / 10), ..Default::default() };
     let n = resync_near(&packed[cut..], 0, known, window, target, &options).unwrap();
     assert!(n.resync.guarded() && !n.window_checked, "{n:?}");
     assert!(n.anchor > filter_at + 20_000, "the filter is before the anchor: {n:?}");
-    let mut u = Unpacker::resume_in_stream(window, &n.resync, 0, 0, known, Some(size)).unwrap();
+    let mut u = Unpacker::resume_in_stream(window, &n.resync, 0, 0, known, Some(truth.len() as u64)).unwrap();
     let mut out = Collect(Vec::new());
     let result = u.feed(&packed[cut + n.resync.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+    (result, out.0, n.resync.output_offset)
+}
+
+/// A dictionary over 4 MiB: a filter's output lies before the anchor (unseen by the follow) but inside the restart's
+/// match window, and a copy after the target reads it. The resumed decoder must refuse that copy rather than write
+/// the filtered bytes where the window held them unfiltered.
+#[test]
+fn a_resumed_decoder_refuses_a_copy_from_output_an_unseen_filter_changed() {
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let (result, out, restart) = resume_past_unseen_filter(&packed, &truth, window, filter_at, before_copy - 50_000);
     let err = result.expect_err("a copy from output an unseen filter changed must not pass").to_string();
     assert!(err.contains("before the window checked"), "{err}");
-    let good = (before_copy - n.resync.output_offset) as usize;
-    assert!(
-        out.0.len() <= good + 3_000
-            && out.0[..good.min(out.0.len())] == truth[n.resync.output_offset as usize..][..good.min(out.0.len())]
-    );
+    let good = (before_copy - restart) as usize;
+    assert!(out.len() <= good && out == truth[restart as usize..][..out.len()], "no wrong byte reached the sink");
+}
+
+/// The same copy starting one byte before the target: its first byte (the call's opcode, which the filter leaves)
+/// is the only one known plaintext checks, and the rest would land past the target unchecked. Refused too.
+#[test]
+fn a_resumed_decoder_refuses_such_a_copy_across_the_end_of_the_known_plaintext() {
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let (result, out, restart) = resume_past_unseen_filter(&packed, &truth, window, filter_at, before_copy + 1);
+    let err = result.expect_err("a copy straddling the end of the known plaintext must not pass").to_string();
+    assert!(err.contains("before the window checked"), "{err}");
+    let good = (before_copy - restart) as usize;
+    assert!(out.len() <= good && out == truth[restart as usize..][..out.len()], "no wrong byte reached the sink");
+}
+
+/// Blocks inside output a filter declared before the packed bytes given changed: their literals are not in the
+/// plaintext, though they lie before the target. The search goes on past them to a block that pins.
+#[test]
+fn resync_near_searches_on_past_blocks_inside_filtered_output() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops = testenc::lz(&sample(20_000), 1 << 17, 16);
+    ops.push(Op::Filter { start: 0, len: 300_000, kind: 0, channels: 3 });
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..300_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ops.push(Op::Lit(x as u8));
+    }
+    let tail: Vec<u8> = sample(200_000).into_iter().rev().collect();
+    ops.extend(testenc::lz(&tail, 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 500);
+    let size = testenc::model(&ops).len() as u64;
+    let window = window_for(1 << 20, Some(size), false).unwrap();
+    let truth = decode(window, &packed, size);
+    // From inside the filtered output: the filter's block is not given.
+    let cut = packed.len() / 10;
+    let target = size - 20_000;
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed[cut..], 0, &truth[..target as usize], window, target, &options).unwrap();
+    assert!(n.anchor >= 320_000 && n.back < 40_000, "pinned past the filtered output: {n:?}");
+    assert_eq!(resumed(window, &n.resync, 0, &truth, size, &packed[cut..]), truth[n.resync.output_offset as usize..]);
 }
 
 /// More than a step's share of blocks that cannot pin, right at the estimate: the rest of the interval is still
