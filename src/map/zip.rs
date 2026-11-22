@@ -396,5 +396,6 @@ pub(super) fn zip_member(
         complete,
         pieces,
         folder: None,
+        dictionary: None,
     })
 }

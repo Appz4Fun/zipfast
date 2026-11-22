@@ -2116,3 +2116,32 @@ fn rar4_unicode_decoding_skips_incomplete_ops_and_clips_runs() {
         assert_eq!(volume.members[0].name.as_deref(), Some(want), "{field:?}");
     }
 }
+
+/// Every RAR member lists the dictionary size its header declares, `-hp` headers included; ZIP and 7z do not.
+#[test]
+fn rar_members_list_their_dictionary_size() {
+    let a = data(5000, 1);
+    let bytes = archive(&[FileSpec::new("a.bin", &a)]);
+    let map = MemberMap::from_memory(&[&bytes], "x.rar", None).unwrap();
+    // the test writer's compression info leaves the dictionary bits 0: 128 KiB
+    assert_eq!(map.members[0].dictionary, Some(128 << 10));
+    let hp = hp_archive(&data(700, 5));
+    let map = MemberMap::from_memory(&[&hp], "hp.rar", Some(HP_PASSWORD)).unwrap();
+    assert_eq!(map.members[0].dictionary, Some(128 << 10), "known from decrypted headers");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar4");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rar") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let Ok(map) = MemberMap::from_memory(&[&bytes], path.file_name().unwrap(), None) else { continue };
+        for m in map.members.iter().filter(|m| !m.is_dir) {
+            let d = m.dictionary.unwrap_or_else(|| panic!("{path:?} {:?}", m.name));
+            assert!(d.is_power_of_two() && (64 << 10..=4 << 20).contains(&d), "{path:?}: {d}");
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "some RAR 4.x members were checked");
+}

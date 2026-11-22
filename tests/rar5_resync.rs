@@ -465,3 +465,61 @@ fn a_reset_after_a_resume_decodes_ordinarily() {
     assert_eq!((reset_ok, reset_out), (fresh_ok, fresh_out));
     assert!(!fresh_ok, "a fresh decoder rejects bytes past the last block");
 }
+
+/// A second file of a solid stream resumes with its filters addressed from its own start: an E8 filter after the
+/// restart decodes exactly with `resume_in_stream`, while treating the stream as one member from 0 gets the
+/// operands wrong and is caught before a wrong byte reaches the sink.
+#[test]
+fn a_solid_second_member_resumes_with_filters_based_at_its_start() {
+    use zipfast::rar5::testenc::{self, Op};
+    let a = sample(100_000);
+    let mut b = sample(300_000);
+    for x in b.iter_mut().filter(|x| **x == 0xe8) {
+        *x = 0xe9;
+    }
+    for at in (160_000..240_000).step_by(997) {
+        b[at..at + 5].copy_from_slice(&[0xe8, (at % 251) as u8, 0x10, 0, 0]);
+    }
+    const PER: usize = 2_000;
+    let first = testenc::tuned_stream(&testenc::lz(&a, 1 << 17, 16), PER);
+    let mut ops = testenc::lz(&b[..150_000], 1 << 17, 16);
+    ops.push(Op::Filter { start: 0, len: 100_000, kind: 1, channels: 0 });
+    ops.extend(testenc::lz(&b[150_000..], 1 << 17, 16));
+    let second = testenc::tuned_stream(&ops, PER);
+    let window = window_for(1 << 20, Some((a.len() + b.len()) as u64), true).unwrap();
+    // The solid stream's output: the first file, then the second with its filter applied.
+    let mut u = Unpacker::new(window).unwrap();
+    u.reset(Some(a.len() as u64));
+    let mut out = Collect(Vec::new());
+    u.feed(&first, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    u.next_file(Some(b.len() as u64));
+    u.feed(&second, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    let stream = out.0;
+    assert_eq!(&stream[..a.len()], &a[..]);
+    let truth_b = &stream[a.len()..];
+    assert_ne!(truth_b[160_001..160_005], b[160_001..160_005], "the filter changes the operands");
+    // Lose packed bytes early in the second file, well before the filter's block.
+    let after = &second[second.len() / 5..];
+    let start = a.len() as u64;
+    let r = resync(after, 0, &stream, window, start..stream.len() as u64).unwrap();
+    assert!(r.output_offset > start && r.output_offset < start + 150_000, "{r:?}");
+    let resumed = |member_start: u64, size: u64| {
+        let mut u = Unpacker::resume_in_stream(window, &r, member_start, 0, &stream, Some(size)).unwrap();
+        let mut out = Collect(Vec::new());
+        let result = u.feed(&after[r.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+        (result, out.0)
+    };
+    let (result, out) = resumed(start, b.len() as u64);
+    result.unwrap();
+    assert_eq!(out, truth_b[(r.output_offset - start) as usize..], "filters are addressed from the member's start");
+    // As one member from the stream's start (resume_at's view), the E8 operands come out wrong; the
+    // known-plaintext window stops them.
+    let (result, out) = resumed(0, stream.len() as u64);
+    let err = result.expect_err("a filter based at the stream's start must not pass").to_string();
+    assert!(err.contains("differs from the known plaintext"), "{err}");
+    assert!(r.output_offset + out.len() as u64 <= start + 160_001, "no wrong byte reached the sink");
+    // A member start past the restart is refused.
+    assert!(Unpacker::resume_in_stream(window, &r, r.output_offset + 1, 0, &stream, Some(b.len() as u64)).is_err());
+}

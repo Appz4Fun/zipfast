@@ -790,6 +790,7 @@ impl RarWalker {
                 final_part: part.final_part,
             }],
             folder: None,
+            dictionary: (!header.is_dir() && header.dictionary > 0).then_some(header.dictionary),
         };
         self.members.try_reserve(1).map_err(|_| self.allocation())?;
         self.members.push(member);
