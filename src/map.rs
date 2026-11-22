@@ -560,6 +560,10 @@ pub struct MapMember {
     /// 7z: the folder holding the member's data and its offset there. None for members without data (directories
     /// and empty files) and for other formats.
     pub folder: Option<FolderSlot>,
+    /// RAR: the dictionary (window) size the member's header declares, which a decoder restarted inside the member
+    /// needs ([`crate::rar5::unpack::window_for`]); headers decrypted with `-hp` give it too. `None` for
+    /// directories, ZIP entries and 7z members (a 7z folder's dictionary is in its coder properties).
+    pub dictionary: Option<u64>,
 }
 
 fn floor_block(offset: u64) -> u64 {

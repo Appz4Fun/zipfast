@@ -36,6 +36,12 @@ u.finish(&mut sink)?;
 ## Output and errors
 
 - **`resume_at`:** gives a decoder that writes the member's output from `Resync::output_offset` on. The CRC32 it hands a sink covers only that output. Combine it with the CRC of the plaintext before it, using `zipfast::crc32::combine(prefix_crc, resumed_crc, resumed_len)`, and check the result against the member's CRC.
+  - **Solid streams:** `Unpacker::resume_in_stream(window, &r, member_start, known_base, &known, size)` resumes a
+    member that starts at stream offset `member_start` of a solid stream, such as a solid archive's second file.
+    Every offset is then a stream offset (the known plaintext may reach back into earlier members, as matches do),
+    `size` is the member's own size, and filters are addressed from the member's start, as RAR does per file.
+    `resume_at` is this with `member_start` 0; using it inside a later solid member decodes E8/E8E9/ARM-filtered
+    output wrongly (the known-plaintext window below catches that within its reach).
   - **Filters the hole erased:** a filter declared in a lost block can cover output after the restart, and the resumed decoder cannot see it. So it checks its output against the known plaintext until it is 4 MiB (a filter's longest length) past the restart, or at the member's end, and reports a difference as `Error::BadChecksum` before the bytes reach the sink. Resync again from packed bytes past that point. `known` must cover that window, or `resume_at` fails; past it no plaintext is needed.
   - **Encrypted members:** the decrypted packed bytes run on past the last block to the AES block end. The resumed decoder stops at the block flagged last and ignores them, as a normal extraction does.
 - **`ResyncError::NotFound`:** no block decodes to the plaintext in the range. Either the plaintext or the range is wrong, or a filter that started before the hole covers the output.

@@ -551,10 +551,37 @@ impl Unpacker {
         known: &[u8],
         size: Option<u64>,
     ) -> Result<Self> {
+        Self::resume_in_stream(window, resync, 0, known_base, known, size)
+    }
+
+    /// [`Self::resume_at`] for a member that starts at stream offset `member_start` of a solid stream, such as the
+    /// second file of a solid archive.
+    ///
+    /// Every offset is in the solid stream's coordinates: [`Resync::output_offset`], `known_base` (and so the
+    /// plaintext `known`, which may reach back into earlier members, as matches do), and the result's stream
+    /// position. `size` is the member's own output size, and the sink gets the member's output from
+    /// `output_offset - member_start` on. E8/E8E9/ARM filters address relative to the member's start, as RAR does
+    /// for each file of a solid stream, so a member resumed with the wrong `member_start` decodes filtered data
+    /// wrongly; the known-plaintext window catches that within its reach. `member_start` must not lie past
+    /// `output_offset`; `resume_at` is this with `member_start` 0.
+    pub fn resume_in_stream(
+        window: Window,
+        resync: &Resync,
+        member_start: u64,
+        known_base: u64,
+        known: &[u8],
+        size: Option<u64>,
+    ) -> Result<Self> {
         let offset = resync.output_offset;
+        if member_start > offset {
+            return Err(Error::Unsupported(format!(
+                "resuming RAR 5.0 output at stream offset {offset} inside a member that starts later, at {member_start}"
+            )));
+        }
         let known_end = known_base.saturating_add(known.len() as u64);
         // A member of unknown size may end where the known plaintext does.
-        let check_end = offset.saturating_add(MAX_FILTER_LEN).min(size.unwrap_or(known_end));
+        let member_end = size.map_or(known_end, |s| member_start.saturating_add(s));
+        let check_end = offset.saturating_add(MAX_FILTER_LEN).min(member_end);
         if known_base > offset || known_end < check_end {
             return Err(Error::Unsupported(format!(
                 "resuming RAR 5.0 output at {offset} needs known plaintext for {offset}..{check_end} to check it \
@@ -565,7 +592,8 @@ impl Unpacker {
         u.reset(size);
         if check_end > offset {
             let bytes = known[(offset - known_base) as usize..(check_end - known_base) as usize].to_vec();
-            u.verify = Some(Box::new(Verify { end: check_end, bytes }));
+            // the window is checked in the member's output coordinates, as `emitted` counts them
+            u.verify = Some(Box::new(Verify { end: check_end - member_start, bytes }));
         }
         let from = offset.saturating_sub(u.reach).max(known_base);
         for f in from..offset {
@@ -574,8 +602,8 @@ impl Unpacker {
             }
         }
         u.sp = offset;
-        u.file_base = 0;
-        u.emitted = offset;
+        u.file_base = member_start;
+        u.emitted = offset - member_start;
         u.history = resync.history;
         u.last_len = resync.last_len;
         u.slot = Slot::filled(Some(*resync.lens));

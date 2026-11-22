@@ -77,8 +77,9 @@ empty except for 7z).
 pieces are present; 7z: see [7z](#7z)), `method` (`Stored`, `Compressed { id }` with the format's method number, or
 `Coders` for a 7z coded folder), `mapping`, `solid`, `encrypted`, `cipher`, final `checks` (once the final piece is
 seen), `mtime`, `dos_time` (RAR 4.x: the header's DOS date and time as stored, also when it is not a valid date and
-`mtime` is None; None for other formats), `attributes`, `unix_mode` and `complete`, its `pieces`, and `folder` (7z
-only: the folder and substream offset).
+`mtime` is None; None for other formats), `attributes`, `unix_mode` and `complete`, its `pieces`, `folder` (7z
+only: the folder and substream offset), and `dictionary` (RAR only: the dictionary size the member's header
+declares, also behind `-hp`, which a decoder restarted inside the member needs; None for directories, ZIP and 7z).
 
 `MapPiece` is one part header: `volume`, `packed` (data bytes in that volume), `header` (the header's wire extent,
 including the IV and padding of an encrypted header, or a ZIP local header with its name and extra field; empty for
