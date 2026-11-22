@@ -300,11 +300,15 @@ creates, renames, compacts or deletes, and never takes a bundle over.
   advisory lock while it is read, so a session opening that bundle at the same moment gets `Busy` and can retry.
 - Without the anchor store, the newest record (highest sequence) is used. That is safe: an intent record marks the
   output it may change unknown, and a commit record is written only after its output was synced, so no record
-  claims bytes the output does not hold. A record that fails its checksum is ignored, since a record torn by a
-  crash was never anchored. When two records share the newest sequence, only output both call good is returned.
-- Damage the newest record depends on (a missing or corrupt page, a record of another member, an unknown state
-  version) skips the bundle; an older record is never used in its place, since a newer one may have taken output
-  back.
+  claims bytes the output does not hold. A record that fails its checksum (or is too short to carry one) is
+  ignored, since a record torn by a crash was never anchored. When two records share the newest sequence, only
+  output both call good is returned, and leaves they share count once against `CrcLeaves`.
+- Any other damage skips the bundle: a record whose checksum holds but which has an unknown version or a malformed
+  field, a missing or corrupt page the newest record names, a record of another member. An older record is never
+  used in its place, since a newer one may have taken output back.
+- Every file is opened read-only, without following a symbolic link and without blocking, so a state directory on
+  read-only media or owned by another user can be read. A FIFO or any other non-regular file in place of `lock`, a
+  record or a page skips the bundle with `UnsafePath` instead of stalling.
 - The output file must be a regular file (`UnsafePath` otherwise; a missing one is an `Io` error). When it is not
   the file the state was written for (another inode, as after a copy across file systems, or another length), every
   good range is re-read and kept only where its recorded CRC-32 still matches. `HeldOptions::rehash` re-reads

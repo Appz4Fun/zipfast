@@ -447,3 +447,119 @@ fn an_encrypted_member_with_keyed_checks_reports_no_plaintext_checks() {
     assert_eq!(scanned.held[0].good, held.good);
     assert_eq!(scanned.held[0].checks, None);
 }
+
+/// A closed primary: four of ten volumes extracted, the handle dropped. Returns the tempdir, the live held output
+/// and the bundle directory.
+fn closed_primary() -> (tempfile::TempDir, HeldOutput, std::path::PathBuf) {
+    let gold = gold(10_000);
+    let primary = common::volumes(&common::FileSpec::new("movie.bin", &gold), 1000);
+    let dir = tempfile::tempdir().unwrap();
+    let Primary { session, file, .. } = primary_dies(dir.path(), &primary, 4, None);
+    drop(session);
+    let live = file.held_output().unwrap();
+    drop(file);
+    let bundle = std::fs::read_dir(dir.path().join("state")).unwrap().next().unwrap().unwrap().path();
+    (dir, live, bundle)
+}
+/// The bundle's newest record: its path and bytes.
+fn newest_record(bundle: &Path) -> (std::path::PathBuf, Vec<u8>) {
+    let mut best: Option<(u64, std::path::PathBuf, Vec<u8>)> = None;
+    for entry in std::fs::read_dir(bundle).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.file_name().unwrap().to_str().unwrap().starts_with("r-") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        // magic (8), version (2), kind (1), then the sequence
+        let sequence = u64::from_le_bytes(bytes[11..19].try_into().unwrap());
+        if best.as_ref().is_none_or(|(s, _, _)| sequence > *s) {
+            best = Some((sequence, path, bytes));
+        }
+    }
+    let (_, path, bytes) = best.unwrap();
+    (path, bytes)
+}
+/// `bytes` (a record) after `edit`, with its checksum recomputed, written next to the others under its digest name.
+fn write_record(bundle: &Path, mut bytes: Vec<u8>, edit: impl FnOnce(&mut [u8])) {
+    let split = bytes.len() - 4;
+    edit(&mut bytes[..split]);
+    let crc = crc32fast::hash(&bytes[..split]);
+    bytes[split..].copy_from_slice(&crc.to_le_bytes());
+    let digest: String = zipfast::crypto::sha256(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(bundle.join(format!("r-{digest}")), bytes).unwrap();
+}
+
+#[test]
+fn load_held_reads_state_it_cannot_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, live, bundle) = closed_primary();
+    let files: Vec<_> = std::fs::read_dir(&bundle).unwrap().map(|e| e.unwrap().path()).collect();
+    for path in &files {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let scanned = scan(dir.path(), false);
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for path in &files {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(scanned.skipped.is_empty(), "{:?}", scanned.skipped);
+    assert_eq!(scanned.held[0].good, live.good);
+}
+
+#[test]
+fn a_newer_record_of_an_unknown_version_or_kind_skips_the_bundle() {
+    for (what, field, value) in [("version", 8..10, vec![2u8, 0]), ("kind", 10..11, vec![9u8])] {
+        let (dir, _, bundle) = closed_primary();
+        let (_, bytes) = newest_record(&bundle);
+        write_record(&bundle, bytes, |b| {
+            let sequence = u64::from_le_bytes(b[11..19].try_into().unwrap()) + 1;
+            b[11..19].copy_from_slice(&sequence.to_le_bytes());
+            b[field.clone()].copy_from_slice(&value);
+        });
+        let scanned = scan(dir.path(), false);
+        assert!(scanned.held.is_empty(), "{what}: an older record was used in its place");
+        let kind = &scanned.skipped[0].error.kind;
+        match what {
+            "version" => assert!(matches!(kind, PartialErrorKind::StateVersion), "{kind:?}"),
+            _ => assert!(matches!(kind, PartialErrorKind::StateMalformed), "{kind:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_fifo_in_place_of_the_lock_or_a_record_is_skipped_without_blocking() {
+    for name in ["lock".to_string(), format!("r-{}", "b".repeat(64))] {
+        let (dir, _, bundle) = closed_primary();
+        let path = bundle.join(&name);
+        let _ = std::fs::remove_file(&path);
+        assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+        let (done, wait) = std::sync::mpsc::channel();
+        let root = dir.path().to_path_buf();
+        std::thread::spawn(move || done.send(scan(&root, false)).unwrap());
+        let scanned = wait.recv_timeout(std::time::Duration::from_secs(20)).expect("load_held blocked on a FIFO");
+        assert!(scanned.held.is_empty(), "{name}");
+        assert!(matches!(scanned.skipped[0].error.kind, PartialErrorKind::UnsafePath), "{name}: {:?}", scanned.skipped);
+    }
+}
+
+#[test]
+fn tied_newest_records_charge_their_shared_leaves_once() {
+    let (dir, live, bundle) = closed_primary();
+    let with = |leaves: u32| {
+        let options =
+            HeldOptions { limits: PartialLimits { crc_leaves: leaves, ..PartialLimits::default() }, rehash: false };
+        load_held(&dir.path().join("state"), &dir.path().join("out"), &options).unwrap()
+    };
+    // The fewest leaves one record needs.
+    let needed = (1..1000).find(|&n| !with(n).held.is_empty()).unwrap();
+    // Another record at the same sequence naming the same pages (an intent retried after a failed anchor update).
+    let (_, bytes) = newest_record(&bundle);
+    write_record(&bundle, bytes, |b| {
+        let transaction = u64::from_le_bytes(b[19..27].try_into().unwrap()) ^ 0x5555;
+        b[19..27].copy_from_slice(&transaction.to_le_bytes());
+    });
+    let scanned = with(needed);
+    assert!(scanned.skipped.is_empty(), "{:?}", scanned.skipped);
+    assert_eq!(scanned.held[0].good, live.good);
+}

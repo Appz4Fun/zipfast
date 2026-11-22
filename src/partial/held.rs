@@ -17,8 +17,7 @@
 //! Held output: the plaintext a persistent member already holds, read from a live handle or, read-only and without
 //! the archive or its binding, from a closed state directory. See "Held output" in `docs/persistent-partials.md`.
 
-use super::journal::Bundle;
-use super::native::bundle_name;
+use super::native::{bundle_name, hex};
 use super::state::{self, KnownLeaf, Snapshot};
 use super::types::{err, io_error, malformed};
 use super::*;
@@ -77,7 +76,8 @@ pub struct HeldSkip {
     pub bundle: PathBuf,
     /// Why: `Busy` when a session holds the bundle, `StateUnavailable` when it has no readable record,
     /// `StateMalformed`/`JournalCorrupt`/`StateVersion` for damage, an `Io` error (for example `NotFound` for the
-    /// output file), or `UnsafePath` when the output path is not a regular file.
+    /// output file), or `UnsafePath` when the output file or a state file (`lock`, a record, a page) is not a
+    /// regular file.
     pub error: PartialError,
 }
 
@@ -103,9 +103,15 @@ pub struct HeldScan {
 /// Which state counts: without the anchor store the newest record is taken (the highest sequence). Every record
 /// is conservative for the output it describes (an intent marks the output it may change unknown, and a commit
 /// is written only after its output was synced), so the newest record never claims bytes the output does not
-/// hold. Records that fail their checksum are ignored: such a record was never anchored (a crash during its
-/// write), so the output never depended on it. When two records share the newest sequence (an intent whose
-/// anchor update failed, retried), only output both call good is returned.
+/// hold. Records that fail their checksum (or are too short to carry one) are ignored: such a record was torn by
+/// a crash during its write and never anchored, so the output never depended on it. A record whose checksum
+/// holds but which is otherwise unreadable (an unknown version, a malformed field) skips the bundle; an older
+/// record is never used in its place. When two records share the newest sequence (an intent whose anchor update
+/// failed, retried), only output both call good is returned, and leaves they share are charged once.
+///
+/// Every file is opened read-only, without following a symbolic link and without blocking, so state on read-only
+/// media or owned by another user is read, and a FIFO or other non-regular file in place of a state file skips
+/// the bundle (`UnsafePath`) instead of stalling.
 ///
 /// Errors are for `state_root` itself (it cannot be listed); every problem with one bundle lands in
 /// [`HeldScan::skipped`]. Directory entries whose names are not bundle names are ignored.
@@ -126,7 +132,7 @@ pub fn load_held(state_root: &Path, output_root: &Path, options: &HeldOptions) -
     let mut scan = HeldScan::default();
     for name in names {
         let bundle = state_root.join(&name);
-        match held_bundle(&state_root, &bundle, &name, &output_root, options) {
+        match held_bundle(&bundle, &name, &output_root, options) {
             Ok(held) => scan.held.push(held),
             Err(error) => scan.skipped.push(HeldSkip { bundle, error }),
         }
@@ -134,16 +140,28 @@ pub fn load_held(state_root: &Path, output_root: &Path, options: &HeldOptions) -
     Ok(scan)
 }
 
-/// Opens `path` read-only without following a symbolic link at its last component.
-fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+/// Opens `path` read-only, as the session's own state-file opener does: without following a symbolic link at its
+/// last component and without blocking (a FIFO in its place never stalls the read). `None` when nothing is there;
+/// `UnsafePath` when it is not a regular file.
+fn open_regular(path: &Path) -> PartialResult<Option<std::fs::File>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
-    options.open(path)
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(err(PartialErrorKind::UnsafePath)),
+        Err(e) => return Err(io_error(OutputOperation::Read, e)),
+    };
+    if !file.metadata().map_err(|e| io_error(OutputOperation::Metadata, e))?.is_file() {
+        return Err(err(PartialErrorKind::UnsafePath));
+    }
+    Ok(Some(file))
 }
 
 /// A shared, non-blocking advisory lock on an open file, released when the file is dropped. `Busy` when a session
@@ -166,25 +184,37 @@ fn probe_lock(file: &std::fs::File) -> PartialResult<()> {
     Ok(())
 }
 
-fn held_bundle(
-    state_root: &Path,
-    bundle_path: &Path,
-    name: &str,
-    output_root: &Path,
-    options: &HeldOptions,
-) -> PartialResult<HeldOutput> {
+/// The snapshot `state` names, its pages read from `bundle` read-only (a saved state may be on read-only media or
+/// owned by another user). Leaves equal to ones in `reusable` share their charge.
+fn read_snapshot(
+    bundle: &Path,
+    state: &PartialState,
+    budget: &PartialBudget,
+    reusable: &[KnownLeaf],
+) -> PartialResult<Snapshot> {
+    let (_, _, _, head) = state::decode_record(&state.wire, &budget.limits)?;
+    let mut pages = budget.vector(head.pages.len())?;
+    for reference in &head.pages {
+        let file = open_regular(&bundle.join(format!("p-{}", hex(&reference.digest))))?
+            .ok_or_else(|| err(PartialErrorKind::StateUnavailable))?;
+        let bytes = state::read_bounded(&file, reference.len as usize, budget)?;
+        if bytes.len() != reference.len as usize || crate::crypto::sha256(&bytes) != reference.digest {
+            return Err(err(PartialErrorKind::JournalCorrupt));
+        }
+        pages.push((reference.kind, bytes));
+    }
+    state::decode_pages(head, pages, budget, reusable)
+}
+
+fn held_bundle(bundle_path: &Path, name: &str, output_root: &Path, options: &HeldOptions) -> PartialResult<HeldOutput> {
     let meta = std::fs::symlink_metadata(bundle_path).map_err(|e| io_error(OutputOperation::Metadata, e))?;
     if !meta.is_dir() {
         return Err(malformed());
     }
-    let _lock = match open_nofollow(&bundle_path.join("lock")) {
-        Ok(file) => {
-            probe_lock(&file)?;
-            Some(file)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_error(OutputOperation::Read, e)),
-    };
+    let lock = open_regular(&bundle_path.join("lock"))?;
+    if let Some(lock) = &lock {
+        probe_lock(lock)?;
+    }
     let usage = crate::progressive::Usage::new(crate::progressive::ProgressiveLimits::default());
     let budget = PartialBudget::new(options.limits.clone(), usage.clone(), Arc::new(PartialExclusions::new(usage)))?;
     // Every record that decodes, with its sequence.
@@ -193,13 +223,20 @@ fn held_bundle(
         let entry = entry.map_err(|e| io_error(OutputOperation::Read, e))?;
         let file_name = entry.file_name();
         let Some(record) = file_name.to_str().filter(|n| n.starts_with("r-")) else { continue };
-        let file = open_nofollow(&bundle_path.join(record)).map_err(|e| io_error(OutputOperation::Read, e))?;
-        if !file.metadata().map_err(|e| io_error(OutputOperation::Metadata, e))?.is_file() {
-            return Err(malformed());
-        }
+        // Gone since the listing (a session retired it): nothing to read.
+        let Some(file) = open_regular(&bundle_path.join(record))? else { continue };
         let wire = state::read_bounded(&file, options.limits.state_wire_bytes as usize, &budget)?;
-        // A record that fails its checksum or framing was never anchored: ignore it.
-        let Ok((_, _, _, head)) = state::decode_record(&wire, &options.limits) else { continue };
+        // A record torn by a crash during its write (too short for its checksum, or failing it) was never
+        // anchored: ignore it. Anything else wrong with a record whose checksum holds (an unknown version, a
+        // malformed field) is damage: the bundle is skipped, never read from an older record.
+        if wire.len() < 4 {
+            continue;
+        }
+        let head = match state::decode_record(&wire, &options.limits) {
+            Ok((_, _, _, head)) => head,
+            Err(e) if matches!(e.kind, PartialErrorKind::JournalCorrupt) => continue,
+            Err(e) => return Err(e),
+        };
         if bundle_name(&head.member) != name {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
         }
@@ -211,8 +248,9 @@ fn held_bundle(
     let mut first: Option<(HeldOutput, Vec<KnownLeaf>, Identity)> = None;
     for (_, wire) in records.into_iter().filter(|(sequence, _)| *sequence == newest) {
         let state = PartialState::parse(wire, &options.limits)?;
-        let bundle = Bundle::at(state_root, state.member(), &budget)?;
-        let snapshot = bundle.snapshot(&state)?;
+        // A tied record naming the same leaves shares their charge with the first one.
+        let reusable = first.as_ref().map_or(&[][..], |(_, known, _)| known.as_slice());
+        let snapshot = read_snapshot(bundle_path, &state, &budget, reusable)?;
         let candidate = held_from_snapshot(&snapshot, output_root.join(&snapshot.head.relative_output));
         match &mut first {
             None => first = Some((candidate, snapshot.known, snapshot.head.binding.output)),
@@ -313,7 +351,8 @@ fn check_output(held: &mut HeldOutput, known: &[KnownLeaf], recorded: Identity, 
     if same && !rehash {
         return Ok(());
     }
-    let file = open_nofollow(&held.output_path).map_err(|e| io_error(OutputOperation::Read, e))?;
+    let file = open_regular(&held.output_path)?
+        .ok_or_else(|| io_error(OutputOperation::Read, std::io::ErrorKind::NotFound.into()))?;
     let len = file.metadata().map_err(|e| io_error(OutputOperation::Metadata, e))?.len();
     let mut buffer = vec![0u8; 1 << 20];
     let mut matching = Vec::new();
