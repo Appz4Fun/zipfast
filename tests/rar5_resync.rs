@@ -397,3 +397,71 @@ fn a_resumed_solid_file_continues_into_the_next() {
     u.finish(&mut out).unwrap();
     assert_eq!(out.0, b, "the next file decodes after the resumed one");
 }
+
+/// The same through the workers: a resumed file whose next file is queued (`queue_file`) before the first is done.
+#[test]
+fn a_resumed_solid_file_continues_into_a_queued_next_file() {
+    use zipfast::rar5::testenc::{self, Op};
+    let plain = sample(300_000);
+    let (a, b) = plain.split_at(200_000);
+    let first = testenc::tuned_stream(&testenc::lz(a, 1 << 17, 16), 2_000);
+    let second = testenc::tuned_stream(&b.iter().map(|&x| Op::Lit(x)).collect::<Vec<_>>(), 2_000);
+    let window = window_for(128 << 10, Some(a.len() as u64), true).unwrap();
+    let after = &first[first.len() / 2..];
+    let r = resync(after, 0, a, window, 0..a.len() as u64).unwrap();
+    let mut u = Unpacker::resume_at(window, &r, 0, a, Some(a.len() as u64)).unwrap();
+    u.force_parallel();
+    // The files' outputs, split at the empty slice the decoder puts where they meet.
+    struct Files(Vec<Vec<u8>>);
+    impl Sink for Files {
+        fn put(&mut self, bytes: &[u8]) -> zipfast::Result<()> {
+            if bytes.is_empty() {
+                self.0.push(Vec::new());
+            } else {
+                self.0.last_mut().unwrap().extend_from_slice(bytes);
+            }
+            Ok(())
+        }
+    }
+    let mut out = Files(vec![Vec::new()]);
+    let padded = |bytes: &[u8]| [bytes, &[0x5a; 11][..]].concat();
+    u.feed(&padded(&after[r.packed_offset..]), &mut out).unwrap();
+    u.queue_file(Some(b.len() as u64));
+    u.feed(&padded(&second), &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0.len(), 2, "two files");
+    assert_eq!(out.0[0], a[r.output_offset as usize..]);
+    assert_eq!(out.0[1], b, "the queued file decodes after the resumed one");
+}
+
+/// A decoder that resumed a member and is then reset for a file of its own decodes it as usual: the resumed
+/// member's stop at its last block and its known plaintext do not carry over.
+#[test]
+fn a_reset_after_a_resume_decodes_ordinarily() {
+    use zipfast::rar5::testenc;
+    let plain = sample(200_000);
+    let packed = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let window = window_for(128 << 10, Some(plain.len() as u64), false).unwrap();
+    let after = &packed[packed.len() / 2..];
+    let r = resync(after, 0, &plain, window, 0..plain.len() as u64).unwrap();
+    let mut u = Unpacker::resume_at(window, &r, 0, &plain, Some(plain.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&after[r.packed_offset..], &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    // Another member, from its start, then bytes past its last block: the reset decoder treats them as a fresh one
+    // does (it does not keep the resumed member's stop at the last block).
+    let other = sample(150_000).into_iter().map(|b| b ^ 0x55).collect::<Vec<u8>>();
+    let packed2 = [testenc::tuned_stream(&testenc::lz(&other, 1 << 17, 16), 2_000), vec![0x5a; 11]].concat();
+    let run = |u: &mut Unpacker| {
+        let mut out = Collect(Vec::new());
+        let r = u.feed(&packed2, &mut out).and_then(|()| u.finish(&mut out));
+        (r.is_ok(), out.0)
+    };
+    u.reset(Some(other.len() as u64));
+    let mut fresh = Unpacker::new(window).unwrap();
+    fresh.reset(Some(other.len() as u64));
+    let (reset_ok, reset_out) = run(&mut u);
+    let (fresh_ok, fresh_out) = run(&mut fresh);
+    assert_eq!((reset_ok, reset_out), (fresh_ok, fresh_out));
+    assert!(!fresh_ok, "a fresh decoder rejects bytes past the last block");
+}

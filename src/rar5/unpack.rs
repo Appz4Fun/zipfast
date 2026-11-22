@@ -946,6 +946,8 @@ impl Unpacker {
         debug_assert!(self.parallel, "queued files are decoded on the workers");
         let boundary = Boundary { size, truncated: !self.input.is_empty() };
         self.input.clear();
+        // a resumed file stopped taking input at its last block; this file's blocks come next
+        self.ended = false;
         let at = self.batch.buf.len();
         self.batch.parts.push(Part {
             at,
@@ -1001,6 +1003,8 @@ impl Unpacker {
         self.tables_ready = false;
         self.history = [0; 4];
         self.last_len = 0;
+        // ordinary decoding again, until resume_at says otherwise
+        self.stop_at_last = false;
         self.next_file(size);
     }
 
@@ -1204,6 +1208,8 @@ impl Unpacker {
         }
         self.check_end(sink)?;
         sink.put(&[])?;
+        // the known plaintext a resumed file was checked against was that file's
+        self.verify = None;
         self.crc.reset();
         self.files_begun += 1;
         self.file_base = self.sp;
