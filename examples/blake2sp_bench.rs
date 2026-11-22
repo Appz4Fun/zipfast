@@ -14,7 +14,8 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Times BLAKE2sp over 256 MiB in 1 MiB updates: `cargo run --release --example blake2sp_bench [runs]`.
+//! Times BLAKE2sp over 256 MiB: `cargo run --release --example blake2sp_bench [runs] [update bytes]` (default
+//! 1 MiB updates; 0 hashes the whole input in one update).
 //! Run with `ZIPFAST_BLAKE2SP=scalar` for the portable rounds.
 
 use std::time::Instant;
@@ -22,13 +23,14 @@ use zipfast::blake2sp::{Blake2sp, blake2sp_backend};
 
 fn main() {
     let runs: usize = std::env::args().nth(1).map_or(3, |s| s.parse().unwrap());
+    let step: usize = std::env::args().nth(2).map_or(1 << 20, |s| s.parse().unwrap());
     let data: Vec<u8> = (0..256u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
     let mut best = f64::MAX;
     let mut digest = [0u8; 32];
     for _ in 0..runs {
         let t = Instant::now();
         let mut h = Blake2sp::new();
-        for chunk in data.chunks(1 << 20) {
+        for chunk in data.chunks(if step == 0 { data.len() } else { step }) {
             h.update(chunk);
         }
         digest = h.finish();

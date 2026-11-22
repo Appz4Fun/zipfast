@@ -152,7 +152,7 @@ pub(crate) enum Backend {
     #[cfg(target_arch = "x86_64")]
     Avx2,
     /// NEON: four leaves side by side, twice per round.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     Neon,
 }
 
@@ -162,7 +162,7 @@ impl Backend {
             Backend::Scalar => "scalar",
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2 => "avx2",
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             Backend::Neon => "neon",
         }
     }
@@ -176,7 +176,7 @@ impl Backend {
         if std::arch::is_x86_feature_detected!("avx2") {
             all.push(Backend::Avx2);
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         if std::arch::is_aarch64_feature_detected!("neon") {
             all.push(Backend::Neon);
         }
@@ -192,7 +192,7 @@ impl Backend {
         if std::arch::is_x86_feature_detected!("avx2") {
             return Backend::Avx2;
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         if std::arch::is_aarch64_feature_detected!("neon") {
             return Backend::Neon;
         }
@@ -206,7 +206,7 @@ impl Backend {
             1 => Backend::Scalar,
             #[cfg(target_arch = "x86_64")]
             2 => Backend::Avx2,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             3 => Backend::Neon,
             _ => {
                 let b = Backend::detect();
@@ -214,7 +214,7 @@ impl Backend {
                     Backend::Scalar => 1,
                     #[cfg(target_arch = "x86_64")]
                     Backend::Avx2 => 2,
-                    #[cfg(target_arch = "aarch64")]
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
                     Backend::Neon => 3,
                 };
                 PICKED.store(code, Ordering::Relaxed);
@@ -240,7 +240,7 @@ impl Backend {
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2 => unsafe { avx2::rounds(h, t, data) },
             // SAFETY: a `Neon` is only made once NEON has been found
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             Backend::Neon => unsafe { neon::rounds(h, t, data) },
         }
     }
@@ -299,23 +299,40 @@ impl Blake2sp {
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
+        // A round is compressed only while more than two rounds of input remain after it (buffered or not), so
+        // every leaf still has a later block for its final flag; at most two rounds stay buffered.
         while !data.is_empty() {
-            if self.buf_len == 0 && data.len() > 2 * ROUND {
-                // Straight from the input, leaving at most two rounds (and more than one) for the buffer.
-                let n = (data.len() - 2 * ROUND).div_ceil(ROUND) * ROUND;
-                self.run(&data[..n]);
-                data = &data[n..];
-                continue;
+            if self.buf_len == 0 {
+                if data.len() > 2 * ROUND {
+                    // Straight from the input, leaving at most two rounds (and more than one) for the buffer.
+                    let n = (data.len() - 2 * ROUND).div_ceil(ROUND) * ROUND;
+                    self.run(&data[..n]);
+                    data = &data[n..];
+                }
+                self.buf[..data.len()].copy_from_slice(data);
+                self.buf_len = data.len();
+                return;
             }
-            let take = (2 * ROUND - self.buf_len).min(data.len());
+            if self.buf_len + data.len() <= 2 * ROUND {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            // More than two rounds remain: complete the buffered round, then flush buffered rounds while the
+            // rule allows, so the buffer empties and the rest goes straight from the input.
+            let take = ((ROUND - self.buf_len % ROUND) % ROUND).min(data.len());
             self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
             self.buf_len += take;
             data = &data[take..];
-            if self.buf_len == 2 * ROUND && !data.is_empty() {
-                let first: [u8; ROUND] = self.buf[..ROUND].try_into().unwrap();
-                self.run(&first);
-                self.buf.copy_within(ROUND.., 0);
-                self.buf_len = ROUND;
+            let mut flush = 0;
+            while flush < self.buf_len && self.buf_len - flush + data.len() > 2 * ROUND {
+                flush += ROUND;
+            }
+            if flush > 0 {
+                self.backend.rounds(&mut self.h, self.t, &self.buf[..flush]);
+                self.t += (flush / LANES) as u64;
+                self.buf.copy_within(flush..self.buf_len, 0);
+                self.buf_len -= flush;
             }
         }
     }
@@ -515,7 +532,7 @@ mod avx2 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod neon {
     use super::{BLOCK, IV, LANES, ROUND, SIGMA};
     use std::arch::aarch64::*;
@@ -821,5 +838,30 @@ mod tests {
         // Detection reads the variable once per process; check the decision function directly.
         let forced = std::env::var_os("ZIPFAST_BLAKE2SP").is_some_and(|v| v == "scalar");
         assert_eq!(Backend::detect() == Backend::Scalar, forced || Backend::available().len() == 1);
+    }
+
+    /// Large updates after a small one leave the buffer and go straight to the backend; the digest is the same
+    /// however the input is cut, including cuts that leave exactly one or two rounds for the end.
+    #[test]
+    fn many_large_updates_hash_like_one() {
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2_246_822_519) >> 9) as u8).collect();
+        let want = hash_with(Backend::Scalar, &data, &[]);
+        for backend in Backend::available() {
+            for (first, step) in
+                [(1usize, 1 << 20), (100, 1 << 20), (511, 70_000), (513, 1024), (1024, 512), (1000, 1025)]
+            {
+                let mut h = Blake2sp::with_backend(backend);
+                h.update(&data[..first]);
+                for chunk in data[first..].chunks(step) {
+                    h.update(chunk);
+                }
+                assert_eq!(h.finish(), want, "{backend:?} first {first} step {step}");
+            }
+            // ends that leave one round, two rounds, and a round and a byte after the last update
+            for tail in [ROUND, 2 * ROUND, ROUND + 1, 2 * ROUND - 1] {
+                let cut = data.len() - tail;
+                assert_eq!(hash_with(backend, &data, &[37, cut - 37]), want, "{backend:?} tail {tail}");
+            }
+        }
     }
 }
