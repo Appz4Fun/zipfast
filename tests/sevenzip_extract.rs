@@ -208,8 +208,16 @@ fn passwords_missing_and_wrong_are_typed() {
         assert!(matches!(missing, Err(Error::Encrypted)), "{archive}: {missing:?}");
         assert_eq!(missing.unwrap_err().to_string(), "encrypted: a password is required, or the one given is wrong");
         let wrong = extract::run_with_password(&fixture(archive), &opts(Mode::Extract, &out), Some("wrong"), |_| {});
-        assert!(matches!(seven(&wrong), Some(SevenZipError::WrongPassword)), "{archive}: {wrong:?}");
-        assert_eq!(wrong.unwrap_err().to_string(), "7z: wrong password");
+        if archive == "aes_hdr.7z" {
+            // Encrypted headers: nothing can be listed, so the whole run fails.
+            assert!(matches!(seven(&wrong), Some(SevenZipError::WrongPassword)), "{archive}: {wrong:?}");
+            assert_eq!(wrong.unwrap_err().to_string(), "7z: wrong password");
+        } else {
+            // Data-only encryption: each member fails as a wrong password, as 7-Zip reports it, and the run ends.
+            let summary = wrong.unwrap_or_else(|e| panic!("{archive}: {e:?}"));
+            assert!(!summary.errors.is_empty(), "{archive}");
+            assert!(summary.errors.iter().all(|e| e.ends_with(": data error in encrypted file: wrong password?")));
+        }
         // Nothing was published.
         assert!(fs::read_dir(&out).map_or(true, |d| d.flatten().all(|e| e.path().is_dir())), "{archive}");
     }
@@ -236,8 +244,29 @@ fn the_checked_dispatcher_runs_7z_with_typed_password_faults() {
     assert_eq!((report.files(), report.failed()), (2, 0));
     let error = run("aes.7z", None, &Cancellation::default()).unwrap_err();
     assert!(matches!(error.operation(), Some(ReadFault::PasswordRequired)), "{error:?}");
-    let error = run("aes.7z", Some("wrong"), &Cancellation::default()).unwrap_err();
+    // Encrypted headers with a wrong password fail the run, typed.
+    let error = run("aes_hdr.7z", Some("wrong"), &Cancellation::default()).unwrap_err();
     assert!(matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes })));
+    // Data-only encryption: each member fails, with the typed wrong password as its error.
+    let mut wrong = Vec::new();
+    let report = extract::run_with_zip_policy(
+        &fixture("aes.7z"),
+        &opts(Mode::Extract, &dir.path().join("wrong")),
+        Some("wrong"),
+        &Cancellation::default(),
+        &Default::default(),
+        |event: ZipRunEvent<'_>| {
+            if let ZipRunEvent::MemberFailed { name, error, .. } = event {
+                let typed =
+                    matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes }));
+                wrong.push((name.to_owned(), typed));
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!((report.files(), report.failed()), (0, 2));
+    assert_eq!(wrong, [("text/a.txt".to_owned(), true), ("text/b.txt".to_owned(), true)]);
     let canceled = Cancellation::default();
     canceled.cancel();
     let error = run("lzma.7z", None, &canceled).unwrap_err();
@@ -787,18 +816,18 @@ fn rename_modes_for_duplicate_members() {
 }
 
 #[test]
-fn a_terminal_error_after_a_rename_existing_move_keeps_the_rename() {
+fn a_wrong_password_after_a_rename_existing_move_keeps_the_rename() {
     use zipfast::extract::RenameStyle;
     let dir = tempfile::tempdir().unwrap();
     let text = dir.path().join("text");
     fs::create_dir_all(&text).unwrap();
     fs::write(text.join("a.txt"), b"old").unwrap();
     let options = renaming(dir.path(), Overwrite::RenameExisting(RenameStyle::Underscore));
-    // The move happens when the member starts; the wrong password shows when it decodes.
-    let error = extract::run_with_renames(&fixture("aes.7z"), &options, Some("wrong"), |_| {}).unwrap_err();
-    assert!(matches!(SevenZipError::of(&error.error), Some(SevenZipError::WrongPassword)), "{error:?}");
-    assert_eq!(error.renames.len(), 1);
-    assert_eq!(error.renames[0].existing, Some(text.join("a_1.txt")));
+    // The move happens when the member starts; the wrong password shows when it decodes, and fails the member.
+    let summary = extract::run_with_renames(&fixture("aes.7z"), &options, Some("wrong"), |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert_eq!(summary.renames.len(), 1);
+    assert_eq!(summary.renames[0].existing, Some(text.join("a_1.txt")));
     assert_eq!(fs::read(text.join("a_1.txt")).unwrap(), b"old");
     // The reserved name is not left as an empty file.
     assert!(!text.join("a.txt").exists());
@@ -1124,4 +1153,166 @@ fn listing_applies_header_limits_only() {
         matches!(SevenZipError::of(&error), Some(SevenZipError::Limit { limit: SevenZipLimit::Entries, .. })),
         "{error:?}"
     );
+}
+
+// ---- A wrong password with data-only encryption fails each member, as 7-Zip does ----
+
+/// `7z x -pwrong` (7-Zip 26.06) on the `*_wrongpw.7z` fixtures prints
+/// `ERROR: Data Error in encrypted file. Wrong password? : <name>` for these members, in this order, writes none of
+/// them, extracts the plain ones and exits 2 (see the fixtures' README).
+const SEVEN_ZIP_WRONG_PASSWORD: [(&str, &[&str], &[&str]); 3] = [
+    ("solid_wrongpw.7z", &["a.txt", "b.txt", "c.txt"], &[]),
+    ("nonsolid_wrongpw.7z", &["a.txt", "b.txt"], &[]),
+    ("mixed_wrongpw.7z", &["a.txt"], &["p.txt"]),
+];
+
+#[test]
+fn a_wrong_password_fails_each_encrypted_member_as_7zip_reports_it() {
+    for mode in [Mode::Extract, Mode::Test] {
+        for (archive, failed, written) in SEVEN_ZIP_WRONG_PASSWORD {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let mut lines = Vec::new();
+            let summary = extract::run_with_password(&fixture(archive), &opts(mode, &out), Some("wrong"), |l| {
+                lines.push(l.to_owned())
+            })
+            .unwrap_or_else(|e| panic!("{archive}: the run goes on past wrong-password members: {e:?}"));
+            let want: Vec<String> =
+                failed.iter().map(|n| format!("{n}: data error in encrypted file: wrong password?")).collect();
+            assert_eq!(summary.errors, want, "{archive} {mode:?}: one line per member, in archive order");
+            assert_eq!(summary.files as usize, written.len(), "{archive} {mode:?}");
+            for name in failed {
+                assert!(!out.join(name).exists(), "{archive}: {name} is not published");
+            }
+            if mode == Mode::Extract {
+                for name in written {
+                    assert!(out.join(name).is_file(), "{archive}: the plain {name} is extracted");
+                }
+            }
+            // With the right password everything extracts.
+            let right = extract::run_with_password(
+                &fixture(archive),
+                &opts(mode, &dir.path().join("right")),
+                Some("pw"),
+                |_| {},
+            )
+            .unwrap();
+            assert!(right.errors.is_empty(), "{archive}: {:?}", right.errors);
+            assert_eq!(right.files as usize, failed.len() + written.len(), "{archive}");
+        }
+    }
+}
+
+/// One 7zAES-over-Copy folder holding `files` (name, contents, whether the member stores its CRC), with the folder's
+/// own CRC: the shape where a member without a CRC is held back for the folder's CRC. 7-Zip always writes member
+/// CRCs, so this is built by hand. The key derivation is 7zAES's "no hashing" power 0x3F: the key is the password.
+fn aes_folder_with_a_crc(dir: &Path, password: &str, files: &[(&str, &[u8], bool)]) -> PathBuf {
+    let mut key = [0u8; 32];
+    for (slot, byte) in key.iter_mut().zip(password.encode_utf16().flat_map(u16::to_le_bytes)) {
+        *slot = byte;
+    }
+    let iv = [9u8; 16];
+    let plain: Vec<u8> = files.iter().flat_map(|(_, data, _)| data.iter().copied()).collect();
+    let mut padded = plain.clone();
+    padded.resize(plain.len().next_multiple_of(16), 0);
+    let packed = zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap();
+    let mut h = vec![0x01, 0x04, 0x06, 0x00, 0x01, 0x09];
+    num(&mut h, packed.len() as u64);
+    // one folder: the 7zAES coder, with the folder's CRC
+    h.extend([0x00, 0x07, 0x0B, 0x01, 0x00, 0x01, 0x24, 0x06, 0xF1, 0x07, 0x01]);
+    let mut props = vec![0x7F, 0x0F];
+    props.extend(iv);
+    num(&mut h, props.len() as u64);
+    h.extend(props);
+    h.push(0x0C);
+    num(&mut h, plain.len() as u64);
+    h.extend([0x0A, 0x01]);
+    h.extend(crc32fast::hash(&plain).to_le_bytes());
+    h.push(0x00);
+    // substreams: one per file, sizes of all but the last, then the CRCs of those that store one
+    h.extend([0x08, 0x0D]);
+    num(&mut h, files.len() as u64);
+    h.push(0x09);
+    for (_, data, _) in &files[..files.len() - 1] {
+        num(&mut h, data.len() as u64);
+    }
+    h.extend([0x0A, 0x00]);
+    let mut bits = vec![0u8; files.len().div_ceil(8)];
+    for (i, (_, _, crc)) in files.iter().enumerate() {
+        if *crc {
+            bits[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    h.extend(bits);
+    for (_, data, crc) in files {
+        if *crc {
+            h.extend(crc32fast::hash(data).to_le_bytes());
+        }
+    }
+    h.extend([0x00, 0x00]);
+    // files: names only
+    h.push(0x05);
+    num(&mut h, files.len() as u64);
+    let mut names = vec![0u8];
+    for (name, _, _) in files {
+        names.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+        names.extend([0, 0]);
+    }
+    h.push(0x11);
+    num(&mut h, names.len() as u64);
+    h.extend(names);
+    h.extend([0x00, 0x00]);
+    let mut start = [0u8; 20];
+    start[..8].copy_from_slice(&(packed.len() as u64).to_le_bytes());
+    start[8..16].copy_from_slice(&(h.len() as u64).to_le_bytes());
+    start[16..].copy_from_slice(&crc32fast::hash(&h).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend(crc32fast::hash(&start).to_le_bytes());
+    out.extend(start);
+    out.extend(packed);
+    out.extend(h);
+    let path = dir.join("aes-folder-crc.7z");
+    fs::write(&path, out).unwrap();
+    path
+}
+
+/// A member held back for the folder's CRC (it has no CRC of its own) fails before the later member whose CRC
+/// shows the wrong password: the failures come in archive order, as 7-Zip lists them.
+#[test]
+fn a_wrong_password_reports_held_members_in_archive_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: [(&str, &[u8], bool); 3] = [
+        ("first.txt", b"no crc of its own", false),
+        ("second.txt", b"checked by its crc", true),
+        ("third.txt", b"after", true),
+    ];
+    let archive = aes_folder_with_a_crc(dir.path(), "right", &files);
+    for mode in [Mode::Extract, Mode::Test] {
+        let out = dir.path().join(format!("wrong-{mode:?}"));
+        let mut events = Vec::new();
+        let summary =
+            extract::run_with_password(&archive, &opts(mode, &out), Some("wrong"), |l| events.push(l.to_owned()))
+                .unwrap();
+        let want: Vec<String> = ["first.txt", "second.txt", "third.txt"]
+            .iter()
+            .map(|n| format!("{n}: data error in encrypted file: wrong password?"))
+            .collect();
+        assert_eq!(summary.errors, want, "{mode:?}: archive order");
+        let reported: Vec<&String> = events.iter().filter(|l| l.contains("wrong password")).collect();
+        assert_eq!(reported, want.iter().collect::<Vec<_>>(), "{mode:?}: lines as they happen, in archive order");
+        assert_eq!(summary.files, 0);
+        for (name, _, _) in &files {
+            assert!(!out.join(name).exists(), "{mode:?}: {name} is not published");
+        }
+        // The right password extracts all three, the first vouched for by the folder's CRC.
+        let right = extract::run_with_password(
+            &archive,
+            &opts(mode, &dir.path().join(format!("right-{mode:?}"))),
+            Some("right"),
+            |_| {},
+        )
+        .unwrap();
+        assert!(right.errors.is_empty(), "{:?}", right.errors);
+        assert_eq!(right.files, 3);
+    }
 }
