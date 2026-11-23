@@ -516,6 +516,9 @@ pub fn set_identity(
     let mut firsts: HashMap<(Vec<u8>, Kind, usize), usize> = HashMap::new();
     let mut first_volume_number = None;
     let mut first_is_rar = false;
+    // A first-volume RAR error waits for the last volume: a ZIP or 7z directory there identifies the set even
+    // when the RAR the scanner found in the first volume is one stored inside it that cannot be read.
+    let mut first_error = None;
     if let Some(held) = first {
         // The RAR scanner finds a volume behind a self-extracting stub; anything else is read as a last volume.
         match MemberMap::from_volume(held.head, options.clone()) {
@@ -545,17 +548,26 @@ pub fn set_identity(
                 }
             }
             Err(MapError::NotArchive) => {}
-            Err(error) => return Err(error),
+            Err(error) if control.is_canceled() => return Err(error),
+            Err(error) => first_error = Some(error),
         }
     }
+    let rar = |f: MapFormat| matches!(f, MapFormat::Rar4 | MapFormat::Rar5);
     let (identity, source) = match (last, first) {
-        (Some(held), _) => (Some(last_volume_identity(held, options)?), FactSource::Last),
+        (Some(held), _) => match last_volume_identity(held, options) {
+            // The last volume is RAR too, so the first volume's error is the set's own.
+            Ok(identity) if first_error.is_some() && rar(identity.format) => {
+                return Err(first_error.expect("checked"));
+            }
+            Ok(identity) => (Some(identity), FactSource::Last),
+            Err(error) => return Err(first_error.unwrap_or(error)),
+        },
+        (None, Some(_)) if first_error.is_some() => return Err(first_error.expect("checked")),
         (None, Some(held)) if !first_is_rar => (Some(last_volume_identity(held, options)?), FactSource::First),
         (None, None) => return Err(MapError::NotArchive),
         _ => (None, FactSource::Last),
     };
     if let Some(identity) = identity {
-        let rar = |f: MapFormat| matches!(f, MapFormat::Rar4 | MapFormat::Rar5);
         if first_is_rar && !rar(identity.format) {
             // A ZIP or 7z directory in the last volume decides the set: a RAR found in the first volume was one
             // stored inside it (a split ZIP's .z01 holding a .rar, say), not the set itself.

@@ -342,10 +342,13 @@ fn a_last_volume_directory_decides_over_a_rar_stored_in_the_first() {
 
 #[test]
 fn many_members_match_in_linear_time() {
-    const N: usize = 20_000;
-    let names: Vec<String> = (0..N).map(|i| format!("f{i:06}")).collect();
-    let specs: Vec<FileSpec<'_>> = names.iter().map(|n| FileSpec::new(n, b"x")).collect();
-    let rar = common::archive(&specs);
+    // Work-bound rather than wall-clock: identifying four times the members must take about four times as long,
+    // not sixteen. The best of three runs of each size keeps a busy machine from deciding the ratio.
+    fn archive_of(n: usize) -> Vec<u8> {
+        let names: Vec<String> = (0..n).map(|i| format!("f{i:06}")).collect();
+        let specs: Vec<FileSpec<'_>> = names.iter().map(|n| FileSpec::new(n, b"x")).collect();
+        common::archive(&specs)
+    }
     let mut options = MapOptions::new("big.rar");
     options.limits.entries = 1 << 20;
     options.limits.header_bytes = 1 << 30;
@@ -355,13 +358,43 @@ fn many_members_match_in_linear_time() {
     options.limits.header_allocation = 1 << 30;
     options.limits.metadata_bytes = 1 << 30;
     options.limits.parts = 1 << 20;
-    let started = std::time::Instant::now();
-    let s = set_identity(Some(HeldVolume::whole(&rar)), Some(HeldVolume::whole(&rar)), options.clone()).unwrap();
-    assert_eq!(s.members.len(), N, "each member matched with itself, none duplicated");
-    assert!(s.members.iter().all(|m| m.checks.is_some() && m.size_from == Some(FactSource::First)));
-    // Quadratic matching took minutes at this size; linear takes well under a second (generous for debug builds).
-    assert!(started.elapsed().as_secs() < 60, "took {:?}", started.elapsed());
+    let best = |rar: &[u8], n: usize| -> f64 {
+        (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let s =
+                    set_identity(Some(HeldVolume::whole(rar)), Some(HeldVolume::whole(rar)), options.clone()).unwrap();
+                assert_eq!(s.members.len(), n, "each member matched with itself, none duplicated");
+                assert!(s.members.iter().all(|m| m.checks.is_some() && m.size_from == Some(FactSource::First)));
+                started.elapsed().as_secs_f64()
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let (small, large) = (archive_of(4_000), archive_of(16_000));
+    let (t_small, t_large) = (best(&small, 4_000), best(&large, 16_000));
+    // Linear work gives a ratio near 4; matching every member against all earlier ones gives near 16.
+    assert!(
+        t_large < t_small * 9.0,
+        "4x the members took {:.1}x as long ({t_small:.3}s, {t_large:.3}s)",
+        t_large / t_small
+    );
     // Cancellation is honoured.
     options.control.cancel();
-    assert!(set_identity(Some(HeldVolume::whole(&rar)), Some(HeldVolume::whole(&rar)), options).is_err());
+    assert!(set_identity(Some(HeldVolume::whole(&large)), Some(HeldVolume::whole(&large)), options).is_err());
+}
+
+#[test]
+fn an_unreadable_rar_stored_in_the_first_volume_does_not_hide_the_zip_directory() {
+    // An -hp RAR (password unknown), stored in a split ZIP's .z01; the ZIP itself is not encrypted.
+    let inner = fixture("rar4/encrypted_headers.rar");
+    let (z01, zip) = split_zip("locked.rar", &inner);
+    let s = id(Some(HeldVolume::whole(&z01)), Some(HeldVolume::whole(&zip)), Some("not the password"));
+    assert_eq!(s.format, MapFormat::Zip);
+    assert_eq!(s.members.len(), 1);
+    assert_eq!(s.members[0].name.as_deref(), Some("locked.rar"));
+    assert_eq!(s.members[0].checks.and_then(|c| c.crc32), Some(crc32fast::hash(&inner)));
+    // With only the first volume there is nothing else to go on: the RAR's error stands.
+    let alone =
+        set_identity(Some(HeldVolume::whole(&z01)), None, MapOptions::new("x").password(Some("not the password")));
+    assert!(alone.is_err(), "{alone:?}");
 }
