@@ -162,13 +162,50 @@ impl Bundle {
         Ok(())
     }
     fn put(&mut self, name: &str, bytes: &[u8], page: bool) -> PartialResult<()> {
+        self.put_batch(&[(name.to_owned(), bytes.to_vec(), page)])
+    }
+    /// Writes `files` and makes each durable: each file is written and synced (and its descriptor closed) in
+    /// turn, then the directory is synced once for all their names, then they are marked durable. Nothing in a batch is
+    /// anchored by it: the caller anchors a record only after the batch returns, so a file durable before
+    /// another of its batch never matters (an unanchored record or page is ignored on recovery).
+    pub(super) fn put_batch(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
         self.directory.check()?;
+        let mut names = Vec::new();
+        for (name, bytes, page) in files {
+            // Each file is synced and its descriptor closed before the next is opened, so a batch holds one
+            // journal descriptor at a time, as single puts do, whatever `PartialLimits::open_files` allows; only
+            // the directory sync is shared.
+            if let Some(file) = self.put_write(name, bytes, *page)? {
+                sync_journal(&file.file, &[name], false).map_err(|e| io_error(OutputOperation::Flush, e))?;
+                drop(file);
+                names.push(name.as_str());
+            }
+        }
+        if names.is_empty() {
+            return Ok(());
+        }
+        // Equal visible bytes may be left by a failed file or directory sync.
+        // Every successful put must establish both durability boundaries.
+        sync_journal(&self.directory.held.file, &names, true).map_err(|e| io_error(OutputOperation::Flush, e))?;
+        self.directory.check()?;
+        for name in names {
+            self.files.iter_mut().find(|f| f.name == name).unwrap().durable = true;
+        }
+        Ok(())
+    }
+    /// Writes one file of a batch, or nothing (None) when this process already put it durably.
+    fn put_write(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        page: bool,
+    ) -> PartialResult<Option<std::sync::Arc<super::native::HeldFile>>> {
         // A content-addressed file this process already put durably needs nothing more, unless something outside
         // changed its size; then the full path below re-reads it and refuses to repair anchored bytes.
         if self.files.iter().any(|f| f.name == name && f.durable && f.size == bytes.len() as u64)
             && std::fs::symlink_metadata(self.directory.path.join(name)).is_ok_and(|m| m.len() == bytes.len() as u64)
         {
-            return Ok(());
+            return Ok(None);
         }
         let exists = self.files.iter().any(|f| f.name == name && f.written);
         if !self.files.iter().any(|f| f.name == name) {
@@ -200,13 +237,7 @@ impl Bundle {
             }
             at += n;
         }
-        // Equal visible bytes may be left by a failed file or directory sync.
-        // Every successful put must establish both durability boundaries.
-        sync_journal(&file.file, name, false).map_err(|e| io_error(OutputOperation::Flush, e))?;
-        sync_journal(&self.directory.held.file, name, true).map_err(|e| io_error(OutputOperation::Flush, e))?;
-        self.directory.check()?;
-        self.files.iter_mut().find(|f| f.name == name).unwrap().durable = true;
-        Ok(())
+        Ok(Some(file))
     }
     fn require_unanchored(&self, name: &str) -> PartialResult<()> {
         let anchor = self.acknowledged.as_ref().ok_or_else(|| err(PartialErrorKind::JournalCorrupt))?;
@@ -465,13 +496,10 @@ impl Bundle {
         }
         Ok(pressure && reclaim.iter().any(|n| *n > 0))
     }
-    pub(super) fn write_pages(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
-        for (name, bytes, page) in files {
-            if *page {
-                self.put(name, bytes, true)?;
-            }
-        }
-        Ok(())
+    /// Writes every file a transaction prepared, its pages and its records, in one batch (see [`Self::put_batch`]):
+    /// the records' later `append_*` find them durable and write nothing.
+    pub(super) fn write_files(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
+        self.put_batch(files)
     }
     pub(super) fn acknowledge(&mut self, state: &StateAnchor, ack: &AnchorAck) -> PartialResult<()> {
         if !ack.matches(state) {
@@ -545,15 +573,16 @@ fn write_journal(file: &std::fs::File, name: &str, at: u64, bytes: &[u8]) -> std
         crate::output::range::write_at(file, at, bytes)
     }
 }
-fn sync_journal(file: &std::fs::File, name: &str, directory: bool) -> std::io::Result<()> {
+/// Syncs a journal file, or the journal directory for the files `names` just created or extended.
+fn sync_journal(file: &std::fs::File, names: &[&str], directory: bool) -> std::io::Result<()> {
     super::SYNCS.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     {
-        super::tests::state::journal_sync(file, name, directory)
+        super::tests::state::journal_sync(file, names, directory)
     }
     #[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
     {
-        let _ = (name, directory);
+        let _ = (names, directory);
         file.sync_all()
     }
 }

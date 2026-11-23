@@ -1163,10 +1163,10 @@ pub(crate) fn journal_write(file: &fs::File, name: &str, at: u64, bytes: &[u8]) 
     }
     crate::output::range::write_at(file, at, bytes)
 }
-pub(crate) fn journal_sync(file: &fs::File, name: &str, directory: bool) -> std::io::Result<()> {
+pub(crate) fn journal_sync(file: &fs::File, names: &[&str], directory: bool) -> std::io::Result<()> {
     if let Some(JournalFault::Sync { page, directory: wanted, remaining }) = JOURNAL_FAULT.get()
         && directory == wanted
-        && name.starts_with(if page { "p-" } else { "r-" })
+        && names.iter().any(|name| name.starts_with(if page { "p-" } else { "r-" }))
     {
         if remaining > 0 {
             JOURNAL_FAULT.set(Some(JournalFault::Sync { page, directory, remaining: remaining - 1 }));
@@ -1701,4 +1701,118 @@ fn dropping_while_panicking_leaves_the_group_uncommitted() {
     assert_eq!(anchor.sequence(), 2, "the group intent stays anchored");
     let state = PartialState::load(&f.dir.path().join("state"), &anchor, &PartialLimits::default()).unwrap();
     assert_eq!(f.open(state).unwrap().remaining().unwrap(), vec![0..16]);
+}
+
+// Catches a grouped hole (`PartialLimits::group_holes`) paying a transaction of its own, sharing an id with
+// another hole, or being lost once its group commits.
+#[test]
+fn grouped_holes_join_the_open_group_and_commit_with_it() {
+    let f = Fixture::new();
+    let limits = PartialLimits { group_holes: true, ..PartialLimits::default() };
+    let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    let data = b"abcdefghijklmnop";
+    file.core.write_original(0, &data[..4]).unwrap();
+    let sequence = || f.store.current(&f.member).unwrap().unwrap().sequence();
+    let opened = sequence();
+    let first = file.core.hole_report(4..6, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(first.clone(), &[]).unwrap();
+    file.core.write_original(6, &data[6..10]).unwrap();
+    let second = file.core.hole_report(10..12, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(second.clone(), &[]).unwrap();
+    // No anchor moved: the holes are in the open group, and the anchored state (what a crash would reopen) is
+    // still the group's intent, which knows neither hole nor the output after them.
+    assert_eq!(sequence(), opened, "grouped holes add no transaction");
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.revision, second.revision, "a group's holes share its revision");
+    // Committing the group makes both durable.
+    assert_eq!(file.remaining().unwrap(), vec![4..6, 10..16]);
+    assert!(sequence() > opened);
+    let state = file.close().unwrap();
+    let reopened = f.open(state).unwrap();
+    assert_eq!(reopened.remaining().unwrap(), vec![4..6, 10..16]);
+}
+// Catches the opt-in changing anything when it is off, or grouping a hole that is not at the end of the produced
+// output: those still commit in a transaction of their own.
+#[test]
+fn ungrouped_holes_still_commit_on_their_own() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    file.core.write_original(0, b"abcd").unwrap();
+    let sequence = || f.store.current(&f.member).unwrap().unwrap().sequence();
+    let before = sequence();
+    let report = file.core.hole_report(4..6, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(report.clone(), &[]).unwrap();
+    assert!(sequence() > before, "without group_holes a hole is its own transaction");
+    assert_eq!(report.id, report.revision);
+}
+// Catches grouped hole ids repeating when a long hole arrives one read buffer at a time: the reports coalesce into
+// one kept record, but each is delivered as its own event and must keep its own id.
+#[test]
+fn a_long_grouped_hole_arriving_buffer_by_buffer_keeps_distinct_ids() {
+    let f = Fixture::new();
+    let limits = PartialLimits { group_holes: true, ..PartialLimits::default() };
+    let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    file.core.write_original(0, b"abcd").unwrap();
+    let mut ids = Vec::new();
+    for at in 4..10 {
+        let report = file.core.hole_report(at..at + 1, HoleCause::Missing).unwrap();
+        file.core.record_hole_with(report.clone(), &[]).unwrap();
+        ids.push(report.id);
+    }
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "{ids:?}");
+    assert_eq!(file.remaining().unwrap(), vec![4..16]);
+}
+// Catches a grouped hole leaving its group open past `group_commit_interval`: with an interval of zero, recording
+// the hole commits the group at once.
+#[test]
+fn a_grouped_hole_commits_a_group_past_its_interval() {
+    let f = Fixture::new();
+    let limits = PartialLimits {
+        group_holes: true,
+        group_commit_interval: std::time::Duration::ZERO,
+        ..PartialLimits::default()
+    };
+    let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    file.core.write_original(0, b"abcd").unwrap();
+    let sequence = || f.store.current(&f.member).unwrap().unwrap().sequence();
+    let before = sequence();
+    let report = file.core.hole_report(4..6, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(report, &[]).unwrap();
+    // The hole opened a group (its intent) and, the interval being spent, committed it (its commit).
+    assert_eq!(sequence(), before + 2, "the expired group committed with the hole");
+}
+// Catches a grouped refill (`PartialLimits::group_refills`) paying a transaction per step, losing its bytes once the
+// group commits, or grouping bytes over known output that archive bytes must correct.
+#[test]
+fn grouped_refills_join_the_open_group_and_corrections_keep_their_transaction() {
+    let f = Fixture::new();
+    let limits = PartialLimits { group_refills: true, fill_bytes: 4, ..PartialLimits::default() };
+    let mut file = f.create_with(limits.clone(), ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    let start = f.evidence.parts[0].packed.range.start;
+    hole(&f, &file, 1, 0..16);
+    let mut volume = vec![0u8; start as usize + 16];
+    volume[start as usize..].copy_from_slice(b"abcdefghijklmnop");
+    let sequence = || f.store.current(&f.member).unwrap().unwrap().sequence();
+    let before = sequence();
+    let result = file.refill_from_packed(0, start..start + 16, &mut std::io::Cursor::new(volume.clone())).unwrap();
+    // Four 4-byte steps, one group: only its intent is anchored, no transaction per step.
+    assert_eq!(sequence(), before + 1);
+    assert_eq!(result.applied, vec![0..4, 4..8, 8..12, 12..16]);
+    // The group's commit makes the bytes known.
+    assert!(file.remaining().unwrap().is_empty());
+    assert_eq!(fs::read(f.output()).unwrap(), b"abcdefghijklmnop");
+    let state = file.close().unwrap();
+    assert!(f.open(state).unwrap().remaining().unwrap().is_empty());
+
+    // Alt bytes that differ are corrected by the archive bytes, in a transaction, never in a group.
+    let f = Fixture::new();
+    let mut file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    hole(&f, &file, 1, 0..16);
+    file.core.fill_plain(0, b"wxyz").unwrap();
+    let result = file.refill_from_packed(0, start..start + 8, &mut std::io::Cursor::new(volume)).unwrap();
+    assert_eq!(result.corrected, vec![0..4]);
+    assert_eq!(&fs::read(f.output()).unwrap()[..8], b"abcdefgh");
 }

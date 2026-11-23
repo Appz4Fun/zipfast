@@ -423,6 +423,10 @@ pub(crate) struct PersistentNative {
     pub(super) binding: NativeBinding,
     protection: NativeProtection,
     usage: Usage,
+    /// Whether the output may hold bytes not yet synced. Set before every write or resize of the output (and on
+    /// open, when nothing is known), cleared by a successful [`Self::sync`]; a sync with nothing written since
+    /// the last one is skipped, so a transaction that writes no output (a hole, a kept block) costs no output sync.
+    dirty: std::sync::atomic::AtomicBool,
 }
 pub(super) fn hex(bytes: &[u8]) -> String {
     const H: &[u8; 16] = b"0123456789abcdef";
@@ -713,6 +717,7 @@ impl PersistentNative {
                 binding,
                 protection,
                 usage,
+                dirty: std::sync::atomic::AtomicBool::new(true),
             };
             native.check(if create { 0 } else { spec.size })?;
             Ok(native)
@@ -768,7 +773,18 @@ impl PersistentNative {
         Ok(())
     }
     pub(crate) fn sync(&self) -> PartialResult<()> {
-        super::sync_file(&self.output.file).map_err(|e| io_error(OutputOperation::Flush, e))
+        use std::sync::atomic::Ordering;
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        super::sync_file(&self.output.file).map_err(|e| {
+            self.dirty.store(true, Ordering::Release);
+            io_error(OutputOperation::Flush, e)
+        })
+    }
+    /// Marks the output as changed since the last sync; call before any write or resize of it.
+    pub(crate) fn written(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
     pub(super) fn sync_parents(&self) -> PartialResult<()> {
         for file in [&self.root.held.file, &self.state_root.held.file, &self.bundle.held.file] {

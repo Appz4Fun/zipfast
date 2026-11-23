@@ -60,6 +60,10 @@ path = "src/main.rs"
 name = "persistent_bench"
 required-features = ["persistent-partials"]
 
+[[example]]
+name = "persistent_holes_bench"
+required-features = ["persistent-partials"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
