@@ -475,6 +475,36 @@ impl MemberMachine {
                 let mut at = 0;
                 let result = (|| -> Result<()> {
                     while at < len {
+                        // A run of whole blocks with known ciphertext before it decrypts in one call, so the
+                        // hardware AES path decrypts eight blocks at a time; it emits exactly what the block
+                        // loop below would (no CBC neighbour records: every block and its predecessor are known).
+                        if let Some(bytes) = data
+                            && state.used == 0
+                            && state.known
+                            && state.previous_known
+                        {
+                            let whole = (len - at) / 16 * 16;
+                            if whole >= 32 {
+                                if hole != 0 {
+                                    flush_stored_run(&mut self.scratch, &mut hole, checks, &mut self.delivered, sink)?;
+                                }
+                                // Capacity was admitted before processing (len plus one retained block).
+                                if self.scratch.capacity() - self.scratch.len() < whole {
+                                    return Err(Error::Corrupt("unadmitted Stored scratch"));
+                                }
+                                let start = self.scratch.len();
+                                let run = &bytes[at..at + whole];
+                                self.scratch.extend_from_slice(run);
+                                state.block.copy_from_slice(&run[whole - 16..]);
+                                cipher.aes.decrypt_cbc_in_place(&mut cipher.iv, &mut self.scratch[start..]);
+                                let kept = cipher.trim_stored(&self.scratch[start..], processed)?.len();
+                                self.scratch.truncate(start + kept);
+                                processed =
+                                    processed.checked_add(kept as u64).ok_or(Error::Corrupt("inner size overflow"))?;
+                                at += whole;
+                                continue;
+                            }
+                        }
                         let n = (16 - state.used).min(len - at);
                         if let Some(bytes) = data {
                             state.block[state.used..state.used + n].copy_from_slice(&bytes[at..at + n]);
@@ -1105,6 +1135,52 @@ mod tests {
             self.holes += 1;
             self.output.resize(self.output.len() + len as usize, None);
             Ok(())
+        }
+    }
+    /// Whole-block runs decrypt in one call; whatever the feed sizes and holes, the output is what feeding one byte
+    /// at a time (which never takes that path) gives.
+    #[test]
+    fn stored_runs_decrypt_like_single_bytes_at_any_split_and_hole() {
+        let size = 4096 + 7;
+        let (header, ciphertext, plain) = recovery_fixture(size);
+        let packed = ciphertext.len();
+        let run = |feeds: &[(usize, bool)]| {
+            let usage = Usage::new(ProgressiveLimits::default());
+            let mut machine =
+                MemberMachine::new(&header, context(), Some("secret"), &usage, &SessionControl::default()).unwrap();
+            let mut sink = RecoveryRecorder::default();
+            let mut at = 0;
+            for &(len, absent) in feeds {
+                let len = len.min(packed - at);
+                machine.reserve_progressive_scratch(len, &usage).unwrap();
+                machine.feed_stored((!absent).then_some(&ciphertext[at..at + len]), len, &mut sink).unwrap();
+                at += len;
+            }
+            assert_eq!(at, packed);
+            sink.output
+        };
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..40u32 {
+            let mut feeds = Vec::new();
+            let mut at = 0;
+            while at < packed {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let len = 1 + (x % 700) as usize;
+                let absent = !round.is_multiple_of(2) && x.is_multiple_of(9);
+                feeds.push((len.min(packed - at), absent));
+                at += len.min(packed - at);
+            }
+            // the reference: the same holes, fed one byte at a time
+            let singles: Vec<(usize, bool)> =
+                feeds.iter().flat_map(|&(len, absent)| (0..len).map(move |_| (1, absent))).collect();
+            let got = run(&feeds);
+            assert_eq!(got, run(&singles), "round {round}");
+            assert_eq!(got.len(), size);
+            if round.is_multiple_of(2) {
+                assert!(got.iter().zip(&plain).all(|(g, p)| *g == Some(*p)), "round {round}: no hole, exact plaintext");
+            }
         }
     }
     #[test]

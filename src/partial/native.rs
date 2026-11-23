@@ -406,6 +406,11 @@ pub(crate) struct NativeBinding {
     pub output: Identity,
     pub bundle: Identity,
 }
+#[cfg(test)]
+thread_local! {
+    /// Full checks run on this thread ([`PersistentNative::check`]), to test that writes in a group skip them.
+    pub(crate) static FULL_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 pub(crate) struct PersistentNative {
     pub(super) output: Arc<HeldFile>,
     pub(super) output_path: PathBuf,
@@ -720,6 +725,24 @@ impl PersistentNative {
         })
     }
     pub(crate) fn check(&self, expected_len: u64) -> PartialResult<()> {
+        #[cfg(test)]
+        FULL_CHECKS.with(|c| c.set(c.get() + 1));
+        self.check_held(expected_len)?;
+        self.protection.check_partial_bindings(&self.usage)?;
+        self.protection.check_partial_target(&self.output_path, &mut self.usage.clone())?;
+        self.protection.check_partial_subtree(&self.bundle.path, &mut self.usage.clone())?;
+        self.protection.check_target(&self.output_path, Some(self.binding.output), &mut self.usage.clone())?;
+        Ok(())
+    }
+    /// The part of [`Self::check`] about what this member holds: the roots, parents and bundle directories, the
+    /// output and lock files by identity at their paths, and the output's length. It leaves out the comparisons
+    /// with the protected inputs, which canonicalize every protected path (a `realpath` and `lstat` per volume).
+    ///
+    /// A write inside an open group checks only this. That is safe because writes go through the held output
+    /// descriptor, never a path, and the full check runs when the group's intent is anchored and before and
+    /// after its commit, so no durable state claims output written after a change the full check would see.
+    /// Between those, a replaced or truncated output, lock or parent is still caught before the next write.
+    pub(crate) fn check_held(&self, expected_len: u64) -> PartialResult<()> {
         self.root.check()?;
         self.state_root.check()?;
         self.bundle.check()?;
@@ -742,10 +765,6 @@ impl PersistentNative {
         if self.output.file.metadata().map_err(|e| io_error(OutputOperation::Metadata, e))?.len() != expected_len {
             return Err(err(PartialErrorKind::OutputChanged));
         }
-        self.protection.check_partial_bindings(&self.usage)?;
-        self.protection.check_partial_target(&self.output_path, &mut self.usage.clone())?;
-        self.protection.check_partial_subtree(&self.bundle.path, &mut self.usage.clone())?;
-        self.protection.check_target(&self.output_path, Some(self.binding.output), &mut self.usage.clone())?;
         Ok(())
     }
     pub(crate) fn sync(&self) -> PartialResult<()> {

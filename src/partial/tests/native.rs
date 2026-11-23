@@ -305,3 +305,35 @@ fn creation_failure_reports_retained_bundle_location() {
     assert_eq!(fs::metadata(f.output()).unwrap().len(), 0);
     assert!(fs::read_dir(&location.state_bundle).unwrap().count() >= 5);
 }
+
+const DATA: &[u8; 16] = b"abcdefghijklmnop";
+// Catches a write inside an open group skipping the checks that still matter: a parent swapped after the group's
+// first write is refused before the next write, and nothing reaches the replacement.
+#[test]
+fn a_parent_swap_inside_an_open_group_refuses_the_next_write() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    file.core.write_original(0, &DATA[..4]).unwrap();
+    fs::rename(f.dir.path().join("out"), f.dir.path().join("old-out")).unwrap();
+    fs::create_dir(f.dir.path().join("out")).unwrap();
+    fs::write(f.output(), b"replacement").unwrap();
+    assert!(file.core.write_original(4, &DATA[4..8]).is_err());
+    assert_eq!(fs::read(f.output()).unwrap(), b"replacement");
+}
+// Catches every write in a group paying the full protection check (a realpath per protected path): writes after the
+// group opened run only the held-file checks, and the group's commit runs the full check again.
+#[test]
+fn writes_in_an_open_group_skip_the_full_check_and_the_commit_runs_it() {
+    use crate::partial::native::FULL_CHECKS;
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    file.core.write_original(0, &DATA[..1]).unwrap();
+    let before = FULL_CHECKS.with(|c| c.get());
+    for at in 1..12 {
+        file.core.write_original(at, &DATA[at as usize..at as usize + 1]).unwrap();
+    }
+    assert_eq!(FULL_CHECKS.with(|c| c.get()), before, "no full check inside the open group");
+    let state = file.state().unwrap();
+    assert!(FULL_CHECKS.with(|c| c.get()) > before, "committing the group checks in full");
+    drop(state);
+}
