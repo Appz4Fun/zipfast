@@ -184,8 +184,9 @@ pub struct FeedStats {
     /// once when it skips it).
     pub holes: u64,
     /// Output decoded again without being written: a compressed repair from its checkpoint up to the lost range,
-    /// a restored decode from its checkpoint up to the frontier it had reached, and a 7z member's folder output from
-    /// the last reset before it.
+    /// a restored decode from its checkpoint up to the frontier it had reached, and output before the member that a
+    /// decoder not handed the state before it decodes again (a 7z member's folder output from the last reset, a
+    /// RAR 4.x solid successor's earlier members).
     pub redecoded: u64,
 }
 
@@ -1418,9 +1419,9 @@ impl FeedDecoder {
         self.stream_start
     }
 
-    /// A decoder of member `index`, the next member of this one's RAR 5.0 solid stream, going on from this decoder's
-    /// state: the decoder with its window, tables and match history, so nothing before the new member is decoded
-    /// again. Once this decoder's main decode has finished (its frontier at its size), however
+    /// A decoder of member `index`, the next member of this one's solid stream (RAR), going on from this decoder's
+    /// state: the RAR 5.0 or 4.x decoder with its window, tables and history (and PPMd model), so nothing before the
+    /// new member is decoded again. Once this decoder's main decode has finished (its frontier at its size), however
     /// its repairs stand: this decoder keeps its lost ranges and repairs them as before, and the new one reads from
     /// where this one stopped.
     ///
@@ -1433,6 +1434,9 @@ impl FeedDecoder {
         if self.rar5.is_some() {
             return self.handoff_rar5(map, index, options);
         }
+        if self.rar4.is_some() {
+            return self.handoff_rar4(map, index, options);
+        }
         Err(FeedError::Unsupported(FeedUnsupported::Solid))
     }
 
@@ -1440,6 +1444,9 @@ impl FeedDecoder {
     /// before it.
     fn reach(&self) -> u64 {
         if let Some(r) = &self.rar5 {
+            return r.reach();
+        }
+        if let Some(r) = &self.rar4 {
             return r.reach();
         }
         u64::MAX
@@ -1505,12 +1512,14 @@ impl FeedDecoder {
 
 /// How a decoder starts.
 enum Begin {
-    /// at the member's start
+    /// at the member's start (a solid successor of RAR 4.x decodes the stream from its start)
     Fresh,
     /// in [`FeedDecoder::restore`]: the snapshot gives the state
     Restore,
     /// a RAR 5.0 solid successor from a carry (and, handed over in-session, the live decoder installed after)
     Carry(SolidCarry),
+    /// a RAR 4.x solid successor going on from the decoder of the member before
+    Rar4(Box<crate::rar5::unpack::rar4::Rar4Decoder>),
 }
 
 /// The state a RAR 5.0 solid successor starts from ([`FeedDecoder::solid_carry`]): about 500 bytes, no plaintext
@@ -1581,6 +1590,8 @@ impl SolidCarry {
 
 /// A member's place in its RAR solid stream.
 struct SolidRun {
+    /// the stream's first member
+    first: usize,
     /// the member's start in the stream's output
     start: u64,
     /// the starts of the stream's members up to this one, ascending (this one's last)
@@ -1635,7 +1646,7 @@ fn solid_run(map: &MemberMap, index: usize) -> Result<SolidRun, FeedError> {
         dictionary = dictionary.max(m.dictionary);
     }
     let successor = members[index + 1..].iter().find(|m| decodes(m)).is_some_and(|m| m.solid);
-    Ok(SolidRun { start: at, starts, prev, successor, dictionary })
+    Ok(SolidRun { first, start: at, starts, prev, successor, dictionary })
 }
 
 /// [`member_identity`] of a solid successor, bound to its place in the stream too (the sizes before it).

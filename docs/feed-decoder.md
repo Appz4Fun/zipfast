@@ -94,7 +94,8 @@ check value (RAR 5.0 with a check, WinZip AES); otherwise as `crc_ok: Some(false
 
 `stats()` counts packed bytes read, output bytes written, holes met and output `redecoded` (decoded again without
 being written: a compressed repair from its checkpoint up to the lost range, a restore from its checkpoint up to the
-old frontier, and for a 7z member after its folder's first the folder output before it), over the decoder's life.
+old frontier, for a 7z member after its folder's first the folder output before it, and for a RAR 4.x solid successor
+started on its own the stream's earlier members), over the decoder's life.
 
 ## Layers
 
@@ -106,8 +107,8 @@ old frontier, and for a 7z member after its folder's first the folder output bef
 | ZipCrypto | refused (`FeedUnsupported::SequentialCipher`): its keystream needs every earlier byte |
 | compressed RAR 5.0 (methods 1-5, AES-256 under them too) | see [compressed RAR 5.0](#compressed-rar-50); solid successors [below](#solid-streams-and-folders) |
 | 7z folders of one LZMA2 coder, alone or over 7zAES, any member of the folder | see [7z LZMA2](#7z-lzma2) |
-| compressed RAR 4.x (unpack versions 1.5, 2.0, 2.6, 2.9: LZ, audio, PPMd, filters; AES-128 under them too), not solid | waits at every hole; see [compressed RAR 4.x](#compressed-rar-4x) |
-| solid RAR 4.x members after a stream's first, ZIP compressed members, other 7z coder chains | refused (`Solid`, `Compressed`, `Coders`); see [next](#next) |
+| compressed RAR 4.x (unpack versions 1.5, 2.0, 2.6, 2.9: LZ, audio, PPMd, filters; AES-128 under them too) | waits at every hole; see [compressed RAR 4.x](#compressed-rar-4x); solid successors [below](#solid-streams-and-folders) |
+| ZIP compressed members, other 7z coder chains | refused (`Compressed`, `Coders`); see [next](#next) |
 
 A repair reads only the lost range's bytes (under CBC, also the block before it as IV) and writes only the lost
 output. A repair that stops at bytes still missing keeps what it decoded, needs only the rest, and next time asks
@@ -214,8 +215,8 @@ so their output can trail the bytes fed by that much.
 
 ## Solid streams and folders
 
-A solid RAR 5.0 stream decodes its members one after another with one decoder: a member's window (and tables,
-match history) is what the members before it left. `FeedDecoder::next_solid(&mut self, &map, index, options)` starts the decoder of the next member from this
+A solid RAR stream decodes its members one after another with one decoder: a member's window (and tables, match
+history, PPMd model) is what the members before it left. `FeedDecoder::next_solid(&mut self, &map, index, options)` starts the decoder of the next member from this
 one's state, once this one's main decode has finished (its frontier at its size), however its repairs stand:
 
 ```rust,ignore
@@ -268,6 +269,15 @@ the window holds the held output as plaintext where the decoder held a filter's 
 rebuild. A member waiting at a hole without held output holds back every member after it
 (the next one starts once its bytes come). A RAR 5.0 restart found at a member's very end (only the cipher's padding
 after it) is not taken; the last block before it is.
+
+**RAR 4.x.** The decoder (window, tables, distances, PPMd model, filters) goes on into the next member: each member's
+end-of-file marker is read past its output and says where the next starts. A successor that was not handed the
+decoder (`FeedDecoder::new`, or `restore` from a snapshot) **decodes the stream again from its first member**,
+writing nothing before its own member: those members' packed bytes are asked for again (`Next` needs, members
+released one by one as they are passed), their keys derived again (one RAR 3.x key derivation per encrypted
+member), and their output counted in `redecoded`, so a restore costs the stream's output up to the snapshot's frontier
+(`stream_start() + frontier`). There is no restart point inside a RAR 4.x member, so nothing cheaper exists without
+the decoder's state; keep the session (and the hand-off) alive across a set where you can.
 
 ## Saving and restoring
 
@@ -372,8 +382,7 @@ not meet its restart), `HeldOutput { range }` (a checkpoint's window the sink do
 - 7z LZMA2 under BCJ or Delta (a chain of coders), LZMA (not LZMA2) folders.
 - A skip without held output past the hole is impossible for compressed RAR data (see above). RAR 4.x members have no
   restart search at all: a resync over RAR 2.9 LZ blocks (tables at block starts) and cheap decoder checkpoints would
-  let holes be skipped and restores start near their frontier.
-- Solid RAR 4.x members after the first.
+  let holes be skipped and restores (also of solid successors) start near their frontier.
 
 ## Tests
 
@@ -435,8 +444,8 @@ filters (x86 E8/E9, delta, RGB, audio, Itanium), AES-128, old- and new-style mul
 articles and into six articles, shuffled, every fifth or third missing: the decoder waits at the first hole (its bytes
 the first `Next` need, nothing lost), and once the missing articles come (with a snapshot round trip half way, after
 which the released bytes are asked for from the member's start and given again) the output is exact, CRC verified,
-each byte written once, and `redecoded` is at most the frontier at the snapshot (0 to 164 KB on the fixtures). Solid
-successors are refused (`Solid`), an encrypted member without a password is `PasswordRequired`.
+each byte written once, and `redecoded` is at most the frontier at the snapshot (0 to 164 KB on the fixtures). A solid
+successor on its own decodes its stream again (below), an encrypted member without a password is `PasswordRequired`.
 
 Restarts (`tests/persistent_direct.rs`, see `docs/persistent-partials.md`): every container is fed into persistent
 partials, restarted part way and restored from each partial's cursor, and on the z-fixtures `live_feed --restart-at 15`
@@ -460,9 +469,9 @@ against a straight extraction. Also covered:
 - the need-to-article mapping and the priority order;
 - a restart part way (`restart_at`) on the stored RAR 5.0, RAR 4.x and 7z volume sets, with partials and plain files.
 
-Solid RAR 5.0 streams (`tests/feed_decoder_solid.rs`):
+Solid streams (`tests/feed_decoder_solid.rs`, `tests/feed_decoder_solid_rar4.rs`):
 
-- Three members of 220 to 230 KB, each starting with copies of the one before (its window and first match
+- RAR 5.0: three members of 220 to 230 KB, each starting with copies of the one before (its window and first match
   distances reach into the earlier member), plain and AES, in 5,000 to 7,000-byte articles shuffled: handed over
   member to member, exact, CRCs verified, each byte written once, `redecoded` 0, nothing read back. Holes without held
   output: the first member waits, nothing after it starts, and once the bytes come all finish exact with `redecoded`
@@ -479,3 +488,8 @@ Solid RAR 5.0 streams (`tests/feed_decoder_solid.rs`):
   or a window limit, then succeeds in-session with a write-only sink; and a carry refused by an archive whose members
   have the same sizes but other names; and a member that skipped a hole after an E8-filtered region, repaired and
   proven by its CRC, whose successor copying that region still starts `unproven`.
+- RAR 4.x: every solid stream the fixtures hold that decodes (10 streams, 21 members: LZ, PPMd, an E8 filter at a
+  member offset, AES), in 97-byte articles and in eight, shuffled, every fifth or third missing: each successor starts
+  once the member before is done, a member waiting at a hole holds back those after it, a successor restored half way
+  through the missing articles decodes the stream again (`redecoded` at most `stream_start() + frontier`), and every
+  member ends exact, CRC verified, each byte written once.

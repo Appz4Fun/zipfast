@@ -19,10 +19,24 @@
 //! PPMd model of up to 256 MiB plus Huffman tables and filters, cannot be checkpointed cheaply), so the main decode
 //! feeds the packed bytes in order and waits at a hole until its bytes come. A restore decodes again from the member's
 //! start up to where the snapshot stood, writing nothing before it (counted in `redecoded`).
+//!
+//! A solid successor goes on from the decoder the member before it left ([`FeedDecoder::next_solid`]): window,
+//! tables, distances, PPMd model. Created on its own (or restored), it decodes the solid stream's earlier members
+//! again first, writing nothing, then its own member.
 
 use super::rar5::OutSink;
 use super::*;
-use crate::rar5::unpack::rar4::{Rar4DecodeError, Rar4Decoder};
+use crate::rar5::unpack::rar4::{CoreFrame, Rar4DecodeError, Rar4Decoder};
+
+/// An earlier member of the solid stream, decoded again (nothing written) before a successor that was not handed
+/// the decoder.
+struct Pre {
+    geometry: Geometry,
+    stream_len: u64,
+    cipher: StoredCipher,
+    size: u64,
+    frame: CoreFrame,
+}
 
 pub(super) struct Rar4 {
     /// the decoder; None until it is started at the member's start (at first, or after a restore)
@@ -35,11 +49,24 @@ pub(super) struct Rar4 {
     stalled: bool,
     dictionary: u64,
     version: u8,
+    /// the member's frame, for a decoder handed over to it
+    frame: CoreFrame,
+    /// the stream's earlier members to decode again first, and how many of them are done
+    prefix: Vec<Pre>,
+    pre_at: usize,
+    pre_lane: Option<Lane>,
+    /// a solid member follows: the finished decoder is kept for a hand-off
+    successor: bool,
+    ended: Option<Box<Rar4Decoder>>,
 }
 
 impl Rar4 {
     pub(super) fn frontier(&self) -> u64 {
         self.out.max(self.write_from)
+    }
+
+    pub(super) fn reach(&self) -> u64 {
+        self.dictionary
     }
 
     pub(super) fn stalled(&self) -> bool {
@@ -60,6 +87,9 @@ impl Rar4 {
         self.out = 0;
         self.fed = 0;
         self.write_from = frontier;
+        self.pre_at = 0;
+        self.pre_lane = None;
+        self.ended = None;
         Ok(())
     }
 }
@@ -77,7 +107,7 @@ fn decode_error(e: Rar4DecodeError, out: &mut OutSink<'_>) -> FeedError {
 }
 
 impl FeedDecoder {
-    /// A decoder of a compressed RAR 4.x member, not solid.
+    /// A decoder of a compressed RAR 4.x member.
     pub(super) fn new_rar4(
         map: &MemberMap,
         index: usize,
@@ -85,16 +115,105 @@ impl FeedDecoder {
         begin: Begin,
     ) -> Result<Self, FeedError> {
         let member = &map.members[index];
-        if !matches!(begin, Begin::Fresh | Begin::Restore) {
-            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
-        }
         let size = member.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
-        if member.solid {
-            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
+        let run = solid_run(map, index)?;
+        let handed = match begin {
+            Begin::Fresh | Begin::Restore => None,
+            Begin::Rar4(dec) if run.prev.is_some() => Some(dec),
+            _ => return Err(FeedError::Handoff("a hand-off from another layer or place")),
+        };
+        let (geometry, stream_len, cipher, frame) = Self::rar4_parts(member, &options)?;
+        // a solid stream's decoder holds the largest window its members ask for
+        let dictionary = match run.dictionary {
+            Some(most) if run.successor || run.prev.is_some() => most.max(frame.dictionary),
+            _ => frame.dictionary,
+        };
+        if dictionary > options.max_window {
+            return Err(FeedError::Unsupported(FeedUnsupported::Window { size: dictionary }));
         }
+        let version = frame.unpack_version;
+        // a successor not handed the decoder decodes the stream's earlier members again first
+        let mut prefix = Vec::new();
+        if handed.is_none() && run.prev.is_some() {
+            let decodes = |m: &MapMember| !m.is_dir && matches!(m.method, MapMethod::Compressed { .. });
+            for m in map.members[run.first..index].iter().filter(|m| decodes(m)) {
+                let (geometry, stream_len, cipher, frame) = Self::rar4_parts(m, &options)?;
+                let size = m.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
+                prefix.push(Pre { geometry, stream_len, cipher, size, frame });
+            }
+        }
+        let checks = member.checks.filter(|c| c.crc32.is_some());
+        let chunk = options.read_chunk.clamp(16, 64 << 20);
+        let mut d = Self {
+            size,
+            stream_len,
+            geometry,
+            cipher,
+            tag: LayerTag::Rar4,
+            want_crc: checks.and_then(|c| c.crc32),
+            hash_key: None,
+            keyed: false,
+            main: None,
+            lost: RangeSet::default(),
+            blocked: BTreeMap::new(),
+            crc: CrcRuns::default(),
+            stats: FeedStats::default(),
+            released: RangeSet::default(),
+            identity: solid_identity(member, run.start),
+            options,
+            buf: vec![0; chunk],
+            scratch: Vec::new(),
+            run_written: 0,
+            failed: false,
+            status: FeedStatus::default(),
+            index: 0,
+            stream_start: 0,
+            unproven: false,
+            suspect: None,
+            seeded: None,
+            rar5: None,
+            lzma2: None,
+            rar4: Some(Box::new(Rar4 {
+                dec: None,
+                out: 0,
+                fed: 0,
+                write_from: 0,
+                stalled: false,
+                dictionary,
+                version,
+                frame,
+                prefix,
+                pre_at: 0,
+                pre_lane: None,
+                successor: run.successor,
+                ended: None,
+            })),
+        };
+        d.stream_start = run.start;
+        // an empty member of a solid stream still has its end-of-file marker read, which says where the next starts
+        let feeds = size > 0 || run.successor || run.prev.is_some();
+        if let Some(mut dec) = handed {
+            let fail = |_| FeedError::Handoff("the RAR 4.x decoder does not go on into this member");
+            dec.next_solid_member(frame).map_err(fail)?;
+            let r = d.rar4.as_mut().expect("RAR 4.x state");
+            r.dec = Some(dec);
+        }
+        if feeds {
+            d.main = Some(d.packed_lane(0, stream_len));
+        }
+        d.status = d.make_status(Vec::new(), false);
+        Ok(d)
+    }
+
+    /// A RAR 4.x member's pieces, packed length, cipher and frame.
+    fn rar4_parts(
+        member: &MapMember,
+        options: &FeedOptions,
+    ) -> Result<(Geometry, u64, StoredCipher, CoreFrame), FeedError> {
         if !member.complete {
             return Err(FeedError::IncompleteMember);
         }
+        let size = member.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
         let version = member.unpack_version.ok_or(FeedError::Malformed("RAR 4.x member without an unpack version"))?;
         let id = match member.method {
             MapMethod::Compressed { id } => id,
@@ -142,61 +261,56 @@ impl FeedDecoder {
             }
             Some(_) => return Err(FeedError::Unsupported(FeedUnsupported::UnmappedCipher)),
         };
-        let checks = member.checks.filter(|c| c.crc32.is_some());
-        let chunk = options.read_chunk.clamp(16, 64 << 20);
-        let mut d = Self {
-            size,
-            stream_len,
-            geometry,
-            cipher,
-            tag: LayerTag::Rar4,
-            want_crc: checks.and_then(|c| c.crc32),
-            hash_key: None,
-            keyed: false,
-            main: None,
-            lost: RangeSet::default(),
-            blocked: BTreeMap::new(),
-            crc: CrcRuns::default(),
-            stats: FeedStats::default(),
-            released: RangeSet::default(),
-            identity: member_identity(member),
-            options,
-            buf: vec![0; chunk],
-            scratch: Vec::new(),
-            run_written: 0,
-            failed: false,
-            status: FeedStatus::default(),
-            index: 0,
-            stream_start: 0,
-            unproven: false,
-            suspect: None,
-            seeded: None,
-            rar5: None,
-            lzma2: None,
-            rar4: Some(Box::new(Rar4 {
-                dec: None,
-                out: 0,
-                fed: 0,
-                write_from: 0,
-                stalled: false,
-                dictionary,
-                version,
-            })),
+        let frame = CoreFrame {
+            ordinal: member.ordinal,
+            packed: stream_len,
+            unpacked: size,
+            unpack_version: version,
+            method: u8::try_from(id).unwrap_or(0),
+            dictionary,
         };
-        if size > 0 {
-            d.main = Some(d.packed_lane(0, stream_len));
-        }
-        d.status = d.make_status(Vec::new(), false);
-        Ok(d)
+        Ok((geometry, stream_len, cipher, frame))
     }
 
+    /// [`FeedDecoder::next_solid`] for a RAR 4.x member: the decoder kept at the member's end starts the next one.
+    pub(super) fn handoff_rar4(
+        &mut self,
+        map: &MemberMap,
+        index: usize,
+        options: FeedOptions,
+    ) -> Result<FeedDecoder, FeedError> {
+        if index >= map.members.len() {
+            return Err(FeedError::NoSuchMember { index });
+        }
+        if solid_run(map, index)?.prev != Some(self.index) {
+            return Err(FeedError::Handoff("not the next member of the solid stream"));
+        }
+        let r = self.rar4.as_mut().expect("RAR 4.x state");
+        let dec = r.ended.take().ok_or(FeedError::Handoff(
+            "the main decode has not finished, was handed over, or was restored (a RAR 4.x successor then decodes the \
+             stream again: FeedDecoder::new)",
+        ))?;
+        let suspect = self.carried_suspect();
+        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Rar4(dec))?;
+        next.inherit(suspect);
+        Ok(next)
+    }
+
+    /// A decoder at the solid stream's start: its first member's (an earlier one's when decoding them again).
     fn start_rar4(&self, r: &Rar4) -> Result<Box<Rar4Decoder>, FeedError> {
         let fail = |_| FeedError::Decode { out: 0, error: crate::Error::Corrupt("RAR 4.x decoder setup") };
         let cancel = Some(self.options.control.cancellation_token());
+        let (packed, size, version) = match r.prefix.first() {
+            Some(p) => (p.stream_len, p.size, p.frame.unpack_version),
+            None => (self.stream_len, self.size, r.version),
+        };
         let mut dec =
-            Rar4Decoder::new_with_cancel(r.dictionary, self.stream_len, self.size, self.options.max_window, cancel)
-                .map_err(fail)?;
-        dec.set_version(r.version).map_err(fail)?;
+            Rar4Decoder::new_with_cancel(r.dictionary, packed, size, self.options.max_window, cancel).map_err(fail)?;
+        dec.set_version(version).map_err(fail)?;
+        if r.successor || !r.prefix.is_empty() {
+            // each member's end-of-file marker says where the next one starts
+            dec.track_boundary();
+        }
         Ok(Box::new(dec))
     }
 
@@ -211,6 +325,71 @@ impl FeedDecoder {
         result
     }
 
+    /// Decodes the stream's earlier members again (nothing written), as far as their bytes allow: Some(true) once
+    /// they are all done, Some(false) waiting for bytes (the need is added), None at the run's budget.
+    fn rar4_prefix(
+        &mut self,
+        r: &mut Rar4,
+        dec: &mut Rar4Decoder,
+        source: &mut dyn PackedSource,
+        sink: &mut dyn FeedSink,
+        next: &mut Vec<NeedBytes>,
+    ) -> Result<Option<bool>, FeedError> {
+        while r.pre_at < r.prefix.len() {
+            let i = r.pre_at;
+            // the earlier member's pieces and cipher stand in for this member's while it is read
+            std::mem::swap(&mut self.geometry, &mut r.prefix[i].geometry);
+            std::mem::swap(&mut self.stream_len, &mut r.prefix[i].stream_len);
+            std::mem::swap(&mut self.cipher, &mut r.prefix[i].cipher);
+            let mut lane = r.pre_lane.take().unwrap_or_else(|| self.packed_lane(0, self.stream_len));
+            let stop = self.pump4(&mut lane, dec, r, 0..0, source, sink);
+            let mut waits = None;
+            if let Ok(Stop::Missing { stream, len, hole }) = &stop {
+                self.push_needs(next, *stream..*stream + *len, NeedKind::Next);
+                waits = Some(*hole);
+            }
+            let ranges = self.geometry.volume_ranges(0..self.stream_len);
+            std::mem::swap(&mut self.geometry, &mut r.prefix[i].geometry);
+            std::mem::swap(&mut self.stream_len, &mut r.prefix[i].stream_len);
+            std::mem::swap(&mut self.cipher, &mut r.prefix[i].cipher);
+            match stop? {
+                Stop::Reached => {
+                    let mut out = self.out_sink(sink, r.out, 0..0);
+                    let ended = dec.finish_logical(&mut out).map(|_| ()).map_err(|e| decode_error(e, &mut out));
+                    r.out = out.at;
+                    ended?;
+                    if r.out != r.prefix[i].size {
+                        return Err(FeedError::Decode {
+                            out: 0,
+                            error: crate::Error::Corrupt("an earlier solid member decodes to another size"),
+                        });
+                    }
+                    let frame = r.prefix.get(i + 1).map_or(r.frame, |p| p.frame);
+                    dec.next_solid_member(frame).map_err(|_| FeedError::Decode {
+                        out: 0,
+                        error: crate::Error::Corrupt("the solid stream does not go on into the next member"),
+                    })?;
+                    for (volume, range) in ranges {
+                        source.release(volume, range);
+                    }
+                    r.pre_at += 1;
+                    r.out = 0;
+                    r.fed = 0;
+                }
+                Stop::Budget => {
+                    r.pre_lane = Some(lane);
+                    return Ok(None);
+                }
+                Stop::Missing { .. } => {
+                    r.stalled = waits == Some(true);
+                    r.pre_lane = Some(lane);
+                    return Ok(Some(false));
+                }
+            }
+        }
+        Ok(Some(true))
+    }
+
     fn run_rar4_with(
         &mut self,
         r: &mut Rar4,
@@ -223,13 +402,24 @@ impl FeedDecoder {
         let mut dec = match r.dec.take() {
             Some(dec) => dec,
             None => {
-                // at the start, or restored: from the member's start
+                // at the start, or restored: from the solid stream's start
                 lane = self.packed_lane(0, self.stream_len);
                 r.out = 0;
                 r.fed = 0;
+                r.pre_at = 0;
+                r.pre_lane = None;
                 self.start_rar4(r)?
             }
         };
+        match self.rar4_prefix(r, &mut dec, source, sink, &mut next)? {
+            Some(true) => {}
+            waiting => {
+                more = waiting.is_none();
+                self.main = Some(lane);
+                r.dec = Some(dec);
+                return Ok((next, Vec::new(), more, gap));
+            }
+        }
         let write = r.write_from..self.size;
         match self.pump4(&mut lane, &mut dec, r, write.clone(), source, sink)? {
             Stop::Reached => {
@@ -242,6 +432,9 @@ impl FeedDecoder {
                         out: r.out,
                         error: crate::Error::Corrupt("RAR 4.x member decodes to another size"),
                     });
+                }
+                if r.successor && dec.has_boundary() {
+                    r.ended = Some(dec);
                 }
             }
             Stop::Budget => {

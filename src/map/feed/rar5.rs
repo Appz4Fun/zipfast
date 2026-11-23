@@ -344,6 +344,7 @@ impl FeedDecoder {
                 }
                 carry_cp(&carry, &run.starts)?
             }
+            _ => return Err(FeedError::Handoff("a hand-off from another layer")),
         };
         if !member.complete {
             return Err(FeedError::IncompleteMember);

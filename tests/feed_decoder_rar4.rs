@@ -206,7 +206,11 @@ fn compressed_rar4_fixtures_feed_shuffled_and_wait_at_holes() {
                 }
                 let mut any = false;
                 for (i, m) in map.members.iter().enumerate() {
-                    if !matches!(m.method, MapMethod::Compressed { .. }) || m.unpacked_size.is_none_or(|s| s == 0) {
+                    // solid successors decode the stream again on their own: tests/feed_decoder_solid.rs
+                    if !matches!(m.method, MapMethod::Compressed { .. })
+                        || m.unpacked_size.is_none_or(|s| s == 0)
+                        || m.solid
+                    {
                         continue;
                     }
                     let Ok(mut probe) = FeedDecoder::new(&map, i, FeedOptions::new(password)) else { continue };
@@ -250,15 +254,22 @@ fn compressed_rar4_fixtures_feed_shuffled_and_wait_at_holes() {
 }
 
 #[test]
-fn rar4_solid_successors_and_legacy_ciphers_are_refused() {
+fn a_rar4_solid_successor_on_its_own_decodes_the_stream_again() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4");
     let bytes = std::fs::read(root.join("solid.rar")).unwrap();
     let map = MemberMap::from_memory(&[&bytes], "solid.rar", None).unwrap();
-    let solid = map.members.iter().position(|m| m.solid).expect("a solid successor");
-    assert!(matches!(
-        FeedDecoder::new(&map, solid, FeedOptions::default()),
-        Err(FeedError::Unsupported(FeedUnsupported::Solid))
-    ));
+    let solid = map.members.iter().rposition(|m| m.solid).expect("a solid successor");
+    let mut d = FeedDecoder::new(&map, solid, FeedOptions::default()).unwrap();
+    assert!(d.stream_start() > 0);
+    let n = d.size() as usize;
+    let mut out = Out { bytes: vec![0; n], seen: vec![false; n], written: 0 };
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &bytes).unwrap();
+    let s = d.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    // the earlier members were decoded again, not written
+    assert_eq!(d.stats().redecoded, d.stream_start());
+    assert_eq!(out.written, n as u64);
 }
 
 #[test]
