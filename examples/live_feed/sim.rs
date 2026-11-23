@@ -68,6 +68,8 @@ pub struct Config {
     pub window: usize,
     /// The fraction of articles that fail on their first try and are delivered later as repairs.
     pub drop: f64,
+    /// Exactly these articles (indices over the whole set, volume by volume) fail once, in place of `drop`.
+    pub drop_articles: Option<Vec<usize>>,
     /// A failed article can be fetched again this many deliveries after it failed; None: once the first pass is over
     /// (as when repairs come from a backup server or par2 at the end).
     pub repair_delay: Option<usize>,
@@ -98,6 +100,7 @@ impl Config {
             lateness: Some(8),
             window: 4,
             drop: 0.05,
+            drop_articles: None,
             repair_delay: None,
             sink: SinkKind::Auto,
             group_holes: false,
@@ -353,8 +356,9 @@ impl Network {
         rng.shuffle(&mut pick);
         let mut fails = vec![false; count];
         let dropped = ((config.drop.clamp(0.0, 1.0) * count as f64).round() as usize).min(count);
-        for &i in &pick[..dropped] {
-            fails[i] = true;
+        match &config.drop_articles {
+            Some(list) => list.iter().filter(|&&i| i < count).for_each(|&i| fails[i] = true),
+            None => pick[..dropped].iter().for_each(|&i| fails[i] = true),
         }
         Self {
             queue: order.into(),
@@ -451,6 +455,11 @@ impl Ranges {
             end += 1;
         }
         self.0.splice(at..end, [r]);
+    }
+    /// Whether any range overlaps `r`.
+    fn overlaps(&self, r: &Range<u64>) -> bool {
+        let at = self.0.partition_point(|x| x.end <= r.start);
+        self.0.get(at).is_some_and(|x| x.start < r.end)
     }
     /// How many bytes from `offset` are held, contiguously.
     fn held_from(&self, offset: u64) -> u64 {
@@ -680,10 +689,18 @@ mod persistent {
         );
         options.limits.volume_handles = 4096;
         options.set_password(config.password.clone()).map_err(|e| format!("{e:?}"))?;
+        // Every member's handle stays open until its feed is done, and each holds descriptors (output, state
+        // bundle, journal; about five per member): the defaults (16 open partials, 64 files) refuse the 17th stored
+        // member. Both cap at 4096, so a set of more than about 500 stored members needs handles closed and reopened
+        // (`PartialFile::open`) as members finish. The process's own descriptor limit must allow as many.
+        let members = map.members.len() as u32;
+        let defaults = PartialLimits::default();
         let mut limits = PartialLimits {
             group_holes: config.group_holes,
             group_refills: config.group_refills,
-            ..PartialLimits::default()
+            open_partials: defaults.open_partials.max(members.saturating_add(1)).min(4096),
+            open_files: defaults.open_files.max(members.saturating_mul(8).saturating_add(64)).min(4096),
+            ..defaults
         };
         if let Some(mib) = config.group_commit_mib {
             limits.group_commit_bytes = mib << 20;
@@ -736,8 +753,8 @@ mod persistent {
 /// A member's sink, counting repair writes.
 struct Sink {
     out: Out,
-    /// The end of the furthest write: a write before it fills output reported lost earlier.
-    end: u64,
+    /// Every output range the decoder has reported lost (`FeedStatus::lost`): a write into one is a repair.
+    lost: Ranges,
     refills: u64,
     refill_bytes: u64,
 }
@@ -750,11 +767,10 @@ enum Out {
 
 impl FeedSink for Sink {
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        if offset < self.end {
+        if self.lost.overlaps(&(offset..offset + bytes.len() as u64)) {
             self.refills += 1;
             self.refill_bytes += bytes.len() as u64;
         }
-        self.end = self.end.max(offset + bytes.len() as u64);
         match &mut self.out {
             Out::File(f) => f.write_at(offset, bytes),
             #[cfg(feature = "persistent-partials")]
@@ -804,8 +820,9 @@ struct Member {
 
 // ---- The run ----
 
-/// Lists a set directory's volumes in order: `.partN.rar` and `.7z.NNN` by number, an old-style `.rar` before its
-/// `.rNN`. Other files (par2, json, nfo) are left out.
+/// Lists a set directory's volumes in order. A RAR set is followed from its first volume with
+/// `zipfast::volume::next_volume`, the names extraction itself opens (`.partN.rar`, or `.rar`, `.r00` .. `.r99`,
+/// `.s00` ..); other sets (`.7z.NNN`) are sorted by number. Other files (par2, json, nfo) are left out.
 pub fn volumes_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     fn is_volume(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
@@ -844,11 +861,30 @@ pub fn volumes_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
         .filter(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()).is_some_and(is_volume))
         .collect();
     files.sort_by_cached_key(|p| key(p.file_name().and_then(|n| n.to_str()).unwrap_or("")));
-    Ok(files)
+    let Some(first) = files.first().filter(|p| p.to_string_lossy().to_ascii_lowercase().ends_with(".rar")) else {
+        return Ok(files);
+    };
+    // the files present, by lower-case name: a set's names may differ in case from what next_volume derives
+    let present: HashMap<String, PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .filter_map(|p| Some((p.file_name()?.to_str()?.to_ascii_lowercase(), p)))
+        .collect();
+    let mut chain = vec![first.clone()];
+    while let Some(next) = zipfast::volume::next_volume(chain.last().unwrap()) {
+        let Some(path) = next.file_name().and_then(|n| n.to_str()).and_then(|n| present.get(&n.to_ascii_lowercase()))
+        else {
+            break;
+        };
+        chain.push(path.clone());
+    }
+    Ok(chain)
 }
 
-fn output_name(name: &str) -> String {
-    name.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect()
+/// A plain-file output name: the member's index first, so `a/b.bin` and `a_b.bin` stay apart once flattened.
+fn output_name(index: usize, name: &str) -> String {
+    let flat: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
+    format!("{index:05}-{flat}")
 }
 
 /// Simulates the download of `config.volumes` and feeds it through the decoders. See the module docs.
@@ -925,12 +961,12 @@ pub fn run(config: &Config) -> Result<Report, String> {
             }
             None => {
                 kinds.1 += 1;
-                let path = dest.join(output_name(&name));
+                let path = dest.join(output_name(index, &name));
                 Out::File(FileSink::create(path, size).map_err(|e| e.to_string())?)
             }
         };
         report.output_bytes += size;
-        let sink = Sink { out, end: 0, refills: 0, refill_bytes: 0 };
+        let sink = Sink { out, lost: Ranges::default(), refills: 0, refill_bytes: 0 };
         members.push(Member { index, name, size, decoder, sink, status: FeedStatus::default() });
     }
     report.fed = members.len();
@@ -961,6 +997,9 @@ pub fn run(config: &Config) -> Result<Report, String> {
         let run_start = Instant::now();
         for m in members.iter_mut().filter(|m| !m.status.done) {
             m.status = m.decoder.run(&mut source, &mut m.sink).map_err(|e| format!("member {}: {e}", m.index))?;
+            for r in &m.status.lost {
+                m.sink.lost.insert(r.clone());
+            }
             report.stalls += m.status.stalled as u64;
         }
         if repair_run {

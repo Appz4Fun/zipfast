@@ -225,7 +225,7 @@ set, plays it as a Usenet download and extracts while the articles arrive. `sim.
 
 ```text
 cargo run --release --features persistent-partials --example live_feed -- \
-    [--password PW] [--article 750000] [--seed 1] [--lateness 8|all] [--window 4] [--drop 0.05] \
+    [--password PW] [--article 750000] [--seed 1] [--lateness 8|all] [--window 4] [--drop 0.05] [--drop-articles I,J,..] \
     [--repair-delay N] [--sink auto|file|partial] [--group-holes] [--group-refills] [--group-commit-mib N] \
     [--max-needs 64] [--buffer-mib N] [--work DIR] [--keep] [--no-verify] [--runs N] [--label NAME] [--header] \
     <set dir | volume...>
@@ -239,18 +239,24 @@ The simulation:
   seeded by `--seed`). The downloader can choose among the next `--window` arrivals (its connections in flight). A
   `--drop` fraction fails on the first try: the article is `mark_lost` in the `ArticleBuffer`, and it can be
   fetched again `--repair-delay` deliveries later (by default once the first pass is over), as a repair.
+  `--drop-articles` names exactly which articles fail (indices over the whole set, volume by volume).
 - **Decoding.** After every delivery or failure, each member's `FeedDecoder` runs over the shared `ArticleBuffer`.
   Its `FeedStatus::needs` choose the next delivery (see below).
 - **Output.** With `persistent-partials`, each member the persistent path admits (stored RAR, no `-hp`) writes
   into a `PartialFile`. A genesis session reads the headers and is told every data byte is a hole, so each member
   starts at full size with its whole output one hole per volume piece. The decoder's `write_at` then fills those
   holes through a `FillWriter`, and the writes join the open group commit. `read_held` gives back what was
-  written. Other members, or every member with `--sink file`, write a preallocated plain file instead (synced once,
-  not durable). `--group-holes` sets `PartialLimits::group_holes`, which affects the genesis holes.
+  written. Every member's handle stays open until its feed is done. Each one holds about five descriptors, and the
+  defaults (`PartialLimits::open_partials` 16, `open_files` 64) refuse the 17th member. The example raises both
+  to fit the set: `open_partials` to the member count plus one, `open_files` to 64 plus eight per member. RustyGet
+  must do the same, or close and reopen handles (`PartialFile::open`) beyond the 4096 ceiling. Other members, or
+  every member with `--sink file`, write a preallocated plain file instead (`NNNNN-name`, by member index, synced
+  once, not durable). `--group-holes` sets `PartialLimits::group_holes`, which affects the genesis holes.
   `--group-refills` sets `group_refills`, which only affects `refill_from_packed`. The feed path never calls that:
   its repairs are plaintext fills, which join the group anyway.
 - **Report.** stdout gets one tab-separated line per run (`--header` prints the column names first): wall time,
-  MB/s, bytes written, `redecoded`, packed bytes read, holes met, repair writes (`refills`) and their bytes, the
+  MB/s, bytes written, `redecoded`, packed bytes read, holes met, repair writes (`refills`: writes into a range a
+  status listed as lost) and their bytes, the
   repair time and that time per dropped article, stalls, syncs (`durable_sync_count` for partials, one per plain
   file), peak buffer, the CRC verdict (`crc_ok`, plus `poll_verify` for partials), and whether the output equals a
   straight extraction of the set. The exit status is non-zero when a check fails.
@@ -357,4 +363,10 @@ successors are refused (`Solid`), an encrypted member without a password is `Pas
 `tests/live_feed.rs` runs the [live feed example](#live-feed-example)'s core on a generated stored RAR 5.0 set (a
 persistent partial with `persistent-partials`, a plain file without), the RAR 4.x volume fixture and the 7z volume
 fixture. Each is delivered out of order with a fifth of the articles dropped and repaired later, and checked
-against a straight extraction. It also checks the need-to-article mapping and the priority order.
+against a straight extraction. Also covered:
+
+- a set of 20 stored members over two volumes, beyond the default partial limits, two of whose names flatten
+  alike;
+- a dropped trailing article counting as a refill when repaired;
+- old-style volume discovery past `.r99` (`.s00`, `.s01`);
+- the need-to-article mapping and the priority order.

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: live_feed [--password PW] [--article BYTES] [--seed N] [--lateness N|all] [--window N] \
-[--drop FRACTION] [--repair-delay N] [--sink auto|file|partial] [--group-holes] [--group-refills] \
+[--drop FRACTION] [--drop-articles I,J,..] [--repair-delay N] [--sink auto|file|partial] [--group-holes] [--group-refills] \
 [--group-commit-mib N] [--max-needs N] [--buffer-mib N] [--work DIR] [--keep] [--no-verify] [--runs N] \
 [--label NAME] [--header] <set dir | volume...>";
 
@@ -71,6 +71,11 @@ fn real_main() -> Result<bool, String> {
             }
             "--window" => config.window = num(&arg, value(&arg)?)?,
             "--drop" => config.drop = num(&arg, value(&arg)?)?,
+            "--drop-articles" => {
+                let list = value(&arg)?;
+                config.drop_articles =
+                    Some(list.split(',').map(|i| num(&arg, i.to_owned())).collect::<Result<_, _>>()?);
+            }
             "--repair-delay" => config.repair_delay = Some(num(&arg, value(&arg)?)?),
             "--sink" => {
                 config.sink = match value(&arg)?.as_str() {

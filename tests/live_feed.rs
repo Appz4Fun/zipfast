@@ -111,6 +111,95 @@ fn rar4_and_7z_volume_fixtures_through_the_live_feed() {
     }
 }
 
+/// `count` stored RAR 5.0 members over two volumes (the middle one split across them), written to `dir`. Two of
+/// them flatten to the same name, `d_x.bin`.
+fn rar5_many_members(dir: &Path, count: usize) -> Vec<PathBuf> {
+    std::fs::create_dir_all(dir).unwrap();
+    let names: Vec<String> = (0..count)
+        .map(|i| match i {
+            0 => "d/x.bin".to_owned(),
+            1 => "d_x.bin".to_owned(),
+            _ => format!("m{i:02}.bin"),
+        })
+        .collect();
+    let datas: Vec<Vec<u8>> = (0..count).map(|i| (0..3_000 + i * 37).map(|j| (j * 7 + i) as u8).collect()).collect();
+    let split = count / 2;
+    let mut volumes = vec![common::SIG.to_vec(), common::SIG.to_vec()];
+    volumes[0].extend(common::main_block(true, None));
+    volumes[1].extend(common::main_block(true, Some(1)));
+    for i in 0..count {
+        let data = &datas[i];
+        let mut spec = common::FileSpec::new(&names[i], data);
+        spec.size = Some(data.len() as u64);
+        let crc = crc32fast::hash(data);
+        if i == split {
+            let (a, b) = data.split_at(data.len() / 2);
+            volumes[0].extend(common::file_block(&spec, a, crc32fast::hash(a), false, true));
+            volumes[1].extend(common::file_block(&spec, b, crc, true, false));
+        } else {
+            volumes[usize::from(i > split)].extend(common::file_block(&spec, data, crc, false, false));
+        }
+    }
+    volumes[0].extend(common::end_block(true));
+    volumes[1].extend(common::end_block(false));
+    volumes
+        .into_iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            let path = dir.join(format!("many.part{}.rar", i + 1));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect()
+}
+
+// Catches a set of more members than the default partial limits keep open (16 partials, 64 files), and plain-file
+// outputs of two members whose names flatten alike colliding.
+#[test]
+fn a_set_of_many_stored_members_feeds_every_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volumes = rar5_many_members(&tmp.path().join("set"), 20);
+    for (i, sink) in [sim::SinkKind::Auto, sim::SinkKind::File].into_iter().enumerate() {
+        let mut config = config(volumes.clone(), &tmp.path().join(format!("work-{i}")), 2_000);
+        config.sink = sink;
+        let report = sim::run(&config).unwrap();
+        check(&report);
+        assert_eq!((report.members, report.fed), (20, 20), "{report:?}");
+    }
+}
+
+// Catches a repair of a trailing hole (the member's last data article dropped) not counting as a refill: it starts
+// at the end of everything written before.
+#[test]
+fn a_repaired_trailing_hole_counts_as_a_refill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volumes = rar5_stored_set(&tmp.path().join("set"), 100_000, 40_000);
+    let lens: Vec<u64> = volumes.iter().map(|p| std::fs::metadata(p).unwrap().len()).collect();
+    let articles = sim::Articles::cut(&lens, 8_000);
+    // the last volume's last article holds the end block; the one before it the member's last data bytes
+    let last = articles.list.len() - 2;
+    let mut config = config(volumes, &tmp.path().join("work"), 8_000);
+    config.drop_articles = Some(vec![last]);
+    config.lateness = Some(0);
+    let report = sim::run(&config).unwrap();
+    check(&report);
+    assert!(report.refills >= 1 && report.refill_bytes >= 1, "{report:?}");
+}
+
+#[test]
+fn old_style_volume_names_go_on_past_r99() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut expect = vec!["a.rar".to_owned()];
+    expect.extend((0..100).map(|i| format!("a.r{i:02}")));
+    expect.extend(["a.s00".to_owned(), "a.s01".to_owned()]);
+    for name in expect.iter().chain(&["a.par2".to_owned(), "notes.txt".to_owned()]) {
+        std::fs::write(tmp.path().join(name), b"").unwrap();
+    }
+    let found = sim::volumes_in(tmp.path()).unwrap();
+    let names: Vec<_> = found.iter().map(|p| p.file_name().unwrap().to_str().unwrap().to_owned()).collect();
+    assert_eq!(names, expect);
+}
+
 #[test]
 fn needs_map_to_articles_in_priority_order() {
     let articles = sim::Articles::cut(&[2_500, 1_000], 1_000);
