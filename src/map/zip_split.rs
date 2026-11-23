@@ -1173,9 +1173,21 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
         usage.charge(Resource::HeaderBytes, n as u64).map_err(|e| MapError::from_failure(last, e))?;
         parser.supply(range.start, bytes).map_err(|e| directory_error(e, &limits, last))?;
     }
-    let found = parser.finish().map_err(|e| directory_error(e, &limits, last))?;
+    let mut found = parser.finish().map_err(|e| directory_error(e, &limits, last))?;
     if found.prefix_shift != 0 {
-        return Err(malformed(last, "central directory offset"));
+        // A single-disk archive may have bytes before it (a self-extracting stub) that its offsets leave out, as the
+        // whole-archive reader allows; a split set's offsets are per disk and must not shift.
+        if last != 0 {
+            return Err(malformed(last, "central directory offset"));
+        }
+        for e in &mut found.entries {
+            e.entry.local_at = e
+                .entry
+                .local_at
+                .checked_add(found.prefix_shift)
+                .filter(|at| *at < len)
+                .ok_or_else(|| malformed(last, "local header offset"))?;
+        }
     }
     if let Some(record) = &found.zip64_end {
         let at = locator.filter(|(at, _)| at.vol == last).map(|(at, _)| at.off);
