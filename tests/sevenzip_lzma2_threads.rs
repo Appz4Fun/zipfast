@@ -38,6 +38,10 @@ fn opts(mode: Mode, dest: &Path, threads: usize) -> Options {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: zipfast::extract::SpecialEntries::Refuse,
+        fallback_mtime: None,
+        compressed_tar: zipfast::extract::CompressedTar::Members,
+        version_naming: zipfast::extract::VersionNaming::Semicolon,
     }
 }
 
