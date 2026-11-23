@@ -428,7 +428,8 @@ impl ProgressiveSession {
     #[allow(clippy::result_large_err, reason = "the path check callback returns typed partial receipts")]
     pub(super) fn partial_directory(&mut self) -> ProgressiveResult<ProgressiveEvent> {
         let header = &self.model.members.last().unwrap().header;
-        let relative = crate::path::sanitize_fallible(&header.name, !header.is_unix())
+        let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        let relative = crate::path::sanitize_fallible(&name, !header.is_unix())
             .map_err(|_| error(PartialErrorKind::UnsafePath))?;
         let meta = crate::extract::Meta::from(header);
         let persistent = self.partial.as_mut().unwrap();
