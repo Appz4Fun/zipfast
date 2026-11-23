@@ -723,3 +723,15 @@ fn tar_names_and_link_targets_keep_their_bytes() {
     // the hard link still names its file, so it is written as a link and the data once
     assert_eq!(out.windows(3).filter(|w| w == b"abc").count(), 1);
 }
+
+#[test]
+fn ar_members_named_like_a_symbol_table_stay_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = plain_ar(&[("__.SYMDEF_notes", b"just notes\n"), ("a.o", OBJ_A)], 7, 7);
+    let i = write(dir.path(), "symdef-like.a", &input);
+    let o = dir.path().join("symdef-like.out");
+    assert_eq!(repack(&i, &o, &RepackOptions::default()).unwrap().members, 2);
+    let out = std::fs::read(o).unwrap();
+    assert!(out.windows(15).any(|w| w == b"__.SYMDEF_notes"));
+    assert!(out.windows(11).any(|w| w == b"just notes\n"));
+}

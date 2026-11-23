@@ -20,9 +20,9 @@
 //!
 //! * **ar** is written as GNU `ar D` writes it: every member's time is [`RepackOptions::mtime`] (0 by default),
 //!   its owner and group 0 and its mode `644`. Members are sorted by name, except that a `.deb`'s leading
-//!   `debian-binary` stays first, as dpkg requires. A symbol table (GNU `/` or `/SYM64/`, BSD `__.SYMDEF*`) stays
-//!   first and its member offsets are rewritten for the new order. The input's naming style (plain, GNU, BSD) is
-//!   kept.
+//!   `debian-binary` stays first, as dpkg requires. A symbol table (GNU `/` or `/SYM64/`, BSD `__.SYMDEF`,
+//!   `__.SYMDEF SORTED`, `__.SYMDEF_64` or `__.SYMDEF_64 SORTED`) stays first and its member offsets are rewritten
+//!   for the new order. The input's naming style (plain, GNU, BSD) is kept.
 //! * **tar** (plain, or compressed in any way the tar reader reads, cpio included) is written as
 //!   `tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@N --format=posix` would, then gzipped: POSIX
 //!   ustar headers with pax records only where a name, link or size does not fit, sorted by the name's bytes,
