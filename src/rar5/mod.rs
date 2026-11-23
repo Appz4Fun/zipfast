@@ -240,6 +240,8 @@ pub struct RarTime {
 
 /// RAR4 main header flag: volumes are named `NAME.partN.rar` rather than `NAME.rar`, `NAME.r00`, ...
 pub const MHD_NEWNUMBERING: u16 = 0x0010;
+/// RAR4 main header flag: the headers after the main header are encrypted (`-hp`).
+pub const MHD_PASSWORD: u16 = 0x0080;
 
 impl MainHeader {
     pub fn is_volume(&self) -> bool {
@@ -308,6 +310,10 @@ pub struct Rar4Metadata {
     pub dos_time: u32,
     /// The encryption salt, when the header carries one.
     pub salt: Option<[u8; 8]>,
+    /// The header's CRC field as stored. Before RAR 2.0 (unpack version under 20) a part with a later
+    /// continuation stores a value there that UnRAR lists as its "Pack-CRC32" but never checks, so
+    /// [`FileHeader::crc32`] leaves it out; this keeps it for listings.
+    pub stored_crc: u32,
 }
 
 impl Rar4Metadata {

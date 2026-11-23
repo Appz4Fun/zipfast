@@ -336,7 +336,15 @@ impl HeaderParser {
                 format: RarFormat::Rar4,
                 service: bytes[2] == 0x7a,
                 sub_data,
-                rar4: Some(Rar4Metadata { flags, host, method, unpack_version: version, dos_time: dos, salt }),
+                rar4: Some(Rar4Metadata {
+                    flags,
+                    host,
+                    method,
+                    unpack_version: version,
+                    dos_time: dos,
+                    salt,
+                    stored_crc: crc,
+                }),
                 block_flags: (u64::from(flags & 1 != 0) * HFL_SPLIT_BEFORE)
                     | (u64::from(flags & 2 != 0) * HFL_SPLIT_AFTER),
                 file_flags: u64::from(directory) * FHFL_DIRECTORY,
