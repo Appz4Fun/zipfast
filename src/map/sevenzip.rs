@@ -1507,6 +1507,9 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
     let mut work = 0u64;
     let mut last_error: Option<MapError> = None;
     let mut need: Option<u64> = None;
+    // Key derivation is charged for the whole search, not per candidate: a candidate that derives a key and then
+    // fails must not hand the next one a fresh KDF session budget.
+    let mut kdf_spent = 0u64;
     // Encoded headers, nearest the end first: `0x17` then the packed stream info (`0x06`).
     let lowest = tail.len().saturating_sub(TAIL_ENCODED_WINDOW);
     for h in (lowest..tail.len() - 1).rev() {
@@ -1520,6 +1523,9 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
             return Ok(TailSearch::Exhausted);
         }
         let usage = Usage::new(options.limits.clone());
+        if usage.charge(Resource::KdfSessionBlocks, kdf_spent).is_err() {
+            continue;
+        }
         let mut reader = Reader::new(&tail[h + 1..], &usage);
         let parsed = reader.streams_info();
         work = work.saturating_add(reader.steps());
@@ -1551,6 +1557,11 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
             }
             continue;
         }
+        // As a whole-archive walk checks a packed header before reading it: the budget bounds the packed stream too.
+        if let Err(e) = usage.check(Resource::HeaderBytes, packed_len) {
+            last_error = Some(MapError::from_failure(0, e));
+            continue;
+        }
         let packed = &tail[h - packed_len as usize..h];
         work = work.saturating_add(packed_len).saturating_add(streams.folders[0].unpacked_size());
         let mut walker = SevenZipWalker::new(options, usage);
@@ -1562,7 +1573,9 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
             walker.header_encrypted = true;
             walker.header_cipher = aes_params(&aes.properties);
         }
-        let result = walker.decode(&streams, packed, options).and_then(|decoded| {
+        let decoded = walker.decode(&streams, packed, options);
+        kdf_spent = walker.usage.snapshot(Resource::KdfSessionBlocks).used;
+        let result = decoded.and_then(|decoded| {
             match decoded.first().map(|&b| u64::from(b)) {
                 Some(ID_HEADER) => walker.header(&decoded, true),
                 // A nested encoded header (or noise) is not taken from a tail.
