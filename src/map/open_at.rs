@@ -115,6 +115,8 @@ pub enum OpenAtError {
     NoChain,
     /// Decoding failed.
     Decode(String),
+    /// The resumed output would exceed [`Lzma2DecodeOptions::max_output`].
+    OutputLimit { limit: u64 },
 }
 
 impl std::fmt::Display for OpenAtError {
@@ -130,6 +132,7 @@ impl std::fmt::Display for OpenAtError {
             Self::NeedMore { needed } => write!(f, "known plaintext from output offset {} is needed", needed.start),
             Self::NoChain => write!(f, "no LZMA2 chunk chain to the folder's end in the packed bytes held"),
             Self::Decode(e) => write!(f, "decoding failed: {e}"),
+            Self::OutputLimit { limit } => write!(f, "the resumed output would exceed {limit} bytes"),
         }
     }
 }
@@ -466,8 +469,10 @@ pub struct Lzma2Resume {
 /// to the folder's end with the known output before it as the dictionary.
 ///
 /// `packed` is the folder's packed stream from offset `packed_from` (at most the plan's `fetch_from`) to its end,
-/// decrypted when 7zAES sits under LZMA2 (padding after the end marker is allowed); `known` is the folder's output
-/// from `known_base`, covering at least the plan's `donor`.
+/// decrypted when 7zAES sits under LZMA2 (the block padding after the stream's end is ignored: the AES coder's output
+/// size says where the stream ends); `known` is the folder's output from `known_base`, covering at least the plan's
+/// `donor`. The end marker must be the stream's last byte. The resumed output (stored and decoded) is bounded by
+/// `options.max_output`.
 pub fn complete_lzma2(
     map: &MemberMap,
     plan: &OpenAt,
@@ -478,9 +483,59 @@ pub fn complete_lzma2(
     options: &Lzma2DecodeOptions,
 ) -> Result<Lzma2Resume, OpenAtError> {
     let Start::Lzma2 { folder, folder_target, dict_prop, .. } = plan.start else { return Err(OpenAtError::WrongPlan) };
-    let total = map.folders.get(folder as usize).ok_or(OpenAtError::Incomplete("the member's folder"))?.unpacked_size;
+    let f = map.folders.get(folder as usize).ok_or(OpenAtError::Incomplete("the member's folder"))?;
+    // Where the LZMA2 stream ends in the folder's packed stream: the packed size, or under 7zAES the AES coder's
+    // output size (the ciphertext is padded to whole blocks; the stream ends inside the last one).
+    let packed_len: u64 = f.pack_sizes.iter().sum();
+    let stream_end = match f.coders.iter().position(|c| c.kind == CoderKind::Aes) {
+        None => packed_len,
+        Some(aes) => {
+            let out: u64 = f.coders[..aes].iter().map(|c| u64::from(c.out_streams)).sum();
+            *f.unpack_sizes.get(out as usize).ok_or(OpenAtError::Incomplete("the 7zAES coder's output size"))?
+        }
+    };
+    resume_lzma2(
+        &Lzma2Bounds { total: f.unpacked_size, stream_end, target: folder_target, dict_prop },
+        packed_from,
+        packed,
+        known_base,
+        known,
+        options,
+    )
+}
+
+/// What [`resume_lzma2`] knows of the folder from the map.
+struct Lzma2Bounds {
+    /// The folder's output size.
+    total: u64,
+    /// The LZMA2 stream's length: its end marker is its last byte.
+    stream_end: u64,
+    /// The target in the folder's output.
+    target: u64,
+    dict_prop: u8,
+}
+
+fn resume_lzma2(
+    b: &Lzma2Bounds,
+    packed_from: u64,
+    packed: &[u8],
+    known_base: u64,
+    known: &[u8],
+    options: &Lzma2DecodeOptions,
+) -> Result<Lzma2Resume, OpenAtError> {
+    let (total, folder_target, dict_prop) = (b.total, b.target, b.dict_prop);
     let known_end = known_base.saturating_add(known.len() as u64);
-    // The first chunk header chain that runs to the end marker at the end of the bytes.
+    // The held bytes must reach the stream's end, whose end marker fixes every chunk's output offset.
+    let Some(end) = b.stream_end.checked_sub(packed_from).and_then(|e| usize::try_from(e).ok()) else {
+        return Err(OpenAtError::Incomplete("packed bytes before the LZMA2 stream's end"));
+    };
+    if end > packed.len() {
+        return Err(OpenAtError::NeedMore { needed: packed_from..b.stream_end });
+    }
+    let packed = &packed[..end];
+    // The first chunk header chain that runs to the end marker at exactly the stream's end. A header-like byte
+    // inside a payload can start a false chain, but one ending at the true end marker is rare, and the restart
+    // chunk is checked against the known output below.
     let mut found = None;
     for p in 0..packed.len() {
         let c = packed[p];
@@ -493,7 +548,7 @@ pub fn complete_lzma2(
         };
         let idx = Lzma2Index::from_bytes(&packed[p..], opts);
         let Lzma2End::EndMarker { offset } = idx.end else { continue };
-        if idx.chunks.len() < 2 || (packed.len() - p) as u64 - (offset + 1) >= 16 {
+        if idx.chunks.is_empty() || p as u64 + offset + 1 != packed.len() as u64 {
             continue;
         }
         let rest = idx.end_position().unpacked;
@@ -546,19 +601,26 @@ pub fn complete_lzma2(
     let output = x + chunks[s].unpacked_offset;
     let dictionary = known_at(known_base, output - known_base).ok_or(OpenAtError::NeedMore { needed: 0..output })?;
     let decode_err = |e: Lzma2DecodeError| OpenAtError::Decode(format!("{e:?}"));
+    let limit = options.max_output;
+    let over = |n: u64| if n > limit { Err(OpenAtError::OutputLimit { limit }) } else { Ok(()) };
     let mut out = Vec::new();
     let mut i = s;
     while i < chunks.len() {
         let c = chunks[i];
         if c.kind == Lzma2ChunkKind::Stored {
             let pl = c.payload();
+            over(out.len() as u64 + (pl.end - pl.start))?;
             out.extend_from_slice(&bytes[pl.start as usize..pl.end as usize]);
             i += 1;
         } else if restartable(i) {
             let dict = [dictionary, &out].concat();
-            out.extend(
-                idx.decode_with_dictionary(i..chunks.len(), bytes, 0, dict_prop, &dict, options).map_err(decode_err)?,
-            );
+            // the decoder's own bound is what is left of the limit
+            let mut left = options.clone();
+            left.max_output = limit - out.len() as u64;
+            let decoded =
+                idx.decode_with_dictionary(i..chunks.len(), bytes, 0, dict_prop, &dict, &left).map_err(decode_err)?;
+            over(out.len() as u64 + decoded.len() as u64)?;
+            out.extend(decoded);
             break;
         } else {
             return Err(OpenAtError::Decode(format!(
@@ -573,4 +635,59 @@ pub fn complete_lzma2(
         bytes: out,
         redecode: folder_target - output,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> Lzma2DecodeOptions {
+        Lzma2DecodeOptions::default()
+    }
+
+    /// Stored chunks `01 00 0f` + 16 bytes, then `02 00 00 64` ("d"), then the end marker: output "prefix" ... "d".
+    const STREAM: [u8; 24] = [
+        0x01, 0x00, 0x0f, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x02, 0x00, 0x00, 0x61, 0x02, 0x00, 0x00, 0x62, 0x00,
+        0x61, 0x02, 0x00, 0x00, 0x64, 0x00,
+    ];
+
+    fn plain() -> Vec<u8> {
+        [&STREAM[3..19], b"d"].concat()
+    }
+
+    fn bounds(target: u64) -> Lzma2Bounds {
+        Lzma2Bounds { total: 17, stream_end: STREAM.len() as u64, target, dict_prop: 0 }
+    }
+
+    /// Fetched from inside the first chunk's payload, the header-like bytes there end in a `00` that is not the
+    /// stream's end; only the chain ending at the true end marker counts.
+    #[test]
+    fn a_false_chain_inside_a_payload_is_not_taken() {
+        let plain = plain();
+        let r = resume_lzma2(&bounds(16), 9, &STREAM[9..], 0, &plain, &opts()).unwrap();
+        assert_eq!((r.output, r.bytes.as_slice()), (16, &b"d"[..]));
+        assert_eq!(r.feed_from, 19);
+    }
+
+    /// One data chunk and the end marker are a chain.
+    #[test]
+    fn a_single_chunk_chain_restarts() {
+        let plain = plain();
+        let r = resume_lzma2(&bounds(16), 19, &STREAM[19..], 0, &plain, &opts()).unwrap();
+        assert_eq!((r.output, r.bytes.as_slice()), (16, &b"d"[..]));
+        // bytes short of the stream's end are asked for, not guessed past
+        let r = resume_lzma2(&bounds(16), 19, &STREAM[19..23], 0, &plain, &opts());
+        assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+    }
+
+    /// Stored payloads count toward `max_output` too.
+    #[test]
+    fn stored_output_is_bounded() {
+        let plain = plain();
+        let small = Lzma2DecodeOptions { max_output: 10, ..opts() };
+        let r = resume_lzma2(&bounds(0), 0, &STREAM, 0, &plain, &small);
+        assert!(matches!(r, Err(OpenAtError::OutputLimit { limit: 10 })), "{r:?}");
+        let r = resume_lzma2(&bounds(0), 0, &STREAM, 0, &plain, &opts()).unwrap();
+        assert_eq!((r.output, r.bytes), (0, plain));
+    }
 }

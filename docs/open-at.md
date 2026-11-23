@@ -61,10 +61,13 @@ held bytes or the known plaintext do not reach far enough back: fetch from earli
 
 `complete_lzma2(&map, &plan, packed_from, packed, known_base, known, &Lzma2DecodeOptions) -> Lzma2Resume` needs the
 folder's packed bytes from `fetch_from` to the folder's end. It finds the first chunk header chain in them that runs
-to the end marker at the end; counting back from the folder's size gives every chunk's output offset. It restarts
+to the end marker at exactly the LZMA2 stream's end (the folder's packed size, or under 7zAES the AES coder's output
+size, which leaves out the block padding); counting back from the folder's size gives every chunk's output offset.
+A single chunk and its end marker count as a chain. It restarts
 at the last chunk at or before the target that resets the LZMA state or stores its bytes and checks out against the
 known output, and decodes from there to the folder's end with the known output before it as the dictionary:
-`bytes` is the folder's output from `output` on, and `redecode` is `folder_target - output`. A member's output is
+`bytes` is the folder's output from `output` on, bounded by `Lzma2DecodeOptions::max_output` (stored and decoded
+output together; `OpenAtError::OutputLimit` past it), and `redecode` is `folder_target - output`. A member's output is
 the folder's from its `stream_start`.
 
 ## Limits
