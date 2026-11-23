@@ -183,6 +183,25 @@ fn text(field: &[u8]) -> &[u8] {
     &field[..end]
 }
 
+/// Opens `path`, which on Unix has to be the file `expect` describes (same device and inode) when given: opened
+/// then without following a symlink and without blocking on a FIFO put in its place.
+fn open_same(path: &Path, expect: Option<&std::fs::Metadata>) -> Result<File> {
+    #[cfg(unix)]
+    if let Some(expect) = expect {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file =
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+        let got = file.metadata()?;
+        if (got.dev(), got.ino()) != (expect.dev(), expect.ino()) {
+            return Err(Error::Unsupported(format!("{} changed while it was being read", path.display())));
+        }
+        return Ok(file);
+    }
+    #[cfg(not(unix))]
+    let _ = expect;
+    Ok(File::open(path)?)
+}
+
 fn name_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -201,8 +220,7 @@ enum Source {
 }
 
 impl Source {
-    fn open(path: &Path, threads: usize, limit: Option<u64>, cancel: Option<Cancellation>) -> Result<Source> {
-        let mut file = File::open(path)?;
+    fn open(mut file: File, threads: usize, limit: Option<u64>, cancel: Option<Cancellation>) -> Result<Source> {
         let mut head = [0u8; stream::SNIFF_BYTES];
         let n = read_full(&mut file, &mut head)?;
         file.rewind()?;
@@ -798,7 +816,21 @@ impl Reader {
         cancel: Option<Cancellation>,
         whole: bool,
     ) -> Result<Reader> {
-        let mut src = Source::open(path, threads, limit, cancel.clone())?;
+        Self::open_checked(path, None, threads, limit, cancel, whole)
+    }
+
+    /// [`Reader::open_with_limit`], refusing (on Unix) to read any file at `path` but the one `expect` describes,
+    /// so a path swapped after the caller checked it is not read in its place.
+    fn open_checked(
+        path: &Path,
+        expect: Option<&std::fs::Metadata>,
+        threads: usize,
+        limit: Option<u64>,
+        cancel: Option<Cancellation>,
+        whole: bool,
+    ) -> Result<Reader> {
+        let open = || open_same(path, expect);
+        let mut src = Source::open(open()?, threads, limit, cancel.clone())?;
         let mut first = vec![0u8; BLOCK];
         let n = src.read(&mut first)?;
         first.truncate(n);
@@ -813,17 +845,23 @@ impl Reader {
             Some(Content::Tar)
         } else if plain && sniff_xar(&first) {
             // xar data is read where the table of contents puts it, from the file itself
-            random = Some(Box::new(xar::open(File::open(path)?, std::fs::metadata(path)?.len())?));
+            let file = open()?;
+            let len = file.metadata()?.len();
+            random = Some(Box::new(xar::open(file, len)?));
             first.clear();
             Some(Content::Tar)
         } else if plain && sniff_wim(&first) {
             // WIM data is read where the lookup table puts it, from the file itself; image 1 is the one taken
-            random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), 1)?));
+            let file = open()?;
+            let len = file.metadata()?.len();
+            random = Some(Box::new(wim::open(file, len, 1)?));
             first.clear();
             Some(Content::Tar)
-        } else if plain && n == BLOCK && iso::sniff(&File::open(path)?) {
+        } else if plain && n == BLOCK && iso::sniff(&open()?) {
             // an ISO 9660 image: its tree is read from the volume descriptors 32 KiB in
-            random = Some(Box::new(iso::open(File::open(path)?, std::fs::metadata(path)?.len())?));
+            let file = open()?;
+            let len = file.metadata()?.len();
+            random = Some(Box::new(iso::open(file, len)?));
             first.clear();
             Some(Content::Tar)
         } else if let Some(format) = cpio::sniff(&first) {
@@ -2173,10 +2211,12 @@ impl RepackData<'_> {
 /// length, or for a compressed stream every byte decoded, whichever is more.
 pub(crate) fn walk_members(
     path: &Path,
+    input: &File,
     limit: u64,
     mut each: impl FnMut(RawMember, RepackData<'_>) -> Result<()>,
 ) -> Result<u64> {
-    let mut reader = Reader::open_with_limit(path, 1, Some(limit), None, false)?;
+    let expect = input.metadata()?;
+    let mut reader = Reader::open_checked(path, Some(&expect), 1, Some(limit), None, false)?;
     if matches!(reader.content, Content::Single) {
         return Err(Error::NotAnArchive);
     }
@@ -2224,7 +2264,7 @@ pub(crate) fn walk_members(
     if reader.src.codec().is_some() {
         reader.drain(&mut buf)?;
     }
-    let len = std::fs::metadata(path)?.len();
+    let len = expect.len();
     Ok(match reader.src {
         Source::Packed(_, _, decoded) => decoded.max(len),
         Source::Plain { .. } => len,
@@ -2285,6 +2325,35 @@ mod tests {
     /// Where hard links fail (FAT, exFAT), each link to a sparse file is a copy that writes its holes as data: the
     /// copies are charged to the run's budget of holes, and refused one by one once it is spent.
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_reads_only_the_file_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_of = |name: &str| {
+            let mut t = test_header(name, b'0', 1, "").to_vec();
+            t.extend_from_slice(&[b'x'; BLOCK]);
+            t.resize(t.len() + 2 * BLOCK, 0);
+            t
+        };
+        let path = dir.path().join("in.tar");
+        std::fs::write(&path, tar_of("checked")).unwrap();
+        let checked = File::open(&path).unwrap();
+        let walk = |file: &File| {
+            let mut names = Vec::new();
+            walk_members(&path, file, u64::MAX, |raw, _| {
+                names.push(raw.name);
+                Ok(())
+            })
+            .map(|_| names)
+        };
+        assert_eq!(walk(&checked).unwrap(), [b"checked".to_vec()]);
+        // another file renamed over the path after it was checked is not read in its place
+        let other = dir.path().join("other.tar");
+        std::fs::write(&other, tar_of("swapped")).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert!(matches!(walk(&checked), Err(Error::Unsupported(_))));
+    }
+
     #[test]
     fn hard_links_copied_in_place_of_linking_are_charged_for_holes() {
         copies_are_charged(false);

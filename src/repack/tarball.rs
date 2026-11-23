@@ -63,7 +63,8 @@ pub(super) fn repack(
     budget: &mut Budget,
     scratch: &Path,
 ) -> Result<RepackSummary> {
-    drop(open_input(input)?);
+    // the checked file is the one read: the walk refuses a different file found at the path later
+    let checked = open_input(input)?;
     let mut spool = BufWriter::with_capacity(1 << 20, tempfile::tempfile_in(scratch)?);
     let mut spooled = 0u64;
     let mut members = Vec::new();
@@ -74,7 +75,7 @@ pub(super) fn repack(
     let mut by_name: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut nested = 0u64;
     let limit = budget.left;
-    let decoded = walk_members(input, limit, |raw, data| {
+    let decoded = walk_members(input, &checked, limit, |raw, data| {
         if unsafe_name(&raw.name) {
             return Err(Error::UnsafePath(lossy(&raw.name)));
         }
