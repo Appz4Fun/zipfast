@@ -378,6 +378,8 @@ struct Member {
     /// the stored name's bytes, kept only when they aren't UTF-8 and `name` had to replace some
     raw_name: Option<Vec<u8>>,
     link: String,
+    /// the stored link target's bytes, kept only when they aren't UTF-8 and `link` had to replace some
+    raw_link: Option<Vec<u8>>,
     size: u64,
     kind: Kind,
     mtime: Option<i64>,
@@ -616,8 +618,9 @@ impl Member {
 /// Values from pax records, for the next member or (from a global record) for every member after.
 #[derive(Clone, Debug, Default)]
 struct Pax {
-    path: Option<String>,
-    linkpath: Option<String>,
+    /// `path` and `linkpath` as stored: a pax header with `hdrcharset=BINARY` may hold bytes that aren't UTF-8
+    path: Option<Vec<u8>>,
+    linkpath: Option<Vec<u8>>,
     size: Option<u64>,
     mtime: Option<(i64, u32)>,
     atime: Option<(i64, u32)>,
@@ -669,8 +672,8 @@ impl Pax {
                 b"gname" => self.gname = Some(owner()),
                 b"uid" => self.uid = Some(id()?),
                 b"gid" => self.gid = Some(id()?),
-                b"path" => self.path = Some(name_of(value)),
-                b"linkpath" => self.linkpath = Some(name_of(value)),
+                b"path" => self.path = Some(value.to_vec()),
+                b"linkpath" => self.linkpath = Some(value.to_vec()),
                 b"size" => {
                     self.size = Some(std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()).ok_or_else(bad)?)
                 }
@@ -909,7 +912,7 @@ impl Reader {
             self.src.skip(n, &mut self.scratch)?;
         }
         let mut long_name: Option<Vec<u8>> = None;
-        let mut long_link: Option<String> = None;
+        let mut long_link: Option<Vec<u8>> = None;
         let mut pax = Pax::default();
         let mut pax_header_name = None;
         loop {
@@ -923,7 +926,7 @@ impl Reader {
                     continue;
                 }
                 b'K' => {
-                    long_link = Some(name_of(text(&self.ext_data(size)?)));
+                    long_link = Some(text(&self.ext_data(size)?).to_vec());
                     continue;
                 }
                 b'x' | b'X' => {
@@ -956,15 +959,17 @@ impl Reader {
                 }
             }
             let real_name = if p.sparse { p.gnu_sparse.name.clone() } else { None };
-            let (name, raw_name) = match real_name.or_else(|| p.path.clone()) {
+            let (name, raw_name) = match real_name {
                 Some(path) => (path, None),
                 None => {
-                    let stored = long_name.unwrap_or(name);
+                    let stored = p.path.clone().or(long_name).unwrap_or(name);
                     let decoded = name_of(&stored);
                     (decoded, std::str::from_utf8(&stored).is_err().then_some(stored))
                 }
             };
-            let link = p.linkpath.clone().or(long_link).unwrap_or_else(|| name_of(text(&h[157..257])));
+            let stored_link = p.linkpath.clone().or(long_link).unwrap_or_else(|| text(&h[157..257]).to_vec());
+            let link = name_of(&stored_link);
+            let raw_link = std::str::from_utf8(&stored_link).is_err().then_some(stored_link);
             let mut size = p.size.unwrap_or(size);
             // the size with its padding has to be a number too
             if size > u64::MAX - BLOCK as u64 {
@@ -1001,6 +1006,7 @@ impl Reader {
                 name,
                 raw_name,
                 link,
+                raw_link,
                 size: if has_data { size } else { 0 },
                 kind,
                 mtime,
@@ -2199,7 +2205,7 @@ pub(crate) fn walk_members(
         budget.record(&m.name)?;
         let raw = RawMember {
             name: m.raw_name.clone().unwrap_or_else(|| m.name.clone().into_bytes()),
-            link: m.link.clone().into_bytes(),
+            link: m.raw_link.clone().unwrap_or_else(|| m.link.clone().into_bytes()),
             kind,
             mode: m.mode,
             size: if kind == RawKind::File { m.real_size() } else { 0 },
@@ -2380,7 +2386,7 @@ mod tests {
         let data =
             format!("{}{}{}", rec("path", "a/é/long name.mkv"), rec("size", "12345678901"), rec("mtime", "-1.25"));
         p.parse(data.as_bytes()).unwrap();
-        assert_eq!(p.path.as_deref(), Some("a/é/long name.mkv"));
+        assert_eq!(p.path.as_deref(), Some("a/é/long name.mkv".as_bytes()));
         assert_eq!(p.size, Some(12_345_678_901));
         assert_eq!(p.mtime, Some((-2, 750_000_000)));
         assert!(Pax::default().parse(b"99 path=x\n").is_err());

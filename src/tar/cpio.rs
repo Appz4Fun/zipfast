@@ -233,6 +233,7 @@ fn cpio_member(
         name,
         raw_name,
         link,
+        raw_link: None,
         size: if matches!(kind, Kind::File) { size } else { 0 },
         kind,
         mtime: Some(mtime),
@@ -375,6 +376,7 @@ impl Reader {
                 _ => Kind::Other(b's'),
             };
             let mut link = String::new();
+            let mut raw_link = None;
             let mut size = h.filesize;
             if kind == Kind::Symlink {
                 if h.filesize > MAX_TARGET {
@@ -384,6 +386,7 @@ impl Reader {
                 self.read_exact_cpio(&mut target)?;
                 self.src.skip(data_pad, &mut self.scratch)?;
                 link = name_of(&target);
+                raw_link = std::str::from_utf8(&target).is_err().then_some(target);
                 size = 0;
             } else {
                 self.unread = h.filesize + data_pad;
@@ -419,7 +422,8 @@ impl Reader {
                     }
                 }
             }
-            let m = cpio_member(decoded, raw_name, kind, link, size, (h.mtime, h.mode), (h.uid, h.gid));
+            let mut m = cpio_member(decoded, raw_name, kind, link, size, (h.mtime, h.mode), (h.uid, h.gid));
+            m.raw_link = raw_link;
             if matches!(format, Format::Newc { crc: true }) && kind == Kind::File {
                 self.crc = Some(super::CpioCrc { want: h.check, sum: 0, left: h.filesize });
             }

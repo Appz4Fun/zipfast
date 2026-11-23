@@ -591,6 +591,7 @@ impl State {
             name: path,
             raw_name: raw_path,
             link: e.link,
+            raw_link: None,
             size: if e.kind == Kind::File { size } else { 0 },
             kind: e.kind,
             mtime: e.mtime,

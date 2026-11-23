@@ -685,3 +685,41 @@ fn temporaries_go_beside_the_output_and_are_removed() {
     let left: Vec<_> = std::fs::read_dir(&out_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(left, ["x.deb"]);
 }
+
+/// One pax record, `"<len> <key>=<value>\n"`.
+fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let body = key.len() + value.len() + 3;
+    let mut len = body + 1;
+    while len != body + len.to_string().len() {
+        len = body + len.to_string().len();
+    }
+    [format!("{len} ").as_bytes(), key, b"=", value, b"\n"].concat()
+}
+
+#[test]
+fn tar_names_and_link_targets_keep_their_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Vec::new();
+    let mut push = |h: [u8; 512], data: &[u8]| {
+        t.extend_from_slice(&h);
+        t.extend_from_slice(data);
+        t.resize(t.len().next_multiple_of(512), 0);
+    };
+    push(tar_header(b"d/\xfe", b'0', 0o644, 3, b"", &ALICE), b"abc");
+    push(tar_header(b"h", b'1', 0o644, 0, b"d/\xfe", &ALICE), b"");
+    push(tar_header(b"s", b'2', 0o777, 0, b"t\xff", &ALICE), b"");
+    // a pax path record holding bytes that aren't UTF-8, as `hdrcharset=BINARY` allows
+    let long = [vec![b'p'; 120], b"\xfd".to_vec()].concat();
+    let records = [pax_record(b"hdrcharset", b"BINARY"), pax_record(b"path", &long)].concat();
+    push(tar_header(b"PaxHeaders/p", b'x', 0o644, records.len() as u64, b"", &ALICE), &records);
+    push(tar_header(b"short", b'0', 0o644, 1, b"", &ALICE), b"p");
+    t.resize(t.len() + 1024, 0);
+    let out = flate2_decode(&repacked(dir.path(), "raw", &t, &RepackOptions::default()));
+    let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+    assert!(!has("\u{fffd}".as_bytes()), "a name or link was decoded lossily");
+    assert!(has(b"d/\xfe\0"));
+    assert!(has(b"t\xff\0"));
+    assert!(has(&[b"path=".as_slice(), &long, b"\n"].concat()));
+    // the hard link still names its file, so it is written as a link and the data once
+    assert_eq!(out.windows(3).filter(|w| w == b"abc").count(), 1);
+}

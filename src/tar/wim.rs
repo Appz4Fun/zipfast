@@ -798,6 +798,7 @@ impl State {
                 name: path,
                 raw_name: None,
                 link,
+                raw_link: None,
                 size,
                 kind,
                 mtime,

@@ -370,6 +370,7 @@ impl State {
             name: e.path,
             raw_name: e.raw_path,
             link,
+            raw_link: None,
             size,
             kind,
             mtime: e.mtime,
