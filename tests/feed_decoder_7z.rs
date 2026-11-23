@@ -291,7 +291,9 @@ fn feed(volumes: &[Vec<u8>], member: usize, plain: &[u8], article: usize, every:
     let mut d = FeedDecoder::new(&map, member, options).unwrap();
     let mut out = Out::new(plain.len(), donor.then(|| plain.to_vec()));
     let mut all = articles(volumes, article);
-    shuffle(&mut all, 0xFEED ^ article as u64 ^ every as u64);
+    // fixed; FEED7Z_SEED varies it (to run many shuffles in a loop)
+    let extra: u64 = std::env::var("FEED7Z_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    shuffle(&mut all, (0xFEED ^ article as u64 ^ every as u64).wrapping_add(extra.wrapping_mul(0x9E37_79B9)));
     let (missing, present): (Vec<_>, Vec<_>) = all.into_iter().enumerate().partition(|(i, _)| i % every == every / 2);
     let missing: Vec<Article> = missing.into_iter().map(|(_, a)| a).collect();
     let mut source = ArticleBuffer::new(usize::MAX);
@@ -332,7 +334,8 @@ fn feed(volumes: &[Vec<u8>], member: usize, plain: &[u8], article: usize, every:
     assert_eq!(s.crc_ok, Some(true));
     assert!(out.bytes == plain, "output differs");
     assert_eq!(out.written, plain.len() as u64, "each output byte written once");
-    Report { redecoded: d.stats().redecoded, ..report }
+    // holes skipped over the decoder's whole life (a restored decoder skips again those it meets again)
+    Report { redecoded: d.stats().redecoded, holes: d.stats().holes, ..report }
 }
 
 #[test]
@@ -349,8 +352,9 @@ fn lzma2_folders_feed_shuffled_with_holes_skipped_and_repaired() {
                      again",
                     r.stalled, r.holes, r.lost, r.redecoded
                 );
-                // a repair decodes again at most from the restart point before its hole: a block of 400 KB each
-                assert!(r.redecoded <= r.holes.max(1) * 400_000 + 400_000, "{}", r.redecoded);
+                // a repair decodes again at most from the restart point before its hole (a block of 400 KB), and the
+                // restore half way decodes again from the main decode's restart point
+                assert!(r.redecoded <= (r.holes + 1) * 400_000, "{}", r.redecoded);
             }
         }
     }
@@ -364,7 +368,10 @@ fn small_holes_inside_payloads_are_skipped_without_held_output() {
     let archive = seven_zip(&[("m.bin", plain.clone())], false, 400_000);
     let volumes = vec![archive];
     let r = feed(&volumes, 0, &plain, 1_000, 41, false);
-    assert!(r.holes > 0, "no hole skipped");
+    // with the fixed shuffle some hole lies inside a payload (another shuffle may put every one over a header)
+    if std::env::var_os("FEED7Z_SEED").is_none() {
+        assert!(r.holes > 0, "no hole skipped");
+    }
 }
 
 #[test]

@@ -1077,9 +1077,13 @@ impl FeedDecoder {
                     } else if state {
                         let d = lz.dict.min(c.unpacked_offset);
                         let from = c.unpacked_offset - d;
-                        let r = from.max(lz.ss) - lz.ss..c.unpacked_offset - lz.ss;
-                        // a restart point must be restorable: the sink gives the output it was written back
-                        if from >= lz.ss && self.lz_written(r.clone()) && held_probe(sink, r) {
+                        // a restart point must be restorable: its dictionary lies in the member (a state reset before a
+                        // later member's start cannot be one) and the sink gives the output written there back
+                        let held = from >= lz.ss && {
+                            let r = from - lz.ss..c.unpacked_offset - lz.ss;
+                            self.lz_written(r.clone()) && held_probe(sink, r)
+                        };
+                        if held {
                             lane.cp = Some(Cp {
                                 packed: c.packed_offset,
                                 out: c.unpacked_offset,
