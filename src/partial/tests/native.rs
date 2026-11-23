@@ -337,3 +337,20 @@ fn writes_in_an_open_group_skip_the_full_check_and_the_commit_runs_it() {
     assert!(FULL_CHECKS.with(|c| c.get()) > before, "committing the group checks in full");
     drop(state);
 }
+// Catches a batched journal write holding every file of the batch open at once: with the fixture's tight
+// descriptor budget a group commit (a changed page and the commit record together), a hole's transaction and a
+// fill must still go through.
+#[test]
+fn journal_batches_fit_a_tight_descriptor_budget() {
+    let f = Fixture::new();
+    let limits = PartialLimits { open_files: 7, ..PartialLimits::default() };
+    let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    file.core.write_original(0, &DATA[..4]).unwrap();
+    assert_eq!(file.remaining().unwrap(), vec![4..16], "the group commits");
+    let report = file.core.hole_report(4..8, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(report, &[]).unwrap();
+    file.core.fill_plain(4, &DATA[4..8]).unwrap();
+    file.core.write_original(8, &DATA[8..16]).unwrap();
+    assert!(file.remaining().unwrap().is_empty());
+    assert_eq!(fs::read(f.output()).unwrap(), DATA);
+}

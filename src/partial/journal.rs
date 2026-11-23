@@ -164,27 +164,28 @@ impl Bundle {
     fn put(&mut self, name: &str, bytes: &[u8], page: bool) -> PartialResult<()> {
         self.put_batch(&[(name.to_owned(), bytes.to_vec(), page)])
     }
-    /// Writes `files` and makes each durable: every file is written, then each written file is synced, then the
-    /// directory is synced once for all their names, then they are marked durable. Nothing in a batch is
+    /// Writes `files` and makes each durable: each file is written and synced (and its descriptor closed) in
+    /// turn, then the directory is synced once for all their names, then they are marked durable. Nothing in a batch is
     /// anchored by it: the caller anchors a record only after the batch returns, so a file durable before
     /// another of its batch never matters (an unanchored record or page is ignored on recovery).
     pub(super) fn put_batch(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
         self.directory.check()?;
-        let mut written = Vec::new();
+        let mut names = Vec::new();
         for (name, bytes, page) in files {
+            // Each file is synced and its descriptor closed before the next is opened, so a batch holds one
+            // journal descriptor at a time, as single puts do, whatever `PartialLimits::open_files` allows; only
+            // the directory sync is shared.
             if let Some(file) = self.put_write(name, bytes, *page)? {
-                written.push((name.as_str(), file));
+                sync_journal(&file.file, &[name], false).map_err(|e| io_error(OutputOperation::Flush, e))?;
+                drop(file);
+                names.push(name.as_str());
             }
         }
-        if written.is_empty() {
+        if names.is_empty() {
             return Ok(());
         }
         // Equal visible bytes may be left by a failed file or directory sync.
         // Every successful put must establish both durability boundaries.
-        let names: Vec<&str> = written.iter().map(|(name, _)| *name).collect();
-        for (name, file) in &written {
-            sync_journal(&file.file, &[name], false).map_err(|e| io_error(OutputOperation::Flush, e))?;
-        }
         sync_journal(&self.directory.held.file, &names, true).map_err(|e| io_error(OutputOperation::Flush, e))?;
         self.directory.check()?;
         for name in names {
