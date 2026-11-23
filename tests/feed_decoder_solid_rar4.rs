@@ -281,3 +281,31 @@ fn feed(
     assert!(redecoded <= restore_cost, "{redecoded} > {restore_cost}");
     restore_cost > 0
 }
+
+/// A hand-off that fails on the successor's own setup (a window limit) keeps the decoder: the next attempt still
+/// goes on from it.
+#[test]
+fn a_failed_rar4_hand_off_keeps_the_decoder() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4");
+    let bytes = std::fs::read(root.join("solid.rar")).unwrap();
+    let map = MemberMap::from_memory(&[&bytes], "solid.rar", None).unwrap();
+    let stream = streams(&map).into_iter().next().expect("a solid stream");
+    let plain = reference(&map, stream[1], std::slice::from_ref(&bytes), None).expect("it decodes");
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &bytes).unwrap();
+    let mut d0 = FeedDecoder::new(&map, stream[0], FeedOptions::default()).unwrap();
+    let mut out0 = Out::new(d0.size() as usize);
+    assert!(d0.run(&mut source, &mut out0).unwrap().done);
+    let small = FeedOptions { max_window: 1 << 10, ..FeedOptions::default() };
+    assert!(matches!(
+        d0.next_solid(&map, stream[1], small),
+        Err(FeedError::Unsupported(FeedUnsupported::Window { .. }))
+    ));
+    let mut d1 = d0.next_solid(&map, stream[1], FeedOptions::default()).unwrap();
+    let mut out1 = Out::new(plain.len());
+    let s = d1.run(&mut source, &mut out1).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert_eq!(out1.bytes, plain);
+    // handed the decoder: nothing before the member decoded again
+    assert_eq!(d1.stats().redecoded, 0);
+}

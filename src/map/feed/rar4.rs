@@ -118,9 +118,10 @@ impl FeedDecoder {
         let member = &map.members[index];
         let size = member.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
         let run = solid_run(map, index)?;
+        // a successor handed the decoder in-session gets it installed after it is set up
         let handed = match begin {
-            Begin::Fresh | Begin::Restore => None,
-            Begin::Rar4(dec) if run.prev.is_some() => Some(dec),
+            Begin::Fresh | Begin::Restore => false,
+            Begin::Rar4 if run.prev.is_some() => true,
             _ => return Err(FeedError::Handoff("a hand-off from another layer or place")),
         };
         let (geometry, stream_len, cipher, frame) = Self::rar4_parts(member, &options)?;
@@ -135,7 +136,7 @@ impl FeedDecoder {
         let version = frame.unpack_version;
         // a successor not handed the decoder decodes the stream's earlier members again first
         let mut prefix = Vec::new();
-        if handed.is_none() && run.prev.is_some() {
+        if !handed && run.prev.is_some() {
             let decodes = |m: &MapMember| !m.is_dir && matches!(m.method, MapMethod::Compressed { .. });
             for m in map.members[run.first..index].iter().filter(|m| decodes(m)) {
                 let (geometry, stream_len, cipher, frame) = Self::rar4_parts(m, &options)?;
@@ -193,12 +194,6 @@ impl FeedDecoder {
         d.stream_start = run.start;
         // an empty member of a solid stream still has its end-of-file marker read, which says where the next starts
         let feeds = size > 0 || run.successor || run.prev.is_some();
-        if let Some(mut dec) = handed {
-            let fail = |_| FeedError::Handoff("the RAR 4.x decoder does not go on into this member");
-            dec.next_solid_member(frame).map_err(fail)?;
-            let r = d.rar4.as_mut().expect("RAR 4.x state");
-            r.dec = Some(dec);
-        }
         if feeds {
             d.main = Some(d.packed_lane(0, stream_len));
         }
@@ -286,13 +281,20 @@ impl FeedDecoder {
         if solid_run(map, index)?.prev != Some(self.index) {
             return Err(FeedError::Handoff("not the next member of the solid stream"));
         }
-        let r = self.rar4.as_mut().expect("RAR 4.x state");
-        let dec = r.ended.take().ok_or(FeedError::Handoff(
-            "the main decode has not finished, was handed over, or was restored (a RAR 4.x successor then decodes the \
-             stream again: FeedDecoder::new)",
-        ))?;
+        if self.rar4.as_ref().expect("RAR 4.x state").ended.is_none() {
+            return Err(FeedError::Handoff(
+                "the main decode has not finished, was handed over, or was restored (a RAR 4.x successor then decodes \
+                 the stream again: FeedDecoder::new)",
+            ));
+        }
+        // the successor is set up (keys, limits) before the decoder leaves this one: a failure keeps it here
         let suspect = self.carried_suspect();
-        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Rar4(dec))?;
+        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Rar4)?;
+        let mut dec = self.rar4.as_mut().expect("RAR 4.x state").ended.take().expect("checked above");
+        let frame = next.rar4.as_ref().expect("RAR 4.x state").frame;
+        dec.next_solid_member(frame)
+            .map_err(|_| FeedError::Handoff("the RAR 4.x decoder does not go on into this member"))?;
+        next.rar4.as_mut().expect("RAR 4.x state").dec = Some(dec);
         next.inherit(suspect);
         Ok(next)
     }

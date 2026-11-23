@@ -1518,8 +1518,8 @@ enum Begin {
     Restore,
     /// a RAR 5.0 solid successor from a carry (and, handed over in-session, the live decoder installed after)
     Carry(SolidCarry),
-    /// a RAR 4.x solid successor going on from the decoder of the member before
-    Rar4(Box<crate::rar5::unpack::rar4::Rar4Decoder>),
+    /// a RAR 4.x solid successor going on from the decoder of the member before (installed after it is set up)
+    Rar4,
 }
 
 /// The state a RAR 5.0 solid successor starts from ([`FeedDecoder::solid_carry`]): about 500 bytes, no plaintext
