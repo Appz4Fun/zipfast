@@ -427,6 +427,86 @@ fn a_missing_zip_extracts_the_members_wholly_before_it() {
 }
 
 #[test]
+fn a_missing_zip_keeps_winzip_aes_members_before_it_readable() {
+    // The local walk reads the AES extra field, so an encrypted member wholly before the gap still decrypts.
+    let plain = data(6000, 5);
+    let entries = [Entry::stored("first.bin", b"x"), aes_entry(&plain), Entry::stored("last.bin", &data(900, 4))];
+    let start = split_zip_builder::data_abs(&entries, 1, true);
+    let last_start = split_zip_builder::data_abs(&entries, 2, true);
+    let set = split_zip(&entries, &[start + 7, start + 4000, last_start + 5], Layout { marker: true, zip64: false });
+    let dir = tempfile::tempdir().unwrap();
+    let zip = write_set(dir.path(), "aes", &set.volumes);
+    fs::remove_file(&zip).unwrap();
+    let z01 = dir.path().join("aes.z01");
+    let out = dir.path().join("out");
+    let s = extract::run_with_password(&z01, &options(&out, Mode::Extract), Some("pw"), |_| {}).unwrap();
+    assert_eq!(fs::read(out.join("aes.bin")).unwrap(), plain, "{:?}", s.errors);
+    assert!(s.errors.iter().all(|e| !e.contains("aes.bin")), "{:?}", s.errors);
+    assert!(s.errors.iter().any(|e| e.contains("last.bin") && e.contains("aes.zip")), "{:?}", s.errors);
+}
+
+#[test]
+fn a_missing_zip_walks_past_members_with_zip64_local_sizes() {
+    // A member whose local header defers its sizes to the ZIP64 extra field (as forced-ZIP64 writers do) is
+    // listed and extracted, and the walk goes on to the members after it.
+    let a = data(700, 1);
+    let b = data(300, 2);
+    let mut zip64 = Entry::stored("a.bin", &a);
+    zip64.size = u32::MAX;
+    zip64.extra = [&[1, 0, 16, 0][..], &(a.len() as u64).to_le_bytes(), &(a.len() as u64).to_le_bytes()].concat();
+    let entries = [zip64, Entry::stored("b.bin", &b), Entry::stored("c.bin", &data(900, 3))];
+    let cuts =
+        [split_zip_builder::data_abs(&entries, 0, true) + 100, split_zip_builder::data_abs(&entries, 2, true) + 10];
+    let set = split_zip(&entries, &cuts, Layout { marker: true, zip64: false });
+    let dir = tempfile::tempdir().unwrap();
+    let zip = write_set(dir.path(), "z64", &set.volumes);
+    fs::remove_file(&zip).unwrap();
+    let z01 = dir.path().join("z64.z01");
+    let detailed = extract::list_detailed(&z01, None).unwrap();
+    let got: Vec<_> = detailed.entries.iter().map(|e| (e.name.as_str(), e.size)).collect();
+    assert_eq!(got, [("a.bin", 700), ("b.bin", 300), ("c.bin", 900)]);
+    let out = dir.path().join("out");
+    let s = extract::run(&z01, &options(&out, Mode::Extract), |_| {}).unwrap();
+    assert_eq!((fs::read(out.join("a.bin")).unwrap(), fs::read(out.join("b.bin")).unwrap()), (a, b), "{:?}", s.errors);
+    assert!(s.errors.iter().any(|e| e.contains("c.bin") && e.contains("z64.zip")), "{:?}", s.errors);
+}
+
+/// Marks `name`'s central directory record in `volume` as a Unix symbolic link.
+#[cfg(unix)]
+fn make_symlink(volume: &mut [u8], name: &str) {
+    let at = (0..volume.len() - 46)
+        .find(|&i| {
+            volume[i..i + 4] == *b"PK\x01\x02" && volume.get(i + 46..i + 46 + name.len()) == Some(name.as_bytes())
+        })
+        .expect("central record");
+    volume[at + 38..at + 42].copy_from_slice(&(0o120777u32 << 16).to_le_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_reaching_a_missing_middle_volume_fails_alone() {
+    let target = b"some/where/far/away";
+    let after = data(800, 6);
+    let entries = [Entry::stored("link", target), Entry::stored("after.bin", &after)];
+    // the link's target runs from `.z01` through `.z02` (removed) into the `.zip`, which holds after.bin whole
+    let start = split_zip_builder::data_abs(&entries, 0, true);
+    let mut set = split_zip(&entries, &[start + 3, start + 8], Layout { marker: true, zip64: false });
+    make_symlink(set.volumes.last_mut().unwrap(), "link");
+    let dir = tempfile::tempdir().unwrap();
+    let zip = write_set(dir.path(), "sym", &set.volumes);
+    fs::remove_file(dir.path().join("sym.z02")).unwrap();
+    for mode in [Mode::Test, Mode::Extract] {
+        let out = dir.path().join(format!("out-{mode:?}"));
+        let s = extract::run(&zip, &options(&out, mode), |_| {}).unwrap();
+        assert!(s.errors.iter().any(|e| e.contains("link") && e.contains("sym.z02")), "{mode:?}: {:?}", s.errors);
+        assert!(s.errors.iter().all(|e| !e.contains("after.bin")), "{mode:?}: {:?}", s.errors);
+        if mode == Mode::Extract {
+            assert_eq!(fs::read(out.join("after.bin")).unwrap(), after);
+        }
+    }
+}
+
+#[test]
 fn a_missing_numbered_volume_and_zip_end_the_walk_at_the_first_gap() {
     let a = data(3000, 1);
     let entries = [Entry::stored("a.bin", &a), Entry::stored("b.bin", b"tail")];

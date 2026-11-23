@@ -233,6 +233,18 @@ fn single_disk_zip_is_volume_zero_of_one() {
 }
 
 #[test]
+fn single_disk_zip_after_a_stub_its_offsets_leave_out_is_read() {
+    // A self-extracting stub before a ZIP whose offsets count from the ZIP's own start: the whole-archive reader
+    // shifts them, and so does reading the directory from the tail.
+    let mut zip = b"MZ self-extracting stub".repeat(8);
+    zip.extend(stored_zip(&[("a.txt", b"hello"), ("b.txt", b"world!")]));
+    let id = identity(&zip, "sfx.exe");
+    assert_eq!((id.volume_number, id.volumes), (Some(0), Some(1)));
+    let k = identity_keys(&id);
+    assert_eq!(k, [("a.txt".into(), 5, crc32fast::hash(b"hello")), ("b.txt".into(), 6, crc32fast::hash(b"world!"))]);
+}
+
+#[test]
 fn split_zip_directory_on_an_earlier_volume_is_missing() {
     let mut last = fixture("zip-split/stored.zip");
     let n = last.len();
@@ -566,4 +578,79 @@ fn candidates_that_spend_the_search_bound_are_reported_as_such() {
     }
     let result = last_volume_identity(HeldVolume::new(&[], &tail, tail.len() as u64).unwrap(), MapOptions::new("x"));
     assert!(matches!(result, Err(MapError::TailSearchExhausted)), "{result:?}");
+}
+
+/// An encoded header over a Copy folder whose packed stream holds `plain` and then `pad` bytes more: the folder
+/// takes the first `plain.len()` bytes. The tail is `data`, that packed stream and the encoded header.
+fn padded_encoded(data: &[u8], plain: &[u8], pad: usize) -> Vec<u8> {
+    let mut out = data.to_vec();
+    out.extend_from_slice(plain);
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out.extend_from_slice(&[0x17, 0x06]);
+    num(data.len() as u64, &mut out);
+    out.extend_from_slice(&[0x01, 0x09]);
+    num((plain.len() + pad) as u64, &mut out);
+    out.push(0x00);
+    copy_folder(plain.len() as u64, Some(crc32fast::hash(plain)), &mut out);
+    out.push(0x00);
+    out
+}
+
+#[test]
+fn an_encoded_tail_header_charges_its_packed_stream_to_the_header_budget() {
+    let data = noise(300, 4);
+    let plain = plain_header("a.bin", &data, 0);
+    let pad = 4000;
+    let tail = padded_encoded(&data, &plain, pad);
+    assert_eq!(identity_keys(&identity(&tail, "a.7z")).len(), 1);
+    // The decoded header fits the budget, the packed stream it is decoded from does not.
+    let mut options = MapOptions::new("a.7z");
+    options.limits.header_bytes = (plain.len() + pad / 2) as u64;
+    let result = last_volume_identity(HeldVolume::whole(&tail), options);
+    assert!(
+        matches!(result, Err(MapError::Limit { resource: zipfast::progressive::Resource::HeaderBytes, .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn tail_candidates_share_one_kdf_session_budget() {
+    // Two overlapping encoded-header candidates, both ending at the tail's end and both with a 7zAES coder that
+    // derives a key before its unconnected coder graph is refused (a non-final error, so the search goes on). The
+    // second candidate (B) starts inside the first one's (A's) 7zAES salt.
+    let suffix = |out: &mut Vec<u8>| {
+        out.extend_from_slice(&[0x01, 0x00]); // a Copy coder
+        out.extend_from_slice(&[0x00, 0x00]); // bind pair: the 7zAES coder's input to its own output
+        out.extend_from_slice(&[0x0C, 16, 16]); // unpack sizes
+        out.extend_from_slice(&[0x0A, 0x01, 1, 2, 3, 4]); // folder CRC
+        out.extend_from_slice(&[0x00, 0x00]);
+    };
+    // the encoded header up to its 7zAES properties' length
+    let prefix = |props_len: u8| {
+        vec![
+            0x17, 0x06, 0x7F, 0x01, 0x09, 16, 0x00, 0x07, 0x0B, 0x01, 0x00, 0x02, 0x24, 0x06, 0xF1, 0x07, 0x01,
+            props_len,
+        ]
+    };
+    let b_prefix = prefix(1);
+    assert_eq!(b_prefix.len(), 18);
+    // A's properties: power 10 with a 16-byte salt and 3-byte IV, which hold B's prefix and B's properties (power 10).
+    let mut a_props = vec![0xCA, 0xF2];
+    a_props.extend_from_slice(&b_prefix);
+    a_props.push(0x0A);
+    let mut tail = vec![0u8; 16];
+    tail.extend(prefix(a_props.len() as u8));
+    tail.extend(&a_props);
+    suffix(&mut tail);
+    let mut options = MapOptions::new("k.7z").password(Some("pw"));
+    // B's derivation (193 SHA-256 blocks) and A's (449) each fit alone, not together.
+    options.limits.kdf_session_blocks = 500;
+    let result = last_volume_identity(HeldVolume::whole(&tail), options.clone());
+    assert!(
+        matches!(result, Err(MapError::Limit { resource: zipfast::progressive::Resource::KdfSessionBlocks, .. })),
+        "{result:?}"
+    );
+    options.limits.kdf_session_blocks = 1000;
+    let result = last_volume_identity(HeldVolume::whole(&tail), options);
+    assert!(!matches!(result, Err(MapError::Limit { .. })), "{result:?}");
 }
