@@ -418,3 +418,32 @@ fn rr_moved_is_kept_without_relocation() {
     assert!(s.errors.is_empty(), "{:?}", s.errors);
     assert_eq!(fs::read(dir.path().join("out/rr_moved/F.TXT")).unwrap(), b"hi");
 }
+
+/// A hybrid image (boot code in the system area, so its head looks like nothing known) takes the ISO reader on
+/// every entry point, not only those that sniff past the head.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_hybrid_image_is_read_on_every_route() {
+    use zipfast::extract::{Cancellation, Inspection, RunEvent};
+    let bytes = iso(21, &[record(b"A.TXT;1", 20, 2, 0)], |img| {
+        img[..4].copy_from_slice(&[0x33, 0xed, 0xfa, 0x8e]);
+        img[20 * SECTOR..20 * SECTOR + 2].copy_from_slice(b"ok");
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hybrid.iso");
+    fs::write(&path, bytes).unwrap();
+    let Inspection::Other(entries) = extract::inspect(&path).unwrap() else { panic!("read as ZIP") };
+    assert_eq!(entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["A.TXT"]);
+    let out = dir.path().join("out");
+    let report = extract::run_with_zip_policy(
+        &path,
+        &opts(Mode::Extract, &out),
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |_: RunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(report.files(), 1);
+    assert_eq!(fs::read(out.join("A.TXT")).unwrap(), b"ok");
+}
