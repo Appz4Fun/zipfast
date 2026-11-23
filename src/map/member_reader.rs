@@ -275,7 +275,7 @@ impl Plan {
 /// Checks that a map member (a public type the caller may have built or edited) describes a readable stream: pieces
 /// contiguous from stream offset 0 with ordered ranges, encryption consistent with the mapping and the cipher, and
 /// each piece's output range the one its stream range carries.
-fn validate(member: &MapMember, mapping: OutputMapping, size: u64) -> Result<(), ExtractFromError> {
+pub(super) fn validate(member: &MapMember, mapping: OutputMapping, size: u64) -> Result<(), ExtractFromError> {
     use ExtractFromError::Malformed;
     let encrypted_mapping = !matches!(mapping, OutputMapping::Direct);
     if member.encrypted != encrypted_mapping {
@@ -361,6 +361,129 @@ enum Cipher {
         check: u8,
         header: Vec<u8>,
     },
+}
+
+/// A member's data key, derived from the password.
+pub(super) enum MemberKey {
+    None,
+    /// AES-CBC: the key and the IV of block 0.
+    Cbc {
+        aes: crate::crypto::AesKey,
+        iv: [u8; 16],
+    },
+    /// WinZip AES counter mode after `skip` bytes, and the HMAC-SHA1 key of its authentication code.
+    Ctr {
+        aes: crate::crypto::AesKey,
+        skip: u64,
+        mac_key: Vec<u8>,
+    },
+    /// ZipCrypto, with the check byte its header decrypts to last.
+    ZipCrypto {
+        check: u8,
+    },
+}
+
+/// What [`derive_keys`] gives: the key, RAR 5.0's key for keyed checks, and whether a check value proved the
+/// password.
+pub(super) struct DerivedKeys {
+    pub(super) key: MemberKey,
+    pub(super) hash_key: Option<[u8; 32]>,
+    pub(super) verified: bool,
+}
+
+/// Derives the data key of `member` read with `mapping` (a compressed RAR 5.0 member's AES layer reads as
+/// [`OutputMapping::CbcBlocks`]), charging the KDF work to `usage` and stopping when `control` cancels.
+pub(super) fn derive_keys(
+    member: &MapMember,
+    mapping: OutputMapping,
+    password: Option<&str>,
+    limits: &crate::progressive::ProgressiveLimits,
+    usage: &Usage,
+    control: &crate::progressive::SessionControl,
+) -> Result<DerivedKeys, ExtractFromError> {
+    let password = || password.filter(|p| !p.is_empty()).ok_or(ExtractFromError::PasswordRequired);
+    let mut hash_key = None;
+    let mut verified = false;
+    let key = match (&member.cipher, mapping) {
+        (_, OutputMapping::Direct) => MemberKey::None,
+        (Some(CipherParams::Rar5 { kdf_count, salt, iv, check, keyed_checks }), OutputMapping::CbcBlocks) => {
+            let member_iv = iv.ok_or(ExtractFromError::Malformed("RAR 5.0 member without a data IV"))?;
+            let params = crate::crypto::Rar5CryptParams {
+                kdf_count: *kdf_count,
+                salt: *salt,
+                iv: member_iv,
+                check: *check,
+                tweaked_crc: *keyed_checks,
+            };
+            let scope = crate::error::RarScope::Member { index: Some(member.ordinal) };
+            let keys = crate::rar5::member::controlled_keys(password()?, params, usage, control, scope)
+                .map_err(ExtractFromError::from_failure)?;
+            hash_key = Some(keys.hash_key);
+            verified = keys.evidence == crate::error::RarPasswordEvidence::VerifierMatched;
+            MemberKey::Cbc { aes: crate::crypto::AesKey::new(&keys.key).expect("AES-256 key"), iv: member_iv }
+        }
+        (Some(CipherParams::Rar4 { salt }), OutputMapping::CbcBlocks) => {
+            let (key, iv) = crate::rar5::member::controlled_legacy_keys(password()?, salt, usage, control)
+                .map_err(ExtractFromError::from_failure)?;
+            MemberKey::Cbc { aes: crate::crypto::AesKey::new(&key).expect("AES-128 key"), iv }
+        }
+        (Some(CipherParams::SevenZipAes { num_cycles_power, salt, iv }), OutputMapping::CbcBlocks) => {
+            let password = password()?;
+            let fail = ExtractFromError::from_failure;
+            usage.check(Resource::PasswordUtf8Bytes, password.len() as u64).map_err(fail)?;
+            usage.check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2).map_err(fail)?;
+            limits.check_seven_zip_kdf(*num_cycles_power).map_err(fail)?;
+            let mut meter = crate::rar5::member::KdfMeter::new(usage, control);
+            let key = match crate::crypto::derive_7z_key_controlled(password, salt, *num_cycles_power, &mut meter) {
+                None => return Err(ExtractFromError::Unsupported(UnsupportedRead::UnmappedCipher)),
+                Some(Ok(key)) => key,
+                Some(Err(crate::crypto::KdfControlError::Canceled)) => {
+                    return Err(ExtractFromError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
+                }
+                Some(Err(crate::crypto::KdfControlError::Limit { resource, limit, attempted })) => {
+                    return Err(ExtractFromError::Limit { resource, limit, attempted });
+                }
+            };
+            MemberKey::Cbc { aes: crate::crypto::AesKey::new(&key).expect("AES-256 key"), iv: *iv }
+        }
+        (Some(CipherParams::WinZipAes { strength, salt, verifier, .. }), OutputMapping::Counter { skip }) => {
+            if !(1..=3).contains(strength) {
+                return Err(ExtractFromError::Malformed("WinZip AES strength"));
+            }
+            let key_len = (usize::from(*strength) + 1) * 8;
+            usage
+                .check(Resource::PasswordUtf8Bytes, password()?.len() as u64)
+                .map_err(ExtractFromError::from_failure)?;
+            // PBKDF2-HMAC-SHA1, 1,000 rounds per 20-byte output block, about four SHA-1 compressions a round.
+            let blocks = ((2 * key_len + 2).div_ceil(20) * 1000 * 4 + 4) as u64;
+            crate::crypto::KdfControl::charge(&mut crate::rar5::member::KdfMeter::new(usage, control), blocks)
+                .map_err(|e| match e {
+                    crate::crypto::KdfControlError::Canceled => {
+                        ExtractFromError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled)))
+                    }
+                    crate::crypto::KdfControlError::Limit { resource, limit, attempted } => {
+                        ExtractFromError::Limit { resource, limit, attempted }
+                    }
+                })?;
+            let derived = crate::crypto::aes_derive(password()?.as_bytes(), salt, key_len)
+                .ok_or(ExtractFromError::Malformed("WinZip AES key derivation"))?;
+            use subtle::ConstantTimeEq;
+            if !bool::from(derived[2 * key_len..2 * key_len + 2].ct_eq(verifier)) {
+                return Err(ExtractFromError::WrongPassword);
+            }
+            verified = true;
+            let aes = crate::crypto::AesKey::new(&derived[..key_len]).expect("WinZip AES key");
+            MemberKey::Ctr { aes, skip, mac_key: derived[key_len..2 * key_len].to_vec() }
+        }
+        (Some(CipherParams::ZipCrypto { check }), OutputMapping::Sequential { .. }) => {
+            usage
+                .check(Resource::PasswordUtf8Bytes, password()?.len() as u64)
+                .map_err(ExtractFromError::from_failure)?;
+            MemberKey::ZipCrypto { check: *check }
+        }
+        _ => return Err(ExtractFromError::Malformed("cipher parameters do not match the output mapping")),
+    };
+    Ok(DerivedKeys { key, hash_key, verified })
 }
 
 struct PartHash {
@@ -532,107 +655,29 @@ impl Core {
     }
 
     fn keys(&mut self) -> Result<(), ExtractFromError> {
-        let plan = &self.plan;
-        let cipher = match (&self.member.cipher, plan.mapping) {
-            (_, OutputMapping::Direct) => Cipher::Plain,
-            (Some(CipherParams::Rar5 { kdf_count, salt, iv, check, keyed_checks }), OutputMapping::CbcBlocks) => {
-                let member_iv = iv.ok_or(ExtractFromError::Malformed("RAR 5.0 member without a data IV"))?;
-                let params = crate::crypto::Rar5CryptParams {
-                    kdf_count: *kdf_count,
-                    salt: *salt,
-                    iv: member_iv,
-                    check: *check,
-                    tweaked_crc: *keyed_checks,
-                };
-                let scope = crate::error::RarScope::Member { index: Some(self.member.ordinal) };
-                let keys = crate::rar5::member::controlled_keys(
-                    self.password()?,
-                    params,
-                    &self.usage,
-                    &self.options.control,
-                    scope,
-                )
-                .map_err(ExtractFromError::from_failure)?;
-                self.hash_key = Some(keys.hash_key);
-                if keys.evidence == crate::error::RarPasswordEvidence::VerifierMatched {
-                    self.password_verified = true;
-                }
-                let aes = crate::crypto::AesKey::new(&keys.key).expect("AES-256 key");
-                self.cbc(aes, member_iv)
+        let password = self.options.password.clone();
+        let keys = derive_keys(
+            &self.member,
+            self.plan.mapping,
+            password.as_deref(),
+            &self.options.limits,
+            &self.usage,
+            &self.options.control,
+        )?;
+        self.hash_key = keys.hash_key;
+        if keys.verified {
+            self.password_verified = true;
+        }
+        let cipher = match keys.key {
+            MemberKey::None => Cipher::Plain,
+            MemberKey::Cbc { aes, iv } => self.cbc(aes, iv),
+            MemberKey::Ctr { aes, skip, mac_key } => {
+                let hmac = self.plan.whole.then(|| crate::crypto::HmacSha1::new(&mac_key));
+                Cipher::Ctr { aes, skip, hmac, tag: Vec::new(), ct_end: skip + self.plan.size }
             }
-            (Some(CipherParams::Rar4 { salt }), OutputMapping::CbcBlocks) => {
-                let (key, iv) = crate::rar5::member::controlled_legacy_keys(
-                    self.password()?,
-                    salt,
-                    &self.usage,
-                    &self.options.control,
-                )
-                .map_err(ExtractFromError::from_failure)?;
-                self.cbc(crate::crypto::AesKey::new(&key).expect("AES-128 key"), iv)
+            MemberKey::ZipCrypto { check } => {
+                Cipher::ZipCrypto { state: crate::crypto::ZipCrypto::new(self.password()?), check, header: Vec::new() }
             }
-            (Some(CipherParams::SevenZipAes { num_cycles_power, salt, iv }), OutputMapping::CbcBlocks) => {
-                let password = self.password()?;
-                let fail = ExtractFromError::from_failure;
-                self.usage.check(Resource::PasswordUtf8Bytes, password.len() as u64).map_err(fail)?;
-                self.usage
-                    .check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2)
-                    .map_err(fail)?;
-                self.options.limits.check_seven_zip_kdf(*num_cycles_power).map_err(fail)?;
-                let mut meter = crate::rar5::member::KdfMeter::new(&self.usage, &self.options.control);
-                let key = match crate::crypto::derive_7z_key_controlled(password, salt, *num_cycles_power, &mut meter) {
-                    None => return Err(ExtractFromError::Unsupported(UnsupportedRead::UnmappedCipher)),
-                    Some(Ok(key)) => key,
-                    Some(Err(crate::crypto::KdfControlError::Canceled)) => {
-                        return Err(ExtractFromError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled))));
-                    }
-                    Some(Err(crate::crypto::KdfControlError::Limit { resource, limit, attempted })) => {
-                        return Err(ExtractFromError::Limit { resource, limit, attempted });
-                    }
-                };
-                let iv = *iv;
-                self.cbc(crate::crypto::AesKey::new(&key).expect("AES-256 key"), iv)
-            }
-            (Some(CipherParams::WinZipAes { strength, salt, verifier, .. }), OutputMapping::Counter { skip }) => {
-                if !(1..=3).contains(strength) {
-                    return Err(ExtractFromError::Malformed("WinZip AES strength"));
-                }
-                let key_len = (usize::from(*strength) + 1) * 8;
-                self.usage
-                    .check(Resource::PasswordUtf8Bytes, self.password()?.len() as u64)
-                    .map_err(ExtractFromError::from_failure)?;
-                // PBKDF2-HMAC-SHA1, 1,000 rounds per 20-byte output block, about four SHA-1 compressions a round.
-                let blocks = ((2 * key_len + 2).div_ceil(20) * 1000 * 4 + 4) as u64;
-                crate::crypto::KdfControl::charge(
-                    &mut crate::rar5::member::KdfMeter::new(&self.usage, &self.options.control),
-                    blocks,
-                )
-                .map_err(|e| match e {
-                    crate::crypto::KdfControlError::Canceled => {
-                        ExtractFromError::Source(Box::new(ProgressiveFailure::new(FailureKind::Canceled)))
-                    }
-                    crate::crypto::KdfControlError::Limit { resource, limit, attempted } => {
-                        ExtractFromError::Limit { resource, limit, attempted }
-                    }
-                })?;
-                let derived = crate::crypto::aes_derive(self.password()?.as_bytes(), salt, key_len)
-                    .ok_or(ExtractFromError::Malformed("WinZip AES key derivation"))?;
-                use subtle::ConstantTimeEq;
-                if !bool::from(derived[2 * key_len..2 * key_len + 2].ct_eq(verifier)) {
-                    return Err(ExtractFromError::WrongPassword);
-                }
-                self.password_verified = true;
-                let aes = crate::crypto::AesKey::new(&derived[..key_len]).expect("WinZip AES key");
-                let hmac = plan.whole.then(|| crate::crypto::HmacSha1::new(&derived[key_len..2 * key_len]));
-                Cipher::Ctr { aes, skip, hmac, tag: Vec::new(), ct_end: skip + plan.size }
-            }
-            (Some(CipherParams::ZipCrypto { check }), OutputMapping::Sequential { .. }) => {
-                let password = self.password()?;
-                self.usage
-                    .check(Resource::PasswordUtf8Bytes, password.len() as u64)
-                    .map_err(ExtractFromError::from_failure)?;
-                Cipher::ZipCrypto { state: crate::crypto::ZipCrypto::new(password), check: *check, header: Vec::new() }
-            }
-            _ => return Err(ExtractFromError::Malformed("cipher parameters do not match the output mapping")),
         };
         self.cipher = cipher;
         Ok(())

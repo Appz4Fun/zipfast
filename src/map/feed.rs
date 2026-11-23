@@ -1,0 +1,1401 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+//! A feed-driven decoder for one member of a [`MemberMap`]: it takes packed bytes as they arrive, in any order,
+//! writes the member's output as far as the bytes allow, never blocks, and says which packed bytes it needs next
+//! ([`NeedBytes`]). Holes are skipped where the layer allows and repaired when their bytes come; the decoder's state
+//! can be saved and restored. See `docs/feed-decoder.md`.
+
+use super::member_reader::{MemberKey, derive_keys, validate};
+use super::{CipherParams, ExtractFromError, MapMember, MapMethod, MemberMap, OutputMapping, UnsupportedRead};
+use crate::crypto::AesKey;
+use crate::progressive::{ProgressiveLimits, SessionControl, Usage};
+use std::collections::BTreeMap;
+use std::io;
+use std::ops::Range;
+
+/// What a [`PackedSource`] answers for a read of packed bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackedRead {
+    /// The first `n` bytes of the buffer were filled (`0 < n <= buf.len()`).
+    Data(usize),
+    /// The bytes at the offset have not arrived. `len` bytes from the offset are absent, as far as the source knows
+    /// (at least 1; `u64::MAX` when it knows of nothing later). The decoder clips it to what it reads.
+    NotYet { len: u64 },
+    /// `len` bytes from the offset are lost (an article that will not come, a damaged or missing volume) until the
+    /// source holds them again, which repairs the hole. At least 1; the decoder clips it.
+    Hole { len: u64 },
+}
+
+/// Where a [`FeedDecoder`] reads packed bytes: the caller's article store. It never waits: bytes that have not
+/// arrived are [`PackedRead::NotYet`], and the decoder is run again once more have.
+///
+/// Offsets are a volume's own byte offsets, as [`super::MapPiece::packed`] gives them. [`ArticleBuffer`] is an
+/// in-memory implementation that takes articles in any order.
+pub trait PackedSource {
+    /// Reads packed bytes of volume `volume` from byte `offset` into `buf` (never empty).
+    fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead;
+
+    /// The parts of `range` of volume `volume` the source does not hold, in order, when it can tell without
+    /// reading. The decoder lists them as [`NeedKind::Ahead`]. The default, None, lists nothing ahead.
+    fn absent(&self, volume: u32, range: Range<u64>) -> Option<Vec<Range<u64>>> {
+        let _ = (volume, range);
+        None
+    }
+
+    /// The decoder will not read `range` of volume `volume` again (unless it is restored from an earlier
+    /// [`FeedSnapshot`]), so the source may let those bytes go. A hint; the default keeps them.
+    fn release(&mut self, volume: u32, range: Range<u64>) {
+        let _ = (volume, range);
+    }
+}
+
+/// Where a [`FeedDecoder`] writes the member's output.
+pub trait FeedSink {
+    /// The plaintext of member output offsets `offset..offset + bytes.len()`. The main decode writes in order; a
+    /// repair writes a range reported lost earlier ([`FeedStatus::lost`]). No output byte is written twice.
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()>;
+}
+
+impl FeedSink for Vec<u8> {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let at = usize::try_from(offset).map_err(|_| io::Error::other("output offset past memory"))?;
+        let end = at.checked_add(bytes.len()).ok_or_else(|| io::Error::other("output offset past memory"))?;
+        if self.len() < end {
+            self.resize(end, 0);
+        }
+        self[at..end].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// Packed bytes a [`FeedDecoder`] needs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NeedBytes {
+    /// The volume (as [`super::MapPiece::volume`] numbers them).
+    pub volume: u32,
+    /// The volume's byte range.
+    pub range: Range<u64>,
+    pub kind: NeedKind,
+}
+
+/// Why packed bytes are needed. [`FeedStatus::needs`] lists them in this order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NeedKind {
+    /// The main decode waits for them: the output cannot go on in order without them.
+    Next,
+    /// They repair output reported lost ([`FeedStatus::lost`]).
+    Repair,
+    /// The main decode will read them later; the source does not hold them yet ([`PackedSource::absent`]).
+    Ahead,
+}
+
+/// Where the decoder stands after [`FeedDecoder::run`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct FeedStatus {
+    /// The main decode's output offset: every byte before it was written or is in [`Self::lost`].
+    pub frontier: u64,
+    /// Output ranges lost to holes and not yet repaired, in order.
+    pub lost: Vec<Range<u64>>,
+    /// The packed bytes the decoder needs, in priority order: [`NeedKind::Next`], then [`NeedKind::Repair`] in
+    /// output order, then [`NeedKind::Ahead`]; at most [`FeedOptions::max_needs`].
+    pub needs: Vec<NeedBytes>,
+    /// The run stopped at [`FeedOptions::run_budget`] with more to do: run again.
+    pub more: bool,
+    /// Every output byte was written.
+    pub done: bool,
+    /// Once done: whether the output matched the member's CRC32 (keyed with the password where the map says the
+    /// checks are keyed). None when the member records none, or before done.
+    pub crc_ok: Option<bool>,
+}
+
+/// Work counters over the decoder's life (restored with a snapshot).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct FeedStats {
+    /// Packed bytes read from the source.
+    pub packed_read: u64,
+    /// Output bytes written to the sink.
+    pub written: u64,
+    /// Holes met (each [`PackedRead::Hole`] answer to the main decode).
+    pub holes: u64,
+}
+
+/// How a [`FeedDecoder`] runs.
+#[derive(Clone)]
+pub struct FeedOptions {
+    /// The password of an encrypted member.
+    pub password: Option<String>,
+    /// Bounds the key derivation (KDF work, password sizes), as for maps.
+    pub limits: ProgressiveLimits,
+    /// Cancels a run between reads, and a key derivation in progress.
+    pub control: SessionControl,
+    /// The most packed bytes asked of the source in one read (default 256 KiB; at least 16).
+    pub read_chunk: usize,
+    /// The most [`NeedBytes`] a status lists (default 64).
+    pub max_needs: usize,
+    /// The most output bytes one run writes before it returns with [`FeedStatus::more`] (default unlimited), so a
+    /// caller can interleave other work.
+    pub run_budget: Option<u64>,
+}
+
+impl Default for FeedOptions {
+    fn default() -> Self {
+        Self {
+            password: None,
+            limits: ProgressiveLimits::default(),
+            control: SessionControl::default(),
+            read_chunk: 256 << 10,
+            max_needs: 64,
+            run_budget: None,
+        }
+    }
+}
+
+impl FeedOptions {
+    /// Defaults with `password`.
+    pub fn new(password: Option<&str>) -> Self {
+        Self { password: password.map(str::to_owned), ..Self::default() }
+    }
+}
+
+/// Why a member cannot be fed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FeedUnsupported {
+    /// Compressed data of a format or method without a feed decoder.
+    Compressed { id: u16 },
+    /// 7z data coded by its folder's coders.
+    Coders,
+    /// ZipCrypto: its keystream depends on every earlier byte, so a hole loses the rest of the member.
+    SequentialCipher,
+    /// RAR 4.x encryption other than AES-128.
+    LegacyRar4Cipher,
+    /// Encryption the map does not map.
+    UnmappedCipher,
+    /// No recorded unpacked size.
+    UnknownSize,
+}
+
+/// A typed failure of a [`FeedDecoder`]. Missing bytes are never an error: they are [`FeedStatus::needs`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum FeedError {
+    NoSuchMember {
+        index: usize,
+    },
+    Unsupported(FeedUnsupported),
+    /// The map lists only some of the member's pieces (`complete: false`).
+    IncompleteMember,
+    PasswordRequired,
+    WrongPassword,
+    /// The key derivation failed otherwise (a limit, cancellation).
+    Key(ExtractFromError),
+    /// The map is inconsistent.
+    Malformed(&'static str),
+    /// The source broke the [`PackedSource`] contract (a `Data` count of 0 or past the buffer).
+    SourceContract(&'static str),
+    /// The sink failed writing output offset `out`.
+    Write {
+        out: u64,
+        error: io::Error,
+    },
+    Canceled,
+    /// A snapshot that does not decode or belongs to another member or layer.
+    Snapshot(&'static str),
+    /// An earlier run failed; the decoder is unusable (restore a snapshot instead).
+    AlreadyFailed,
+}
+
+impl std::fmt::Display for FeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchMember { index } => write!(f, "no member {index}"),
+            Self::Unsupported(what) => write!(f, "member cannot be fed: {what:?}"),
+            Self::IncompleteMember => f.write_str("the map lists only some of the member's pieces"),
+            Self::PasswordRequired => f.write_str("password required"),
+            Self::WrongPassword => f.write_str("wrong password"),
+            Self::Key(e) => write!(f, "key derivation: {e}"),
+            Self::Malformed(what) => write!(f, "inconsistent map: {what}"),
+            Self::SourceContract(what) => write!(f, "packed source contract: {what}"),
+            Self::Write { out, error } => write!(f, "writing output at {out}: {error}"),
+            Self::Canceled => f.write_str("canceled"),
+            Self::Snapshot(what) => write!(f, "snapshot: {what}"),
+            Self::AlreadyFailed => f.write_str("the decoder failed earlier"),
+        }
+    }
+}
+
+impl std::error::Error for FeedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Key(e) => Some(e),
+            Self::Write { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl FeedError {
+    fn from_extract(e: ExtractFromError) -> Self {
+        match e {
+            ExtractFromError::PasswordRequired => Self::PasswordRequired,
+            ExtractFromError::WrongPassword => Self::WrongPassword,
+            ExtractFromError::Malformed(what) => Self::Malformed(what),
+            ExtractFromError::Unsupported(UnsupportedRead::UnmappedCipher) => {
+                Self::Unsupported(FeedUnsupported::UnmappedCipher)
+            }
+            ExtractFromError::Source(f) if matches!(f.kind, crate::progressive::FailureKind::Canceled) => {
+                Self::Canceled
+            }
+            other => Self::Key(other),
+        }
+    }
+}
+
+// ---- An in-memory article store ----
+
+/// [`ArticleBuffer::insert`] would hold more than the buffer's limit; nothing was stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferFull {
+    pub held: usize,
+    pub limit: usize,
+}
+
+impl std::fmt::Display for BufferFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "article buffer full: {} of {} bytes held", self.held, self.limit)
+    }
+}
+
+impl std::error::Error for BufferFull {}
+
+#[derive(Default)]
+struct VolumeBytes {
+    /// start -> bytes; never overlapping
+    chunks: BTreeMap<u64, Vec<u8>>,
+    lost: RangeSet,
+}
+
+/// A [`PackedSource`] holding articles in memory, inserted in any order, up to a byte limit. Bytes not held are
+/// [`PackedRead::NotYet`], or [`PackedRead::Hole`] inside a range marked lost; inserting them repairs it. It lets go
+/// of bytes the decoder [releases](PackedSource::release).
+pub struct ArticleBuffer {
+    volumes: BTreeMap<u32, VolumeBytes>,
+    held: usize,
+    limit: usize,
+}
+
+impl ArticleBuffer {
+    /// An empty buffer holding at most `limit` bytes.
+    pub fn new(limit: usize) -> Self {
+        Self { volumes: BTreeMap::new(), held: 0, limit }
+    }
+
+    /// Bytes held.
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Holds `bytes` at `offset` of volume `volume`. Bytes already held are kept as they are; a range marked lost
+    /// that they cover is no longer lost. Fails, storing nothing, when the new bytes would pass the limit: the caller
+    /// then holds them itself and inserts them when the decoder asks ([`NeedBytes`]).
+    pub fn insert(&mut self, volume: u32, offset: u64, bytes: &[u8]) -> Result<(), BufferFull> {
+        let end = offset.saturating_add(bytes.len() as u64);
+        let v = self.volumes.entry(volume).or_default();
+        // the gaps of what is held, inside offset..end
+        let mut gaps = Vec::new();
+        let mut at = offset;
+        let first = v.chunks.range(..offset).next_back().map(|(&s, c)| s + c.len() as u64).filter(|&e| e > offset);
+        if let Some(e) = first {
+            at = e.min(end);
+        }
+        for (&s, c) in v.chunks.range(offset..end) {
+            if s > at {
+                gaps.push(at..s);
+            }
+            at = at.max(s + c.len() as u64);
+        }
+        if at < end {
+            gaps.push(at..end);
+        }
+        let new: u64 = gaps.iter().map(|g| g.end - g.start).sum();
+        let new = usize::try_from(new).unwrap_or(usize::MAX);
+        if self.held.saturating_add(new) > self.limit {
+            return Err(BufferFull { held: self.held, limit: self.limit });
+        }
+        for g in gaps {
+            let piece = bytes[(g.start - offset) as usize..(g.end - offset) as usize].to_vec();
+            v.chunks.insert(g.start, piece);
+        }
+        v.lost.remove(offset..end);
+        self.held += new;
+        Ok(())
+    }
+
+    /// Marks `range` of volume `volume` lost: reads of bytes not held there answer [`PackedRead::Hole`].
+    pub fn mark_lost(&mut self, volume: u32, range: Range<u64>) {
+        if range.start < range.end {
+            self.volumes.entry(volume).or_default().lost.insert(range);
+        }
+    }
+}
+
+impl PackedSource for ArticleBuffer {
+    fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead {
+        let Some(v) = self.volumes.get(&volume) else {
+            return PackedRead::NotYet { len: u64::MAX - offset };
+        };
+        if let Some((&s, c)) = v.chunks.range(..=offset).next_back()
+            && offset < s + c.len() as u64
+        {
+            let from = (offset - s) as usize;
+            let n = (c.len() - from).min(buf.len());
+            buf[..n].copy_from_slice(&c[from..from + n]);
+            return PackedRead::Data(n);
+        }
+        let next_held = v.chunks.range(offset..).next().map_or(u64::MAX, |(&s, _)| s);
+        if let Some(lost) = v.lost.containing(offset) {
+            return PackedRead::Hole { len: lost.end.min(next_held) - offset };
+        }
+        let next_lost = v.lost.next_start(offset).unwrap_or(u64::MAX);
+        PackedRead::NotYet { len: next_held.min(next_lost) - offset }
+    }
+
+    fn absent(&self, volume: u32, range: Range<u64>) -> Option<Vec<Range<u64>>> {
+        let Some(v) = self.volumes.get(&volume) else { return Some(vec![range]) };
+        let mut out = Vec::new();
+        let mut at = range.start;
+        if let Some((&s, c)) = v.chunks.range(..range.start).next_back() {
+            at = at.max(s + c.len() as u64);
+        }
+        for (&s, c) in v.chunks.range(range.start..range.end) {
+            if s > at {
+                out.push(at..s);
+            }
+            at = at.max(s + c.len() as u64);
+        }
+        if at < range.end {
+            out.push(at..range.end);
+        }
+        Some(out)
+    }
+
+    fn release(&mut self, volume: u32, range: Range<u64>) {
+        let Some(v) = self.volumes.get_mut(&volume) else { return };
+        let mut touched: Vec<u64> = v.chunks.range(range.start..range.end).map(|(&s, _)| s).collect();
+        if let Some((&s, c)) = v.chunks.range(..range.start).next_back()
+            && s + c.len() as u64 > range.start
+        {
+            touched.insert(0, s);
+        }
+        for s in touched {
+            let c = v.chunks.remove(&s).expect("chunk");
+            let e = s + c.len() as u64;
+            self.held -= c.len();
+            if s < range.start {
+                let keep = c[..(range.start - s) as usize].to_vec();
+                self.held += keep.len();
+                v.chunks.insert(s, keep);
+            }
+            if e > range.end {
+                let keep = c[(range.end - s) as usize..].to_vec();
+                self.held += keep.len();
+                v.chunks.insert(range.end, keep);
+            }
+        }
+    }
+}
+
+// ---- Range bookkeeping ----
+
+/// Disjoint, non-adjacent ranges: start -> end.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RangeSet(BTreeMap<u64, u64>);
+
+impl RangeSet {
+    fn insert(&mut self, r: Range<u64>) {
+        if r.start >= r.end {
+            return;
+        }
+        let (mut s, mut e) = (r.start, r.end);
+        if let Some((&ps, &pe)) = self.0.range(..=s).next_back()
+            && pe >= s
+        {
+            s = ps;
+            e = e.max(pe);
+        }
+        let inside: Vec<u64> = self.0.range(s..=e).map(|(&k, _)| k).collect();
+        for k in inside {
+            e = e.max(self.0.remove(&k).expect("range"));
+        }
+        self.0.insert(s, e);
+    }
+
+    fn remove(&mut self, r: Range<u64>) {
+        if r.start >= r.end {
+            return;
+        }
+        let mut hit: Vec<(u64, u64)> = self.0.range(r.start..r.end).map(|(&s, &e)| (s, e)).collect();
+        if let Some((&s, &e)) = self.0.range(..r.start).next_back()
+            && e > r.start
+        {
+            hit.insert(0, (s, e));
+        }
+        for (s, e) in hit {
+            self.0.remove(&s);
+            if s < r.start {
+                self.0.insert(s, r.start);
+            }
+            if e > r.end {
+                self.0.insert(r.end, e);
+            }
+        }
+    }
+
+    fn containing(&self, at: u64) -> Option<Range<u64>> {
+        self.0.range(..=at).next_back().filter(|&(_, &e)| e > at).map(|(&s, &e)| s..e)
+    }
+
+    fn next_start(&self, after: u64) -> Option<u64> {
+        self.0.range(after..).next().map(|(&s, _)| s)
+    }
+
+    fn ranges(&self) -> Vec<Range<u64>> {
+        self.0.iter().map(|(&s, &e)| s..e).collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn first_start(&self) -> Option<u64> {
+        self.0.keys().next().copied()
+    }
+}
+
+/// CRC32s of the output written, per run of contiguous output: start -> (end, crc).
+#[derive(Clone, Debug, Default)]
+struct CrcRuns {
+    runs: BTreeMap<u64, (u64, u32)>,
+    /// output was written twice (a broken sink contract): no verdict
+    broken: bool,
+}
+
+impl CrcRuns {
+    fn add(&mut self, start: u64, bytes: &[u8]) {
+        if bytes.is_empty() || self.broken {
+            return;
+        }
+        let end = start + bytes.len() as u64;
+        let overlaps = self.runs.range(..end).next_back().is_some_and(|(_, &(e, _))| e > start);
+        if overlaps {
+            self.broken = true;
+            return;
+        }
+        let (mut s, mut e, mut crc) = (start, end, crc32fast::hash(bytes));
+        if let Some((&ps, &(pe, pc))) = self.runs.range(..start).next_back()
+            && pe == start
+        {
+            self.runs.remove(&ps);
+            crc = crate::crc32::combine(pc, crc, e - s);
+            s = ps;
+        }
+        if let Some(&(ne, nc)) = self.runs.get(&end) {
+            self.runs.remove(&end);
+            crc = crate::crc32::combine(crc, nc, ne - end);
+            e = ne;
+        }
+        self.runs.insert(s, (e, crc));
+    }
+
+    /// The CRC32 of `0..size` once it is one run.
+    fn whole(&self, size: u64) -> Option<u32> {
+        if self.broken {
+            return None;
+        }
+        if size == 0 {
+            return Some(0);
+        }
+        match self.runs.get(&0) {
+            Some(&(e, crc)) if e == size => Some(crc),
+            _ => None,
+        }
+    }
+}
+
+// ---- Geometry ----
+
+/// One piece of the member's packed stream.
+#[derive(Clone, Debug)]
+struct Span {
+    stream: Range<u64>,
+    volume: u32,
+    packed_start: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Geometry {
+    spans: Vec<Span>,
+}
+
+impl Geometry {
+    fn new(member: &MapMember) -> Self {
+        let spans = member
+            .pieces
+            .iter()
+            .filter(|p| p.packed.end > p.packed.start)
+            .map(|p| Span {
+                stream: p.stream_offset..p.stream_offset + (p.packed.end - p.packed.start),
+                volume: p.volume,
+                packed_start: p.packed.start,
+            })
+            .collect();
+        Self { spans }
+    }
+
+    fn covered(&self) -> u64 {
+        self.spans.last().map_or(0, |s| s.stream.end)
+    }
+
+    fn locate(&self, stream: u64) -> Option<&Span> {
+        let i = self.spans.partition_point(|s| s.stream.end <= stream);
+        self.spans.get(i).filter(|s| s.stream.start <= stream)
+    }
+
+    /// The per-volume packed ranges of a stream range, in stream order.
+    fn volume_ranges(&self, stream: Range<u64>) -> Vec<(u32, Range<u64>)> {
+        let mut out = Vec::new();
+        let i = self.spans.partition_point(|s| s.stream.end <= stream.start);
+        for s in &self.spans[i..] {
+            if s.stream.start >= stream.end {
+                break;
+            }
+            let from = stream.start.max(s.stream.start);
+            let to = stream.end.min(s.stream.end);
+            let at = |x: u64| s.packed_start + (x - s.stream.start);
+            out.push((s.volume, at(from)..at(to)));
+        }
+        out
+    }
+}
+
+// ---- Stored layers ----
+
+/// How stream bytes become output in a stored member.
+#[derive(Clone, Copy)]
+enum StoredCipher {
+    Plain,
+    Cbc { aes: AesKey, iv: [u8; 16] },
+    Ctr { aes: AesKey, skip: u64 },
+}
+
+/// A reader of a stretch of the packed stream that writes the output it carries.
+#[derive(Clone, Debug)]
+struct Lane {
+    /// stream offset of the next byte to read
+    pos: u64,
+    /// stream offset to stop reading at
+    end: u64,
+    /// CBC: stream (and output) offset of `rem[0]`, block aligned; otherwise unused
+    next: u64,
+    /// CBC: the IV of the block at `next`, once read
+    iv: Option<[u8; 16]>,
+    /// CBC: ciphertext short of a block, or the IV block being collected
+    rem: Vec<u8>,
+}
+
+/// Why a lane stopped.
+enum Stop {
+    /// It read to its end.
+    Reached,
+    /// Stream bytes `stream..stream + len` are not there (`hole`: lost, else not yet).
+    Missing { stream: u64, len: u64, hole: bool },
+    /// The run's output budget is spent.
+    Budget,
+}
+
+/// Which layer a decoder decodes, for snapshots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayerTag {
+    Plain = 1,
+    Cbc = 2,
+    Ctr = 3,
+}
+
+/// A feed-driven decoder of one member. See the module docs and `docs/feed-decoder.md`.
+///
+/// Supported: stored members whose output maps directly to packed offsets (plain stored RAR, ZIP and 7z Copy;
+/// AES-CBC stored RAR 5.0, RAR 4.x and 7zAES over Copy; WinZip AES stored). A hole costs exactly its own output
+/// (widened to whole blocks, plus one block, under CBC), and repairing it reads and writes only that.
+pub struct FeedDecoder {
+    size: u64,
+    stream_len: u64,
+    geometry: Geometry,
+    cipher: StoredCipher,
+    tag: LayerTag,
+    /// the member's CRC32 as the output's CRC32 compares to it
+    want_crc: Option<u32>,
+    hash_key: Option<[u8; 32]>,
+    keyed: bool,
+    main: Option<Lane>,
+    lost: RangeSet,
+    /// lost output start -> the stream offset its repair stopped at in the last run
+    blocked: BTreeMap<u64, u64>,
+    crc: CrcRuns,
+    stats: FeedStats,
+    /// the stream offset below which bytes were released to the source
+    released: u64,
+    options: FeedOptions,
+    buf: Vec<u8>,
+    scratch: Vec<u8>,
+    run_written: u64,
+    failed: bool,
+    status: FeedStatus,
+}
+
+impl std::fmt::Debug for FeedDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FeedDecoder")
+            .field("size", &self.size)
+            .field("layer", &self.tag)
+            .field("status", &self.status)
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FeedDecoder {
+    /// A decoder of member `index` of `map`. Derives the member's key now (when encrypted), so a wrong password
+    /// shows here where the member records a check value.
+    pub fn new(map: &MemberMap, index: usize, options: FeedOptions) -> Result<Self, FeedError> {
+        let member = map.members.get(index).ok_or(FeedError::NoSuchMember { index })?;
+        match member.method {
+            MapMethod::Compressed { id } => return Err(FeedError::Unsupported(FeedUnsupported::Compressed { id })),
+            MapMethod::Coders => return Err(FeedError::Unsupported(FeedUnsupported::Coders)),
+            MapMethod::Stored => {}
+        }
+        let mapping = member.mapping;
+        let tag = match mapping {
+            OutputMapping::Direct => LayerTag::Plain,
+            OutputMapping::CbcBlocks => LayerTag::Cbc,
+            OutputMapping::Counter { .. } => LayerTag::Ctr,
+            OutputMapping::Sequential { .. } => {
+                return Err(FeedError::Unsupported(FeedUnsupported::SequentialCipher));
+            }
+            OutputMapping::None => {
+                return Err(FeedError::Unsupported(match member.cipher {
+                    Some(CipherParams::Rar4Legacy { .. }) => FeedUnsupported::LegacyRar4Cipher,
+                    _ => FeedUnsupported::UnmappedCipher,
+                }));
+            }
+        };
+        let size = member.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
+        validate(member, mapping, size).map_err(FeedError::from_extract)?;
+        if !member.complete {
+            return Err(FeedError::IncompleteMember);
+        }
+        let overflow = FeedError::Malformed("member size overflows");
+        let stream_len = match mapping {
+            OutputMapping::CbcBlocks => size.checked_next_multiple_of(16).ok_or(overflow)?,
+            OutputMapping::Counter { skip } => skip.checked_add(size).ok_or(overflow)?,
+            _ => size,
+        };
+        let geometry = Geometry::new(member);
+        if geometry.covered() < stream_len {
+            return Err(FeedError::IncompleteMember);
+        }
+        let usage = Usage::new(options.limits.clone());
+        let mut hash_key = None;
+        let cipher = if member.encrypted && size > 0 {
+            let keys =
+                derive_keys(member, mapping, options.password.as_deref(), &options.limits, &usage, &options.control)
+                    .map_err(FeedError::from_extract)?;
+            hash_key = keys.hash_key;
+            match keys.key {
+                MemberKey::Cbc { aes, iv } => StoredCipher::Cbc { aes, iv },
+                MemberKey::Ctr { aes, skip, .. } => StoredCipher::Ctr { aes, skip },
+                MemberKey::None | MemberKey::ZipCrypto { .. } => {
+                    return Err(FeedError::Malformed("cipher parameters do not match the output mapping"));
+                }
+            }
+        } else {
+            match mapping {
+                // an empty encrypted member needs no key: nothing is read
+                OutputMapping::Counter { skip } => StoredCipher::Ctr { aes: AesKey::new(&[0; 16]).expect("key"), skip },
+                OutputMapping::CbcBlocks => StoredCipher::Cbc { aes: AesKey::new(&[0; 16]).expect("key"), iv: [0; 16] },
+                _ => StoredCipher::Plain,
+            }
+        };
+        let checks = member.checks.filter(|c| c.crc32.is_some());
+        let chunk = options.read_chunk.clamp(16, 64 << 20);
+        let mut decoder = Self {
+            size,
+            stream_len,
+            geometry,
+            cipher,
+            tag,
+            want_crc: checks.and_then(|c| c.crc32),
+            hash_key,
+            keyed: checks.is_some_and(|c| c.keyed),
+            main: None,
+            lost: RangeSet::default(),
+            blocked: BTreeMap::new(),
+            crc: CrcRuns::default(),
+            stats: FeedStats::default(),
+            released: 0,
+            options,
+            buf: vec![0; chunk],
+            scratch: Vec::new(),
+            run_written: 0,
+            failed: false,
+            status: FeedStatus::default(),
+        };
+        if size > 0 {
+            decoder.main = Some(decoder.lane_at(0, size));
+        }
+        decoder.status = decoder.make_status(Vec::new(), false);
+        Ok(decoder)
+    }
+
+    /// The member's output size.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The status as of the last run (or construction).
+    pub fn status(&self) -> &FeedStatus {
+        &self.status
+    }
+
+    /// Work counters.
+    pub fn stats(&self) -> FeedStats {
+        self.stats
+    }
+
+    /// Reads what the source holds and writes the output it allows: the main decode in order as far as the bytes
+    /// are contiguous (skipping holes), then repairs of lost output whose bytes are back. Never waits.
+    pub fn run(&mut self, source: &mut dyn PackedSource, sink: &mut dyn FeedSink) -> Result<FeedStatus, FeedError> {
+        if self.failed {
+            return Err(FeedError::AlreadyFailed);
+        }
+        let result = self.run_inner(source, sink);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn run_inner(&mut self, source: &mut dyn PackedSource, sink: &mut dyn FeedSink) -> Result<FeedStatus, FeedError> {
+        self.run_written = 0;
+        let mut next = Vec::new();
+        let mut repair = Vec::new();
+        let mut more = false;
+        let mut next_gap = None;
+        // the main decode
+        while let Some(mut lane) = self.main.take() {
+            match self.pump(&mut lane, source, sink)? {
+                Stop::Reached => break,
+                Stop::Budget => {
+                    self.main = Some(lane);
+                    more = true;
+                    break;
+                }
+                Stop::Missing { stream, len, hole: false } => {
+                    self.push_needs(&mut next, stream..stream + len, NeedKind::Next);
+                    next_gap = Some(stream + len..lane.end);
+                    self.main = Some(lane);
+                    break;
+                }
+                Stop::Missing { stream, len, hole: true } => {
+                    self.stats.holes += 1;
+                    let from = self.lane_out(&lane);
+                    let restart = self.restart_after(stream + len);
+                    self.lost.insert(from..restart);
+                    if restart < self.size {
+                        self.main = Some(self.lane_at(restart, self.size));
+                    }
+                }
+            }
+        }
+        // repairs
+        if !more {
+            let blocked = std::mem::take(&mut self.blocked);
+            'repairs: for range in self.lost.ranges() {
+                let mut at = range.start;
+                while at < range.end {
+                    let mut lane = self.lane_at(at, range.end);
+                    // a repair that stopped at missing bytes last time waits there until they come, without reading
+                    // again what it read before them
+                    if let Some(&stream) = blocked.get(&at)
+                        && let Some(len) = self.probe(stream, lane.end, source)?
+                    {
+                        self.blocked.insert(at, stream);
+                        self.push_needs(&mut repair, stream..stream + len, NeedKind::Repair);
+                        at = self.restart_after(stream + len).max(at + 1);
+                        continue;
+                    }
+                    match self.pump(&mut lane, source, sink)? {
+                        Stop::Reached => {
+                            self.lost.remove(at..range.end);
+                            break;
+                        }
+                        Stop::Budget => {
+                            self.lost.remove(at..self.lane_out(&lane));
+                            more = true;
+                            break 'repairs;
+                        }
+                        Stop::Missing { stream, len, .. } => {
+                            let reached = self.lane_out(&lane);
+                            self.lost.remove(at..reached);
+                            self.blocked.insert(reached, stream);
+                            self.push_needs(&mut repair, stream..stream + len, NeedKind::Repair);
+                            at = self.restart_after(stream + len).max(reached);
+                        }
+                    }
+                }
+            }
+        }
+        let mut needs = next;
+        needs.extend(repair);
+        if let Some(gap) = next_gap {
+            for (volume, range) in self.geometry.volume_ranges(gap) {
+                if needs.len() >= self.options.max_needs {
+                    break;
+                }
+                for r in source.absent(volume, range).unwrap_or_default() {
+                    needs.push(NeedBytes { volume, range: r, kind: NeedKind::Ahead });
+                }
+            }
+        }
+        needs.truncate(self.options.max_needs);
+        self.release(source);
+        self.status = self.make_status(needs, more);
+        Ok(self.status.clone())
+    }
+
+    /// Whether stream byte `stream` is still missing, and for how long (up to `end`), without consuming it.
+    fn probe(&mut self, stream: u64, end: u64, source: &mut dyn PackedSource) -> Result<Option<u64>, FeedError> {
+        let span = self.geometry.locate(stream).ok_or(FeedError::Malformed("stream offset outside the pieces"))?;
+        let left = span.stream.end.min(end).saturating_sub(stream).max(1);
+        let mut one = [0u8; 1];
+        match source.read_packed(span.volume, span.packed_start + (stream - span.stream.start), &mut one) {
+            PackedRead::Data(1) => Ok(None),
+            PackedRead::Data(_) => Err(FeedError::SourceContract("Data count of 0 or past the buffer")),
+            PackedRead::NotYet { len } | PackedRead::Hole { len } => Ok(Some(len.clamp(1, left))),
+        }
+    }
+
+    fn push_needs(&self, out: &mut Vec<NeedBytes>, stream: Range<u64>, kind: NeedKind) {
+        for (volume, range) in self.geometry.volume_ranges(stream) {
+            out.push(NeedBytes { volume, range, kind });
+        }
+    }
+
+    fn make_status(&self, needs: Vec<NeedBytes>, more: bool) -> FeedStatus {
+        let frontier = self.main.as_ref().map_or(self.size, |l| self.lane_out(l));
+        let done = self.main.is_none() && self.lost.is_empty();
+        let crc_ok = if done {
+            self.want_crc.and_then(|want| {
+                let crc = self.crc.whole(self.size)?;
+                let crc = match (self.keyed, &self.hash_key) {
+                    (true, Some(k)) => crate::crypto::rar5_tweak_crc32(crc, k),
+                    _ => crc,
+                };
+                Some(crc == want)
+            })
+        } else {
+            None
+        };
+        FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, crc_ok }
+    }
+
+    /// Tells the source which stream bytes no lane will read again.
+    fn release(&mut self, source: &mut dyn PackedSource) {
+        let mut low = self.stream_len;
+        if let Some(l) = &self.main {
+            // a lane restored from a snapshot reads again from the start of its partial block
+            let from = match (self.cipher, l.iv) {
+                (StoredCipher::Cbc { .. }, Some(_)) => l.next,
+                (StoredCipher::Cbc { .. }, None) => self.lane_at(l.next, self.size).pos,
+                _ => l.pos,
+            };
+            low = low.min(from);
+        }
+        if let Some(a) = self.lost.first_start() {
+            low = low.min(self.lane_at(a, self.size).pos);
+        }
+        if low > self.released {
+            for (volume, range) in self.geometry.volume_ranges(self.released..low) {
+                source.release(volume, range);
+            }
+            self.released = low;
+        }
+    }
+
+    /// A lane that writes output `out..out_end` (`out` block aligned under CBC).
+    fn lane_at(&self, out: u64, out_end: u64) -> Lane {
+        match self.cipher {
+            StoredCipher::Plain => Lane { pos: out, end: out_end, next: out, iv: None, rem: Vec::new() },
+            StoredCipher::Ctr { skip, .. } => {
+                Lane { pos: out + skip, end: out_end + skip, next: out, iv: None, rem: Vec::new() }
+            }
+            StoredCipher::Cbc { iv, .. } => {
+                let end = out_end.checked_next_multiple_of(16).unwrap_or(u64::MAX).min(self.stream_len);
+                if out == 0 {
+                    Lane { pos: 0, end, next: 0, iv: Some(iv), rem: Vec::new() }
+                } else {
+                    Lane { pos: out - 16, end, next: out, iv: None, rem: Vec::new() }
+                }
+            }
+        }
+    }
+
+    /// The output offset a lane has written up to.
+    fn lane_out(&self, lane: &Lane) -> u64 {
+        let out = match self.cipher {
+            StoredCipher::Plain => lane.pos,
+            StoredCipher::Ctr { skip, .. } => lane.pos.saturating_sub(skip),
+            StoredCipher::Cbc { .. } => lane.next,
+        };
+        out.min(self.size)
+    }
+
+    /// The first output offset decodable once stream bytes before `stream_end` are missing.
+    fn restart_after(&self, stream_end: u64) -> u64 {
+        let out = match self.cipher {
+            StoredCipher::Plain => stream_end,
+            StoredCipher::Ctr { skip, .. } => stream_end.saturating_sub(skip),
+            // the block after the missing bytes is the IV of the one after it
+            StoredCipher::Cbc { .. } => stream_end.checked_next_multiple_of(16).unwrap_or(u64::MAX).saturating_add(16),
+        };
+        out.min(self.size)
+    }
+
+    /// Reads and decodes a lane until it ends, misses bytes or spends the run's budget.
+    fn pump(
+        &mut self,
+        lane: &mut Lane,
+        source: &mut dyn PackedSource,
+        sink: &mut dyn FeedSink,
+    ) -> Result<Stop, FeedError> {
+        let mut buf = std::mem::take(&mut self.buf);
+        let result = self.pump_with(lane, source, sink, &mut buf);
+        self.buf = buf;
+        result
+    }
+
+    fn pump_with(
+        &mut self,
+        lane: &mut Lane,
+        source: &mut dyn PackedSource,
+        sink: &mut dyn FeedSink,
+        buf: &mut [u8],
+    ) -> Result<Stop, FeedError> {
+        loop {
+            if self.options.control.is_canceled() {
+                return Err(FeedError::Canceled);
+            }
+            if lane.pos >= lane.end {
+                return Ok(Stop::Reached);
+            }
+            if self.options.run_budget.is_some_and(|b| self.run_written >= b) {
+                return Ok(Stop::Budget);
+            }
+            let span =
+                self.geometry.locate(lane.pos).ok_or(FeedError::Malformed("stream offset outside the pieces"))?;
+            let left = (span.stream.end.min(lane.end) - lane.pos).min(buf.len() as u64) as usize;
+            let (volume, packed) = (span.volume, span.packed_start + (lane.pos - span.stream.start));
+            let piece_left = span.stream.end.min(lane.end) - lane.pos;
+            match source.read_packed(volume, packed, &mut buf[..left]) {
+                PackedRead::Data(n) => {
+                    if n == 0 || n > left {
+                        return Err(FeedError::SourceContract("Data count of 0 or past the buffer"));
+                    }
+                    let at = lane.pos;
+                    lane.pos += n as u64;
+                    self.stats.packed_read += n as u64;
+                    self.absorb(lane, at, &mut buf[..n], sink)?;
+                }
+                PackedRead::NotYet { len } => {
+                    return Ok(Stop::Missing { stream: lane.pos, len: len.clamp(1, piece_left), hole: false });
+                }
+                PackedRead::Hole { len } => {
+                    return Ok(Stop::Missing { stream: lane.pos, len: len.clamp(1, piece_left), hole: true });
+                }
+            }
+        }
+    }
+
+    /// Decodes stream bytes `bytes` read at stream offset `at` and writes their output.
+    fn absorb(&mut self, lane: &mut Lane, at: u64, bytes: &mut [u8], sink: &mut dyn FeedSink) -> Result<(), FeedError> {
+        match self.cipher {
+            StoredCipher::Plain => self.emit(at, bytes, sink),
+            StoredCipher::Ctr { aes, skip } => {
+                ctr_xor(&aes, at - skip, bytes);
+                self.emit(at - skip, bytes, sink)
+            }
+            StoredCipher::Cbc { aes, .. } => {
+                let mut bytes: &[u8] = bytes;
+                if lane.iv.is_none() {
+                    let take = (16 - lane.rem.len()).min(bytes.len());
+                    lane.rem.extend_from_slice(&bytes[..take]);
+                    bytes = &bytes[take..];
+                    if lane.rem.len() < 16 {
+                        return Ok(());
+                    }
+                    lane.iv = Some(lane.rem[..].try_into().expect("one block"));
+                    lane.rem.clear();
+                }
+                let mut scratch = std::mem::take(&mut self.scratch);
+                scratch.clear();
+                scratch.extend_from_slice(&lane.rem);
+                scratch.extend_from_slice(bytes);
+                let aligned = scratch.len() & !15;
+                lane.rem.clear();
+                lane.rem.extend_from_slice(&scratch[aligned..]);
+                scratch.truncate(aligned);
+                aes.decrypt_cbc_in_place(lane.iv.as_mut().expect("IV known"), &mut scratch);
+                let out = lane.next;
+                lane.next += aligned as u64;
+                let result = self.emit(out, &scratch, sink);
+                self.scratch = scratch;
+                result
+            }
+        }
+    }
+
+    /// Writes output at `out`, clipped to the member.
+    fn emit(&mut self, out: u64, bytes: &[u8], sink: &mut dyn FeedSink) -> Result<(), FeedError> {
+        let end = (out + bytes.len() as u64).min(self.size);
+        if out >= end {
+            return Ok(());
+        }
+        let bytes = &bytes[..(end - out) as usize];
+        sink.write_at(out, bytes).map_err(|error| FeedError::Write { out, error })?;
+        self.crc.add(out, bytes);
+        self.stats.written += bytes.len() as u64;
+        self.run_written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// The decoder's state, to restore later ([`Self::restore`]) or keep across a restart
+    /// ([`FeedSnapshot::to_bytes`]). Taken between runs, it resumes exactly where the decoder stands: the main
+    /// decode at its frontier (bytes read past it, short of a block, are read again) and every lost range still
+    /// lost.
+    pub fn snapshot(&self) -> FeedSnapshot {
+        FeedSnapshot {
+            tag: self.tag as u8,
+            size: self.size,
+            stream_len: self.stream_len,
+            want_crc: self.want_crc,
+            main: self.main.as_ref().map(|l| match self.cipher {
+                StoredCipher::Cbc { .. } => (l.next, l.iv),
+                _ => (l.pos, None),
+            }),
+            lost: self.lost.ranges(),
+            crc: self.crc.runs.iter().map(|(&s, &(e, c))| (s, e, c)).collect(),
+            crc_broken: self.crc.broken,
+            stats: self.stats,
+            released: self.released,
+        }
+    }
+
+    /// A decoder of member `index` of `map` in the state `snapshot` recorded. The key is derived again from
+    /// `options`; the snapshot never holds keys or plaintext.
+    pub fn restore(
+        map: &MemberMap,
+        index: usize,
+        options: FeedOptions,
+        snapshot: &FeedSnapshot,
+    ) -> Result<Self, FeedError> {
+        let mut d = Self::new(map, index, options)?;
+        if snapshot.tag != d.tag as u8 {
+            return Err(FeedError::Snapshot("another layer"));
+        }
+        if snapshot.size != d.size || snapshot.stream_len != d.stream_len || snapshot.want_crc != d.want_crc {
+            return Err(FeedError::Snapshot("another member"));
+        }
+        let size = d.size;
+        let bad = || FeedError::Snapshot("out of range");
+        d.main = match snapshot.main {
+            None => None,
+            Some((at, iv)) => Some(match d.cipher {
+                StoredCipher::Cbc { .. } => {
+                    if at % 16 != 0 || at >= size {
+                        return Err(bad());
+                    }
+                    let mut lane = d.lane_at(at, size);
+                    if let Some(iv) = iv {
+                        lane.pos = at;
+                        lane.iv = Some(iv);
+                    }
+                    lane
+                }
+                StoredCipher::Ctr { skip, .. } => {
+                    if at < skip || at - skip >= size {
+                        return Err(bad());
+                    }
+                    d.lane_at(at - skip, size)
+                }
+                StoredCipher::Plain => {
+                    if at >= size {
+                        return Err(bad());
+                    }
+                    d.lane_at(at, size)
+                }
+            }),
+        };
+        let mut lost = RangeSet::default();
+        for r in &snapshot.lost {
+            let aligned = !matches!(d.cipher, StoredCipher::Cbc { .. }) || r.start % 16 == 0;
+            if r.start >= r.end || r.end > size || !aligned {
+                return Err(bad());
+            }
+            lost.insert(r.clone());
+        }
+        d.lost = lost;
+        let mut crc = CrcRuns { broken: snapshot.crc_broken, ..CrcRuns::default() };
+        for &(s, e, c) in &snapshot.crc {
+            if s >= e || e > size {
+                return Err(bad());
+            }
+            crc.runs.insert(s, (e, c));
+        }
+        d.crc = crc;
+        d.stats = snapshot.stats;
+        d.released = snapshot.released.min(d.stream_len);
+        d.status = d.make_status(Vec::new(), false);
+        Ok(d)
+    }
+}
+
+/// XORs WinZip AES keystream into `data`, whose first byte is ciphertext offset `offset` (after the salt and
+/// verifier). Blocks count from 1, little-endian.
+fn ctr_xor(aes: &AesKey, mut offset: u64, data: &mut [u8]) {
+    let mut done = 0;
+    while done < data.len() {
+        let block = offset / 16;
+        let within = (offset % 16) as usize;
+        let keystream = aes.encrypt_block(&(u128::from(block) + 1).to_le_bytes());
+        let take = (16 - within).min(data.len() - done);
+        for (byte, key) in data[done..done + take].iter_mut().zip(&keystream[within..]) {
+            *byte ^= key;
+        }
+        done += take;
+        offset += take as u64;
+    }
+}
+
+/// A [`FeedDecoder`]'s saved state: positions, lost ranges and running CRCs, never keys or plaintext.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedSnapshot {
+    tag: u8,
+    size: u64,
+    stream_len: u64,
+    want_crc: Option<u32>,
+    /// the main lane: its stream position (CBC: its block-aligned output and the IV of that block)
+    main: Option<(u64, Option<[u8; 16]>)>,
+    lost: Vec<Range<u64>>,
+    crc: Vec<(u64, u64, u32)>,
+    crc_broken: bool,
+    stats: FeedStats,
+    released: u64,
+}
+
+const SNAPSHOT_MAGIC: &[u8; 4] = b"ZFFD";
+const SNAPSHOT_VERSION: u8 = 1;
+/// The most lost ranges or CRC runs a snapshot may list.
+const SNAPSHOT_MAX_RANGES: u64 = 1 << 20;
+
+impl FeedSnapshot {
+    /// Output ranges lost when it was taken.
+    pub fn lost(&self) -> &[Range<u64>] {
+        &self.lost
+    }
+
+    /// The serialized form, for keeping across a restart.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96 + 16 * self.lost.len() + 20 * self.crc.len());
+        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.push(SNAPSHOT_VERSION);
+        out.push(self.tag);
+        out.extend_from_slice(&self.size.to_le_bytes());
+        out.extend_from_slice(&self.stream_len.to_le_bytes());
+        match self.want_crc {
+            Some(c) => {
+                out.push(1);
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        match self.main {
+            None => out.push(0),
+            Some((at, None)) => {
+                out.push(1);
+                out.extend_from_slice(&at.to_le_bytes());
+            }
+            Some((at, Some(iv))) => {
+                out.push(2);
+                out.extend_from_slice(&at.to_le_bytes());
+                out.extend_from_slice(&iv);
+            }
+        }
+        out.extend_from_slice(&(self.lost.len() as u64).to_le_bytes());
+        for r in &self.lost {
+            out.extend_from_slice(&r.start.to_le_bytes());
+            out.extend_from_slice(&r.end.to_le_bytes());
+        }
+        out.push(u8::from(self.crc_broken));
+        out.extend_from_slice(&(self.crc.len() as u64).to_le_bytes());
+        for &(s, e, c) in &self.crc {
+            out.extend_from_slice(&s.to_le_bytes());
+            out.extend_from_slice(&e.to_le_bytes());
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        for v in [self.stats.packed_read, self.stats.written, self.stats.holes, self.released] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Decodes [`Self::to_bytes`]. [`FeedDecoder::restore`] checks it against the member.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FeedError> {
+        let mut r = Reader(bytes);
+        if r.take(4)? != SNAPSHOT_MAGIC {
+            return Err(FeedError::Snapshot("not a feed decoder snapshot"));
+        }
+        if r.u8()? != SNAPSHOT_VERSION {
+            return Err(FeedError::Snapshot("unknown version"));
+        }
+        let tag = r.u8()?;
+        let size = r.u64()?;
+        let stream_len = r.u64()?;
+        let want_crc = match r.u8()? {
+            0 => None,
+            1 => Some(r.u32()?),
+            _ => return Err(FeedError::Snapshot("bad flag")),
+        };
+        let main = match r.u8()? {
+            0 => None,
+            1 => Some((r.u64()?, None)),
+            2 => Some((r.u64()?, Some(r.take(16)?.try_into().expect("16 bytes")))),
+            _ => return Err(FeedError::Snapshot("bad flag")),
+        };
+        let n = r.count(16)?;
+        let mut lost = Vec::with_capacity(n);
+        for _ in 0..n {
+            lost.push(r.u64()?..r.u64()?);
+        }
+        let crc_broken = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(FeedError::Snapshot("bad flag")),
+        };
+        let n = r.count(20)?;
+        let mut crc = Vec::with_capacity(n);
+        for _ in 0..n {
+            crc.push((r.u64()?, r.u64()?, r.u32()?));
+        }
+        let stats = FeedStats { packed_read: r.u64()?, written: r.u64()?, holes: r.u64()? };
+        let released = r.u64()?;
+        if !r.0.is_empty() {
+            return Err(FeedError::Snapshot("trailing bytes"));
+        }
+        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, released })
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], FeedError> {
+        if self.0.len() < n {
+            return Err(FeedError::Snapshot("truncated"));
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+    fn u8(&mut self) -> Result<u8, FeedError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32, FeedError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+    }
+    fn u64(&mut self) -> Result<u64, FeedError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
+    }
+    /// A count of items of `each` bytes, checked against the bytes left.
+    fn count(&mut self, each: u64) -> Result<usize, FeedError> {
+        let n = self.u64()?;
+        if n > SNAPSHOT_MAX_RANGES || n.saturating_mul(each) > self.0.len() as u64 {
+            return Err(FeedError::Snapshot("bad count"));
+        }
+        Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_set_merges_and_splits() {
+        let mut s = RangeSet::default();
+        s.insert(10..20);
+        s.insert(30..40);
+        s.insert(20..30);
+        assert_eq!(s.ranges(), vec![10..40]);
+        s.remove(15..25);
+        assert_eq!(s.ranges(), vec![10..15, 25..40]);
+        s.remove(0..100);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn crc_runs_combine_in_any_order() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        let mut c = CrcRuns::default();
+        c.add(500, &data[500..]);
+        c.add(0, &data[..200]);
+        assert_eq!(c.whole(1000), None);
+        c.add(200, &data[200..500]);
+        assert_eq!(c.whole(1000), Some(crc32fast::hash(&data)));
+    }
+
+    #[test]
+    fn article_buffer_answers_and_releases() {
+        let mut b = ArticleBuffer::new(100);
+        b.insert(0, 10, &[1; 10]).unwrap();
+        b.mark_lost(0, 30..40);
+        let mut buf = [0u8; 64];
+        assert_eq!(b.read_packed(0, 0, &mut buf), PackedRead::NotYet { len: 10 });
+        assert_eq!(b.read_packed(0, 15, &mut buf), PackedRead::Data(5));
+        assert_eq!(b.read_packed(0, 20, &mut buf), PackedRead::NotYet { len: 10 });
+        assert_eq!(b.read_packed(0, 32, &mut buf), PackedRead::Hole { len: 8 });
+        assert_eq!(b.absent(0, 0..50), Some(vec![0..10, 20..50]));
+        b.insert(0, 5, &[2; 30]).unwrap();
+        assert_eq!(b.held(), 30);
+        assert_eq!(b.read_packed(0, 32, &mut buf), PackedRead::Data(3));
+        assert!(b.insert(0, 100, &[0; 80]).is_err());
+        b.release(0, 0..12);
+        assert_eq!(b.held(), 23);
+        assert_eq!(b.read_packed(0, 11, &mut buf), PackedRead::NotYet { len: 1 });
+    }
+}
