@@ -23,7 +23,7 @@
 //! copy of the same content (an "alt") can stand in for missing ones. See `docs/probe.md`.
 
 mod media;
-mod zip;
+pub(crate) mod zip;
 
 pub use media::{Confidence, MediaKind, MediaMatch, media_kind_for_name, sniff};
 

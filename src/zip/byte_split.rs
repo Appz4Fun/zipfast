@@ -263,6 +263,11 @@ pub(crate) fn scan_local_headers(
         let mut raw = vec![0u8; usize::from(h.name_len)];
         source.read_exact(&mut raw)?;
         let data_at = name_at + u64::from(h.name_len) + u64::from(h.extra_len);
+        // The extra field, when it lies before the gap: a WinZip AES member's parameters and ZIP64 sizes are there.
+        let mut extra = vec![0u8; usize::from(h.extra_len)];
+        if data_at > len || source.read_exact(&mut extra).is_err() {
+            extra.clear();
+        }
         let streamed = h.flags & 0x08 != 0;
         let (crc32, packed, size, next) = if streamed {
             match find_descriptor(source, data_at, len, h.packed_size == u32::MAX || h.unpacked_size == u32::MAX)? {
@@ -275,11 +280,10 @@ pub(crate) fn scan_local_headers(
                 }
             }
         } else {
-            if h.packed_size == u32::MAX || h.unpacked_size == u32::MAX {
-                break;
-            }
-            let packed = u64::from(h.packed_size);
-            (h.crc32, packed, u64::from(h.unpacked_size), Some(data_at + packed))
+            // ZIP64 sizes come from the local ZIP64 extra field; without one the member can't be passed over.
+            let (Some(size), Some(packed)) = crate::probe::zip::zip64_sizes(&extra, &h) else { break };
+            let Some(end) = data_at.checked_add(packed) else { break };
+            (h.crc32, packed, size, Some(end))
         };
         let name = super::decode_name(&raw, h.flags & super::FLAG_UTF8 != 0)
             .unwrap_or_else(|_| String::from_utf8_lossy(&raw).into_owned());
@@ -294,6 +298,7 @@ pub(crate) fn scan_local_headers(
             local_at: at,
             mtime,
             mtime_origin: mtime.map(|_| crate::extract::MtimeOrigin::LocalWallClock),
+            aes_info: crate::crypto::aes_extra_info(&extra),
             ..Default::default()
         });
         match next {
