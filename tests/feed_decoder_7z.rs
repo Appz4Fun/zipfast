@@ -464,3 +464,65 @@ fn a_header_in_a_hole_stalls_until_it_comes() {
     assert_eq!(d.stats().redecoded, 0);
     assert!(out.bytes == plain);
 }
+
+/// A sink that keeps nothing it is given (the default `read_held`).
+struct WriteOnly {
+    out: Out,
+}
+
+impl FeedSink for WriteOnly {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.out.write_at(offset, bytes)
+    }
+}
+
+/// A hole in a stored chunk followed by a chunk that resets only the LZMA state, decoded into a sink that gives
+/// nothing back: the repair must not pick a restart that needs the dictionary from the sink (written output is not
+/// held there), and finishes with the decoder it kept.
+#[test]
+fn a_write_only_sink_repairs_a_stored_hole_before_a_state_reset() {
+    let plain = mixed(900_000, 21);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 1 << 20);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let index = map.lzma2_chunks(0, &refs, Default::default()).unwrap();
+    let k = (0..index.chunks.len() - 1)
+        .find(|&k| {
+            index.chunks[k].kind == Lzma2ChunkKind::Stored
+                && index.chunks[k + 1].kind == Lzma2ChunkKind::Lzma
+                && matches!(index.chunks[k + 1].reset, Lzma2Reset::State | Lzma2Reset::StateProps)
+        })
+        .expect("a stored chunk before a state reset");
+    let p = index.chunks[k].payload();
+    let at = 32 + (p.start + p.end) / 2;
+    let hole = at..at + 100;
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..hole.start as usize]).unwrap();
+    source.insert(0, hole.end, &archive[hole.end as usize..]).unwrap();
+    source.mark_lost(0, hole.clone());
+    let mut d = FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap();
+    let mut sink = WriteOnly { out: Out::new(plain.len(), None) };
+    let s = d.run(&mut source, &mut sink).unwrap();
+    assert!(!s.lost.is_empty(), "{s:?}");
+    source.insert(0, hole.start, &archive[hole.start as usize..hole.end as usize]).unwrap();
+    let s = d.run(&mut source, &mut sink).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert!(sink.out.bytes == plain);
+    assert_eq!(sink.out.written, plain.len() as u64);
+}
+
+/// Cancellation stops the header walk before a later member of a folder, even while bytes are missing.
+#[test]
+fn cancellation_interrupts_the_walk_to_a_later_member() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("a.txt", text(300_000, 1)), ("b.txt", text(200_000, 2))];
+    let archive = seven_zip(&files, false, 1 << 20);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let options = FeedOptions::default();
+    let control = options.control.clone();
+    let mut d = FeedDecoder::new(&map, 1, options).unwrap();
+    control.cancel();
+    let mut out = Out::new(200_000, None);
+    let mut source = ArticleBuffer::new(usize::MAX);
+    assert!(matches!(d.run(&mut source, &mut out), Err(FeedError::Canceled)));
+}

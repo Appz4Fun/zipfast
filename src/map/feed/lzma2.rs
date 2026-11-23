@@ -75,6 +75,13 @@ struct Live {
     stream: liblzma::stream::Stream,
 }
 
+/// Whether the sink gives back member output `r` (output written to a write-only sink is not held): its first and
+/// last bytes, a cheap probe before relying on it as a dictionary.
+fn held_probe(sink: &mut dyn FeedSink, r: Range<u64>) -> bool {
+    let mut one = [0u8; 1];
+    r.start >= r.end || [r.start, r.end - 1].into_iter().all(|at| matches!(sink.read_held(at, &mut one), Ok(1)))
+}
+
 fn corrupt(out: u64, what: &'static str) -> FeedError {
     FeedError::Decode { out, error: crate::Error::Corrupt(what) }
 }
@@ -764,6 +771,9 @@ impl FeedDecoder {
     fn lz_seek(&mut self, lz: &mut Lz, source: &mut dyn PackedSource) -> Result<Option<(Range<u64>, bool)>, FeedError> {
         let (mut pos, mut out, mut start) = (0u64, 0u64, None);
         loop {
+            if self.options.control.is_canceled() {
+                return Err(FeedError::Canceled);
+            }
             let c = match self.lz_header(lz, source, pos, out)? {
                 Hdr::Chunk(c) => c,
                 Hdr::End => return Err(corrupt(out, "LZMA2 stream ends before the member")),
@@ -799,6 +809,9 @@ impl FeedDecoder {
 
     /// The chunk whose header is at plain packed offset `pos` (output offset `out`), from the walk's cache or read.
     fn lz_header(&mut self, lz: &mut Lz, source: &mut dyn PackedSource, pos: u64, out: u64) -> Result<Hdr, FeedError> {
+        if self.options.control.is_canceled() {
+            return Err(FeedError::Canceled);
+        }
         if let Some(c) = lz.walked.get(&pos) {
             if c.unpacked_offset != out {
                 return Err(corrupt(out, "LZMA2 chunk framing"));
@@ -846,6 +859,9 @@ impl FeedDecoder {
 
     /// Reads plain packed bytes at `pos` (under 7zAES decrypting whole blocks, the block before as IV).
     fn lz_read(&mut self, lz: &Lz, source: &mut dyn PackedSource, pos: u64, buf: &mut [u8]) -> Result<Got, FeedError> {
+        if self.options.control.is_canceled() {
+            return Err(FeedError::Canceled);
+        }
         let want = (buf.len() as u64).min(lz.plain_len.saturating_sub(pos)) as usize;
         if want == 0 {
             return Err(FeedError::Malformed("read past the LZMA2 stream"));
@@ -930,7 +946,8 @@ impl FeedDecoder {
         if o - d < lz.ss {
             return false;
         }
-        self.lz_written(o - d - lz.ss..o - lz.ss) || self.lz_dict(lz, sink, o).is_some()
+        let r = o - d - lz.ss..o - lz.ss;
+        (self.lz_written(r.clone()) && held_probe(sink, r)) || self.lz_dict(lz, sink, o).is_some()
     }
 
     /// Writes decoded output at folder offset `at`: the part inside `write` and the member, the rest counted as
@@ -1060,7 +1077,9 @@ impl FeedDecoder {
                     } else if state {
                         let d = lz.dict.min(c.unpacked_offset);
                         let from = c.unpacked_offset - d;
-                        if from >= lz.ss && self.lz_written(from - lz.ss..c.unpacked_offset - lz.ss) {
+                        let r = from.max(lz.ss) - lz.ss..c.unpacked_offset - lz.ss;
+                        // a restart point must be restorable: the sink gives the output it was written back
+                        if from >= lz.ss && self.lz_written(r.clone()) && held_probe(sink, r) {
                             lane.cp = Some(Cp {
                                 packed: c.packed_offset,
                                 out: c.unpacked_offset,
