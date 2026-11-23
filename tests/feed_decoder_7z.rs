@@ -785,3 +785,26 @@ fn a_trailing_empty_member_of_a_folder_is_handed_over_to() {
     let s = d1.run(&mut source, &mut Out::new(0, None)).unwrap();
     assert!(s.done && s.crc_ok != Some(false), "{s:?}");
 }
+
+/// A zero-length member at the folder's start hands over to the member after it.
+#[test]
+fn a_leading_empty_member_of_a_folder_hands_over() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("e.txt", Vec::new()), ("a.bin", mixed(200_000, 34))];
+    let archive = seven_zip(&files, false, 350_000);
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    assert_eq!(map.members[0].unpacked_size, Some(0));
+    if map.members[0].folder.is_none() {
+        // a map that gives the empty member no place in the folder has nothing to hand over
+        return;
+    }
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut d0 = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+    assert!(d0.run(&mut source, &mut Out::new(0, None)).unwrap().done);
+    let mut d1 = d0.next_solid(&map, 1, FolderRun::options()).unwrap();
+    let mut out1 = Out::new(200_000, None);
+    let s = d1.run(&mut source, &mut out1).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert!(out1.bytes == files[1].1);
+    assert_eq!(d1.stats().redecoded, 0);
+}

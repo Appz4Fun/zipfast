@@ -295,7 +295,8 @@ the member `unproven` until its CRC matches. `FeedDecoder::new` on a later membe
 reset before it (decoding the folder output in between again). A member's snapshot taken after its main decode
 finished and before the hand-off keeps what it is to hand over: the restart point to go on from (the output past its
 end is decoded again from there) and the lost output past its end with its repairs. The next member is the folder's
-next member in the map, also a zero-length one at the folder's end.
+next member in the map, also a zero-length one at the folder's end; a zero-length member with a member after it
+(at the folder's start, say) runs its main decode to its own start and hands over from there.
 
 ## Saving and restoring
 
@@ -520,4 +521,4 @@ Solid streams (`tests/feed_decoder_solid.rs`, `tests/feed_decoder_solid_rar4.rs`
   is restored from a snapshot, and all end exact, CRCs verified, each byte written once (repairs decode up to 1.1 MB
   again in the single-reset folder, 38 KB in the blocked one). Also: a finished member snapshotted and restored
   before it hands over, with and without a loss running on into the next member, and a zero-length member at the
-  folder's end handed over to.
+  folder's end handed over to, and one at its start handing over.

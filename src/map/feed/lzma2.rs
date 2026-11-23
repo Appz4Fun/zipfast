@@ -920,7 +920,8 @@ impl FeedDecoder {
                 }));
             }
             d.lzma2 = Some(lz);
-        } else if size > 0 {
+        } else if size > 0 || successor {
+            // an empty member a member follows still runs its main decode (to its own start) to hand it over
             let lz = d.lzma2.as_mut().expect("LZMA2 state");
             if slot.offset == 0 {
                 lz.main =
