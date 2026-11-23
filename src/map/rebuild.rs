@@ -235,6 +235,10 @@ pub enum Missing {
     /// The final CBC block, whose `pad` padding bytes are random (RAR): no check decided it (`searched` false), or
     /// none of the at most 2^24 paddings passed (`searched` true). More than 3 padding bytes are never searched.
     FinalPadding { pad: u8, searched: bool },
+    /// The final CBC block: `candidates` paddings pass every check given, and they differ in these bytes (the
+    /// checks see too little of the block, an article boundary cutting through it, say). Bytes all passing
+    /// candidates agree on are rebuilt. Give the CRC of the other article holding the block too.
+    FinalPaddingAmbiguous { pad: u8, candidates: u32 },
     /// CBC padding blocks past the output.
     Padding,
     /// No key: no password was given, it is wrong (the format's check value refused it), or derivation failed.
@@ -523,7 +527,15 @@ impl<'m> ContainerRebuilder<'m> {
         }
         self.headers(&mut out, options);
         for p in pending {
-            self.finish_final(p, &mut out, options);
+            // another member's final block (a shared 7z folder) is masked below: not worth a search
+            if options.member.is_none_or(|m| m == p.member) {
+                self.finish_final(p, &mut out, options);
+            }
+        }
+        if let Some(m) = options.member {
+            // a shared 7z folder holds the member and others: their plaintext chains the CBC stream, but their
+            // bytes are not this call's
+            out.mask_other_members(m);
         }
         out.compare_known(&options.known);
         Ok(RebuiltRange { volume, range, bytes: out.bytes, regions: out.regions, conflicts: out.conflicts })
@@ -556,10 +568,15 @@ impl<'m> ContainerRebuilder<'m> {
             }
             Kind::Compressed(layer) => {
                 let stream = &self.streams[sid];
-                let plan = options.plans.iter().find(|p| match p.start {
-                    Start::Lzma2 { folder, .. } => stream.folder == Some(folder),
-                    _ => stream.folder.is_none() && stream.holds(p.member),
-                });
+                // several plans on one stream (members of one 7z folder): the earliest restart decides what is unneeded
+                let plan = options
+                    .plans
+                    .iter()
+                    .filter(|p| match p.start {
+                        Start::Lzma2 { folder, .. } => stream.folder == Some(folder),
+                        _ => stream.folder.is_none() && stream.holds(p.member),
+                    })
+                    .min_by_key(|p| p.fetch_from);
                 let compressed = ByteState::Missing(Missing::Compressed(layer));
                 match plan {
                     Some(plan) if part.stream.start < plan.fetch_from => {
@@ -1048,25 +1065,51 @@ impl<'m> ContainerRebuilder<'m> {
             .filter_map(|i| p.places[i].and_then(|(v, o)| known_byte(&options.known, v, o)).map(|b| (i, b)))
             .collect();
         let filter = |blk: &[u8; 16]| known.iter().all(|&(i, b)| blk[i] == b);
-        let mut found = None;
-        let mut searched = false;
-        for check in &options.checks {
-            let Some(affine) = CrcAffine::new(check, &p, out, &options.known) else { continue };
-            searched = true;
-            found = crate::crypto::rebuild_final_block(&p.key, &p.previous, &p.partial, |blk| {
-                filter(blk) && affine.crc(blk) == check.crc32
-            });
-            break;
+        // every check that can judge the block, together: a check may see only a byte or two of it (an article
+        // boundary inside the block), so one check alone can pass several paddings
+        let checks: Vec<(CrcAffine, u32)> = options
+            .checks
+            .iter()
+            .filter_map(|c| CrcAffine::new(c, &p, out, &options.known).map(|a| (a, c.crc32)))
+            .collect();
+        let mut accept = options.accept.as_deref_mut();
+        let searched = !checks.is_empty() || accept.is_some();
+        // every padding is tried; the bytes rebuilt are those all passing candidates agree on
+        let mut first: Option<[u8; 16]> = None;
+        let mut agree = [true; 16];
+        let mut passing = 0u32;
+        if searched && let Some(aes) = AesKey::new(&p.key) {
+            let rem = p.partial.len();
+            for v in 0..1u32 << (8 * pad) {
+                let mut x = [0u8; 16];
+                x[..rem].copy_from_slice(&p.partial);
+                for (i, b) in x[rem..].iter_mut().enumerate() {
+                    *b = (v >> (8 * (pad - 1 - i))) as u8;
+                }
+                for (xb, pb) in x.iter_mut().zip(p.previous) {
+                    *xb ^= pb;
+                }
+                let blk = aes.encrypt_block(&x);
+                if !filter(&blk) || !checks.iter().all(|(a, crc)| a.crc(&blk) == *crc) {
+                    continue;
+                }
+                if let Some(accept) = accept.as_deref_mut()
+                    && !accept(&FinalBlock { member: p.member, block: blk, places: p.places, pad: pad as u8 })
+                {
+                    continue;
+                }
+                passing = passing.saturating_add(1);
+                match first {
+                    None => first = Some(blk),
+                    Some(f) => {
+                        for i in 0..16 {
+                            agree[i] &= f[i] == blk[i];
+                        }
+                    }
+                }
+            }
         }
-        if found.is_none()
-            && !searched
-            && let Some(accept) = options.accept.as_deref_mut()
-        {
-            searched = true;
-            found = crate::crypto::rebuild_final_block(&p.key, &p.previous, &p.partial, |blk| {
-                filter(blk) && accept(&FinalBlock { member: p.member, block: *blk, places: p.places, pad: pad as u8 })
-            });
-        }
+        let found = first.filter(|_| passing == 1);
         let stream = &self.streams[p.stream];
         for i in 0..16 {
             let Some((v, o)) = p.places[i] else { continue };
@@ -1078,11 +1121,12 @@ impl<'m> ContainerRebuilder<'m> {
                 let (_, mo) = stream.member_at(s).unwrap_or((p.member, s));
                 mo..mo + 1
             });
-            let state = match found {
-                Some(blk) => {
+            let state = match first {
+                Some(blk) if passing == 1 || agree[i] => {
                     out.write(o, &blk[i..i + 1]);
                     ByteState::Rebuilt(Rebuilt::CbcFinal { pad: pad as u8, searched: true })
                 }
+                Some(_) => ByteState::Missing(Missing::FinalPaddingAmbiguous { pad: pad as u8, candidates: passing }),
                 None => ByteState::Missing(Missing::FinalPadding { pad: pad as u8, searched }),
             };
             out.set(o..o + 1, Some(p.member), output, state);
@@ -1218,6 +1262,22 @@ impl Out {
         }
     }
 
+    /// Reports every byte of a member other than `member` as [`Missing::OtherMember`], zeroing it.
+    fn mask_other_members(&mut self, member: usize) {
+        let others: Vec<(Range<u64>, Option<usize>)> = self
+            .regions
+            .iter()
+            .filter(|r| r.member.is_some_and(|x| x != member))
+            .filter(|r| r.state != ByteState::Missing(Missing::OtherMember))
+            .map(|r| (r.range.clone(), r.member))
+            .collect();
+        for (range, owner) in others {
+            let len = (range.end - range.start) as usize;
+            self.write(range.start, &vec![0; len]);
+            self.set(range, owner, None, ByteState::Missing(Missing::OtherMember));
+        }
+    }
+
     fn replace_placeholder(&mut self, state: ByteState) {
         self.replace_state(&HEADER_PLACEHOLDER, state);
     }
@@ -1339,8 +1399,9 @@ fn merge(sorted: Vec<Range<u64>>) -> Vec<Range<u64>> {
 fn clip_output(out: &mut Out, v: Range<u64>, n: u64, stream: &Stream) {
     let regions: Vec<Region> =
         out.regions.iter().filter(|r| r.range.start < v.end && r.range.end > v.start).cloned().collect();
-    let member_end = stream.members.last().map_or(n, |m| m.2);
     for r in regions {
+        // each region's output stops at its own member's end: only the last member's region reaches the padding
+        let member_end = r.member.and_then(|id| stream.members.iter().find(|m| m.0 == id)).map_or(n, |m| m.2);
         if let Some(o) = &r.output
             && o.end > member_end
         {
@@ -1623,7 +1684,7 @@ impl CrcAffine {
         let len = range.end - range.start;
         let inside: Vec<(usize, u64)> = (0..16)
             .filter_map(|i| {
-                p.places[i].and_then(|(v, o)| (v == check.volume && range.contains(&o)).then_some((i, o - range.start)))
+                p.places[i].and_then(|(v, o)| (v == check.volume && range.contains(&o)).then(|| (i, o - range.start)))
             })
             .collect();
         if inside.is_empty() || usize::try_from(len).is_err() {

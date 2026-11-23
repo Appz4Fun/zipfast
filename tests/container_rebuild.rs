@@ -276,6 +276,50 @@ fn aes_rar5_volumes_rebuild_byte_for_byte_with_the_final_block_from_a_crc() {
 }
 
 #[test]
+fn a_final_block_cut_by_an_article_boundary_needs_both_articles_crcs() {
+    let data = payload(100_014, 11); // 2 bytes of padding: 65,536 candidates
+    let vols = aes_volumes(&data, 19_753, &[0x5e, 0xe1]);
+    let map = MemberMap::from_memory(&refs(&vols), "s.part1.rar", Some(PASSWORD)).unwrap();
+    let last = vols.len() - 1;
+    let (vi, vol) = (last as u32, &vols[last]);
+    let d = data_ranges(&map, vi)[0].clone();
+    let real = &vol[d.end as usize - 16..d.end as usize];
+    // the first article ends one byte into the final block, the second holds the rest and the tail
+    let cut = d.end - 15;
+    let known = || {
+        vec![
+            KnownBytes { volume: vi, offset: 0, bytes: &vol[..d.start as usize] },
+            KnownBytes { volume: vi, offset: d.end, bytes: &vol[d.end as usize..] },
+        ]
+    };
+    let first = Crc32Check { volume: vi, range: 0..cut, crc32: crc32fast::hash(&vol[..cut as usize]) };
+    let second = Crc32Check { volume: vi, range: cut..vol.len() as u64, crc32: crc32fast::hash(&vol[cut as usize..]) };
+    let mut held = HeldMembers::new().with(0, &data, None);
+    // the first article's CRC sees one byte of the block: about 256 paddings pass it
+    let mut rb = ContainerRebuilder::new(&map, Some(PASSWORD));
+    let mut options = RebuildOptions { known: known(), checks: vec![first.clone()], ..Default::default() };
+    let got = rb.rebuild(vi, 0..vol.len() as u64, &mut held, &mut options).unwrap();
+    assert_exact(&got, vol);
+    let block: Vec<&zipfast::map::Region> =
+        got.regions.iter().filter(|r| r.range.start < d.end && r.range.end > d.end - 16).collect();
+    // the checked byte is certain; the other 15 are not
+    assert_eq!(block[0].range, d.end - 16..d.end - 15);
+    assert!(matches!(block[0].state, ByteState::Rebuilt(Rebuilt::CbcFinal { .. })));
+    let ambiguous: u64 = block
+        .iter()
+        .filter(|r| matches!(r.state, ByteState::Missing(Missing::FinalPaddingAmbiguous { pad: 2, candidates }) if candidates > 1))
+        .map(|r| r.range.end.min(d.end) - r.range.start.max(d.end - 16))
+        .sum();
+    assert_eq!(ambiguous, 15);
+    // both articles' CRCs together leave one padding
+    let mut rb = ContainerRebuilder::new(&map, Some(PASSWORD));
+    let mut options = RebuildOptions { known: known(), checks: vec![first, second], ..Default::default() };
+    let got = rb.rebuild(vi, 0..vol.len() as u64, &mut held, &mut options).unwrap();
+    assert_eq!(assert_exact(&got, vol), d.end - d.start);
+    assert_eq!(&got.bytes[d.end as usize - 16..d.end as usize], real);
+}
+
+#[test]
 fn aes_ranges_cutting_through_blocks_and_volumes_rebuild_exactly() {
     let data = payload(70_000, 4);
     let vols = aes_volumes(&data, 9_999, &[0; 0]);
@@ -570,6 +614,6 @@ fn rar4_aes_stored_volumes_rebuild_and_the_final_block_from_a_crc() {
             assert_eq!(n, d.end - d.start, "volume {v}");
         }
         assert!(got.missing().all(|r| matches!(r.state, ByteState::Missing(Missing::Header(HeaderGap::NotRar5)))
-            || matches!(r.state, ByteState::Missing(Missing::FinalPadding { .. }))));
+            || matches!(r.state, ByteState::Missing(Missing::FinalPaddingAmbiguous { pad: 2, candidates }) if candidates > 1)));
     }
 }

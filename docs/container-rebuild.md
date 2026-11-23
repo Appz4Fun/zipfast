@@ -41,12 +41,12 @@ and returns the ranges it holds. Bytes outside them are holes. Offsets are the m
 
 | field | use |
 |---|---|
-| `member` | rebuild only this member; other members' bytes are `Missing::OtherMember` |
+| `member` | rebuild only this member; other members' bytes are `Missing::OtherMember`, also inside a shared 7z folder, whose other members' output still chains the CBC stream internally |
 | `known` | `KnownBytes { volume, offset, bytes }`: volume bytes the caller holds (downloaded articles). Never reported as rebuilt. They give the CBC block before a range when the held output has a hole, take part in CRC checks, and are compared with what is rebuilt (`RebuiltRange::conflicts`) |
-| `checks` | `Crc32Check { volume, range, crc32 }`: an article's CRC32 (from its yEnc trailer), used to find a RAR final block's random padding |
-| `accept` | the caller's own test of a final block candidate (`FinalBlock { member, block, places, pad }`), for example a par2 slice hash. It is tried when no CRC check can decide, up to 2^24 times |
+| `checks` | `Crc32Check { volume, range, crc32 }`: an article's CRC32 (from its yEnc trailer), used to find a RAR final block's random padding. Every usable check applies together; give both articles' CRCs when an article boundary cuts through the block |
+| `accept` | the caller's own test of a final block candidate (`FinalBlock { member, block, places, pad }`), for example a par2 slice hash. It applies together with the CRC checks, to the candidates they pass, up to 2^24 times |
 | `headers` | `VolumeHeaders`: rebuild RAR 5.0 headers from the bytes held of the volume (see below) |
-| `plans` | `open_at` plans of compressed members (see below) |
+| `plans` | `open_at` plans of compressed members (see below); with several plans on one stream (members of one 7z folder), the earliest restart decides |
 | `max_chain` | the most stream bytes encrypted forward to reach a CBC range's previous block (default: no limit) |
 | `max_range` | the largest range accepted (default 1 GiB) |
 
@@ -81,6 +81,7 @@ though the map gives them no pieces. Each RAR member is its own stream; a volume
 | `NotHeld` | The output these bytes carry (`region.output`) is not held. For CBC that is the whole block |
 | `Chain` | AES-CBC: the ciphertext block before is unknown, because the held output has a hole since the last checkpoint (or `max_chain` was hit). Pass the 16 volume bytes before the range as `known` (for example the end of the previous article) to restart the chain |
 | `FinalPadding { pad, searched }` | A RAR final block with `pad` random padding bytes. Either no check could decide (`searched: false`; a `Crc32Check` needs every other byte of its range rebuilt in the call or `known`), or no padding passed. More than 3 padding bytes are never searched (2^32 tries and more) |
+| `FinalPaddingAmbiguous { pad, candidates }` | Several paddings pass every check (a check that sees only a byte or two of the block). Bytes all passing candidates agree on are rebuilt; the others are this. Give the other article's CRC too |
 | `Padding` | CBC blocks wholly past the output (extra padding) |
 | `Key(problem)` | `NoPassword`, `WrongPassword` (a RAR 5.0 or WinZip check value refused it) or `Derivation`. Without a check value (7z, RAR 4.x, RAR 5.0 without one), a wrong password rebuilds wrong bytes: compare with `known` bytes (`conflicts`), and prove the result with the article CRC or par2 |
 | `AuthCode` | The WinZip AES code covers the whole output, which is not all held |
@@ -126,6 +127,11 @@ XORs, not a CRC over 750 KB. The check needs every other byte of its range, rebu
 
 `known` bytes inside the final block also act as a filter.
 
+Every padding is tried against all usable checks, the `known` filter and `accept` together. A byte of the block is
+rebuilt only when every passing candidate agrees on it: a check that covers one byte of the block (the article
+boundary falls just inside it) passes about 256 paddings out of 65,536 for 2 padding bytes, which agree on that
+byte only.
+
 ## Checked against
 
 `tests/container_rebuild.rs` covers:
@@ -163,4 +169,4 @@ On the compressed sets, a seeded handover at 60% of the output leaves unneeded:
 - F03 (RAR 5.0 `-m3`): 11.1 MB of 36.1 MB;
 - F07 (7z LZMA2): 17.4 MB of 36.0 MB, except its chunk headers.
 
-A whole stored set rebuilds in 0.1 to 2.4 s (release, M4, one thread), key derivation and the final block search included.
+A whole stored set rebuilds in 0.2 to 3.2 s (release, M4, one thread), key derivation and the full final block search included.
