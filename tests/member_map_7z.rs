@@ -1598,3 +1598,103 @@ fn kept_volumes_are_selected_again_without_asking_the_source() {
     let (map, _) = counting_map(&volumes, 1, 0, 0);
     assert!(matches!(map, Err(MapError::Limit { resource: Resource::VolumeHandles, .. })), "{map:?}");
 }
+
+// ---- Container rebuild over shared folders ----
+
+fn held_all<'a>(map: &MemberMap, outputs: &[&'a [u8]]) -> HeldMembers<'a> {
+    let mut held = HeldMembers::new();
+    for (i, m) in map.members.iter().enumerate() {
+        if m.folder.is_some() {
+            held = held.with(i, outputs[i], None);
+        }
+    }
+    held
+}
+
+fn assert_rebuilt_exact(got: &RebuiltRange, volume: &[u8]) {
+    for r in got.regions.iter().filter(|r| matches!(r.state, ByteState::Rebuilt(_))) {
+        for o in r.range.clone() {
+            assert_eq!(got.bytes[(o - got.range.start) as usize], volume[o as usize], "byte {o}");
+        }
+    }
+}
+
+#[test]
+fn the_member_filter_applies_inside_a_shared_folder() {
+    let aes = Aes::new("secret");
+    let (a, b, c) = (data(3000, 2), data(500, 3), data(777, 4));
+    for method in [Method::Copy, Method::AesCopy(aes.clone())] {
+        let archive = build(
+            &[(method, vec![Entry::File("a", a.clone()), Entry::File("b", b.clone()), Entry::File("c", c.clone())])],
+            &[],
+            &HeaderMode::Plain,
+        );
+        let map = map_set(std::slice::from_ref(&archive), None).unwrap();
+        let mut rb = ContainerRebuilder::new(&map, Some("secret"));
+        let mut held = held_all(&map, &[&a, &b, &c]);
+        let mut options = RebuildOptions { member: Some(1), ..Default::default() };
+        let got = rb.rebuild(0, 0..archive.len() as u64, &mut held, &mut options).unwrap();
+        assert_rebuilt_exact(&got, &archive);
+        // only b's bytes are rebuilt (its CBC chain runs through a's output internally)
+        let rebuilt: Vec<_> = got
+            .regions
+            .iter()
+            .filter(|r| matches!(r.state, ByteState::Rebuilt(_)))
+            .map(|r| (r.member, r.output.clone()))
+            .collect();
+        assert_eq!(rebuilt, [(Some(1), Some(0..500))]);
+        for m in [0, 2] {
+            let other: u64 =
+                got.regions.iter().filter(|r| r.member == Some(m)).map(|r| r.range.end - r.range.start).sum();
+            let masked: u64 = got
+                .regions
+                .iter()
+                .filter(|r| r.member == Some(m) && r.state == ByteState::Missing(Missing::OtherMember))
+                .map(|r| r.range.end - r.range.start)
+                .sum();
+            assert_eq!(masked, other, "member {m}: every byte is another member's");
+            assert!(masked > 0);
+        }
+    }
+}
+
+#[test]
+fn a_final_block_shared_by_two_members_keeps_each_members_output() {
+    let aes = Aes::new("secret");
+    let (a, b) = (data(1000, 5), data(1, 6));
+    let archive = build(
+        &[(Method::AesCopy(aes.clone()), vec![Entry::File("a", a.clone()), Entry::File("b", b.clone())])],
+        &[],
+        &HeaderMode::Plain,
+    );
+    let map = map_set(std::slice::from_ref(&archive), None).unwrap();
+    let mut rb = ContainerRebuilder::new(&map, Some("secret"));
+    let mut held = held_all(&map, &[&a, &b]);
+    let got = rb.rebuild(0, 0..archive.len() as u64, &mut held, &mut RebuildOptions::default()).unwrap();
+    assert_rebuilt_exact(&got, &archive);
+    let outputs: Vec<_> =
+        got.regions.iter().filter(|r| r.member.is_some()).map(|r| (r.member, r.output.clone())).collect();
+    // a: 0..1000 (its tail in the final block too), b: 0..1, then the 7 padding bytes carry no output
+    assert_eq!(outputs, [(Some(0), Some(0..992)), (Some(0), Some(992..1000)), (Some(1), Some(0..1)), (Some(1), None)]);
+}
+
+#[test]
+fn plans_on_one_folder_skip_only_what_the_earliest_restart_does_not_need() {
+    let (a, b) = (noise(300_000, 7), noise(300_000, 8));
+    let archive = build(
+        &[(Method::Lzma2, vec![Entry::File("a", a.clone()), Entry::File("b", b.clone())])],
+        &[],
+        &HeaderMode::Plain,
+    );
+    let map = map_set(std::slice::from_ref(&archive), None).unwrap();
+    let options = OpenAtOptions { search: Some(1_000), ..Default::default() };
+    let early = open_at(&map, 0, 100_000, &options).unwrap();
+    let late = open_at(&map, 1, 200_000, &options).unwrap();
+    assert!(early.fetch_from < late.fetch_from);
+    let plans = [late.clone(), early.clone()];
+    let mut rb = ContainerRebuilder::new(&map, None);
+    let mut held = HeldMembers::new();
+    let mut ro = RebuildOptions { plans: &plans, ..Default::default() };
+    let got = rb.rebuild(0, 0..archive.len() as u64, &mut held, &mut ro).unwrap();
+    assert_eq!(got.unneeded_len(), early.fetch_from);
+}
