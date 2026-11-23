@@ -592,6 +592,9 @@ pub struct MapMember {
     /// needs ([`crate::rar5::unpack::window_for`]); headers decrypted with `-hp` give it too. `None` for
     /// directories, ZIP entries and 7z members (a 7z folder's dictionary is in its coder properties).
     pub dictionary: Option<u64>,
+    /// RAR 4.x: the unpack version the member's header declares (15, 20, 26, 29, 36), which picks its decoder. `None`
+    /// for other formats.
+    pub unpack_version: Option<u8>,
 }
 
 fn floor_block(offset: u64) -> u64 {

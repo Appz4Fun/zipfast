@@ -28,6 +28,7 @@ use std::io;
 use std::ops::Range;
 
 mod lzma2;
+mod rar4;
 mod rar5;
 
 /// What a [`PackedSource`] answers for a read of packed bytes.
@@ -686,6 +687,7 @@ enum LayerTag {
     Ctr = 3,
     Rar5 = 4,
     Lzma2 = 5,
+    Rar4 = 6,
 }
 
 /// A feed-driven decoder of one member. See the module docs and `docs/feed-decoder.md`.
@@ -723,6 +725,8 @@ pub struct FeedDecoder {
     rar5: Option<Box<rar5::Rar5>>,
     /// a 7z LZMA2 folder member's decoder state
     lzma2: Option<Box<lzma2::Lz>>,
+    /// a compressed RAR 4.x member's decoder state
+    rar4: Option<Box<rar4::Rar4>>,
 }
 
 impl std::fmt::Debug for FeedDecoder {
@@ -743,6 +747,9 @@ impl FeedDecoder {
         let member = map.members.get(index).ok_or(FeedError::NoSuchMember { index })?;
         if matches!(member.method, MapMethod::Compressed { .. }) && map.format == super::MapFormat::Rar5 {
             return Self::new_rar5(member, options);
+        }
+        if matches!(member.method, MapMethod::Compressed { .. }) && map.format == super::MapFormat::Rar4 {
+            return Self::new_rar4(member, options);
         }
         if member.method == MapMethod::Coders && map.format == super::MapFormat::SevenZip {
             return Self::new_lzma2(map, member, options);
@@ -832,6 +839,7 @@ impl FeedDecoder {
             status: FeedStatus::default(),
             rar5: None,
             lzma2: None,
+            rar4: None,
         };
         if size > 0 {
             decoder.main = Some(decoder.lane_at(0, size));
@@ -879,6 +887,9 @@ impl FeedDecoder {
         }
         if self.lzma2.is_some() {
             (next, repair, more, next_gap) = self.run_lzma2(source, sink)?;
+        }
+        if self.rar4.is_some() {
+            (next, repair, more, next_gap) = self.run_rar4(source, sink)?;
         }
         // the main decode
         while !self.layered()
@@ -984,13 +995,14 @@ impl FeedDecoder {
 
     /// Whether a compressed layer decodes the member (rather than the stored lanes).
     fn layered(&self) -> bool {
-        self.rar5.is_some() || self.lzma2.is_some()
+        self.rar5.is_some() || self.lzma2.is_some() || self.rar4.is_some()
     }
 
     fn make_status(&self, needs: Vec<NeedBytes>, more: bool) -> FeedStatus {
-        let frontier = match (&self.rar5, &self.lzma2) {
-            (Some(r), _) => r.frontier(),
-            (_, Some(l)) => l.frontier(),
+        let frontier = match (&self.rar5, &self.lzma2, &self.rar4) {
+            (Some(r), _, _) => r.frontier(),
+            (_, Some(l), _) => l.frontier(),
+            (_, _, Some(r)) if self.main.is_some() => r.frontier(),
             _ => self.main.as_ref().map_or(self.size, |l| self.lane_out(l)),
         };
         let done = self.main.is_none() && self.lost.is_empty() && self.lzma2.as_ref().is_none_or(|l| l.done());
@@ -1006,8 +1018,9 @@ impl FeedDecoder {
         } else {
             None
         };
-        let stalled =
-            self.rar5.as_ref().is_some_and(|r| r.stalled()) || self.lzma2.as_ref().is_some_and(|l| l.stalled());
+        let stalled = self.rar5.as_ref().is_some_and(|r| r.stalled())
+            || self.lzma2.as_ref().is_some_and(|l| l.stalled())
+            || self.rar4.as_ref().is_some_and(|r| r.stalled());
         FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, stalled, crc_ok }
     }
 
@@ -1022,6 +1035,11 @@ impl FeedDecoder {
         } else if let Some(l) = &self.lzma2 {
             for range in l.needed(matches!(self.cipher, StoredCipher::Cbc { .. })) {
                 keep.insert(range);
+            }
+        } else if self.rar4.is_some() {
+            // nothing before the main decode is read again (a restore reads the member from its start again)
+            if let Some(l) = &self.main {
+                keep.insert(l.pos..self.stream_len);
             }
         } else {
             if let Some(l) = &self.main {
@@ -1196,9 +1214,10 @@ impl FeedDecoder {
             crc_broken: self.crc.broken,
             stats: self.stats,
             identity: self.identity,
-            layer: match (&self.rar5, &self.lzma2) {
-                (Some(r), _) => Some(r.to_bytes()),
-                (_, Some(l)) => Some(l.to_bytes()),
+            layer: match (&self.rar5, &self.lzma2, &self.rar4) {
+                (Some(r), _, _) => Some(r.to_bytes()),
+                (_, Some(l), _) => Some(l.to_bytes()),
+                (_, _, Some(r)) => Some(r.to_bytes()),
                 _ => None,
             },
         }
@@ -1234,6 +1253,12 @@ impl FeedDecoder {
         }
         if let Some(l) = d.lzma2.as_mut() {
             l.restore(snapshot.layer.as_deref().ok_or(FeedError::Snapshot("no LZMA2 state"))?)?;
+        }
+        if let Some(r) = d.rar4.as_mut() {
+            r.restore(snapshot.layer.as_deref().ok_or(FeedError::Snapshot("no RAR 4.x state"))?, size)?;
+            if snapshot.main.is_none() {
+                d.main = None;
+            }
         }
         d.main = match snapshot.main {
             _ if d.layered() => d.main.take(),

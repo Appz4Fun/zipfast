@@ -1356,6 +1356,7 @@ impl SevenZipWalker {
                 pieces: Vec::new(),
                 folder: None,
                 dictionary: None,
+                unpack_version: None,
             };
             if !file.has_stream {
                 members.push(base);
