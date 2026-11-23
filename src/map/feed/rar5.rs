@@ -125,7 +125,7 @@ impl OutSink<'_> {
 }
 
 /// Reads held output `range` from the sink, all of it or an error naming it.
-fn read_back(sink: &mut dyn FeedSink, range: Range<u64>) -> Result<Vec<u8>, FeedError> {
+pub(super) fn read_back(sink: &mut dyn FeedSink, range: Range<u64>) -> Result<Vec<u8>, FeedError> {
     let len = usize::try_from(range.end - range.start).map_err(|_| FeedError::HeldOutput { range: range.clone() })?;
     let mut buf = vec![0; len];
     let mut got = 0;
@@ -271,7 +271,7 @@ fn get_cp(r: &mut Reader<'_>) -> Result<Cp, FeedError> {
 
 /// What one run of the compressed layer found: needs for the main decode and for repairs, whether the budget
 /// stopped it, and the stream range after the main decode's gap (for lookahead needs).
-type RunOut = (Vec<NeedBytes>, Vec<NeedBytes>, bool, Option<Range<u64>>);
+pub(super) type RunOut = (Vec<NeedBytes>, Vec<NeedBytes>, bool, Option<Range<u64>>);
 
 impl FeedDecoder {
     /// A decoder of a compressed RAR 5.0 member.
@@ -357,6 +357,7 @@ impl FeedDecoder {
                 skip_failed: None,
                 ratio,
             })),
+            lzma2: None,
         };
         if size > 0 {
             d.main = Some(d.packed_lane(0, stream_len));

@@ -375,7 +375,7 @@ impl<I: MapInput> PackedInput for VolumesInput<I> {
 }
 
 /// Header length for control byte `c`; None for a bad control byte.
-fn header_len(c: u8) -> Option<usize> {
+pub(super) fn header_len(c: u8) -> Option<usize> {
     match c {
         0x00 => Some(1),
         0x01 | 0x02 => Some(3),
@@ -386,7 +386,7 @@ fn header_len(c: u8) -> Option<usize> {
 }
 
 /// Whether LZMA props byte `p` is valid in LZMA2.
-fn props_valid(p: u8) -> bool {
+pub(super) fn props_valid(p: u8) -> bool {
     if p >= 225 {
         return false;
     }
@@ -396,7 +396,7 @@ fn props_valid(p: u8) -> bool {
 }
 
 /// Parses a complete chunk header (`hdr` holds at least its header length) at `pos`/`unpacked`.
-fn parse_chunk(hdr: &[u8], pos: u64, unpacked: u64) -> Lzma2Chunk {
+pub(super) fn parse_chunk(hdr: &[u8], pos: u64, unpacked: u64) -> Lzma2Chunk {
     let c = hdr[0];
     if c < 0x80 {
         let size = (u64::from(hdr[1]) << 8 | u64::from(hdr[2])) + 1;
@@ -1124,7 +1124,7 @@ fn decode_run(
 }
 
 /// LZMA2's dictionary size for property byte `b` (at most 40).
-fn lzma2_dict(b: u8) -> u64 {
+pub(super) fn lzma2_dict(b: u8) -> u64 {
     if b >= 40 { u64::from(u32::MAX) } else { (2 | u64::from(b & 1)) << (b / 2 + 11) }
 }
 
