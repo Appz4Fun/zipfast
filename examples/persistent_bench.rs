@@ -20,6 +20,9 @@
 //! `cargo run --release --features persistent-partials --example persistent_bench -- <work dir> [MiB] [volumes]
 //! [plain|persistent|both]`; set `ZF_GROUP_MIB` to override `PartialLimits::group_commit_bytes`.
 //!
+//! `ZF_SET=<dir>` runs an existing set instead: every `*.rar` in it, in name order (for example a RustyGet
+//! z-fixture), with `ZF_PASSWORD` for an encrypted one. `ZF_RUNS` repeats each run and reports the best.
+//!
 //! The volumes are generated once into `<work dir>/set-<MiB>-<volumes>` and reused. Each run extracts into a fresh
 //! directory under `<work dir>` and removes it afterwards. The persistent run also reports durable syncs issued by
 //! zipfast and the anchor store's CAS and `current` calls, each per GiB of output.
@@ -47,7 +50,25 @@ mod anchor_store {
 }
 
 fn volume_name(index: u32) -> OsString {
-    format!("big.part{:03}.rar", index + 1).into()
+    match std::env::var_os("ZF_SET") {
+        Some(dir) => existing_names(Path::new(&dir))[index as usize].clone(),
+        None => format!("big.part{:03}.rar", index + 1).into(),
+    }
+}
+
+/// The `*.rar` volumes of an existing set, in name order (`r.part1.rar` .. `r.part7.rar` sort correctly below ten).
+fn existing_names(dir: &Path) -> Vec<OsString> {
+    let mut names: Vec<OsString> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().ends_with(".rar"))
+        .collect();
+    names.sort_by_key(|n| {
+        let s = n.to_string_lossy().into_owned();
+        let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+        (digits.len(), s)
+    });
+    names
 }
 
 /// Writes the set once: a stored member of `size` bytes cut into `volumes` parts.
@@ -154,6 +175,9 @@ fn options(dest: &Path) -> ProgressiveOptions {
         volume_name(0),
     );
     options.limits.volume_handles = 4096;
+    if let Ok(password) = std::env::var("ZF_PASSWORD") {
+        options.set_password(Some(password)).unwrap();
+    }
     options
 }
 
@@ -261,7 +285,9 @@ fn persistent(set: &Path, work: &Path, volumes: u32, size: u64) -> f64 {
         current as f64 / gib,
         (2 * cas + current) as f64 / gib,
     );
-    assert_eq!(fs::metadata(root.join("out/big.bin")).unwrap().len(), size);
+    if std::env::var_os("ZF_SET").is_none() {
+        assert_eq!(fs::metadata(root.join("out/big.bin")).unwrap().len(), size);
+    }
     fs::remove_dir_all(&root).unwrap();
     elapsed
 }
@@ -272,17 +298,29 @@ fn main() {
     let mib: u64 = args.get(2).map_or(2048, |s| s.parse().unwrap());
     let volumes: u32 = args.get(3).map_or(40, |s| s.parse().unwrap());
     let which = args.get(4).map_or("both", String::as_str);
-    let set = work.join(format!("set-{mib}-{volumes}"));
-    let size = generate(&set, mib << 20, volumes);
+    let (set, size, volumes, mib) = match std::env::var_os("ZF_SET") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            let names = existing_names(&dir);
+            let size: u64 = names.iter().map(|n| fs::metadata(dir.join(n)).unwrap().len()).sum();
+            (dir, size, names.len() as u32, size >> 20)
+        }
+        None => {
+            let set = work.join(format!("set-{mib}-{volumes}"));
+            let size = generate(&set, mib << 20, volumes);
+            (set, size, volumes, mib)
+        }
+    };
+    let runs: usize = std::env::var("ZF_RUNS").map_or(1, |r| r.parse().unwrap());
     let gib = size as f64 / (1u64 << 30) as f64;
     let mut times = (None, None);
     if which != "persistent" {
-        let t = plain(&set, &work, volumes);
+        let t = (0..runs).map(|_| plain(&set, &work, volumes)).fold(f64::MAX, f64::min);
         println!("plain progressive: {t:.2} s ({:.0} MiB/s)", mib as f64 / t);
         times.0 = Some(t);
     }
     if which != "plain" {
-        let t = persistent(&set, &work, volumes, size);
+        let t = (0..runs).map(|_| persistent(&set, &work, volumes, size)).fold(f64::MAX, f64::min);
         println!("persistent: {t:.2} s ({:.0} MiB/s, {:.1} s/GiB)", mib as f64 / t, t / gib);
         times.1 = Some(t);
     }

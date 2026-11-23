@@ -278,6 +278,20 @@ impl PartialCore {
         }
         Ok(())
     }
+    /// [`Self::check`] for a write joining an open group: the held files, parents and stamp, without the
+    /// comparisons with protected inputs (see [`native::PersistentNative::check_held`]). With no group open it is
+    /// the full check, since the write is about to open one or run its own transaction.
+    fn check_write(&self, data: &CoreData) -> PartialResult<()> {
+        if data.group.is_none() {
+            return self.check(data);
+        }
+        canceled(&self.control)?;
+        self.native.check_held(data.snapshot.head.size)?;
+        if stamp(&self.native)? != data.stamp {
+            return Err(err(PartialErrorKind::OutputChanged));
+        }
+        Ok(())
+    }
     #[cfg(test)]
     pub(crate) fn create(spec: CreateSpec, checks: MemberChecks, options: CoreOptions) -> PartialResult<Arc<Self>> {
         Self::prepare_create(spec, checks, options)?.complete()
@@ -478,7 +492,7 @@ impl PartialCore {
     /// `group_commit_interval`.
     pub(crate) fn write_original(&self, offset: u64, bytes: &[u8]) -> PartialResult<()> {
         let mut op = self.operation()?;
-        self.check(&op)?;
+        self.check_write(&op)?;
         if self.grouping() {
             if op.group.is_none() {
                 self.reconcile(&mut op)?;
@@ -495,7 +509,7 @@ impl PartialCore {
     /// every grouped write is committed now (no group remains open).
     pub(crate) fn fill_grouped(&self, offset: u64, bytes: &[u8]) -> PartialResult<(Vec<Range<u64>>, bool)> {
         let mut op = self.operation()?;
-        self.check(&op)?;
+        self.check_write(&op)?;
         if !self.grouping() {
             self.reconcile(&mut op)?;
             // The result's copy of the state lives as long as the call does.
@@ -1212,7 +1226,8 @@ impl PartialCore {
                 let mut at = range.start;
                 while at < range.end {
                     canceled(&self.control)?;
-                    self.native.check(op.snapshot.head.size)?;
+                    // The group is open, and its intent was anchored after a full check: see `check_write`.
+                    self.native.check_held(op.snapshot.head.size)?;
                     let stop = range.end.min(at + self.read_chunk as u64);
                     let n = write_output(
                         &self.native.output.file,
