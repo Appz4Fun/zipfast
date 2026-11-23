@@ -495,50 +495,92 @@ pub fn set_identity(
     last: Option<HeldVolume<'_>>,
     options: MapOptions,
 ) -> Result<SetIdentity, MapError> {
+    // Members are matched across the two volumes by name, by kind (a RAR part going on into later volumes
+    // matches the part continuing in the last one; whole members match only when both inputs are the same
+    // volume) and by occurrence among equal names and kinds, so two entries of one name never merge.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Whole,
+        Spanning,
+    }
+    fn occurrences<'a>(entries: impl Iterator<Item = (&'a [u8], Kind)>) -> Vec<usize> {
+        let mut seen: Vec<(&[u8], Kind, usize)> = Vec::new();
+        entries
+            .map(|(name, kind)| match seen.iter_mut().find(|(n, k, _)| *n == name && *k == kind) {
+                Some((_, _, count)) => {
+                    *count += 1;
+                    *count - 1
+                }
+                None => {
+                    seen.push((name, kind, 1));
+                    0
+                }
+            })
+            .collect()
+    }
     let mut format = None;
     let mut members: Vec<SetMember> = Vec::new();
-    fn slot<'m>(members: &'m mut Vec<SetMember>, raw: &[u8], name: &Option<String>, dir: bool) -> &'m mut SetMember {
-        let at = match members.iter().position(|m| m.raw_name == raw) {
-            Some(at) => at,
-            None => {
-                members.push(SetMember::new(raw, name, dir));
-                members.len() - 1
+    // (member index, name, kind, occurrence) of each first-volume entry
+    let mut firsts: Vec<(usize, Kind, usize)> = Vec::new();
+    let mut first_volume_number = None;
+    let mut first_is_rar = false;
+    if let Some(held) = first {
+        // The RAR scanner finds a volume behind a self-extracting stub; anything else is read as a last volume.
+        match MemberMap::from_volume(held.head, options.clone()) {
+            Ok(volume) => {
+                first_is_rar = true;
+                format = Some(volume.format);
+                first_volume_number = volume.volume_number;
+                let parts: Vec<&VolumeMember> =
+                    volume.members.iter().filter(|p| p.header.end <= held.len && p.packed.end <= held.len).collect();
+                let kind = |p: &VolumeMember| if p.split_after { Kind::Spanning } else { Kind::Whole };
+                let counts = occurrences(parts.iter().map(|p| (p.raw_name.as_slice(), kind(p))));
+                for (part, occurrence) in parts.iter().zip(counts) {
+                    let mut member = SetMember::new(&part.raw_name, &part.name, part.is_dir);
+                    member.learn(
+                        FactSource::First,
+                        part.unpacked_size,
+                        part.method,
+                        part.dictionary,
+                        part.encrypted,
+                        part.checks,
+                    );
+                    firsts.push((members.len(), kind(part), occurrence));
+                    members.push(member);
+                }
             }
-        };
-        &mut members[at]
-    }
-    let rar_first = first.filter(|f| f.head.starts_with(RAR5_SIGNATURE) || f.head.starts_with(RAR4_SIGNATURE));
-    if let Some(held) = rar_first {
-        let volume = MemberMap::from_volume(held.head, options.clone())?;
-        format = Some(volume.format);
-        for part in volume.members.iter().filter(|p| p.header.end <= held.len && p.packed.end <= held.len) {
-            slot(&mut members, &part.raw_name, &part.name, part.is_dir).learn(
-                FactSource::First,
-                part.unpacked_size,
-                part.method,
-                part.dictionary,
-                part.encrypted,
-                part.checks,
-            );
+            Err(MapError::NotArchive) => {}
+            Err(error) => return Err(error),
         }
     }
     let (identity, source) = match (last, first) {
         (Some(held), _) => (Some(last_volume_identity(held, options)?), FactSource::Last),
-        (None, Some(held)) if rar_first.is_none() => (Some(last_volume_identity(held, options)?), FactSource::First),
+        (None, Some(held)) if !first_is_rar => (Some(last_volume_identity(held, options)?), FactSource::First),
         (None, None) => return Err(MapError::NotArchive),
         _ => (None, FactSource::Last),
     };
     if let Some(identity) = identity {
         format.get_or_insert(identity.format);
-        for m in &identity.members {
-            slot(&mut members, &m.raw_name, &m.name, m.is_dir).learn(
-                source,
-                m.unpacked_size,
-                m.method,
-                m.dictionary,
-                m.encrypted,
-                m.checks,
-            );
+        // Whole members of the first volume are the last volume's only when both are the same volume.
+        let same_volume = first_is_rar && first_volume_number == identity.volume_number;
+        let kind = |m: &IdentityMember| if m.split_before == Some(true) { Kind::Spanning } else { Kind::Whole };
+        let counts = occurrences(identity.members.iter().map(|m| (m.raw_name.as_slice(), kind(m))));
+        for (m, occurrence) in identity.members.iter().zip(counts) {
+            let k = kind(m);
+            let matched = firsts
+                .iter()
+                .find(|&&(at, fk, fo)| {
+                    members[at].raw_name == m.raw_name
+                        && fk == k
+                        && fo == occurrence
+                        && (k == Kind::Spanning || same_volume)
+                })
+                .map(|&(at, ..)| at);
+            let at = matched.unwrap_or_else(|| {
+                members.push(SetMember::new(&m.raw_name, &m.name, m.is_dir));
+                members.len() - 1
+            });
+            members[at].learn(source, m.unpacked_size, m.method, m.dictionary, m.encrypted, m.checks);
         }
     }
     Ok(SetIdentity { format: format.expect("a volume was read"), members })

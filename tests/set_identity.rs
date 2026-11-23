@@ -200,3 +200,94 @@ fn z_fixtures_identify_from_one_article_at_each_end() {
     assert!(keyed.members.iter().all(|m| m.checks.is_some_and(|c| c.keyed)));
     assert_eq!(keyed.members[0].unpacked_size, Some(video[0].0));
 }
+
+/// A stored ZIP holding `entries` (name, data) as written, duplicates included.
+fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in entries {
+        let at = out.len() as u32;
+        let crc = crc32fast::hash(data);
+        let fixed = |sig: u32, out: &mut Vec<u8>, central_dir: bool| {
+            out.extend(sig.to_le_bytes());
+            if central_dir {
+                out.extend(20u16.to_le_bytes());
+            }
+            out.extend(20u16.to_le_bytes());
+            out.extend(0u16.to_le_bytes()); // flags
+            out.extend(0u16.to_le_bytes()); // stored
+            out.extend(0u32.to_le_bytes()); // time and date
+            out.extend(crc.to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((data.len() as u32).to_le_bytes());
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend(0u16.to_le_bytes()); // extra
+        };
+        fixed(0x0403_4b50, &mut out, false);
+        out.extend(name.as_bytes());
+        out.extend(*data);
+        fixed(0x0201_4b50, &mut central, true);
+        central.extend(0u16.to_le_bytes()); // comment
+        central.extend(0u16.to_le_bytes()); // disk
+        central.extend(0u16.to_le_bytes()); // internal attributes
+        central.extend(0u32.to_le_bytes()); // external attributes
+        central.extend(at.to_le_bytes());
+        central.extend(name.as_bytes());
+    }
+    let dir_at = out.len() as u32;
+    let dir_len = central.len() as u32;
+    out.extend(central);
+    out.extend(0x0605_4b50u32.to_le_bytes());
+    out.extend([0u8; 4]);
+    out.extend((entries.len() as u16).to_le_bytes());
+    out.extend((entries.len() as u16).to_le_bytes());
+    out.extend(dir_len.to_le_bytes());
+    out.extend(dir_at.to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out
+}
+
+#[test]
+fn entries_sharing_a_name_stay_separate() {
+    let (a, b) = (b"first copy".to_vec(), b"second, different".to_vec());
+    // RAR: two members named movie.mkv in one archive, given as both volumes.
+    let rar = common::archive(&[FileSpec::new("movie.mkv", &a), FileSpec::new("movie.mkv", &b)]);
+    for s in [
+        id(Some(HeldVolume::whole(&rar)), Some(HeldVolume::whole(&rar)), None),
+        id(Some(HeldVolume::whole(&rar)), None, None),
+        id(None, Some(HeldVolume::whole(&rar)), None),
+    ] {
+        let facts: Vec<_> = s.members.iter().map(|m| (m.unpacked_size, m.checks.and_then(|c| c.crc32))).collect();
+        assert_eq!(
+            facts,
+            [(Some(a.len() as u64), Some(crc32fast::hash(&a))), (Some(b.len() as u64), Some(crc32fast::hash(&b)))]
+        );
+    }
+    // ZIP with a duplicate name.
+    let zip = stored_zip(&[("movie.mkv", &a), ("movie.mkv", &b)]);
+    let s = id(Some(HeldVolume::whole(&zip)), Some(HeldVolume::whole(&zip)), None);
+    let crcs: Vec<_> = s.members.iter().map(|m| m.checks.and_then(|c| c.crc32)).collect();
+    assert_eq!(crcs, [Some(crc32fast::hash(&a)), Some(crc32fast::hash(&b))]);
+}
+
+#[test]
+fn a_stubbed_first_volume_gives_its_split_member() {
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i * 13 % 251) as u8).collect();
+    let vols = common::volumes(&FileSpec::new("movie.mkv", &data), 20_000);
+    let mut stubbed = b"MZ".to_vec();
+    stubbed.resize(5000, 0x90);
+    stubbed.extend(&vols[0]);
+    let s = id(Some(HeldVolume::whole(&stubbed)), None, None);
+    assert_eq!(s.format, MapFormat::Rar5);
+    let m = &s.members[0];
+    assert_eq!(
+        (m.name.as_deref(), m.unpacked_size, m.method),
+        (Some("movie.mkv"), Some(50_000), Some(MapMethod::Stored))
+    );
+    assert!(m.checks.is_none(), "a split member's checks are in its last part");
+    // With the last volume too, one member with both.
+    let last = vols.last().unwrap();
+    let both = id(Some(HeldVolume::whole(&stubbed)), Some(HeldVolume::whole(last)), None);
+    assert_eq!(both.members.len(), 1);
+    assert_eq!(both.members[0].checks.and_then(|c| c.crc32), Some(crc32fast::hash(&data)));
+}
