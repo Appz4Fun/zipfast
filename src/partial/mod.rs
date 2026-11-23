@@ -2019,11 +2019,13 @@ impl PartialCore {
             let mut evidence = evidence.clone();
             let mut checks = data.snapshot.head.checks.clone();
             self.apply_evidence(update, &mut evidence, &mut checks)?;
-            if state::validate_evidence(&data.snapshot.name, data.snapshot.head.size, &evidence, &self.budget)?
-                != data.snapshot.crypt
-            {
+            let crypt =
+                state::validate_evidence(&data.snapshot.name, data.snapshot.head.size, &evidence, &self.budget)?;
+            if !state::same_member_crypt(crypt.as_ref(), data.snapshot.crypt.as_ref()) {
                 return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
             }
+            // the final part decides whether the member's checks are keyed (see `validate_evidence`)
+            data.snapshot.crypt = crypt;
             // Evidence only grows by new parts after the last one, so results of the parts already recorded still
             // hold (`Verification::after` matches them by index, ordinal, volume and range). The final part's range
             // is the whole member, so it is judged again, as any write would make it.
@@ -2045,9 +2047,11 @@ impl PartialCore {
         self.reconcile(&mut data)?;
         let (intent, mut valid, _snapshots) = self.next_snapshots(&data)?;
         self.apply_evidence(update, &mut valid.evidence, &mut valid.head.checks)?;
-        if state::validate_evidence(&valid.name, valid.head.size, &valid.evidence, &self.budget)? != valid.crypt {
+        let crypt = state::validate_evidence(&valid.name, valid.head.size, &valid.evidence, &self.budget)?;
+        if !state::same_member_crypt(crypt.as_ref(), valid.crypt.as_ref()) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
         }
+        valid.crypt = crypt;
         // Evidence only appends parts and witnesses: every known leaf, and so
         // every existing part's CRC result, is unchanged by this transaction.
         let carried = self.part_results(&mut data);

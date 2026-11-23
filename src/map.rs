@@ -360,7 +360,9 @@ pub enum CipherParams {
         iv: Option<[u8; 16]>,
         /// Password check value and its 4-byte checksum, when recorded.
         check: Option<([u8; 8], [u8; 4])>,
-        /// Whether the member's CRC32/BLAKE2sp checks are keyed with the password.
+        /// Whether the member's CRC32/BLAKE2sp checks are keyed with the password. rar flags this in the final part's
+        /// encryption record only (earlier parts' CRCs are plain checks of their ciphertext), so for a split member it
+        /// is the final part's flag once that part is mapped; each piece's own [`MapChecks::keyed`] says it per part.
         keyed_checks: bool,
     },
     /// RAR 4.x: AES-128-CBC, key and IV derived from the password and this salt (2^18 SHA-1 rounds).
