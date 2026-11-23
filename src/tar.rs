@@ -119,9 +119,8 @@ pub fn list_wim_image(path: &Path, image: u32) -> Result<Vec<Entry>> {
     if !sniff_wim(&head[..n]) {
         return Err(Error::NotAnArchive);
     }
-    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None, false)?;
-    reader.random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), image)?));
-    list_members(reader)
+    // only the requested image's metadata is read: image 1 may be damaged while this one is whole
+    list_members(Reader::open_image(path, 1, Some(COMPRESSED_LIST_LIMIT), None, false, image)?)
 }
 
 /// Whether `file` is an ISO 9660 image: "CD001" in the volume descriptor 32 KiB in.
@@ -830,11 +829,23 @@ impl Reader {
         cancel: Option<Cancellation>,
         whole: bool,
     ) -> Result<Reader> {
-        Self::open_checked(path, None, threads, limit, cancel, whole)
+        Self::open_checked(path, None, threads, limit, cancel, whole, 1)
     }
 
-    /// [`Reader::open_with_limit`], refusing (on Unix) to read any file at `path` but the one `expect` describes,
-    /// so a path swapped after the caller checked it is not read in its place.
+    /// [`Reader::open_with_limit`], taking image `wim_image` (from 1) of a WIM file.
+    fn open_image(
+        path: &Path,
+        threads: usize,
+        limit: Option<u64>,
+        cancel: Option<Cancellation>,
+        whole: bool,
+        wim_image: u32,
+    ) -> Result<Reader> {
+        Self::open_checked(path, None, threads, limit, cancel, whole, wim_image)
+    }
+
+    /// [`Reader::open_with_limit`] for image `wim_image` (from 1) of a WIM file, refusing (on Unix) to read any file
+    /// at `path` but the one `expect` describes, so a path swapped after the caller checked it is not read in its place.
     fn open_checked(
         path: &Path,
         expect: Option<&std::fs::Metadata>,
@@ -842,6 +853,7 @@ impl Reader {
         limit: Option<u64>,
         cancel: Option<Cancellation>,
         whole: bool,
+        wim_image: u32,
     ) -> Result<Reader> {
         let open = || open_same(path, expect);
         let mut src = Source::open(open()?, threads, limit, cancel.clone())?;
@@ -865,10 +877,10 @@ impl Reader {
             first.clear();
             Some(Content::Tar)
         } else if plain && sniff_wim(&first) {
-            // WIM data is read where the lookup table puts it, from the file itself; image 1 is the one taken
+            // WIM data is read where the lookup table puts it, from the file itself; image 1 unless asked for another
             let file = open()?;
             let len = file.metadata()?.len();
-            random = Some(Box::new(wim::open(file, len, 1)?));
+            random = Some(Box::new(wim::open(file, len, wim_image)?));
             first.clear();
             Some(Content::Tar)
         } else if plain && n == BLOCK && iso::sniff(&open()?) {
@@ -2259,7 +2271,7 @@ pub(crate) fn walk_members(
     mut each: impl FnMut(RawMember, RepackData<'_>) -> Result<()>,
 ) -> Result<u64> {
     let expect = input.metadata()?;
-    let mut reader = Reader::open_checked(path, Some(&expect), 1, Some(limit), None, false)?;
+    let mut reader = Reader::open_checked(path, Some(&expect), 1, Some(limit), None, false, 1)?;
     if matches!(reader.content, Content::Single) {
         return Err(Error::NotAnArchive);
     }
