@@ -230,10 +230,10 @@ impl SpoolStore {
                 let file = self.file.as_mut().ok_or(SevenZipError::Corrupt("7z spool file missing"))?;
                 file.seek(SeekFrom::Start(*start)).map_err(SevenZipError::Io)?;
                 let mut left = spool.len;
-                let mut chunk = vec![0; CHUNK.min(left as usize)];
+                let mut chunk = vec![0; chunk_len(left)];
                 while left > 0 {
                     canceled()?;
-                    let want = (left as usize).min(chunk.len());
+                    let want = chunk_len(left).min(chunk.len());
                     match file.read(&mut chunk[..want]) {
                         Ok(0) => return Err(SevenZipError::Io(io::ErrorKind::UnexpectedEof.into())),
                         Ok(n) => {
@@ -248,6 +248,12 @@ impl SpoolStore {
         }
         canceled()
     }
+}
+
+/// The next read's length for `left` bytes still to go: at most [`CHUNK`], the minimum taken in `u64`, so a member of
+/// 4 GiB or more is not truncated on a 32-bit target.
+fn chunk_len(left: u64) -> usize {
+    left.min(CHUNK as u64) as usize
 }
 
 /// Where a member's bytes go while it is decoded.
@@ -1108,6 +1114,16 @@ mod spool_tests {
         for member in [0, 1, 2500, 4999] {
             assert_eq!(replayed(&mut store, &held[member]), data(member), "member {member}");
         }
+    }
+
+    /// Lengths of 4 GiB and more give a full chunk, as smaller ones do (a 32-bit `usize` cast first would truncate
+    /// them to nothing or to a sliver).
+    #[test]
+    fn chunk_lengths_take_the_minimum_before_narrowing() {
+        for left in [0u64, 1, CHUNK as u64 - 1, CHUNK as u64, 1 << 32, (1 << 32) + 5, u64::MAX] {
+            assert_eq!(chunk_len(left) as u64, left.min(CHUNK as u64), "{left}");
+        }
+        assert_eq!(chunk_len(1 << 32), CHUNK);
     }
 
     /// A cancel that arrives during the last chunk of a member held in memory is reported, as it is from the file.
