@@ -1134,6 +1134,8 @@ fn resync_near_never_pins_wrong_whatever_the_plaintext_start() {
             &format!("base {known_base} guard {guard}"),
         );
     }
+}
+
 // ---- Seeding the window from held plaintext (Unpacker::resume_seeded) ----
 
 /// The unseen-filter stream resumed `back` bytes before its copy, seeded from the plaintext before that target, from
@@ -1285,4 +1287,37 @@ fn a_decoder_seeded_from_a_plain_resync_is_unverified_and_strict_refuses_it() {
     assert_ne!(out.0, truth[r.output_offset as usize..], "the unseen filter's output came out unfiltered");
     let strict = Unpacker::resume_seeded(window, &r, 0, 0, known, Some(truth.len() as u64), true);
     assert!(matches!(strict, Err(zipfast::Error::Unsupported(_))), "strict refuses an unguarded restart");
+}
+
+/// The same with the member's size unknown and the held plaintext ending at the restart: the member's end is
+/// unknown too, so a filter may still reach past the restart; the restart is unguarded, noted, and strict refuses it.
+#[test]
+fn an_unknown_size_does_not_make_an_unguarded_seeded_restart_look_guarded() {
+    use zipfast::rar5::testenc::{self, Op};
+    use zipfast::rar5::unpack::SeedReason;
+    let mut plain = sample(400_000);
+    for b in plain.iter_mut().filter(|b| **b == 0xe8) {
+        *b = 0xe9;
+    }
+    plain[250_000..250_005].copy_from_slice(&[0xe8, 0x10, 0, 0, 0]);
+    let mut ops = testenc::lz(&plain[..100_000], 1 << 17, 16);
+    let at = ops.len();
+    ops.push(Op::Filter { start: 0, len: 200_000, kind: 1, channels: 0 });
+    ops.extend(testenc::lz(&plain[100_000..], 1 << 17, 16));
+    const PER: usize = 2_000;
+    let packed = testenc::tuned_stream(&ops, PER);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let truth = decode(window, &packed, plain.len() as u64);
+    let chunks: Vec<&[Op]> = ops.chunks(PER).collect();
+    let block = at / PER;
+    let start: usize = chunks[..block].iter().map(|c| testenc::tuned_block(c, false).len()).sum();
+    let end = start + testenc::tuned_block(chunks[block], false).len();
+    let after = &packed[end..];
+    let r = resync(after, 0, &truth, window, 0..truth.len() as u64).unwrap();
+    let known = &truth[..r.output_offset as usize];
+    let u = Unpacker::resume_seeded(window, &r, 0, 0, known, None, false).unwrap();
+    assert_eq!(u.seed_checked(), Some(false));
+    assert!(u.seed_suspects().iter().any(|s| s.reason == SeedReason::Unguarded), "{:?}", u.seed_suspects());
+    let strict = Unpacker::resume_seeded(window, &r, 0, 0, known, None, true);
+    assert!(matches!(strict, Err(zipfast::Error::Unsupported(_))), "strict refuses it");
 }

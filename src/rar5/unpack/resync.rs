@@ -1297,7 +1297,9 @@ impl Unpacker {
         };
         // A filter declared before the restart can cover output past it, up to a filter's longest length, unless
         // the restart is guarded; held plaintext past the restart is the only other check.
-        let reach_end = offset.saturating_add(MAX_FILTER_LEN).min(member_end);
+        // with the member's size unknown its end is too: a filter may reach its full length past the restart
+        let reach_end =
+            offset.saturating_add(MAX_FILTER_LEN).min(size.map_or(u64::MAX, |s| member_start.saturating_add(s)));
         let unguarded = !resync.guarded && !resync.window_checked && check_end < reach_end;
         if unguarded && strict {
             return Err(Error::Unsupported(format!(
