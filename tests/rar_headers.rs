@@ -555,3 +555,77 @@ fn kept_extra_records_count_against_catalogue_capacity() {
     assert!(RarSession::open(&small, None, options.clone()).is_ok());
     assert!(RarSession::open(&large, None, options).is_err());
 }
+
+fn compat(set: &str, name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(set).join(name)
+}
+
+/// RAR 4.x `-hp` keeps its main header in the clear and marks it with `MHD_PASSWORD`; UnRAR's `lt` says
+/// "encrypted headers" for it, also when the archive opens with the right password.
+#[test]
+fn rar4_encrypted_headers_are_reported_after_opening_with_the_password() {
+    for (set, name, password) in [
+        ("rar4-archiver", "win-enchdr.rar", "testpw123"),
+        ("rar4", "secret-crypted-none.rar", "secret"),
+        ("rar4-rar300", "header_encrypted_multivol_rar300.rar", "password"),
+        ("rar4-rar300", "header_encrypted_newnaming_rar300.part01.rar", "password"),
+    ] {
+        let session = RarSession::open(&compat(set, name), Some(password), RarSessionOptions::default())
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert!(session.headers().count() > 0, "{name}: the headers decrypted");
+        for volume in session.volumes() {
+            assert!(volume.encrypted_headers(), "{name}: encrypted headers");
+        }
+    }
+    // a RAR 4.x archive without -hp still says no
+    let plain = RarSession::open(&compat("rar4-legacy", "rars-split-store.rar"), None, single()).unwrap();
+    assert!(!plain.volumes().next().unwrap().encrypted_headers());
+}
+
+/// A RAR 1.5 part with a later continuation stores a CRC field that UnRAR lists as "Pack-CRC32" but never checks.
+#[test]
+fn a_rar15_part_lists_its_stored_pack_crc_without_checking_it() {
+    let session = RarSession::open(&compat("rar4-legacy", "rars-split-store.rar"), None, single()).unwrap();
+    let first = session.headers().next().unwrap();
+    assert!(first.split_after());
+    // UnRAR 7.30 lt: "Pack-CRC32: C945A8B6"
+    assert_eq!(first.pack_crc32(), Some(0xC945_A8B6));
+    assert_eq!(first.checks().crc32, None, "never checked before RAR 2.0");
+    assert_eq!(first.crc32(), None);
+}
+
+/// UnRAR reads the block header at the main header's start plus the quick open offset when it opens a volume; a
+/// failing CRC there is "Main archive header is corrupt" (exit 3), a header running past the end "Unexpected end
+/// of archive" (exit 1). Each variant below was run through UnRAR 7.30 for its expected outcome.
+#[test]
+fn a_quick_open_locator_is_checked_as_unrar_checks_it() {
+    use zipfast::rar5::session::RarQuickOpen;
+    let original = fs::read(compat("rar5-compat", "r5extra.rar")).unwrap();
+    // The main header is bytes 8..47; its locator record sets flags at 0x27, the quick open offset at 0x28 and the
+    // recovery record offset at 0x29..0x2b.
+    let variant = |flags: u8, quick_open: u8| {
+        let mut b = original.clone();
+        b[0x27] = flags;
+        b[0x28] = quick_open;
+        let crc = crc32fast::hash(&b[12..47]);
+        b[8..12].copy_from_slice(&crc.to_le_bytes());
+        b
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for (what, bytes, unrar_exit, want) in [
+        ("the fixture (quick open 100)", original.clone(), 3, RarQuickOpen::Corrupt),
+        ("quick open 8, inside the main header", variant(1, 8), 3, RarQuickOpen::Corrupt),
+        ("quick open 20, a size past the end", variant(1, 20), 1, RarQuickOpen::Truncated),
+        ("quick open 150, near the end", variant(1, 150), 1, RarQuickOpen::Truncated),
+        ("quick open 39, the next file header", variant(1, 39), 0, RarQuickOpen::Valid),
+        ("quick open 0", variant(1, 0), 0, RarQuickOpen::Absent),
+        ("recovery record only", variant(2, 100), 0, RarQuickOpen::Absent),
+    ] {
+        let path = dir.path().join("v.rar");
+        fs::write(&path, &bytes).unwrap();
+        let session = RarSession::open(&path, None, single()).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        assert_eq!(session.volumes().next().unwrap().quick_open(), want, "{what} (UnRAR exits {unrar_exit})");
+        // like UnRAR, the files are still listed
+        assert_eq!(session.headers().filter(|h| !h.is_service()).count(), 2, "{what}");
+    }
+}

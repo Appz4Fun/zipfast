@@ -534,8 +534,12 @@ impl Volume {
         self.format
     }
 
+    /// Whether the headers are encrypted (`-hp`). RAR 5.0 knows it from its encryption header; a RAR 4.x main header
+    /// stays in the clear and says so with `MHD_PASSWORD`, before any header has been decrypted.
     pub(super) fn encrypted_headers(&self) -> bool {
-        self.header_key.is_some() || self.legacy_keys.is_some()
+        self.header_key.is_some()
+            || self.legacy_keys.is_some()
+            || self.main.rar4_flags.is_some_and(|flags| flags & super::MHD_PASSWORD != 0)
     }
 
     pub(super) fn end_record(&self) -> Option<super::RarEndRecord> {

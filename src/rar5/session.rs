@@ -141,6 +141,29 @@ pub struct RarVolumeMetadata {
     end_record: Option<super::RarEndRecord>,
     headers: std::ops::Range<usize>,
     comment: Option<usize>,
+    quick_open: RarQuickOpen,
+}
+
+/// What a RAR 5.0 volume's quick open locator points at. UnRAR reads the block header at the main header's start
+/// plus the locator's quick open offset when it opens a volume: a header whose CRC fails there makes it report
+/// "Corrupt header is found" and "Main archive header is corrupt" (exit code 3), and one running past the end of the
+/// volume "Unexpected end of archive" (exit code 1). Either way it goes on listing and extracting. The recovery
+/// record offset is not read at open.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum RarQuickOpen {
+    /// No locator, no quick open offset, or an offset of 0; and every RAR 4.x volume.
+    #[default]
+    Absent,
+    /// A block header with a valid CRC starts at the offset.
+    Valid,
+    /// The block header at the offset fails its CRC (UnRAR: main archive header corrupt).
+    Corrupt,
+    /// The block header at the offset, or the offset itself, runs past the end of the volume (UnRAR: unexpected end
+    /// of archive).
+    Truncated,
+    /// Not checked: the headers are encrypted, so the block at the offset is ciphertext.
+    Encrypted,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -182,6 +205,11 @@ impl RarVolumeMetadata {
 
     pub fn encrypted_headers(&self) -> bool {
         self.encrypted_headers
+    }
+
+    /// RAR 5.0: what the main header's quick open locator points at; see [`RarQuickOpen`].
+    pub fn quick_open(&self) -> RarQuickOpen {
+        self.quick_open
     }
 
     /// The end of archive header's flags, CRC, volume number and offset, when the volume has one.
@@ -429,8 +457,14 @@ impl<'a> RarHeader<'a> {
     }
 
     /// The CRC-32 of this part's packed data, declared by a part with a later continuation (UnRAR's "Pack-CRC32").
+    /// A RAR 1.5 part (unpack version under 20) lists its stored field here as UnRAR does, although neither UnRAR
+    /// nor zipfast checks it there, so [`Self::checks`] leaves it out.
     pub fn pack_crc32(&self) -> Option<u32> {
-        self.0.header.crc32.filter(|_| self.split_after())
+        let header = &self.0.header;
+        header
+            .crc32
+            .or_else(|| header.rar4.filter(|r| r.unpack_version < 20).map(|r| r.stored_crc))
+            .filter(|_| self.split_after())
     }
 
     pub fn blake2sp(&self) -> Option<[u8; 32]> {
@@ -1105,7 +1139,7 @@ impl Catalogue {
             )?;
             let original = add(original, extra_records_bytes(&volume.main.extra_records))?;
             self.owned_capacity = add(self.owned_capacity, original)?;
-            let metadata = RarVolumeMetadata {
+            let mut metadata = RarVolumeMetadata {
                 format,
                 main: volume.main.clone(),
                 encrypted_headers,
@@ -1114,8 +1148,10 @@ impl Catalogue {
                 end_record: volume.end_record(),
                 headers: first_header..self.session.headers.len(),
                 comment,
+                quick_open: RarQuickOpen::Absent,
             };
             let file = volume.into_catalogue_file();
+            metadata.quick_open = self.quick_open(&file, &path, stamp.len, &metadata)?;
             stamp.check(&file, &path)?;
             if !self.options.follow_volumes {
                 next = None;
@@ -1276,6 +1312,60 @@ impl Catalogue {
         self.owned_capacity = add(self.owned_capacity, allocation)?;
         self.session.headers.push(HeaderRecord { volume, header, raw_name });
         self.update_capacity()
+    }
+
+    /// Reads the block header the quick open locator of `metadata` points at, as UnRAR does when it opens a volume.
+    fn quick_open(
+        &mut self,
+        file: &File,
+        path: &Path,
+        len: u64,
+        metadata: &RarVolumeMetadata,
+    ) -> RarResult<RarQuickOpen> {
+        let Some(offset) = metadata.main.locator.and_then(|l| l.quick_open).filter(|&o| o > 0) else {
+            return Ok(RarQuickOpen::Absent);
+        };
+        if metadata.format != super::RarFormat::Rar5 {
+            return Ok(RarQuickOpen::Absent);
+        }
+        if metadata.encrypted_headers {
+            return Ok(RarQuickOpen::Encrypted);
+        }
+        // the main header starts right after the signature, which follows any SFX module
+        let Some(at) = (metadata.sfx_size + super::SIGNATURE.len() as u64).checked_add(offset) else {
+            return Ok(RarQuickOpen::Truncated);
+        };
+        // CRC32, then the header size as a vint of at most three bytes (a header is at most 2 MiB)
+        let mut head = [0u8; 7];
+        let have = len.saturating_sub(at).min(head.len() as u64) as usize;
+        if have < 5 {
+            return Ok(RarQuickOpen::Truncated);
+        }
+        let mut budget = self.scan_budget();
+        budget.read(file, path, &mut head[..have], at)?;
+        let (mut size, mut n) = (0u64, 0usize);
+        loop {
+            let Some(&b) = head[4..have].get(n) else { return Ok(RarQuickOpen::Truncated) };
+            size |= u64::from(b & 0x7f) << (7 * n);
+            n += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+            if n == 3 {
+                return Ok(RarQuickOpen::Corrupt);
+            }
+        }
+        if size == 0 || size > 2 << 20 {
+            return Ok(RarQuickOpen::Corrupt);
+        }
+        let body = n as u64 + size;
+        if at + 4 + body > len {
+            return Ok(RarQuickOpen::Truncated);
+        }
+        let mut bytes = vec![0u8; body as usize];
+        budget.read(file, path, &mut bytes, at + 4)?;
+        let stored = u32::from_le_bytes(head[..4].try_into().unwrap());
+        Ok(if crate::crc32::hash(&bytes) == stored { RarQuickOpen::Valid } else { RarQuickOpen::Corrupt })
     }
 
     fn end_incomplete(&mut self) -> RarResult<()> {
