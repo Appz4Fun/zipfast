@@ -344,6 +344,32 @@ fn a_hole_under_cbc_loses_its_blocks_and_one_more() {
     assert_eq!(sink, plain);
 }
 
+// Catches the main decode releasing the IV block it holds in memory while it waits inside a partial block: a hole
+// met there starts its lost range at that block, and the repair reads the IV block from the source again.
+#[test]
+fn a_hole_after_a_partial_cbc_block_keeps_the_iv_block_for_its_repair() {
+    let plain = data(10_000, 5);
+    let volumes = rar5_encrypted(&plain, &[]);
+    let map = MemberMap::from_memory(&refs(&volumes), "e.rar", Some("pw")).unwrap();
+    let base = map.members[0].pieces[0].packed.start as usize;
+    // the first article ends one byte into a block, the second is lost, the rest arrives
+    let (cut, cut2) = (base + 4_001, base + 5_001);
+    let mut source = ArticleBuffer::new(usize::MAX);
+    let mut decoder = FeedDecoder::new(&map, 0, FeedOptions::new(Some("pw"))).unwrap();
+    let mut sink = Vec::new();
+    source.insert(0, 0, &volumes[0][..cut]).unwrap();
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert_eq!(status.frontier, 4_000);
+    source.mark_lost(0, cut as u64..cut2 as u64);
+    source.insert(0, cut2 as u64, &volumes[0][cut2..]).unwrap();
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert_eq!(status.lost, vec![4_000..5_024]);
+    source.insert(0, cut as u64, &volumes[0][cut..cut2]).unwrap();
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert!(status.done && status.crc_ok == Some(true), "{status:?}");
+    assert_eq!(sink, plain);
+}
+
 #[test]
 fn a_run_budget_interleaves_and_a_snapshot_resumes_the_main_decode() {
     let case = &cases()[1];

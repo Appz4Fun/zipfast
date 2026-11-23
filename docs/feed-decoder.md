@@ -34,6 +34,11 @@ bounded:
 - `absent(volume, range)` (optional): the parts of a range not held, listed as `NeedKind::Ahead`.
 - `release(volume, range)` (optional hint): bytes the decoder will not read again, so the source may drop them.
   Everything the main decode passed is released, also past holes, except the bytes a lost range's repair still reads.
+  The hint is per decoder: when several decoders share a source and their members share packed bytes (the members of
+  one 7z folder all read the folder's packed stream, `MapFolder::packed`, and list no `pieces` of their own), the
+  source must keep bytes until no decoder reads them. Count releases per decoder, or ignore them; `ArticleBuffer`
+  drops whatever it is told. The [live feed example](#live-feed-example) ignores releases when the fed members'
+  bytes overlap.
 
 `ArticleBuffer::new(limit)` is an in-memory source: `insert(volume, offset, bytes)` in any order (overlaps keep
 the bytes already held; `BufferFull` when the limit would be passed, storing nothing, so the caller holds them
@@ -217,6 +222,68 @@ writing (counted in `redecoded`: at most the output since the last block boundar
 on; it never decodes from the member's start unless the snapshot was taken there. Persistent partials (`docs/persistent-partials.md`) remain the durable,
 journaled store for output; a snapshot is the decoder's position over it.
 
+## Live feed example
+
+`examples/live_feed/` is a reference integration for a downloader: it takes a multi-volume RAR 5.0, RAR 4.x or 7z
+set, plays it as a Usenet download and extracts while the articles arrive. `sim.rs` holds everything (it is also what
+`tests/live_feed.rs` runs on small fixtures); `main.rs` is its command line.
+
+```text
+cargo run --release --features persistent-partials --example live_feed -- \
+    [--password PW] [--article 750000] [--seed 1] [--lateness 8|all] [--window 4] [--drop 0.05] [--drop-articles I,J,..] \
+    [--repair-delay N] [--sink auto|file|partial] [--group-holes] [--group-refills] [--group-commit-mib N] \
+    [--max-needs 64] [--buffer-mib N] [--work DIR] [--keep] [--no-verify] [--runs N] [--label NAME] [--header] \
+    <set dir | volume...>
+```
+
+The simulation:
+
+- **Articles.** Each volume is cut into decoded articles of `--article` bytes. The map is built from the whole
+  volumes first, since a downloader has the headers before the data.
+- **Network.** Articles arrive in volume order, each up to `--lateness` places late (`all` shuffles the whole set,
+  seeded by `--seed`). The downloader can choose among the next `--window` arrivals (its connections in flight). A
+  `--drop` fraction fails on the first try: the article is `mark_lost` in the `ArticleBuffer`, and it can be
+  fetched again `--repair-delay` deliveries later (by default once the first pass is over), as a repair.
+  `--drop-articles` names exactly which articles fail (indices over the whole set, volume by volume).
+- **Decoding.** After every delivery or failure, each member's `FeedDecoder` runs over the shared `ArticleBuffer`.
+  Its `FeedStatus::needs` choose the next delivery (see below).
+- **Output.** With `persistent-partials`, each member the persistent path admits (stored RAR, no `-hp`) writes
+  into a `PartialFile`. A genesis session reads the headers and is told every data byte is a hole, so each member
+  starts at full size with its whole output one hole per volume piece. The decoder's `write_at` then fills those
+  holes through a `FillWriter`, and the writes join the open group commit. `read_held` gives back what was
+  written. Every member's handle stays open until its feed is done. Each one holds about five descriptors, and the
+  defaults (`PartialLimits::open_partials` 16, `open_files` 64) refuse the 17th member. The example raises both
+  to fit the set: `open_partials` to the member count plus one, `open_files` to 64 plus eight per member. RustyGet
+  must do the same, or close and reopen handles (`PartialFile::open`) beyond the 4096 ceiling. Other members, or
+  every member with `--sink file`, write a preallocated plain file instead (`plain/member-NNNNN.out`, named by
+  member index alone, synced once, not durable). `--group-holes` sets `PartialLimits::group_holes`, which affects the genesis holes.
+  `--group-refills` sets `group_refills`, which only affects `refill_from_packed`. The feed path never calls that:
+  its repairs are plaintext fills, which join the group anyway.
+- **Report.** stdout gets one tab-separated line per run (`--header` prints the column names first): wall time,
+  MB/s, bytes written, `redecoded`, packed bytes read, holes met, repair writes (`refills`: writes into a range a
+  status listed as lost) and their bytes, the
+  repair time and that time per dropped article, stalls, syncs (`durable_sync_count` for partials, one per plain
+  file), peak buffer, the CRC verdict (`crc_ok`, plus `poll_verify` for partials), and whether the output equals a
+  straight extraction of the set (each output must equal one file the extraction wrote, each file used once). The
+  exit status is non-zero when a check fails.
+
+### From `NeedBytes` to download priority
+
+Each `NeedBytes` names a byte range of one volume. A downloader knows where each of its segments (articles) lies
+in its volume, so a need becomes the articles covering that range. With equal articles that is
+`first_article[volume] + range.start / article ..= (range.end - 1) / article` (`Articles::covering`); with an NZB,
+search the segment offsets instead. `priority` builds one list over all members:
+
+1. every `Next` need of every member: a main decode is waiting for it;
+2. then every `Repair` need: it repairs output reported lost;
+3. then every `Ahead` need: read later, not held yet.
+
+Members keep archive order within each kind, and an article listed once keeps its first (most urgent) place. The
+network then delivers the candidate ranked highest among those it can deliver now (the next `--window` arrivals and
+the repairs that are due), or the next arrival when none is ranked. The `picks` column counts the times this changed
+the order. This matters most for a compressed member that waits at a hole: its `Next` need is the dropped article,
+and it moves ahead of every `Ahead` article as soon as the article can be fetched again.
+
 ## Errors
 
 Missing bytes are never an error. `FeedError`: `NoSuchMember`, `Unsupported(FeedUnsupported)`, `IncompleteMember`
@@ -243,7 +310,8 @@ that is not a block multiple) and WinZip AES, cut into articles of 64 to 4,096 b
 to seventh article missing, then the missing ones supplied in another order after a snapshot round trip: the output
 equals the payload with no byte written twice, the CRC matches, the needs are exactly the missing articles' data
 bytes, and bytes read again stay within two blocks per hole. Also: `Next` and `Ahead` needs before anything
-arrives, the CBC hole geometry, run budgets with a restore in between, release keeping an in-order feed's buffer to
+arrives, the CBC hole geometry, a hole met while the main decode waits inside a partial CBC block (the IV block
+before it stays held for the repair), run budgets with a restore in between, release keeping an in-order feed's buffer to
 one article, and typed refusals (passwords, cancellation, foreign snapshots).
 
 Compressed RAR 5.0 (`tests/feed_decoder.rs`, plain and AES, 600 KB of video-like content over four volumes, 7,000-byte
@@ -297,3 +365,18 @@ the first `Next` need, nothing lost), and once the missing articles come (with a
 which the released bytes are asked for from the member's start and given again) the output is exact, CRC verified,
 each byte written once, and `redecoded` is at most the frontier at the snapshot (0 to 164 KB on the fixtures). Solid
 successors are refused (`Solid`), an encrypted member without a password is `PasswordRequired`.
+
+`tests/live_feed.rs` runs the [live feed example](#live-feed-example)'s core on a generated stored RAR 5.0 set (a
+persistent partial with `persistent-partials`, a plain file without), the RAR 4.x volume fixture and the 7z volume
+fixture. Each is delivered out of order with a fifth of the articles dropped and repaired later, and checked
+against a straight extraction. Also covered:
+
+- a set of 20 stored members over two volumes, beyond the default partial limits, two of whose names flatten
+  alike;
+- a dropped trailing article counting as a refill when repaired;
+- old-style volume discovery past `.r99` (`.s00`, `.s01`);
+- the three members of one solid 7z LZMA2 folder (`lzma2_chunks.7z` cut into volumes) fed from one buffer;
+- a 250-byte member name, and stored and compressed members whose names match the plain-file fallback's;
+- backslash names checked against the file the extraction wrote, whether it made `d/x` (Windows-made) or kept the
+  backslash (Unix-made);
+- the need-to-article mapping and the priority order.
