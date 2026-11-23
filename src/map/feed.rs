@@ -1528,8 +1528,8 @@ enum Begin {
     Carry(SolidCarry),
     /// a RAR 4.x solid successor going on from the decoder of the member before (installed after it is set up)
     Rar4,
-    /// a 7z member going on from the LZMA2 state the member before left
-    Lzma2(Box<lzma2::Handoff>),
+    /// a 7z member going on from the LZMA2 state the member before left (installed after it is set up)
+    Lzma2,
 }
 
 /// The state a RAR 5.0 solid successor starts from ([`FeedDecoder::solid_carry`]): about 500 bytes, no plaintext

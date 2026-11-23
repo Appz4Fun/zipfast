@@ -296,7 +296,9 @@ reset before it (decoding the folder output in between again). A member's snapsh
 finished and before the hand-off keeps what it is to hand over: the restart point to go on from (the output past its
 end is decoded again from there) and the lost output past its end with its repairs. The next member is the folder's
 next member in the map, also a zero-length one at the folder's end; a zero-length member with a member after it
-(at the folder's start, say) runs its main decode to its own start and hands over from there.
+(at the folder's start, say) runs its main decode to its own start and hands over from there (under 7zAES with
+its key). The next member is set up (keys, limits) before the state leaves the member before it, so a hand-off that
+fails there can be tried again.
 
 ## Saving and restoring
 
@@ -521,4 +523,5 @@ Solid streams (`tests/feed_decoder_solid.rs`, `tests/feed_decoder_solid_rar4.rs`
   is restored from a snapshot, and all end exact, CRCs verified, each byte written once (repairs decode up to 1.1 MB
   again in the single-reset folder, 38 KB in the blocked one). Also: a finished member snapshotted and restored
   before it hands over, with and without a loss running on into the next member, and a zero-length member at the
-  folder's end handed over to, and one at its start handing over.
+  folder's end handed over to, one at its start handing over, one in the middle of a 7zAES folder created on its own
+handing over, and a hand-off failing on a window limit, then going on with nothing decoded again.

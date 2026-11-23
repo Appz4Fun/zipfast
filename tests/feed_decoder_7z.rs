@@ -808,3 +808,47 @@ fn a_leading_empty_member_of_a_folder_hands_over() {
     assert!(out1.bytes == files[1].1);
     assert_eq!(d1.stats().redecoded, 0);
 }
+
+/// Under 7zAES, a zero-length member in the middle of a folder created on its own walks to its start through the
+/// decrypted stream, and hands over to the member after it.
+#[test]
+fn an_empty_member_under_7zaes_seeks_and_hands_over() {
+    let files: Vec<(&str, Vec<u8>)> =
+        vec![("a.bin", mixed(150_000, 35)), ("e.txt", Vec::new()), ("b.bin", mixed(150_000, 36))];
+    let archive = seven_zip(&files, true, 100_000);
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    if map.members[1].folder.is_none() {
+        return;
+    }
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut d1 = FeedDecoder::new(&map, 1, FolderRun::options()).unwrap();
+    let s = d1.run(&mut source, &mut Out::new(0, None)).unwrap();
+    assert!(s.done, "{s:?}");
+    let mut d2 = d1.next_solid(&map, 2, FolderRun::options()).unwrap();
+    let mut out = Out::new(150_000, None);
+    let s = d2.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert!(out.bytes == files[2].1);
+}
+
+/// A hand-off that fails on the next member's own setup (a window limit) keeps the state: the next attempt still
+/// goes on from it, decoding nothing again.
+#[test]
+fn a_failed_lzma2_hand_off_keeps_the_state() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("a.bin", mixed(200_000, 37)), ("b.bin", mixed(200_000, 38))];
+    let archive = seven_zip(&files, false, usize::MAX);
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut d0 = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+    assert!(d0.run(&mut source, &mut Out::new(200_000, None)).unwrap().done);
+    let small = FeedOptions { max_window: 1 << 10, ..FolderRun::options() };
+    assert!(matches!(d0.next_solid(&map, 1, small), Err(FeedError::Unsupported(FeedUnsupported::Window { .. }))));
+    let mut d1 = d0.next_solid(&map, 1, FolderRun::options()).unwrap();
+    let mut out = Out::new(200_000, None);
+    let s = d1.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert!(out.bytes == files[1].1);
+    assert_eq!(d1.stats().redecoded, 0);
+}

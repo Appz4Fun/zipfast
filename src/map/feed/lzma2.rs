@@ -700,11 +700,46 @@ impl FeedDecoder {
         if member.folder.is_none_or(|f| f.index != lz.folder || f.offset != lz.end) {
             return Err(FeedError::Handoff("not the next member of the folder"));
         }
-        let h = lz.handoff.take().ok_or(FeedError::Handoff("the main decode has not finished, or was handed over"))?;
+        if lz.handoff.is_none() {
+            return Err(FeedError::Handoff("the main decode has not finished, or was handed over"));
+        }
+        // the next member is set up (keys, limits) before the state leaves this one: a failure keeps it here
         let suspect = self.carried_suspect();
-        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Lzma2(h))?;
+        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Lzma2)?;
+        let h = self.lzma2.as_mut().expect("LZMA2 state").handoff.take().expect("checked above");
+        next.install_lzma2(h);
         next.inherit(suspect);
         Ok(next)
+    }
+
+    /// Goes on from the state the member before handed over: its main decode, the output it decoded past its end,
+    /// and the lost output past its end with its repairs.
+    fn install_lzma2(&mut self, h: Box<Handoff>) {
+        let size = self.size;
+        let mut lz = self.lzma2.take().expect("LZMA2 state");
+        let successor = lz.successor;
+        let Handoff { lane, spill, overflow, walked, floor, seek } = *h;
+        lz.main = lane.filter(|_| size > 0 || successor);
+        lz.seek = seek && (size > 0 || successor);
+        lz.walked = walked;
+        lz.floor = floor;
+        lz.pending = spill;
+        for (lost, kind) in overflow {
+            self.lz_lose(&mut lz, lost, kind);
+        }
+        if lz.main.is_none() && !lz.seek && successor {
+            // nothing goes on here (lost to the folder's end): the next member gets the rest
+            lz.handoff = Some(Box::new(Handoff {
+                lane: None,
+                spill: Vec::new(),
+                overflow: std::mem::take(&mut lz.overflow),
+                walked: BTreeMap::new(),
+                floor,
+                seek: false,
+            }));
+        }
+        self.lzma2 = Some(lz);
+        self.status = self.make_status(Vec::new(), false);
     }
 
     /// Leaves the main decode's end state for the next member of the folder, when one follows: `lane` where the main
@@ -748,9 +783,10 @@ impl FeedDecoder {
         options: FeedOptions,
         begin: Begin,
     ) -> Result<Self, FeedError> {
+        // a member handed the state of the one before gets it installed after it is set up
         let handed = match begin {
-            Begin::Fresh | Begin::Restore => None,
-            Begin::Lzma2(h) => Some(h),
+            Begin::Fresh | Begin::Restore => false,
+            Begin::Lzma2 => true,
             _ => return Err(FeedError::Handoff("a hand-off from another layer")),
         };
         let slot = member.folder.ok_or(FeedError::Malformed("7z member without a folder"))?;
@@ -810,7 +846,8 @@ impl FeedDecoder {
         if lzma2_dict(dec_prop) > options.max_window {
             return Err(FeedError::Unsupported(FeedUnsupported::Window { size: lzma2_dict(dec_prop) }));
         }
-        let cipher = if encrypted && size > 0 {
+        // an empty member a member follows still reads the stream (to hand it over)
+        let cipher = if encrypted && (size > 0 || successor) {
             let usage = Usage::new(options.limits.clone());
             let keys = derive_keys(
                 member,
@@ -895,32 +932,7 @@ impl FeedDecoder {
             })),
         };
         d.stream_start = slot.offset;
-        if let Some(h) = handed {
-            // going on from the member before: its main decode, the output it decoded past its end, and the lost
-            // output past its end with its repairs
-            let mut lz = d.lzma2.take().expect("LZMA2 state");
-            let Handoff { lane, spill, overflow, walked, floor, seek } = *h;
-            lz.main = lane.filter(|_| size > 0 || successor);
-            lz.seek = seek && size > 0;
-            lz.walked = walked;
-            lz.floor = floor;
-            lz.pending = spill;
-            for (lost, kind) in overflow {
-                d.lz_lose(&mut lz, lost, kind);
-            }
-            if lz.main.is_none() && !lz.seek && successor {
-                // nothing goes on here (lost to the folder's end): the next member gets the rest
-                lz.handoff = Some(Box::new(Handoff {
-                    lane: None,
-                    spill: Vec::new(),
-                    overflow: std::mem::take(&mut lz.overflow),
-                    walked: BTreeMap::new(),
-                    floor,
-                    seek: false,
-                }));
-            }
-            d.lzma2 = Some(lz);
-        } else if size > 0 || successor {
+        if !handed && (size > 0 || successor) {
             // an empty member a member follows still runs its main decode (to its own start) to hand it over
             let lz = d.lzma2.as_mut().expect("LZMA2 state");
             if slot.offset == 0 {
