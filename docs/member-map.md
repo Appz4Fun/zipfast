@@ -497,7 +497,8 @@ list to fetch, in stream order and cut at piece boundaries. `out` is clipped to 
 - `None`: `packed_spans` returns None. Encrypted members of unknown size also return None.
 
 For stored members these spans are the restart points: decryption can begin at any block boundary, plain data at
-any byte. Restart points inside compressed data (decoder checkpoints) are future work.
+any byte. For restart points inside compressed data (RAR 5.0 blocks, LZMA2 chunks) and handover plans, see
+[Opening a member at an output offset](open-at.md) (`member_restart`, `open_at`).
 
 Only pieces present in the map are covered. For a map with `complete: false`, compare the returned `stream` ranges
 with the request to see what the missing volumes still have to supply.
