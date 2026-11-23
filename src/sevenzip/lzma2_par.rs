@@ -615,7 +615,15 @@ fn decode(shared: &Shared, mut decoder: Decoder) -> Option<io::Error> {
             Step::Ended(n, fault) => {
                 // A short last segment goes out in a buffer of its own size, so a block just past a multiple of
                 // the segment does not leave a near-empty segment-sized buffer queued.
-                let last = if made + n == out.len() { out } else { out[..made + n].to_vec() };
+                // The segment-sized original is freed before `hand_out` can wait for budget, so a waiting worker
+                // holds only the one buffer its reserved cost covers.
+                let last = if made + n == out.len() {
+                    out
+                } else {
+                    let exact = out[..made + n].to_vec();
+                    drop(out);
+                    exact
+                };
                 if !hand_out(shared, decoder.number, last) {
                     return Some(Fault::Canceled.into());
                 }
