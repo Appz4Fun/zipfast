@@ -533,3 +533,187 @@ fn cancellation_interrupts_the_walk_to_a_later_member() {
     let mut source = ArticleBuffer::new(usize::MAX);
     assert!(matches!(d.run(&mut source, &mut out), Err(FeedError::Canceled)));
 }
+
+// ---- Several members of one folder in sequence: each hands its LZMA2 state to the next ----
+
+/// The members' outputs of one folder, as one sink per member: each member's own output, and the earlier members'
+/// at folder offsets (`FeedSink::read_earlier`).
+struct FolderView<'a> {
+    outs: &'a mut [Out],
+    i: usize,
+    starts: &'a [u64],
+}
+
+impl FeedSink for FolderView<'_> {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.outs[self.i].write_at(offset, bytes)
+    }
+
+    fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.outs[self.i].read_held(offset, buf)
+    }
+
+    fn read_earlier(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let j = self.starts.partition_point(|&s| s <= offset) - 1;
+        assert!(j < self.i);
+        let room = (self.starts[j + 1] - offset) as usize;
+        let n = buf.len().min(room);
+        self.outs[j].read_held(offset - self.starts[j], &mut buf[..n])
+    }
+}
+
+/// The LZMA2 chunks of a raw stream: (packed range of the payload, output range), from the stream's start.
+fn chunks(lz: &[u8]) -> Vec<(Range<u64>, Range<u64>)> {
+    let (mut p, mut o) = (0usize, 0u64);
+    let mut out = Vec::new();
+    while lz[p] != 0 {
+        let c = lz[p];
+        let (hdr, unpacked, packed) = if c < 0x80 {
+            let u = (usize::from(lz[p + 1]) << 8 | usize::from(lz[p + 2])) + 1;
+            (3, u, u)
+        } else {
+            let u = ((usize::from(c & 0x1F) << 16) | usize::from(lz[p + 1]) << 8 | usize::from(lz[p + 2])) + 1;
+            let k = (usize::from(lz[p + 3]) << 8 | usize::from(lz[p + 4])) + 1;
+            (if (c >> 5) & 3 >= 2 { 6 } else { 5 }, u, k)
+        };
+        out.push(((p + hdr) as u64..(p + hdr + packed) as u64, o..o + unpacked as u64));
+        p += hdr + packed;
+        o += unpacked as u64;
+    }
+    out
+}
+
+struct FolderRun {
+    map: MemberMap,
+    starts: Vec<u64>,
+    outs: Vec<Out>,
+    decoders: Vec<Option<FeedDecoder>>,
+    /// a successor had output lost from its very start: a hole in the member before reached it
+    saw_overflow: bool,
+}
+
+impl FolderRun {
+    fn options() -> FeedOptions {
+        FeedOptions { max_needs: usize::MAX, read_chunk: 4096, ..FeedOptions::new(Some(PASSWORD)) }
+    }
+
+    fn step(&mut self, source: &mut ArticleBuffer) {
+        let n = self.decoders.len();
+        for k in 0..n {
+            let waiting_next = k + 1 < n && self.decoders[k + 1].is_none();
+            let Some(d) = self.decoders[k].as_mut() else { continue };
+            let mut view = FolderView { outs: &mut self.outs, i: k, starts: &self.starts };
+            let s = d.run(source, &mut view).unwrap_or_else(|e| panic!("member {k}: {e}"));
+            if k > 0 && s.lost.first().is_some_and(|r| r.start == 0) {
+                self.saw_overflow = true;
+            }
+            if waiting_next && s.frontier == d.size() {
+                let next = d.next_solid(&self.map, k + 1, Self::options()).unwrap();
+                self.decoders[k + 1] = Some(next);
+            }
+        }
+    }
+}
+
+/// Members of one folder decoded in sequence, each going on from the LZMA2 decoder the member before left (a
+/// folder that resets its dictionary only at its start, and one in 7-Zip-like blocks), from shuffled articles with
+/// small holes inside payloads: one late in the first member, inside a chunk the second member continues, so the
+/// output it loses runs on into the second member, which repairs that part from the first member's restart point.
+/// With and without held output, with a snapshot round trip of the second member: exact, CRCs verified, each byte
+/// written once, and nothing before a member decoded again except for repairs.
+#[test]
+fn members_of_a_folder_hand_over_in_sequence() {
+    let files: Vec<(&str, Vec<u8>)> =
+        vec![("a.bin", mixed(300_000, 21)), ("b.bin", mixed(700_000, 22)), ("c.txt", text(500_000, 4))];
+    let sizes: Vec<u64> = files.iter().map(|(_, b)| b.len() as u64).collect();
+    let starts = vec![0, sizes[0], sizes[0] + sizes[1], sizes.iter().sum()];
+    let plain: Vec<u8> = files.iter().flat_map(|(_, b)| b.clone()).collect();
+    for block in [usize::MAX, 350_000] {
+        let lz = lzma2(&plain, block.min(plain.len()));
+        let walked = chunks(&lz);
+        // the chunk holding output 5,000 bytes before the first member's end, and one in the middle of the
+        // folder, each with 8 payload bytes lost (folder packed offsets: the archive's packed bytes start at 32)
+        let mut holes: Vec<u64> = Vec::new();
+        for target in [sizes[0] - 5_000, starts[2] + 100_000] {
+            let (p, _) = walked.iter().find(|(_, o)| o.contains(&target)).unwrap();
+            holes.push(32 + (p.start + p.end) / 2);
+        }
+        for encrypted in [false, true] {
+            for (donor, with_holes) in [(false, false), (false, true), (true, true)] {
+                let holes: &[u64] = if with_holes { &holes } else { &[] };
+                let archive = seven_zip(&files, encrypted, block.min(plain.len()));
+                let volumes: Vec<Vec<u8>> = archive.chunks(400_000).map(<[u8]>::to_vec).collect();
+                let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+                let map = MemberMap::from_memory(&refs, "set.7z.001", Some(PASSWORD)).unwrap();
+                let first = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+                let mut run = FolderRun {
+                    map,
+                    starts: starts.clone(),
+                    outs: files.iter().map(|(_, b)| Out::new(b.len(), donor.then(|| b.clone()))).collect(),
+                    decoders: vec![Some(first), None, None],
+                    saw_overflow: false,
+                };
+                let mut all = articles(&volumes, 2_500);
+                shuffle(&mut all, 0x7501 ^ block as u64);
+                let mut source = ArticleBuffer::new(usize::MAX);
+                let lost: Vec<(u32, Range<u64>)> =
+                    holes.iter().map(|&h| ((h / 400_000) as u32, h % 400_000..h % 400_000 + 8)).collect();
+                for (v, r) in &lost {
+                    source.mark_lost(*v, r.clone());
+                }
+                for (v, off, b) in &all {
+                    let end = off + b.len() as u64;
+                    let mut at = *off;
+                    for (_, r) in lost.iter().filter(|(lv, r)| lv == v && *off <= r.start && r.end <= end) {
+                        source.insert(*v, at, &b[(at - off) as usize..(r.start - off) as usize]).unwrap();
+                        at = r.end;
+                    }
+                    source.insert(*v, at, &b[(at - off) as usize..]).unwrap();
+                    run.step(&mut source);
+                }
+                let started = run.decoders.iter().filter(|d| d.is_some()).count();
+                let state: Vec<_> = run.decoders.iter().map(|d| d.as_ref().map(|d| d.status().clone())).collect();
+                eprintln!(
+                    "block {block} aes {encrypted} donor {donor}: {started} started, overflow {}, {state:?}",
+                    run.saw_overflow
+                );
+                // a snapshot round trip of the second member, then the lost bytes
+                if let Some(d) = run.decoders[1].as_ref().filter(|_| !holes.is_empty()) {
+                    let snap = FeedSnapshot::from_bytes(&d.snapshot().to_bytes()).unwrap();
+                    run.decoders[1] = Some(FeedDecoder::restore(&run.map, 1, FolderRun::options(), &snap).unwrap());
+                    for (v, off, b) in &all {
+                        source.insert(*v, *off, b).unwrap();
+                    }
+                }
+                for (v, r) in &lost {
+                    let a = all.iter().find(|(av, off, b)| av == v && *off <= r.start && r.end <= off + b.len() as u64);
+                    let (_, off, b) = a.unwrap();
+                    source.insert(*v, r.start, &b[(r.start - off) as usize..(r.end - off) as usize]).unwrap();
+                    run.step(&mut source);
+                }
+                for _ in 0..3 {
+                    run.step(&mut source);
+                }
+                let mut redecoded = 0;
+                for (k, d) in run.decoders.iter().enumerate() {
+                    let d = d.as_ref().unwrap_or_else(|| panic!("member {k} never started"));
+                    let s = d.status();
+                    assert!(s.done && s.crc_ok == Some(true), "member {k}: {s:?}");
+                    assert!(run.outs[k].bytes == files[k].1, "member {k} output");
+                    assert_eq!(run.outs[k].written, sizes[k], "member {k}: each byte written once");
+                    redecoded += d.stats().redecoded;
+                }
+                eprintln!("  decoded again {redecoded}");
+                if holes.is_empty() {
+                    // nothing before a member is decoded again (FeedDecoder::new for member 2 of the single-reset
+                    // folder decodes the 1 MB before it)
+                    assert_eq!(redecoded, 0);
+                } else {
+                    // repairs decode from the restart point before their hole, which in a folder that resets only
+                    // at its start can lie in an earlier member
+                    assert!(redecoded <= 2 * plain.len() as u64, "{redecoded}");
+                }
+            }
+        }
+    }
+}

@@ -57,7 +57,7 @@ at a checkpoint (after a snapshot, for a repair) and to skip holes (below). `Vec
 length, so a `Vec` the caller filled beforehand acts as held output.
 
 `FeedSink::read_earlier(stream_offset, buf) -> usize` (default: nothing held) gives back output of the earlier
-members of the member's solid stream (RAR), at offsets in that stream's output before the member's
+members of the member's solid stream (RAR) or folder (7z), at offsets in that stream's output before the member's
 start (`FeedDecoder::stream_start()`). A window that reaches back into earlier members reads it: a solid successor
 started from a carry or restored from a snapshot, and restarts, repairs and skips close after a member's start. See
 [solid streams and folders](#solid-streams-and-folders).
@@ -94,8 +94,8 @@ check value (RAR 5.0 with a check, WinZip AES); otherwise as `crc_ok: Some(false
 
 `stats()` counts packed bytes read, output bytes written, holes met and output `redecoded` (decoded again without
 being written: a compressed repair from its checkpoint up to the lost range, a restore from its checkpoint up to the
-old frontier, for a 7z member after its folder's first the folder output before it, and for a RAR 4.x solid successor
-started on its own the stream's earlier members), over the decoder's life.
+old frontier, for a 7z member after its folder's first started on its own the folder output before it, and for a RAR
+4.x solid successor started on its own the stream's earlier members), over the decoder's life.
 
 ## Layers
 
@@ -106,7 +106,7 @@ started on its own the stream's earlier members), over the decoder's life.
 | WinZip AES stored: `Counter { skip }` | each byte decrypts on its own: exactly the hole's output is lost |
 | ZipCrypto | refused (`FeedUnsupported::SequentialCipher`): its keystream needs every earlier byte |
 | compressed RAR 5.0 (methods 1-5, AES-256 under them too) | see [compressed RAR 5.0](#compressed-rar-50); solid successors [below](#solid-streams-and-folders) |
-| 7z folders of one LZMA2 coder, alone or over 7zAES, any member of the folder | see [7z LZMA2](#7z-lzma2) |
+| 7z folders of one LZMA2 coder, alone or over 7zAES, any member of the folder | see [7z LZMA2](#7z-lzma2); members in sequence [below](#solid-streams-and-folders) |
 | compressed RAR 4.x (unpack versions 1.5, 2.0, 2.6, 2.9: LZ, audio, PPMd, filters; AES-128 under them too) | waits at every hole; see [compressed RAR 4.x](#compressed-rar-4x); solid successors [below](#solid-streams-and-folders) |
 | ZIP compressed members, other 7z coder chains | refused (`Compressed`, `Coders`); see [next](#next) |
 
@@ -216,7 +216,8 @@ so their output can trail the bytes fed by that much.
 ## Solid streams and folders
 
 A solid RAR stream decodes its members one after another with one decoder: a member's window (and tables, match
-history, PPMd model) is what the members before it left. `FeedDecoder::next_solid(&mut self, &map, index, options)` starts the decoder of the next member from this
+history, PPMd model) is what the members before it left. A 7z folder is one LZMA2 stream holding its members end to
+end. `FeedDecoder::next_solid(&mut self, &map, index, options)` starts the decoder of the next member from this
 one's state, once this one's main decode has finished (its frontier at its size), however its repairs stand:
 
 ```rust,ignore
@@ -236,7 +237,7 @@ loop {
 
 The earlier decoder keeps its lost ranges and repairs them as before; the new one reads on from where the earlier
 one stopped, so nothing before the new member is decoded again (`redecoded` 0 on a clean feed). A hand-off of
-anything else (not the next member of the stream, a main decode still running, a second hand-off) is
+anything else (not the next member of the stream or folder, a main decode still running, a second hand-off) is
 `FeedError::Handoff`. A member's sink gives the earlier members' output through `read_earlier` (stream offsets),
 the caller's view over the earlier members' files.
 
@@ -282,6 +283,16 @@ all charged to the one session budget, `ProgressiveLimits::kdf_session_blocks`),
 (`stream_start() + frontier`). While it decodes them again its frontier (and a snapshot's) stays where its own
 output stands. There is no restart point inside a RAR 4.x member, so nothing cheaper exists without
 the decoder's state; keep the session (and the hand-off) alive across a set where you can.
+
+**7z.** The LZMA2 decoder goes on at the member's end: the output it decoded past the member's end in its last step
+(at most a chunk's worth) goes to the next member, which writes it first. A member that a successor follows walks
+past its end for a restart after a hole: lost output that runs on into the next member is handed over as lost, with
+its repair (from the restart point before the hole, which then lies in the earlier member; that output is decoded
+again, not written). Lost output can run on through several members. The packed bytes the members share are released
+in turn: a member never releases what the members after it start from, a successor never what the members before it
+may still read. A dictionary taken from output the decoder did not write (held output, an earlier member's) leaves
+the member `unproven` until its CRC matches. `FeedDecoder::new` on a later member still starts at the last dictionary
+reset before it (decoding the folder output in between again).
 
 ## Saving and restoring
 
@@ -387,6 +398,8 @@ not meet its restart), `HeldOutput { range }` (a checkpoint's window the sink do
 - A skip without held output past the hole is impossible for compressed RAR data (see above). RAR 4.x members have no
   restart search at all: a resync over RAR 2.9 LZ blocks (tables at block starts) and cheap decoder checkpoints would
   let holes be skipped and restores (also of solid successors) start near their frontier.
+- A 7z repair in a later member whose lost output began in an earlier one decodes from that member's restart point;
+  in a folder that resets only at its start, several such repairs decode the same stretch again each.
 
 ## Tests
 
@@ -473,7 +486,7 @@ against a straight extraction. Also covered:
 - the need-to-article mapping and the priority order;
 - a restart part way (`restart_at`) on the stored RAR 5.0, RAR 4.x and 7z volume sets, with partials and plain files.
 
-Solid streams (`tests/feed_decoder_solid.rs`, `tests/feed_decoder_solid_rar4.rs`):
+Solid streams (`tests/feed_decoder_solid.rs`, `tests/feed_decoder_solid_rar4.rs`, `tests/feed_decoder_7z.rs`):
 
 - RAR 5.0: three members of 220 to 230 KB, each starting with copies of the one before (its window and first match
   distances reach into the earlier member), plain and AES, in 5,000 to 7,000-byte articles shuffled: handed over
@@ -497,3 +510,9 @@ Solid streams (`tests/feed_decoder_solid.rs`, `tests/feed_decoder_solid_rar4.rs`
   once the member before is done, a member waiting at a hole holds back those after it, a successor restored half way
   through the missing articles decodes the stream again (`redecoded` at most `stream_start() + frontier`), and every
   member ends exact, CRC verified, each byte written once.
+- 7z: three members (300 KB, 700 KB, 500 KB) in one folder that resets only at its start and in 350 KB blocks, plain
+  and 7zAES, in 2,500-byte articles shuffled: handed over in sequence, `redecoded` 0. With 8 bytes lost in the
+  chunk holding output 5,000 bytes before member 0's end and in the middle of member 2, with and without held output:
+  the loss runs on into member 1 (lost from its start, repaired by member 1 from member 0's restart point), member 1
+  is restored from a snapshot, and all end exact, CRCs verified, each byte written once (repairs decode up to 1.1 MB
+  again in the single-reset folder, 38 KB in the blocked one).
