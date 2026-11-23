@@ -32,7 +32,7 @@ mod parallel;
 mod resync;
 use super::reader::Piece;
 use parallel::{Boundary, Done, Job, OWN, Packed, Part, Pool, Slot, block_bytes};
-pub use resync::{Resync, ResyncError, resync};
+pub use resync::{NearError, NearOptions, Resync, ResyncError, ResyncNear, resync, resync_near};
 
 /// Where decoded output goes.
 pub trait Sink {
@@ -682,6 +682,10 @@ pub struct Unpacker {
     /// set by [`Unpacker::resume_at`]: the bytes after the block flagged last are the encrypted stream's padding, not
     /// packed data, so feeding stops there
     stop_at_last: bool,
+    /// set by [`Unpacker::resume_in_stream`]: matches with any output at or past `floor_from` may not copy from before
+    /// `floor`, where the window may hold output a filter the restart never saw changed (0: no floor)
+    floor: u64,
+    floor_from: u64,
     /// the block flagged last has been decoded and `stop_at_last` is set: later bytes are dropped
     ended: bool,
     /// set by [`Unpacker::resume_at`]: known plaintext the output must equal until it is past the reach of any filter
@@ -864,6 +868,8 @@ impl Unpacker {
             input: Vec::new(),
             padded: Vec::new(),
             stop_at_last: false,
+            floor: 0,
+            floor_from: u64::MAX,
             ended: false,
             verify: None,
             threads: default_threads(),
@@ -1005,6 +1011,8 @@ impl Unpacker {
         self.last_len = 0;
         // ordinary decoding again, until resume_at says otherwise
         self.stop_at_last = false;
+        self.floor = 0;
+        self.floor_from = u64::MAX;
         self.next_file(size);
     }
 
@@ -1284,7 +1292,8 @@ impl Unpacker {
         let (mut sp, mut history, mut last_len) = (self.sp, self.history, self.last_len);
         // SAFETY: the window is neither resized nor freed while this runs, and the pointer is taken again after
         // every flush, which reads the window through `self`
-        let mut win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach);
+        let (floor, floor_from) = (self.floor, self.floor_from);
+        let mut win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach).floored(floor, floor_from);
         // output past this is emitted before more is decoded
         let mut stop = self.file_base + self.emitted + flush_at;
         let mut li = 0usize;
@@ -1298,7 +1307,7 @@ impl Unpacker {
                     }
                     stop = self.file_base + self.emitted + flush_at;
                     // SAFETY: as above
-                    win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach);
+                    win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach).floored(floor, floor_from);
                 }
                 match tok {
                     Tok::Lits(n) if sp + u64::from(n) <= (stop + 1).min(size_end) => {
@@ -1317,7 +1326,9 @@ impl Unpacker {
                                 }
                                 stop = self.file_base + self.emitted + flush_at;
                                 // SAFETY: as above
-                                win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach);
+                                win = unsafe { Win::detached(&mut self.window) }
+                                    .reaching(self.reach)
+                                    .floored(floor, floor_from);
                             }
                             if sp >= size_end {
                                 self.size_failure =
@@ -1553,7 +1564,19 @@ impl Unpacker {
         let mut local = *bits_at;
         let bits = &mut local;
         let Unpacker {
-            window, mask, reach, sp: sp_ref, file_base, size, size_failure, history, last_len, filters, ..
+            window,
+            mask,
+            reach,
+            sp: sp_ref,
+            file_base,
+            size,
+            size_failure,
+            history,
+            last_len,
+            filters,
+            floor,
+            floor_from,
+            ..
         } = self;
         let mask = *mask;
         let file_base = *file_base;
@@ -1562,7 +1585,7 @@ impl Unpacker {
         let mut sp = *sp_ref;
         let mut hist = *history;
         let mut last = *last_len;
-        let window = Win::of(window).reaching(*reach);
+        let window = Win::of(window).reaching(*reach).floored(*floor, *floor_from);
         let main = &t.main;
         macro_rules! decode {
             ($table:expr) => {
@@ -1879,6 +1902,9 @@ struct Win<'a> {
     mask: usize,
     /// the farthest back a match may reach
     reach: u64,
+    /// matches with output at or past `floor_from` may not copy from before `floor` (see [`Unpacker::floor`])
+    floor: u64,
+    floor_from: u64,
     _window: PhantomData<&'a mut Vec<u8>>,
 }
 
@@ -1888,7 +1914,14 @@ impl<'a> Win<'a> {
     fn of(window: &'a mut Vec<u8>) -> Self {
         debug_assert!(window.len().is_power_of_two());
         let len = window.len();
-        Win { ptr: window.as_mut_ptr(), mask: len - 1, reach: len as u64, _window: PhantomData }
+        Win {
+            ptr: window.as_mut_ptr(),
+            mask: len - 1,
+            reach: len as u64,
+            floor: 0,
+            floor_from: u64::MAX,
+            _window: PhantomData,
+        }
     }
 
     /// A `Win` over `window` that doesn't keep it borrowed.
@@ -1900,7 +1933,14 @@ impl<'a> Win<'a> {
     unsafe fn detached(window: &mut Vec<u8>) -> Win<'a> {
         debug_assert!(window.len().is_power_of_two());
         let len = window.len();
-        Win { ptr: window.as_mut_ptr(), mask: len - 1, reach: len as u64, _window: PhantomData }
+        Win {
+            ptr: window.as_mut_ptr(),
+            mask: len - 1,
+            reach: len as u64,
+            floor: 0,
+            floor_from: u64::MAX,
+            _window: PhantomData,
+        }
     }
 
     /// This window with matches reaching no farther back than `reach`.
@@ -1908,6 +1948,12 @@ impl<'a> Win<'a> {
     fn reaching(self, reach: u64) -> Self {
         debug_assert!(reach <= self.len() as u64);
         Win { reach, ..self }
+    }
+
+    /// This window with matches that write at or past `floor_from` copying from no earlier than `floor`.
+    #[inline(always)]
+    fn floored(self, floor: u64, floor_from: u64) -> Self {
+        Win { floor, floor_from, ..self }
     }
 
     /// Whether short writes may spill: write up to [`SPILL`] bytes past their end, which hold nothing yet, rather
@@ -1975,6 +2021,8 @@ fn put_from<const SPILLS: bool>(window: Win<'_>, sp: u64, lits: &[u8], at: usize
 enum MatchCopyError {
     Distance,
     Size,
+    /// A resumed decoder's match copies from before its floor.
+    Floor,
 }
 
 impl MatchCopyError {
@@ -1982,6 +2030,11 @@ impl MatchCopyError {
         match self {
             Self::Distance => corrupt("match reaches before the start of the data"),
             Self::Size => corrupt("more data than the header says"),
+            Self::Floor => Error::BadChecksum(
+                "resumed RAR 5.0 output copies from output before the window checked from the restart's anchor \
+                 (a filter declared before the anchor may have changed it): restart from earlier packed bytes"
+                    .into(),
+            ),
         }
     }
 }
@@ -1998,8 +2051,15 @@ fn copy<const SPILLS: bool>(
 ) -> std::result::Result<(), MatchCopyError> {
     debug_assert!(!SPILLS || window.spills());
     let mask = window.mask as u64;
-    if dist == 0 || dist > sp || dist > window.reach {
-        return Err(MatchCopyError::Distance);
+    if dist == 0 || dist > sp - window.floor || dist > window.reach {
+        if dist == 0 || dist > sp || dist > window.reach {
+            return Err(MatchCopyError::Distance);
+        }
+        // Any of its output past where known plaintext checks it: a copy that starts before that boundary and ends
+        // after it would carry unchecked bytes past it.
+        if sp + u64::from(len) > window.floor_from {
+            return Err(MatchCopyError::Floor);
+        }
     }
     if u64::from(len) > size_end - sp {
         return Err(MatchCopyError::Size);
@@ -2359,6 +2419,75 @@ fn apply_filter(f: Filter, data: &mut Vec<u8>, spare: &mut Vec<u8>) {
                     let q = ((f.start + j as u64) / 4) as u32;
                     let v = (v.wrapping_sub(q) & 0x00ff_ffff) | 0xeb00_0000;
                     data[j..j + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                j += 4;
+            }
+        }
+    }
+}
+
+/// Undoes `apply_filter` on `data`, the output of a filter of `kind` at file-relative output position `start`:
+/// gives back the bytes the decoder's window held. Where E8 operands could come from more than one stored value
+/// (which rar never writes), the bytes are left as they are.
+fn unapply_filter(kind: FilterKind, start: u64, data: &mut [u8]) {
+    let n = data.len();
+    match kind {
+        FilterKind::Delta(channels) => {
+            let channels = usize::from(channels.max(1));
+            let mut stored = vec![0u8; n];
+            let mut s = 0;
+            for c in 0..channels {
+                let mut acc = 0u8;
+                for &out in data.iter().skip(c).step_by(channels) {
+                    stored[s] = acc.wrapping_sub(out);
+                    acc = out;
+                    s += 1;
+                }
+            }
+            data.copy_from_slice(&stored);
+        }
+        FilterKind::E8 | FilterKind::E8E9 => {
+            let e9 = kind == FilterKind::E8E9;
+            let forward = |a: u32, pos: u32| {
+                if a & 0x8000_0000 != 0 {
+                    if a.wrapping_add(pos) & 0x8000_0000 == 0 { a.wrapping_add(0x100_0000) } else { a }
+                } else if a < 0x100_0000 {
+                    a.wrapping_sub(pos)
+                } else {
+                    a
+                }
+            };
+            let mut j = 0;
+            while j + 4 < n {
+                j = find_call(data, j, n - 4, e9);
+                if j + 4 >= n {
+                    break;
+                }
+                let p = j + 1;
+                let pos = ((start + p as u64) % 0x100_0000) as u32;
+                let v = u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
+                let mut found = None;
+                let mut many = false;
+                for a in [v.wrapping_add(pos), v.wrapping_sub(0x100_0000), v] {
+                    if forward(a, pos) == v && found != Some(a) {
+                        many |= found.is_some();
+                        found = Some(a);
+                    }
+                }
+                if let (Some(a), false) = (found, many) {
+                    data[p..p + 4].copy_from_slice(&a.to_le_bytes());
+                }
+                j = p + 4;
+            }
+        }
+        FilterKind::Arm => {
+            let mut j = 0;
+            while j + 3 < n {
+                if data[j + 3] == 0xeb {
+                    let v = u32::from_le_bytes(data[j..j + 4].try_into().unwrap()) & 0x00ff_ffff;
+                    let q = ((start + j as u64) / 4) as u32;
+                    let a = (v.wrapping_add(q) & 0x00ff_ffff) | 0xeb00_0000;
+                    data[j..j + 4].copy_from_slice(&a.to_le_bytes());
                 }
                 j += 4;
             }

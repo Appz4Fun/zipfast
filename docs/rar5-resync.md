@@ -49,6 +49,80 @@ u.finish(&mut sink)?;
 - **`ResyncError::Ambiguous`:** a block fits the plaintext at more than one offset. Narrow `expected`.
 - **`ResyncError::Exhausted`:** the work budget ran out first. Narrow `expected`, or look again from later packed bytes.
 
+## Restarting near a target (handover)
+
+`resync_near(packed, known_base, &known, window, target, &NearOptions { estimate, work, deadline, guard })` finds
+the restart closest before output offset `target`, for a handover from one copy of a member to another: the known
+plaintext is what the old copy extracted, so it usually ends at the target.
+
+```rust,ignore
+let est = (target as f64 * packed_len as f64 / size as f64) as usize; // or a map's estimate
+let n = resync_near(&packed, 0, &known[..target as usize], window, target,
+                    &NearOptions { estimate: Some(est), ..Default::default() })?;
+// n.back = target - n.resync.output_offset; n.resync.guarded(): resumes with no plaintext past the restart
+let mut u = Unpacker::resume_in_stream(window, &n.resync, member_start, 0, &known, Some(size))?;
+u.feed(&packed[n.resync.packed_offset..], &mut sink)?;
+```
+
+- **How:** starting a little before `estimate` and moving back geometrically (16 KiB, 64 KiB, ... before it), it
+  looks for a block whose literals pin it to the plaintext before the target. A few blocks in a row found nowhere
+  in it are most likely past the target, so the step moves back. Blocks inside output a filter changed miss too, so
+  the rest of such a step is searched after the steps back, as is the rest of a step that tried its share of blocks. From that anchor it decodes forward without a window, checking every block against the plaintext and
+  learning the decoder's state. It does not stop when the state is known; it goes on to the last block that starts
+  at or before the target and restarts there. So the restart is within one block of the target, whatever packing
+  ratio the content between has (rar's ratio varies from 1:1 to over 15:1 inside one mixed member, which makes a
+  ratio estimate land megabytes off), and the work grows with the distance searched, not the member's size.
+- **Filters:** blocks that start a filter are decoded past. Their output is not compared, since the plaintext
+  holds it filtered, and a restart is only placed past every filter seen. The decoder's window holds filtered output
+  as it was before the filter ran, so `resume_in_stream` undoes the filters seen (E8, E8E9, ARM, delta) in the
+  plaintext it copies into the window. Without that, a match after the restart that copies from filtered output
+  decodes wrong. Undoing a filter needs all of its output in the plaintext given to `resume_in_stream`, so when the
+  window still holds part of a seen filter's output the plaintext does not cover, resuming is refused with an error
+  naming the plaintext it needs.
+- **Guarded restarts (`NearOptions::guard`, default true):** a restart checked from a filter's longest length
+  (4 MiB) before it is `guarded()`. No filter declared before the anchor can cover output after it, assuming rar
+  declares a filter in the block its output starts in, as it does. `resume_in_stream` then needs no plaintext past
+  the restart, which a handover does not have. It still checks what plaintext there is. A restart followed from the
+  member's start counts as guarded too.
+- **The match window (`ResyncNear::window_checked`):** a match after the restart may copy from anywhere in the
+  window, up to the dictionary size back. Output a filter changed there must be undone before the decoder copies
+  from it, and only filters the follow saw can be undone. So the search first looks for an anchor that covers the
+  restart's whole window: the window's reach plus 4 MiB before the target, or the plaintext's start when the window
+  reaches back that far. The plaintext's start is a member's start in a handover, where nothing can be declared
+  before. Following from there is cheap, since decoding without a window is a byte comparison. Failing that, it
+  falls back to a guarded anchor with `window_checked: false`. The resumed decoder then refuses, as
+  `Error::BadChecksum`, a match that copies from before the anchor plus 4 MiB and writes any byte where no known
+  plaintext checks it (one that starts just before that boundary and runs past it included).
+  That is an error, never silently wrong output. Failing that too, it gives the closest restart, which needs
+  plaintext past it to resume.
+- **Block granularity:** a restart is a block start. One rar block can cover megabytes of very compressible output:
+  in `mixed.mkv` (z-fixtures F05/F06) a single block covers output 14.2 MB to 22.0 MB, so every target in it
+  restarts at 14.2 MB.
+- **Result:** `ResyncNear { resync, back, anchor, searched_from, work, elapsed, window_checked }`.
+- **Errors:** `NearError::NotFound { lowest }` means no block pinned before the target from packed offset `lowest`
+  on. `NearError::Exhausted { lowest }` means the work budget (default 2^30, about a second) or the deadline ran out.
+  The deadline is checked during long literal searches, on every block followed, and before a result is given, so
+  no result comes after it.
+- **Solid streams:** offsets are in the plaintext's coordinates, the solid stream's for a later member. Resume
+  with that member's start (`resume_in_stream`). A follow from a later member's start covers that member only: the
+  decoder held earlier members' output unfiltered, and their filters were never seen. So when the window reaches
+  before the member's start, the resumed decoder refuses a copy from there into output no known plaintext checks,
+  unless the member's start is the stream's start (offset 0).
+
+Measured on z-fixtures (release, one thread, M4; plaintext only up to the target; every restart followed from the
+member's start, window checked, guarded and resumed exactly):
+
+| set | target | restart (back) | time |
+|---|---|---|---|
+| F03 video (-m3) | 5 / 12 / 20 / 25 MB | 13 / 9 / 4.4 / 1.1 KB back | 4 / 10 / 17 / 27 ms |
+| F05 mixed (-m5) | 5 / 12 / 20 / 25 MB | 13 KB / 127 KB / 5.75 MB (block) / 11 KB back | 4 / 30 / 61 / 66 ms |
+| F06 mixed -hp (-m3) | 5 / 12 / 20 / 25 MB | 13 KB / 127 KB / 5.80 MB (block) / 14 KB back | 4 / 30 / 62 / 65 ms |
+
+Before (`resync` with a packing-ratio estimate at the F06 20 MB target), every width up to the whole member was
+`NotFound` or `Exhausted` (22 ms to 1.6 s per call). The estimate (packed 10.78 MB) decodes to output about 22.8 MB,
+past the target. Prybar's layered search over `resync` took about 25 s and landed about 4 MB back. The example
+`cargo run --release --example resync_near -- <set dir> <password> <plaintext> <target>...` reproduces the table.
+
 ## Checked against
 
 - **rar 7.30 output (`-ma5 -m3`):**
@@ -63,6 +137,17 @@ u.finish(&mut sink)?;
   - a filter after the hole is reported with its offsets and its output end;
   - a filter declared in the lost block, covering output after the restart, is an error rather than wrong output;
   - the AES padding after a resumed member's last block is ignored;
-  - repeated content is `Ambiguous` until `expected` is narrowed.
+  - repeated content is `Ambiguous` until `expected` is narrowed;
+  - `resync_near` restarts at the last block before the target (and at a target exactly at or just past a block
+    start), reports a spent budget and plaintext that is not the member's, decodes past a filter and undoes it in
+    the resumed window (a later copy from the filtered output decodes exactly), finds a restart in a solid second
+    member, and a guarded restart resumes with plaintext only up to the target;
+  - with a 16 MiB dictionary, a copy after the target from output a filter before the anchor changed is refused by
+    the resumed decoder, as is the same copy starting one byte before the end of the known plaintext; more than a
+    step's share of unpinnable blocks at the estimate is searched past, as are blocks inside output a delta filter
+    declared before the given packed bytes changed; a deadline that passes during a long follow gives `Exhausted`;
+    a later solid member resumed from its start refuses a copy, after the target, from an earlier member's filtered
+    output; resuming with a plaintext suffix that starts inside a retained filter's output is refused;
+  - with `ZIPFAST_Z_FIXTURES`, `resync_near` on F03/F05/F06 at several targets (guarded, exact, under 1 s in release).
 
 RAR 4.x is not covered.

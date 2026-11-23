@@ -1,6 +1,6 @@
 //! Restarting the RAR 5.0 decoder after a hole in a compressed member (`zipfast::rar5::unpack::resync`).
 
-use zipfast::rar5::unpack::{ResyncError, Sink, Unpacker, resync, window_for};
+use zipfast::rar5::unpack::{NearError, NearOptions, ResyncError, Sink, Unpacker, resync, resync_near, window_for};
 
 fn vint(b: &[u8], mut i: usize) -> (u64, usize) {
     let (mut v, mut s) = (0u64, 0);
@@ -522,4 +522,509 @@ fn a_solid_second_member_resumes_with_filters_based_at_its_start() {
     assert!(r.output_offset + out.len() as u64 <= start + 160_001, "no wrong byte reached the sink");
     // A member start past the restart is refused.
     assert!(Unpacker::resume_in_stream(window, &r, r.output_offset + 1, 0, &stream, Some(b.len() as u64)).is_err());
+}
+
+// ---- resync_near: restarting as close as possible before a target, for a handover ----
+
+fn near(
+    packed: &[u8],
+    known: &[u8],
+    window: zipfast::rar5::unpack::Window,
+    target: u64,
+    guard: bool,
+) -> zipfast::rar5::unpack::ResyncNear {
+    let options = NearOptions { estimate: Some(packed.len() / 2), guard, ..Default::default() };
+    resync_near(packed, 0, known, window, target, &options).unwrap()
+}
+
+fn resumed(
+    window: zipfast::rar5::unpack::Window,
+    r: &zipfast::rar5::unpack::Resync,
+    member_start: u64,
+    known: &[u8],
+    size: u64,
+    packed: &[u8],
+) -> Vec<u8> {
+    let mut u = Unpacker::resume_in_stream(window, r, member_start, 0, known, Some(size)).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&packed[r.packed_offset..], &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    out.0
+}
+
+/// The plaintext ends at the target, as a handover's does: the restart is the last block start at or before it,
+/// found from an estimate far off, and the decoder resumed there produces the rest exactly.
+#[test]
+fn resync_near_restarts_at_the_last_block_before_the_target() {
+    use zipfast::rar5::testenc;
+    let plain = sample(400_000);
+    let packed = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let target = 333_333u64;
+    let n = near(&packed, &plain[..target as usize], window, target, false);
+    assert!(n.resync.output_offset <= target && n.back == target - n.resync.output_offset, "{n:?}");
+    assert!(n.back < 40_000, "within a block of the target: {n:?}");
+    assert!(n.anchor < n.resync.output_offset && n.resync.verified.end == n.resync.output_offset);
+    assert_eq!(
+        resumed(window, &n.resync, 0, &plain, plain.len() as u64, &packed),
+        plain[n.resync.output_offset as usize..]
+    );
+    // A target exactly at that block start, or one byte past it, restarts there too.
+    let block = n.resync.output_offset;
+    for (t, back) in [(block, 0), (block + 1, 1)] {
+        let m = near(&packed, &plain[..t as usize], window, t, false);
+        assert_eq!((m.resync.output_offset, m.back), (block, back));
+    }
+}
+
+#[test]
+fn resync_near_reports_a_spent_budget() {
+    use zipfast::rar5::testenc;
+    let plain = sample(400_000);
+    let packed = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let options = NearOptions { estimate: Some(packed.len()), work: 1_000, guard: false, ..Default::default() };
+    match resync_near(&packed, 0, &plain[..300_000], window, 300_000, &options) {
+        Err(NearError::Exhausted { lowest }) => assert!(lowest < packed.len()),
+        other => panic!("{other:?}"),
+    }
+    // Plaintext that is not this member's: nothing pins.
+    let other: Vec<u8> = sample(500_000).iter().map(|b| b ^ 0x5a).collect();
+    let options = NearOptions { guard: false, ..Default::default() };
+    let r = resync_near(&packed, 0, &other[100_000..400_000], window, 300_000, &options);
+    assert!(matches!(r, Err(NearError::NotFound { lowest: 0 })), "{r:?}");
+}
+
+/// A filter before the target is decoded past: the restart lies after its output, and the decoder resumed there
+/// copies from it exactly, although its window holds that output unfiltered and the plaintext holds it filtered.
+#[test]
+fn resync_near_decodes_past_a_filter_and_undoes_it_in_the_window() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut plain = sample(500_000);
+    for x in plain.iter_mut().filter(|x| **x == 0xe8) {
+        *x = 0xe9;
+    }
+    for at in (60_000..140_000).step_by(499) {
+        plain[at..at + 5].copy_from_slice(&[0xe8, (at % 251) as u8, 0x10, 0, 0]);
+    }
+    let mut ops = testenc::lz(&plain[..50_000], 1 << 17, 16);
+    ops.push(Op::Filter { start: 0, len: 100_000, kind: 1, channels: 0 });
+    ops.extend(testenc::lz(&plain[50_000..390_000], 1 << 17, 16));
+    // A copy from the filtered output, after the restart.
+    ops.push(Op::Match(2_000, 390_000 - 70_000));
+    ops.extend(testenc::lz(&plain[392_000..], 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 2_000);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let truth = decode(window, &packed, plain.len() as u64);
+    assert_ne!(truth[70_000..72_000], plain[70_000..72_000], "the filter changes its output");
+    assert_eq!(truth[390_000..392_000], plain[70_000..72_000], "the copy reads the window's unfiltered bytes");
+    let target = 385_000u64;
+    // From the stream's start, so the blocks followed include the filter's.
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed, 0, &truth[..target as usize], window, target, &options).unwrap();
+    assert!(n.anchor < 50_000 && n.resync.output_offset > 150_000, "decoded past the filter: {n:?}");
+    // The whole plaintext is given, so the known-plaintext check runs over the copy too.
+    assert_eq!(
+        resumed(window, &n.resync, 0, &truth, truth.len() as u64, &packed),
+        truth[n.resync.output_offset as usize..]
+    );
+}
+
+/// A target in a solid stream's second member, in stream offsets: the restart resumes with the member's start.
+#[test]
+fn resync_near_finds_a_restart_in_a_solid_second_member() {
+    use zipfast::rar5::testenc;
+    let a = sample(100_000);
+    let b = sample(300_000).into_iter().rev().collect::<Vec<u8>>();
+    // The second member's own blocks: its copies stay within it, and the first member is only window.
+    let second = testenc::tuned_stream(&testenc::lz(&b, 1 << 17, 16), 2_000);
+    let window = window_for(1 << 20, Some((a.len() + b.len()) as u64), true).unwrap();
+    let stream = [a.as_slice(), b.as_slice()].concat();
+    let start = a.len() as u64;
+    let target = start + 250_000;
+    let n = near(&second, &stream[..target as usize], window, target, false);
+    assert!(n.resync.output_offset > start && n.back < 40_000, "{n:?}");
+    let out = resumed(window, &n.resync, start, &stream, b.len() as u64, &second);
+    assert_eq!(out, b[(n.resync.output_offset - start) as usize..]);
+}
+
+/// Ops for `len` bytes of output: unique literal runs (which pin blocks) between copies at varying distances (which
+/// teach the decoder's state).
+fn spread(len: usize) -> Vec<zipfast::rar5::testenc::Op> {
+    use zipfast::rar5::testenc::Op;
+    let (mut ops, mut out, mut x) = (Vec::new(), 0usize, 0x2545_F491_4F6C_DD1Du64);
+    while out < len {
+        for _ in 0..48 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ops.push(Op::Lit(x as u8));
+        }
+        out += 48;
+        if out > 70_000 {
+            let dist = 1_000 + (x >> 20) % 60_000;
+            ops.push(Op::Match(1_500, dist));
+            out += 1_500;
+        }
+    }
+    ops
+}
+
+/// The handover case: a guarded restart (checked from 4 MiB before it) resumes with the plaintext only up to the
+/// target, with no known plaintext past it.
+#[test]
+fn a_guarded_resync_near_resumes_without_plaintext_past_the_target() {
+    use zipfast::rar5::testenc;
+    let ops = spread(5_200_000);
+    let plain = testenc::model(&ops);
+    let packed = testenc::tuned_stream(&ops, 4_000);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let target = 5_000_000u64;
+    let known = &plain[..target as usize];
+    let n = near(&packed, known, window, target, true);
+    assert!(n.resync.guarded() && n.back < 200_000, "{n:?}");
+    assert!(n.anchor + (4 << 20) <= n.resync.output_offset);
+    assert_eq!(
+        resumed(window, &n.resync, 0, known, plain.len() as u64, &packed),
+        plain[n.resync.output_offset as usize..]
+    );
+    // Within 4 MiB of the plaintext's start the follow starts at the member's start, before which no filter can be
+    // declared: that restart resumes with plaintext only up to the target too.
+    let early = &plain[..1_000_000];
+    let e = near(&packed, early, window, 1_000_000, true);
+    assert!(e.anchor == 0 && e.window_checked && e.back < 200_000, "{e:?}");
+    assert_eq!(
+        resumed(window, &e.resync, 0, early, plain.len() as u64, &packed),
+        plain[e.resync.output_offset as usize..]
+    );
+    // Without the member's first blocks such a restart is not guarded: it needs plaintext past it.
+    let cut = &packed[packed.len() / 40..];
+    let options = NearOptions { estimate: Some(cut.len() / 10), ..Default::default() };
+    let e = resync_near(cut, 0, early, window, 1_000_000, &options).unwrap();
+    assert!(!e.resync.guarded() && !e.window_checked && e.anchor > 0, "{e:?}");
+    assert!(Unpacker::resume_in_stream(window, &e.resync, 0, 0, early, Some(plain.len() as u64)).is_err());
+}
+
+/// RustyGet's z-fixtures (set ZIPFAST_Z_FIXTURES to the sets directory): a handover at several targets of the
+/// RAR 5.0 sets restarts within a block of the target, guarded, resumes exactly with the plaintext only up to the
+/// target, and (in release builds) takes well under a second.
+#[test]
+fn resync_near_on_the_z_fixtures() {
+    use zipfast::crypto::{decrypt_cbc, derive_rar5_key};
+    use zipfast::map::{CipherParams, MemberMap};
+    let Some(dir) = std::env::var_os("ZIPFAST_Z_FIXTURES").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: set ZIPFAST_Z_FIXTURES to the z-fixtures sets directory");
+        return;
+    };
+    let manifest = String::from_utf8(std::fs::read(dir.join("MANIFEST.json")).unwrap()).unwrap();
+    let at = manifest.find("\"password\"").unwrap();
+    let password = manifest[at..].split('"').nth(3).unwrap().to_owned();
+    for (set, payload, max_back) in [
+        ("F03_rar5_m3_video", "cabac.mkv", 64u64 << 10),
+        ("F05_rar5_m5_mixed", "mixed.mkv", 8 << 20),
+        ("F06_rar5_m3_mixed_hp", "mixed.mkv", 8 << 20),
+    ] {
+        let plain = std::fs::read(dir.join(payload)).unwrap();
+        let set_dir = dir.join(set);
+        let mut names: Vec<String> = std::fs::read_dir(&set_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".rar"))
+            .collect();
+        names.sort();
+        let vols: Vec<Vec<u8>> = names.iter().map(|n| std::fs::read(set_dir.join(n)).unwrap()).collect();
+        let refs: Vec<&[u8]> = vols.iter().map(Vec::as_slice).collect();
+        let map = MemberMap::from_memory(&refs, &names[0], Some(&password)).unwrap();
+        let m = map.members.iter().find(|m| m.unpacked_size == Some(plain.len() as u64)).unwrap();
+        let mut packed: Vec<u8> = m
+            .pieces
+            .iter()
+            .flat_map(|p| vols[p.volume as usize][p.packed.start as usize..p.packed.end as usize].to_vec())
+            .collect();
+        if let Some(CipherParams::Rar5 { kdf_count, salt, iv: Some(iv), check, .. }) = m.cipher.clone() {
+            let key = derive_rar5_key(&password, kdf_count, &salt, check).unwrap();
+            packed = decrypt_cbc(&key, &iv, &packed[..packed.len() / 16 * 16]).unwrap();
+        }
+        let size = plain.len() as u64;
+        let window = window_for(m.dictionary.unwrap(), Some(size), false).unwrap();
+        let ratio = size as f64 / packed.len() as f64;
+        for (target, estimate) in [5_000_000u64, 12_000_000, 20_000_000, 25_000_000]
+            .into_iter()
+            .map(|t| (t, Some((t as f64 / ratio) as usize)))
+            .chain([(20_000_000, None)])
+        {
+            let known = &plain[..target as usize];
+            let options = NearOptions { estimate, ..Default::default() };
+            let n = resync_near(&packed, 0, known, window, target, &options)
+                .unwrap_or_else(|e| panic!("{set} target {target}: {e}"));
+            eprintln!(
+                "{set} target {target} (estimate {estimate:?}): restart {} ({} back), anchor {}, {} ms",
+                n.resync.output_offset,
+                n.back,
+                n.anchor,
+                n.elapsed.as_millis()
+            );
+            assert!(n.resync.guarded() && n.back <= max_back, "{set} target {target}: {n:?}");
+            if !cfg!(debug_assertions) {
+                assert!(n.elapsed < std::time::Duration::from_secs(1), "{set} target {target}: {:?}", n.elapsed);
+            }
+            assert_eq!(
+                resumed(window, &n.resync, 0, known, size, &packed),
+                plain[n.resync.output_offset as usize..],
+                "{set} {target}"
+            );
+        }
+    }
+}
+
+/// A stream with a 16 MiB dictionary: an E8 filter's output at about 2 MiB, then 9 MiB more, then (at
+/// `before_copy`) a 3,000-byte copy from inside the filter's output, starting at a call's opcode. Returns the packed
+/// stream, its decoded output, the window, the filter's start and `before_copy`.
+fn unseen_filter_stream() -> (Vec<u8>, Vec<u8>, zipfast::rar5::unpack::Window, u64, u64) {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops = spread(2 << 20);
+    let filter_at = testenc::model(&ops).len() as u64;
+    ops.push(Op::Filter { start: 0, len: 20_000, kind: 1, channels: 0 });
+    // Calls whose operands the E8 filter rewrites.
+    for k in 0..4_000u32 {
+        ops.extend([0xe8, (k % 251) as u8, 0x10, 0, 0].map(Op::Lit));
+    }
+    ops.extend(spread(9 << 20));
+    let before_copy = testenc::model(&ops).len() as u64;
+    ops.push(Op::Match(3_000, before_copy - (filter_at + 10_000)));
+    ops.extend(spread(200_000));
+    let packed = testenc::tuned_stream(&ops, 4_000);
+    let unfiltered = testenc::model(&ops);
+    let window = window_for(16 << 20, Some(unfiltered.len() as u64), false).unwrap();
+    let truth = decode(window, &packed, unfiltered.len() as u64);
+    let (lo, hi) = (filter_at as usize + 10_000, filter_at as usize + 13_000);
+    assert_eq!(
+        truth[before_copy as usize..before_copy as usize + 3_000],
+        unfiltered[lo..hi],
+        "the copy reads unfiltered bytes"
+    );
+    assert_ne!(truth[lo..hi], unfiltered[lo..hi], "which the filter changed in the output");
+    assert_eq!(truth[lo], 0xe8, "the copy starts at a call's opcode, which the filter leaves");
+    (packed, truth, window, filter_at, before_copy)
+}
+
+/// Resumes `resync_near` at `target` from packed bytes that start at about 4 MiB of output (the member's first
+/// blocks and the filter's are not given), with the plaintext only up to the target. Returns the result and the
+/// restart's output offset.
+fn resume_past_unseen_filter(
+    packed: &[u8],
+    truth: &[u8],
+    window: zipfast::rar5::unpack::Window,
+    filter_at: u64,
+    target: u64,
+) -> (zipfast::Result<()>, Vec<u8>, u64) {
+    let cut = packed.len() * 4 / 11;
+    let known = &truth[..target as usize];
+    let options = NearOptions { estimate: Some((packed.len() - cut) * 6 / 10), ..Default::default() };
+    let n = resync_near(&packed[cut..], 0, known, window, target, &options).unwrap();
+    assert!(n.resync.guarded() && !n.window_checked, "{n:?}");
+    assert!(n.anchor > filter_at + 20_000, "the filter is before the anchor: {n:?}");
+    let mut u = Unpacker::resume_in_stream(window, &n.resync, 0, 0, known, Some(truth.len() as u64)).unwrap();
+    let mut out = Collect(Vec::new());
+    let result = u.feed(&packed[cut + n.resync.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+    (result, out.0, n.resync.output_offset)
+}
+
+/// A dictionary over 4 MiB: a filter's output lies before the anchor (unseen by the follow) but inside the restart's
+/// match window, and a copy after the target reads it. The resumed decoder must refuse that copy rather than write
+/// the filtered bytes where the window held them unfiltered.
+#[test]
+fn a_resumed_decoder_refuses_a_copy_from_output_an_unseen_filter_changed() {
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let (result, out, restart) = resume_past_unseen_filter(&packed, &truth, window, filter_at, before_copy - 50_000);
+    let err = result.expect_err("a copy from output an unseen filter changed must not pass").to_string();
+    assert!(err.contains("before the window checked"), "{err}");
+    let good = (before_copy - restart) as usize;
+    assert!(out.len() <= good && out == truth[restart as usize..][..out.len()], "no wrong byte reached the sink");
+}
+
+/// The same copy starting one byte before the target: its first byte (the call's opcode, which the filter leaves)
+/// is the only one known plaintext checks, and the rest would land past the target unchecked. Refused too.
+#[test]
+fn a_resumed_decoder_refuses_such_a_copy_across_the_end_of_the_known_plaintext() {
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let (result, out, restart) = resume_past_unseen_filter(&packed, &truth, window, filter_at, before_copy + 1);
+    let err = result.expect_err("a copy straddling the end of the known plaintext must not pass").to_string();
+    assert!(err.contains("before the window checked"), "{err}");
+    let good = (before_copy - restart) as usize;
+    assert!(out.len() <= good && out == truth[restart as usize..][..out.len()], "no wrong byte reached the sink");
+}
+
+/// Blocks inside output a filter declared before the packed bytes given changed: their literals are not in the
+/// plaintext, though they lie before the target. The search goes on past them to a block that pins.
+#[test]
+fn resync_near_searches_on_past_blocks_inside_filtered_output() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops = testenc::lz(&sample(20_000), 1 << 17, 16);
+    ops.push(Op::Filter { start: 0, len: 300_000, kind: 0, channels: 3 });
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..300_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ops.push(Op::Lit(x as u8));
+    }
+    let tail: Vec<u8> = sample(200_000).into_iter().rev().collect();
+    ops.extend(testenc::lz(&tail, 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 500);
+    let size = testenc::model(&ops).len() as u64;
+    let window = window_for(1 << 20, Some(size), false).unwrap();
+    let truth = decode(window, &packed, size);
+    // From inside the filtered output: the filter's block is not given.
+    let cut = packed.len() / 10;
+    let target = size - 20_000;
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed[cut..], 0, &truth[..target as usize], window, target, &options).unwrap();
+    assert!(n.anchor >= 320_000 && n.back < 40_000, "pinned past the filtered output: {n:?}");
+    assert_eq!(resumed(window, &n.resync, 0, &truth, size, &packed[cut..]), truth[n.resync.output_offset as usize..]);
+}
+
+/// More than a step's share of blocks that cannot pin, right at the estimate: the rest of the interval is still
+/// searched, and a later block pins.
+#[test]
+fn resync_near_searches_past_many_unpinnable_blocks() {
+    use zipfast::rar5::testenc::{self, Op};
+    let pattern = b"abcdefghijklmnop";
+    let mut ops: Vec<Op> = (0..70 * 500).map(|i| Op::Lit(pattern[i % 16])).collect();
+    let tail = sample(200_000);
+    ops.extend(testenc::lz(&tail, 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 500);
+    let plain = testenc::model(&ops);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let target = plain.len() as u64 - 20_000;
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed, 0, &plain[..target as usize], window, target, &options).unwrap();
+    assert!(n.resync.output_offset <= target && n.back < 40_000, "{n:?}");
+    assert_eq!(
+        resumed(window, &n.resync, 0, &plain, plain.len() as u64, &packed),
+        plain[n.resync.output_offset as usize..]
+    );
+}
+
+/// A deadline that passes while the follow decodes a long way is honoured: no result is given after it.
+#[test]
+fn resync_near_gives_no_result_after_its_deadline() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops = testenc::lz(&sample(100_000), 1 << 17, 16);
+    for _ in 0..10_000 {
+        ops.push(Op::Lit(b'A'));
+        ops.push(Op::Match(4_000, 1));
+    }
+    let tail: Vec<u8> = sample(100_000).into_iter().rev().collect();
+    ops.extend(testenc::lz(&tail, 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 2_000);
+    let plain = testenc::model(&ops);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let target = plain.len() as u64 - 20_000;
+    let known = &plain[..target as usize];
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed, 0, known, window, target, &options).unwrap();
+    assert!(n.anchor < 100_000, "the follow covers the long run: {n:?}");
+    let options = NearOptions { estimate: Some(0), guard: false, deadline: Some(n.elapsed / 8), ..Default::default() };
+    let late = resync_near(&packed, 0, known, window, target, &options);
+    assert!(matches!(late, Err(NearError::Exhausted { .. })), "{late:?}");
+}
+
+/// A solid stream: the first member has an E8 filter near its end, and the second copies from that filtered output
+/// after the target. Resumed from the second member's start, the follow saw none of the first member's filters, so
+/// the copy (which the decoder makes from the unfiltered window) must be refused rather than written from the
+/// filtered plaintext.
+#[test]
+fn a_later_solid_member_resumed_from_its_start_refuses_a_copy_from_an_earlier_members_filtered_output() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut ops_a = testenc::lz(&sample(200_000), 1 << 17, 16);
+    let filter_at = testenc::model(&ops_a).len() as u64;
+    ops_a.push(Op::Filter { start: 0, len: 20_000, kind: 1, channels: 0 });
+    for k in 0..4_000u32 {
+        ops_a.extend([0xe8, (k % 251) as u8, 0x10, 0, 0].map(Op::Lit));
+    }
+    ops_a.extend(testenc::lz(&sample(300_000)[250_000..], 1 << 17, 16));
+    let a_len = testenc::model(&ops_a).len() as u64;
+    let b_head: Vec<u8> = sample(150_000).into_iter().rev().collect();
+    let mut ops_b = testenc::lz(&b_head, 1 << 17, 16);
+    let copy_at = a_len + b_head.len() as u64;
+    // A copy from the first member's filtered output, starting at a call's opcode.
+    ops_b.push(Op::Match(3_000, copy_at - (filter_at + 10_000)));
+    ops_b.extend(testenc::lz(&sample(400_000)[300_000..], 1 << 17, 16));
+    let first = testenc::tuned_stream(&ops_a, 2_000);
+    let second = testenc::tuned_stream(&ops_b, 2_000);
+    let window = window_for(1 << 20, Some(1 << 20), true).unwrap();
+    // The stream's output: the first member, then the second.
+    let mut u = Unpacker::new(window).unwrap();
+    u.reset(Some(a_len));
+    let mut out = Collect(Vec::new());
+    u.feed(&first, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    // (The second member's copy reaches into the first, so its length is counted, not modelled.)
+    let b_len = b_head.len() as u64 + 3_000 + 100_000;
+    u.next_file(Some(b_len));
+    u.feed(&second, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    let stream = out.0;
+    let (lo, at) = ((filter_at + 10_000) as usize, copy_at as usize);
+    assert_ne!(stream[at..at + 3_000], stream[lo..lo + 3_000], "the copy reads the window's unfiltered bytes");
+    assert_eq!(stream[lo], 0xe8);
+    // Resumed from the second member's start (estimate 0 on its packed bytes), the target just before the copy.
+    let target = copy_at - 20_000;
+    let known = &stream[..target as usize];
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&second, 0, known, window, target, &options).unwrap();
+    assert_eq!(n.anchor, a_len, "followed from the second member's start: {n:?}");
+    let mut u = Unpacker::resume_in_stream(window, &n.resync, a_len, 0, known, Some(b_len)).unwrap();
+    let mut out = Collect(Vec::new());
+    let result = u.feed(&second[n.resync.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+    let err = result.expect_err("a copy from an earlier member's filtered output must not pass").to_string();
+    assert!(err.contains("before the window checked"), "{err}");
+    let good = (copy_at - n.resync.output_offset) as usize;
+    assert!(out.0.len() <= good && out.0 == stream[n.resync.output_offset as usize..][..out.0.len()]);
+}
+
+/// The search had the whole plaintext, but the decoder is resumed with only a suffix of it that starts inside a
+/// filter's output the window still holds: that filter cannot be undone, so resuming is refused, saying what
+/// plaintext it needs, rather than leaving filtered bytes in the window for a later copy to read.
+#[test]
+fn resuming_without_the_plaintext_to_undo_a_retained_filter_is_refused() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut plain = sample(500_000);
+    for x in plain.iter_mut().filter(|x| **x == 0xe8) {
+        *x = 0xe9;
+    }
+    for at in (60_000..140_000).step_by(499) {
+        plain[at..at + 5].copy_from_slice(&[0xe8, (at % 251) as u8, 0x10, 0, 0]);
+    }
+    let mut ops = testenc::lz(&plain[..50_000], 1 << 17, 16);
+    ops.push(Op::Filter { start: 0, len: 100_000, kind: 1, channels: 0 });
+    ops.extend(testenc::lz(&plain[50_000..], 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 2_000);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let truth = decode(window, &packed, plain.len() as u64);
+    let target = 385_000u64;
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed, 0, &truth[..target as usize], window, target, &options).unwrap();
+    assert!(n.anchor == 0 && n.resync.output_offset > 150_000, "{n:?}");
+    // The whole plaintext resumes exactly.
+    assert_eq!(
+        resumed(window, &n.resync, 0, &truth, truth.len() as u64, &packed),
+        truth[n.resync.output_offset as usize..]
+    );
+    // A suffix from inside the filter's output (still within the window) does not.
+    let base = 100_000usize;
+    let err = Unpacker::resume_in_stream(window, &n.resync, 0, base as u64, &truth[base..], Some(truth.len() as u64))
+        .err()
+        .expect("the filter's output before the plaintext cannot be undone")
+        .to_string();
+    assert!(err.contains("to undo a filter") && err.contains("50000.."), "{err}");
+    // A suffix that starts after the filter's output resumes (its window holds no part of it).
+    let after = 160_000usize;
+    if n.resync.output_offset > after as u64 {
+        assert!(
+            Unpacker::resume_in_stream(window, &n.resync, 0, after as u64, &truth[after..], Some(truth.len() as u64))
+                .is_ok()
+        );
+    }
 }
