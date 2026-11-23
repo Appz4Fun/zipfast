@@ -78,8 +78,8 @@ struct Entry {
     hard: Option<String>,
     /// a symbolic link's target
     target: Option<String>,
-    /// a hard link's file (chains followed to the file that holds the data), or why there is none
-    link_to: Option<std::result::Result<usize, String>>,
+    /// a hard link's file (chains followed to the file that holds the data), or Err when the chain leads nowhere
+    link_to: Option<std::result::Result<usize, ()>>,
     mode: Option<u32>,
     uid: Option<u64>,
     gid: Option<u64>,
@@ -142,27 +142,29 @@ pub(super) fn open(mut file: File, len: u64) -> Result<State> {
         alg_name = toc_style.unwrap_or_default();
     }
     // the table of contents' own checksum, kept in the heap
-    if let Some((offset, size)) = toc_sum {
-        let digest = match (alg, alg_name.as_str()) {
-            (1, _) => Some(Digest::Sha1(Vec::new())),
-            (2, _) => Some(Digest::Md5(Vec::new())),
-            (3, "sha256") => Some(Digest::Sha256(Vec::new())),
-            (3, "sha512") => Some(Digest::Sha512(Vec::new())),
-            _ => None,
-        };
-        if let Some(kind) = digest {
-            let start = heap.checked_add(offset).filter(|s| s.checked_add(size).is_some_and(|e| e <= len));
-            let start = start.ok_or(corrupt("a xar table of contents' checksum lies outside the file"))?;
-            if size > 64 {
-                return Err(corrupt("a xar table of contents' checksum is too long"));
-            }
-            let mut stored = vec![0u8; size as usize];
-            read_at(&mut file, start, &mut stored)?;
-            let mut h = Hasher::of(&kind);
-            h.update(&packed);
-            if h.finish() != stored {
-                return Err(corrupt("a xar table of contents fails its checksum"));
-            }
+    let digest = match (alg, alg_name.as_str()) {
+        (1, _) => Some(Digest::Sha1(Vec::new())),
+        (2, _) => Some(Digest::Md5(Vec::new())),
+        (3, "sha256") => Some(Digest::Sha256(Vec::new())),
+        (3, "sha512") => Some(Digest::Sha512(Vec::new())),
+        _ => None,
+    };
+    // a header that names a checksum the table doesn't say where to find has lost it: refused, not read unchecked
+    if digest.is_some() && toc_sum.is_none() {
+        return Err(corrupt("a xar table of contents' checksum is missing"));
+    }
+    if let (Some((offset, size)), Some(kind)) = (toc_sum, digest) {
+        let start = heap.checked_add(offset).filter(|s| s.checked_add(size).is_some_and(|e| e <= len));
+        let start = start.ok_or(corrupt("a xar table of contents' checksum lies outside the file"))?;
+        if size > 64 {
+            return Err(corrupt("a xar table of contents' checksum is too long"));
+        }
+        let mut stored = vec![0u8; size as usize];
+        read_at(&mut file, start, &mut stored)?;
+        let mut h = Hasher::of(&kind);
+        h.update(&packed);
+        if h.finish() != stored {
+            return Err(corrupt("a xar table of contents fails its checksum"));
         }
     }
     let mut names = Names::default();
@@ -241,6 +243,10 @@ impl Read for Range {
 pub(super) struct Data {
     inner: Box<dyn Read>,
     left: u64,
+    /// the data's length in the archive, as stored or compressed
+    packed: u64,
+    /// set once the end has been checked: no byte past the size, and the checksum
+    ended: bool,
     hasher: Option<(Hasher, Vec<u8>)>,
     /// why the last read failed, when it was the data's own fault
     pub(super) fault: Option<&'static str>,
@@ -248,15 +254,14 @@ pub(super) struct Data {
 
 impl Read for Data {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut fault = None;
-        let mut bad = |why: &'static str| {
-            fault = Some(why);
-            io::Error::new(io::ErrorKind::InvalidData, why)
-        };
         if buf.is_empty() {
             return Ok(0);
         }
         if self.left == 0 {
+            // an empty file is checked on its first read: nothing ever comes out of it to trigger the check below
+            if !self.ended {
+                self.end()?;
+            }
             return Ok(0);
         }
         let want = buf.len().min(self.left.min(usize::MAX as u64) as usize);
@@ -270,20 +275,28 @@ impl Read for Data {
         self.left -= n as u64;
         // checked as the last byte comes out: the reader may never ask past the size
         if self.left == 0 {
-            if self.inner.read(&mut [0u8; 1])? != 0 {
-                let e = bad("a xar file's data is longer than its size");
-                self.fault = fault;
-                return Err(e);
-            }
-            if let Some((h, want)) = self.hasher.take()
-                && h.finish() != want
-            {
-                let e = bad("a xar file fails its checksum");
-                self.fault = fault;
-                return Err(e);
-            }
+            self.end()?;
         }
         Ok(n)
+    }
+}
+
+impl Data {
+    /// Checks the end of the data, once all of its size is out: no byte past it, and its checksum.
+    fn end(&mut self) -> io::Result<()> {
+        self.ended = true;
+        let bad = |why: &'static str| io::Error::new(io::ErrorKind::InvalidData, why);
+        if self.inner.read(&mut [0u8; 1])? != 0 {
+            self.fault = Some("a xar file's data is longer than its size");
+            return Err(bad("a xar file's data is longer than its size"));
+        }
+        if let Some((h, want)) = self.hasher.take()
+            && h.finish() != want
+        {
+            self.fault = Some("a xar file fails its checksum");
+            return Err(bad("a xar file fails its checksum"));
+        }
+        Ok(())
     }
 }
 
@@ -298,8 +311,8 @@ impl State {
         let (path, raw_path) = self.path(i)?;
         let link_target = match self.entries[i].link_to.take() {
             Some(Ok(t)) => Some(self.path(t)?.0),
-            // a link that leads nowhere fails as a link to a file this run didn't extract
-            Some(Err(why)) => Some(why),
+            // a link that leads nowhere has no target: an empty one, which no member can be named, fails it alone
+            Some(Err(())) => Some(String::new()),
             None => None,
         };
         // what the file says beyond its name and folder is needed once, here
@@ -352,7 +365,7 @@ impl State {
                 (Hasher::of(d), want)
             });
             size = extracted;
-            data = Some(Data { inner, left: extracted, hasher, fault: None });
+            data = Some(Data { inner, left: extracted, packed: length, ended: false, hasher, fault: None });
         }
         let typeflag = match kind {
             Kind::File => b'0',
@@ -614,13 +627,13 @@ fn parse_toc(toc: &[u8]) -> Result<(Vec<Entry>, Vec<usize>, Option<(u64, u64)>, 
         let Some(mut id) = link_id(&entries[i]) else { continue };
         let mut hops = 0;
         let resolved = loop {
-            let Some(&t) = by_id.get(&id) else { break Err(format!("xar file id {id}")) };
+            let Some(&t) = by_id.get(&id) else { break Err(()) };
             match link_id(&entries[t]) {
                 Some(next) if hops < 64 && t != i => {
                     id = next;
                     hops += 1;
                 }
-                Some(_) => break Err(format!("xar file id {id}")),
+                Some(_) => break Err(()),
                 None => break Ok(t),
             }
         };
@@ -802,6 +815,10 @@ mod xml {
 impl super::MemberData for Data {
     fn fault(&mut self) -> Option<&'static str> {
         self.fault.take()
+    }
+
+    fn packed(&self) -> Option<u64> {
+        Some(self.packed)
     }
 }
 

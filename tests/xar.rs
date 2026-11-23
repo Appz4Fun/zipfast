@@ -372,3 +372,92 @@ fn sha512_checksums_are_checked() {
     let wrong = format!("{}0", &digest[..127]);
     fails(&xar(&toc(&file(&wrong)), b"alpha"), "checksum");
 }
+
+/// An empty file is still held to its checksum and to holding no data.
+#[test]
+fn an_empty_file_is_checked_too() {
+    fails(&xar(&toc(&stored(1, "e", 0, b"", Some(&hex(&[0u8; 32])))), b""), "checksum");
+    let stray = "<file id=\"1\"><name>e</name><type>file</type><data><length>5</length><offset>0</offset>\
+                 <size>0</size><encoding style=\"application/octet-stream\"/></data></file>";
+    fails(&xar(&toc(stray), b"alpha"), "longer than its size");
+    // a right one passes
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ok.xar");
+    fs::write(&path, xar(&toc(&stored(1, "e", 0, b"", None)), b"")).unwrap();
+    let s = extract::run(&path, &opts(Mode::Test, dir.path()), |_| {}).unwrap();
+    assert!(s.errors.is_empty() && s.files == 1, "{:?}", s.errors);
+}
+
+/// A link to an id nobody has fails, even when a file happens to be named the way the failure used to be written.
+#[test]
+fn an_unresolved_link_never_links_to_a_lookalike_name() {
+    let files = format!("{}{}", stored(1, "xar file id 42", 0, b"alpha", None), link(2, "l", 42));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l.xar");
+    fs::write(&path, xar(&toc(&files), b"alpha")).unwrap();
+    for mode in [Mode::Extract, Mode::Test] {
+        let out = dir.path().join(format!("{mode:?}"));
+        let s = extract::run(&path, &opts(mode, &out), |_| {}).unwrap();
+        assert!(s.errors.iter().any(|e| e.starts_with('l')), "{mode:?}: {:?}", s.errors);
+        assert!(!out.join("l").exists(), "{mode:?}");
+    }
+}
+
+/// A header naming a TOC checksum whose table doesn't say where it is has lost it: refused.
+#[test]
+fn a_missing_toc_checksum_fails() {
+    let mut bytes = xar(&toc(&stored(1, "a", 0, b"alpha", None)), b"alpha");
+    bytes[24..28].copy_from_slice(&1u32.to_be_bytes());
+    fails(&bytes, "checksum is missing");
+}
+
+/// A compressed file lists its length in the archive as its packed size, and a read by index holds that length
+/// to the byte limit.
+#[test]
+fn a_compressed_file_lists_and_limits_its_archived_length() {
+    let data = b"xyz";
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).unwrap();
+    let packed = enc.finish().unwrap();
+    let file = format!(
+        "<file id=\"1\"><name>z</name><type>file</type><data><length>{}</length><offset>0</offset>\
+         <size>3</size><encoding style=\"application/x-gzip\"/></data></file>",
+        packed.len()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("z.xar");
+    fs::write(&path, xar(&toc(&file), &packed)).unwrap();
+    let listing = extract::list(&path).unwrap();
+    assert_eq!((listing[0].size, listing[0].packed), (3, packed.len() as u64));
+    assert!(SelectedEntry::open(&path, 0, None, packed.len() as u64).is_ok());
+    assert!(SelectedEntry::open(&path, 0, None, packed.len() as u64 - 1).is_err());
+}
+
+/// Canceled from the first member's report, a run stops: the files after it are neither extracted nor reported.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_canceled_run_stops_reading_members() {
+    use zipfast::extract::Cancellation;
+    let files = format!("{}{}", stored(1, "a", 0, b"alpha", None), stored(2, "b", 5, b"beta", None));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.xar");
+    fs::write(&path, xar(&toc(&files), b"alphabeta")).unwrap();
+    let out = dir.path().join("out");
+    let cancel = Cancellation::default();
+    let mut succeeded = 0;
+    let result = zipfast::tar::run_with_policy(
+        &path,
+        &opts(Mode::Extract, &out),
+        &cancel,
+        |e: zipfast::zip::ZipRunEvent<'_>| {
+            if let zipfast::zip::ZipRunEvent::MemberSucceeded { .. } = e {
+                succeeded += 1;
+                cancel.cancel();
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err(), "the run went on");
+    assert_eq!(succeeded, 1);
+    assert!(!out.join("b").exists());
+}

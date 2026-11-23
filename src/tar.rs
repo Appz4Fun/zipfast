@@ -46,6 +46,11 @@ pub use wim::WimInfo;
 trait MemberData: Read {
     /// Why the last read failed, when it was the data's own fault (a checksum, a size).
     fn fault(&mut self) -> Option<&'static str>;
+
+    /// The data's length in the archive, when it differs from its size as extracted (compressed).
+    fn packed(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// An archive whose members are found by a table read first (xar's TOC, an ISO 9660 image's folders), each with
@@ -313,6 +318,15 @@ impl Source {
                 let rest = std::mem::replace(r, Box::new(io::empty()));
                 *r = Box::new(io::Cursor::new(bytes).chain(rest));
             }
+        }
+        Ok(())
+    }
+
+    /// Fails once the run is canceled: for reads that don't go through [`Source::read`] (a member's data read
+    /// from its own place in the file).
+    fn check_cancel(&self) -> Result<()> {
+        if let Source::Plain { cancel: Some(cancel), .. } = self {
+            cancel.check_io()?;
         }
         Ok(())
     }
@@ -941,6 +955,7 @@ impl Reader {
         }
         if let Some(state) = &mut self.random {
             self.member_data = None;
+            self.src.check_cancel()?;
             let Some((member, data)) = state.next()? else { return Ok(None) };
             self.member_data = data;
             return Ok(Some(member));
@@ -1223,9 +1238,20 @@ impl Reader {
 
     /// The current member's data, in pieces, to `sink`. Reads exactly its size and leaves the padding for later.
     fn read_data(&mut self, size: u64, buf: &mut [u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        if size == 0
+            && let Some(data) = &mut self.member_data
+        {
+            // nothing comes out of an empty member, but its reader still checks it (a checksum, a stray byte)
+            if let Err(e) = data.read(&mut [0u8; 1]) {
+                return Err(data.fault().map_or_else(|| read_error(e), Error::Corrupt));
+            }
+        }
         let mut left = size;
         while left > 0 {
             let want = left.min(buf.len() as u64) as usize;
+            if self.member_data.is_some() {
+                self.src.check_cancel()?;
+            }
             let got = match &mut self.member_data {
                 Some(data) => match read_full(data, &mut buf[..want]) {
                     Ok(n) => n,
@@ -1321,6 +1347,11 @@ impl Selected {
                     continue;
                 }
                 if current == index {
+                    // data read from its own place in the file doesn't pass the packed stream's limit: its stored
+                    // length is held to it here
+                    if reader.member_data.as_ref().and_then(|d| d.packed()).is_some_and(|p| p > limit) {
+                        return Err(Error::Unsupported("the selected member exceeds the byte limit".into()));
+                    }
                     let mut member = member;
                     if member.kind != Kind::File {
                         if !(special == SpecialEntries::EmptyFile && member.is_special()) {
@@ -1482,7 +1513,12 @@ fn list_members(mut reader: Reader) -> Result<Vec<Entry>> {
     while let Some(m) = reader.next()? {
         if m.kind != Kind::Other(b'V') {
             budget.record(&m.name)?;
-            out.push(m.into_entry());
+            let packed = reader.member_data.as_ref().and_then(|d| d.packed());
+            let mut entry = m.into_entry();
+            if let Some(packed) = packed {
+                entry.packed = packed;
+            }
+            out.push(entry);
         }
     }
     if reader.src.codec().is_some() {
