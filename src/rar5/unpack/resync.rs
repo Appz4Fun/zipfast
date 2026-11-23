@@ -919,6 +919,7 @@ fn follow_near(
     let (mut pos, mut out) = (at, start);
     let mut seen: Vec<SeenFilter> = Vec::new();
     let (mut any, mut guarded): (Option<Candidate>, Option<Candidate>) = (None, None);
+    let reached_end;
     let mut owned;
     let mut block = first;
     let note = |pos: usize,
@@ -953,6 +954,7 @@ fn follow_near(
             // The plaintext ends in this block (at the target): restart at the best place before it.
             Sim::Short => {
                 seen.truncate(before);
+                reached_end = true;
                 break;
             }
             Sim::Mismatch | Sim::Filter(_) => return Follow::Mismatch,
@@ -963,6 +965,8 @@ fn follow_near(
             return Follow::Exhausted;
         }
         let Some(next) = next else {
+            // The member's last block ending exactly where the plaintext does reaches its end too.
+            reached_end = block.last && out == known.end();
             note(pos, out, &st, &block.lens, &seen, &mut any, &mut guarded);
             break;
         };
@@ -971,6 +975,12 @@ fn follow_near(
     }
     if work.late() {
         return Follow::Exhausted;
+    }
+    // A true anchor's blocks decode, checked, all the way to the plaintext's end (the target). A follow that runs out
+    // of blocks first matched the plaintext only where its content repeats: packed bytes from past the target pinned
+    // where the same bytes occur before it. Refused, however long the stretch it matched.
+    if !reached_end {
+        return Follow::Mismatch;
     }
     let is_guarded = guarded.is_some();
     let Some(c) = guarded.or(any) else { return Follow::Mismatch };

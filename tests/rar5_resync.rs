@@ -1028,3 +1028,110 @@ fn resuming_without_the_plaintext_to_undo_a_retained_filter_is_refused() {
         );
     }
 }
+
+/// Checks a `resync_near` result on the unseen-filter stream: a restart must resume to the stream's exact output
+/// (given the whole plaintext) up to `before_copy`, where the stream copies from output of a filter the follow did
+/// not see (the resumed decoder may stop there); anything else must be a typed `NotFound` or `Exhausted`.
+fn assert_restart_or_typed_failure(
+    packed: &[u8],
+    truth: &[u8],
+    window: zipfast::rar5::unpack::Window,
+    before_copy: u64,
+    result: Result<zipfast::rar5::unpack::ResyncNear, NearError>,
+    what: &str,
+) {
+    match result {
+        Ok(n) => {
+            let r = &n.resync;
+            let mut u = Unpacker::resume_in_stream(window, r, 0, 0, truth, Some(truth.len() as u64))
+                .unwrap_or_else(|e| panic!("{what}: resume: {e} ({n:?})"));
+            let mut out = Collect(Vec::new());
+            let result = u.feed(&packed[r.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+            let rest = &truth[r.output_offset as usize..];
+            assert!(
+                out.0.len() <= rest.len() && out.0 == rest[..out.0.len()],
+                "{what}: restart at {} decodes wrong",
+                r.output_offset
+            );
+            // The only error a right restart may stop with: the known-plaintext check (or the floor) at the copy.
+            if let Err(e) = result {
+                let msg = e.to_string();
+                let at = msg
+                    .split("output offset ")
+                    .nth(1)
+                    .and_then(|t| t.split(' ').next())
+                    .and_then(|t| t.parse::<u64>().ok());
+                let at_copy = at.is_some_and(|at| at >= before_copy) || msg.contains("before the window checked");
+                assert!(
+                    at_copy && r.output_offset < before_copy,
+                    "{what}: a wrong restart at {}: {msg}",
+                    r.output_offset
+                );
+            }
+        }
+        Err(NearError::NotFound { .. } | NearError::Exhausted { .. }) => {}
+    }
+}
+
+/// Packed bytes from past the target repeat plaintext from before it (each `spread` starts with the same bytes).
+/// With the known plaintext starting just after the filter, those bytes occur in it only once, so a block from past
+/// the target pinned there, and its blocks matched the repeat until the packed bytes ran out, short of the target.
+/// A true anchor's blocks reach the target: that follow is refused, and the true restart found.
+#[test]
+fn resync_near_refuses_a_pin_in_content_that_repeats_past_the_target() {
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let target = before_copy - 50_000;
+    let cut = packed.len() * 8 / 11;
+    let estimate = (target as u128 * packed.len() as u128 / truth.len() as u128) as usize - cut;
+    let options = NearOptions { estimate: Some(estimate), guard: false, ..Default::default() };
+    let mut restarts = Vec::new();
+    for known_base in [0, filter_at + 20_000, target - (6 << 20)] {
+        let known = &truth[known_base as usize..target as usize];
+        let n = resync_near(&packed[cut..], known_base, known, window, target, &options).unwrap();
+        assert!(n.resync.output_offset <= target && n.back < 1 << 20, "base {known_base}: {n:?}");
+        restarts.push((n.resync.packed_offset, n.resync.output_offset));
+        assert_restart_or_typed_failure(
+            &packed[cut..],
+            &truth,
+            window,
+            before_copy,
+            Ok(n),
+            &format!("base {known_base}"),
+        );
+    }
+    assert!(restarts.windows(2).all(|w| w[0] == w[1]), "every base finds the same restart: {restarts:?}");
+}
+
+/// The same stream with the known plaintext starting at many offsets: every result is a correct restart or a typed
+/// failure, never a wrong pin.
+#[test]
+fn resync_near_never_pins_wrong_whatever_the_plaintext_start() {
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let target = before_copy - 50_000;
+    let cut = packed.len() * 8 / 11;
+    let estimate = (target as u128 * packed.len() as u128 / truth.len() as u128) as usize - cut;
+    let mut bases: Vec<u64> = (0..6).map(|i| i * (target - (1 << 20)) / 6).collect();
+    bases.extend([
+        filter_at,
+        filter_at + 1,
+        filter_at + 10_000,
+        filter_at + 20_000,
+        filter_at + 20_001,
+        filter_at + 70_000,
+    ]);
+    bases.extend([target - (3 << 20), target - (1 << 20), target - 100_000]);
+    for (i, &known_base) in bases.iter().enumerate() {
+        let known = &truth[known_base as usize..target as usize];
+        let guard = i % 2 == 0;
+        let options = NearOptions { estimate: Some(estimate), guard, ..Default::default() };
+        let result = resync_near(&packed[cut..], known_base, known, window, target, &options);
+        assert_restart_or_typed_failure(
+            &packed[cut..],
+            &truth,
+            window,
+            before_copy,
+            result,
+            &format!("base {known_base} guard {guard}"),
+        );
+    }
+}

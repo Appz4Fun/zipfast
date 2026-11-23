@@ -69,7 +69,9 @@ u.feed(&packed[n.resync.packed_offset..], &mut sink)?;
   in it are most likely past the target, so the step moves back. Blocks inside output a filter changed miss too, so
   the rest of such a step is searched after the steps back, as is the rest of a step that tried its share of blocks. From that anchor it decodes forward without a window, checking every block against the plaintext and
   learning the decoder's state. It does not stop when the state is known; it goes on to the last block that starts
-  at or before the target and restarts there. So the restart is within one block of the target, whatever packing
+  at or before the target and restarts there. A follow must reach the target: one that runs out of blocks first
+  has only matched plaintext that repeats (packed bytes from past the target, pinned where the same bytes occur before
+  it), and is refused however long the stretch it matched. So the restart is within one block of the target, whatever packing
   ratio the content between has (rar's ratio varies from 1:1 to over 15:1 inside one mixed member, which makes a
   ratio estimate land megabytes off), and the work grows with the distance searched, not the member's size.
 - **Filters:** blocks that start a filter are decoded past. Their output is not compared, since the plaintext
@@ -148,6 +150,8 @@ past the target. Prybar's layered search over `resync` took about 25 s and lande
     declared before the given packed bytes changed; a deadline that passes during a long follow gives `Exhausted`;
     a later solid member resumed from its start refuses a copy, after the target, from an earlier member's filtered
     output; resuming with a plaintext suffix that starts inside a retained filter's output is refused;
+  - content past the target that repeats plaintext before it (a pin unique in a plaintext starting just after it) is
+    refused, and over many plaintext starts every result is the right restart or a typed failure;
   - with `ZIPFAST_Z_FIXTURES`, `resync_near` on F03/F05/F06 at several targets (guarded, exact, under 1 s in release).
 
 RAR 4.x is not covered.
