@@ -606,9 +606,10 @@ pub struct ResyncNear {
     pub work: u64,
     /// Time spent.
     pub elapsed: std::time::Duration,
-    /// Whether the decoding checked from the anchor covers the restart's whole match window (or starts at the
-    /// plaintext's start): no filter the follow did not see can have changed output a match after the restart copies
-    /// from. When false, the resumed decoder refuses (as [`crate::Error::BadChecksum`]) a match that copies from
+    /// Whether the decoding checked from the anchor covers the restart's whole match window, or starts at the solid
+    /// stream's start (output offset 0, with the plaintext from there): no filter the follow did not see can have
+    /// changed output a match after the restart copies from. The plaintext's start alone is no proof: a filter
+    /// declared before it is never seen. When false, the resumed decoder refuses (as [`crate::Error::BadChecksum`]) a match that copies from
     /// before the anchor plus a filter's length into output no known plaintext checks, rather than risk wrong output.
     /// For a later member of a solid stream, a follow from that member's start covers only that member: when earlier
     /// members lie within the window, [`Unpacker::resume_in_stream`] refuses copies from before the member's start
@@ -683,8 +684,13 @@ pub fn resync_near(
     let known = Known { base: known_base, bytes: &known[..(target - known_base) as usize] };
     let mut pre = Huff::new();
     let est = options.estimate.unwrap_or(packed.len()).min(packed.len());
-    let checked =
-        |r: &Resync, anchor: u64| anchor <= known_base || r.floor <= r.output_offset.saturating_sub(window.reach);
+    // The window is proven only when the follow saw every filter that could have changed it: it started at the
+    // solid stream's start (offset 0: nothing before it), or its floor (no filter declared before the anchor reaches
+    // past it) lies at or before the window's start. The plaintext's start alone proves nothing: a filter declared
+    // before it, inside the member or in an earlier member of a solid stream, is never seen.
+    let checked = |r: &Resync, anchor: u64| {
+        (known_base == 0 && anchor == 0) || r.floor <= r.output_offset.saturating_sub(window.reach)
+    };
     let done = |(mut r, anchor, from): (Resync, u64, usize), work: &mut Work| {
         // A result found after the deadline is not given: the caller's time is up.
         if work.late() {
@@ -1295,6 +1301,11 @@ impl Unpacker {
         } else {
             offset
         };
+        // Earlier members of a solid stream within the window: their filters were seen only by a follow from the
+        // stream's start (as `resume_in_stream` keeps this floor).
+        if member_start > 0 && window_start < member_start && resync.verified.start > 0 {
+            floor = floor.max(member_start);
+        }
         // A filter declared before the restart can cover output past it, up to a filter's longest length, unless
         // the restart is guarded; held plaintext past the restart is the only other check.
         // with the member's size unknown its end is too: a filter may reach its full length past the restart

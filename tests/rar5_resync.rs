@@ -1321,3 +1321,75 @@ fn an_unknown_size_does_not_make_an_unguarded_seeded_restart_look_guarded() {
     let strict = Unpacker::resume_seeded(window, &r, 0, 0, known, None, true);
     assert!(matches!(strict, Err(zipfast::Error::Unsupported(_))), "strict refuses it");
 }
+
+/// A later member of a solid stream searched from its own start, with the held plaintext starting there (a block
+/// boundary, with the earlier member's filters declared before it) or including the earlier member: the follow saw
+/// none of the earlier member's filters, so the window is never called checked, and a copy after the target into
+/// the earlier member's filtered output is noted (strict refuses the restart or the copy).
+#[test]
+fn a_seeded_later_solid_member_keeps_the_earlier_members_floor() {
+    use zipfast::rar5::testenc::{self, Op};
+    const PER: usize = 2_000;
+    let mut ops_a = testenc::lz(&sample(50_000), 1 << 17, 16);
+    let filter_at = testenc::model(&ops_a).len() as u64;
+    ops_a.push(Op::Filter { start: 0, len: 20_000, kind: 1, channels: 0 });
+    for k in 0..4_000u32 {
+        ops_a.extend([0xe8, (k % 251) as u8, 0x10, 0, 0].map(Op::Lit));
+    }
+    ops_a.extend(testenc::lz(&sample(30_000).iter().map(|b| b ^ 0x33).collect::<Vec<_>>(), 1 << 17, 16));
+    let len_a = testenc::model(&ops_a).len() as u64;
+    let other: Vec<u8> = sample(260_000).iter().map(|b| b ^ 0x55).collect();
+    let mut ops_b = testenc::lz(&other[..200_000], 1 << 17, 16);
+    let copy_at = len_a + testenc::model(&ops_b).len() as u64;
+    ops_b.push(Op::Match(3_000, copy_at - (filter_at + 10_000)));
+    ops_b.extend(testenc::lz(&other[200_000..], 1 << 17, 16));
+    // member 2's match reaches into member 1: model them as one stream
+    let len_b = testenc::model(&[ops_a.clone(), ops_b.clone()].concat()).len() as u64 - len_a;
+    let first = testenc::tuned_stream(&ops_a, PER);
+    let second = testenc::tuned_stream(&ops_b, PER);
+    let window = window_for(1 << 20, Some(len_a + len_b), true).unwrap();
+    let mut u = Unpacker::new(window).unwrap();
+    u.reset(Some(len_a));
+    let mut out = Collect(Vec::new());
+    u.feed(&first, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    u.next_file(Some(len_b));
+    u.feed(&second, &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    let stream = out.0;
+    let (lo, hi) = ((filter_at + 10_000) as usize, (filter_at + 13_000) as usize);
+    assert_ne!(stream[copy_at as usize..][..3_000], stream[lo..hi], "the copy reads the unfiltered bytes");
+    let target = len_a + 150_000;
+    for known_base in [len_a, 0] {
+        let known = &stream[known_base as usize..target as usize];
+        let n = resync_near(&second, known_base, known, window, target, &NearOptions::default()).unwrap();
+        assert!(!n.window_checked, "base {known_base}: a follow from the later member's start proves no window: {n:?}");
+        for strict in [false, true] {
+            let made = Unpacker::resume_seeded(window, &n.resync, len_a, known_base, known, Some(len_b), strict);
+            if strict && matches!(made, Err(zipfast::Error::Unsupported(_))) {
+                // refused at the start: the restart is unguarded
+                continue;
+            }
+            let mut u = made.unwrap();
+            assert_eq!(u.seed_checked(), Some(false), "base {known_base}");
+            let mut out = Collect(Vec::new());
+            let result = u.feed(&second[n.resync.packed_offset..], &mut out).and_then(|()| u.finish(&mut out));
+            let from = (n.resync.output_offset - len_a) as usize;
+            let truth_b = &stream[len_a as usize..];
+            if strict {
+                assert!(result.is_err(), "base {known_base}: strict refuses the copy");
+                let good = (copy_at - n.resync.output_offset) as usize;
+                assert!(out.0.len() <= good && out.0 == truth_b[from..][..out.0.len()], "no wrong byte");
+            } else {
+                result.unwrap();
+                let suspect = u.seed_suspects();
+                assert!(
+                    suspect
+                        .iter()
+                        .any(|s| s.at <= copy_at - len_a && s.reason != zipfast::rar5::unpack::SeedReason::Filter),
+                    "base {known_base}: the copy is noted: {suspect:?}"
+                );
+            }
+        }
+    }
+}
