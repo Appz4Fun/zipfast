@@ -286,6 +286,13 @@ struct Run<'a> {
     print: Option<PrintSink<'a>>,
     /// Where held-back members keep their plaintext (see [`SpoolStore`]).
     store: SpoolStore,
+    /// threads an LZMA2 coder may decode its blocks on
+    threads: usize,
+}
+
+/// `threads` as asked for, None for one per core.
+fn thread_count(threads: Option<usize>) -> usize {
+    threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())).max(1)
 }
 
 pub(super) fn run(
@@ -348,6 +355,7 @@ pub(super) fn run(
         current: 0,
         print: None,
         store: SpoolStore::default(),
+        threads: thread_count(options.threads),
     };
     let result = run.members(&selected, &needed);
     crate::extract::finish_dirs(&mut run.summary);
@@ -430,6 +438,7 @@ pub(super) fn print(
         current: 0,
         print: Some(sink),
         store: SpoolStore::default(),
+        threads: thread_count(limits.decode_threads),
     };
     run.members(&selected, &needed)?;
     Ok(run.summary)
@@ -790,6 +799,8 @@ impl Run<'_> {
             limits: self.limits,
             cancel: self.cancel,
             dictionaries: 0,
+            threads: self.threads,
+            spare: Default::default(),
         };
         let reader = coders::folder_reader(folder, &mut cx)?;
         self.active = Some(Active {

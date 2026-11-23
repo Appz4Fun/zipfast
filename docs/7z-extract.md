@@ -20,8 +20,9 @@ through the same entry points as the other formats. The headers come from the me
 
 `Options` work as for ZIP and tar: `mode` (`Test` decodes and checks everything and writes nothing), `dest`,
 `overwrite`, `flatten`, `protected_paths` (the archive and every volume of a split set are protected too) and
-`select` (a `MemberFilter`, asked once per member in archive order with the ordinal `list` gives). `threads` and
-`parallel_min` are ignored: a folder decodes on one thread.
+`select` (a `MemberFilter`, asked once per member in archive order with the ordinal `list` gives). `threads` (None:
+one per core) is how many threads an LZMA2 folder written in independent blocks decodes on; `Some(1)` keeps every
+folder on the calling thread ([LZMA2 on several threads](#lzma2-on-several-threads)). `parallel_min` is ignored.
 
 Overwrite choices are made by `extract::check_target`, the function every whole-archive run uses:
 
@@ -77,7 +78,7 @@ copying out check for cancellation every chunk.
 |---|---|---|
 | Copy | `00` | |
 | LZMA | `030101` | liblzma raw decoder; the dictionary is shrunk to the coder's output size |
-| LZMA2 | `21` | the same |
+| LZMA2 | `21` | the same; a stream of independent blocks (`7z -mmt`) decodes on several threads, see below |
 | Deflate | `040108` | flate2 |
 | Deflate64 | `040109` | zipfast's own streaming inflater (`zipfast::inflate64`), 64 KiB window |
 | BZip2 | `040202` | the bzip2 crate (pure Rust backend), multi-stream |
@@ -106,11 +107,74 @@ stream that way. A cycle, a coder nothing reads, an input bound to nothing or a 
 refused.
 
 Each folder is decoded once, from the front, as a chain of readers: nothing is buffered beyond a few 64 KiB
-buffers per coder, whatever the folder's size. Members are cut from the folder's output by their sizes, in order.
+buffers per coder, whatever the folder's size (an LZMA2 coder decoding blocks on several threads holds a bounded
+budget more, see below). Members are cut from the folder's output by their sizes, in order.
 A member that is not written (unselected, an existing file under `Skip`, an unsafe name) but sits before a member
 that is, is decoded through and dropped; decoding of a folder stops after the last member anyone needs, and a
 folder nothing is selected from is not opened at all. Every coder's output is held to the size the header gives
 it: data that ends early, or does not decode, fails the member.
+
+## LZMA2 on several threads
+
+7-Zip with `-mmt` (the default on a machine with several cores) writes LZMA2 as a run of independent blocks: each
+starts with a chunk that resets the dictionary (control byte `0x01`, a stored chunk, or `0xE0` and up, an LZMA chunk
+with new properties), and since a dictionary reset forces new properties on the next LZMA chunk, a block decodes on
+its own exactly as it does inside the stream. With more than one thread (`Options::threads` for `sevenzip::run`
+and the dispatchers, `SevenZipLimits::decode_threads` for `print_selected` and `SelectedEntry`, None for one per
+core), an LZMA2 coder whose output is at least 2 MiB decodes such blocks side by side:
+
+- Every stream starts on the one-thread decoder, with a walker that follows the chunk headers (as
+  [`map::Lzma2Index`](member-map.md) reads them) in each 64 KiB block it reads: a few operations per chunk, no
+  copies. It switches to the pipeline below at a chunk boundary only once that can pay: at a second piece (a
+  dictionary reset at least 1 MiB of output after the start), or once more than 1 MiB of output has gone by and less
+  than nine tenths of it came from stored chunks. A stream of stored chunks with no second piece (incompressible data
+  from one-thread 7-Zip, F07 below) never switches and runs at the one-thread speed.
+- In the pipeline, the run's thread reads the packed stream and walks its chunk headers; a dictionary reset at least
+  1 MiB of output after the last cut starts a new piece. Packed bytes are read in 64 KiB blocks that are moved, not
+  copied, to whichever thread decodes them.
+- The run's thread decodes the piece at the head of the stream itself, straight into the reader's buffer, as the
+  one-thread decoder does. Each later piece goes to one of `threads` worker threads, which decodes it as its packed
+  bytes arrive and hands back its output in 1 MiB segments (the run's thread mostly reads, checks and writes once
+  the workers have the pieces). When the head piece is done, the next one is
+  handed out from its worker, or decoded on the run's thread if no worker has taken it yet. The output goes out in
+  stream order, so it is byte for byte the one-thread output, and the member and folder CRCs check the same bytes.
+- Worker threads start only with a second piece: an LZMA-coded stream of one block (one-thread 7-Zip, `-mmt1`,
+  liblzma) is decoded on the run's thread alone, with a short lookahead.
+
+Memory is bounded by `SevenZipLimits::lzma2_parallel_bytes` (256 MiB, at least 4 MiB), so several extractions at
+once stay modest. Each worker costs its dictionary (the coder's, shrunk to the folder's output) and its one 1 MiB
+output buffer, which it makes only when it has output to make; the workers take at most a third of the budget, and
+fewer start when they would take more (none: one thread). Their dictionaries also come out of what
+`dictionary_bytes` leaves once the folder's coders are built, shared by all its LZMA2 coders and taken when a coder
+starts its workers. At most two pieces per thread are in the pipeline, and the packed bytes waiting for decoders and
+the decoded bytes waiting for the run together stay within the rest of the budget: a worker waits while it is
+spent, and reading ahead stops (except the head piece's next bytes, up to 256 KiB waiting for its decoder, which
+the run cannot move without; anything further ahead must fit the budget). The
+head's worker is let past the budget only while the run has fewer than two of its 1 MiB segments waiting, since the
+run is waiting for those: the run always moves, and a run that stops reading (writing a member, a slow `-so`
+consumer) stops the head too, so a block of zeros cannot pile up decoded output. Reading ahead also stops once the
+packed bytes waiting in the piece being read pass the larger of 8 MiB and the output handed out so far, capped by
+the budget (256 KiB in a piece that is nine tenths stored chunks, which cost only a copy to decode), so a one-block stream holds little more
+than the one-thread decoder does. All told, the threads add at most the budget and two segments.
+
+7-Zip's blocks are four times its dictionary: 4 MiB at `-md=1m`, 64 MiB at `-mx5`'s 16 MiB, 256 MiB at `-mx9`'s
+64 MiB (7-Zip 26 at `-mx5 -mmt8` wrote 134 MiB blocks with a 32 MiB dictionary for the measured archive). With the
+256 MiB default such a stream gets two workers (a 32 MiB dictionary and a 1 MiB buffer each) and 190 MiB for bytes
+in flight, about one and a half blocks, so it decodes only partly side by side: about 1.6 times one thread on that
+archive, whatever the thread count. Streams of smaller blocks (16 MiB at `-md=4m`) get every thread. A caller that
+wants the most speed on large blocks and has the memory raises `lzma2_parallel_bytes` (1 GiB lets the six 134 MiB
+blocks overlap: about 3.4 times one thread at 8 threads, with peak memory near 1 GiB).
+
+Failures keep their place. A piece that does not decode, ends early, or whose packed bytes cannot be read gives the
+output it decoded before the failure and then the failure, in stream order, so the failure lands on the member it
+lands on with one thread. (The one-thread decoder drops what liblzma made in the call that failed, up to one 256 KiB
+read; the threaded one hands it out, so a member that ends within that much before a failure can check out on
+several threads where it fails on one.) Workers check the `Cancellation` every 1 MiB of output and every 20 ms while
+they wait, the run's thread does the same, and a folder that is closed early (a failure, the last needed member)
+stops and joins its workers.
+
+Measured on a solid 768 MiB folder (`7z a -mx5 -mmt8`) and the RustyGet fixtures; see the pull request that added it
+for the table. LZMA2 written by one thread, xz and LZMA (not LZMA2) folders are unchanged.
 
 ## Checks and publication
 

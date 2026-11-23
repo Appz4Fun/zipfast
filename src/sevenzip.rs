@@ -28,6 +28,7 @@
 mod bcj;
 mod bcj2;
 mod coders;
+mod lzma2_par;
 mod run;
 mod source;
 
@@ -83,6 +84,18 @@ pub struct SevenZipLimits {
     /// nothing is left behind however the process ends, and the run uses one descriptor however many members it
     /// holds back.
     pub spool_dir: Option<std::path::PathBuf>,
+    /// Memory an LZMA2 coder decoding its blocks on several threads may add: 256 MiB (at least 4 MiB is used). A
+    /// stream 7-Zip wrote with `-mmt` is a run of independent blocks; with more than one thread they are decoded
+    /// side by side. Each worker thread costs its dictionary and a 1 MiB output buffer; the workers take at most a
+    /// third of this (fewer start when they would take more; their dictionaries count against `dictionary_bytes`
+    /// too), and the packed and decoded bytes in flight the rest: a worker waits while that is spent. Large blocks
+    /// (7-Zip's are four times the dictionary: 64 MiB to 256 MiB at `-mx5` to `-mx9`) then decode only partly side
+    /// by side; a caller that wants the most speed and has the memory raises it. See `docs/7z-extract.md`.
+    pub lzma2_parallel_bytes: u64,
+    /// Threads [`print_selected`] (and reading one member through `extract::SelectedEntry`) decode a folder's
+    /// LZMA2 blocks on: None for one per core, `Some(1)` for the calling thread alone. [`run`] takes
+    /// [`Options::threads`] instead.
+    pub decode_threads: Option<usize>,
 }
 
 impl Default for SevenZipLimits {
@@ -98,6 +111,8 @@ impl Default for SevenZipLimits {
             spool_member_bytes: 8 << 30,
             spool_memory_bytes: 1 << 20,
             spool_dir: None,
+            lzma2_parallel_bytes: 256 << 20,
+            decode_threads: None,
         }
     }
 }

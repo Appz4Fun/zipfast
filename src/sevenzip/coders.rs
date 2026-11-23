@@ -20,10 +20,14 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use super::bcj::{Arch, BranchReader, DeltaReader, SwapReader};
 use super::bcj2::Bcj2Reader;
+use super::lzma2_par::{self, Lzma2Blocks};
 use super::source::{PackReader, VolumeSet};
 use super::{SevenZipError, SevenZipLimit, SevenZipLimits};
 use crate::extract::Cancellation;
@@ -128,9 +132,15 @@ impl<R: Read> Read for Exact<R> {
 type Stream = Box<dyn Read>;
 
 /// LZMA or LZMA2 through liblzma's raw decoder.
-struct LzmaReader {
+pub(crate) struct LzmaReader {
     input: BufReader<Stream>,
     stream: liblzma::stream::Stream,
+}
+
+impl LzmaReader {
+    pub(crate) fn new(input: Stream, stream: liblzma::stream::Stream) -> Self {
+        Self { input: BufReader::with_capacity(BUF, input), stream }
+    }
 }
 
 impl Read for LzmaReader {
@@ -161,20 +171,11 @@ impl Read for LzmaReader {
     }
 }
 
-/// LZMA2's dictionary size for property byte `b` (at most 40).
-fn lzma2_dict(b: u8) -> u64 {
-    if b >= 40 { u64::from(u32::MAX) } else { (2 | u64::from(b & 1)) << (b / 2 + 11) }
-}
-
-/// `dictionaries` is what the folder's earlier LZMA coders allocated; this one's window is added to it.
-fn lzma(
-    kind: CoderKind,
-    properties: &[u8],
-    input: Stream,
-    size: u64,
-    limits: &SevenZipLimits,
-    dictionaries: &mut u64,
-) -> Built {
+/// `dictionaries` is what the folder's earlier LZMA coders allocated; this one's window is added to it. An LZMA2
+/// coder with `threads` above one decodes its blocks on that many worker threads besides the caller's
+/// ([`Lzma2Blocks`]); each worker's window comes out of what `dictionary_bytes` has left.
+fn lzma(kind: CoderKind, properties: &[u8], input: Stream, size: u64, cx: &mut Context<'_>) -> Built {
+    let (limits, dictionaries) = (cx.limits, &mut cx.dictionaries);
     // The dictionary never needs to be larger than the output, so a stated dictionary never allocates more.
     let need = size.max(4096);
     let mut filters = liblzma::stream::Filters::new();
@@ -190,9 +191,9 @@ fn lzma(
         if b > 40 {
             return Err(SevenZipError::Corrupt("7z LZMA2 properties"));
         }
-        let b = (0..=b).find(|&s| lzma2_dict(s) >= need).unwrap_or(b);
+        let b = lzma2_par::shrink(b, need);
         filters.lzma2_properties(&[b]).map_err(|_| SevenZipError::Corrupt("7z LZMA2 properties"))?;
-        lzma2_dict(b)
+        lzma2_par::dict_size(b)
     };
     let total = dictionaries.saturating_add(window);
     if total > limits.dictionary_bytes {
@@ -203,13 +204,32 @@ fn lzma(
         });
     }
     *dictionaries = total;
+    if kind == CoderKind::Lzma2 && cx.threads > 1 && size >= 2 * lzma2_par::MIN_PIECE {
+        // The caller's thread reads the stream, hands out the output and decodes the head piece in the window
+        // counted above; up to `threads` workers decode the pieces after it, as many as the parallel budget pays
+        // for, dictionaries and buffers included ([`lzma2_par::plan`]). Their windows also come out of what
+        // `dictionary_bytes` leaves once the whole folder is built (`cx.spare`), shared by all its LZMA2 coders,
+        // taken when the workers start.
+        let (workers, memory) = lzma2_par::plan(cx.threads, limits.lzma2_parallel_bytes, window);
+        if workers > 0 {
+            let b = lzma2_par::shrink(properties[0], need);
+            let blocks = Lzma2Blocks::new(input, size, b, workers, memory, cx.cancel).map_err(|e| {
+                if e.kind() == io::ErrorKind::OutOfMemory {
+                    SevenZipError::Io(e)
+                } else {
+                    SevenZipError::Corrupt("7z LZMA properties")
+                }
+            })?;
+            return Ok(Box::new(blocks.with_allowance(cx.spare.clone(), window)));
+        }
+    }
     let stream = liblzma::stream::Stream::new_raw_decoder(&filters).map_err(|e| match e {
         liblzma::stream::Error::Mem | liblzma::stream::Error::MemLimit => {
             SevenZipError::Io(io::Error::from(io::ErrorKind::OutOfMemory))
         }
         _ => SevenZipError::Corrupt("7z LZMA properties"),
     })?;
-    Ok(Box::new(LzmaReader { input: BufReader::with_capacity(BUF, input), stream }))
+    Ok(Box::new(LzmaReader::new(input, stream)))
 }
 
 /// 7zAES: AES-256-CBC over whole blocks.
@@ -434,6 +454,10 @@ pub(crate) struct Context<'a> {
     pub(crate) cancel: &'a Cancellation,
     /// LZMA dictionary bytes the folder being built has allocated so far.
     pub(crate) dictionaries: u64,
+    /// Threads an LZMA2 coder may decode its blocks on; 1 for the one-thread decoder.
+    pub(crate) threads: usize,
+    /// What `dictionary_bytes` leaves for LZMA2 workers once the folder is built, shared by its coders.
+    pub(crate) spare: Rc<Cell<u64>>,
 }
 
 /// The folder's output stream, exactly `folder.unpacked_size` bytes.
@@ -460,6 +484,8 @@ pub(crate) fn folder_reader(folder: &MapFolder, cx: &mut Context<'_>) -> Built {
     if used.iter().any(|u| !u) {
         return Err(SevenZipError::Corrupt("7z folder has a coder nothing reads"));
     }
+    // Every coder's own window is counted now: the LZMA2 workers may have what is left.
+    cx.spare.set(cx.limits.dictionary_bytes.saturating_sub(cx.dictionaries));
     Ok(reader)
 }
 
@@ -519,9 +545,7 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
     };
     match coder.kind {
         CoderKind::Copy => one(inputs),
-        kind @ (CoderKind::Lzma | CoderKind::Lzma2) => {
-            lzma(kind, props, one(inputs)?, size, cx.limits, &mut cx.dictionaries)
-        }
+        kind @ (CoderKind::Lzma | CoderKind::Lzma2) => lzma(kind, props, one(inputs)?, size, cx),
         CoderKind::Deflate => {
             Ok(Box::new(flate2::bufread::DeflateDecoder::new(BufReader::with_capacity(BUF, one(inputs)?))))
         }
