@@ -343,6 +343,7 @@ impl PartialCore {
         } else {
             // The operation token excludes mutation; callbacks have completed and
             // this stamp was checked for the same revision immediately above.
+            self.native.written();
             let result = crate::extract::finish_file_checked(&self.native.output.file, &op.snapshot.evidence.metadata);
             let attribute = |result: Option<std::io::Result<()>>| match result {
                 None => AttributeResult::NotRequested,

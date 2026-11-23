@@ -53,6 +53,17 @@ pub struct PartialLimits {
     /// A group is also committed at the first write (or provider wait of the session) after it has been open this
     /// long. Default 2 s, at most one hour.
     pub group_commit_interval: std::time::Duration,
+    /// Opt-in: a hole the extraction meets (cause `Missing` or `CipherNeighbour`, at the end of the produced
+    /// output) joins the open group instead of committing the group and then its own transaction, so it costs no
+    /// sync or anchor CAS of its own. Off by default. Needs grouping (`group_commit_bytes` above 0).
+    ///
+    /// Crash semantics change for those holes only: the `Hole` event is durable once the group commits (at the
+    /// next `fill`, `fill_packed`, `refill_from_packed`, `declare_hole`, `remaining`, `state`, `close`,
+    /// `poll_verify`, member finish, a later hole recorded the ordinary way, or the group's size or interval),
+    /// not when it is delivered. A crash before that loses the hole together with the output the group wrote
+    /// after it: the member resumes from the committed `produced`, before the hole, and the hole is extracted, met
+    /// and reported again. Holes from `declare_hole` and late damage are always committed before they return.
+    pub group_holes: bool,
 }
 /// Hard cap of [`PartialLimits::group_commit_bytes`].
 const GROUP_COMMIT_BYTES_MAX: u64 = 16 << 30;
@@ -73,6 +84,7 @@ impl Default for PartialLimits {
             fill_bytes: 1_048_576,
             group_commit_bytes: 64 << 20,
             group_commit_interval: std::time::Duration::from_secs(2),
+            group_holes: false,
         }
     }
 }

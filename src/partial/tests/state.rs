@@ -1163,10 +1163,10 @@ pub(crate) fn journal_write(file: &fs::File, name: &str, at: u64, bytes: &[u8]) 
     }
     crate::output::range::write_at(file, at, bytes)
 }
-pub(crate) fn journal_sync(file: &fs::File, name: &str, directory: bool) -> std::io::Result<()> {
+pub(crate) fn journal_sync(file: &fs::File, names: &[&str], directory: bool) -> std::io::Result<()> {
     if let Some(JournalFault::Sync { page, directory: wanted, remaining }) = JOURNAL_FAULT.get()
         && directory == wanted
-        && name.starts_with(if page { "p-" } else { "r-" })
+        && names.iter().any(|name| name.starts_with(if page { "p-" } else { "r-" }))
     {
         if remaining > 0 {
             JOURNAL_FAULT.set(Some(JournalFault::Sync { page, directory, remaining: remaining - 1 }));
@@ -1701,4 +1701,47 @@ fn dropping_while_panicking_leaves_the_group_uncommitted() {
     assert_eq!(anchor.sequence(), 2, "the group intent stays anchored");
     let state = PartialState::load(&f.dir.path().join("state"), &anchor, &PartialLimits::default()).unwrap();
     assert_eq!(f.open(state).unwrap().remaining().unwrap(), vec![0..16]);
+}
+
+// Catches a grouped hole (`PartialLimits::group_holes`) paying a transaction of its own, sharing an id with
+// another hole, or being lost once its group commits.
+#[test]
+fn grouped_holes_join_the_open_group_and_commit_with_it() {
+    let f = Fixture::new();
+    let limits = PartialLimits { group_holes: true, ..PartialLimits::default() };
+    let file = f.create_with(limits, ProgressiveLimits::default(), SessionControl::default()).unwrap();
+    let data = b"abcdefghijklmnop";
+    file.core.write_original(0, &data[..4]).unwrap();
+    let sequence = || f.store.current(&f.member).unwrap().unwrap().sequence();
+    let opened = sequence();
+    let first = file.core.hole_report(4..6, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(first.clone(), &[]).unwrap();
+    file.core.write_original(6, &data[6..10]).unwrap();
+    let second = file.core.hole_report(10..12, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(second.clone(), &[]).unwrap();
+    // No anchor moved: the holes are in the open group, and the anchored state (what a crash would reopen) is
+    // still the group's intent, which knows neither hole nor the output after them.
+    assert_eq!(sequence(), opened, "grouped holes add no transaction");
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.revision, second.revision, "a group's holes share its revision");
+    // Committing the group makes both durable.
+    assert_eq!(file.remaining().unwrap(), vec![4..6, 10..16]);
+    assert!(sequence() > opened);
+    let state = file.close().unwrap();
+    let reopened = f.open(state).unwrap();
+    assert_eq!(reopened.remaining().unwrap(), vec![4..6, 10..16]);
+}
+// Catches the opt-in changing anything when it is off, or grouping a hole that is not at the end of the produced
+// output: those still commit in a transaction of their own.
+#[test]
+fn ungrouped_holes_still_commit_on_their_own() {
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    file.core.write_original(0, b"abcd").unwrap();
+    let sequence = || f.store.current(&f.member).unwrap().unwrap().sequence();
+    let before = sequence();
+    let report = file.core.hole_report(4..6, HoleCause::Missing).unwrap();
+    file.core.record_hole_with(report.clone(), &[]).unwrap();
+    assert!(sequence() > before, "without group_holes a hole is its own transaction");
+    assert_eq!(report.id, report.revision);
 }
