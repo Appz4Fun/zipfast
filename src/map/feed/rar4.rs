@@ -78,7 +78,16 @@ fn decode_error(e: Rar4DecodeError, out: &mut OutSink<'_>) -> FeedError {
 
 impl FeedDecoder {
     /// A decoder of a compressed RAR 4.x member, not solid.
-    pub(super) fn new_rar4(member: &MapMember, options: FeedOptions) -> Result<Self, FeedError> {
+    pub(super) fn new_rar4(
+        map: &MemberMap,
+        index: usize,
+        options: FeedOptions,
+        begin: Begin,
+    ) -> Result<Self, FeedError> {
+        let member = &map.members[index];
+        if !matches!(begin, Begin::Fresh | Begin::Restore) {
+            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
+        }
         let size = member.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
         if member.solid {
             return Err(FeedError::Unsupported(FeedUnsupported::Solid));
@@ -157,6 +166,9 @@ impl FeedDecoder {
             run_written: 0,
             failed: false,
             status: FeedStatus::default(),
+            index: 0,
+            stream_start: 0,
+            unproven: false,
             rar5: None,
             lzma2: None,
             rar4: Some(Box::new(Rar4 {

@@ -21,7 +21,6 @@
 //! The lost output is repaired later from the restart point before the hole (a chunk start plus its dictionary, read
 //! back from the sink), or copied straight from the packed bytes when it lies in a stored chunk.
 
-use super::rar5::read_back;
 use super::*;
 use crate::map::lzma2::{header_len, lzma2_dict, parse_chunk, props_valid};
 use crate::map::{Lzma2Chunk, Lzma2ChunkKind, Lzma2Reset};
@@ -525,7 +524,15 @@ enum Skip {
 
 impl FeedDecoder {
     /// A decoder of a member of a 7z folder whose coders are one LZMA2 coder, alone or over 7zAES.
-    pub(super) fn new_lzma2(map: &MemberMap, member: &MapMember, options: FeedOptions) -> Result<Self, FeedError> {
+    pub(super) fn new_lzma2(
+        map: &MemberMap,
+        member: &MapMember,
+        options: FeedOptions,
+        begin: Begin,
+    ) -> Result<Self, FeedError> {
+        if !matches!(begin, Begin::Fresh | Begin::Restore) {
+            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
+        }
         let slot = member.folder.ok_or(FeedError::Malformed("7z member without a folder"))?;
         let folder = map.folders.get(slot.index as usize).ok_or(FeedError::Malformed("7z member's folder"))?;
         let (dict_prop, encrypted) = super::super::open_at::lzma2_coders(&folder.coders)
@@ -626,6 +633,9 @@ impl FeedDecoder {
             run_written: 0,
             failed: false,
             status: FeedStatus::default(),
+            index: 0,
+            stream_start: 0,
+            unproven: false,
             rar5: None,
             rar4: None,
             lzma2: Some(Box::new(Lz {
@@ -938,7 +948,7 @@ impl FeedDecoder {
         if o - d < lz.ss {
             return None;
         }
-        read_back(sink, o - d - lz.ss..o - lz.ss).ok()
+        read_stream(sink, lz.ss, o - d..o).ok()
     }
 
     /// Whether a decoder could restart at state reset `o` from held output: written, or the sink holds it.

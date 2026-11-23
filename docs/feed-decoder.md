@@ -56,6 +56,12 @@ handover (a persistent partial's held output). Compressed members use it to rebu
 at a checkpoint (after a snapshot, for a repair) and to skip holes (below). `Vec<u8>` gives back its bytes up to its
 length, so a `Vec` the caller filled beforehand acts as held output.
 
+`FeedSink::read_earlier(stream_offset, buf) -> usize` (default: nothing held) gives back output of the earlier
+members of the member's solid stream (RAR), at offsets in that stream's output before the member's
+start (`FeedDecoder::stream_start()`). A window that reaches back into earlier members reads it: a solid successor
+started from a carry or restored from a snapshot, and restarts, repairs and skips close after a member's start. See
+[solid streams and folders](#solid-streams-and-folders).
+
 ## Running
 
 `run(&mut source, &mut sink) -> FeedStatus` first advances the main decode from its frontier as far as the source
@@ -71,6 +77,7 @@ has contiguous bytes (holes skipped where the layer allows), then retries each l
 | `done` | every output byte is written |
 | `stalled` | a compressed main decode waits at a hole it cannot skip; the hole's bytes are the first `Next` need |
 | `crc_ok` | once done: whether the output matches the member's CRC32 (keyed with the password where the map says so, as RAR 5.0 AES members' are); None without one |
+| `unproven` | output written so far was decoded from a window not proven yet: seeded from held output past a hole, or handed over from an earlier solid member that was not done with its CRC matched; cleared once done with `crc_ok` true |
 
 `NeedBytes` ranges are exact: a `Next` need is the run of bytes from the frontier the source reported absent, a
 `Repair` need the missing bytes a repair stopped at. Both are cut at piece (volume) boundaries.
@@ -97,10 +104,10 @@ old frontier, and for a 7z member after its folder's first the folder output bef
 | AES-CBC stored (RAR 5.0, RAR 4.x AES-128, the first member of a 7zAES-over-Copy folder): `CbcBlocks` | each block needs the ciphertext block before it: the lost output runs from the start of the block the hole begins in to the end of the block after the one it ends in (`[floor16(start), ceil16(end) + 16)`); the main decode restarts there with the block before as IV |
 | WinZip AES stored: `Counter { skip }` | each byte decrypts on its own: exactly the hole's output is lost |
 | ZipCrypto | refused (`FeedUnsupported::SequentialCipher`): its keystream needs every earlier byte |
-| compressed RAR 5.0 (methods 1-5, AES-256 under them too), not solid | see [compressed RAR 5.0](#compressed-rar-50) |
+| compressed RAR 5.0 (methods 1-5, AES-256 under them too) | see [compressed RAR 5.0](#compressed-rar-50); solid successors [below](#solid-streams-and-folders) |
 | 7z folders of one LZMA2 coder, alone or over 7zAES, any member of the folder | see [7z LZMA2](#7z-lzma2) |
 | compressed RAR 4.x (unpack versions 1.5, 2.0, 2.6, 2.9: LZ, audio, PPMd, filters; AES-128 under them too), not solid | waits at every hole; see [compressed RAR 4.x](#compressed-rar-4x) |
-| solid RAR 5.0 and RAR 4.x members after a stream's first, ZIP compressed members, other 7z coder chains | refused (`Solid`, `Compressed`, `Coders`); see [next](#next) |
+| solid RAR 4.x members after a stream's first, ZIP compressed members, other 7z coder chains | refused (`Solid`, `Compressed`, `Coders`); see [next](#next) |
 
 A repair reads only the lost range's bytes (under CBC, also the block before it as IV) and writes only the lost
 output. A repair that stops at bytes still missing keeps what it decoded, needs only the rest, and next time asks
@@ -205,12 +212,59 @@ the decoder passed are released as it goes (memory stays bounded), so a restored
 bytes from its start again (`Next` needs). The 1.5/2.0 engines and PPMd hold up to 4 KiB of input back as lookahead,
 so their output can trail the bytes fed by that much.
 
+## Solid streams and folders
+
+A solid RAR 5.0 stream decodes its members one after another with one decoder: a member's window (and tables,
+match history) is what the members before it left. `FeedDecoder::next_solid(&mut self, &map, index, options)` starts the decoder of the next member from this
+one's state, once this one's main decode has finished (its frontier at its size), however its repairs stand:
+
+```rust,ignore
+let mut decoders = vec![FeedDecoder::new(&map, first, options.clone())?];
+loop {
+    for (k, d) in decoders.iter_mut().enumerate() {
+        d.run(&mut articles, &mut sinks.member(k))?;     // a sink per member, see read_earlier
+    }
+    let last = decoders.last_mut().unwrap();
+    if last.status().frontier == last.size() && more_members {
+        let next = last.next_solid(&map, next_index, options.clone())?;
+        decoders.push(next);
+    }
+    // ... feed articles, stop once every decoder is done
+}
+```
+
+The earlier decoder keeps its lost ranges and repairs them as before; the new one reads on from where the earlier
+one stopped, so nothing before the new member is decoded again (`redecoded` 0 on a clean feed). A hand-off of
+anything else (not the next member of the stream, a main decode still running, a second hand-off) is
+`FeedError::Handoff`. A member's sink gives the earlier members' output through `read_earlier` (stream offsets),
+the caller's view over the earlier members' files.
+
+**RAR 5.0.** Every member of a solid stream decodes with one window, sized for the stream's largest dictionary
+(`FeedOptions::max_window` bounds it). Checkpoints count stream offsets, and a filter they record addresses from its
+own member's start, so a checkpoint in member N+1 rebuilds its window from member N's output (`read_earlier`) and
+undoes member N's filters there as the decoder held them. At its end a member keeps its decoder for the hand-off
+and its state there as a checkpoint at the next member's start: the **carry**. `solid_carry()` gives it
+(`SolidCarry`, about 500 bytes, `to_bytes`/`from_bytes`, no plaintext or keys), and the member's snapshots keep it
+from then on. `FeedDecoder::resume_solid(&map, index, options, &carry)` starts the next member from it, in this
+process or a later one: its first run reads the window (the dictionary's worth of output before the member) back
+through `read_earlier` (`FeedError::EarlierOutput` when not held), and the decoder state is exact. A finished member
+restored from its snapshot hands over the same way (`next_solid` falls back to its carry). `FeedDecoder::new` on a
+solid successor is `Unsupported(Solid)`: without the carry its window and match history are unknown.
+
+Holes work as in a single member, at stream offsets: a skip over held output reads the window from the earlier
+members' output too, and a repair or restore whose checkpoint window reaches before the member reads it there. A
+member that skipped a hole hands over once its main decode passes its end, with ranges still lost: the next member's
+window holds the held output in those ranges, so it is `unproven` until it is done with its CRC matched (and so is
+its carry, `SolidCarry::unproven`). A member waiting at a hole without held output holds back every member after it
+(the next one starts once its bytes come). A RAR 5.0 restart found at a member's very end (only the cipher's padding
+after it) is not taken; the last block before it is.
+
 ## Saving and restoring
 
 `snapshot()` captures the decoder between runs: the main decode's position (under CBC its block and that block's
 IV; for a compressed member its checkpoint, frontier and the skipped holes' checkpoints and restarts), the lost
 ranges, the CRC runs and the stats. It never holds keys or plaintext. `FeedSnapshot::to_bytes()` and `from_bytes()`
-give a compact versioned encoding (`ZFFD`, version 2; version 1 stored snapshots still load) to keep next to the
+give a compact versioned encoding (`ZFFD`, version 3, which adds `unproven`; versions 1 and 2 still load) to keep next to the
 output file. It records a fingerprint of the member (name, sizes, method, cipher parameters, piece positions), so it
 restores only onto that member.
 `FeedDecoder::restore(&map, member, options, &snapshot)` derives the key again and continues from there: bytes read
@@ -298,14 +352,13 @@ Missing bytes are never an error. `FeedError`: `NoSuchMember`, `Unsupported(Feed
 (the map lists only some pieces), `PasswordRequired`, `WrongPassword`, `Key` (other key-derivation failures:
 limits), `Malformed` (an inconsistent map, checked as `MemberReader` checks it), `SourceContract`, `Write { out,
 error }`, `Canceled`, `Snapshot`, `Decode { out, error }` (compressed data that does not decode, a repair that does
-not meet its restart), `HeldOutput { range }` (a checkpoint's window the sink does not give back), and
-`AlreadyFailed` after a failed run (restore a snapshot instead).
+not meet its restart), `HeldOutput { range }` (a checkpoint's window the sink does not give back),
+`EarlierOutput { range }` (earlier solid members' output, stream offsets, that `read_earlier` does not give),
+`Handoff` (a solid hand-off that does not fit), and `AlreadyFailed` after a failed run (restore a snapshot instead).
 
 ## Next
 
 - 7z LZMA2 under BCJ or Delta (a chain of coders), LZMA (not LZMA2) folders.
-- Solid RAR 5.0 members after the first: the same checkpoints over the solid stream (the window holds earlier
-  members' output).
 - A skip without held output past the hole is impossible for compressed RAR data (see above). RAR 4.x members have no
   restart search at all: a resync over RAR 2.9 LZ blocks (tables at block starts) and cheap decoder checkpoints would
   let holes be skipped and restores start near their frontier.
@@ -395,3 +448,17 @@ against a straight extraction. Also covered:
   backslash (Unix-made);
 - the need-to-article mapping and the priority order;
 - a restart part way (`restart_at`) on the stored RAR 5.0, RAR 4.x and 7z volume sets, with partials and plain files.
+
+Solid RAR 5.0 streams (`tests/feed_decoder_solid.rs`):
+
+- Three members of 220 to 230 KB, each starting with copies of the one before (its window and first match
+  distances reach into the earlier member), plain and AES, in 5,000 to 7,000-byte articles shuffled: handed over
+  member to member, exact, CRCs verified, each byte written once, `redecoded` 0, nothing read back. Holes without held
+  output: the first member waits, nothing after it starts, and once the bytes come all finish exact with `redecoded`
+  0. Holes with held output, one late in member 0 (its lost output is what member 1 copies), one early in member 1
+  (the restart's window reaches into member 0) and one in member 2: every member starts before any repair, the
+  successors are `unproven` until done, a snapshot of member 1 is restored half way through the late articles, and
+  all end exact with `redecoded` 0. A carry taken at member 0's end, serialized, starts member 1 (its window read back
+  from member 0's output), and member 1's snapshot restores across the boundary (under 64 KiB decoded again). An E8
+  filter in member 1 over output member 2 copies is undone relative to member 1's start when member 2 starts from a
+  carry (with the filter undone at the stream's offset instead, member 2's CRC fails).

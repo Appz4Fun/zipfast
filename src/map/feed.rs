@@ -88,6 +88,17 @@ pub trait FeedSink {
         let _ = (offset, buf);
         Ok(0)
     }
+
+    /// Output of the earlier members of the member's solid stream (RAR) at offsets in that stream's output, before
+    /// the member's own start ([`FeedDecoder::stream_start`]): what their decoders wrote, or plaintext known from
+    /// elsewhere. Fills the start of `buf` and returns how many bytes from `stream_offset` it holds, 0 for none.
+    /// Asked only when a window reaches back into earlier members: a solid successor started from a
+    /// [`SolidCarry`], or restored from a snapshot, or a restart, repair or hole skip close after its start. The
+    /// default holds nothing; those then fail with [`FeedError::EarlierOutput`] (a skip waits instead).
+    fn read_earlier(&mut self, stream_offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let _ = (stream_offset, buf);
+        Ok(0)
+    }
 }
 
 impl FeedSink for Vec<u8> {
@@ -154,6 +165,11 @@ pub struct FeedStatus {
     /// Once done: whether the output matched the member's CRC32 (keyed with the password where the map says the
     /// checks are keyed). None when the member records none, or before done.
     pub crc_ok: Option<bool>,
+    /// Output written so far was decoded from a window not proven yet: seeded from held output past a hole (a RAR
+    /// 5.0 skip), or handed over from an earlier solid member that was not done with its CRC matched (a hole it
+    /// skipped, a repair still to come). Cleared once the member is done with `crc_ok` true; a member without a CRC
+    /// stays unproven.
+    pub unproven: bool,
 }
 
 /// Work counters over the decoder's life (restored with a snapshot).
@@ -168,7 +184,8 @@ pub struct FeedStats {
     /// once when it skips it).
     pub holes: u64,
     /// Output decoded again without being written: a compressed repair from its checkpoint up to the lost range,
-    /// and a restored decode from its checkpoint up to the frontier it had reached.
+    /// a restored decode from its checkpoint up to the frontier it had reached, and a 7z member's folder output from
+    /// the last reset before it.
     pub redecoded: u64,
 }
 
@@ -230,7 +247,9 @@ pub enum FeedUnsupported {
     UnmappedCipher,
     /// No recorded unpacked size.
     UnknownSize,
-    /// A solid member after the first of its stream: its window starts with the earlier members' output.
+    /// A solid member after the first of its stream, created without the state the member before it left: start it
+    /// with [`FeedDecoder::next_solid`] or [`FeedDecoder::resume_solid`] (RAR 5.0). Also a hand-off of a layer without
+    /// one.
     Solid,
     /// The member's dictionary is larger than [`FeedOptions::max_window`].
     Window { size: u64 },
@@ -275,6 +294,14 @@ pub enum FeedError {
     HeldOutput {
         range: Range<u64>,
     },
+    /// A window reaching back into the earlier members of a solid stream needs their output `range` (stream
+    /// offsets), which [`FeedSink::read_earlier`] does not give.
+    EarlierOutput {
+        range: Range<u64>,
+    },
+    /// A solid hand-off ([`FeedDecoder::next_solid`], [`FeedDecoder::resume_solid`]) that does not fit: not the next
+    /// member of the stream, the main decode not finished yet, already handed over, or a carry of another stream.
+    Handoff(&'static str),
 }
 
 impl std::fmt::Display for FeedError {
@@ -294,6 +321,8 @@ impl std::fmt::Display for FeedError {
             Self::AlreadyFailed => f.write_str("the decoder failed earlier"),
             Self::Decode { out, error } => write!(f, "decoding at output {out}: {error}"),
             Self::HeldOutput { range } => write!(f, "restoring needs held output {range:?}"),
+            Self::EarlierOutput { range } => write!(f, "needs earlier solid members' output {range:?}"),
+            Self::Handoff(what) => write!(f, "solid hand-off: {what}"),
         }
     }
 }
@@ -649,6 +678,31 @@ impl Geometry {
     }
 }
 
+/// Reads held output at stream offsets `range` of a member whose output starts at stream offset `start`: before the
+/// member from [`FeedSink::read_earlier`], from its start on from [`FeedSink::read_held`] (member offsets). All of
+/// it, or the error naming what is not held.
+pub(super) fn read_stream(sink: &mut dyn FeedSink, start: u64, range: Range<u64>) -> Result<Vec<u8>, FeedError> {
+    let whole = || FeedError::HeldOutput { range: range.start.saturating_sub(start)..range.end.saturating_sub(start) };
+    let len = usize::try_from(range.end.saturating_sub(range.start)).map_err(|_| whole())?;
+    let mut buf = vec![0; len];
+    let mut got = 0;
+    while got < len {
+        let at = range.start + got as u64;
+        let (read, limit) = if at < start {
+            let limit = ((start - at).min((len - got) as u64)) as usize;
+            (sink.read_earlier(at, &mut buf[got..got + limit]), limit)
+        } else {
+            (sink.read_held(at - start, &mut buf[got..]), len - got)
+        };
+        match read {
+            Ok(n) if n > 0 && n <= limit => got += n,
+            _ if at < start => return Err(FeedError::EarlierOutput { range: at..range.end.min(start) }),
+            _ => return Err(FeedError::HeldOutput { range: at - start..range.end - start }),
+        }
+    }
+    Ok(buf)
+}
+
 // ---- Stored layers ----
 
 /// How stream bytes become output in a stored member.
@@ -726,6 +780,12 @@ pub struct FeedDecoder {
     run_written: u64,
     failed: bool,
     status: FeedStatus,
+    /// the member's index in the map
+    index: usize,
+    /// where the member's output starts in its solid stream's (RAR) output; 0 otherwise
+    stream_start: u64,
+    /// output written was decoded from a window not proven yet ([`FeedStatus::unproven`])
+    unproven: bool,
     /// a compressed RAR 5.0 member's decoder state
     rar5: Option<Box<rar5::Rar5>>,
     /// a 7z LZMA2 folder member's decoder state
@@ -749,15 +809,28 @@ impl FeedDecoder {
     /// A decoder of member `index` of `map`. Derives the member's key now (when encrypted), so a wrong password
     /// shows here where the member records a check value.
     pub fn new(map: &MemberMap, index: usize, options: FeedOptions) -> Result<Self, FeedError> {
+        Self::new_begin(map, index, options, Begin::Fresh)
+    }
+
+    fn new_begin(map: &MemberMap, index: usize, options: FeedOptions, begin: Begin) -> Result<Self, FeedError> {
+        let mut d = Self::new_inner(map, index, options, begin)?;
+        d.index = index;
+        Ok(d)
+    }
+
+    fn new_inner(map: &MemberMap, index: usize, options: FeedOptions, begin: Begin) -> Result<Self, FeedError> {
         let member = map.members.get(index).ok_or(FeedError::NoSuchMember { index })?;
         if matches!(member.method, MapMethod::Compressed { .. }) && map.format == super::MapFormat::Rar5 {
-            return Self::new_rar5(member, options);
+            return Self::new_rar5(map, index, options, begin);
         }
         if matches!(member.method, MapMethod::Compressed { .. }) && map.format == super::MapFormat::Rar4 {
-            return Self::new_rar4(member, options);
+            return Self::new_rar4(map, index, options, begin);
         }
         if member.method == MapMethod::Coders && map.format == super::MapFormat::SevenZip {
-            return Self::new_lzma2(map, member, options);
+            return Self::new_lzma2(map, member, options, begin);
+        }
+        if !matches!(begin, Begin::Fresh | Begin::Restore) {
+            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
         }
         match member.method {
             MapMethod::Compressed { id } => return Err(FeedError::Unsupported(FeedUnsupported::Compressed { id })),
@@ -842,6 +915,9 @@ impl FeedDecoder {
             run_written: 0,
             failed: false,
             status: FeedStatus::default(),
+            index: 0,
+            stream_start: 0,
+            unproven: false,
             rar5: None,
             lzma2: None,
             rar4: None,
@@ -1026,7 +1102,8 @@ impl FeedDecoder {
         let stalled = self.rar5.as_ref().is_some_and(|r| r.stalled())
             || self.lzma2.as_ref().is_some_and(|l| l.stalled())
             || self.rar4.as_ref().is_some_and(|r| r.stalled());
-        FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, stalled, crc_ok }
+        let unproven = self.unproven && !(done && crc_ok == Some(true));
+        FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, stalled, crc_ok, unproven }
     }
 
     /// Tells the source which stream bytes no lane will read again: everything before the main decode except what
@@ -1221,6 +1298,7 @@ impl FeedDecoder {
             crc_broken: self.crc.broken,
             stats: self.stats,
             identity: self.identity,
+            unproven: self.unproven,
             layer: match (&self.rar5, &self.lzma2, &self.rar4) {
                 (Some(r), _, _) => Some(r.to_bytes()),
                 (_, Some(l), _) => Some(l.to_bytes()),
@@ -1238,7 +1316,7 @@ impl FeedDecoder {
         options: FeedOptions,
         snapshot: &FeedSnapshot,
     ) -> Result<Self, FeedError> {
-        let mut d = Self::new(map, index, options)?;
+        let mut d = Self::new_begin(map, index, options, Begin::Restore)?;
         if snapshot.tag != d.tag as u8 {
             return Err(FeedError::Snapshot("another layer"));
         }
@@ -1314,9 +1392,220 @@ impl FeedDecoder {
         }
         d.crc = crc;
         d.stats = snapshot.stats;
+        d.unproven = snapshot.unproven;
         d.status = d.make_status(Vec::new(), false);
         Ok(d)
     }
+
+    /// Where the member's output starts in its solid stream's output ([`FeedSink::read_earlier`] offsets count from
+    /// there): for RAR the sizes of the compressed members before it back to the stream's first; 0 for a member that
+    /// is not a solid successor, and for other formats.
+    pub fn stream_start(&self) -> u64 {
+        self.stream_start
+    }
+
+    /// A decoder of member `index`, the next member of this one's RAR 5.0 solid stream, going on from this decoder's
+    /// state: the decoder with its window, tables and match history, so nothing before the new member is decoded
+    /// again. Once this decoder's main decode has finished (its frontier at its size), however
+    /// its repairs stand: this decoder keeps its lost ranges and repairs them as before, and the new one reads from
+    /// where this one stopped.
+    ///
+    /// The new decoder is [`FeedStatus::unproven`] while this one is not done with its CRC matched and this one
+    /// skipped a hole over held output (or failed its CRC). A RAR 5.0 decoder restored from a snapshot after it
+    /// finished hands over from the state it saved at its end (as [`Self::resume_solid`]); others refuse
+    /// ([`FeedError::Handoff`]).
+    pub fn next_solid(&mut self, map: &MemberMap, index: usize, options: FeedOptions) -> Result<Self, FeedError> {
+        if self.rar5.is_some() {
+            return self.handoff_rar5(map, index, options);
+        }
+        Err(FeedError::Unsupported(FeedUnsupported::Solid))
+    }
+
+    /// Whether the output this decoder hands to a solid successor was decoded from an unproven window.
+    fn carried_unproven(&self) -> bool {
+        let s = &self.status;
+        match (s.done, s.crc_ok) {
+            (true, Some(true)) => false,
+            (true, Some(false)) => true,
+            _ => self.unproven,
+        }
+    }
+
+    /// RAR 5.0: the state a solid successor starts from, once this member's main decode has finished (and kept in
+    /// this decoder's snapshots from then on): the decoder state between this member's last block and the next
+    /// member's first, without the window. [`Self::resume_solid`] starts the next member from it, in this process or
+    /// a later one, reading the window back from the earlier members' output ([`FeedSink::read_earlier`]). None
+    /// before then, for a member with no solid successor, and for other layers.
+    pub fn solid_carry(&self) -> Option<SolidCarry> {
+        let r = self.rar5.as_ref()?;
+        r.carry_blob().map(|(next_start, cp)| SolidCarry {
+            tag: LayerTag::Rar5 as u8,
+            next_start,
+            unproven: self.carried_unproven(),
+            cp,
+        })
+    }
+
+    /// A decoder of member `index`, a RAR 5.0 solid successor, starting from `carry` (taken from the member before
+    /// it with [`Self::solid_carry`]). Its first run reads the window (the dictionary's worth of output before the
+    /// member) back from [`FeedSink::read_earlier`], and fails with [`FeedError::EarlierOutput`] when it is not held.
+    /// The decoder state is exact, so the output is as proven as the earlier members' output it copies from (see
+    /// [`SolidCarry::unproven`]).
+    pub fn resume_solid(
+        map: &MemberMap,
+        index: usize,
+        options: FeedOptions,
+        carry: &SolidCarry,
+    ) -> Result<Self, FeedError> {
+        if carry.tag != LayerTag::Rar5 as u8 {
+            return Err(FeedError::Handoff("a carry of another layer"));
+        }
+        let mut d = Self::new_begin(map, index, options, Begin::Carry(carry.clone()))?;
+        d.unproven = carry.unproven;
+        d.status = d.make_status(Vec::new(), false);
+        Ok(d)
+    }
+}
+
+/// How a decoder starts.
+enum Begin {
+    /// at the member's start
+    Fresh,
+    /// in [`FeedDecoder::restore`]: the snapshot gives the state
+    Restore,
+    /// a RAR 5.0 solid successor from a carry
+    Carry(SolidCarry),
+    /// a RAR 5.0 solid successor going on from the decoder of the member before
+    Rar5(Box<crate::rar5::unpack::Unpacker>, SolidCarry),
+}
+
+/// The state a RAR 5.0 solid successor starts from ([`FeedDecoder::solid_carry`]): about 500 bytes, no plaintext
+/// or keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SolidCarry {
+    tag: u8,
+    /// the successor's start in the solid stream's output
+    next_start: u64,
+    unproven: bool,
+    /// the decoder state at the successor's start
+    cp: Vec<u8>,
+}
+
+const CARRY_MAGIC: &[u8; 4] = b"ZFSC";
+
+impl SolidCarry {
+    /// Where the next member starts in the solid stream's output.
+    pub fn next_start(&self) -> u64 {
+        self.next_start
+    }
+
+    /// Whether the earlier members' output was unproven when it was taken: a hole skipped over held output whose
+    /// member was not done with its CRC matched yet. The successor reports [`FeedStatus::unproven`] then.
+    pub fn unproven(&self) -> bool {
+        self.unproven
+    }
+
+    /// The serialized form.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24 + self.cp.len());
+        out.extend_from_slice(CARRY_MAGIC);
+        out.push(1);
+        out.push(self.tag);
+        out.extend_from_slice(&self.next_start.to_le_bytes());
+        out.push(u8::from(self.unproven));
+        out.extend_from_slice(&(self.cp.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.cp);
+        out
+    }
+
+    /// Decodes [`Self::to_bytes`]; [`FeedDecoder::resume_solid`] checks it against the member.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FeedError> {
+        let mut r = Reader(bytes);
+        if r.take(4)? != CARRY_MAGIC {
+            return Err(FeedError::Snapshot("not a solid carry"));
+        }
+        if r.u8()? != 1 {
+            return Err(FeedError::Snapshot("unknown version"));
+        }
+        let tag = r.u8()?;
+        let next_start = r.u64()?;
+        let unproven = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(FeedError::Snapshot("bad flag")),
+        };
+        let n = usize::try_from(r.u64()?).map_err(|_| FeedError::Snapshot("bad count"))?;
+        let cp = r.take(n)?.to_vec();
+        if !r.0.is_empty() {
+            return Err(FeedError::Snapshot("trailing bytes"));
+        }
+        Ok(Self { tag, next_start, unproven, cp })
+    }
+}
+
+/// A member's place in its RAR solid stream.
+struct SolidRun {
+    /// the member's start in the stream's output
+    start: u64,
+    /// the starts of the stream's members up to this one, ascending (this one's last)
+    starts: Vec<u64>,
+    /// the compressed member before this one in the stream, when this one is a solid successor
+    prev: Option<usize>,
+    /// a solid member follows this one
+    successor: bool,
+    /// the largest dictionary of the stream's members
+    dictionary: Option<u64>,
+}
+
+/// Where member `index` lies in its RAR solid stream. Only compressed files take part (directories and stored
+/// members pass the decoder by, as extraction treats them); a compressed member without the solid flag starts a
+/// new stream.
+fn solid_run(map: &MemberMap, index: usize) -> Result<SolidRun, FeedError> {
+    let decodes = |m: &MapMember| !m.is_dir && matches!(m.method, MapMethod::Compressed { .. });
+    let members = &map.members;
+    let mut first = index;
+    if members[index].solid {
+        for i in (0..index).rev() {
+            if decodes(&members[i]) {
+                first = i;
+                if !members[i].solid {
+                    break;
+                }
+            }
+        }
+    }
+    let mut starts = Vec::new();
+    let mut at = 0u64;
+    let mut prev = None;
+    for (i, m) in members.iter().enumerate().take(index).skip(first) {
+        if !decodes(m) {
+            continue;
+        }
+        starts.push(at);
+        prev = Some(i);
+        let size = m.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
+        at = at.checked_add(size).ok_or(FeedError::Malformed("solid stream size overflows"))?;
+    }
+    starts.push(at);
+    // the stream runs on to the last solid member after this one; its window fits the largest dictionary
+    let mut dictionary = None;
+    for (i, m) in members.iter().enumerate().skip(first) {
+        if i != index && !decodes(m) {
+            continue;
+        }
+        if i > index && !m.solid {
+            break;
+        }
+        dictionary = dictionary.max(m.dictionary);
+    }
+    let successor = members[index + 1..].iter().find(|m| decodes(m)).is_some_and(|m| m.solid);
+    Ok(SolidRun { start: at, starts, prev, successor, dictionary })
+}
+
+/// [`member_identity`] of a solid successor, bound to its place in the stream too (the sizes before it).
+fn solid_identity(m: &MapMember, stream_start: u64) -> u64 {
+    let h = member_identity(m);
+    if stream_start == 0 { h } else { (h ^ stream_start).wrapping_mul(0x0000_0100_0000_01b3) }
 }
 
 /// A fingerprint of a member as the map describes it (name, sizes, method, cipher parameters and where its pieces
@@ -1400,12 +1689,14 @@ pub struct FeedSnapshot {
     stats: FeedStats,
     /// the member's fingerprint ([`member_identity`])
     identity: u64,
+    /// [`FeedStatus::unproven`] before done
+    unproven: bool,
     /// a compressed layer's state: RAR 5.0 checkpoints and repairs, LZMA2 restart points and repairs
     layer: Option<Vec<u8>>,
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"ZFFD";
-const SNAPSHOT_VERSION: u8 = 2;
+const SNAPSHOT_VERSION: u8 = 3;
 /// The most lost ranges or CRC runs a snapshot may list.
 const SNAPSHOT_MAX_RANGES: u64 = 1 << 20;
 
@@ -1465,6 +1756,7 @@ impl FeedSnapshot {
                 out.extend_from_slice(blob);
             }
         }
+        out.push(u8::from(self.unproven));
         out
     }
 
@@ -1522,10 +1814,16 @@ impl FeedSnapshot {
                 _ => return Err(FeedError::Snapshot("bad flag")),
             }
         }
+        let unproven = version >= 3
+            && match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(FeedError::Snapshot("bad flag")),
+            };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
-        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, identity, layer })
+        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, identity, unproven, layer })
     }
 }
 

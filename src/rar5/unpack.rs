@@ -1824,7 +1824,12 @@ impl Unpacker {
 
     fn run_filter(&mut self, f: Filter, sink: &mut dyn Sink) -> Result<()> {
         if let Some(seen) = &mut self.seen {
-            seen.push(SeenFilterRec { start: self.file_base + f.start, len: f.len, kind: f.kind });
+            seen.push(SeenFilterRec {
+                start: self.file_base + f.start,
+                len: f.len,
+                kind: f.kind,
+                base: self.file_base,
+            });
         }
         let n = f.len as usize;
         let mut data = std::mem::take(&mut self.scratch);
@@ -1849,12 +1854,14 @@ impl Unpacker {
     }
 }
 
-/// A filter a decoder ran: stream offsets `start..start + len`.
+/// A filter a decoder ran: stream offsets `start..start + len`, in the file that starts at stream offset `base` (a
+/// filter addresses relative to its file's start, and never covers output of another file).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SeenFilterRec {
     pub(crate) start: u64,
     pub(crate) len: u64,
     kind: FilterKind,
+    pub(crate) base: u64,
 }
 
 impl SeenFilterRec {
@@ -1868,7 +1875,7 @@ impl SeenFilterRec {
         }
     }
 
-    pub(crate) fn from_code(start: u64, len: u64, code: u8) -> Option<Self> {
+    pub(crate) fn from_code(start: u64, len: u64, code: u8, base: u64) -> Option<Self> {
         let kind = match code {
             1 => FilterKind::E8,
             2 => FilterKind::E8E9,
@@ -1876,7 +1883,7 @@ impl SeenFilterRec {
             0x40..=0x7F => FilterKind::Delta(code - 0x40),
             _ => return None,
         };
-        (len > 0 && len <= MAX_FILTER_LEN).then_some(Self { start, len, kind })
+        (len > 0 && len <= MAX_FILTER_LEN && base <= start).then_some(Self { start, len, kind, base })
     }
 }
 
@@ -1942,13 +1949,15 @@ impl Unpacker {
         })
     }
 
-    /// A decoder of a member (alone in its stream, of output size `size`) restarted at `cp`, recording filters.
-    /// `known` is the member's output from `known_base`, covering `cp.sp - reach` (or 0) to `cp.sp` and every
-    /// recorded filter's output; filtered bytes are undone into the window, as the decoder held them. Feed it the
-    /// packed bytes from the block after the checkpoint on.
+    /// A decoder of a member (of output size `size`, starting at stream offset `member_start` of its solid stream, 0
+    /// when it stands alone) restarted at `cp`, recording filters. `known` is the stream's output from `known_base`,
+    /// covering `cp.sp - reach` (or 0) to `cp.sp` and every recorded filter's output, which may lie in earlier files
+    /// of a solid stream; filtered bytes are undone into the window, as the decoder held them. Feed it the packed
+    /// bytes from the block after the checkpoint on.
     pub(crate) fn from_checkpoint(
         window: Window,
         cp: &UnpackCheckpoint,
+        member_start: u64,
         size: Option<u64>,
         known_base: u64,
         known: &[u8],
@@ -1975,7 +1984,7 @@ impl Unpacker {
                 continue;
             }
             let mut bytes = known[(f.start - known_base) as usize..(end - known_base) as usize].to_vec();
-            unapply_filter(f.kind, f.start, &mut bytes);
+            unapply_filter(f.kind, f.start - f.base, &mut bytes);
             for (i, &b) in bytes.iter().enumerate() {
                 let at = f.start + i as u64;
                 if at >= from {
@@ -1983,9 +1992,14 @@ impl Unpacker {
                 }
             }
         }
+        if member_start > offset {
+            return Err(Error::Unsupported(format!(
+                "a RAR 5.0 checkpoint at stream offset {offset} inside a member that starts later, at {member_start}"
+            )));
+        }
         u.sp = offset;
-        u.file_base = 0;
-        u.emitted = offset;
+        u.file_base = member_start;
+        u.emitted = offset - member_start;
         u.history = cp.history;
         u.last_len = cp.last_len;
         match &cp.lens {
