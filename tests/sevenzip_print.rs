@@ -318,3 +318,26 @@ fn a_member_over_the_spool_cap_fails_and_prints_nothing() {
     assert_eq!(out.len(), 5_999 + 2_999 + 18 + 9);
     assert_eq!(summary.files, 4);
 }
+
+/// A sink that cancels while it takes a short member's last (only) chunk ends the run as canceled, whether the member
+/// was held in memory or on disk.
+#[test]
+fn a_cancel_on_a_short_members_last_chunk_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    for limits in [SevenZipLimits::default(), on_disk(dir.path())] {
+        let cancel = Cancellation::default();
+        let result = sevenzip::print_selected_with(
+            &fixture("7z-extract/solid.7z"),
+            None,
+            &mut |_, name| name == "text/tiny.txt",
+            &mut |_, _| {
+                cancel.cancel();
+                Ok(())
+            },
+            &cancel,
+            &limits,
+        );
+        let error = result.expect_err("canceled");
+        assert!(matches!(sevenzip::SevenZipError::of(&error), Some(sevenzip::SevenZipError::Canceled)), "{error}");
+    }
+}

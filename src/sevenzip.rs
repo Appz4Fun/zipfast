@@ -74,11 +74,14 @@ pub struct SevenZipLimits {
     /// may hold back until its CRC checks out: 8 GiB. A larger member fails with
     /// [`SevenZipLimit::SpoolBytes`] as soon as it goes past this, prints nothing, and the run goes on.
     pub spool_member_bytes: u64,
-    /// Plaintext a member holds back in memory before it moves to a temporary file: 1 MiB, so short members never
-    /// touch the disk.
+    /// Plaintext all held-back members keep in memory together: 1 MiB, so short members never touch the disk.
+    /// Past it a member moves to the run's temporary file. A folder that holds its members back for its own CRC
+    /// counts them all against this, however many there are.
     pub spool_memory_bytes: u64,
-    /// The folder for a member's temporary file: the system's temporary folder by default. The file is unlinked as
-    /// it is made (it has no name in the folder), so nothing is left behind however the process ends.
+    /// The folder for the run's temporary file: the system's temporary folder by default. The run keeps one such
+    /// file, each held member a range of it, and it is unlinked as it is made (it has no name in the folder), so
+    /// nothing is left behind however the process ends, and the run uses one descriptor however many members it
+    /// holds back.
     pub spool_dir: Option<std::path::PathBuf>,
 }
 

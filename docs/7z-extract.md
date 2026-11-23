@@ -62,10 +62,12 @@ for several members of one solid folder `print_selected` is the cheaper route. A
 7-Zip prints an encrypted member's data before its CRC fails (a wrong password on a Copy folder); zipfast withholds
 a member until it checks out.
 
-Held-back plaintext stays in memory up to `SevenZipLimits::spool_memory_bytes` (1 MiB), then moves to a temporary
-file in `spool_dir` (the system's temporary folder by default) that is unlinked as it is made: it has no name, is
-written and read back through one descriptor, and vanishes with the descriptor, so neither a crash nor `SIGKILL`
-leaves decrypted data on disk. A member that would hold back more than `spool_member_bytes` (8 GiB) fails with
+Held-back plaintext stays in memory while all held members together keep at most
+`SevenZipLimits::spool_memory_bytes` (1 MiB); past that a member moves to the run's one temporary file in `spool_dir`
+(the system's temporary folder by default), as a range of it. The file is unlinked as it is made: it has no name, is
+written and read back at each member's offsets through its one descriptor, and vanishes with the descriptor, so
+neither a crash nor `SIGKILL` leaves decrypted data on disk, and a folder that holds back many members (for its own
+CRC) uses one descriptor and bounded memory. A member that would hold back more than `spool_member_bytes` (8 GiB) fails with
 `SevenZipLimit::SpoolBytes` as soon as it goes past it, prints nothing, and the run goes on. Holding back and
 copying out check for cancellation every chunk.
 
