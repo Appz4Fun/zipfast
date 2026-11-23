@@ -33,7 +33,7 @@ bounded:
   source holds them again). Offsets are a volume's own byte offsets, as `MapPiece::packed` gives them.
 - `absent(volume, range)` (optional): the parts of a range not held, listed as `NeedKind::Ahead`.
 - `release(volume, range)` (optional hint): bytes the decoder will not read again, so the source may drop them.
-  Bytes a lost range's repair still needs are not released.
+  Everything the main decode passed is released, also past holes, except the bytes a lost range's repair still reads.
 
 `ArticleBuffer::new(limit)` is an in-memory source: `insert(volume, offset, bytes)` in any order (overlaps keep
 the bytes already held; `BufferFull` when the limit would be passed, storing nothing, so the caller holds them
@@ -93,7 +93,9 @@ the source for one byte at the point it stopped before reading anything again.
 
 `snapshot()` captures the decoder between runs: the main decode's position (under CBC its block and that block's
 IV), the lost ranges, the CRC runs and the stats. It never holds keys or plaintext. `FeedSnapshot::to_bytes()` and
-`from_bytes()` give a compact versioned encoding (`ZFFD`, version 1) to keep next to the output file.
+`from_bytes()` give a compact versioned encoding (`ZFFD`, version 1) to keep next to the output file. It records a
+fingerprint of the member (name, sizes, method, cipher parameters, piece positions), so it restores only onto that
+member.
 `FeedDecoder::restore(&map, member, options, &snapshot)` derives the key again and continues from there: bytes read
 past the frontier short of a block are read again, and lost ranges are repaired as before. A snapshot of another
 member or layer is `FeedError::Snapshot`. Persistent partials (`docs/persistent-partials.md`) remain the durable,

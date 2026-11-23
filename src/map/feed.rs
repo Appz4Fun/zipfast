@@ -483,10 +483,6 @@ impl RangeSet {
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-
-    fn first_start(&self) -> Option<u64> {
-        self.0.keys().next().copied()
-    }
 }
 
 /// CRC32s of the output written, per run of contiguous output: start -> (end, crc).
@@ -659,8 +655,10 @@ pub struct FeedDecoder {
     blocked: BTreeMap<u64, u64>,
     crc: CrcRuns,
     stats: FeedStats,
-    /// the stream offset below which bytes were released to the source
-    released: u64,
+    /// stream ranges released to the source
+    released: RangeSet,
+    /// the member's fingerprint, binding snapshots to it
+    identity: u64,
     options: FeedOptions,
     buf: Vec<u8>,
     scratch: Vec<u8>,
@@ -722,7 +720,9 @@ impl FeedDecoder {
         }
         let usage = Usage::new(options.limits.clone());
         let mut hash_key = None;
-        let cipher = if member.encrypted && size > 0 {
+        // an empty member needs no key, unless its CRC is keyed with the password
+        let keyed_crc = member.checks.is_some_and(|c| c.keyed && c.crc32.is_some());
+        let cipher = if member.encrypted && (size > 0 || keyed_crc) {
             let keys =
                 derive_keys(member, mapping, options.password.as_deref(), &options.limits, &usage, &options.control)
                     .map_err(FeedError::from_extract)?;
@@ -758,7 +758,8 @@ impl FeedDecoder {
             blocked: BTreeMap::new(),
             crc: CrcRuns::default(),
             stats: FeedStats::default(),
-            released: 0,
+            released: RangeSet::default(),
+            identity: member_identity(member),
             options,
             buf: vec![0; chunk],
             scratch: Vec::new(),
@@ -925,7 +926,8 @@ impl FeedDecoder {
         FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, crc_ok }
     }
 
-    /// Tells the source which stream bytes no lane will read again.
+    /// Tells the source which stream bytes no lane will read again: everything before the main decode except what
+    /// the repairs of lost ranges read.
     fn release(&mut self, source: &mut dyn PackedSource) {
         let mut low = self.stream_len;
         if let Some(l) = &self.main {
@@ -937,14 +939,20 @@ impl FeedDecoder {
             };
             low = low.min(from);
         }
-        if let Some(a) = self.lost.first_start() {
-            low = low.min(self.lane_at(a, self.size).pos);
+        let mut free = RangeSet::default();
+        free.insert(0..low);
+        for r in self.lost.ranges() {
+            let lane = self.lane_at(r.start, r.end);
+            free.remove(lane.pos..lane.end);
         }
-        if low > self.released {
-            for (volume, range) in self.geometry.volume_ranges(self.released..low) {
+        for r in self.released.ranges() {
+            free.remove(r);
+        }
+        for r in free.ranges() {
+            for (volume, range) in self.geometry.volume_ranges(r.clone()) {
                 source.release(volume, range);
             }
-            self.released = low;
+            self.released.insert(r);
         }
     }
 
@@ -1112,7 +1120,7 @@ impl FeedDecoder {
             crc: self.crc.runs.iter().map(|(&s, &(e, c))| (s, e, c)).collect(),
             crc_broken: self.crc.broken,
             stats: self.stats,
-            released: self.released,
+            identity: self.identity,
         }
     }
 
@@ -1128,7 +1136,11 @@ impl FeedDecoder {
         if snapshot.tag != d.tag as u8 {
             return Err(FeedError::Snapshot("another layer"));
         }
-        if snapshot.size != d.size || snapshot.stream_len != d.stream_len || snapshot.want_crc != d.want_crc {
+        if snapshot.identity != d.identity
+            || snapshot.size != d.size
+            || snapshot.stream_len != d.stream_len
+            || snapshot.want_crc != d.want_crc
+        {
             return Err(FeedError::Snapshot("another member"));
         }
         let size = d.size;
@@ -1179,10 +1191,32 @@ impl FeedDecoder {
         }
         d.crc = crc;
         d.stats = snapshot.stats;
-        d.released = snapshot.released.min(d.stream_len);
         d.status = d.make_status(Vec::new(), false);
         Ok(d)
     }
+}
+
+/// A fingerprint of a member as the map describes it (name, sizes, method, cipher parameters and where its pieces
+/// lie), so a snapshot restores only onto the member it was taken of: FNV-1a over those fields.
+fn member_identity(m: &MapMember) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    eat(&(m.raw_name.len() as u64).to_le_bytes());
+    eat(&m.raw_name);
+    eat(&m.unpacked_size.unwrap_or(u64::MAX).to_le_bytes());
+    eat(&m.packed_size.to_le_bytes());
+    eat(format!("{:?}|{:?}|{:?}|{:?}", m.method, m.mapping, m.cipher, m.checks).as_bytes());
+    for p in &m.pieces {
+        for v in [u64::from(p.volume), p.packed.start, p.packed.end, p.stream_offset] {
+            eat(&v.to_le_bytes());
+        }
+    }
+    h
 }
 
 /// XORs WinZip AES keystream into `data`, whose first byte is ciphertext offset `offset` (after the salt and
@@ -1215,7 +1249,8 @@ pub struct FeedSnapshot {
     crc: Vec<(u64, u64, u32)>,
     crc_broken: bool,
     stats: FeedStats,
-    released: u64,
+    /// the member's fingerprint ([`member_identity`])
+    identity: u64,
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"ZFFD";
@@ -1268,7 +1303,7 @@ impl FeedSnapshot {
             out.extend_from_slice(&e.to_le_bytes());
             out.extend_from_slice(&c.to_le_bytes());
         }
-        for v in [self.stats.packed_read, self.stats.written, self.stats.holes, self.released] {
+        for v in [self.stats.packed_read, self.stats.written, self.stats.holes, self.identity] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
@@ -1313,11 +1348,11 @@ impl FeedSnapshot {
             crc.push((r.u64()?, r.u64()?, r.u32()?));
         }
         let stats = FeedStats { packed_read: r.u64()?, written: r.u64()?, holes: r.u64()? };
-        let released = r.u64()?;
+        let identity = r.u64()?;
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
-        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, released })
+        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, identity })
     }
 }
 

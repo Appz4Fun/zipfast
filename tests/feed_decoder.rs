@@ -425,3 +425,43 @@ fn refusals_and_failures_are_typed() {
     assert!(matches!(FeedDecoder::restore(&map, 0, FeedOptions::new(Some("pw")), &snap), Err(FeedError::Snapshot(_))));
     assert!(matches!(FeedSnapshot::from_bytes(b"ZFFD\x01"), Err(FeedError::Snapshot(_))));
 }
+
+#[test]
+fn bytes_past_an_early_hole_are_released_too() {
+    let case = &cases()[1];
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+    let mut decoder = FeedDecoder::new(&map, 0, FeedOptions::new(case.password)).unwrap();
+    // a buffer of three articles: the decode must let go of what it passed, also past the hole
+    let mut source = ArticleBuffer::new(3_000);
+    let mut sink = Once::default();
+    let all = articles(&case.volumes, 1_000);
+    let (lost_v, lost_off, lost_bytes) = all[3].clone();
+    source.mark_lost(lost_v, lost_off..lost_off + 1_000);
+    for (i, a) in all.iter().enumerate() {
+        if i != 3 {
+            source.insert(a.0, a.1, &a.2).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+    }
+    let status = decoder.status().clone();
+    assert_eq!(status.lost.len(), 1);
+    source.insert(lost_v, lost_off, &lost_bytes).unwrap();
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert!(status.done && status.crc_ok == Some(true));
+    assert_eq!(sink.out, case.plain);
+}
+
+#[test]
+fn snapshots_bind_to_their_member_and_empty_keyed_members_verify() {
+    let (a, b) = (data(3_000, 1), data(3_000, 2));
+    let bytes = common::archive(&[FileSpec::new("a.bin", &a), FileSpec::new("b.bin", &b)]);
+    let map = MemberMap::from_memory(&[&bytes], "two.rar", None).unwrap();
+    let snap = FeedDecoder::new(&map, 1, FeedOptions::default()).unwrap().snapshot();
+    assert!(matches!(FeedDecoder::restore(&map, 0, FeedOptions::default(), &snap), Err(FeedError::Snapshot(_))));
+    assert!(FeedDecoder::restore(&map, 1, FeedOptions::default(), &snap).is_ok());
+    // an empty AES member whose CRC is keyed with the password
+    let empty = rar5_encrypted(&[], &[]);
+    let map = MemberMap::from_memory(&refs(&empty), "e.rar", Some("pw")).unwrap();
+    let decoder = FeedDecoder::new(&map, 0, FeedOptions::new(Some("pw"))).unwrap();
+    assert_eq!((decoder.status().done, decoder.status().crc_ok), (true, Some(true)));
+}
