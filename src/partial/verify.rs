@@ -112,8 +112,9 @@ impl Verification {
         hash_key: Option<&[u8; 32]>,
     ) -> PartialResult<Self> {
         // Checks the caller supplied for an abandoned tail are plain, whatever the archive keys.
-        let keyed =
-            snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc) && snapshot.head.tail != Some(TailChecks::Supplied);
+        let keyed = (snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc)
+            || snapshot.evidence.direct.as_ref().is_some_and(|d| d.keyed.is_some()))
+            && snapshot.head.tail != Some(TailChecks::Supplied);
         let password_required = keyed
             && hash_key.is_none()
             && (snapshot.head.checks.crc32.is_some() || snapshot.head.checks.blake2sp.is_some());
@@ -335,10 +336,13 @@ impl PartialCore {
         let size = op.snapshot.head.size;
         let holes = ledger::Ledger { known: &mut op.snapshot.known, size, budget: &self.budget }.remaining()?;
         self.check(&op)?;
-        if password_required && op.snapshot.head.member_finished && holes.is_empty() && !pending {
+        // A direct member has no extraction to finish: its checks came from the map, and every byte written once
+        // is all it needs.
+        let finished = op.snapshot.head.member_finished || op.snapshot.evidence.direct.is_some();
+        if password_required && finished && holes.is_empty() && !pending {
             return Err(err(PartialErrorKind::PasswordRequired));
         }
-        if !op.snapshot.head.member_finished || !holes.is_empty() || missing_checks || pending || password_required {
+        if !finished || !holes.is_empty() || missing_checks || pending || password_required {
             Ok(Poll::Ready(Verdict::Incomplete { revision, holes, parts, missing_checks }))
         } else {
             // The operation token excludes mutation; callbacks have completed and

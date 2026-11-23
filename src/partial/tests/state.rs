@@ -170,6 +170,7 @@ impl Fixture {
                 packed: frame.extent.clone(),
                 bytes: bytes[frame.extent.start as usize..frame.extent.end as usize].to_vec(),
             }],
+            direct: None,
         };
         Self {
             dir,
@@ -709,6 +710,7 @@ fn split_fixture() -> (Fixture, EvidenceUpdate) {
                 packed: frame.extent.clone(),
                 bytes: bytes[..frame.extent.end as usize].to_vec(),
             }],
+            direct: None,
         }
     };
     f.evidence = part(0, 0);

@@ -278,7 +278,9 @@ fn held_bundle(bundle_path: &Path, name: &str, output_root: &Path, options: &Hel
 /// The held output of `snapshot`, written at `output_path`.
 pub(super) fn held_from_snapshot(snapshot: &Snapshot, output_path: PathBuf) -> HeldOutput {
     let head = &snapshot.head;
-    let keyed = snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc) && head.tail != Some(TailChecks::Supplied);
+    let keyed = (snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc)
+        || snapshot.evidence.direct.as_ref().is_some_and(|d| d.keyed.is_some()))
+        && head.tail != Some(TailChecks::Supplied);
     let checks =
         (!keyed && (head.checks.crc32.is_some() || head.checks.blake2sp.is_some())).then(|| head.checks.clone());
     let mut good: Vec<Range<u64>> = snapshot.known.iter().map(|leaf| leaf.range.clone()).collect();
@@ -286,6 +288,11 @@ pub(super) fn held_from_snapshot(snapshot: &Snapshot, output_path: PathBuf) -> H
     let good = merge(good);
     let mut holes: Vec<Range<u64>> = snapshot.holes.iter().map(|hole| hole.out.clone()).collect();
     holes.sort_by_key(|r| r.start);
+    let good = subtract(&good, &merge(holes));
+    // A direct member has no extraction: it is finished once every byte is written.
+    let finished = head.member_finished
+        || (snapshot.evidence.direct.is_some() && good.first().is_some_and(|r| *r == (0..head.size)))
+        || (snapshot.evidence.direct.is_some() && head.size == 0);
     HeldOutput {
         output_path,
         relative_output: head.relative_output.clone(),
@@ -293,8 +300,8 @@ pub(super) fn held_from_snapshot(snapshot: &Snapshot, output_path: PathBuf) -> H
         name: snapshot.name.clone(),
         size: head.size,
         checks,
-        finished: head.member_finished,
-        good: subtract(&good, &merge(holes)),
+        finished,
+        good,
     }
 }
 

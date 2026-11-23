@@ -145,9 +145,10 @@ pub struct Report {
     pub deliveries: usize,
     /// Deliveries where the priority list picked another article than the next arrival.
     pub picks: usize,
-    /// From the first byte of work (the partials' genesis) to every member written, committed and verified.
+    /// From the first byte of work (creating the decoders and the partials) to every member written, committed and
+    /// verified.
     pub wall: Duration,
-    /// Creating the persistent partials (part of `wall`).
+    /// Creating the persistent partials from the map (part of `wall`).
     pub genesis: Duration,
     /// Decoder runs after a repair arrived (part of `wall`).
     pub repair_time: Duration,
@@ -503,15 +504,13 @@ impl FeedSink for FileSink {
 
 #[cfg(feature = "persistent-partials")]
 mod persistent {
-    //! The persistent-partial sink. A `PartialFile` exists only for a member a persistent session created, so the
-    //! partials are made by a "genesis" session that reads the set's headers and is told every data byte is a hole
-    //! (nothing has arrived yet): each admitted member gets its output file at full size, its state bundle and an
-    //! anchor, with its whole output one hole per volume piece. From then on the feed decoder's output reaches the
-    //! partial as plaintext fills of those holes, through a `FillWriter`, which joins the open group commit: one
-    //! durable commit per `group_commit_bytes` of output, not per write.
+    //! The persistent-partial sink: a `PartialFile` per member, created straight from the member map by
+    //! `DirectPartials` (no session, no header read again). Each is born at full size with nothing written, and
+    //! the feed decoder's output reaches it through a `DirectSink`, whose writes join the open group commit: one
+    //! durable commit per `group_commit_bytes` of output, not per write. A restart finds the same partials again
+    //! (`DirectOrigin::Adopted`).
 
     use super::*;
-    use std::io::Write;
     use std::task::{Context, Poll, Waker};
     use zipfast::partial::*;
     use zipfast::progressive::*;
@@ -522,28 +521,24 @@ mod persistent {
     }
 
     pub(super) struct PartialSink {
-        file: PartialFile,
-        reader: File,
-        written: Ranges,
-    }
-
-    fn io_err(e: PartialError) -> io::Error {
-        io::Error::other(e.to_string())
+        sink: DirectSink,
     }
 
     impl PartialSink {
         pub(super) fn path(&self) -> PathBuf {
-            self.file.output_path().to_path_buf()
+            self.sink.file().output_path().to_path_buf()
         }
         /// Commits the open group and verifies the member's checks (`Verdict::Ok` once every byte is known).
-        pub(super) fn finish(mut self) -> Result<bool, String> {
-            self.file.remaining().map_err(|e| e.to_string())?;
+        pub(super) fn finish(self) -> Result<bool, String> {
+            let path = self.path();
+            let mut file = self.sink.into_file();
+            file.remaining().map_err(|e| e.to_string())?;
             let mut cx = Context::from_waker(Waker::noop());
             loop {
-                match self.file.poll_verify(&mut cx) {
+                match file.poll_verify(&mut cx) {
                     Poll::Ready(Ok(Verdict::Ok { .. })) => return Ok(true),
                     Poll::Ready(Ok(other)) => {
-                        eprintln!("partial {}: {other:?}", self.path().display());
+                        eprintln!("partial {}: {other:?}", path.display());
                         return Ok(false);
                     }
                     Poll::Ready(Err(e)) => return Err(e.to_string()),
@@ -555,103 +550,35 @@ mod persistent {
 
     impl FeedSink for PartialSink {
         fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
-            // A writer per call: `flush` hands the bytes to the open group (no durable work of its own), and the
-            // writer is dropped with nothing buffered. The group commits at its size or interval, or when the
-            // handle's next ordinary operation runs.
-            let mut writer = self.file.fill_writer(offset).map_err(io_err)?;
-            writer.write_all(bytes)?;
-            writer.flush()?;
-            drop(writer);
-            self.written.insert(offset..offset + bytes.len() as u64);
-            Ok(())
+            self.sink.write_at(offset, bytes)
         }
         fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-            // Grouped writes are in the output file already, committed or not.
-            let n = self.written.held_from(offset).min(buf.len() as u64) as usize;
-            self.reader.read_exact_at(&mut buf[..n], offset)?;
-            Ok(n)
+            // What this partial holds: written through it (grouped writes are in the output file already,
+            // committed or not), or after a restart what its durable state knows.
+            self.sink.read_held(offset, buf)
         }
     }
 
-    /// A volume in memory whose member data reads as holes.
-    struct HeaderOnly {
-        index: u32,
-        bytes: Arc<Vec<u8>>,
-        holes: Vec<Range<u64>>,
-    }
-
-    impl RangeSource for HeaderOnly {
-        fn info(&self) -> SourceInfo {
-            let len = self.bytes.len() as u64;
-            SourceInfo {
-                id: SourceId(self.index as u128 + 1),
-                generation: 0,
-                extent: len,
-                length: SourceLength::Final(len),
-            }
-        }
-        fn backing_files(&self) -> &[File] {
-            &[]
-        }
-        fn read_at(&mut self, at: u64, buf: &mut [u8], _: &mut Context<'_>) -> ProgressiveResult<RangeRead> {
-            if let Some(hole) = self.holes.iter().find(|h| h.contains(&at)) {
-                // one answer for the whole piece (the session accepts up to 256 MiB)
-                return Ok(RangeRead::Hole { len: (hole.end - at).min(256 << 20) });
-            }
-            let next = self.holes.iter().filter(|h| h.start > at).map(|h| h.start).min().unwrap_or(u64::MAX);
-            let end = (self.bytes.len() as u64).min(next).min(at + buf.len() as u64);
-            let count = end.saturating_sub(at) as usize;
-            buf[..count].copy_from_slice(&self.bytes[at as usize..at as usize + count]);
-            Ok(RangeRead::Filled { count })
+    /// Whether `member` gets a persistent partial: a stored member of a RAR set without encrypted headers (plain or
+    /// AES for RAR 5.0, plain for RAR 4.x), as the persistent session path admitted. Other members write a plain
+    /// file.
+    pub(super) fn admits(map: &MemberMap, member: &zipfast::map::MapMember) -> bool {
+        use zipfast::map::{MapFormat, MapMethod};
+        let stored = member.method == MapMethod::Stored;
+        match map.format {
+            MapFormat::Rar5 => stored && !map.header_encrypted,
+            MapFormat::Rar4 => stored && !map.header_encrypted && !member.encrypted,
+            _ => false,
         }
     }
 
-    struct Provider {
-        names: Vec<std::ffi::OsString>,
-        volumes: Vec<Arc<Vec<u8>>>,
-        holes: Vec<Vec<Range<u64>>>,
-    }
-
-    impl VolumeSource for Provider {
-        fn protection(&mut self) -> ProgressiveResult<ProtectionDeclaration> {
-            let volumes = (0..self.names.len() as u32)
-                .map(|index| ProtectedVolume {
-                    index,
-                    name: self.names[index as usize].clone(),
-                    backing: VolumeBacking::NonFile,
-                })
-                .collect();
-            Ok(ProtectionDeclaration::Complete {
-                epoch: 1,
-                inventory: ProtectionInventory { volumes, auxiliary_paths: Vec::new() },
-            })
-        }
-        fn volume(&mut self, request: &VolumeRequest, _: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
-            let i = request.index as usize;
-            if i >= self.volumes.len() {
-                return Ok(VolumeAnswer::Missing);
-            }
-            Ok(VolumeAnswer::Ready(Box::new(HeaderOnly {
-                index: request.index,
-                bytes: self.volumes[i].clone(),
-                holes: self.holes[i].clone(),
-            })))
-        }
-    }
-
-    /// Whether the persistent path admits the set at all: RAR without encrypted headers. Members it does not
-    /// admit (compressed, encrypted RAR 4.x) are refused one by one by the session.
-    pub(super) fn admits(map: &MemberMap) -> bool {
-        matches!(map.format, zipfast::map::MapFormat::Rar5 | zipfast::map::MapFormat::Rar4) && !map.header_encrypted
-    }
-
-    /// Runs the genesis session over `volumes` and returns a sink per admitted member, keyed by its stored name.
-    pub(super) fn genesis(
+    /// Creates the persistent partials of the members `indices` and returns a sink for each, keyed by member index.
+    pub(super) fn create(
         config: &Config,
         map: &MemberMap,
-        volumes: &[Arc<Vec<u8>>],
+        indices: &[usize],
         dest: &Path,
-    ) -> Result<HashMap<Vec<u8>, PartialSink>, String> {
+    ) -> Result<HashMap<usize, PartialSink>, String> {
         let root = config.work.join("partial");
         for sub in ["state", "anchors"] {
             fs::create_dir_all(root.join(sub)).map_err(|e| e.to_string())?;
@@ -661,86 +588,45 @@ mod persistent {
             File::open(dir).and_then(|d| d.sync_all()).map_err(|e| e.to_string())?;
         }
         let anchors = Arc::new(anchor_store::DurableAnchors::open(&root.join("anchors")).map_err(|e| e.to_string())?);
-        let mut holes = vec![Vec::new(); volumes.len()];
-        for member in &map.members {
-            for piece in &member.pieces {
-                holes[piece.volume as usize].push(piece.packed.clone());
-            }
-        }
-        let names: Vec<std::ffi::OsString> =
-            config.volumes.iter().map(|p| p.file_name().unwrap_or_default().to_owned()).collect();
-        let mut options = ProgressiveOptions::new(
-            zipfast::extract::Options {
-                mode: zipfast::extract::Mode::Extract,
-                dest: dest.into(),
-                overwrite: zipfast::extract::Overwrite::Always,
-                flatten: false,
-                threads: Some(1),
-                protected_paths: Default::default(),
-                parallel_min: None,
-                select: None,
-                windows_safe_names: false,
-                special_entries: Default::default(),
-                fallback_mtime: None,
-                compressed_tar: Default::default(),
-                version_naming: Default::default(),
-            },
-            names[0].clone(),
-        );
-        options.limits.volume_handles = 4096;
-        options.set_password(config.password.clone()).map_err(|e| format!("{e:?}"))?;
-        // Every member's handle stays open until its feed is done, and each holds descriptors (output, state
-        // bundle, journal; about five per member): the defaults (16 open partials, 64 files) refuse the 17th stored
-        // member. Both cap at 4096, so a set of more than about 500 stored members needs handles closed and reopened
-        // (`PartialFile::open`) as members finish. The process's own descriptor limit must allow as many.
-        let members = map.members.len() as u32;
-        let defaults = PartialLimits::default();
+        let volumes = (0..config.volumes.len() as u32)
+            .map(|index| ProtectedVolume {
+                index,
+                name: config.volumes[index as usize].file_name().unwrap_or_default().to_owned(),
+                backing: VolumeBacking::NonFile,
+            })
+            .collect();
+        // Every member's handle stays open until its feed is done: `for_members` sizes `open_partials` and
+        // `open_files` for that (a handle holds about six descriptors). Both cap at 4096, so a set of more than
+        // about 500 members needs handles closed and reopened as members finish. The process's own descriptor
+        // limit must allow as many.
         let mut limits = PartialLimits {
             group_holes: config.group_holes,
             group_refills: config.group_refills,
-            open_partials: defaults.open_partials.max(members.saturating_add(1)).min(4096),
-            open_files: defaults.open_files.max(members.saturating_mul(8).saturating_add(64)).min(4096),
-            ..defaults
+            ..PartialLimits::for_members(indices.len())
         };
         if let Some(mib) = config.group_commit_mib {
             limits.group_commit_bytes = mib << 20;
         }
-        let partial = PartialOptions {
+        let parts = DirectPartials::new(DirectOptions {
             binding: ArchiveBinding { job: [1; 16], archive: [2; 32] },
-            naming: PartialNaming::ArchivePath,
+            output_root: dest.into(),
             state_dir: root.join("state"),
+            naming: PartialNaming::ArchivePath,
             limits,
+            progressive_limits: ProgressiveLimits::default(),
             anchors,
             control: SessionControl::default(),
-        };
-        let provider = Provider { names, volumes: volumes.to_vec(), holes };
-        let mut session =
-            ProgressiveSession::new_partial(Box::new(provider), options, partial).map_err(|e| format!("{e:?}"))?;
-        let mut cx = Context::from_waker(Waker::noop());
-        let mut name = Vec::new();
-        let mut key = None;
+            protection: ProtectionDeclaration::Complete {
+                epoch: 1,
+                inventory: ProtectionInventory { volumes, auxiliary_paths: Vec::new() },
+            },
+            password: config.password.clone(),
+        })
+        .map_err(|e| e.to_string())?;
         let mut sinks = HashMap::new();
-        loop {
-            match session.poll_event(&mut cx) {
-                Poll::Ready(Ok(None)) => break,
-                Poll::Ready(Ok(Some(ProgressiveEvent::MemberStarted { name: n, .. }))) => name = n.to_vec(),
-                Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => key = Some(member),
-                Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => {
-                    if let Some(member) = key.take() {
-                        let file = session.partial_file(&member).map_err(|e| e.to_string())?;
-                        let reader = File::open(file.output_path()).map_err(|e| e.to_string())?;
-                        sinks.insert(
-                            std::mem::take(&mut name),
-                            PartialSink { file, reader, written: Ranges::default() },
-                        );
-                    }
-                }
-                Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
-                    return Err(format!("genesis session: {failure:?}"));
-                }
-                Poll::Ready(Err(e)) => return Err(format!("genesis session: {e:?}")),
-                _ => {}
-            }
+        for &index in indices {
+            let member = parts.open(map, index).map_err(|e| format!("member {index}: {e}"))?;
+            sinks.insert(index, PartialSink { sink: DirectSink::new(member.file) });
         }
         Ok(sinks)
     }
@@ -909,10 +795,29 @@ pub fn run(config: &Config) -> Result<Report, String> {
     #[cfg(feature = "persistent-partials")]
     let syncs_before = persistent::syncs();
 
-    // Sinks: the persistent partials first (their genesis reads only headers), then plain files.
+    // The decoders first: a member the feed decoder refuses gets no sink.
+    let mut decoders = Vec::new();
+    for (index, m) in map.members.iter().enumerate() {
+        let Some(size) = m.unpacked_size.filter(|&s| s > 0 && !m.is_dir) else { continue };
+        report.members += 1;
+        let options = FeedOptions { max_needs: config.max_needs, ..FeedOptions::new(config.password.as_deref()) };
+        match FeedDecoder::new(&map, index, options) {
+            Ok(d) => decoders.push((index, size, d)),
+            Err(FeedError::Unsupported(why)) => eprintln!("member {index} ({:?}): not fed: {why:?}", m.name),
+            Err(e) => return Err(format!("member {index}: {e}")),
+        }
+    }
+
+    // Sinks: the persistent partials first (created from the map alone, nothing read again), then plain files.
+    let genesis = Instant::now();
     #[cfg(feature = "persistent-partials")]
-    let mut partials = if config.sink != SinkKind::File && persistent::admits(&map) {
-        persistent::genesis(config, &map, &volumes, &dest)?
+    let mut partials = if config.sink != SinkKind::File {
+        let admitted: Vec<usize> = decoders
+            .iter()
+            .map(|(index, _, _)| *index)
+            .filter(|&index| persistent::admits(&map, &map.members[index]))
+            .collect();
+        persistent::create(config, &map, &admitted, &dest)?
     } else {
         HashMap::new()
     };
@@ -925,25 +830,15 @@ pub fn run(config: &Config) -> Result<Report, String> {
             eprintln!("note: the --group-* options only apply to persistent partials (build with persistent-partials)");
         }
     }
-    report.genesis = start.elapsed();
+    report.genesis = genesis.elapsed();
 
     let mut members = Vec::new();
     let mut kinds = (0, 0); // (partial, file)
-    for (index, m) in map.members.iter().enumerate() {
-        let Some(size) = m.unpacked_size.filter(|&s| s > 0 && !m.is_dir) else { continue };
-        report.members += 1;
-        let options = FeedOptions { max_needs: config.max_needs, ..FeedOptions::new(config.password.as_deref()) };
-        let decoder = match FeedDecoder::new(&map, index, options) {
-            Ok(d) => d,
-            Err(FeedError::Unsupported(why)) => {
-                eprintln!("member {index} ({:?}): not fed: {why:?}", m.name);
-                continue;
-            }
-            Err(e) => return Err(format!("member {index}: {e}")),
-        };
+    for (index, size, decoder) in decoders {
+        let m = &map.members[index];
         let name = m.name.clone().unwrap_or_else(|| format!("member{index}"));
         #[cfg(feature = "persistent-partials")]
-        let partial = partials.remove(&m.raw_name);
+        let partial = partials.remove(&index);
         #[cfg(not(feature = "persistent-partials"))]
         let partial: Option<()> = None;
         let out = match partial {
