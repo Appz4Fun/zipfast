@@ -51,7 +51,10 @@ pub(crate) mod sevenzip;
 pub(crate) mod zip;
 pub(crate) mod zip_split;
 
-pub use last_volume::{HeldVolume, IdentityMember, IdentityScope, LastVolumeIdentity, SetFacts, last_volume_identity};
+pub use last_volume::{
+    FactSource, HeldVolume, IdentityMember, IdentityScope, LastVolumeIdentity, SetFacts, SetIdentity, SetMember,
+    last_volume_identity, set_identity,
+};
 pub use lzma2::{
     LZMA2_MAX_LZMA_UNPACKED, LZMA2_MAX_PAYLOAD, Lzma2Bound, Lzma2Chunk, Lzma2ChunkKind, Lzma2Damage, Lzma2DecodeError,
     Lzma2DecodeOptions, Lzma2Decoder, Lzma2End, Lzma2Error, Lzma2Index, Lzma2IndexBuilder, Lzma2IndexOptions,
@@ -510,6 +513,9 @@ pub struct VolumeMember {
     pub attributes: u64,
     /// Unix permission and type bits, when the host was Unix.
     pub unix_mode: Option<u32>,
+    /// The dictionary (window) size this part's header declares, as [`MapMember::dictionary`]. None for
+    /// directories.
+    pub dictionary: Option<u64>,
 }
 
 /// A packed byte range in one volume, as returned by [`MapMember::packed_spans`].

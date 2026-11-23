@@ -691,6 +691,7 @@ impl RarWalker {
             dos_time: header.rar4.map(|r| r.dos_time),
             attributes: header.attributes,
             unix_mode,
+            dictionary: (!header.is_dir() && header.dictionary > 0).then_some(header.dictionary),
         };
         let members = &mut self.single.as_mut().expect("single-volume mode").members;
         if members.try_reserve(1).is_err() {

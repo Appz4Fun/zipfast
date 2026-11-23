@@ -544,3 +544,27 @@ fetched) before matching sets on it, for example as twin or alternate keys.
 Bytes needed further from the end than the tail held give `MapError::TailTooShort { from_end }` (for ZIP, at least
 the end records' window of 64 KiB and a bit, or the whole volume when shorter). A 7z header encrypted with `-mhe`
 needs the password (`PasswordRequired`, `WrongPassword`). Bytes of no format named here are `NotArchive`.
+
+Each `IdentityMember` also carries `method` (`MapMethod`: stored, compressed with the format's method, or 7z coders)
+and `dictionary` (RAR from the header; 7z from the folder's LZMA or LZMA2 coder properties; None for ZIP, other
+7z coders and directories).
+
+### First and last volume together
+
+`map::set_identity(first, last, options)` combines what the held bytes of a set's first volume, its last volume,
+or both state about each member: `SetIdentity { format, members: Vec<SetMember> }`, each `SetMember` with
+`raw_name`, `name`, `is_dir`, `unpacked_size`, `method`, `dictionary`, `encrypted` and `checks`, each an `Option`
+(unknown when neither volume states it), and `size_from`, `method_from` and `checks_from` naming the volume
+(`FactSource::First` or `Last`) that supplied it. Members are matched by raw name.
+
+- RAR: every part header states the member's name, size, method and encryption; the header of its last part also
+  states its final checks. `first` is read as `MemberMap::from_volume` reads a volume, `last` as
+  `last_volume_identity` reads one, so a member split across volumes gets its checks only from `last`. One
+  article at each end of a download is enough.
+- ZIP and 7z: the directory at the end of the last volume lists every member with its checks; `first` adds
+  nothing. With `last` None, `first` is read as a last volume (a single-volume archive).
+
+Two copies whose members agree in size and checks hold the same files, whatever their containers. Compare plain
+checks with plain ones: RAR 5.0 keys the checks of AES data members with the password (`MapChecks::keyed`), so a
+keyed CRC of the same file differs from its plain CRC. The password in `options` also opens encrypted headers
+(RAR `-hp`, 7z `-mhe`).
