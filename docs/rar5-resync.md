@@ -76,7 +76,9 @@ u.feed(&packed[n.resync.packed_offset..], &mut sink)?;
   holds it filtered, and a restart is only placed past every filter seen. The decoder's window holds filtered output
   as it was before the filter ran, so `resume_in_stream` undoes the filters seen (E8, E8E9, ARM, delta) in the
   plaintext it copies into the window. Without that, a match after the restart that copies from filtered output
-  decodes wrong.
+  decodes wrong. Undoing a filter needs all of its output in the plaintext given to `resume_in_stream`, so when the
+  window still holds part of a seen filter's output the plaintext does not cover, resuming is refused with an error
+  naming the plaintext it needs.
 - **Guarded restarts (`NearOptions::guard`, default true):** a restart checked from a filter's longest length
   (4 MiB) before it is `guarded()`. No filter declared before the anchor can cover output after it, assuming rar
   declares a filter in the block its output starts in, as it does. `resume_in_stream` then needs no plaintext past
@@ -145,7 +147,7 @@ past the target. Prybar's layered search over `resync` took about 25 s and lande
     step's share of unpinnable blocks at the estimate is searched past, as are blocks inside output a delta filter
     declared before the given packed bytes changed; a deadline that passes during a long follow gives `Exhausted`;
     a later solid member resumed from its start refuses a copy, after the target, from an earlier member's filtered
-    output;
+    output; resuming with a plaintext suffix that starts inside a retained filter's output is refused;
   - with `ZIPFAST_Z_FIXTURES`, `resync_near` on F03/F05/F06 at several targets (guarded, exact, under 1 s in release).
 
 RAR 4.x is not covered.

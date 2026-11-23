@@ -1154,8 +1154,18 @@ impl Unpacker {
         // The decoder's window holds filtered output as it was before the filter ran: undo the filters seen.
         for f in &resync.filters {
             let end = f.start + f.len;
-            if f.start < known_base || end > known_end || end <= from || f.start < member_start {
+            if end <= from || f.start < member_start {
                 continue;
+            }
+            // Undoing it needs all of its output; a window holding part of it unfiltered-in-plaintext would decode a
+            // later copy from there wrong.
+            if f.start < known_base || end > known_end {
+                return Err(Error::Unsupported(format!(
+                    "resuming RAR 5.0 output at {offset} needs known plaintext for {}..{} to undo a filter whose output \
+                     the window still holds; given {known_base}..{known_end}",
+                    f.start.min(known_base),
+                    end.max(known_end)
+                )));
             }
             let mut bytes = known[(f.start - known_base) as usize..(end - known_base) as usize].to_vec();
             super::unapply_filter(f.kind, f.start - member_start, &mut bytes);

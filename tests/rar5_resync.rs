@@ -983,3 +983,48 @@ fn a_later_solid_member_resumed_from_its_start_refuses_a_copy_from_an_earlier_me
     let good = (copy_at - n.resync.output_offset) as usize;
     assert!(out.0.len() <= good && out.0 == stream[n.resync.output_offset as usize..][..out.0.len()]);
 }
+
+/// The search had the whole plaintext, but the decoder is resumed with only a suffix of it that starts inside a
+/// filter's output the window still holds: that filter cannot be undone, so resuming is refused, saying what
+/// plaintext it needs, rather than leaving filtered bytes in the window for a later copy to read.
+#[test]
+fn resuming_without_the_plaintext_to_undo_a_retained_filter_is_refused() {
+    use zipfast::rar5::testenc::{self, Op};
+    let mut plain = sample(500_000);
+    for x in plain.iter_mut().filter(|x| **x == 0xe8) {
+        *x = 0xe9;
+    }
+    for at in (60_000..140_000).step_by(499) {
+        plain[at..at + 5].copy_from_slice(&[0xe8, (at % 251) as u8, 0x10, 0, 0]);
+    }
+    let mut ops = testenc::lz(&plain[..50_000], 1 << 17, 16);
+    ops.push(Op::Filter { start: 0, len: 100_000, kind: 1, channels: 0 });
+    ops.extend(testenc::lz(&plain[50_000..], 1 << 17, 16));
+    let packed = testenc::tuned_stream(&ops, 2_000);
+    let window = window_for(1 << 20, Some(plain.len() as u64), false).unwrap();
+    let truth = decode(window, &packed, plain.len() as u64);
+    let target = 385_000u64;
+    let options = NearOptions { estimate: Some(0), guard: false, ..Default::default() };
+    let n = resync_near(&packed, 0, &truth[..target as usize], window, target, &options).unwrap();
+    assert!(n.anchor == 0 && n.resync.output_offset > 150_000, "{n:?}");
+    // The whole plaintext resumes exactly.
+    assert_eq!(
+        resumed(window, &n.resync, 0, &truth, truth.len() as u64, &packed),
+        truth[n.resync.output_offset as usize..]
+    );
+    // A suffix from inside the filter's output (still within the window) does not.
+    let base = 100_000usize;
+    let err = Unpacker::resume_in_stream(window, &n.resync, 0, base as u64, &truth[base..], Some(truth.len() as u64))
+        .err()
+        .expect("the filter's output before the plaintext cannot be undone")
+        .to_string();
+    assert!(err.contains("to undo a filter") && err.contains("50000.."), "{err}");
+    // A suffix that starts after the filter's output resumes (its window holds no part of it).
+    let after = 160_000usize;
+    if n.resync.output_offset > after as u64 {
+        assert!(
+            Unpacker::resume_in_stream(window, &n.resync, 0, after as u64, &truth[after..], Some(truth.len() as u64))
+                .is_ok()
+        );
+    }
+}
