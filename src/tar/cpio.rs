@@ -107,6 +107,9 @@ struct Header {
     namesize: u64,
     filesize: u64,
     check: u32,
+    /// a device node's major and minor numbers: newc stores them apart; odc and bin store one number whose split
+    /// depends on the writer's system, so they are left unknown there
+    rdev: Option<(u64, u64)>,
 }
 
 fn digits(field: &[u8], radix: u32) -> Result<u64> {
@@ -132,6 +135,7 @@ fn parse(format: Format, h: &[u8]) -> Result<Header> {
                 namesize: word(10),
                 filesize: (word(11) << 16) | word(12),
                 check: 0,
+                rdev: None,
             }
         }
         Format::Odc => {
@@ -147,6 +151,7 @@ fn parse(format: Format, h: &[u8]) -> Result<Header> {
                 namesize: f(59, 6)?,
                 filesize: f(65, 11)?,
                 check: 0,
+                rdev: None,
             }
         }
         Format::Newc { .. } => {
@@ -162,6 +167,7 @@ fn parse(format: Format, h: &[u8]) -> Result<Header> {
                 dev: (f(7)? << 32) | f(8)?,
                 namesize: f(11)?,
                 check: f(12)? as u32,
+                rdev: Some((f(9)?, f(10)?)),
             }
         }
     };
@@ -424,6 +430,10 @@ impl Reader {
             }
             let mut m = cpio_member(decoded, raw_name, kind, link, size, (h.mtime, h.mode), (h.uid, h.gid));
             m.raw_link = raw_link;
+            if matches!(kind, Kind::Other(b'3' | b'4')) {
+                m.tar.device_major = h.rdev.map(|r| r.0);
+                m.tar.device_minor = h.rdev.map(|r| r.1);
+            }
             if matches!(format, Format::Newc { crc: true }) && kind == Kind::File {
                 self.crc = Some(super::CpioCrc { want: h.check, sum: 0, left: h.filesize });
             }

@@ -2202,6 +2202,14 @@ pub(crate) fn walk_members(
         if let Some(why) = m.sparse_refusal() {
             return Err(Error::Unsupported(why.into()));
         }
+        let device = matches!(kind, RawKind::CharDevice | RawKind::BlockDevice);
+        if device && m.cpio && m.tar.device_major.is_none() {
+            // an odc or bin header's one device number splits differently by system: a guess could change the device
+            return Err(Error::Unsupported(format!(
+                "cpio device {:?} has no major and minor numbers a repack can keep",
+                m.name
+            )));
+        }
         budget.record(&m.name)?;
         let raw = RawMember {
             name: m.raw_name.clone().unwrap_or_else(|| m.name.clone().into_bytes()),

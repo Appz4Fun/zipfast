@@ -735,3 +735,44 @@ fn ar_members_named_like_a_symbol_table_stay_members() {
     assert!(out.windows(15).any(|w| w == b"__.SYMDEF_notes"));
     assert!(out.windows(11).any(|w| w == b"just notes\n"));
 }
+
+/// A newc member whose device node numbers are `rdev`.
+fn newc_node(name: &str, mode: u32, rdev: (u32, u32)) -> Vec<u8> {
+    let fields = [1, mode, 0, 0, 1, 0, 0, 0, 1, rdev.0, rdev.1, name.len() as u32 + 1, 0];
+    let mut out = b"070701".to_vec();
+    for f in fields {
+        out.extend_from_slice(format!("{f:08X}").as_bytes());
+    }
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.resize(out.len().next_multiple_of(4), 0);
+    out
+}
+
+/// An odc member with no data: its device number is one field, `rdev`.
+fn odc_node(name: &str, mode: u32, rdev: u32) -> Vec<u8> {
+    let n = name.len() + 1;
+    let mut out =
+        format!("070707{:06o}{:06o}{mode:06o}{:06o}{:06o}{:06o}{rdev:06o}{:011o}{n:06o}{:011o}", 0, 1, 0, 0, 1, 0, 0)
+            .into_bytes();
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out
+}
+
+#[test]
+fn cpio_devices_keep_their_numbers_or_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let newc =
+        [newc_node("null", 0o020644, (1, 3)), newc_node("sda", 0o060644, (8, 0)), newc_node("TRAILER!!!", 0, (0, 0))]
+            .concat();
+    let out = flate2_decode(&repacked(dir.path(), "newc", &newc, &RepackOptions::default()));
+    let header = |name: &[u8]| out.chunks(512).find(|h| h.starts_with(name) && h[name.len()] == 0).unwrap().to_vec();
+    let dev = |h: &[u8]| (h[156], h[329..336].to_vec(), h[337..344].to_vec());
+    assert_eq!(dev(&header(b"null")), (b'3', b"0000001".to_vec(), b"0000003".to_vec()));
+    assert_eq!(dev(&header(b"sda")), (b'4', b"0000010".to_vec(), b"0000000".to_vec()));
+    // odc keeps one number whose split depends on the writer's system: refused rather than guessed
+    let odc = [odc_node("null", 0o020644, 0x0103), odc_node("TRAILER!!!", 0, 0)].concat();
+    let i = write(dir.path(), "odc.cpio", &odc);
+    assert!(matches!(repack(&i, &dir.path().join("odc.out"), &RepackOptions::default()), Err(Error::Unsupported(_))));
+}
