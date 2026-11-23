@@ -42,7 +42,12 @@
 //! [`MemberReader`] and [`extract_member_from`] stream a stored member's plaintext from any output offset, reading
 //! only the packed bytes that offset needs, for example to fill the rest of a partial output from another copy. See
 //! `docs/extract-member-from.md`.
+//!
+//! [`FeedDecoder`] decodes one member from packed bytes fed in any order, never waiting: it writes output as far
+//! as the bytes allow, skips and later repairs holes, reports the bytes it needs ([`NeedBytes`]) and saves its state
+//! ([`FeedSnapshot`]). See `docs/feed-decoder.md`.
 
+mod feed;
 mod last_volume;
 mod lzma2;
 mod member_reader;
@@ -52,6 +57,10 @@ pub(crate) mod sevenzip;
 pub(crate) mod zip;
 pub(crate) mod zip_split;
 
+pub use feed::{
+    ArticleBuffer, BufferFull, FeedDecoder, FeedError, FeedOptions, FeedSink, FeedSnapshot, FeedStats, FeedStatus,
+    FeedUnsupported, NeedBytes, NeedKind, PackedRead, PackedSource,
+};
 pub use last_volume::{
     FactSource, HeldVolume, IdentityMember, IdentityScope, LastVolumeIdentity, SetFacts, SetIdentity, SetMember,
     last_volume_identity, set_identity,
