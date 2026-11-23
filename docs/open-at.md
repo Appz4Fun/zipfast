@@ -57,6 +57,51 @@ The restart lands at the last block start at or before the target; one block of 
 highly compressible output, so `redecode` can be that large. `OpenAtError::Resync` and `NeedMore` say when the
 held bytes or the known plaintext do not reach far enough back: fetch from earlier, or supply more plaintext.
 
+#### Seeding the window from held plaintext
+
+`OpenAtOptions { seed: Seed::HeldPlaintext { strict }, .. }` is for a handover that holds the output before the
+target (from an earlier copy) and wants to download as little of the new copy as it can. The plan fetches packed
+bytes from shortly before the target's estimated packed position: by default a filter's reach (4 MiB of output) at
+twice the member's average packing ratio plus `SEED_SEARCH` (2 MiB), enough for a guarded restart; `search` sets it.
+Its `donor` is the dictionary's worth of output before the target, and `complete_rar5` starts the decoder with
+`Unpacker::resume_seeded`: the window is filled from the held plaintext instead of being followed from far back.
+A smaller `search` fetches less but can give an unguarded restart (below).
+
+The output is then **unverified**: `Rar5Resume::checked` is false unless the follow happened to cover the window.
+RAR's window holds output as it was before its filters (E8, E8E9, ARM, delta) ran, while held plaintext is filtered
+output, so a filter declared before the restart, which nothing fetched shows, may have changed bytes a later match
+copies. Prove the member with its CRC32 or BLAKE2sp at the end and fall back to a checked plan
+(`Seed::Checked`, the default) when it fails. On the way, `decoder.seed_suspect()` / `seed_suspects()` give early
+signs, the first of each kind, most telling first:
+
+- `BeforeSeed { source }`: a match copied from before the held plaintext (window bytes never seeded): wrong unless
+  what it wrote is overwritten. Supply more plaintext.
+- `Unguarded`: noted at the restart, before decoding: it is not guarded, so a filter declared before it may cover
+  output after it, and the held plaintext does not reach past such a filter's longest reach. A plain `resync` result
+  is never guarded and never proves its window (its floor of 0 is no proof).
+- `Filter`: the decoder met a filter record. That filter decodes right, but filters come where content suits them
+  (x86 code, tables), so earlier ones may have changed seeded bytes.
+- `UncheckedCopy { source }`: a match copied from seeded output a filter it never saw may have changed. On video
+  this fires on nearly every handover (long matches reach back past the restart), so it says little on its own.
+
+With `strict`, a copy that a checked decoder would refuse is refused (`Error::BadChecksum`) instead of decoded, and
+an unguarded restart is refused at the start (`Error::Unsupported`).
+No scan cheaper than the follow itself can prove there was no filter before the restart: filter records sit inside
+the Huffman-coded blocks, which only decoding them reads.
+
+Measured on z-fixtures (release, M4, one thread; plaintext only up to the target; checked against the payload):
+
+| set | target | fetched (checked plan) | result | suspects |
+|---|---|---|---|---|
+| F03, F04, F12 video | 12.0 MB | 34.5 MB (36.1 MB) | exact, 6.4 KB back, unverified, 0.3 s | `UncheckedCopy` |
+| F03, F04, F12 video | 28.8 MB | 17.7 MB (36.1 MB) | exact, 5.5 KB back, unverified, 0.3 s | `UncheckedCopy` |
+| F05, F06, F12 mixed | 8.7 MB | 14.0 MB (14.0 MB) | exact, 678 KB back, checked (the reach covers the member's start), 25 ms | `Filter` |
+| F05, F06, F12 mixed | 20.8 MB | 9.4 MB (14.0 MB) | exact, 6.6 MB back (block start), unverified, 0.2 s | `UncheckedCopy` |
+
+An earlier run with a 2 MiB `search` and no guard fetched 26.1 / 9.3 MB on the video sets (exact) and was refused at
+20.8 MB on the mixed ones (search exhausted); such unguarded restarts are now noted as `Unguarded`. A refused seeded plan is retried with a larger `search`, or as
+a checked plan.
+
 ### 7z LZMA2
 
 An LZMA2 restart must sit at a chunk start, and only a walk of chunk headers from the stream's first byte proves

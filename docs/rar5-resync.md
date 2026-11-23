@@ -125,6 +125,14 @@ Before (`resync` with a packing-ratio estimate at the F06 20 MB target), every w
 past the target. Prybar's layered search over `resync` took about 25 s and landed about 4 MB back. The example
 `cargo run --release --example resync_near -- <set dir> <password> <plaintext> <target>...` reproduces the table.
 
+### Seeding from held plaintext
+
+`Unpacker::resume_seeded(window, &resync, member_start, known_base, &known, size, strict)` is `resume_in_stream` for
+a handover that holds the output before the restart but not the packed bytes far before it: the window is seeded
+from `known`, no plaintext past the restart is needed, and what the follow could not prove is noted instead of
+refused (`seed_suspect`, `seed_suspects`, `seed_checked`). The output is unverified unless `seed_checked()` is true:
+the member's checksum decides. See [open-at.md](open-at.md#seeding-the-window-from-held-plaintext).
+
 ## Checked against
 
 - **rar 7.30 output (`-ma5 -m3`):**

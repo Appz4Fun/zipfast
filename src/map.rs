@@ -65,7 +65,7 @@ pub use member_reader::{
 };
 pub use open_at::{
     Layer, Lzma2Framing, Lzma2Resume, MemberRestart, OpenAt, OpenAtError, OpenAtOptions, Rar5Resume, RestartGrain,
-    Start, complete_lzma2, complete_rar5, member_restart, open_at,
+    SEED_SEARCH, Seed, Start, complete_lzma2, complete_rar5, member_restart, open_at,
 };
 
 use crate::progressive::{

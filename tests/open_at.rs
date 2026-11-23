@@ -21,7 +21,7 @@ mod common;
 use common::{FileSpec, archive, archive_with};
 use zipfast::map::{
     Layer, Lzma2DecodeOptions, Lzma2Framing, MapMember, MemberMap, OpenAt, OpenAtError, OpenAtOptions, RestartGrain,
-    Start, complete_lzma2, complete_rar5, member_restart, open_at,
+    Seed, Start, complete_lzma2, complete_rar5, member_restart, open_at,
 };
 use zipfast::rar5::unpack::{NearOptions, Sink};
 
@@ -155,6 +155,59 @@ fn a_compressed_rar5_member_hands_over_through_a_plan() {
         let resume = handover(&map, &plan, &held, &plain);
         assert!(resume <= target && target - resume < 100_000, "restart {resume} for {target}");
     }
+}
+
+/// A seeded plan fetches only near the target and resumes from the held plaintext; its output is flagged
+/// unverified, and on filter-free content it is exact.
+#[test]
+fn a_seeded_rar5_plan_fetches_near_the_target() {
+    use zipfast::rar5::testenc;
+    // literal-rich content, as the restart search pins blocks by their literals: random runs and repeats of them
+    let mut plain = Vec::with_capacity(600_000);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    while plain.len() < 600_000 {
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            plain.push(x as u8);
+        }
+        let back = plain.len() - 1_000.min(plain.len());
+        let repeat = plain[back..back + 200.min(plain.len() - back)].to_vec();
+        plain.extend(repeat);
+    }
+    plain.truncate(600_000);
+    let data = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let mut spec = FileSpec::new("c.bin", &data);
+    spec.method = 3;
+    spec.size = Some(plain.len() as u64);
+    let bytes = archive_with(&[(spec, crc32fast::hash(&plain))], false);
+    let map = MemberMap::from_memory(&[&bytes], "c.rar", None).unwrap();
+    let target = 450_000u64;
+    let checked = open_at(&map, 0, target, &OpenAtOptions::default()).unwrap();
+    let packed_len = map.members[0].packed_size;
+    let options = OpenAtOptions {
+        seed: Seed::HeldPlaintext { strict: false },
+        search: Some(packed_len / 3),
+        ..Default::default()
+    };
+    let plan = open_at(&map, 0, target, &options).unwrap();
+    assert_eq!(plan.seed, Seed::HeldPlaintext { strict: false });
+    assert!(plan.fetch_from > checked.fetch_from, "fetches less: {} vs {}", plan.fetch_from, checked.fetch_from);
+    let Start::Rar5 { ref donor, .. } = plan.start else { panic!() };
+    assert_eq!(donor.end, target);
+    let held = fetch(&[&bytes], &plan.spans);
+    let known = &plain[..target as usize];
+    let mut r = complete_rar5(&map, &plan, plan.fetch_from, &held, 0, known, &NearOptions::default()).unwrap();
+    assert!(!r.checked, "a seeded window is unverified");
+    let mut out = Collect(Vec::new());
+    r.decoder.feed(&held[(r.feed_from - plan.fetch_from) as usize..], &mut out).unwrap();
+    r.decoder.finish(&mut out).unwrap();
+    assert_eq!(out.0, plain[r.output as usize..]);
+    // the checked plan is still checked
+    let held = fetch(&[&bytes], &checked.spans);
+    let r = complete_rar5(&map, &checked, checked.fetch_from, &held, 0, known, &NearOptions::default()).unwrap();
+    assert!(r.checked);
 }
 
 /// Completes a RAR 5.0 plan with the whole plaintext known, decodes to the end and checks the output; returns the
@@ -402,6 +455,47 @@ fn handovers_on_the_z_fixtures() {
                     }
                 };
                 eprintln!("{set} member {i} target {target} narrow (4 MiB): {verdict}");
+                // Seeded from the held plaintext: fetch from near the target only; the output is unverified and
+                // checked here against the payload.
+                if target > 0 {
+                    let default_fetch =
+                        m.packed_size - open_at(&f.map, i, target, &OpenAtOptions::default()).unwrap().fetch_from;
+                    let seeded = OpenAtOptions { seed: Seed::HeldPlaintext { strict: false }, ..Default::default() };
+                    let plan = open_at(&f.map, i, target, &seeded).unwrap();
+                    let held = fetch(&refs, &plan.spans);
+                    let (from, held) = match m.cipher.clone() {
+                        Some(CipherParams::Rar5 { kdf_count, salt, iv: Some(iv), check, .. }) => {
+                            let key = zipfast::crypto::derive_rar5_key(&f.password, kdf_count, &salt, check).unwrap();
+                            decrypt_held(&key, &iv, plan.fetch_from, &held)
+                        }
+                        _ => (plan.fetch_from, held),
+                    };
+                    let started = std::time::Instant::now();
+                    let verdict = match complete_rar5(&f.map, &plan, from, &held, 0, known, &NearOptions::default()) {
+                        Err(e) => format!("refused: {e}"),
+                        Ok(mut res) => {
+                            let mut out = Collect(Vec::new());
+                            let fed = res.decoder.feed(&held[(res.feed_from - from) as usize..], &mut out);
+                            let fin = fed.and_then(|()| res.decoder.finish(&mut out));
+                            let exact = fin.is_ok() && out.0 == plain[res.output as usize..];
+                            format!(
+                                "{} from {} ({} back), checked {}, suspects {:?}, {} ms",
+                                if exact { "exact" } else { "WRONG" },
+                                res.output,
+                                res.redecode,
+                                res.checked,
+                                res.decoder.seed_suspects().iter().map(|s| (s.at, s.reason)).collect::<Vec<_>>(),
+                                started.elapsed().as_millis()
+                            )
+                        }
+                    };
+                    eprintln!(
+                        "{set} member {i} target {target} seeded: fetched {} of {} packed (checked plan {}): {verdict}",
+                        m.packed_size - plan.fetch_from,
+                        m.packed_size,
+                        default_fetch
+                    );
+                }
             }
         }
     }

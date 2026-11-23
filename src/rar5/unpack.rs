@@ -686,6 +686,9 @@ pub struct Unpacker {
     /// `floor`, where the window may hold output a filter the restart never saw changed (0: no floor)
     floor: u64,
     floor_from: u64,
+    /// set by [`Unpacker::resume_seeded`]: the window was seeded from held plaintext; a match the floor refuses is
+    /// noted and decoded anyway (unless strict), and so is the first filter met
+    seed: Option<Box<SeedState>>,
     /// the block flagged last has been decoded and `stop_at_last` is set: later bytes are dropped
     ended: bool,
     /// set by [`Unpacker::resume_at`]: known plaintext the output must equal until it is past the reach of any filter
@@ -870,6 +873,7 @@ impl Unpacker {
             stop_at_last: false,
             floor: 0,
             floor_from: u64::MAX,
+            seed: None,
             ended: false,
             verify: None,
             threads: default_threads(),
@@ -1001,6 +1005,25 @@ impl Unpacker {
         self.stop_at_last = true;
     }
 
+    /// For a decoder from [`Self::resume_seeded`]: the most telling sign so far that its output may be wrong (a copy
+    /// from before the held plaintext, then an unguarded restart, then a filter met, then a copy from unproven
+    /// output); None while there is
+    /// none, and for any other decoder. See [`Self::seed_suspects`] for the first of each kind.
+    pub fn seed_suspect(&self) -> Option<SeedSuspect> {
+        self.seed.as_deref().and_then(|s| s.suspects().next())
+    }
+
+    /// For a decoder from [`Self::resume_seeded`]: the first suspect of each kind, the most telling first.
+    pub fn seed_suspects(&self) -> Vec<SeedSuspect> {
+        self.seed.as_deref().map(|s| s.suspects().collect()).unwrap_or_default()
+    }
+
+    /// For a decoder from [`Self::resume_seeded`]: whether its window was proven to need no filter it did not see, so
+    /// its output is as checked as a [`Self::resume_in_stream`] decoder's. None for any other decoder.
+    pub fn seed_checked(&self) -> Option<bool> {
+        self.seed.as_deref().map(|s| s.checked)
+    }
+
     /// [`Self::reset`] for a stream that needs the window `window`, which this decoder [`fits`](Self::fits).
     pub fn restart(&mut self, window: Window, size: Option<u64>) {
         assert!(self.fits(window), "{window:?} in a window of {}", self.window_size());
@@ -1019,6 +1042,7 @@ impl Unpacker {
         self.stop_at_last = false;
         self.floor = 0;
         self.floor_from = u64::MAX;
+        self.seed = None;
         self.next_file(size);
     }
 
@@ -1298,7 +1322,7 @@ impl Unpacker {
         let (mut sp, mut history, mut last_len) = (self.sp, self.history, self.last_len);
         // SAFETY: the window is neither resized nor freed while this runs, and the pointer is taken again after
         // every flush, which reads the window through `self`
-        let (floor, floor_from) = (self.floor, self.floor_from);
+        let (mut floor, mut floor_from) = (self.floor, self.floor_from);
         let mut win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach).floored(floor, floor_from);
         // output past this is emitted before more is decoded
         let mut stop = self.file_base + self.emitted + flush_at;
@@ -1354,13 +1378,27 @@ impl Unpacker {
                     }
                     Tok::Filter { offset, len, kind } => {
                         let window = self.window_size();
+                        if let Some(seed) = self.seed.as_deref_mut() {
+                            seed.note_filter(sp - self.file_base);
+                        }
                         if let Err(e) = add_filter(&mut self.filters, sp - self.file_base, offset, len, kind, window) {
                             break 'apply Err(e);
                         }
                     }
                     _ => {
                         if let Some((len, d)) = resolve(tok, &mut history, &mut last_len) {
-                            if let Err(e) = copy::<SPILLS>(win, sp, len, d, size_end) {
+                            let mut copied = copy::<SPILLS>(win, sp, len, d, size_end);
+                            if matches!(copied, Err(MatchCopyError::Floor))
+                                && let Some(seed) = self.seed.as_deref_mut().filter(|s| !s.strict)
+                            {
+                                // a seeded decoder notes the copy and goes on: the member's checksum decides
+                                let next = seed.note_copy(sp - self.file_base, sp - d);
+                                (floor, floor_from) = if next == 0 { (0, u64::MAX) } else { (next, floor_from) };
+                                (self.floor, self.floor_from) = (floor, floor_from);
+                                win = win.floored(floor, floor_from);
+                                copied = copy::<SPILLS>(win, sp, len, d, size_end);
+                            }
+                            if let Err(e) = copied {
                                 if matches!(e, MatchCopyError::Size) {
                                     self.size_failure = self
                                         .size
@@ -1582,6 +1620,7 @@ impl Unpacker {
             filters,
             floor,
             floor_from,
+            seed,
             ..
         } = self;
         let mask = *mask;
@@ -1591,7 +1630,7 @@ impl Unpacker {
         let mut sp = *sp_ref;
         let mut hist = *history;
         let mut last = *last_len;
-        let window = Win::of(window).reaching(*reach).floored(*floor, *floor_from);
+        let mut window = Win::of(window).reaching(*reach).floored(*floor, *floor_from);
         let main = &t.main;
         macro_rules! decode {
             ($table:expr) => {
@@ -1669,13 +1708,30 @@ impl Unpacker {
                 Err(e) => break Err(e),
             };
             if let Tok::Filter { offset, len, kind } = tok {
+                if let Some(seed) = seed.as_deref_mut() {
+                    seed.note_filter(sp - file_base);
+                }
                 if let Err(e) = add_filter(filters, sp - file_base, offset, len, kind, mask + 1) {
                     break Err(e);
                 }
                 continue;
             }
             let Some((len, d)) = resolve(tok, &mut hist, &mut last) else { continue };
-            if let Err(e) = copy::<SPILLS>(window, sp, len, d, size_end) {
+            let mut copied = copy::<SPILLS>(window, sp, len, d, size_end);
+            if matches!(copied, Err(MatchCopyError::Floor))
+                && let Some(s) = seed.as_deref_mut().filter(|s| !s.strict)
+            {
+                // a seeded decoder notes the copy and goes on: the member's checksum decides
+                let next = s.note_copy(sp - file_base, sp - d);
+                if next == 0 {
+                    (*floor, *floor_from) = (0, u64::MAX);
+                } else {
+                    *floor = next;
+                }
+                window = window.floored(*floor, *floor_from);
+                copied = copy::<SPILLS>(window, sp, len, d, size_end);
+            }
+            if let Err(e) = copied {
                 if matches!(e, MatchCopyError::Size) {
                     *size_failure = size.map(|size| (size, (sp - file_base).saturating_add(u64::from(len))));
                 }
@@ -2021,6 +2077,82 @@ fn put_from<const SPILLS: bool>(window: Win<'_>, sp: u64, lits: &[u8], at: usize
     } else {
         window.write(sp, &lits[at..at + n]);
     }
+}
+
+/// What a decoder seeded from held plaintext ([`Unpacker::resume_seeded`]) noted.
+#[derive(Debug)]
+pub(crate) struct SeedState {
+    /// refuse a suspect copy (as a checked decoder does) instead of noting it
+    pub(crate) strict: bool,
+    /// the stream offset the held plaintext starts at: earlier window bytes were never seeded
+    pub(crate) seeded_from: u64,
+    /// whether no filter the follow did not see can have changed a seeded byte a match may copy
+    pub(crate) checked: bool,
+    before_seed: Option<SeedSuspect>,
+    unguarded: Option<SeedSuspect>,
+    unchecked: Option<SeedSuspect>,
+    filter: Option<SeedSuspect>,
+}
+
+impl SeedState {
+    pub(crate) fn new(strict: bool, seeded_from: u64, checked: bool) -> Self {
+        SeedState { strict, seeded_from, checked, before_seed: None, unguarded: None, unchecked: None, filter: None }
+    }
+
+    /// Notes a copy the floor refused and gives the floor to go on with: the held plaintext's start while copies
+    /// from before it are still worth noting, else none.
+    fn note_copy(&mut self, at: u64, source: u64) -> u64 {
+        if source < self.seeded_from {
+            self.before_seed.get_or_insert(SeedSuspect { at, reason: SeedReason::BeforeSeed { source } });
+            0
+        } else {
+            self.unchecked.get_or_insert(SeedSuspect { at, reason: SeedReason::UncheckedCopy { source } });
+            if self.before_seed.is_none() { self.seeded_from } else { 0 }
+        }
+    }
+
+    pub(crate) fn note_unguarded(&mut self, at: u64) {
+        self.unguarded.get_or_insert(SeedSuspect { at, reason: SeedReason::Unguarded });
+    }
+
+    fn note_filter(&mut self, at: u64) {
+        self.filter.get_or_insert(SeedSuspect { at, reason: SeedReason::Filter });
+    }
+
+    /// The first suspect of each kind, the most telling first.
+    fn suspects(&self) -> impl Iterator<Item = SeedSuspect> + '_ {
+        [self.before_seed, self.unguarded, self.filter, self.unchecked].into_iter().flatten()
+    }
+}
+
+/// A sign that a decoder seeded from held plaintext ([`Unpacker::resume_seeded`]) may write wrong output, noted the
+/// first time it happens, while decoding goes on. The member's checksum is the proof either way; a suspect lets a
+/// caller start fetching the packed bytes for a checked restart before the member ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeedSuspect {
+    /// The member output offset where it happened.
+    pub at: u64,
+    pub reason: SeedReason,
+}
+
+/// Why a seeded decoder's output is suspect; see [`SeedSuspect`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeedReason {
+    /// A match copied from stream offset `source`, before the window was ever seeded: those bytes are zeros, not
+    /// output, so the copy is wrong unless the bytes it wrote happen to be overwritten.
+    BeforeSeed { source: u64 },
+    /// A match copied from seeded output at stream offset `source` that a filter declared before the restart, which
+    /// the decoder never saw, may have changed: held plaintext is filtered output, while the window should hold it
+    /// as it was before the filter ran.
+    UncheckedCopy { source: u64 },
+    /// The restart is not guarded (noted at the restart, before anything is decoded): a filter declared before it,
+    /// which the decoder never saw, may cover output after it, and the held plaintext ends before such a filter's
+    /// longest reach could.
+    Unguarded,
+    /// The decoder met a filter record. That filter itself is decoded right, but filters come where the content
+    /// suits them (x86 code, tables), so earlier ones may have changed seeded bytes a later match copies.
+    Filter,
 }
 
 #[derive(Debug)]
