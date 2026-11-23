@@ -806,12 +806,17 @@ impl Lzma2Index {
             return Err(Lzma2DecodeError::BadDictionaryProp(dict_prop));
         }
         let last = run.last().expect("nonempty");
-        let input = slice(packed, packed_base, first.packed_offset..last.packed().end)?;
         // The dictionary as stored chunks (the first resets the dictionary), then the first chunk with its control
         // byte setting props so the decoder starts the LZMA state from them, then the rest as they are.
         let keep = dictionary.len().min(usize::try_from(lzma2_dict(dict_prop)).unwrap_or(usize::MAX));
         let dict = &dictionary[dictionary.len() - keep..];
         bound(Lzma2Bound::Dictionary, options.max_dictionary, dict.len() as u64)?;
+        // The run's limits before the made-up stream is allocated: its output, and everything decoded (the
+        // dictionary replayed as stored chunks, then the run).
+        let total = run.iter().map(|c| c.unpacked_len).sum::<u64>();
+        bound(Lzma2Bound::Output, options.max_output, total)?;
+        bound(Lzma2Bound::Streamed, options.max_streamed, (dict.len() as u64).saturating_add(total))?;
+        let input = slice(packed, packed_base, first.packed_offset..last.packed().end)?;
         let mut stream = Vec::new();
         stream.try_reserve_exact(dict.len() + dict.len() / 65_536 * 3 + 3 + input.len() + 1).map_err(|_| {
             Lzma2DecodeError::Limit {
@@ -867,7 +872,6 @@ impl Lzma2Index {
             unpacked_offset: out + (c.unpacked_offset - first.unpacked_offset),
             ..*c
         }));
-        let total = run.iter().map(|c| c.unpacked_len).sum::<u64>();
         let skip = dict.len() as u64;
         decode_run(&synthetic, &stream, 0, dict_prop, options, skip..skip + total)
             .and_then(|out| check_output(out, total))

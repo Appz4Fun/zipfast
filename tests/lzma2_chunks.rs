@@ -923,3 +923,29 @@ fn packed_bytes_that_disagree_with_the_index_fail_as_data() {
     let r = index.decode_with_dictionary(i..i + 1, &bad, 0, DICT_PROP, &plain[..c.unpacked_offset as usize], &opts());
     assert!(r.is_err() || r.as_ref().unwrap() != &plain[c.unpacked().start as usize..c.unpacked().end as usize]);
 }
+
+/// A restart's output and streamed limits are checked from the index before the made-up stream (the dictionary and
+/// the whole packed run) is copied: an over-limit run fails as a limit even with none of its packed bytes at hand.
+#[test]
+fn a_restart_checks_its_limits_before_copying_the_run() {
+    let plain = mixed();
+    let packed = encode(&plain);
+    let index = index(&packed);
+    let i = index.chunks.iter().position(|c| c.reset == Lzma2Reset::State).unwrap();
+    let c = index.chunks[i];
+    let end = index.chunks.len();
+    let total: u64 = index.chunks[i..end].iter().map(|c| c.unpacked_len).sum();
+    let dictionary = &plain[..c.unpacked_offset as usize];
+    let output = Lzma2DecodeOptions { max_output: 1000, ..opts() };
+    let r = index.decode_with_dictionary(i..end, &[], c.packed_offset, DICT_PROP, dictionary, &output);
+    assert!(
+        matches!(r, Err(Lzma2DecodeError::Limit { bound: Lzma2Bound::Output, limit: 1000, attempted }) if attempted == total),
+        "{r:?}"
+    );
+    let streamed = Lzma2DecodeOptions { max_streamed: total, ..opts() };
+    let r = index.decode_with_dictionary(i..end, &[], c.packed_offset, DICT_PROP, dictionary, &streamed);
+    assert!(
+        matches!(r, Err(Lzma2DecodeError::Limit { bound: Lzma2Bound::Streamed, limit, .. }) if limit == total),
+        "{r:?}"
+    );
+}
