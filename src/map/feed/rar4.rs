@@ -169,6 +169,7 @@ impl FeedDecoder {
             index: 0,
             stream_start: 0,
             unproven: false,
+            suspect: None,
             rar5: None,
             lzma2: None,
             rar4: Some(Box::new(Rar4 {

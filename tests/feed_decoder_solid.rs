@@ -80,7 +80,6 @@ fn rar5_solid(seed: u64, encrypted: bool) -> Solid {
 /// With `filter`, member 1 declares an E8 filter over part of the output member 2 starts by copying: a window
 /// rebuilt from held output must undo it relative to member 1's start.
 fn rar5_solid_with(seed: u64, encrypted: bool, filter: bool) -> Solid {
-    use zipfast::rar5::testenc;
     let a = video_like(220_000, seed);
     let mut b = a[a.len() - 90_000..a.len() - 20_000].to_vec();
     b.extend(video_like(160_000, seed + 1));
@@ -93,56 +92,77 @@ fn rar5_solid_with(seed: u64, encrypted: bool, filter: bool) -> Solid {
     }
     let mut c = b[b.len() - 100_000..b.len() - 40_000].to_vec();
     c.extend(video_like(140_000, seed + 2));
-    let all = [a.clone(), b.clone(), c.clone()].concat();
-    // one LZ pass over the stream, cut between ops near the members' ends: a member's ops never run into the next
+    solid_from(&[a, b, c], encrypted, filter.then_some(1), "")
+}
+
+fn op_len(op: &zipfast::rar5::testenc::Op) -> usize {
+    use zipfast::rar5::testenc::Op;
+    match op {
+        Op::Lit(_) => 1,
+        Op::Match(n, _) | Op::Rep(_, n) => *n as usize,
+        _ => 0,
+    }
+}
+
+/// One LZ pass over the members' concatenation, cut between ops at or just past each member's end (a member's ops
+/// never run into the next): the ops of each member.
+fn solid_ops(raw: &[Vec<u8>]) -> (Vec<u8>, Vec<Vec<zipfast::rar5::testenc::Op>>) {
+    use zipfast::rar5::testenc;
+    let all = raw.concat();
     let ops = testenc::lz(&all, 1 << 17, 16);
-    let wanted = [a.len(), a.len() + b.len()];
-    let mut cuts = Vec::new();
+    let mut wanted = Vec::new();
+    let mut sum = 0;
+    for r in &raw[..raw.len() - 1] {
+        sum += r.len();
+        wanted.push(sum);
+    }
     let mut at = 0usize;
     let mut groups: Vec<Vec<testenc::Op>> = vec![Vec::new()];
     for op in ops {
-        if cuts.len() < wanted.len() && at >= wanted[cuts.len()] {
-            cuts.push(at);
+        if groups.len() <= wanted.len() && at >= wanted[groups.len() - 1] {
             groups.push(Vec::new());
         }
-        at += match op {
-            testenc::Op::Lit(_) => 1,
-            testenc::Op::Match(n, _) | testenc::Op::Rep(_, n) => n as usize,
-            _ => unreachable!(),
-        };
+        at += op_len(&op);
         groups.last_mut().unwrap().push(op);
     }
-    assert_eq!(cuts.len(), 2);
-    let bounds = [0, cuts[0], cuts[1], all.len()];
-    let sizes: Vec<usize> = bounds.windows(2).map(|w| w[1] - w[0]).collect();
-    let starts = vec![0, cuts[0] as u64, cuts[1] as u64];
+    assert_eq!(groups.len(), raw.len());
+    (all, groups)
+}
+
+/// A solid archive of the members `raw` (one LZ pass, blocks of 2,000 ops); with `filter`, that member declares an
+/// E8 filter at the block 95,000 bytes before its end, over 40,000 bytes.
+fn solid_from(raw: &[Vec<u8>], encrypted: bool, filter: Option<usize>, prefix: &str) -> Solid {
+    use zipfast::rar5::testenc;
+    let (_, groups) = solid_ops(raw);
     let mut streams: Vec<Vec<u8>> = groups.iter().map(|g| testenc::tuned_stream(g, 2_000)).collect();
-    if filter {
-        // member 1's blocks again, an E8 filter declared at the block that starts 95,000 bytes before its end
-        let chunks: Vec<&[testenc::Op]> = groups[1].chunks(2_000).collect();
+    if let Some(m) = filter {
+        let size: usize = groups[m].iter().map(op_len).sum();
+        let chunks: Vec<&[testenc::Op]> = groups[m].chunks(2_000).collect();
         let mut out = Vec::new();
         let mut at = 0usize;
         let mut placed = false;
         for (i, c) in chunks.iter().enumerate() {
             let mut c = c.to_vec();
-            if !placed && at + 95_000 >= sizes[1] {
+            if !placed && at + 95_000 >= size {
                 c.insert(0, testenc::Op::Filter { start: 0, len: 40_000, kind: 1, channels: 0 });
                 placed = true;
             }
-            at += c
-                .iter()
-                .map(|op| match op {
-                    testenc::Op::Lit(_) => 1,
-                    testenc::Op::Match(n, _) | testenc::Op::Rep(_, n) => *n as usize,
-                    _ => 0,
-                })
-                .sum::<usize>();
+            at += c.iter().map(op_len).sum::<usize>();
             out.extend(testenc::tuned_block(&c, i + 1 == chunks.len()));
         }
         assert!(placed);
-        streams[1] = out;
+        streams[m] = out;
     }
-    // what the stream decodes to (filters applied), member by member
+    let plains = reference(&streams, &groups.iter().map(|g| g.iter().map(op_len).sum()).collect::<Vec<_>>());
+    if filter.is_none() {
+        let (all, _) = (raw.concat(), ());
+        assert_eq!(plains.concat(), all);
+    }
+    pack(&streams, plains, encrypted, prefix)
+}
+
+/// What the packed streams of a solid stream decode to (filters applied), member by member.
+fn reference(streams: &[Vec<u8>], sizes: &[usize]) -> Vec<Vec<u8>> {
     let mut dec = zipfast::rar5::unpack::Unpacker::new(zipfast::rar5::unpack::Window::full(1 << 18)).unwrap();
     dec.set_threads(0, u64::MAX);
     let mut plains = Vec::new();
@@ -156,15 +176,41 @@ fn rar5_solid_with(seed: u64, encrypted: bool, filter: bool) -> Solid {
         dec.feed(st, &mut out).unwrap();
         dec.finish(&mut out).unwrap();
         assert_eq!(out.0.len(), sizes[i]);
-        if !filter {
-            assert_eq!(out.0, all[bounds[i]..bounds[i + 1]]);
-        }
         plains.push(out.0);
     }
-    if filter {
-        assert_ne!(plains[1], all[bounds[1]..bounds[2]], "the filter changes member 1's output");
+    plains
+}
+
+fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut padded = [0u8; 64];
+    padded[..key.len()].copy_from_slice(key);
+    let mut inner: Vec<u8> = padded.iter().map(|b| b ^ 0x36).collect();
+    inner.extend_from_slice(message);
+    let mut outer: Vec<u8> = padded.iter().map(|b| b ^ 0x5c).collect();
+    outer.extend_from_slice(&zipfast::crypto::sha256(&inner));
+    zipfast::crypto::sha256(&outer)
+}
+
+/// The RAR 5.0 password check value for `password` (KDF count 1).
+fn password_check(password: &str) -> [u8; 8] {
+    let mut block = SALT.to_vec();
+    block.extend(1u32.to_be_bytes());
+    let mut u = hmac(password.as_bytes(), &block);
+    let mut sum = u;
+    for _ in 1..(1u32 << 1) + 32 {
+        u = hmac(password.as_bytes(), &u);
+        sum.iter_mut().zip(u).for_each(|(s, b)| *s ^= b);
     }
+    let mut folded = [0u8; 8];
+    sum.iter().enumerate().for_each(|(i, b)| folded[i % 8] ^= b);
+    folded
+}
+
+/// The archive: member `i` holds packed stream `streams[i]` decoding to `plains[i]`, every one after the first
+/// solid; encrypted with password "pw" (with a password check), each member its own IV; names prefixed.
+fn pack(streams: &[Vec<u8>], plains: Vec<Vec<u8>>, encrypted: bool, prefix: &str) -> Solid {
     let keys = encrypted.then(|| zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap());
+    let check = password_check("pw");
     let mut packed = Vec::new();
     let mut crcs = Vec::new();
     let mut extras = Vec::new();
@@ -176,19 +222,21 @@ fn rar5_solid_with(seed: u64, encrypted: bool, filter: bool) -> Solid {
             let iv = [i as u8 + 1; 16];
             data.resize(data.len().div_ceil(16) * 16, 0);
             data = zipfast::crypto::encrypt_cbc(key, &iv, &data).unwrap();
-            extra = vec![36, 1, 0, 2, 1];
+            extra = vec![48, 1, 0, 3, 1];
             extra.extend(SALT);
             extra.extend(iv);
+            extra.extend(check);
+            extra.extend(&zipfast::crypto::sha256(&check)[..4]);
             crc = zipfast::crypto::rar5_tweak_crc32(crc, hash_key);
         }
         packed.push(data);
         crcs.push(crc);
         extras.push(extra);
     }
-    let names = ["a.bin", "b.bin", "c.bin"];
-    let specs: Vec<(FileSpec<'_>, u32)> = (0..3)
+    let names: Vec<String> = (0..streams.len()).map(|i| format!("{prefix}{}.bin", (b'a' + i as u8) as char)).collect();
+    let specs: Vec<(FileSpec<'_>, u32)> = (0..streams.len())
         .map(|i| {
-            let mut s = FileSpec::new(names[i], &packed[i]);
+            let mut s = FileSpec::new(&names[i], &packed[i]);
             s.method = 3;
             s.size = Some(plains[i].len() as u64);
             s.solid = i > 0;
@@ -199,7 +247,12 @@ fn rar5_solid_with(seed: u64, encrypted: bool, filter: bool) -> Solid {
     let bytes = archive_with(&specs, true);
     let password = encrypted.then_some("pw");
     let map = MemberMap::from_memory(&[&bytes], "s.rar", password).unwrap();
-    assert!(map.members[1].solid && map.members[2].solid && !map.members[0].solid);
+    assert!(map.members[1..].iter().all(|m| m.solid) && !map.members[0].solid);
+    let mut starts = vec![0u64];
+    for p in &plains {
+        starts.push(starts.last().unwrap() + p.len() as u64);
+    }
+    starts.pop();
     Solid { map, bytes, plains, starts, password }
 }
 
@@ -282,6 +335,8 @@ struct Run<'s> {
     earlier: u64,
     /// whether a successor was ever unproven while the member before it was not done
     saw_unproven: bool,
+    /// whether each successor was unproven when handed over
+    started_unproven: Vec<bool>,
 }
 
 impl<'s> Run<'s> {
@@ -296,9 +351,13 @@ impl<'s> Run<'s> {
             s,
             source: ArticleBuffer::new(usize::MAX),
             outs,
-            decoders: vec![Some(first), None, None],
+            decoders: std::iter::once(Some(first))
+                .chain(std::iter::repeat_with(|| None))
+                .take(s.plains.len())
+                .collect(),
             earlier: 0,
             saw_unproven: false,
+            started_unproven: vec![false; s.plains.len()],
         }
     }
 
@@ -308,10 +367,9 @@ impl<'s> Run<'s> {
     }
 
     fn step(&mut self) {
-        let mut ends = self.s.starts.clone();
-        ends.push(self.s.starts[2] + self.s.plains[2].len() as u64);
+        let n = self.s.plains.len();
         let mut i = 0;
-        while i < 3 {
+        while i < n {
             if self.decoders[i].is_some() {
                 let (d, src, mut view) = self.view(i);
                 loop {
@@ -321,13 +379,19 @@ impl<'s> Run<'s> {
                     }
                 }
                 let st = self.decoders[i].as_ref().unwrap().status().clone();
-                if i + 1 < 3 && self.decoders[i + 1].is_none() && st.frontier == self.s.plains[i].len() as u64 {
-                    let next = self.decoders[i].as_mut().unwrap().next_solid(&self.s.map, i + 1, options(self.s));
-                    let next = next.unwrap();
-                    if next.status().unproven && !st.done {
-                        self.saw_unproven = true;
+                if i + 1 < n && self.decoders[i + 1].is_none() && st.frontier == self.s.plains[i].len() as u64 {
+                    // an empty member's frontier is at its size from the start: it hands over once its blocks are in
+                    match self.decoders[i].as_mut().unwrap().next_solid(&self.s.map, i + 1, options(self.s)) {
+                        Ok(next) => {
+                            if next.status().unproven {
+                                self.saw_unproven = true;
+                                self.started_unproven[i + 1] = true;
+                            }
+                            self.decoders[i + 1] = Some(next);
+                        }
+                        Err(FeedError::Handoff(_)) if self.s.plains[i].is_empty() => {}
+                        Err(e) => panic!("member {i}: {e}"),
                     }
-                    self.decoders[i + 1] = Some(next);
                 }
             }
             i += 1;
@@ -341,7 +405,7 @@ impl<'s> Run<'s> {
 
     fn check_done(&self) -> FeedStats {
         let mut total = FeedStats::default();
-        for i in 0..3 {
+        for i in 0..self.s.plains.len() {
             let d = self.decoders[i].as_ref().unwrap_or_else(|| panic!("member {i} never started"));
             let st = d.status();
             assert!(st.done && st.crc_ok == Some(true) && !st.unproven, "member {i}: {st:?}");
@@ -574,4 +638,134 @@ fn a_carry_undoes_an_earlier_members_filter_relative_to_that_member() {
         run.check_done();
         assert!(run.earlier > 0);
     }
+}
+
+/// A member shorter than the window does not prove the older bytes it leaves in the window: member 0 skips a hole
+/// over held output (its repair still to come), member 1 (20 KB) decodes and passes its CRC, and member 2, which
+/// starts by copying member 0's output from around the hole, is unproven until its own CRC matches.
+#[test]
+fn a_short_proven_member_does_not_prove_the_older_window() {
+    for encrypted in [false, true] {
+        let a = video_like(200_000, 41);
+        let b = video_like(20_000, 42);
+        let mut c = a[60_000..150_000].to_vec();
+        c.extend(video_like(60_000, 43));
+        let s = solid_from(&[a, b, c], encrypted, None, "");
+        let (present, missing) = split_at(&s, 7_000, &[(0, 0.5)], 11);
+        let mut run = Run::new(&s, true);
+        for (v, off, b) in &missing {
+            run.source.mark_lost(*v, *off..*off + b.len() as u64);
+        }
+        for a in &present {
+            run.insert(a);
+        }
+        let st: Vec<FeedStatus> = run.decoders.iter().map(|d| d.as_ref().unwrap().status().clone()).collect();
+        assert!(!st[0].done && st[0].unproven, "member 0 skipped its hole: {:?}", st[0]);
+        assert!(st[1].done && st[1].crc_ok == Some(true) && !st[1].unproven, "{:?}", st[1]);
+        // member 2 decoded from member 0's unproven output: unproven until its own CRC matched
+        assert!(run.started_unproven[2], "member 2 started from a window holding member 0's unproven output");
+        assert!(st[2].unproven || (st[2].done && st[2].crc_ok == Some(true)), "{:?}", st[2]);
+        for a in &missing {
+            run.insert(a);
+        }
+        run.check_done();
+    }
+}
+
+/// An empty member's blocks set the tables the next member's first block (which has none) goes on with: they are
+/// decoded before the hand-off and before the carry is taken, also when the empty member is the stream's first.
+#[test]
+fn an_empty_member_with_blocks_sets_the_next_members_tables() {
+    use zipfast::rar5::testenc;
+    for encrypted in [false, true] {
+        for empty_first in [false, true] {
+            let a = video_like(120_000, 51);
+            let mut c = a[40_000..100_000].to_vec();
+            c.extend(video_like(50_000, 52));
+            let raw: Vec<Vec<u8>> = if empty_first { vec![c.clone()] } else { vec![a, c] };
+            let (_, groups) = solid_ops(&raw);
+            let sizes: Vec<usize> = groups.iter().map(|g| g.iter().map(op_len).sum()).collect();
+            // an empty member: one block with fixed tables and no symbols; then a member whose block has no tables
+            let empty = testenc::block(&[], true, true);
+            let last = testenc::block(groups.last().unwrap(), false, true);
+            let (streams, sizes) = if empty_first {
+                (vec![empty, last], vec![0, sizes[0]])
+            } else {
+                (vec![testenc::tuned_stream(&groups[0], 2_000), empty, last], vec![sizes[0], 0, sizes[1]])
+            };
+            let plains = reference(&streams, &sizes);
+            let s = pack(&streams, plains, encrypted, "");
+            let (present, _) = split(&s, 4_000, 0, 12);
+            let mut run = Run::new(&s, false);
+            for a in &present {
+                run.insert(a);
+            }
+            let stats = run.check_done();
+            assert_eq!(stats.redecoded, 0);
+            // the carry taken at the empty member's end holds its tables too
+            let e = if empty_first { 0 } else { 1 };
+            let carry = run.decoders[e].as_ref().unwrap().solid_carry().expect("a carry");
+            let mut run2 = Run::new(&s, false);
+            for a in &present {
+                run2.source.insert(a.0, a.1, &a.2).unwrap();
+            }
+            run2.outs = run.outs.iter().map(|o| Held { donor: o.out.clone(), ..Held::default() }).collect();
+            run2.outs[e + 1] = Held::default();
+            run2.decoders = (0..s.plains.len()).map(|_| None).collect();
+            run2.decoders[e + 1] = Some(FeedDecoder::resume_solid(&s.map, e + 1, options(&s), &carry).unwrap());
+            let (d, src, mut view) = run2.view(e + 1);
+            let st = d.run(src, &mut view).unwrap();
+            assert!(st.done && st.crc_ok == Some(true), "from the carry: {st:?}");
+        }
+    }
+}
+
+/// A sink that only takes output: no read_held, no read_earlier.
+struct WriteOnly(Vec<u8>);
+
+impl FeedSink for WriteOnly {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.write_at(offset, bytes)
+    }
+}
+
+/// A hand-off that fails on the successor's own setup (a wrong password, a window limit) keeps the live decoder:
+/// the next attempt still goes on in-session, needing no output read back.
+#[test]
+fn a_failed_hand_off_keeps_the_live_decoder() {
+    let s = rar5_solid(26, true);
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &s.bytes).unwrap();
+    let mut d0 = FeedDecoder::new(&s.map, 0, options(&s)).unwrap();
+    let mut out0 = WriteOnly(Vec::new());
+    assert!(d0.run(&mut source, &mut out0).unwrap().done);
+    assert!(matches!(d0.next_solid(&s.map, 1, FeedOptions::new(Some("wrong"))), Err(FeedError::WrongPassword)));
+    let small = FeedOptions { max_window: 1 << 10, ..options(&s) };
+    assert!(matches!(d0.next_solid(&s.map, 1, small), Err(FeedError::Unsupported(FeedUnsupported::Window { .. }))));
+    let mut d1 = d0.next_solid(&s.map, 1, options(&s)).unwrap();
+    let mut out1 = WriteOnly(Vec::new());
+    let st = d1.run(&mut source, &mut out1).unwrap();
+    assert!(st.done && st.crc_ok == Some(true), "{st:?}");
+    assert_eq!(out1.0, s.plains[1]);
+}
+
+/// A carry binds to its stream: one from another archive whose members have the same sizes is refused.
+#[test]
+fn a_carry_from_another_stream_is_refused() {
+    let raw = {
+        let a = video_like(100_000, 61);
+        let mut b = a[20_000..80_000].to_vec();
+        b.extend(video_like(40_000, 62));
+        vec![a, b]
+    };
+    let x = solid_from(&raw, false, None, "");
+    let y = solid_from(&raw, false, None, "other/");
+    assert_eq!(x.starts, y.starts);
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &x.bytes).unwrap();
+    let mut d0 = FeedDecoder::new(&x.map, 0, options(&x)).unwrap();
+    assert!(d0.run(&mut source, &mut WriteOnly(Vec::new())).unwrap().done);
+    let carry = d0.solid_carry().unwrap();
+    assert!(FeedDecoder::resume_solid(&x.map, 1, options(&x), &carry).is_ok());
+    assert!(matches!(FeedDecoder::resume_solid(&y.map, 1, options(&y), &carry), Err(FeedError::Handoff(_))));
 }

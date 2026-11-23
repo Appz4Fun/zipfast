@@ -248,14 +248,21 @@ and its state there as a checkpoint at the next member's start: the **carry**. `
 from then on. `FeedDecoder::resume_solid(&map, index, options, &carry)` starts the next member from it, in this
 process or a later one: its first run reads the window (the dictionary's worth of output before the member) back
 through `read_earlier` (`FeedError::EarlierOutput` when not held), and the decoder state is exact. A finished member
-restored from its snapshot hands over the same way (`next_solid` falls back to its carry). `FeedDecoder::new` on a
-solid successor is `Unsupported(Solid)`: without the carry its window and match history are unknown.
+restored from its snapshot hands over the same way (`next_solid` falls back to its carry). A carry records the
+member it was taken from, so `resume_solid` refuses one of another stream (`Handoff`), even with the same sizes. The
+successor is set up (keys, limits) before the live decoder leaves the member before it, so a hand-off that fails
+there (`WrongPassword`, `Unsupported(Window)`) can be tried again in-session. An empty member's blocks are decoded too
+(they may set the tables the next member goes on with) before it hands over; an empty member without packed bytes
+passes the stream on as it got it. `FeedDecoder::new` on a solid successor is `Unsupported(Solid)`: without the carry
+its window and match history are unknown.
 
 Holes work as in a single member, at stream offsets: a skip over held output reads the window from the earlier
 members' output too, and a repair or restore whose checkpoint window reaches before the member reads it there. A
 member that skipped a hole hands over once its main decode passes its end, with ranges still lost: the next member's
-window holds the held output in those ranges, so it is `unproven` until it is done with its CRC matched (and so is
-its carry, `SolidCarry::unproven`). A member waiting at a hole without held output holds back every member after it
+window holds the held output in those ranges, so it is `unproven` until its own CRC matches (and so is the carry,
+`SolidCarry::unproven`). A member's CRC proves only its own output: the end of the output not proven is handed on
+from member to member while it lies within a window's reach of the next member's start, so a member after a short
+one that passed its CRC is still `unproven` when its window holds the older unproven bytes. A member waiting at a hole without held output holds back every member after it
 (the next one starts once its bytes come). A RAR 5.0 restart found at a member's very end (only the cipher's padding
 after it) is not taken; the last block before it is.
 
@@ -264,7 +271,8 @@ after it) is not taken; the last block before it is.
 `snapshot()` captures the decoder between runs: the main decode's position (under CBC its block and that block's
 IV; for a compressed member its checkpoint, frontier and the skipped holes' checkpoints and restarts), the lost
 ranges, the CRC runs and the stats. It never holds keys or plaintext. `FeedSnapshot::to_bytes()` and `from_bytes()`
-give a compact versioned encoding (`ZFFD`, version 3, which adds `unproven`; versions 1 and 2 still load) to keep next to the
+give a compact versioned encoding (`ZFFD`, version 3, which adds `unproven` and the window's unproven end; versions
+1 and 2 still load) to keep next to the
 output file. It records a fingerprint of the member (name, sizes, method, cipher parameters, piece positions), so it
 restores only onto that member.
 `FeedDecoder::restore(&map, member, options, &snapshot)` derives the key again and continues from there: bytes read
@@ -461,4 +469,9 @@ Solid RAR 5.0 streams (`tests/feed_decoder_solid.rs`):
   all end exact with `redecoded` 0. A carry taken at member 0's end, serialized, starts member 1 (its window read back
   from member 0's output), and member 1's snapshot restores across the boundary (under 64 KiB decoded again). An E8
   filter in member 1 over output member 2 copies is undone relative to member 1's start when member 2 starts from a
-  carry (with the filter undone at the stream's offset instead, member 2's CRC fails).
+  carry (with the filter undone at the stream's offset instead, member 2's CRC fails). Also: a 20 KB member that
+  passes its CRC between a member with a skipped hole and one that copies from around it leaves the third
+  `unproven`; an empty member whose block sets the tables the next member's first block (without tables) uses, as the
+  stream's first member and after another, handed over and from its carry; a hand-off that fails on a wrong password
+  or a window limit, then succeeds in-session with a write-only sink; and a carry refused by an archive whose members
+  have the same sizes but other names.

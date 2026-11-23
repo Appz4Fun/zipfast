@@ -786,6 +786,9 @@ pub struct FeedDecoder {
     stream_start: u64,
     /// output written was decoded from a window not proven yet ([`FeedStatus::unproven`])
     unproven: bool,
+    /// for a solid successor: the stream offset where output of earlier members that is not proven ends, while it
+    /// may still lie in the window (a member's CRC proves its own output, not the older bytes its window holds)
+    suspect: Option<u64>,
     /// a compressed RAR 5.0 member's decoder state
     rar5: Option<Box<rar5::Rar5>>,
     /// a 7z LZMA2 folder member's decoder state
@@ -918,6 +921,7 @@ impl FeedDecoder {
             index: 0,
             stream_start: 0,
             unproven: false,
+            suspect: None,
             rar5: None,
             lzma2: None,
             rar4: None,
@@ -1299,6 +1303,7 @@ impl FeedDecoder {
             stats: self.stats,
             identity: self.identity,
             unproven: self.unproven,
+            suspect: self.suspect,
             layer: match (&self.rar5, &self.lzma2, &self.rar4) {
                 (Some(r), _, _) => Some(r.to_bytes()),
                 (_, Some(l), _) => Some(l.to_bytes()),
@@ -1393,6 +1398,7 @@ impl FeedDecoder {
         d.crc = crc;
         d.stats = snapshot.stats;
         d.unproven = snapshot.unproven;
+        d.suspect = snapshot.suspect;
         d.status = d.make_status(Vec::new(), false);
         Ok(d)
     }
@@ -1410,8 +1416,9 @@ impl FeedDecoder {
     /// its repairs stand: this decoder keeps its lost ranges and repairs them as before, and the new one reads from
     /// where this one stopped.
     ///
-    /// The new decoder is [`FeedStatus::unproven`] while this one is not done with its CRC matched and this one
-    /// skipped a hole over held output (or failed its CRC). A RAR 5.0 decoder restored from a snapshot after it
+    /// The new decoder is [`FeedStatus::unproven`] until its own CRC matches when its window may hold output not
+    /// proven: this member's, while it is not done with its CRC matched and skipped a hole over held output (or
+    /// failed its CRC), or an earlier member's still within a window's reach (see [`SolidCarry::unproven`]). A RAR 5.0 decoder restored from a snapshot after it
     /// finished hands over from the state it saved at its end (as [`Self::resume_solid`]); others refuse
     /// ([`FeedError::Handoff`]).
     pub fn next_solid(&mut self, map: &MemberMap, index: usize, options: FeedOptions) -> Result<Self, FeedError> {
@@ -1421,14 +1428,35 @@ impl FeedDecoder {
         Err(FeedError::Unsupported(FeedUnsupported::Solid))
     }
 
-    /// Whether the output this decoder hands to a solid successor was decoded from an unproven window.
-    fn carried_unproven(&self) -> bool {
-        let s = &self.status;
-        match (s.done, s.crc_ok) {
-            (true, Some(true)) => false,
-            (true, Some(false)) => true,
-            _ => self.unproven,
+    /// The farthest back a match may copy from: the window a successor inherits holds this much of the output
+    /// before it.
+    fn reach(&self) -> u64 {
+        if let Some(r) = &self.rar5 {
+            return r.reach();
         }
+        u64::MAX
+    }
+
+    /// Where the output not proven that a solid successor's window may hold ends (stream offsets), if any: this
+    /// member's own output unless its CRC matched, and older output still within reach of the successor's start
+    /// (a member shorter than the window does not push it out, and its own CRC does not prove it).
+    fn carried_suspect(&self) -> Option<u64> {
+        let s = &self.status;
+        let end = self.stream_start + self.size;
+        let own = match (s.done, s.crc_ok) {
+            (true, Some(true)) => None,
+            (true, Some(false)) => Some(end),
+            _ => self.unproven.then_some(end),
+        };
+        own.max(self.suspect).filter(|&at| at.saturating_add(self.reach()) > end)
+    }
+
+    /// Starts this successor with the suspect window `suspect` handed to it ([`Self::carried_suspect`]): its output
+    /// is unproven until its own CRC matches.
+    fn inherit(&mut self, suspect: Option<u64>) {
+        self.suspect = suspect;
+        self.unproven |= suspect.is_some();
+        self.status = self.make_status(Vec::new(), false);
     }
 
     /// RAR 5.0: the state a solid successor starts from, once this member's main decode has finished (and kept in
@@ -1441,7 +1469,8 @@ impl FeedDecoder {
         r.carry_blob().map(|(next_start, cp)| SolidCarry {
             tag: LayerTag::Rar5 as u8,
             next_start,
-            unproven: self.carried_unproven(),
+            from: self.identity,
+            suspect: self.carried_suspect(),
             cp,
         })
     }
@@ -1461,8 +1490,7 @@ impl FeedDecoder {
             return Err(FeedError::Handoff("a carry of another layer"));
         }
         let mut d = Self::new_begin(map, index, options, Begin::Carry(carry.clone()))?;
-        d.unproven = carry.unproven;
-        d.status = d.make_status(Vec::new(), false);
+        d.inherit(carry.suspect);
         Ok(d)
     }
 }
@@ -1473,10 +1501,8 @@ enum Begin {
     Fresh,
     /// in [`FeedDecoder::restore`]: the snapshot gives the state
     Restore,
-    /// a RAR 5.0 solid successor from a carry
+    /// a RAR 5.0 solid successor from a carry (and, handed over in-session, the live decoder installed after)
     Carry(SolidCarry),
-    /// a RAR 5.0 solid successor going on from the decoder of the member before
-    Rar5(Box<crate::rar5::unpack::Unpacker>, SolidCarry),
 }
 
 /// The state a RAR 5.0 solid successor starts from ([`FeedDecoder::solid_carry`]): about 500 bytes, no plaintext
@@ -1486,7 +1512,10 @@ pub struct SolidCarry {
     tag: u8,
     /// the successor's start in the solid stream's output
     next_start: u64,
-    unproven: bool,
+    /// the fingerprint of the member it was taken from, which binds it to its stream
+    from: u64,
+    /// where output not proven ends that the successor's window may hold ([`FeedDecoder::carried_suspect`])
+    suspect: Option<u64>,
     /// the decoder state at the successor's start
     cp: Vec<u8>,
 }
@@ -1499,10 +1528,11 @@ impl SolidCarry {
         self.next_start
     }
 
-    /// Whether the earlier members' output was unproven when it was taken: a hole skipped over held output whose
-    /// member was not done with its CRC matched yet. The successor reports [`FeedStatus::unproven`] then.
+    /// Whether the window it hands over may hold output not proven: a hole skipped over held output whose member
+    /// was not done with its CRC matched yet, still within a window's reach of the next member's start (a later
+    /// member's CRC proves only its own output). The successor reports [`FeedStatus::unproven`] then.
     pub fn unproven(&self) -> bool {
-        self.unproven
+        self.suspect.is_some()
     }
 
     /// The serialized form.
@@ -1512,7 +1542,8 @@ impl SolidCarry {
         out.push(1);
         out.push(self.tag);
         out.extend_from_slice(&self.next_start.to_le_bytes());
-        out.push(u8::from(self.unproven));
+        out.extend_from_slice(&self.from.to_le_bytes());
+        put_opt_u64(&mut out, self.suspect);
         out.extend_from_slice(&(self.cp.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.cp);
         out
@@ -1529,17 +1560,14 @@ impl SolidCarry {
         }
         let tag = r.u8()?;
         let next_start = r.u64()?;
-        let unproven = match r.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(FeedError::Snapshot("bad flag")),
-        };
+        let from = r.u64()?;
+        let suspect = r.opt_u64()?;
         let n = usize::try_from(r.u64()?).map_err(|_| FeedError::Snapshot("bad count"))?;
         let cp = r.take(n)?.to_vec();
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
-        Ok(Self { tag, next_start, unproven, cp })
+        Ok(Self { tag, next_start, from, suspect, cp })
     }
 }
 
@@ -1689,8 +1717,9 @@ pub struct FeedSnapshot {
     stats: FeedStats,
     /// the member's fingerprint ([`member_identity`])
     identity: u64,
-    /// [`FeedStatus::unproven`] before done
+    /// [`FeedStatus::unproven`] before done, and the suspect window a solid successor inherited
     unproven: bool,
+    suspect: Option<u64>,
     /// a compressed layer's state: RAR 5.0 checkpoints and repairs, LZMA2 restart points and repairs
     layer: Option<Vec<u8>>,
 }
@@ -1757,6 +1786,7 @@ impl FeedSnapshot {
             }
         }
         out.push(u8::from(self.unproven));
+        put_opt_u64(&mut out, self.suspect);
         out
     }
 
@@ -1814,16 +1844,44 @@ impl FeedSnapshot {
                 _ => return Err(FeedError::Snapshot("bad flag")),
             }
         }
-        let unproven = version >= 3
-            && match r.u8()? {
+        let (unproven, suspect) = if version >= 3 {
+            let unproven = match r.u8()? {
                 0 => false,
                 1 => true,
                 _ => return Err(FeedError::Snapshot("bad flag")),
             };
+            (unproven, r.opt_u64()?)
+        } else {
+            (false, None)
+        };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
-        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, identity, unproven, layer })
+        Ok(Self {
+            tag,
+            size,
+            stream_len,
+            want_crc,
+            main,
+            lost,
+            crc,
+            crc_broken,
+            stats,
+            identity,
+            unproven,
+            suspect,
+            layer,
+        })
+    }
+}
+
+fn put_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        None => out.push(0),
+        Some(v) => {
+            out.push(1);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
     }
 }
 
@@ -1846,6 +1904,13 @@ impl<'a> Reader<'a> {
     }
     fn u64(&mut self) -> Result<u64, FeedError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
+    }
+    fn opt_u64(&mut self) -> Result<Option<u64>, FeedError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.u64()?)),
+            _ => Err(FeedError::Snapshot("bad flag")),
+        }
     }
     /// A count of items of `each` bytes, checked against the bytes left.
     fn count(&mut self, each: u64) -> Result<usize, FeedError> {

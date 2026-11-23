@@ -150,6 +150,10 @@ impl Rar5 {
         self.out.max(self.write_from)
     }
 
+    pub(super) fn reach(&self) -> u64 {
+        self.window.reach
+    }
+
     pub(super) fn stalled(&self) -> bool {
         self.stalled
     }
@@ -326,17 +330,20 @@ impl FeedDecoder {
         let size = member.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
         let run = solid_run(map, index)?;
         let solid = run.prev.is_some();
-        // the successor's start: the carry's checkpoint, or the decoder handed over with it
-        let (base, handed) = match begin {
+        // a successor starts at the carry's checkpoint (a decoder handed over in-session is installed after)
+        let base = match begin {
             Begin::Fresh if solid => return Err(FeedError::Unsupported(FeedUnsupported::Solid)),
-            Begin::Fresh => (Cp::start(0), None),
-            Begin::Restore => (Cp::start(run.start), None),
-            Begin::Carry(carry) | Begin::Rar5(_, carry) if !solid || carry.next_start != run.start => {
-                let _ = carry;
-                return Err(FeedError::Handoff("a carry of another place in the stream"));
+            Begin::Fresh => Cp::start(0),
+            Begin::Restore => Cp::start(run.start),
+            Begin::Carry(carry) => {
+                // taken at the end of the member before, in this stream
+                let prev = run.prev.ok_or(FeedError::Handoff("a carry for a member that is not a solid successor"))?;
+                let prev_start = run.starts[run.starts.len() - 2];
+                if carry.next_start != run.start || carry.from != solid_identity(&map.members[prev], prev_start) {
+                    return Err(FeedError::Handoff("a carry of another stream or place in it"));
+                }
+                carry_cp(&carry, &run.starts)?
             }
-            Begin::Carry(carry) => (carry_cp(&carry, &run.starts)?, None),
-            Begin::Rar5(dec, carry) => (carry_cp(&carry, &run.starts)?, Some(dec)),
         };
         if !member.complete {
             return Err(FeedError::IncompleteMember);
@@ -355,11 +362,6 @@ impl FeedDecoder {
         let stream = solid || run.successor;
         let dictionary = if stream { run.dictionary.unwrap_or(dictionary).max(dictionary) } else { dictionary };
         let window = window_for(dictionary, Some(size), stream).map_err(|error| FeedError::Decode { out: 0, error })?;
-        if let Some(dec) = &handed
-            && dec.window_size() != window.size
-        {
-            return Err(FeedError::Handoff("a decoder of another window"));
-        }
         if window.size > options.max_window {
             return Err(FeedError::Unsupported(FeedUnsupported::Window { size: window.size }));
         }
@@ -414,6 +416,7 @@ impl FeedDecoder {
             index: 0,
             stream_start: run.start,
             unproven: false,
+            suspect: None,
             rar5: Some(Box::new(Rar5 {
                 window,
                 dec: None,
@@ -434,22 +437,14 @@ impl FeedDecoder {
             lzma2: None,
             rar4: None,
         };
+        // An empty member of a solid stream still has its blocks decoded: they may set the tables the next member's
+        // first block goes on with. One without packed bytes passes the stream on as it got it.
+        let feeds = size > 0 || (stream_len > 0 && (solid || run.successor));
         let r = d.rar5.as_mut().expect("RAR 5.0 state");
-        if let Some(mut dec) = handed {
-            dec.next_file(Some(size));
-            if size > 0 {
-                r.dec = Some(dec);
-            } else if r.successor {
-                // an empty member passes the stream on as it got it
-                r.carry = Some(r.base.clone());
-                r.ended = Some(dec);
-            }
-        } else if size == 0 && r.successor && solid {
+        if !feeds && r.successor {
             r.carry = Some(r.base.clone());
-        } else if size == 0 && r.successor {
-            r.carry = Some(Cp::start(0));
         }
-        if size > 0 {
+        if feeds {
             d.main = Some(d.packed_lane(0, stream_len));
         }
         d.status = d.make_status(Vec::new(), false);
@@ -856,14 +851,34 @@ impl FeedDecoder {
             return Err(FeedError::Handoff("not the next member of the solid stream"));
         }
         let carry = self.solid_carry().ok_or(FeedError::Handoff("the main decode has not finished"))?;
+        // the successor is set up (keys, limits) before the live decoder leaves this one: a failure keeps it here
+        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Carry(carry.clone()))?;
         let r = self.rar5.as_mut().expect("RAR 5.0 state");
-        let mut next = match r.ended.take() {
-            Some(dec) => FeedDecoder::new_begin(map, index, options, Begin::Rar5(dec, carry.clone()))?,
-            None => FeedDecoder::new_begin(map, index, options, Begin::Carry(carry.clone()))?,
-        };
-        next.unproven = carry.unproven;
-        next.status = next.make_status(Vec::new(), false);
+        if let Some(dec) = r.ended.take()
+            && let Err(dec) = next.install_rar5(dec)
+        {
+            r.ended = Some(dec);
+        }
+        next.inherit(carry.suspect);
         Ok(next)
+    }
+
+    /// Makes `dec`, the decoder the member before kept at its end, this successor's main decoder (it then goes on
+    /// without reading its window back). Gives it back when it does not fit.
+    fn install_rar5(&mut self, mut dec: Box<Unpacker>) -> Result<(), Box<Unpacker>> {
+        let size = self.size;
+        let feeds = self.main.is_some();
+        let r = self.rar5.as_mut().expect("RAR 5.0 state");
+        if dec.window_size() != r.window.size || r.dec.is_some() {
+            return Err(dec);
+        }
+        dec.next_file(Some(size));
+        if feeds {
+            r.dec = Some(dec);
+        } else if r.successor {
+            r.ended = Some(dec);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
