@@ -27,6 +27,8 @@ use std::collections::BTreeMap;
 use std::io;
 use std::ops::Range;
 
+mod rar5;
+
 /// What a [`PackedSource`] answers for a read of packed bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackedRead {
@@ -68,6 +70,17 @@ pub trait FeedSink {
     /// The plaintext of member output offsets `offset..offset + bytes.len()`. The main decode writes in order; a
     /// repair writes a range reported lost earlier ([`FeedStatus::lost`]). No output byte is written twice.
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()>;
+
+    /// Output already held from `offset` on: bytes this decoder wrote, or plaintext of the member known from
+    /// elsewhere (another copy of the file). Fills the start of `buf` and returns how many bytes from `offset` it
+    /// holds, 0 for none. Compressed layers read back the output before a restart point to fill their window (only
+    /// output they wrote, or that they reported lost after a skip, which came from here), and the output past a hole
+    /// to skip it (see `docs/feed-decoder.md`). The default holds nothing: compressed members then wait at holes and
+    /// cannot be restored from a snapshot.
+    fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let _ = (offset, buf);
+        Ok(0)
+    }
 }
 
 impl FeedSink for Vec<u8> {
@@ -79,6 +92,15 @@ impl FeedSink for Vec<u8> {
         }
         self[at..end].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// The bytes up to the vector's length: what was written, and what the caller put there before (a donor).
+    /// Only meaningful for output this decoder wrote or the caller filled.
+    fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(at) = usize::try_from(offset).ok().filter(|&at| at < self.len()) else { return Ok(0) };
+        let n = self.len().saturating_sub(at).min(buf.len());
+        buf[..n].copy_from_slice(&self[at..at + n]);
+        Ok(n)
     }
 }
 
@@ -119,6 +141,9 @@ pub struct FeedStatus {
     pub more: bool,
     /// Every output byte was written.
     pub done: bool,
+    /// A compressed main decode waits at a hole it cannot skip (no held output past it, see
+    /// [`FeedSink::read_held`]): its bytes are the first [`NeedKind::Next`] need.
+    pub stalled: bool,
     /// Once done: whether the output matched the member's CRC32 (keyed with the password where the map says the
     /// checks are keyed). None when the member records none, or before done.
     pub crc_ok: Option<bool>,
@@ -132,8 +157,12 @@ pub struct FeedStats {
     pub packed_read: u64,
     /// Output bytes written to the sink.
     pub written: u64,
-    /// Holes met (each [`PackedRead::Hole`] answer to the main decode).
+    /// Holes met (each [`PackedRead::Hole`] answer to the main decode; a compressed decode waiting at one counts it
+    /// once when it skips it).
     pub holes: u64,
+    /// Output decoded again without being written: a compressed repair from its checkpoint up to the lost range,
+    /// and a restored decode from its checkpoint up to the frontier it had reached.
+    pub redecoded: u64,
 }
 
 /// How a [`FeedDecoder`] runs.
@@ -152,6 +181,9 @@ pub struct FeedOptions {
     /// The most output bytes one run writes before it returns with [`FeedStatus::more`] (default unlimited), so a
     /// caller can interleave other work.
     pub run_budget: Option<u64>,
+    /// The largest RAR 5.0 window (dictionary) a compressed member may allocate (default 1 GiB). A repair runs a
+    /// second decoder with its own window while it lasts.
+    pub max_window: u64,
 }
 
 impl Default for FeedOptions {
@@ -163,6 +195,7 @@ impl Default for FeedOptions {
             read_chunk: 256 << 10,
             max_needs: 64,
             run_budget: None,
+            max_window: 1 << 30,
         }
     }
 }
@@ -190,6 +223,10 @@ pub enum FeedUnsupported {
     UnmappedCipher,
     /// No recorded unpacked size.
     UnknownSize,
+    /// A solid member after the first of its stream: its window starts with the earlier members' output.
+    Solid,
+    /// The member's dictionary is larger than [`FeedOptions::max_window`].
+    Window { size: u64 },
 }
 
 /// A typed failure of a [`FeedDecoder`]. Missing bytes are never an error: they are [`FeedStatus::needs`].
@@ -220,6 +257,17 @@ pub enum FeedError {
     Snapshot(&'static str),
     /// An earlier run failed; the decoder is unusable (restore a snapshot instead).
     AlreadyFailed,
+    /// The compressed data does not decode (at output offset `out`), or a repair did not meet the restart it was
+    /// to reach.
+    Decode {
+        out: u64,
+        error: crate::Error,
+    },
+    /// Restoring a compressed decoder at a checkpoint needs the output `range`, which [`FeedSink::read_held`] does
+    /// not give.
+    HeldOutput {
+        range: Range<u64>,
+    },
 }
 
 impl std::fmt::Display for FeedError {
@@ -237,6 +285,8 @@ impl std::fmt::Display for FeedError {
             Self::Canceled => f.write_str("canceled"),
             Self::Snapshot(what) => write!(f, "snapshot: {what}"),
             Self::AlreadyFailed => f.write_str("the decoder failed earlier"),
+            Self::Decode { out, error } => write!(f, "decoding at output {out}: {error}"),
+            Self::HeldOutput { range } => write!(f, "restoring needs held output {range:?}"),
         }
     }
 }
@@ -246,6 +296,7 @@ impl std::error::Error for FeedError {
         match self {
             Self::Key(e) => Some(e),
             Self::Write { error, .. } => Some(error),
+            Self::Decode { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -632,6 +683,7 @@ enum LayerTag {
     Plain = 1,
     Cbc = 2,
     Ctr = 3,
+    Rar5 = 4,
 }
 
 /// A feed-driven decoder of one member. See the module docs and `docs/feed-decoder.md`.
@@ -665,6 +717,8 @@ pub struct FeedDecoder {
     run_written: u64,
     failed: bool,
     status: FeedStatus,
+    /// a compressed RAR 5.0 member's decoder state
+    rar5: Option<Box<rar5::Rar5>>,
 }
 
 impl std::fmt::Debug for FeedDecoder {
@@ -683,6 +737,9 @@ impl FeedDecoder {
     /// shows here where the member records a check value.
     pub fn new(map: &MemberMap, index: usize, options: FeedOptions) -> Result<Self, FeedError> {
         let member = map.members.get(index).ok_or(FeedError::NoSuchMember { index })?;
+        if matches!(member.method, MapMethod::Compressed { .. }) && map.format == super::MapFormat::Rar5 {
+            return Self::new_rar5(member, options);
+        }
         match member.method {
             MapMethod::Compressed { id } => return Err(FeedError::Unsupported(FeedUnsupported::Compressed { id })),
             MapMethod::Coders => return Err(FeedError::Unsupported(FeedUnsupported::Coders)),
@@ -766,6 +823,7 @@ impl FeedDecoder {
             run_written: 0,
             failed: false,
             status: FeedStatus::default(),
+            rar5: None,
         };
         if size > 0 {
             decoder.main = Some(decoder.lane_at(0, size));
@@ -808,8 +866,13 @@ impl FeedDecoder {
         let mut repair = Vec::new();
         let mut more = false;
         let mut next_gap = None;
+        if self.rar5.is_some() {
+            (next, repair, more, next_gap) = self.run_rar5(source, sink)?;
+        }
         // the main decode
-        while let Some(mut lane) = self.main.take() {
+        while self.rar5.is_none()
+            && let Some(mut lane) = self.main.take()
+        {
             match self.pump(&mut lane, source, sink)? {
                 Stop::Reached => break,
                 Stop::Budget => {
@@ -835,7 +898,7 @@ impl FeedDecoder {
             }
         }
         // repairs
-        if !more {
+        if !more && self.rar5.is_none() {
             let blocked = std::mem::take(&mut self.blocked);
             'repairs: for range in self.lost.ranges() {
                 let mut at = range.start;
@@ -909,7 +972,10 @@ impl FeedDecoder {
     }
 
     fn make_status(&self, needs: Vec<NeedBytes>, more: bool) -> FeedStatus {
-        let frontier = self.main.as_ref().map_or(self.size, |l| self.lane_out(l));
+        let frontier = match &self.rar5 {
+            Some(r) => r.frontier(),
+            None => self.main.as_ref().map_or(self.size, |l| self.lane_out(l)),
+        };
         let done = self.main.is_none() && self.lost.is_empty();
         let crc_ok = if done {
             self.want_crc.and_then(|want| {
@@ -923,29 +989,36 @@ impl FeedDecoder {
         } else {
             None
         };
-        FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, crc_ok }
+        let stalled = self.rar5.as_ref().is_some_and(|r| r.stalled());
+        FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, stalled, crc_ok }
     }
 
     /// Tells the source which stream bytes no lane will read again: everything before the main decode except what
     /// the repairs of lost ranges read.
     fn release(&mut self, source: &mut dyn PackedSource) {
-        let mut low = self.stream_len;
-        if let Some(l) = &self.main {
-            // a lane restored from a snapshot reads again from the start of its partial block
-            let from = match (self.cipher, l.iv) {
-                (StoredCipher::Cbc { .. }, Some(_)) => l.next,
-                (StoredCipher::Cbc { .. }, None) => self.lane_at(l.next, self.size).pos,
-                _ => l.pos,
-            };
-            low = low.min(from);
+        let mut keep = RangeSet::default();
+        if let Some(r) = &self.rar5 {
+            for range in r.needed(self) {
+                keep.insert(range);
+            }
+        } else {
+            if let Some(l) = &self.main {
+                // a lane restored from a snapshot reads again from the start of its partial block
+                let from = match (self.cipher, l.iv) {
+                    (StoredCipher::Cbc { .. }, Some(_)) => l.next,
+                    (StoredCipher::Cbc { .. }, None) => self.lane_at(l.next, self.size).pos,
+                    _ => l.pos,
+                };
+                keep.insert(from..self.stream_len);
+            }
+            for r in self.lost.ranges() {
+                let lane = self.lane_at(r.start, r.end);
+                keep.insert(lane.pos..lane.end);
+            }
         }
         let mut free = RangeSet::default();
-        free.insert(0..low);
-        for r in self.lost.ranges() {
-            let lane = self.lane_at(r.start, r.end);
-            free.remove(lane.pos..lane.end);
-        }
-        for r in self.released.ranges() {
+        free.insert(0..self.stream_len);
+        for r in keep.ranges().into_iter().chain(self.released.ranges()) {
             free.remove(r);
         }
         for r in free.ranges() {
@@ -1059,28 +1132,8 @@ impl FeedDecoder {
                 self.emit(at - skip, bytes, sink)
             }
             StoredCipher::Cbc { aes, .. } => {
-                let mut bytes: &[u8] = bytes;
-                if lane.iv.is_none() {
-                    let take = (16 - lane.rem.len()).min(bytes.len());
-                    lane.rem.extend_from_slice(&bytes[..take]);
-                    bytes = &bytes[take..];
-                    if lane.rem.len() < 16 {
-                        return Ok(());
-                    }
-                    lane.iv = Some(lane.rem[..].try_into().expect("one block"));
-                    lane.rem.clear();
-                }
                 let mut scratch = std::mem::take(&mut self.scratch);
-                scratch.clear();
-                scratch.extend_from_slice(&lane.rem);
-                scratch.extend_from_slice(bytes);
-                let aligned = scratch.len() & !15;
-                lane.rem.clear();
-                lane.rem.extend_from_slice(&scratch[aligned..]);
-                scratch.truncate(aligned);
-                aes.decrypt_cbc_in_place(lane.iv.as_mut().expect("IV known"), &mut scratch);
-                let out = lane.next;
-                lane.next += aligned as u64;
+                let out = cbc_step(&aes, lane, bytes, &mut scratch);
                 let result = self.emit(out, &scratch, sink);
                 self.scratch = scratch;
                 result
@@ -1121,6 +1174,7 @@ impl FeedDecoder {
             crc_broken: self.crc.broken,
             stats: self.stats,
             identity: self.identity,
+            rar5: self.rar5.as_ref().map(|r| r.to_bytes()),
         }
     }
 
@@ -1145,7 +1199,15 @@ impl FeedDecoder {
         }
         let size = d.size;
         let bad = || FeedError::Snapshot("out of range");
+        if let Some(r) = d.rar5.as_mut() {
+            let blob = snapshot.rar5.as_deref().ok_or(FeedError::Snapshot("no RAR 5.0 state"))?;
+            r.restore(blob, size, d.stream_len)?;
+            if snapshot.main.is_none() {
+                d.main = None;
+            }
+        }
         d.main = match snapshot.main {
+            _ if d.rar5.is_some() => d.main.take(),
             None => None,
             Some((at, iv)) => Some(match d.cipher {
                 StoredCipher::Cbc { .. } => {
@@ -1175,7 +1237,7 @@ impl FeedDecoder {
         };
         let mut lost = RangeSet::default();
         for r in &snapshot.lost {
-            let aligned = !matches!(d.cipher, StoredCipher::Cbc { .. }) || r.start % 16 == 0;
+            let aligned = !matches!(d.cipher, StoredCipher::Cbc { .. }) || r.start % 16 == 0 || d.rar5.is_some();
             if r.start >= r.end || r.end > size || !aligned {
                 return Err(bad());
             }
@@ -1219,6 +1281,32 @@ fn member_identity(m: &MapMember) -> u64 {
     h
 }
 
+/// Decrypts CBC stream bytes read by `lane` into `scratch` (cleared first): whole blocks only, the rest kept in the
+/// lane, the first 16 bytes after a restart taken as the IV. Returns the stream offset of `scratch[0]`.
+fn cbc_step(aes: &AesKey, lane: &mut Lane, mut bytes: &[u8], scratch: &mut Vec<u8>) -> u64 {
+    scratch.clear();
+    if lane.iv.is_none() {
+        let take = (16 - lane.rem.len()).min(bytes.len());
+        lane.rem.extend_from_slice(&bytes[..take]);
+        bytes = &bytes[take..];
+        if lane.rem.len() < 16 {
+            return lane.next;
+        }
+        lane.iv = Some(lane.rem[..].try_into().expect("one block"));
+        lane.rem.clear();
+    }
+    scratch.extend_from_slice(&lane.rem);
+    scratch.extend_from_slice(bytes);
+    let aligned = scratch.len() & !15;
+    lane.rem.clear();
+    lane.rem.extend_from_slice(&scratch[aligned..]);
+    scratch.truncate(aligned);
+    aes.decrypt_cbc_in_place(lane.iv.as_mut().expect("IV known"), scratch);
+    let out = lane.next;
+    lane.next += aligned as u64;
+    out
+}
+
 /// XORs WinZip AES keystream into `data`, whose first byte is ciphertext offset `offset` (after the salt and
 /// verifier). Blocks count from 1, little-endian.
 fn ctr_xor(aes: &AesKey, mut offset: u64, data: &mut [u8]) {
@@ -1251,10 +1339,12 @@ pub struct FeedSnapshot {
     stats: FeedStats,
     /// the member's fingerprint ([`member_identity`])
     identity: u64,
+    /// a compressed RAR 5.0 member's checkpoints and repairs
+    rar5: Option<Vec<u8>>,
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"ZFFD";
-const SNAPSHOT_VERSION: u8 = 1;
+const SNAPSHOT_VERSION: u8 = 2;
 /// The most lost ranges or CRC runs a snapshot may list.
 const SNAPSHOT_MAX_RANGES: u64 = 1 << 20;
 
@@ -1303,8 +1393,16 @@ impl FeedSnapshot {
             out.extend_from_slice(&e.to_le_bytes());
             out.extend_from_slice(&c.to_le_bytes());
         }
-        for v in [self.stats.packed_read, self.stats.written, self.stats.holes, self.identity] {
+        for v in [self.stats.packed_read, self.stats.written, self.stats.holes, self.identity, self.stats.redecoded] {
             out.extend_from_slice(&v.to_le_bytes());
+        }
+        match &self.rar5 {
+            None => out.push(0),
+            Some(blob) => {
+                out.push(1);
+                out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+                out.extend_from_slice(blob);
+            }
         }
         out
     }
@@ -1315,7 +1413,8 @@ impl FeedSnapshot {
         if r.take(4)? != SNAPSHOT_MAGIC {
             return Err(FeedError::Snapshot("not a feed decoder snapshot"));
         }
-        if r.u8()? != SNAPSHOT_VERSION {
+        let version = r.u8()?;
+        if !(1..=SNAPSHOT_VERSION).contains(&version) {
             return Err(FeedError::Snapshot("unknown version"));
         }
         let tag = r.u8()?;
@@ -1347,12 +1446,25 @@ impl FeedSnapshot {
         for _ in 0..n {
             crc.push((r.u64()?, r.u64()?, r.u32()?));
         }
-        let stats = FeedStats { packed_read: r.u64()?, written: r.u64()?, holes: r.u64()? };
+        let mut stats = FeedStats { packed_read: r.u64()?, written: r.u64()?, holes: r.u64()?, redecoded: 0 };
         let identity = r.u64()?;
+        let mut rar5 = None;
+        if version >= 2 {
+            stats.redecoded = r.u64()?;
+            match r.u8()? {
+                0 => {}
+                1 => {
+                    // checked against the bytes left only: its own counts are checked as it is decoded
+                    let n = usize::try_from(r.u64()?).map_err(|_| FeedError::Snapshot("bad count"))?;
+                    rar5 = Some(r.take(n)?.to_vec());
+                }
+                _ => return Err(FeedError::Snapshot("bad flag")),
+            }
+        }
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
-        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, identity })
+        Ok(Self { tag, size, stream_len, want_crc, main, lost, crc, crc_broken, stats, identity, rar5 })
     }
 }
 

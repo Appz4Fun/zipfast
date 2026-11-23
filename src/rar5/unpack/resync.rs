@@ -1096,6 +1096,19 @@ fn resync_at(
 }
 
 impl Unpacker {
+    /// Starts recording filters ([`Self::record_filters`]) with those `resync`'s follow decoded past, which a decoder
+    /// resumed from it holds unfiltered in its window.
+    pub(crate) fn record_filters_from(&mut self, resync: &Resync) {
+        self.record_filters();
+        if let Some(seen) = &mut self.seen {
+            for f in &resync.filters {
+                seen.push(super::SeenFilterRec { start: f.start, len: f.len, kind: f.kind });
+            }
+        }
+    }
+}
+
+impl Unpacker {
     /// A decoder that restarts a member at `resync`'s block: its window holds the known plaintext before
     /// [`Resync::output_offset`], and its state is what [`resync`] learned. Feed it the packed bytes from
     /// [`Resync::packed_offset`] on; it writes the member's output from `output_offset` on. `size` is the member's
