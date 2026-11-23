@@ -203,10 +203,15 @@ fn z_fixtures_identify_from_one_article_at_each_end() {
 
 /// A stored ZIP holding `entries` (name, data) as written, duplicates included.
 fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    stored_zip_at(0, entries)
+}
+
+/// [`stored_zip`] for appending after `base` bytes (a self-extracting stub): offsets count from the file's start.
+fn stored_zip_at(base: usize, entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     for (name, data) in entries {
-        let at = out.len() as u32;
+        let at = (base + out.len()) as u32;
         let crc = crc32fast::hash(data);
         let fixed = |sig: u32, out: &mut Vec<u8>, central_dir: bool| {
             out.extend(sig.to_le_bytes());
@@ -234,7 +239,7 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         central.extend(at.to_le_bytes());
         central.extend(name.as_bytes());
     }
-    let dir_at = out.len() as u32;
+    let dir_at = (base + out.len()) as u32;
     let dir_len = central.len() as u32;
     out.extend(central);
     out.extend(0x0605_4b50u32.to_le_bytes());
@@ -397,4 +402,76 @@ fn an_unreadable_rar_stored_in_the_first_volume_does_not_hide_the_zip_directory(
     let alone =
         set_identity(Some(HeldVolume::whole(&z01)), None, MapOptions::new("x").password(Some("not the password")));
     assert!(alone.is_err(), "{alone:?}");
+}
+/// A legacy RAR 4.x volume: no first-volume flag and end headers without numbers, so no volume number is stated.
+fn rar4_volume(files: &[(&str, &[u8], u16, u32, u64)], next: bool) -> Vec<u8> {
+    use zipfast::rar5::frame::rar4::*;
+    let mut out = MARKER.to_vec();
+    out.extend(MainHeader::new(MHD_VOLUME).encode().unwrap());
+    for &(name, data, flags, crc, size) in files {
+        let header = FileHeader {
+            head_type: HEAD_FILE,
+            flags: flags | LONG_BLOCK,
+            packed_size: data.len() as u64,
+            unpacked_size: size,
+            host_os: 2,
+            crc,
+            dos_time: 0x5a21_6000,
+            unpack_version: 29,
+            method: 0x30,
+            attributes: 0x20,
+            name: name.as_bytes().to_vec(),
+            salt: None,
+            ext_time: None,
+            rest: Vec::new(),
+        };
+        out.extend(header.encode().unwrap());
+        out.extend(data);
+    }
+    out.extend(EndOfArchive::new(next).encode().unwrap());
+    out
+}
+
+#[test]
+fn unnumbered_volumes_are_not_taken_for_the_same_volume() {
+    use zipfast::rar5::frame::rar4::{LHD_SPLIT_AFTER, LHD_SPLIT_BEFORE};
+    let movie: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+    let (p1, p2) = movie.split_at(2000);
+    let (a, b) = (b"notes in the first volume".as_slice(), b"other notes, same name, last volume".as_slice());
+    let crc = crc32fast::hash;
+    let first = rar4_volume(
+        &[("notes.txt", a, 0, crc(a), a.len() as u64), ("movie.mkv", p1, LHD_SPLIT_AFTER, crc(p1), 4000)],
+        true,
+    );
+    let last = rar4_volume(
+        &[("movie.mkv", p2, LHD_SPLIT_BEFORE, crc(&movie), 4000), ("notes.txt", b, 0, crc(b), b.len() as u64)],
+        false,
+    );
+    let s = id(Some(HeldVolume::whole(&first)), Some(HeldVolume::whole(&last)), None);
+    assert_eq!(s.format, MapFormat::Rar4);
+    let facts: Vec<_> = s.members.iter().map(|m| (m.name.clone().unwrap(), m.checks.and_then(|c| c.crc32))).collect();
+    assert_eq!(
+        facts,
+        [
+            ("notes.txt".to_string(), Some(crc(a))),
+            ("movie.mkv".to_string(), Some(crc(&movie))),
+            ("notes.txt".to_string(), Some(crc(b))),
+        ],
+        "the two notes.txt are different files; the split movie joins up"
+    );
+}
+
+#[test]
+fn a_whole_self_extracting_zip_given_as_the_first_volume_reads_its_directory() {
+    let inner = common::archive(&[FileSpec::new("inside.bin", b"nested payload")]);
+    let mut sfx = b"MZ".to_vec();
+    sfx.resize(4096, 0x90);
+    sfx.extend(stored_zip_at(4096, &[("inner.rar", &inner)]));
+    let as_last = id(None, Some(HeldVolume::whole(&sfx)), None);
+    assert_eq!(as_last.format, MapFormat::Zip, "the tail holds the ZIP directory");
+    let as_first = id(Some(HeldVolume::whole(&sfx)), None, None);
+    assert_eq!(as_first.format, MapFormat::Zip);
+    let names = |s: &SetIdentity| s.members.iter().map(|m| m.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&as_first), names(&as_last));
+    assert_eq!(names(&as_first), [Some("inner.rar".to_string())]);
 }

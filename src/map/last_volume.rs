@@ -562,10 +562,17 @@ pub fn set_identity(
             Ok(identity) => (Some(identity), FactSource::Last),
             Err(error) => return Err(first_error.unwrap_or(error)),
         },
-        (None, Some(_)) if first_error.is_some() => return Err(first_error.expect("checked")),
-        (None, Some(held)) if !first_is_rar => (Some(last_volume_identity(held, options)?), FactSource::First),
+        // Only the first volume: a ZIP or 7z directory in its held bytes (a whole single-volume archive, maybe
+        // behind a self-extracting stub) decides over a RAR the scanner found stored inside it.
+        (None, Some(held)) if first_is_rar || first_error.is_some() => match last_volume_identity(held, options) {
+            Ok(identity) if !rar(identity.format) => (Some(identity), FactSource::First),
+            _ => match first_error {
+                Some(error) => return Err(error),
+                None => (None, FactSource::Last),
+            },
+        },
+        (None, Some(held)) => (Some(last_volume_identity(held, options)?), FactSource::First),
         (None, None) => return Err(MapError::NotArchive),
-        _ => (None, FactSource::Last),
     };
     if let Some(identity) = identity {
         if first_is_rar && !rar(identity.format) {
@@ -577,7 +584,14 @@ pub fn set_identity(
         }
         format.get_or_insert(identity.format);
         // Whole members of the first volume are the last volume's only when both are the same volume.
-        let same_volume = !firsts.is_empty() && first_volume_number == identity.volume_number;
+        // Same volume only on evidence: equal stated numbers, or the very same bytes. Legacy RAR volumes may state
+        // no number at all, and two unknowns prove nothing.
+        let same_bytes = match (first, last) {
+            (Some(a), Some(b)) => a.len == b.len && a.head == b.head && a.tail == b.tail,
+            _ => false,
+        };
+        let same_number = matches!((first_volume_number, identity.volume_number), (Some(a), Some(b)) if a == b);
+        let same_volume = !firsts.is_empty() && (same_number || same_bytes);
         let mut counts: HashMap<(&[u8], Kind), usize> = HashMap::new();
         for (i, m) in identity.members.iter().enumerate() {
             check(i)?;
