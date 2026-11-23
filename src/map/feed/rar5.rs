@@ -260,6 +260,10 @@ fn get_cp(r: &mut Reader<'_>) -> Result<Cp, FeedError> {
     let mut filters = Vec::with_capacity(n);
     for _ in 0..n {
         let (start, len, code) = (r.u64()?, r.u64()?, r.u8()?);
+        // a recorded filter ran before the checkpoint: its output ends at or before it
+        if start.checked_add(len).is_none_or(|end| end > sp) {
+            return Err(FeedError::Snapshot("filter past its checkpoint"));
+        }
         filters.push(SeenFilterRec::from_code(start, len, code).ok_or(FeedError::Snapshot("bad filter"))?);
     }
     Ok(Cp { packed, state: UnpackCheckpoint { sp, history, last_len, lens, filters } })
@@ -685,8 +689,29 @@ impl FeedDecoder {
         dec.record_filters_from(&restart);
         let until_packed = first + restart.packed_offset as u64;
         let until_out = restart.output_offset;
-        r.repairs.push(Repair { from: r.base.clone(), until_packed, until_out, lost: out_h..until_out, blocked: None });
-        self.lost.insert(out_h..until_out);
+        // Repairs never overlap, so no output byte is written twice: output an earlier repair already covers (a
+        // hole skipped again after a restore) is left to it.
+        let mut from_out = out_h;
+        for x in &r.repairs {
+            if x.lost.start <= from_out && from_out < x.lost.end {
+                from_out = x.lost.end;
+            }
+        }
+        if from_out < until_out && !r.repairs.iter().any(|x| x.lost.start < until_out && from_out < x.lost.end) {
+            r.repairs.push(Repair {
+                from: r.base.clone(),
+                until_packed,
+                until_out,
+                lost: from_out..until_out,
+                blocked: None,
+            });
+            self.lost.insert(from_out..until_out);
+        }
+        // The restart is a checkpoint at once, before a block after it can leave a filter pending: a restore never
+        // goes back before the hole just skipped.
+        if let Some(cp) = dec.checkpoint() {
+            r.base = Cp { packed: until_packed, state: cp };
+        }
         self.stats.holes += 1;
         r.skip_failed = None;
         r.fed = until_packed;
@@ -782,5 +807,33 @@ impl FeedDecoder {
         self.buf = buf;
         self.scratch = scratch;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_filter(sp: u64, start: u64, len: u64) -> Result<Cp, FeedError> {
+        let mut cp = Cp::start();
+        cp.state.sp = sp;
+        let mut out = Vec::new();
+        put_cp(&mut out, &cp);
+        // the filter count and one filter, written by hand: a recorded filter cannot be made past its checkpoint
+        out.truncate(out.len() - 8);
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.push(1);
+        get_cp(&mut Reader(&out))
+    }
+
+    #[test]
+    fn checkpoint_filters_must_end_before_the_checkpoint() {
+        assert!(with_filter(1 << 20, 1000, 4000).is_ok());
+        assert!(with_filter(5000, 1000, 4000).is_ok());
+        assert!(matches!(with_filter(1, 2, 4), Err(FeedError::Snapshot(_))));
+        assert!(matches!(with_filter(5000, 1000, 4001), Err(FeedError::Snapshot(_))));
+        assert!(matches!(with_filter(u64::MAX, u64::MAX - 1, 4), Err(FeedError::Snapshot(_))));
     }
 }

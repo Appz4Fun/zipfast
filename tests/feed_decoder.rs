@@ -752,3 +752,149 @@ fn a_skipped_compressed_hole_does_not_pin_the_bytes_after_its_restart() {
     assert!(status.done && status.crc_ok == Some(true), "{status:?}");
     assert_eq!(sink.out, plain);
 }
+
+#[test]
+fn a_repair_that_waited_goes_on_under_a_run_budget() {
+    let plain = video_like(600_000, 14);
+    let volumes = rar5_compressed(&plain, false, 1 << 20);
+    let map = MemberMap::from_memory(&refs(&volumes), "c.rar", None).unwrap();
+    let options = FeedOptions { run_budget: Some(1_500), ..FeedOptions::default() };
+    let mut decoder = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    let mut sink = Held { donor: plain.clone(), ..Held::default() };
+    let all = articles(&volumes, 7_000);
+    let hole = 10;
+    let (hv, hoff, hbytes) = all[hole].clone();
+    source.mark_lost(hv, hoff..hoff + hbytes.len() as u64);
+    let run = |decoder: &mut FeedDecoder, source: &mut ArticleBuffer, sink: &mut Held| {
+        let mut status = decoder.run(source, sink).unwrap();
+        for _ in 0..10_000 {
+            if !status.more {
+                break;
+            }
+            status = decoder.run(source, sink).unwrap();
+        }
+        status
+    };
+    for (i, (v, off, b)) in all.iter().enumerate() {
+        if i != hole {
+            source.insert(*v, *off, b).unwrap();
+            run(&mut decoder, &mut source, &mut sink);
+        }
+    }
+    // the repair waits at the hole
+    let status = decoder.status().clone();
+    assert!(status.lost.len() == 1 && status.needs.iter().any(|n| n.kind == NeedKind::Repair), "{status:?}");
+    // its bytes come; the repair goes on a budget at a time, past them (and its source lets them go)
+    source.insert(hv, hoff, &hbytes).unwrap();
+    let status = run(&mut decoder, &mut source, &mut sink);
+    assert!(status.done && status.crc_ok == Some(true), "{status:?}");
+    assert_eq!(sink.out, plain);
+}
+
+/// The packed stream of `plain` with a delta filter declared at the start of block `k`, covering `len` bytes of
+/// output from there (past the block's end).
+fn stream_with_filter(plain: &[u8], k: usize, len: u64) -> (Vec<u8>, Vec<u64>) {
+    use zipfast::rar5::testenc::{self, Op};
+    let ops = testenc::lz(plain, 1 << 17, 16);
+    let chunks: Vec<Vec<Op>> = ops.chunks(2_000).map(<[Op]>::to_vec).collect();
+    let mut starts = Vec::new();
+    let mut at = 0u64;
+    let mut out = Vec::new();
+    for (i, c) in chunks.iter().enumerate() {
+        starts.push(at);
+        at += c
+            .iter()
+            .map(|op| match op {
+                Op::Lit(_) => 1,
+                Op::Match(len, _) | Op::Rep(_, len) => u64::from(*len),
+                _ => 0,
+            })
+            .sum::<u64>();
+        let mut c = c.clone();
+        if i == k {
+            c.insert(0, Op::Filter { start: 0, len, kind: 0, channels: 1 });
+        }
+        out.extend(testenc::tuned_block(&c, i + 1 == chunks.len()));
+    }
+    (out, starts)
+}
+
+/// One plain compressed member over volumes of `chunk` packed bytes, without a CRC (its output is what it decodes to).
+fn rar5_packed_volumes(data: &[u8], size: usize, chunk: usize) -> Vec<Vec<u8>> {
+    let mut spec = FileSpec::new("c.bin", data);
+    spec.method = 3;
+    spec.size = Some(size as u64);
+    spec.no_crc = true;
+    let parts: Vec<&[u8]> = data.chunks(chunk).collect();
+    let n = parts.len();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let last = i + 1 == n;
+            let mut bytes = SIG.to_vec();
+            bytes.extend(main_block(true, if i == 0 { None } else { Some(i as u64) }));
+            bytes.extend(file_block(&spec, part, 0, i > 0, !last));
+            bytes.extend(end_block(!last));
+            bytes
+        })
+        .collect()
+}
+
+#[test]
+fn a_snapshot_after_a_skip_restores_at_the_restart_not_before_the_hole() {
+    let plain0 = video_like(600_000, 15);
+    let hole = 10;
+    let present_after = 5;
+    // where a skip of the hole restarts on this content: the block the lost range ends at
+    let (packed, starts) = stream_with_filter(&plain0, usize::MAX, 0);
+    let volumes = rar5_packed_volumes(&packed, plain0.len(), 1 << 20);
+    let skip = |volumes: &[Vec<u8>], plain: &[u8]| {
+        let map = MemberMap::from_memory(&refs(volumes), "c.rar", None).unwrap();
+        let all = articles(volumes, 7_000);
+        let mut decoder = FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        let mut sink = Held { donor: plain.to_vec(), ..Held::default() };
+        source.mark_lost(all[hole].0, all[hole].1..all[hole].1 + 7_000);
+        for (v, off, b) in all.iter().take(hole + 1 + present_after).filter(|a| a.1 != all[hole].1) {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        (decoder, source, sink, map)
+    };
+    let (decoder, ..) = skip(&volumes, &plain0);
+    let restart = decoder.status().lost.first().expect("the hole is skipped").end;
+    let k = starts.iter().position(|&s| s == restart).expect("a restart at a block start");
+    // the same content with a filter declared in the restart's block that runs past it: at the end of that block
+    // no checkpoint can be taken
+    let (packed, _) = stream_with_filter(&plain0, k, 60_000);
+    let volumes = rar5_packed_volumes(&packed, plain0.len(), 1 << 20);
+    let mut whole = Vec::new();
+    let map = MemberMap::from_memory(&refs(&volumes), "c.rar", None).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &volumes[0]).unwrap();
+    assert!(FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap().run(&mut source, &mut whole).unwrap().done);
+    let all = articles(&volumes, 7_000);
+    let (decoder, mut source, mut sink, map) = skip(&volumes, &whole);
+    let status = decoder.status().clone();
+    assert_eq!(status.lost.first().map(|r| r.end), Some(restart), "{status:?}");
+    assert!(status.frontier < restart + 60_000, "the main decode stopped inside the filter: {status:?}");
+    // a restore with the hole still missing must not skip it again
+    let snap = FeedSnapshot::from_bytes(&decoder.snapshot().to_bytes()).unwrap();
+    drop(decoder);
+    let mut decoder = FeedDecoder::restore(&map, 0, FeedOptions::default(), &snap).unwrap();
+    let holes = decoder.stats().holes;
+    decoder.run(&mut source, &mut sink).unwrap();
+    // it restored at the restart: the hole was not met (and skipped) again
+    assert_eq!(decoder.stats().holes, holes, "{:?}", decoder.stats());
+    for (v, off, b) in all.iter().skip(hole + 1 + present_after) {
+        source.insert(*v, *off, b).unwrap();
+        decoder.run(&mut source, &mut sink).unwrap();
+    }
+    source.insert(all[hole].0, all[hole].1, &volumes[0][all[hole].1 as usize..all[hole].1 as usize + 7_000]).unwrap();
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert!(status.done, "{status:?}");
+    assert_eq!(sink.out, whole);
+    assert!(sink.seen.iter().all(|s| *s));
+}
