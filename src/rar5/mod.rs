@@ -487,9 +487,15 @@ impl FileHeader {
         self.host_os == 1
     }
 
-    /// The name this member is written under; see [`crate::path::rar_output_name`].
+    /// The name this member is written under; see [`crate::path::rar_output_name`]. A RAR 5.0 name always uses
+    /// `/` between folders, so a `\` in a Windows-made one is part of a file name, which Windows itself cannot
+    /// hold: it is written as `_`, as UnRAR writes it (`d\x.txt` becomes `d_x.txt`), instead of making a folder.
     pub(crate) fn output_name(&self) -> Option<std::borrow::Cow<'_, str>> {
-        crate::path::rar_output_name(&self.name, self.format == RarFormat::Rar4)
+        let name = crate::path::rar_output_name(&self.name, self.format == RarFormat::Rar4)?;
+        if self.format != RarFormat::Rar4 && self.is_windows() && name.contains('\\') {
+            return Some(std::borrow::Cow::Owned(name.replace('\\', "_")));
+        }
+        Some(name)
     }
 
     /// [`Self::output_name`], or for an older revision (RAR 5.0 version record) taken by a run that includes them

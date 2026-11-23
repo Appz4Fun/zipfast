@@ -1653,6 +1653,10 @@ impl SelectedEntry {
         if let SelectedSource::Rar { name, rar4, .. } = &self.source {
             let output = crate::path::rar_output_name(name, *rar4)
                 .ok_or_else(|| Error::Unsupported("the selected name can't be written one to one".into()))?;
+            // a RAR 5.0 name separates folders with `/` only: a Windows-made `\\` is a name character, written `_`
+            if !*rar4 && self.windows_names && output.contains('\\') {
+                return sanitize(&output.replace('\\', "_"), true);
+            }
             return sanitize(&output, self.windows_names);
         }
         sanitize(self.name(), self.windows_names)
@@ -3583,7 +3587,14 @@ impl Run<'_, '_, '_> {
         // A name mapped from bytes that aren't UTF-8 is written under its private-use characters; one that can't
         // be written one to one is refused (`crate::path::rar_output_name`).
         // (`h.name` was moved into `ctx`)
-        let output = crate::path::rar_output_name(&ctx.entry.name, h.format == RarFormat::Rar4);
+        let output = crate::path::rar_output_name(&ctx.entry.name, h.format == RarFormat::Rar4).map(|name| {
+            // a RAR 5.0 name separates folders with `/` only: a Windows-made `\\` is a name character, written `_`
+            if h.format != RarFormat::Rar4 && h.is_windows() && name.contains('\\') {
+                std::borrow::Cow::Owned(name.replace('\\', "_"))
+            } else {
+                name
+            }
+        });
         // an older revision taken by `with_versions` is named `name;N`, tested or written, as UnRAR's `-ver` names it
         let output = match (output, h.version.filter(|_| self.opts.takes_versions())) {
             (Some(name), Some(version)) => Some(std::borrow::Cow::Owned(format!("{name};{version}"))),
