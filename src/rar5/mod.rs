@@ -289,6 +289,18 @@ impl Redirection {
             Self::Unknown(kind) => *kind,
         }
     }
+
+    /// The target as stored; empty for an unknown type, which has none.
+    pub fn target(&self) -> &str {
+        match self {
+            Self::UnixSymlink(t)
+            | Self::WindowsSymlink(t)
+            | Self::Junction(t)
+            | Self::HardLink(t)
+            | Self::FileCopy(t) => t,
+            Self::Unknown(_) => "",
+        }
+    }
 }
 
 /// Archive format governing the member's wire fields and payload decoder.

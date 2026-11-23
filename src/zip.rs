@@ -1013,6 +1013,8 @@ pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
     // encrypted; otherwise left empty.
     let mut targets = Vec::with_capacity(archive.entries.len());
     let mut buf = vec![0u8; BUF];
+    // The names are already held by the central directory; the targets read here are counted in a listing budget.
+    let mut budget = crate::extract::ListingBudget::default();
     for (index, e) in archive.entries.iter().enumerate() {
         let mut text = Vec::new();
         if e.is_link()
@@ -1036,6 +1038,7 @@ pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
             if read.is_err() {
                 text.clear();
             }
+            budget.record_link_bytes(text.len())?;
         }
         targets.push(text);
     }

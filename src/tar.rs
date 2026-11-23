@@ -1519,12 +1519,17 @@ fn list_reading(path: &Path, whole: bool) -> Result<Vec<Entry>> {
 }
 
 /// Lists what is left of `reader`'s members.
-fn list_members(mut reader: Reader) -> Result<Vec<Entry>> {
+fn list_members(reader: Reader) -> Result<Vec<Entry>> {
+    list_members_within(reader, &mut ListingBudget::default())
+}
+
+/// [`list_members`] under `budget`, which counts each member's name and link target (a `K` record's, a pax
+/// `linkpath`'s or the header's), all kept in the listing.
+fn list_members_within(mut reader: Reader, budget: &mut ListingBudget) -> Result<Vec<Entry>> {
     let mut out = Vec::new();
-    let mut budget = ListingBudget::default();
     while let Some(m) = reader.next()? {
         if m.kind != Kind::Other(b'V') {
-            budget.record(&m.name)?;
+            budget.record_with_link(&m.name, &m.link)?;
             let packed = reader.member_data.as_ref().and_then(|d| d.packed());
             let mut entry = m.into_entry();
             if let Some(packed) = packed {
@@ -2098,7 +2103,7 @@ fn run_tar(
                     }
                 };
                 if let Some(staged) = &mut staged {
-                    staged.budget.record(&m.name)?;
+                    staged.budget.record_with_link(&m.name, &m.link)?;
                     let meta = opts.meta(m.meta());
                     staged.members.push(StagedMember::Link {
                         relative: rel,
@@ -2305,7 +2310,7 @@ pub(crate) fn walk_members(
                 m.name
             )));
         }
-        budget.record(&m.name)?;
+        budget.record_with_link(&m.name, &m.link)?;
         let raw = RawMember {
             name: m.raw_name.clone().unwrap_or_else(|| m.name.clone().into_bytes()),
             link: m.raw_link.clone().unwrap_or_else(|| m.link.clone().into_bytes()),
@@ -2350,6 +2355,74 @@ mod tests {
         let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
         h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
         h
+    }
+
+    /// A member data block run: `data` padded to whole blocks.
+    fn test_padded(mut data: Vec<u8>) -> Vec<u8> {
+        data.resize(data.len().div_ceil(BLOCK) * BLOCK, 0);
+        data
+    }
+
+    /// A symbolic link `name` whose target comes in a pax `linkpath` record.
+    fn test_pax_link(name: &str, target: &str) -> Vec<u8> {
+        let body = record("linkpath", target);
+        let mut out = test_header(&format!("PaxHeaders/{name}"), b'x', body.len() as u64, "").to_vec();
+        out.extend(test_padded(body.into_bytes()));
+        out.extend(test_header(name, b'2', 0, ""));
+        out
+    }
+
+    fn test_listing(tar: &[u8], budget: &mut ListingBudget) -> Result<Vec<Entry>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("links.tar");
+        std::fs::write(&path, tar).unwrap();
+        let reader = Reader::open_with_limit(&path, 1, Some(COMPRESSED_LIST_LIMIT), None, false)?;
+        list_members_within(reader, budget)
+    }
+
+    /// Many members whose pax `linkpath` targets are about 1 MiB each go over a listing budget that their names alone
+    /// would stay well inside.
+    #[test]
+    fn pax_link_targets_count_in_the_listing_budget() {
+        // as long as a target can be: its record (length, key and all) fills a 1 MiB extension header
+        let target = "t".repeat(MAX_EXT as usize - 64);
+        let mut tar = Vec::new();
+        for i in 0..8 {
+            tar.extend(test_pax_link(&format!("l{i}"), &target));
+        }
+        tar.extend([0u8; 2 * BLOCK]);
+        let mut budget = ListingBudget::with_limits(1_000_000, 4 << 20);
+        let err = test_listing(&tar, &mut budget).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(ref why) if why.contains("link target")), "{err:?}");
+        // the default budget holds them
+        assert_eq!(test_listing(&tar, &mut ListingBudget::default()).unwrap().len(), 8);
+    }
+
+    /// A tar with ordinary links (a header's target, a GNU `K` record's, a pax `linkpath`'s) still lists, and the
+    /// budget's total is the names and targets together.
+    #[test]
+    fn a_tar_with_links_lists_and_counts_its_targets() {
+        let long = format!("deep/{}/target", "d".repeat(200));
+        let mut tar = test_header("file", b'0', 1, "").to_vec();
+        tar.extend(test_padded(b"x".to_vec()));
+        tar.extend(test_header("sym", b'2', 0, "file"));
+        tar.extend(test_header("hard", b'1', 0, "file"));
+        let mut k = long.clone().into_bytes();
+        k.push(0);
+        tar.extend(test_header("././@LongLink", b'K', k.len() as u64, ""));
+        tar.extend(test_padded(k));
+        tar.extend(test_header("gnu", b'2', 0, ""));
+        tar.extend(test_pax_link("pax", "pax/target"));
+        tar.extend([0u8; 2 * BLOCK]);
+        let mut budget = ListingBudget::default();
+        let entries = test_listing(&tar, &mut budget).unwrap();
+        let links: Vec<_> = entries.iter().map(|e| e.link.as_ref().map(|l| l.target().to_owned())).collect();
+        assert_eq!(
+            links,
+            [None, Some("file".into()), Some("file".into()), Some(long.clone()), Some("pax/target".into())]
+        );
+        let names = "file".len() + "sym".len() + "hard".len() + "gnu".len() + "pax".len();
+        assert_eq!(budget.bytes(), names + 4 + 4 + long.len() + "pax/target".len());
     }
 
     /// A pax 0.1 sparse member: one byte of data at the very end of a file `real` bytes long.
