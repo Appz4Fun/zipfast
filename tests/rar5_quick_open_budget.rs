@@ -68,3 +68,36 @@ fn a_large_header_at_the_quick_open_target_costs_no_large_allocation_and_respect
     let limits = RarCatalogueLimits { read_bytes: 64 << 10, ..RarCatalogueLimits::default() };
     assert_eq!(open(&bytes, limits), RarQuickOpen::Unchecked);
 }
+
+/// The check is optional and never fails the open: at every read budget, an archive whose locator points at a
+/// corrupt header opens exactly when the same archive without a locator does, and a budget that leaves too little
+/// for the probe gives `Unchecked`.
+#[test]
+fn the_quick_open_check_never_fails_an_open_at_any_read_budget() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5-compat/r5extra.rar");
+    let with = std::fs::read(path).unwrap();
+    let mut without = with.clone();
+    without[0x27] = 0; // locator flags: no offsets
+    let crc = crc32fast::hash(&without[12..47]);
+    without[8..12].copy_from_slice(&crc.to_le_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    let open = |bytes: &[u8], read_bytes: u64| {
+        let path = dir.path().join("a.rar");
+        std::fs::write(&path, bytes).unwrap();
+        let limits = RarCatalogueLimits { read_bytes, ..RarCatalogueLimits::default() };
+        let options = RarSessionOptions { limits, follow_volumes: false, ..RarSessionOptions::default() };
+        RarSession::open(&path, None, options).ok().map(|s| s.volumes().next().unwrap().quick_open())
+    };
+    let mut unchecked = 0;
+    for read_bytes in 0..=with.len() as u64 + 64 {
+        let plain = open(&without, read_bytes);
+        let located = open(&with, read_bytes);
+        assert_eq!(plain.is_some(), located.is_some(), "read budget {read_bytes}: the check changed whether it opens");
+        match located {
+            Some(RarQuickOpen::Unchecked) => unchecked += 1,
+            Some(status) => assert_eq!(status, RarQuickOpen::Corrupt, "read budget {read_bytes}"),
+            None => {}
+        }
+    }
+    assert!(unchecked > 0, "some budget fits the headers but not the probe");
+}

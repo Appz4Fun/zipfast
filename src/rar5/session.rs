@@ -1345,6 +1345,10 @@ impl Catalogue {
             return Ok(RarQuickOpen::Truncated);
         }
         let mut budget = self.scan_budget();
+        // the check is optional: it never fails the open, so it stops where the read budget would
+        if budget.read_room() < have as u64 {
+            return Ok(RarQuickOpen::Unchecked);
+        }
         budget.read(file, path, &mut head[..have], at)?;
         let (mut size, mut n) = (0u64, 0usize);
         loop {
