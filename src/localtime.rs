@@ -32,16 +32,14 @@ pub(crate) fn local_to_utc(wall: i64) -> i64 {
     thread_local! {
         static OFFSETS: RefCell<HourOffsets> = RefCell::new(HourOffsets::default());
     }
-    OFFSETS
-        .with_borrow_mut(|offsets| offsets.convert(wall, || std::env::var_os("TZ"), imp::local_to_utc))
-        .unwrap_or(wall)
+    OFFSETS.with_borrow_mut(|offsets| offsets.convert(wall, imp::zone, imp::local_to_utc)).unwrap_or(wall)
 }
 
 /// How many hours [`HourOffsets`] remembers before it starts over.
 const REMEMBERED_HOURS: usize = 4096;
 
-/// How many conversions answered from memory may pass before `TZ` is read again. Reading it scans the environment,
-/// which costs more than the conversion itself.
+/// How many conversions answered from memory may pass before the zone is read again. Reading it (scanning the
+/// environment for `TZ`, or asking Windows for its zone) costs more than the conversion itself.
 const TZ_CHECK_EVERY: u32 = 256;
 
 /// The local zone's offset for each wall-clock hour already converted.
@@ -51,10 +49,10 @@ const TZ_CHECK_EVERY: u32 = 256;
 /// hour is converted by adding the offset. An hour whose ends differ holds a daylight-saving change, and every time
 /// in it goes to the platform. So does every time in an hour whose ends the platform can't convert.
 ///
-/// The offsets are kept for one value of `TZ` and dropped when it changes, since `mktime` reads `TZ` on Unix
-/// (Windows ignores it, so there the check only costs a read). `TZ` is
-/// read again before converting a new hour and after every [`TZ_CHECK_EVERY`] conversions from memory, so a change
-/// to it takes effect within that many conversions.
+/// The offsets are kept for one zone and dropped when it changes: the value of `TZ` on Unix, which `mktime` reads,
+/// and the system zone on Windows (its key name, biases and rules), which the conversion follows and `TZ` does not
+/// affect. The zone is read again before converting a new hour and after every [`TZ_CHECK_EVERY`] conversions from
+/// memory, so a change to it takes effect within that many conversions.
 #[derive(Default)]
 struct HourOffsets {
     zone: Option<OsString>,
@@ -112,6 +110,11 @@ impl HourOffsets {
 
 #[cfg(unix)]
 mod imp {
+    /// The zone `mktime` converts in: it reads `TZ`.
+    pub(super) fn zone() -> Option<std::ffi::OsString> {
+        std::env::var_os("TZ")
+    }
+
     pub(super) fn local_to_utc(wall: i64) -> Option<i64> {
         let time = libc::time_t::try_from(wall).ok()?;
         // SAFETY: both are plain C structs written by the calls below; a null return is checked.
@@ -143,6 +146,20 @@ mod imp {
         milliseconds: u16,
     }
 
+    /// `DYNAMIC_TIME_ZONE_INFORMATION`.
+    #[repr(C)]
+    struct DynamicZone {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTime,
+        daylight_bias: i32,
+        key_name: [u16; 128],
+        dynamic_daylight_disabled: u8,
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn TzSpecificLocalTimeToSystemTime(
@@ -150,6 +167,33 @@ mod imp {
             local: *const SystemTime,
             universal: *mut SystemTime,
         ) -> i32;
+        fn GetDynamicTimeZoneInformation(zone: *mut DynamicZone) -> u32;
+    }
+
+    /// The system zone's identity: its key name, biases, names and change rules. `TzSpecificLocalTimeToSystemTime`
+    /// with a null zone converts in the current system zone and ignores `TZ`, so a change to the system zone while
+    /// running must drop the remembered offsets.
+    pub(super) fn zone() -> Option<std::ffi::OsString> {
+        use std::os::windows::ffi::OsStringExt;
+        // SAFETY: a plain C struct of integers, filled by the call; an all-zero one is valid.
+        let mut zone: DynamicZone = unsafe { std::mem::zeroed() };
+        // SAFETY: `zone` is valid for writes for the call.
+        if unsafe { GetDynamicTimeZoneInformation(&mut zone) } == u32::MAX {
+            return None;
+        }
+        let date = |d: &SystemTime| [d.year, d.month, d.day_of_week, d.day, d.hour, d.minute, d.second, d.milliseconds];
+        let bias = |b: i32| [b as u16, (b >> 16) as u16];
+        let mut id = Vec::with_capacity(256);
+        id.extend(bias(zone.bias));
+        id.extend(zone.standard_name);
+        id.extend(date(&zone.standard_date));
+        id.extend(bias(zone.standard_bias));
+        id.extend(zone.daylight_name);
+        id.extend(date(&zone.daylight_date));
+        id.extend(bias(zone.daylight_bias));
+        id.extend(zone.key_name);
+        id.push(u16::from(zone.dynamic_daylight_disabled));
+        Some(std::ffi::OsString::from_wide(&id))
     }
 
     pub(super) fn local_to_utc(wall: i64) -> Option<i64> {
@@ -197,6 +241,10 @@ mod imp {
 
 #[cfg(not(any(unix, windows)))]
 mod imp {
+    pub(super) fn zone() -> Option<std::ffi::OsString> {
+        None
+    }
+
     pub(super) fn local_to_utc(_wall: i64) -> Option<i64> {
         None
     }

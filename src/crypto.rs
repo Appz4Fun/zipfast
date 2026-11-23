@@ -448,8 +448,9 @@ pub struct CbcSpan {
     pub range: std::ops::Range<u64>,
     /// Where the previous 16 bytes start (`range.start - 16`), or None when the range starts the stream (use the IV).
     pub previous_at: Option<u64>,
-    /// The intact bytes after the hole within `range`, as stream offsets: pass them as `intact`, at
-    /// `check.start - range.start`. None when the hole reaches the stream's end.
+    /// The intact bytes after the hole, as stream offsets: pass them as `intact`, at `check.start - range.start`.
+    /// When `range` ends the stream on a partial block, the check runs to that block's end (the packed stream's
+    /// end), so all 16 ciphertext bytes of the final block are compared. None when the hole reaches the stream's end.
     pub check: Option<std::ops::Range<u64>>,
     /// Whether `range` ends the stream (pass as `stream_end`).
     pub stream_end: bool,
@@ -463,7 +464,10 @@ pub fn cbc_rebuild_span(hole: std::ops::Range<u64>, stream_len: u64) -> CbcSpan 
     let block_end = end.div_ceil(16) * 16;
     // One more block to check against, unless the hole reaches the end.
     let range_end = if block_end >= stream_len { stream_len } else { (block_end + 16).min(stream_len) };
-    let check = (end < stream_len).then_some(end..range_end);
+    // The check runs through the last block's ciphertext, past the plaintext into its padding: a final block with
+    // few plaintext bytes is still compared whole.
+    let check_end = if range_end == stream_len { range_end.div_ceil(16) * 16 } else { range_end };
+    let check = (end < stream_len).then_some(end..check_end);
     CbcSpan { range: start..range_end, previous_at: start.checked_sub(16), check, stream_end: range_end == stream_len }
 }
 

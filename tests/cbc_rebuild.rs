@@ -96,12 +96,12 @@ fn a_wrong_key_plaintext_or_block_is_caught_by_the_intact_overlap() {
 
 /// An arbitrary hole (bytes 20..37 of the 55-byte stream, as a lost article would be) rebuilt through
 /// `cbc_rebuild_span`: widened to 16..55 (to the stream's end) from the previous 16 bytes, and checked against the
-/// intact bytes 37..55 after the hole.
+/// intact bytes after the hole through the end of the final block (37..64).
 #[test]
 fn a_hole_widens_to_blocks_with_a_check_after_it() {
     let data = unhex(RAR5_DATA);
     let span = cbc_rebuild_span(20..37, PLAIN.len() as u64);
-    assert_eq!(span, CbcSpan { range: 16..55, previous_at: Some(0), check: Some(37..55), stream_end: true });
+    assert_eq!(span, CbcSpan { range: 16..55, previous_at: Some(0), check: Some(37..64), stream_end: true });
     let previous: [u8; 16] = data[..16].try_into().unwrap();
     let check = span.check.clone().unwrap();
     let intact = &data[check.start as usize..check.end as usize];
@@ -165,4 +165,29 @@ fn overlap_and_padding_edges() {
     let key7 = derive_7z_key("secret", &[], 19).unwrap();
     let prev7: [u8; 16] = seven[..16].try_into().unwrap();
     assert_eq!(rebuild_cbc(&key7, &prev7, &PLAIN[16..48], false, Some((16, &seven[32..48]))).unwrap(), seven[16..48]);
+}
+
+/// A hole ending just before a final block holding one plaintext byte: the check covers that block's 16 ciphertext
+/// bytes, not only the one byte of plaintext, so a wrong replacement for the hole that happens to agree on that byte
+/// (here byte 0 as 196, all zero key, IV and plaintext, 7z zero padding) is caught.
+#[test]
+fn the_check_covers_the_whole_final_block() {
+    let (key, iv) = ([0u8; 32], [0u8; 16]);
+    let plain = [0u8; 49];
+    let mut padded = plain.to_vec();
+    padded.resize(64, 0);
+    let data = encrypt_cbc(&key, &iv, &padded).unwrap();
+    let span = cbc_rebuild_span(0..48, 49);
+    assert_eq!(span, CbcSpan { range: 0..49, previous_at: None, check: Some(48..64), stream_end: true });
+    let check = span.check.clone().unwrap();
+    let intact = &data[check.start as usize..check.end as usize];
+    let mut wrong = plain;
+    wrong[0] = 196;
+    // One byte of the final block agrees with the wrong plaintext's ciphertext: a one-byte check passes it.
+    assert!(rebuild_cbc_zero_padded(&key, &iv, &wrong, true, Some((48, &intact[..1]))).is_ok());
+    assert!(matches!(
+        rebuild_cbc_zero_padded(&key, &iv, &wrong, true, Some((48, intact))),
+        Err(CbcRebuildError::Mismatch { .. })
+    ));
+    assert_eq!(rebuild_cbc_zero_padded(&key, &iv, &plain, true, Some((48, intact))).unwrap(), data);
 }

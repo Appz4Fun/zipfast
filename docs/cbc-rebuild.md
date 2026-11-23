@@ -33,7 +33,7 @@ let ciphertext = zipfast::crypto::rebuild_cbc(&key, &previous_block, &plaintext,
 
 - **`range`:** the hole widened to whole blocks, plus one intact block after it.
 - **`previous_at`:** where the previous 16 bytes start, or None to use the IV.
-- **`check`:** the intact bytes to compare.
+- **`check`:** the intact bytes to compare. When `range` ends the stream on a partial block, it runs to that block's end in the packed stream, so all 16 bytes of the final block's ciphertext are compared, not only its plaintext bytes.
 - **`stream_end`**
 
 ```rust

@@ -1175,9 +1175,11 @@ impl SourceDriver {
             match self.declared_overlay(full)? {
                 Overlay::Hole(step) => return Ok(Poll::Ready(Ok(step))),
                 Overlay::Limit(n) => {
-                    // Declared damage ahead: the source's answer must stop before it, holes included.
+                    // Declared damage ahead: the source's answer must stop before it, holes included. Inside the
+                    // buffer, a long answer (allowed for this read) is still taken, trimmed to the damage: the
+                    // source cannot see the declaration.
                     if n < full {
-                        hole_max = 0;
+                        hole_max = hole_max.min(n as u64);
                     } else if let Some(start) = self.next_declared_start() {
                         hole_max = hole_max.min(start.saturating_sub(self.cursor.offset()));
                     }

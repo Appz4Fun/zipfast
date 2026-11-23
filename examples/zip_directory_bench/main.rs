@@ -47,7 +47,7 @@ use std::fs::File;
 use std::hint::black_box;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use shapes::{BENCH_SHAPES, Shape, Written};
@@ -57,12 +57,22 @@ use zipview::{ZipIndex, ZipIndexOpener, ZipReader};
 
 struct Meter;
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Whether allocations are counted: only inside [`peak_of`], so timed opens run without the bookkeeping.
+static METERING: AtomicBool = AtomicBool::new(false);
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
 
 fn grew(bytes: usize) {
-    let live = LIVE.fetch_add(bytes, Relaxed) + bytes;
-    PEAK.fetch_max(live, Relaxed);
+    if METERING.load(Relaxed) {
+        let live = LIVE.fetch_add(bytes as isize, Relaxed) + bytes as isize;
+        PEAK.fetch_max(live, Relaxed);
+    }
+}
+
+fn shrank(bytes: usize) {
+    if METERING.load(Relaxed) {
+        LIVE.fetch_sub(bytes as isize, Relaxed);
+    }
 }
 
 // SAFETY: every method forwards to `System` with the caller's layout, and only
@@ -89,14 +99,14 @@ unsafe impl GlobalAlloc for Meter {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: forwarded unchanged; the caller upholds `dealloc`'s contract.
         unsafe { System.dealloc(ptr, layout) };
-        LIVE.fetch_sub(layout.size(), Relaxed);
+        shrank(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: forwarded unchanged; the caller upholds `realloc`'s contract.
         let moved = unsafe { System.realloc(ptr, layout, new_size) };
         if !moved.is_null() {
-            LIVE.fetch_sub(layout.size(), Relaxed);
+            shrank(layout.size());
             grew(new_size);
         }
         moved
@@ -106,12 +116,15 @@ unsafe impl GlobalAlloc for Meter {
 #[global_allocator]
 static METER: Meter = Meter;
 
-/// Heap bytes the call had live at its peak, beyond what was live before it.
+/// Heap bytes the call had live at its peak, beyond what was live before it. Only allocations made while it runs
+/// are counted (a free of an earlier one lowers the count, which the peak, taken from the start, never goes below).
 fn peak_of<T>(call: impl FnOnce() -> T) -> (T, usize) {
     let base = LIVE.load(Relaxed);
     PEAK.store(base, Relaxed);
+    METERING.store(true, Relaxed);
     let value = call();
-    (value, PEAK.load(Relaxed) - base)
+    METERING.store(false, Relaxed);
+    (value, (PEAK.load(Relaxed) - base).max(0) as usize)
 }
 
 #[cfg(unix)]
@@ -235,16 +248,35 @@ fn verify(reader: &str, shape: &Shape, written: &Written, path: &Path, bytes: &[
     }
 }
 
-/// One open by `reader`, returning nothing the optimizer may drop early.
-fn open_once(reader: &str, path: &Path, file: &File, bytes: &[u8]) -> usize {
-    let len = bytes.len() as u64;
-    match reader {
-        "fast" => black_box(open_fast(path)).entries.len(),
-        "container" => black_box(open_container(file, len)).entries.len(),
-        "view-slice" => black_box(ZipReader::new(bytes).expect("zipview reads the archive")).len(),
-        "view-index" => black_box(open_view_index(file, len)).len(),
-        _ => unreachable!(),
+/// A reader as opened, kept so the caller drops it (freeing its directory, closing its file) outside a timed span.
+enum Opened<'a> {
+    Fast(Archive),
+    Container(zip_container::Directory),
+    ViewSlice(ZipReader<'a>),
+    ViewIndex(ZipIndex),
+}
+
+impl Opened<'_> {
+    fn count(&self) -> usize {
+        match self {
+            Opened::Fast(archive) => archive.entries.len(),
+            Opened::Container(directory) => directory.entries.len(),
+            Opened::ViewSlice(reader) => reader.len(),
+            Opened::ViewIndex(index) => index.len(),
+        }
     }
+}
+
+/// One open by `reader`, returned whole so the optimizer cannot drop it early and its teardown is not timed.
+fn open_once<'a>(reader: &str, path: &Path, file: &File, bytes: &'a [u8]) -> Opened<'a> {
+    let len = bytes.len() as u64;
+    black_box(match reader {
+        "fast" => Opened::Fast(open_fast(path)),
+        "container" => Opened::Container(open_container(file, len)),
+        "view-slice" => Opened::ViewSlice(ZipReader::new(bytes).expect("zipview reads the archive")),
+        "view-index" => Opened::ViewIndex(open_view_index(file, len)),
+        _ => unreachable!(),
+    })
 }
 
 fn main() {
@@ -276,13 +308,16 @@ fn main() {
         let file = File::open(&path).expect("open archive");
         for &reader in &readers {
             verify(reader, shape, &written, &path, &bytes);
-            let (count, peak) = peak_of(|| open_once(reader, &path, &file, &bytes));
+            // Allocations are counted in this pass only; the timed rounds below run without the bookkeeping.
+            let (count, peak) = peak_of(|| open_once(reader, &path, &file, &bytes).count());
             assert_eq!(count, shape.count);
             let mut times: Vec<Duration> = (0..rounds)
                 .map(|_| {
                     let start = Instant::now();
-                    black_box(open_once(reader, &path, &file, &bytes));
-                    start.elapsed()
+                    let opened = open_once(reader, &path, &file, &bytes);
+                    let elapsed = start.elapsed();
+                    drop(black_box(opened));
+                    elapsed
                 })
                 .collect();
             times.sort();
