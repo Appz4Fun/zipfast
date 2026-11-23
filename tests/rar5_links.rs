@@ -624,3 +624,28 @@ fn a_member_under_a_linked_folder_fails_only_itself() {
         }
     }
 }
+
+/// In a Windows-made archive a `\` in a RAR 5.0 name is written as `_`; a hard link's or file copy's target names
+/// that member the same way, so it finds the file where it was written.
+#[test]
+fn links_to_a_windows_name_with_a_backslash_find_the_written_file() {
+    for threads in [1, 4] {
+        let tmp = tempfile::tempdir().unwrap();
+        let windows = |spec: FileSpec<'static>| FileSpec { unix_mode: None, ..spec };
+        let arc = write(
+            tmp.path(),
+            &[
+                windows(FileSpec::new("d\\x.txt", b"data")),
+                windows(link("hard", 4, "d\\x.txt")),
+                windows(link("copy", 5, "d\\x.txt")),
+            ],
+        );
+        let dest = tmp.path().join("out");
+        let s = extract::run(&arc, &options(&dest, Mode::Extract, Overwrite::Always, threads), |_| {}).unwrap();
+        assert!(s.errors.is_empty(), "threads={threads}: {:?}", s.errors);
+        assert_eq!(fs::read(dest.join("d_x.txt")).unwrap(), b"data");
+        assert_eq!(ino(&dest.join("hard")), ino(&dest.join("d_x.txt")), "threads={threads}");
+        assert_eq!(fs::read(dest.join("copy")).unwrap(), b"data");
+        assert!(!dest.join("d").exists(), "no folder made from the backslash");
+    }
+}

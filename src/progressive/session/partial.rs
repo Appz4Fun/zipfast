@@ -555,7 +555,8 @@ impl ProgressiveSession {
             self.member.unwrap().ordinal,
             crate::crypto::sha256(&identity),
         );
-        let mut relative = crate::path::sanitize_fallible(&header.name, !header.is_unix())
+        let output = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        let mut relative = crate::path::sanitize_fallible(&output, !header.is_unix())
             .map_err(|_| error(PartialErrorKind::UnsafePath))?;
         if let PartialNaming::Suffix(suffix) = &persistent.options.naming {
             let mut name = relative.file_name().ok_or_else(|| error(PartialErrorKind::UnsafePath))?.to_os_string();

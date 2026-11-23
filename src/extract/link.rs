@@ -151,8 +151,9 @@ pub(crate) enum LinkKind {
 
 /// A RAR 5.0 redirection as a link member, or None for a kind this does not know. A Windows symbolic link or a
 /// junction becomes a symbolic link with its backslashes made slashes (an absolute one, `\??\C:\...`, then fails
-/// the target check). A hard link's or file copy's target is an earlier member's name, sanitized as member names
-/// are (`windows` for a Windows-host archive) and, with `flatten`, only its last component.
+/// the target check). A hard link's or file copy's target is an earlier member's name, mapped and sanitized as
+/// member names are (`windows` for a Windows-host archive: a `\` is `_`, see `FileHeader::output_name`) and, with
+/// `flatten`, only its last component.
 pub(crate) fn from_rar5(
     redirection: &crate::rar5::Redirection,
     windows: bool,
@@ -161,7 +162,10 @@ pub(crate) fn from_rar5(
 ) -> Option<Result<LinkKind, crate::error::Error>> {
     use crate::rar5::Redirection;
     let member = |name: &str| {
-        crate::path::sanitize_with(name, windows, windows_safe_names)
+        // the target is an earlier member's RAR 5.0 name, written as member names are: a Windows-made `\\` is `_`
+        let name =
+            if windows && name.contains('\\') { std::borrow::Cow::Owned(name.replace('\\', "_")) } else { name.into() };
+        crate::path::sanitize_with(&name, windows, windows_safe_names)
             .map(|rel| if flatten { std::path::PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel })
     };
     Some(match redirection {
