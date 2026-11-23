@@ -1470,6 +1470,14 @@ impl PartialCore {
             if !op.cursor_pending {
                 return Ok(());
             }
+            // An earlier commit whose anchor CAS is uncertain is resolved first: a new group must start from the
+            // state the store holds. The rebuilt snapshot holds that state's cursor, and a newer one is dropped.
+            if op.uncertain.is_some() {
+                self.reconcile(op)?;
+                if !op.cursor_pending {
+                    return Ok(());
+                }
+            }
             // A cursor alone: a group with no output carries it, one intent and one commit.
             self.begin_group(op)?;
         }

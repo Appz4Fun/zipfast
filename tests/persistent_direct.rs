@@ -844,3 +844,43 @@ fn a_compressed_member_survives_an_abort_from_its_last_committed_cursor() {
     let mut file = sink.into_file();
     assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
 }
+
+/// A group commit whose anchor CAS lands but reports an error, with a cursor pending: the next operation resolves
+/// the uncertain commit from the store instead of opening a cursor-only group on top of it.
+#[test]
+fn an_uncertain_commit_with_a_cursor_pending_is_reconciled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = payload(90_000, 13);
+    let volumes = stored_set("u.bin", &data, 40_000, false);
+    let refs: Vec<&[u8]> = volumes.iter().map(|v| v.as_slice()).collect();
+    let map = MemberMap::from_memory(&refs, "set.part1.rar", None).unwrap();
+    let (output_root, state_dir, anchor_dir) = roots(tmp.path());
+    let anchors = Arc::new(anchor_store::DurableAnchors::open(&anchor_dir).unwrap());
+    let parts = DirectPartials::new(DirectOptions {
+        binding: ArchiveBinding { job: [2; 16], archive: [2; 32] },
+        output_root,
+        state_dir,
+        naming: PartialNaming::ArchivePath,
+        limits: PartialLimits::default(),
+        progressive_limits: ProgressiveLimits::default(),
+        anchors: anchors.clone(),
+        control: SessionControl::default(),
+        protection: protection(volumes.len()),
+        password: None,
+    })
+    .unwrap();
+    let mut sink = DirectSink::new(parts.open(&map, 0).unwrap().file);
+    sink.write_at(0, &data[..50_000]).unwrap();
+    sink.set_cursor(b"one").unwrap();
+    anchors.fail_after_rename(1);
+    let error = sink.commit().unwrap_err();
+    assert!(error.committed.is_some(), "{error:?}");
+    // the commit landed in the store; the next operation reconciles with it and goes on
+    assert_eq!(sink.file().remaining().unwrap(), vec![50_000..90_000]);
+    assert_eq!(sink.file().cursor().unwrap().as_deref(), Some(&b"one"[..]));
+    sink.write_at(50_000, &data[50_000..]).unwrap();
+    sink.set_cursor(b"two").unwrap();
+    let mut file = sink.into_file();
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    assert_eq!(file.cursor().unwrap().as_deref(), Some(&b"two"[..]));
+}
