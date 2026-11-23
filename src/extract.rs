@@ -1248,7 +1248,58 @@ impl LegacyRoute {
 enum SelectedSource {
     Zip(crate::zip::read::ProjectedOwner),
     Tar(Box<crate::tar::Selected>),
-    Rar { path: PathBuf, chain_start: usize, name: String, rar4: bool },
+    Rar {
+        path: PathBuf,
+        chain_start: usize,
+        name: String,
+        rar4: bool,
+    },
+    /// A 7z member: read by decoding its folder up to it (see [`crate::sevenzip::print_selected_with`]).
+    SevenZip {
+        path: PathBuf,
+        name: String,
+    },
+    /// A member of a split ZIP set (Info-ZIP `.z01`... `.zip`, or a byte split `.zip.001`...), read through the
+    /// set's volumes as `extract::run` reads them.
+    SplitZip {
+        path: PathBuf,
+        archive: Box<crate::zip::Archive>,
+    },
+}
+
+/// Whether `path` names a split ZIP set, which [`crate::zip::Archive`] opens across its volumes.
+fn is_split_zip(path: &Path) -> bool {
+    crate::zip::is_spanned(path) || crate::zip::is_headless_spanned(path) || crate::zip::is_byte_split(path)
+}
+
+/// A split ZIP set opened for one selected entry: the entry must be a regular file within `limit` bytes.
+fn split_zip_selected(
+    path: &Path,
+    index: usize,
+    limit: u64,
+    cancel: &Cancellation,
+) -> Result<(Box<crate::zip::Archive>, bool, Meta)> {
+    let archive = crate::zip::Archive::open_cancelable(path, Some(cancel))?;
+    let entry = archive.selected_entry(index, limit)?;
+    let meta = Meta { mtime: entry.mtime, nanos: entry.nanos, mode: entry.unix_mode() };
+    let windows_names = entry.host != 3;
+    Ok((Box::new(archive), windows_names, meta))
+}
+
+/// The name and metadata of 7z member `index`, refused unless it is a regular file within `limit` bytes.
+fn seven_zip_selected(path: &Path, index: usize, password: Option<&str>, limit: u64) -> Result<(String, Meta)> {
+    let limits = crate::sevenzip::SevenZipLimits::default();
+    let map = crate::sevenzip::open_map(path, password, &Cancellation::default(), &limits)?;
+    let member = map.members.get(index).ok_or_else(|| Error::Unsupported("entry index is out of range".into()))?;
+    let link = member.unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000);
+    if member.is_dir || link {
+        return Err(Error::Unsupported("the selected 7z entry is not a regular file".into()));
+    }
+    if member.unpacked_size.unwrap_or(0) > limit {
+        return Err(Error::Unsupported("the selected 7z entry exceeds the byte limit".into()));
+    }
+    let (mtime, nanos) = member.mtime.map_or((None, 0), |(seconds, nanos)| (Some(seconds), nanos));
+    Ok((crate::sevenzip::member_name(member), Meta { mtime, nanos, mode: member.unix_mode }))
 }
 
 const RAR_SELECTED_WINDOW_LIMIT: u64 = 256 << 20;
@@ -1475,7 +1526,28 @@ impl SelectedEntry {
                 Err(Error::NotAnArchive) => {}
                 Err(error) => return Err(error),
             },
-            Format::SevenZip => return Err(Error::Unsupported("reading one 7z entry on its own".into())),
+            Format::Zip if is_split_zip(path) => {
+                let (archive, windows_names, meta) = split_zip_selected(path, index, limit, &cancel)?;
+                return Ok(Self {
+                    meta,
+                    windows_names,
+                    index,
+                    limit,
+                    source: SelectedSource::SplitZip { path: path.to_path_buf(), archive },
+                    cancel,
+                });
+            }
+            Format::SevenZip => {
+                let (name, meta) = seven_zip_selected(path, index, password, limit)?;
+                return Ok(Self {
+                    meta,
+                    windows_names: false,
+                    index,
+                    limit,
+                    source: SelectedSource::SevenZip { path: path.to_path_buf(), name },
+                    cancel,
+                });
+            }
             Format::Zip => {}
         }
         let archive = crate::zip::read::ProjectedOwner::open_legacy(path, &cancel)?;
@@ -1519,13 +1591,27 @@ impl SelectedEntry {
                 });
             }
             CheckedRoute::Legacy(LegacyRoute::SevenZip) => {
-                return Err(ReadFault::Legacy(Error::Unsupported("reading one 7z entry on its own".into())).into());
+                let (name, meta) = seven_zip_selected(path, index, password, max_bytes).map_err(ReadFault::Legacy)?;
+                return Ok(Self {
+                    meta,
+                    windows_names: false,
+                    index,
+                    limit: max_bytes,
+                    source: SelectedSource::SevenZip { path: path.to_path_buf(), name },
+                    cancel,
+                });
             }
             CheckedRoute::Legacy(LegacyRoute::SplitZip) => {
-                return Err(ReadFault::Legacy(Error::Unsupported(
-                    "reading one entry of a split ZIP on its own".into(),
-                ))
-                .into());
+                let (archive, windows_names, meta) =
+                    split_zip_selected(path, index, max_bytes, &cancel).map_err(ReadFault::Legacy)?;
+                return Ok(Self {
+                    meta,
+                    windows_names,
+                    index,
+                    limit: max_bytes,
+                    source: SelectedSource::SplitZip { path: path.to_path_buf(), archive },
+                    cancel,
+                });
             }
             CheckedRoute::Legacy(LegacyRoute::Rar { signature, path: held_path }) => {
                 let volume = Volume::from_held_signature(&held_path, signature, password).map_err(ReadFault::Legacy)?;
@@ -1645,6 +1731,8 @@ impl SelectedEntry {
             SelectedSource::Zip(owner) => &owner.entries()[self.index].name,
             SelectedSource::Tar(selected) => &selected.name,
             SelectedSource::Rar { name, .. } => name,
+            SelectedSource::SevenZip { name, .. } => name,
+            SelectedSource::SplitZip { archive, .. } => &archive.entries[self.index].name,
         }
     }
 
@@ -1658,6 +1746,10 @@ impl SelectedEntry {
                 return sanitize(&output.replace('\\', "_"), true);
             }
             return sanitize(&output, self.windows_names);
+        }
+        if let SelectedSource::SevenZip { name, .. } = &self.source {
+            // as the 7z runner writes names: a `\` separates folders too
+            return sanitize(&name.replace('\\', "/"), false);
         }
         sanitize(self.name(), self.windows_names)
     }
@@ -1730,6 +1822,40 @@ impl SelectedEntry {
                     cancel: &self.cancel,
                 };
                 rar_read_at(&path, chain_start, self.index, &name, password, selection, observer)
+            }
+            SelectedSource::SplitZip { path, mut archive } => {
+                observer.notify(0, &path, SelectedReadRole::Selected, Some(&self.cancel))?;
+                archive.read_at_cancelable(self.index, password, self.limit, Some(&self.cancel), &mut checked_sink)
+            }
+            SelectedSource::SevenZip { path, name } => {
+                observer.notify(0, &path, SelectedReadRole::Selected, Some(&self.cancel))?;
+                let limits = crate::sevenzip::SevenZipLimits::default();
+                let want = self.index as u64;
+                let mut failure = None;
+                let summary = crate::sevenzip::print_selected_with(
+                    &path,
+                    password,
+                    &mut |ordinal, _| ordinal == want,
+                    &mut |_, bytes| {
+                        checked_sink(bytes).map_err(|e| {
+                            let message = e.to_string();
+                            failure = Some(e);
+                            std::io::Error::other(message)
+                        })
+                    },
+                    &self.cancel,
+                    &limits,
+                );
+                match (summary, failure) {
+                    // the sink's own error, as the other formats return it
+                    (_, Some(error)) => Err(error),
+                    (Err(error), None) => Err(error),
+                    (Ok(summary), None) => match summary.errors.first() {
+                        Some(line) => Err(Error::Io(std::io::Error::other(line.clone()))),
+                        None if summary.files == 0 => Err(Error::Unsupported(format!("{name}: not read"))),
+                        None => Ok(()),
+                    },
+                }
             }
         }?;
         self.cancel.check_io()?;

@@ -225,6 +225,42 @@ pub fn run(
     run_reporting(first, options, password, cancel, limits, &mut report).map_err(|e| e.error)
 }
 
+/// Prints the members `select` takes to `output` in archive order, as `7z x -so` does: their data only, one after
+/// another.
+///
+/// `select` gets each member's listing index (as [`list`] numbers them) and name; directories are never offered.
+/// Each folder is decoded once, front to back, also when several of its members are taken (the members before and
+/// between them are decoded and dropped), so printing a whole solid archive costs one decode. Each member is spooled
+/// to a private temporary file until its CRC checks out (and, for a folder of several members that stores its own
+/// CRC, until the folder's does, which prints the folder's members together at its end), so a member that fails
+/// prints nothing. Such a member is a line in [`Summary::errors`] and the run goes on, as in [`run`]; `files` and
+/// `bytes` count what was printed. The run itself fails as [`run`] does (a missing or wrong password, a limit, an
+/// unsupported coder, cancellation, unreadable headers or volumes) and on an error writing to `output`, after which
+/// `output` may hold the members printed before.
+pub fn print_selected(
+    first: &Path,
+    password: Option<&str>,
+    mut select: impl FnMut(u64, &str) -> bool,
+    output: &mut dyn std::io::Write,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+) -> Result<Summary> {
+    print_selected_with(first, password, &mut select, &mut |_, bytes| output.write_all(bytes), cancel, limits)
+}
+
+/// [`print_selected`] handing each chunk to `on_bytes` with the listing index of the member it belongs to, so a
+/// caller can tell where one member ends and the next begins.
+pub fn print_selected_with(
+    first: &Path,
+    password: Option<&str>,
+    select: &mut dyn FnMut(u64, &str) -> bool,
+    on_bytes: &mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+) -> Result<Summary> {
+    run::print(first, password, select, on_bytes, cancel, limits).map_err(Error::from)
+}
+
 /// [`run`], reporting a rename mode's renames to `report` as they happen; a terminal error keeps them too.
 pub(crate) fn run_reporting(
     first: &Path,
