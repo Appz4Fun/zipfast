@@ -1006,7 +1006,8 @@ impl Unpacker {
     }
 
     /// For a decoder from [`Self::resume_seeded`]: the most telling sign so far that its output may be wrong (a copy
-    /// from before the held plaintext, then a filter met, then a copy from unproven output); None while there is
+    /// from before the held plaintext, then an unguarded restart, then a filter met, then a copy from unproven
+    /// output); None while there is
     /// none, and for any other decoder. See [`Self::seed_suspects`] for the first of each kind.
     pub fn seed_suspect(&self) -> Option<SeedSuspect> {
         self.seed.as_deref().and_then(|s| s.suspects().next())
@@ -2088,13 +2089,14 @@ pub(crate) struct SeedState {
     /// whether no filter the follow did not see can have changed a seeded byte a match may copy
     pub(crate) checked: bool,
     before_seed: Option<SeedSuspect>,
+    unguarded: Option<SeedSuspect>,
     unchecked: Option<SeedSuspect>,
     filter: Option<SeedSuspect>,
 }
 
 impl SeedState {
     pub(crate) fn new(strict: bool, seeded_from: u64, checked: bool) -> Self {
-        SeedState { strict, seeded_from, checked, before_seed: None, unchecked: None, filter: None }
+        SeedState { strict, seeded_from, checked, before_seed: None, unguarded: None, unchecked: None, filter: None }
     }
 
     /// Notes a copy the floor refused and gives the floor to go on with: the held plaintext's start while copies
@@ -2109,13 +2111,17 @@ impl SeedState {
         }
     }
 
+    pub(crate) fn note_unguarded(&mut self, at: u64) {
+        self.unguarded.get_or_insert(SeedSuspect { at, reason: SeedReason::Unguarded });
+    }
+
     fn note_filter(&mut self, at: u64) {
         self.filter.get_or_insert(SeedSuspect { at, reason: SeedReason::Filter });
     }
 
     /// The first suspect of each kind, the most telling first.
     fn suspects(&self) -> impl Iterator<Item = SeedSuspect> + '_ {
-        [self.before_seed, self.filter, self.unchecked].into_iter().flatten()
+        [self.before_seed, self.unguarded, self.filter, self.unchecked].into_iter().flatten()
     }
 }
 
@@ -2140,6 +2146,10 @@ pub enum SeedReason {
     /// the decoder never saw, may have changed: held plaintext is filtered output, while the window should hold it
     /// as it was before the filter ran.
     UncheckedCopy { source: u64 },
+    /// The restart is not guarded (noted at the restart, before anything is decoded): a filter declared before it,
+    /// which the decoder never saw, may cover output after it, and the held plaintext ends before such a filter's
+    /// longest reach could.
+    Unguarded,
     /// The decoder met a filter record. That filter itself is decoded right, but filters come where the content
     /// suits them (x86 code, tables), so earlier ones may have changed seeded bytes a later match copies.
     Filter,

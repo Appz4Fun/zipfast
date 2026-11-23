@@ -85,6 +85,9 @@ pub struct Resync {
     /// checked, which the follow never saw (0 for [`resync`]). The resumed decoder refuses a match that copies from
     /// there into output no known plaintext checks.
     floor: u64,
+    /// [`resync_near`] only: the follow covered the restart's whole match window ([`ResyncNear::window_checked`]).
+    /// Never set by [`resync`], whose floor of 0 proves nothing.
+    window_checked: bool,
 }
 
 /// A filter a [`resync_near`] follow decoded past: output offsets `start..start + len` (in the plaintext's
@@ -682,11 +685,12 @@ pub fn resync_near(
     let est = options.estimate.unwrap_or(packed.len()).min(packed.len());
     let checked =
         |r: &Resync, anchor: u64| anchor <= known_base || r.floor <= r.output_offset.saturating_sub(window.reach);
-    let done = |(r, anchor, from): (Resync, u64, usize), work: &mut Work| {
+    let done = |(mut r, anchor, from): (Resync, u64, usize), work: &mut Work| {
         // A result found after the deadline is not given: the caller's time is up.
         if work.late() {
             return Err(NearError::Exhausted { lowest: from });
         }
+        r.window_checked = checked(&r, anchor);
         Ok(ResyncNear {
             back: target - r.output_offset,
             anchor,
@@ -1080,6 +1084,7 @@ fn resync_at(
             filters,
             guarded,
             floor,
+            window_checked: false,
         }
     }
 }
@@ -1229,6 +1234,11 @@ impl Unpacker {
     /// refuses it. A copy from before `known_base` (window bytes never seeded) is noted the same way. The first
     /// filter the decoder meets is noted too, as a weaker sign.
     ///
+    /// A restart that is not guarded ([`Resync::guarded`]; a plain [`resync`] result never is) can have a filter
+    /// declared before it cover output after it, which only held plaintext past the restart could catch: such a
+    /// restart is noted as [`super::SeedReason::Unguarded`] at once, and refused with `strict` (as
+    /// [`crate::Error::Unsupported`]).
+    ///
     /// The window is proven (checked) when the follow to the restart covered it: [`ResyncNear::window_checked`] (a
     /// follow from the member's start, or from the dictionary plus a filter's reach before the restart), with
     /// `known` covering the window and every filter seen undone. Filter records sit inside Huffman-coded blocks, so
@@ -1270,15 +1280,31 @@ impl Unpacker {
                 u.window[(f & u.mask) as usize] = b;
             }
         }
-        // The lowest stream offset whose window bytes are proven: everything when the follow covered the window,
-        // else the follow's floor. Raised past seen filters whose output `known` lacks (they cannot be undone) and to
-        // `known_base` when the window reaches before it (never seeded; nothing before the stream's start exists).
+        // The lowest stream offset whose window bytes are proven: everything when the follow covered the window
+        // (`resync_near` says so; a plain `resync` result never proves it), else the follow's floor, or the restart
+        // itself when nothing before it was followed. Raised past seen filters whose output `known` lacks (they
+        // cannot be undone) and to `known_base` when the window reaches before it (never seeded; nothing before the
+        // stream's start exists).
         let from_member_start = resync.floor > 0 && resync.verified.start <= member_start;
-        let mut floor = if resync.floor == 0 || from_member_start {
-            if member_start > 0 && window_start < member_start && from_member_start { member_start } else { 0 }
-        } else {
+        let mut floor = if resync.window_checked {
+            0
+        } else if from_member_start {
+            if member_start > 0 && window_start < member_start { member_start } else { 0 }
+        } else if resync.floor > 0 {
             resync.floor.min(offset)
+        } else {
+            offset
         };
+        // A filter declared before the restart can cover output past it, up to a filter's longest length, unless
+        // the restart is guarded; held plaintext past the restart is the only other check.
+        let reach_end = offset.saturating_add(MAX_FILTER_LEN).min(member_end);
+        let unguarded = !resync.guarded && !resync.window_checked && check_end < reach_end;
+        if unguarded && strict {
+            return Err(Error::Unsupported(format!(
+                "seeding a RAR 5.0 decoder at {offset} strictly needs a guarded restart (resync_near) or held \
+                 plaintext to {reach_end}, past any filter declared before it; given {known_base}..{known_end}"
+            )));
+        }
         for f in &resync.filters {
             let end = f.start + f.len;
             if end <= from || f.start < member_start {
@@ -1304,7 +1330,11 @@ impl Unpacker {
             u.floor = floor;
             u.floor_from = check_end;
         }
-        u.seed = Some(Box::new(super::SeedState::new(strict, known_base, floor == 0)));
+        let mut seed = super::SeedState::new(strict, known_base, floor == 0 && !unguarded);
+        if unguarded {
+            seed.note_unguarded(offset - member_start);
+        }
+        u.seed = Some(Box::new(seed));
         u.sp = offset;
         u.file_base = member_start;
         u.emitted = offset - member_start;

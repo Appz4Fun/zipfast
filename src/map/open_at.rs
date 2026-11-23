@@ -255,16 +255,17 @@ pub enum Seed {
     #[default]
     Checked,
     /// The window is seeded from the caller's held plaintext (the output before the target, from an earlier copy),
-    /// and the plan fetches packed bytes only from just before the target's estimated position
-    /// ([`OpenAtOptions::search`], default [`SEED_SEARCH`]). The output is unverified unless
+    /// and the plan fetches packed bytes only from shortly before the target's estimated position
+    /// ([`OpenAtOptions::search`]; by default enough for a guarded restart, see [`SEED_SEARCH`]). The output is unverified unless
     /// [`Rar5Resume::checked`] says otherwise: the member's CRC32 or BLAKE2sp at its end proves it, and the decoder
     /// reports early signs of trouble ([`Unpacker::seed_suspect`]). With `strict`, a suspect copy is refused instead
     /// of decoded. See [`Unpacker::resume_seeded`].
     HeldPlaintext { strict: bool },
 }
 
-/// The packed bytes a [`Seed::HeldPlaintext`] plan fetches before the target's estimated position when
-/// [`OpenAtOptions::search`] is `None`.
+/// The margin a [`Seed::HeldPlaintext`] plan fetches before the target's estimated position when
+/// [`OpenAtOptions::search`] is `None`, on top of a filter's reach (4 MiB of output) at twice the member's average
+/// packing ratio, so the restart can be guarded.
 pub const SEED_SEARCH: u64 = 2 << 20;
 
 /// The LZMA2 search when [`OpenAtOptions::search`] is `None`.
@@ -376,7 +377,10 @@ pub fn open_at(map: &MemberMap, member: usize, offset: u64, options: &OpenAtOpti
             let seeded = matches!(options.seed, Seed::HeldPlaintext { .. });
             let search = options.search.unwrap_or_else(|| {
                 if seeded {
-                    SEED_SEARCH
+                    // enough for a guarded restart (followed from a filter's reach before it), at the average
+                    // ratio doubled, plus the seed margin
+                    let scaled = (RAR5_FILTER_REACH as u128 * packed_len as u128 / size.max(1) as u128) as u64;
+                    scaled.saturating_mul(2).saturating_add(SEED_SEARCH)
                 } else if reach >= offset {
                     // the window reaches the member's start: search from there
                     estimate
@@ -513,11 +517,7 @@ pub fn complete_rar5(
         return if from_start { fresh() } else { Err(OpenAtError::NeedMore { needed: 0..0 }) };
     }
     let seed = plan.seed;
-    let mut options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
-    if let Seed::HeldPlaintext { .. } = seed {
-        // the seeded window needs no guard: the packed bytes held start near the target
-        options.guard = false;
-    }
+    let options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
     let found = match resync_near(packed, known_base, known, window, stream_target, &options) {
         Ok(found) => found,
         Err(_) if from_start => return fresh(),
