@@ -20,10 +20,13 @@ mod common;
 
 use common::{FileSpec, archive, archive_with};
 use zipfast::map::{
-    Layer, Lzma2DecodeOptions, MapMember, MemberMap, OpenAt, OpenAtError, OpenAtOptions, RestartGrain, Start,
-    complete_lzma2, complete_rar5, member_restart, open_at,
+    Layer, Lzma2DecodeOptions, Lzma2Framing, MapMember, MemberMap, OpenAt, OpenAtError, OpenAtOptions, RestartGrain,
+    Start, complete_lzma2, complete_rar5, member_restart, open_at,
 };
 use zipfast::rar5::unpack::{NearOptions, Sink};
+
+/// A Usenet article's size, for counting the pieces a header walk touches.
+const ARTICLE: u64 = 768_000;
 
 struct Collect(Vec<u8>);
 impl Sink for Collect {
@@ -243,7 +246,7 @@ fn plans_refuse_what_they_cannot_do() {
     let r = complete_rar5(&map, &plan, plan.fetch_from, &held, 0, &plain[..10_000], &NearOptions::default());
     assert!(matches!(r, Err(OpenAtError::NeedMore { .. })));
     // a RAR plan is not an LZMA2 plan
-    let r = complete_lzma2(&map, &plan, plan.fetch_from, &held, 0, &plain, &Lzma2DecodeOptions::default());
+    let r = complete_lzma2(&map, &plan, plan.fetch_from, &held, 0, &plain, None, &Lzma2DecodeOptions::default());
     assert!(matches!(r, Err(OpenAtError::WrongPlan)));
 }
 
@@ -390,9 +393,19 @@ fn handovers_on_the_z_fixtures() {
             assert_eq!((r.layer, r.grain), (Layer::SevenZipLzma2, RestartGrain::Lzma2Chunks), "{set}");
             for target in [plain.len() as u64 / 3, plain.len() as u64 * 4 / 5] {
                 let plan = open_at(&f.map, i, target, &OpenAtOptions::default()).unwrap();
+                let Start::Lzma2 { framing: how, .. } = plan.start else { panic!("{:?}", plan.start) };
                 let held = fetch(&refs, &plan.spans);
+                // The framing: a header walk from the stream's start (the map walks the in-memory volumes, reading
+                // headers only), or under 7zAES the decrypted bytes from 0 that the plan fetches.
+                let framing = match how {
+                    Lzma2Framing::HeaderWalk => {
+                        Some(f.map.lzma2_chunks(slot.index as usize, &refs, Default::default()).unwrap())
+                    }
+                    _ => None,
+                };
                 let (from, held) = match folder.cipher.clone() {
                     Some(CipherParams::SevenZipAes { num_cycles_power, salt, iv }) => {
+                        assert_eq!((how, plan.fetch_from), (Lzma2Framing::FromStart, 0), "{set}");
                         let key = zipfast::crypto::derive_7z_key(&f.password, &salt, num_cycles_power).unwrap();
                         decrypt_held(&key, &iv, plan.fetch_from, &held)
                     }
@@ -401,13 +414,27 @@ fn handovers_on_the_z_fixtures() {
                 let known = &plain[..target as usize];
                 let options = Lzma2DecodeOptions { max_output: 1 << 34, max_dictionary: 1 << 31, ..Default::default() };
                 let started = std::time::Instant::now();
-                let res = complete_lzma2(&f.map, &plan, from, &held, 0, known, &options)
+                let res = complete_lzma2(&f.map, &plan, from, &held, 0, known, framing.as_ref(), &options)
                     .unwrap_or_else(|e| panic!("{set} member {i} target {target}: {e}"));
+                // What the handover fetched: the bulk from `fetch_from`, plus the header walk before it.
+                let folder_len: u64 = folder.pack_sizes.iter().sum();
+                let walk = framing.as_ref().map(|ix| {
+                    let before: Vec<_> = ix.chunks.iter().filter(|c| c.packed_offset < plan.fetch_from).collect();
+                    let articles: std::collections::BTreeSet<u64> =
+                        before.iter().map(|c| c.packed_offset / ARTICLE).collect();
+                    (before.len(), before.iter().map(|c| c.header_len()).sum::<u64>(), articles.len())
+                });
                 eprintln!(
-                    "{set} member {i} target {target}: restart {} ({} back), {} ms",
+                    "{set} member {i} target {target}: restart {} ({} back), {} ms; bulk {} of {} packed bytes from {}; \
+                     header walk before it (chunks, header bytes, {}-byte pieces touched): {:?}",
                     res.output,
                     res.redecode,
-                    started.elapsed().as_millis()
+                    started.elapsed().as_millis(),
+                    folder_len - plan.fetch_from,
+                    folder_len,
+                    plan.fetch_from,
+                    ARTICLE,
+                    walk
                 );
                 assert_eq!(res.bytes, plain[res.output as usize..], "{set} member {i} target {target}");
             }

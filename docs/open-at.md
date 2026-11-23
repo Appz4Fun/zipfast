@@ -59,19 +59,31 @@ held bytes or the known plaintext do not reach far enough back: fetch from earli
 
 ### 7z LZMA2
 
-`complete_lzma2(&map, &plan, packed_from, packed, known_base, known, &Lzma2DecodeOptions) -> Lzma2Resume` needs the
-folder's packed bytes from `fetch_from` to the folder's end. It finds the first chunk header chain in them that runs
-to the end marker at exactly the LZMA2 stream's end (the folder's packed size, or under 7zAES the AES coder's output
-size, which leaves out the block padding); counting back from the folder's size gives every chunk's output offset.
-A single chunk and its end marker count as a chain. Because header-like bytes inside a stored payload can form a
-false chain that still ends at the true end marker, the framing must be proven before a restart is used: the chain
-starts at the stream's first byte, or whole chunks ending at the restart (or the restart chunk itself) decode to
-exactly the known output, at least 64 bytes of it. Otherwise the result is `NeedMore`: fetch from earlier. It restarts
-at the last chunk at or before the target that resets the LZMA state or stores its bytes and checks out against the
-known output, and decodes from there to the folder's end with the known output before it as the dictionary:
-`bytes` is the folder's output from `output` on, bounded by `Lzma2DecodeOptions::max_output` (stored and decoded
-output together; `OpenAtError::OutputLimit` past it), and `redecode` is `folder_target - output`. A member's output is
-the folder's from its `stream_start`.
+An LZMA2 restart must sit at a chunk start, and only a walk of chunk headers from the stream's first byte proves
+where those are. Header-like bytes inside a stored payload form chains that end at the true end marker, and since
+repeated plaintext can make such a chain match any amount of the known output, no plaintext match can prove
+the framing. So the plan's `framing` says how the chunk starts become known:
+
+- `Lzma2Framing::HeaderWalk` (unencrypted folders): walk the headers from the folder's packed stream start up to
+  past the target, reading only each header (at most 6 bytes; the next header lies a header and a payload further
+  on). `Lzma2IndexBuilder::for_folder` does this over a `VolumeSource`, and `MemberMap::lzma2_chunks` does it over
+  volumes in memory. Pass the index to `complete_lzma2`. The bulk fetch starts at `fetch_from`. LZMA2 chunks carry at
+  most 64 KiB of packed bytes, so the headers are that close: a download in larger pieces (Usenet articles, about
+  750 KB) touches every piece before the target for the walk, even though it reads only a few bytes of each.
+- `Lzma2Framing::FromStart` (7zAES under LZMA2): headers are ciphertext, so the plan fetches the folder from its
+  start (`fetch_from` is 0) and `complete_lzma2` walks the decrypted bytes itself. A caller that decrypts header
+  blocks on its own can pass an index instead.
+
+`complete_lzma2(&map, &plan, packed_from, packed, known_base, known, framing, &Lzma2DecodeOptions) -> Lzma2Resume`
+restarts at the last chunk at or before the target that resets the LZMA state or stores its bytes, among the chunk
+starts in `framing` (an index walked from the stream's start; `None` walks `packed`, which must then start at 0)
+whose header is in `packed`. From there the chunks must run to the end marker at exactly the LZMA2 stream's end (the
+folder's packed size, or under 7zAES the AES coder's output size, which leaves out the block padding). It decodes to
+the folder's end with the known output before the restart as the dictionary (only its last dictionary-sized bytes are
+used): `bytes` is the folder's output from `output` on, bounded by `Lzma2DecodeOptions::max_output` (stored and
+decoded output together; `OpenAtError::OutputLimit` past it), and `redecode` is `folder_target - output`. Without a
+usable chunk start the result is `NeedMore`. A member's output is the folder's from its `stream_start`. A folder
+counts as LZMA2 only with exactly one LZMA2 coder, alone or under 7zAES.
 
 ## Limits
 

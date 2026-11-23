@@ -188,9 +188,13 @@ fn lzma2_dictionary(prop: u8) -> u64 {
 /// The LZMA2 property byte and whether 7zAES sits under it, for a folder whose coders are LZMA2 alone or 7zAES
 /// feeding LZMA2.
 fn lzma2_folder(map: &MemberMap, m: &MapMember) -> Option<(u8, bool)> {
-    let folder = map.folders.get(m.folder?.index as usize)?;
-    let lzma2 = folder.coders.iter().find(|c| c.kind == CoderKind::Lzma2)?;
-    let others = folder.coders.iter().filter(|c| c.kind != CoderKind::Lzma2).collect::<Vec<_>>();
+    lzma2_coders(&map.folders.get(m.folder?.index as usize)?.coders)
+}
+
+/// [`lzma2_folder`] over a folder's coders: exactly one LZMA2 coder, and at most one 7zAES coder besides it.
+fn lzma2_coders(coders: &[super::MapCoder]) -> Option<(u8, bool)> {
+    let (lzma2, others): (Vec<_>, Vec<_>) = coders.iter().partition(|c| c.kind == CoderKind::Lzma2);
+    let [lzma2] = lzma2.as_slice() else { return None };
     let encrypted = match others.as_slice() {
         [] => false,
         [aes] if aes.kind == CoderKind::Aes => true,
@@ -281,8 +285,9 @@ pub enum Start {
         /// The known plaintext to supply: at least this range, ideally from the solid stream's start.
         donor: Range<u64>,
     },
-    /// 7z LZMA2: fetch the folder's packed bytes from `fetch_from` to its end and run [`complete_lzma2`] with known
-    /// folder output covering `donor`. The restart lands at a chunk start at or before the target.
+    /// 7z LZMA2: fetch the folder's packed bytes from `fetch_from` to its end, learn the chunk framing as `framing`
+    /// says, and run [`complete_lzma2`] with known folder output covering `donor`. The restart lands at a chunk start
+    /// at or before the target.
     Lzma2 {
         folder: u32,
         /// The target in the folder's output (`stream_start + target`).
@@ -290,7 +295,26 @@ pub enum Start {
         dict_prop: u8,
         /// The known folder output to supply: at least this range.
         donor: Range<u64>,
+        /// How the chunk starts before the target become known.
+        framing: Lzma2Framing,
     },
+}
+
+/// How a [`Start::Lzma2`] plan learns where the folder's LZMA2 chunks start. Only a walk of chunk headers from the
+/// stream's first byte establishes that: no plaintext match can, since repeated plaintext can fake a chunk chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Lzma2Framing {
+    /// Walk the chunk headers from the folder's packed stream start up to past the target, reading each header's few
+    /// bytes only ([`super::Lzma2IndexBuilder::for_folder`] does it, at most 6 bytes per chunk; each next header
+    /// lies a header and a payload further on), and pass the index to [`complete_lzma2`]. The bulk fetch starts at
+    /// `fetch_from`. LZMA2 chunks carry at most 64 KiB of packed bytes, so the headers are that close together: a
+    /// download in larger pieces (Usenet articles) touches every piece before the target.
+    HeaderWalk,
+    /// The packed stream is 7zAES ciphertext: headers cannot be read on their own, so the plan fetches from the
+    /// folder's start (`fetch_from` is 0) and [`complete_lzma2`] walks the decrypted bytes. A caller decrypting
+    /// header blocks itself may pass an index instead.
+    FromStart,
 }
 
 /// Plans opening member `member` of `map` at member output offset `offset`, from the map alone.
@@ -361,14 +385,21 @@ pub fn open_at(map: &MemberMap, member: usize, offset: u64, options: &OpenAtOpti
                     (folder_target as u128 * packed_len as u128 / folder.unpacked_size.max(1) as u128) as u64
                 })
                 .min(packed_len);
-            let mut fetch_from = estimate.saturating_sub(options.search.unwrap_or(LZMA2_SEARCH));
-            if restart.encrypted {
-                fetch_from = (fetch_from & !15).saturating_sub(16);
-            }
+            let (framing, fetch_from) = if restart.encrypted {
+                (Lzma2Framing::FromStart, 0)
+            } else {
+                (Lzma2Framing::HeaderWalk, estimate.saturating_sub(options.search.unwrap_or(LZMA2_SEARCH)))
+            };
             let dictionary = lzma2_dictionary(dict_prop);
             let donor_from = folder_target.saturating_sub(dictionary.saturating_mul(2));
             plan(
-                Start::Lzma2 { folder: slot.index, folder_target, dict_prop, donor: donor_from..folder_target },
+                Start::Lzma2 {
+                    folder: slot.index,
+                    folder_target,
+                    dict_prop,
+                    donor: donor_from..folder_target,
+                    framing,
+                },
                 fetch_from,
                 stream_spans(folder.packed.iter().map(|s| (s.volume, s.packed.clone(), s.stream.start)), fetch_from),
             )
@@ -470,16 +501,22 @@ pub struct Lzma2Resume {
     pub redecode: u64,
 }
 
-/// Finishes a [`Start::Lzma2`] plan: finds the folder's chunk chain in the held packed bytes (it must run to the
-/// end marker at the folder's end, which fixes every chunk's output offset), picks the last chunk at or before the
-/// target that resets the LZMA state or stores its bytes, checks it against the known output, and decodes from it
-/// to the folder's end with the known output before it as the dictionary.
+/// Finishes a [`Start::Lzma2`] plan: restarts at the last chunk at or before the target that resets the LZMA state
+/// or stores its bytes, among chunk starts known from a walk of headers from the stream's first byte, and decodes
+/// from it to the folder's end with the known output before it as the dictionary.
 ///
-/// `packed` is the folder's packed stream from offset `packed_from` (at most the plan's `fetch_from`) to its end,
-/// decrypted when 7zAES sits under LZMA2 (the block padding after the stream's end is ignored: the AES coder's output
-/// size says where the stream ends); `known` is the folder's output from `known_base`, covering at least the plan's
-/// `donor`. The end marker must be the stream's last byte. The resumed output (stored and decoded) is bounded by
-/// `options.max_output`.
+/// The chunk starts come from `framing`, an index walked from the stream's start (built over the header bytes with
+/// [`super::Lzma2IndexBuilder::for_folder`], or over earlier bytes held from an earlier pass), or, when `packed`
+/// itself starts at the stream's first byte (`packed_from` 0), from walking `packed`. A restart chunk's header must
+/// lie in `packed`. Nothing else establishes the framing: header-like bytes in payloads form chains that can still
+/// match the known output. Without a usable chunk start the result is `NeedMore`.
+///
+/// `packed` is the folder's packed stream from offset `packed_from` to its end, decrypted when 7zAES sits under
+/// LZMA2 (the block padding after the stream's end is ignored: the AES coder's output size says where the stream
+/// ends); `known` is the folder's output from `known_base`, covering at least the plan's `donor`. From the restart
+/// the chunks must run to the end marker at the stream's last byte. The resumed output (stored and decoded) is
+/// bounded by `options.max_output`.
+#[allow(clippy::too_many_arguments)]
 pub fn complete_lzma2(
     map: &MemberMap,
     plan: &OpenAt,
@@ -487,6 +524,7 @@ pub fn complete_lzma2(
     packed: &[u8],
     known_base: u64,
     known: &[u8],
+    framing: Option<&Lzma2Index>,
     options: &Lzma2DecodeOptions,
 ) -> Result<Lzma2Resume, OpenAtError> {
     let Start::Lzma2 { folder, folder_target, dict_prop, .. } = plan.start else { return Err(OpenAtError::WrongPlan) };
@@ -507,6 +545,7 @@ pub fn complete_lzma2(
         packed,
         known_base,
         known,
+        framing,
         options,
     )
 }
@@ -528,11 +567,10 @@ fn resume_lzma2(
     packed: &[u8],
     known_base: u64,
     known: &[u8],
+    framing: Option<&Lzma2Index>,
     options: &Lzma2DecodeOptions,
 ) -> Result<Lzma2Resume, OpenAtError> {
     let (total, folder_target, dict_prop) = (b.total, b.target, b.dict_prop);
-    let known_end = known_base.saturating_add(known.len() as u64);
-    // The held bytes must reach the stream's end, whose end marker fixes every chunk's output offset.
     let Some(end) = b.stream_end.checked_sub(packed_from).and_then(|e| usize::try_from(e).ok()) else {
         return Err(OpenAtError::Incomplete("packed bytes before the LZMA2 stream's end"));
     };
@@ -540,110 +578,65 @@ fn resume_lzma2(
         return Err(OpenAtError::NeedMore { needed: packed_from..b.stream_end });
     }
     let packed = &packed[..end];
-    // The first chunk header chain that runs to the end marker at exactly the stream's end. A header-like byte
-    // inside a payload can start a false chain, but one ending at the true end marker is rare, and the restart
-    // chunk is checked against the known output below.
-    let mut found = None;
-    for p in 0..packed.len() {
-        let c = packed[p];
-        if !(c == 1 || c == 2 || c >= 0x80) {
-            continue;
+    let need_framing = || OpenAtError::NeedMore { needed: 0..b.stream_end };
+    // Chunk starts known from a walk from the stream's first byte.
+    let walked;
+    let starts: &[super::Lzma2Chunk] = match framing {
+        Some(index) => {
+            if index.start != (Lzma2Position { packed: 0, unpacked: 0 }) {
+                return Err(OpenAtError::Incomplete("an LZMA2 index walked from the stream's start"));
+            }
+            &index.chunks
         }
-        let opts = Lzma2IndexOptions {
-            start: Lzma2Start::Resume(Lzma2Position { packed: 0, unpacked: 0 }),
-            ..Lzma2IndexOptions::default()
-        };
-        let idx = Lzma2Index::from_bytes(&packed[p..], opts);
-        let Lzma2End::EndMarker { offset } = idx.end else { continue };
-        if idx.chunks.is_empty() || p as u64 + offset + 1 != packed.len() as u64 {
-            continue;
+        None if packed_from == 0 => {
+            walked = Lzma2Index::from_bytes(packed, Lzma2IndexOptions::default());
+            &walked.chunks
         }
-        let rest = idx.end_position().unpacked;
-        if rest > total {
-            continue;
-        }
-        found = Some((p, idx, total - rest));
-        break;
-    }
-    let (p, idx, x) = found.ok_or(OpenAtError::NoChain)?;
-    let bytes = &packed[p..];
-    let chunks = &idx.chunks;
-    let restartable = |k: usize| {
-        let c = chunks[k];
+        None => return Err(need_framing()),
+    };
+    let restartable = |c: &super::Lzma2Chunk| {
         c.kind == Lzma2ChunkKind::Stored
             || matches!(c.reset, Lzma2Reset::State | Lzma2Reset::StateProps | Lzma2Reset::DictStateProps)
     };
+    // The last restartable chunk start at or before the target whose header is held.
+    let start = starts
+        .iter()
+        .rev()
+        .find(|c| c.unpacked_offset <= folder_target && c.packed_offset >= packed_from && restartable(c))
+        .copied()
+        .ok_or_else(need_framing)?;
+    let rel = usize::try_from(start.packed_offset - packed_from).map_err(|_| need_framing())?;
+    // From there the chunks run to the end marker at the stream's last byte and fill the folder's output.
+    let idx = Lzma2Index::from_bytes(
+        &packed[rel..],
+        Lzma2IndexOptions {
+            start: Lzma2Start::Resume(Lzma2Position { packed: 0, unpacked: start.unpacked_offset }),
+            ..Lzma2IndexOptions::default()
+        },
+    );
+    let ends_right =
+        matches!(idx.end, Lzma2End::EndMarker { offset } if rel as u64 + offset + 1 == packed.len() as u64);
+    if !ends_right || idx.chunks.is_empty() || idx.end_position().unpacked != total {
+        return Err(OpenAtError::Decode(format!(
+            "the LZMA2 chunks from folder output {} do not run to the stream's end marker",
+            start.unpacked_offset
+        )));
+    }
+    let bytes = &packed[rel..];
+    let chunks = &idx.chunks;
     let known_at = |at: u64, len: u64| -> Option<&[u8]> {
         let s = usize::try_from(at.checked_sub(known_base)?).ok()?;
         known.get(s..s.checked_add(usize::try_from(len).ok()?)?)
     };
-    // A false header before the true chain can lead into it: offsets counted back from the end are right for the
-    // true chunks, so a restart must check out against the known output (a stored chunk's bytes, or the first
-    // bytes of an LZMA chunk decoded with the known output before it).
-    let checks_out = |k: usize| -> bool {
-        let c = chunks[k];
-        let at = x + c.unpacked_offset;
-        if at > folder_target || at < known_base {
-            return false;
-        }
-        if c.kind == Lzma2ChunkKind::Stored {
-            let pl = c.payload();
-            let len = c.unpacked_len.min(known_end.saturating_sub(at));
-            len > 0 && known_at(at, len) == bytes.get(pl.start as usize..(pl.start + len) as usize)
-        } else {
-            let Some(dict) = known_at(known_base, at - known_base) else { return false };
-            let len = c.unpacked_len.min(known_end.saturating_sub(at));
-            len > 0
-                && idx
-                    .decode_with_dictionary(k..k + 1, bytes, 0, dict_prop, dict, options)
-                    .is_ok_and(|b| known_at(at, len) == b.get(..len as usize))
-        }
-    };
-    // A chunk's offset counted back from the end is right only if its header is a real one; a header-like run of
-    // bytes inside a stored payload can form a chain that ends at the true end marker and still matches a short
-    // prefix of the known output. So the framing must be proven by more than that: the chain starts at the
-    // stream's first byte, or a run of whole chunks ending at the restart (from a chunk that decodes on its own),
-    // or the restart chunk itself, decodes to exactly the known output, at least `PROOF` bytes of it.
-    const PROOF: u64 = 64;
-    let starts_stream = packed_from + p as u64 == 0 && x + chunks.first().map_or(0, |c| c.unpacked_offset) == 0;
-    let run_matches = |j: usize, end: usize| -> Option<u64> {
-        let from = x + chunks[j].unpacked_offset;
-        let to = if end < chunks.len() { x + chunks[end].unpacked_offset } else { total };
-        let want = known_at(from, to - from)?;
-        let c = chunks[j];
-        let got = if c.kind == Lzma2ChunkKind::Stored && end == j + 1 {
-            bytes.get(c.payload().start as usize..c.payload().end as usize)?.to_vec()
-        } else {
-            let dict = known_at(known_base, from.checked_sub(known_base)?)?;
-            idx.decode_with_dictionary(j..end, bytes, 0, dict_prop, dict, options).ok()?
-        };
-        (got == want).then_some(to - from)
-    };
-    let proven = |s: usize| -> bool {
-        if starts_stream {
-            return true;
-        }
-        // the restart chunk itself, when the known output covers it
-        if run_matches(s, s + 1).is_some_and(|n| n >= PROOF) {
-            return true;
-        }
-        // a run of whole chunks just before it, nearest start first
-        (0..s).rev().filter(|&j| restartable(j)).any(|j| run_matches(j, s).is_some_and(|n| n >= PROOF))
-    };
-    // The last restartable chunk at or before the target that checks out, in a chain whose framing is proven.
-    let s = (0..chunks.len())
-        .rev()
-        .filter(|&k| x + chunks[k].unpacked_offset <= folder_target)
-        .find(|&k| restartable(k) && checks_out(k))
-        .filter(|&k| proven(k))
-        .ok_or(OpenAtError::NeedMore { needed: known_base..folder_target })?;
-    let output = x + chunks[s].unpacked_offset;
-    let dictionary = known_at(known_base, output - known_base).ok_or(OpenAtError::NeedMore { needed: 0..output })?;
+    let output = start.unpacked_offset;
+    let dictionary = known_at(known_base, output.saturating_sub(known_base))
+        .filter(|_| known_base <= output)
+        .ok_or(OpenAtError::NeedMore { needed: 0..output })?;
     let decode_err = |e: Lzma2DecodeError| OpenAtError::Decode(format!("{e:?}"));
     let limit = options.max_output;
     let over = |n: u64| if n > limit { Err(OpenAtError::OutputLimit { limit }) } else { Ok(()) };
     let mut out = Vec::new();
-    let mut i = s;
+    let mut i = 0;
     while i < chunks.len() {
         let c = chunks[i];
         if c.kind == Lzma2ChunkKind::Stored {
@@ -651,7 +644,7 @@ fn resume_lzma2(
             over(out.len() as u64 + (pl.end - pl.start))?;
             out.extend_from_slice(&bytes[pl.start as usize..pl.end as usize]);
             i += 1;
-        } else if restartable(i) {
+        } else if restartable(&c) {
             // only the last dictionary-sized bytes are used: the known output's tail, then what was resumed
             let need = usize::try_from(lzma2_dictionary(dict_prop)).unwrap_or(usize::MAX);
             let from_known = need.saturating_sub(out.len()).min(dictionary.len());
@@ -669,16 +662,11 @@ fn resume_lzma2(
         } else {
             return Err(OpenAtError::Decode(format!(
                 "LZMA2 chunk at folder output {} continues the state of the chunk before it",
-                x + c.unpacked_offset
+                c.unpacked_offset
             )));
         }
     }
-    Ok(Lzma2Resume {
-        output,
-        feed_from: packed_from + p as u64 + chunks[s].packed_offset,
-        bytes: out,
-        redecode: folder_target - output,
-    })
+    Ok(Lzma2Resume { output, feed_from: start.packed_offset, bytes: out, redecode: folder_target - output })
 }
 
 #[cfg(test)]
@@ -689,71 +677,108 @@ mod tests {
         Lzma2DecodeOptions::default()
     }
 
-    /// Stored chunks `01 00 0f` + 16 bytes, then `02 00 00 64` ("d"), then the end marker: output "prefix" ... "d".
-    const STREAM: [u8; 24] = [
-        0x01, 0x00, 0x0f, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x02, 0x00, 0x00, 0x61, 0x02, 0x00, 0x00, 0x62, 0x00,
-        0x61, 0x02, 0x00, 0x00, 0x64, 0x00,
-    ];
-
-    fn plain() -> Vec<u8> {
-        [&STREAM[3..19], b"d"].concat()
+    fn bounds(stream: &[u8], total: u64, target: u64) -> Lzma2Bounds {
+        Lzma2Bounds { total, stream_end: stream.len() as u64, target, dict_prop: 0 }
     }
 
-    fn bounds(target: u64) -> Lzma2Bounds {
-        Lzma2Bounds { total: 17, stream_end: STREAM.len() as u64, target, dict_prop: 0 }
-    }
-
-    /// Fetched from inside the first chunk's payload, the header-like bytes there end in a `00` that is not the
-    /// stream's end, so that chain is never taken; the one-byte chunk at the true end is too short to prove the
-    /// framing, so more packed bytes are asked for. From the stream's start the framing is given.
-    #[test]
-    fn a_false_chain_inside_a_payload_is_not_taken() {
-        let plain = plain();
-        let r = resume_lzma2(&bounds(16), 9, &STREAM[9..], 0, &plain, &opts());
-        assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
-        let r = resume_lzma2(&bounds(16), 0, &STREAM, 0, &plain, &opts()).unwrap();
-        assert_eq!((r.output, r.bytes.as_slice(), r.feed_from), (16, &b"d"[..], 19));
-    }
-
-    /// A false chain inside a stored payload that ends at the true end marker and matches the known output's short
-    /// prefix: its framing is not proven, so it is refused rather than decoded to the wrong bytes.
-    #[test]
-    fn a_false_chain_ending_at_the_true_end_marker_is_refused() {
+    /// Codex's first stream: `01 00 19`, a 26-byte payload of `02 00 09` + ten `a` + `02 00 09` + ten `b`, then the
+    /// end marker. Its payload holds a chunk chain that ends at the true end marker.
+    fn stream_one() -> (Vec<u8>, Vec<u8>) {
         let payload = [&[0x02, 0x00, 0x09][..], &[b'a'; 10], &[0x02, 0x00, 0x09], &[b'b'; 10]].concat();
-        let stream = [&[0x01, 0x00, 0x19][..], &payload, &[0x00]].concat();
-        let b = Lzma2Bounds { total: 26, stream_end: stream.len() as u64, target: 7, dict_prop: 0 };
-        for known in [&payload[..7], &payload[..]] {
-            let r = resume_lzma2(&b, 3, &stream[3..], 0, known, &opts());
-            assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
-        }
-        let r = resume_lzma2(&b, 0, &stream, 0, &payload[..7], &opts()).unwrap();
-        assert_eq!((r.output, r.bytes), (0, payload.clone()));
+        ([&[0x01, 0x00, 0x19][..], &payload, &[0x00]].concat(), payload)
     }
 
-    /// One data chunk and the end marker are a chain, proven by the chunk's whole output.
+    /// Codex's second stream: one stored chunk `01 04 72` of P = two repeats of (`02 02 02` + 515 `02`), then
+    /// `02 00 63` + 100 `62`; the repeats let a fake chain match more than 515 bytes of known output.
+    fn stream_two() -> (Vec<u8>, Vec<u8>) {
+        let rep = [&[0x02, 0x02, 0x02][..], &[0x02; 515]].concat();
+        let p = [&rep[..], &rep, &[0x02, 0x00, 0x63], &[0x62; 100]].concat();
+        assert_eq!(p.len(), 0x473);
+        ([&[0x01, 0x04, 0x72][..], &p, &[0x00]].concat(), p)
+    }
+
+    /// Fetched from inside the stored payload, no chunk start is known: refused, whatever the known output. With the
+    /// framing walked from the stream's start the only chunk starts at 0, so a restart needs the bytes from 0.
     #[test]
-    fn a_single_chunk_chain_restarts() {
+    fn a_chain_inside_a_payload_is_never_taken() {
+        for (stream, plain, from, target, known) in [
+            {
+                let (s, p) = stream_one();
+                (s, p.clone(), 3usize, 7u64, p[..7].to_vec())
+            },
+            {
+                let (s, p) = stream_two();
+                (s, p.clone(), 3, 600, p[..600].to_vec())
+            },
+        ] {
+            let b = bounds(&stream, plain.len() as u64, target);
+            let r = resume_lzma2(&b, from as u64, &stream[from..], 0, &known, None, &opts());
+            assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+            let r = resume_lzma2(&b, from as u64, &stream[from..], 0, &plain, None, &opts());
+            assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+            let framing = Lzma2Index::from_bytes(&stream, Lzma2IndexOptions::default());
+            let r = resume_lzma2(&b, from as u64, &stream[from..], 0, &known, Some(&framing), &opts());
+            assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+            // from the stream's start the framing is walked, and the output is right
+            let r = resume_lzma2(&b, 0, &stream, 0, &known, None, &opts()).unwrap();
+            assert_eq!((r.output, r.bytes), (0, plain));
+        }
+    }
+
+    /// With a framing index from the start, a restart at a later chunk needs only the bytes from that chunk.
+    #[test]
+    fn a_framing_index_lets_a_later_chunk_restart() {
         let a: Vec<u8> = (0..100u8).map(|i| b'A' + i % 26).collect();
         let b: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
         let stream = [&[0x01, 0x00, 99][..], &a, &[0x02, 0x00, 99], &b, &[0x00]].concat();
         let plain = [a.clone(), b.clone()].concat();
-        let bounds = Lzma2Bounds { total: 200, stream_end: stream.len() as u64, target: 150, dict_prop: 0 };
-        // fetched from inside the first payload: the chain is the second chunk alone
-        let r = resume_lzma2(&bounds, 50, &stream[50..], 0, &plain, &opts()).unwrap();
+        let bounds = bounds(&stream, 200, 150);
+        let framing = Lzma2Index::from_bytes(&stream, Lzma2IndexOptions::default());
+        let r = resume_lzma2(&bounds, 103, &stream[103..], 0, &plain[..150], Some(&framing), &opts()).unwrap();
         assert_eq!((r.output, r.bytes.as_slice(), r.feed_from), (100, &b[..], 103));
+        // without it: refused
+        let r = resume_lzma2(&bounds, 103, &stream[103..], 0, &plain[..150], None, &opts());
+        assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+        // an index that does not start at the stream's start is not framing
+        let resumed = Lzma2Index::from_bytes(
+            &stream[103..],
+            Lzma2IndexOptions {
+                start: Lzma2Start::Resume(Lzma2Position { packed: 103, unpacked: 100 }),
+                ..Default::default()
+            },
+        );
+        let r = resume_lzma2(&bounds, 103, &stream[103..], 0, &plain[..150], Some(&resumed), &opts());
+        assert!(matches!(r, Err(OpenAtError::Incomplete(_))), "{r:?}");
         // bytes short of the stream's end are asked for, not guessed past
-        let r = resume_lzma2(&bounds, 50, &stream[50..150], 0, &plain, &opts());
+        let r = resume_lzma2(&bounds, 103, &stream[103..150], 0, &plain, Some(&framing), &opts());
         assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
     }
 
     /// Stored payloads count toward `max_output` too.
     #[test]
     fn stored_output_is_bounded() {
-        let plain = plain();
+        let (stream, plain) = stream_one();
+        let b = bounds(&stream, plain.len() as u64, 0);
         let small = Lzma2DecodeOptions { max_output: 10, ..opts() };
-        let r = resume_lzma2(&bounds(0), 0, &STREAM, 0, &plain, &small);
+        let r = resume_lzma2(&b, 0, &stream, 0, &plain, None, &small);
         assert!(matches!(r, Err(OpenAtError::OutputLimit { limit: 10 })), "{r:?}");
-        let r = resume_lzma2(&bounds(0), 0, &STREAM, 0, &plain, &opts()).unwrap();
+        let r = resume_lzma2(&b, 0, &stream, 0, &plain, None, &opts()).unwrap();
         assert_eq!((r.output, r.bytes), (0, plain));
+    }
+
+    /// Exactly one LZMA2 coder, alone or under 7zAES; two chained LZMA2 coders are not one stage.
+    #[test]
+    fn only_a_single_lzma2_coder_is_an_lzma2_folder() {
+        let coder = |kind, properties: &[u8]| super::super::MapCoder {
+            kind,
+            id: 0,
+            properties: properties.to_vec(),
+            in_streams: 1,
+            out_streams: 1,
+        };
+        assert_eq!(lzma2_coders(&[coder(CoderKind::Lzma2, &[16])]), Some((16, false)));
+        assert_eq!(lzma2_coders(&[coder(CoderKind::Aes, &[]), coder(CoderKind::Lzma2, &[18])]), Some((18, true)));
+        assert_eq!(lzma2_coders(&[coder(CoderKind::Lzma2, &[16]), coder(CoderKind::Lzma2, &[16])]), None);
+        assert_eq!(lzma2_coders(&[coder(CoderKind::Bcj, &[]), coder(CoderKind::Lzma2, &[16])]), None);
     }
 }

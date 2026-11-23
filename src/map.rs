@@ -61,8 +61,8 @@ pub use member_reader::{
     ExtractFromError, ExtractedFrom, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
 };
 pub use open_at::{
-    Layer, Lzma2Resume, MemberRestart, OpenAt, OpenAtError, OpenAtOptions, Rar5Resume, RestartGrain, Start,
-    complete_lzma2, complete_rar5, member_restart, open_at,
+    Layer, Lzma2Framing, Lzma2Resume, MemberRestart, OpenAt, OpenAtError, OpenAtOptions, Rar5Resume, RestartGrain,
+    Start, complete_lzma2, complete_rar5, member_restart, open_at,
 };
 
 use crate::progressive::{
