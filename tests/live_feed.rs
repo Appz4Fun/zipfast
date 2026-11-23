@@ -228,6 +228,48 @@ fn backslash_names_verify_against_what_extraction_wrote() {
     assert_eq!(report.fed, 2);
 }
 
+// Catches plain-file outputs named after the member: a 250-byte name plus a prefix passes the 255-byte limit of a
+// path component.
+#[test]
+fn a_member_name_of_250_bytes_feeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = vec![7u8; 9_000];
+    let name = format!("{}.bin", "n".repeat(246));
+    let path = tmp.path().join("long.rar");
+    std::fs::write(&path, common::archive(&[common::FileSpec::new(&name, &data)])).unwrap();
+    for (i, sink) in [sim::SinkKind::Auto, sim::SinkKind::File].into_iter().enumerate() {
+        let mut config = config(vec![path.clone()], &tmp.path().join(format!("work-{i}")), 1_000);
+        config.sink = sink;
+        check(&sim::run(&config).unwrap());
+    }
+}
+
+// Catches the plain-file fallback sharing a directory with the persistent partials: stored members named as a
+// compressed member's fallback output is (`00001-c.bin` by the old naming, `plain/member-00001.out` by the new).
+#[test]
+fn stored_and_compressed_members_with_a_colliding_name_feed() {
+    use zipfast::rar5::testenc;
+    let tmp = tempfile::tempdir().unwrap();
+    let stored = vec![3u8; 7_000];
+    let plain: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8 ^ (i / 997) as u8).collect();
+    let stream = testenc::tuned_stream(&testenc::lz(&plain, 1 << 16, 4), 1_500);
+    let compressed =
+        common::FileSpec { method: 3, size: Some(plain.len() as u64), ..common::FileSpec::new("c.bin", &stream) };
+    let files = [
+        (common::FileSpec::new("00001-c.bin", &stored), crc32fast::hash(&stored)),
+        (compressed, crc32fast::hash(&plain)),
+        (common::FileSpec::new("plain/member-00001.out", &stored), crc32fast::hash(&stored)),
+    ];
+    let path = tmp.path().join("mixed.rar");
+    std::fs::write(&path, common::archive_with(&files, false)).unwrap();
+    let report = sim::run(&config(vec![path], &tmp.path().join("work"), 1_000)).unwrap();
+    check(&report);
+    assert_eq!(report.fed, 3, "{report:?}");
+    if cfg!(feature = "persistent-partials") {
+        assert_eq!(report.sink, "mixed");
+    }
+}
+
 #[test]
 fn old_style_volume_names_go_on_past_r99() {
     let tmp = tempfile::tempdir().unwrap();

@@ -255,8 +255,8 @@ The simulation:
   defaults (`PartialLimits::open_partials` 16, `open_files` 64) refuse the 17th member. The example raises both
   to fit the set: `open_partials` to the member count plus one, `open_files` to 64 plus eight per member. RustyGet
   must do the same, or close and reopen handles (`PartialFile::open`) beyond the 4096 ceiling. Other members, or
-  every member with `--sink file`, write a preallocated plain file instead (`NNNNN-name`, by member index, synced
-  once, not durable). `--group-holes` sets `PartialLimits::group_holes`, which affects the genesis holes.
+  every member with `--sink file`, write a preallocated plain file instead (`plain/member-NNNNN.out`, named by
+  member index alone, synced once, not durable). `--group-holes` sets `PartialLimits::group_holes`, which affects the genesis holes.
   `--group-refills` sets `group_refills`, which only affects `refill_from_packed`. The feed path never calls that:
   its repairs are plaintext fills, which join the group anyway.
 - **Report.** stdout gets one tab-separated line per run (`--header` prints the column names first): wall time,
@@ -376,6 +376,7 @@ against a straight extraction. Also covered:
 - a dropped trailing article counting as a refill when repaired;
 - old-style volume discovery past `.r99` (`.s00`, `.s01`);
 - the three members of one solid 7z LZMA2 folder (`lzma2_chunks.7z` cut into volumes) fed from one buffer;
+- a 250-byte member name, and stored and compressed members whose names match the plain-file fallback's;
 - backslash names checked against the file the extraction wrote, whether it made `d/x` (Windows-made) or kept the
   backslash (Unix-made);
 - the need-to-article mapping and the priority order.

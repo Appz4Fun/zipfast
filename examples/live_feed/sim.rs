@@ -824,6 +824,8 @@ struct Member {
 /// `zipfast::volume::next_volume`, the names extraction itself opens (`.partN.rar`, or `.rar`, `.r00` .. `.r99`,
 /// `.s00` ..); other sets (`.7z.NNN`) are sorted by number. Other files (par2, json, nfo) are left out.
 pub fn volumes_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    // This filter only picks the first volume; the chain after it is followed with `next_volume` over every file
+    // in the directory, so `.s00` and later are kept (`old_style_volume_names_go_on_past_r99`).
     fn is_volume(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         let ext = lower.rsplit('.').next().unwrap_or("");
@@ -881,12 +883,6 @@ pub fn volumes_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(chain)
 }
 
-/// A plain-file output name: the member's index first, so `a/b.bin` and `a_b.bin` stay apart once flattened.
-fn output_name(index: usize, name: &str) -> String {
-    let flat: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':') { '_' } else { c }).collect();
-    format!("{index:05}-{flat}")
-}
-
 /// Simulates the download of `config.volumes` and feeds it through the decoders. See the module docs.
 pub fn run(config: &Config) -> Result<Report, String> {
     let mut report = Report::default();
@@ -905,6 +901,8 @@ pub fn run(config: &Config) -> Result<Report, String> {
     let articles = Articles::cut(&volumes.iter().map(|v| v.len() as u64).collect::<Vec<_>>(), config.article.max(1));
     report.articles = articles.list.len();
     fs::create_dir_all(&config.work).map_err(|e| e.to_string())?;
+    // persistent partials' outputs (their archive paths under it); plain-file outputs go to `work/plain`
+    #[cfg(feature = "persistent-partials")]
     let dest = config.work.join("feed");
 
     let start = Instant::now();
@@ -961,7 +959,9 @@ pub fn run(config: &Config) -> Result<Report, String> {
             }
             None => {
                 kinds.1 += 1;
-                let path = dest.join(output_name(index, &name));
+                // by member index alone, in a directory of their own: no member name can be too long for a path
+                // component or collide with another member's output or a persistent partial's (under `dest`)
+                let path = config.work.join("plain").join(format!("member-{index:05}.out"));
                 Out::File(FileSink::create(path, size).map_err(|e| e.to_string())?)
             }
         };
