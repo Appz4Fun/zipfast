@@ -448,6 +448,18 @@ impl SetMember {
         }
     }
 
+    /// Whether `m` can be this member: every whole-member fact both state is equal.
+    fn agrees(&self, m: &IdentityMember) -> bool {
+        fn same<T: PartialEq>(a: Option<T>, b: Option<T>) -> bool {
+            a.zip(b).is_none_or(|(a, b)| a == b)
+        }
+        self.is_dir == m.is_dir
+            && same(self.unpacked_size, m.unpacked_size)
+            && same(self.method, Some(m.method))
+            && same(self.encrypted, Some(m.encrypted))
+            && same(self.dictionary, m.dictionary)
+    }
+
     /// Takes the facts `source` states that are still unknown.
     fn learn(
         &mut self,
@@ -553,6 +565,16 @@ pub fn set_identity(
         }
     }
     let rar = |f: MapFormat| matches!(f, MapFormat::Rar4 | MapFormat::Rar5);
+    // Reads a first volume's held bytes as a last volume, for a ZIP or 7z directory they may hold.
+    let probe = |held: HeldVolume<'_>, options: MapOptions| {
+        #[cfg(test)]
+        tests::BEFORE_PROBE.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook(&options.control)
+            }
+        });
+        last_volume_identity(held, options)
+    };
     let (identity, source) = match (last, first) {
         (Some(held), _) => match last_volume_identity(held, options) {
             // The last volume is RAR too, so the first volume's error is the set's own.
@@ -560,12 +582,16 @@ pub fn set_identity(
                 return Err(first_error.expect("checked"));
             }
             Ok(identity) => (Some(identity), FactSource::Last),
+            Err(error) if control.is_canceled() => return Err(error),
             Err(error) => return Err(first_error.unwrap_or(error)),
         },
         // Only the first volume: a ZIP or 7z directory in its held bytes (a whole single-volume archive, maybe
         // behind a self-extracting stub) decides over a RAR the scanner found stored inside it.
-        (None, Some(held)) if first_is_rar || first_error.is_some() => match last_volume_identity(held, options) {
+        (None, Some(held)) if first_is_rar || first_error.is_some() => match probe(held, options) {
             Ok(identity) if !rar(identity.format) => (Some(identity), FactSource::First),
+            // A cancellation during the probe is the caller's, never a reason to fall back.
+            Err(error) if control.is_canceled() => return Err(error),
+            _ if control.is_canceled() => return Err(canceled()),
             _ => match first_error {
                 Some(error) => return Err(error),
                 None => (None, FactSource::Last),
@@ -605,6 +631,9 @@ pub fn set_identity(
                 (kind == Kind::Spanning || same_volume)
                     .then(|| firsts.get(&(m.raw_name.clone(), kind, occurrence)).copied())
                     .flatten()
+                    // Two members of one name (one ending in a middle volume, another starting there) are
+                    // one member only when every whole-member fact both state agrees.
+                    .filter(|&at| members[at].agrees(m))
             };
             let at = matched.unwrap_or_else(|| {
                 members.push(SetMember::new(&m.raw_name, &m.name, m.is_dir));
@@ -694,6 +723,71 @@ fn rar4_end(tail: &[u8], start: u64) -> Option<RarEndRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Called just before `set_identity` probes a first-volume RAR's bytes for a ZIP or 7z directory.
+        pub(super) static BEFORE_PROBE: std::cell::Cell<Option<fn(&crate::progressive::SessionControl)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// A one-member RAR 5.0 archive, stored, in one volume.
+    fn rar5_single(name: &str, data: &[u8]) -> Vec<u8> {
+        fn vint(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+        }
+        fn block(kind: u64, flags: u64, fields: &[u8], data_len: Option<u64>) -> Vec<u8> {
+            let mut body = Vec::new();
+            vint(kind, &mut body);
+            vint(flags | if data_len.is_some() { 2 } else { 0 }, &mut body);
+            if let Some(n) = data_len {
+                vint(n, &mut body);
+            }
+            body.extend_from_slice(fields);
+            let mut size = Vec::new();
+            vint(body.len() as u64, &mut size);
+            let mut covered = size.clone();
+            covered.extend_from_slice(&body);
+            let mut out = crate::crc32::hash(&covered).to_le_bytes().to_vec();
+            out.extend(covered);
+            out
+        }
+        let mut out = RAR5_SIGNATURE.to_vec();
+        out.extend(block(1, 0, &[0], None));
+        let mut fields = Vec::new();
+        vint(4, &mut fields); // file flags: CRC32 present
+        vint(data.len() as u64, &mut fields);
+        vint(0x20, &mut fields); // attributes
+        fields.extend(crate::crc32::hash(data).to_le_bytes());
+        vint(0, &mut fields); // compression info: stored
+        vint(0, &mut fields); // host OS
+        vint(name.len() as u64, &mut fields);
+        fields.extend_from_slice(name.as_bytes());
+        out.extend(block(2, 0, &fields, Some(data.len() as u64)));
+        out.extend_from_slice(data);
+        out.extend(block(5, 0, &[0], None));
+        out
+    }
+
+    #[test]
+    fn a_cancellation_during_the_first_only_probe_is_returned() {
+        let rar = rar5_single("a.bin", b"payload");
+        let held = HeldVolume::whole(&rar);
+        // Without a cancellation the first volume alone identifies the archive.
+        let s = set_identity(Some(held), None, MapOptions::new("a.rar")).unwrap();
+        assert_eq!(s.members.len(), 1);
+        BEFORE_PROBE.with(|hook| hook.set(Some(|control| control.cancel())));
+        let result = set_identity(Some(held), None, MapOptions::new("a.rar"));
+        BEFORE_PROBE.with(|hook| hook.set(None));
+        assert!(matches!(result, Err(MapError::Source(_))), "{result:?}");
+    }
 
     #[test]
     fn held_volume_bounds() {

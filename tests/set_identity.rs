@@ -475,3 +475,23 @@ fn a_whole_self_extracting_zip_given_as_the_first_volume_reads_its_directory() {
     assert_eq!(names(&as_first), names(&as_last));
     assert_eq!(names(&as_first), [Some("inner.rar".to_string())]);
 }
+
+#[test]
+fn spanning_members_of_one_name_join_only_when_their_facts_agree() {
+    use zipfast::rar5::frame::rar4::{LHD_SPLIT_AFTER, LHD_SPLIT_BEFORE};
+    // One movie.mkv starts in the first volume and ends in a middle one; another starts in the middle volume and
+    // ends in the last. They share a name, and both look like the member that spans, but their sizes differ.
+    let early = vec![1u8; 3000];
+    let late = vec![2u8; 5000];
+    let crc = crc32fast::hash;
+    let first = rar4_volume(&[("movie.mkv", &early[..1500], LHD_SPLIT_AFTER, crc(&early[..1500]), 3000)], true);
+    let last = rar4_volume(&[("movie.mkv", &late[2500..], LHD_SPLIT_BEFORE, crc(&late), 5000)], false);
+    let s = id(Some(HeldVolume::whole(&first)), Some(HeldVolume::whole(&last)), None);
+    let facts: Vec<_> = s.members.iter().map(|m| (m.unpacked_size, m.checks.and_then(|c| c.crc32))).collect();
+    assert_eq!(facts, [(Some(3000), None), (Some(5000), Some(crc(&late)))], "kept apart: no size mixed with a CRC");
+    // The same layout with agreeing sizes is one member continuing through.
+    let first = rar4_volume(&[("movie.mkv", &late[..2500], LHD_SPLIT_AFTER, crc(&late[..2500]), 5000)], true);
+    let s = id(Some(HeldVolume::whole(&first)), Some(HeldVolume::whole(&last)), None);
+    let facts: Vec<_> = s.members.iter().map(|m| (m.unpacked_size, m.checks.and_then(|c| c.crc32))).collect();
+    assert_eq!(facts, [(Some(5000), Some(crc(&late)))]);
+}
