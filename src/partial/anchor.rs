@@ -16,6 +16,27 @@
 
 use super::*;
 use std::sync::Arc;
+/// Anchor changes attempted in this process. The exclusion registry keys its cached directory proof to it, so every
+/// intent, commit and compaction CAS expires the proof (see `PartialExclusions::check_input_revision`).
+#[cfg(not(test))]
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per thread under test, so a test's proof is not expired by commits of tests running beside it.
+#[cfg(test)]
+thread_local! {
+    static EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+pub(super) fn epoch() -> u64 {
+    #[cfg(not(test))]
+    return EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(test)]
+    EPOCH.with(std::cell::Cell::get)
+}
+fn advance_epoch() {
+    #[cfg(not(test))]
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    #[cfg(test)]
+    EPOCH.with(|e| e.set(e.get() + 1));
+}
 pub(crate) struct AnchorBinding {
     member: MemberKey,
     store: Arc<dyn StateAnchorStore>,
@@ -50,6 +71,7 @@ impl AnchorBinding {
         if next.member() != &self.member || expected.is_some_and(|a| a.member() != &self.member) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));
         }
+        advance_epoch();
         self.store
             .compare_exchange(&self.member, expected, next)
             .map_err(|_| err(PartialErrorKind::AnchorCommitUncertain))?;

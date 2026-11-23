@@ -1048,6 +1048,50 @@ fn native_source_path_swap_after_read_callback_precedes_acceptance_and_output() 
     assert!(fs::read(dest.join("a.bin")).unwrap().iter().all(|b| *b == 0));
 }
 
+/// The output's directory swapped during a source read, after the exclusions cached their directory proof (reads
+/// share it until the next anchor change), is still refused before anything is written under it or anchored.
+#[test]
+fn output_directory_swap_during_a_read_is_refused_before_output_or_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let moved = dir.path().join("moved");
+    let mut fixture = Fixture::new();
+    let hook = fixture.volumes[0].as_ref().unwrap().hook.clone();
+    let start = fixture.payloads[0].start;
+    let (old, new) = (dest.clone(), moved.clone());
+    let mut swapped = false;
+    *hook.lock().unwrap() = Some(Box::new(move |_, at| {
+        if at == start && !swapped {
+            swapped = true;
+            fs::rename(&old, &new).unwrap();
+            fs::create_dir(&old).unwrap();
+        }
+        None
+    }));
+    let anchors = Arc::new(Anchors::default());
+    let mut partial = partial_options(&dir.path().join("state"));
+    partial.anchors = anchors.clone();
+    let mut session = ProgressiveSession::new_partial(Box::new(fixture.provider()), options(&dest), partial).unwrap();
+    let (member, file) = next_partial(&mut session);
+    let before = anchors.current(&member).unwrap();
+    let mut failed = false;
+    for _ in 0..10000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Err(_)) | Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { .. }))) => {
+                failed = true;
+                break;
+            }
+            Poll::Ready(Ok(None)) => break,
+            _ => {}
+        }
+    }
+    assert!(failed, "the swapped output directory was accepted");
+    assert_eq!(anchors.current(&member).unwrap(), before, "nothing after the swap is anchored");
+    assert!(fs::read(moved.join("a.bin")).unwrap().iter().all(|b| *b == 0), "no output written");
+    assert!(!dest.join("a.bin").exists());
+    drop(file);
+}
+
 struct CommitHookStore {
     inner: Anchors,
     hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,

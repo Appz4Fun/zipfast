@@ -1239,6 +1239,8 @@ impl SourceDriver {
         }
         #[cfg(feature = "persistent-partials")]
         if let Some(exclusions) = &self.partial_exclusions {
+            // A newly opened input gets a full proof.
+            exclusions.expire_proof();
             exclusions.check_input(&[], backing)?;
         }
         let external = self.other_lane_handles()?;

@@ -264,6 +264,7 @@ fn run(set: &Path, work: &Path, volumes: u32, holes: &[(u32, std::ops::Range<u64
         control: SessionControl::default(),
     };
     let s0 = durable_sync_count();
+    let l0 = exclusion_lstat_count();
     let start = Instant::now();
     let mut session = ProgressiveSession::new_partial(
         Box::new(Provider { dir: set.into(), volumes, holes: holes.to_vec() }),
@@ -311,11 +312,12 @@ fn run(set: &Path, work: &Path, volumes: u32, holes: &[(u32, std::ops::Range<u64
     }
     let verify_time = start.elapsed().as_secs_f64();
     eprintln!(
-        "syncs: session {}, refill {}, verify {}; anchor CAS {}",
+        "syncs: session {}, refill {}, verify {}; anchor CAS {}; exclusion lstats {}",
         s1 - s0,
         s2 - s1,
         durable_sync_count() - s2,
-        anchors.cas.load(Ordering::Relaxed)
+        anchors.cas.load(Ordering::Relaxed),
+        exclusion_lstat_count() - l0
     );
     drop(file);
     assert_eq!(fs::metadata(root.join("out/big.bin")).unwrap().len(), size);

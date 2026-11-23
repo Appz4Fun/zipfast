@@ -58,6 +58,9 @@ pub(crate) struct PartialExclusions {
     // the entry (journal files dropped by compaction). Locked after `entries`.
     leases: Mutex<Vec<(PathBuf, [Lease; 3])>>,
     revision: std::sync::atomic::AtomicU64,
+    // The registry revision and anchor epoch (`anchor::epoch`) at which every entry's root and parent directory
+    // were last proven by `lstat`; see `check_input_revision`.
+    proven: Mutex<Option<(u64, u64)>>,
     usage: Usage,
     pub(super) counters: Arc<Mutex<[u64; 10]>>,
 }
@@ -67,6 +70,7 @@ impl PartialExclusions {
             entries: Mutex::new(Vec::new()),
             leases: Mutex::new(Vec::new()),
             revision: std::sync::atomic::AtomicU64::new(0),
+            proven: Mutex::new(None),
             usage,
             counters: Arc::new(Mutex::new([0; 10])),
         }
@@ -215,23 +219,60 @@ impl PartialExclusions {
         }
         Ok(())
     }
-    /// None requests a bounded retry: the examined snapshot was retired while
-    /// path IO ran. No filesystem or caller callback runs under the registry lock.
+    /// Forgets the last directory proof, so the next [`Self::check_input_revision`] re-proves every entry's
+    /// directories. The session calls this when it admits a volume.
+    pub(crate) fn expire_proof(&self) {
+        *self.proven.lock().unwrap() = None;
+    }
+    /// Refuses an input path naming an excluded path (or one inside an excluded directory) and an input handle that
+    /// is an excluded file, and re-proves that each entry's root and parent directories are still the ones it was
+    /// registered under. None requests a bounded retry: the examined snapshot was retired while path IO ran. No
+    /// filesystem or caller callback runs under the registry lock.
+    ///
+    /// The directory proof costs two `lstat`s per entry, and a source read (which passes no paths) used to pay it
+    /// on every read. It is now cached: a call with no paths skips it when it was proven at the current registry
+    /// revision and anchor epoch. The proof therefore runs again after any registry change (a member, journal file
+    /// or binding added or retired), after any anchor change of any member in this process (each intent, commit and
+    /// compaction CAS advances the epoch, so at most one group's reads share a proof), at every volume admission
+    /// (`expire_proof`), and on every call that passes paths (declaration checks). The session's full validation
+    /// does not expire it: the persistent path runs that after every data step, which would make the cache useless,
+    /// and it is not where bytes become durable (the anchor changes are). The handle comparison is not
+    /// cached: each call compares each handle's identity with every excluded file. Skipping the directory proof
+    /// between those points is safe because every member re-proves its own directories by identity before each
+    /// write and in full before each anchored intent and commit (`PersistentNative::check_held` and `check`), and
+    /// outputs are written through held descriptors, never paths: a renamed or replaced directory is still caught
+    /// before any byte written under it becomes durable.
     pub(crate) fn check_input_revision(&self, paths: &[PathBuf], files: &[File]) -> ProgressiveResult<Option<u64>> {
+        let unsafe_path = || ProgressiveFailure::new(FailureKind::UnsafePath);
+        let mut handles = Vec::new();
+        handles.try_reserve_exact(files.len()).map_err(|_| unsafe_path())?;
+        for file in files {
+            handles.push(Identity::file(file).map_err(|_| unsafe_path())?);
+        }
+        let epoch = super::anchor::epoch();
         // Keep path facts alive without repeatedly allocating three paths per
         // live state file on every source callback. IO remains outside the lock.
         // The cloned list is freed on return; charge it only while it is held.
         let (revision, entries, _entries) = {
             let list = self.entries.lock().unwrap();
+            let revision = self.revision.load(Ordering::Relaxed);
+            if paths.is_empty() && *self.proven.lock().unwrap() == Some((revision, epoch)) {
+                if list.iter().any(|entry| entry.identity.is_some_and(|id| handles.contains(&id))) {
+                    return Err(unsafe_path());
+                }
+                return Ok(Some(revision));
+            }
             let lease = self.usage.lease(
                 Resource::MetadataBytes,
                 (list.len() * std::mem::size_of::<Arc<PartialProtectedPath>>()) as u64,
             )?;
-            (self.revision.load(Ordering::Relaxed), list.clone(), lease)
+            (revision, list.clone(), lease)
         };
-        let unsafe_path = || ProgressiveFailure::new(FailureKind::UnsafePath);
         for entry in entries {
             for (path, expected) in [(&entry.root, entry.root_identity), (&entry.parent, entry.parent_identity)] {
+                super::EXCLUSION_LSTATS.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                PROOF_LSTATS.with(|c| c.set(c.get() + 1));
                 let m = fs::symlink_metadata(path).map_err(|_| unsafe_path())?;
                 if !m.is_dir() || Identity::metadata(&m).map_err(|_| unsafe_path())? != expected {
                     return Err(unsafe_path());
@@ -242,13 +283,17 @@ impl PartialExclusions {
                     return Err(unsafe_path());
                 }
             }
-            for file in files {
-                if Some(Identity::file(file).map_err(|_| unsafe_path())?) == entry.identity {
-                    return Err(unsafe_path());
-                }
+            if entry.identity.is_some_and(|id| handles.contains(&id)) {
+                return Err(unsafe_path());
             }
         }
-        Ok((revision == self.revision()).then_some(revision))
+        let list = self.entries.lock().unwrap();
+        if revision != self.revision.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        *self.proven.lock().unwrap() = Some((revision, epoch));
+        drop(list);
+        Ok(Some(revision))
     }
 }
 
@@ -410,6 +455,8 @@ pub(crate) struct NativeBinding {
 thread_local! {
     /// Full checks run on this thread ([`PersistentNative::check`]), to test that writes in a group skip them.
     pub(crate) static FULL_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Directory `lstat`s of the exclusion registry's proof on this thread ([`PartialExclusions::check_input_revision`]).
+    pub(crate) static PROOF_LSTATS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 pub(crate) struct PersistentNative {
     pub(super) output: Arc<HeldFile>,
