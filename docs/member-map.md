@@ -503,6 +503,9 @@ any byte. For restart points inside compressed data (RAR 5.0 blocks, LZMA2 chunk
 Only pieces present in the map are covered. For a map with `complete: false`, compare the returned `stream` ranges
 with the request to see what the missing volumes still have to supply.
 
+To compute a stored copy's volume bytes from output already held (instead of downloading them), see
+[Rebuilding a copy's volumes from held output](container-rebuild.md) (`ContainerRebuilder`).
+
 ## Identity from the last volume
 
 `map::last_volume_identity(held, options)` reads a set's identity from its last volume alone, without the first

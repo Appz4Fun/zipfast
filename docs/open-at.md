@@ -130,6 +130,9 @@ decoded output together; `OpenAtError::OutputLimit` past it), and `redecode` is 
 usable chunk start the result is `NeedMore`. A member's output is the folder's from its `stream_start`. A folder
 counts as LZMA2 only with exactly one LZMA2 coder, alone or under 7zAES.
 
+Which volume bytes a plan never needs, per article, is what `ContainerRebuilder` reports as `Unneeded` with the plan
+in `RebuildOptions::plans`; `skipped_spans(&map, &plan)` lists them (see [container rebuild](container-rebuild.md)).
+
 ## Limits
 
 - RAR 4.x compressed members, ZIP compressed entries and 7z folders with coders other than LZMA2 (and 7zAES under

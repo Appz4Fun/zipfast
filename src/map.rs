@@ -47,6 +47,7 @@ mod last_volume;
 mod lzma2;
 mod member_reader;
 mod open_at;
+mod rebuild;
 pub(crate) mod sevenzip;
 pub(crate) mod zip;
 pub(crate) mod zip_split;
@@ -66,6 +67,11 @@ pub use member_reader::{
 pub use open_at::{
     Layer, Lzma2Framing, Lzma2Resume, MemberRestart, OpenAt, OpenAtError, OpenAtOptions, Rar5Resume, RestartGrain,
     SEED_SEARCH, Seed, Start, complete_lzma2, complete_rar5, member_restart, open_at,
+};
+pub use rebuild::{
+    ByteState, ContainerRebuilder, Crc32Check, FinalBlock, HeaderDoubt, HeaderGap, HeaderSource, HeldMembers,
+    HeldOutput, KeyProblem, KnownBytes, Missing, RebuildError, RebuildOptions, Rebuilt, RebuiltRange, Region,
+    VolumeHeaders, skipped_spans,
 };
 
 use crate::progressive::{
