@@ -164,6 +164,9 @@ pub enum RarQuickOpen {
     Truncated,
     /// Not checked: the headers are encrypted, so the block at the offset is ciphertext.
     Encrypted,
+    /// Not checked: reading the block header at the offset would exceed the catalogue's read budget
+    /// (`RarCatalogueLimits::read_bytes`).
+    Unchecked,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1362,10 +1365,22 @@ impl Catalogue {
         if at + 4 + body > len {
             return Ok(RarQuickOpen::Truncated);
         }
-        let mut bytes = vec![0u8; body as usize];
-        budget.read(file, path, &mut bytes, at + 4)?;
+        // The header is hashed in fixed pieces, so a locator pointing into packed data at a large size field costs
+        // no allocation; and it is read only within the catalogue's read budget, checked before any of it is read.
+        if budget.read_room() < body {
+            return Ok(RarQuickOpen::Unchecked);
+        }
+        let mut piece = [0u8; 8192];
+        let mut hasher = crate::crc32::Hasher::new();
+        let mut done = 0u64;
+        while done < body {
+            let n = (body - done).min(piece.len() as u64) as usize;
+            budget.read(file, path, &mut piece[..n], at + 4 + done)?;
+            hasher.update(&piece[..n]);
+            done += n as u64;
+        }
         let stored = u32::from_le_bytes(head[..4].try_into().unwrap());
-        Ok(if crate::crc32::hash(&bytes) == stored { RarQuickOpen::Valid } else { RarQuickOpen::Corrupt })
+        Ok(if hasher.finalize() == stored { RarQuickOpen::Valid } else { RarQuickOpen::Corrupt })
     }
 
     fn end_incomplete(&mut self) -> RarResult<()> {
@@ -1547,6 +1562,11 @@ impl ScanBudget<'_> {
         self.usage.read_bytes += bytes.len() as u64;
         read_at_detailed(file, bytes, at)
             .map_err(|error| read_failure(error, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))
+    }
+
+    /// How many more bytes the catalogue's read budget allows.
+    pub(super) fn read_room(&self) -> u64 {
+        self.limits.read_bytes.saturating_sub(self.usage.read_bytes)
     }
 
     pub(super) fn check_read(&self, len: usize) -> RarResult<()> {
