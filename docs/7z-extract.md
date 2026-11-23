@@ -51,7 +51,11 @@ CRC checks out (for a folder of several members that stores its own CRC, until t
 together at the folder's end), so a member that fails prints nothing; it is a line in `Summary::errors` and the run
 goes on. `print_selected_with` hands each chunk to a callback with the member's listing index instead.
 `extract::SelectedEntry::open` (and `open_cancelable_with_zip_limit`) read one 7z member through the same code, so
-callers that read members one by one get the same bytes; that decodes the member's folder up to it each time, so
+callers that read members one by one get the same bytes. Their byte limit counts the solid history the member
+needs, as for RAR: its folder's packed bytes and the decoded bytes through the member (the whole folder when the
+folder's own CRC must vouch for it), refused at open with `ReadResource::MemberPackedBytes` /
+`MemberDecodedBytes` on the checked dispatcher. The caller's cancellation reaches the header walk and an encrypted
+header's key derivation. Reading one by one decodes the member's folder up to it each time, so
 for several members of one solid folder `print_selected` is the cheaper route. A split ZIP set (`.z01`... `.zip`, or
 `.zip.001`...) also opens with `SelectedEntry`, read across its volumes as `extract::run` reads it.
 

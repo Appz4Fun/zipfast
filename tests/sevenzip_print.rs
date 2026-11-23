@@ -200,3 +200,28 @@ fn split_zip_entries_read_one_by_one_match_7z_x_so() {
         assert!(checked.is_ok(), "{set}: {:?}", checked.err().map(|e| e.to_string()));
     }
 }
+
+/// A small member late in a solid folder needs the members before it decoded: that work counts against the
+/// selection's byte limit, packed and decoded, as RAR's solid history does.
+#[test]
+fn a_late_member_of_a_solid_folder_counts_the_members_before_it() {
+    use zipfast::zip::{ReadFault, ReadResource};
+    let path = fixture("7z-extract/solid.7z");
+    let entries = extract::list(&path).unwrap();
+    let tiny = entries.iter().position(|e| e.name == "text/tiny.txt").unwrap();
+    assert!(entries[tiny].size < 1000);
+    // the whole folder fits a large budget
+    assert!(SelectedEntry::open(&path, tiny, None, 1 << 30).is_ok());
+    let error = SelectedEntry::open(&path, tiny, None, 1000).err().expect("refused over the budget");
+    assert!(error.to_string().contains("byte limit"), "{error}");
+    let error = SelectedEntry::open_cancelable_with_zip_limit(&path, tiny, None, 1000, None, Cancellation::default())
+        .err()
+        .expect("refused over the budget");
+    assert!(
+        matches!(
+            error.operation(),
+            Some(ReadFault::Limit { resource: ReadResource::MemberPackedBytes | ReadResource::MemberDecodedBytes, .. })
+        ),
+        "{error:?}"
+    );
+}

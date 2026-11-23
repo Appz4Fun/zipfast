@@ -1287,19 +1287,53 @@ fn split_zip_selected(
 }
 
 /// The name and metadata of 7z member `index`, refused unless it is a regular file within `limit` bytes.
-fn seven_zip_selected(path: &Path, index: usize, password: Option<&str>, limit: u64) -> Result<(String, Meta)> {
+/// A selected 7z member: its name and metadata, and the work reading it takes.
+struct SevenZipSelected {
+    name: String,
+    meta: Meta,
+    /// Packed bytes of the member's folder, all of which its decoders may read.
+    packed: u64,
+    /// Decoded bytes its folder must produce: through the member's end, or the whole folder when the folder's own
+    /// CRC must vouch for it (a folder of several members that stores one), as the solid members before it are
+    /// decoded and dropped.
+    decoded: u64,
+}
+
+/// The 7z member `index`, refused unless it is a regular file. Its headers are read under `cancel`, which also
+/// stops an encrypted header's key derivation.
+fn seven_zip_selected(
+    path: &Path,
+    index: usize,
+    password: Option<&str>,
+    cancel: &Cancellation,
+) -> Result<SevenZipSelected> {
     let limits = crate::sevenzip::SevenZipLimits::default();
-    let map = crate::sevenzip::open_map(path, password, &Cancellation::default(), &limits)?;
+    let map = crate::sevenzip::open_map(path, password, cancel, &limits)?;
     let member = map.members.get(index).ok_or_else(|| Error::Unsupported("entry index is out of range".into()))?;
     let link = member.unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000);
     if member.is_dir || link {
         return Err(Error::Unsupported("the selected 7z entry is not a regular file".into()));
     }
-    if member.unpacked_size.unwrap_or(0) > limit {
-        return Err(Error::Unsupported("the selected 7z entry exceeds the byte limit".into()));
-    }
+    let size = member.unpacked_size.unwrap_or(0);
+    let (packed, decoded) = match member.folder.and_then(|slot| map.folders.get(slot.index as usize).map(|f| (slot, f)))
+    {
+        None => (0, size),
+        Some((slot, folder)) => {
+            let through = slot.offset.saturating_add(size);
+            let whole = folder.crc32.is_some() && folder.members > 1;
+            (
+                folder.pack_sizes.iter().fold(0u64, |a, &b| a.saturating_add(b)),
+                if whole { folder.unpacked_size } else { through },
+            )
+        }
+    };
     let (mtime, nanos) = member.mtime.map_or((None, 0), |(seconds, nanos)| (Some(seconds), nanos));
-    Ok((crate::sevenzip::member_name(member), Meta { mtime, nanos, mode: member.unix_mode }))
+    Ok(SevenZipSelected {
+        name: crate::sevenzip::member_name(member),
+        meta: Meta { mtime, nanos, mode: member.unix_mode },
+        packed,
+        decoded,
+    })
 }
 
 const RAR_SELECTED_WINDOW_LIMIT: u64 = 256 << 20;
@@ -1538,7 +1572,12 @@ impl SelectedEntry {
                 });
             }
             Format::SevenZip => {
-                let (name, meta) = seven_zip_selected(path, index, password, limit)?;
+                let SevenZipSelected { name, meta, packed, decoded } =
+                    seven_zip_selected(path, index, password, &cancel)?;
+                // the whole solid history the member needs counts, as for RAR
+                if packed > limit || decoded > limit {
+                    return Err(Error::Unsupported("the selected 7z entry exceeds the byte limit".into()));
+                }
                 return Ok(Self {
                     meta,
                     windows_names: false,
@@ -1591,7 +1630,32 @@ impl SelectedEntry {
                 });
             }
             CheckedRoute::Legacy(LegacyRoute::SevenZip) => {
-                let (name, meta) = seven_zip_selected(path, index, password, max_bytes).map_err(ReadFault::Legacy)?;
+                let SevenZipSelected { name, meta, packed, decoded } =
+                    seven_zip_selected(path, index, password, &cancel).map_err(|error| match error {
+                        error
+                            if is_cancellation(&error)
+                                || matches!(
+                                    crate::sevenzip::SevenZipError::of(&error),
+                                    Some(crate::sevenzip::SevenZipError::Canceled)
+                                ) =>
+                        {
+                            ReadFault::Cancelled
+                        }
+                        error => ReadFault::Legacy(error),
+                    })?;
+                // the whole solid history the member needs counts, as for RAR
+                for (resource, attempted) in
+                    [(ReadResource::MemberPackedBytes, packed), (ReadResource::MemberDecodedBytes, decoded)]
+                {
+                    if attempted > max_bytes {
+                        return Err(ReadFault::Limit {
+                            resource,
+                            limit: max_bytes.into(),
+                            attempted: attempted.into(),
+                        }
+                        .into());
+                    }
+                }
                 return Ok(Self {
                     meta,
                     windows_names: false,
@@ -4960,5 +5024,27 @@ mod tests {
             budget.record(&name).unwrap();
         }
         assert!(matches!(budget.record("a"), Err(Error::Unsupported(_))));
+    }
+}
+
+#[cfg(test)]
+mod seven_zip_selected_tests {
+    use super::*;
+
+    /// The caller's cancellation reaches the 7z header walk (and an encrypted header's key derivation).
+    #[test]
+    fn a_canceled_selection_stops_reading_the_7z_headers() {
+        // index 2 of solid.7z is its first file (0 and 1 are folders)
+        for (archive, index) in [("7z-extract/aes_hdr.7z", 0), ("7z-extract/solid.7z", 2)] {
+            let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(archive);
+            assert!(seven_zip_selected(&path, index, Some("password"), &Cancellation::default()).is_ok(), "{archive}");
+            let canceled = Cancellation::default();
+            canceled.cancel();
+            let error = seven_zip_selected(&path, index, Some("password"), &canceled).err().expect(archive);
+            assert!(
+                matches!(crate::sevenzip::SevenZipError::of(&error), Some(crate::sevenzip::SevenZipError::Canceled)),
+                "{archive}: {error}"
+            );
+        }
     }
 }
