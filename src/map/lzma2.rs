@@ -772,6 +772,23 @@ impl Lzma2Index {
         dictionary: &[u8],
         options: &Lzma2DecodeOptions,
     ) -> Result<Vec<u8>, Lzma2DecodeError> {
+        self.decode_with_dictionary_props(chunks, packed, packed_base, dict_prop, dictionary, None, options)
+    }
+
+    /// [`Self::decode_with_dictionary`] for an index that starts after the chunk that set the props in effect (a
+    /// walk resumed at a restart chunk): `inherited` is that props byte, used when no chunk of this index up to the
+    /// first one sets props.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_with_dictionary_props(
+        &self,
+        chunks: Range<usize>,
+        packed: &[u8],
+        packed_base: u64,
+        dict_prop: u8,
+        dictionary: &[u8],
+        inherited: Option<u8>,
+        options: &Lzma2DecodeOptions,
+    ) -> Result<Vec<u8>, Lzma2DecodeError> {
         let start = chunks.start;
         let run = self.chunks.get(chunks.clone()).ok_or(Lzma2DecodeError::NotContiguous)?;
         let first = *run.first().ok_or(Lzma2DecodeError::NotContiguous)?;
@@ -779,7 +796,9 @@ impl Lzma2Index {
             return self.decode_chunks(chunks, packed, packed_base, dict_prop, options);
         }
         let props = match first.reset {
-            Lzma2Reset::State | Lzma2Reset::StateProps if first.kind == Lzma2ChunkKind::Lzma => self.props_for(start),
+            Lzma2Reset::State | Lzma2Reset::StateProps if first.kind == Lzma2ChunkKind::Lzma => {
+                self.props_for(start).or(inherited)
+            }
             _ => None,
         }
         .ok_or(Lzma2DecodeError::NotStateReset { offset: first.packed_offset })?;

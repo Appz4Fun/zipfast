@@ -436,8 +436,8 @@ pub struct Rar5Resume {
     pub output: u64,
     /// Output decoded again before the target: `target - output`.
     pub redecode: u64,
-    /// The restart search's report.
-    pub near: ResyncNear,
+    /// The restart search's report; `None` when decoding starts at the stream's start, where no search is needed.
+    pub near: Option<ResyncNear>,
 }
 
 /// Finishes a [`Start::Rar5`] plan: finds the restart in the held packed bytes and starts a decoder there.
@@ -462,9 +462,26 @@ pub fn complete_rar5(
     if known_base > stream_target || known_base.saturating_add(known.len() as u64) < stream_target {
         return Err(OpenAtError::NeedMore { needed: known_base.min(stream_target)..stream_target });
     }
-    let options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
-    let found = resync_near(packed, known_base, known, window, stream_target, &options).map_err(OpenAtError::Resync)?;
     let member_start = plan.restart.stream_start;
+    // At the stream's start (a member that is not a later member of a solid stream, with its packed bytes from 0)
+    // a fresh decoder needs no search and no known plaintext: it is the restart for a target of 0, and the fallback
+    // when the search finds none.
+    let fresh = || -> Result<Rar5Resume, OpenAtError> {
+        let mut decoder = Unpacker::new(window).map_err(|e| OpenAtError::Decode(e.to_string()))?;
+        decoder.reset(Some(size));
+        decoder.stop_at_last_block();
+        Ok(Rar5Resume { decoder, feed_from: 0, output: 0, redecode: plan.target, near: None })
+    };
+    let from_start = member_start == 0 && packed_from == 0;
+    if stream_target == 0 {
+        return if from_start { fresh() } else { Err(OpenAtError::NeedMore { needed: 0..0 }) };
+    }
+    let options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
+    let found = match resync_near(packed, known_base, known, window, stream_target, &options) {
+        Ok(found) => found,
+        Err(_) if from_start => return fresh(),
+        Err(e) => return Err(OpenAtError::Resync(e)),
+    };
     if found.resync.output_offset < member_start {
         return Err(OpenAtError::NeedMore { needed: known_base..stream_target });
     }
@@ -479,7 +496,7 @@ pub fn complete_rar5(
         feed_from: packed_from + found.resync.packed_offset as u64,
         output,
         redecode: plan.target - output,
-        near: found,
+        near: Some(found),
     })
 }
 
@@ -599,12 +616,13 @@ fn resume_lzma2(
             || matches!(c.reset, Lzma2Reset::State | Lzma2Reset::StateProps | Lzma2Reset::DictStateProps)
     };
     // The last restartable chunk start at or before the target whose header is held.
-    let start = starts
+    let k = starts
         .iter()
-        .rev()
-        .find(|c| c.unpacked_offset <= folder_target && c.packed_offset >= packed_from && restartable(c))
-        .copied()
+        .rposition(|c| c.unpacked_offset <= folder_target && c.packed_offset >= packed_from && restartable(c))
         .ok_or_else(need_framing)?;
+    let start = starts[k];
+    // The props in effect there, from the chunk that set them (the walk resumed below starts after it).
+    let inherited = starts[..=k].iter().rev().find_map(|c| c.props);
     let rel = usize::try_from(start.packed_offset - packed_from).map_err(|_| need_framing())?;
     // From there the chunks run to the end marker at the stream's last byte and fill the folder's output.
     let idx = Lzma2Index::from_bytes(
@@ -654,8 +672,9 @@ fn resume_lzma2(
             // the decoder's own bound is what is left of the limit
             let mut left = options.clone();
             left.max_output = limit - out.len() as u64;
-            let decoded =
-                idx.decode_with_dictionary(i..chunks.len(), bytes, 0, dict_prop, &dict, &left).map_err(decode_err)?;
+            let decoded = idx
+                .decode_with_dictionary_props(i..chunks.len(), bytes, 0, dict_prop, &dict, inherited, &left)
+                .map_err(decode_err)?;
             over(out.len() as u64 + decoded.len() as u64)?;
             out.extend(decoded);
             break;
@@ -780,5 +799,74 @@ mod tests {
         assert_eq!(lzma2_coders(&[coder(CoderKind::Aes, &[]), coder(CoderKind::Lzma2, &[18])]), Some((18, true)));
         assert_eq!(lzma2_coders(&[coder(CoderKind::Lzma2, &[16]), coder(CoderKind::Lzma2, &[16])]), None);
         assert_eq!(lzma2_coders(&[coder(CoderKind::Bcj, &[]), coder(CoderKind::Lzma2, &[16])]), None);
+    }
+
+    /// A raw LZMA2 stream (2 MiB dictionary) of text and incompressible runs: liblzma stores the runs and resets
+    /// the state (without props) for the LZMA chunk after each.
+    fn mixed_stream() -> (Vec<u8>, Vec<u8>) {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect()
+        };
+        let text = |n: usize, seed: usize| -> Vec<u8> {
+            (0..n).map(|i| b"the quick brown fox jumps over the lazy dog "[(i * 7 + seed) % 44]).collect()
+        };
+        let plain = [text(300_000, 1), noise(400_000), text(150_000, 9), noise(130_000), text(90_000, 3)].concat();
+        let mut opts = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
+        opts.dict_size(2 << 20);
+        let mut filters = liblzma::stream::Filters::new();
+        filters.lzma2(&opts);
+        let mut stream = liblzma::stream::Stream::new_raw_encoder(&filters).unwrap();
+        let mut out = Vec::with_capacity(plain.len() + (1 << 16));
+        let mut consumed = 0;
+        loop {
+            out.reserve(1 << 16);
+            let before = stream.total_in();
+            let status = stream.process_vec(&plain[consumed..], &mut out, liblzma::stream::Action::Finish).unwrap();
+            consumed += (stream.total_in() - before) as usize;
+            if status == liblzma::stream::Status::StreamEnd {
+                return (out, plain);
+            }
+        }
+    }
+
+    /// A restart at a state-only reset (or at a stored chunk before one) inherits the props from the chunk that set
+    /// them, before the restart: the walk resumed at the restart does not see that chunk.
+    #[test]
+    fn a_state_only_reset_restarts_with_inherited_props() {
+        let (stream, plain) = mixed_stream();
+        let framing = Lzma2Index::from_bytes(&stream, Lzma2IndexOptions::default());
+        let state_only = framing
+            .chunks
+            .iter()
+            .position(|c| c.reset == Lzma2Reset::State && c.props.is_none())
+            .expect("a state-only reset after stored chunks");
+        let bounds =
+            |target| Lzma2Bounds { total: plain.len() as u64, stream_end: stream.len() as u64, target, dict_prop: 18 };
+        let stored = framing.chunks[..state_only].iter().rposition(|c| c.kind == Lzma2ChunkKind::Stored).unwrap();
+        for k in [state_only, stored] {
+            let c = framing.chunks[k];
+            let target = c.unpacked_offset + 10;
+            let from = c.packed_offset;
+            let r = resume_lzma2(
+                &bounds(target),
+                from,
+                &stream[from as usize..],
+                0,
+                &plain[..target as usize],
+                Some(&framing),
+                &opts(),
+            )
+            .unwrap_or_else(|e| panic!("chunk {k} ({:?}): {e}", c.reset));
+            assert_eq!(r.output, c.unpacked_offset, "chunk {k}");
+            assert_eq!(r.bytes, plain[r.output as usize..], "chunk {k}");
+        }
     }
 }

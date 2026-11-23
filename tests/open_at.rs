@@ -199,6 +199,32 @@ fn a_solid_second_rar5_member_hands_over_at_its_stream_offset() {
     handover(&map, &plan, &held, &stream);
 }
 
+/// A restart at the member's start needs no search: a target of 0 (and a target so close to the start that no block
+/// before it pins) starts a fresh decoder at packed offset 0.
+#[test]
+fn a_compressed_rar5_member_opens_at_its_start() {
+    use zipfast::rar5::testenc;
+    let plain = sample(300_000);
+    let data = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let mut spec = FileSpec::new("c.bin", &data);
+    spec.method = 3;
+    spec.size = Some(plain.len() as u64);
+    let bytes = archive_with(&[(spec, crc32fast::hash(&plain))], false);
+    let map = MemberMap::from_memory(&[&bytes], "c.rar", None).unwrap();
+    for target in [0u64, 40] {
+        let plan = open_at(&map, 0, target, &OpenAtOptions::default()).unwrap();
+        assert_eq!(plan.fetch_from, 0);
+        let held = fetch(&[&bytes], &plan.spans);
+        let mut r = complete_rar5(&map, &plan, 0, &held, 0, &plain[..target as usize], &NearOptions::default())
+            .unwrap_or_else(|e| panic!("target {target}: {e}"));
+        assert_eq!((r.output, r.feed_from, r.redecode, r.near.is_none()), (0, 0, target, true), "target {target}");
+        let mut out = Collect(Vec::new());
+        r.decoder.feed(&held, &mut out).unwrap();
+        r.decoder.finish(&mut out).unwrap();
+        assert_eq!(out.0, plain, "target {target}");
+    }
+}
+
 /// Directories and stored members take no part in a solid stream's decoding: a solid member's stream starts after
 /// the last compressed member without the solid flag, and only compressed members' sizes count.
 #[test]
@@ -317,7 +343,7 @@ fn handovers_on_the_z_fixtures() {
             }
             assert_eq!(r.stream_start, stream.len() as u64, "{set} member {i}");
             stream.extend_from_slice(&plain);
-            for target in [plain.len() as u64 / 3, plain.len() as u64 * 4 / 5] {
+            for target in [0, plain.len() as u64 / 3, plain.len() as u64 * 4 / 5] {
                 let plan = open_at(&f.map, i, target, &OpenAtOptions::default()).unwrap();
                 let held = fetch(&refs, &plan.spans);
                 let (from, held) = match m.cipher.clone() {
@@ -343,7 +369,7 @@ fn handovers_on_the_z_fixtures() {
                 );
                 assert_eq!(out.0, plain[res.output as usize..], "{set} member {i} target {target}");
                 assert!(
-                    res.near.window_checked,
+                    res.near.as_ref().is_none_or(|n| n.window_checked),
                     "{set} member {i} target {target}: the default plan checks the window"
                 );
                 // A narrow fetch: the restart either decodes exactly or is refused, never wrong.

@@ -995,6 +995,12 @@ impl Unpacker {
         self.parallel = self.wants_parallel();
     }
 
+    /// Stops decoding at the block flagged last, dropping later bytes: an encrypted member's packed stream runs on
+    /// to its cipher block's end, past the last block. [`Self::reset`] turns this off again.
+    pub(crate) fn stop_at_last_block(&mut self) {
+        self.stop_at_last = true;
+    }
+
     /// [`Self::reset`] for a stream that needs the window `window`, which this decoder [`fits`](Self::fits).
     pub fn restart(&mut self, window: Window, size: Option<u64>) {
         assert!(self.fits(window), "{window:?} in a window of {}", self.window_size());
