@@ -26,9 +26,13 @@
 //! the bytes actually fetched) before using it as a twin or alternate key.
 use super::sevenzip::{self, TailSearch};
 use super::zip_split::{self, TailZip};
-use super::{MapChecks, MapError, MapFormat, MapMember, MapOptions, MemberMap, VolumeEnd, VolumeMap, VolumeMember};
+use super::{
+    CoderKind, MapChecks, MapError, MapFolder, MapFormat, MapMember, MapMethod, MapOptions, MemberMap, VolumeEnd,
+    VolumeMap, VolumeMember,
+};
 use crate::progressive::{FailureKind, ProgressiveFailure};
 use crate::rar5::RarEndRecord;
+use std::collections::HashMap;
 use std::ops::Range;
 
 const RAR4_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -103,6 +107,22 @@ pub struct IdentityMember {
     pub split_before: Option<bool>,
     /// Modification time as seconds since 1970 and nanoseconds.
     pub mtime: Option<(i64, u32)>,
+    /// How the member is packed: stored, or compressed with the format's method (see [`MapMethod`]).
+    pub method: MapMethod,
+    /// The dictionary size the format states for the member: RAR from its header, 7z from its folder's LZMA or
+    /// LZMA2 coder properties. None for directories, ZIP entries and other 7z coders.
+    pub dictionary: Option<u64>,
+}
+
+/// The dictionary a 7z folder's LZMA or LZMA2 coder states, if it has exactly one.
+pub(super) fn folder_dictionary(folder: &MapFolder) -> Option<u64> {
+    let mut found = folder.coders.iter().filter_map(|c| match c.kind {
+        CoderKind::Lzma => c.properties.get(1..5).map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+        CoderKind::Lzma2 => c.properties.first().map(|&b| crate::codec::lzma2_dict(b)),
+        _ => None,
+    });
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
 }
 
 impl IdentityMember {
@@ -116,10 +136,16 @@ impl IdentityMember {
             encrypted: part.encrypted,
             split_before: Some(part.split_before),
             mtime: part.mtime,
+            method: part.method,
+            dictionary: part.dictionary,
         }
     }
 
-    fn from_member(member: &MapMember) -> Self {
+    fn from_member(member: &MapMember, folders: &[MapFolder]) -> Self {
+        let dictionary = member.dictionary.or_else(|| {
+            let slot = member.folder?;
+            folders.get(slot.index as usize).and_then(folder_dictionary)
+        });
         Self {
             raw_name: member.raw_name.clone(),
             name: member.name.clone(),
@@ -129,6 +155,8 @@ impl IdentityMember {
             encrypted: member.encrypted,
             split_before: None,
             mtime: member.mtime,
+            method: member.method,
+            dictionary: if member.is_dir { None } else { dictionary },
         }
     }
 }
@@ -321,7 +349,7 @@ fn zip(found: zip_split::TailDirectory) -> LastVolumeIdentity {
         volume_number: Some(found.last),
         is_last: Some(true),
         volumes: found.last.checked_add(1),
-        members: found.members.iter().map(IdentityMember::from_member).collect(),
+        members: found.members.iter().map(|m| IdentityMember::from_member(m, &[])).collect(),
         set: SetFacts::Zip {
             end_at: found.end_at,
             directory: found.directory,
@@ -338,7 +366,17 @@ fn seven(found: sevenzip::TailHeader) -> LastVolumeIdentity {
         volume_number: None,
         is_last: Some(true),
         volumes: None,
-        members: found.map.members.iter().map(IdentityMember::from_member).collect(),
+        members: found
+            .map
+            .members
+            .iter()
+            .zip(found.dictionaries.iter().copied().chain(std::iter::repeat(None)))
+            .map(|(m, dictionary)| {
+                let mut member = IdentityMember::from_member(m, &[]);
+                member.dictionary = dictionary;
+                member
+            })
+            .collect(),
         set: SetFacts::SevenZip {
             archive_offset: found.archive_offset,
             header: found.header,
@@ -346,6 +384,265 @@ fn seven(found: sevenzip::TailHeader) -> LastVolumeIdentity {
             header_encrypted: found.map.header_encrypted,
         },
     }
+}
+
+/// Which held volume supplied a fact of a [`SetMember`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FactSource {
+    /// The first volume's bytes.
+    First,
+    /// The last volume's bytes.
+    Last,
+}
+
+/// One member of a set, from whatever its first and last volumes' held bytes state. Every fact is `None` when
+/// neither volume states it; `*_from` says which volume supplied it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SetMember {
+    /// The name exactly as stored (members of the two volumes are matched by it).
+    pub raw_name: Vec<u8>,
+    /// The name decoded by the format's rules, when it decodes.
+    pub name: Option<String>,
+    pub is_dir: bool,
+    /// The member's whole unpacked size.
+    pub unpacked_size: Option<u64>,
+    pub size_from: Option<FactSource>,
+    /// Stored or compressed, and with which method.
+    pub method: Option<MapMethod>,
+    /// The dictionary size, where the format states it (see [`IdentityMember::dictionary`]).
+    pub dictionary: Option<u64>,
+    pub method_from: Option<FactSource>,
+    /// Whether the member's data is encrypted.
+    pub encrypted: Option<bool>,
+    /// The member's whole-file checks: CRC32 and/or BLAKE2sp (RAR 5.0 checks of encrypted members may be keyed
+    /// with the password, [`MapChecks::keyed`]). RAR states them in the header of the member's last part, so a
+    /// member split across volumes has them only from the volume where it ends.
+    pub checks: Option<MapChecks>,
+    pub checks_from: Option<FactSource>,
+}
+
+/// A set's identity from the held bytes of its first volume, its last volume, or both: see [`set_identity`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SetIdentity {
+    pub format: MapFormat,
+    /// Members in the order the volumes list them: the first volume's, then any only the last volume lists.
+    pub members: Vec<SetMember>,
+}
+
+impl SetMember {
+    fn new(raw_name: &[u8], name: &Option<String>, is_dir: bool) -> Self {
+        Self {
+            raw_name: raw_name.to_vec(),
+            name: name.clone(),
+            is_dir,
+            unpacked_size: None,
+            size_from: None,
+            method: None,
+            dictionary: None,
+            method_from: None,
+            encrypted: None,
+            checks: None,
+            checks_from: None,
+        }
+    }
+
+    /// Whether `m` can be this member: every whole-member fact both state is equal.
+    fn agrees(&self, m: &IdentityMember) -> bool {
+        fn same<T: PartialEq>(a: Option<T>, b: Option<T>) -> bool {
+            a.zip(b).is_none_or(|(a, b)| a == b)
+        }
+        self.is_dir == m.is_dir
+            && same(self.unpacked_size, m.unpacked_size)
+            && same(self.method, Some(m.method))
+            && same(self.encrypted, Some(m.encrypted))
+            && same(self.dictionary, m.dictionary)
+    }
+
+    /// Takes the facts `source` states that are still unknown.
+    fn learn(
+        &mut self,
+        source: FactSource,
+        size: Option<u64>,
+        method: MapMethod,
+        dictionary: Option<u64>,
+        encrypted: bool,
+        checks: Option<MapChecks>,
+    ) {
+        if self.unpacked_size.is_none() && size.is_some() {
+            self.unpacked_size = size;
+            self.size_from = Some(source);
+        }
+        if self.method.is_none() {
+            self.method = Some(method);
+            self.dictionary = dictionary;
+            self.method_from = Some(source);
+        }
+        self.encrypted.get_or_insert(encrypted);
+        if self.checks.is_none() && checks.is_some() {
+            self.checks = checks;
+            self.checks_from = Some(source);
+        }
+    }
+}
+
+/// Identifies a set's members from the held bytes of its first volume, its last volume, or both, for example
+/// the one article at each end of a download: name, unpacked size, packing method, encryption and the whole-file
+/// checks, each `None` when the bytes held do not state it. Two copies of a release whose members agree in size
+/// and checks hold the same files, whatever their containers.
+///
+/// - RAR: every part header states the member's name, size, method and encryption; the header of its last part
+///   also states its final checks. `first` is read from its first bytes as [`MemberMap::from_volume`] reads a
+///   volume, `last` as [`last_volume_identity`] reads one. A member split across volumes therefore gets its
+///   checks only from `last`.
+/// - ZIP and 7z: the directory at the end of the last volume lists every member with its checks, so `last`
+///   decides (`first` adds nothing). With `last` None, `first` is read as a last volume, which suits a
+///   single-volume archive.
+///
+/// For a single-volume archive pass the same bytes as both, or either alone. `options` carries the password for
+/// encrypted headers (RAR `-hp`, 7z `-mhe`). Fails with the first volume's error, or the last's, when either
+/// cannot be read; [`MapError::NotArchive`] when neither is given.
+pub fn set_identity(
+    first: Option<HeldVolume<'_>>,
+    last: Option<HeldVolume<'_>>,
+    options: MapOptions,
+) -> Result<SetIdentity, MapError> {
+    // Members are matched across the two volumes by name, by kind (a RAR part going on into later volumes
+    // matches the part continuing in the last one; whole members match only when both inputs are the same
+    // volume) and by occurrence among equal names and kinds, so two entries of one name never merge.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Kind {
+        Whole,
+        Spanning,
+    }
+    /// Checked between entries of long loops: an archive may list hundreds of thousands of members.
+    const CANCEL_EVERY: usize = 4096;
+    let control = options.control.clone();
+    let check = |i: usize| -> Result<(), MapError> {
+        if i.is_multiple_of(CANCEL_EVERY) && control.is_canceled() { Err(canceled()) } else { Ok(()) }
+    };
+    let mut format = None;
+    let mut members: Vec<SetMember> = Vec::new();
+    // Each first-volume entry by (raw name, kind, occurrence among equal names and kinds): its index in `members`.
+    let mut firsts: HashMap<(Vec<u8>, Kind, usize), usize> = HashMap::new();
+    let mut first_volume_number = None;
+    let mut first_is_rar = false;
+    // A first-volume RAR error waits for the last volume: a ZIP or 7z directory there identifies the set even
+    // when the RAR the scanner found in the first volume is one stored inside it that cannot be read.
+    let mut first_error = None;
+    if let Some(held) = first {
+        // The RAR scanner finds a volume behind a self-extracting stub; anything else is read as a last volume.
+        match MemberMap::from_volume(held.head, options.clone()) {
+            Ok(volume) => {
+                first_is_rar = true;
+                format = Some(volume.format);
+                first_volume_number = volume.volume_number;
+                let mut counts: HashMap<(&[u8], Kind), usize> = HashMap::new();
+                let parts = volume.members.iter().filter(|p| p.header.end <= held.len && p.packed.end <= held.len);
+                for (i, part) in parts.enumerate() {
+                    check(i)?;
+                    let kind = if part.split_after { Kind::Spanning } else { Kind::Whole };
+                    let count = counts.entry((part.raw_name.as_slice(), kind)).or_insert(0);
+                    let occurrence = *count;
+                    *count += 1;
+                    let mut member = SetMember::new(&part.raw_name, &part.name, part.is_dir);
+                    member.learn(
+                        FactSource::First,
+                        part.unpacked_size,
+                        part.method,
+                        part.dictionary,
+                        part.encrypted,
+                        part.checks,
+                    );
+                    firsts.insert((part.raw_name.clone(), kind, occurrence), members.len());
+                    members.push(member);
+                }
+            }
+            Err(MapError::NotArchive) => {}
+            Err(error) if control.is_canceled() => return Err(error),
+            Err(error) => first_error = Some(error),
+        }
+    }
+    let rar = |f: MapFormat| matches!(f, MapFormat::Rar4 | MapFormat::Rar5);
+    // Reads a first volume's held bytes as a last volume, for a ZIP or 7z directory they may hold.
+    let probe = |held: HeldVolume<'_>, options: MapOptions| {
+        #[cfg(test)]
+        tests::BEFORE_PROBE.with(|hook| {
+            if let Some(hook) = hook.get() {
+                hook(&options.control)
+            }
+        });
+        last_volume_identity(held, options)
+    };
+    let (identity, source) = match (last, first) {
+        (Some(held), _) => match last_volume_identity(held, options) {
+            // The last volume is RAR too, so the first volume's error is the set's own.
+            Ok(identity) if first_error.is_some() && rar(identity.format) => {
+                return Err(first_error.expect("checked"));
+            }
+            Ok(identity) => (Some(identity), FactSource::Last),
+            Err(error) if control.is_canceled() => return Err(error),
+            Err(error) => return Err(first_error.unwrap_or(error)),
+        },
+        // Only the first volume: a ZIP or 7z directory in its held bytes (a whole single-volume archive, maybe
+        // behind a self-extracting stub) decides over a RAR the scanner found stored inside it.
+        (None, Some(held)) if first_is_rar || first_error.is_some() => match probe(held, options) {
+            Ok(identity) if !rar(identity.format) => (Some(identity), FactSource::First),
+            // A cancellation during the probe is the caller's, never a reason to fall back.
+            Err(error) if control.is_canceled() => return Err(error),
+            _ if control.is_canceled() => return Err(canceled()),
+            _ => match first_error {
+                Some(error) => return Err(error),
+                None => (None, FactSource::Last),
+            },
+        },
+        (None, Some(held)) => (Some(last_volume_identity(held, options)?), FactSource::First),
+        (None, None) => return Err(MapError::NotArchive),
+    };
+    if let Some(identity) = identity {
+        if first_is_rar && !rar(identity.format) {
+            // A ZIP or 7z directory in the last volume decides the set: a RAR found in the first volume was one
+            // stored inside it (a split ZIP's .z01 holding a .rar, say), not the set itself.
+            members.clear();
+            firsts.clear();
+            format = None;
+        }
+        format.get_or_insert(identity.format);
+        // Whole members of the first volume are the last volume's only when both are the same volume.
+        // Same volume only on evidence: equal stated numbers, or the very same bytes. Legacy RAR volumes may state
+        // no number at all, and two unknowns prove nothing.
+        let same_bytes = match (first, last) {
+            (Some(a), Some(b)) => a.len == b.len && a.head == b.head && a.tail == b.tail,
+            _ => false,
+        };
+        let same_number = matches!((first_volume_number, identity.volume_number), (Some(a), Some(b)) if a == b);
+        let same_volume = !firsts.is_empty() && (same_number || same_bytes);
+        let mut counts: HashMap<(&[u8], Kind), usize> = HashMap::new();
+        for (i, m) in identity.members.iter().enumerate() {
+            check(i)?;
+            let matched = if firsts.is_empty() {
+                None
+            } else {
+                let kind = if m.split_before == Some(true) { Kind::Spanning } else { Kind::Whole };
+                let count = counts.entry((m.raw_name.as_slice(), kind)).or_insert(0);
+                let occurrence = *count;
+                *count += 1;
+                (kind == Kind::Spanning || same_volume)
+                    .then(|| firsts.get(&(m.raw_name.clone(), kind, occurrence)).copied())
+                    .flatten()
+                    // Two members of one name (one ending in a middle volume, another starting there) are
+                    // one member only when every whole-member fact both state agrees.
+                    .filter(|&at| members[at].agrees(m))
+            };
+            let at = matched.unwrap_or_else(|| {
+                members.push(SetMember::new(&m.raw_name, &m.name, m.is_dir));
+                members.len() - 1
+            });
+            members[at].learn(source, m.unpacked_size, m.method, m.dictionary, m.encrypted, m.checks);
+        }
+    }
+    Ok(SetIdentity { format: format.expect("a volume was read"), members })
 }
 
 /// A RAR 5.0 vint at `at`: its value and length.
@@ -426,6 +723,71 @@ fn rar4_end(tail: &[u8], start: u64) -> Option<RarEndRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Called just before `set_identity` probes a first-volume RAR's bytes for a ZIP or 7z directory.
+        pub(super) static BEFORE_PROBE: std::cell::Cell<Option<fn(&crate::progressive::SessionControl)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// A one-member RAR 5.0 archive, stored, in one volume.
+    fn rar5_single(name: &str, data: &[u8]) -> Vec<u8> {
+        fn vint(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+        }
+        fn block(kind: u64, flags: u64, fields: &[u8], data_len: Option<u64>) -> Vec<u8> {
+            let mut body = Vec::new();
+            vint(kind, &mut body);
+            vint(flags | if data_len.is_some() { 2 } else { 0 }, &mut body);
+            if let Some(n) = data_len {
+                vint(n, &mut body);
+            }
+            body.extend_from_slice(fields);
+            let mut size = Vec::new();
+            vint(body.len() as u64, &mut size);
+            let mut covered = size.clone();
+            covered.extend_from_slice(&body);
+            let mut out = crate::crc32::hash(&covered).to_le_bytes().to_vec();
+            out.extend(covered);
+            out
+        }
+        let mut out = RAR5_SIGNATURE.to_vec();
+        out.extend(block(1, 0, &[0], None));
+        let mut fields = Vec::new();
+        vint(4, &mut fields); // file flags: CRC32 present
+        vint(data.len() as u64, &mut fields);
+        vint(0x20, &mut fields); // attributes
+        fields.extend(crate::crc32::hash(data).to_le_bytes());
+        vint(0, &mut fields); // compression info: stored
+        vint(0, &mut fields); // host OS
+        vint(name.len() as u64, &mut fields);
+        fields.extend_from_slice(name.as_bytes());
+        out.extend(block(2, 0, &fields, Some(data.len() as u64)));
+        out.extend_from_slice(data);
+        out.extend(block(5, 0, &[0], None));
+        out
+    }
+
+    #[test]
+    fn a_cancellation_during_the_first_only_probe_is_returned() {
+        let rar = rar5_single("a.bin", b"payload");
+        let held = HeldVolume::whole(&rar);
+        // Without a cancellation the first volume alone identifies the archive.
+        let s = set_identity(Some(held), None, MapOptions::new("a.rar")).unwrap();
+        assert_eq!(s.members.len(), 1);
+        BEFORE_PROBE.with(|hook| hook.set(Some(|control| control.cancel())));
+        let result = set_identity(Some(held), None, MapOptions::new("a.rar"));
+        BEFORE_PROBE.with(|hook| hook.set(None));
+        assert!(matches!(result, Err(MapError::Source(_))), "{result:?}");
+    }
 
     #[test]
     fn held_volume_bounds() {

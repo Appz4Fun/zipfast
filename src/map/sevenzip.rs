@@ -1454,6 +1454,8 @@ pub(crate) struct TailHeader {
     pub(crate) archive_offset: u64,
     /// The header was encoded (`kEncodedHeader`).
     pub(crate) encoded: bool,
+    /// Each member's dictionary from its folder's LZMA or LZMA2 coder, taken before the folders are dropped.
+    pub(crate) dictionaries: Vec<Option<u64>>,
 }
 
 /// What looking for a 7z header at the end of a volume gave.
@@ -1569,11 +1571,13 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
         });
         match result {
             Ok(Some(map)) => {
+                let dictionaries = dictionaries(&map);
                 return Ok(TailSearch::Found(Box::new(TailHeader {
                     map: strip(map),
                     header: at..len,
                     archive_offset,
                     encoded: true,
+                    dictionaries,
                 })));
             }
             Ok(None) => {}
@@ -1628,11 +1632,13 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
         walker.header_len = len - at;
         match walker.map(MapEnd::Complete, streams, files) {
             Ok(map) => {
+                let dictionaries = dictionaries(&map);
                 return Ok(TailSearch::Found(Box::new(TailHeader {
                     map: strip(map),
                     header: at..len,
                     archive_offset,
                     encoded: false,
+                    dictionaries,
                 })));
             }
             Err(e) if final_failure(&e) => return Err(e),
@@ -1647,6 +1653,17 @@ pub(crate) fn from_tail(tail: &[u8], len: u64, options: &MapOptions) -> Result<T
 
 /// A tail map's members without pieces or folder slots: their archive offsets are relative to a volume whose
 /// position was inferred, and earlier volumes' lengths are unknown.
+/// Each member's dictionary, from the LZMA or LZMA2 coder of its folder when the folder has exactly one.
+fn dictionaries(map: &MemberMap) -> Vec<Option<u64>> {
+    map.members
+        .iter()
+        .map(|m| {
+            let folder = map.folders.get(m.folder?.index as usize)?;
+            (!m.is_dir).then(|| super::last_volume::folder_dictionary(folder)).flatten()
+        })
+        .collect()
+}
+
 fn strip(mut map: MemberMap) -> MemberMap {
     for member in &mut map.members {
         member.pieces.clear();
