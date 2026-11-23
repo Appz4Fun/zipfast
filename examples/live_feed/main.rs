@@ -28,7 +28,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: live_feed [--password PW] [--article BYTES] [--seed N] [--lateness N|all] [--window N] \
 [--drop FRACTION] [--drop-articles I,J,..] [--repair-delay N] [--sink auto|file|partial] [--group-holes] [--group-refills] \
-[--group-commit-mib N] [--max-needs N] [--buffer-mib N] [--work DIR] [--keep] [--no-verify] [--runs N] \
+[--group-commit-mib N] [--max-needs N] [--buffer-mib N] [--restart-at N] [--work DIR] [--keep] [--no-verify] [--runs N] \
 [--label NAME] [--header] <set dir | volume...>";
 
 fn main() -> ExitCode {
@@ -93,6 +93,7 @@ fn real_main() -> Result<bool, String> {
             "--work" => work = Some(PathBuf::from(value(&arg)?)),
             "--keep" => keep = true,
             "--no-verify" => config.verify = false,
+            "--restart-at" => config.restart_at = Some(num(&arg, value(&arg)?)?),
             "--runs" => runs = num(&arg, value(&arg)?)?,
             "--label" => label = Some(value(&arg)?),
             "--header" => header = true,

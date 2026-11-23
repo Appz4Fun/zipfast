@@ -88,6 +88,10 @@ pub struct Config {
     pub work: PathBuf,
     /// Compare the output with a straight extraction of the set.
     pub verify: bool,
+    /// Restart after this many deliveries: the decoders, sinks and article buffer are dropped (the process ends),
+    /// then the partials are found again, each decoder restored from its partial's cursor, and the articles the
+    /// decoders need again are fetched again. Plain-file members start over.
+    pub restart_at: Option<usize>,
 }
 
 impl Config {
@@ -110,6 +114,7 @@ impl Config {
             buffer_limit: usize::MAX,
             work,
             verify: true,
+            restart_at: None,
         }
     }
 }
@@ -117,8 +122,7 @@ impl Config {
 /// Where member output goes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SinkKind {
-    /// A persistent partial for each member the persistent path admits (stored RAR, no `-hp`), a plain file for the
-    /// rest.
+    /// A persistent partial for every fed member (with `persistent-partials`), a plain file otherwise.
     Auto,
     /// Plain preallocated files only.
     File,
@@ -170,13 +174,17 @@ pub struct Report {
     pub crc_ok: bool,
     /// The output equals a straight extraction (None when not checked).
     pub verified: Option<bool>,
+    /// With `restart_at`: reopening the partials and restoring the decoders (part of `wall`).
+    pub restart: Duration,
+    /// Articles fetched again after the restart because a decoder needed them again.
+    pub refetched: usize,
 }
 
 impl Report {
     /// The column names of [`Self::tsv`].
     pub const HEADER: &'static str = "label\tformat\tmembers\tfed\tsink\tset_mb\tout_mb\tarticles\tdropped\tdeliveries\t\
          picks\twall_ms\tgenesis_ms\tmb_s\twritten\tredecoded\tpacked_read\tholes\trefills\trefill_bytes\trepair_ms\t\
-         ms_per_hole\tstalls\tsyncs\tpeak_buf_mb\tcrc\tverify";
+         ms_per_hole\tstalls\tsyncs\tpeak_buf_mb\tcrc\tverify\trestart_ms\trefetched";
 
     /// One tab-separated line, columns as in [`Self::HEADER`]. `ms_per_hole` is the repair time per dropped article.
     pub fn tsv(&self, label: &str) -> String {
@@ -189,7 +197,7 @@ impl Report {
         };
         format!(
             "{label}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.2}\t{}\t{}\t\
-             {:.1}\t{}\t{verify}",
+             {:.1}\t{}\t{verify}\t{:.1}\t{}",
             self.format,
             self.members,
             self.fed,
@@ -215,6 +223,8 @@ impl Report {
             self.syncs,
             mb(self.peak_buffer as u64),
             if self.crc_ok { "ok" } else { "FAIL" },
+            ms(self.restart),
+            self.refetched,
         )
     }
 }
@@ -338,6 +348,8 @@ struct Network {
     delay: Option<usize>,
     /// Deliveries and failures so far.
     tick: usize,
+    /// Articles delivered and not queued again.
+    delivered: Vec<bool>,
 }
 
 impl Network {
@@ -368,7 +380,21 @@ impl Network {
             window: config.window.max(1),
             delay: config.repair_delay,
             tick: 0,
+            delivered: vec![false; count],
         }
+    }
+
+    /// After a restart: every article in `order` (the decoders' needs) that was delivered before is fetched again,
+    /// as a repair due now. Returns how many.
+    fn refetch(&mut self, order: &[usize]) -> usize {
+        let mut count = 0;
+        for &article in order {
+            if std::mem::take(&mut self.delivered[article]) {
+                self.repairs.push((article, self.tick));
+                count += 1;
+            }
+        }
+        count
     }
 
     /// The next event: the candidate the priority list ranks first (`rank`: article -> place), else the next
@@ -406,10 +432,12 @@ impl Network {
                 self.repairs.push((article, at));
                 Event::Fail { article }
             } else {
+                self.delivered[article] = true;
                 Event::Deliver { article, repair: false }
             }
         } else {
             self.repairs.remove(place);
+            self.delivered[article] = true;
             Event::Deliver { article, repair: true }
         };
         Some((event, picked))
@@ -505,10 +533,12 @@ impl FeedSink for FileSink {
 #[cfg(feature = "persistent-partials")]
 mod persistent {
     //! The persistent-partial sink: a `PartialFile` per member, created straight from the member map by
-    //! `DirectPartials` (no session, no header read again). Each is born at full size with nothing written, and
-    //! the feed decoder's output reaches it through a `DirectSink`, whose writes join the open group commit: one
-    //! durable commit per `group_commit_bytes` of output, not per write. A restart finds the same partials again
-    //! (`DirectOrigin::Adopted`).
+    //! `DirectPartials` (no session, no header read again), for every container and method the feed decoder
+    //! handles. Each is born at full size with nothing written, and the feed decoder's output reaches it through
+    //! a `DirectSink`, whose writes join the open group commit: one durable commit per `group_commit_bytes` of
+    //! output, not per write. The decoder's snapshot is set as the partial's cursor after every run and committed
+    //! with the output it describes. A restart finds the same partials again (`DirectOrigin::Adopted`), and each
+    //! decoder is restored from its partial's durable cursor.
 
     use super::*;
     use std::task::{Context, Poll, Waker};
@@ -528,6 +558,10 @@ mod persistent {
         pub(super) fn path(&self) -> PathBuf {
             self.sink.file().output_path().to_path_buf()
         }
+        /// Sets the decoder's snapshot as the cursor, committed with the next commit.
+        pub(super) fn set_cursor(&mut self, cursor: &[u8]) -> Result<(), String> {
+            self.sink.set_cursor(cursor).map_err(|e| e.to_string())
+        }
         /// Commits the open group and verifies the member's checks (`Verdict::Ok` once every byte is known).
         pub(super) fn finish(self) -> Result<bool, String> {
             let path = self.path();
@@ -537,6 +571,10 @@ mod persistent {
             loop {
                 match file.poll_verify(&mut cx) {
                     Poll::Ready(Ok(Verdict::Ok { .. })) => return Ok(true),
+                    // every byte is there, but the archive records no check to judge it by
+                    Poll::Ready(Ok(Verdict::Incomplete { holes, missing_checks: true, .. })) if holes.is_empty() => {
+                        return Ok(true);
+                    }
                     Poll::Ready(Ok(other)) => {
                         eprintln!("partial {}: {other:?}", path.display());
                         return Ok(false);
@@ -559,26 +597,17 @@ mod persistent {
         }
     }
 
-    /// Whether `member` gets a persistent partial: a stored member of a RAR set without encrypted headers (plain or
-    /// AES for RAR 5.0, plain for RAR 4.x), as the persistent session path admitted. Other members write a plain
-    /// file.
-    pub(super) fn admits(map: &MemberMap, member: &zipfast::map::MapMember) -> bool {
-        use zipfast::map::{MapFormat, MapMethod};
-        let stored = member.method == MapMethod::Stored;
-        match map.format {
-            MapFormat::Rar5 => stored && !map.header_encrypted,
-            MapFormat::Rar4 => stored && !map.header_encrypted && !member.encrypted,
-            _ => false,
-        }
-    }
+    /// A member's sink and the cursor its partial holds (None when nothing was committed with one).
+    pub(super) type Reopened = (PartialSink, Option<Vec<u8>>);
 
-    /// Creates the persistent partials of the members `indices` and returns a sink for each, keyed by member index.
+    /// Creates (or after a restart finds) the persistent partials of the members `indices` and returns a sink for
+    /// each, keyed by member index, with the cursor its partial holds.
     pub(super) fn create(
         config: &Config,
         map: &MemberMap,
         indices: &[usize],
         dest: &Path,
-    ) -> Result<HashMap<usize, PartialSink>, String> {
+    ) -> Result<HashMap<usize, Reopened>, String> {
         let root = config.work.join("partial");
         for sub in ["state", "anchors"] {
             fs::create_dir_all(root.join(sub)).map_err(|e| e.to_string())?;
@@ -626,7 +655,8 @@ mod persistent {
         let mut sinks = HashMap::new();
         for &index in indices {
             let member = parts.open(map, index).map_err(|e| format!("member {index}: {e}"))?;
-            sinks.insert(index, PartialSink { sink: DirectSink::new(member.file) });
+            let cursor = member.file.cursor().map_err(|e| format!("member {index}: {e}"))?;
+            sinks.insert(index, (PartialSink { sink: DirectSink::new(member.file) }, cursor));
         }
         Ok(sinks)
     }
@@ -673,6 +703,18 @@ impl FeedSink for Sink {
 }
 
 impl Sink {
+    /// Persistent partials keep the decoder's snapshot with their output; plain files keep nothing.
+    fn set_cursor(&mut self, decoder: &FeedDecoder) -> Result<(), String> {
+        let _ = decoder;
+        match &mut self.out {
+            Out::File(_) => Ok(()),
+            #[cfg(feature = "persistent-partials")]
+            Out::Partial(p) => p.set_cursor(&decoder.snapshot().to_bytes()),
+        }
+    }
+    fn is_partial(&self) -> bool {
+        !matches!(self.out, Out::File(_))
+    }
     fn path(&self) -> PathBuf {
         match &self.out {
             Out::File(f) => f.path.clone(),
@@ -702,6 +744,10 @@ struct Member {
     decoder: FeedDecoder,
     sink: Sink,
     status: FeedStatus,
+    /// The decoder's counters when it was made (a restored decoder starts with its snapshot's).
+    base: zipfast::map::FeedStats,
+    /// Output bytes written when the cursor was last set.
+    cursor_at: u64,
 }
 
 // ---- The run ----
@@ -812,12 +858,8 @@ pub fn run(config: &Config) -> Result<Report, String> {
     let genesis = Instant::now();
     #[cfg(feature = "persistent-partials")]
     let mut partials = if config.sink != SinkKind::File {
-        let admitted: Vec<usize> = decoders
-            .iter()
-            .map(|(index, _, _)| *index)
-            .filter(|&index| persistent::admits(&map, &map.members[index]))
-            .collect();
-        persistent::create(config, &map, &admitted, &dest)?
+        let fed: Vec<usize> = decoders.iter().map(|(index, _, _)| *index).collect();
+        persistent::create(config, &map, &fed, &dest)?
     } else {
         HashMap::new()
     };
@@ -843,7 +885,7 @@ pub fn run(config: &Config) -> Result<Report, String> {
         let partial: Option<()> = None;
         let out = match partial {
             #[cfg(feature = "persistent-partials")]
-            Some(p) => {
+            Some((p, _)) => {
                 kinds.0 += 1;
                 Out::Partial(p)
             }
@@ -862,7 +904,8 @@ pub fn run(config: &Config) -> Result<Report, String> {
         };
         report.output_bytes += size;
         let sink = Sink { out, lost: Ranges::default(), refills: 0, refill_bytes: 0 };
-        members.push(Member { index, name, size, decoder, sink, status: FeedStatus::default() });
+        let base = decoder.stats();
+        members.push(Member { index, name, size, decoder, sink, status: FeedStatus::default(), base, cursor_at: 0 });
     }
     report.fed = members.len();
     report.sink = match kinds {
@@ -895,12 +938,26 @@ pub fn run(config: &Config) -> Result<Report, String> {
 
     // Run every member once before anything arrives: the first needs say where to start.
     let mut repair_run = false;
+    let mut restarted = false;
     loop {
+        if !restarted && config.restart_at.is_some_and(|at| report.deliveries >= at) {
+            restarted = true;
+            let began = Instant::now();
+            restart(config, &map, &mut members, &mut report, &dest_or_work(config))?;
+            source.buffer = ArticleBuffer::new(config.buffer_limit);
+            report.restart = began.elapsed();
+        }
         let run_start = Instant::now();
         for m in members.iter_mut().filter(|m| !m.status.done) {
             m.status = m.decoder.run(&mut source, &mut m.sink).map_err(|e| format!("member {}: {e}", m.index))?;
             for r in &m.status.lost {
                 m.sink.lost.insert(r.clone());
+            }
+            // The decoder's position, committed with the output it describes (set after the writes).
+            let written = m.decoder.stats().written;
+            if m.sink.is_partial() && (written != m.cursor_at || m.status.done) {
+                m.sink.set_cursor(&m.decoder)?;
+                m.cursor_at = written;
             }
             report.stalls += m.status.stalled as u64;
         }
@@ -912,6 +969,9 @@ pub fn run(config: &Config) -> Result<Report, String> {
         }
         // NeedBytes -> download priority -> the next delivery.
         let order = priority(members.iter().map(|m| &m.status), &articles);
+        if restarted {
+            report.refetched += network.refetch(&order);
+        }
         let rank: HashMap<usize, usize> = order.iter().enumerate().map(|(place, &a)| (a, place)).collect();
         let Some((event, picked)) = network.next(&rank) else {
             let stuck: Vec<_> = members.iter().filter(|m| !m.status.done).map(|m| (m.index, &m.status)).collect();
@@ -940,10 +1000,10 @@ pub fn run(config: &Config) -> Result<Report, String> {
     let mut outputs = Vec::new();
     for m in members {
         let stats = m.decoder.stats();
-        report.written += stats.written;
-        report.redecoded += stats.redecoded;
-        report.packed_read += stats.packed_read;
-        report.holes += stats.holes;
+        report.written += stats.written - m.base.written;
+        report.redecoded += stats.redecoded - m.base.redecoded;
+        report.packed_read += stats.packed_read - m.base.packed_read;
+        report.holes += stats.holes - m.base.holes;
         report.refills += m.sink.refills;
         report.refill_bytes += m.sink.refill_bytes;
         if m.status.crc_ok == Some(false) {
@@ -966,6 +1026,77 @@ pub fn run(config: &Config) -> Result<Report, String> {
         report.verified = Some(verify(config, &map, &outputs)?);
     }
     Ok(report)
+}
+
+/// Where persistent partials' outputs go.
+fn dest_or_work(config: &Config) -> PathBuf {
+    config.work.join("feed")
+}
+
+/// A simulated restart: every decoder and sink is dropped (as when the process ends; a partial's open group is
+/// committed when its last handle drops, its cursor with it), then the partials are found again and each decoder
+/// restored from the cursor its partial holds. Plain-file members have nothing durable: they start over.
+fn restart(
+    config: &Config,
+    map: &MemberMap,
+    members: &mut Vec<Member>,
+    report: &mut Report,
+    dest: &Path,
+) -> Result<(), String> {
+    let _ = (dest, &map);
+    let mut partial = Vec::new();
+    let mut old = Vec::new();
+    for m in members.drain(..) {
+        // the counters of the work done so far stay counted
+        let stats = m.decoder.stats();
+        report.written += stats.written - m.base.written;
+        report.redecoded += stats.redecoded - m.base.redecoded;
+        report.packed_read += stats.packed_read - m.base.packed_read;
+        report.holes += stats.holes - m.base.holes;
+        if m.sink.is_partial() {
+            partial.push(m.index);
+        }
+        let Member { index, name, size, sink, .. } = m;
+        let path = sink.path();
+        let is_partial = sink.is_partial();
+        let Sink { lost, refills, refill_bytes, out } = sink;
+        drop(out);
+        old.push((index, name, size, is_partial, path, lost, refills, refill_bytes));
+    }
+    #[cfg(feature = "persistent-partials")]
+    let mut reopened =
+        if partial.is_empty() { HashMap::new() } else { persistent::create(config, map, &partial, dest)? };
+    for (index, name, size, is_partial, path, lost, refills, refill_bytes) in old {
+        let options = FeedOptions { max_needs: config.max_needs, ..FeedOptions::new(config.password.as_deref()) };
+        let (out, decoder, lost) = if is_partial {
+            #[cfg(feature = "persistent-partials")]
+            {
+                let (sink, cursor) = reopened.remove(&index).ok_or("partial not found again")?;
+                let decoder = match cursor {
+                    Some(bytes) => {
+                        let snapshot = zipfast::map::FeedSnapshot::from_bytes(&bytes)
+                            .map_err(|e| format!("member {index}: {e}"))?;
+                        FeedDecoder::restore(map, index, options, &snapshot)
+                    }
+                    None => FeedDecoder::new(map, index, options),
+                }
+                .map_err(|e| format!("member {index}: restore: {e}"))?;
+                (Out::Partial(sink), decoder, lost)
+            }
+            #[cfg(not(feature = "persistent-partials"))]
+            unreachable!()
+        } else {
+            drop(lost);
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+            let decoder = FeedDecoder::new(map, index, options).map_err(|e| format!("member {index}: {e}"))?;
+            (Out::File(FileSink::create(path, size).map_err(|e| e.to_string())?), decoder, Ranges::default())
+        };
+        let base = decoder.stats();
+        let cursor_at = base.written;
+        let sink = Sink { out, lost, refills, refill_bytes };
+        members.push(Member { index, name, size, decoder, sink, status: FeedStatus::default(), base, cursor_at });
+    }
+    Ok(())
 }
 
 /// Extracts the set the ordinary way and compares every fed member's output with it, byte for byte.

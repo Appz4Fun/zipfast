@@ -220,7 +220,8 @@ old frontier without writing and goes on; repairs restart from their restart poi
 with `read_held` (`FeedError::HeldOutput` when the sink does not give it), decodes up to the old frontier without
 writing (counted in `redecoded`: at most the output since the last block boundary before the snapshot) and goes
 on; it never decodes from the member's start unless the snapshot was taken there. Persistent partials (`docs/persistent-partials.md`) remain the durable,
-journaled store for output; a snapshot is the decoder's position over it.
+journaled store for output; a snapshot is the decoder's position over it. Kept as a direct partial's cursor
+(`PartialFile::set_cursor`), it commits atomically with the output it describes.
 
 ## Live feed example
 
@@ -247,18 +248,25 @@ The simulation:
   `--drop-articles` names exactly which articles fail (indices over the whole set, volume by volume).
 - **Decoding.** After every delivery or failure, each member's `FeedDecoder` runs over the shared `ArticleBuffer`.
   Its `FeedStatus::needs` choose the next delivery (see below).
-- **Output.** With `persistent-partials`, each stored member of a RAR set without `-hp` (plain or AES for RAR 5.0,
-  plain for RAR 4.x) writes into a `PartialFile` that `DirectPartials` creates straight from the member map (see
-  `docs/persistent-partials.md`, "Partials from a member map"): born at full size with nothing written, no session
-  and no header read again. The decoder's `write_at` reaches it through a `DirectSink`, whose writes join the open
-  group commit; `read_held` gives back what the partial holds. Every member's handle stays open until its feed is
-  done; each holds about six descriptors, so the example sizes the limits with `PartialLimits::for_members` (the
-  defaults, 16 open partials and 64 files, run out at about ten members). RustyGet must do the same, or close and
-  reopen handles beyond the 4096 ceiling. Other members, or every member with `--sink file`, write a preallocated
-  plain file instead (`plain/member-NNNNN.out`, named by member index alone, synced once, not durable).
-  `--group-holes` and `--group-refills` set `PartialLimits::group_holes` and `group_refills`; the feed path records no
-  hole and calls no `refill_from_packed`, so neither changes anything here (lost output is just unknown output, and
-  repairs are plaintext writes, which join the group anyway). `genesis_ms` is the time to create the partials.
+- **Output.** With `persistent-partials`, every fed member, whatever its container and method (stored or compressed
+  RAR 5.0 and RAR 4.x, `-hp` sets, 7z Copy and LZMA2, encrypted or not), writes into a `PartialFile` that
+  `DirectPartials` creates straight from the member map (see `docs/persistent-partials.md`, "Partials from a member
+  map"): born at full size with nothing written, no session and no header read again. The decoder's `write_at`
+  reaches it through a `DirectSink`, whose writes join the open group commit; `read_held` gives back what the partial
+  holds. After every run that wrote something, the decoder's snapshot is set as the partial's cursor, which commits
+  with the output it describes. Every member's handle stays open until its feed is done; each holds about six
+  descriptors, so the example sizes the limits with `PartialLimits::for_members` (the defaults, 16 open partials and
+  64 files, run out at about ten members). RustyGet must do the same, or close and reopen handles beyond the 4096
+  ceiling. Without the feature, or with `--sink file`, members write a preallocated plain file instead
+  (`plain/member-NNNNN.out`, named by member index alone, synced once, not durable). `--group-holes` and
+  `--group-refills` set `PartialLimits::group_holes` and `group_refills`; the feed path records no hole and calls no
+  `refill_from_packed`, so neither changes anything here (lost output is just unknown output, and repairs are
+  plaintext writes, which join the group anyway). `genesis_ms` is the time to create the partials.
+- **Restart.** `--restart-at N` restarts the downloader after `N` deliveries: every decoder, sink and the article
+  buffer are dropped (each partial's open group and last cursor commit as its handle drops), the partials are found
+  again (`DirectOrigin::Adopted`), each decoder is restored from its partial's cursor, and the articles the decoders
+  need again (their `NeedBytes` over articles already delivered) are fetched again as repairs due now. Plain-file
+  members start over. `restart_ms` and `refetched` report the cost.
 - **Report.** stdout gets one tab-separated line per run (`--header` prints the column names first): wall time,
   MB/s, bytes written, `redecoded`, packed bytes read, holes met, repair writes (`refills`: writes into a range a
   status listed as lost) and their bytes, the
@@ -366,6 +374,12 @@ which the released bytes are asked for from the member's start and given again) 
 each byte written once, and `redecoded` is at most the frontier at the snapshot (0 to 164 KB on the fixtures). Solid
 successors are refused (`Solid`), an encrypted member without a password is `PasswordRequired`.
 
+Restarts (`tests/persistent_direct.rs`, see `docs/persistent-partials.md`): every container is fed into persistent
+partials, restarted part way and restored from each partial's cursor, and on the z-fixtures `live_feed --restart-at 15`
+and `30` finish exact on every set (F01-F12: RAR 5.0 stored, AES, `-hp`, `-m3`/`-m5`, 7z LZMA2, 7zAES, `-mhe`), with
+1 to 30 articles fetched again and 40-140 ms to reopen and restore. LZMA2 members restore at their restart point
+and decode up to the old frontier again (F07: 9-22 MB `redecoded`).
+
 `tests/live_feed.rs` runs the [live feed example](#live-feed-example)'s core on a generated stored RAR 5.0 set (a
 persistent partial with `persistent-partials`, a plain file without), the RAR 4.x volume fixture and the 7z volume
 fixture. Each is delivered out of order with a fifth of the articles dropped and repaired later, and checked
@@ -379,4 +393,5 @@ against a straight extraction. Also covered:
 - a 250-byte member name, and stored and compressed members whose names match the plain-file fallback's;
 - backslash names checked against the file the extraction wrote, whether it made `d/x` (Windows-made) or kept the
   backslash (Unix-made);
-- the need-to-article mapping and the priority order.
+- the need-to-article mapping and the priority order;
+- a restart part way (`restart_at`) on the stored RAR 5.0, RAR 4.x and 7z volume sets, with partials and plain files.

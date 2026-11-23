@@ -133,6 +133,11 @@ struct CoreData {
     /// An open group commit: its intent is anchored, and `snapshot` already holds the output written since, which
     /// the next commit makes durable.
     group: Option<Group>,
+    /// A cursor set with `set_cursor` that no commit has made durable yet: the next flush commits it, opening a
+    /// group for it when none is open.
+    cursor_pending: bool,
+    /// Charge of the cursor bytes held in `snapshot`.
+    cursor_lease: Option<Lease>,
 }
 /// A group of writes committed together. While it is open, `CoreData::state` is the anchored intent (the state
 /// before the group, conservatively), and `CoreData::snapshot` runs ahead of it with every grouped write: their
@@ -355,6 +360,7 @@ impl PartialCore {
             holes: Vec::new(),
             crypt,
             cipher: Vec::new(),
+            cursor: None,
         };
         // The genesis pages stay with the prepared core until it is created.
         let (pages, encoded) = state::encode_pages(&initial, &budget)?;
@@ -435,6 +441,10 @@ impl PartialCore {
                 data.state = candidate;
                 data.snapshot = snapshot;
                 data.uncertain = None;
+                // The rebuilt snapshot holds the cursor of the state the store holds; a newer one set since is
+                // dropped (set it again).
+                data.cursor_pending = false;
+                data.cursor_lease = None;
                 if let Some(prepared) = data.pending_compaction.take()
                     && ack.matches(prepared.state.anchor())
                 {
@@ -1456,6 +1466,13 @@ impl PartialCore {
     /// keeps the group open (the next operation tries again); an uncertain CAS leaves recovery to `reconcile`,
     /// which rebuilds the snapshot from whichever state the store holds.
     fn flush_group(&self, op: &mut CoreData) -> PartialResult<()> {
+        if op.group.is_none() {
+            if !op.cursor_pending {
+                return Ok(());
+            }
+            // A cursor alone: a group with no output carries it, one intent and one commit.
+            self.begin_group(op)?;
+        }
         let Some(group) = &op.group else { return Ok(()) };
         let mut intent = group.intent.clone();
         let result = (|| {
@@ -1516,6 +1533,7 @@ impl PartialCore {
             op.state = commit.clone();
             op.snapshot.head = head;
             op.uncertain = None;
+            op.cursor_pending = false;
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             tests::state::checkpoint("commit-cas");
             self.check(op).map_err(|mut e| {
@@ -1717,6 +1735,7 @@ impl PartialCore {
             data.state = transaction.commit;
             data.snapshot = transaction.valid;
             data.uncertain = None;
+            data.cursor_pending = false;
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             tests::state::checkpoint("commit-cas");
             self.check(data).map_err(|mut e| {
@@ -2440,6 +2459,30 @@ impl PartialCore {
         }
         Ok(held::held_from_snapshot(&op.snapshot, self.output_path().to_path_buf()))
     }
+    /// Sets a direct member's cursor: opaque bytes (a decoder snapshot) describing output written so far. They are
+    /// committed with the next commit (a group commit at its size or interval, or the next ordinary operation; when
+    /// no group is open, that operation commits one for the cursor alone), so a durable cursor never describes
+    /// output the durable state lacks, as long as it is set after the writes it describes.
+    pub(crate) fn set_cursor(&self, bytes: &[u8]) -> PartialResult<()> {
+        let mut op = self.operation()?;
+        if op.snapshot.evidence.direct.is_none() {
+            return Err(err(PartialErrorKind::UnsupportedMethod));
+        }
+        self.budget.limits.check(PartialResource::LedgerBytes, bytes.len() as u64)?;
+        if op.snapshot.cursor.as_deref() == Some(bytes) {
+            return Ok(());
+        }
+        let lease = self.budget.metadata_lease(bytes.len() as u64)?;
+        op.snapshot.cursor = Some(Arc::from(bytes));
+        op.cursor_lease = Some(lease);
+        op.cursor_pending = true;
+        Ok(())
+    }
+    /// The cursor as last set, or as the state this handle was opened with holds it.
+    pub(crate) fn cursor(&self) -> PartialResult<Option<Vec<u8>>> {
+        let op = self.operation()?;
+        Ok(op.snapshot.cursor.as_deref().map(<[u8]>::to_vec))
+    }
     /// Reads output known from `offset` on (written through this handle, committed or in the open group, or known
     /// from the durable state it was opened with) into `buf`: the contiguous run of known bytes from `offset`, at
     /// most `buf.len()`. Returns how many bytes were read, 0 when `offset` is not known.
@@ -2558,6 +2601,8 @@ impl PartialCore {
                 part_results: None,
                 reopened: true,
                 group: None,
+                cursor_pending: false,
+                cursor_lease: None,
             })),
             keys,
             keys_proven: AtomicBool::new(keys_proven),
@@ -2741,7 +2786,7 @@ impl Drop for PartialCore {
         }
         let data = self.data.get_mut().ok().and_then(Option::take);
         if let Some(mut data) = data
-            && data.group.is_some()
+            && (data.group.is_some() || data.cursor_pending)
         {
             let _ = self.flush_group(&mut data);
         }
@@ -2919,6 +2964,19 @@ impl PartialFile {
     pub fn state(&self) -> PartialResult<PartialState> {
         self.core.state()
     }
+    /// Sets a direct member's cursor ([`DirectPartials`]): opaque bytes, such as a `FeedSnapshot`, that describe
+    /// the output written so far. They become durable with the next commit, together with that output, and come
+    /// back from [`Self::cursor`] after a reopen. Set it after the writes it describes: the durable cursor then
+    /// never claims output the durable state lacks (the state may hold more, which a decoder restored from it
+    /// offers again; [`DirectSink`] skips known bytes). `UnsupportedMethod` for a session's member.
+    pub fn set_cursor(&mut self, bytes: &[u8]) -> PartialResult<()> {
+        self.core.set_cursor(bytes)
+    }
+    /// The cursor last set through this handle, or the one the state it was opened with holds: after a restart,
+    /// the cursor of the last commit.
+    pub fn cursor(&self) -> PartialResult<Option<Vec<u8>>> {
+        self.core.cursor()
+    }
     pub fn close(self) -> PartialResult<PartialState> {
         self.core.state()
     }
@@ -3043,6 +3101,8 @@ impl PreparedCreate {
                 part_results: None,
                 reopened: false,
                 group: None,
+                cursor_pending: false,
+                cursor_lease: None,
             })
         })()
         .map_err(|mut error: PartialError| {
