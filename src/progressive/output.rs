@@ -287,6 +287,8 @@ struct Root {
     flatten: bool,
     overwrite: crate::extract::Overwrite,
     protected: Vec<(PathBuf, Option<native::Identity>)>,
+    /// [`crate::extract::Options::fallback_mtime`]
+    fallback_mtime: Option<std::time::SystemTime>,
 }
 impl OutputContext {
     pub(crate) fn new(options: &ProgressiveOptions, usage: Usage, control: SessionControl) -> ProgressiveResult<Self> {
@@ -328,6 +330,7 @@ impl OutputContext {
                 identity,
                 flatten: options.extract.flatten,
                 overwrite: options.extract.overwrite,
+                fallback_mtime: options.extract.fallback_mtime,
                 protected,
             }),
             usage,

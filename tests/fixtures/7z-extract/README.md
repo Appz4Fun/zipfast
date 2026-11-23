@@ -26,6 +26,7 @@ The password of the encrypted ones is `password`.
 | `aes_copy.7z` | `text/tiny.txt`, 7zAES over Copy |
 | `split.7z.001` to `.003` | `noise/noise.bin` (10000 random bytes) and `text/tiny.txt`, LZMA2, split at 4 KiB (`-v4k`) |
 | `times.7z` | `a.txt`, made by hand (not by `gen.sh`) with `7zz a -mtc=on -mta=on -mx=1`: stores creation and access times |
+| `notime.7z` | `a.txt` (`alpha\n`), `d/`, `d/b.txt` (`bravo\n`), made by hand with 7-Zip 26.06 for Linux x86-64: `7z a -mtm=off -mtc=off -mta=off -mx=1 notime.7z a.txt d`, so no entry has a modification time (`7z l -slt` shows `Modified =` empty) |
 | `solid_wrongpw.7z` | `a.txt`, `b.txt`, `c.txt` in one solid LZMA2 + 7zAES folder, plain header, password `pw` |
 | `nonsolid_wrongpw.7z` | `a.txt`, `b.txt`, one LZMA2 + 7zAES folder each, plain header, password `pw` |
 | `mixed_wrongpw.7z` | `p.txt` in a plain LZMA2 folder, then `a.txt` in an LZMA2 + 7zAES folder (password `pw`) |
@@ -36,3 +37,6 @@ tests. `7z x -pwrong` on them prints `ERROR: Data Error in encrypted file. Wrong
 encrypted member (all three of the solid folder), writes no encrypted member, extracts `p.txt`, and exits 2.
 
 All entries carry the mtime 2020-01-02 03:04:05 (local time of the generating machine).
+
+`7z t -pwrong aes_copy.7z` prints `ERROR: CRC Failed in encrypted file. Wrong password? : text/tiny.txt` instead:
+its Copy folder decodes whatever the key, so only the CRC shows the wrong password (`EncryptedFailure::CrcFailed`).

@@ -78,6 +78,10 @@ fn run(archive: &Path, dest: &Path, overwrite: Overwrite, storage: StagedStorage
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     let overrides = EncryptedReadOverrides { staged_storage: storage, ..Default::default() };
     crate::zip::run_with_policy(
@@ -266,6 +270,10 @@ fn run_with_context_restores_the_stream_setting() {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     let mut context = EncryptedReadContext::new(Default::default()).unwrap();
     assert!(!context.options.stream_staged_aes);

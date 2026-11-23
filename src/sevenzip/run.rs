@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use super::coders::{self, Fault, Keys};
 use super::source::VolumeSet;
-use super::{SevenZipError, SevenZipLimits, check_bounds, member_name, open_map_keyed};
+use super::{EncryptedFailure, SevenZipError, SevenZipLimits, check_bounds, member_name, open_map_keyed};
 use crate::extract::{
     Cancellation, Checked, Dirs, LegacyMember, LegacyReport, Meta, Mode, Options, Overwrite, Place, RenameLog,
     RenamedOutput, Summary,
@@ -57,10 +57,6 @@ struct Staged {
 }
 
 /// The folder being decoded.
-/// The failure line of a member whose encrypted folder did not decrypt under the password (7-Zip: "Data Error in
-/// encrypted file. Wrong password?").
-const WRONG_PASSWORD: &str = "data error in encrypted file: wrong password?";
-
 struct Active {
     index: usize,
     reader: Box<dyn Read>,
@@ -69,9 +65,10 @@ struct Active {
     crc: crc32fast::Hasher,
     /// Why the rest of the folder cannot be decoded, once something failed.
     failed: Option<String>,
-    /// The failure is an encrypted folder that did not decrypt under the password: every member of it that is
-    /// taken fails as a wrong password, as 7-Zip reports each one ("Data Error in encrypted file. Wrong password?").
-    wrong_password: bool,
+    /// The failure is an encrypted folder that did not decrypt under the password, and how that showed: every member
+    /// of it that is taken fails as a wrong password the same way, as 7-Zip reports each one ("Data Error in
+    /// encrypted file. Wrong password?" or "CRC Failed in encrypted file. Wrong password?").
+    wrong_password: Option<EncryptedFailure>,
     /// Files held back for the folder's CRC: only for a folder of several members that stores one.
     staged: Vec<Staged>,
     /// Tested members held back for the folder's CRC in the same case: name and size.
@@ -409,6 +406,10 @@ pub(super) fn print(
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};
@@ -481,23 +482,26 @@ impl Run<'_> {
     }
 
     /// A member of an encrypted folder that did not decrypt under the given password: a line, and as its outcome
-    /// the typed [`SevenZipError::WrongPassword`] (`SevenZipError::of` finds it in the member's error).
-    fn fail_wrong_password(&mut self, ordinal: u64, name: &str) {
-        let line = format!("{name}: {WRONG_PASSWORD}");
+    /// the typed [`SevenZipError::WrongPassword`] with how it failed (`SevenZipError::of` finds it in the member's
+    /// error).
+    fn fail_wrong_password(&mut self, ordinal: u64, name: &str, failure: EncryptedFailure) {
+        let line = format!("{name}: {}", failure.line());
         self.report.line(&line);
         self.report.member(LegacyMember::Failed {
             ordinal,
             name,
-            error: crate::Error::from(SevenZipError::WrongPassword),
+            error: crate::Error::from(SevenZipError::WrongPassword { failure: Some(failure) }),
         });
         self.summary.errors.push(line);
     }
 
-    /// Marks the active folder as not decrypting under the password, and fails this member if it is taken.
-    fn wrong_password(&mut self, active: &mut Active, name: &str, take: bool) {
-        active.wrong_password = true;
+    /// Marks the active folder as not decrypting under the password (shown by `failure`), and fails this member if it
+    /// is taken.
+    fn wrong_password(&mut self, active: &mut Active, name: &str, take: bool, failure: EncryptedFailure) {
+        // the first sign decides: the rest of the folder fails the same way
+        let failure = *active.wrong_password.get_or_insert(failure);
         if active.failed.is_none() {
-            active.failed = Some(WRONG_PASSWORD.to_owned());
+            active.failed = Some(failure.line().to_owned());
         }
         // Earlier members held back for the folder's CRC (ones without a CRC of their own) failed too: report them
         // first, so the failures come in archive order. Their staged files are dropped, which removes them.
@@ -512,10 +516,10 @@ impl Run<'_> {
             let _ = self.store.release(&mut spool);
         }
         for (ordinal, held) in held {
-            self.fail_wrong_password(ordinal, &held);
+            self.fail_wrong_password(ordinal, &held, failure);
         }
         if take {
-            self.fail_wrong_password(self.current, name);
+            self.fail_wrong_password(self.current, name, failure);
         }
     }
 
@@ -636,7 +640,7 @@ impl Run<'_> {
                     self.fail(&name, why);
                     return Ok(());
                 }
-                self.summary.dir_meta.push((self.opts.dest.join(&rel), meta(member)));
+                self.summary.dir_meta.push((self.opts.dest.join(&rel), self.opts.meta(meta(member))));
             }
             self.summary.dirs += 1;
             self.report.member(LegacyMember::Succeeded { ordinal: self.current, name: &name, bytes: 0 });
@@ -644,7 +648,9 @@ impl Run<'_> {
         }
         if let Some(place) = place {
             let (temporary, output) = self.stage(&place, 0)?;
-            output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
+            output
+                .finish(|file| crate::extract::finish_file(file, &self.opts.meta(meta(member))))
+                .map_err(SevenZipError::Io)?;
             let link = is_link(member).then(|| rel.clone());
             if !self.publish(Staged {
                 temporary,
@@ -653,7 +659,7 @@ impl Run<'_> {
                 size: 0,
                 ordinal: self.current,
                 link,
-                modified: meta(member).modified(),
+                modified: self.opts.meta(meta(member)).modified(),
             })? {
                 return Ok(());
             }
@@ -735,7 +741,12 @@ impl Run<'_> {
         let complete = active.failed.is_none() && active.pos == folder.unpacked_size;
         let good = complete && folder.crc32.is_none_or(|crc| crc == active.crc.clone().finalize());
         // An encrypted folder whose own CRC fails before any data proved the password did not decrypt.
-        let wrong_password = active.wrong_password || (!good && folder.cipher.is_some() && !self.password_proven);
+        // a folder that decoded to its end and fails only its own CRC shows it as a CRC failure
+        let wrong_password = active.wrong_password.or_else(|| {
+            (!good && folder.cipher.is_some() && !self.password_proven).then(|| {
+                if active.failed.is_some() { EncryptedFailure::DataError } else { EncryptedFailure::CrcFailed }
+            })
+        });
         let staged = std::mem::take(&mut active.staged);
         let tested = std::mem::take(&mut active.tested);
         let held = std::mem::take(&mut active.held);
@@ -748,8 +759,8 @@ impl Run<'_> {
                 .collect();
             failed.sort_by_key(|(o, _)| *o);
             for (ordinal, name) in failed {
-                if wrong_password {
-                    self.fail_wrong_password(ordinal, name);
+                if let Some(failure) = wrong_password {
+                    self.fail_wrong_password(ordinal, name, failure);
                 } else {
                     self.fail_at(ordinal, name, &why);
                 }
@@ -787,7 +798,7 @@ impl Run<'_> {
             pos: 0,
             crc: crc32fast::Hasher::new(),
             failed: None,
-            wrong_password: false,
+            wrong_password: None,
             staged: Vec::new(),
             tested: Vec::new(),
             held: Vec::new(),
@@ -869,8 +880,8 @@ impl Run<'_> {
         let encrypted = member.encrypted;
         if let Some(why) = active.failed.clone() {
             if take {
-                if active.wrong_password {
-                    self.fail_wrong_password(self.current, name);
+                if let Some(failure) = active.wrong_password {
+                    self.fail_wrong_password(self.current, name, failure);
                 } else {
                     self.fail(name, &why);
                 }
@@ -934,7 +945,7 @@ impl Run<'_> {
             if encrypted && !self.password_proven {
                 // Decrypted garbage: the password does not open this folder. The rest of the folder fails the same
                 // way; the run goes on with the other folders.
-                self.wrong_password(active, name, take);
+                self.wrong_password(active, name, take, EncryptedFailure::CrcFailed);
                 return Ok(());
             }
             if take {
@@ -994,7 +1005,9 @@ impl Run<'_> {
             return Ok(());
         };
         let (temporary, output) = staged.take().expect("a staged output");
-        output.finish(|file| crate::extract::finish_file(file, &meta(member))).map_err(SevenZipError::Io)?;
+        output
+            .finish(|file| crate::extract::finish_file(file, &self.opts.meta(meta(member))))
+            .map_err(SevenZipError::Io)?;
         let link = is_link(member).then_some(rel);
         let staged = Staged {
             temporary,
@@ -1003,7 +1016,7 @@ impl Run<'_> {
             size,
             ordinal: self.current,
             link,
-            modified: meta(member).modified(),
+            modified: self.opts.meta(meta(member)).modified(),
         };
         if active.defer {
             active.staged.push(staged);
@@ -1026,7 +1039,7 @@ impl Run<'_> {
 
     fn data_failure(&mut self, active: &mut Active, name: &str, why: &str, encrypted: bool, take: bool) -> Outcome<()> {
         if encrypted && !self.password_proven {
-            self.wrong_password(active, name, take);
+            self.wrong_password(active, name, take, EncryptedFailure::DataError);
             return Ok(());
         }
         if active.failed.is_none() {

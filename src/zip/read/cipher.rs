@@ -417,7 +417,7 @@ fn aes_keys(
         derive_winzip_cancellable(password.as_bytes(), &salt[..key_len / 2], key_len, || io::canceled(Some(cancel)))?
             .ok_or(ReadFault::InvalidPlan)?;
     if !bool::from(keys[2 * key_len..2 * key_len + 2].ct_eq(&verifier)) {
-        return Err(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes });
+        return Err(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, seven_zip: None });
     }
     Ok(keys)
 }
@@ -567,7 +567,7 @@ impl<'a, 's> ZipCryptoInput<'a, 's> {
             if header[11]
                 != if descriptor { local_time_high } else { (plan.crc.ok_or(ReadFault::InvalidPlan)? >> 24) as u8 }
             {
-                return Err(ReadFault::PasswordCheckFailed { cipher: CipherKind::ZipCrypto });
+                return Err(ReadFault::PasswordCheckFailed { cipher: CipherKind::ZipCrypto, seven_zip: None });
             }
             Ok((cipher, remaining))
         })();

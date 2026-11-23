@@ -166,19 +166,45 @@ pub enum RunCategory {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ReadFault {
-    Directory { error: zip_container::DirectoryError },
+    Directory {
+        error: zip_container::DirectoryError,
+    },
     PasswordRequired,
-    PasswordCheckFailed { cipher: CipherKind },
+    /// The password failed its check. `seven_zip` is `None` for ZIP (and for 7z encrypted headers); for a 7z member
+    /// whose encrypted folder the password did not decrypt it says how it failed, as 7-Zip words it
+    /// ([`crate::sevenzip::EncryptedFailure`]).
+    PasswordCheckFailed {
+        cipher: CipherKind,
+        seven_zip: Option<crate::sevenzip::EncryptedFailure>,
+    },
     AuthenticationFailed,
-    Integrity { reason: IntegrityReason, password_evidence: PasswordEvidence },
-    Limit { resource: ReadResource, limit: u128, attempted: u128 },
-    Allocation { capacity: usize },
-    Io { stage: IoStage, operation: ReadIoOperation, offset: u64, error: io::Error },
+    Integrity {
+        reason: IntegrityReason,
+        password_evidence: PasswordEvidence,
+    },
+    Limit {
+        resource: ReadResource,
+        limit: u128,
+        attempted: u128,
+    },
+    Allocation {
+        capacity: usize,
+    },
+    Io {
+        stage: IoStage,
+        operation: ReadIoOperation,
+        offset: u64,
+        error: io::Error,
+    },
     UnsupportedCheckedFormat,
     UnsupportedIdentity,
     UnsupportedStorage,
-    UnsupportedMethod { method: u16 },
-    CheckedFormat { reason: &'static str },
+    UnsupportedMethod {
+        method: u16,
+    },
+    CheckedFormat {
+        reason: &'static str,
+    },
     InvalidPlan,
     CounterOverflow,
     Cancelled,

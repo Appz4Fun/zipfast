@@ -436,7 +436,7 @@ impl Guard {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
                 }
                 let name = header
-                    .output_name_as(selection.takes_versions())
+                    .output_name_as(selection.takes_versions().then_some(options.version_naming))
                     .unwrap_or(std::borrow::Cow::Borrowed(&header.name));
                 let relative = crate::path::sanitize_fallible(&name, !header.is_unix()).map_err(|e| match e {
                     crate::path::ProjectionError::Unsafe => {

@@ -1617,6 +1617,10 @@ fn rar4_leniency_stays_out_of_sessions_and_extraction() {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     // written under its private-use mapping
     let summary = zipfast::extract::run(&path, &options, |_| {}).unwrap();

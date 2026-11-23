@@ -120,6 +120,37 @@ pub enum SevenZipLimit {
     SpoolBytes,
 }
 
+/// How a member of an encrypted 7z folder failed under a password that was never proven right: the evidence that
+/// the password is wrong, which 7-Zip words differently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EncryptedFailure {
+    /// The decrypted data did not decode (a compressed folder: LZMA, LZMA2, PPMd, BZip2, Deflate): 7-Zip's
+    /// "Data Error in encrypted file. Wrong password?".
+    DataError,
+    /// The decrypted data decoded (a Copy folder, or a coder that took the garbage) but failed the member's or the
+    /// folder's CRC: 7-Zip's "CRC Failed in encrypted file. Wrong password?".
+    CrcFailed,
+}
+
+impl EncryptedFailure {
+    /// 7-Zip 26.06's message for it, as it prints it after `ERROR: ` and before ` : <name>`.
+    pub fn seven_zip_message(self) -> &'static str {
+        match self {
+            Self::DataError => "Data Error in encrypted file. Wrong password?",
+            Self::CrcFailed => "CRC Failed in encrypted file. Wrong password?",
+        }
+    }
+
+    /// The text of a member's line in [`Summary::errors`] after `<name>: `.
+    pub(crate) fn line(self) -> &'static str {
+        match self {
+            Self::DataError => "data error in encrypted file: wrong password?",
+            Self::CrcFailed => "CRC failed in encrypted file: wrong password?",
+        }
+    }
+}
+
 /// Why a 7z run stopped.
 ///
 /// Through [`crate::extract::run`] and friends it arrives inside the crate [`Error`]: see [`SevenZipError::of`].
@@ -131,10 +162,12 @@ pub enum SevenZipLimit {
 pub enum SevenZipError {
     /// Encrypted data or headers, and no password.
     PasswordRequired,
-    /// The password does not decrypt the headers, which stops the run; or, as a member's error, the member's
-    /// encrypted folder does not decode or fails its CRC before the password is proven (7z has no password check
-    /// value; 7-Zip says "Data Error in encrypted file. Wrong password?" in the same cases).
-    WrongPassword,
+    /// The password does not decrypt the headers, which stops the run (`failure: None`); or, as a member's error, the
+    /// member's encrypted folder does not decode or fails its CRC before the password is proven (7z has no password
+    /// check value), and `failure` says which, as 7-Zip's wording does: [`EncryptedFailure::DataError`] ("Data Error
+    /// in encrypted file. Wrong password?") or [`EncryptedFailure::CrcFailed`] ("CRC Failed in encrypted file. Wrong
+    /// password?").
+    WrongPassword { failure: Option<EncryptedFailure> },
     /// The [`Cancellation`] was triggered. Nothing in progress is published.
     Canceled,
     /// The archive asks for more than [`SevenZipLimits`] allows.
@@ -158,7 +191,8 @@ impl std::fmt::Display for SevenZipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PasswordRequired => f.write_str("7z: a password is required"),
-            Self::WrongPassword => f.write_str("7z: wrong password"),
+            Self::WrongPassword { failure: None } => f.write_str("7z: wrong password"),
+            Self::WrongPassword { failure: Some(failure) } => write!(f, "7z: {}", failure.line()),
             Self::Canceled => f.write_str("7z: canceled"),
             Self::Limit { limit, max, attempted } => write!(f, "7z limit {limit:?} exceeded ({attempted} > {max})"),
             Self::UnsupportedCoder { id } => write!(f, "7z coder {id:#x} is not supported"),
@@ -207,7 +241,7 @@ impl From<SevenZipError> for Error {
                 let SevenZipError::Io(io) = e else { unreachable!() };
                 return Error::Io(io);
             }
-            SevenZipError::WrongPassword => ErrorKind::PermissionDenied,
+            SevenZipError::WrongPassword { .. } => ErrorKind::PermissionDenied,
             SevenZipError::Canceled => ErrorKind::ConnectionAborted,
             SevenZipError::UnsupportedCoder { .. } | SevenZipError::Unsupported(_) => ErrorKind::Unsupported,
             SevenZipError::Limit { .. } => ErrorKind::InvalidInput,
@@ -228,8 +262,10 @@ pub(crate) fn sniff(head: &[u8]) -> bool {
 /// lines work as for the other formats' whole-archive runs; a rename is a report line as it is made and an entry in
 /// [`Summary::renames`]. A member that fails (a CRC mismatch, data that does not decode, an unsafe name) is a
 /// line in [`Summary::errors`] and is not published; the run goes on. So is a member whose encrypted folder the
-/// password does not decrypt (`<name>: data error in encrypted file: wrong password?`, each member of a solid folder,
-/// with [`SevenZipError::WrongPassword`] as its error), as 7-Zip reports each one. The run itself fails on a missing
+/// password does not decrypt (`<name>: data error in encrypted file: wrong password?` when its folder's data does not
+/// decode, `<name>: CRC failed in encrypted file: wrong password?` when it decodes but fails a CRC; each member of a
+/// solid folder, with [`SevenZipError::WrongPassword`] carrying the matching [`EncryptedFailure`] as its error), as
+/// 7-Zip reports each one. The run itself fails on a missing
 /// password, a wrong one for encrypted headers, a limit, an unsupported coder, cancellation, unreadable headers or
 /// volumes and output errors.
 pub fn run(
@@ -534,7 +570,7 @@ pub(crate) fn open_map_keyed(
     let key = builder.seven_zip_header_key().cloned();
     let map = map.map_err(|e| match e {
         MapError::PasswordRequired => SevenZipError::PasswordRequired,
-        MapError::WrongPassword => SevenZipError::WrongPassword,
+        MapError::WrongPassword => SevenZipError::WrongPassword { failure: None },
         MapError::Limit { resource: crate::progressive::Resource::Entries, limit: _, attempted } => {
             limit(SevenZipLimit::Entries, limits.entries, attempted)
         }
@@ -658,6 +694,10 @@ mod header_key_tests {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         };
         let whole = compressions(|| {
             let summary = run(first, &options, Some("password"), &cancel, &limits, |_| {}).unwrap();

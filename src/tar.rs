@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::extract::link::{self, Extracted, LinkKind};
 use crate::extract::{
-    Cancellation, Checked, Entry, LegacyMember, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin, Options,
-    Overwrite, Place, RenameLog, RunError, Summary, check_target, create_sparse_target, create_target, finish_dirs,
-    finish_file, make_member_dirs,
+    Cancellation, Checked, CompressedTar, Entry, LegacyMember, LegacyReport, ListingBudget, Meta, Mode, MtimeOrigin,
+    Options, Overwrite, Place, RenameLog, RunError, SpecialEntries, Summary, check_target, create_sparse_target,
+    create_target, finish_dirs, finish_file, make_member_dirs,
 };
 use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
@@ -114,7 +114,7 @@ pub fn list_wim_image(path: &Path, image: u32) -> Result<Vec<Entry>> {
     if !sniff_wim(&head[..n]) {
         return Err(Error::NotAnArchive);
     }
-    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None)?;
+    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None, false)?;
     reader.random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), image)?));
     list_members(reader)
 }
@@ -554,6 +554,19 @@ impl Member {
         Meta { mtime: self.mtime, nanos: self.nanos, mode: Some(self.mode) }
     }
 
+    /// A character or block device or a FIFO, which [`SpecialEntries::EmptyFile`] writes as an empty file.
+    fn is_special(&self) -> bool {
+        matches!(self.kind, Kind::Other(b'3' | b'4' | b'6'))
+    }
+
+    /// Turns a device or FIFO member into an empty regular file. Its data, if the header claims any, stays unread
+    /// and is passed over with the padding.
+    fn as_empty_file(&mut self) {
+        self.kind = Kind::File;
+        self.size = 0;
+        self.sparse = None;
+    }
+
     /// The length of the file the member makes: its sparse size, or its stored size.
     fn real_size(&self) -> u64 {
         self.sparse.as_ref().map_or(self.size, |s| s.real_size)
@@ -778,6 +791,7 @@ impl Reader {
         threads: usize,
         limit: Option<u64>,
         cancel: Option<Cancellation>,
+        whole: bool,
     ) -> Result<Reader> {
         let mut src = Source::open(path, threads, limit, cancel)?;
         let mut first = vec![0u8; BLOCK];
@@ -786,7 +800,11 @@ impl Reader {
         let mut cpio = None;
         let mut random: Option<Box<dyn RandomAccess>> = None;
         let plain = matches!(src, Source::Plain { .. });
-        let mut content = if n == BLOCK && checksum_ok(&first) {
+        // CompressedTar::Whole: whatever is inside a compression layer is one file, as 7-Zip reads it
+        let whole = whole && src.codec().is_some();
+        let mut content = if whole {
+            Some(Content::Single)
+        } else if n == BLOCK && checksum_ok(&first) {
             Some(Content::Tar)
         } else if plain && sniff_xar(&first) {
             // xar data is read where the table of contents puts it, from the file itself
@@ -813,7 +831,7 @@ impl Reader {
         } else {
             None
         };
-        if n == BLOCK && cpio.is_none() && random.is_none() && zero(&first) {
+        if !whole && n == BLOCK && cpio.is_none() && random.is_none() && zero(&first) {
             // an empty archive is zero blocks and nothing else; a compressed file that only starts with zeros is
             // a file
             first.resize(EMPTY_MAX + 1, 0);
@@ -1226,8 +1244,18 @@ pub(crate) struct Selected {
 }
 
 impl Selected {
-    pub(crate) fn open(path: &Path, index: usize, limit: u64, cancel: Cancellation) -> Result<Self> {
-        let mut reader = Reader::open_with_limit(path, 1, Some(limit), Some(cancel))?;
+    /// Opens member `index` (as [`list_with_options`] numbers them under `compressed`); `special` decides whether a
+    /// device or FIFO member opens as an empty file or is refused.
+    pub(crate) fn open(
+        path: &Path,
+        index: usize,
+        limit: u64,
+        cancel: Cancellation,
+        special: SpecialEntries,
+        compressed: CompressedTar,
+    ) -> Result<Self> {
+        let whole = compressed == CompressedTar::Whole;
+        let mut reader = Reader::open_with_limit(path, 1, Some(limit), Some(cancel), whole)?;
         if matches!(reader.content, Content::Single) {
             let codec = reader.src.codec().ok_or(Error::NotAnArchive)?;
             if index == 0 {
@@ -1246,8 +1274,13 @@ impl Selected {
                     continue;
                 }
                 if current == index {
+                    let mut member = member;
                     if member.kind != Kind::File {
-                        return Err(Error::Unsupported("the selected tar member is not a regular file".into()));
+                        if !(special == SpecialEntries::EmptyFile && member.is_special()) {
+                            return Err(Error::Unsupported("the selected tar member is not a regular file".into()));
+                        }
+                        // read as an empty file: any data the header claims is passed over
+                        member.as_empty_file();
                     }
                     // a sparse member counts at its full size: its holes come out as zeros
                     if member.real_size() > limit {
@@ -1351,7 +1384,18 @@ fn single_fallback(codec: Codec, path: &Path, clean: &dyn Fn(&str) -> Option<Str
 /// The archive's members. A lone compressed file is decoded to find its size: the gzip trailer holds only the
 /// last member's size, and only below 4 GiB, and other formats may not record it at all.
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
-    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None)?;
+    list_reading(path, false)
+}
+
+/// [`list`], numbering entries as [`run`] and [`crate::extract::SelectedEntry`] with the same `options` do: with
+/// [`CompressedTar::Whole`](crate::extract::CompressedTar::Whole) a compressed tar is the one entry its decompressed
+/// stream makes (`pax.tgz` lists `pax.tar`), as 7-Zip lists it.
+pub fn list_with_options(path: &Path, options: &Options) -> Result<Vec<Entry>> {
+    list_reading(path, options.compressed_tar == CompressedTar::Whole)
+}
+
+fn list_reading(path: &Path, whole: bool) -> Result<Vec<Entry>> {
+    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None, whole)?;
     if let (Content::Single, Some(codec)) = (&reader.content, reader.src.codec()) {
         let gzip = codec == Codec::Gzip;
         let packed = std::fs::metadata(path)?.len();
@@ -1459,7 +1503,8 @@ pub(crate) fn run_reporting_cancelable(
     report: &mut impl LegacyReport,
 ) -> std::result::Result<Summary, RunError> {
     let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    let mut reader = Reader::open_with_limit(path, threads, None, cancel.cloned())?;
+    let whole = opts.compressed_tar == CompressedTar::Whole;
+    let mut reader = Reader::open_with_limit(path, threads, None, cancel.cloned(), whole)?;
     let opts = &*opts.protecting(path)?;
     if opts.mode == Mode::Extract {
         std::fs::create_dir_all(&opts.dest).map_err(Error::from)?;
@@ -1856,7 +1901,7 @@ fn run_tar(
     let mut ordinal = 0u64;
     let mut holes = HoleBudget::new();
     loop {
-        let m = match reader.next() {
+        let mut m = match reader.next() {
             Ok(Some(m)) => m,
             Ok(None) => {
                 // compressed streams check their data at the end, which may lie past the end marker
@@ -1915,7 +1960,7 @@ fn run_tar(
                 if opts.mode == Mode::Extract && !opts.flatten {
                     if let Some(staged) = &mut staged {
                         staged.budget.record(&m.name)?;
-                        let meta = m.meta();
+                        let meta = opts.meta(m.meta());
                         staged.members.push(StagedMember::Directory {
                             relative: rel,
                             meta,
@@ -1928,7 +1973,7 @@ fn run_tar(
                         fail_member(summary, report, position, &m.name, why, Error::UnsafePath(m.name.clone()));
                         continue;
                     }
-                    summary.dir_meta.push((opts.dest.join(&rel), m.meta()));
+                    summary.dir_meta.push((opts.dest.join(&rel), opts.meta(m.meta())));
                 }
                 folder(summary, report, position, &m.name);
                 continue;
@@ -1951,7 +1996,7 @@ fn run_tar(
                 };
                 if let Some(staged) = &mut staged {
                     staged.budget.record(&m.name)?;
-                    let meta = m.meta();
+                    let meta = opts.meta(m.meta());
                     staged.members.push(StagedMember::Link {
                         relative: rel,
                         name: m.name,
@@ -1960,7 +2005,7 @@ fn run_tar(
                         meta,
                     });
                 } else {
-                    let member = (position, m.name.as_str(), &m.meta());
+                    let member = (position, m.name.as_str(), &opts.meta(m.meta()));
                     link_member(opts, &rel, member, &kind, (&mut extracted, &mut holes), summary, report)?;
                 }
                 continue;
@@ -1968,6 +2013,11 @@ fn run_tar(
             Kind::Other(b'V') => continue,
             Kind::Other(b'S') => Some("an old GNU sparse member in a ustar header is not understood"),
             Kind::Other(b'M') => Some("multi-volume tar archives are not supported yet"),
+            Kind::Other(_) if opts.special_entries == SpecialEntries::EmptyFile && m.is_special() => {
+                // 7-Zip's choice: an empty regular file with the member's mode and time
+                m.as_empty_file();
+                None
+            }
             Kind::Other(_) => Some("devices and pipes are not extracted"),
         };
         if let Some(why) = why {
@@ -1990,7 +2040,7 @@ fn run_tar(
                 crate::output::mark_sparse(&file);
             }
             let output = Output::new(file, Some(m.real_size()));
-            match copy_out(Some(output), &m.meta(), |sink| reader.read_member(&m, buf, sink))? {
+            match copy_out(Some(output), &opts.meta(m.meta()), |sink| reader.read_member(&m, buf, sink))? {
                 Outcome::Done => {
                     let (size, holes) = (m.real_size(), m.real_size() - m.size);
                     let name = m.name;
@@ -2033,7 +2083,7 @@ fn run_tar(
             Some((out, landed)) => (Some(out), Some(landed)),
             None => (None, None),
         };
-        match copy_out(out, &m.meta(), |sink| reader.read_member(&m, buf, sink))? {
+        match copy_out(out, &opts.meta(m.meta()), |sink| reader.read_member(&m, buf, sink))? {
             Outcome::Done => {
                 match &landed {
                     Some(landed) => {
@@ -2112,7 +2162,7 @@ pub(crate) fn walk_members(
     limit: u64,
     mut each: impl FnMut(RawMember, RepackData<'_>) -> Result<()>,
 ) -> Result<u64> {
-    let mut reader = Reader::open_with_limit(path, 1, Some(limit), None)?;
+    let mut reader = Reader::open_with_limit(path, 1, Some(limit), None, false)?;
     if matches!(reader.content, Content::Single) {
         return Err(Error::NotAnArchive);
     }
@@ -2263,6 +2313,10 @@ mod tests {
                 parallel_min: None,
                 select: None,
                 windows_safe_names: false,
+                special_entries: Default::default(),
+                fallback_mtime: None,
+                compressed_tar: Default::default(),
+                version_naming: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);

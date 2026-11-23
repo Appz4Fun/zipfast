@@ -142,7 +142,9 @@ following links, a link at a target or in the way is refused, and protected path
   everything inside them is written.
 - Anti items (deletion markers of update archives) are skipped: the member map does not list them, and nothing is
   ever deleted.
-- `mtime` is restored. Attributes with the Unix extension bit (`0x8000`) give the permission bits of the high 16
+- `mtime` is restored. A member without an `MTime` property lists `mtime: None` and is written with
+  `Options::fallback_mtime` when one is given (7-Zip uses the archive file's mtime), else left with the time it was
+  written at. Attributes with the Unix extension bit (`0x8000`) give the permission bits of the high 16
   bits (`mode & 0o777`; set-id and sticky bits are dropped). An entry whose Unix file type is a symbolic link is
   reported (`links are not supported yet`) and not written; devices and pipes likewise. Windows attribute bits
   without the Unix extension are listed (`Entry::attributes`) but not applied.
@@ -153,10 +155,14 @@ Data encryption and encrypted headers (`-mhe`) are both read. 7z stores no passw
 does, a wrong password is recognised by its effect: for encrypted headers, a header that does not decode; for
 encrypted data, an encrypted folder failing to decode or failing its CRC before the password is proven.
 Encrypted headers that do not decode stop the run with `SevenZipError::WrongPassword`: nothing can be listed.
-With data-only encryption, as 7-Zip does ("Data Error in encrypted file. Wrong password? : <name>"), each member
-of such a folder fails on its own (every member of a solid folder, in archive order): a
-`<name>: data error in encrypted file: wrong password?` line in `Summary::errors`, `SevenZipError::WrongPassword`
-as the member's error (`ReadFault::PasswordCheckFailed` on the checked dispatcher), and nothing published for it.
+With data-only encryption, as 7-Zip does ("Data Error in encrypted file. Wrong password? : <name>" when the folder's
+data does not decode, "CRC Failed in encrypted file. Wrong password? : <name>" when it decodes, as a Copy folder
+does, but fails a CRC), each member of such a folder fails on its own (every member of a solid folder, in archive
+order): a `<name>: data error in encrypted file: wrong password?` or `<name>: CRC failed in encrypted file: wrong
+password?` line in `Summary::errors`, `SevenZipError::WrongPassword { failure: Some(..) }` as the member's error,
+with `EncryptedFailure::DataError` or `EncryptedFailure::CrcFailed` (`ReadFault::PasswordCheckFailed { seven_zip:
+Some(..), .. }` on the checked dispatcher), and nothing published for it. The first sign in a folder decides for all
+of its members. See [compatibility options](compat-options.md#7z-wrong-passwords-how-the-member-failed).
 The run goes on with the other folders, so plain folders still extract. The run ends `Ok` with these failures in
 its summary (the `zipfast` command then exits 1, as for any failed member; 7-Zip exits 2).
 
@@ -170,7 +176,7 @@ Key derivation accepts `NumCyclesPower` up to 24 (7-Zip's own limit) for headers
 | failure | `extract::run*` | `extract::run_with_zip_policy` |
 |---|---|---|
 | no password | `Error::Encrypted` ("encrypted: a password is required, or the one given is wrong") | `ReadFault::PasswordRequired` |
-| wrong password | `Error::Io` (kind `PermissionDenied`) carrying `SevenZipError::WrongPassword` | `ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes }` |
+| wrong password | `Error::Io` (kind `PermissionDenied`) carrying `SevenZipError::WrongPassword { failure }` (`None` for encrypted headers) | `ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, seven_zip: failure }` |
 | canceled | `Error::Io` (kind `ConnectionAborted`) carrying `SevenZipError::Canceled` | `ReadFault::Cancelled` |
 | anything else | as below | `ReadFault::Legacy(..)` with the same `Error` |
 

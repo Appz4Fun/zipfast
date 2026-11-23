@@ -237,6 +237,14 @@ hold the linked file, and reports a link it had to leave behind.
 
 `Overwrite` is now `#[non_exhaustive]`. Code that matched `Skip` and `Always` exhaustively needs a wildcard arm.
 
+### Library: 7-Zip and UnRAR compatibility options
+
+`Options::special_entries` (tar devices and FIFOs as empty files), `Options::fallback_mtime` (a time for entries that
+record none), `Options::compressed_tar` (`.tgz` and the like as one `.tar`) and `Options::version_naming` (RAR 5.0
+revisions as `[VER]/N/name`) give 7-Zip's or UnRAR's behaviour where zipfast's default differs, and a 7z member's
+wrong-password error says whether its data failed to decode or failed its CRC. See
+[compatibility options](docs/compat-options.md).
+
 ### Library: listing metadata
 
 `extract::list` and `list_with_password` return one `extract::Entry` per member: `name`, `size`, `packed`, `mtime`,

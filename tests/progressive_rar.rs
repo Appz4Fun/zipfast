@@ -145,6 +145,10 @@ fn options(dir: &std::path::Path) -> ProgressiveOptions {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         },
         OsString::from("a.part01.rar"),
     )
@@ -1477,6 +1481,26 @@ fn task4b_policy_directory_and_file_metadata() {
     assert_eq!(file.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), 1_700_000_000);
     assert_eq!(std::fs::metadata(tmp.path().join("dir")).unwrap().permissions().mode() & 0o777, 0o500);
     std::fs::set_permissions(tmp.path().join("dir"), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+/// `Options::fallback_mtime` dates a file and a folder whose headers record no time; a recorded time is kept.
+#[test]
+fn task4b_policy_fallback_mtime_for_members_without_a_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let specs = [
+        FileSpec { dir: true, mtime: None, unix_mode: Some(0o755), ..FileSpec::new("dir", b"") },
+        FileSpec { mtime: None, ..FileSpec::new("dir/file", b"payload") },
+        FileSpec::new("timed", b"t"),
+    ];
+    let mut o = options(tmp.path());
+    o.extract.fallback_mtime = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890));
+    assert_eq!(policy_run(archive(&specs), o).len(), 3);
+    let secs = |name: &str| {
+        let modified = std::fs::metadata(tmp.path().join(name)).unwrap().modified().unwrap();
+        modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    };
+    assert_eq!(secs("dir/file"), 1_234_567_890);
+    assert_eq!(secs("dir"), 1_234_567_890);
+    assert_eq!(secs("timed"), 1_700_000_000);
 }
 #[test]
 fn task4b_policy_solid_history_survives_skipped_predecessor() {

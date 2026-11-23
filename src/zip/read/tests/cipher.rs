@@ -209,7 +209,7 @@ fn framing_password_tamper_and_zero_plaintext_on_rejection() {
             if mutation <= 3 {
                 assert!(matches!(
                     error.operation(),
-                    Some(ReadFault::PasswordRequired | ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes })
+                    Some(ReadFault::PasswordRequired | ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, .. })
                 ));
                 assert_eq!(ledger.with_state(|s| s.encrypted.usage.create_attempts), 0);
             }
@@ -726,11 +726,11 @@ fn source_final_admission_stops_auth_password_and_header_rejections() {
                 0 => assert!(matches!(error.operation(), Some(ReadFault::AuthenticationFailed))),
                 1 => assert!(matches!(
                     error.operation(),
-                    Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes })
+                    Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, .. })
                 )),
                 _ => assert!(matches!(
                     error.operation(),
-                    Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::ZipCrypto })
+                    Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::ZipCrypto, .. })
                 )),
             }
             assert_eq!(error.cleanup_errors().len(), 1, "earlier={earlier} admission={admission} must stop");

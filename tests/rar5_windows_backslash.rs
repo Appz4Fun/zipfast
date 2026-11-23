@@ -20,6 +20,10 @@ fn extract_to(bytes: &[u8], dir: &std::path::Path) -> Vec<String> {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     extract::run_with_password(&rar, &options, None, |_| {}).unwrap();
     let mut names: Vec<String> =

@@ -1138,7 +1138,7 @@ pub(crate) fn run_renaming(
                         fail(&mut summary, &mut report, &e.name, why);
                         continue;
                     }
-                    summary.dir_meta.push((opts.dest.join(&rel), e.meta()));
+                    summary.dir_meta.push((opts.dest.join(&rel), opts.meta(e.meta())));
                 }
                 summary.dirs += 1;
                 continue;
@@ -1223,7 +1223,7 @@ pub(crate) fn run_renaming(
                         &rel,
                         place,
                         &kind,
-                        e.meta().modified(),
+                        opts.meta(e.meta()).modified(),
                         &mut extracted,
                     ) {
                         if let Some(why) = crate::extract::link::member_failure(&io) {
@@ -1280,7 +1280,7 @@ pub(crate) fn run_renaming(
             match read {
                 Ok(()) => {
                     if let Some(out) = target
-                        && let Err(io) = out.finish(|file| finish_file(file, &e.meta()))
+                        && let Err(io) = out.finish(|file| finish_file(file, &opts.meta(e.meta())))
                     {
                         finish_dirs(&mut summary);
                         return Err(Error::Io(io));
