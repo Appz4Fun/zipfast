@@ -465,3 +465,263 @@ fn snapshots_bind_to_their_member_and_empty_keyed_members_verify() {
     let decoder = FeedDecoder::new(&map, 0, FeedOptions::new(Some("pw"))).unwrap();
     assert_eq!((decoder.status().done, decoder.status().crc_ok), (true, Some(true)));
 }
+// ---- Compressed RAR 5.0 ----
+
+/// Literal-rich content (random runs and repeats of them), as video is: the restart search pins blocks by their
+/// literals.
+fn video_like(len: usize, seed: u64) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(len + 512);
+    let mut x = seed | 1;
+    while plain.len() < len {
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            plain.push(x as u8);
+        }
+        let back = plain.len() - 1_000.min(plain.len());
+        let repeat = plain[back..back + 200.min(plain.len() - back)].to_vec();
+        plain.extend(repeat);
+    }
+    plain.truncate(len);
+    plain
+}
+
+/// One compressed (method 3) RAR 5.0 member holding `plain`, AES-encrypted with password "pw" when `encrypted`,
+/// cut into volumes of at most `chunk` packed bytes.
+fn rar5_compressed(plain: &[u8], encrypted: bool, chunk: usize) -> Vec<Vec<u8>> {
+    use zipfast::rar5::testenc;
+    let mut data = testenc::tuned_stream(&testenc::lz(plain, 1 << 17, 16), 2_000);
+    let mut crc = crc32fast::hash(plain);
+    let mut extra = Vec::new();
+    if encrypted {
+        let (key, hash_key) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap();
+        data.resize(data.len().div_ceil(16) * 16, 0);
+        data = zipfast::crypto::encrypt_cbc(&key, &IV, &data).unwrap();
+        extra = vec![36, 1, 0, 2, 1];
+        extra.extend(SALT);
+        extra.extend(IV);
+        crc = zipfast::crypto::rar5_tweak_crc32(crc, &hash_key);
+    }
+    let mut spec = FileSpec::new("c.bin", &data);
+    spec.method = 3;
+    spec.size = Some(plain.len() as u64);
+    spec.extra = extra;
+    let parts: Vec<&[u8]> = data.chunks(chunk).collect();
+    let n = parts.len();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let last = i + 1 == n;
+            let mut bytes = SIG.to_vec();
+            bytes.extend(main_block(true, if i == 0 { None } else { Some(i as u64) }));
+            let part_crc = if last {
+                crc
+            } else if encrypted {
+                let (_, hash_key) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap();
+                zipfast::crypto::rar5_tweak_crc32(crc32fast::hash(part), &hash_key)
+            } else {
+                crc32fast::hash(part)
+            };
+            bytes.extend(file_block(&spec, part, part_crc, i > 0, !last));
+            bytes.extend(end_block(!last));
+            bytes
+        })
+        .collect()
+}
+
+/// A sink that writes each byte once, reads back what it wrote, and holds a donor: plaintext known from another
+/// copy, read back where nothing was written.
+#[derive(Default)]
+struct Held {
+    out: Vec<u8>,
+    seen: Vec<bool>,
+    donor: Vec<u8>,
+}
+
+impl FeedSink for Held {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        let end = offset as usize + bytes.len();
+        if self.seen.len() < end {
+            self.seen.resize(end, false);
+        }
+        assert!(self.seen[offset as usize..end].iter().all(|s| !s), "output {offset}..{end} written twice");
+        self.seen[offset as usize..end].iter_mut().for_each(|s| *s = true);
+        self.out.write_at(offset, bytes)
+    }
+
+    fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut n = 0;
+        for (i, b) in buf.iter_mut().enumerate() {
+            let at = offset as usize + i;
+            if self.seen.get(at).copied().unwrap_or(false) {
+                *b = self.out[at];
+            } else if let Some(&d) = self.donor.get(at) {
+                *b = d;
+            } else {
+                break;
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+/// An article: volume, offset and bytes.
+type Article = (u32, u64, Vec<u8>);
+
+struct Feed {
+    map: MemberMap,
+    plain: Vec<u8>,
+    password: Option<&'static str>,
+    present: Vec<Article>,
+    missing: Vec<Article>,
+}
+
+fn compressed_feed(encrypted: bool, missing_every: usize, seed: u64) -> (Feed, Vec<Vec<u8>>) {
+    let plain = video_like(600_000, seed);
+    let volumes = rar5_compressed(&plain, encrypted, 150_000);
+    let password = encrypted.then_some("pw");
+    let map = MemberMap::from_memory(&refs(&volumes), "c.part1.rar", password).unwrap();
+    assert!(matches!(map.members[0].method, MapMethod::Compressed { .. }));
+    let mut all = articles(&volumes, 7_000);
+    shuffle(&mut all, seed);
+    let (missing, present): (Vec<_>, Vec<_>) =
+        all.into_iter().enumerate().partition(|(i, _)| missing_every > 0 && i % missing_every == missing_every / 2);
+    let strip = |v: Vec<(usize, Article)>| v.into_iter().map(|(_, a)| a).collect();
+    (Feed { map, plain, password, present: strip(present), missing: strip(missing) }, volumes)
+}
+
+fn missing_data(feed: &Feed) -> Vec<(u32, Range<u64>)> {
+    let m = &feed.map.members[0];
+    merge(
+        feed.missing
+            .iter()
+            .flat_map(|(v, off, b)| {
+                m.pieces.iter().filter(move |p| p.volume == *v).filter_map(move |p| {
+                    let (s, e) = ((*off).max(p.packed.start), (off + b.len() as u64).min(p.packed.end));
+                    (s < e).then_some((*v, s..e))
+                })
+            })
+            .collect(),
+    )
+}
+
+fn within(needs: &[NeedBytes], ranges: &[(u32, Range<u64>)]) -> bool {
+    needs.iter().all(|n| ranges.iter().any(|(v, r)| *v == n.volume && r.start <= n.range.start && n.range.end <= r.end))
+}
+
+#[test]
+fn compressed_without_held_output_waits_at_holes_and_never_decodes_twice() {
+    for encrypted in [false, true] {
+        let (feed, _) = compressed_feed(encrypted, 6, 11);
+        let mut decoder = FeedDecoder::new(&feed.map, 0, all_needs(feed.password)).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        for (v, off, b) in &feed.missing {
+            source.mark_lost(*v, *off..*off + b.len() as u64);
+        }
+        let mut sink = Held::default();
+        for (v, off, b) in &feed.present {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        let status = decoder.status().clone();
+        let holes = missing_data(&feed);
+        assert!(status.stalled && !status.done, "{status:?}");
+        assert_eq!(status.needs[0].kind, NeedKind::Next);
+        // the hole it waits at is the first missing article after the frontier, exactly
+        assert!(holes.iter().any(|(v, r)| *v == status.needs[0].volume && *r == status.needs[0].range), "{status:?}");
+        assert!(within(&status.needs[..1], &holes));
+        assert!(status.lost.is_empty());
+        assert_eq!(sink.out, feed.plain[..status.frontier as usize]);
+        for (v, off, b) in &feed.missing {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        let status = decoder.status().clone();
+        assert!(status.done && status.crc_ok == Some(true), "{status:?}");
+        assert_eq!(sink.out, feed.plain);
+        let stats = decoder.stats();
+        assert_eq!((stats.written, stats.redecoded), (feed.plain.len() as u64, 0));
+    }
+}
+
+#[test]
+fn compressed_holes_are_skipped_with_held_output_and_repaired_from_a_checkpoint() {
+    for encrypted in [false, true] {
+        let (feed, _) = compressed_feed(encrypted, 9, 12);
+        let mut decoder = FeedDecoder::new(&feed.map, 0, all_needs(feed.password)).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        for (v, off, b) in &feed.missing {
+            source.mark_lost(*v, *off..*off + b.len() as u64);
+        }
+        // another copy's output is held (a twin), but only where nothing is written: every byte written comes from
+        // this copy's packed bytes
+        let from = 0;
+        let mut sink = Held { donor: vec![0; from], ..Held::default() };
+        sink.donor.extend_from_slice(&feed.plain[from..]);
+        for (v, off, b) in &feed.present {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        let status = decoder.status().clone();
+        let holes = missing_data(&feed);
+        // the main decode got past every hole it met after the held output starts
+        assert!(decoder.stats().holes > 0, "{status:?}");
+        assert!(!status.lost.is_empty());
+        assert!(status.lost.iter().all(|r| r.start as usize >= from), "{:?}", status.lost);
+        assert!(within(&status.needs, &holes), "{:?} vs {holes:?}", status.needs);
+        for (i, w) in sink.seen.iter().enumerate() {
+            if *w {
+                assert_eq!(sink.out[i], feed.plain[i], "byte {i}");
+            }
+        }
+        for (v, off, b) in &feed.missing {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        let status = decoder.status().clone();
+        assert!(status.done && status.crc_ok == Some(true), "{status:?}");
+        assert!(sink.seen.iter().all(|s| *s));
+        assert_eq!(sink.out, feed.plain);
+        let stats = decoder.stats();
+        assert_eq!(stats.written, feed.plain.len() as u64);
+        // repairs re-decode from the checkpoint before each hole, not from the start
+        assert!(stats.redecoded < feed.plain.len() as u64 / 4, "{stats:?}");
+        eprintln!("encrypted {encrypted}: {stats:?}");
+    }
+}
+
+#[test]
+fn a_compressed_snapshot_resumes_from_its_checkpoint() {
+    for encrypted in [false, true] {
+        let plain = video_like(600_000, 13);
+        let volumes = rar5_compressed(&plain, encrypted, 1 << 20);
+        let password = encrypted.then_some("pw");
+        let map = MemberMap::from_memory(&refs(&volumes), "c.rar", password).unwrap();
+        let mut decoder = FeedDecoder::new(&map, 0, FeedOptions::new(password)).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        let mut sink = Held::default();
+        let cut = volumes[0].len() * 3 / 5;
+        source.insert(0, 0, &volumes[0][..cut]).unwrap();
+        let status = decoder.run(&mut source, &mut sink).unwrap();
+        assert!(status.frontier > 0 && !status.done);
+        let bytes = decoder.snapshot().to_bytes();
+        drop(decoder);
+        let snap = FeedSnapshot::from_bytes(&bytes).unwrap();
+        let mut decoder = FeedDecoder::restore(&map, 0, FeedOptions::new(password), &snap).unwrap();
+        assert_eq!(decoder.status().frontier, status.frontier);
+        source.insert(0, cut as u64, &volumes[0][cut..]).unwrap();
+        let done = decoder.run(&mut source, &mut sink).unwrap();
+        assert!(done.done && done.crc_ok == Some(true), "{done:?}");
+        assert_eq!(sink.out, plain);
+        let stats = decoder.stats();
+        assert_eq!(stats.written, plain.len() as u64);
+        // only the output since the last block boundary before the snapshot was decoded again
+        assert!(stats.redecoded < 64 << 10, "{stats:?}");
+        // without held output a compressed restore cannot rebuild its window
+        let mut decoder = FeedDecoder::restore(&map, 0, FeedOptions::new(password), &snap).unwrap();
+        assert!(matches!(decoder.run(&mut source, &mut Vec::new()), Err(FeedError::HeldOutput { .. })));
+    }
+}

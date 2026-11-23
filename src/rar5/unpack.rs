@@ -726,6 +726,9 @@ pub struct Unpacker {
     /// [`HAND_OVER_MIN`])
     hand_over_window: usize,
     hand_over_min: usize,
+    /// filters run so far whose output the window may still hold, when a feed decoder wants checkpoints
+    /// ([`Self::record_filters`]): stream offsets
+    seen: Option<Vec<SeenFilterRec>>,
 }
 
 impl Drop for Unpacker {
@@ -893,6 +896,7 @@ impl Unpacker {
             crc: crc::FileCrc::with_helper(default_threads() > 0),
             hand_over_window: HAND_OVER_WINDOW,
             hand_over_min: HAND_OVER_MIN,
+            seen: None,
         })
     }
 
@@ -1819,6 +1823,9 @@ impl Unpacker {
     }
 
     fn run_filter(&mut self, f: Filter, sink: &mut dyn Sink) -> Result<()> {
+        if let Some(seen) = &mut self.seen {
+            seen.push(SeenFilterRec { start: self.file_base + f.start, len: f.len, kind: f.kind });
+        }
         let n = f.len as usize;
         let mut data = std::mem::take(&mut self.scratch);
         data.clear();
@@ -1839,6 +1846,159 @@ impl Unpacker {
         self.drop_verified();
         self.keep_clear();
         Ok(())
+    }
+}
+
+/// A filter a decoder ran: stream offsets `start..start + len`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeenFilterRec {
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+    kind: FilterKind,
+}
+
+impl SeenFilterRec {
+    /// The filter kind as one byte: 1 E8, 2 E8E9, 3 ARM, 0x40 + channels for delta.
+    pub(crate) fn code(&self) -> u8 {
+        match self.kind {
+            FilterKind::E8 => 1,
+            FilterKind::E8E9 => 2,
+            FilterKind::Arm => 3,
+            FilterKind::Delta(c) => 0x40u8.wrapping_add(c),
+        }
+    }
+
+    pub(crate) fn from_code(start: u64, len: u64, code: u8) -> Option<Self> {
+        let kind = match code {
+            1 => FilterKind::E8,
+            2 => FilterKind::E8E9,
+            3 => FilterKind::Arm,
+            0x40..=0x7F => FilterKind::Delta(code - 0x40),
+            _ => return None,
+        };
+        (len > 0 && len <= MAX_FILTER_LEN).then_some(Self { start, len, kind })
+    }
+}
+
+/// A decoder's state between two blocks, from [`Unpacker::checkpoint`]: what [`Unpacker::from_checkpoint`] needs,
+/// besides the output before it, to decode on from the next block exactly as the decoder would have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnpackCheckpoint {
+    /// stream output offset of the next block's first byte
+    pub(crate) sp: u64,
+    pub(crate) history: [u64; 4],
+    pub(crate) last_len: u32,
+    /// the code lengths a block without tables would be read with; None before the first tables
+    pub(crate) lens: Option<Box<Lengths>>,
+    /// filters run whose output the window still holds (unfiltered there)
+    pub(crate) filters: Vec<SeenFilterRec>,
+}
+
+/// Every code length a block's tables give.
+pub(crate) const CHECKPOINT_LENS: usize = TABLES;
+
+impl Unpacker {
+    /// Records the filters this decoder runs, so [`Self::checkpoint`] can say which ones the window holds unfiltered.
+    pub(crate) fn record_filters(&mut self) {
+        self.seen.get_or_insert_with(Vec::new);
+    }
+
+    /// Packed bytes taken but not decoded yet: the start of a block still coming in.
+    pub(crate) fn pending_input(&self) -> usize {
+        self.input.len()
+    }
+
+    /// Whether the block flagged last was decoded on a decoder that stops there.
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// Emits everything decoded that no pending filter holds back.
+    pub(crate) fn flush_now(&mut self, sink: &mut dyn Sink) -> Result<()> {
+        self.settle(0, sink)?;
+        self.flush(sink)
+    }
+
+    /// The decoder's state after the last whole block, when it can be restored: decoded on this thread, everything
+    /// emitted, no filter pending, not strictly seeded. A decoder restored from it decodes the same bytes; the checks
+    /// a resumed decoder makes (known plaintext it compares, a floor it refuses copies below) are not carried over,
+    /// since the output they guard is what the restore reads back. Needs [`Self::record_filters`] from the start.
+    pub(crate) fn checkpoint(&mut self) -> Option<UnpackCheckpoint> {
+        let seen = self.seen.as_mut()?;
+        let quiet = !self.parallel && self.submitted == self.applied && self.batch.parts.is_empty();
+        let strict = self.seed.as_ref().is_some_and(|s| s.strict);
+        if !quiet || !self.filters.is_empty() || self.emitted != self.sp - self.file_base || strict || self.ended {
+            return None;
+        }
+        let from = self.sp.saturating_sub(self.reach);
+        seen.retain(|f| f.start + f.len > from);
+        let lens = if self.tables_ready { Some(Box::new(self.slot.wait()?)) } else { None };
+        Some(UnpackCheckpoint {
+            sp: self.sp,
+            history: self.history,
+            last_len: self.last_len,
+            lens,
+            filters: seen.clone(),
+        })
+    }
+
+    /// A decoder of a member (alone in its stream, of output size `size`) restarted at `cp`, recording filters.
+    /// `known` is the member's output from `known_base`, covering `cp.sp - reach` (or 0) to `cp.sp` and every
+    /// recorded filter's output; filtered bytes are undone into the window, as the decoder held them. Feed it the
+    /// packed bytes from the block after the checkpoint on.
+    pub(crate) fn from_checkpoint(
+        window: Window,
+        cp: &UnpackCheckpoint,
+        size: Option<u64>,
+        known_base: u64,
+        known: &[u8],
+    ) -> Result<Self> {
+        let offset = cp.sp;
+        let mut u = Unpacker::new(window)?;
+        u.set_threads(0, u64::MAX);
+        u.reset(size);
+        let from = offset.saturating_sub(u.reach);
+        let known_end = known_base.saturating_add(known.len() as u64);
+        let need_from = cp.filters.iter().map(|f| f.start).fold(from, u64::min);
+        if known_base > need_from || known_end < offset {
+            return Err(Error::Unsupported(format!(
+                "restoring a RAR 5.0 checkpoint at {offset} needs output {need_from}..{offset}; given \
+                 {known_base}..{known_end}"
+            )));
+        }
+        for f in from..offset {
+            u.window[(f & u.mask) as usize] = known[(f - known_base) as usize];
+        }
+        for f in &cp.filters {
+            let end = (f.start + f.len).min(offset);
+            if end <= from {
+                continue;
+            }
+            let mut bytes = known[(f.start - known_base) as usize..(end - known_base) as usize].to_vec();
+            unapply_filter(f.kind, f.start, &mut bytes);
+            for (i, &b) in bytes.iter().enumerate() {
+                let at = f.start + i as u64;
+                if at >= from {
+                    u.window[(at & u.mask) as usize] = b;
+                }
+            }
+        }
+        u.sp = offset;
+        u.file_base = 0;
+        u.emitted = offset;
+        u.history = cp.history;
+        u.last_len = cp.last_len;
+        match &cp.lens {
+            Some(lens) => {
+                u.slot = Slot::filled(Some(**lens));
+                u.tables_ready = true;
+            }
+            None => u.tables_ready = false,
+        }
+        u.built = None;
+        u.stop_at_last = true;
+        u.seen = Some(cp.filters.clone());
+        Ok(u)
     }
 }
 
