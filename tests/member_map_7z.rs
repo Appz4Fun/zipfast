@@ -825,6 +825,36 @@ fn cut_sets_report_the_header_unavailable() {
     assert_eq!(map.end, MapEnd::Truncated { volume: 0, offset: 0 });
 }
 
+#[test]
+fn a_missing_middle_volume_is_reported_not_mapped() {
+    let archive = build(&[(Method::Copy, vec![Entry::File("big", data(9000, 15))])], &[], &HeaderMode::Lzma2);
+    let header_at = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap());
+    let volumes = split(&archive, 4000);
+    assert_eq!(volumes.len(), 3);
+    // .001 and .003 handed over as a two-volume set, .002 absent: the volumes no longer reach the header, so nothing is
+    // mapped from the misplaced .003.
+    let gapped = vec![volumes[0].clone(), volumes[2].clone()];
+    let map = map_set(&gapped, None).unwrap();
+    assert!(!map.complete);
+    assert!(matches!(map.end, MapEnd::HeaderUnavailable { offset, .. } if offset == header_at), "{:?}", map.end);
+    assert!(map.members.is_empty() && map.folders.is_empty());
+    // Through a volume source that answers Missing for .002: the map stops there and never reads past the gap.
+    let gate = Arc::new(Mutex::new(Gate::default()));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let provider = Provider { volumes: volumes[..1].to_vec(), gate, asked: asked.clone() };
+    let mut builder = MapBuilder::new(Box::new(provider), MapOptions::new("set.7z.001"));
+    let mut cx = Context::from_waker(Waker::noop());
+    let map = loop {
+        if let Poll::Ready(result) = builder.poll_map(&mut cx) {
+            break result.unwrap();
+        }
+    };
+    assert!(!map.complete);
+    assert_eq!(map.end, MapEnd::HeaderUnavailable { volume: 1, offset: header_at, suspect: None });
+    assert!(map.members.is_empty() && map.folders.is_empty());
+    assert_eq!(asked.lock().unwrap().last().unwrap(), &(1, "set.7z.002".to_string()));
+}
+
 // ---- Detection ----
 
 #[test]
