@@ -1065,8 +1065,16 @@ pub(super) fn validate_evidence(
         };
         if index == 0 {
             crypt = params;
-        } else if params != crypt {
+        } else if !same_member_crypt(params.as_ref(), crypt.as_ref()) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+        }
+        // rar (7.00) sets the RAR 5.0 "tweaked checksums" flag only in the final part's encryption record: the
+        // earlier parts' CRCs are plain checks of their ciphertext, and the final part's member checks are keyed.
+        // So the member's checks are keyed as its final part says.
+        if part.final_part
+            && let (Some(member), Some(last)) = (crypt.as_mut(), params.as_ref())
+        {
+            member.tweaked_crc = last.tweaked_crc;
         }
         let padded = size.checked_next_multiple_of(16).ok_or_else(malformed)?;
         let geometry = if crypt.is_some() {
@@ -1093,6 +1101,21 @@ pub(super) fn validate_evidence(
         }
     }
     Ok(crypt)
+}
+
+/// Whether a continuation part's cipher parameters name the same encrypted member as its first part's: the same KDF
+/// count, salt and password check. The parts are one CBC stream, so only the first part's IV is used (a later part
+/// restating another is accepted, as member maps accept it), and the tweaked-checksum flag may appear on the final
+/// part only (rar 7.00 writes it there), so neither is compared.
+pub(crate) fn same_member_crypt(
+    part: Option<&crate::crypto::Rar5CryptParams>,
+    first: Option<&crate::crypto::Rar5CryptParams>,
+) -> bool {
+    match (part, first) {
+        (None, None) => true,
+        (Some(p), Some(f)) => p.kdf_count == f.kdf_count && p.salt == f.salt && p.check == f.check,
+        _ => false,
+    }
 }
 
 /// A part recorded with no CRC by a session that opted in to

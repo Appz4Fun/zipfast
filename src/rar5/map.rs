@@ -747,6 +747,11 @@ impl RarWalker {
             if part.final_part {
                 member.checks = Some(checks);
                 member.complete = true;
+                // rar (7.00) flags keyed checks only in the final part's encryption record: the member's checks are
+                // keyed as that part says, whatever the first part's record stated
+                if let (Some(CipherParams::Rar5 { keyed_checks, .. }), Some(last)) = (member.cipher.as_mut(), params) {
+                    *keyed_checks = last.tweaked_crc;
+                }
             } else {
                 self.open = Some(open);
             }
