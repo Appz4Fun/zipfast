@@ -62,7 +62,8 @@ pub(super) struct Rar4 {
 
 impl Rar4 {
     pub(super) fn frontier(&self) -> u64 {
-        self.out.max(self.write_from)
+        // while the stream's earlier members are decoded again, `out` counts their output, not this member's
+        if self.pre_at < self.prefix.len() { self.write_from } else { self.out.max(self.write_from) }
     }
 
     pub(super) fn reach(&self) -> u64 {
@@ -518,5 +519,54 @@ impl FeedDecoder {
         self.buf = buf;
         self.scratch = scratch;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A successor decoding its stream's earlier members again has not begun its own output: its frontier, and the
+    /// one a snapshot keeps, are where its own output stands (0, or the frontier it was restored at).
+    #[test]
+    fn replaying_earlier_members_is_not_progress_through_this_one() {
+        let frame = CoreFrame {
+            ordinal: 0,
+            packed: 10,
+            unpacked: 100_000,
+            unpack_version: 29,
+            method: 0x33,
+            dictionary: 1 << 22,
+        };
+        let pre = Pre {
+            geometry: Geometry { spans: Vec::new() },
+            stream_len: 10,
+            cipher: StoredCipher::Plain,
+            size: 100_000,
+            frame,
+        };
+        let mut r = Rar4 {
+            dec: None,
+            out: 65_536,
+            fed: 7_000,
+            write_from: 0,
+            stalled: false,
+            dictionary: 1 << 22,
+            version: 29,
+            frame,
+            prefix: vec![pre],
+            pre_at: 0,
+            pre_lane: None,
+            successor: false,
+            ended: None,
+        };
+        assert_eq!(r.frontier(), 0);
+        assert_eq!(r.to_bytes(), 0u64.to_le_bytes());
+        r.write_from = 500;
+        assert_eq!(r.frontier(), 500);
+        // the replay done, the member's own output counts
+        r.pre_at = 1;
+        r.out = 700;
+        assert_eq!(r.frontier(), 700);
     }
 }
