@@ -201,16 +201,23 @@ fn lzma2_folder(map: &MemberMap, m: &MapMember) -> Option<(u8, bool)> {
 
 /// Where member `member`'s output starts in its RAR solid stream: the sizes of the members before it back to the
 /// stream's first (the last member not marked solid).
+///
+/// Only compressed files take part in the stream: directories and stored members (method 0) pass the decoder by,
+/// whatever their solid flag, as extraction treats them. A compressed member without the solid flag starts a new
+/// stream.
 fn rar_stream_start(map: &MemberMap, member: usize) -> Result<u64, OpenAtError> {
-    let mut first = member;
-    while first > 0 && map.members[first].solid {
-        first -= 1;
+    let decodes = |m: &MapMember| !m.is_dir && matches!(m.method, MapMethod::Compressed { .. });
+    if !map.members[member].solid {
+        return Ok(0);
     }
-    map.members[first..member]
-        .iter()
-        .filter(|m| !m.is_dir)
-        .try_fold(0u64, |sum, m| m.unpacked_size.and_then(|s| sum.checked_add(s)))
-        .ok_or(OpenAtError::SizeUnknown)
+    let mut sum = 0u64;
+    for m in map.members[..member].iter().rev().filter(|m| decodes(m)) {
+        sum = m.unpacked_size.and_then(|s| sum.checked_add(s)).ok_or(OpenAtError::SizeUnknown)?;
+        if !m.solid {
+            break;
+        }
+    }
+    Ok(sum)
 }
 
 /// Options for [`open_at`].
@@ -592,11 +599,43 @@ fn resume_lzma2(
                     .is_ok_and(|b| known_at(at, len) == b.get(..len as usize))
         }
     };
-    // The last restartable chunk at or before the target that checks out.
+    // A chunk's offset counted back from the end is right only if its header is a real one; a header-like run of
+    // bytes inside a stored payload can form a chain that ends at the true end marker and still matches a short
+    // prefix of the known output. So the framing must be proven by more than that: the chain starts at the
+    // stream's first byte, or a run of whole chunks ending at the restart (from a chunk that decodes on its own),
+    // or the restart chunk itself, decodes to exactly the known output, at least `PROOF` bytes of it.
+    const PROOF: u64 = 64;
+    let starts_stream = packed_from + p as u64 == 0 && x + chunks.first().map_or(0, |c| c.unpacked_offset) == 0;
+    let run_matches = |j: usize, end: usize| -> Option<u64> {
+        let from = x + chunks[j].unpacked_offset;
+        let to = if end < chunks.len() { x + chunks[end].unpacked_offset } else { total };
+        let want = known_at(from, to - from)?;
+        let c = chunks[j];
+        let got = if c.kind == Lzma2ChunkKind::Stored && end == j + 1 {
+            bytes.get(c.payload().start as usize..c.payload().end as usize)?.to_vec()
+        } else {
+            let dict = known_at(known_base, from.checked_sub(known_base)?)?;
+            idx.decode_with_dictionary(j..end, bytes, 0, dict_prop, dict, options).ok()?
+        };
+        (got == want).then_some(to - from)
+    };
+    let proven = |s: usize| -> bool {
+        if starts_stream {
+            return true;
+        }
+        // the restart chunk itself, when the known output covers it
+        if run_matches(s, s + 1).is_some_and(|n| n >= PROOF) {
+            return true;
+        }
+        // a run of whole chunks just before it, nearest start first
+        (0..s).rev().filter(|&j| restartable(j)).any(|j| run_matches(j, s).is_some_and(|n| n >= PROOF))
+    };
+    // The last restartable chunk at or before the target that checks out, in a chain whose framing is proven.
     let s = (0..chunks.len())
         .rev()
         .filter(|&k| x + chunks[k].unpacked_offset <= folder_target)
         .find(|&k| restartable(k) && checks_out(k))
+        .filter(|&k| proven(k))
         .ok_or(OpenAtError::NeedMore { needed: known_base..folder_target })?;
     let output = x + chunks[s].unpacked_offset;
     let dictionary = known_at(known_base, output - known_base).ok_or(OpenAtError::NeedMore { needed: 0..output })?;
@@ -613,7 +652,12 @@ fn resume_lzma2(
             out.extend_from_slice(&bytes[pl.start as usize..pl.end as usize]);
             i += 1;
         } else if restartable(i) {
-            let dict = [dictionary, &out].concat();
+            // only the last dictionary-sized bytes are used: the known output's tail, then what was resumed
+            let need = usize::try_from(lzma2_dictionary(dict_prop)).unwrap_or(usize::MAX);
+            let from_known = need.saturating_sub(out.len()).min(dictionary.len());
+            let mut dict = Vec::with_capacity(from_known + out.len().min(need));
+            dict.extend_from_slice(&dictionary[dictionary.len() - from_known..]);
+            dict.extend_from_slice(&out[out.len().saturating_sub(need)..]);
             // the decoder's own bound is what is left of the limit
             let mut left = options.clone();
             left.max_output = limit - out.len() as u64;
@@ -660,23 +704,45 @@ mod tests {
     }
 
     /// Fetched from inside the first chunk's payload, the header-like bytes there end in a `00` that is not the
-    /// stream's end; only the chain ending at the true end marker counts.
+    /// stream's end, so that chain is never taken; the one-byte chunk at the true end is too short to prove the
+    /// framing, so more packed bytes are asked for. From the stream's start the framing is given.
     #[test]
     fn a_false_chain_inside_a_payload_is_not_taken() {
         let plain = plain();
-        let r = resume_lzma2(&bounds(16), 9, &STREAM[9..], 0, &plain, &opts()).unwrap();
-        assert_eq!((r.output, r.bytes.as_slice()), (16, &b"d"[..]));
-        assert_eq!(r.feed_from, 19);
+        let r = resume_lzma2(&bounds(16), 9, &STREAM[9..], 0, &plain, &opts());
+        assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+        let r = resume_lzma2(&bounds(16), 0, &STREAM, 0, &plain, &opts()).unwrap();
+        assert_eq!((r.output, r.bytes.as_slice(), r.feed_from), (16, &b"d"[..], 19));
     }
 
-    /// One data chunk and the end marker are a chain.
+    /// A false chain inside a stored payload that ends at the true end marker and matches the known output's short
+    /// prefix: its framing is not proven, so it is refused rather than decoded to the wrong bytes.
+    #[test]
+    fn a_false_chain_ending_at_the_true_end_marker_is_refused() {
+        let payload = [&[0x02, 0x00, 0x09][..], &[b'a'; 10], &[0x02, 0x00, 0x09], &[b'b'; 10]].concat();
+        let stream = [&[0x01, 0x00, 0x19][..], &payload, &[0x00]].concat();
+        let b = Lzma2Bounds { total: 26, stream_end: stream.len() as u64, target: 7, dict_prop: 0 };
+        for known in [&payload[..7], &payload[..]] {
+            let r = resume_lzma2(&b, 3, &stream[3..], 0, known, &opts());
+            assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+        }
+        let r = resume_lzma2(&b, 0, &stream, 0, &payload[..7], &opts()).unwrap();
+        assert_eq!((r.output, r.bytes), (0, payload.clone()));
+    }
+
+    /// One data chunk and the end marker are a chain, proven by the chunk's whole output.
     #[test]
     fn a_single_chunk_chain_restarts() {
-        let plain = plain();
-        let r = resume_lzma2(&bounds(16), 19, &STREAM[19..], 0, &plain, &opts()).unwrap();
-        assert_eq!((r.output, r.bytes.as_slice()), (16, &b"d"[..]));
+        let a: Vec<u8> = (0..100u8).map(|i| b'A' + i % 26).collect();
+        let b: Vec<u8> = (0..100u8).map(|i| b'a' + i % 26).collect();
+        let stream = [&[0x01, 0x00, 99][..], &a, &[0x02, 0x00, 99], &b, &[0x00]].concat();
+        let plain = [a.clone(), b.clone()].concat();
+        let bounds = Lzma2Bounds { total: 200, stream_end: stream.len() as u64, target: 150, dict_prop: 0 };
+        // fetched from inside the first payload: the chain is the second chunk alone
+        let r = resume_lzma2(&bounds, 50, &stream[50..], 0, &plain, &opts()).unwrap();
+        assert_eq!((r.output, r.bytes.as_slice(), r.feed_from), (100, &b[..], 103));
         // bytes short of the stream's end are asked for, not guessed past
-        let r = resume_lzma2(&bounds(16), 19, &STREAM[19..23], 0, &plain, &opts());
+        let r = resume_lzma2(&bounds, 50, &stream[50..150], 0, &plain, &opts());
         assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
     }
 

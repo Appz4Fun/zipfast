@@ -63,7 +63,10 @@ held bytes or the known plaintext do not reach far enough back: fetch from earli
 folder's packed bytes from `fetch_from` to the folder's end. It finds the first chunk header chain in them that runs
 to the end marker at exactly the LZMA2 stream's end (the folder's packed size, or under 7zAES the AES coder's output
 size, which leaves out the block padding); counting back from the folder's size gives every chunk's output offset.
-A single chunk and its end marker count as a chain. It restarts
+A single chunk and its end marker count as a chain. Because header-like bytes inside a stored payload can form a
+false chain that still ends at the true end marker, the framing must be proven before a restart is used: the chain
+starts at the stream's first byte, or whole chunks ending at the restart (or the restart chunk itself) decode to
+exactly the known output, at least 64 bytes of it. Otherwise the result is `NeedMore`: fetch from earlier. It restarts
 at the last chunk at or before the target that resets the LZMA state or stores its bytes and checks out against the
 known output, and decodes from there to the folder's end with the known output before it as the dictionary:
 `bytes` is the folder's output from `output` on, bounded by `Lzma2DecodeOptions::max_output` (stored and decoded

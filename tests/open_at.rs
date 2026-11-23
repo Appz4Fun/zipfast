@@ -196,6 +196,36 @@ fn a_solid_second_rar5_member_hands_over_at_its_stream_offset() {
     handover(&map, &plan, &held, &stream);
 }
 
+/// Directories and stored members take no part in a solid stream's decoding: a solid member's stream starts after
+/// the last compressed member without the solid flag, and only compressed members' sizes count.
+#[test]
+fn a_solid_streams_start_skips_directories_and_stored_members() {
+    use zipfast::rar5::testenc;
+    let a = sample(50_000);
+    let b = sample(30_000);
+    let stored = sample(7_000);
+    let pa = testenc::tuned_stream(&testenc::lz(&a, 1 << 17, 16), 2_000);
+    let pb = testenc::tuned_stream(&testenc::lz(&b, 1 << 17, 16), 2_000);
+    let mut sa = FileSpec::new("a.bin", &pa);
+    sa.method = 3;
+    sa.size = Some(a.len() as u64);
+    let mut dir = FileSpec::new("d", &[]);
+    dir.dir = true;
+    let ss = FileSpec::new("s.bin", &stored);
+    let mut sb = FileSpec::new("b.bin", &pb);
+    sb.method = 3;
+    sb.size = Some(b.len() as u64);
+    sb.solid = true;
+    let bytes = archive_with(
+        &[(sa, crc32fast::hash(&a)), (dir, 0), (ss, crc32fast::hash(&stored)), (sb, crc32fast::hash(&b))],
+        true,
+    );
+    let map = MemberMap::from_memory(&[&bytes], "s.rar", None).unwrap();
+    assert_eq!(map.members.len(), 4);
+    assert_eq!(member_restart(&map, 3).unwrap().stream_start, a.len() as u64);
+    assert_eq!(member_restart(&map, 0).unwrap().stream_start, 0);
+}
+
 #[test]
 fn plans_refuse_what_they_cannot_do() {
     use zipfast::rar5::testenc;
