@@ -4542,6 +4542,22 @@ fn a_rar5_dead_volume_answered_with_one_hole_is_one_event_and_refills_in_pieces(
     }
 }
 
+/// Damage declared within one read buffer (1 MiB) of the cursor still lets the source answer the whole dead range:
+/// the answer is trimmed at the declaration, not refused as a source contract violation.
+#[test]
+fn a_long_hole_stops_at_damage_declared_within_the_read_buffer() {
+    let (holes, mut file, volume, payload, data, dir) = long_hole_rar5(false, Some((512 << 10)..(1536 << 10)));
+    let causes: Vec<_> = holes.iter().map(|h| h.cause.clone()).collect();
+    assert_eq!(causes, [HoleCause::Missing, HoleCause::DeclaredBad, HoleCause::Missing], "{holes:?}");
+    let p = payload.start;
+    let spans: Vec<_> = holes.iter().map(|h| h.packed[0].range.clone()).collect();
+    assert_eq!(spans, [p..p + (512 << 10), p + (512 << 10)..p + (1536 << 10), p + (1536 << 10)..payload.end]);
+    file.refill_from_packed(1, 0..volume.len() as u64, &mut std::io::Cursor::new(volume.as_slice())).unwrap();
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), data);
+}
+
 /// Damage declared inside the dead range splits the source's one answer: the hole is accepted up to the declared
 /// range (the source cannot see it), the declared range is a `DeclaredBad` hole, and the rest is read again.
 #[test]
