@@ -32,6 +32,7 @@ use super::{
 };
 use crate::progressive::{FailureKind, ProgressiveFailure};
 use crate::rar5::RarEndRecord;
+use std::collections::HashMap;
 use std::ops::Range;
 
 const RAR4_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -498,30 +499,21 @@ pub fn set_identity(
     // Members are matched across the two volumes by name, by kind (a RAR part going on into later volumes
     // matches the part continuing in the last one; whole members match only when both inputs are the same
     // volume) and by occurrence among equal names and kinds, so two entries of one name never merge.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum Kind {
         Whole,
         Spanning,
     }
-    fn occurrences<'a>(entries: impl Iterator<Item = (&'a [u8], Kind)>) -> Vec<usize> {
-        let mut seen: Vec<(&[u8], Kind, usize)> = Vec::new();
-        entries
-            .map(|(name, kind)| match seen.iter_mut().find(|(n, k, _)| *n == name && *k == kind) {
-                Some((_, _, count)) => {
-                    *count += 1;
-                    *count - 1
-                }
-                None => {
-                    seen.push((name, kind, 1));
-                    0
-                }
-            })
-            .collect()
-    }
+    /// Checked between entries of long loops: an archive may list hundreds of thousands of members.
+    const CANCEL_EVERY: usize = 4096;
+    let control = options.control.clone();
+    let check = |i: usize| -> Result<(), MapError> {
+        if i.is_multiple_of(CANCEL_EVERY) && control.is_canceled() { Err(canceled()) } else { Ok(()) }
+    };
     let mut format = None;
     let mut members: Vec<SetMember> = Vec::new();
-    // (member index, name, kind, occurrence) of each first-volume entry
-    let mut firsts: Vec<(usize, Kind, usize)> = Vec::new();
+    // Each first-volume entry by (raw name, kind, occurrence among equal names and kinds): its index in `members`.
+    let mut firsts: HashMap<(Vec<u8>, Kind, usize), usize> = HashMap::new();
     let mut first_volume_number = None;
     let mut first_is_rar = false;
     if let Some(held) = first {
@@ -531,11 +523,14 @@ pub fn set_identity(
                 first_is_rar = true;
                 format = Some(volume.format);
                 first_volume_number = volume.volume_number;
-                let parts: Vec<&VolumeMember> =
-                    volume.members.iter().filter(|p| p.header.end <= held.len && p.packed.end <= held.len).collect();
-                let kind = |p: &VolumeMember| if p.split_after { Kind::Spanning } else { Kind::Whole };
-                let counts = occurrences(parts.iter().map(|p| (p.raw_name.as_slice(), kind(p))));
-                for (part, occurrence) in parts.iter().zip(counts) {
+                let mut counts: HashMap<(&[u8], Kind), usize> = HashMap::new();
+                let parts = volume.members.iter().filter(|p| p.header.end <= held.len && p.packed.end <= held.len);
+                for (i, part) in parts.enumerate() {
+                    check(i)?;
+                    let kind = if part.split_after { Kind::Spanning } else { Kind::Whole };
+                    let count = counts.entry((part.raw_name.as_slice(), kind)).or_insert(0);
+                    let occurrence = *count;
+                    *count += 1;
                     let mut member = SetMember::new(&part.raw_name, &part.name, part.is_dir);
                     member.learn(
                         FactSource::First,
@@ -545,7 +540,7 @@ pub fn set_identity(
                         part.encrypted,
                         part.checks,
                     );
-                    firsts.push((members.len(), kind(part), occurrence));
+                    firsts.insert((part.raw_name.clone(), kind, occurrence), members.len());
                     members.push(member);
                 }
             }
@@ -560,22 +555,31 @@ pub fn set_identity(
         _ => (None, FactSource::Last),
     };
     if let Some(identity) = identity {
+        let rar = |f: MapFormat| matches!(f, MapFormat::Rar4 | MapFormat::Rar5);
+        if first_is_rar && !rar(identity.format) {
+            // A ZIP or 7z directory in the last volume decides the set: a RAR found in the first volume was one
+            // stored inside it (a split ZIP's .z01 holding a .rar, say), not the set itself.
+            members.clear();
+            firsts.clear();
+            format = None;
+        }
         format.get_or_insert(identity.format);
         // Whole members of the first volume are the last volume's only when both are the same volume.
-        let same_volume = first_is_rar && first_volume_number == identity.volume_number;
-        let kind = |m: &IdentityMember| if m.split_before == Some(true) { Kind::Spanning } else { Kind::Whole };
-        let counts = occurrences(identity.members.iter().map(|m| (m.raw_name.as_slice(), kind(m))));
-        for (m, occurrence) in identity.members.iter().zip(counts) {
-            let k = kind(m);
-            let matched = firsts
-                .iter()
-                .find(|&&(at, fk, fo)| {
-                    members[at].raw_name == m.raw_name
-                        && fk == k
-                        && fo == occurrence
-                        && (k == Kind::Spanning || same_volume)
-                })
-                .map(|&(at, ..)| at);
+        let same_volume = !firsts.is_empty() && first_volume_number == identity.volume_number;
+        let mut counts: HashMap<(&[u8], Kind), usize> = HashMap::new();
+        for (i, m) in identity.members.iter().enumerate() {
+            check(i)?;
+            let matched = if firsts.is_empty() {
+                None
+            } else {
+                let kind = if m.split_before == Some(true) { Kind::Spanning } else { Kind::Whole };
+                let count = counts.entry((m.raw_name.as_slice(), kind)).or_insert(0);
+                let occurrence = *count;
+                *count += 1;
+                (kind == Kind::Spanning || same_volume)
+                    .then(|| firsts.get(&(m.raw_name.clone(), kind, occurrence)).copied())
+                    .flatten()
+            };
             let at = matched.unwrap_or_else(|| {
                 members.push(SetMember::new(&m.raw_name, &m.name, m.is_dir));
                 members.len() - 1

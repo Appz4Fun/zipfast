@@ -291,3 +291,77 @@ fn a_stubbed_first_volume_gives_its_split_member() {
     assert_eq!(both.members.len(), 1);
     assert_eq!(both.members[0].checks.and_then(|c| c.crc32), Some(crc32fast::hash(&data)));
 }
+
+/// An Info-ZIP split set: `.z01` (spanning signature, then a stored member `name` holding `data`) and `.zip`
+/// holding the central directory and end record.
+fn split_zip(name: &str, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let crc = crc32fast::hash(data);
+    let mut z01 = 0x0807_4b50u32.to_le_bytes().to_vec();
+    let local_at = z01.len() as u32;
+    z01.extend(0x0403_4b50u32.to_le_bytes());
+    z01.extend([20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    z01.extend(crc.to_le_bytes());
+    z01.extend((data.len() as u32).to_le_bytes());
+    z01.extend((data.len() as u32).to_le_bytes());
+    z01.extend((name.len() as u16).to_le_bytes());
+    z01.extend(0u16.to_le_bytes());
+    z01.extend(name.as_bytes());
+    z01.extend(data);
+    let mut cd = 0x0201_4b50u32.to_le_bytes().to_vec();
+    cd.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    cd.extend(crc.to_le_bytes());
+    cd.extend((data.len() as u32).to_le_bytes());
+    cd.extend((data.len() as u32).to_le_bytes());
+    cd.extend((name.len() as u16).to_le_bytes());
+    cd.extend([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // extra, comment, disk 0, attributes
+    cd.extend(local_at.to_le_bytes());
+    cd.extend(name.as_bytes());
+    let mut zip = cd.clone();
+    zip.extend(0x0605_4b50u32.to_le_bytes());
+    zip.extend(1u16.to_le_bytes()); // this disk
+    zip.extend(1u16.to_le_bytes()); // directory's disk
+    zip.extend(1u16.to_le_bytes());
+    zip.extend(1u16.to_le_bytes());
+    zip.extend((cd.len() as u32).to_le_bytes());
+    zip.extend(0u32.to_le_bytes());
+    zip.extend(0u16.to_le_bytes());
+    (z01, zip)
+}
+
+#[test]
+fn a_last_volume_directory_decides_over_a_rar_stored_in_the_first() {
+    let inner = common::archive(&[FileSpec::new("inside.bin", b"nested payload")]);
+    let (z01, zip) = split_zip("inner.rar", &inner);
+    // The first volume alone finds the stored RAR (its scanner looks past the prefix), as before.
+    let s = id(Some(HeldVolume::whole(&z01)), Some(HeldVolume::whole(&zip)), None);
+    assert_eq!(s.format, MapFormat::Zip);
+    let names: Vec<_> = s.members.iter().map(|m| m.name.clone().unwrap()).collect();
+    assert_eq!(names, ["inner.rar"]);
+    assert_eq!(s.members[0].checks.and_then(|c| c.crc32), Some(crc32fast::hash(&inner)));
+}
+
+#[test]
+fn many_members_match_in_linear_time() {
+    const N: usize = 20_000;
+    let names: Vec<String> = (0..N).map(|i| format!("f{i:06}")).collect();
+    let specs: Vec<FileSpec<'_>> = names.iter().map(|n| FileSpec::new(n, b"x")).collect();
+    let rar = common::archive(&specs);
+    let mut options = MapOptions::new("big.rar");
+    options.limits.entries = 1 << 20;
+    options.limits.header_bytes = 1 << 30;
+    options.limits.volume_header_bytes = 1 << 30;
+    options.limits.header_blocks = 1 << 20;
+    options.limits.name_bytes = 1 << 30;
+    options.limits.header_allocation = 1 << 30;
+    options.limits.metadata_bytes = 1 << 30;
+    options.limits.parts = 1 << 20;
+    let started = std::time::Instant::now();
+    let s = set_identity(Some(HeldVolume::whole(&rar)), Some(HeldVolume::whole(&rar)), options.clone()).unwrap();
+    assert_eq!(s.members.len(), N, "each member matched with itself, none duplicated");
+    assert!(s.members.iter().all(|m| m.checks.is_some() && m.size_from == Some(FactSource::First)));
+    // Quadratic matching took minutes at this size; linear takes well under a second (generous for debug builds).
+    assert!(started.elapsed().as_secs() < 60, "took {:?}", started.elapsed());
+    // Cancellation is honoured.
+    options.control.cancel();
+    assert!(set_identity(Some(HeldVolume::whole(&rar)), Some(HeldVolume::whole(&rar)), options).is_err());
+}
