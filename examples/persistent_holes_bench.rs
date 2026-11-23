@@ -20,7 +20,7 @@
 //!
 //! `cargo run --release --features persistent-partials --example persistent_holes_bench -- <work dir> [MiB]
 //! [volumes] [holes] [hole KiB] [runs]`. Holes are spread evenly over the member's data; `ZF_GROUP_HOLES=1` turns on
-//! `PartialLimits::group_holes`.
+//! `PartialLimits::group_holes`, `ZF_GROUP_REFILLS=1` `PartialLimits::group_refills`.
 
 use std::{
     ffi::OsString,
@@ -250,7 +250,11 @@ fn run(set: &Path, work: &Path, volumes: u32, holes: &[(u32, std::ops::Range<u64
         naming: PartialNaming::ArchivePath,
         state_dir: root.join("state"),
         // `ZF_GROUP_HOLES=1`: holes join the open group (`PartialLimits::group_holes`).
-        limits: PartialLimits { group_holes: std::env::var_os("ZF_GROUP_HOLES").is_some(), ..PartialLimits::default() },
+        limits: PartialLimits {
+            group_holes: std::env::var_os("ZF_GROUP_HOLES").is_some(),
+            group_refills: std::env::var_os("ZF_GROUP_REFILLS").is_some(),
+            ..PartialLimits::default()
+        },
         anchors: anchors.clone(),
         control: SessionControl::default(),
     };
@@ -288,6 +292,8 @@ fn run(set: &Path, work: &Path, volumes: u32, holes: &[(u32, std::ops::Range<u64
         let mut reader = File::open(set.join(volume_name(*v))).unwrap();
         file.refill_from_packed(*v, range.clone(), &mut reader).unwrap();
     }
+    // Grouped refills are durable at the group's commit: count that commit as part of the refill.
+    file.remaining().unwrap();
     let refill_time = start.elapsed().as_secs_f64();
     let s2 = durable_sync_count();
     let start = Instant::now();
