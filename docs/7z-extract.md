@@ -36,7 +36,7 @@ Overwrite choices are made by `extract::check_target`, the function every whole-
   Each rename is reported to the callback as it is made (`<requested>: exists, written as <path>` or
   `<requested>: existing file moved to <path>`), recorded in `Summary::renames`, sent to the observer as
   `ZipRunEvent::MemberRenamed` on the checked dispatcher, and kept in `RunError::renames` when
-  `extract::run_with_renames` stops early (a wrong password, cancellation).
+  `extract::run_with_renames` stops early (a wrong password for encrypted headers, cancellation).
 
 Selected single-entry reads (`SelectedEntry::open*`) refuse 7z with `Unsupported`. Progressive and persistent-partial
 sessions read RAR only and refuse a 7z archive as before.
@@ -121,13 +121,19 @@ following links, a link at a target or in the way is refused, and protected path
 
 Data encryption and encrypted headers (`-mhe`) are both read. 7z stores no password check value, so as 7-Zip
 does, a wrong password is recognised by its effect: for encrypted headers, a header that does not decode; for
-encrypted data, the first encrypted member failing to decode or failing its CRC before the password is proven.
-Either stops the run with `SevenZipError::WrongPassword`; nothing is published.
+encrypted data, an encrypted folder failing to decode or failing its CRC before the password is proven.
+Encrypted headers that do not decode stop the run with `SevenZipError::WrongPassword`: nothing can be listed.
+With data-only encryption, as 7-Zip does ("Data Error in encrypted file. Wrong password? : <name>"), each member
+of such a folder fails on its own (every member of a solid folder, in archive order): a
+`<name>: data error in encrypted file: wrong password?` line in `Summary::errors`, `SevenZipError::WrongPassword`
+as the member's error (`ReadFault::PasswordCheckFailed` on the checked dispatcher), and nothing published for it.
+The run goes on with the other folders, so plain folders still extract. The run ends `Ok` with these failures in
+its summary (the `zipfast` command then exits 1, as for any failed member; 7-Zip exits 2).
 
 The password is proven by encrypted headers that decode and pass their CRC, or by an encrypted member that passes
 its CRC. After that, a failing encrypted member is a data error for that member. Before it, a correct password
-with a damaged first encrypted member is indistinguishable from a wrong one and is reported as
-`WrongPassword`, as 7-Zip reports "Wrong password?" in the same case.
+with a damaged encrypted member is indistinguishable from a wrong one and is reported as a wrong password, as
+7-Zip reports "Wrong password?" in the same case.
 
 Key derivation accepts `NumCyclesPower` up to 24 (7-Zip's own limit) for headers and data alike; 7-Zip writes 19.
 

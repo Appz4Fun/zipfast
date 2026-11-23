@@ -106,14 +106,16 @@ pub enum SevenZipLimit {
 ///
 /// Through [`crate::extract::run`] and friends it arrives inside the crate [`Error`]: see [`SevenZipError::of`].
 /// Through [`crate::extract::run_with_zip_policy`] a missing password is `ReadFault::PasswordRequired`, a wrong one
-/// `ReadFault::PasswordCheckFailed` and cancellation `ReadFault::Cancelled`; the rest is `ReadFault::Legacy`.
+/// `ReadFault::PasswordCheckFailed` (for the run with encrypted headers, for each member with encrypted data only)
+/// and cancellation `ReadFault::Cancelled`; the rest is `ReadFault::Legacy`.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SevenZipError {
     /// Encrypted data or headers, and no password.
     PasswordRequired,
-    /// The password does not decrypt the headers, or the first encrypted data decoded does not decode or fails its
-    /// CRC (7z has no password check value; 7-Zip says "Wrong password?" in the same cases).
+    /// The password does not decrypt the headers, which stops the run; or, as a member's error, the member's
+    /// encrypted folder does not decode or fails its CRC before the password is proven (7z has no password check
+    /// value; 7-Zip says "Data Error in encrypted file. Wrong password?" in the same cases).
     WrongPassword,
     /// The [`Cancellation`] was triggered. Nothing in progress is published.
     Canceled,
@@ -207,8 +209,11 @@ pub(crate) fn sniff(head: &[u8]) -> bool {
 /// Options, member selection, overwrite choices (including the rename modes), protected paths and the per-file report
 /// lines work as for the other formats' whole-archive runs; a rename is a report line as it is made and an entry in
 /// [`Summary::renames`]. A member that fails (a CRC mismatch, data that does not decode, an unsafe name) is a
-/// line in [`Summary::errors`] and is not published; the run goes on. The run itself fails on a missing or wrong
-/// password, a limit, an unsupported coder, cancellation, unreadable headers or volumes and output errors.
+/// line in [`Summary::errors`] and is not published; the run goes on. So is a member whose encrypted folder the
+/// password does not decrypt (`<name>: data error in encrypted file: wrong password?`, each member of a solid folder,
+/// with [`SevenZipError::WrongPassword`] as its error), as 7-Zip reports each one. The run itself fails on a missing
+/// password, a wrong one for encrypted headers, a limit, an unsupported coder, cancellation, unreadable headers or
+/// volumes and output errors.
 pub fn run(
     first: &Path,
     options: &Options,

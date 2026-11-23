@@ -208,8 +208,16 @@ fn passwords_missing_and_wrong_are_typed() {
         assert!(matches!(missing, Err(Error::Encrypted)), "{archive}: {missing:?}");
         assert_eq!(missing.unwrap_err().to_string(), "encrypted: a password is required, or the one given is wrong");
         let wrong = extract::run_with_password(&fixture(archive), &opts(Mode::Extract, &out), Some("wrong"), |_| {});
-        assert!(matches!(seven(&wrong), Some(SevenZipError::WrongPassword)), "{archive}: {wrong:?}");
-        assert_eq!(wrong.unwrap_err().to_string(), "7z: wrong password");
+        if archive == "aes_hdr.7z" {
+            // Encrypted headers: nothing can be listed, so the whole run fails.
+            assert!(matches!(seven(&wrong), Some(SevenZipError::WrongPassword)), "{archive}: {wrong:?}");
+            assert_eq!(wrong.unwrap_err().to_string(), "7z: wrong password");
+        } else {
+            // Data-only encryption: each member fails as a wrong password, as 7-Zip reports it, and the run ends.
+            let summary = wrong.unwrap_or_else(|e| panic!("{archive}: {e:?}"));
+            assert!(!summary.errors.is_empty(), "{archive}");
+            assert!(summary.errors.iter().all(|e| e.ends_with(": data error in encrypted file: wrong password?")));
+        }
         // Nothing was published.
         assert!(fs::read_dir(&out).map_or(true, |d| d.flatten().all(|e| e.path().is_dir())), "{archive}");
     }
@@ -236,8 +244,29 @@ fn the_checked_dispatcher_runs_7z_with_typed_password_faults() {
     assert_eq!((report.files(), report.failed()), (2, 0));
     let error = run("aes.7z", None, &Cancellation::default()).unwrap_err();
     assert!(matches!(error.operation(), Some(ReadFault::PasswordRequired)), "{error:?}");
-    let error = run("aes.7z", Some("wrong"), &Cancellation::default()).unwrap_err();
+    // Encrypted headers with a wrong password fail the run, typed.
+    let error = run("aes_hdr.7z", Some("wrong"), &Cancellation::default()).unwrap_err();
     assert!(matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes })));
+    // Data-only encryption: each member fails, with the typed wrong password as its error.
+    let mut wrong = Vec::new();
+    let report = extract::run_with_zip_policy(
+        &fixture("aes.7z"),
+        &opts(Mode::Extract, &dir.path().join("wrong")),
+        Some("wrong"),
+        &Cancellation::default(),
+        &Default::default(),
+        |event: ZipRunEvent<'_>| {
+            if let ZipRunEvent::MemberFailed { name, error, .. } = event {
+                let typed =
+                    matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes }));
+                wrong.push((name.to_owned(), typed));
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!((report.files(), report.failed()), (0, 2));
+    assert_eq!(wrong, [("text/a.txt".to_owned(), true), ("text/b.txt".to_owned(), true)]);
     let canceled = Cancellation::default();
     canceled.cancel();
     let error = run("lzma.7z", None, &canceled).unwrap_err();
@@ -787,18 +816,18 @@ fn rename_modes_for_duplicate_members() {
 }
 
 #[test]
-fn a_terminal_error_after_a_rename_existing_move_keeps_the_rename() {
+fn a_wrong_password_after_a_rename_existing_move_keeps_the_rename() {
     use zipfast::extract::RenameStyle;
     let dir = tempfile::tempdir().unwrap();
     let text = dir.path().join("text");
     fs::create_dir_all(&text).unwrap();
     fs::write(text.join("a.txt"), b"old").unwrap();
     let options = renaming(dir.path(), Overwrite::RenameExisting(RenameStyle::Underscore));
-    // The move happens when the member starts; the wrong password shows when it decodes.
-    let error = extract::run_with_renames(&fixture("aes.7z"), &options, Some("wrong"), |_| {}).unwrap_err();
-    assert!(matches!(SevenZipError::of(&error.error), Some(SevenZipError::WrongPassword)), "{error:?}");
-    assert_eq!(error.renames.len(), 1);
-    assert_eq!(error.renames[0].existing, Some(text.join("a_1.txt")));
+    // The move happens when the member starts; the wrong password shows when it decodes, and fails the member.
+    let summary = extract::run_with_renames(&fixture("aes.7z"), &options, Some("wrong"), |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert_eq!(summary.renames.len(), 1);
+    assert_eq!(summary.renames[0].existing, Some(text.join("a_1.txt")));
     assert_eq!(fs::read(text.join("a_1.txt")).unwrap(), b"old");
     // The reserved name is not left as an empty file.
     assert!(!text.join("a.txt").exists());
@@ -1124,4 +1153,52 @@ fn listing_applies_header_limits_only() {
         matches!(SevenZipError::of(&error), Some(SevenZipError::Limit { limit: SevenZipLimit::Entries, .. })),
         "{error:?}"
     );
+}
+
+// ---- A wrong password with data-only encryption fails each member, as 7-Zip does ----
+
+/// `7z x -pwrong` (7-Zip 26.06) on the `*_wrongpw.7z` fixtures prints
+/// `ERROR: Data Error in encrypted file. Wrong password? : <name>` for these members, in this order, writes none of
+/// them, extracts the plain ones and exits 2 (see the fixtures' README).
+const SEVEN_ZIP_WRONG_PASSWORD: [(&str, &[&str], &[&str]); 3] = [
+    ("solid_wrongpw.7z", &["a.txt", "b.txt", "c.txt"], &[]),
+    ("nonsolid_wrongpw.7z", &["a.txt", "b.txt"], &[]),
+    ("mixed_wrongpw.7z", &["a.txt"], &["p.txt"]),
+];
+
+#[test]
+fn a_wrong_password_fails_each_encrypted_member_as_7zip_reports_it() {
+    for mode in [Mode::Extract, Mode::Test] {
+        for (archive, failed, written) in SEVEN_ZIP_WRONG_PASSWORD {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let mut lines = Vec::new();
+            let summary = extract::run_with_password(&fixture(archive), &opts(mode, &out), Some("wrong"), |l| {
+                lines.push(l.to_owned())
+            })
+            .unwrap_or_else(|e| panic!("{archive}: the run goes on past wrong-password members: {e:?}"));
+            let want: Vec<String> =
+                failed.iter().map(|n| format!("{n}: data error in encrypted file: wrong password?")).collect();
+            assert_eq!(summary.errors, want, "{archive} {mode:?}: one line per member, in archive order");
+            assert_eq!(summary.files as usize, written.len(), "{archive} {mode:?}");
+            for name in failed {
+                assert!(!out.join(name).exists(), "{archive}: {name} is not published");
+            }
+            if mode == Mode::Extract {
+                for name in written {
+                    assert!(out.join(name).is_file(), "{archive}: the plain {name} is extracted");
+                }
+            }
+            // With the right password everything extracts.
+            let right = extract::run_with_password(
+                &fixture(archive),
+                &opts(mode, &dir.path().join("right")),
+                Some("pw"),
+                |_| {},
+            )
+            .unwrap();
+            assert!(right.errors.is_empty(), "{archive}: {:?}", right.errors);
+            assert_eq!(right.files as usize, failed.len() + written.len(), "{archive}");
+        }
+    }
 }

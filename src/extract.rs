@@ -2105,7 +2105,8 @@ pub(crate) fn legacy_zip_report(
                 }
                 LegacyMember::Skipped { ordinal, name } => self.send(ZipRunEvent::MemberSkipped { ordinal, name }),
                 LegacyMember::Failed { ordinal, name, error } => {
-                    let error = ZipReadError::from(ReadFault::Legacy(error));
+                    // a 7z member whose folder the password does not decrypt is typed as ZIP's password failure
+                    let error = ZipReadError::from(seven_zip_fault(error));
                     self.send(ZipRunEvent::MemberFailed { ordinal, name, error: &error });
                 }
             }
