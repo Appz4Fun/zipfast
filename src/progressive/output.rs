@@ -350,7 +350,7 @@ impl OutputContext {
             authority: Arc::new(Authority { control }),
             aftermath: options.artifact_aftermath,
             directories: Vec::new(),
-            extracted: Default::default(),
+            extracted: crate::extract::link::Extracted::new(&options.extract),
         })
     }
     pub(crate) fn terminate(&self, mut stage: Stage, failure: ProgressiveFailure) -> Termination {

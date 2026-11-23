@@ -72,7 +72,7 @@ pub(super) struct DirectoryOutput {
 
 impl<'a> Extraction<'a> {
     pub(super) fn new(options: &'a Options) -> Self {
-        Self { options, versions: false, dirs: Vec::new(), extracted: Default::default() }
+        Self { options, versions: false, dirs: Vec::new(), extracted: crate::extract::link::Extracted::new(options) }
     }
 
     fn member(
@@ -431,7 +431,7 @@ impl<'a> Extraction<'a> {
                 Some(_) if source.kind() == io::ErrorKind::Unsupported => {
                     Arc::new(RarFailure::Unsupported(RarUnsupported::Rar4Feature("symbolic link")))
                 }
-                Some(link::FOREIGN_LINK) => policy(RarPolicyReason::LinkTarget, path.to_path_buf()),
+                Some(link::FOREIGN_LINK | link::LINK_LEAVES) => policy(RarPolicyReason::LinkTarget, path.to_path_buf()),
                 Some(_) => policy(RarPolicyReason::HardLinkTarget, path.to_path_buf()),
                 None => output_fault(IoOperation::Publish, path, source),
             }
@@ -918,6 +918,7 @@ mod tests {
             fallback_mtime: None,
             compressed_tar: Default::default(),
             version_naming: Default::default(),
+            preexisting_links: Default::default(),
         }
     }
 

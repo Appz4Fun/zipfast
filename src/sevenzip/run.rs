@@ -348,7 +348,7 @@ pub(super) fn run(
         report,
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
-        extracted: Default::default(),
+        extracted: crate::extract::link::Extracted::new(&opts),
         active: None,
         password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],
@@ -418,6 +418,7 @@ pub(super) fn print(
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};
@@ -431,7 +432,7 @@ pub(super) fn print(
         report: &mut report,
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
-        extracted: Default::default(),
+        extracted: crate::extract::link::Extracted::new(&options),
         active: None,
         password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],

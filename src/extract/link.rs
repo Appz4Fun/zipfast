@@ -29,6 +29,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::extract::PreexistingLinks;
+
 /// The longest target taken, in bytes (`PATH_MAX` less its NUL).
 pub(crate) const MAX_TARGET: u64 = 4095;
 
@@ -234,6 +236,8 @@ pub(crate) struct Extracted {
     /// device and inode of each symbolic link this run placed: the only links another link's target may pass
     /// through (see [`foreign_link`])
     links: std::collections::BTreeSet<(u64, u64)>,
+    /// what a link's target may do with links the destination held before the run
+    preexisting: PreexistingLinks,
     /// where each extracted file landed, and the members that landed there
     landed: BTreeMap<PathBuf, Vec<PathBuf>>,
     bytes: usize,
@@ -264,6 +268,10 @@ fn normalised(rel: &Path) -> bool {
 }
 
 impl Extracted {
+    /// No records yet, with the link settings of `options`.
+    pub(crate) fn new(options: &crate::extract::Options) -> Self {
+        Self { preexisting: options.preexisting_links, ..Self::default() }
+    }
     fn forget(&mut self, rel: &Path) {
         // the record's own key, which is what was charged: never another spelling of it
         let Some((key, old)) = self.records.remove_entry(rel) else { return };
@@ -346,37 +354,77 @@ fn identity(_: &std::fs::Metadata) -> (u64, u64) {
 /// What one recorded symbolic link takes against [`MAX_RECORDED`].
 const LINK_COST: usize = 64;
 
-/// The message for a link whose target passes through a symbolic link that was in the destination before the run.
+/// The message for a link whose target passes through a symbolic link that was in the destination before the run,
+/// under [`PreexistingLinks::Refuse`].
 pub(crate) const FOREIGN_LINK: &str = "the link's target passes through a link that was not extracted by this run";
 
-/// Whether the symbolic link to be placed at `path` (under `dest`) would reach its `target` through a symbolic link
-/// already in the destination that this run did not place: lexical containment ([`contained`]) holds only for links
-/// this extractor checked, so a link the destination held before (`alias -> ../outside`) could lead out. Each part
-/// of the target that exists now is looked at without following it; the walk stops at the first part that doesn't
-/// exist, and at a link this run placed, which was checked the same way when it was made.
+/// The message for a link whose target, followed through the links on its way, leads out of the destination.
+pub(crate) const LINK_LEAVES: &str = "the link's target leads out of the destination through another link";
+
+/// How many links resolving one target may follow before it is refused (a loop, or a chain too long to check).
+const MAX_HOPS: usize = 40;
+
+/// Why the symbolic link to be placed at `path` (under `dest`) is refused for where its `target` really goes, or
+/// None. Lexical containment ([`contained`]) treats every folder on the way as a real one; this follows the links
+/// that are there now, as the system will: those the destination held before the run (`alias -> ../outside`) and
+/// those this run placed (checked when they were made, and followed again as they are now). The target is refused
+/// if any step leaves the destination, and under [`PreexistingLinks::Refuse`] as soon as it meets a link this run
+/// did not place. The walk stops at the first part that doesn't exist: whatever is created there later is checked then.
 #[cfg(unix)]
-pub(crate) fn foreign_link(dest: &Path, path: &Path, target: &[u8], extracted: &Extracted) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Some(mut at) = path.parent().map(Path::to_path_buf) else { return true };
-    for part in target.split(|&b| b == b'/') {
-        match part {
+pub(crate) fn foreign_link(dest: &Path, path: &Path, target: &[u8], extracted: &Extracted) -> Option<&'static str> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let parts = |bytes: &[u8]| -> Vec<Vec<u8>> { bytes.split(|&b| b == b'/').map(<[u8]>::to_vec).collect() };
+    let Some(mut at) = path.parent().map(Path::to_path_buf) else { return Some(LINK_LEAVES) };
+    let mut pending: std::collections::VecDeque<Vec<u8>> = parts(target).into();
+    let mut real_dest = None;
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        match part.as_slice() {
             b"" | b"." => continue,
             b".." => {
-                // `contained` lets `..` climb only the link's own folders, which are real ones
                 if !at.pop() || !at.starts_with(dest) {
-                    return true;
+                    return Some(LINK_LEAVES);
                 }
                 continue;
             }
             name => at.push(std::ffi::OsStr::from_bytes(name)),
         }
-        match std::fs::symlink_metadata(&at) {
-            Ok(m) if m.file_type().is_symlink() => return !extracted.links.contains(&identity(&m)),
-            Ok(_) => {}
-            Err(_) => return false,
+        let m = match std::fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        if !m.file_type().is_symlink() {
+            continue;
+        }
+        if extracted.preexisting == PreexistingLinks::Refuse && !extracted.links.contains(&identity(&m)) {
+            return Some(FOREIGN_LINK);
+        }
+        hops += 1;
+        let Ok(next) = std::fs::read_link(&at) else { return Some(LINK_LEAVES) };
+        if hops > MAX_HOPS {
+            return Some(LINK_LEAVES);
+        }
+        at.pop();
+        let next = next.into_os_string().into_vec();
+        let rest = if next.first() == Some(&b'/') {
+            // an absolute target stays inside only if it names the destination, as given or as it really is
+            let next = Path::new(std::ffi::OsStr::from_bytes(&next));
+            let real = real_dest.get_or_insert_with(|| std::fs::canonicalize(dest).ok());
+            let Some(rest) =
+                next.strip_prefix(dest).ok().or_else(|| real.as_ref().and_then(|r| next.strip_prefix(r).ok()))
+            else {
+                return Some(LINK_LEAVES);
+            };
+            at = dest.to_path_buf();
+            parts(rest.as_os_str().as_bytes())
+        } else {
+            parts(&next)
+        };
+        for part in rest.into_iter().rev() {
+            pending.push_front(part);
         }
     }
-    false
+    None
 }
 
 /// Why a link member is refused before anything is written, or None when it may be placed at `rel`.
@@ -451,7 +499,7 @@ fn make_charging(
 ) -> io::Result<()> {
     match kind {
         #[cfg(unix)]
-        LinkKind::Symbolic(target) if foreign_link(dest, path, target, extracted) => Err(refused(FOREIGN_LINK)),
+        LinkKind::Symbolic(target) if let Some(why) = foreign_link(dest, path, target, extracted) => Err(refused(why)),
         LinkKind::Symbolic(target) => create(path, target, replace, modified),
         LinkKind::Hard(source) | LinkKind::Copy(source) => {
             let landed = extracted.records.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;

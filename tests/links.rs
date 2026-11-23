@@ -43,6 +43,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite) -> Options {
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     }
 }
 
@@ -270,14 +271,14 @@ fn rename_existing_never_links_through_a_symlink_that_replaced_a_folder() {
         write_tar(&archive, bytes, gz);
         let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore));
         let s = extract::run(&archive, &opts, |_| {}).unwrap();
-        // `ext` was in the destination before the run, so the link `d -> ext` is refused before it is made; the
-        // folder had already moved aside, so `d/f` is gone and the hard link to it is refused too (#189)
+        // `ext` (in the destination before the run) leads out, so the link `d -> ext` is refused before it is made;
+        // the folder had already moved aside, so `d/f` is gone and the hard link to it is refused too (#189)
         assert!(fs::symlink_metadata(dest.join("d")).is_err(), "gz={gz}");
         assert_eq!(fs::read(dest.join("d_1/f")).unwrap(), b"mine", "gz={gz}");
         assert_eq!(
             s.errors,
             [
-                "d: the link's target passes through a link that was not extracted by this run".to_string(),
+                "d: the link's target leads out of the destination through another link".to_string(),
                 "h: the hard link's target is no longer the file extracted earlier".to_string(),
             ],
             "gz={gz}"
@@ -471,4 +472,44 @@ fn xar_refusals_fail_only_their_members() {
     assert!(fs::symlink_metadata(dest.join("up")).is_err());
     assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "written through the link");
     assert_eq!(fs::read(dest.join("z.txt")).unwrap(), b"z\n");
+}
+
+/// Symbolic links the destination held before the run: by default one that stays inside is followed, as UnRAR
+/// does (`f -> d/file.txt` with `d -> sub`, and `l -> d` then `m -> l/file.txt`), and an archive link that leads
+/// out through one is refused. Under `PreexistingLinks::Refuse` any link through one is refused, as 7-Zip does.
+#[test]
+fn preexisting_links_are_followed_inside_or_refused_by_policy() {
+    use zipfast::extract::PreexistingLinks;
+    let members: &[(&str, u8, &[u8])] =
+        &[("f", b'2', b"d/file.txt"), ("l", b'2', b"d"), ("m", b'2', b"l/file.txt"), ("e", b'2', b"x/file.txt")];
+    for policy in [PreexistingLinks::FollowInside, PreexistingLinks::Refuse] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("outside")).unwrap();
+        let archive = dir.path().join("a.tar");
+        write_tar(&archive, tar(members), false);
+        let dest = dir.path().join("out");
+        fs::create_dir_all(dest.join("sub")).unwrap();
+        fs::write(dest.join("sub/file.txt"), b"pre").unwrap();
+        std::os::unix::fs::symlink("sub", dest.join("d")).unwrap();
+        std::os::unix::fs::symlink("../outside", dest.join("x")).unwrap();
+        let opts = Options { preexisting_links: policy, ..options(&dest, Mode::Extract, Overwrite::Always) };
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        let leaves = "e: the link's target leads out of the destination through another link".to_string();
+        if policy == PreexistingLinks::FollowInside {
+            assert_eq!(s.errors, [leaves], "{policy:?}");
+            assert_eq!(fs::read_link(dest.join("f")).unwrap(), Path::new("d/file.txt"));
+            assert_eq!(fs::read_link(dest.join("l")).unwrap(), Path::new("d"));
+            assert_eq!(fs::read_link(dest.join("m")).unwrap(), Path::new("l/file.txt"));
+            assert_eq!(fs::read(dest.join("m")).unwrap(), b"pre");
+        } else {
+            let foreign =
+                |n: &str| format!("{n}: the link's target passes through a link that was not extracted by this run");
+            // `m -> l/file.txt` is made: `l` was refused, so nothing is there to pass through
+            assert_eq!(s.errors, [foreign("f"), foreign("l"), foreign("e")], "{policy:?}");
+            for name in ["f", "l"] {
+                assert!(fs::symlink_metadata(dest.join(name)).is_err(), "{name}");
+            }
+        }
+        assert!(fs::symlink_metadata(dest.join("e")).is_err(), "{policy:?}");
+    }
 }

@@ -1183,6 +1183,7 @@ fn direct_setup_output(
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     };
     (file, session, options, context)
 }

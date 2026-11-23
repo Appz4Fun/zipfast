@@ -1668,7 +1668,7 @@ impl StagedTar {
         report: &mut impl LegacyReport,
         cancel: Option<&Cancellation>,
     ) -> Result<()> {
-        let mut extracted = Extracted::default();
+        let mut extracted = Extracted::new(opts);
         for member in self.members {
             // a cancellation from an earlier member's outcome stops the rest from being published
             if let Some(cancel) = cancel {
@@ -1904,7 +1904,7 @@ fn run_tar(
 ) -> Result<()> {
     let mut staged = (opts.mode == Mode::Extract && reader.src.codec().is_some()).then(StagedTar::default);
     // the files written so far, for hard links (a staged run tracks them as it publishes)
-    let mut extracted = Extracted::default();
+    let mut extracted = Extracted::new(opts);
     // the next member's position in a listing, which leaves out volume labels
     let mut ordinal = 0u64;
     let mut holes = HoleBudget::new();
@@ -2325,6 +2325,7 @@ mod tests {
                 fallback_mtime: None,
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
+                preexisting_links: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);

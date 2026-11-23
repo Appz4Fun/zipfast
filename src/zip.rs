@@ -1142,7 +1142,7 @@ pub(crate) fn run_renaming(
         report.member(LegacyMember::Skipped { ordinal, name });
     }
     // ZIP holds no hard links: only symbolic ones are placed, and they never replace a file the run relies on.
-    let mut extracted = crate::extract::link::Extracted::default();
+    let mut extracted = crate::extract::link::Extracted::new(opts);
     // A run that stops early still says which files a rename mode renamed or moved aside.
     let result = (|| -> Result<()> {
         for (ordinal, e) in entries.iter().enumerate() {

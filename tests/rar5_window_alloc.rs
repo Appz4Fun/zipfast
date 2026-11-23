@@ -104,6 +104,7 @@ fn check_archive(archive: &Path, refuse: bool) {
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     };
     let mut seen = 0;
     REFUSE_WINDOW.store(refuse, Ordering::Relaxed);

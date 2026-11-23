@@ -713,6 +713,7 @@ mod header_key_tests {
             fallback_mtime: None,
             compressed_tar: Default::default(),
             version_naming: Default::default(),
+            preexisting_links: Default::default(),
         };
         let whole = compressions(|| {
             let summary = run(first, &options, Some("password"), &cancel, &limits, |_| {}).unwrap();

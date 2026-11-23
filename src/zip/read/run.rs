@@ -252,7 +252,7 @@ impl ProjectedReadSession {
         // Directories a Publication::Bulk run published into, flushed once when the run ends.
         let mut bulk_dirs = std::collections::BTreeSet::<PathBuf>::new();
         // the symbolic links this run placed: a later link's target may pass through them, not through others
-        let mut links = crate::extract::link::Extracted::default();
+        let mut links = crate::extract::link::Extracted::new(options);
         // Counter and limit faults inside the loop return early; the directories already published into are still
         // flushed before that fault is returned.
         let looped = (|| -> ZipReadResult<()> {
