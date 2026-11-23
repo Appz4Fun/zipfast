@@ -279,13 +279,14 @@ fn infer(known: &Known<'_>, at: u64, len: u32, limit: u64, work: &mut Work) -> s
 }
 
 /// Checks `block`, decoded at output offset `at` with state `st`, against the plaintext, learning the state it
-/// uses. Distances the hole erased are taken from the plaintext when exactly one fits.
+/// uses. Distances the hole erased are taken from the plaintext when exactly one fits, up to `reach` back (the
+/// window's [`Window::reach`], as far as the decoder lets a match copy from, not its allocated size).
 fn simulate(
     block: &Block,
     at: u64,
     known: &Known<'_>,
     st: &mut State,
-    window: u64,
+    reach: u64,
     work: &mut Work,
     mut seen: Option<&mut Vec<SeenFilter>>,
 ) -> Sim {
@@ -295,7 +296,7 @@ fn simulate(
     let touches = |seen: &Option<&mut Vec<SeenFilter>>, lo: u64, hi: u64| {
         seen.as_ref().is_some_and(|f| f.iter().any(|f| f.start < hi && f.start + f.len > lo))
     };
-    let limit = window.min(SEARCH);
+    let limit = reach.min(SEARCH);
     for tok in block.toks.iter().map(|p| p.get(&block.filters)) {
         let tok = &tok;
         let (len, dist) = match *tok {
@@ -528,17 +529,12 @@ pub fn resync(
             break;
         }
         let range = expected.start.saturating_add(shift)..expected.end.saturating_add(shift + slack);
-        let moved = |shift: &mut u64, slack: &mut u64| {
-            if let Some((len, extra)) = known_len(&first) {
-                *shift += len;
-                *slack += extra;
-            }
-        };
         let Some(starts) = candidates(&first, &known, &range, &mut work) else {
             if work.left == 0 {
                 return Err(ResyncError::Exhausted);
             }
-            moved(&mut shift, &mut slack);
+            let (len, extra) = passed_len(packed, at, &first, &mut pre, &mut work);
+            (shift, slack) = (shift + len, slack + extra);
             continue;
         };
         // Every offset the block fits at is followed through the read-ahead; exactly one may hold.
@@ -561,9 +557,30 @@ pub fn resync(
             return result;
         }
         // Pinned but contradicted everywhere: the block is passed, and so is its output.
-        moved(&mut shift, &mut slack);
+        let (len, extra) = passed_len(packed, at, &first, &mut pre, &mut work);
+        (shift, slack) = (shift + len, slack + extra);
     }
     Err(ResyncError::NotFound)
+}
+
+/// The output of `first` (at packed offset `at`), a block [`resync`] passes without pinning, and of the blocks right
+/// after it that reuse its tables (the scan looks only at blocks with their own tables, so it would never count
+/// them): how far the expected range moves on, as [`known_len`] gives it. Stops at a block with its own tables, one
+/// whose length is unknown (a filter), or one that does not decode.
+fn passed_len(packed: &[u8], at: usize, first: &Block, pre: &mut Huff, work: &mut Work) -> (u64, u64) {
+    let Some((mut len, mut extra)) = known_len(first) else { return (0, 0) };
+    let mut pos = at + first.len;
+    let mut owned;
+    let mut block = first;
+    while !block.last && packed.get(pos).is_some_and(|&b| b & 0x80 == 0) {
+        let Some(next) = probe(packed, pos, Some(&block.lens), pre, work) else { break };
+        let Some((l, e)) = known_len(&next) else { break };
+        (len, extra) = (len + l, extra + e);
+        pos += next.len;
+        owned = next;
+        block = &owned;
+    }
+    (len, extra)
 }
 
 /// Options for [`resync_near`].
@@ -955,7 +972,7 @@ fn follow_near(
         note(pos, out, &st, &block.lens, &seen, &mut any, &mut guarded);
         let mut trial = st;
         let before = seen.len();
-        match simulate(block, out, known, &mut trial, window.size, work, Some(&mut seen)) {
+        match simulate(block, out, known, &mut trial, window.reach, work, Some(&mut seen)) {
             Sim::Matches(n) => {
                 st = trial;
                 out += n;
@@ -1033,7 +1050,7 @@ fn follow(
         }
         // On a copy of the state: a block that is not wholly checked teaches nothing.
         let mut trial = st;
-        match simulate(block, out, known, &mut trial, window.size, work, None) {
+        match simulate(block, out, known, &mut trial, window.reach, work, None) {
             Sim::Matches(n) => {
                 st = trial;
                 out += n;
