@@ -76,8 +76,13 @@ struct Active {
     staged: Vec<Staged>,
     /// Tested members held back for the folder's CRC in the same case: name and size.
     tested: Vec<(String, u64, u64)>,
+    /// Printed members held back for the folder's CRC in the same case: listing index and spooled data.
+    held: Vec<(u64, tempfile::TempPath)>,
     defer: bool,
 }
+
+/// Where printed members go: their listing index and a chunk of their data, in archive order.
+pub(super) type PrintSink<'a> = &'a mut dyn FnMut(u64, &[u8]) -> io::Result<()>;
 
 struct Run<'a> {
     opts: &'a Options,
@@ -98,6 +103,9 @@ struct Run<'a> {
     current: u64,
     /// files written so far (symbolic links only are placed; 7z hard links are stored as files)
     extracted: crate::extract::link::Extracted,
+    /// Printing (`7z x -so`) instead of extracting or testing: each selected member is spooled until it checks
+    /// out, then copied here.
+    print: Option<PrintSink<'a>>,
 }
 
 pub(super) fn run(
@@ -158,6 +166,7 @@ pub(super) fn run(
         password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],
         current: 0,
+        print: None,
     };
     let result = run.members(&selected, &needed);
     crate::extract::finish_dirs(&mut run.summary);
@@ -165,6 +174,79 @@ pub(super) fn run(
         Ok(()) => Ok(run.summary),
         Err(error) => Err((error, std::mem::take(&mut run.summary.renames))),
     }
+}
+
+/// Prints the members `select` takes (by listing index and name; directories are never offered) to `sink` in
+/// archive order: each folder is decoded once, front to back, and each member is spooled until its CRC (and, for a
+/// folder of several members that stores one, the folder's CRC) checks out, then copied to `sink`. A member that
+/// fails is a line in the returned [`Summary::errors`] and prints nothing; the run goes on. The run itself fails as
+/// [`run`] does (a missing or wrong password, a limit, an unsupported coder, cancellation, unreadable volumes), and
+/// on an error from `sink`.
+pub(super) fn print(
+    first: &Path,
+    password: Option<&str>,
+    select: &mut dyn FnMut(u64, &str) -> bool,
+    sink: PrintSink<'_>,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+) -> Outcome<Summary> {
+    let (map, header_key) = open_map_keyed(first, password, cancel, limits)?;
+    let mut keys = Keys::new(password);
+    if let Some((cycles, salt, key)) = header_key {
+        keys.seed(cycles, salt, key);
+    }
+    check_bounds(&map, limits)?;
+    let selected: Vec<bool> = map
+        .members
+        .iter()
+        .enumerate()
+        .map(|(ordinal, m)| !m.is_dir && select(ordinal as u64, &member_name(m)))
+        .collect();
+    let mut needed = vec![None::<usize>; map.folders.len()];
+    for (ordinal, m) in map.members.iter().enumerate() {
+        if let Some(slot) = m.folder
+            && selected[ordinal]
+        {
+            *needed.get_mut(slot.index as usize).ok_or(SevenZipError::Corrupt("7z folder index"))? = Some(ordinal);
+        }
+    }
+    for (folder, _) in map.folders.iter().zip(&needed).filter(|(_, n)| n.is_some()) {
+        if let Some(coder) = folder.coders.iter().find(|c| !coders::supported(c.kind)) {
+            return Err(SevenZipError::UnsupportedCoder { id: coder.id });
+        }
+    }
+    let options = Options {
+        mode: Mode::Test,
+        dest: PathBuf::new(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: None,
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+        windows_safe_names: false,
+    };
+    let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
+    let mut report = |_: &str| {};
+    let mut run = Run {
+        opts: &options,
+        map: &map,
+        set,
+        keys,
+        limits,
+        cancel,
+        report: &mut report,
+        summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
+        dirs: Dirs::default(),
+        extracted: Default::default(),
+        active: None,
+        password_proven: map.header_encrypted,
+        buf: vec![0; CHUNK],
+        current: 0,
+        print: Some(sink),
+    };
+    run.members(&selected, &needed)?;
+    Ok(run.summary)
 }
 
 /// The options with every volume of the set protected as well as the first.
@@ -351,6 +433,13 @@ impl Run<'_> {
     /// A directory or an empty file: no data.
     fn loose(&mut self, member: &MapMember) -> Outcome<()> {
         let name = member_name(member);
+        if self.print.is_some() {
+            // an empty file prints nothing; directories are never selected for printing
+            if !member.is_dir {
+                self.succeeded(self.current, &name, 0);
+            }
+            return Ok(());
+        }
         let Some((rel, place)) = self.place(member, &name)? else { return Ok(()) };
         if member.is_dir {
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
@@ -460,6 +549,7 @@ impl Run<'_> {
         let wrong_password = active.wrong_password || (!good && folder.cipher.is_some() && !self.password_proven);
         let staged = std::mem::take(&mut active.staged);
         let tested = std::mem::take(&mut active.tested);
+        let held = std::mem::take(&mut active.held);
         if !good {
             let why = active.failed.clone().unwrap_or_else(|| "checksum error in its solid block".to_owned());
             let mut failed: Vec<(u64, &str)> = staged
@@ -476,6 +566,9 @@ impl Run<'_> {
                 }
             }
             return Ok(());
+        }
+        for (ordinal, temporary) in held {
+            self.print_spooled(ordinal, &temporary)?;
         }
         for (name, size, ordinal) in tested {
             self.succeeded(ordinal, &name, size);
@@ -506,6 +599,7 @@ impl Run<'_> {
             wrong_password: false,
             staged: Vec::new(),
             tested: Vec::new(),
+            held: Vec::new(),
             defer: folder.crc32.is_some() && folder.members > 1,
         });
         Ok(())
@@ -601,11 +695,16 @@ impl Run<'_> {
                 return self.data_failure(active, name, &why, encrypted, take);
             }
         }
-        let target = if take { self.place(member, name)? } else { None };
+        let target = match take {
+            // printing writes no file, so the name needs no checking: it is only reported
+            true if self.print.is_some() => Some((PathBuf::new(), None)),
+            true => self.place(member, name)?,
+            false => None,
+        };
         let mut staged = match &target {
             Some((_, Some(place))) => Some(self.stage(place, size)?),
-            // testing a link: its target is held aside (in the system's temporary folder) to be checked
-            Some((_, None)) if is_link(member) => {
+            // testing a link, or printing: the data is held aside (in the system's temporary folder) to be checked
+            Some((_, None)) if is_link(member) || self.print.is_some() => {
                 let (file, temporary) = tempfile::NamedTempFile::new().map_err(SevenZipError::Io)?.into_parts();
                 Some((temporary, Output::new(file, Some(size))))
             }
@@ -640,6 +739,19 @@ impl Run<'_> {
             self.password_proven = true;
         }
         let Some((rel, place)) = target else { return Ok(()) };
+        if self.print.is_some() {
+            let (temporary, output) = staged.take().expect("a spooled member");
+            output.finish(|_| ()).map_err(SevenZipError::Io)?;
+            // A folder with its own CRC vouches for its members at its end: printed then, in order.
+            if active.defer {
+                active.held.push((self.current, temporary));
+                active.tested.push((name.to_owned(), size, self.current));
+            } else {
+                self.print_spooled(self.current, &temporary)?;
+                self.succeeded(self.current, name, size);
+            }
+            return Ok(());
+        }
         let Some(place) = place else {
             // Testing a link checks its target as extracting would.
             if let Some((temporary, output)) = staged.take() {
@@ -677,6 +789,25 @@ impl Run<'_> {
             self.publish(staged)?;
         }
         Ok(())
+    }
+
+    /// Copies a checked member's spooled data to the print sink.
+    fn print_spooled(&mut self, ordinal: u64, temporary: &Path) -> Outcome<()> {
+        let Some(sink) = self.print.as_mut() else { return Ok(()) };
+        let mut file = fs::File::open(temporary).map_err(SevenZipError::Io)?;
+        let mut chunk = vec![0; CHUNK];
+        loop {
+            if self.cancel.is_canceled() {
+                return Err(SevenZipError::Canceled);
+            }
+            let n = match file.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SevenZipError::Io(e)),
+            };
+            sink(ordinal, &chunk[..n]).map_err(SevenZipError::Io)?;
+        }
     }
 
     fn data_failure(&mut self, active: &mut Active, name: &str, why: &str, encrypted: bool, take: bool) -> Outcome<()> {

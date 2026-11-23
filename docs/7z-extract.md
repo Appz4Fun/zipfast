@@ -41,6 +41,27 @@ Overwrite choices are made by `extract::check_target`, the function every whole-
 Selected single-entry reads (`SelectedEntry::open*`) refuse 7z with `Unsupported`. Progressive and persistent-partial
 sessions read RAR only and refuse a 7z archive as before.
 
+## Printing members (`7z x -so`)
+
+`sevenzip::print_selected(first, password, select, output, cancel, limits)` writes the data of the members `select`
+takes (it gets each member's listing index and name; directories are never offered) to one writer, in archive order,
+as `7z x -so` does. Each folder is decoded once, front to back, even when several of its members are taken: the
+members before and between them are decoded and dropped. Each member is spooled to a private temporary file until its
+CRC checks out (for a folder of several members that stores its own CRC, until the folder's does, so those print
+together at the folder's end), so a member that fails prints nothing; it is a line in `Summary::errors` and the run
+goes on. `print_selected_with` hands each chunk to a callback with the member's listing index instead.
+`extract::SelectedEntry::open` (and `open_cancelable_with_zip_limit`) read one 7z member through the same code, so
+callers that read members one by one get the same bytes. Their byte limit counts the solid history the member
+needs, as for RAR: its folder's packed bytes and the decoded bytes through the member (the whole folder when the
+folder's own CRC must vouch for it), refused at open with `ReadResource::MemberPackedBytes` /
+`MemberDecodedBytes` on the checked dispatcher. The caller's cancellation reaches the header walk and an encrypted
+header's key derivation. Reading one by one decodes the member's folder up to it each time, so
+for several members of one solid folder `print_selected` is the cheaper route. A split ZIP set (`.z01`... `.zip`, or
+`.zip.001`...) also opens with `SelectedEntry`, read across its volumes as `extract::run` reads it.
+
+7-Zip prints an encrypted member's data before its CRC fails (a wrong password on a Copy folder); zipfast withholds
+a member until it checks out.
+
 ## What decodes
 
 | coder | id | notes |
