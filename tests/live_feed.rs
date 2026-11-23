@@ -186,6 +186,48 @@ fn a_repaired_trailing_hole_counts_as_a_refill() {
     assert!(report.refills >= 1 && report.refill_bytes >= 1, "{report:?}");
 }
 
+// Catches releases left on for members of one 7z folder: their pieces are empty (the bytes are the folder's), and
+// one member's decoder releasing the folder's bytes starves the others.
+#[test]
+fn members_of_one_solid_7z_folder_share_its_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let whole = std::fs::read(fixture("7z", &["lzma2_chunks.7z"]).remove(0)).unwrap();
+    let dir = tmp.path().join("set");
+    std::fs::create_dir_all(&dir).unwrap();
+    let volumes: Vec<PathBuf> = whole
+        .chunks(whole.len().div_ceil(3))
+        .enumerate()
+        .map(|(i, part)| {
+            let path = dir.join(format!("chunks.7z.{:03}", i + 1));
+            std::fs::write(&path, part).unwrap();
+            path
+        })
+        .collect();
+    for seed in 1..4 {
+        let mut config = config(volumes.clone(), &tmp.path().join(format!("work-{seed}")), 4_000);
+        config.seed = seed;
+        let report = sim::run(&config).unwrap();
+        check(&report);
+        assert_eq!(report.fed, 3, "{report:?}");
+    }
+}
+
+// Catches verification looking for a backslash name at a path extraction does not write: a Windows-made `d\x` is
+// `d/x`, a Unix-made one keeps its backslash.
+#[test]
+fn backslash_names_verify_against_what_extraction_wrote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (vec![1u8; 5_000], vec![2u8; 6_000]);
+    let mut windows = common::FileSpec::new("d\\x.bin", &a);
+    windows.unix_mode = None;
+    let unix = common::FileSpec::new("e\\y.bin", &b);
+    let path = tmp.path().join("names.rar");
+    std::fs::write(&path, common::archive(&[windows, unix])).unwrap();
+    let report = sim::run(&config(vec![path], &tmp.path().join("work"), 1_000)).unwrap();
+    check(&report);
+    assert_eq!(report.fed, 2);
+}
+
 #[test]
 fn old_style_volume_names_go_on_past_r99() {
     let tmp = tempfile::tempdir().unwrap();

@@ -980,11 +980,18 @@ pub fn run(config: &Config) -> Result<Report, String> {
         return Err("no member can be fed".into());
     }
 
-    // Releases are safe only when the fed members' packed bytes are disjoint.
-    let mut spans: Vec<(u32, u64, u64)> = members
-        .iter()
-        .flat_map(|m| map.members[m.index].pieces.iter().map(|p| (p.volume, p.packed.start, p.packed.end)))
-        .collect();
+    // Releases are safe only when the fed members' packed bytes are disjoint. A 7z member's bytes are its folder's
+    // (its `pieces` are empty), and every member of a folder reads them: a release by one decoder would drop bytes
+    // the others still need (see `PackedSource::release` in docs/feed-decoder.md).
+    let mut spans: Vec<(u32, u64, u64)> = Vec::new();
+    for m in &members {
+        let member = &map.members[m.index];
+        spans.extend(member.pieces.iter().map(|p| (p.volume, p.packed.start, p.packed.end)));
+        if let Some(slot) = &member.folder {
+            let folder = &map.folders[slot.index as usize];
+            spans.extend(folder.packed.iter().map(|p| (p.volume, p.packed.start, p.packed.end)));
+        }
+    }
     spans.sort();
     let disjoint = spans.windows(2).all(|w| w[0].0 != w[1].0 || w[0].2 <= w[1].1);
     let mut source = Source { buffer: ArticleBuffer::new(config.buffer_limit), release: disjoint };
@@ -1086,14 +1093,40 @@ fn verify(config: &Config, map: &MemberMap, outputs: &[(usize, u64, PathBuf)]) -
     };
     zipfast::extract::run_with_password(&config.volumes[0], &options, config.password.as_deref(), |_| {})
         .map_err(|e| format!("straight extraction: {e}"))?;
+    // The files the extraction wrote, wherever its name projection put them (a RAR 5.0 `d\\x` is `d/x` or a literal
+    // backslash depending on the host that made it): each output must equal one of them, each used once.
+    let mut extracted = Vec::new();
+    let mut dirs = vec![straight];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                extracted.push((entry.metadata().map_err(|e| e.to_string())?.len(), entry.path()));
+            }
+        }
+    }
     let mut all = true;
     for (index, size, path) in outputs {
-        let name = map.members[*index].name.clone().unwrap_or_default().replace('\\', "/");
-        let same = same_bytes(path, &straight.join(&name), *size).map_err(|e| format!("{name}: {e}"))?;
-        if !same {
-            eprintln!("member {index} ({name}): output differs from the straight extraction");
+        let name = map.members[*index].name.clone().unwrap_or_default();
+        let mut matched = None;
+        for (i, (len, reference)) in extracted.iter().enumerate() {
+            if len == size && same_bytes(path, reference, *size).map_err(|e| format!("{name}: {e}"))? {
+                matched = Some(i);
+                break;
+            }
         }
-        all &= same;
+        match matched {
+            Some(i) => {
+                extracted.swap_remove(i);
+            }
+            None => {
+                eprintln!("member {index} ({name}): no file of the straight extraction equals its output");
+                all = false;
+            }
+        }
     }
     Ok(all)
 }

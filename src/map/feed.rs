@@ -62,6 +62,11 @@ pub trait PackedSource {
 
     /// The decoder will not read `range` of volume `volume` again (unless it is restored from an earlier
     /// [`FeedSnapshot`]), so the source may let those bytes go. A hint; the default keeps them.
+    ///
+    /// The hint is per decoder. A source shared by several decoders whose members share packed bytes, as every
+    /// member of a 7z folder reads the folder's packed stream ([`super::MapFolder::packed`]; the members' own
+    /// `pieces` are empty), must keep bytes until no decoder reads them: count releases per decoder, or ignore them
+    /// ([`ArticleBuffer`] drops what it is told).
     fn release(&mut self, volume: u32, range: Range<u64>) {
         let _ = (volume, range);
     }

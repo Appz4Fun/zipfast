@@ -34,6 +34,11 @@ bounded:
 - `absent(volume, range)` (optional): the parts of a range not held, listed as `NeedKind::Ahead`.
 - `release(volume, range)` (optional hint): bytes the decoder will not read again, so the source may drop them.
   Everything the main decode passed is released, also past holes, except the bytes a lost range's repair still reads.
+  The hint is per decoder: when several decoders share a source and their members share packed bytes (the members of
+  one 7z folder all read the folder's packed stream, `MapFolder::packed`, and list no `pieces` of their own), the
+  source must keep bytes until no decoder reads them. Count releases per decoder, or ignore them; `ArticleBuffer`
+  drops whatever it is told. The [live feed example](#live-feed-example) ignores releases when the fed members'
+  bytes overlap.
 
 `ArticleBuffer::new(limit)` is an in-memory source: `insert(volume, offset, bytes)` in any order (overlaps keep
 the bytes already held; `BufferFull` when the limit would be passed, storing nothing, so the caller holds them
@@ -259,7 +264,8 @@ The simulation:
   status listed as lost) and their bytes, the
   repair time and that time per dropped article, stalls, syncs (`durable_sync_count` for partials, one per plain
   file), peak buffer, the CRC verdict (`crc_ok`, plus `poll_verify` for partials), and whether the output equals a
-  straight extraction of the set. The exit status is non-zero when a check fails.
+  straight extraction of the set (each output must equal one file the extraction wrote, each file used once). The
+  exit status is non-zero when a check fails.
 
 ### From `NeedBytes` to download priority
 
@@ -369,4 +375,7 @@ against a straight extraction. Also covered:
   alike;
 - a dropped trailing article counting as a refill when repaired;
 - old-style volume discovery past `.r99` (`.s00`, `.s01`);
+- the three members of one solid 7z LZMA2 folder (`lzma2_chunks.7z` cut into volumes) fed from one buffer;
+- backslash names checked against the file the extraction wrote, whether it made `d/x` (Windows-made) or kept the
+  backslash (Unix-made);
 - the need-to-article mapping and the priority order.
