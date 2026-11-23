@@ -232,6 +232,17 @@ impl Run<'_> {
         if active.failed.is_none() {
             active.failed = Some(WRONG_PASSWORD.to_owned());
         }
+        // Earlier members held back for the folder's CRC (ones without a CRC of their own) failed too: report them
+        // first, so the failures come in archive order. Their staged files are dropped, which removes them.
+        let mut held: Vec<(u64, String)> = std::mem::take(&mut active.staged)
+            .into_iter()
+            .map(|s| (s.ordinal, s.name))
+            .chain(std::mem::take(&mut active.tested).into_iter().map(|(n, _, o)| (o, n)))
+            .collect();
+        held.sort_by_key(|(o, _)| *o);
+        for (ordinal, held) in held {
+            self.fail_wrong_password(ordinal, &held);
+        }
         if take {
             self.fail_wrong_password(self.current, name);
         }
