@@ -938,6 +938,20 @@ impl Guard {
             if !fits {
                 return Err(RarDiagnosticFailure::PublicationUnverified { ordinal });
             }
+            // A symbolic link placed where none was has no followed record: one is added, so its referent is
+            // checked against the diagnostic file now and on every later refresh, as a link found in preparation is.
+            if let (PlacedLink::Symbolic { .. }, Some(i)) = (placed, at) {
+                let followed = self
+                    .records
+                    .iter()
+                    .any(|r| r.follow && r.ordinal == Some(ordinal) && r.path == self.records[i].path);
+                if !followed {
+                    let path = std::mem::take(&mut self.records[i].path);
+                    let admitted = self.admit_record(c, &path[..path.len() - 1], ordinal, true, true, attempts);
+                    self.records[i].path = path;
+                    admitted?;
+                }
+            }
         }
         let symbolic = matches!(placed, PlacedLink::Symbolic { .. });
         let source = match placed {
