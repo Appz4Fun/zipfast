@@ -365,3 +365,63 @@ fn waiting_links_resolve_to_their_own_file_only() {
     assert!(shown[1].1.as_deref().unwrap().contains("a3") && shown[2].1.as_deref().unwrap().contains("a3"));
     assert!(shown[4].1.as_deref().unwrap().contains("b1"), "{shown:?}");
 }
+
+/// A first name longer than the 512 bytes read to tell the format: still found to be cpio, plain and compressed.
+#[test]
+fn a_long_first_name_is_still_cpio() {
+    let long = ["d".repeat(100), "e".repeat(100), "f".repeat(100), "g".repeat(100), "h".repeat(100)].join("/");
+    let bytes = archive(&[file(&long, b"deep"), file("b", b"beta")]);
+    for (what, s, dir) in runs(&bytes) {
+        assert!(s.errors.is_empty() && s.files == 2, "{what}: {:?}", s.errors);
+        if what.ends_with("Extract") {
+            assert_eq!(fs::read(dir.path().join("out").join(&long)).unwrap(), b"deep", "{what}");
+        }
+    }
+}
+
+/// Inode zero is an identity like any other: an empty name before the one carrying the data links to it.
+#[test]
+fn links_with_inode_zero_share_their_data() {
+    let bytes = archive(&[newc("a", 0o100644, 0, 2, b"", false), newc("b", 0o100644, 0, 2, b"data", false)]);
+    for (what, s, dir) in runs(&bytes) {
+        assert!(s.errors.is_empty() && s.files == 2, "{what}: {:?}", s.errors);
+        if what.ends_with("Extract") {
+            assert_eq!(fs::read(dir.path().join("out/a")).unwrap(), b"data", "{what}");
+            assert_eq!(fs::read(dir.path().join("out/b")).unwrap(), b"data", "{what}");
+        }
+    }
+}
+
+/// A second name of a file that carries its own copy of the data comes out as a link, but its copy is still held
+/// to its checksum.
+#[test]
+fn a_linked_copy_is_checked_before_it_is_passed_over() {
+    let mut bad = newc("b", 0o100644, 5, 2, b"bad", true);
+    bad[102..110].copy_from_slice(b"00000001");
+    let bytes = archive(&[newc("a", 0o100644, 5, 2, b"good", true), bad]);
+    for (what, s, _) in runs(&bytes) {
+        assert!(s.errors.iter().any(|e| e.contains("checksum")), "{what}: {:?}", s.errors);
+    }
+    let good = archive(&[newc("a", 0o100644, 5, 2, b"good", true), newc("b", 0o100644, 5, 2, b"good", true)]);
+    for (what, s, _) in runs(&good) {
+        assert!(s.errors.is_empty() && s.files == 2, "{what}: {:?}", s.errors);
+    }
+}
+
+/// Many short names waiting for data that comes under a 60,000-byte name: each becomes a link holding that long
+/// name, and those copies count against the hard-link cap before they pile up.
+#[test]
+fn links_expanded_to_a_long_name_are_bounded() {
+    let long = "n".repeat(60_000);
+    let mut parts: Vec<Vec<u8>> = (0..2_000).map(|i| newc(&format!("w{i}"), 0o100644, 9, 3, b"", false)).collect();
+    parts.push(newc(&long, 0o100644, 9, 3, b"x", false));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l.cpio");
+    fs::write(&path, archive(&parts)).unwrap();
+    let err = extract::list(&path).unwrap_err();
+    assert!(err.to_string().contains("too many hard links"), "{err}");
+    // a few of them are fine
+    parts.drain(..1_990);
+    fs::write(&path, archive(&parts)).unwrap();
+    assert_eq!(extract::list(&path).unwrap().len(), 11);
+}

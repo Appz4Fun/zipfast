@@ -92,8 +92,13 @@ pub(super) fn sniff(head: &[u8]) -> Option<Format> {
     let header = parse(format, head.get(..format.header_len())?).ok()?;
     // the name has to be there and end in its NUL: two bytes of binary magic alone say little
     let start = format.header_len();
-    let name = head.get(start..start + usize::try_from(header.namesize).ok()?)?;
-    (name.last() == Some(&0)).then_some(format)
+    let end = start + usize::try_from(header.namesize).ok()?;
+    match head.get(start..end) {
+        Some(name) => (name.last() == Some(&0)).then_some(format),
+        // a long first name runs past the probe: an ASCII header whose every field reads as a number is evidence
+        // enough, and the name is checked as the member is read
+        None => (!matches!(format, Format::Bin { .. }) && head.len() > start).then_some(format),
+    }
 }
 
 struct Header {
@@ -191,6 +196,8 @@ pub(super) struct State {
     /// the next waiting link's place in the archive, so the ones never resolved come out in order
     seq: u64,
     link_bytes: usize,
+    /// what the members in `queue` hold in names and link targets, counted with `link_bytes` against the cap
+    queued_bytes: usize,
 }
 
 /// A link read before any carried its file's data: only what it takes to hand it out later, as a link or (at the
@@ -277,6 +284,7 @@ impl State {
             waiting_count: 0,
             seq: 0,
             link_bytes: 0,
+            queued_bytes: 0,
         }
     }
 
@@ -289,27 +297,81 @@ impl State {
         Ok(())
     }
 
+    /// Counts a member about to wait in `queue`: every link expanded from one data-carrying name holds its own copy
+    /// of that name as its target, which the cap has to see before the copies pile up.
+    fn charge_queued(&mut self, m: &Member) -> Result<()> {
+        self.queued_bytes += queued_cost(m);
+        if self.link_bytes + self.queued_bytes > MAX_LINK_BYTES {
+            return Err(Error::Corrupt("a cpio archive has too many hard links"));
+        }
+        Ok(())
+    }
+
+    fn enqueue(&mut self, m: Member) -> Result<()> {
+        self.charge_queued(&m)?;
+        self.queue.push_back(m);
+        Ok(())
+    }
+
+    fn dequeue(&mut self) -> Option<Member> {
+        let m = self.queue.pop_front()?;
+        self.queued_bytes -= queued_cost(&m);
+        Some(m)
+    }
+
     /// Hands out the links still waiting for data at the end: the first as an empty file, the rest as links to it.
-    fn flush(&mut self) {
+    fn flush(&mut self) -> Result<()> {
         let mut out: Vec<(u64, Member)> = Vec::with_capacity(self.waiting_count);
         for (_, links) in std::mem::take(&mut self.waiting) {
             let mut links = links.into_iter();
             let Some(first) = links.next() else { continue };
-            let target = first.name.clone();
-            out.push((first.seq, first.into_member(Kind::File, String::new())));
-            out.extend(links.map(|l| (l.seq, l.into_member(Kind::HardLink, target.clone()))));
+            let (seq, target) = (first.seq, first.name.clone());
+            let m = first.into_member(Kind::File, String::new());
+            self.charge_queued(&m)?;
+            out.push((seq, m));
+            for l in links {
+                let seq = l.seq;
+                let m = l.into_member(Kind::HardLink, target.clone());
+                self.charge_queued(&m)?;
+                out.push((seq, m));
+            }
         }
         self.waiting_count = 0;
         // each file's first link comes before its others, so archive order keeps every link after its target
         out.sort_unstable_by_key(|(seq, _)| *seq);
         self.queue.extend(out.into_iter().map(|(_, m)| m));
+        Ok(())
     }
+}
+
+/// What a queued member holds in names and link target.
+fn queued_cost(m: &Member) -> usize {
+    std::mem::size_of::<Member>() + m.name.len() + m.link.len() + m.raw_name.as_ref().map_or(0, Vec::len)
 }
 
 impl Reader {
     fn read_exact_cpio(&mut self, buf: &mut [u8]) -> Result<()> {
         if self.src.read(buf)? < buf.len() {
             return Err(Error::Truncated);
+        }
+        Ok(())
+    }
+
+    /// Reads and sums `size` bytes of data that are not handed out, failing when they don't add up to `want`.
+    fn check_skipped(&mut self, size: u64, want: u32) -> Result<()> {
+        let mut left = size;
+        let mut sum = 0u32;
+        while left > 0 {
+            let n = left.min(self.scratch.len() as u64) as usize;
+            let got = self.src.read(&mut self.scratch[..n])?;
+            if got == 0 {
+                return Err(Error::Truncated);
+            }
+            sum = self.scratch[..got].iter().fold(sum, |s, &b| s.wrapping_add(u32::from(b)));
+            left -= got as u64;
+        }
+        if sum != want {
+            return Err(Error::Corrupt("a cpio member fails its checksum"));
         }
         Ok(())
     }
@@ -323,7 +385,7 @@ impl Reader {
         self.crc = None;
         loop {
             let state = self.cpio.as_mut().expect("a cpio reader");
-            if let Some(m) = state.queue.pop_front() {
+            if let Some(m) = state.dequeue() {
                 return Ok(Some(m));
             }
             if state.ended {
@@ -337,7 +399,7 @@ impl Reader {
                 // the trailer is missing, as an end marker can be in tar: what was read stands
                 let state = self.cpio.as_mut().expect("a cpio reader");
                 state.ended = true;
-                state.flush();
+                state.flush()?;
                 continue;
             }
             if got < head.len() {
@@ -366,7 +428,7 @@ impl Reader {
                 self.src.skip(h.filesize, &mut self.scratch)?;
                 let state = self.cpio.as_mut().expect("a cpio reader");
                 state.ended = true;
-                state.flush();
+                state.flush()?;
                 continue;
             }
             let decoded = name_of(&name);
@@ -397,12 +459,19 @@ impl Reader {
             } else {
                 self.unread = h.filesize + data_pad;
             }
-            if kind == Kind::File && h.nlink > 1 && h.ino != 0 {
+            // inode zero is an identity like any other: libarchive groups such links too
+            if kind == Kind::File && h.nlink > 1 {
                 let key = (h.dev, h.ino);
                 let state = self.cpio.as_mut().expect("a cpio reader");
                 if let Some(owner) = state.owners.get(&key) {
-                    // the data is already out under another name: this one links to it, and its copy is passed over
+                    // the data is already out under another name: this one links to it, and its copy is passed over,
+                    // checked first against its own checksum when it has one
                     let owner = owner.clone();
+                    if matches!(format, Format::Newc { crc: true }) && h.filesize > 0 {
+                        self.unread = 0;
+                        self.check_skipped(h.filesize, h.check)?;
+                        self.unread = data_pad;
+                    }
                     let m = cpio_member(decoded, raw_name, Kind::HardLink, owner, 0, (h.mtime, h.mode), (h.uid, h.gid));
                     return Ok(Some(m));
                 }
@@ -424,7 +493,7 @@ impl Reader {
                     // their bookkeeping is freed: only the owner's name stays
                     state.link_bytes -= before.iter().map(|w| w.cost() + 32).sum::<usize>();
                     for earlier in before {
-                        state.queue.push_back(earlier.into_member(Kind::HardLink, decoded.clone()));
+                        state.enqueue(earlier.into_member(Kind::HardLink, decoded.clone()))?;
                     }
                 }
             }
