@@ -588,7 +588,9 @@ fn bsd_symbol_table_names_are_resolved_once_and_capped() {
     let shared = write(dir.path(), "shared.a", &bsd_symdef_ar(200_000, 1 << 20, |_| 0));
     let started = std::time::Instant::now();
     repack(&shared, &dir.path().join("shared.out"), &opts).unwrap();
-    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+    // A name copied once per entry would be 200 GiB of copying, hours of work: this bound only catches that, with
+    // room for a debug build on a loaded machine (a fixed 20 s failed at load average 70 here).
+    assert!(started.elapsed().as_secs() < 600, "took {:?}", started.elapsed());
     let out_len = std::fs::metadata(dir.path().join("shared.out")).unwrap().len();
     assert!(out_len < 8 << 20, "rebuilt archive is {out_len} bytes");
     // entries naming every byte of the name: each is a different suffix, so the copies hit the cap
