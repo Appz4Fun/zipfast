@@ -789,6 +789,11 @@ pub struct FeedDecoder {
     /// for a solid successor: the stream offset where output of earlier members that is not proven ends, while it
     /// may still lie in the window (a member's CRC proves its own output, not the older bytes its window holds)
     suspect: Option<u64>,
+    /// RAR 5.0: the stream offset of the latest restart seeded from held output. The live window (and a window
+    /// rebuilt from a checkpoint after it) holds that held output, as plaintext, where the decoder held a filter's
+    /// input: wrong where a filter the restart search did not see covered it, whatever the member's own CRC says,
+    /// until it is pushed out of reach.
+    seeded: Option<u64>,
     /// a compressed RAR 5.0 member's decoder state
     rar5: Option<Box<rar5::Rar5>>,
     /// a 7z LZMA2 folder member's decoder state
@@ -922,6 +927,7 @@ impl FeedDecoder {
             stream_start: 0,
             unproven: false,
             suspect: None,
+            seeded: None,
             rar5: None,
             lzma2: None,
             rar4: None,
@@ -1304,6 +1310,7 @@ impl FeedDecoder {
             identity: self.identity,
             unproven: self.unproven,
             suspect: self.suspect,
+            seeded: self.seeded,
             layer: match (&self.rar5, &self.lzma2, &self.rar4) {
                 (Some(r), _, _) => Some(r.to_bytes()),
                 (_, Some(l), _) => Some(l.to_bytes()),
@@ -1399,6 +1406,7 @@ impl FeedDecoder {
         d.stats = snapshot.stats;
         d.unproven = snapshot.unproven;
         d.suspect = snapshot.suspect;
+        d.seeded = snapshot.seeded;
         d.status = d.make_status(Vec::new(), false);
         Ok(d)
     }
@@ -1448,7 +1456,7 @@ impl FeedDecoder {
             (true, Some(false)) => Some(end),
             _ => self.unproven.then_some(end),
         };
-        own.max(self.suspect).filter(|&at| at.saturating_add(self.reach()) > end)
+        own.max(self.suspect).max(self.seeded).filter(|&at| at.saturating_add(self.reach()) > end)
     }
 
     /// Starts this successor with the suspect window `suspect` handed to it ([`Self::carried_suspect`]): its output
@@ -1720,6 +1728,8 @@ pub struct FeedSnapshot {
     /// [`FeedStatus::unproven`] before done, and the suspect window a solid successor inherited
     unproven: bool,
     suspect: Option<u64>,
+    /// [`FeedDecoder::seeded`]
+    seeded: Option<u64>,
     /// a compressed layer's state: RAR 5.0 checkpoints and repairs, LZMA2 restart points and repairs
     layer: Option<Vec<u8>>,
 }
@@ -1787,6 +1797,7 @@ impl FeedSnapshot {
         }
         out.push(u8::from(self.unproven));
         put_opt_u64(&mut out, self.suspect);
+        put_opt_u64(&mut out, self.seeded);
         out
     }
 
@@ -1844,15 +1855,15 @@ impl FeedSnapshot {
                 _ => return Err(FeedError::Snapshot("bad flag")),
             }
         }
-        let (unproven, suspect) = if version >= 3 {
+        let (unproven, suspect, seeded) = if version >= 3 {
             let unproven = match r.u8()? {
                 0 => false,
                 1 => true,
                 _ => return Err(FeedError::Snapshot("bad flag")),
             };
-            (unproven, r.opt_u64()?)
+            (unproven, r.opt_u64()?, r.opt_u64()?)
         } else {
-            (false, None)
+            (false, None, None)
         };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
@@ -1870,6 +1881,7 @@ impl FeedSnapshot {
             identity,
             unproven,
             suspect,
+            seeded,
             layer,
         })
     }

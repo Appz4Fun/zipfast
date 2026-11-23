@@ -262,7 +262,10 @@ member that skipped a hole hands over once its main decode passes its end, with 
 window holds the held output in those ranges, so it is `unproven` until its own CRC matches (and so is the carry,
 `SolidCarry::unproven`). A member's CRC proves only its own output: the end of the output not proven is handed on
 from member to member while it lies within a window's reach of the next member's start, so a member after a short
-one that passed its CRC is still `unproven` when its window holds the older unproven bytes. A member waiting at a hole without held output holds back every member after it
+one that passed its CRC is still `unproven` when its window holds the older unproven bytes. A member that restarted
+from held output hands on its window as unproven while that restart is within reach, even once its own CRC matches:
+the window holds the held output as plaintext where the decoder held a filter's input, which a repair does not
+rebuild. A member waiting at a hole without held output holds back every member after it
 (the next one starts once its bytes come). A RAR 5.0 restart found at a member's very end (only the cipher's padding
 after it) is not taken; the last block before it is.
 
@@ -474,4 +477,5 @@ Solid RAR 5.0 streams (`tests/feed_decoder_solid.rs`):
   `unproven`; an empty member whose block sets the tables the next member's first block (without tables) uses, as the
   stream's first member and after another, handed over and from its carry; a hand-off that fails on a wrong password
   or a window limit, then succeeds in-session with a write-only sink; and a carry refused by an archive whose members
-  have the same sizes but other names.
+  have the same sizes but other names; and a member that skipped a hole after an E8-filtered region, repaired and
+  proven by its CRC, whose successor copying that region still starts `unproven`.

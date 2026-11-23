@@ -769,3 +769,48 @@ fn a_carry_from_another_stream_is_refused() {
     assert!(FeedDecoder::resume_solid(&x.map, 1, options(&x), &carry).is_ok());
     assert!(matches!(FeedDecoder::resume_solid(&y.map, 1, options(&y), &carry), Err(FeedError::Handoff(_))));
 }
+
+/// A member that skipped a hole hands over a window seeded from held output, which holds filtered plaintext where an
+/// E8 filter declared before the restart's search covered it: even once the hole is repaired and the member's CRC
+/// matches, a successor copying that region starts unproven.
+#[test]
+fn a_seeded_window_stays_unproven_past_the_members_own_crc() {
+    let mut a = video_like(200_000, 71);
+    // calls with small addresses in the filtered region, which an E8 filter rewrites
+    for k in (100_000..150_000).step_by(64) {
+        a[k] = 0xE8;
+        a[k + 4] = 0;
+    }
+    let mut b = a[105_000..145_000].to_vec();
+    b.extend(video_like(50_000, 72));
+    let s = solid_from(&[a, b], false, Some(0), "");
+    let p = s.map.members[0].pieces[0].packed.clone();
+    let size = 7_000u64;
+    let at = |f: f64| p.start + ((p.end - p.start) as f64 * f) as u64;
+    let article = |x: u64| (x / size) * size;
+    let hole = article(at(0.82));
+    let last = article(p.end - 1);
+    assert!(hole < last);
+    let all: Vec<Article> =
+        s.bytes.chunks(size as usize).enumerate().map(|(i, c)| (0u32, i as u64 * size, c.to_vec())).collect();
+    let mut run = Run::new(&s, true);
+    run.source.mark_lost(0, hole..hole + size);
+    for a in all.iter().filter(|a| a.1 != hole && a.1 != last) {
+        run.insert(a);
+    }
+    let st = run.decoders[0].as_ref().unwrap().status().clone();
+    assert!(run.decoders[0].as_ref().unwrap().stats().holes > 0, "member 0 skipped its hole: {st:?}");
+    // the hole's bytes come and are repaired, then the member's end: done, its CRC matched
+    run.insert(all.iter().find(|a| a.1 == hole).unwrap());
+    run.insert(all.iter().find(|a| a.1 == last).unwrap());
+    for a in &all {
+        run.insert(a);
+    }
+    let st0 = run.decoders[0].as_ref().unwrap().status().clone();
+    assert!(st0.done && st0.crc_ok == Some(true), "{st0:?}");
+    assert!(run.decoders[1].is_some());
+    assert!(run.started_unproven[1], "member 1 started from a window seeded from held output");
+    let st1 = run.decoders[1].as_ref().unwrap().status().clone();
+    // never proven by anything but its own CRC
+    assert!(st1.unproven || st1.crc_ok == Some(true), "{st1:?}");
+}

@@ -417,6 +417,7 @@ impl FeedDecoder {
             stream_start: run.start,
             unproven: false,
             suspect: None,
+            seeded: None,
             rar5: Some(Box::new(Rar5 {
                 window,
                 dec: None,
@@ -828,8 +829,10 @@ impl FeedDecoder {
             r.base = Cp { packed: until_packed, state: cp };
         }
         self.stats.holes += 1;
-        // what follows was decoded from held output: unproven until the member's CRC matches
+        // what follows was decoded from held output: unproven until the member's CRC matches; the window holds that
+        // output until it is pushed out of reach, whatever the CRC says (a successor inherits it)
         self.unproven = true;
+        self.seeded = self.seeded.max(Some(restart.output_offset));
         r.skip_failed = None;
         r.fed = until_packed;
         r.out = until_out;
