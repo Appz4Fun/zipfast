@@ -2043,6 +2043,9 @@ fn run_tar(
             }
         };
         let rel = if opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+        // what the hole budget held before this member took from it: a member skipped or refused at its target
+        // makes no holes, and gives back what it took
+        let hole_mark = holes.left;
         let why = match m.kind {
             Kind::Dir => {
                 if opts.mode == Mode::Extract && !opts.flatten {
@@ -2120,6 +2123,7 @@ fn run_tar(
                 && opts.dest.join(&rel).parent() == Some(parent.as_path())
                 && checked_place(opts, &rel, (position, &m.name), summary, report)?.is_none()
             {
+                holes.left = hole_mark;
                 continue;
             }
             staged.budget.record(&m.name)?;
@@ -2146,7 +2150,10 @@ fn run_tar(
         if opts.mode == Mode::Extract {
             match target(opts, &rel, (position, &m.name), (Some(m.real_size()), m.sparse.is_some()), summary, report)? {
                 Some(t) => out = Some(t),
-                None => continue,
+                None => {
+                    holes.left = hole_mark;
+                    continue;
+                }
             }
         } else if let (Source::Plain { .. }, true) = (&reader.src, reader.crc.is_none() && reader.member_data.is_none())
         {
@@ -2469,6 +2476,52 @@ mod tests {
             assert_eq!(std::fs::read(dest.join("after.txt")).unwrap(), b"after", "{name}");
         }
         link::NO_HARD_LINKS.with(|n| n.set(false));
+    }
+
+    /// A sparse member skipped because its file exists makes no holes, so it takes nothing from the run's budget:
+    /// two members of 600 MiB of holes each, the first already there, extract the second.
+    #[test]
+    fn a_skipped_sparse_member_leaves_the_hole_budget_alone() {
+        use std::io::Write;
+        const MIB: u64 = 1 << 20;
+        let mut tar = test_sparse("a", 600 * MIB);
+        tar.extend(test_sparse("b", 600 * MIB));
+        tar.extend([0u8; 2 * BLOCK]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        let tgz = gz.finish().unwrap();
+        for (name, bytes) in [("s.tar", tar), ("s.tgz", tgz)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let dest = dir.path().join("out");
+            std::fs::create_dir(&dest).unwrap();
+            std::fs::write(dest.join("a"), b"kept").unwrap();
+            let opts = Options {
+                mode: Mode::Extract,
+                dest: dest.clone(),
+                overwrite: Overwrite::Skip,
+                flatten: false,
+                threads: None,
+                protected_paths: Default::default(),
+                parallel_min: None,
+                select: None,
+                windows_safe_names: false,
+                special_entries: Default::default(),
+                fallback_mtime: None,
+                compressed_tar: Default::default(),
+                version_naming: Default::default(),
+                preexisting_links: Default::default(),
+            };
+            let s = run(&path, &opts, |_| {}).unwrap();
+            assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);
+            assert_eq!((s.files, s.skipped), (1, 1), "{name}");
+            assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"kept", "{name}");
+            assert_eq!(std::fs::metadata(dest.join("b")).unwrap().len(), 600 * MIB, "{name}");
+            // testing still charges every member
+            let s = run(&path, &Options { mode: Mode::Test, ..opts }, |_| {}).unwrap();
+            assert_eq!(s.errors.len(), 1, "{name}: {:?}", s.errors);
+        }
     }
 
     #[test]
