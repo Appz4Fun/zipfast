@@ -575,7 +575,6 @@ fn write_journal(file: &std::fs::File, name: &str, at: u64, bytes: &[u8]) -> std
 }
 /// Syncs a journal file, or the journal directory for the files `names` just created or extended.
 fn sync_journal(file: &std::fs::File, names: &[&str], directory: bool) -> std::io::Result<()> {
-    super::SYNCS.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     {
         super::tests::state::journal_sync(file, names, directory)
@@ -583,6 +582,6 @@ fn sync_journal(file: &std::fs::File, names: &[&str], directory: bool) -> std::i
     #[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
     {
         let _ = (names, directory);
-        file.sync_all()
+        super::durable::sync(file)
     }
 }

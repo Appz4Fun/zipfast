@@ -71,6 +71,10 @@ impl AnchorBinding {
         if next.member() != &self.member || expected.is_some_and(|a| a.member() != &self.member) {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));
         }
+        // Everything this anchor names was synced; make it device durable before the store can point at it.
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        super::tests::state::checkpoint("barrier");
+        super::durable::barrier().map_err(|e| io_error(crate::progressive::OutputOperation::Flush, e))?;
         advance_epoch();
         self.store
             .compare_exchange(&self.member, expected, next)

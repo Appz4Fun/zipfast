@@ -19,6 +19,7 @@
 #![doc = include_str!("../../docs/persistent-partials.md")]
 mod anchor;
 mod cipher;
+mod durable;
 mod held;
 pub use held::{HeldOptions, HeldOutput, HeldScan, HeldSkip, load_held};
 mod journal;
@@ -187,12 +188,20 @@ impl std::ops::DerefMut for Operation<'_> {
         self.data.as_mut().unwrap()
     }
 }
-/// File and directory syncs issued by persistent partial output in this process (output, journal, pages and
-/// bundle directories; not the caller's anchor store). For benchmarks and diagnostics.
-static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Device-durable file and directory syncs issued by persistent partial output in this process (output, journal,
+/// pages and bundle directories; not the caller's anchor store): `F_FULLFSYNC` on macOS, `fsync` elsewhere. On
+/// macOS the files of one transaction get a plain `fsync` each and the device flush is issued once, just before the
+/// next anchor CAS (see `docs/persistent-partials.md`); those plain syncs are counted by [`ordering_sync_count`].
+/// For benchmarks and diagnostics.
 #[doc(hidden)]
 pub fn durable_sync_count() -> u64 {
-    SYNCS.load(Ordering::Relaxed)
+    durable::DURABLE.load(Ordering::Relaxed)
+}
+/// Plain `fsync`s on macOS whose device flush was deferred to the next anchor change; 0 elsewhere. For benchmarks
+/// and diagnostics.
+#[doc(hidden)]
+pub fn ordering_sync_count() -> u64 {
+    durable::ORDERED.load(Ordering::Relaxed)
 }
 /// Path `lstat`s the exclusion registry issued in this process to re-prove its directory facts (see
 /// `PartialExclusions::check_input_revision`). For benchmarks and diagnostics.
@@ -202,8 +211,7 @@ pub fn exclusion_lstat_count() -> u64 {
     EXCLUSION_LSTATS.load(Ordering::Relaxed)
 }
 fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
-    SYNCS.fetch_add(1, Ordering::Relaxed);
-    file.sync_all()
+    durable::sync(file)
 }
 fn canceled(control: &SessionControl) -> PartialResult<()> {
     if control.is_canceled() { Err(err(PartialErrorKind::Canceled)) } else { Ok(()) }
@@ -3002,6 +3010,7 @@ impl PartialFile {
 }
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) mod tests {
+    mod durable;
     mod ledger;
     mod native;
     #[path = "../../../tests/common/mod.rs"]
