@@ -164,13 +164,18 @@ impl Rar5 {
         self.stalled
     }
 
-    /// The lowest stream offset a restore or a repair may read again.
-    pub(super) fn lowest_needed(&self, d: &FeedDecoder) -> u64 {
-        let mut low = if d.main.is_some() { d.packed_lane(self.base.packed, d.stream_len).pos } else { d.stream_len };
-        for r in &self.repairs {
-            low = low.min(d.packed_lane(r.from.packed, d.stream_len).pos);
+    /// The stream ranges a restore of the main decode or a repair may read again: from the main checkpoint on, and
+    /// each repair's from its checkpoint to its restart.
+    pub(super) fn needed(&self, d: &FeedDecoder) -> Vec<Range<u64>> {
+        let mut out = Vec::new();
+        if d.main.is_some() {
+            out.push(d.packed_lane(self.base.packed, d.stream_len).pos..d.stream_len);
         }
-        low
+        for r in &self.repairs {
+            let lane = d.packed_lane(r.from.packed, r.until_packed);
+            out.push(lane.pos..lane.end);
+        }
+        out
     }
 
     pub(super) fn to_bytes(&self) -> Vec<u8> {
@@ -503,6 +508,8 @@ impl FeedDecoder {
             self.push_needs(needs, b..b + len, NeedKind::Repair);
             return Ok(Some(false));
         }
+        // the bytes it waited for are there: it goes on, and may pass them
+        r.repairs[i].blocked = None;
         let mut dec = self.restore_dec(r.window, &rep.from, sink)?;
         let mut lane = self.packed_lane(rep.from.packed, rep.until_packed);
         let (mut fed, mut out) = (rep.from.packed, rep.from.state.sp);

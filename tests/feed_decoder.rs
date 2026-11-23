@@ -725,3 +725,30 @@ fn a_compressed_snapshot_resumes_from_its_checkpoint() {
         assert!(matches!(decoder.run(&mut source, &mut Vec::new()), Err(FeedError::HeldOutput { .. })));
     }
 }
+
+#[test]
+fn a_skipped_compressed_hole_does_not_pin_the_bytes_after_its_restart() {
+    let plain = video_like(600_000, 14);
+    let volumes = rar5_compressed(&plain, false, 1 << 20);
+    let map = MemberMap::from_memory(&refs(&volumes), "c.rar", None).unwrap();
+    let mut decoder = FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap();
+    // room for about fifteen articles: the decode has to let go of what it passed, past the skipped hole too
+    let mut source = ArticleBuffer::new(100_000);
+    let mut sink = Held { donor: plain.clone(), ..Held::default() };
+    let all = articles(&volumes, 7_000);
+    let hole = 10;
+    source.mark_lost(all[hole].0, all[hole].1..all[hole].1 + all[hole].2.len() as u64);
+    for (i, (v, off, b)) in all.iter().enumerate() {
+        if i != hole {
+            source.insert(*v, *off, b).unwrap_or_else(|e| panic!("article {i}: {e}"));
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+    }
+    let status = decoder.status().clone();
+    assert!(status.frontier == plain.len() as u64 && status.lost.len() == 1, "{status:?}");
+    let (v, off, b) = &all[hole];
+    source.insert(*v, *off, b).unwrap();
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert!(status.done && status.crc_ok == Some(true), "{status:?}");
+    assert_eq!(sink.out, plain);
+}

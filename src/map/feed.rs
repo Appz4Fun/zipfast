@@ -996,26 +996,29 @@ impl FeedDecoder {
     /// Tells the source which stream bytes no lane will read again: everything before the main decode except what
     /// the repairs of lost ranges read.
     fn release(&mut self, source: &mut dyn PackedSource) {
-        let mut low = self.stream_len;
+        let mut keep = RangeSet::default();
         if let Some(r) = &self.rar5 {
-            low = r.lowest_needed(self);
-        } else if let Some(l) = &self.main {
-            // a lane restored from a snapshot reads again from the start of its partial block
-            let from = match (self.cipher, l.iv) {
-                (StoredCipher::Cbc { .. }, Some(_)) => l.next,
-                (StoredCipher::Cbc { .. }, None) => self.lane_at(l.next, self.size).pos,
-                _ => l.pos,
-            };
-            low = low.min(from);
+            for range in r.needed(self) {
+                keep.insert(range);
+            }
+        } else {
+            if let Some(l) = &self.main {
+                // a lane restored from a snapshot reads again from the start of its partial block
+                let from = match (self.cipher, l.iv) {
+                    (StoredCipher::Cbc { .. }, Some(_)) => l.next,
+                    (StoredCipher::Cbc { .. }, None) => self.lane_at(l.next, self.size).pos,
+                    _ => l.pos,
+                };
+                keep.insert(from..self.stream_len);
+            }
+            for r in self.lost.ranges() {
+                let lane = self.lane_at(r.start, r.end);
+                keep.insert(lane.pos..lane.end);
+            }
         }
         let mut free = RangeSet::default();
-        free.insert(0..low);
-        // a compressed member's repairs restart at checkpoints before `low` (see `Rar5::lowest_needed`)
-        for r in self.lost.ranges().into_iter().filter(|_| self.rar5.is_none()) {
-            let lane = self.lane_at(r.start, r.end);
-            free.remove(lane.pos..lane.end);
-        }
-        for r in self.released.ranges() {
+        free.insert(0..self.stream_len);
+        for r in keep.ranges().into_iter().chain(self.released.ranges()) {
             free.remove(r);
         }
         for r in free.ranges() {
@@ -1451,7 +1454,8 @@ impl FeedSnapshot {
             match r.u8()? {
                 0 => {}
                 1 => {
-                    let n = r.count(1)?;
+                    // checked against the bytes left only: its own counts are checked as it is decoded
+                    let n = usize::try_from(r.u64()?).map_err(|_| FeedError::Snapshot("bad count"))?;
                     rar5 = Some(r.take(n)?.to_vec());
                 }
                 _ => return Err(FeedError::Snapshot("bad flag")),
