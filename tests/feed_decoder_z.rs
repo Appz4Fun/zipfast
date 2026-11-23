@@ -32,6 +32,9 @@ use zipfast::map::{ArticleBuffer, FeedDecoder, FeedOptions, FeedSink, MemberMap,
 
 const ARTICLE: usize = 750_000;
 
+/// An article: its volume, offset there and bytes.
+type Article<'a> = (u32, u64, &'a [u8]);
+
 /// An [`ArticleBuffer`] shared by several members' decoders: it keeps what one decoder releases.
 struct Keep(ArticleBuffer);
 
@@ -99,7 +102,10 @@ fn payload_for<'a>(payloads: &'a [(String, Vec<u8>)], m: &zipfast::map::MapMembe
 
 /// `donor`: the decoders' sinks hold the payload as another copy (compressed members then skip holes and repair
 /// them from a checkpoint instead of waiting at them).
-fn run_set(dir: &Path, name: &str, password: &str, payloads: &[(String, Vec<u8>)], donor: bool) {
+///
+/// `slice`: of each missing article only this many bytes in its middle are lost (the rest arrives with the others),
+/// so holes fall inside LZMA2 chunk payloads rather than over their headers.
+fn run_set(dir: &Path, name: &str, password: &str, payloads: &[(String, Vec<u8>)], donor: bool, slice: Option<usize>) {
     let set_dir = dir.join(name);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&set_dir).unwrap().map(|e| e.unwrap().path()).collect();
     files.sort();
@@ -114,7 +120,21 @@ fn run_set(dir: &Path, name: &str, password: &str, payloads: &[(String, Vec<u8>)
     }
     shuffle(&mut articles, 0x5EED ^ name.len() as u64);
     // every seventh article is missing at first
-    let (missing, present): (Vec<_>, Vec<_>) = articles.into_iter().enumerate().partition(|(i, _)| i % 7 == 3);
+    let (missing, mut present): (Vec<_>, Vec<_>) = articles.into_iter().enumerate().partition(|(i, _)| i % 7 == 3);
+    let missing: Vec<(usize, Article)> = match slice {
+        None => missing,
+        Some(n) => missing
+            .into_iter()
+            .map(|(i, (v, off, b))| {
+                let at = (b.len().saturating_sub(n)) / 2;
+                let end = (at + n).min(b.len());
+                present.push((i, (v, off, &b[..at])));
+                present.push((i, (v, off + end as u64, &b[end..])));
+                (i, (v, off + at as u64, &b[at..end]))
+            })
+            .collect(),
+    };
+    present.retain(|(_, (_, _, b))| !b.is_empty());
     let members: Vec<usize> =
         (0..map.members.len()).filter(|&i| !map.members[i].is_dir && map.members[i].unpacked_size > Some(0)).collect();
     let mut decoders: Vec<(usize, FeedDecoder, Out)> = members
@@ -160,7 +180,7 @@ fn run_set(dir: &Path, name: &str, password: &str, payloads: &[(String, Vec<u8>)
             }
         }
         eprintln!(
-            "{name} member {i} (donor {donor}): frontier {} of {}, stalled {}, {} holes skipped, {} lost ranges ({} \
+            "{name} member {i} (donor {donor}, slice {slice:?}): frontier {} of {}, stalled {}, {} holes skipped, {} lost ranges ({} \
              bytes), {} needs",
             s.frontier,
             d.size(),
@@ -189,10 +209,10 @@ fn run_set(dir: &Path, name: &str, password: &str, payloads: &[(String, Vec<u8>)
         // no output byte decoded twice
         assert_eq!(out.written, m.unpacked_size.unwrap(), "{name} {i}");
         eprintln!(
-            "{name} member {i} (donor {donor}): exact; read {} of {} packed bytes, decoded again {}; feed {:.0?}, \
+            "{name} member {i} (donor {donor}, slice {slice:?}): exact; read {} of {} packed bytes, decoded again {}; feed {:.0?}, \
              repairs {:.0?}",
             d.stats().packed_read,
-            m.packed_size,
+            m.packed_size.max(m.folder.map_or(0, |f| map.folders[f.index as usize].pack_sizes.iter().sum())),
             d.stats().redecoded,
             first,
             repair
@@ -221,10 +241,35 @@ fn z_fixture_sets_feed_shuffled_with_holes() {
         ("F05_rar5_m5_mixed", true),
         ("F12_rar5_m3_aes_2files", false),
         ("F12_rar5_m3_aes_2files", true),
+        ("F07_7z_lzma2_video", false),
+        ("F07_7z_lzma2_video", true),
+        ("F08_7z_lzma2_mixed_mt", false),
+        ("F08_7z_lzma2_mixed_mt", true),
+        ("F10_7z_lzma2_aes_mixed", false),
+        ("F10_7z_lzma2_aes_mixed", true),
     ];
     for (name, donor) in sets {
         if only.as_deref().is_none_or(|o| o.split(',').any(|p| name.starts_with(p))) {
-            run_set(&dir, name, &password, &payloads, donor);
+            run_set(&dir, name, &password, &payloads, donor, None);
+        }
+    }
+}
+
+/// The 7z sets again with only 16 KiB of each missing article lost: the holes fall inside chunk payloads, so the main
+/// decode restarts after them (at the next stored chunk or reset) instead of waiting, and the repairs fill them.
+#[test]
+fn z_fixture_7z_sets_skip_holes_inside_chunks() {
+    let Some(dir) = std::env::var_os("ZIPFAST_Z_FIXTURES").map(PathBuf::from) else {
+        eprintln!("skipped: set ZIPFAST_Z_FIXTURES to the z-fixtures sets directory");
+        return;
+    };
+    let manifest = std::fs::read_to_string(dir.join("MANIFEST.json")).unwrap();
+    let password = manifest.split("\"password\": \"").nth(1).and_then(|s| s.split('"').next()).unwrap().to_owned();
+    let payloads: Vec<(String, Vec<u8>)> =
+        ["cabac.mkv", "mixed.mkv"].iter().map(|n| (n.to_string(), std::fs::read(dir.join(n)).unwrap())).collect();
+    for name in ["F07_7z_lzma2_video", "F08_7z_lzma2_mixed_mt", "F10_7z_lzma2_aes_mixed"] {
+        for donor in [false, true] {
+            run_set(&dir, name, &password, &payloads, donor, Some(16 << 10));
         }
     }
 }

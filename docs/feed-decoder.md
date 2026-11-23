@@ -77,12 +77,12 @@ partial's verify for those).
 
 `FeedOptions`: `password`, `limits` (KDF budgets and password sizes, as for maps), `control` (a `SessionControl`:
 cancels a run between reads and a key derivation in progress), `read_chunk` (the largest read, default 256 KiB),
-`max_needs`, `run_budget`, `max_window` (the largest RAR 5.0 dictionary a member may allocate, default 1 GiB). Keys are derived in `new`, so a wrong password shows there where the member records a
+`max_needs`, `run_budget`, `max_window` (the largest RAR 5.0 dictionary, or LZMA2 decoder dictionary, a member may allocate, default 1 GiB). Keys are derived in `new`, so a wrong password shows there where the member records a
 check value (RAR 5.0 with a check, WinZip AES); otherwise as `crc_ok: Some(false)`.
 
 `stats()` counts packed bytes read, output bytes written, holes met and output `redecoded` (decoded again without
 being written: a compressed repair from its checkpoint up to the lost range, a restore from its checkpoint up to the
-old frontier), over the decoder's life.
+old frontier, and for a 7z member after its folder's first the folder output before it), over the decoder's life.
 
 ## Layers
 
@@ -93,7 +93,8 @@ old frontier), over the decoder's life.
 | WinZip AES stored: `Counter { skip }` | each byte decrypts on its own: exactly the hole's output is lost |
 | ZipCrypto | refused (`FeedUnsupported::SequentialCipher`): its keystream needs every earlier byte |
 | compressed RAR 5.0 (methods 1-5, AES-256 under them too), not solid | see [compressed RAR 5.0](#compressed-rar-50) |
-| solid RAR 5.0 members after a stream's first, RAR 4.x and ZIP compressed members, 7z coded folders | refused (`Solid`, `Compressed`, `Coders`); see [next](#next) |
+| 7z folders of one LZMA2 coder, alone or over 7zAES, any member of the folder | see [7z LZMA2](#7z-lzma2) |
+| solid RAR 5.0 members after a stream's first, RAR 4.x and ZIP compressed members, other 7z coder chains | refused (`Solid`, `Compressed`, `Coders`); see [next](#next) |
 
 A repair reads only the lost range's bytes (under CBC, also the block before it as IV) and writes only the lost
 output. A repair that stops at bytes still missing keeps what it decoded, needs only the rest, and next time asks
@@ -131,6 +132,58 @@ offset and the window they copy from are unknown. So:
 
 The member's size and CRC are checked at its end (`crc_ok`); the CRC runs join across repairs as for stored members.
 
+## 7z LZMA2
+
+A 7z folder's output spans its members: the decoder is per member, but it decodes the folder's LZMA2 stream, and
+its positions (restart points, lost ranges inside it) are folder output offsets; the sink still gets member offsets
+(`MemberRestart::stream_start` is the member's place in the folder). Output before the member is decoded and
+counted in `redecoded`, never written.
+
+**Framing.** Chunk starts are known only from a walk of chunk headers from the folder's first packed byte, each
+header giving the next one's place; nothing is ever taken from plaintext or header-like bytes in a payload. The main
+decode reads the chunks in order. Headers walked ahead (to find a restart) are cached. Under 7zAES each read decrypts
+whole blocks with the ciphertext block before as IV, so a header needs its blocks and the one before, and a hole of
+ciphertext `[a, b)` leaves plaintext `[floor16(a), ceil16(b) + 16)` unusable. A first header that cannot be one under
+7zAES (7zAES records no password check) is `WrongPassword`.
+
+**Start.** The folder's first member starts at the folder's start. A later member walks the headers before it
+(those bytes are `Next` needs, nothing else) and starts at the last chunk at or before its first byte that resets
+the dictionary; the output before the member is decoded again (7-Zip resets per block with `-mmt`; a single-threaded
+folder resets only at its start).
+
+**Decoding.** liblzma's raw LZMA2 decoder is fed the chunks from a restart point: a chunk that resets the
+dictionary, or one that resets the LZMA state with the dictionary-sized output before it given back by the sink
+(`read_held`), fed to the decoder as stored chunks. The main decode keeps its restart point at the last such chunk it
+passed (a state reset counts only when the output before it was written).
+
+**Holes.** At a hole in a chunk's payload the main decode restarts after it where it can decode without the lost
+bytes:
+
+- in a stored chunk, right after the hole: exactly the hole's output (under 7zAES widened to blocks) is lost, and
+  copying goes on; its repair copies the payload bytes when they come;
+- otherwise at the next chunk, found by walking the headers after the hole, that is stored (copied as it is), resets
+  the dictionary, or resets the state with the output before it held. Everything from the hole to there is lost.
+
+A chunk met later that needs the lost bytes (an LZMA chunk continuing the state across them) is lost too, up to the
+next restart. The restart is never searched for in plaintext: when a header after the hole is itself in a hole, or no
+restart exists before the member's end (a single-threaded folder), the main decode waits at the hole (`stalled`, the
+hole's bytes the first `Next` need) and goes on with its decoder when they come, decoding nothing twice. When a header
+after the hole has not arrived yet, its bytes are the first `Next` need and the hole the next. Usenet articles (750 KB)
+are far larger than a chunk (at most 64 KiB packed), so an article-sized hole always hides headers and waits; holes
+inside payloads (damaged or partly fetched articles) are skipped.
+
+**Repairs.** A decoded repair starts from the restart point before its hole, decodes without writing up to the lost
+range and writes exactly it. When the main decode skips a hole in an LZMA chunk, its decoder, stopped at the hole,
+becomes the repair's: the repair goes on from the hole once its bytes come (`redecoded` 0). A repair whose lost range
+starts at a state reset starts there once the output before it is held (after the stored repair before it, say).
+A repair that stops at missing bytes keeps its decoder and what it wrote. At most 8 repairs keep a decoder; the others,
+and every repair after a restore, start from their restart point, so a repair decodes again at most from the restart
+point before its hole (a 7-Zip block, about 4 dictionaries) to the lost range.
+
+**Memory.** Packed bytes from the main decode's restart point on are kept for a repair or a restore (at most 64 MiB
+behind its read position; older ones are released and asked for again as needs when a repair reads them).
+
+
 ## Saving and restoring
 
 `snapshot()` captures the decoder between runs: the main decode's position (under CBC its block and that block's
@@ -141,7 +194,8 @@ output file. It records a fingerprint of the member (name, sizes, method, cipher
 restores only onto that member.
 `FeedDecoder::restore(&map, member, options, &snapshot)` derives the key again and continues from there: bytes read
 past the frontier short of a block are read again, and lost ranges are repaired as before. A snapshot of another
-member or layer is `FeedError::Snapshot`. A compressed member restores at its checkpoint, reading its window back
+member or layer is `FeedError::Snapshot`. An LZMA2 member restores at its restart point (its dictionary read back when it is a state reset), decodes up to the
+old frontier without writing and goes on; repairs restart from their restart points. A compressed RAR 5.0 member restores at its checkpoint, reading its window back
 with `read_held` (`FeedError::HeldOutput` when the sink does not give it), decodes up to the old frontier without
 writing (counted in `redecoded`: at most the output since the last block boundary before the snapshot) and goes
 on; it never decodes from the member's start unless the snapshot was taken there. Persistent partials (`docs/persistent-partials.md`) remain the durable,
@@ -158,12 +212,7 @@ not meet its restart), `HeldOutput { range }` (a checkpoint's window the sink do
 
 ## Next
 
-- 7z LZMA2 folders: `Lzma2Index` (from chunk headers, which a hole in a payload does not hide) gives the restart
-  points. Stored chunks map output to packed bytes directly, so a hole in one costs its own bytes; an LZMA chunk run
-  restarts at the next chunk that resets the dictionary, or at a state reset with held output as the dictionary
-  (`decode_with_dictionary`). Checkpoints are chunk starts plus the dictionary read back from the sink, so the same
-  checkpoint and repair scheme applies. Members of a solid folder after the first need the folder decoded from its
-  start (or a checkpoint inside it), so the decoder would run over the folder, not the member.
+- 7z LZMA2 under BCJ or Delta (a chain of coders), LZMA (not LZMA2) folders.
 - Solid RAR 5.0 members after the first: the same checkpoints over the solid stream (the window holds earlier
   members' output).
 - A skip without held output past the hole is impossible for compressed data (see above); RAR 4.x compressed
@@ -206,3 +255,18 @@ Every output byte is written once, and `crc_ok` is true. Skips cost packed reads
 after the hole again, so F12 with held output read 60 and 72 MB of packed bytes for 36 and 14 MB members. Timings
 (release, M-series, but on a machine running other builds at a load of about 25): a set's feed takes 0.1 to 1 s and
 its repairs 0.01 to 2 s, mostly in the restart searches.
+
+7z LZMA2 (`tests/feed_decoder_7z.rs`): folders built with liblzma's raw encoder in 7-Zip-like independent blocks
+(text and incompressible runs: LZMA chunks, stored chunks, state resets), plain and 7zAES, split into volumes, cut
+into articles of 1,500 to 20,000 bytes, shuffled, every 7th to 11th missing, with and without held output, a
+snapshot round trip half way through the repairs: exact, CRC verified, each byte written once, needs only inside the
+missing articles, `redecoded` under a block per skipped hole (0 with held output, a few hundred KB of a 1.5 MB member
+without: repairs of LZMA chunks that continue across a lost stored run). Also: members after a folder's first (seek
+from the last reset), a header in a hole stalling until it comes (`redecoded` 0), headers as the first `Next` need, a
+snapshot mid-member restored from its restart point, and a wrong 7zAES password.
+
+`tests/feed_decoder_z.rs` feeds F07 (video, all stored chunks), F08 (mixed, `-mmt4 -md1m`) and F10 (F08 under
+7zAES, `-mhe`) as above, each with and without held output: every set waits at its first hole (each article-sized
+hole hides chunk headers) and finishes exact once the missing articles come, `redecoded` 0. Then again with only
+16 KiB in the middle of each missing article lost: F07 and F08 skip two holes (32 KB lost; F08 without held output
+445 KB, up to the next reset) and wait at a hole over a header; F10 skips all three; all exact, `redecoded` 0.

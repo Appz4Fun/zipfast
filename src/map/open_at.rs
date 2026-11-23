@@ -192,7 +192,7 @@ fn lzma2_folder(map: &MemberMap, m: &MapMember) -> Option<(u8, bool)> {
 }
 
 /// [`lzma2_folder`] over a folder's coders: exactly one LZMA2 coder, and at most one 7zAES coder besides it.
-fn lzma2_coders(coders: &[super::MapCoder]) -> Option<(u8, bool)> {
+pub(super) fn lzma2_coders(coders: &[super::MapCoder]) -> Option<(u8, bool)> {
     let (lzma2, others): (Vec<_>, Vec<_>) = coders.iter().partition(|c| c.kind == CoderKind::Lzma2);
     let [lzma2] = lzma2.as_slice() else { return None };
     let encrypted = match others.as_slice() {
