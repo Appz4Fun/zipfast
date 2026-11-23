@@ -1043,9 +1043,11 @@ impl FeedDecoder {
             }
         } else {
             if let Some(l) = &self.main {
-                // a lane restored from a snapshot reads again from the start of its partial block
+                // a lane restored from a snapshot reads again from the start of its partial block; a CBC lane keeps
+                // the block before it too, though it holds that IV itself: a hole met inside the partial block
+                // starts its lost range there, and the repair reads its IV from the source
                 let from = match (self.cipher, l.iv) {
-                    (StoredCipher::Cbc { .. }, Some(_)) => l.next,
+                    (StoredCipher::Cbc { .. }, Some(_)) => l.next.saturating_sub(16),
                     (StoredCipher::Cbc { .. }, None) => self.lane_at(l.next, self.size).pos,
                     _ => l.pos,
                 };
