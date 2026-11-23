@@ -65,6 +65,8 @@ use crate::extract::Cancellation;
 pub(crate) const MIN_PIECE: u64 = 1 << 20;
 /// Decoded bytes a worker hands out at a time; it checks the cancellation between them.
 const SEGMENT: usize = 1 << 20;
+/// Dictionary bytes freed by finished pieces between two trims of glibc's arenas (see [`release_freed_memory`]).
+const TRIM_EVERY: u64 = 4 << 20;
 /// Streams whose output so far is more than this many times their packed bytes stay on one thread: they decode at
 /// close to memory speed there, and passing blocks between threads costs more than it gains.
 const MAX_RATIO: u64 = 64;
@@ -321,6 +323,8 @@ struct State {
     buffers: u64,
     /// the most `held` and `buffers` have been together, for the tests
     peak_total: u64,
+    /// dictionary bytes freed since the arenas were last trimmed
+    freed: u64,
     /// workers waiting for room in the budget
     budget_waiters: usize,
     /// packed blocks the decoders are done with, for the reader to read into again
@@ -511,14 +515,41 @@ fn work(shared: &Shared) {
             Ok(decoder) => decode(shared, decoder),
             Err(e) => Some(e),
         };
+        // The piece's decoder, and its dictionary, are freed by now.
         let mut state = shared.lock();
         if let Some(piece) = state.piece(number) {
             piece.done = true;
             piece.fault = fault;
         }
+        state.freed += dict_size(shared.dict);
+        let trim = state.freed >= TRIM_EVERY;
+        if trim {
+            state.freed = 0;
+        }
+        drop(state);
         shared.reader.notify_one();
+        if trim {
+            release_freed_memory();
+        }
     }
 }
+
+/// Every piece's decoder allocates its dictionary afresh (liblzma has no way to reuse one), and glibc keeps freed
+/// blocks of that size in the freeing thread's arena instead of handing them back, so with many workers the
+/// process's resident memory grows past what is live. Asking glibc to trim its arenas every [`TRIM_EVERY`] bytes of
+/// dictionaries freed hands that memory back.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_freed_memory() {
+    // SAFETY: malloc_trim has no preconditions; it only returns free memory in glibc's arenas to the system and
+    // never touches a live allocation.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// Other allocators hand large blocks back themselves.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_freed_memory() {}
 
 /// Hands `out` to the reader; false once the reader is gone or the run is canceled. A worker waits while the budget
 /// is spent, except the head's while the reader has fewer than [`HEAD_SEGMENTS`] of its segments queued: the reader
@@ -1007,6 +1038,7 @@ impl Lzma2Blocks {
                 peak: 0,
                 buffers: 0,
                 peak_total: 0,
+                freed: 0,
                 budget_waiters: 0,
                 spare: Vec::new(),
                 stop: false,

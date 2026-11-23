@@ -163,10 +163,10 @@ the budget (256 KiB in a piece that is nine tenths stored chunks, which cost onl
 than the one-thread decoder does. All told, the threads hold at most the budget and two segments at any moment.
 Peak resident memory can read higher: each piece's decoder allocates its dictionary afresh (liblzma offers no way to
 reuse one), and on Linux glibc keeps freed blocks of that size in its per-thread arenas instead of returning them.
-With 12 threads on the 16 MiB-block archive below that showed as 364 MiB peak RSS, against 287 MiB with
-`MALLOC_MMAP_THRESHOLD_=131072` (which makes glibc hand such blocks back) and 296 MiB at 8 threads. A
-process that runs several extractions at once and must keep resident memory tight can set that variable or lower
-the thread count.
+So on glibc a worker asks it to trim its arenas (`malloc_trim`) after finishing pieces, at most once per 4 MiB of
+dictionaries freed. With 12 threads on the 16 MiB-block archive below that brought peak RSS from 343-367 MiB to
+289-315 MiB, with no measurable cost in time; `MALLOC_MMAP_THRESHOLD_=131072` (which makes glibc hand such blocks
+back by itself) gave 287 MiB, and 8 threads 296 MiB without either.
 
 7-Zip's blocks are four times its dictionary: 4 MiB at `-md=1m`, 64 MiB at `-mx5`'s 16 MiB, 256 MiB at `-mx9`'s
 64 MiB (7-Zip 26 at `-mx5 -mmt8` wrote 134 MiB blocks with a 32 MiB dictionary for the measured archive). With the
