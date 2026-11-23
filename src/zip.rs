@@ -863,9 +863,18 @@ fn project_mtime(header: CentralHeader, mtime_override: Option<ExtraMtime>) -> (
         Some(ExtraMtime::NtfsFiletime(ticks)) => {
             (Some((ticks / 10_000_000) as i64 - 11_644_473_600), ((ticks % 10_000_000) * 100) as u32)
         }
-        Some(ExtraMtime::UnixSeconds(seconds)) => (Some(i64::from(seconds)), 0),
+        Some(ExtraMtime::UnixSeconds(seconds)) => (Some(unix_extra_seconds(seconds, header.mod_date)), 0),
         None => (dos_time(header.mod_time, header.mod_date).map(crate::localtime::local_to_utc), 0),
     }
+}
+
+/// Widens a 32-bit extended-timestamp (UT) value. Writers store times past
+/// 2038-01-19 truncated into the field, so a negative value is read as
+/// unsigned when the entry's DOS date says 2038 or later; otherwise the field
+/// stays signed, which keeps pre-1970 times.
+pub(crate) fn unix_extra_seconds(seconds: i32, dos_date: u16) -> i64 {
+    let dos_year = 1980 + u32::from(dos_date >> 9);
+    if seconds < 0 && dos_year >= 2038 { i64::from(seconds as u32) } else { i64::from(seconds) }
 }
 
 /// An extended-timestamp or NTFS extra overrides the DOS fields (the last one
@@ -1343,6 +1352,17 @@ mod tests {
 
     use std::io::{self, Write};
     use std::ops::Range;
+
+    #[test]
+    fn unix_extra_seconds_follows_the_dos_year() {
+        let year = |y: u16| (y - 1980) << 9;
+        assert_eq!(unix_extra_seconds(i32::MIN, year(2038)), 0x8000_0000);
+        assert_eq!(unix_extra_seconds(-1, year(2106)), i64::from(u32::MAX));
+        assert_eq!(unix_extra_seconds(-1, year(2037)), -1);
+        assert_eq!(unix_extra_seconds(-1, year(1980)), -1);
+        assert_eq!(unix_extra_seconds(i32::MAX, year(2107)), i64::from(i32::MAX));
+        assert_eq!(unix_extra_seconds(5, year(2039)), 5);
+    }
 
     fn sparse_directory(entries: u16, comment_len: u16, directory_size: u32) -> (tempfile::NamedTempFile, u64) {
         let mut archive = tempfile::NamedTempFile::new().unwrap();
