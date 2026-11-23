@@ -776,3 +776,18 @@ fn cpio_devices_keep_their_numbers_or_are_refused() {
     let i = write(dir.path(), "odc.cpio", &odc);
     assert!(matches!(repack(&i, &dir.path().join("odc.out"), &RepackOptions::default()), Err(Error::Unsupported(_))));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_input_is_refused_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("in.tar");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let out = dir.path().join("out.tar.gz");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(matches!(repack(&fifo, &out, &RepackOptions::default()), Err(Error::Unsupported(_))));
+    });
+    // with no writer, opening the FIFO would block forever
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the repack blocked on a FIFO"));
+}

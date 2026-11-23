@@ -133,15 +133,20 @@ fn is_ar(path: &Path) -> Result<bool> {
 /// Opens an input archive without following a symlink at its path, refusing anything but a regular file (a FIFO
 /// would hang, a device would never end).
 fn open_input(path: &Path) -> Result<File> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    if kind.is_symlink() {
         return Err(Error::Unsupported(format!("{} is a symlink, which a repack does not follow", path.display())));
+    }
+    if !kind.is_file() {
+        return Err(Error::Unsupported(format!("{} is not a regular file", path.display())));
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // a FIFO swapped in after the check above must not block the open: the descriptor is checked below
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
