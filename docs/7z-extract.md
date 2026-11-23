@@ -46,7 +46,7 @@ sessions read RAR only and refuse a 7z archive as before.
 `sevenzip::print_selected(first, password, select, output, cancel, limits)` writes the data of the members `select`
 takes (it gets each member's listing index and name; directories are never offered) to one writer, in archive order,
 as `7z x -so` does. Each folder is decoded once, front to back, even when several of its members are taken: the
-members before and between them are decoded and dropped. Each member is spooled to a private temporary file until its
+members before and between them are decoded and dropped. Each member is held back until its
 CRC checks out (for a folder of several members that stores its own CRC, until the folder's does, so those print
 together at the folder's end), so a member that fails prints nothing; it is a line in `Summary::errors` and the run
 goes on. `print_selected_with` hands each chunk to a callback with the member's listing index instead.
@@ -61,6 +61,13 @@ for several members of one solid folder `print_selected` is the cheaper route. A
 
 7-Zip prints an encrypted member's data before its CRC fails (a wrong password on a Copy folder); zipfast withholds
 a member until it checks out.
+
+Held-back plaintext stays in memory up to `SevenZipLimits::spool_memory_bytes` (1 MiB), then moves to a temporary
+file in `spool_dir` (the system's temporary folder by default) that is unlinked as it is made: it has no name, is
+written and read back through one descriptor, and vanishes with the descriptor, so neither a crash nor `SIGKILL`
+leaves decrypted data on disk. A member that would hold back more than `spool_member_bytes` (8 GiB) fails with
+`SevenZipLimit::SpoolBytes` as soon as it goes past it, prints nothing, and the run goes on. Holding back and
+copying out check for cancellation every chunk.
 
 ## What decodes
 

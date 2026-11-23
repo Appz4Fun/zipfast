@@ -77,8 +77,84 @@ struct Active {
     /// Tested members held back for the folder's CRC in the same case: name and size.
     tested: Vec<(String, u64, u64)>,
     /// Printed members held back for the folder's CRC in the same case: listing index and spooled data.
-    held: Vec<(u64, tempfile::TempPath)>,
+    held: Vec<(u64, Spool)>,
     defer: bool,
+}
+
+/// Plaintext held back until it checks out: in memory up to `spool_memory_bytes`, then in a temporary file that has
+/// no name (unlinked as it is made, written and read back through the one descriptor), so neither a crash nor a kill
+/// leaves decrypted data on disk. Past `spool_member_bytes` it drops what it holds and takes no more.
+#[derive(Default)]
+struct Spool {
+    memory: Vec<u8>,
+    file: Option<fs::File>,
+    len: u64,
+    /// went past `spool_member_bytes`: emptied, takes nothing more
+    over: bool,
+}
+
+impl Spool {
+    fn write(&mut self, bytes: &[u8], limits: &SevenZipLimits) -> io::Result<()> {
+        use std::io::Write;
+        if self.over {
+            return Ok(());
+        }
+        let len = self.len.saturating_add(bytes.len() as u64);
+        if len > limits.spool_member_bytes {
+            *self = Spool { over: true, ..Spool::default() };
+            return Ok(());
+        }
+        if self.file.is_none() && len <= limits.spool_memory_bytes {
+            self.memory.extend_from_slice(bytes);
+        } else {
+            if self.file.is_none() {
+                let mut file = match &limits.spool_dir {
+                    Some(dir) => tempfile::tempfile_in(dir)?,
+                    None => tempfile::tempfile()?,
+                };
+                file.write_all(&self.memory)?;
+                self.memory = Vec::new();
+                self.file = Some(file);
+            }
+            self.file.as_mut().expect("a spool file").write_all(bytes)?;
+        }
+        self.len = len;
+        Ok(())
+    }
+
+    /// Hands what is held to `sink`, in order, checking for cancellation between chunks.
+    fn replay(&mut self, cancel: &Cancellation, mut sink: impl FnMut(&[u8]) -> io::Result<()>) -> Outcome<()> {
+        use std::io::{Seek, SeekFrom};
+        let Some(file) = self.file.as_mut() else {
+            for chunk in self.memory.chunks(CHUNK) {
+                if cancel.is_canceled() {
+                    return Err(SevenZipError::Canceled);
+                }
+                sink(chunk).map_err(SevenZipError::Io)?;
+            }
+            return Ok(());
+        };
+        file.seek(SeekFrom::Start(0)).map_err(SevenZipError::Io)?;
+        let mut chunk = vec![0; CHUNK];
+        loop {
+            if cancel.is_canceled() {
+                return Err(SevenZipError::Canceled);
+            }
+            let n = match file.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SevenZipError::Io(e)),
+            };
+            sink(&chunk[..n]).map_err(SevenZipError::Io)?;
+        }
+    }
+}
+
+/// Where a member's bytes go while it is decoded.
+enum Dest<'o> {
+    File(&'o mut Output),
+    Spool(&'o mut Spool),
 }
 
 /// Where printed members go: their listing index and a chunk of their data, in archive order.
@@ -322,6 +398,8 @@ impl Run<'_> {
             .chain(std::mem::take(&mut active.tested).into_iter().map(|(n, _, o)| (o, n)))
             .collect();
         held.sort_by_key(|(o, _)| *o);
+        // printed members held for the same CRC print nothing: let their plaintext go now
+        active.held.clear();
         for (ordinal, held) in held {
             self.fail_wrong_password(ordinal, &held);
         }
@@ -567,8 +645,8 @@ impl Run<'_> {
             }
             return Ok(());
         }
-        for (ordinal, temporary) in held {
-            self.print_spooled(ordinal, &temporary)?;
+        for (ordinal, spool) in held {
+            self.print_spooled(ordinal, spool)?;
         }
         for (name, size, ordinal) in tested {
             self.succeeded(ordinal, &name, size);
@@ -611,7 +689,7 @@ impl Run<'_> {
         &mut self,
         active: &mut Active,
         mut len: u64,
-        mut out: Option<&mut Output>,
+        mut out: Option<Dest<'_>>,
         mut member_crc: Option<&mut crc32fast::Hasher>,
     ) -> Outcome<Option<String>> {
         while len > 0 {
@@ -642,8 +720,10 @@ impl Run<'_> {
             if let Some(crc) = member_crc.as_deref_mut() {
                 crc.update(bytes);
             }
-            if let Some(out) = out.as_deref_mut() {
-                out.write(bytes).map_err(SevenZipError::Io)?;
+            match out.as_mut() {
+                Some(Dest::File(out)) => out.write(bytes).map_err(SevenZipError::Io)?,
+                Some(Dest::Spool(spool)) => spool.write(bytes, self.limits).map_err(SevenZipError::Io)?,
+                None => {}
             }
             active.pos += got as u64;
             len -= got as u64;
@@ -703,15 +783,20 @@ impl Run<'_> {
         };
         let mut staged = match &target {
             Some((_, Some(place))) => Some(self.stage(place, size)?),
-            // testing a link, or printing: the data is held aside (in the system's temporary folder) to be checked
-            Some((_, None)) if is_link(member) || self.print.is_some() => {
-                let (file, temporary) = tempfile::NamedTempFile::new().map_err(SevenZipError::Io)?.into_parts();
-                Some((temporary, Output::new(file, Some(size))))
-            }
+            _ => None,
+        };
+        // testing a link, or printing: the data is held back (see `Spool`) until it is checked
+        let mut spool = match &target {
+            Some((_, None)) if is_link(member) || self.print.is_some() => Some(Spool::default()),
             _ => None,
         };
         let mut crc = crc32fast::Hasher::new();
-        let outcome = self.pump(active, size, staged.as_mut().map(|(_, out)| out), Some(&mut crc))?;
+        let dest = match (staged.as_mut(), spool.as_mut()) {
+            (Some((_, out)), _) => Some(Dest::File(out)),
+            (None, Some(spool)) => Some(Dest::Spool(spool)),
+            (None, None) => None,
+        };
+        let outcome = self.pump(active, size, dest, Some(&mut crc))?;
         if let Some(why) = outcome {
             return self.data_failure(active, name, &why, encrypted, take);
         }
@@ -739,24 +824,32 @@ impl Run<'_> {
             self.password_proven = true;
         }
         let Some((rel, place)) = target else { return Ok(()) };
+        if spool.as_ref().is_some_and(|s| s.over) {
+            // held back too much to be checked: it fails, and nothing of it is printed or tested
+            let max = self.limits.spool_member_bytes;
+            self.fail(name, &super::limit(super::SevenZipLimit::SpoolBytes, max, size).to_string());
+            return Ok(());
+        }
         if self.print.is_some() {
-            let (temporary, output) = staged.take().expect("a spooled member");
-            output.finish(|_| ()).map_err(SevenZipError::Io)?;
+            let spool = spool.take().expect("a spooled member");
             // A folder with its own CRC vouches for its members at its end: printed then, in order.
             if active.defer {
-                active.held.push((self.current, temporary));
+                active.held.push((self.current, spool));
                 active.tested.push((name.to_owned(), size, self.current));
             } else {
-                self.print_spooled(self.current, &temporary)?;
+                self.print_spooled(self.current, spool)?;
                 self.succeeded(self.current, name, size);
             }
             return Ok(());
         }
         let Some(place) = place else {
             // Testing a link checks its target as extracting would.
-            if let Some((temporary, output)) = staged.take() {
-                output.finish(|_| ()).map_err(SevenZipError::Io)?;
-                let text = std::fs::read(&temporary).map_err(SevenZipError::Io)?;
+            if let Some(mut spool) = spool.take() {
+                let mut text = Vec::new();
+                spool.replay(self.cancel, |bytes| {
+                    text.extend_from_slice(bytes);
+                    Ok(())
+                })?;
                 let kind = crate::extract::link::LinkKind::Symbolic(text);
                 if let Some(why) = crate::extract::link::refusal(&rel, &kind, &self.extracted) {
                     self.fail(name, why);
@@ -791,23 +884,10 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Copies a checked member's spooled data to the print sink.
-    fn print_spooled(&mut self, ordinal: u64, temporary: &Path) -> Outcome<()> {
+    /// Copies a checked member's held-back data to the print sink.
+    fn print_spooled(&mut self, ordinal: u64, mut spool: Spool) -> Outcome<()> {
         let Some(sink) = self.print.as_mut() else { return Ok(()) };
-        let mut file = fs::File::open(temporary).map_err(SevenZipError::Io)?;
-        let mut chunk = vec![0; CHUNK];
-        loop {
-            if self.cancel.is_canceled() {
-                return Err(SevenZipError::Canceled);
-            }
-            let n = match file.read(&mut chunk) {
-                Ok(0) => return Ok(()),
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(SevenZipError::Io(e)),
-            };
-            sink(ordinal, &chunk[..n]).map_err(SevenZipError::Io)?;
-        }
+        spool.replay(self.cancel, |bytes| sink(ordinal, bytes))
     }
 
     fn data_failure(&mut self, active: &mut Active, name: &str, why: &str, encrypted: bool, take: bool) -> Outcome<()> {

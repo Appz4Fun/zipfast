@@ -70,6 +70,16 @@ pub struct SevenZipLimits {
     /// end the process instead. The Zstandard coder's window, at most what its frame header asks for, isn't counted
     /// here. Lower it on a machine with less memory to spare.
     pub dictionary_bytes: u64,
+    /// [`print_selected`] (and reading one member through `extract::SelectedEntry`): the most plaintext one member
+    /// may hold back until its CRC checks out: 8 GiB. A larger member fails with
+    /// [`SevenZipLimit::SpoolBytes`] as soon as it goes past this, prints nothing, and the run goes on.
+    pub spool_member_bytes: u64,
+    /// Plaintext a member holds back in memory before it moves to a temporary file: 1 MiB, so short members never
+    /// touch the disk.
+    pub spool_memory_bytes: u64,
+    /// The folder for a member's temporary file: the system's temporary folder by default. The file is unlinked as
+    /// it is made (it has no name in the folder), so nothing is left behind however the process ends.
+    pub spool_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for SevenZipLimits {
@@ -82,6 +92,9 @@ impl Default for SevenZipLimits {
             coder_properties: 64,
             entries: 65536,
             dictionary_bytes: 4 << 30,
+            spool_member_bytes: 8 << 30,
+            spool_memory_bytes: 1 << 20,
+            spool_dir: None,
         }
     }
 }
@@ -100,6 +113,8 @@ pub enum SevenZipLimit {
     CoderProperties,
     Entries,
     DictionaryBytes,
+    /// A printed member held back more plaintext than `spool_member_bytes` before its CRC could check it.
+    SpoolBytes,
 }
 
 /// Why a 7z run stopped.
@@ -470,7 +485,7 @@ pub(crate) fn member_name(m: &crate::map::MapMember) -> String {
     })
 }
 
-fn limit(limit: SevenZipLimit, max: u64, attempted: u64) -> SevenZipError {
+pub(crate) fn limit(limit: SevenZipLimit, max: u64, attempted: u64) -> SevenZipError {
     SevenZipError::Limit { limit, max, attempted }
 }
 

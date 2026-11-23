@@ -225,3 +225,96 @@ fn a_late_member_of_a_solid_folder_counts_the_members_before_it() {
         "{error:?}"
     );
 }
+
+/// Limits that spool every member to a temporary file in `dir`.
+fn on_disk(dir: &Path) -> SevenZipLimits {
+    let mut limits = SevenZipLimits::default();
+    limits.spool_memory_bytes = 0;
+    limits.spool_dir = Some(dir.to_path_buf());
+    limits
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()
+}
+
+/// Spooled to disk, the output is still byte-identical to `7z x -so`, and the spool file never has a name: the
+/// spool folder is empty while a member is being copied out (its file still open) and after the run.
+#[test]
+fn spooling_to_disk_leaves_no_named_file_and_prints_the_same_bytes() {
+    for (archive, want) in ARCHIVES {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = on_disk(dir.path());
+        let mut out = Vec::new();
+        let mut seen_names = Vec::new();
+        let summary = sevenzip::print_selected_with(
+            &fixture(archive),
+            Some("password"),
+            &mut |_, _| true,
+            &mut |_, bytes| {
+                seen_names.extend(names_in(dir.path()));
+                out.extend_from_slice(bytes);
+                Ok(())
+            },
+            &Cancellation::default(),
+            &limits,
+        )
+        .unwrap_or_else(|e| panic!("{archive}: {e}"));
+        assert!(summary.errors.is_empty(), "{archive}: {:?}", summary.errors);
+        assert_eq!(hex(&zipfast::crypto::sha256(&out)), *want, "{archive}");
+        assert!(seen_names.is_empty(), "{archive}: named spool files {seen_names:?}");
+        assert!(names_in(dir.path()).is_empty(), "{archive}");
+    }
+}
+
+/// A run that fails (wrong password) or is canceled mid-member leaves nothing in the spool folder either.
+#[test]
+fn a_failed_or_canceled_print_leaves_no_spool_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = on_disk(dir.path());
+    for archive in ["7z-extract/aes.7z", "7z/encrypted_files.7z"] {
+        let mut out = Vec::new();
+        let _ = sevenzip::print_selected(
+            &fixture(archive),
+            Some("wrong"),
+            |_, _| true,
+            &mut out,
+            &Cancellation::default(),
+            &limits,
+        );
+        assert!(names_in(dir.path()).is_empty(), "{archive}");
+    }
+    // canceled while the first member is being copied out
+    let cancel = Cancellation::default();
+    let result = sevenzip::print_selected_with(
+        &fixture("7z-extract/solid.7z"),
+        None,
+        &mut |_, _| true,
+        &mut |_, _| {
+            cancel.cancel();
+            Ok(())
+        },
+        &cancel,
+        &limits,
+    );
+    let error = result.expect_err("canceled");
+    assert!(matches!(sevenzip::SevenZipError::of(&error), Some(sevenzip::SevenZipError::Canceled)), "{error}");
+    assert!(names_in(dir.path()).is_empty());
+}
+
+/// A member that would hold back more than `spool_member_bytes` fails with the typed limit and prints nothing; the
+/// others still print.
+#[test]
+fn a_member_over_the_spool_cap_fails_and_prints_nothing() {
+    let path = fixture("7z-extract/solid.7z");
+    let mut limits = SevenZipLimits::default();
+    limits.spool_member_bytes = 10_000;
+    let mut out = Vec::new();
+    let summary =
+        sevenzip::print_selected(&path, None, |_, _| true, &mut out, &Cancellation::default(), &limits).unwrap();
+    // big/one.txt (49,999) and big/two.txt (50,000) are over; text/* (5,999 + 2,999 + 18 + 9) print
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert!(summary.errors.iter().all(|e| e.contains("SpoolBytes")), "{:?}", summary.errors);
+    assert_eq!(out.len(), 5_999 + 2_999 + 18 + 9);
+    assert_eq!(summary.files, 4);
+}
