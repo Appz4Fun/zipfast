@@ -627,6 +627,7 @@ impl FeedDecoder {
             failed: false,
             status: FeedStatus::default(),
             rar5: None,
+            rar4: None,
             lzma2: Some(Box::new(Lz {
                 ss: slot.offset,
                 end,

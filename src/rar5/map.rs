@@ -797,6 +797,7 @@ impl RarWalker {
             }],
             folder: None,
             dictionary: (!header.is_dir() && header.dictionary > 0).then_some(header.dictionary),
+            unpack_version: header.rar4.map(|r| r.unpack_version),
         };
         self.members.try_reserve(1).map_err(|_| self.allocation())?;
         self.members.push(member);

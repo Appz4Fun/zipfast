@@ -81,9 +81,9 @@ pub(super) struct Rar5 {
 }
 
 /// An [`Sink`] writing the part of the decoder's output inside `write` to the feed sink.
-struct OutSink<'a> {
+pub(super) struct OutSink<'a> {
     sink: &'a mut dyn FeedSink,
-    at: u64,
+    pub(super) at: u64,
     write: Range<u64>,
     crc: &'a mut CrcRuns,
     stats: &'a mut FeedStats,
@@ -116,7 +116,7 @@ impl Sink for OutSink<'_> {
 }
 
 impl OutSink<'_> {
-    fn fail(&mut self, error: crate::Error) -> FeedError {
+    pub(super) fn fail(&mut self, error: crate::Error) -> FeedError {
         match self.io.take() {
             Some(error) => FeedError::Write { out: self.at, error },
             None => FeedError::Decode { out: self.at, error },
@@ -358,6 +358,7 @@ impl FeedDecoder {
                 ratio,
             })),
             lzma2: None,
+            rar4: None,
         };
         if size > 0 {
             d.main = Some(d.packed_lane(0, stream_len));
@@ -484,7 +485,7 @@ impl FeedDecoder {
         Ok((next, repair, more, gap))
     }
 
-    fn out_sink<'a>(&'a mut self, sink: &'a mut dyn FeedSink, at: u64, write: Range<u64>) -> OutSink<'a> {
+    pub(super) fn out_sink<'a>(&'a mut self, sink: &'a mut dyn FeedSink, at: u64, write: Range<u64>) -> OutSink<'a> {
         OutSink {
             sink,
             at,
