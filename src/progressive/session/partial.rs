@@ -79,12 +79,17 @@ impl Slot {
     fn live(&self) -> Option<Arc<PartialCore>> {
         self.core.clone().or_else(|| self.weak.upgrade())
     }
+    /// Drops the session's own reference once the member finished and its handle was taken, keeping its packed
+    /// spans. While a caller's operation holds the core's data the spans can't be read: the core is kept and
+    /// released on a later call instead of recording no spans.
     fn release_if_done(&mut self) {
         if self.taken
             && self.finished
-            && let Some(core) = self.core.take()
+            && let Some(core) = &self.core
+            && let Some(spans) = core.packed_parts()
         {
-            self.spans = core.packed_parts();
+            self.spans = spans;
+            self.core = None;
         }
     }
 }
@@ -215,6 +220,8 @@ impl ProgressiveSession {
             slot.live().ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
         slot.taken = true;
         slot.release_if_done();
+        // retry members whose release found their core busy
+        self.partial.as_mut().into_iter().flat_map(|p| p.cores.iter_mut()).for_each(Slot::release_if_done);
         Ok(PartialFile::from_core(core))
     }
     /// Declares archive bytes `range` of zero-based `volume` damaged, at any time, including bytes already
@@ -1107,7 +1114,8 @@ impl ProgressiveSession {
         };
         let slot = &mut persistent.cores[persistent.current.take().expect("persistent member")];
         slot.finished = true;
-        slot.release_if_done();
+        // this member, and any whose release found their core busy
+        persistent.cores.iter_mut().for_each(Slot::release_if_done);
         persistent.unavailable.clear();
         persistent.resume = None;
         self.phase = Phase::Header;

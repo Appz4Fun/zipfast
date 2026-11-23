@@ -251,6 +251,8 @@ impl HeaderParser {
                 packed |= u64::from(fields.u32()?) << 32;
                 unpacked |= u64::from(fields.u32()?) << 32;
             }
+            // As UnRAR reads it: all ones (both halves with the large-file flag) means the size is unknown.
+            let size_unknown = if flags & 0x100 != 0 { unpacked == u64::MAX } else { unpacked == 0xffff_ffff };
             let encoded = fields.take(name_len)?;
             let name = match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
                 // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
@@ -347,7 +349,8 @@ impl HeaderParser {
                 }),
                 block_flags: (u64::from(flags & 1 != 0) * HFL_SPLIT_BEFORE)
                     | (u64::from(flags & 2 != 0) * HFL_SPLIT_AFTER),
-                file_flags: u64::from(directory) * FHFL_DIRECTORY,
+                file_flags: (u64::from(directory) * FHFL_DIRECTORY)
+                    | (u64::from(size_unknown && !directory) * FHFL_UNPUNKNOWN),
                 packed_size: packed,
                 data_at,
                 unpacked_size: unpacked,
@@ -629,6 +632,18 @@ fn legacy_name(
     let stored_mark = |c: char| if c == '\u{FFFE}' && value.as_ptr() != mapped_ptr { '\u{FFFF}' } else { c };
     name.extend(value.chars().map(stored_mark).map(separator));
     Ok(name)
+}
+
+/// A RAR 4.x Unix symbolic link's target bytes as the link is written: mapped as member names are written
+/// (`crate::path::rar_output_name`), so a target naming a member whose raw name isn't UTF-8 points at that member
+/// where it was extracted. A stored U+FFFE stands for itself and is refused, as in a name. None when the target
+/// can't keep its meaning that way.
+pub(crate) fn link_target(bytes: &[u8]) -> Option<Vec<u8>> {
+    let decoded = match std::str::from_utf8(bytes) {
+        Ok(text) => text.replace('\u{FFFE}', "\u{FFFF}"),
+        Err(_) => unrar_mapped_name(bytes)?,
+    };
+    crate::path::rar_output_name(&decoded, true).map(|name| name.into_owned().into_bytes())
 }
 
 /// `bytes`, which aren't UTF-8, as UnRAR's `CharToWideMap` reads them in a UTF-8 locale: U+FFFE marks the name

@@ -436,3 +436,34 @@ fn encrypted_primary_tail_is_filled_with_plaintext_and_verified_with_the_supplie
         }
     }
 }
+
+/// An encrypted member whose final (keyed) checks were already read: abandoning its tail with plaintext checks
+/// accepts them without comparing them with the keyed values, and repeating the same call is idempotent.
+#[test]
+fn repeating_an_abandon_with_keyed_archive_checks_is_idempotent() {
+    let gold = gold(10_000);
+    let primary = encrypted(&gold, 1 << 20);
+    assert_eq!(primary.len(), 1);
+    let crc32 = zipfast::crc32::hash(&gold);
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = Arc::new(Anchors::default());
+    let mut session = session(dir.path(), &primary, usize::MAX, &anchors, Some("pw"));
+    let mut abandoned = None;
+    for _ in 0..100_000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                let mut handle = session.partial_file(&member).unwrap();
+                let first = handle.abandon_tail(Some(checks(gold.len(), crc32))).unwrap();
+                assert_eq!(handle.tail_checks().unwrap(), Some(TailChecks::Archive));
+                let again = handle.abandon_tail(Some(checks(gold.len(), crc32))).unwrap();
+                assert_eq!(again.out, first.out);
+                abandoned = Some(handle);
+                break;
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { .. }))) => panic!("finished before the abandon"),
+            Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => break,
+            _ => {}
+        }
+    }
+    assert!(abandoned.is_some(), "the member was abandoned");
+}

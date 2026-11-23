@@ -652,3 +652,17 @@ fn a_maximum_ppm_model_fits_a_limit_of_exactly_256_mib() {
         assert_eq!(limited, refused, "{limit}: {result:?}");
     }
 }
+
+/// A RAR 1.5 or 2.0 stream with no packed data cannot decode a byte: the zeros past the input are lookahead only,
+/// so a code read from them fails instead of completing the member.
+#[test]
+fn legacy_codes_past_the_packed_input_are_refused() {
+    for version in [15, 20] {
+        let mut d = decoder(0, 1);
+        d.set_version(version).unwrap();
+        let mut out = Vec::new();
+        let error = first_error(&mut d, &[], &mut out);
+        assert!(matches!(error, Rar4DecodeError::Malformed(_)), "version {version}: {error:?}");
+        assert!(out.is_empty(), "version {version}: {out:?}");
+    }
+}

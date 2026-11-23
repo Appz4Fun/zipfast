@@ -465,6 +465,7 @@ impl EncryptedReadContext {
                     return Err(ReadFault::InvalidPlan);
                 }
             }
+            let loose_identity = loose_identity(&token, encrypted, file)?;
             // Task4 binds member scope; selected clear registrations must never spend encrypted quota.
             token.with_state(|s| s.reserve(encrypted, bytes, if parent.is_some() { 2 } else { 1 }))?;
             Ok(OutputReservation {
@@ -476,24 +477,38 @@ impl EncryptedReadContext {
                 identity: FileIdentity::capture(&identity),
                 handle: file_handle(file),
                 retired: false,
-                loose_identity: loose_identity(file),
+                loose_identity,
             })
         })();
         result.map_err(|fault: ReadFault| ZipReadError::from(fault).with_usage(self.usage(), self.run_usage()))
     }
 }
 /// Whether a caller's output file lives outside the native allow-list, where an open file's inode number need not
-/// stay stable (exFAT numbers it by its first cluster, so it changes once data is written).
-fn loose_identity(file: &File) -> bool {
+/// stay stable (exFAT numbers it by its first cluster, so it changes once data is written). The filesystem probe is
+/// admitted and charged like the registration's other I/O.
+fn loose_identity(ledger: &impl shared::LedgerAccess, encrypted: bool, file: &File) -> Result<bool, ReadFault> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::fd::AsRawFd;
-        matches!(native_policy::backend(file.as_raw_fd()), Err(e) if e.kind() == std::io::ErrorKind::Unsupported)
+        let probe = io::operation(
+            ledger,
+            encrypted,
+            RunCategory::StageFinalization,
+            IoStage::Output,
+            ReadIoOperation::Stat,
+            None,
+            || native_policy::backend(file.as_raw_fd()),
+        );
+        match probe {
+            Ok(()) => Ok(false),
+            Err(ReadFault::Io { error, .. }) => Ok(error.kind() == std::io::ErrorKind::Unsupported),
+            Err(fault) => Err(fault),
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = file;
-        false
+        let _ = (ledger, encrypted, file);
+        Ok(false)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

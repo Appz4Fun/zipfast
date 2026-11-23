@@ -402,11 +402,20 @@ impl ProgressiveSession {
     /// What this session has charged to `resource` so far, and its effective limit. Read-only: a caller can
     /// budget further work (such as a Complete declaration) from real numbers rather than estimates.
     pub fn resource_usage(&self, resource: Resource) -> ResourceUsage {
-        self.usage.snapshot(resource)
+        let mut usage = self.usage.snapshot(resource);
+        // Tracked apart from the charged counters: held descriptors by the source driver, outputs by their quota.
+        match resource {
+            Resource::VolumeHandles => usage.used = self.driver.held_handles(),
+            Resource::ActiveOutputs | Resource::RetainedArtifacts => {
+                usage.used = self.output.as_ref().map_or(0, |output| output.occupancy(resource));
+            }
+            _ => {}
+        }
+        usage
     }
     /// [`Self::resource_usage`] for every resource, in [`Resource::ALL`] order.
     pub fn resource_usages(&self) -> impl Iterator<Item = (Resource, ResourceUsage)> + '_ {
-        Resource::ALL.into_iter().map(|r| (r, self.usage.snapshot(r)))
+        Resource::ALL.into_iter().map(|r| (r, self.resource_usage(r)))
     }
     /// The limits this session was opened with, as configured; [`Self::resource_usage`] reports the effective
     /// ceiling after fixed safety clamps.
@@ -1623,7 +1632,9 @@ impl ProgressiveSession {
                 Some(kind) => kind,
                 None => {
                     let rel = self.link_rel(header)?;
-                    let text = std::mem::take(&mut self.link_text);
+                    // written mapped as the member names it may point at; an empty target is refused below
+                    let text =
+                        crate::extract::link::rar4_target(&std::mem::take(&mut self.link_text)).unwrap_or_default();
                     if !crate::extract::link::contained(&rel, &text) {
                         return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
                     }

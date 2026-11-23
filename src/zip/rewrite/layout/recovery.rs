@@ -56,6 +56,9 @@ impl DescriptorRepair {
 #[derive(Default)]
 pub(in crate::zip) struct RecoveryUsage {
     pub(in crate::zip) layout_read_bytes: u64,
+    /// Where the planning work budget stops layout reads (a total of `layout_read_bytes`), when it does before
+    /// `RewriteLimits::layout_read_bytes`.
+    pub(in crate::zip) layout_work_max: Option<u64>,
     pub(in crate::zip) payload: VerificationUsage,
 }
 
@@ -83,14 +86,12 @@ pub(in crate::zip) fn recover_member(
     }
     preflight(central, limits.common, &usage.payload)?;
     let mut buffer = [0; BUFFER];
+    let (max, exhausted) = match usage.layout_work_max {
+        Some(work) if work < limits.layout_read_bytes => (work, ReadLimit::Create(CreateLimit::PlanWork)),
+        _ => (limits.layout_read_bytes, ReadLimit::Rewrite(RewriteLimit::LayoutReadBytes)),
+    };
     let framing = framed_member(
-        &mut Reader {
-            file,
-            attempts,
-            bytes: &mut usage.layout_read_bytes,
-            max: limits.layout_read_bytes,
-            exhausted: ReadLimit::Rewrite(RewriteLimit::LayoutReadBytes),
-        },
+        &mut Reader { file, attempts, bytes: &mut usage.layout_read_bytes, max, exhausted },
         central,
         boundary,
         &mut buffer,

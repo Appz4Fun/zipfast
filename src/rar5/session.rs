@@ -705,7 +705,13 @@ impl<'a> RarMember<'a> {
     /// its whole block and the block before it as IV. [`crate::map::MapMember::packed_spans`] gives those spans.
     pub fn locate(&self, offset: u64) -> Option<(usize, u64)> {
         let header = &self.member.header;
-        if header.method != 0 || header.encrypted || header.is_dir() || offset >= header.unpacked_size {
+        // the member's resolved size: a first part may mark it unknown and a later one state it; with no size
+        // known at all, the part walk bounds the offset
+        if header.method != 0
+            || header.encrypted
+            || header.is_dir()
+            || self.member.unpacked_size.is_some_and(|s| offset >= s)
+        {
             return None;
         }
         let mut start = 0u64;
@@ -974,6 +980,10 @@ fn rar2_comment(held: &HeldVolume, block: &[u8], cancel: &Cancellation) -> Resul
     let size = usize::from(size);
     if size < 13 {
         return Err(framing("RAR 2.x comment header"));
+    }
+    // The main header's CRC covers only its own 13 bytes: the comment header carries its own, over its fields.
+    if field(0) != Some(crate::crc32::hash(&block[2..13]) as u16) {
+        return Err(comment_integrity(held, RarIntegrityReason::HeaderCrc));
     }
     let Some(packed) = block.get(13..size) else { return Err(framing("RAR 2.x comment size")) };
     let bytes = if method == 0x30 {

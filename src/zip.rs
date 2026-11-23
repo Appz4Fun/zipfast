@@ -1092,7 +1092,7 @@ pub fn run_with_password(
     password: Option<&str>,
     mut report: impl FnMut(&str),
 ) -> Result<Summary> {
-    run_renaming(path, opts, password, &mut report).map_err(|e| e.error)
+    run_renaming(path, opts, password, None, &mut report).map_err(|e| e.error)
 }
 
 /// [`run_with_password`], whose terminal error keeps the renames a rename mode made before it, and whose report
@@ -1101,9 +1101,11 @@ pub(crate) fn run_renaming(
     path: &Path,
     opts: &Options,
     password: Option<&str>,
-    mut report: impl FnMut(&str),
+    cancel: Option<&Cancellation>,
+    report: &mut impl crate::extract::LegacyReport,
 ) -> std::result::Result<Summary, RunError> {
-    let mut archive = Archive::open(path)?;
+    use crate::extract::LegacyMember;
+    let mut archive = Archive::open_cancelable(path, cancel)?;
     let mut opts = opts.protecting(path)?;
     // Protect every piece of a byte-split set, not only the first.
     for piece in &archive.pieces {
@@ -1116,19 +1118,41 @@ pub(crate) fn run_renaming(
     let mut buf = vec![0u8; BUF];
     let entries = std::mem::take(&mut archive.entries);
     let password = password.filter(|s| !s.is_empty());
-    fn fail(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
+    /// A member failed: a line, and as its outcome the member's failure.
+    fn fail(
+        summary: &mut Summary,
+        report: &mut impl crate::extract::LegacyReport,
+        (ordinal, name): (u64, &str),
+        why: &str,
+    ) {
         let line = format!("{name}: {why}");
-        report(&line);
+        report.line(&line);
+        report.member(LegacyMember::Failed { ordinal, name, error: Error::Io(std::io::Error::other(why.to_owned())) });
         summary.errors.push(line);
+    }
+    /// A member passed over: a line, and as its outcome a skip.
+    fn skipped(
+        summary: &mut Summary,
+        report: &mut impl crate::extract::LegacyReport,
+        (ordinal, name): (u64, &str),
+        why: &str,
+    ) {
+        report.line(&format!("{name}: {why}, skipped"));
+        summary.skipped += 1;
+        report.member(LegacyMember::Skipped { ordinal, name });
     }
     // ZIP holds no hard links: only symbolic ones are placed, and they never replace a file the run relies on.
     let mut extracted = crate::extract::link::Extracted::default();
     // A run that stops early still says which files a rename mode renamed or moved aside.
     let result = (|| -> Result<()> {
         for (ordinal, e) in entries.iter().enumerate() {
+            if let Some(cancel) = cancel {
+                cancel.check_io()?;
+            }
             if !opts.selects(&e.name, None, e.is_dir(), ordinal as u64) {
                 continue;
             }
+            let member = (ordinal as u64, e.name.as_str());
             summary.matched += 1;
             if e.is_dir() && crate::path::names_root(&e.name) {
                 continue;
@@ -1136,7 +1160,7 @@ pub(crate) fn run_renaming(
             let rel = match sanitize_with(&e.name, e.host != HOST_UNIX, opts.windows_safe_names) {
                 Ok(rel) => rel,
                 Err(err) => {
-                    fail(&mut summary, &mut report, &e.name, &err.to_string());
+                    fail(&mut summary, report, member, &err.to_string());
                     continue;
                 }
             };
@@ -1144,12 +1168,13 @@ pub(crate) fn run_renaming(
             if e.is_dir() {
                 if opts.mode == Mode::Extract && !opts.flatten {
                     if let Some(why) = crate::extract::make_member_dirs(&opts.dest, &rel)? {
-                        fail(&mut summary, &mut report, &e.name, why);
+                        fail(&mut summary, report, member, why);
                         continue;
                     }
                     summary.dir_meta.push((opts.dest.join(&rel), opts.meta(e.meta())));
                 }
                 summary.dirs += 1;
+                report.member(LegacyMember::Succeeded { ordinal: member.0, name: member.1, bytes: 0 });
                 continue;
             }
             let eff_method = e.effective_method();
@@ -1165,7 +1190,7 @@ pub(crate) fn run_renaming(
                 None
             };
             if let Some(why) = refuse {
-                fail(&mut summary, &mut report, &e.name, &why);
+                fail(&mut summary, report, member, &why);
                 continue;
             }
             if e.is_link() {
@@ -1186,12 +1211,12 @@ pub(crate) fn run_renaming(
                         text.extend_from_slice(chunk);
                         Ok(())
                     },
-                    None,
+                    cancel,
                 );
                 match read {
                     Err(Error::Io(io)) if io.kind() != std::io::ErrorKind::UnexpectedEof => return Err(Error::Io(io)),
                     Err(err) => {
-                        fail(&mut summary, &mut report, &e.name, &err.to_string());
+                        fail(&mut summary, report, member, &err.to_string());
                         continue;
                     }
                     Ok(()) => {}
@@ -1199,31 +1224,29 @@ pub(crate) fn run_renaming(
                 // testing checks the target as extracting would
                 let kind = crate::extract::link::LinkKind::Symbolic(text);
                 if let Some(why) = crate::extract::link::refusal(&rel, &kind, &extracted) {
-                    fail(&mut summary, &mut report, &e.name, why);
+                    fail(&mut summary, report, member, why);
                     continue;
                 }
                 if opts.mode == Mode::Extract {
                     let mut log = RenameLog {
                         budget: &mut summary.rename_budget,
                         record: &mut |renamed| {
-                            report(&renamed.line());
+                            report.renamed_member(member.0, &renamed);
                             summary.renames.push(renamed);
                         },
                     };
                     let place = match crate::extract::check_target(opts, &rel, None, &mut log)? {
                         crate::extract::Checked::Write(place) => place,
                         crate::extract::Checked::Exists => {
-                            report(&format!("{}: exists, skipped", e.name));
-                            summary.skipped += 1;
+                            skipped(&mut summary, report, member, "exists");
                             continue;
                         }
                         crate::extract::Checked::Declined => {
-                            report(&format!("{}: declined, skipped", e.name));
-                            summary.skipped += 1;
+                            skipped(&mut summary, report, member, "declined");
                             continue;
                         }
                         crate::extract::Checked::Blocked(why) => {
-                            fail(&mut summary, &mut report, &e.name, why);
+                            fail(&mut summary, report, member, why);
                             continue;
                         }
                     };
@@ -1236,7 +1259,7 @@ pub(crate) fn run_renaming(
                         &mut extracted,
                     ) {
                         if let Some(why) = crate::extract::link::member_failure(&io) {
-                            fail(&mut summary, &mut report, &e.name, why);
+                            fail(&mut summary, report, member, why);
                             continue;
                         }
                         finish_dirs(&mut summary);
@@ -1244,6 +1267,7 @@ pub(crate) fn run_renaming(
                     }
                 }
                 summary.files += 1;
+                report.member(LegacyMember::Succeeded { ordinal: member.0, name: member.1, bytes: 0 });
                 continue;
             }
             let mut target = None;
@@ -1251,24 +1275,22 @@ pub(crate) fn run_renaming(
                 let mut log = RenameLog {
                     budget: &mut summary.rename_budget,
                     record: &mut |renamed| {
-                        report(&renamed.line());
+                        report.renamed_member(member.0, &renamed);
                         summary.renames.push(renamed);
                     },
                 };
                 match open_target(opts, &rel, Some(e.size), &mut log)? {
                     Target::Write(out) => target = Some(out),
                     Target::Exists => {
-                        report(&format!("{}: exists, skipped", e.name));
-                        summary.skipped += 1;
+                        skipped(&mut summary, report, member, "exists");
                         continue;
                     }
                     Target::Declined => {
-                        report(&format!("{}: declined, skipped", e.name));
-                        summary.skipped += 1;
+                        skipped(&mut summary, report, member, "declined");
                         continue;
                     }
                     Target::Blocked(why) => {
-                        fail(&mut summary, &mut report, &e.name, why);
+                        fail(&mut summary, report, member, why);
                         continue;
                     }
                 }
@@ -1282,9 +1304,9 @@ pub(crate) fn run_renaming(
                     password,
                     &mut buf,
                     &mut |chunk| Ok(out.write(chunk)?),
-                    None,
+                    cancel,
                 ),
-                None => read_entry(&mut archive.file, archive.len, &entry, password, &mut buf, &mut |_| Ok(()), None),
+                None => read_entry(&mut archive.file, archive.len, &entry, password, &mut buf, &mut |_| Ok(()), cancel),
             };
             match read {
                 Ok(()) => {
@@ -1296,6 +1318,7 @@ pub(crate) fn run_renaming(
                     }
                     summary.files += 1;
                     summary.bytes += e.size;
+                    report.member(LegacyMember::Succeeded { ordinal: member.0, name: member.1, bytes: e.size });
                 }
                 Err(err) => {
                     drop(target);
@@ -1314,7 +1337,7 @@ pub(crate) fn run_renaming(
                             archive.holes.iter().any(|hole| e.local_at < hole.end && end > hole.start)
                         });
                     if let Some(missing) = archive.missing.as_ref().filter(|_| crosses_gap) {
-                        fail(&mut summary, &mut report, &e.name, &Error::MissingVolume(missing.clone()).to_string());
+                        fail(&mut summary, report, member, &Error::MissingVolume(missing.clone()).to_string());
                         continue;
                     }
                     match err {
@@ -1323,8 +1346,8 @@ pub(crate) fn run_renaming(
                             finish_dirs(&mut summary);
                             return Err(Error::Io(io));
                         }
-                        Error::Io(_) => fail(&mut summary, &mut report, &e.name, &Error::Truncated.to_string()),
-                        other => fail(&mut summary, &mut report, &e.name, &other.to_string()),
+                        Error::Io(_) => fail(&mut summary, report, member, &Error::Truncated.to_string()),
+                        other => fail(&mut summary, report, member, &other.to_string()),
                     }
                 }
             }
@@ -1332,7 +1355,7 @@ pub(crate) fn run_renaming(
         // Members after the gap are unknown: the set as a whole is incomplete.
         if let Some(missing) = &archive.missing {
             let line = Error::MissingVolume(missing.clone()).to_string();
-            report(&line);
+            report.line(&line);
             summary.errors.push(line);
         }
         Ok(())

@@ -759,6 +759,8 @@ enum Content {
 
 struct Reader {
     src: Source,
+    /// the run's cancellation, also checked between the publications of a staged (compressed) tar
+    cancel: Option<Cancellation>,
     content: Content,
     /// the start of the data, read to tell tar from a lone compressed file: one header block for tar
     first: Option<Vec<u8>>,
@@ -793,7 +795,7 @@ impl Reader {
         cancel: Option<Cancellation>,
         whole: bool,
     ) -> Result<Reader> {
-        let mut src = Source::open(path, threads, limit, cancel)?;
+        let mut src = Source::open(path, threads, limit, cancel.clone())?;
         let mut first = vec![0u8; BLOCK];
         let n = src.read(&mut first)?;
         first.truncate(n);
@@ -847,6 +849,7 @@ impl Reader {
         let Some(content) = content else { return Err(Error::NotAnArchive) };
         Ok(Reader {
             src,
+            cancel,
             content,
             first: Some(first),
             unread: 0,
@@ -1663,9 +1666,14 @@ impl StagedTar {
         holes: &mut HoleBudget,
         summary: &mut Summary,
         report: &mut impl LegacyReport,
+        cancel: Option<&Cancellation>,
     ) -> Result<()> {
         let mut extracted = Extracted::default();
         for member in self.members {
+            // a cancellation from an earlier member's outcome stops the rest from being published
+            if let Some(cancel) = cancel {
+                cancel.check_io()?;
+            }
             match member {
                 StagedMember::Link { relative, name, kind, ordinal, meta } => {
                     let member = (ordinal, name.as_str(), &meta);
@@ -1916,7 +1924,7 @@ fn run_tar(
                     }
                 }
                 if let Some(staged) = staged {
-                    staged.publish(opts, &mut holes, summary, report)?;
+                    staged.publish(opts, &mut holes, summary, report, reader.cancel.as_ref())?;
                 }
                 return Ok(());
             }

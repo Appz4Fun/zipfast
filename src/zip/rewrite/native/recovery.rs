@@ -176,22 +176,40 @@ impl RecoveryPlan {
         check_source(&source.parent, &source.file, source.stamp, &attempts)?;
         self.destination.check(&attempts)?;
         let prefix = order.first().map_or(central, |&ordinal| at(ordinal));
-        layout::prefix(
+        // Layout reads are planning work, as in an ordinary rewrite preflight: each read is capped by what is left
+        // of the budget, and what was read is charged, also when a member is omitted or a read fails.
+        let work_max =
+            |usage: &RewriteUsage| add(usage.layout_read_bytes, limits.common.plan_work - usage.common.plan.work);
+        let before = source.usage.layout_read_bytes;
+        let maximum = work_max(&source.usage)?;
+        let (maximum, exhausted) = if maximum < limits.layout_read_bytes {
+            (maximum, ReadLimit::Create(CreateLimit::PlanWork))
+        } else {
+            (limits.layout_read_bytes, ReadLimit::Rewrite(RewriteLimit::LayoutReadBytes))
+        };
+        let read = layout::prefix(
             &mut Reader {
                 file: &source.file,
                 attempts: &attempts,
                 bytes: &mut source.usage.layout_read_bytes,
-                max: limits.layout_read_bytes,
-                exhausted: ReadLimit::Rewrite(RewriteLimit::LayoutReadBytes),
+                max: maximum,
+                exhausted,
             },
             prefix,
             limits.prefix_bytes,
-        )?;
-        let mut recovery_usage =
-            RecoveryUsage { layout_read_bytes: source.usage.layout_read_bytes, payload: source.usage.source_payload };
+        );
+        source.usage.common.plan.work += source.usage.layout_read_bytes - before;
+        read?;
+        let mut recovery_usage = RecoveryUsage {
+            layout_read_bytes: source.usage.layout_read_bytes,
+            layout_work_max: None,
+            payload: source.usage.source_payload,
+        };
         let mut survivors = 0;
         for ordinal in 0..count {
             work(&source.options, &mut source.usage, 1)?;
+            let before = recovery_usage.layout_read_bytes;
+            recovery_usage.layout_work_max = Some(work_max(&source.usage)?);
             let result = recover_member(
                 &mut source.file,
                 source.metadata.view(ordinal),
@@ -201,6 +219,7 @@ impl RecoveryPlan {
                 &mut recovery_usage,
             );
             source.usage.layout_read_bytes = recovery_usage.layout_read_bytes;
+            source.usage.common.plan.work += recovery_usage.layout_read_bytes - before;
             source.usage.source_payload = recovery_usage.payload;
             let outcome = match result? {
                 Candidate::Verified(member) => {

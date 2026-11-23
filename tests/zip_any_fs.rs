@@ -369,3 +369,107 @@ fn bulk_publication_through_a_symlinked_destination_root() {
     assert_eq!((report.files(), report.failed()), (4, 0));
     check_tree(&real, &files);
 }
+
+fn bulk_overrides() -> EncryptedReadOverrides {
+    let mut overrides = overrides(StagedStorage::Auto);
+    overrides.publication = Publication::Bulk;
+    overrides
+}
+
+/// A flattened Bulk run flushes the directory its files really went to (the root), not their archive folders,
+/// which a flattened run never creates.
+#[test]
+fn bulk_publication_with_flatten_flushes_the_root() {
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("a.zip");
+    let files = fixture(&archive, 1000);
+    let dest = work.path().join("out");
+    let report = run_with_policy(
+        &archive,
+        &Options { flatten: true, ..options(&dest, Overwrite::Always) },
+        Some("password"),
+        &Cancellation::default(),
+        &bulk_overrides(),
+        |_: ZipRunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    assert_eq!((report.files(), report.failed()), (4, 0));
+    for (name, data) in &files {
+        assert_eq!(std::fs::read(dest.join(Path::new(name).file_name().unwrap())).unwrap(), *data, "{name}");
+    }
+}
+
+/// An archived directory mode that no longer lets the directory be opened (0300) is restored after the run's
+/// directory flush, so it doesn't turn a successful Bulk extraction into a Flush fault.
+#[test]
+fn bulk_publication_flushes_before_restoring_restrictive_directory_modes() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("a.zip");
+    let mut writer = ZipStreamWriter::new(std::fs::File::create(&archive).unwrap(), WriterOptions::default()).unwrap();
+    writer
+        .add_directory(EntryOptions {
+            permissions: Permissions::new(0o300).unwrap(),
+            ..entry("locked/", Method::Stored)
+        })
+        .unwrap();
+    writer.add_file(entry("locked/f.txt", Method::Stored), &mut &b"data"[..], InputLength::Exact(4)).unwrap();
+    writer.finish().unwrap().sink.sync_all().unwrap();
+    let dest = work.path().join("out");
+    let report = run_with_policy(
+        &archive,
+        &options(&dest, Overwrite::Always),
+        None,
+        &Cancellation::default(),
+        &bulk_overrides(),
+        |_: ZipRunEvent<'_>| Ok(()),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(dest.join("locked")).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(dest.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let report = report.unwrap();
+    assert_eq!((report.files(), report.failed()), (1, 0));
+    assert_eq!(mode, 0o300);
+    assert_eq!(std::fs::read(dest.join("locked/f.txt")).unwrap(), b"data");
+}
+
+/// The checked route's start hook sees the path a member is published at (flattened when flattening) and is not
+/// asked about a member whose target is blocked (an existing directory under `Always`).
+#[test]
+fn start_hook_sees_published_paths_and_never_blocked_targets() {
+    use std::sync::{Arc, Mutex};
+    use zipfast::extract::{MemberFilter, StartDecision};
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("a.zip");
+    fixture(&archive, 1000);
+    for flatten in [false, true] {
+        let dest = work.path().join(format!("out{flatten}"));
+        std::fs::create_dir_all(dest.join("a.txt")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let filter = MemberFilter::all().on_start(move |start| {
+            record.lock().unwrap().push(start.path.to_path_buf());
+            StartDecision::Write
+        });
+        let report = run_with_policy(
+            &archive,
+            &Options { flatten, select: Some(filter), ..options(&dest, Overwrite::Always) },
+            Some("password"),
+            &Cancellation::default(),
+            &overrides(StagedStorage::Auto),
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(report.failed(), 1, "a.txt is blocked by the directory");
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        let mut want: Vec<PathBuf> = ["dir/b.bin", "dir/c.txt", "dir/secret.bin"]
+            .iter()
+            .map(|n| if flatten { dest.join(Path::new(n).file_name().unwrap()) } else { dest.join(n) })
+            .collect();
+        want.sort();
+        assert_eq!(seen, want, "flatten {flatten}");
+    }
+}

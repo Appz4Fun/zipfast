@@ -568,7 +568,12 @@ impl Run<'_> {
                 }
             }
         }
-        self.close_folder()
+        self.close_folder()?;
+        // canceled from the last folder's deferred outcomes
+        if self.cancel.is_canceled() {
+            return Err(SevenZipError::Canceled);
+        }
+        Ok(())
     }
 
     /// Where a member is to go, or None when it is not written (already reported). Folders above it are made.
@@ -777,14 +782,19 @@ impl Run<'_> {
             drop(held);
             return self.store.reset().map_err(SevenZipError::Io);
         }
+        // A cancellation from an earlier member's outcome stops the deferred members still to come.
+        let canceled = |run: &Self| if run.cancel.is_canceled() { Err(SevenZipError::Canceled) } else { Ok(()) };
         for (ordinal, spool) in held {
+            canceled(self)?;
             self.print_spooled(ordinal, spool)?;
         }
         self.store.reset().map_err(SevenZipError::Io)?;
         for (name, size, ordinal) in tested {
+            canceled(self)?;
             self.succeeded(ordinal, &name, size);
         }
         for staged in staged {
+            canceled(self)?;
             self.publish(staged)?;
         }
         Ok(())

@@ -427,6 +427,17 @@ fn acquire(
             target::Target::Blocked(refusal) => return Err(refusal.fault().into()),
             _ => {}
         }
+        // A run's start hook (`MemberFilter::on_start`) is asked here: after the target checks, so a target that
+        // Skip keeps or that is blocked is never offered, and before anything is staged or decoded. It sees the path
+        // the member is published at (flattened when flattening); a rename mode picks its name only at publication,
+        // so the hook sees the requested name.
+        if allow_blocked
+            && let Some(select) = &options.select
+            && select.starts(&crate::extract::MemberStart { path: &options.dest.join(relative) })
+                == crate::extract::StartDecision::Skip
+        {
+            return Ok(false);
+        }
         let tilde = !parent.target().to_bytes().contains(&b'~');
         if select_backend(
             &ledger,
@@ -501,7 +512,9 @@ fn acquire(
                 mode: binding.mode,
                 mtime: binding.mtime,
                 overwrite: options.overwrite,
-                sync: context.options.publication != Publication::Bulk,
+                // Bulk drops the per-file flush only in a run, which flushes the directories once at its end; a
+                // standalone stage has no such boundary and keeps its own.
+                sync: context.options.publication != Publication::Bulk || !allow_blocked,
             };
             preparing.finished = true;
             Ok(Some(Prepared::Portable(ready)))

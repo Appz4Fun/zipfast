@@ -401,6 +401,10 @@ fn capacity_release_precedes_more_input_in_long_session() {
             }
             Poll::Ready(Ok(Some(ProgressiveEvent::CapacityNeeded { retained: n }))) => {
                 assert_eq!(n, 16);
+                // the snapshot reports the retained artifacts, not a budget that looks untouched
+                let usage = s.resource_usage(Resource::RetainedArtifacts);
+                assert_eq!((usage.used, usage.limit), (16, 16));
+                assert_eq!(s.resource_usage(Resource::ActiveOutputs).used, 0);
                 capacity += 1;
                 let calls = g.lock().unwrap().calls;
                 for _ in 0..3 {

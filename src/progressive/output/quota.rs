@@ -55,6 +55,11 @@ impl Quota {
         // A task's final destructor may reenter cancellation or release artifacts.
         drop(previous);
     }
+    /// How many outputs are active and how many artifacts are retained now.
+    pub(super) fn occupancy(&self) -> (u64, u64) {
+        let s = self.state.lock().unwrap();
+        (u64::from(s.active), s.retained)
+    }
     pub(super) fn acquire(&self) -> ProgressiveResult<Lease> {
         let mut s = self.state.lock().unwrap();
         if s.active || self.active_limit == 0 {

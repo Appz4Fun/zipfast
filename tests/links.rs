@@ -24,8 +24,6 @@ use std::path::{Path, PathBuf};
 
 use zipfast::extract::{self, Mode, Options, Overwrite};
 
-const HARD_TARGET: &str = "the hard link's target is not a file extracted earlier in this run";
-
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/links").join(name)
 }
@@ -272,12 +270,18 @@ fn rename_existing_never_links_through_a_symlink_that_replaced_a_folder() {
         write_tar(&archive, bytes, gz);
         let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore));
         let s = extract::run(&archive, &opts, |_| {}).unwrap();
-        // the attack's setup happened: the folder moved aside and `d` is now the link to `ext`
-        assert_eq!(fs::read_link(dest.join("d")).unwrap(), Path::new("ext"), "gz={gz}");
+        // `ext` was in the destination before the run, so the link `d -> ext` is refused before it is made; the
+        // folder had already moved aside, so `d/f` is gone and the hard link to it is refused too (#189)
+        assert!(fs::symlink_metadata(dest.join("d")).is_err(), "gz={gz}");
         assert_eq!(fs::read(dest.join("d_1/f")).unwrap(), b"mine", "gz={gz}");
-        // refused as a file no longer recorded, before any device and inode check: the link replaced the folder,
-        // so every record under it went (#189)
-        assert_eq!(s.errors, [format!("h: {HARD_TARGET}")], "gz={gz}");
+        assert_eq!(
+            s.errors,
+            [
+                "d: the link's target passes through a link that was not extracted by this run".to_string(),
+                "h: the hard link's target is no longer the file extracted earlier".to_string(),
+            ],
+            "gz={gz}"
+        );
         let outside_ino = fs::metadata(outside.join("f")).unwrap().ino();
         if let Ok(h) = fs::symlink_metadata(dest.join("h")) {
             assert_ne!(h.ino(), outside_ino, "gz={gz}: h shares the outside file");

@@ -280,6 +280,18 @@ pub(crate) struct OutputContext {
     /// the files this session published or tested: the files a RAR 5.0 hard link or file copy may take
     pub(crate) extracted: crate::extract::link::Extracted,
 }
+impl OutputContext {
+    /// What is occupied now of [`Resource::ActiveOutputs`] or [`Resource::RetainedArtifacts`], which the output
+    /// quota tracks itself; 0 for any other resource.
+    pub(crate) fn occupancy(&self, resource: Resource) -> u64 {
+        let (active, retained) = self.quota.occupancy();
+        match resource {
+            Resource::ActiveOutputs => active,
+            Resource::RetainedArtifacts => retained,
+            _ => 0,
+        }
+    }
+}
 struct Root {
     path: PathBuf,
     file: fs::File,

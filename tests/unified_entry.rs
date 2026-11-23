@@ -749,3 +749,26 @@ fn the_prybar_rar4_reference_extracts_twice_with_skip() {
     let report = run_rendering(path, &options(&out, Overwrite::Skip)).0.unwrap();
     assert_eq!((report.files(), report.skipped()), (0, 2));
 }
+
+/// A cancellation from a member's success event stops the members still waiting to be published: a compressed
+/// tar publishes its staged files after the stream checks out, and a solid 7z folder its deferred members after
+/// the folder CRC.
+#[test]
+fn a_cancel_from_a_success_event_stops_staged_publication() {
+    for family in [Family::TarGz, Family::SevenZip, Family::SevenZipPpmd] {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, names) = archive(dir.path(), family, b"one", b"two");
+        let out = dir.path().join("out");
+        let cancel = Cancellation::default();
+        let (result, events) = run(&path, &options(&out, Overwrite::Always), &cancel, |event| {
+            if let RunEvent::MemberSucceeded { name, .. } = event
+                && names.contains(name)
+            {
+                cancel.cancel();
+            }
+        });
+        assert!(cancelled(&result), "{family:?}: {result:?}");
+        let published: Vec<_> = names.iter().filter(|n| out.join(n).exists()).collect();
+        assert_eq!(published.len(), 1, "{family:?}: {published:?} {events:?}");
+    }
+}

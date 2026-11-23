@@ -1818,3 +1818,21 @@ fn grouped_refills_join_the_open_group_and_corrections_keep_their_transaction() 
     assert_eq!(result.corrected, vec![0..4]);
     assert_eq!(&fs::read(f.output()).unwrap()[..8], b"abcdefgh");
 }
+
+/// While an operation holds a core's data its packed spans are unknown, not empty: the session must not record an
+/// empty span list for a member released at that moment.
+#[test]
+fn packed_parts_are_unknown_while_an_operation_holds_the_core() {
+    let f = Fixture::new();
+    let core = PartialCore::create(
+        f.spec(),
+        f.checks.clone(),
+        f.options(PartialLimits::default(), ProgressiveLimits::default(), SessionControl::default()),
+    )
+    .unwrap();
+    assert!(core.packed_parts().is_some());
+    let operation = core.operation().unwrap();
+    assert!(core.packed_parts().is_none());
+    drop(operation);
+    assert!(core.packed_parts().is_some());
+}

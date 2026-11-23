@@ -482,6 +482,9 @@ fn compares_only_known_split_sizes_and_projects_the_available_value() {
         let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
         let member = session.entries().next().unwrap();
         assert_eq!(member.unpacked_size(), size);
+        // the second part's byte is located by the resolved size, not the first header's placeholder
+        assert!(member.locate(1).is_some(), "{size:?}");
+        assert_eq!(member.locate(2), None);
         match (mismatch, member.payload_issue()) {
             (false, None) => {}
             (

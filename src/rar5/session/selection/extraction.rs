@@ -401,6 +401,8 @@ impl<'a> Extraction<'a> {
                     Ok(decoded) => decoded,
                     Err(outcome) => return Ok(outcome),
                 };
+                // written mapped as the member names it may point at; an empty target is refused below
+                let text = link::rar4_target(&text).unwrap_or_default();
                 if !link::contained(relative, &text) {
                     return Err(policy(RarPolicyReason::LinkTarget, target.to_path_buf()).into());
                 }
@@ -429,6 +431,7 @@ impl<'a> Extraction<'a> {
                 Some(_) if source.kind() == io::ErrorKind::Unsupported => {
                     Arc::new(RarFailure::Unsupported(RarUnsupported::Rar4Feature("symbolic link")))
                 }
+                Some(link::FOREIGN_LINK) => policy(RarPolicyReason::LinkTarget, path.to_path_buf()),
                 Some(_) => policy(RarPolicyReason::HardLinkTarget, path.to_path_buf()),
                 None => output_fault(IoOperation::Publish, path, source),
             }

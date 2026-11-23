@@ -662,8 +662,8 @@ pub(crate) trait LegacyReport {
     fn renamed_member(&mut self, _ordinal: u64, renamed: &RenamedOutput) {
         self.renamed(renamed)
     }
-    /// A member finished, as soon as it did: from the runners that report members one by one (tar and lone
-    /// compressed streams).
+    /// A member finished, as soon as it did: from the runners that report members one by one (tar, lone
+    /// compressed streams, 7z and split ZIP sets).
     fn member(&mut self, _member: LegacyMember<'_>) {}
 }
 
@@ -1328,6 +1328,12 @@ pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::Z
             let (opened, probe) = opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?;
             match opened.recognize_rar(&probe) {
                 Ok((signature, path)) => Ok(CheckedRoute::Legacy(LegacyRoute::Rar { signature, path })),
+                // A byte-split ZIP whose first piece doesn't start with a ZIP signature (a self-extractor, or a
+                // first piece of under four bytes) is still read as the pieces concatenated.
+                Err(opened) if crate::zip::is_byte_split(path) => {
+                    opened.retire()?;
+                    Ok(CheckedRoute::Legacy(LegacyRoute::SplitZip))
+                }
                 Err(opened) => Ok(CheckedRoute::Zip(opened)),
             }
         }
@@ -1363,7 +1369,7 @@ impl LegacyRoute {
                 if options.mode == Mode::Extract {
                     fs::create_dir_all(&options.dest).map_err(Error::from)?;
                 }
-                crate::zip::run_renaming(first, options, password, |line: &str| report.line(line))
+                crate::zip::run_renaming(first, options, password, Some(cancel), report)
             }
             Self::Rar { signature, .. } => {
                 let mut reports = Reports::legacy(report);
@@ -2274,6 +2280,11 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
                     drop(source);
                     rar_list(first, password)?
                 }
+                // a byte-split ZIP whose first piece has no ZIP signature at its start, as above
+                Err(Error::NotAnArchive) if crate::zip::is_byte_split(first) => {
+                    drop(source);
+                    crate::zip::list(first)?
+                }
                 Err(Error::NotAnArchive) => return source.into_zip(cancel).map(Inspection::Zip),
                 Err(error) => return Err(error.into()),
             }
@@ -2606,7 +2617,7 @@ fn zip_run(
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest).map_err(Error::from)?;
     }
-    crate::zip::run_renaming(path, opts, password, report)
+    crate::zip::run_renaming(path, opts, password, None, report)
 }
 
 fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
@@ -3192,9 +3203,18 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
     if let Some(LinkOut { place, rel, target }) = p.link.take() {
         // the target is the decoded data: reported with the outcome, refused or not
         p.context.link = Some(crate::rar5::Redirection::UnixSymlink(String::from_utf8_lossy(&target).into_owned()));
+        // written mapped as the member names it may point at
+        let target = link::rar4_target(&target).unwrap_or_default();
         if !link::contained(&rel, &target) {
             let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path };
             return books.fail(&p.context, failure, blocked_message(&RarPolicyReason::LinkTarget));
+        }
+        // a link the destination held before the run must not carry the target out (a reserved name sits in the
+        // same folder, and dropping the place removes it)
+        #[cfg(unix)]
+        if link::foreign_link(books.dest, &place.path, &target, &books.landing.extracted) {
+            let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path.clone() };
+            return books.fail(&p.context, failure, link::FOREIGN_LINK);
         }
         // a rename mode's reserved file is replaced by the link
         let (path, replace) = match place.reserved {

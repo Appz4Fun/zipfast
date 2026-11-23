@@ -680,3 +680,77 @@ fn a_moved_folder_is_never_trusted_under_another_spelling() {
         }
     }
 }
+
+/// A link whose target names a member with a raw non-UTF-8 name points at that member where it was written (its
+/// name mapped to U+E080..U+E0FF), on every route, rather than at the raw bytes.
+#[test]
+fn link_targets_are_mapped_like_raw_member_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.rar");
+    fs::write(&path, archive(&[header(0x74, 3, b"caf\xe9", b"data", 0o100644, &[]), link_member(b"link", b"caf\xe9")]))
+        .unwrap();
+    let written = "caf\u{E0E9}";
+    let check = |route: &str, out: &Path| {
+        assert_eq!(fs::read(out.join(written)).unwrap(), b"data", "{route}");
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(written), "{route}");
+        assert_eq!(fs::read(out.join("link")).unwrap(), b"data", "{route}: the link resolves to the member");
+    };
+    let out = dir.path().join("run");
+    let summary = extract::run(&path, &options(&out), |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    check("run", &out);
+
+    let out = dir.path().join("selected");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (2, 0));
+    check("selected", &out);
+
+    let out = dir.path().join("progressive");
+    let outcomes = progressive(&path, &out).unwrap();
+    assert_eq!(outcomes.iter().filter(|o| *o == "verified").count(), 2, "{outcomes:?}");
+    check("progressive", &out);
+}
+
+/// A link already in the destination (`alias -> ../outside`) is not this run's: an archive link whose target
+/// passes through it (`new -> alias/secret`, or `new -> alias`) is refused on every route, while a chain through
+/// a link the same run placed is still made.
+#[test]
+fn link_targets_through_preexisting_links_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("outside")).unwrap();
+    for (n, target) in [&b"alias/secret"[..], b"alias", b"./sub/../alias/x"].into_iter().enumerate() {
+        let path = dir.path().join(format!("{n}.rar"));
+        let blocks = [link_member(b"new", target), link_member(b"mine", b"sub"), link_member(b"chain", b"mine/x")];
+        fs::write(&path, archive(&blocks)).unwrap();
+        let label = String::from_utf8_lossy(target);
+        let prepare = |route: &str| {
+            let out = dir.path().join(format!("{n}-{route}"));
+            fs::create_dir_all(out.join("sub")).unwrap();
+            std::os::unix::fs::symlink("../outside", out.join("alias")).unwrap();
+            out
+        };
+        let check = |route: &str, out: &Path| {
+            assert!(fs::symlink_metadata(out.join("new")).is_err(), "{label} {route}");
+            assert_eq!(fs::read_link(out.join("chain")).unwrap(), Path::new("mine/x"), "{label} {route}");
+        };
+
+        let out = prepare("run");
+        let summary = extract::run(&path, &options(&out), |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), 1, "{label}: {:?}", summary.errors);
+        check("run", &out);
+
+        let out = prepare("selected");
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!((summary.files, summary.failed), (2, 1), "{label}");
+        check("selected", &out);
+
+        let out = prepare("progressive");
+        let failure = progressive(&path, &out).unwrap_err();
+        assert!(matches!(failure.kind, zipfast::progressive::FailureKind::UnsafePath), "{label}: {failure:?}");
+        assert!(fs::symlink_metadata(out.join("new")).is_err(), "{label}");
+    }
+}

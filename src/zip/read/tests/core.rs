@@ -200,6 +200,21 @@ fn raw_registration_drop_keeps_unresolved_usage_and_poison() {
     token.retire_confirmed();
 }
 
+/// Registering a caller's output file charges every syscall it makes, the filesystem probe included: a stat and
+/// the descriptor mode, plus that probe where it runs.
+#[test]
+fn raw_registration_charges_its_filesystem_probe() {
+    let mut context = bound_context(false, 3, 3);
+    let file = tempfile::tempfile().unwrap();
+    let before = context.run_usage();
+    let token = context.reserve_output(&file, None, 3).unwrap();
+    let after = context.run_usage();
+    let probes = if cfg!(any(target_os = "macos", target_os = "linux")) { 3 } else { 2 };
+    assert_eq!(after.stage_finalization - before.stage_finalization, probes);
+    assert_eq!(after.io_attempts - before.io_attempts, probes);
+    token.retire_confirmed();
+}
+
 #[test]
 fn output_transfers_are_bounded_and_clear_quota_independent() {
     let length = 2 * io::WINDOW + 13;

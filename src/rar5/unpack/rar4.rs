@@ -781,11 +781,17 @@ impl Rar4Decoder {
             self.work.tick(1).and_then(|()| engine.step(&mut bits, &mut LegacyOut { decoder: self, sink }))
         };
         let (addr, bit) = (bits.addr, bits.bit);
+        // Reads past the input give zeros only as lookahead: a code whose bits run past the end of the member's
+        // last input was never in the data.
+        let past_end = self.finishing && !self.in_tail && bits.past_end();
         self.ppm_in = data;
         self.ppm_pos = addr;
         self.legacy_bit = bit;
         self.legacy = Some(engine);
         result?;
+        if past_end {
+            return Err(Rar4DecodeError::Malformed("RAR 1.5/2.0 data ends early"));
+        }
         if self.in_tail {
             self.finish_tail(Phase::Legacy);
         } else if self.produced == self.expected && self.lifecycle == Lifecycle::Active {
