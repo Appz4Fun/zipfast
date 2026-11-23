@@ -184,6 +184,8 @@ point before its hole (a 7-Zip block, about 4 dictionaries) to the lost range.
 behind its read position; older ones are released and asked for again as needs when a repair reads them).
 
 
+## Saving and restoring
+
 `snapshot()` captures the decoder between runs: the main decode's position (under CBC its block and that block's
 IV; for a compressed member its checkpoint, frontier and the skipped holes' checkpoints and restarts), the lost
 ranges, the CRC runs and the stats. It never holds keys or plaintext. `FeedSnapshot::to_bytes()` and `from_bytes()`
