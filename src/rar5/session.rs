@@ -1142,7 +1142,7 @@ impl Catalogue {
             )?;
             let original = add(original, extra_records_bytes(&volume.main.extra_records))?;
             self.owned_capacity = add(self.owned_capacity, original)?;
-            let mut metadata = RarVolumeMetadata {
+            let metadata = RarVolumeMetadata {
                 format,
                 main: volume.main.clone(),
                 encrypted_headers,
@@ -1154,7 +1154,6 @@ impl Catalogue {
                 quick_open: RarQuickOpen::Absent,
             };
             let file = volume.into_catalogue_file();
-            metadata.quick_open = self.quick_open(&file, &path, stamp.len, &metadata)?;
             stamp.check(&file, &path)?;
             if !self.options.follow_volumes {
                 next = None;
@@ -1178,6 +1177,18 @@ impl Catalogue {
             }
         }
         self.end_incomplete()?;
+        // The quick open checks are optional, so they run only once every required header is read, each within
+        // what is left of the read budget: they can never take budget a later volume's headers need.
+        for index in 0..self.session.volumes.len() {
+            let status = {
+                let Self { session, options, .. } = self;
+                let mut budget =
+                    ScanBudget { cancel: &options.cancel, limits: options.limits, usage: &mut session.usage };
+                let volume = &session.volumes[index];
+                quick_open(&mut budget, &volume.file, &volume.path, volume.stamp.len, &volume.metadata)?
+            };
+            self.session.volumes[index].metadata.quick_open = status;
+        }
         #[cfg(all(test, unix))]
         BEFORE_FINAL_BINDING_CHECK.with_borrow_mut(|hook| {
             if let Some(hook) = hook.take() {
@@ -1315,76 +1326,6 @@ impl Catalogue {
         self.owned_capacity = add(self.owned_capacity, allocation)?;
         self.session.headers.push(HeaderRecord { volume, header, raw_name });
         self.update_capacity()
-    }
-
-    /// Reads the block header the quick open locator of `metadata` points at, as UnRAR does when it opens a volume.
-    fn quick_open(
-        &mut self,
-        file: &File,
-        path: &Path,
-        len: u64,
-        metadata: &RarVolumeMetadata,
-    ) -> RarResult<RarQuickOpen> {
-        let Some(offset) = metadata.main.locator.and_then(|l| l.quick_open).filter(|&o| o > 0) else {
-            return Ok(RarQuickOpen::Absent);
-        };
-        if metadata.format != super::RarFormat::Rar5 {
-            return Ok(RarQuickOpen::Absent);
-        }
-        if metadata.encrypted_headers {
-            return Ok(RarQuickOpen::Encrypted);
-        }
-        // the main header starts right after the signature, which follows any SFX module
-        let Some(at) = (metadata.sfx_size + super::SIGNATURE.len() as u64).checked_add(offset) else {
-            return Ok(RarQuickOpen::Truncated);
-        };
-        // CRC32, then the header size as a vint of at most three bytes (a header is at most 2 MiB)
-        let mut head = [0u8; 7];
-        let have = len.saturating_sub(at).min(head.len() as u64) as usize;
-        if have < 5 {
-            return Ok(RarQuickOpen::Truncated);
-        }
-        let mut budget = self.scan_budget();
-        // the check is optional: it never fails the open, so it stops where the read budget would
-        if budget.read_room() < have as u64 {
-            return Ok(RarQuickOpen::Unchecked);
-        }
-        budget.read(file, path, &mut head[..have], at)?;
-        let (mut size, mut n) = (0u64, 0usize);
-        loop {
-            let Some(&b) = head[4..have].get(n) else { return Ok(RarQuickOpen::Truncated) };
-            size |= u64::from(b & 0x7f) << (7 * n);
-            n += 1;
-            if b & 0x80 == 0 {
-                break;
-            }
-            if n == 3 {
-                return Ok(RarQuickOpen::Corrupt);
-            }
-        }
-        if size == 0 || size > 2 << 20 {
-            return Ok(RarQuickOpen::Corrupt);
-        }
-        let body = n as u64 + size;
-        if at + 4 + body > len {
-            return Ok(RarQuickOpen::Truncated);
-        }
-        // The header is hashed in fixed pieces, so a locator pointing into packed data at a large size field costs
-        // no allocation; and it is read only within the catalogue's read budget, checked before any of it is read.
-        if budget.read_room() < body {
-            return Ok(RarQuickOpen::Unchecked);
-        }
-        let mut piece = [0u8; 8192];
-        let mut hasher = crate::crc32::Hasher::new();
-        let mut done = 0u64;
-        while done < body {
-            let n = (body - done).min(piece.len() as u64) as usize;
-            budget.read(file, path, &mut piece[..n], at + 4 + done)?;
-            hasher.update(&piece[..n]);
-            done += n as u64;
-        }
-        let stored = u32::from_le_bytes(head[..4].try_into().unwrap());
-        Ok(if hasher.finalize() == stored { RarQuickOpen::Valid } else { RarQuickOpen::Corrupt })
     }
 
     fn end_incomplete(&mut self) -> RarResult<()> {
@@ -1578,6 +1519,76 @@ impl ScanBudget<'_> {
         let total = add(self.usage.read_bytes, len as u64)?;
         limit(total, self.limits.read_bytes, RarResource::CatalogueReadBytes)
     }
+}
+
+/// Reads the block header the quick open locator of `metadata` points at, as UnRAR does when it opens a volume,
+/// within what is left of `budget`'s read bytes (`Unchecked` when it doesn't fit).
+fn quick_open(
+    budget: &mut ScanBudget<'_>,
+    file: &File,
+    path: &Path,
+    len: u64,
+    metadata: &RarVolumeMetadata,
+) -> RarResult<RarQuickOpen> {
+    let Some(offset) = metadata.main.locator.and_then(|l| l.quick_open).filter(|&o| o > 0) else {
+        return Ok(RarQuickOpen::Absent);
+    };
+    if metadata.format != super::RarFormat::Rar5 {
+        return Ok(RarQuickOpen::Absent);
+    }
+    if metadata.encrypted_headers {
+        return Ok(RarQuickOpen::Encrypted);
+    }
+    // the main header starts right after the signature, which follows any SFX module
+    let Some(at) = (metadata.sfx_size + super::SIGNATURE.len() as u64).checked_add(offset) else {
+        return Ok(RarQuickOpen::Truncated);
+    };
+    // CRC32, then the header size as a vint of at most three bytes (a header is at most 2 MiB)
+    let mut head = [0u8; 7];
+    let have = len.saturating_sub(at).min(head.len() as u64) as usize;
+    if have < 5 {
+        return Ok(RarQuickOpen::Truncated);
+    }
+    // the check is optional: it never fails the open, so it stops where the read budget would
+    if budget.read_room() < have as u64 {
+        return Ok(RarQuickOpen::Unchecked);
+    }
+    budget.read(file, path, &mut head[..have], at)?;
+    let (mut size, mut n) = (0u64, 0usize);
+    loop {
+        let Some(&b) = head[4..have].get(n) else { return Ok(RarQuickOpen::Truncated) };
+        size |= u64::from(b & 0x7f) << (7 * n);
+        n += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+        if n == 3 {
+            return Ok(RarQuickOpen::Corrupt);
+        }
+    }
+    if size == 0 || size > 2 << 20 {
+        return Ok(RarQuickOpen::Corrupt);
+    }
+    let body = n as u64 + size;
+    if at + 4 + body > len {
+        return Ok(RarQuickOpen::Truncated);
+    }
+    // The header is hashed in fixed pieces, so a locator pointing into packed data at a large size field costs
+    // no allocation; and it is read only within the catalogue's read budget, checked before any of it is read.
+    if budget.read_room() < body {
+        return Ok(RarQuickOpen::Unchecked);
+    }
+    let mut piece = [0u8; 8192];
+    let mut hasher = crate::crc32::Hasher::new();
+    let mut done = 0u64;
+    while done < body {
+        let n = (body - done).min(piece.len() as u64) as usize;
+        budget.read(file, path, &mut piece[..n], at + 4 + done)?;
+        hasher.update(&piece[..n]);
+        done += n as u64;
+    }
+    let stored = u32::from_le_bytes(head[..4].try_into().unwrap());
+    Ok(if hasher.finalize() == stored { RarQuickOpen::Valid } else { RarQuickOpen::Corrupt })
 }
 
 fn open_read_only(path: &Path) -> io::Result<File> {
