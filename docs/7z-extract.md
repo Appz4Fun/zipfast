@@ -128,7 +128,11 @@ core), an LZMA2 coder whose output is at least 2 MiB decodes such blocks side by
   copies. It switches to the pipeline below at a chunk boundary only once that can pay: at a second piece (a
   dictionary reset at least 1 MiB of output after the start), or once more than 1 MiB of output has gone by and less
   than nine tenths of it came from stored chunks. A stream of stored chunks with no second piece (incompressible data
-  from one-thread 7-Zip, F07 below) never switches and runs at the one-thread speed.
+  from one-thread 7-Zip, F07 below) never switches and runs at the one-thread speed. Nor does a stream whose output
+  so far is more than 64 times its packed bytes: highly repetitive data (1 GiB of a repeated paragraph packs to
+  158 KB) decodes at close to memory speed on one thread, and handing its blocks between threads costs more than it
+  gains (0.9 times one thread on a loaded i7-8700K before this rule). The ratio is checked at each chunk boundary
+  until the switch, over the whole stream so far.
 - In the pipeline, the run's thread reads the packed stream and walks its chunk headers; a dictionary reset at least
   1 MiB of output after the last cut starts a new piece. Packed bytes are read in 64 KiB blocks that are moved, not
   copied, to whichever thread decodes them.
@@ -143,7 +147,8 @@ core), an LZMA2 coder whose output is at least 2 MiB decodes such blocks side by
 
 Memory is bounded by `SevenZipLimits::lzma2_parallel_bytes` (256 MiB, at least 4 MiB), so several extractions at
 once stay modest. Each worker costs its dictionary (the coder's, shrunk to the folder's output) and its one 1 MiB
-output buffer, which it makes only when it has output to make; the workers take at most a third of the budget, and
+output buffer, which it makes only when it has output to make (a short last segment goes out in a buffer of its own
+size, and every queued buffer counts by what it allocates); the workers take at most a third of the budget, and
 fewer start when they would take more (none: one thread). Their dictionaries also come out of what
 `dictionary_bytes` leaves once the folder's coders are built, shared by all its LZMA2 coders and taken when a coder
 starts its workers. At most two pieces per thread are in the pipeline, and the packed bytes waiting for decoders and
@@ -155,7 +160,13 @@ run is waiting for those: the run always moves, and a run that stops reading (wr
 consumer) stops the head too, so a block of zeros cannot pile up decoded output. Reading ahead also stops once the
 packed bytes waiting in the piece being read pass the larger of 8 MiB and the output handed out so far, capped by
 the budget (256 KiB in a piece that is nine tenths stored chunks, which cost only a copy to decode), so a one-block stream holds little more
-than the one-thread decoder does. All told, the threads add at most the budget and two segments.
+than the one-thread decoder does. All told, the threads hold at most the budget and two segments at any moment.
+Peak resident memory can read higher: each piece's decoder allocates its dictionary afresh (liblzma offers no way to
+reuse one), and on Linux glibc keeps freed blocks of that size in its per-thread arenas instead of returning them.
+With 12 threads on the 16 MiB-block archive below that showed as 364 MiB peak RSS, against 287 MiB with
+`MALLOC_MMAP_THRESHOLD_=131072` (which makes glibc hand such blocks back) and 296 MiB at 8 threads. A
+process that runs several extractions at once and must keep resident memory tight can set that variable or lower
+the thread count.
 
 7-Zip's blocks are four times its dictionary: 4 MiB at `-md=1m`, 64 MiB at `-mx5`'s 16 MiB, 256 MiB at `-mx9`'s
 64 MiB (7-Zip 26 at `-mx5 -mmt8` wrote 134 MiB blocks with a 32 MiB dictionary for the measured archive). With the

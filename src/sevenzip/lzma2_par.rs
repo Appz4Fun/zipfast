@@ -30,7 +30,9 @@
 //! block it reads (a few operations per chunk, no copies). The pipeline takes over at a chunk boundary only once it
 //! can pay: at a second piece (a dictionary reset at least [`MIN_PIECE`] on), or once more than [`MIN_PIECE`] of
 //! output has gone by and less than nine tenths of it came from stored chunks (LZMA decoding is slow enough that
-//! reading ahead for the next piece is worth it). A stream of stored chunks in one piece, as one-thread 7-Zip writes
+//! reading ahead for the next piece is worth it), and never while the output so far is more than [`MAX_RATIO`] times
+//! its packed bytes (such data decodes near memory speed on one thread, and the handoff costs more than it gains).
+//! A stream of stored chunks in one piece, as one-thread 7-Zip writes
 //! for data it cannot compress, never leaves the one-thread decoder and runs at its speed; worker threads start only
 //! with a second piece. In the pipeline, packed bytes are read in blocks that are moved, not copied, to the decoder
 //! that needs them.
@@ -63,6 +65,9 @@ use crate::extract::Cancellation;
 pub(crate) const MIN_PIECE: u64 = 1 << 20;
 /// Decoded bytes a worker hands out at a time; it checks the cancellation between them.
 const SEGMENT: usize = 1 << 20;
+/// Streams whose output so far is more than this many times their packed bytes stay on one thread: they decode at
+/// close to memory speed there, and passing blocks between threads costs more than it gains.
+const MAX_RATIO: u64 = 64;
 /// Packed bytes the head piece's decoder may have waiting that are read whatever the budget.
 const HEAD_INPUT: u64 = 256 << 10;
 /// Segments of the head's output the reader may have queued before its worker waits for the budget too.
@@ -334,8 +339,8 @@ impl State {
     fn take(&mut self, number: u64) -> Option<Taken> {
         let piece = self.piece(number)?;
         if let Some(bytes) = piece.input.pop_front() {
-            piece.queued -= bytes.len() as u64;
-            self.held -= bytes.len() as u64;
+            piece.queued -= bytes.capacity() as u64;
+            self.held -= bytes.capacity() as u64;
             return Some(Taken::Bytes(bytes));
         }
         if piece.closed {
@@ -521,7 +526,8 @@ fn work(shared: &Shared) {
 /// sink) stops the head as well, so nothing grows past the budget and those few segments.
 fn hand_out(shared: &Shared, number: u64, out: Vec<u8>) -> bool {
     let mut state = shared.lock();
-    let len = out.len() as u64;
+    // charged by what it holds, not by what it fills
+    let len = out.capacity() as u64;
     loop {
         // `out` is the worker's buffer: it stays counted in `buffers` until it is handed out or dropped
         if shared.halted(&state) {
@@ -576,8 +582,10 @@ fn decode(shared: &Shared, mut decoder: Decoder) -> Option<io::Error> {
         match decoder.step(&mut out[made..]) {
             Step::Made(n) => made += n,
             Step::Ended(n, fault) => {
-                out.truncate(made + n);
-                if !hand_out(shared, decoder.number, out) {
+                // A short last segment goes out in a buffer of its own size, so a block just past a multiple of
+                // the segment does not leave a near-empty segment-sized buffer queued.
+                let last = if made + n == out.len() { out } else { out[..made + n].to_vec() };
+                if !hand_out(shared, decoder.number, last) {
                     return Some(Fault::Canceled.into());
                 }
                 return fault;
@@ -676,7 +684,7 @@ impl Parallel {
         let Some(piece) = state.piece(number) else { return };
         let mut len = 0;
         for bytes in run {
-            len += bytes.len() as u64;
+            len += bytes.capacity() as u64;
             piece.input.push_back(bytes);
         }
         piece.queued += len;
@@ -884,7 +892,7 @@ impl Parallel {
                 let head = state.head;
                 if let Some(piece) = state.pieces.front_mut() {
                     if let Some(bytes) = piece.output.pop_front() {
-                        state.held -= bytes.len() as u64;
+                        state.held -= bytes.capacity() as u64;
                         self.out = bytes;
                         break;
                     }
@@ -1015,8 +1023,9 @@ impl Lzma2Blocks {
         // (the cut is made in a block just read, so it has taken none of it).
         let mut piece = Piece::default();
         if cut > 0 {
-            piece.input.push_back(buf[..cut].to_vec());
-            piece.queued = cut as u64;
+            let first = buf[..cut].to_vec();
+            piece.queued = first.capacity() as u64;
+            piece.input.push_back(first);
         }
         {
             let mut state = shared.lock();
@@ -1101,6 +1110,8 @@ struct Walker {
     /// output handed out so far
     produced: u64,
     size: u64,
+    /// the output-to-packed ratio past which the stream stays on one thread
+    max_ratio: u64,
 }
 
 impl Walker {
@@ -1130,7 +1141,10 @@ impl Walker {
                     }
                     let reset = control == 0x01 || control >= 0xE0;
                     let coded = self.stored * 10 < self.decoded * 9;
-                    if self.decoded >= MIN_PIECE && (reset || coded) {
+                    // Output that comes out at more than MAX_RATIO times its packed size decodes near memory
+                    // speed on one thread: handing it between threads would cost more than it gains.
+                    let extreme = self.decoded > (self.walked + i as u64).saturating_mul(self.max_ratio);
+                    if self.decoded >= MIN_PIECE && (reset || coded) && !extreme {
                         self.walked += i as u64;
                         return Some(i);
                     }
@@ -1199,7 +1213,16 @@ impl Single {
             len: 0,
             eof: false,
             stream: raw_decoder(dict)?,
-            walker: Walker { at: At::Control, header: [0; 6], decoded: 0, stored: 0, walked: 0, produced: 0, size },
+            walker: Walker {
+                at: At::Control,
+                header: [0; 6],
+                decoded: 0,
+                stored: 0,
+                walked: 0,
+                produced: 0,
+                size,
+                max_ratio: MAX_RATIO,
+            },
             made: 0,
         })
     }
@@ -1504,12 +1527,29 @@ mod tests {
     }
 
     impl Lzma2Blocks {
+        /// Lets even extremely compressible streams into the pipeline, for the tests that need them there.
+        fn any_ratio(mut self) -> Self {
+            if let Mode::Single(single) = &mut self.mode {
+                single.walker.max_ratio = u64::MAX;
+            }
+            self
+        }
+
         /// The most the pipeline's held bytes and the workers' output buffers have been together.
         fn peak_total(&self) -> Option<u64> {
             match &self.mode {
                 Mode::Parallel(parallel) => Some(parallel.shared.lock().peak_total),
                 _ => None,
             }
+        }
+
+        /// The bytes the queued buffers allocate right now (packed input and decoded output), counted directly.
+        fn queued_capacity(&self) -> u64 {
+            let Mode::Parallel(parallel) = &self.mode else { return 0 };
+            let state = parallel.shared.lock();
+            let input: usize = state.pieces.iter().flat_map(|p| p.input.iter()).map(Vec::capacity).sum();
+            let output: usize = state.pieces.iter().flat_map(|p| p.output.iter()).map(Vec::capacity).sum();
+            (input + output) as u64
         }
 
         /// The worker threads started, once the pipeline runs.
@@ -1544,8 +1584,9 @@ mod tests {
         packed.push(0);
         let total = (zeros.len() * blocks) as u64;
         for memory in [0, SEGMENT as u64, 4 << 20, 16 << 20] {
-            let mut reader =
-                Lzma2Blocks::new(cursor(&packed), total, DICT, 4, memory, &Cancellation::default()).unwrap();
+            let mut reader = Lzma2Blocks::new(cursor(&packed), total, DICT, 4, memory, &Cancellation::default())
+                .unwrap()
+                .any_ratio();
             let mut buf = vec![0u8; 256 << 10];
             let mut read = 0u64;
             let mut take = |reader: &mut Lzma2Blocks, read: &mut u64| {
@@ -1679,6 +1720,68 @@ mod tests {
             let bound = memory.max(HEAD_INPUT) + 2 * READ as u64 + (HEAD_SEGMENTS as u64 + 1) * SEGMENT as u64;
             assert!(peak <= bound, "{memory}: peak {peak}, bound {bound}");
         }
+    }
+
+    /// Blocks of zeros 1 MiB and one byte long: each ends in a one-byte segment. With the reader paused the queued
+    /// buffers, counted by what they allocate, stay within the budget and the head's segments.
+    #[test]
+    fn short_last_segments_are_charged_by_what_they_hold() {
+        let zeros = vec![0u8; (1 << 20) + 1];
+        let one = block(&zeros);
+        let blocks = 64;
+        let mut packed = Vec::with_capacity(one.len() * blocks + 1);
+        for _ in 0..blocks {
+            packed.extend_from_slice(&one);
+        }
+        packed.push(0);
+        let total = (zeros.len() * blocks) as u64;
+        for memory in [4u64 << 20, 16 << 20] {
+            let mut reader = Lzma2Blocks::new(cursor(&packed), total, DICT, 8, memory, &Cancellation::default())
+                .unwrap()
+                .any_ratio();
+            let mut buf = vec![0u8; 256 << 10];
+            let mut read = 0u64;
+            let mut most = 0u64;
+            while read < total {
+                let n = reader.read(&mut buf).unwrap();
+                assert!(n > 0 && buf[..n].iter().all(|&b| b == 0), "{memory}");
+                read += n as u64;
+                if (3 << 20..(3 << 20) + (256 << 10)).contains(&read) {
+                    // paused, as while a member is written
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                most = most.max(reader.queued_capacity());
+            }
+            let bound = memory + (HEAD_SEGMENTS as u64 + 1) * SEGMENT as u64 + 2 * READ as u64;
+            assert!(most <= bound, "{memory}: {most} bytes queued, bound {bound}");
+            assert!(reader.peak().unwrap() <= bound, "{memory}");
+        }
+    }
+
+    /// An extremely compressible stream of many blocks (a repeated paragraph, as in a 1 GiB text archive) stays on
+    /// one thread: it decodes near memory speed there.
+    #[test]
+    fn extremely_compressible_blocks_stay_on_one_thread() {
+        let paragraph = bytes(4096, 77, true);
+        let data: Vec<u8> = paragraph.iter().copied().cycle().take(4 << 20).collect();
+        let one = block(&data);
+        assert!(one.len() * 64 < data.len(), "{} packed for {}", one.len(), data.len());
+        let mut packed = Vec::new();
+        for _ in 0..8 {
+            packed.extend_from_slice(&one);
+        }
+        packed.push(0);
+        let total = (data.len() * 8) as u64;
+        let mut reader = Lzma2Blocks::new(cursor(&packed), total, DICT, 8, 1 << 30, &Cancellation::default()).unwrap();
+        let got = drain(&mut reader, total);
+        assert!(got.1.is_none() && got.0.chunks(data.len()).all(|c| c == data));
+        assert!(reader.peak().is_none(), "the pipeline started");
+        // the same stream with the ratio lifted does go to the threads, with the same bytes
+        let mut reader =
+            Lzma2Blocks::new(cursor(&packed), total, DICT, 8, 1 << 30, &Cancellation::default()).unwrap().any_ratio();
+        let again = drain(&mut reader, total);
+        assert!(again == got);
+        assert!(reader.started().unwrap() > 0);
     }
 
     #[test]
