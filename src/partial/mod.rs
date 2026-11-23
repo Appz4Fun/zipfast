@@ -2994,13 +2994,13 @@ impl PartialFile {
     }
 }
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-mod tests {
+pub(crate) mod tests {
     mod ledger;
     mod native;
     #[path = "../../../tests/common/mod.rs"]
     mod rar_fixture;
     mod serde;
-    pub(super) mod state;
+    pub(crate) mod state;
     mod verify;
 }
 

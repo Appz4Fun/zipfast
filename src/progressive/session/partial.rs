@@ -26,6 +26,9 @@ pub(super) struct Persistent {
     options: PartialOptions,
     exclusions: Arc<PartialExclusions>,
     cores: Vec<Slot>,
+    /// Indices into `cores` of the members whose release found their core busy: only these are retried, so the
+    /// retry work stays proportional to the busy members, not to every member the session has seen.
+    deferred: Vec<usize>,
     current: Option<usize>,
     header_start: u64,
     header: Vec<u8>,
@@ -59,6 +62,8 @@ struct Slot {
     output: std::path::PathBuf,
     taken: bool,
     finished: bool,
+    /// Listed in `Persistent::deferred`.
+    deferred: bool,
     /// Packed ranges of the recorded parts, kept once the core is released so declared damage still maps.
     spans: Vec<PackedSpan>,
 }
@@ -72,6 +77,7 @@ impl Slot {
             output,
             taken: false,
             finished: false,
+            deferred: false,
             spans: Vec::new(),
         }
     }
@@ -82,16 +88,38 @@ impl Slot {
     /// Drops the session's own reference once the member finished and its handle was taken, keeping its packed
     /// spans. While a caller's operation holds the core's data the spans can't be read: the core is kept and
     /// released on a later call instead of recording no spans.
-    fn release_if_done(&mut self) {
-        if self.taken
-            && self.finished
-            && let Some(core) = &self.core
-            && let Some(spans) = core.packed_parts()
-        {
-            self.spans = spans;
-            self.core = None;
+    /// Returns whether the release is still owed: due, but the core was busy.
+    fn release_if_done(&mut self) -> bool {
+        let Some(core) = &self.core else { return false };
+        if !(self.taken && self.finished) {
+            return false;
+        }
+        match core.packed_parts() {
+            Some(spans) => {
+                self.spans = spans;
+                self.core = None;
+                false
+            }
+            None => true,
         }
     }
+}
+/// Releases slot `index` if it is due, listing it in `deferred` when its core is busy, then retries the listed
+/// slots (and only those), dropping each that is released. Returns how many slots were looked at.
+fn release(cores: &mut [Slot], deferred: &mut Vec<usize>, index: usize) -> usize {
+    let slot = &mut cores[index];
+    if !slot.deferred && slot.release_if_done() {
+        slot.deferred = true;
+        deferred.push(index);
+    }
+    let mut checks = 1;
+    deferred.retain(|&i| {
+        checks += 1;
+        let slot = &mut cores[i];
+        slot.deferred = slot.release_if_done();
+        slot.deferred
+    });
+    checks
 }
 /// A directory entry's directory: its metadata waits until nothing more is created inside it.
 struct PendingDirectory {
@@ -188,6 +216,7 @@ impl ProgressiveSession {
             options: partial,
             exclusions,
             cores: Vec::new(),
+            deferred: Vec::new(),
             current: None,
             header_start: 0,
             header: Vec::new(),
@@ -211,17 +240,21 @@ impl ProgressiveSession {
     /// again by the session; while any handle lives this returns another one, and after the last is dropped it is
     /// `BindingMismatch(Member)`: reopen the member with [`PartialFile::open`] from its state.
     pub fn partial_file(&mut self, member: &MemberKey) -> PartialResult<PartialFile> {
-        let slot = self
+        let persistent = self
             .partial
             .as_mut()
-            .and_then(|p| p.cores.iter_mut().find(|slot| slot.key == *member))
             .ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
-        let core =
-            slot.live().ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
-        slot.taken = true;
-        slot.release_if_done();
-        // retry members whose release found their core busy
-        self.partial.as_mut().into_iter().flat_map(|p| p.cores.iter_mut()).for_each(Slot::release_if_done);
+        let index = persistent
+            .cores
+            .iter()
+            .position(|slot| slot.key == *member)
+            .ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
+        let core = persistent.cores[index]
+            .live()
+            .ok_or_else(|| PartialError::new(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
+        persistent.cores[index].taken = true;
+        // this member, and those whose release found their core busy
+        release(&mut persistent.cores, &mut persistent.deferred, index);
         Ok(PartialFile::from_core(core))
     }
     /// Declares archive bytes `range` of zero-based `volume` damaged, at any time, including bytes already
@@ -1112,10 +1145,10 @@ impl ProgressiveSession {
         } else {
             MemberOutcome::PersistentComplete { member: key.clone(), state, verdict }
         };
-        let slot = &mut persistent.cores[persistent.current.take().expect("persistent member")];
-        slot.finished = true;
-        // this member, and any whose release found their core busy
-        persistent.cores.iter_mut().for_each(Slot::release_if_done);
+        let index = persistent.current.take().expect("persistent member");
+        persistent.cores[index].finished = true;
+        // this member, and those whose release found their core busy
+        release(&mut persistent.cores, &mut persistent.deferred, index);
         persistent.unavailable.clear();
         persistent.resume = None;
         self.phase = Phase::Header;
@@ -1302,5 +1335,50 @@ fn failure(error: PartialError) -> ProgressiveFailure {
     match error.kind {
         PartialErrorKind::Progressive(inner) if matches!(inner.kind, FailureKind::Partial(_)) => *inner,
         _ => ProgressiveFailure::new(FailureKind::Partial(Box::new(error))),
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::*;
+    use crate::partial::tests::state::Fixture;
+
+    fn released(key: MemberKey) -> Slot {
+        Slot {
+            key,
+            core: None,
+            weak: std::sync::Weak::new(),
+            output: Default::default(),
+            taken: true,
+            finished: true,
+            deferred: false,
+            spans: Vec::new(),
+        }
+    }
+
+    /// Releasing a member looks at it and at the members whose release is owed, never at every member: with many
+    /// released members the work per call stays constant, and a busy member is retried until it can be released.
+    #[test]
+    fn release_retries_only_the_busy_members() {
+        let (f, core) = Fixture::with_core();
+        let mut cores: Vec<Slot> = (0..1000).map(|_| released(f.member.clone())).collect();
+        let mut deferred = Vec::new();
+        for i in 0..cores.len() {
+            assert_eq!(release(&mut cores, &mut deferred, i), 1);
+        }
+        let mut busy = Slot::new(cores[0].key.clone(), core.clone());
+        (busy.taken, busy.finished) = (true, true);
+        cores.push(busy);
+        Fixture::while_busy(&core, || {
+            assert_eq!(release(&mut cores, &mut deferred, 1000), 2);
+            assert_eq!(deferred, [1000]);
+            assert!(cores[1000].core.is_some());
+            for i in 0..10 {
+                assert_eq!(release(&mut cores, &mut deferred, i), 2, "only the busy member is retried");
+            }
+        });
+        assert_eq!(release(&mut cores, &mut deferred, 0), 2);
+        assert!(deferred.is_empty() && cores[1000].core.is_none() && !cores[1000].deferred);
+        assert_eq!(release(&mut cores, &mut deferred, 0), 1);
     }
 }

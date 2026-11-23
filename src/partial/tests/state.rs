@@ -63,10 +63,10 @@ impl StateAnchorStore for Store {
         Ok(())
     }
 }
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub(super) dir: tempfile::TempDir,
     store: Arc<Store>,
-    pub(super) member: MemberKey,
+    pub(crate) member: MemberKey,
     evidence: InitialEvidence,
     checks: MemberChecks,
     size: u64,
@@ -99,6 +99,18 @@ fn sized_header(name: &str, size: u64, crc: u32) -> Vec<u8> {
 impl Fixture {
     pub(super) fn new() -> Self {
         Self::new_in(None)
+    }
+    /// Runs `f` while an operation holds `core`'s data, as a caller's read or write does.
+    pub(crate) fn while_busy<R>(core: &PartialCore, f: impl FnOnce() -> R) -> R {
+        let _operation = core.operation().unwrap();
+        f()
+    }
+    /// A fixture and the core of its member, for tests outside this module.
+    pub(crate) fn with_core() -> (Self, Arc<PartialCore>) {
+        let f = Self::new();
+        let options = f.options(PartialLimits::default(), ProgressiveLimits::default(), SessionControl::default());
+        let core = PartialCore::create(f.spec(), f.checks.clone(), options).unwrap();
+        (f, core)
     }
     fn new_in(parent: Option<&std::path::Path>) -> Self {
         Self::sized_in(parent, 16)
