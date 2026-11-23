@@ -32,6 +32,8 @@ struct Z<'a> {
     flags: u16,
     method: Option<u16>,
     mtime: Option<u32>,
+    /// DOS date word; 2001-02-03 when `None`
+    dos_date: Option<u16>,
     crc: Option<u32>,
     size: Option<u32>,
     /// a local header offset given only through a ZIP64 extra field
@@ -50,6 +52,7 @@ impl<'a> Z<'a> {
             flags: 0x0800,
             method: None,
             mtime: None,
+            dos_date: None,
             crc: None,
             size: None,
             offset64: None,
@@ -97,7 +100,7 @@ fn zip_with(entries: &[Z<'_>], zip64: bool, comment: &[u8]) -> Vec<u8> {
             v.extend_from_slice(&method.to_le_bytes());
             // 2001-02-03 04:05:06
             v.extend_from_slice(&((4u16 << 11) | (5 << 5) | 3).to_le_bytes());
-            v.extend_from_slice(&((21u16 << 9) | (2 << 5) | 3).to_le_bytes());
+            v.extend_from_slice(&e.dos_date.unwrap_or((21u16 << 9) | (2 << 5) | 3).to_le_bytes());
             v.extend_from_slice(&crc.to_le_bytes());
             v.extend_from_slice(&(packed.len() as u32).to_le_bytes());
             v.extend_from_slice(&size.to_le_bytes());
@@ -704,6 +707,50 @@ fn reads_only_the_selected_zip_entry_and_enforces_the_budget() {
     assert!(archive.read_at(1, None, 5, |_| panic!("Decoded over budget")).is_err());
     assert!(archive.read_at(0, None, 6, |_| Ok(())).is_err());
     assert!(archive.read_at(2, None, 6, |_| panic!("Decoded a missing entry")).is_err());
+}
+
+/// Info-ZIP truncates times past 2038-01-19 into the 32-bit UT field; a
+/// negative value means post-2038 when the DOS date is 2038 or later, and a
+/// pre-1970 time otherwise.
+#[test]
+fn ut_mtime_past_2038_is_unsigned_when_the_dos_year_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let arc = dir.path().join("y2038.zip");
+    let dos = |year: u16| ((year - 1980) << 9) | (1 << 5) | 1;
+    let late = 0x8000_0000u32 + 86_400 * 365; // early 2039
+    let early = (-86_400i32 * 365) as u32; // 1969
+    fs::write(
+        &arc,
+        zip(&[
+            Z { mtime: Some(late), dos_date: Some(dos(2039)), ..Z::new("late", b"l") },
+            Z { mtime: Some(early), dos_date: Some(dos(1980)), ..Z::new("early", b"e") },
+            Z { mtime: Some(0xffff_ffff), dos_date: Some(dos(2106)), ..Z::new("edge", b"x") },
+            Z { mtime: Some(0x7fff_ffff), dos_date: Some(dos(2038)), ..Z::new("max", b"m") },
+        ]),
+    )
+    .unwrap();
+    let want = [i64::from(late), -86_400 * 365, i64::from(u32::MAX), i64::from(i32::MAX)];
+
+    let listed: Vec<_> = extract::list(&arc).unwrap().into_iter().map(|e| e.mtime).collect();
+    assert_eq!(listed, want.map(Some));
+    for (index, &seconds) in want.iter().enumerate() {
+        let entry = extract::SelectedEntry::open(&arc, index, None, 1 << 20).unwrap();
+        assert_eq!(entry.modified(), Some((seconds, 0)), "{}", entry.name());
+    }
+
+    let out = dir.path().join("out");
+    let summary = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (4, 0));
+    let on_disk = |name: &str| {
+        let modified = fs::metadata(out.join(name)).unwrap().modified().unwrap();
+        match modified.duration_since(std::time::UNIX_EPOCH) {
+            Ok(after) => after.as_secs() as i64,
+            Err(before) => -(before.duration().as_secs() as i64),
+        }
+    };
+    assert_eq!(on_disk("late"), i64::from(late));
+    assert_eq!(on_disk("early"), -86_400 * 365);
+    assert_eq!(on_disk("max"), i64::from(i32::MAX));
 }
 
 #[test]
