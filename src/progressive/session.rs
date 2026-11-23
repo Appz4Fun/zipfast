@@ -1299,6 +1299,19 @@ impl ProgressiveSession {
                 }
                 Some(machine)
             }
+        } else if decode && self.link_kind.is_some() && header.packed_size == 0 && !header.split_after() {
+            // A RAR 5.0 redirection without data moves past the decoder as the complete route's `past_link` does:
+            // a method it carries neither needs a solid predecessor nor resets the history the next file goes on from.
+            let stored = crate::rar5::FileHeader { method: 0, solid: false, ..header.clone() };
+            Some(MemberMachine::new_with_history(
+                &stored,
+                context,
+                self.options.password(),
+                &self.usage,
+                &self.control,
+                None,
+                wire.legacy.and_then(|w| w.crypt),
+            )?)
         } else if decode {
             let decoder = if header.method != 0 {
                 if header.solid {
@@ -1581,7 +1594,12 @@ impl ProgressiveSession {
         } else {
             None
         };
-        if physical.header.method != 0 && physical.header.format == crate::rar5::RarFormat::Rar5 {
+        // a redirection without data decoded nothing, so the history stays as it was
+        let dataless_link =
+            self.link_kind.is_some() && physical.header.packed_size == 0 && !physical.header.split_after();
+        if dataless_link {
+            // nothing to take back
+        } else if physical.header.method != 0 && physical.header.format == crate::rar5::RarFormat::Rar5 {
             self.history =
                 machine.take_rar5_decoder().map_err(|_| ProgressiveFailure::new(FailureKind::InvalidCapability))?;
             self.history_failure = None;

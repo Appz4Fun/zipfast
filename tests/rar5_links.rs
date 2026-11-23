@@ -259,6 +259,45 @@ fn a_solid_stream_keeps_its_history_past_a_link() {
     assert_eq!(ino(&dest.join("hl")), ino(&dest.join("dependent")));
 }
 
+/// A progressive session moves past a data-less link carrying a method without touching the decoder: a solid one
+/// with no history yet is no failure, and a non-solid one leaves the history the next solid file needs.
+#[test]
+fn a_progressive_session_keeps_solid_history_past_a_link() {
+    use zipfast::rar5::testenc::{self, Op};
+    let tmp = tempfile::tempdir().unwrap();
+    let start = testenc::block(&[Op::Lit(b'A'), Op::Lit(b'A'), Op::Lit(b'A')], true, true);
+    let dependent = testenc::block(&[Op::Match(3, 3)], true, true);
+    let aaa = crc32fast::hash(b"AAA");
+    let mut bytes = SIG.to_vec();
+    bytes.extend(main_block_flags(false, None, true));
+    let files = [
+        // a solid link before any decoder exists
+        (FileSpec { method: 3, solid: true, ..link("first", 1, "start") }, 0),
+        (FileSpec { method: 3, size: Some(3), ..FileSpec::new("start", &start) }, aaa),
+        // a non-solid link carrying a method: decoding it would reset the history `dependent` needs
+        (FileSpec { method: 3, ..link("ln", 1, "start") }, 0),
+        (FileSpec { method: 3, size: Some(3), solid: true, ..FileSpec::new("dependent", &dependent) }, aaa),
+        (FileSpec { method: 3, solid: true, ..link("hl", 4, "dependent") }, 0),
+    ];
+    for (spec, crc) in &files {
+        bytes.extend(file_block(spec, spec.data, *crc, false, false));
+    }
+    bytes.extend(common::end_block(false));
+    let arc = tmp.path().join("solid.rar");
+    fs::write(&arc, bytes).unwrap();
+    for mode in [Mode::Test, Mode::Extract] {
+        let dest = tmp.path().join(format!("out-{mode:?}"));
+        let outcomes = progressive(&arc, &dest, mode).unwrap();
+        let done = if mode == Mode::Test { "tested" } else { "verified" };
+        assert_eq!(outcomes.iter().filter(|o| *o == done).count(), 5, "{mode:?}: {outcomes:?}");
+        if mode == Mode::Extract {
+            assert_eq!(fs::read(dest.join("dependent")).unwrap(), b"AAA");
+            assert_eq!(fs::read_link(dest.join("ln")).unwrap(), Path::new("start"));
+            assert_eq!(ino(&dest.join("hl")), ino(&dest.join("dependent")));
+        }
+    }
+}
+
 #[test]
 fn listings_carry_raw_targets() {
     let tmp = tempfile::tempdir().unwrap();
@@ -419,10 +458,21 @@ fn rar_session_hard_links_follow_renames_and_never_a_replaced_folder() {
 
 /// A progressive session over one sealed volume: each member's outcome, or the failure that stopped it.
 fn progressive(arc: &Path, dest: &Path, mode: Mode) -> Result<Vec<String>, zipfast::progressive::ProgressiveFailure> {
+    progressive_with(arc, dest, mode, |_| {})
+}
+
+fn progressive_with(
+    arc: &Path,
+    dest: &Path,
+    mode: Mode,
+    tweak: impl FnOnce(&mut zipfast::progressive::ProgressiveOptions),
+) -> Result<Vec<String>, zipfast::progressive::ProgressiveFailure> {
     use std::task::{Context, Poll};
     use zipfast::progressive::*;
     let volume = (arc.file_name().unwrap().to_owned(), fs::read(arc).unwrap().into_boxed_slice());
-    let opts = ProgressiveOptions::new(options(dest, mode, Overwrite::Always, 1), arc.file_name().unwrap().to_owned());
+    let mut opts =
+        ProgressiveOptions::new(options(dest, mode, Overwrite::Always, 1), arc.file_name().unwrap().to_owned());
+    tweak(&mut opts);
     let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
     let mut outcomes = Vec::new();
     loop {
@@ -662,4 +712,53 @@ fn links_to_a_windows_name_with_a_backslash_find_the_written_file() {
         assert_eq!(fs::read(dest.join("copy")).unwrap(), b"data");
         assert!(!dest.join("d").exists(), "no folder made from the backslash");
     }
+}
+
+/// A file copy takes the permissions its file was extracted with, on the complete and the progressive route.
+#[test]
+fn file_copies_keep_the_archived_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let files = [
+        FileSpec { unix_mode: Some(0o100755), ..FileSpec::new("run", b"#!/bin/sh\n") },
+        FileSpec { unix_mode: Some(0o100600), ..FileSpec::new("secret", b"key") },
+        link("run-copy", 5, "run"),
+        link("secret-copy", 5, "secret"),
+    ];
+    let arc = write(tmp.path(), &files);
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let complete = tmp.path().join("complete");
+    let s = extract::run(&arc, &options(&complete, Mode::Extract, Overwrite::Always, 1), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    let progressive_dest = tmp.path().join("progressive");
+    progressive(&arc, &progressive_dest, Mode::Extract).unwrap();
+    for dest in [&complete, &progressive_dest] {
+        assert_eq!(mode(&dest.join("run")), 0o755, "{dest:?}");
+        assert_eq!(mode(&dest.join("run-copy")), 0o755, "{dest:?}");
+        assert_eq!(mode(&dest.join("secret-copy")), 0o600, "{dest:?}");
+        assert_eq!(fs::read(dest.join("secret-copy")).unwrap(), b"key");
+    }
+}
+
+/// A progressive file copy writes every byte of its file again, and is charged for them.
+#[test]
+fn progressive_file_copies_are_charged_against_the_output_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files = [FileSpec::new("f", b"0123456789"), link("c1", 5, "f"), link("c2", 5, "f")];
+    let arc = write(tmp.path(), &files);
+    // room for the file and one copy, not two
+    let dest = tmp.path().join("out");
+    let failure = progressive_with(&arc, &dest, Mode::Extract, |o| o.limits.output_write_bytes = 25).unwrap_err();
+    assert!(
+        matches!(
+            failure.kind,
+            zipfast::progressive::FailureKind::Limit { resource: zipfast::progressive::Resource::OutputWriteBytes, .. }
+        ),
+        "{failure:?}"
+    );
+    assert_eq!(fs::read(dest.join("c1")).unwrap(), b"0123456789");
+    assert!(fs::symlink_metadata(dest.join("c2")).is_err());
+    let dest = tmp.path().join("roomy");
+    progressive_with(&arc, &dest, Mode::Extract, |o| o.limits.output_write_bytes = 30).unwrap();
+    assert_eq!(fs::read(dest.join("c2")).unwrap(), b"0123456789");
 }

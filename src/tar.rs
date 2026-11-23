@@ -1816,7 +1816,7 @@ fn link_member(
     }
     if opts.mode == Mode::Extract {
         let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(()) };
-        let mut copy = || match kind {
+        let mut copy = |_| match kind {
             LinkKind::Hard(target) | LinkKind::Copy(target) => holes.copy(target),
             LinkKind::Symbolic(_) => Ok(()),
         };
