@@ -102,6 +102,10 @@ pub(crate) fn main() -> ExitCode {
                 parallel_min: None,
                 select: None,
                 windows_safe_names: false,
+                special_entries: Default::default(),
+                fallback_mtime: None,
+                compressed_tar: Default::default(),
+                version_naming: Default::default(),
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }
@@ -532,7 +536,7 @@ impl std::fmt::Display for ErrorText<'_> {
         }
         match self.0.operation() {
             Some(ReadFault::PasswordRequired) => f.write_str("encrypted (password required)"),
-            Some(ReadFault::PasswordCheckFailed { cipher: crate::zip::CipherKind::ZipCrypto }) => {
+            Some(ReadFault::PasswordCheckFailed { cipher: crate::zip::CipherKind::ZipCrypto, .. }) => {
                 f.write_str("corrupt archive: wrong password")
             }
             Some(ReadFault::PasswordCheckFailed { .. } | ReadFault::AuthenticationFailed) => {

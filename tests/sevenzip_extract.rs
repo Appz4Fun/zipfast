@@ -66,6 +66,10 @@ fn opts(mode: Mode, dest: &Path) -> Options {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     }
 }
 
@@ -210,13 +214,20 @@ fn passwords_missing_and_wrong_are_typed() {
         let wrong = extract::run_with_password(&fixture(archive), &opts(Mode::Extract, &out), Some("wrong"), |_| {});
         if archive == "aes_hdr.7z" {
             // Encrypted headers: nothing can be listed, so the whole run fails.
-            assert!(matches!(seven(&wrong), Some(SevenZipError::WrongPassword)), "{archive}: {wrong:?}");
+            assert!(matches!(seven(&wrong), Some(SevenZipError::WrongPassword { .. })), "{archive}: {wrong:?}");
             assert_eq!(wrong.unwrap_err().to_string(), "7z: wrong password");
         } else {
             // Data-only encryption: each member fails as a wrong password, as 7-Zip reports it, and the run ends.
             let summary = wrong.unwrap_or_else(|e| panic!("{archive}: {e:?}"));
             assert!(!summary.errors.is_empty(), "{archive}");
-            assert!(summary.errors.iter().all(|e| e.ends_with(": data error in encrypted file: wrong password?")));
+            // 7-Zip 26.06: "Data Error in encrypted file" for the LZMA2 folder, "CRC Failed in encrypted file" for
+            // the Copy one
+            let line = if archive == "aes_copy.7z" {
+                ": CRC failed in encrypted file: wrong password?"
+            } else {
+                ": data error in encrypted file: wrong password?"
+            };
+            assert!(summary.errors.iter().all(|e| e.ends_with(line)), "{archive}: {:?}", summary.errors);
         }
         // Nothing was published.
         assert!(fs::read_dir(&out).map_or(true, |d| d.flatten().all(|e| e.path().is_dir())), "{archive}");
@@ -246,7 +257,7 @@ fn the_checked_dispatcher_runs_7z_with_typed_password_faults() {
     assert!(matches!(error.operation(), Some(ReadFault::PasswordRequired)), "{error:?}");
     // Encrypted headers with a wrong password fail the run, typed.
     let error = run("aes_hdr.7z", Some("wrong"), &Cancellation::default()).unwrap_err();
-    assert!(matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes })));
+    assert!(matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, .. })));
     // Data-only encryption: each member fails, with the typed wrong password as its error.
     let mut wrong = Vec::new();
     let report = extract::run_with_zip_policy(
@@ -258,7 +269,7 @@ fn the_checked_dispatcher_runs_7z_with_typed_password_faults() {
         |event: ZipRunEvent<'_>| {
             if let ZipRunEvent::MemberFailed { name, error, .. } = event {
                 let typed =
-                    matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes }));
+                    matches!(error.operation(), Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, .. }));
                 wrong.push((name.to_owned(), typed));
             }
             Ok(())
@@ -1295,8 +1306,10 @@ fn a_wrong_password_reports_held_members_in_archive_order() {
                 .unwrap();
         let want: Vec<String> = ["first.txt", "second.txt", "third.txt"]
             .iter()
-            .map(|n| format!("{n}: data error in encrypted file: wrong password?"))
+            .map(|n| format!("{n}: CRC failed in encrypted file: wrong password?"))
             .collect();
+        // an AES-only folder decodes whatever the key: the CRC shows the wrong password, as 7-Zip's "CRC Failed in
+        // encrypted file. Wrong password?" says (7-Zip itself names only second.txt and third.txt, which have CRCs)
         assert_eq!(summary.errors, want, "{mode:?}: archive order");
         let reported: Vec<&String> = events.iter().filter(|l| l.contains("wrong password")).collect();
         assert_eq!(reported, want.iter().collect::<Vec<_>>(), "{mode:?}: lines as they happen, in archive order");

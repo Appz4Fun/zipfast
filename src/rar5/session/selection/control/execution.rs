@@ -16,7 +16,7 @@
 
 use super::super::extraction::{DirectoryOutput, Extraction, ExtractionHooks, PlacedLink};
 use super::*;
-use crate::extract::{Options, Overwrite};
+use crate::extract::{Options, Overwrite, VersionNaming};
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
 impl RarSession {
@@ -503,11 +503,11 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
     fn observe_publication(&self) -> bool {
         true
     }
-    fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop> {
+    fn project(&mut self, header: &FileHeader, naming: VersionNaming) -> Result<PathBuf, SelectedStop> {
         self.control.native_charge(RarResource::ExtractControlWork, linear_work(header.name.len(), 8)?)?;
         self.reserve(header.name.len())?;
-        // an older revision gets this far only when the selection includes revisions: it is written as `name;N`
-        let name = header.output_name_as(true).unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        // an older revision gets this far only when the selection includes revisions: it is named by `naming`
+        let name = header.output_name_as(Some(naming)).unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         let relative = crate::path::sanitize_fallible(&name, !header.is_unix()).map_err(|e| match e {
             crate::path::ProjectionError::Allocation(e) => SelectedStop::Control(RarExtractControlError::Allocation(e)),
             crate::path::ProjectionError::Unsafe => SelectedStop::Native(Arc::new(RarFailure::Policy {
@@ -709,6 +709,10 @@ mod tests {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         }
     }
     struct Fault {
@@ -955,6 +959,10 @@ mod directory_fault_tests {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1028,6 +1036,10 @@ mod trailing_directory_tests {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

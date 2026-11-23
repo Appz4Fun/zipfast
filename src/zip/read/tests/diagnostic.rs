@@ -1179,6 +1179,10 @@ fn direct_setup_output(
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     (file, session, options, context)
 }

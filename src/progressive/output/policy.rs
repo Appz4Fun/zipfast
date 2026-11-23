@@ -309,7 +309,7 @@ impl OutputContext {
         self.directories.push(Directory {
             path: target.path,
             identity,
-            meta: crate::extract::Meta::from(header),
+            meta: crate::extract::Meta::from(header).or_time(self.root.fallback_mtime),
             depth,
             order: self.directories.len(),
         });

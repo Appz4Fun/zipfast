@@ -67,6 +67,10 @@ fn options(mode: Mode, dest: &Path) -> Options {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     }
 }
 

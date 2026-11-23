@@ -18,7 +18,7 @@ use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 
 use crate::error::RarPolicyReason;
-use crate::extract::{Meta, Options, Overwrite, RarSkipReason, finish_file, make_dirs_detailed};
+use crate::extract::{Meta, Options, Overwrite, RarSkipReason, VersionNaming, finish_file, make_dirs_detailed};
 use crate::output::{Output, temporary};
 use crate::path::sanitize;
 
@@ -134,8 +134,8 @@ impl<'a> Extraction<'a> {
         if !projectable_name(header, &member.wire.name) {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
-        let relative = hooks.project(header)?;
-        let meta = Meta::from(header);
+        let relative = hooks.project(header, self.options.version_naming)?;
+        let meta = self.options.meta(Meta::from(header));
         if header.is_dir() {
             let outcome = run.test(session, index, None)?;
             if !self.options.flatten && matches!(outcome, RarOutcome::Directory) {
@@ -421,7 +421,7 @@ impl<'a> Extraction<'a> {
             return Err(policy(RarPolicyReason::TargetChanged, target.to_path_buf()).into());
         }
         let dest = &self.options.dest;
-        let modified = Meta::from(&session.model.members[index].header).modified();
+        let modified = self.options.meta(Meta::from(&session.model.members[index].header)).modified();
         let create = |path: &Path, replace: bool| link::make(dest, &kind, &self.extracted, path, replace, modified);
         // a hard link's or copy's earlier file gone or changed fails this member only
         let failed = |path: &Path, source: io::Error| -> Arc<RarFailure> {
@@ -730,7 +730,9 @@ pub(super) trait ExtractionHooks {
     fn observe_publication(&self) -> bool {
         false
     }
-    fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop>;
+    /// The member's path relative to the destination; an older revision (taken only when the selection includes
+    /// them) is named by `naming`.
+    fn project(&mut self, header: &FileHeader, naming: VersionNaming) -> Result<PathBuf, SelectedStop>;
     fn target(&mut self, options: &Options, relative: &Path, flatten: bool) -> Result<PathBuf, SelectedStop>;
     fn reserve_directory(
         &mut self,
@@ -789,9 +791,9 @@ pub(super) enum PlacedLink<'a> {
 }
 struct LegacyHooks;
 impl ExtractionHooks for LegacyHooks {
-    fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop> {
-        // an older revision gets this far only when the selection includes revisions: it is written as `name;N`
-        let name = header.output_name_as(true).unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+    fn project(&mut self, header: &FileHeader, naming: VersionNaming) -> Result<PathBuf, SelectedStop> {
+        // an older revision gets this far only when the selection includes revisions: it is named by `naming`
+        let name = header.output_name_as(Some(naming)).unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         sanitize(&name, !header.is_unix())
             .map_err(|_| policy(RarPolicyReason::UnsafePath, PathBuf::from(&header.name)).into())
     }
@@ -909,6 +911,10 @@ mod tests {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         }
     }
 

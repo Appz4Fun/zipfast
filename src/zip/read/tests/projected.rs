@@ -1679,6 +1679,10 @@ fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     for case in 0..6 {
         let cancel = Cancellation::default();
@@ -1780,6 +1784,10 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     for supplied_context in [false, true] {
         OBSERVATIONS.with(|s| s.set(Default::default()));

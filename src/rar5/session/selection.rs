@@ -55,7 +55,8 @@ pub struct RarSelection {
 impl RarSelection {
     /// Extracts the selected older file revisions (RAR 5.0 version records, `rar -ver`) too, as UnRAR's `x -ver`
     /// does: each under its [`RarMember::display_name`], the name with `;` and its version number appended
-    /// (`notes.txt;2`). Without it [`RarSession::extract_selected`] and `extract_selected_controlled` skip them
+    /// (`notes.txt;2`), or as `[VER]/2/notes.txt` with [`crate::extract::VersionNaming::SevenZipDir`] in the run's
+    /// [`crate::extract::Options::version_naming`]. Without it [`RarSession::extract_selected`] and `extract_selected_controlled` skip them
     /// ([`RarSkipReason::OlderVersion`]) even when selected. Testing always checks them.
     pub fn with_versions(mut self) -> Self {
         self.versions = true;
@@ -340,7 +341,7 @@ fn member_filter_refused(session: &RarSession) -> RarRunError {
 /// A member's name as a path relative to the destination, as a test run checks links against it: `name;N` for an
 /// older revision when the selection includes them, as extracting names it.
 fn tested_name(header: &FileHeader, versions: bool) -> Option<PathBuf> {
-    let name = header.output_name_as(versions)?;
+    let name = header.output_name_as(versions.then_some(crate::extract::VersionNaming::Semicolon))?;
     crate::path::sanitize_with(&name, !header.is_unix(), false).ok()
 }
 

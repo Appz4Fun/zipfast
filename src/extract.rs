@@ -155,6 +155,130 @@ pub struct Options {
     /// the names it lists), tar, legacy ZIP ([`crate::zip::run`]) and RAR ([`run`], [`run_with_password`],
     /// [`run_rar_with_outcomes`]) honour it.
     pub windows_safe_names: bool,
+    /// What becomes of a tar-family member (tar, cpio, xar, ISO 9660) that is a character or block device or a FIFO:
+    /// refused by default, or an empty regular file as 7-Zip writes it. See [`SpecialEntries`].
+    pub special_entries: SpecialEntries,
+    /// The modification time given to a file, folder or link whose archive entry records none: a 7z member without
+    /// an `MTime` property, a RAR 4.x member whose DOS date and time is 0, a RAR 5.0 member without a time field. `None`
+    /// (the default) leaves such an output with the time it was written at.
+    ///
+    /// 7-Zip gives these outputs the archive file's own modification time; UnRAR gives a RAR 4.x member with DOS time 0
+    /// 1979-11-30 00:00:00 local time (what the zero DOS date reads as) and leaves a RAR 5.0 member without a time at
+    /// the extraction time. A caller passes the time it wants. Entries say they have no time with `mtime: None`
+    /// ([`Entry::mtime`], [`SelectedEntry::modified`]), which this never changes.
+    ///
+    /// Honoured by every writer that restores times: the whole-archive runners for RAR, 7z, ZIP and tar,
+    /// [`crate::rar5::session::RarSession`] extraction, and progressive and persistent-partial sessions.
+    pub fallback_mtime: Option<SystemTime>,
+    /// How a compressed tar (`.tgz`, `.tar.gz`, `.tbz2`, `.txz`, `.tar.zst` and the like) is extracted: its members
+    /// (the default), or the decompressed stream as one file, as 7-Zip writes it. See [`CompressedTar`].
+    pub compressed_tar: CompressedTar,
+    /// What an older RAR 5.0 file revision taken by [`MemberFilter::with_versions`] is named: UnRAR's `name;N` (the
+    /// default) or 7-Zip's `[VER]/N/name`. See [`VersionNaming`].
+    pub version_naming: VersionNaming,
+}
+
+/// What a run does with a member that is a character device, a block device or a FIFO (named pipe); see
+/// [`Options::special_entries`]. Tar, cpio, xar and ISO 9660 images can hold them; no other format a run reads does.
+///
+/// Neither choice ever makes a device node or a pipe. A sparse member, a GNU multi-volume continuation and an
+/// unknown cpio, xar or ISO 9660 entry type (sockets among them) are refused either way.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SpecialEntries {
+    /// The member fails (`devices and pipes are not extracted`), and a [`SelectedEntry`] for it is refused as not a
+    /// regular file. The other members are extracted.
+    #[default]
+    Refuse,
+    /// The member is an empty regular file with the member's mode bits and modification time, as 7-Zip 26.06 writes
+    /// it for `x`, `e` and `t` (exit code 0), and a [`SelectedEntry`] for it reads as no bytes, as `7z x -so` prints
+    /// it. Any data the header claims is passed over.
+    EmptyFile,
+}
+
+/// How a whole-archive run or a [`SelectedEntry`] reads a tar (or cpio) inside a compression layer: gzip, bzip2, xz,
+/// zstd, lz4, lzma or `.Z`. See [`Options::compressed_tar`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CompressedTar {
+    /// Read the tar inside: each member is listed, tested and extracted on its own.
+    #[default]
+    Members,
+    /// Read the decompressed stream as one file, as 7-Zip 26.06 does for `x`, `e` and `x -so`: `pax.tgz` comes out as
+    /// `pax.tar`. The file is named after the gzip header's stored name when there is one, else after the archive's
+    /// name with its compression ending replaced (`.tgz`, `.tbz`, `.tbz2`, `.txz`, `.tzst` become `.tar`; `.gz`,
+    /// `.bz2`, `.xz`, `.zst` are dropped), and has the gzip header's modification time when it records one, else the
+    /// archive file's own. It is the only member: index 0 for [`SelectedEntry`], ordinal 0 for a filter. A plain
+    /// (uncompressed) tar is read as members either way.
+    Whole,
+}
+
+/// The choices a [`SelectedEntry`] takes from [`Options`] ([`SelectedEntry::open_cancelable_with_options`],
+/// [`SelectedEntry::open_cancelable_with_zip_limit_and_options`]). The default is what the plain `open` functions do.
+///
+/// ```
+/// use zipfast::extract::{CompressedTar, SelectOptions, SpecialEntries};
+///
+/// let select = SelectOptions::new().special_entries(SpecialEntries::EmptyFile).compressed_tar(CompressedTar::Whole);
+/// assert_eq!(select.compressed_tar, CompressedTar::Whole);
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SelectOptions {
+    /// As [`Options::special_entries`].
+    pub special_entries: SpecialEntries,
+    /// As [`Options::compressed_tar`]; it also decides how entries are numbered.
+    pub compressed_tar: CompressedTar,
+}
+
+impl SelectOptions {
+    /// The defaults: devices refused, compressed tars read as members.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`Self::special_entries`].
+    pub fn special_entries(mut self, special_entries: SpecialEntries) -> Self {
+        self.special_entries = special_entries;
+        self
+    }
+
+    /// Sets [`Self::compressed_tar`].
+    pub fn compressed_tar(mut self, compressed_tar: CompressedTar) -> Self {
+        self.compressed_tar = compressed_tar;
+        self
+    }
+}
+
+impl From<&Options> for SelectOptions {
+    fn from(options: &Options) -> Self {
+        Self { special_entries: options.special_entries, compressed_tar: options.compressed_tar }
+    }
+}
+
+/// The name an older RAR 5.0 file revision is written under when a run takes revisions
+/// ([`MemberFilter::with_versions`], [`crate::rar5::session::RarSelection::with_versions`]); see
+/// [`Options::version_naming`]. The current file keeps its own name either way.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum VersionNaming {
+    /// `name;N` beside the current file, as UnRAR's `x -ver` writes it (`notes.txt;2`, `dir/a.txt;2`).
+    #[default]
+    Semicolon,
+    /// `[VER]/N/name`, as 7-Zip 26.06 lists and extracts it (`[VER]/2/notes.txt`, `[VER]/2/dir/a.txt`). With
+    /// [`Options::flatten`] only the file name is left, so a revision lands on the current file's name, as `7z e`
+    /// writes it.
+    SevenZipDir,
+}
+
+impl VersionNaming {
+    /// `name` as revision `version` of it is written under this naming.
+    pub fn name(self, name: &str, version: u64) -> String {
+        match self {
+            Self::Semicolon => format!("{name};{version}"),
+            Self::SevenZipDir => format!("[VER]/{version}/{name}"),
+        }
+    }
 }
 
 /// One member as a [`MemberFilter`] sees it.
@@ -220,6 +344,10 @@ impl MemberRef<'_> {
 ///     parallel_min: None,
 ///     select: Some(MemberFilter::new(|m| m.is_dir || m.name.ends_with(".txt"))),
 ///     windows_safe_names: false,
+///     special_entries: Default::default(),
+///     fallback_mtime: None,
+///     compressed_tar: Default::default(),
+///     version_naming: Default::default(),
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -279,7 +407,8 @@ impl MemberFilter {
 
     /// Also extracts the older file revisions a RAR 5.0 archive keeps (`rar -ver`), as UnRAR's `x -ver` does: each
     /// under its name with `;` and its version number appended (`notes.txt;2`, [`Entry::version`]), beside the
-    /// current file. Without it an extracting RAR run skips them ([`RarSkipReason::OlderVersion`]), as UnRAR does
+    /// current file; or, with [`VersionNaming::SevenZipDir`] in [`Options::version_naming`], as 7-Zip does:
+    /// `[VER]/2/notes.txt`. Without it an extracting RAR run skips them ([`RarSkipReason::OlderVersion`]), as UnRAR does
     /// without `-ver`. The filter itself still decides which members are taken: [`MemberRef::version`] says which
     /// revision each one is, so `|m| m.version.is_none_or(|v| v == 2)` takes the current files and revision 2. Only
     /// whole-archive RAR runs read it; other formats keep no revisions. For [`crate::rar5::session::RarSession`]
@@ -330,6 +459,11 @@ impl Options {
         self.select
             .as_ref()
             .is_none_or(|filter| filter.selects(&MemberRef { name, raw_name: None, is_dir, ordinal, version }))
+    }
+
+    /// `meta` with [`Self::fallback_mtime`] as its time when it has none.
+    pub(crate) fn meta(&self, meta: Meta) -> Meta {
+        meta.or_time(self.fallback_mtime)
     }
 
     /// Whether an extracting RAR run writes older file revisions ([`MemberFilter::with_versions`]).
@@ -394,6 +528,15 @@ impl Meta {
     /// The archived modification time, when there is one that fits.
     pub(crate) fn modified(&self) -> Option<SystemTime> {
         self.mtime.and_then(|seconds| archive_time(seconds, self.nanos))
+    }
+
+    /// This, with `fallback` ([`Options::fallback_mtime`]) as the time when the entry records none.
+    pub(crate) fn or_time(self, fallback: Option<SystemTime>) -> Meta {
+        if self.mtime.is_some() {
+            return self;
+        }
+        let Some((mtime, nanos)) = fallback.and_then(unix_time) else { return self };
+        Meta { mtime: Some(mtime), nanos, ..self }
     }
 }
 
@@ -1522,10 +1665,31 @@ impl SelectedEntry {
         limit: u64,
         cancel: Cancellation,
     ) -> Result<Self> {
+        Self::open_cancelable_with_options(path, index, password, limit, cancel, SelectOptions::default())
+    }
+
+    /// [`Self::open_cancelable`] with the [`SelectOptions`] a whole-archive run takes from [`Options`]: whether a tar
+    /// device or FIFO opens as an empty file, and whether a compressed tar is one entry (index 0, the decompressed
+    /// stream) or its members.
+    pub fn open_cancelable_with_options(
+        path: &Path,
+        index: usize,
+        password: Option<&str>,
+        limit: u64,
+        cancel: Cancellation,
+        select: SelectOptions,
+    ) -> Result<Self> {
         cancel.check_io()?;
         match sniff(path)? {
             Format::Tar => {
-                let selected = crate::tar::Selected::open(path, index, limit, cancel.clone())?;
+                let selected = crate::tar::Selected::open(
+                    path,
+                    index,
+                    limit,
+                    cancel.clone(),
+                    select.special_entries,
+                    select.compressed_tar,
+                )?;
                 return Ok(Self {
                     meta: selected.meta,
                     windows_names: false,
@@ -1614,12 +1778,41 @@ impl SelectedEntry {
         encrypted_zip_max_bytes: Option<u64>,
         cancel: Cancellation,
     ) -> crate::zip::ZipReadResult<Self> {
+        Self::open_cancelable_with_zip_limit_and_options(
+            path,
+            index,
+            password,
+            max_bytes,
+            encrypted_zip_max_bytes,
+            cancel,
+            SelectOptions::default(),
+        )
+    }
+
+    /// [`Self::open_cancelable_with_zip_limit`] with [`SelectOptions`], as [`Self::open_cancelable_with_options`].
+    #[allow(clippy::result_large_err)]
+    pub fn open_cancelable_with_zip_limit_and_options(
+        path: &Path,
+        index: usize,
+        password: Option<&str>,
+        max_bytes: u64,
+        encrypted_zip_max_bytes: Option<u64>,
+        cancel: Cancellation,
+        select: SelectOptions,
+    ) -> crate::zip::ZipReadResult<Self> {
         use crate::zip::{ReadFault, ReadResource};
         let opened = match checked_route(path, &cancel)? {
             CheckedRoute::Zip(opened) => opened,
             CheckedRoute::Legacy(LegacyRoute::Tar) => {
-                let selected =
-                    crate::tar::Selected::open(path, index, max_bytes, cancel.clone()).map_err(ReadFault::Legacy)?;
+                let selected = crate::tar::Selected::open(
+                    path,
+                    index,
+                    max_bytes,
+                    cancel.clone(),
+                    select.special_entries,
+                    select.compressed_tar,
+                )
+                .map_err(ReadFault::Legacy)?;
                 return Ok(Self {
                     meta: selected.meta,
                     windows_names: false,
@@ -2349,7 +2542,9 @@ fn seven_zip_fault(error: Error) -> crate::zip::ReadFault {
     use crate::zip::{CipherKind, ReadFault};
     match (&error, SevenZipError::of(&error)) {
         (Error::Encrypted, _) => ReadFault::PasswordRequired,
-        (_, Some(SevenZipError::WrongPassword)) => ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes },
+        (_, Some(SevenZipError::WrongPassword { failure })) => {
+            ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, seven_zip: *failure }
+        }
         (_, Some(SevenZipError::Canceled)) => ReadFault::Cancelled,
         _ => ReadFault::Legacy(error),
     }
@@ -2849,6 +3044,15 @@ impl From<&FileHeader> for Checks {
     }
 }
 
+impl Checks {
+    /// [`Checks::from`], with `fallback` as the time restored when the header has none.
+    fn with_fallback(h: &FileHeader, fallback: Option<SystemTime>) -> Self {
+        let mut checks = Checks::from(h);
+        checks.meta = checks.meta.or_time(fallback);
+        checks
+    }
+}
+
 /// A file of a solid stream whose blocks went to the decoder behind the ones before it.
 type Queued = (Pending, Checks);
 
@@ -3306,6 +3510,10 @@ fn rar_read_at(
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -3507,7 +3715,7 @@ impl Run<'_, '_, '_> {
                 crc32: h.crc32,
                 blake2sp: h.blake2sp,
                 out,
-                meta: Meta::from(h),
+                meta: self.opts.meta(Meta::from(h)),
             },
         };
         let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads, self.cancel.clone()));
@@ -3693,9 +3901,14 @@ impl Run<'_, '_, '_> {
             let path = place.path.clone();
             // the folders known so far are looked at again past a link
             self.dirs.forget();
-            if let Err(e) =
-                link::publish(&self.opts.dest, rel, place, &kind, Meta::from(h).modified(), &mut self.landing.extracted)
-            {
+            if let Err(e) = link::publish(
+                &self.opts.dest,
+                rel,
+                place,
+                &kind,
+                self.opts.meta(Meta::from(h)).modified(),
+                &mut self.landing.extracted,
+            ) {
                 if let Some(why) = link::member_failure(&e) {
                     let failure = if e.kind() == io::ErrorKind::Unsupported {
                         RarFailure::Unsupported(RarUnsupported::Redirection { kind: redirection_kind(h) })
@@ -3786,9 +3999,10 @@ impl Run<'_, '_, '_> {
                 name
             }
         });
-        // an older revision taken by `with_versions` is named `name;N`, tested or written, as UnRAR's `-ver` names it
+        // an older revision taken by `with_versions` is named by `Options::version_naming`, tested or written: `name;N`
+        // as UnRAR's `-ver` names it, or `[VER]/N/name` as 7-Zip does
         let output = match (output, h.version.filter(|_| self.opts.takes_versions())) {
-            (Some(name), Some(version)) => Some(std::borrow::Cow::Owned(format!("{name};{version}"))),
+            (Some(name), Some(version)) => Some(std::borrow::Cow::Owned(self.opts.version_naming.name(&name, version))),
             (output, _) => output,
         };
         if self.opts.mode == Mode::Extract && output.is_none() {
@@ -3841,7 +4055,7 @@ impl Run<'_, '_, '_> {
                     self.fail_in_order(&ctx, failure, why)?;
                     return Ok(());
                 }
-                self.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
+                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.meta(Meta::from(h))));
             }
             return self.reports.directory(&ctx);
         }
@@ -4167,7 +4381,8 @@ impl Run<'_, '_, '_> {
         if let Some(key) = p.key.clone() {
             self.queued_paths.insert(key);
         }
-        self.queued.push_back((p, Checks::from(h)));
+        let checks = Checks::with_fallback(h, self.opts.fallback_mtime);
+        self.queued.push_back((p, checks));
         let mut stream = self.stream.take();
         let mut books = Books {
             reports: self.reports,
@@ -4545,7 +4760,7 @@ impl Run<'_, '_, '_> {
                 landing: &mut self.landing,
                 dest: &self.opts.dest,
             },
-            &Checks::from(h),
+            &Checks::with_fallback(h, self.opts.fallback_mtime),
             p,
         )
     }
@@ -4709,6 +4924,21 @@ pub(crate) fn finish_file(out: &File, h: &Meta) {
 fn set_time(out: &File, h: &Meta) {
     if let Some(at) = h.mtime.and_then(|seconds| archive_time(seconds, h.nanos)) {
         let _ = out.set_modified(at);
+    }
+}
+
+/// A time as seconds since 1970 (negative before) and a nonnegative fraction, as [`Meta`] keeps it.
+fn unix_time(at: SystemTime) -> Option<(i64, u32)> {
+    match at.duration_since(UNIX_EPOCH) {
+        Ok(after) => Some((i64::try_from(after.as_secs()).ok()?, after.subsec_nanos())),
+        Err(before) => {
+            let before = before.duration();
+            let seconds = i64::try_from(before.as_secs()).ok()?;
+            match before.subsec_nanos() {
+                0 => Some((-seconds, 0)),
+                nanos => Some((-seconds - 1, 1_000_000_000 - nanos)),
+            }
+        }
     }
 }
 

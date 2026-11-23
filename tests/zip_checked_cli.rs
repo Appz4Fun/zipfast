@@ -591,6 +591,10 @@ fn r2_prefixed_zip_public_policy_context_and_selected_caps() {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         };
         for cap in [0, 24, 25] {
             let mut overrides = EncryptedReadOverrides::default();

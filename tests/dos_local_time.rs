@@ -114,6 +114,10 @@ fn times(archive: &Path) -> Vec<(String, i64, i64)> {
         parallel_min: None,
         select: None,
         windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
     };
     let summary = extract::run(archive, &options, |_| {}).unwrap();
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);

@@ -505,13 +505,17 @@ impl FileHeader {
     }
 
     /// [`Self::output_name`], or for an older revision (RAR 5.0 version record) taken by a run that includes them
-    /// (`versions`), its [`Self::display_name`]: `name;N`, as UnRAR's `-ver` writes it. Every route, testing and
-    /// extracting alike, names a revision `name;N` exactly when it includes revisions.
-    pub(crate) fn output_name_as(&self, versions: bool) -> Option<std::borrow::Cow<'_, str>> {
+    /// (`versions` is the run's naming), that name as [`crate::extract::VersionNaming`] writes it: `name;N`, as
+    /// UnRAR's `-ver` writes it, or `[VER]/N/name` as 7-Zip does. Every route, testing and extracting alike, names a
+    /// revision so exactly when it includes revisions.
+    pub(crate) fn output_name_as(
+        &self,
+        versions: Option<crate::extract::VersionNaming>,
+    ) -> Option<std::borrow::Cow<'_, str>> {
         let name = self.output_name()?;
-        Some(match self.version.filter(|_| versions) {
-            Some(version) => std::borrow::Cow::Owned(format!("{name};{version}")),
-            None => name,
+        Some(match (self.version, versions) {
+            (Some(version), Some(naming)) => std::borrow::Cow::Owned(naming.name(&name, version)),
+            _ => name,
         })
     }
 

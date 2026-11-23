@@ -91,6 +91,10 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         };
         let error = extract::run_with_zip_policy(
             &first,
@@ -413,6 +417,10 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
                 parallel_min: None,
                 select: None,
                 windows_safe_names: false,
+                special_entries: Default::default(),
+                fallback_mtime: None,
+                compressed_tar: Default::default(),
+                version_naming: Default::default(),
             };
             let result = extract::run_with_zip_policy(
                 &path,
@@ -678,6 +686,10 @@ mod direct_completion {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         }
     }
     #[test]
@@ -835,6 +847,10 @@ mod direct_aliases {
                     parallel_min: None,
                     select: None,
                     windows_safe_names: false,
+                    special_entries: Default::default(),
+                    fallback_mtime: None,
+                    compressed_tar: Default::default(),
+                    version_naming: Default::default(),
                 };
                 let log_path = match alias {
                     0 => source.clone(),
@@ -943,6 +959,10 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
             parallel_min: None,
             select: None,
             windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
         };
         macro_rules! refuse_completion {
             ($session:ident,$context:ident,$token:expr,$admit:expr,$emit:ident) => {{
@@ -1070,6 +1090,10 @@ mod protected_name_completion {
                             parallel_min: None,
                             select: None,
                             windows_safe_names: false,
+                            special_entries: Default::default(),
+                            fallback_mtime: None,
+                            compressed_tar: Default::default(),
+                            version_naming: Default::default(),
                         };
                         let output = || {
                             if extract {

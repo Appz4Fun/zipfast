@@ -1181,6 +1181,10 @@ mod takeover {
                 parallel_min: None,
                 select: None,
                 windows_safe_names: false,
+                special_entries: Default::default(),
+                fallback_mtime: None,
+                compressed_tar: Default::default(),
+                version_naming: Default::default(),
             },
             name(0),
         );

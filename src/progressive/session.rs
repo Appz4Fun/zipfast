@@ -598,7 +598,7 @@ impl ProgressiveSession {
                         // A growing declaration must never name this file as an input.
                         self.driver.record_output(identity)?;
                     }
-                    stage.set_metadata(crate::extract::Meta::from(&member.header));
+                    stage.set_metadata(self.options.extract.meta(crate::extract::Meta::from(&member.header)));
                     self.stage = Some(stage);
                     self.phase = Phase::Part;
                     return Ok(Poll::Ready(Ok(self.start_event.take())));
@@ -1630,7 +1630,7 @@ impl ProgressiveSession {
                     crate::extract::link::LinkKind::Symbolic(text)
                 }
             };
-            let modified = crate::extract::Meta::from(header).modified();
+            let modified = self.options.extract.meta(crate::extract::Meta::from(header)).modified();
             let mut target = self.target.take().expect("target");
             match self.output.as_mut().expect("output").link(&mut target, &kind, modified, &mut self.driver) {
                 Ok(()) => {}
@@ -1785,6 +1785,10 @@ mod tests {
                 parallel_min: None,
                 select: None,
                 windows_safe_names: false,
+                special_entries: Default::default(),
+                fallback_mtime: None,
+                compressed_tar: Default::default(),
+                version_naming: Default::default(),
             },
             "a.rar".into(),
         );
@@ -1905,6 +1909,10 @@ mod tests {
                     parallel_min: None,
                     select: None,
                     windows_safe_names: false,
+                    special_entries: Default::default(),
+                    fallback_mtime: None,
+                    compressed_tar: Default::default(),
+                    version_naming: Default::default(),
                 },
                 "a.rar".into(),
             );
