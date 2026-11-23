@@ -473,3 +473,39 @@ fn start_hook_sees_published_paths_and_never_blocked_targets() {
         assert_eq!(seen, want, "flatten {flatten}");
     }
 }
+
+/// The start hook is asked before the member's payload storage is admitted: a member larger than the live spool
+/// limit that the hook skips never charges its decoded size, so the run goes on to the other members.
+#[test]
+fn a_start_hook_skip_comes_before_payload_storage_is_admitted() {
+    use zipfast::extract::{MemberFilter, StartDecision};
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("a.zip");
+    let files = fixture(&archive, 200_000);
+    let mut limited = overrides(StagedStorage::Auto);
+    limited.live_spool_bytes = Some(100_000);
+    let run = |dest: &Path, select: Option<MemberFilter>| {
+        run_with_policy(
+            &archive,
+            &Options { select, ..options(dest, Overwrite::Always) },
+            Some("password"),
+            &Cancellation::default(),
+            &limited,
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+    };
+    // without the hook the over-limit member is refused
+    let refused = run(&work.path().join("all"), None);
+    assert!(refused.as_ref().map_or(true, |report| report.failed() > 0), "{refused:?}");
+
+    let dest = work.path().join("skip");
+    let filter = MemberFilter::all().on_start(|start| {
+        if start.path.ends_with("dir/secret.bin") { StartDecision::Skip } else { StartDecision::Write }
+    });
+    let report = run(&dest, Some(filter)).unwrap();
+    assert_eq!((report.files(), report.failed()), (3, 0));
+    for (name, data) in files.iter().filter(|(name, _)| name != "dir/secret.bin") {
+        assert_eq!(std::fs::read(dest.join(name)).unwrap(), *data, "{name}");
+    }
+    assert!(!dest.join("dir/secret.bin").exists());
+}

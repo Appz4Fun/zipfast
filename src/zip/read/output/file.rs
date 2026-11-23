@@ -382,11 +382,13 @@ fn acquire(
     blocked: &mut Option<target::Refusal>,
     allow_blocked: bool,
 ) -> ZipReadResult<Option<Prepared>> {
-    ledger.with_state(|s| s.reserve(binding.encrypted, binding.bytes, 2))?;
+    // descriptors now; payload storage only once the start hook accepts the member, so a member over the spool
+    // limit that the hook skips never charges (or fails on) its decoded size
+    ledger.with_state(|s| s.reserve(binding.encrypted, 0, 2))?;
     let mut preparing = Preparing {
         ledger,
         encrypted: binding.encrypted,
-        bytes: binding.bytes,
+        bytes: 0,
         parent: None,
         directory: None,
         inode: None,
@@ -438,6 +440,9 @@ fn acquire(
         {
             return Ok(false);
         }
+        ledger.with_state(|s| s.reserve(binding.encrypted, binding.bytes, 0))?;
+        preparing.bytes = binding.bytes;
+        let parent = preparing.parent.as_mut().unwrap();
         let tilde = !parent.target().to_bytes().contains(&b'~');
         if select_backend(
             &ledger,
@@ -537,9 +542,10 @@ fn acquire(
             // normally without poisoning this completed selected action.
             let parent = preparing.parent.take();
             preparing.finished = true;
+            let reserved = preparing.bytes;
             ledger.with_state(|s| {
                 s.retire_fd(true);
-                s.release_bytes(binding.encrypted, binding.bytes);
+                s.release_bytes(binding.encrypted, reserved);
             });
             // No parent is held when a nondirectory above the target refused it.
             if let Some(parent) = parent {
