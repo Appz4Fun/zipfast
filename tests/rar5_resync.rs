@@ -1134,4 +1134,113 @@ fn resync_near_never_pins_wrong_whatever_the_plaintext_start() {
             &format!("base {known_base} guard {guard}"),
         );
     }
+// ---- Seeding the window from held plaintext (Unpacker::resume_seeded) ----
+
+/// The unseen-filter stream resumed `back` bytes before its copy, seeded from the plaintext before that target, from
+/// packed bytes that start well after the filter (as a handover that fetches only near the target holds them).
+struct Seeded {
+    result: zipfast::Result<()>,
+    out: Vec<u8>,
+    truth: Vec<u8>,
+    restart: u64,
+    before_copy: u64,
+    decoder: Unpacker,
+}
+
+fn resume_seeded_past_unseen_filter(strict: bool, back: u64) -> Seeded {
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let target = before_copy - back;
+    let cut = packed.len() * 8 / 11;
+    let known = &truth[..target as usize];
+    let estimate = (target as u128 * packed.len() as u128 / truth.len() as u128) as usize - cut;
+    let options = NearOptions { estimate: Some(estimate), guard: false, ..Default::default() };
+    let n = resync_near(&packed[cut..], 0, known, window, target, &options).unwrap();
+    assert!(n.anchor > filter_at + 20_000 && !n.window_checked, "the follow never saw the filter: {n:?}");
+    let mut decoder =
+        Unpacker::resume_seeded(window, &n.resync, 0, 0, known, Some(truth.len() as u64), strict).unwrap();
+    assert_eq!(decoder.seed_checked(), Some(false), "the window is not proven");
+    let mut out = Collect(Vec::new());
+    let result =
+        decoder.feed(&packed[cut + n.resync.packed_offset..], &mut out).and_then(|()| decoder.finish(&mut out));
+    Seeded { result, out: out.0, truth, restart: n.resync.output_offset, before_copy, decoder }
+}
+
+/// A seeded decoder past a filter it never saw: the copy from the filtered output writes wrong bytes, but decoding
+/// goes on to the end, the suspect is noted where the copy is, and the output is flagged unverified, for the
+/// member's checksum to decide.
+#[test]
+fn a_seeded_decoder_notes_a_copy_from_output_an_unseen_filter_changed() {
+    use zipfast::rar5::unpack::SeedReason;
+    let s = resume_seeded_past_unseen_filter(false, 50_000);
+    s.result.expect("a seeded decoder goes on");
+    let from = s.restart as usize;
+    assert_eq!(s.out.len(), s.truth.len() - from, "the whole rest of the member came out");
+    let at = s.before_copy as usize - from;
+    assert_ne!(s.out[at..at + 3_000], s.truth[s.before_copy as usize..][..3_000], "the copy came out wrong");
+    let suspect = s.decoder.seed_suspect().expect("the copy is noted");
+    assert!(matches!(suspect.reason, SeedReason::UncheckedCopy { .. }), "{suspect:?}");
+    assert!(suspect.at <= s.before_copy, "noted at or before the wrong bytes: {suspect:?}");
+}
+
+/// The same with `strict`: the suspect copy is refused, as a checked decoder refuses it, before a wrong byte reaches
+/// the sink.
+#[test]
+fn a_strict_seeded_decoder_refuses_that_copy() {
+    let s = resume_seeded_past_unseen_filter(true, 50_000);
+    let err = s.result.expect_err("strict refuses the copy").to_string();
+    assert!(err.contains("before the window checked"), "{err}");
+    let good = (s.before_copy - s.restart) as usize;
+    assert!(
+        s.out.len() <= good && s.out == s.truth[s.restart as usize..][..s.out.len()],
+        "no wrong byte reached the sink"
+    );
+}
+
+/// Filter-free content: a decoder seeded from the plaintext before the target, from packed bytes near it only,
+/// decodes the rest exactly; copies from before the follow may still be noted (they cannot be told apart from
+/// unfiltered ones without the earlier packed bytes), and the output stays flagged unverified.
+#[test]
+fn a_seeded_decoder_on_filter_free_content_is_exact() {
+    use zipfast::rar5::testenc;
+    let ops = spread(12 << 20);
+    let packed = testenc::tuned_stream(&ops, 4_000);
+    let plain = testenc::model(&ops);
+    let window = window_for(16 << 20, Some(plain.len() as u64), false).unwrap();
+    let target = plain.len() as u64 * 3 / 4;
+    let cut = packed.len() * 2 / 3;
+    let known = &plain[..target as usize];
+    let estimate = (target as u128 * packed.len() as u128 / plain.len() as u128) as usize - cut;
+    let options = NearOptions { estimate: Some(estimate), guard: false, ..Default::default() };
+    let n = resync_near(&packed[cut..], 0, known, window, target, &options).unwrap();
+    assert!(target - n.resync.output_offset < 1 << 20, "the restart is near the target: {n:?}");
+    let mut u = Unpacker::resume_seeded(window, &n.resync, 0, 0, known, Some(plain.len() as u64), false).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&packed[cut + n.resync.packed_offset..], &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    assert_eq!(out.0, plain[n.resync.output_offset as usize..], "exact");
+    assert_eq!(u.seed_checked(), Some(false));
+}
+
+/// A seeded decoder whose held plaintext starts after the window's start notes a copy from before it (bytes never
+/// seeded) as `BeforeSeed`.
+#[test]
+fn a_seeded_decoder_notes_a_copy_from_before_the_held_plaintext() {
+    use zipfast::rar5::unpack::SeedReason;
+    let (packed, truth, window, filter_at, before_copy) = unseen_filter_stream();
+    let target = before_copy - 50_000;
+    // held plaintext only from 6 MiB before the target: the copy's source (in the filter's output) was never seeded
+    let known_base = target - (6 << 20);
+    assert!(known_base > filter_at + 20_000);
+    let known = &truth[known_base as usize..target as usize];
+    let cut = packed.len() * 8 / 11;
+    let estimate = (target as u128 * packed.len() as u128 / truth.len() as u128) as usize - cut;
+    let options = NearOptions { estimate: Some(estimate), guard: false, ..Default::default() };
+    let n = resync_near(&packed[cut..], known_base, known, window, target, &options).unwrap();
+    let mut u =
+        Unpacker::resume_seeded(window, &n.resync, 0, known_base, known, Some(truth.len() as u64), false).unwrap();
+    let mut out = Collect(Vec::new());
+    u.feed(&packed[cut + n.resync.packed_offset..], &mut out).unwrap();
+    u.finish(&mut out).unwrap();
+    let suspect = u.seed_suspect().expect("noted");
+    assert!(matches!(suspect.reason, SeedReason::BeforeSeed { source } if source < known_base), "{suspect:?}");
 }

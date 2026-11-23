@@ -1215,4 +1215,105 @@ impl Unpacker {
         u.stop_at_last = true;
         Ok(u)
     }
+    /// [`Self::resume_in_stream`] for a handover that holds the output before the restart but not the packed bytes
+    /// far before it: the window is seeded from `known` (the held plaintext, solid-stream offsets from
+    /// `known_base`, ending at or past the restart), and no plaintext past the restart is needed.
+    ///
+    /// The output is **unverified** unless [`Self::seed_checked`] says otherwise. RAR's window holds output as it
+    /// was before filters (E8, E8E9, ARM, delta) ran, while held plaintext is filtered output; a filter declared
+    /// before the restart, which the follow to it did not see, may have changed bytes a later match copies, and then
+    /// the copy writes wrong bytes. Filters the follow did see are undone where `known` holds all their output.
+    /// Where the window is not proven, a match that copies from unproven output into output nothing checks is noted
+    /// as a [`SeedSuspect`] ([`Self::seed_suspect`]) and decoded anyway, so the member's CRC32 or BLAKE2sp at its
+    /// end decides; with `strict` it is refused instead ([`crate::Error::BadChecksum`]), as a checked decoder
+    /// refuses it. A copy from before `known_base` (window bytes never seeded) is noted the same way. The first
+    /// filter the decoder meets is noted too, as a weaker sign.
+    ///
+    /// The window is proven (checked) when the follow to the restart covered it: [`ResyncNear::window_checked`] (a
+    /// follow from the member's start, or from the dictionary plus a filter's reach before the restart), with
+    /// `known` covering the window and every filter seen undone. Filter records sit inside Huffman-coded blocks, so
+    /// no scan cheaper than that follow, over the packed bytes before the restart, can show there were none.
+    pub fn resume_seeded(
+        window: Window,
+        resync: &Resync,
+        member_start: u64,
+        known_base: u64,
+        known: &[u8],
+        size: Option<u64>,
+        strict: bool,
+    ) -> Result<Self> {
+        let offset = resync.output_offset;
+        if member_start > offset {
+            return Err(Error::Unsupported(format!(
+                "resuming RAR 5.0 output at stream offset {offset} inside a member that starts later, at {member_start}"
+            )));
+        }
+        let known_end = known_base.saturating_add(known.len() as u64);
+        if known_base > offset || known_end < offset {
+            return Err(Error::Unsupported(format!(
+                "seeding a RAR 5.0 decoder at {offset} needs held plaintext reaching it; given {known_base}..{known_end}"
+            )));
+        }
+        let member_end = size.map_or(known_end, |s| member_start.saturating_add(s));
+        // what held plaintext there is past the restart is still checked
+        let check_end = offset.saturating_add(MAX_FILTER_LEN).min(member_end).min(known_end.max(offset));
+        let mut u = Unpacker::new(window)?;
+        u.reset(size);
+        if check_end > offset {
+            let bytes = known[(offset - known_base) as usize..(check_end - known_base) as usize].to_vec();
+            u.verify = Some(Box::new(Verify { end: check_end - member_start, bytes }));
+        }
+        let window_start = offset.saturating_sub(u.reach);
+        let from = window_start.max(known_base);
+        for f in from..offset {
+            if let Some(&b) = usize::try_from(f - known_base).ok().and_then(|i| known.get(i)) {
+                u.window[(f & u.mask) as usize] = b;
+            }
+        }
+        // The lowest stream offset whose window bytes are proven: everything when the follow covered the window,
+        // else the follow's floor. Raised past seen filters whose output `known` lacks (they cannot be undone) and to
+        // `known_base` when the window reaches before it (never seeded; nothing before the stream's start exists).
+        let from_member_start = resync.floor > 0 && resync.verified.start <= member_start;
+        let mut floor = if resync.floor == 0 || from_member_start {
+            if member_start > 0 && window_start < member_start && from_member_start { member_start } else { 0 }
+        } else {
+            resync.floor.min(offset)
+        };
+        for f in &resync.filters {
+            let end = f.start + f.len;
+            if end <= from || f.start < member_start {
+                continue;
+            }
+            if f.start < known_base || end > known_end {
+                floor = floor.max(end.min(offset));
+                continue;
+            }
+            let mut bytes = known[(f.start - known_base) as usize..(end - known_base) as usize].to_vec();
+            super::unapply_filter(f.kind, f.start - member_start, &mut bytes);
+            for (i, &b) in bytes.iter().enumerate() {
+                let at = f.start + i as u64;
+                if at >= from && at < offset {
+                    u.window[(at & u.mask) as usize] = b;
+                }
+            }
+        }
+        if known_base > window_start && known_base > 0 {
+            floor = floor.max(known_base);
+        }
+        if floor > 0 {
+            u.floor = floor;
+            u.floor_from = check_end;
+        }
+        u.seed = Some(Box::new(super::SeedState::new(strict, known_base, floor == 0)));
+        u.sp = offset;
+        u.file_base = member_start;
+        u.emitted = offset - member_start;
+        u.history = resync.history;
+        u.last_len = resync.last_len;
+        u.slot = Slot::filled(Some(*resync.lens));
+        u.built = None;
+        u.tables_ready = true;
+        u.stop_at_last = true;
+        Ok(u)
+    }
 }

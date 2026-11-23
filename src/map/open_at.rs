@@ -242,7 +242,30 @@ pub struct OpenAtOptions {
     /// refuses (as [`crate::Error::BadChecksum`]) a copy from output a filter it did not see may have changed,
     /// and the caller then fetches from further back.
     pub search: Option<u64>,
+    /// RAR 5.0 compressed members: how the resumed decoder's window is filled. See [`Seed`].
+    pub seed: Seed,
 }
+
+/// How a RAR 5.0 handover fills the resumed decoder's window ([`OpenAtOptions::seed`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Seed {
+    /// The window is checked: the plan fetches packed bytes far enough back to follow the decoding over the whole
+    /// match window (or a decoder floor refuses what was not followed), so the output is right or refused.
+    #[default]
+    Checked,
+    /// The window is seeded from the caller's held plaintext (the output before the target, from an earlier copy),
+    /// and the plan fetches packed bytes only from just before the target's estimated position
+    /// ([`OpenAtOptions::search`], default [`SEED_SEARCH`]). The output is unverified unless
+    /// [`Rar5Resume::checked`] says otherwise: the member's CRC32 or BLAKE2sp at its end proves it, and the decoder
+    /// reports early signs of trouble ([`Unpacker::seed_suspect`]). With `strict`, a suspect copy is refused instead
+    /// of decoded. See [`Unpacker::resume_seeded`].
+    HeldPlaintext { strict: bool },
+}
+
+/// The packed bytes a [`Seed::HeldPlaintext`] plan fetches before the target's estimated position when
+/// [`OpenAtOptions::search`] is `None`.
+pub const SEED_SEARCH: u64 = 2 << 20;
 
 /// The LZMA2 search when [`OpenAtOptions::search`] is `None`.
 const LZMA2_SEARCH: u64 = 4 << 20;
@@ -262,6 +285,8 @@ pub struct OpenAt {
     /// The packed bytes to fetch, from `fetch_from` to the end of the member's (or folder's) packed stream, per
     /// volume, in stream order. Pieces missing from the map are missing here too.
     pub spans: Vec<PackedSpan>,
+    /// How a RAR 5.0 restart's window is filled, from [`OpenAtOptions::seed`].
+    pub seed: Seed,
 }
 
 /// How decoding starts in an [`OpenAt`] plan.
@@ -331,7 +356,7 @@ pub fn open_at(map: &MemberMap, member: usize, offset: u64, options: &OpenAtOpti
         return Err(OpenAtError::PastEnd { offset, size });
     }
     let plan = |start, fetch_from, spans| {
-        Ok(OpenAt { member, target: offset, restart: restart.clone(), start, fetch_from, spans })
+        Ok(OpenAt { member, target: offset, restart: restart.clone(), start, fetch_from, spans, seed: options.seed })
     };
     match restart.grain {
         RestartGrain::AnyByte | RestartGrain::Block16 => {
@@ -348,8 +373,11 @@ pub fn open_at(map: &MemberMap, member: usize, offset: u64, options: &OpenAtOpti
                 .unwrap_or_else(|| (offset as u128 * packed_len as u128 / size.max(1) as u128) as u64)
                 .min(packed_len);
             let reach = dictionary.saturating_add(RAR5_FILTER_REACH);
+            let seeded = matches!(options.seed, Seed::HeldPlaintext { .. });
             let search = options.search.unwrap_or_else(|| {
-                if reach >= offset {
+                if seeded {
+                    SEED_SEARCH
+                } else if reach >= offset {
                     // the window reaches the member's start: search from there
                     estimate
                 } else {
@@ -364,8 +392,12 @@ pub fn open_at(map: &MemberMap, member: usize, offset: u64, options: &OpenAtOpti
                 fetch_from = (fetch_from & !15).saturating_sub(16);
             }
             let stream_target = restart.stream_start + offset;
-            let donor_from =
-                stream_target.saturating_sub(dictionary.saturating_add(RAR5_FILTER_REACH).saturating_mul(2));
+            // a seeded window needs the plaintext it holds: the dictionary before the target
+            let donor_from = if seeded {
+                stream_target.saturating_sub(dictionary)
+            } else {
+                stream_target.saturating_sub(dictionary.saturating_add(RAR5_FILTER_REACH).saturating_mul(2))
+            };
             let first = fetch_from..(estimate.saturating_add(1 << 20)).min(packed_len);
             plan(
                 Start::Rar5 { stream_target, estimate, first, donor: donor_from..stream_target },
@@ -438,6 +470,10 @@ pub struct Rar5Resume {
     pub redecode: u64,
     /// The restart search's report; `None` when decoding starts at the stream's start, where no search is needed.
     pub near: Option<ResyncNear>,
+    /// Whether decoding alone proves the output: always for a [`Seed::Checked`] plan (it decodes right or refuses);
+    /// for [`Seed::HeldPlaintext`] only when the window was proven ([`Unpacker::seed_checked`]). When false, only
+    /// the member's CRC32 or BLAKE2sp proves the output, and [`Unpacker::seed_suspect`] gives early signs.
+    pub checked: bool,
 }
 
 /// Finishes a [`Start::Rar5`] plan: finds the restart in the held packed bytes and starts a decoder there.
@@ -470,13 +506,18 @@ pub fn complete_rar5(
         let mut decoder = Unpacker::new(window).map_err(|e| OpenAtError::Decode(e.to_string()))?;
         decoder.reset(Some(size));
         decoder.stop_at_last_block();
-        Ok(Rar5Resume { decoder, feed_from: 0, output: 0, redecode: plan.target, near: None })
+        Ok(Rar5Resume { decoder, feed_from: 0, output: 0, redecode: plan.target, near: None, checked: true })
     };
     let from_start = member_start == 0 && packed_from == 0;
     if stream_target == 0 {
         return if from_start { fresh() } else { Err(OpenAtError::NeedMore { needed: 0..0 }) };
     }
-    let options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
+    let seed = plan.seed;
+    let mut options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
+    if let Seed::HeldPlaintext { .. } = seed {
+        // the seeded window needs no guard: the packed bytes held start near the target
+        options.guard = false;
+    }
     let found = match resync_near(packed, known_base, known, window, stream_target, &options) {
         Ok(found) => found,
         Err(_) if from_start => return fresh(),
@@ -485,11 +526,17 @@ pub fn complete_rar5(
     if found.resync.output_offset < member_start {
         return Err(OpenAtError::NeedMore { needed: known_base..stream_target });
     }
-    let decoder = Unpacker::resume_in_stream(window, &found.resync, member_start, known_base, known, Some(size))
-        .map_err(|e| match e {
-            crate::Error::Unsupported(_) => OpenAtError::NeedMore { needed: 0..stream_target },
-            e => OpenAtError::Decode(e.to_string()),
-        })?;
+    let resumed = match seed {
+        Seed::Checked => Unpacker::resume_in_stream(window, &found.resync, member_start, known_base, known, Some(size)),
+        Seed::HeldPlaintext { strict } => {
+            Unpacker::resume_seeded(window, &found.resync, member_start, known_base, known, Some(size), strict)
+        }
+    };
+    let decoder = resumed.map_err(|e| match e {
+        crate::Error::Unsupported(_) => OpenAtError::NeedMore { needed: 0..stream_target },
+        e => OpenAtError::Decode(e.to_string()),
+    })?;
+    let checked = decoder.seed_checked().unwrap_or(true);
     let output = found.resync.output_offset - member_start;
     Ok(Rar5Resume {
         decoder,
@@ -497,6 +544,7 @@ pub fn complete_rar5(
         output,
         redecode: plan.target - output,
         near: Some(found),
+        checked,
     })
 }
 
