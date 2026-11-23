@@ -49,7 +49,9 @@
 //!
 //! A piece that fails gives the output it decoded before the failure and then the failure, in order, so the failure
 //! lands on the member it lands on in one-thread decoding. Workers check the [`Cancellation`] every [`SEGMENT`] bytes
-//! of output and while they wait, and dropping the reader stops and joins them.
+//! of output and while they wait, and dropping the reader stops and joins them. A worker that panics fails the piece
+//! it was decoding in the same way ([`worker_panicked`]), so the reader gets an error in order instead of waiting on
+//! it forever.
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -380,6 +382,9 @@ struct Shared {
     memory: u64,
     dict: u8,
     cancel: Cancellation,
+    /// the piece whose worker panics on its first output, for the tests
+    #[cfg(test)]
+    panic_on: Option<u64>,
 }
 
 impl Shared {
@@ -497,7 +502,42 @@ impl Decoder {
     }
 }
 
+/// The failure a piece ends in when its worker panics.
+fn worker_panicked() -> io::Error {
+    io::Error::other("LZMA2 worker thread panicked")
+}
+
+/// Fails a worker's piece if the worker unwinds while it holds one, and wakes every waiter, so the reader takes the
+/// piece's output so far and then [`worker_panicked`] instead of waiting for a worker that is gone.
+struct PanicGuard<'a> {
+    shared: &'a Shared,
+    /// the piece the worker holds
+    number: Option<u64>,
+}
+
+impl Drop for PanicGuard<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        // The panic may have poisoned the lock mid-update; `lock` recovers it, and the counters it may leave off
+        // only bound reading ahead.
+        let mut state = self.shared.lock();
+        if let Some(piece) = self.number.and_then(|number| state.piece(number))
+            && !piece.done
+        {
+            piece.done = true;
+            piece.fault = Some(worker_panicked());
+        }
+        drop(state);
+        self.shared.jobs.notify_all();
+        self.shared.work.notify_all();
+        self.shared.reader.notify_all();
+    }
+}
+
 fn work(shared: &Shared) {
+    let mut guard = PanicGuard { shared, number: None };
     loop {
         let number = {
             let mut state = shared.lock();
@@ -506,6 +546,7 @@ fn work(shared: &Shared) {
                     return;
                 }
                 if let Some(number) = state.jobs.pop_front() {
+                    guard.number = Some(number);
                     break number;
                 }
                 state = shared.wait(&shared.jobs, state);
@@ -521,6 +562,7 @@ fn work(shared: &Shared) {
             piece.done = true;
             piece.fault = fault;
         }
+        guard.number = None;
         state.freed += dict_size(shared.dict);
         let trim = state.freed >= TRIM_EVERY;
         if trim {
@@ -557,6 +599,11 @@ fn release_freed_memory() {}
 /// sink) stops the head as well, so nothing grows past the budget and those few segments.
 fn hand_out(shared: &Shared, number: u64, out: Vec<u8>) -> bool {
     let mut state = shared.lock();
+    // with the lock held, so the reader's lock is poisoned too
+    #[cfg(test)]
+    if shared.panic_on == Some(number) {
+        panic!("the test's panic on piece {number}");
+    }
     // charged by what it holds, not by what it fills
     let len = out.capacity() as u64;
     loop {
@@ -708,6 +755,7 @@ impl Drop for Parallel {
         self.shared.jobs.notify_all();
         self.shared.work.notify_all();
         self.shared.reader.notify_all();
+        // A worker that panicked failed its piece as it unwound ([`PanicGuard`]): its join error adds nothing.
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
@@ -944,7 +992,12 @@ impl Parallel {
                         }
                         continue;
                     }
-                    if state.jobs.front() == Some(&head) {
+                    // (the tests' panicking piece is left to a worker)
+                    #[cfg(test)]
+                    let inline = self.shared.panic_on != Some(head);
+                    #[cfg(not(test))]
+                    let inline = true;
+                    if inline && state.jobs.front() == Some(&head) {
                         // no worker has taken the head: this thread decodes it
                         state.jobs.pop_front();
                         drop(state);
@@ -1002,6 +1055,9 @@ pub(crate) struct Lzma2Blocks {
     workers: usize,
     memory: u64,
     cancel: Cancellation,
+    /// handed to [`Shared::panic_on`]
+    #[cfg(test)]
+    panic_on: Option<u64>,
 }
 
 impl Lzma2Blocks {
@@ -1025,6 +1081,8 @@ impl Lzma2Blocks {
             memory,
             cancel: cancel.clone(),
             allowance: None,
+            #[cfg(test)]
+            panic_on: None,
         })
     }
 
@@ -1058,6 +1116,8 @@ impl Lzma2Blocks {
             memory: self.memory,
             dict: self.dict,
             cancel: self.cancel.clone(),
+            #[cfg(test)]
+            panic_on: self.panic_on,
         });
         // Piece 0 is the stream so far: its decoder goes on, from the bytes before the cut it has not taken yet
         // (the cut is made in a block just read, so it has taken none of it).
@@ -1822,6 +1882,45 @@ mod tests {
         let again = drain(&mut reader, total);
         assert!(again == got);
         assert!(reader.started().unwrap() > 0);
+    }
+
+    /// A worker that panics fails its piece: the reader gets the pieces before it whole and then an error, not a hang,
+    /// and dropping the reader joins the rest.
+    #[test]
+    fn a_panicked_worker_fails_its_piece_instead_of_hanging() {
+        let blocks: Vec<_> = (0..12).map(|i| (2 << 20, 700 + i, true)).collect();
+        let (packed, plain) = stream(&blocks);
+        let size = plain.len() as u64;
+        for (workers, piece) in [(2usize, 1u64), (4, 3), (8, 6)] {
+            let packed = packed.clone();
+            let (done, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader =
+                    Lzma2Blocks::new(cursor(&packed), size, DICT, workers, 1 << 30, &Cancellation::default()).unwrap();
+                reader.panic_on = Some(piece);
+                let mut out = Vec::new();
+                let mut buf = vec![0u8; 256 << 10];
+                let error = loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break None,
+                        Ok(n) => out.extend_from_slice(&buf[..n]),
+                        Err(e) => break Some(e),
+                    }
+                };
+                let started = reader.started();
+                drop(reader);
+                let _ = done.send((out, error, started));
+            });
+            let (out, error, started) =
+                result.recv_timeout(Duration::from_secs(30)).expect("the reader hung after a worker panicked");
+            assert!(started.is_some_and(|n| n > 0), "{workers}: no workers started");
+            let error = error.expect("the read ended without an error");
+            assert_eq!(error.kind(), io::ErrorKind::Other, "{workers}: {error}");
+            assert!(error.to_string().contains("panicked"), "{workers}: {error}");
+            // each 2 MiB block is a piece, and the panic comes before the piece's first output
+            assert_eq!(out.len(), piece as usize * (2 << 20), "{workers}");
+            assert!(out == plain[..out.len()], "{workers}: the output before the panic differs");
+        }
     }
 
     #[test]
