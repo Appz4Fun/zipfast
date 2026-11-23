@@ -292,7 +292,10 @@ again, not written). Lost output can run on through several members. The packed 
 in turn: a member never releases what the members after it start from, a successor never what the members before it
 may still read. A dictionary taken from output the decoder did not write (held output, an earlier member's) leaves
 the member `unproven` until its CRC matches. `FeedDecoder::new` on a later member still starts at the last dictionary
-reset before it (decoding the folder output in between again).
+reset before it (decoding the folder output in between again). A member's snapshot taken after its main decode
+finished and before the hand-off keeps what it is to hand over: the restart point to go on from (the output past its
+end is decoded again from there) and the lost output past its end with its repairs. The next member is the folder's
+next member in the map, also a zero-length one at the folder's end.
 
 ## Saving and restoring
 
@@ -515,4 +518,6 @@ Solid streams (`tests/feed_decoder_solid.rs`, `tests/feed_decoder_solid_rar4.rs`
   chunk holding output 5,000 bytes before member 0's end and in the middle of member 2, with and without held output:
   the loss runs on into member 1 (lost from its start, repaired by member 1 from member 0's restart point), member 1
   is restored from a snapshot, and all end exact, CRCs verified, each byte written once (repairs decode up to 1.1 MB
-  again in the single-reset folder, 38 KB in the blocked one).
+  again in the single-reset folder, 38 KB in the blocked one). Also: a finished member snapshotted and restored
+  before it hands over, with and without a loss running on into the next member, and a zero-length member at the
+  folder's end handed over to.

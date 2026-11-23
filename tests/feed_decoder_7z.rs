@@ -717,3 +717,71 @@ fn members_of_a_folder_hand_over_in_sequence() {
         }
     }
 }
+
+/// A member whose main decode has finished, snapshotted and restored before it hands over, still hands over: the
+/// restart and the lost output past its end it was to hand on are in its snapshot. With a hole late in member 0
+/// (its loss runs on into member 1) and without one, both folder layouts.
+#[test]
+fn a_finished_member_restored_before_its_hand_off_still_hands_over() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("a.bin", mixed(300_000, 31)), ("b.bin", mixed(400_000, 32))];
+    let sizes: Vec<u64> = files.iter().map(|(_, b)| b.len() as u64).collect();
+    let plain: Vec<u8> = files.iter().flat_map(|(_, b)| b.clone()).collect();
+    for block in [usize::MAX, 350_000] {
+        let lz = lzma2(&plain, block.min(plain.len()));
+        let walked = chunks(&lz);
+        let (p, _) = walked.iter().find(|(_, o)| o.contains(&(sizes[0] - 5_000))).unwrap();
+        let hole = 32 + (p.start + p.end) / 2;
+        for with_hole in [false, true] {
+            let archive = seven_zip(&files, false, block.min(plain.len()));
+            let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+            let mut source = ArticleBuffer::new(usize::MAX);
+            if with_hole {
+                source.insert(0, 0, &archive[..hole as usize]).unwrap();
+                source.insert(0, hole + 8, &archive[hole as usize + 8..]).unwrap();
+                source.mark_lost(0, hole..hole + 8);
+            } else {
+                source.insert(0, 0, &archive).unwrap();
+            }
+            let starts = vec![0, sizes[0], sizes[0] + sizes[1]];
+            let mut outs: Vec<Out> = files.iter().map(|(_, b)| Out::new(b.len(), None)).collect();
+            let mut d0 = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+            let s = d0.run(&mut source, &mut FolderView { outs: &mut outs, i: 0, starts: &starts }).unwrap();
+            assert_eq!(s.frontier, sizes[0], "{s:?}");
+            let snap = FeedSnapshot::from_bytes(&d0.snapshot().to_bytes()).unwrap();
+            let mut d0 = FeedDecoder::restore(&map, 0, FolderRun::options(), &snap).unwrap();
+            let mut d1 = d0.next_solid(&map, 1, FolderRun::options()).unwrap();
+            source.insert(0, 0, &archive).unwrap();
+            for _ in 0..2 {
+                d0.run(&mut source, &mut FolderView { outs: &mut outs, i: 0, starts: &starts }).unwrap();
+                d1.run(&mut source, &mut FolderView { outs: &mut outs, i: 1, starts: &starts }).unwrap();
+            }
+            for (k, d) in [d0, d1].iter().enumerate() {
+                let s = d.status();
+                assert!(s.done && s.crc_ok == Some(true), "block {block} hole {with_hole} member {k}: {s:?}");
+                assert!(outs[k].bytes == files[k].1, "member {k} output");
+                assert_eq!(outs[k].written, sizes[k], "member {k}: each byte written once");
+            }
+        }
+    }
+}
+
+/// A zero-length member at the folder's end still follows the member before: the hand-off reaches it.
+#[test]
+fn a_trailing_empty_member_of_a_folder_is_handed_over_to() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("a.bin", mixed(200_000, 33)), ("e.txt", Vec::new())];
+    let archive = seven_zip(&files, false, 350_000);
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    assert_eq!(map.members[1].unpacked_size, Some(0));
+    if map.members[1].folder.is_none() {
+        // a map that gives the empty member no place in the folder has nothing to hand over
+        return;
+    }
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut d0 = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+    let mut out0 = Out::new(200_000, None);
+    assert!(d0.run(&mut source, &mut out0).unwrap().done);
+    let mut d1 = d0.next_solid(&map, 1, FolderRun::options()).unwrap();
+    let s = d1.run(&mut source, &mut Out::new(0, None)).unwrap();
+    assert!(s.done && s.crc_ok != Some(false), "{s:?}");
+}

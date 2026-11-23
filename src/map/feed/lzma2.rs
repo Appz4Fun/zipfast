@@ -209,6 +209,9 @@ pub(super) struct Handoff {
     walked: BTreeMap<u64, Lzma2Chunk>,
     /// packed (cipher) bytes before this offset may still be read by the members before: never released
     floor: u64,
+    /// no restart point to go on from (a decoder restored without one): the next member finds its start from the
+    /// folder's, as on its own
+    seek: bool,
 }
 
 pub(super) struct Lz {
@@ -345,23 +348,47 @@ impl Lz {
         }
         u64s(&mut out, &[self.write_from, self.repairs.len() as u64]);
         for r in &self.repairs {
-            match r.kind {
-                Kind::Stored { plain } => {
-                    out.push(0);
-                    u64s(&mut out, &[plain]);
-                }
-                Kind::Decoded { cp, until, seed } => {
-                    out.push(1);
-                    put_opt_cp(&mut out, Some(cp));
-                    u64s(&mut out, &[until]);
-                    put_opt_cp(&mut out, seed);
-                }
-            }
+            put_kind(&mut out, &r.kind);
             u64s(&mut out, &[r.lost.start, r.lost.end]);
         }
         // what a member handed over keeps pinned (the members before it, the member after it)
-        if self.floor > 0 || self.cap.is_some() {
+        if self.floor > 0 || self.cap.is_some() || self.handoff.is_some() {
             u64s(&mut out, &[self.floor, self.cap.unwrap_or(u64::MAX)]);
+        }
+        // a finished main decode's state still to be handed to the next member: where it goes on (a live decoder as
+        // its restart point, decoding again what it decoded past this member's end) and the lost output past the end
+        if let Some(h) = &self.handoff {
+            out.push(1);
+            match &h.lane {
+                None => out.push(0),
+                Some(l) if l.live.is_none() && !l.restart && h.spill.is_empty() => {
+                    out.push(2);
+                    u64s(&mut out, &[l.pos, l.out]);
+                    match &l.chunk {
+                        None => out.push(0),
+                        Some(c) => {
+                            out.push(1);
+                            put_chunk(&mut out, c);
+                        }
+                    }
+                    out.push(l.props.unwrap_or(0xFF));
+                    put_opt_cp(&mut out, l.cp);
+                }
+                Some(l) => match l.cp {
+                    Some(cp) => {
+                        out.push(1);
+                        put_opt_cp(&mut out, Some(cp));
+                    }
+                    // nowhere to restart: the next member finds its start from the folder's
+                    None => out.push(3),
+                },
+            }
+            u64s(&mut out, &[h.overflow.len() as u64]);
+            for (lost, kind) in &h.overflow {
+                put_kind(&mut out, kind);
+                u64s(&mut out, &[lost.start, lost.end]);
+            }
+            u64s(&mut out, &[h.floor]);
         }
         out
     }
@@ -421,15 +448,7 @@ impl Lz {
         let n = r.count(1 + 8 + 16)?;
         let mut repairs = Vec::with_capacity(n);
         for _ in 0..n {
-            let kind = match r.u8()? {
-                0 => Kind::Stored { plain: r.u64()? },
-                1 => {
-                    let cp = get_opt_cp(&mut r)?.ok_or(bad())?;
-                    let until = r.u64()?;
-                    Kind::Decoded { cp, until, seed: get_opt_cp(&mut r)? }
-                }
-                _ => return Err(FeedError::Snapshot("bad flag")),
-            };
+            let kind = get_kind(&mut r)?;
             let lost = r.u64()?..r.u64()?;
             if lost.start >= lost.end || lost.start < self.ss || lost.end > self.end {
                 return Err(bad());
@@ -450,9 +469,65 @@ impl Lz {
             repairs.push(Repair { kind, lost, blocked: None, lane: None });
         }
         let (floor, cap) = if r.0.is_empty() { (0, u64::MAX) } else { (r.u64()?, r.u64()?) };
+        let handoff = if r.0.is_empty() {
+            None
+        } else {
+            if r.u8()? != 1 || !self.successor || main.is_some() || seek {
+                return Err(bad());
+            }
+            let (lane, seek_next) = match r.u8()? {
+                0 => (None, false),
+                1 => (Some(Lane2::at_cp(get_opt_cp(&mut r)?.ok_or(bad())?)), false),
+                2 => {
+                    let (pos, out) = (r.u64()?, r.u64()?);
+                    let chunk = match r.u8()? {
+                        0 => None,
+                        1 => Some(get_chunk(&mut r)?),
+                        _ => return Err(FeedError::Snapshot("bad flag")),
+                    };
+                    let props = match r.u8()? {
+                        0xFF => None,
+                        p if props_valid(p) => Some(p),
+                        _ => return Err(bad()),
+                    };
+                    let cp = get_opt_cp(&mut r)?;
+                    if pos > self.plain_len || out < self.end || out > self.folder_size {
+                        return Err(bad());
+                    }
+                    (Some(Lane2 { pos, out, chunk, props, live: None, cp, restart: false }), false)
+                }
+                3 => (None, true),
+                _ => return Err(FeedError::Snapshot("bad flag")),
+            };
+            if let Some(cp) = lane.as_ref().and_then(|l| l.cp)
+                && (cp.packed > self.plain_len || cp.out > self.folder_size)
+            {
+                return Err(bad());
+            }
+            let n = r.count(1 + 8 + 16)?;
+            let mut overflow = Vec::with_capacity(n);
+            for _ in 0..n {
+                let kind = get_kind(&mut r)?;
+                let lost = r.u64()?..r.u64()?;
+                if lost.start >= lost.end || lost.start < self.end || lost.end > self.folder_size {
+                    return Err(bad());
+                }
+                overflow.push((lost, kind));
+            }
+            let floor = r.u64()?;
+            Some(Box::new(Handoff {
+                lane,
+                spill: Vec::new(),
+                overflow,
+                walked: BTreeMap::new(),
+                floor,
+                seek: seek_next,
+            }))
+        };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
+        self.handoff = handoff;
         if floor > self.cipher_len || (cap != u64::MAX && cap > self.plain_len) {
             return Err(bad());
         }
@@ -502,6 +577,33 @@ fn get_opt_cp(r: &mut Reader<'_>) -> Result<Option<Cp>, FeedError> {
         }
         _ => Err(FeedError::Snapshot("bad flag")),
     }
+}
+
+fn put_kind(out: &mut Vec<u8>, kind: &Kind) {
+    match *kind {
+        Kind::Stored { plain } => {
+            out.push(0);
+            out.extend_from_slice(&plain.to_le_bytes());
+        }
+        Kind::Decoded { cp, until, seed } => {
+            out.push(1);
+            put_opt_cp(out, Some(cp));
+            out.extend_from_slice(&until.to_le_bytes());
+            put_opt_cp(out, seed);
+        }
+    }
+}
+
+fn get_kind(r: &mut Reader<'_>) -> Result<Kind, FeedError> {
+    Ok(match r.u8()? {
+        0 => Kind::Stored { plain: r.u64()? },
+        1 => {
+            let cp = get_opt_cp(r)?.ok_or(FeedError::Snapshot("out of range"))?;
+            let until = r.u64()?;
+            Kind::Decoded { cp, until, seed: get_opt_cp(r)? }
+        }
+        _ => return Err(FeedError::Snapshot("bad flag")),
+    })
 }
 
 fn put_chunk(out: &mut Vec<u8>, c: &Lzma2Chunk) {
@@ -636,6 +738,7 @@ impl FeedDecoder {
             overflow: std::mem::take(&mut lz.overflow),
             walked,
             floor,
+            seek: false,
         }));
     }
 
@@ -694,8 +797,13 @@ impl FeedDecoder {
         let folder_size = folder.unpacked_size;
         let end = slot.offset.checked_add(size).filter(|&e| e <= folder_size);
         let end = end.ok_or(FeedError::Malformed("member runs past its folder's output"))?;
-        let successor = end < folder_size
-            && map.members.iter().any(|m| m.folder.is_some_and(|f| f.index == slot.index && f.offset == end));
+        // the next member of the folder in the map starts where this one ends (a zero-length one at the folder's end
+        // too)
+        let after = map.members.iter().position(|m| std::ptr::eq(m, member)).map_or(map.members.len(), |i| i + 1);
+        let successor = map.members[after..]
+            .iter()
+            .find_map(|m| m.folder.filter(|f| f.index == slot.index))
+            .is_some_and(|f| f.offset == end);
         let dict = lzma2_dict(dict_prop);
         let need = folder_size.max(4096);
         let dec_prop = (0..=dict_prop).find(|&p| lzma2_dict(p) >= need).unwrap_or(dict_prop);
@@ -791,15 +899,16 @@ impl FeedDecoder {
             // going on from the member before: its main decode, the output it decoded past its end, and the lost
             // output past its end with its repairs
             let mut lz = d.lzma2.take().expect("LZMA2 state");
-            let Handoff { lane, spill, overflow, walked, floor } = *h;
+            let Handoff { lane, spill, overflow, walked, floor, seek } = *h;
             lz.main = lane.filter(|_| size > 0 || successor);
+            lz.seek = seek && size > 0;
             lz.walked = walked;
             lz.floor = floor;
             lz.pending = spill;
             for (lost, kind) in overflow {
                 d.lz_lose(&mut lz, lost, kind);
             }
-            if lz.main.is_none() && successor {
+            if lz.main.is_none() && !lz.seek && successor {
                 // nothing goes on here (lost to the folder's end): the next member gets the rest
                 lz.handoff = Some(Box::new(Handoff {
                     lane: None,
@@ -807,6 +916,7 @@ impl FeedDecoder {
                     overflow: std::mem::take(&mut lz.overflow),
                     walked: BTreeMap::new(),
                     floor,
+                    seek: false,
                 }));
             }
             d.lzma2 = Some(lz);
