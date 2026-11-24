@@ -113,6 +113,24 @@ fn rar4_and_7z_volume_fixtures_through_the_live_feed() {
     }
 }
 
+/// The members of one solid RAR 4.x stream are fed by standalone decoders, each replaying its predecessors' packed
+/// bytes: the feed keeps those bytes (no releases) instead of ending with every article delivered and members not done.
+#[test]
+fn members_of_one_solid_rar4_stream_replay_their_predecessors() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (i, name) in ["ppmd_solid_rar300.rar", "solid_rar300.rar"].into_iter().enumerate() {
+        let volumes = fixture("rar4-rar300", &[name]);
+        for seed in 1..4 {
+            let mut config = config(volumes.clone(), &tmp.path().join(format!("work-{i}-{seed}")), 700);
+            config.seed = seed;
+            config.lateness = None;
+            let report = sim::run(&config).unwrap();
+            check(&report);
+            assert!(report.fed >= 2, "{report:?}");
+        }
+    }
+}
+
 /// `count` stored RAR 5.0 members over two volumes (the middle one split across them), written to `dir`. Two of
 /// them flatten to the same name, `d_x.bin`.
 fn rar5_many_members(dir: &Path, count: usize) -> Vec<PathBuf> {

@@ -429,3 +429,85 @@ fn a_rar4_hand_off_into_another_archive_is_refused() {
     assert_eq!(out.bytes, plain);
     assert_eq!(d1.stats().redecoded, 0);
 }
+
+fn solid_fixture(name: &str) -> (Vec<u8>, MemberMap, Vec<usize>) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-rar300");
+    let bytes = std::fs::read(root.join(name)).unwrap();
+    let map = MemberMap::from_memory(&[&bytes], name, None).unwrap();
+    let stream = streams(&map).into_iter().next().expect("a solid stream");
+    (bytes, map, stream)
+}
+
+fn ppmd_solid() -> (Vec<u8>, MemberMap, Vec<usize>) {
+    let (bytes, map, stream) = solid_fixture("ppmd_solid_rar300.rar");
+    assert_eq!(stream.len(), 2);
+    (bytes, map, stream)
+}
+
+/// Runs member `i` on its own over the whole archive: its status and output.
+fn run_alone(map: &MemberMap, i: usize, bytes: &[u8]) -> Option<(FeedStatus, Vec<u8>)> {
+    let mut d = FeedDecoder::new(map, i, FeedOptions::default()).ok()?;
+    let mut out = Out::new(d.size() as usize);
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, bytes).unwrap();
+    let s = d.run(&mut source, &mut out).ok()?;
+    Some((s, out.bytes))
+}
+
+/// A standalone successor decoding an earlier member again checks that member's CRC: when it fails, what the
+/// successor decodes from that window is unproven, as after a hand-off from the damaged member.
+#[test]
+fn a_replayed_earlier_member_that_fails_its_crc_makes_the_successor_unproven() {
+    let mut checked = 0;
+    for name in ["solid_simple_rar300.rar", "solid_rar300.rar", "ppmd_solid_rar300.rar"] {
+        let (bytes, map, stream) = solid_fixture(name);
+        let last = *stream.last().unwrap();
+        // the clean archive: proven
+        let (clean, _) = run_alone(&map, last, &bytes).unwrap();
+        assert!(clean.done && clean.crc_ok == Some(true) && !clean.unproven, "{clean:?}");
+        let packed = map.members[stream[0]].pieces[0].packed.clone();
+        for at in (packed.start..packed.end).step_by(1.max((packed.end - packed.start) as usize / 200)) {
+            let mut damaged = bytes.clone();
+            damaged[at as usize] ^= 0x55;
+            let Ok(map) = MemberMap::from_memory(&[&damaged], name, None) else { continue };
+            // the earlier member decodes to its size and fails its CRC
+            let Some((first, _)) = run_alone(&map, stream[0], &damaged) else { continue };
+            if !(first.done && first.crc_ok == Some(false)) {
+                continue;
+            }
+            let Some((s, _)) = run_alone(&map, last, &damaged) else { continue };
+            assert!(s.done, "{s:?}");
+            if s.crc_ok == Some(true) {
+                continue;
+            }
+            assert!(s.unproven, "{name}: damaged byte {at}: {s:?}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no damaged byte made the earlier member fail only its CRC");
+}
+
+/// An earlier member larger than the article buffer's limit still replays: the packed bytes it has consumed are
+/// released as the replay goes, so the buffer never fills.
+#[test]
+fn a_replayed_earlier_member_larger_than_the_buffer_limit_completes() {
+    let (bytes, map, stream) = ppmd_solid();
+    let (_, plain) = run_alone(&map, stream[1], &bytes).unwrap();
+    let limit = 4096;
+    assert!(map.members[stream[0]].packed_size > 2 * limit as u64);
+    let mut d = FeedDecoder::new(&map, stream[1], FeedOptions { read_chunk: 64, ..FeedOptions::default() }).unwrap();
+    let mut out = Out::new(plain.len());
+    let mut source = ArticleBuffer::new(limit);
+    let mut status = d.status().clone();
+    for (k, chunk) in bytes.chunks(512).enumerate() {
+        let at = (k * 512) as u64;
+        if source.insert(0, at, chunk).is_err() {
+            d.run(&mut source, &mut out).unwrap();
+            source.insert(0, at, chunk).expect("the replay released what it consumed");
+        }
+        status = d.run(&mut source, &mut out).unwrap();
+    }
+    let s = status;
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert_eq!(out.bytes, plain);
+}

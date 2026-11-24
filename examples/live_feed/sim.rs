@@ -925,6 +925,19 @@ pub fn run(config: &Config) -> Result<Report, String> {
     for m in &members {
         let member = &map.members[m.index];
         spans.extend(member.pieces.iter().map(|p| (p.volume, p.packed.start, p.packed.end)));
+        // a RAR 4.x solid member's standalone decoder replays the packed bytes of the members before it in its
+        // stream (back to the first without the solid flag): they are read by more than one decoder
+        if member.solid && !member.is_dir {
+            let decodes = |x: &zipfast::map::MapMember| {
+                !x.is_dir && matches!(x.method, zipfast::map::MapMethod::Compressed { .. })
+            };
+            for earlier in map.members[..m.index].iter().rev().filter(|x| decodes(x)) {
+                spans.extend(earlier.pieces.iter().map(|p| (p.volume, p.packed.start, p.packed.end)));
+                if !earlier.solid {
+                    break;
+                }
+            }
+        }
         if let Some(slot) = &member.folder {
             let folder = &map.folders[slot.index as usize];
             spans.extend(folder.packed.iter().map(|p| (p.volume, p.packed.start, p.packed.end)));

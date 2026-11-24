@@ -95,6 +95,8 @@ pub(super) struct OutSink<'a> {
     crc: &'a mut CrcRuns,
     stats: &'a mut FeedStats,
     run_written: &'a mut u64,
+    /// every byte put, written or not, goes through this hash (an earlier solid member decoded again)
+    replay: Option<&'a mut crc32fast::Hasher>,
     io: Option<io::Error>,
 }
 
@@ -103,6 +105,9 @@ impl Sink for OutSink<'_> {
         let start = self.at;
         let end = start + bytes.len() as u64;
         self.at = end;
+        if let Some(h) = self.replay.as_mut() {
+            h.update(bytes);
+        }
         let (s, e) = (start.max(self.write.start), end.min(self.write.end));
         let written = if s < e {
             let b = &bytes[(s - start) as usize..(e - start) as usize];
@@ -122,7 +127,13 @@ impl Sink for OutSink<'_> {
     }
 }
 
-impl OutSink<'_> {
+impl<'a> OutSink<'a> {
+    /// Hashes all output put through this sink, written or not.
+    pub(super) fn hashing(mut self, hasher: &'a mut crc32fast::Hasher) -> Self {
+        self.replay = Some(hasher);
+        self
+    }
+
     pub(super) fn fail(&mut self, error: crate::Error) -> FeedError {
         match self.io.take() {
             Some(error) => FeedError::Write { out: self.at, error },
@@ -594,6 +605,7 @@ impl FeedDecoder {
             crc: &mut self.crc,
             stats: &mut self.stats,
             run_written: &mut self.run_written,
+            replay: None,
             io: None,
         }
     }

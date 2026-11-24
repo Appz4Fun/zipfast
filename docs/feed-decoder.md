@@ -235,6 +235,13 @@ the decoder passed are released as it goes (memory stays bounded), so a restored
 bytes from its start again (`Next` needs). The 1.5/2.0 engines and PPMd hold up to 4 KiB of input back as lookahead,
 so their output can trail the bytes fed by that much.
 
+A solid successor that was not handed the decoder (`FeedDecoder::new`, or restored) decodes the stream's earlier
+members again first, writing nothing. It hashes each one's output and checks the CRC32 its header states: a mismatch
+makes the successor's output `unproven` (the suspect offset travels on by the window-reach rules of `next_solid`).
+The consumed packed bytes of the member being replayed are released as the replay goes, so an earlier member larger
+than the article buffer's limit still replays. Several standalone successors fed from one source read the same
+earlier bytes, so a caller must not release them (`examples/live_feed` turns releases off for such sets).
+
 ## ZIP
 
 ZIP members, single files and split sets alike (Info-ZIP `.z01` ... `.zip` sets, mapped as `MemberMap` maps them;
