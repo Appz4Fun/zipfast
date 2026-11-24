@@ -384,6 +384,27 @@ map. A member whose map records no check stays `Incomplete { missing_checks: tru
 password (RAR 5.0 encrypted members) need `DirectOptions::password` (or `PartialOpenContext::password` on reopen);
 without it verification ends in `PasswordRequired`. Hash keys are derived once per KDF salt and count for a set.
 
+**Any member the decoder handles.** The output is plaintext, so the container and method do not matter: stored
+and compressed RAR 5.0 and RAR 4.x members, plain or encrypted, sets with encrypted headers (`-hp`, the map built
+with the password), and 7z members (Copy, LZMA2, under 7zAES or not, `-mhe` or not) all keep their output this way.
+The checks are the map's member checks: RAR's file CRC32 and BLAKE2sp (keyed with the password for RAR 5.0 AES
+members that say so), the 7z member's CRC32. Verification judges the bytes the partial holds, never the decoder's
+word: `FeedStatus::crc_ok` and `Verdict` agree because they check the same output with the same checks, but only
+`poll_verify` makes a member `Ok`, and only once every byte is known. Output a compressed decoder wrote after a
+restart it found over held output (unproven until its CRC matches) is known output like any other: if the CRC fails,
+the verdict is `Bad`, never `Ok`.
+
+**Cursor.** `PartialFile::set_cursor(bytes)` (or `DirectSink::set_cursor`) keeps opaque caller bytes with a direct
+member's state, typically the decoder's `FeedSnapshot::to_bytes()` after each `run`; `PartialFile::cursor()` gives
+them back. A cursor is written as a page of its own and becomes durable with the next commit, together with the
+output written so far: the group commit at its size or interval, the next ordinary operation (`state`, `remaining`,
+`poll_verify`, ...; with no group open it commits one for the cursor alone), or the last handle's drop. So set it
+after the writes it describes, and the durable cursor never describes output the durable state lacks: the state may
+hold more (output written after the cursor and committed with it, or by a later group), which the restored decoder
+offers again and the sink skips. An unchanged cursor costs nothing; a changed one costs one page write per commit.
+States with a cursor are refused by builds without it (`StateMalformed`); other states are unchanged. A session's
+member has no cursor (`UnsupportedMethod`).
+
 **Restart.** `DirectPartials::open` with the same binding, roots and anchor store finds a member whose key the store
 holds and adopts it (`DirectOrigin::Adopted`): it reopens the output and bundle (the native identities recorded at
 birth must match), rehashes the known output and checks that the state records this output path, name, size,
@@ -391,9 +412,22 @@ checks and facts (`BindingMismatch(Member)` otherwise). `PartialFile::open` with
 The member key is the binding, the member's ordinal and a digest of what the map says about it (container, name,
 sizes, checks, method, piece positions), so another archive's member of the same name is another member: creating
 it finds the existing output and fails with `AlreadyExists`. After a crash the member holds what was committed:
-output an open group wrote is unknown again and must be written again. A decoder snapshot (`FeedSnapshot`) saved
-right after a commit (`PartialFile::state` commits the open group) never claims more than is durable; restored, the
-decoder writes everything past its frontier again, and what the partial already knows is skipped.
+output an open group wrote is unknown again and must be written again. To resume a decoder, restore it from the
+partial's cursor (`FeedDecoder::restore(&map, index, options, &FeedSnapshot::from_bytes(&cursor)?)`), or create
+it anew when there is none. The restored decoder writes everything past its frontier again (known bytes are skipped),
+repairs its lost ranges as before, and asks again (`NeedBytes`) for the packed bytes it needs that the downloader no
+longer holds. What each layer needs:
+
+| member | restored at | reads back through `read_held` | asks for again |
+|---|---|---|---|
+| stored, plain or AES (RAR, 7z Copy, 7zAES over Copy) | its frontier (under CBC, the block there) | nothing | from the frontier (one block earlier under CBC) |
+| compressed RAR 5.0 | its last block-boundary checkpoint | the dictionary's worth of output before it | from that checkpoint |
+| 7z LZMA2 | its restart point (a dictionary or state reset) | the dictionary before a state reset | from the restart point |
+| compressed RAR 4.x | the member's start (no restart point inside a member) | nothing | the member's packed bytes from its start |
+
+A restored decoder reads back only output it wrote before its cursor, which the committed state holds, so the
+partial answers `read_held` for its window. A FeedDecoder `read_earlier` (solid streams, once it exists) can be
+answered from earlier members' partials the same way.
 
 **Limits.** Every member of a `DirectPartials` shares one budget: `open_partials` and `open_files` count all its
 live handles together, as a session's members do. A live handle holds five descriptors (output, lock, bundle,
@@ -403,7 +437,13 @@ output root and state root) plus one per directory between the output root and t
 handles of members that are done and open them again when needed. The process's descriptor limit must allow as
 many. The same helper sizes a persistent session that keeps its members' handles.
 
-Tests: `tests/persistent_direct.rs` (a member whose handles are dropped mid-feed and a process aborted with a group
+Tests: `tests/persistent_direct.rs` (every container through a restart from the cursor: compressed RAR 5.0 plain
+and keyed AES, compressed RAR 4.x over five volumes, a RAR 4.x `-hp` set, RAR 4.x AES stored volumes, the three
+members of one 7z LZMA2 folder over three volumes, 7zAES behind encrypted 7z headers, each with articles lost and
+repaired late after the restart: nothing verified before its bytes are there, exact output against a straight
+extraction, `crc_ok`, `Verdict::Ok`, every byte the durable state lacked written exactly once; a process aborted with
+cursors set but uncommitted, resumed from the last committed cursor; the cursor committed alone, on drop, and read
+back after reopen; a member whose handles are dropped mid-feed and a process aborted with a group
 open, both resumed from a decoder snapshot taken at a commit, with lost articles repaired late: exact output,
 `Verdict::Ok`, nothing durable written again, the genesis and commit syncs; a 40 MB member born with the same state
 as a 100 KB one; 40 members held open with `for_members`, the defaults refusing; a wrong byte verifying `Bad`).

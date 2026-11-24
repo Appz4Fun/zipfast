@@ -265,8 +265,9 @@ fn stored_and_compressed_members_with_a_colliding_name_feed() {
     let report = sim::run(&config(vec![path], &tmp.path().join("work"), 1_000)).unwrap();
     check(&report);
     assert_eq!(report.fed, 3, "{report:?}");
+    // every fed member gets a persistent partial, the compressed one too
     if cfg!(feature = "persistent-partials") {
-        assert_eq!(report.sink, "mixed");
+        assert_eq!(report.sink, "partial");
     }
 }
 
@@ -304,4 +305,30 @@ fn needs_map_to_articles_in_priority_order() {
     let volumes = sim::volumes_in(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-volumes")).unwrap();
     let names: Vec<_> = volumes.iter().map(|p| p.file_name().unwrap().to_str().unwrap().to_owned()).collect();
     assert_eq!(names, ["multi.part1.rar", "multi.part2.rar", "multi.part3.rar"]);
+}
+
+// Catches a restart losing persistent output or a decoder not resuming from its partial's cursor: every format
+// gets persistent partials (with the feature), the run restarts part way, and the output must still be exact.
+#[test]
+fn a_restart_mid_feed_resumes_every_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sets = [
+        rar5_stored_set(&tmp.path().join("set"), 300_000, 70_000),
+        fixture("rar4-volumes", &["multi.part1.rar", "multi.part2.rar", "multi.part3.rar"]),
+        fixture("7z", &["multi_volume.7z.001", "multi_volume.7z.002"]),
+    ];
+    for (i, volumes) in sets.into_iter().enumerate() {
+        for (j, sink) in [sim::SinkKind::Auto, sim::SinkKind::File].into_iter().enumerate() {
+            let article = if i == 0 { 9_000 } else { 700 };
+            let mut config = config(volumes.clone(), &tmp.path().join(format!("work-{i}-{j}")), article);
+            config.sink = sink;
+            config.restart_at = Some(6);
+            let report = sim::run(&config).unwrap();
+            check(&report);
+            assert!(report.restart > std::time::Duration::ZERO, "{report:?}");
+            let expect =
+                if cfg!(feature = "persistent-partials") && sink == sim::SinkKind::Auto { "partial" } else { "file" };
+            assert_eq!(report.sink, expect);
+        }
+    }
 }

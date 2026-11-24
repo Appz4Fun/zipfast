@@ -388,6 +388,16 @@ impl DirectSink {
     pub fn into_file(self) -> PartialFile {
         self.file
     }
+    /// Sets the partial's cursor ([`PartialFile::set_cursor`]), typically the decoder's snapshot
+    /// (`FeedDecoder::snapshot().to_bytes()`) after a run: it is committed with the next commit, together with the
+    /// output it describes, and a restart restores the decoder from it ([`PartialFile::cursor`]).
+    pub fn set_cursor(&mut self, cursor: &[u8]) -> PartialResult<()> {
+        self.file.set_cursor(cursor)
+    }
+    /// Commits the open group (and a cursor set since the last commit) now.
+    pub fn commit(&mut self) -> PartialResult<PartialState> {
+        self.file.state()
+    }
     /// Output bytes this sink wrote to the file: those that were unknown when written. Bytes offered again over
     /// known output are not counted.
     pub fn applied_bytes(&self) -> u64 {

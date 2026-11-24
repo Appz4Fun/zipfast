@@ -419,3 +419,468 @@ fn limits_scale_with_the_member_count() {
     let error = other.open(&map, 3).err().unwrap();
     assert!(matches!(error.kind, PartialErrorKind::AlreadyExists), "{error:?}");
 }
+
+// ---- Every container the feed decoder handles: the decoder's cursor kept with the output across a restart ----
+
+fn read_volumes(dir: &str, names: &[&str]) -> Vec<Vec<u8>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(dir);
+    names.iter().map(|n| std::fs::read(root.join(n)).unwrap()).collect()
+}
+
+/// Every file a straight extraction of `volumes` writes, as bytes.
+fn straight(work: &Path, volumes: &[Vec<u8>], first: &str, password: Option<&str>) -> Vec<Vec<u8>> {
+    let set = work.join("set");
+    std::fs::create_dir_all(&set).unwrap();
+    let names: Vec<PathBuf> = volumes_named(first, volumes.len()).into_iter().map(|n| set.join(n)).collect();
+    for (path, bytes) in names.iter().zip(volumes) {
+        std::fs::write(path, bytes).unwrap();
+    }
+    let dest = work.join("straight");
+    let options = zipfast::extract::Options {
+        mode: zipfast::extract::Mode::Extract,
+        dest: dest.clone(),
+        overwrite: zipfast::extract::Overwrite::Always,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+        windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
+    };
+    zipfast::extract::run_with_password(&names[0], &options, password, |_| {}).unwrap();
+    let mut files = Vec::new();
+    let mut dirs = vec![dest];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+            } else {
+                files.push(std::fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+    files
+}
+
+/// The names a set's volumes go by: `x.rar, x.r00, ..` for an old-style first name, `x.7z.001, ..` for a split 7z,
+/// `x.part1.rar, ..` otherwise.
+fn volumes_named(first: &str, count: usize) -> Vec<String> {
+    if let Some(stem) = first.strip_suffix(".7z.001") {
+        return (1..=count).map(|i| format!("{stem}.7z.{i:03}")).collect();
+    }
+    if let Some(stem) = first.strip_suffix(".part1.rar") {
+        return (1..=count).map(|i| format!("{stem}.part{i}.rar")).collect();
+    }
+    let stem = first.strip_suffix(".rar").or_else(|| first.strip_suffix(".7z")).unwrap();
+    let ext = if first.ends_with(".7z") { "7z" } else { "rar" };
+    std::iter::once(format!("{stem}.{ext}")).chain((0..count - 1).map(|i| format!("{stem}.r{i:02}"))).collect()
+}
+
+struct Fed {
+    index: usize,
+    sink: DirectSink,
+    decoder: FeedDecoder,
+}
+
+/// Feeds every member of the set the feed decoder handles into direct partials, setting each decoder's snapshot
+/// as its partial's cursor after every run; drops everything (a restart) after `cut` of the articles; finds the
+/// partials again, restores each decoder from its partial's cursor and delivers every article (the lost ones too:
+/// late repairs). Checks: nothing verified before its bytes are all there, exact output against a straight
+/// extraction, `crc_ok`, `Verdict::Ok`, and every byte the durable state lacked written exactly once, nothing it
+/// held written again. Returns the members fed.
+fn restart_set(work: &Path, volumes: &[Vec<u8>], first: &str, password: Option<&str>, article: u64, cut: f64) -> usize {
+    let refs: Vec<&[u8]> = volumes.iter().map(|v| v.as_slice()).collect();
+    let map = MemberMap::from_memory(&refs, first, password).unwrap();
+    let fed: Vec<usize> = (0..map.members.len())
+        .filter(|&i| {
+            let m = &map.members[i];
+            !m.is_dir
+                && m.unpacked_size.is_some_and(|s| s > 0)
+                && FeedDecoder::new(&map, i, FeedOptions::new(password)).is_ok()
+        })
+        .collect();
+    assert!(!fed.is_empty());
+    let open = |work: &Path| {
+        let (output_root, state_dir, anchors) = roots(work);
+        DirectPartials::new(DirectOptions {
+            binding: ArchiveBinding { job: [3; 16], archive: [4; 32] },
+            output_root,
+            state_dir,
+            naming: PartialNaming::ArchivePath,
+            limits: PartialLimits::for_members(fed.len()),
+            progressive_limits: ProgressiveLimits::default(),
+            anchors: Arc::new(anchor_store::DurableAnchors::open(&anchors).unwrap()),
+            control: SessionControl::default(),
+            protection: protection(volumes.len()),
+            password: password.map(str::to_owned),
+        })
+        .unwrap()
+    };
+    let articles = Articles::new(volumes, article, 4, 23);
+    let upto = ((articles.list.len() as f64 * cut) as usize).max(1);
+    {
+        let parts = open(work);
+        let mut members: Vec<Fed> = fed
+            .iter()
+            .map(|&index| {
+                let member = parts.open(&map, index).unwrap();
+                assert_eq!(member.origin, DirectOrigin::Created);
+                let decoder = FeedDecoder::new(&map, index, FeedOptions::new(password)).unwrap();
+                Fed { index, sink: DirectSink::new(member.file), decoder }
+            })
+            .collect();
+        let mut buffer = ArticleBuffer::new(usize::MAX);
+        let mut source = Shared(&mut buffer);
+        for i in 0..upto {
+            if articles.lost[i] {
+                let (v, at, len) = articles.list[i];
+                source.0.mark_lost(v, at..at + len);
+            } else {
+                articles.insert(source.0, volumes, i);
+            }
+            for m in &mut members {
+                m.decoder.run(&mut source, &mut m.sink).unwrap();
+                m.sink.set_cursor(&m.decoder.snapshot().to_bytes()).unwrap();
+            }
+        }
+        // the restart: every handle dropped without finishing (an open group and the last cursor commit then)
+    }
+    let parts = open(work);
+    let reference = straight(work, volumes, first, password);
+    let mut buffer = ArticleBuffer::new(usize::MAX);
+    let mut members = Vec::new();
+    let mut unknown = Vec::new();
+    for &index in &fed {
+        let member = parts.open(&map, index).unwrap();
+        assert_eq!(member.origin, DirectOrigin::Adopted);
+        let mut file = member.file;
+        let gaps: u64 = file.remaining().unwrap().iter().map(|r| r.end - r.start).sum();
+        if gaps > 0 {
+            assert!(matches!(verify(&mut file), Verdict::Incomplete { .. }), "verified before its bytes are there");
+        }
+        unknown.push(gaps);
+        let decoder = match file.cursor().unwrap() {
+            Some(bytes) => FeedDecoder::restore(
+                &map,
+                index,
+                FeedOptions::new(password),
+                &FeedSnapshot::from_bytes(&bytes).unwrap(),
+            )
+            .unwrap(),
+            None => FeedDecoder::new(&map, index, FeedOptions::new(password)).unwrap(),
+        };
+        members.push(Fed { index, sink: DirectSink::new(file), decoder });
+    }
+    assert!(unknown.iter().sum::<u64>() > 0, "the restart came before the feed was done");
+    let mut source = Shared(&mut buffer);
+    for i in 0..articles.list.len() {
+        articles.insert(source.0, volumes, i);
+        for m in &mut members {
+            if !m.decoder.status().done {
+                m.decoder.run(&mut source, &mut m.sink).unwrap();
+                m.sink.set_cursor(&m.decoder.snapshot().to_bytes()).unwrap();
+            }
+        }
+    }
+    let mut used = vec![false; reference.len()];
+    for (m, unknown) in members.into_iter().zip(unknown) {
+        let status = m.decoder.status().clone();
+        assert!(status.done && status.lost.is_empty(), "member {}: {status:?}", m.index);
+        assert_ne!(status.crc_ok, Some(false), "member {}", m.index);
+        assert_eq!(m.sink.applied_bytes(), unknown, "member {}: each byte the durable state lacked, once", m.index);
+        let mut file = m.sink.into_file();
+        match verify(&mut file) {
+            Verdict::Ok { .. } => {}
+            Verdict::Incomplete { holes, missing_checks: true, .. } if holes.is_empty() => {}
+            other => panic!("member {}: {other:?}", m.index),
+        }
+        let out = std::fs::read(file.output_path()).unwrap();
+        let found = reference.iter().enumerate().position(|(i, r)| !used[i] && *r == out);
+        used[found.unwrap_or_else(|| panic!("member {}: output differs from the extraction", m.index))] = true;
+    }
+    fed.len()
+}
+
+/// The article buffer shared by every member's decoder, with releases ignored: members of one 7z folder read the
+/// same packed bytes.
+struct Shared<'a>(&'a mut ArticleBuffer);
+
+impl zipfast::map::PackedSource for Shared<'_> {
+    fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> zipfast::map::PackedRead {
+        self.0.read_packed(volume, offset, buf)
+    }
+}
+
+const SALT: [u8; 16] = [3; 16];
+const IV: [u8; 16] = [9; 16];
+
+/// One compressed (method 3) RAR 5.0 member holding `plain`, AES with keyed checks (password "pw") when
+/// `encrypted`, cut into volumes of at most `chunk` packed bytes.
+fn rar5_compressed(plain: &[u8], encrypted: bool, chunk: usize) -> Vec<Vec<u8>> {
+    use zipfast::rar5::testenc;
+    let mut data = testenc::tuned_stream(&testenc::lz(plain, 1 << 17, 16), 2_000);
+    let mut crc = crc32fast::hash(plain);
+    let mut extra = Vec::new();
+    let keys = encrypted.then(|| zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap());
+    if let Some((key, hash_key)) = &keys {
+        data.resize(data.len().div_ceil(16) * 16, 0);
+        data = zipfast::crypto::encrypt_cbc(key, &IV, &data).unwrap();
+        extra = vec![36, 1, 0, 2, 1];
+        extra.extend(SALT);
+        extra.extend(IV);
+        crc = zipfast::crypto::rar5_tweak_crc32(crc, hash_key);
+    }
+    let mut spec = common::FileSpec::new("c.bin", &data);
+    spec.method = 3;
+    spec.size = Some(plain.len() as u64);
+    spec.extra = extra;
+    let parts: Vec<&[u8]> = data.chunks(chunk).collect();
+    let n = parts.len();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let last = i + 1 == n;
+            let mut bytes = common::SIG.to_vec();
+            bytes.extend(common::main_block(true, if i == 0 { None } else { Some(i as u64) }));
+            let part_crc = match (&keys, last) {
+                (_, true) => crc,
+                (Some((_, hash_key)), false) => zipfast::crypto::rar5_tweak_crc32(crc32fast::hash(part), hash_key),
+                (None, false) => crc32fast::hash(part),
+            };
+            bytes.extend(common::file_block(&spec, part, part_crc, i > 0, !last));
+            bytes.extend(common::end_block(!last));
+            bytes
+        })
+        .collect()
+}
+
+fn video_like(len: usize, seed: u64) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(len + 512);
+    let mut x = seed | 1;
+    while plain.len() < len {
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            plain.push(x as u8);
+        }
+        let back = plain.len() - 1_000.min(plain.len());
+        let repeat = plain[back..back + 200.min(plain.len() - back)].to_vec();
+        plain.extend(repeat);
+    }
+    plain.truncate(len);
+    plain
+}
+
+#[test]
+fn compressed_rar5_restarts_from_its_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (i, encrypted) in [false, true].into_iter().enumerate() {
+        let volumes = rar5_compressed(&video_like(500_000, 7 + i as u64), encrypted, 90_000);
+        let password = encrypted.then_some("pw");
+        for (j, cut) in [0.3, 0.7].into_iter().enumerate() {
+            let work = tmp.path().join(format!("{i}-{j}"));
+            assert_eq!(restart_set(&work, &volumes, "set.part1.rar", password, 6_000, cut), 1);
+        }
+    }
+}
+
+#[test]
+fn compressed_and_header_encrypted_rar4_restart_from_their_cursors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sets: [(&str, &[&str], Option<&str>); 3] = [
+        (
+            "rar4-rar300",
+            &[
+                "compressed_multivol_prng_rar300.rar",
+                "compressed_multivol_prng_rar300.r00",
+                "compressed_multivol_prng_rar300.r01",
+                "compressed_multivol_prng_rar300.r02",
+                "compressed_multivol_prng_rar300.r03",
+            ],
+            None,
+        ),
+        (
+            "rar4-rar300",
+            &["header_encrypted_multivol_rar300.rar", "header_encrypted_multivol_rar300.r00"],
+            Some("password"),
+        ),
+        ("rar4-archiver", &["win-encvol.rar", "win-encvol.r00", "win-encvol.r01", "win-encvol.r02"], Some("testpw123")),
+    ];
+    for (i, (dir, names, password)) in sets.into_iter().enumerate() {
+        let volumes = read_volumes(dir, names);
+        let article = (volumes.iter().map(|v| v.len()).sum::<usize>() / 24).max(64) as u64;
+        let work = tmp.path().join(format!("{i}"));
+        assert!(restart_set(&work, &volumes, names[0], password, article, 0.5) >= 1);
+    }
+}
+
+#[test]
+fn seven_zip_lzma2_and_header_encrypted_restart_from_their_cursors() {
+    let tmp = tempfile::tempdir().unwrap();
+    // three members of one LZMA2 folder, cut into volumes
+    let whole = read_volumes("7z", &["lzma2_chunks.7z"]).remove(0);
+    let volumes: Vec<Vec<u8>> = whole.chunks(whole.len().div_ceil(3)).map(<[u8]>::to_vec).collect();
+    for (j, cut) in [0.4, 0.8].into_iter().enumerate() {
+        let fed = restart_set(&tmp.path().join(format!("lz-{j}")), &volumes, "chunks.7z.001", None, 4_000, cut);
+        assert_eq!(fed, 3);
+    }
+    // 7zAES over Copy behind encrypted headers (-mhe)
+    let volumes = read_volumes("7z", &["encrypted_headers.7z"]);
+    assert_eq!(restart_set(&tmp.path().join("mhe"), &volumes, "e.7z", Some("password"), 500, 0.5), 1);
+}
+
+/// The cursor is committed with the output it describes: set with no group open it commits on its own; it comes
+/// back after a reopen; a session-made member has none to set.
+#[test]
+fn a_cursor_commits_with_the_output_and_comes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = payload(150_000, 9);
+    let volumes = stored_set("p.bin", &data, 60_000, false);
+    let refs: Vec<&[u8]> = volumes.iter().map(|v| v.as_slice()).collect();
+    let map = MemberMap::from_memory(&refs, "set.part1.rar", None).unwrap();
+    {
+        let parts = direct(tmp.path(), volumes.len(), PartialLimits::default());
+        let mut sink = DirectSink::new(parts.open(&map, 0).unwrap().file);
+        assert_eq!(sink.file().cursor().unwrap(), None);
+        sink.write_at(0, &data[..70_000]).unwrap();
+        sink.set_cursor(b"first").unwrap();
+        sink.commit().unwrap();
+        // a cursor alone, no group open: the next ordinary operation commits it
+        sink.set_cursor(b"second").unwrap();
+        sink.file().remaining().unwrap();
+        // set but never committed by an operation: the last handle's drop commits it
+        sink.write_at(70_000, &data[70_000..80_000]).unwrap();
+        sink.set_cursor(b"third").unwrap();
+    }
+    let parts = direct(tmp.path(), volumes.len(), PartialLimits::default());
+    let member = parts.open(&map, 0).unwrap();
+    assert_eq!(member.origin, DirectOrigin::Adopted);
+    assert_eq!(member.file.cursor().unwrap().as_deref(), Some(&b"third"[..]));
+    assert_eq!(member.file.remaining().unwrap(), vec![80_000..150_000]);
+    // held output for a handover: the durable known bytes, no checks claimed verified yet
+    let held = member.file.held_output().unwrap();
+    assert_eq!(held.good, vec![0..80_000]);
+    assert!(!held.finished);
+}
+
+/// A process aborted mid-feed with cursors set but not committed: the restart restores each decoder from the
+/// cursor of the last commit, which never describes more than that commit's output.
+#[test]
+fn a_compressed_member_survives_an_abort_from_its_last_committed_cursor() {
+    const NAME: &str = "a_compressed_member_survives_an_abort_from_its_last_committed_cursor";
+    let volumes = rar5_compressed(&video_like(600_000, 21), true, 120_000);
+    let refs: Vec<&[u8]> = volumes.iter().map(|v| v.as_slice()).collect();
+    let map = MemberMap::from_memory(&refs, "set.part1.rar", Some("pw")).unwrap();
+    let articles = Articles::new(&volumes, 5_000, 1_000_000, 29);
+    let options = || FeedOptions::new(Some("pw"));
+    let parts = |work: &Path| {
+        let (output_root, state_dir, anchors) = roots(work);
+        DirectPartials::new(DirectOptions {
+            binding: ArchiveBinding { job: [5; 16], archive: [6; 32] },
+            output_root,
+            state_dir,
+            naming: PartialNaming::ArchivePath,
+            limits: PartialLimits::default(),
+            progressive_limits: ProgressiveLimits::default(),
+            anchors: Arc::new(anchor_store::DurableAnchors::open(&anchors).unwrap()),
+            control: SessionControl::default(),
+            protection: protection(volumes.len()),
+            password: Some("pw".into()),
+        })
+        .unwrap()
+    };
+    if let Some(work) = std::env::var_os(CHILD) {
+        let work = PathBuf::from(work);
+        let parts = parts(&work);
+        let mut sink = DirectSink::new(parts.open(&map, 0).unwrap().file);
+        let mut decoder = FeedDecoder::new(&map, 0, options()).unwrap();
+        let mut buffer = ArticleBuffer::new(usize::MAX);
+        let third = articles.list.len() / 3;
+        for i in 0..2 * third {
+            articles.insert(&mut buffer, &volumes, i);
+            decoder.run(&mut buffer, &mut sink).unwrap();
+            sink.set_cursor(&decoder.snapshot().to_bytes()).unwrap();
+            if i + 1 == third {
+                sink.commit().unwrap();
+            }
+        }
+        std::process::abort();
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, tmp.path())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "the child aborts");
+    let parts = parts(tmp.path());
+    let member = parts.open(&map, 0).unwrap();
+    assert_eq!(member.origin, DirectOrigin::Adopted);
+    let mut sink = DirectSink::new(member.file);
+    let unknown: u64 = sink.file().remaining().unwrap().iter().map(|r| r.end - r.start).sum();
+    let size = map.members[0].unpacked_size.unwrap();
+    assert!(unknown > 0 && unknown < size, "{unknown} of {size}");
+    let cursor = FeedSnapshot::from_bytes(&sink.file().cursor().unwrap().unwrap()).unwrap();
+    // the committed cursor's frontier is within the committed output
+    let mut decoder = FeedDecoder::restore(&map, 0, options(), &cursor).unwrap();
+    assert!(decoder.status().frontier <= size - unknown, "{:?}", decoder.status());
+    let mut buffer = ArticleBuffer::new(usize::MAX);
+    for i in 0..articles.list.len() {
+        articles.insert(&mut buffer, &volumes, i);
+        if !decoder.run(&mut buffer, &mut sink).unwrap().done {
+            continue;
+        }
+        break;
+    }
+    assert_eq!(decoder.status().crc_ok, Some(true));
+    assert_eq!(sink.applied_bytes(), unknown);
+    let mut file = sink.into_file();
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+}
+
+/// A group commit whose anchor CAS lands but reports an error, with a cursor pending: the next operation resolves
+/// the uncertain commit from the store instead of opening a cursor-only group on top of it.
+#[test]
+fn an_uncertain_commit_with_a_cursor_pending_is_reconciled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = payload(90_000, 13);
+    let volumes = stored_set("u.bin", &data, 40_000, false);
+    let refs: Vec<&[u8]> = volumes.iter().map(|v| v.as_slice()).collect();
+    let map = MemberMap::from_memory(&refs, "set.part1.rar", None).unwrap();
+    let (output_root, state_dir, anchor_dir) = roots(tmp.path());
+    let anchors = Arc::new(anchor_store::DurableAnchors::open(&anchor_dir).unwrap());
+    let parts = DirectPartials::new(DirectOptions {
+        binding: ArchiveBinding { job: [2; 16], archive: [2; 32] },
+        output_root,
+        state_dir,
+        naming: PartialNaming::ArchivePath,
+        limits: PartialLimits::default(),
+        progressive_limits: ProgressiveLimits::default(),
+        anchors: anchors.clone(),
+        control: SessionControl::default(),
+        protection: protection(volumes.len()),
+        password: None,
+    })
+    .unwrap();
+    let mut sink = DirectSink::new(parts.open(&map, 0).unwrap().file);
+    sink.write_at(0, &data[..50_000]).unwrap();
+    sink.set_cursor(b"one").unwrap();
+    anchors.fail_after_rename(1);
+    let error = sink.commit().unwrap_err();
+    assert!(error.committed.is_some(), "{error:?}");
+    // the commit landed in the store; the next operation reconciles with it and goes on
+    assert_eq!(sink.file().remaining().unwrap(), vec![50_000..90_000]);
+    assert_eq!(sink.file().cursor().unwrap().as_deref(), Some(&b"one"[..]));
+    sink.write_at(50_000, &data[50_000..]).unwrap();
+    sink.set_cursor(b"two").unwrap();
+    let mut file = sink.into_file();
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    assert_eq!(file.cursor().unwrap().as_deref(), Some(&b"two"[..]));
+}

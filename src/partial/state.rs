@@ -39,6 +39,9 @@ pub(crate) enum PageKind {
     Geometry = 1,
     Validity = 2,
     HeaderWitnesses = 3,
+    /// A direct member's decoder cursor ([`super::PartialFile::set_cursor`]): opaque caller bytes committed with the
+    /// output they describe. Only written when a cursor is set, so other states are unchanged.
+    Cursor = 4,
 }
 #[derive(Clone)]
 pub(crate) struct PageRef {
@@ -124,6 +127,8 @@ pub(super) struct Snapshot {
     pub crypt: Option<crate::crypto::Rar5CryptParams>,
     /// Ciphertext blocks next to holes of an encrypted member, sorted by offset.
     pub cipher: Vec<CipherBlock>,
+    /// A direct member's cursor, as last set (committed with the next commit) or as the loaded state holds it.
+    pub cursor: Option<Arc<[u8]>>,
 }
 pub(crate) struct MutationIntent {
     pub transaction: u64,
@@ -518,6 +523,7 @@ pub(super) fn decode_record(
             1 => PageKind::Geometry,
             2 => PageKind::Validity,
             3 => PageKind::HeaderWitnesses,
+            4 => PageKind::Cursor,
             _ => return Err(malformed()),
         };
         let digest = d.take(32)?.try_into().unwrap();
@@ -742,11 +748,13 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
     } else if snapshot.evidence.format == crate::rar5::RarFormat::Rar4 {
         headers.u8(FORMAT_RAR4)?;
     }
+    let cursor: &[u8] = snapshot.cursor.as_deref().unwrap_or(&[]);
     let total = geometry
         .bytes
         .len()
         .checked_add(validity.bytes.len())
         .and_then(|n| n.checked_add(headers.bytes.len()))
+        .and_then(|n| n.checked_add(cursor.len()))
         .ok_or_else(malformed)?;
     budget.limits.check(PartialResource::LedgerBytes, total as u64)?;
     let lease = budget.metadata_lease(total as u64)?;
@@ -769,6 +777,16 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         if bytes.is_empty() {
             budget.limits.check(PartialResource::StatePages, (out.len() + 1) as u64)?;
             out.push((kind, page_bytes(kind, &bytes)?));
+        }
+    }
+    if snapshot.cursor.is_some() {
+        for chunk in cursor.chunks(PAGE_MAX - 15) {
+            budget.limits.check(PartialResource::StatePages, (out.len() + 1) as u64)?;
+            out.push((PageKind::Cursor, page_bytes(PageKind::Cursor, chunk)?));
+        }
+        if cursor.is_empty() {
+            budget.limits.check(PartialResource::StatePages, (out.len() + 1) as u64)?;
+            out.push((PageKind::Cursor, page_bytes(PageKind::Cursor, cursor)?));
         }
     }
     Ok((out, lease))
@@ -816,7 +834,8 @@ pub(super) fn decode_pages(
     budget: &PartialBudget,
     reusable: &[KnownLeaf],
 ) -> PartialResult<Snapshot> {
-    let mut buffers: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut buffers: [Vec<u8>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut has_cursor = false;
     let mut total = 0usize;
     let mut last = 0;
     for (kind, bytes) in pages {
@@ -825,6 +844,7 @@ pub(super) fn decode_pages(
             return Err(malformed());
         }
         last = index;
+        has_cursor |= kind == PageKind::Cursor;
         let b = page_payload(kind, &bytes)?;
         total = total.checked_add(b.len()).ok_or_else(malformed)?;
         budget.limits.check(PartialResource::LedgerBytes, total as u64)?;
@@ -1026,7 +1046,11 @@ pub(super) fn decode_pages(
     }
     d.end()?;
     let evidence = InitialEvidence { format, metadata: head.metadata, parts, admissions, headers, direct };
-    let mut snapshot = Snapshot { head, name, evidence, known, holes, crypt: None, cipher };
+    if has_cursor && evidence.direct.is_none() {
+        return Err(malformed());
+    }
+    let cursor = has_cursor.then(|| Arc::from(std::mem::take(&mut buffers[3]).into_boxed_slice()));
+    let mut snapshot = Snapshot { head, name, evidence, known, holes, crypt: None, cipher, cursor };
     snapshot.crypt = validate_evidence(&snapshot.name, snapshot.head.size, &snapshot.evidence, budget)?;
     if !snapshot.cipher.is_empty() && snapshot.crypt.is_none() {
         return Err(malformed());
