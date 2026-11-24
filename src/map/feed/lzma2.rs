@@ -328,7 +328,18 @@ impl Lz {
         let mut out = Vec::new();
         let u64s = |out: &mut Vec<u8>, v: &[u64]| v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes()));
         match &self.main {
-            // output handed over and not written yet: a restore finds the member's start again
+            // output handed over and not written yet: a restore goes on from the handed-over restart point (the
+            // packed bytes from it on are kept for this member), decoding that output again
+            Some(l) if !self.seek && !self.pending.is_empty() && l.cp.is_some() => {
+                let cp = l.cp.expect("checked");
+                out.push(2);
+                u64s(&mut out, &[cp.packed, cp.out]);
+                out.push(0);
+                out.push(cp.props.unwrap_or(0xFF));
+                put_opt_cp(&mut out, Some(cp));
+                out.push(1);
+            }
+            // otherwise a restore finds the member's start again
             _ if self.seek || !self.pending.is_empty() => out.push(1),
             None => out.push(0),
             Some(l) => {
@@ -1379,6 +1390,9 @@ impl FeedDecoder {
                                 let from = c.unpacked_offset - dict.len() as u64;
                                 if from < lz.ss || !self.lz_written(from - lz.ss..c.unpacked_offset - lz.ss) {
                                     self.unproven = true;
+                                    // the dictionary holds that output until it is pushed out of reach, whatever
+                                    // this member's CRC says (a successor inherits it)
+                                    self.seeded = self.seeded.max(Some(c.unpacked_offset));
                                 }
                                 lane.live = Some(Live::seeded(lz.dec_prop, &dict, &c, props, out_buf)?);
                                 lane.cp = Some(Cp {

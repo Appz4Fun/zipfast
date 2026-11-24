@@ -900,3 +900,69 @@ fn a_member_skipped_whole_by_a_hole_snapshots_and_hands_over() {
         assert_eq!(outs[k].written, sizes[k], "member {k}: each byte written once");
     }
 }
+
+/// A member snapshotted after it was handed over and before its first run, in a block after the folder's first,
+/// with the bytes the decoders passed released: restored, it goes on from the handed-over restart point, whose
+/// packed bytes are still held, and needs nothing again.
+#[test]
+fn a_successor_snapshotted_before_its_first_run_restores_at_the_handed_over_point() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("a.bin", mixed(500_000, 41)), ("b.bin", mixed(300_000, 42))];
+    let archive = seven_zip(&files, false, 350_000);
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    let starts = vec![0, 500_000, 800_000];
+    let mut outs: Vec<Out> = files.iter().map(|(_, b)| Out::new(b.len(), None)).collect();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut d0 = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+    let s = d0.run(&mut source, &mut FolderView { outs: &mut outs, i: 0, starts: &starts }).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    let held = source.held();
+    assert!(held < archive.len(), "the bytes member 0 passed were released");
+    let d1 = d0.next_solid(&map, 1, FolderRun::options()).unwrap();
+    let snap = FeedSnapshot::from_bytes(&d1.snapshot().to_bytes()).unwrap();
+    let mut d1 = FeedDecoder::restore(&map, 1, FolderRun::options(), &snap).unwrap();
+    let s = d1.run(&mut source, &mut FolderView { outs: &mut outs, i: 1, starts: &starts }).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "restored at the handed-over point: {s:?}");
+    assert!(outs[1].bytes == files[1].1);
+    assert_eq!(outs[1].written, 300_000);
+}
+
+/// A member whose main decode restarted with a dictionary from held output hands its window on as unproven, even
+/// once its hole is repaired and its own CRC matches: the member after it starts unproven.
+#[test]
+fn a_seeded_lzma2_dictionary_stays_unproven_past_the_members_own_crc() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("a.bin", mixed(700_000, 43)), ("b.bin", mixed(200_000, 44))];
+    let sizes = [700_000u64, 200_000];
+    let plain: Vec<u8> = files.iter().flat_map(|(_, b)| b.clone()).collect();
+    let lz = lzma2(&plain, plain.len());
+    let walked = chunks(&lz);
+    // 8 bytes lost in the LZMA chunk holding output 180,000 (text, before a stored run and a state reset after it)
+    let target = 180_000;
+    let (p, o) = walked.iter().find(|(_, o)| o.contains(&target)).unwrap();
+    let hole = 32 + p.start + (target - o.start) * (p.end - p.start) / (o.end - o.start);
+    let archive = seven_zip(&files, false, plain.len());
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    let starts = vec![0, sizes[0], sizes[0] + sizes[1]];
+    let mut outs: Vec<Out> = files.iter().map(|(_, b)| Out::new(b.len(), Some(b.clone()))).collect();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    // all but the hole and member 0's last bytes
+    let tail = archive.len() - 200_000;
+    source.insert(0, 0, &archive[..hole as usize]).unwrap();
+    source.insert(0, hole + 8, &archive[hole as usize + 8..tail]).unwrap();
+    source.mark_lost(0, hole..hole + 8);
+    let mut d0 = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+    let s = d0.run(&mut source, &mut FolderView { outs: &mut outs, i: 0, starts: &starts }).unwrap();
+    assert!(d0.stats().holes > 0 && !s.lost.is_empty(), "{s:?}");
+    assert!(s.unproven, "a dictionary from held output: {s:?}");
+    // the hole's bytes, then the rest: member 0 done, its CRC matched
+    source.insert(0, hole, &archive[hole as usize..hole as usize + 8]).unwrap();
+    d0.run(&mut source, &mut FolderView { outs: &mut outs, i: 0, starts: &starts }).unwrap();
+    source.insert(0, 0, &archive).unwrap();
+    let s = d0.run(&mut source, &mut FolderView { outs: &mut outs, i: 0, starts: &starts }).unwrap();
+    assert!(s.done && s.crc_ok == Some(true) && !s.unproven, "{s:?}");
+    let mut d1 = d0.next_solid(&map, 1, FolderRun::options()).unwrap();
+    assert!(d1.status().unproven, "member 1 starts from a dictionary seeded from held output");
+    let s = d1.run(&mut source, &mut FolderView { outs: &mut outs, i: 1, starts: &starts }).unwrap();
+    assert!(s.done && s.crc_ok == Some(true) && !s.unproven, "{s:?}");
+    assert!(outs[1].bytes == files[1].1);
+}

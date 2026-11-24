@@ -292,10 +292,12 @@ again, not written). Lost output can run on through several members; a member a 
 hands the restart on to the next. The packed bytes the members share are released
 in turn: a member never releases what the members after it start from, a successor never what the members before it
 may still read. A dictionary taken from output the decoder did not write (held output, an earlier member's) leaves
-the member `unproven` until its CRC matches. `FeedDecoder::new` on a later member still starts at the last dictionary
+the member `unproven` until its CRC matches, and its successors while that output is within the dictionary's reach
+(as for RAR 5.0). `FeedDecoder::new` on a later member still starts at the last dictionary
 reset before it (decoding the folder output in between again). A member's snapshot taken after its main decode
 finished and before the hand-off keeps what it is to hand over: the restart point to go on from (the output past its
-end is decoded again from there) and the lost output past its end with its repairs. The next member is the folder's
+end is decoded again from there) and the lost output past its end with its repairs; a successor snapshotted before
+its first run restores at that restart point too. The next member is the folder's
 next member in the map, also a zero-length one at the folder's end; a zero-length member with a member after it
 (at the folder's start, say) runs its main decode to its own start and hands over from there (under 7zAES with
 its key). The next member is set up (keys, limits) before the state leaves the member before it, so a hand-off that
