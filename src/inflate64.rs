@@ -239,6 +239,8 @@ enum Stop {
     Input,
     /// The final block has ended.
     End,
+    /// A block that is not the last has ended (only with block stops on).
+    Block,
 }
 
 /// A streaming raw Deflate64 (or Deflate) decoder that works on caller slices; see [`Inflater::step`].
@@ -256,6 +258,12 @@ pub struct Inflater {
     last: bool,
     failed: Option<Error>,
     variant: Variant,
+    /// Return from a step at every block boundary ([`Inflater::set_block_stops`]).
+    block_stops: bool,
+    /// Blocks ended so far.
+    blocks: u64,
+    /// A block stop is pending: the step ends once the block's output is handed out.
+    stopped: bool,
     len_base: [u16; 29],
     len_extra: [u8; 29],
     /// Distance codes this variant has.
@@ -289,6 +297,9 @@ impl Inflater {
             last: false,
             failed: None,
             variant,
+            block_stops: false,
+            blocks: 0,
+            stopped: false,
             len_base,
             len_extra,
             dist_codes: if variant == Variant::Deflate64 { 32 } else { 30 },
@@ -309,6 +320,41 @@ impl Inflater {
         self.variant
     }
 
+    /// A decoder resuming a stream at a block boundary: `history` is the output just before it (at least the
+    /// variant's window, or all of it when `total`, the output so far, is shorter).
+    pub(crate) fn resume(variant: Variant, history: &[u8], total: u64) -> Box<Self> {
+        let mut d = Self::new(variant);
+        let len = history.len().min(HIST);
+        debug_assert!(len as u64 <= total);
+        d.window[..len].copy_from_slice(&history[history.len() - len..]);
+        (d.pos, d.flushed, d.total) = (len, len, total);
+        d
+    }
+
+    /// Before the first step of a resumed decoder whose boundary falls inside a byte: the bits of `byte` after its
+    /// first `used` (1 to 7). Input is then fed from the next byte.
+    pub(crate) fn preload(&mut self, byte: u8, used: u32) {
+        debug_assert!(self.count == 0 && (1..8).contains(&used));
+        self.bits = u64::from(byte >> used);
+        self.count = 8 - used;
+    }
+
+    /// With `on`, a step returns at every block boundary, so the caller can note where blocks start.
+    pub(crate) fn set_block_stops(&mut self, on: bool) {
+        self.block_stops = on;
+    }
+
+    /// Blocks ended so far.
+    pub(crate) fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    /// At a block boundary with every decoded byte handed out: the input bits read past it and not used (the
+    /// boundary lies that many bits before the end of the input consumed so far). None elsewhere.
+    pub(crate) fn boundary(&self) -> Option<u32> {
+        (self.state == State::Header && self.flushed == self.pos && self.failed.is_none()).then_some(self.count)
+    }
+
     /// Decodes from `input` into `output`. Input the step does not report consumed must be offered again, followed
     /// by more. A step that consumes and produces nothing without being done needs more input than it was given: at
     /// the end of the input that means the stream is truncated. After an error every later step returns it again.
@@ -324,6 +370,11 @@ impl Inflater {
             output[produced..produced + n].copy_from_slice(&self.window[self.flushed..self.flushed + n]);
             produced += n;
             self.flushed += n;
+            if self.stopped && self.flushed == self.pos {
+                // at a block boundary with its output handed out: the step ends here
+                self.stopped = false;
+                break;
+            }
             if self.flushed < self.pos || self.state == State::Done || starved {
                 break;
             }
@@ -333,6 +384,7 @@ impl Inflater {
             }
             match self.run(input, &mut at) {
                 Ok(Stop::Room | Stop::End) => {}
+                Ok(Stop::Block) => self.stopped = true,
                 Ok(Stop::Input) => starved = true,
                 Err(error) => {
                     self.failed = Some(error);
@@ -446,6 +498,9 @@ impl Inflater {
                         left -= n as u32;
                     }
                     self.state = self.next_block();
+                    if let Some(stop) = self.block_ended() {
+                        return Ok(stop);
+                    }
                 }
                 State::Counts => {
                     self.refill(input, at);
@@ -547,6 +602,12 @@ impl Inflater {
         if self.last { State::Done } else { State::Header }
     }
 
+    /// Counts a block that just ended; with block stops on, a boundary before another block stops the run.
+    fn block_ended(&mut self) -> Option<Stop> {
+        self.blocks += 1;
+        (self.block_stops && self.state == State::Header).then_some(Stop::Block)
+    }
+
     /// The fixed codes of block type 1.
     fn fixed(&mut self) {
         let mut lens = [8u8; 288];
@@ -587,7 +648,7 @@ impl Inflater {
             if symbol == 256 {
                 self.drop_bits(n);
                 self.state = self.next_block();
-                return Ok(None);
+                return Ok(self.block_ended());
             }
             let index = symbol - 257;
             if index >= 29 {

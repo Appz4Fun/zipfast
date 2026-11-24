@@ -332,3 +332,86 @@ fn a_restart_mid_feed_resumes_every_member() {
         }
     }
 }
+
+/// A ZIP holding a Deflate member, a WinZip AES Deflate member, a ZipCrypto Deflate member and a ZipCrypto stored
+/// one (password "pw"), written forward (data descriptors: sizes only in the central directory).
+fn zip_mixed() -> Vec<u8> {
+    use std::io::Cursor;
+    use zipfast::zip::write::*;
+    let text: Vec<u8> = (0..400_000u32).flat_map(|i| format!("{} line {}\n", i % 977, i / 3).into_bytes()).collect();
+    let mut w = ZipStreamWriter::new(Vec::new(), WriterOptions::default()).unwrap();
+    for (i, name) in ["plain.txt", "aes.txt", "crypt.txt", "stored.txt"].into_iter().enumerate() {
+        let options = EntryOptions {
+            name: EntryName::Utf8(name),
+            method: if i == 3 { Method::Stored } else { Method::Deflate(DeflateLevel::new(6).unwrap()) },
+            modified: DosDateTime::default(),
+            extended_mtime: None,
+            permissions: Permissions::new(0o644).unwrap(),
+            comment: b"",
+        };
+        let plain = &text[i * 1_000..text.len() - i * 50_000];
+        let len = InputLength::Exact(plain.len() as u64);
+        let mut input = Cursor::new(plain);
+        match i {
+            0 => drop(w.add_file(options, &mut input, len).unwrap()),
+            1 => {
+                let request = WinZipAesRequest::new("pw", AesStrength::Aes256, AesVariant::Ae1).unwrap();
+                w.add_winzip_aes_file(options, &mut input, len, request, |s| {
+                    s.fill(5);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            _ => drop(
+                w.add_zipcrypto_file(options, &mut input, len, "pw", |r| {
+                    r.fill(9);
+                    Ok(())
+                })
+                .unwrap(),
+            ),
+        }
+    }
+    w.finish().unwrap().sink
+}
+
+#[test]
+fn zip_sets_through_the_live_feed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let zip = zip_mixed();
+    let one = tmp.path().join("one");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::write(one.join("mixed.zip"), &zip).unwrap();
+    // the same ZIP as a byte split of 300,000-byte pieces
+    let split = tmp.path().join("split");
+    std::fs::create_dir_all(&split).unwrap();
+    for (i, piece) in zip.chunks(300_000).enumerate() {
+        std::fs::write(split.join(format!("mixed.zip.{:03}", i + 1)), piece).unwrap();
+    }
+    let sets = [
+        (sim::volumes_in(&one).unwrap(), Some("pw")),
+        (sim::volumes_in(&split).unwrap(), Some("pw")),
+        (fixture("zip-split", &["deflated.z01", "deflated.zip"]), None),
+        (fixture("zip-split", &["crypt.z01", "crypt.zip"]), Some("password")),
+    ];
+    assert!(sets[1].0.len() > 2 && sets[1].0[0].ends_with("mixed.zip.001"));
+    for (i, (volumes, password)) in sets.into_iter().enumerate() {
+        for seed in 1..3 {
+            let mut config = config(volumes.clone(), &tmp.path().join(format!("work-{i}-{seed}")), 9_000);
+            config.seed = seed;
+            config.password = password.map(str::to_owned);
+            let report = sim::run(&config).unwrap();
+            check(&report);
+            assert_eq!(report.format, "zip");
+            assert_eq!(report.fed, report.members, "{report:?}");
+            // Deflate and ZipCrypto wait at holes; nothing is decoded twice without a restart
+            assert_eq!(report.redecoded, 0, "{report:?}");
+        }
+        // a restart part way: Deflate members restore at a block boundary (their window read back from the partial),
+        // ZipCrypto members read their packed bytes before it again
+        let mut config = config(volumes.clone(), &tmp.path().join(format!("work-{i}-restart")), 9_000);
+        config.password = password.map(str::to_owned);
+        config.restart_at = Some(if i < 2 { 600 } else { 5 });
+        let report = sim::run(&config).unwrap();
+        check(&report);
+    }
+}

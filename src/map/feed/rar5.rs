@@ -438,6 +438,8 @@ impl FeedDecoder {
             })),
             lzma2: None,
             rar4: None,
+            zip: None,
+            mac: None,
         };
         // An empty member of a solid stream still has its blocks decoded: they may set the tables the next member's
         // first block goes on with. One without packed bytes passes the stream on as it got it.
