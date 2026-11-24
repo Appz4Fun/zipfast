@@ -531,6 +531,20 @@ pub(in crate::zip) fn name_bytes<'a>(name: EntryName<'a>) -> &'a [u8] {
     }
 }
 
+/// Validate a replacement member name with the rules for new entries.
+/// Returns the component count.
+pub(in crate::zip) fn validate_rename_name(name: EntryName<'_>, directory: bool) -> Result<usize> {
+    let options = EntryOptions {
+        name,
+        method: Method::Stored,
+        modified: Default::default(),
+        extended_mtime: None,
+        permissions: crate::zip::write::Permissions::new(0o644).expect("ordinary permission bits"),
+        comment: b"",
+    };
+    validate_name(options, directory)
+}
+
 fn validate_name(metadata: EntryOptions<'_>, directory: bool) -> Result<usize> {
     let name = name_bytes(metadata.name);
     if name.is_empty() || name.len() > MAX_FIELD || metadata.comment.len() > MAX_FIELD {

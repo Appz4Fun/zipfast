@@ -245,7 +245,7 @@ impl RecoveryPlan {
                 if matches!(source.actions[ordinal], Action::Keep) {
                     let entry = source.metadata.view(ordinal);
                     feasibility.preserved(
-                        raw_entry(&source.metadata, *member, ordinal),
+                        raw_entry(&source.metadata, *member, ordinal, None),
                         entry.raw_unicode_path().map_or(0, |name| name.len() as u64),
                     )?;
                     packed = add(packed, entry.packed_size())?;
@@ -253,7 +253,10 @@ impl RecoveryPlan {
             }
             feasibility.finish(survivors, source.attempts.get(), packed)?;
         }
-        Ok(Prepared { output: preflight::Prepared { prefix, members, outcomes, written }, repairs })
+        Ok(Prepared {
+            output: preflight::Prepared { prefix, members, outcomes, written, renamed: Vec::new() },
+            repairs,
+        })
     }
 
     fn publish(mut self, mut prepared: Prepared) -> std::result::Result<RecoveryOutcome, RewriteFailure> {
@@ -373,6 +376,7 @@ impl RecoveryPlan {
             actions: &source.actions,
             appends: &[],
             entries: &prepared.output.written,
+            renamed: &[],
             prefix: prepared.output.prefix,
             summary,
             repairs: Some(&prepared.repairs),
