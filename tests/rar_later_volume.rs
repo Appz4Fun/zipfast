@@ -248,3 +248,44 @@ fn rar5_volume_starting_with_a_new_member_does_not_restart() {
     assert_eq!(seen, [ok("z.bin")]);
     assert_eq!(volumes, 1);
 }
+
+/// Y5: a set numbered without padding (part1 .. part10) restarts from part10, whose predecessor is part9.
+#[test]
+fn rar5_unpadded_set_restarts_from_part10() {
+    let data: Vec<u8> = (0..3000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let spec = FileSpec::new("a.bin", &data);
+    let dir = tempfile::tempdir().unwrap();
+    let vols = volumes(&spec, 300);
+    assert_eq!(vols.len(), 10);
+    for (i, volume) in vols.iter().enumerate() {
+        fs::write(dir.path().join(format!("set.part{}.rar", i + 1)), volume).unwrap();
+    }
+    for mode in [Mode::Extract, Mode::Test] {
+        let (tree, seen, volumes) = run(dir.path(), "set.part10.rar", mode);
+        if mode == Mode::Extract {
+            assert_eq!(tree, want(&[("a.bin", 3000)]));
+        }
+        assert_eq!(seen, [ok("a.bin")]);
+        assert_eq!(volumes, 10);
+    }
+}
+
+/// Y4: a selection by listing position means the positions the listing of the volume given shows.
+#[test]
+fn a_selection_by_ordinal_from_a_later_volume_follows_that_volumes_listing() {
+    use zipfast::extract::MemberFilter;
+    let set = stage("rar4-volumes", &["multi.part1.rar", "multi.part2.rar", "multi.part3.rar"]);
+    // part2 lists file3.txt alone (file2.txt continues from part1), so its ordinal 0 is file3.txt
+    for mode in [Mode::Extract, Mode::Test] {
+        let out = tempfile::tempdir().unwrap();
+        let mut opts = options(out.path(), mode);
+        opts.select = Some(MemberFilter::new(|m| m.ordinal == 0));
+        let mut seen = Vec::new();
+        run_rar_with_outcomes(&set.path().join("multi.part2.rar"), &opts, None, |o| seen.push(o.entry.name.clone()))
+            .unwrap();
+        assert_eq!(seen, ["file3.txt"], "{mode:?}");
+        if mode == Mode::Extract {
+            assert_eq!(sizes(out.path()), want(&[("file3.txt", 18)]));
+        }
+    }
+}

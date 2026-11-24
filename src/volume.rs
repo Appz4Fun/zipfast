@@ -75,8 +75,18 @@ pub fn previous_volume(path: &Path) -> Option<PathBuf> {
         if n <= 1 {
             return None;
         }
-        let digits = format!("{:0width$}", n - 1, width = suffix.len());
-        format!("{}{}{}", &name[..digits_at], digits, &name[stem.len()..])
+        // The width the set was named with, unless that name is absent and a narrower one is there: a set numbered
+        // without padding (`part9`, `part10`) grows its width where `next_volume` does, so `part10`'s predecessor
+        // is `part9`, not `part09`.
+        let name_at =
+            |width: usize| format!("{}{:0width$}{}", &name[..digits_at], n - 1, &name[stem.len()..], width = width);
+        let narrowest = (n - 1).to_string().len();
+        let padded = name_at(suffix.len());
+        (narrowest..suffix.len())
+            .rev()
+            .map(name_at)
+            .find(|candidate| !path.with_file_name(&padded).exists() && path.with_file_name(candidate).exists())
+            .unwrap_or(padded)
     } else {
         let (base, ext) = name.rsplit_once('.')?;
         let mut chars = ext.chars();
@@ -149,6 +159,22 @@ mod tests {
         assert_eq!(prev("a.r05").as_deref(), Some("a.r04"));
         assert_eq!(prev("a.s00").as_deref(), Some("a.r99"));
         assert_eq!(prev("a.txt"), None);
+    }
+
+    /// Y5: an unpadded set's predecessor of `part10` is `part9`, found by the file that is there.
+    #[test]
+    fn previous_of_an_unpadded_set_takes_the_narrower_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name);
+        std::fs::write(at("s.part9.rar"), b"").unwrap();
+        assert_eq!(previous_volume(&at("s.part10.rar")), Some(at("s.part9.rar")));
+        // the padded name wins when it exists
+        std::fs::write(at("s.part09.rar"), b"").unwrap();
+        assert_eq!(previous_volume(&at("s.part10.rar")), Some(at("s.part09.rar")));
+        // and with neither there, the set's own width is kept
+        assert_eq!(previous_volume(&at("t.part10.rar")), Some(at("t.part09.rar")));
+        std::fs::write(at("u.part99.rar"), b"").unwrap();
+        assert_eq!(previous_volume(&at("u.part100.rar")), Some(at("u.part99.rar")));
     }
 
     #[test]
