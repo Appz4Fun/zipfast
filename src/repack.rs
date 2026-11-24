@@ -20,9 +20,9 @@
 //!
 //! * **ar** is written as GNU `ar D` writes it: every member's time is [`RepackOptions::mtime`] (0 by default),
 //!   its owner and group 0 and its mode `644`. Members are sorted by name, except that a `.deb`'s leading
-//!   `debian-binary` stays first, as dpkg requires. A symbol table (GNU `/` or `/SYM64/`, BSD `__.SYMDEF*`) stays
-//!   first and its member offsets are rewritten for the new order. The input's naming style (plain, GNU, BSD) is
-//!   kept.
+//!   `debian-binary` stays first, as dpkg requires. A symbol table (GNU `/` or `/SYM64/`, BSD `__.SYMDEF`,
+//!   `__.SYMDEF SORTED`, `__.SYMDEF_64` or `__.SYMDEF_64 SORTED`) stays first and its member offsets are rewritten
+//!   for the new order. The input's naming style (plain, GNU, BSD) is kept.
 //! * **tar** (plain, or compressed in any way the tar reader reads, cpio included) is written as
 //!   `tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@N --format=posix` would, then gzipped: POSIX
 //!   ustar headers with pax records only where a name, link or size does not fit, sorted by the name's bytes,
@@ -133,15 +133,20 @@ fn is_ar(path: &Path) -> Result<bool> {
 /// Opens an input archive without following a symlink at its path, refusing anything but a regular file (a FIFO
 /// would hang, a device would never end).
 fn open_input(path: &Path) -> Result<File> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+    let kind = std::fs::symlink_metadata(path)?.file_type();
+    if kind.is_symlink() {
         return Err(Error::Unsupported(format!("{} is a symlink, which a repack does not follow", path.display())));
+    }
+    if !kind.is_file() {
+        return Err(Error::Unsupported(format!("{} is not a regular file", path.display())));
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // a FIFO swapped in after the check above must not block the open: the descriptor is checked below
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {

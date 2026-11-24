@@ -385,6 +385,25 @@ impl Archive {
         Ok(Archive { file, len, pieces, missing: Some(missing), last_size_unknown, holes, lost: Vec::new(), entries })
     }
 
+    /// The missing piece a failed read of `e` ran into, when its bytes reach a hole of a set cut short or missing a
+    /// volume: that piece is the cause, not the entry. The payload starts past the local header, its name and its
+    /// extra field.
+    fn gap_crossed(&mut self, e: &ZipEntry) -> Option<PathBuf> {
+        let missing = self.missing.clone()?;
+        let crosses = data_at(&mut self.file, self.len, &e.read_description()).map_or(true, |start| {
+            // a streamed member also needs its descriptor: 16 bytes, 24 with ZIP64 sizes
+            let zip64 = e.packed >= u64::from(u32::MAX) || e.size >= u64::from(u32::MAX);
+            let descriptor = match (e.flags & 0x08 != 0, zip64) {
+                (false, _) => 0,
+                (true, false) => 16,
+                (true, true) => 24,
+            };
+            let end = start.saturating_add(e.packed).saturating_add(descriptor);
+            self.holes.iter().any(|hole| e.local_at < hole.end && end > hole.start)
+        });
+        crosses.then_some(missing)
+    }
+
     /// The absent volume the entry at `index` starts on, if any: it can't be read at all.
     fn lost_volume(&self, index: usize) -> Option<&Path> {
         self.lost.get(index).and_then(Option::as_deref)
@@ -1213,6 +1232,13 @@ pub(crate) fn run_renaming(
                     },
                     cancel,
                 );
+                // a target reaching a missing volume fails only this link, as for a file
+                if read.is_err()
+                    && let Some(missing) = archive.gap_crossed(e)
+                {
+                    fail(&mut summary, report, member, &Error::MissingVolume(missing).to_string());
+                    continue;
+                }
                 match read {
                     Err(Error::Io(io)) if io.kind() != std::io::ErrorKind::UnexpectedEof => return Err(Error::Io(io)),
                     Err(err) => {
@@ -1322,22 +1348,8 @@ pub(crate) fn run_renaming(
                 }
                 Err(err) => {
                     drop(target);
-                    // Data running past the end of a set cut short by a missing piece: that piece is the cause.
-                    // The payload starts past the local header, its name and its extra field.
-                    let crosses_gap = archive.missing.is_some()
-                        && data_at(&mut archive.file, archive.len, &entry).map_or(true, |start| {
-                            // a streamed member also needs its descriptor: 16 bytes, 24 with ZIP64 sizes
-                            let zip64 = e.packed >= u64::from(u32::MAX) || e.size >= u64::from(u32::MAX);
-                            let descriptor = match (e.flags & 0x08 != 0, zip64) {
-                                (false, _) => 0,
-                                (true, false) => 16,
-                                (true, true) => 24,
-                            };
-                            let end = start.saturating_add(e.packed).saturating_add(descriptor);
-                            archive.holes.iter().any(|hole| e.local_at < hole.end && end > hole.start)
-                        });
-                    if let Some(missing) = archive.missing.as_ref().filter(|_| crosses_gap) {
-                        fail(&mut summary, report, member, &Error::MissingVolume(missing.clone()).to_string());
+                    if let Some(missing) = archive.gap_crossed(e) {
+                        fail(&mut summary, report, member, &Error::MissingVolume(missing).to_string());
                         continue;
                     }
                     match err {

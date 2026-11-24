@@ -194,10 +194,15 @@ pub(super) fn repack(
         } else {
             field.to_vec()
         };
-        if name.starts_with(b"__.SYMDEF") {
+        // only these exact names: GNU ar keeps `__.SYMDEF_notes` as an ordinary member
+        let bsd_kind = match name.as_slice() {
+            b"__.SYMDEF" | b"__.SYMDEF SORTED" => Some(SymKind::Bsd32),
+            b"__.SYMDEF_64" | b"__.SYMDEF_64 SORTED" => Some(SymKind::Bsd64),
+            _ => None,
+        };
+        if let Some(kind) = bsd_kind {
             bsd = true;
             budget.take(size)?;
-            let kind = if name.starts_with(b"__.SYMDEF_64") { SymKind::Bsd64 } else { SymKind::Bsd32 };
             set_symtab(kind, &name, read_table(&mut file, data_at, size)?)?;
             continue;
         }

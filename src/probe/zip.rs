@@ -183,7 +183,7 @@ fn decode(raw: &[u8], flags: u16) -> Option<String> {
 
 /// A local header's sizes: when either is 0xFFFFFFFF, both come from the ZIP64 extra field (a local header's
 /// ZIP64 field always holds both, uncompressed first).
-fn zip64_sizes(extra: &[u8], header: &LocalHeader) -> (Option<u64>, Option<u64>) {
+pub(crate) fn zip64_sizes(extra: &[u8], header: &LocalHeader) -> (Option<u64>, Option<u64>) {
     if header.unpacked_size != u32::MAX && header.packed_size != u32::MAX {
         return (Some(u64::from(header.unpacked_size)), Some(u64::from(header.packed_size)));
     }

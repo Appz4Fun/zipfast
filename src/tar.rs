@@ -46,6 +46,11 @@ pub use wim::WimInfo;
 trait MemberData: Read {
     /// Why the last read failed, when it was the data's own fault (a checksum, a size).
     fn fault(&mut self) -> Option<&'static str>;
+
+    /// The data's length in the archive, when it differs from its size as extracted (compressed).
+    fn packed(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// An archive whose members are found by a table read first (xar's TOC, an ISO 9660 image's folders), each with
@@ -114,9 +119,8 @@ pub fn list_wim_image(path: &Path, image: u32) -> Result<Vec<Entry>> {
     if !sniff_wim(&head[..n]) {
         return Err(Error::NotAnArchive);
     }
-    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None, false)?;
-    reader.random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), image)?));
-    list_members(reader)
+    // only the requested image's metadata is read: image 1 may be damaged while this one is whole
+    list_members(Reader::open_image(path, 1, Some(COMPRESSED_LIST_LIMIT), None, false, image)?)
 }
 
 /// Whether `file` is an ISO 9660 image: "CD001" in the volume descriptor 32 KiB in.
@@ -183,6 +187,25 @@ fn text(field: &[u8]) -> &[u8] {
     &field[..end]
 }
 
+/// Opens `path`, which on Unix has to be the file `expect` describes (same device and inode) when given: opened
+/// then without following a symlink and without blocking on a FIFO put in its place.
+fn open_same(path: &Path, expect: Option<&std::fs::Metadata>) -> Result<File> {
+    #[cfg(unix)]
+    if let Some(expect) = expect {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file =
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+        let got = file.metadata()?;
+        if (got.dev(), got.ino()) != (expect.dev(), expect.ino()) {
+            return Err(Error::Unsupported(format!("{} changed while it was being read", path.display())));
+        }
+        return Ok(file);
+    }
+    #[cfg(not(unix))]
+    let _ = expect;
+    Ok(File::open(path)?)
+}
+
 fn name_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -201,8 +224,7 @@ enum Source {
 }
 
 impl Source {
-    fn open(path: &Path, threads: usize, limit: Option<u64>, cancel: Option<Cancellation>) -> Result<Source> {
-        let mut file = File::open(path)?;
+    fn open(mut file: File, threads: usize, limit: Option<u64>, cancel: Option<Cancellation>) -> Result<Source> {
         let mut head = [0u8; stream::SNIFF_BYTES];
         let n = read_full(&mut file, &mut head)?;
         file.rewind()?;
@@ -299,6 +321,15 @@ impl Source {
         Ok(())
     }
 
+    /// Fails once the run is canceled: for reads that don't go through [`Source::read`] (a member's data read
+    /// from its own place in the file).
+    fn check_cancel(&self) -> Result<()> {
+        if let Source::Plain { cancel: Some(cancel), .. } = self {
+            cancel.check_io()?;
+        }
+        Ok(())
+    }
+
     fn codec(&self) -> Option<Codec> {
         match self {
             Source::Packed(_, c, _) => Some(*c),
@@ -378,6 +409,8 @@ struct Member {
     /// the stored name's bytes, kept only when they aren't UTF-8 and `name` had to replace some
     raw_name: Option<Vec<u8>>,
     link: String,
+    /// the stored link target's bytes, kept only when they aren't UTF-8 and `link` had to replace some
+    raw_link: Option<Vec<u8>>,
     size: u64,
     kind: Kind,
     mtime: Option<i64>,
@@ -616,8 +649,9 @@ impl Member {
 /// Values from pax records, for the next member or (from a global record) for every member after.
 #[derive(Clone, Debug, Default)]
 struct Pax {
-    path: Option<String>,
-    linkpath: Option<String>,
+    /// `path` and `linkpath` as stored: a pax header with `hdrcharset=BINARY` may hold bytes that aren't UTF-8
+    path: Option<Vec<u8>>,
+    linkpath: Option<Vec<u8>>,
     size: Option<u64>,
     mtime: Option<(i64, u32)>,
     atime: Option<(i64, u32)>,
@@ -669,8 +703,8 @@ impl Pax {
                 b"gname" => self.gname = Some(owner()),
                 b"uid" => self.uid = Some(id()?),
                 b"gid" => self.gid = Some(id()?),
-                b"path" => self.path = Some(name_of(value)),
-                b"linkpath" => self.linkpath = Some(name_of(value)),
+                b"path" => self.path = Some(value.to_vec()),
+                b"linkpath" => self.linkpath = Some(value.to_vec()),
                 b"size" => {
                     self.size = Some(std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()).ok_or_else(bad)?)
                 }
@@ -795,7 +829,34 @@ impl Reader {
         cancel: Option<Cancellation>,
         whole: bool,
     ) -> Result<Reader> {
-        let mut src = Source::open(path, threads, limit, cancel.clone())?;
+        Self::open_checked(path, None, threads, limit, cancel, whole, 1)
+    }
+
+    /// [`Reader::open_with_limit`], taking image `wim_image` (from 1) of a WIM file.
+    fn open_image(
+        path: &Path,
+        threads: usize,
+        limit: Option<u64>,
+        cancel: Option<Cancellation>,
+        whole: bool,
+        wim_image: u32,
+    ) -> Result<Reader> {
+        Self::open_checked(path, None, threads, limit, cancel, whole, wim_image)
+    }
+
+    /// [`Reader::open_with_limit`] for image `wim_image` (from 1) of a WIM file, refusing (on Unix) to read any file
+    /// at `path` but the one `expect` describes, so a path swapped after the caller checked it is not read in its place.
+    fn open_checked(
+        path: &Path,
+        expect: Option<&std::fs::Metadata>,
+        threads: usize,
+        limit: Option<u64>,
+        cancel: Option<Cancellation>,
+        whole: bool,
+        wim_image: u32,
+    ) -> Result<Reader> {
+        let open = || open_same(path, expect);
+        let mut src = Source::open(open()?, threads, limit, cancel.clone())?;
         let mut first = vec![0u8; BLOCK];
         let n = src.read(&mut first)?;
         first.truncate(n);
@@ -810,17 +871,23 @@ impl Reader {
             Some(Content::Tar)
         } else if plain && sniff_xar(&first) {
             // xar data is read where the table of contents puts it, from the file itself
-            random = Some(Box::new(xar::open(File::open(path)?, std::fs::metadata(path)?.len())?));
+            let file = open()?;
+            let len = file.metadata()?.len();
+            random = Some(Box::new(xar::open(file, len)?));
             first.clear();
             Some(Content::Tar)
         } else if plain && sniff_wim(&first) {
-            // WIM data is read where the lookup table puts it, from the file itself; image 1 is the one taken
-            random = Some(Box::new(wim::open(File::open(path)?, std::fs::metadata(path)?.len(), 1)?));
+            // WIM data is read where the lookup table puts it, from the file itself; image 1 unless asked for another
+            let file = open()?;
+            let len = file.metadata()?.len();
+            random = Some(Box::new(wim::open(file, len, wim_image)?));
             first.clear();
             Some(Content::Tar)
-        } else if plain && n == BLOCK && iso::sniff(&File::open(path)?) {
+        } else if plain && n == BLOCK && iso::sniff(&open()?) {
             // an ISO 9660 image: its tree is read from the volume descriptors 32 KiB in
-            random = Some(Box::new(iso::open(File::open(path)?, std::fs::metadata(path)?.len())?));
+            let file = open()?;
+            let len = file.metadata()?.len();
+            random = Some(Box::new(iso::open(file, len)?));
             first.clear();
             Some(Content::Tar)
         } else if let Some(format) = cpio::sniff(&first) {
@@ -900,6 +967,7 @@ impl Reader {
         }
         if let Some(state) = &mut self.random {
             self.member_data = None;
+            self.src.check_cancel()?;
             let Some((member, data)) = state.next()? else { return Ok(None) };
             self.member_data = data;
             return Ok(Some(member));
@@ -909,7 +977,7 @@ impl Reader {
             self.src.skip(n, &mut self.scratch)?;
         }
         let mut long_name: Option<Vec<u8>> = None;
-        let mut long_link: Option<String> = None;
+        let mut long_link: Option<Vec<u8>> = None;
         let mut pax = Pax::default();
         let mut pax_header_name = None;
         loop {
@@ -923,7 +991,7 @@ impl Reader {
                     continue;
                 }
                 b'K' => {
-                    long_link = Some(name_of(text(&self.ext_data(size)?)));
+                    long_link = Some(text(&self.ext_data(size)?).to_vec());
                     continue;
                 }
                 b'x' | b'X' => {
@@ -956,15 +1024,17 @@ impl Reader {
                 }
             }
             let real_name = if p.sparse { p.gnu_sparse.name.clone() } else { None };
-            let (name, raw_name) = match real_name.or_else(|| p.path.clone()) {
+            let (name, raw_name) = match real_name {
                 Some(path) => (path, None),
                 None => {
-                    let stored = long_name.unwrap_or(name);
+                    let stored = p.path.clone().or(long_name).unwrap_or(name);
                     let decoded = name_of(&stored);
                     (decoded, std::str::from_utf8(&stored).is_err().then_some(stored))
                 }
             };
-            let link = p.linkpath.clone().or(long_link).unwrap_or_else(|| name_of(text(&h[157..257])));
+            let stored_link = p.linkpath.clone().or(long_link).unwrap_or_else(|| text(&h[157..257]).to_vec());
+            let link = name_of(&stored_link);
+            let raw_link = std::str::from_utf8(&stored_link).is_err().then_some(stored_link);
             let mut size = p.size.unwrap_or(size);
             // the size with its padding has to be a number too
             if size > u64::MAX - BLOCK as u64 {
@@ -1001,6 +1071,7 @@ impl Reader {
                 name,
                 raw_name,
                 link,
+                raw_link,
                 size: if has_data { size } else { 0 },
                 kind,
                 mtime,
@@ -1179,9 +1250,20 @@ impl Reader {
 
     /// The current member's data, in pieces, to `sink`. Reads exactly its size and leaves the padding for later.
     fn read_data(&mut self, size: u64, buf: &mut [u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        if size == 0
+            && let Some(data) = &mut self.member_data
+        {
+            // nothing comes out of an empty member, but its reader still checks it (a checksum, a stray byte)
+            if let Err(e) = data.read(&mut [0u8; 1]) {
+                return Err(data.fault().map_or_else(|| read_error(e), Error::Corrupt));
+            }
+        }
         let mut left = size;
         while left > 0 {
             let want = left.min(buf.len() as u64) as usize;
+            if self.member_data.is_some() {
+                self.src.check_cancel()?;
+            }
             let got = match &mut self.member_data {
                 Some(data) => match read_full(data, &mut buf[..want]) {
                     Ok(n) => n,
@@ -1277,6 +1359,11 @@ impl Selected {
                     continue;
                 }
                 if current == index {
+                    // data read from its own place in the file doesn't pass the packed stream's limit: its stored
+                    // length is held to it here
+                    if reader.member_data.as_ref().and_then(|d| d.packed()).is_some_and(|p| p > limit) {
+                        return Err(Error::Unsupported("the selected member exceeds the byte limit".into()));
+                    }
                     let mut member = member;
                     if member.kind != Kind::File {
                         if !(special == SpecialEntries::EmptyFile && member.is_special()) {
@@ -1438,7 +1525,12 @@ fn list_members(mut reader: Reader) -> Result<Vec<Entry>> {
     while let Some(m) = reader.next()? {
         if m.kind != Kind::Other(b'V') {
             budget.record(&m.name)?;
-            out.push(m.into_entry());
+            let packed = reader.member_data.as_ref().and_then(|d| d.packed());
+            let mut entry = m.into_entry();
+            if let Some(packed) = packed {
+                entry.packed = packed;
+            }
+            out.push(entry);
         }
     }
     if reader.src.codec().is_some() {
@@ -1736,7 +1828,7 @@ fn link_member(
     }
     if opts.mode == Mode::Extract {
         let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(()) };
-        let mut copy = || match kind {
+        let mut copy = |_| match kind {
             LinkKind::Hard(target) | LinkKind::Copy(target) => holes.copy(target),
             LinkKind::Symbolic(_) => Ok(()),
         };
@@ -1963,6 +2055,9 @@ fn run_tar(
             }
         };
         let rel = if opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+        // what the hole budget held before this member took from it: a member skipped or refused at its target
+        // makes no holes, and gives back what it took
+        let hole_mark = holes.left;
         let why = match m.kind {
             Kind::Dir => {
                 if opts.mode == Mode::Extract && !opts.flatten {
@@ -2040,6 +2135,7 @@ fn run_tar(
                 && opts.dest.join(&rel).parent() == Some(parent.as_path())
                 && checked_place(opts, &rel, (position, &m.name), summary, report)?.is_none()
             {
+                holes.left = hole_mark;
                 continue;
             }
             staged.budget.record(&m.name)?;
@@ -2066,7 +2162,10 @@ fn run_tar(
         if opts.mode == Mode::Extract {
             match target(opts, &rel, (position, &m.name), (Some(m.real_size()), m.sparse.is_some()), summary, report)? {
                 Some(t) => out = Some(t),
-                None => continue,
+                None => {
+                    holes.left = hole_mark;
+                    continue;
+                }
             }
         } else if let (Source::Plain { .. }, true) = (&reader.src, reader.crc.is_none() && reader.member_data.is_none())
         {
@@ -2167,10 +2266,12 @@ impl RepackData<'_> {
 /// length, or for a compressed stream every byte decoded, whichever is more.
 pub(crate) fn walk_members(
     path: &Path,
+    input: &File,
     limit: u64,
     mut each: impl FnMut(RawMember, RepackData<'_>) -> Result<()>,
 ) -> Result<u64> {
-    let mut reader = Reader::open_with_limit(path, 1, Some(limit), None, false)?;
+    let expect = input.metadata()?;
+    let mut reader = Reader::open_checked(path, Some(&expect), 1, Some(limit), None, false, 1)?;
     if matches!(reader.content, Content::Single) {
         return Err(Error::NotAnArchive);
     }
@@ -2196,10 +2297,18 @@ pub(crate) fn walk_members(
         if let Some(why) = m.sparse_refusal() {
             return Err(Error::Unsupported(why.into()));
         }
+        let device = matches!(kind, RawKind::CharDevice | RawKind::BlockDevice);
+        if device && m.cpio && m.tar.device_major.is_none() {
+            // an odc or bin header's one device number splits differently by system: a guess could change the device
+            return Err(Error::Unsupported(format!(
+                "cpio device {:?} has no major and minor numbers a repack can keep",
+                m.name
+            )));
+        }
         budget.record(&m.name)?;
         let raw = RawMember {
             name: m.raw_name.clone().unwrap_or_else(|| m.name.clone().into_bytes()),
-            link: m.link.clone().into_bytes(),
+            link: m.raw_link.clone().unwrap_or_else(|| m.link.clone().into_bytes()),
             kind,
             mode: m.mode,
             size: if kind == RawKind::File { m.real_size() } else { 0 },
@@ -2210,7 +2319,7 @@ pub(crate) fn walk_members(
     if reader.src.codec().is_some() {
         reader.drain(&mut buf)?;
     }
-    let len = std::fs::metadata(path)?.len();
+    let len = expect.len();
     Ok(match reader.src {
         Source::Packed(_, _, decoded) => decoded.max(len),
         Source::Plain { .. } => len,
@@ -2271,6 +2380,35 @@ mod tests {
     /// Where hard links fail (FAT, exFAT), each link to a sparse file is a copy that writes its holes as data: the
     /// copies are charged to the run's budget of holes, and refused one by one once it is spent.
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_reads_only_the_file_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_of = |name: &str| {
+            let mut t = test_header(name, b'0', 1, "").to_vec();
+            t.extend_from_slice(&[b'x'; BLOCK]);
+            t.resize(t.len() + 2 * BLOCK, 0);
+            t
+        };
+        let path = dir.path().join("in.tar");
+        std::fs::write(&path, tar_of("checked")).unwrap();
+        let checked = File::open(&path).unwrap();
+        let walk = |file: &File| {
+            let mut names = Vec::new();
+            walk_members(&path, file, u64::MAX, |raw, _| {
+                names.push(raw.name);
+                Ok(())
+            })
+            .map(|_| names)
+        };
+        assert_eq!(walk(&checked).unwrap(), [b"checked".to_vec()]);
+        // another file renamed over the path after it was checked is not read in its place
+        let other = dir.path().join("other.tar");
+        std::fs::write(&other, tar_of("swapped")).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert!(matches!(walk(&checked), Err(Error::Unsupported(_))));
+    }
+
     #[test]
     fn hard_links_copied_in_place_of_linking_are_charged_for_holes() {
         copies_are_charged(false);
@@ -2352,6 +2490,52 @@ mod tests {
         link::NO_HARD_LINKS.with(|n| n.set(false));
     }
 
+    /// A sparse member skipped because its file exists makes no holes, so it takes nothing from the run's budget:
+    /// two members of 600 MiB of holes each, the first already there, extract the second.
+    #[test]
+    fn a_skipped_sparse_member_leaves_the_hole_budget_alone() {
+        use std::io::Write;
+        const MIB: u64 = 1 << 20;
+        let mut tar = test_sparse("a", 600 * MIB);
+        tar.extend(test_sparse("b", 600 * MIB));
+        tar.extend([0u8; 2 * BLOCK]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&tar).unwrap();
+        let tgz = gz.finish().unwrap();
+        for (name, bytes) in [("s.tar", tar), ("s.tgz", tgz)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let dest = dir.path().join("out");
+            std::fs::create_dir(&dest).unwrap();
+            std::fs::write(dest.join("a"), b"kept").unwrap();
+            let opts = Options {
+                mode: Mode::Extract,
+                dest: dest.clone(),
+                overwrite: Overwrite::Skip,
+                flatten: false,
+                threads: None,
+                protected_paths: Default::default(),
+                parallel_min: None,
+                select: None,
+                windows_safe_names: false,
+                special_entries: Default::default(),
+                fallback_mtime: None,
+                compressed_tar: Default::default(),
+                version_naming: Default::default(),
+                preexisting_links: Default::default(),
+            };
+            let s = run(&path, &opts, |_| {}).unwrap();
+            assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);
+            assert_eq!((s.files, s.skipped), (1, 1), "{name}");
+            assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"kept", "{name}");
+            assert_eq!(std::fs::metadata(dest.join("b")).unwrap().len(), 600 * MIB, "{name}");
+            // testing still charges every member
+            let s = run(&path, &Options { mode: Mode::Test, ..opts }, |_| {}).unwrap();
+            assert_eq!(s.errors.len(), 1, "{name}: {:?}", s.errors);
+        }
+    }
+
     #[test]
     fn numbers() {
         assert_eq!(octal(b"0000644\0"), Some(0o644));
@@ -2380,7 +2564,7 @@ mod tests {
         let data =
             format!("{}{}{}", rec("path", "a/é/long name.mkv"), rec("size", "12345678901"), rec("mtime", "-1.25"));
         p.parse(data.as_bytes()).unwrap();
-        assert_eq!(p.path.as_deref(), Some("a/é/long name.mkv"));
+        assert_eq!(p.path.as_deref(), Some("a/é/long name.mkv".as_bytes()));
         assert_eq!(p.size, Some(12_345_678_901));
         assert_eq!(p.mtime, Some((-2, 750_000_000)));
         assert!(Pax::default().parse(b"99 path=x\n").is_err());

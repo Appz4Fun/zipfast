@@ -255,6 +255,14 @@ impl Store {
         if end.is_none() || res.offset < HEADER_LEN as u64 {
             return Err(corrupt("a WIM resource lies outside the file"));
         }
+        // an empty resource is never read, so its hash is checked here: that of no bytes, or sizes damaged to zero
+        // would pass off a file as empty
+        if res.size == 0
+            && let Some(want) = sha1
+            && Sha1Digest::new().finalize() != want
+        {
+            return Err(corrupt("a WIM file fails its SHA-1"));
+        }
         let compressed = res.flags & RES_COMPRESSED != 0;
         let chunks = if !compressed {
             if res.stored != res.size {
@@ -702,7 +710,10 @@ impl State {
     /// `/` for `\`. An absolute target keeps its leading `\??\` (as `/??/`), so the pipeline refuses it.
     fn reparse_target(&mut self, tag: u32, sha1: [u8; 20]) -> Result<String> {
         if let Some(target) = self.targets.get(&(sha1, tag)) {
-            return Ok(target.clone());
+            // each link hands out its own copy of the target, which the listing keeps: every one is charged
+            let target = target.clone();
+            self.charge(target.len())?;
+            return Ok(target);
         }
         let bad = || corrupt("a WIM symbolic link's reparse data is damaged");
         let Some(b) = self.blobs.get(&sha1).copied() else {
@@ -798,6 +809,7 @@ impl State {
                 name: path,
                 raw_name: None,
                 link,
+                raw_link: None,
                 size,
                 kind,
                 mtime,
@@ -963,6 +975,22 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_resource_is_checked_against_its_sha1() {
+        // the lookup entry for "hello"'s hash has its sizes damaged to zero
+        let mut e = [0u8; 50];
+        e[8..16].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes());
+        e[24..26].copy_from_slice(&1u16.to_le_bytes());
+        e[30..50].copy_from_slice(&sha1(b"hello"));
+        let m = meta(&[dentry("a.txt", 0x80, 0, sha1(b"hello"), 0)], &[]);
+        let err = read(&wim(&[], &m, &[e])).unwrap_err();
+        assert!(err.to_string().contains("SHA-1"), "{err}");
+        // a truly empty resource carries the hash of no bytes, and reads as an empty file
+        e[30..50].copy_from_slice(&sha1(b""));
+        let m = meta(&[dentry("a.txt", 0x80, 0, sha1(b""), 0)], &[]);
+        assert_eq!(read(&wim(&[], &m, &[e])).unwrap(), vec![("a.txt".into(), Ok(Vec::new()))]);
+    }
+
+    #[test]
     fn a_folder_that_contains_itself_is_refused() {
         // the folder's entries start where the root's do: itself
         let m = meta(&[dentry("loop", ATTR_DIRECTORY, FIRST, [0; 20], 0)], &[]);
@@ -1102,6 +1130,29 @@ mod tests {
             n += 1;
         }
         assert_eq!((n, state.reparse_reads), (2000, 1));
+    }
+
+    #[test]
+    fn every_link_to_shared_reparse_data_charges_its_target() {
+        // a relative symbolic link to a 1,000-character target, shared by 100 links
+        let target: Vec<u8> = "x".repeat(1000).encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut blob = Vec::new();
+        for v in [0u16, target.len() as u16, target.len() as u16, 0] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&target);
+        let links: Vec<Vec<u8>> = (0..100)
+            .map(|i| dentry(&format!("l{i}"), ATTR_REPARSE_POINT, 0, sha1(&blob), u64::from(TAG_SYMLINK)))
+            .collect();
+        let w = wim(&[&blob], &meta(&links, &[]), &[]);
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&w).unwrap();
+        let mut state = open(f, w.len() as u64, 1).unwrap();
+        let before = state.path_budget;
+        while super::super::RandomAccess::next(&mut state).unwrap().is_some() {}
+        assert_eq!(state.reparse_reads, 1);
+        assert!(before - state.path_budget >= 100 * 1000, "charged {}", before - state.path_budget);
     }
 
     #[test]

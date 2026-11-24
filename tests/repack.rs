@@ -685,3 +685,109 @@ fn temporaries_go_beside_the_output_and_are_removed() {
     let left: Vec<_> = std::fs::read_dir(&out_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(left, ["x.deb"]);
 }
+
+/// One pax record, `"<len> <key>=<value>\n"`.
+fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let body = key.len() + value.len() + 3;
+    let mut len = body + 1;
+    while len != body + len.to_string().len() {
+        len = body + len.to_string().len();
+    }
+    [format!("{len} ").as_bytes(), key, b"=", value, b"\n"].concat()
+}
+
+#[test]
+fn tar_names_and_link_targets_keep_their_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut t = Vec::new();
+    let mut push = |h: [u8; 512], data: &[u8]| {
+        t.extend_from_slice(&h);
+        t.extend_from_slice(data);
+        t.resize(t.len().next_multiple_of(512), 0);
+    };
+    push(tar_header(b"d/\xfe", b'0', 0o644, 3, b"", &ALICE), b"abc");
+    push(tar_header(b"h", b'1', 0o644, 0, b"d/\xfe", &ALICE), b"");
+    push(tar_header(b"s", b'2', 0o777, 0, b"t\xff", &ALICE), b"");
+    // a pax path record holding bytes that aren't UTF-8, as `hdrcharset=BINARY` allows
+    let long = [vec![b'p'; 120], b"\xfd".to_vec()].concat();
+    let records = [pax_record(b"hdrcharset", b"BINARY"), pax_record(b"path", &long)].concat();
+    push(tar_header(b"PaxHeaders/p", b'x', 0o644, records.len() as u64, b"", &ALICE), &records);
+    push(tar_header(b"short", b'0', 0o644, 1, b"", &ALICE), b"p");
+    t.resize(t.len() + 1024, 0);
+    let out = flate2_decode(&repacked(dir.path(), "raw", &t, &RepackOptions::default()));
+    let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+    assert!(!has("\u{fffd}".as_bytes()), "a name or link was decoded lossily");
+    assert!(has(b"d/\xfe\0"));
+    assert!(has(b"t\xff\0"));
+    assert!(has(&[b"path=".as_slice(), &long, b"\n"].concat()));
+    // the hard link still names its file, so it is written as a link and the data once
+    assert_eq!(out.windows(3).filter(|w| w == b"abc").count(), 1);
+}
+
+#[test]
+fn ar_members_named_like_a_symbol_table_stay_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = plain_ar(&[("__.SYMDEF_notes", b"just notes\n"), ("a.o", OBJ_A)], 7, 7);
+    let i = write(dir.path(), "symdef-like.a", &input);
+    let o = dir.path().join("symdef-like.out");
+    assert_eq!(repack(&i, &o, &RepackOptions::default()).unwrap().members, 2);
+    let out = std::fs::read(o).unwrap();
+    assert!(out.windows(15).any(|w| w == b"__.SYMDEF_notes"));
+    assert!(out.windows(11).any(|w| w == b"just notes\n"));
+}
+
+/// A newc member whose device node numbers are `rdev`.
+fn newc_node(name: &str, mode: u32, rdev: (u32, u32)) -> Vec<u8> {
+    let fields = [1, mode, 0, 0, 1, 0, 0, 0, 1, rdev.0, rdev.1, name.len() as u32 + 1, 0];
+    let mut out = b"070701".to_vec();
+    for f in fields {
+        out.extend_from_slice(format!("{f:08X}").as_bytes());
+    }
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.resize(out.len().next_multiple_of(4), 0);
+    out
+}
+
+/// An odc member with no data: its device number is one field, `rdev`.
+fn odc_node(name: &str, mode: u32, rdev: u32) -> Vec<u8> {
+    let n = name.len() + 1;
+    let mut out =
+        format!("070707{:06o}{:06o}{mode:06o}{:06o}{:06o}{:06o}{rdev:06o}{:011o}{n:06o}{:011o}", 0, 1, 0, 0, 1, 0, 0)
+            .into_bytes();
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out
+}
+
+#[test]
+fn cpio_devices_keep_their_numbers_or_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let newc =
+        [newc_node("null", 0o020644, (1, 3)), newc_node("sda", 0o060644, (8, 0)), newc_node("TRAILER!!!", 0, (0, 0))]
+            .concat();
+    let out = flate2_decode(&repacked(dir.path(), "newc", &newc, &RepackOptions::default()));
+    let header = |name: &[u8]| out.chunks(512).find(|h| h.starts_with(name) && h[name.len()] == 0).unwrap().to_vec();
+    let dev = |h: &[u8]| (h[156], h[329..336].to_vec(), h[337..344].to_vec());
+    assert_eq!(dev(&header(b"null")), (b'3', b"0000001".to_vec(), b"0000003".to_vec()));
+    assert_eq!(dev(&header(b"sda")), (b'4', b"0000010".to_vec(), b"0000000".to_vec()));
+    // odc keeps one number whose split depends on the writer's system: refused rather than guessed
+    let odc = [odc_node("null", 0o020644, 0x0103), odc_node("TRAILER!!!", 0, 0)].concat();
+    let i = write(dir.path(), "odc.cpio", &odc);
+    assert!(matches!(repack(&i, &dir.path().join("odc.out"), &RepackOptions::default()), Err(Error::Unsupported(_))));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_input_is_refused_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("in.tar");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let out = dir.path().join("out.tar.gz");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(matches!(repack(&fifo, &out, &RepackOptions::default()), Err(Error::Unsupported(_))));
+    });
+    // with no writer, opening the FIFO would block forever
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the repack blocked on a FIFO"));
+}

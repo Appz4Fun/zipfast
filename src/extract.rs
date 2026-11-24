@@ -1278,6 +1278,11 @@ fn sniff(path: &Path) -> Result<Format> {
     }
 }
 
+/// Whether the file at `path` is an ISO 9660 image, whose head (a hybrid image's boot code) says nothing.
+fn is_iso(path: &Path) -> bool {
+    File::open(path).is_ok_and(|file| crate::tar::sniff_iso(&file))
+}
+
 fn classify_head(head: &[u8]) -> Format {
     if crate::sevenzip::sniff(head) {
         Format::SevenZip
@@ -1347,6 +1352,11 @@ pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::Z
             // 7z reopens its volumes by path, as TAR does.
             opened.retire()?;
             Ok(CheckedRoute::Legacy(LegacyRoute::SevenZip))
+        }
+        // an ISO 9660 image says so 32 KiB in, past the probe, as in `sniff`
+        Format::Other if is_iso(path) => {
+            opened.retire()?;
+            Ok(CheckedRoute::Legacy(LegacyRoute::Tar))
         }
         Format::Other => {
             let (opened, probe) = opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?;
@@ -2279,7 +2289,11 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
     let mut source = InspectionSource::open(first, cancel)?;
     let mut head = [0; HEAD_PROBE_BYTES];
     let n = source.read_probe(&mut head, cancel)?;
-    let format = if crate::zip::is_spanned(first) { Format::Zip } else { classify_head(&head[..n]) };
+    let format = match classify_head(&head[..n]) {
+        _ if crate::zip::is_spanned(first) => Format::Zip,
+        Format::Other if is_iso(first) => Format::Tar,
+        format => format,
+    };
     cancel.check_io().map_err(Error::from)?;
     let entries = match format {
         // A byte-split set (`.zip.001`) has no single source for a ZIP read session: list it as a whole.

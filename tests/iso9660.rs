@@ -418,3 +418,70 @@ fn rr_moved_is_kept_without_relocation() {
     assert!(s.errors.is_empty(), "{:?}", s.errors);
     assert_eq!(fs::read(dir.path().join("out/rr_moved/F.TXT")).unwrap(), b"hi");
 }
+
+/// A hybrid image (boot code in the system area, so its head looks like nothing known) takes the ISO reader on
+/// every entry point, not only those that sniff past the head.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_hybrid_image_is_read_on_every_route() {
+    use zipfast::extract::{Cancellation, Inspection, RunEvent};
+    let bytes = iso(21, &[record(b"A.TXT;1", 20, 2, 0)], |img| {
+        img[..4].copy_from_slice(&[0x33, 0xed, 0xfa, 0x8e]);
+        img[20 * SECTOR..20 * SECTOR + 2].copy_from_slice(b"ok");
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hybrid.iso");
+    fs::write(&path, bytes).unwrap();
+    let Inspection::Other(entries) = extract::inspect(&path).unwrap() else { panic!("read as ZIP") };
+    assert_eq!(entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["A.TXT"]);
+    let out = dir.path().join("out");
+    let report = extract::run_with_zip_policy(
+        &path,
+        &opts(Mode::Extract, &out),
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |_: RunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(report.files(), 1);
+    assert_eq!(fs::read(out.join("A.TXT")).unwrap(), b"ok");
+}
+
+/// A record with an extended attribute record: the attribute blocks come first, the data after them.
+#[test]
+fn file_data_follows_its_extended_attribute_record() {
+    let mut rec = record(b"A.TXT;1", 19, 4, 0);
+    rec[1] = 1;
+    let bytes = iso(21, &[rec], |img| {
+        img[19 * SECTOR..19 * SECTOR + 4].copy_from_slice(b"attr");
+        img[20 * SECTOR..20 * SECTOR + 4].copy_from_slice(b"data");
+    });
+    let (r, dir) = run_image(&bytes);
+    let s = r.unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert_eq!(fs::read(dir.path().join("out/A.TXT")).unwrap(), b"data");
+}
+
+/// A file whose last record still has the multi-extent flag is unfinished: at the folder's end, before another
+/// name, or before a folder.
+#[test]
+fn a_file_missing_its_last_extent_is_refused() {
+    let at_end = vec![record(b"BIG.BIN;1", 20, 2048, 0x80)];
+    let other_name = vec![record(b"BIG.BIN;1", 20, 2048, 0x80), record(b"C.BIN;1", 21, 2, 0)];
+    let folder = vec![record(b"BIG.BIN;1", 20, 2048, 0x80), record(b"D", 18, SECTOR as u32, 2)];
+    for (what, root) in [("at the end", at_end), ("another name", other_name), ("a folder", folder)] {
+        let (r, _dir) = run_image(&iso(22, &root, |_| {}));
+        assert!(message(r).contains("last extent is missing"), "{what}");
+    }
+}
+
+/// Interleaved data (file unit and gap sizes) isn't contiguous: refused rather than read as if it were.
+#[test]
+fn interleaved_files_are_refused() {
+    let mut rec = record(b"A.BIN;1", 20, 4096, 0);
+    rec[26] = 1;
+    rec[27] = 1;
+    let (r, _dir) = run_image(&iso(24, &[rec], |_| {}));
+    assert!(message(r).contains("interleaved"));
+}

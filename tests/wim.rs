@@ -162,6 +162,30 @@ fn the_header_and_other_images_can_be_read() {
     assert!(zipfast::tar::list_wim_image(&fixtures().join("multi.wim"), 0).is_err());
 }
 
+/// Image 2 lists although image 1's metadata is damaged: only the requested image's metadata is read.
+#[test]
+fn another_image_lists_when_image_1_is_damaged() {
+    let mut bytes = fs::read(fixtures().join("multi.wim")).unwrap();
+    let le64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    // the lookup table (stored as it is) and its first metadata resource, image 1's
+    let (table_flags, table_at, table_len) = (bytes[55], le64(&bytes, 56) as usize, le64(&bytes, 64) as usize);
+    assert_eq!(table_flags & 0x04, 0, "the lookup table is stored");
+    let first_meta = bytes[table_at..table_at + table_len]
+        .as_chunks::<50>()
+        .0
+        .iter()
+        .find(|e| e[7] & 0x02 != 0)
+        .map(|e| (le64(e, 8) as usize, le64(e, 0) as usize & ((1 << 56) - 1)))
+        .unwrap();
+    bytes[first_meta.0 + first_meta.1 / 2] ^= 0x55;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("damaged.wim");
+    fs::write(&path, &bytes).unwrap();
+    assert!(extract::list(&path).is_err(), "image 1 is damaged");
+    let two = zipfast::tar::list_wim_image(&path, 2).unwrap();
+    assert_eq!(two.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["two.txt"]);
+}
+
 #[test]
 fn lzms_and_solid_files_are_refused_as_unsupported() {
     for fixture in ["lzms.wim", "solid.wim"] {

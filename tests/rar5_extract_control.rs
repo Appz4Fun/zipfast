@@ -2224,3 +2224,38 @@ fn a_placed_link_rebound_to_the_log_still_revokes_diagnostics() {
     assert!(report.diagnostic().writer().is_none());
     assert!(report.diagnostic_failure().is_some());
 }
+
+/// A symbolic link placed where none was is followed as one found in preparation is: one leading to the log
+/// revokes diagnostics at once, and one dangling when placed revokes them once its referent becomes the log.
+#[test]
+fn a_newly_placed_symlink_to_the_log_revokes_diagnostics() {
+    for dangling in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("links.rar");
+        let target = if dangling { "later" } else { "err.log" };
+        fs::write(&source, archive(&[link_spec("sym", 1, target), FileSpec::new("after", b"after")])).unwrap();
+        let dest = d.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        let log = dest.join("err.log");
+        let diagnostic = OpenOptions::new().create_new(true).append(true).open(&log).unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control =
+            RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let mut report = session.extract_selected_controlled(
+            &selected,
+            &options(&dest),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Quiet,
+        );
+        assert_eq!(report.outcome().as_ref().unwrap().files, 2, "dangling {dangling}");
+        assert_eq!(fs::read_link(dest.join("sym")).unwrap(), Path::new(target));
+        if dangling {
+            assert!(report.diagnostic_failure().is_none(), "{:?}", report.diagnostic_failure());
+            fs::hard_link(&log, dest.join("later")).unwrap();
+        }
+        assert!(report.diagnostic().writer().is_none(), "dangling {dangling}");
+        assert!(report.diagnostic_failure().is_some(), "dangling {dangling}");
+    }
+}

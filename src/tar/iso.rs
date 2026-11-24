@@ -139,6 +139,8 @@ struct Record {
     extent: u64,
     size: u64,
     flags: u8,
+    /// file unit and interleave gap sizes: nonzero for a file whose data is interleaved, not contiguous
+    interleaved: bool,
     name: Vec<u8>,
     mtime: Option<i64>,
     /// Rock Ridge: what its system use entries say
@@ -163,6 +165,15 @@ struct Rr {
     sl_continues: bool,
     /// the root's SP entry: bytes to skip at the start of every record's system use area
     sp: Option<usize>,
+    /// an ER entry naming Rock Ridge (RRIP), or an RR entry: SP alone only says the system use areas are used
+    rrip: bool,
+}
+
+impl Rr {
+    /// Whether the root's "." record shows Rock Ridge itself, rather than some other SUSP extension.
+    fn is_rock_ridge(&self) -> bool {
+        self.rrip || self.mode.is_some() || self.name.is_some()
+    }
 }
 
 struct Walk<'a> {
@@ -181,8 +192,9 @@ impl Walk<'_> {
         Ok(())
     }
 
-    /// The records of the folder at `extent`, `size` bytes, in order; `.` and `..` left out unless `dots`.
-    fn records(&mut self, extent: u64, size: u64, budget: &mut u64, dots: bool) -> Result<Vec<Record>> {
+    /// The records of the folder at `extent`, `size` bytes, in order; `.` and `..` left out unless `dots`. More than
+    /// `max` records are refused as they are read, before they all take memory.
+    fn records(&mut self, extent: u64, size: u64, budget: &mut u64, dots: bool, max: usize) -> Result<Vec<Record>> {
         self.check_extent(extent, size)?;
         *budget = budget.checked_sub(size).ok_or(corrupt("an ISO 9660 image's folders are too big"))?;
         let mut data = vec![0u8; size as usize];
@@ -210,6 +222,9 @@ impl Walk<'_> {
             if dot && !dots {
                 continue;
             }
+            if out.len() >= max {
+                return Err(corrupt("an ISO 9660 image has too many entries"));
+            }
             let su_start = 33 + name_len + (1 - name_len % 2);
             let mut rr = Rr::default();
             if let Naming::RockRidge { skip } = self.names
@@ -218,9 +233,11 @@ impl Walk<'_> {
                 self.susp(&rec[su_start + skip..], &mut rr, 0)?;
             }
             out.push(Record {
-                extent: u64::from(both32(&rec[2..6])),
+                // an extended attribute record of rec[1] blocks comes first, and the data after it
+                extent: u64::from(both32(&rec[2..6])) + u64::from(rec[1]),
                 size: u64::from(both32(&rec[10..14])),
                 flags: rec[25],
+                interleaved: rec[26] != 0 || rec[27] != 0,
                 name,
                 mtime: time7(&rec[18..25]),
                 rr,
@@ -295,6 +312,13 @@ impl Walk<'_> {
                         i += 2 + clen;
                     }
                 }
+                b"ER" if d.len() >= 4 => {
+                    let id = d.get(4..4 + usize::from(d[0])).unwrap_or_default();
+                    if [&b"RRIP_1991A"[..], b"IEEE_P1282", b"IEEE_1282"].contains(&id) {
+                        rr.rrip = true;
+                    }
+                }
+                b"RR" => rr.rrip = true,
                 b"CL" if d.len() >= 8 => rr.child = Some(u64::from(both32(&d[0..4]))),
                 b"RE" => rr.relocated = true,
                 b"ZF" => rr.zisofs = true,
@@ -375,11 +399,12 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
     let mut walk = Walk { file: &file, len, names: Naming::Plain, susp_bytes: MAX_SUSP_BYTES };
     let root_of = |r: &[u8; 34]| (u64::from(both32(&r[2..6])), u64::from(both32(&r[10..14])));
     let (pext, psize) = root_of(&primary);
-    // Rock Ridge shows in the root's "." record: an SP entry, or Rock Ridge entries straight away
+    // Rock Ridge shows in the root's "." record, the first in its first sector: an ER entry naming it, or Rock
+    // Ridge entries straight away (an SP entry alone is any SUSP extension, and leaves Joliet the choice)
     let mut budget = MAX_DIR_BYTES;
     walk.names = Naming::RockRidge { skip: 0 };
-    let dot = walk.records(pext, psize, &mut budget, true)?.into_iter().next();
-    let rock = dot.as_ref().is_some_and(|d| d.rr.sp.is_some() || d.rr.mode.is_some() || d.rr.name.is_some());
+    let dot = walk.records(pext, psize.min(SECTOR), &mut budget, true, usize::MAX)?.into_iter().next();
+    let rock = dot.as_ref().is_some_and(|d| d.rr.is_rock_ridge());
     let (root_extent, root_size) = if rock {
         walk.names = Naming::RockRidge { skip: dot.and_then(|d| d.rr.sp).unwrap_or(0) };
         (pext, psize)
@@ -403,7 +428,9 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
     // depth-first, each folder before what is in it: (extent, size, the folder's name, depth)
     let mut stack: Vec<(u64, u64, Option<usize>, usize)> = vec![(root_extent, root_size, None, 0)];
     while let Some((extent, size, parent, depth)) = stack.pop() {
-        let records = walk.records(extent, size, &mut budget, false)?;
+        // a folder's records may run past the entries left only by a file's further extents
+        let max = (MAX_ENTRIES - entries.len()).saturating_add(MAX_EXTENTS);
+        let records = walk.records(extent, size, &mut budget, false, max)?;
         let mut folders = Vec::new();
         let mut pending: Option<(Entry, Vec<u8>)> = None;
         for r in records {
@@ -453,6 +480,9 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
                 mtime,
             };
             if kind == Kind::File {
+                if r.interleaved {
+                    return Err(Error::Unsupported("interleaved ISO 9660 files are not supported".into()));
+                }
                 walk.check_extent(r.extent, r.size)?;
                 // a file of several extents: every record but the last has the multi-extent flag
                 declared = declared.saturating_add(r.size);
@@ -467,8 +497,8 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
                         p.extents.push((r.extent, r.size));
                     }
                     _ => {
-                        if let Some((p, _)) = pending.take() {
-                            entries.push(finished(p)?);
+                        if pending.is_some() {
+                            return Err(corrupt(UNFINISHED));
                         }
                         pending = Some((entry(vec![(r.extent, r.size)]), raw.clone()));
                     }
@@ -480,8 +510,8 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
                 }
                 continue;
             }
-            if let Some((p, _)) = pending.take() {
-                entries.push(finished(p)?);
+            if pending.is_some() {
+                return Err(corrupt(UNFINISHED));
             }
             let e = entry(Vec::new());
             let me = e.name;
@@ -510,8 +540,8 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
                 }
             }
         }
-        if let Some((p, _)) = pending.take() {
-            entries.push(finished(p)?);
+        if pending.is_some() {
+            return Err(corrupt(UNFINISHED));
         }
         // the stack takes them in reverse, so the folders come out in their listed order
         stack.extend(folders.into_iter().rev());
@@ -525,6 +555,9 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
     let max_paths = len.saturating_mul(MAX_PATHS_RATIO).saturating_add(MAX_PATHS_FREE);
     Ok(State { file, entries, names, paths: 0, max_paths })
 }
+
+/// A file whose last record still had the multi-extent flag: the record that ends it is missing.
+const UNFINISHED: &str = "an ISO 9660 file's last extent is missing";
 
 /// A file whose extents are all read: refused when they overlap one another, which no writer does and which
 /// would read the same bytes over and over.
@@ -591,6 +624,7 @@ impl State {
             name: path,
             raw_name: raw_path,
             link: e.link,
+            raw_link: None,
             size: if e.kind == Kind::File { size } else { 0 },
             kind: e.kind,
             mtime: e.mtime,
@@ -748,6 +782,48 @@ mod tests {
         let mut rr = Rr::default();
         walk.susp(&sl(&[(0x08, b""), (0, b"etc"), (0x04, b""), (0, b"x")]), &mut rr, 0).unwrap();
         assert_eq!(rr.symlink.as_deref(), Some(&b"/etc/../x"[..]));
+    }
+
+    /// SP says only that SUSP is in use: another extension's ER doesn't make an image Rock Ridge, RRIP's does.
+    #[test]
+    fn rock_ridge_needs_more_than_susp() {
+        let file = tempfile::tempfile().unwrap();
+        let mut walk = Walk { file: &file, len: 0, names: Naming::RockRidge { skip: 0 }, susp_bytes: MAX_SUSP_BYTES };
+        let er = |id: &[u8]| {
+            let mut e = vec![b'E', b'R', (8 + id.len()) as u8, 1, id.len() as u8, 0, 0, 1];
+            e.extend_from_slice(id);
+            e
+        };
+        let sp = [b'S', b'P', 7, 1, 0xbe, 0xef, 0];
+        for (id, rock) in [(&b"OTHER_EXT"[..], false), (b"RRIP_1991A", true), (b"IEEE_P1282", true)] {
+            let mut area = sp.to_vec();
+            area.extend(er(id));
+            let mut rr = Rr::default();
+            walk.susp(&area, &mut rr, 0).unwrap();
+            assert_eq!((rr.sp, rr.is_rock_ridge()), (Some(0), rock), "{id:?}");
+        }
+    }
+
+    /// A folder's records past the bound are refused as they are read, and the root probe reads one sector.
+    #[test]
+    fn records_past_the_bound_are_refused_while_reading() {
+        let mut folder = vec![0u8; 2 * SECTOR as usize];
+        let mut at = 0;
+        for i in 0..60 {
+            let r = rec(format!("F{i:02}.TXT;1").as_bytes(), 0, 0, 0);
+            if at % SECTOR as usize + r.len() > SECTOR as usize {
+                at = (at / SECTOR as usize + 1) * SECTOR as usize;
+            }
+            folder[at..at + r.len()].copy_from_slice(&r);
+            at += r.len();
+        }
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut file, &folder).unwrap();
+        let mut walk = Walk { file: &file, len: folder.len() as u64, names: Naming::Plain, susp_bytes: MAX_SUSP_BYTES };
+        let mut budget = MAX_DIR_BYTES;
+        assert_eq!(walk.records(0, 2 * SECTOR, &mut budget, false, 60).unwrap().len(), 60);
+        let e = walk.records(0, 2 * SECTOR, &mut budget, false, 59).err().unwrap();
+        assert!(e.to_string().contains("too many entries"), "{e}");
     }
 
     #[test]

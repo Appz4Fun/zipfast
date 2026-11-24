@@ -448,11 +448,11 @@ pub(crate) fn publish(
     modified: Option<SystemTime>,
     extracted: &mut Extracted,
 ) -> io::Result<()> {
-    publish_charging(dest, rel, place, kind, modified, extracted, &mut || Ok(()))
+    publish_charging(dest, rel, place, kind, modified, extracted, &mut |_| Ok(()))
 }
 
-/// [`publish`], asking `charge` first whenever the link has to be made as a copy, which writes every byte of the
-/// target, holes included: an error from it fails the link instead.
+/// [`publish`], asking `charge` first, with the copy's length, whenever the link has to be made as a copy, which
+/// writes every byte of the target, holes included: an error from it fails the link instead.
 pub(crate) fn publish_charging(
     dest: &Path,
     rel: &Path,
@@ -460,7 +460,7 @@ pub(crate) fn publish_charging(
     kind: &LinkKind,
     modified: Option<SystemTime>,
     extracted: &mut Extracted,
-    charge: &mut dyn FnMut() -> io::Result<()>,
+    charge: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> io::Result<()> {
     let (path, replace) = match &place.reserved {
         Some(reserved) => (reserved.path().to_path_buf(), true),
@@ -485,17 +485,18 @@ pub(crate) fn make(
     replace: bool,
     modified: Option<SystemTime>,
 ) -> io::Result<()> {
-    make_charging(dest, kind, extracted, path, replace, modified, &mut || Ok(()))
+    make_charging(dest, kind, extracted, path, replace, modified, &mut |_| Ok(()))
 }
 
-fn make_charging(
+/// [`make`], asking `charge` first, with the copy's length, whenever the link has to be made as a copy.
+pub(crate) fn make_charging(
     dest: &Path,
     kind: &LinkKind,
     extracted: &Extracted,
     path: &Path,
     replace: bool,
     modified: Option<SystemTime>,
-    charge: &mut dyn FnMut() -> io::Result<()>,
+    charge: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> io::Result<()> {
     match kind {
         #[cfg(unix)]
@@ -561,7 +562,7 @@ fn hard(
     path: &Path,
     replace: bool,
     copy: bool,
-    charge: &mut dyn FnMut() -> io::Result<()>,
+    charge: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> io::Result<()> {
     let stage = stage_beside(path)?;
     let copied = stage_hard(dest, landed, &stage, copy, charge)?;
@@ -571,11 +572,12 @@ fn hard(
         linked(&stage, path).or_else(|e| match e.kind() {
             io::ErrorKind::AlreadyExists => Err(e),
             _ => {
+                let mut from = open_no_follow(&stage)?;
                 // a stage that is already a copy was charged for
                 if !copied {
-                    charge()?;
+                    charge(from.metadata()?.len())?;
                 }
-                copy_new(&mut open_no_follow(&stage)?, path)
+                copy_new(&mut from, path)
             }
         })
     };
@@ -615,10 +617,16 @@ fn open_no_follow(path: &Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// Copies `from` into a new file at `to`, created only where nothing is.
+/// Copies `from` into a new file at `to`, created only where nothing is, with `from`'s permissions (the
+/// archived ones it was extracted with), as a hard link would share them.
 fn copy_new(from: &mut std::fs::File, to: &Path) -> io::Result<()> {
     let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
-    if let Err(e) = io::copy(from, &mut out) {
+    // set before any byte is written, so a restricted file's data is never readable under a wider mode
+    if let Err(e) = from
+        .metadata()
+        .and_then(|m| out.set_permissions(m.permissions()))
+        .and_then(|()| io::copy(from, &mut out).map(drop))
+    {
         drop(out);
         let _ = std::fs::remove_file(to);
         return Err(e);
@@ -633,7 +641,7 @@ fn stage_hard(
     landed: &Landed,
     stage: &Path,
     copy: bool,
-    charge: &mut dyn FnMut() -> io::Result<()>,
+    charge: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> io::Result<bool> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -687,7 +695,7 @@ fn stage_hard(
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || !same(&st) {
         return Err(gone());
     }
-    charge()?;
+    charge(u64::try_from(st.st_size).unwrap_or(0))?;
     copy_new(&mut std::fs::File::from(fd), stage).map(|()| true)
 }
 
@@ -697,7 +705,7 @@ fn stage_hard(
     landed: &Landed,
     stage: &Path,
     copy: bool,
-    charge: &mut dyn FnMut() -> io::Result<()>,
+    charge: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> io::Result<bool> {
     let source = dest.join(&landed.rel);
     if !std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file()) {
@@ -706,8 +714,9 @@ fn stage_hard(
     if !copy && linked(&source, stage).is_ok() {
         return Ok(false);
     }
-    charge()?;
-    copy_new(&mut std::fs::File::open(&source)?, stage).map(|()| true)
+    let mut from = std::fs::File::open(&source)?;
+    charge(from.metadata()?.len())?;
+    copy_new(&mut from, stage).map(|()| true)
 }
 
 #[cfg(test)]

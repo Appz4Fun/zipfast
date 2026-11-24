@@ -238,14 +238,25 @@ impl OutputContext {
         }
         let replace = target.initial.is_some() && matches!(self.root.overwrite, crate::extract::Overwrite::Always);
         let root = &self.root.path;
-        link::make(root, kind, &self.extracted, &target.path, replace, modified).map_err(
-            |e| match link::member_failure(&e) {
-                Some(_) if e.kind() != std::io::ErrorKind::Unsupported => {
-                    ProgressiveFailure::new(FailureKind::UnsafePath)
-                }
-                _ => out(OutputOperation::Publish, e, 0),
-            },
-        )?;
+        // a file copy (or a hard link made as one) writes every byte of the earlier file: it is charged as a
+        // published file's extent and writes are
+        let mut over = None;
+        let mut charge = |len: u64| {
+            let charged =
+                self.usage.output_extent(len).and_then(|()| self.usage.charge(Resource::OutputWriteBytes, len));
+            charged.map_err(|failure| {
+                over = Some(failure);
+                std::io::Error::other("progressive output budget")
+            })
+        };
+        let made = link::make_charging(root, kind, &self.extracted, &target.path, replace, modified, &mut charge);
+        if let Some(failure) = over {
+            return Err(failure);
+        }
+        made.map_err(|e| match link::member_failure(&e) {
+            Some(_) if e.kind() != std::io::ErrorKind::Unsupported => ProgressiveFailure::new(FailureKind::UnsafePath),
+            _ => out(OutputOperation::Publish, e, 0),
+        })?;
         let rel = target.path.strip_prefix(root).map_err(|_| invalid())?.to_path_buf();
         link::placed(root, &rel, kind, &target.path, &mut self.extracted);
         Ok(())
