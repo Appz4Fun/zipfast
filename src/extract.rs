@@ -802,6 +802,8 @@ fn check_target_detailed(
         if !start_rename_is_safe(&new) {
             return Ok(DetailedChecked::Blocked(RarPolicyReason::UnsafePath));
         }
+        // `a//b` and `a/./b` are the same place as `a/b`: later records and checks want one spelling
+        let new: PathBuf = new.components().collect();
         return place_target(opts, &new, dirs, log);
     }
     if decision == StartDecision::Skip {
@@ -824,6 +826,7 @@ fn start_rename_is_safe(new: &Path) -> bool {
     let mut any = false;
     for c in new.components() {
         match c {
+            Component::Normal(n) if n.to_string_lossy().contains('\0') => return false,
             Component::Normal(n) if !n.to_string_lossy().contains([':', '\\']) || cfg!(unix) => any = true,
             _ => return false,
         }
@@ -3537,6 +3540,8 @@ struct Run<'a, 'r, 'c> {
     selection: Option<RarSelection<'a>>,
     /// members with a first header seen so far: the next one's listing position
     members: u64,
+    /// Members counted before the volume the run was asked to start at (see `members_before`)
+    members_before: u64,
     /// the files placed and extracted so far, for RAR 5.0 hard links and file copies
     landing: Landing,
     /// checked before each member and as each member's data is decoded
@@ -3652,6 +3657,28 @@ fn restart_volume(path: &Path, password: Option<&str>) -> Option<PathBuf> {
     None
 }
 
+/// How many members start in the volumes from `from` up to (not including) `until`: the listing positions a run
+/// restarted at `from` counts before `until`'s own first member.
+fn members_before(from: &Path, until: &Path, password: Option<&str>) -> Option<u64> {
+    let mut count = 0u64;
+    let mut current = from.to_path_buf();
+    for _ in 0..4096 {
+        if current == until {
+            return Some(count);
+        }
+        let mut volume = Volume::open_with_password(&current, password).ok()?;
+        while let Some(block) = volume.next_block().ok()? {
+            match block {
+                Block::File(header) if !header.split_before() => count = count.checked_add(1)?,
+                Block::End { .. } => break,
+                _ => {}
+            }
+        }
+        current = next_volume(&current)?;
+    }
+    None
+}
+
 fn rar_run_shared_open<'a>(
     first: &Path,
     opts: &Options,
@@ -3668,6 +3695,12 @@ fn rar_run_shared_open<'a>(
     // As UnRAR: extracting or testing from a later volume starts over at the set's first volume when every volume
     // before it is there.
     let restart = restart_volume(first, password);
+    // A selection by listing position (`MemberRef::ordinal`) means the positions the listing of the volume given
+    // shows, which start at that volume: the restarted run shifts its own count by the members before it.
+    let skipped = match restart.as_deref() {
+        Some(from) => members_before(from, first, password),
+        None => Some(0),
+    };
     let first = restart.as_deref().unwrap_or(first);
     if restart.is_some() {
         first_volume = Volume::open_detailed(first, password)?;
@@ -3702,6 +3735,8 @@ fn rar_run_shared_open<'a>(
     let threads = if opts.parallel_min.is_some() { 1 } else { threads };
     let mut run = Run::new(&opts, password, reports, threads);
     run.cancel = cancel.cloned();
+    // not countable: the members before the volume given are left alone
+    run.members_before = skipped.unwrap_or(u64::MAX);
     let walked = walk_rar(first_volume, &mut run).and_then(|()| run.drain());
     let canceled = cancel.is_some_and(Cancellation::is_canceled);
     if canceled {
@@ -3843,6 +3878,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             dirs: Dirs::default(),
             selection: None,
             members: 0,
+            members_before: 0,
             landing: Landing { placed: HashMap::new(), extracted: link::Extracted::new(opts) },
             cancel: None,
         }
@@ -3986,9 +4022,13 @@ impl Run<'_, '_, '_> {
             // an orphan continuation has no listing position to filter on
             self.opts.select.is_none()
         } else {
-            let ordinal = self.members;
-            self.members = ordinal.checked_add(1).ok_or_else(RarFault::counter_limit)?;
-            self.opts.selects_revision(&name, h.is_dir(), ordinal, h.version)
+            let counted = self.members;
+            self.members = counted.checked_add(1).ok_or_else(RarFault::counter_limit)?;
+            match counted.checked_sub(self.members_before) {
+                Some(ordinal) => self.opts.selects_revision(&name, h.is_dir(), ordinal, h.version),
+                // before the volume the run was started at: not in the listing, so a selection leaves it out
+                None => self.opts.select.is_none(),
+            }
         };
         if !selected {
             return self.unselected_block(vol, h, name, continuation);
@@ -4378,7 +4418,7 @@ impl Run<'_, '_, '_> {
             let cause = self.fail_in_order(&ctx, reason, "unsupported symbolic link")?;
             return self.pass_over(vol, h, ctx, cipher, Some(cause));
         }
-        let place = if self.opts.mode == Mode::Extract {
+        let mut place = if self.opts.mode == Mode::Extract {
             let mut renamed = None;
             let order = ctx.entry.order;
             let mut log = RenameLog {
@@ -4415,6 +4455,51 @@ impl Run<'_, '_, '_> {
             }
         } else {
             None
+        };
+        // A start hook may have sent the member elsewhere: what later members must wait for is the place it is
+        // really written at, so the collision checks and the pending sets go by that.
+        let key = match place.as_ref().and_then(|p| p.path.strip_prefix(&self.opts.dest).ok()) {
+            Some(at) if self.opts.mode == Mode::Extract && at.to_string_lossy().to_lowercase() != key => {
+                let at = at.to_string_lossy().to_lowercase();
+                let busy = Path::new(&at).ancestors().any(|a| {
+                    let a = a.to_string_lossy().to_lowercase();
+                    self.batch_paths.contains(&a) || self.queued_paths.contains(&a)
+                });
+                if busy {
+                    // the name was judged while an earlier write to it was still pending: wait, then judge again
+                    self.drain()?;
+                    if self.opts.overwrite.rename().is_none()
+                        && let Some(old) = place.take()
+                    {
+                        let rel = old.path.strip_prefix(&self.opts.dest).unwrap_or(&old.path).to_path_buf();
+                        let mut log = RenameLog {
+                            budget: &mut self.rename_budget,
+                            placed: Some(&self.landing.extracted),
+                            record: &mut |_| {},
+                        };
+                        let checked = place_target(self.opts, &rel, Some(&mut self.dirs), &mut log);
+                        match checked.map_err(|e| self.terminal(&ctx, e))? {
+                            DetailedChecked::Write(place2) => place = Some(place2),
+                            DetailedChecked::Exists => {
+                                self.reports.skipped(&ctx, RarSkipReason::ExistingTarget)?;
+                                return self.pass_over(vol, h, ctx, cipher, None);
+                            }
+                            DetailedChecked::Blocked(reason) => {
+                                let message = blocked_message(&reason);
+                                let cause = self.fail_in_order(
+                                    &ctx,
+                                    RarFailure::Policy { reason, path: self.opts.dest.join(&rel) },
+                                    message,
+                                )?;
+                                return self.pass_over(vol, h, ctx, cipher, Some(cause));
+                            }
+                            DetailedChecked::Declined => unreachable!("place_target never declines"),
+                        }
+                    }
+                }
+                at
+            }
+            _ => key,
         };
         // a file a later hard link or file copy may take, once it is verified
         if self.selection.is_none() && !h.is_rar4_symlink() {

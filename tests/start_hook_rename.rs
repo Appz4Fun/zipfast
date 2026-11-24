@@ -222,3 +222,72 @@ fn the_checked_zip_route_fails_the_member_instead_of_renaming() {
     assert!(!tmp.path().join("renamed-by-hook.bin").exists());
     assert!(!tmp.path().join("dir/file.txt").exists());
 }
+
+fn rar_ab(tmp: &Path) -> PathBuf {
+    let arc = tmp.join("ab.rar");
+    fs::write(&arc, archive(&[FileSpec::new("a", b"from a"), FileSpec::new("b", b"from b")])).unwrap();
+    arc
+}
+
+/// Y1: a member sent to `b` and a later member `b` write the same place, so the second waits for the first.
+#[test]
+fn a_renamed_member_and_a_later_member_at_its_new_name_are_serialized() {
+    for (overwrite, expect) in [(Overwrite::Always, &b"from b"[..]), (Overwrite::Skip, &b"from a"[..])] {
+        for _ in 0..20 {
+            let tmp = tempfile::tempdir().unwrap();
+            let arc = rar_ab(tmp.path());
+            let dest = tmp.path().join("out");
+            let mut opts = options(&dest, overwrite, renaming(&dest, "a", "b"));
+            opts.threads = Some(4);
+            let s = extract::run(&arc, &opts, |_| {}).unwrap();
+            assert!(s.errors.is_empty(), "{overwrite:?}: {:?}", s.errors);
+            assert!(!dest.join("a").exists());
+            assert_eq!(fs::read(dest.join("b")).unwrap(), expect, "{overwrite:?}");
+        }
+    }
+}
+
+/// Y2: a new name spelled `a//b` or `a/./b` lands at `a/b`.
+#[test]
+fn a_new_name_with_empty_or_dot_components_is_normalized() {
+    for spelled in ["x//y", "x/./y"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let arc = rar_ab(tmp.path());
+        let dest = tmp.path().join("out");
+        let opts = options(&dest, Overwrite::Always, renaming(&dest, "a", spelled));
+        let s = extract::run(&arc, &opts, |_| {}).unwrap();
+        assert!(s.errors.is_empty(), "{spelled}: {:?}", s.errors);
+        assert_eq!(fs::read(dest.join("x/y")).unwrap(), b"from a", "{spelled}");
+    }
+}
+
+/// Y3: a NUL in a new name is an unsafe path for that member, not a fault that stops the run.
+#[test]
+fn a_new_name_with_a_nul_fails_only_its_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = rar_ab(tmp.path());
+    let dest = tmp.path().join("out");
+    let opts = options(&dest, Overwrite::Always, renaming(&dest, "a", "bad\0name"));
+    let s = extract::run(&arc, &opts, |_| {}).unwrap();
+    assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
+    assert!(s.errors[0].starts_with("a:"), "{:?}", s.errors);
+    assert_eq!(fs::read(dest.join("b")).unwrap(), b"from b", "the run went on");
+}
+
+/// Y1, the other order: the renamed member lands on a name an earlier, still pending member writes.
+#[test]
+fn a_member_renamed_onto_an_earlier_pending_name_waits_for_it() {
+    for (overwrite, expect) in [(Overwrite::Always, &b"from a"[..]), (Overwrite::Skip, &b"from b"[..])] {
+        for _ in 0..20 {
+            let tmp = tempfile::tempdir().unwrap();
+            let arc = tmp.path().join("ba.rar");
+            fs::write(&arc, archive(&[FileSpec::new("b", b"from b"), FileSpec::new("a", b"from a")])).unwrap();
+            let dest = tmp.path().join("out");
+            let mut opts = options(&dest, overwrite, renaming(&dest, "a", "b"));
+            opts.threads = Some(4);
+            let s = extract::run(&arc, &opts, |_| {}).unwrap();
+            assert!(s.errors.is_empty(), "{overwrite:?}: {:?}", s.errors);
+            assert_eq!(fs::read(dest.join("b")).unwrap(), expect, "{overwrite:?}");
+        }
+    }
+}
