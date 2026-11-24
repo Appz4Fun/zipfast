@@ -62,6 +62,44 @@ pub fn next_volume(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(next))
 }
 
+/// The volume before `path`, the inverse of [`next_volume`]: `name.part02.rar` becomes `name.part01.rar`, `name.r00`
+/// becomes `name.rar`, `name.s00` becomes `name.r99`. None for a first name (`name.rar`, `name.part1.rar`) and for a
+/// name that is no volume name.
+pub fn previous_volume(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let lower = name.to_ascii_lowercase();
+    let previous = if let Some(stem) = lower.strip_suffix(".rar") {
+        let digits_at = part_digits_at(stem)?;
+        let suffix = &stem[digits_at..];
+        let n: u64 = suffix.parse().ok()?;
+        if n <= 1 {
+            return None;
+        }
+        let digits = format!("{:0width$}", n - 1, width = suffix.len());
+        format!("{}{}{}", &name[..digits_at], digits, &name[stem.len()..])
+    } else {
+        let (base, ext) = name.rsplit_once('.')?;
+        let mut chars = ext.chars();
+        let letter = chars.next()?;
+        let digits = chars.as_str();
+        if !letter.is_ascii_alphabetic() || digits.len() < 2 || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let n: u32 = digits.parse().ok()?;
+        let width = digits.len();
+        if n > 0 {
+            format!("{base}.{letter}{:0width$}", n - 1)
+        } else if letter.eq_ignore_ascii_case(&'r') {
+            let r = if letter == 'R' { "RAR" } else { "rar" };
+            format!("{base}.{r}")
+        } else {
+            let before = (letter as u8 - 1) as char;
+            format!("{base}.{before}{:0width$}", 10u32.checked_pow(width.try_into().ok()?)? - 1)
+        }
+    };
+    Some(path.with_file_name(previous))
+}
+
 /// In `name.partNN`, where the digits start.
 fn part_digits_at(stem: &str) -> Option<usize> {
     let digits_len = stem.bytes().rev().take_while(u8::is_ascii_digit).count();
@@ -97,6 +135,20 @@ mod tests {
         for name in ["a.é00", "a.100", "a.z99", "a.Z99"] {
             assert_eq!(next_volume(Path::new(name)), None, "{name}");
         }
+    }
+
+    #[test]
+    fn previous_names() {
+        let prev = |s: &str| previous_volume(Path::new(s)).map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(prev("a.part02.rar").as_deref(), Some("a.part01.rar"));
+        assert_eq!(prev("a.part10.rar").as_deref(), Some("a.part09.rar"));
+        assert_eq!(prev("a.part1.rar"), None);
+        assert_eq!(prev("a.rar"), None);
+        assert_eq!(prev("a.r00").as_deref(), Some("a.rar"));
+        assert_eq!(prev("A.R00").as_deref(), Some("A.RAR"));
+        assert_eq!(prev("a.r05").as_deref(), Some("a.r04"));
+        assert_eq!(prev("a.s00").as_deref(), Some("a.r99"));
+        assert_eq!(prev("a.txt"), None);
     }
 
     #[test]
