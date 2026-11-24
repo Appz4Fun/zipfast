@@ -149,7 +149,7 @@ pub(crate) struct WriteFile {
 
 enum PendingPath {
     New(Cleanup),
-    Replacement(TempPath, PathBuf),
+    Replacement(TempPath, PathBuf, Option<(u64, u64)>),
     #[cfg(unix)]
     Selected(SelectedStage, PathBuf),
 }
@@ -235,10 +235,24 @@ pub(crate) fn replace(temporary: TempPath, target: &Path) -> io::Result<()> {
     replace_detailed(temporary, target).map_err(OutputError::into_legacy)
 }
 
+/// [`replace`] for a target that held the symbolic link with identity `link` (one this run placed) when it was
+/// checked: that link is replaced by the rename, any other is refused.
+pub(crate) fn replace_link(temporary: TempPath, target: &Path, link: Option<(u64, u64)>) -> io::Result<()> {
+    replace_over(temporary, target, link).map_err(OutputError::into_legacy)
+}
+
 fn replace_detailed(temporary: TempPath, target: &Path) -> Result<(), OutputError> {
+    replace_over(temporary, target, None)
+}
+
+fn replace_over(temporary: TempPath, target: &Path, link: Option<(u64, u64)>) -> Result<(), OutputError> {
     let fault = |operation, source| OutputError::Io { operation, path: Some(target.to_path_buf()), source };
     // An earlier check cannot account for a symlink installed while decoding.
     match fs::symlink_metadata(target) {
+        Ok(meta)
+            if meta.file_type().is_symlink()
+                && link.is_some()
+                && link == Some(crate::extract::link::identity(&meta)) => {}
         Ok(meta) if meta.file_type().is_symlink() => return Err(OutputError::Symlink(target.to_path_buf())),
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -267,7 +281,7 @@ impl PendingPath {
     fn target(&self) -> Option<&Path> {
         match self {
             Self::New(cleanup) => cleanup.0.as_deref(),
-            Self::Replacement(_, target) => Some(target),
+            Self::Replacement(_, target, _) => Some(target),
             #[cfg(unix)]
             Self::Selected(_, target) => Some(target),
         }
@@ -333,7 +347,7 @@ impl WriteFile {
         let Self { file, pending } = self;
         drop(file);
         match pending {
-            Some(PendingPath::Replacement(temporary, target)) => replace_detailed(temporary, &target),
+            Some(PendingPath::Replacement(temporary, target, link)) => replace_over(temporary, &target, link),
             #[cfg(unix)]
             Some(PendingPath::Selected(_, _)) => unreachable!("selected output uses checked publication"),
             Some(PendingPath::New(mut cleanup)) => {
@@ -391,9 +405,15 @@ impl Output {
         output
     }
 
-    pub fn staged(file: File, size: Option<u64>, temporary: TempPath, target: PathBuf) -> Self {
+    pub fn staged(
+        file: File,
+        size: Option<u64>,
+        temporary: TempPath,
+        target: PathBuf,
+        link: Option<(u64, u64)>,
+    ) -> Self {
         let mut output = Self::new(file, size);
-        output.pending = Some(PendingPath::Replacement(temporary, target));
+        output.pending = Some(PendingPath::Replacement(temporary, target, link));
         output
     }
 
@@ -639,7 +659,7 @@ mod tests {
         let before = fs::metadata(&target).unwrap();
         let temp = temporary(dir.path()).unwrap();
         let file = File::open(temp.path()).unwrap();
-        let mut out = Output::staged(file, None, temp.into_temp_path(), target.clone());
+        let mut out = Output::staged(file, None, temp.into_temp_path(), target.clone(), None);
         out.write(b"buffered bytes").unwrap();
 
         assert!(out.finish(|_| panic!("a failed write cannot prepare publication")).is_err());
@@ -655,7 +675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         let (file, temp) = temporary(dir.path()).unwrap().into_parts();
-        let mut out = Output::staged(file, Some(4), temp, target.clone());
+        let mut out = Output::staged(file, Some(4), temp, target.clone(), None);
         out.write(b"data").unwrap();
 
         fs::create_dir(&target).unwrap();
@@ -674,7 +694,7 @@ mod tests {
         fs::write(&target, b"original").unwrap();
         let temp = temporary(dir.path()).unwrap();
         let file = File::open(temp.path()).unwrap();
-        let mut out = Output::staged(file, None, temp.into_temp_path(), target.clone());
+        let mut out = Output::staged(file, None, temp.into_temp_path(), target.clone(), None);
         out.write(b"buffered").unwrap();
         let fault = out.finish_detailed(|_| panic!("failed write reached publication")).unwrap_err().detailed(false);
         assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
@@ -686,7 +706,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("keep"), b"original").unwrap();
         let (file, temp) = temporary(dir.path()).unwrap().into_parts();
-        let mut out = Output::staged(file, Some(4), temp, target.clone());
+        let mut out = Output::staged(file, Some(4), temp, target.clone(), None);
         out.write(b"data").unwrap();
         let fault = out.finish_detailed(|_| {}).unwrap_err().detailed(false);
         assert!(matches!(fault.failure.as_ref(), RarFailure::Output {

@@ -108,6 +108,11 @@ The link is refused when that leads out of the destination, whichever choice is 
 
 UnRAR also makes `e`; zipfast never makes a link that leads out of the destination.
 
+A symbolic link this run placed itself (same device and inode as the link it made) is not a pre-existing link: a
+later member of the same name replaces it by rename, never following it, as a file replaces a file (tar, ZIP, 7z and
+RAR runs; `Overwrite::Skip` keeps it). A link from before the run is still refused (`a symlink is in the way`). The
+checked ZIP route (`run_with_policy`) does this for a link over a link, but still refuses a file over a link it placed.
+
 ## `refused_link_placeholder`: an empty file where a link was refused
 
 When 7-Zip refuses a dangerous link ("Dangerous link via another link was ignored") it writes an empty regular file
