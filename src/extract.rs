@@ -3512,6 +3512,8 @@ struct Run<'a, 'r, 'c> {
     dir_meta: Vec<(PathBuf, Meta)>,
     unavailable: Option<HistoryFailure>,
     pending: Option<Pending>,
+    /// The member whose continuation parts were last reported as lacking their start; its later parts stay quiet.
+    orphan: Option<String>,
     /// the decoder, kept between files of a solid stream
     stream: Option<Unpacker>,
     /// the RAR4 decoder, kept between the parts of a split file and the files of a solid stream
@@ -3620,6 +3622,36 @@ fn rar_run_shared<'a>(
     rar_run_shared_open(first, opts, password, None, reports, || Volume::open_detailed(first, password))
 }
 
+/// Whether the first member in the volume at `path` continues from an earlier volume.
+fn starts_with_continuation(path: &Path, password: Option<&str>) -> Option<bool> {
+    let mut volume = Volume::open_with_password(path, password).ok()?;
+    loop {
+        match volume.next_block().ok()? {
+            Some(Block::File(header)) => return Some(header.split_before()),
+            Some(Block::End { .. }) | None => return Some(false),
+            Some(_) => {}
+        }
+    }
+}
+
+/// The volume to start a run at instead of `path`: when the first member in `path` continues from an earlier
+/// volume, the volume before it (by name) back to one that doesn't, if each of them exists and opens. UnRAR then
+/// extracts the whole set; with a volume missing in between it extracts only what starts at `path`, and reports the
+/// continued member as lacking its start.
+fn restart_volume(path: &Path, password: Option<&str>) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    if !starts_with_continuation(&current, password)? {
+        return None;
+    }
+    for _ in 0..4096 {
+        current = crate::volume::previous_volume(&current)?;
+        if !starts_with_continuation(&current, password)? {
+            return Some(current);
+        }
+    }
+    None
+}
+
 fn rar_run_shared_open<'a>(
     first: &Path,
     opts: &Options,
@@ -3632,7 +3664,14 @@ fn rar_run_shared_open<'a>(
         fs::create_dir_all(&opts.dest)
             .map_err(|e| RarFault::output(IoOperation::CreateDirectory, Some(opts.dest.clone()), None, e, false))?;
     }
-    let first_volume = open()?;
+    let mut first_volume = open()?;
+    // As UnRAR: extracting or testing from a later volume starts over at the set's first volume when every volume
+    // before it is there.
+    let restart = restart_volume(first, password);
+    let first = restart.as_deref().unwrap_or(first);
+    if restart.is_some() {
+        first_volume = Volume::open_detailed(first, password)?;
+    }
     let mut opts = match opts.protecting_detailed(first) {
         Ok(opts) => opts,
         Err(fault) => {
@@ -3792,6 +3831,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             dir_meta: Vec::new(),
             unavailable: None,
             pending: None,
+            orphan: None,
             stream: None,
             rar4: None,
             rar4_keys: Default::default(),
@@ -3935,6 +3975,12 @@ impl Run<'_, '_, '_> {
             let p = self.pending.take().unwrap();
             return self.continue_file(vol, &h, p, crypt);
         }
+        if !continuation {
+            self.orphan = None;
+        } else if self.orphan.as_deref() == Some(h.name.as_str()) {
+            // a later part of a member already reported as lacking its start (as UnRAR, which warns once)
+            return Ok(());
+        }
         let name = std::mem::take(&mut h.name);
         let selected = if continuation {
             // an orphan continuation has no listing position to filter on
@@ -3964,6 +4010,7 @@ impl Run<'_, '_, '_> {
             if self.reports.typed() {
                 self.drain()?;
             }
+            self.orphan = Some(ctx.entry.name.clone());
             return self.reports.skipped(&ctx, RarSkipReason::MissingStart);
         }
         self.start_file(vol, &h, ctx, crypt)
