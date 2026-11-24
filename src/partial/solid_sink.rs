@@ -33,8 +33,10 @@ pub struct StreamSlot {
 }
 
 /// The members that make up the solid stream (RAR 4.x and 5.0) or folder (7z) of member `index`, up to and
-/// including it, in stream order, with their stream offsets. Members that produce no output through the stream
-/// (directories, stored RAR members, empty members) are left out; another format gives the member alone at 0.
+/// including it, in stream order, with their stream offsets. For RAR, members that produce no output through the
+/// stream (directories, stored members, empty members) are left out. For 7z, every member of the folder up to `index`
+/// is kept in member order, zero-length ones included, so an empty member can be opened and handed over. Another
+/// format gives the member alone at 0.
 pub fn stream_slots(map: &MemberMap, index: usize) -> PartialResult<Vec<StreamSlot>> {
     let member = map.members.get(index).ok_or_else(|| err(PartialErrorKind::InvalidOptions))?;
     let size = |i: usize| map.members[i].unpacked_size.ok_or_else(|| err(PartialErrorKind::InvalidOptions));
