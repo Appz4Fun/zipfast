@@ -281,8 +281,8 @@ impl ZipWalker {
 
     /// The member's data as pieces: one, or for a byte split the data cut at the volume boundaries. The local header
     /// belongs to the piece holding the start of the data.
-    fn cut(&self, packed: Range<u64>, header: Range<u64>) -> Vec<ZipPiece> {
-        let Some(lens) = &self.volumes else { return vec![ZipPiece { volume: 0, packed, header }] };
+    fn cut(&self, packed: Range<u64>, header: Range<u64>) -> Result<Vec<ZipPiece>, MapError> {
+        let Some(lens) = &self.volumes else { return Ok(vec![ZipPiece { volume: 0, packed, header }]) };
         let mut pieces = Vec::new();
         let (mut at, mut start) = (packed.start, 0u64);
         for (volume, &len) in lens.iter().enumerate() {
@@ -290,6 +290,10 @@ impl ZipWalker {
             if at < end && (at < packed.end || pieces.is_empty()) {
                 let take = (packed.end - at).min(end - at);
                 let first = pieces.is_empty();
+                if !first {
+                    // Each piece past the first is a part of its own, charged before it is allocated.
+                    self.usage.charge(Resource::Parts, 1).map_err(|e| MapError::from_failure(0, e))?;
+                }
                 let header = if !first {
                     0..0
                 } else if header.start >= start {
@@ -309,13 +313,13 @@ impl ZipWalker {
             let header = header.start.saturating_sub(start)..header.end.saturating_sub(start);
             pieces.push(ZipPiece { volume: volume as u32, packed: packed.start - start..packed.start - start, header });
         }
-        pieces
+        Ok(pieces)
     }
 
     fn member(&self, entry: &ZipEntry, aes_prefix: Option<usize>) -> Result<MapMember, MapError> {
         let (header, packed, local) = self.local.clone().expect("local header parsed");
         let prefix = aes_prefix.filter(|&prefix| self.scratch.len() == prefix).map(|_| self.scratch.as_slice());
-        zip_member(&self.usage, self.members.len() as u64, entry, Some(&local), prefix, self.cut(packed, header), true)
+        zip_member(&self.usage, self.members.len() as u64, entry, Some(&local), prefix, self.cut(packed, header)?, true)
     }
 }
 

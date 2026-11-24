@@ -123,14 +123,27 @@ struct Provider {
     volumes: Vec<Option<Vec<u8>>>,
     gate: Arc<Mutex<Gate>>,
     asked: Arc<Mutex<Vec<(u32, String)>>>,
+    /// A piece that is present the first time it is asked for and missing every time after.
+    vanish: Option<u32>,
+    /// Called with the index of every piece handed out.
+    on_ready: Option<Box<dyn FnMut(u32) + Send>>,
+    /// Answers volume requests at once, never pending.
+    immediate: bool,
 }
 
 impl VolumeSource for Provider {
     fn volume(&mut self, r: &VolumeRequest, cx: &mut Context<'_>) -> ProgressiveResult<VolumeAnswer> {
-        if wait(&self.gate, cx) {
+        if !self.immediate && wait(&self.gate, cx) {
             return Ok(VolumeAnswer::Wait);
         }
+        let again = self.asked.lock().unwrap().iter().any(|(i, _)| *i == r.index);
         self.asked.lock().unwrap().push((r.index, r.expected.to_string_lossy().into_owned()));
+        if again && self.vanish == Some(r.index) {
+            return Ok(VolumeAnswer::Missing);
+        }
+        if let Some(hook) = &mut self.on_ready {
+            hook(r.index);
+        }
         Ok(match self.volumes.get(r.index as usize).cloned().flatten() {
             Some(data) => VolumeAnswer::Ready(Box::new(Piece { data, gate: self.gate.clone() })),
             None => VolumeAnswer::Missing,
@@ -139,13 +152,31 @@ impl VolumeSource for Provider {
 }
 
 fn drive(volumes: Vec<Option<Vec<u8>>>, handles: Option<u64>) -> (Result<MemberMap, MapError>, Vec<(u32, String)>) {
-    let gate = Arc::new(Mutex::new(Gate::default()));
-    let asked = Arc::new(Mutex::new(Vec::new()));
-    let provider = Provider { volumes, gate: gate.clone(), asked: asked.clone() };
     let mut options = MapOptions::new("s.zip.001");
     if let Some(h) = handles {
         options.limits.volume_handles = h;
     }
+    drive_with(volumes, options, None, None)
+}
+
+fn drive_with(
+    volumes: Vec<Option<Vec<u8>>>,
+    options: MapOptions,
+    vanish: Option<u32>,
+    on_ready: Option<Box<dyn FnMut(u32) + Send>>,
+) -> (Result<MemberMap, MapError>, Vec<(u32, String)>) {
+    let gate = Arc::new(Mutex::new(Gate::default()));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let provider = Provider { volumes, gate: gate.clone(), asked: asked.clone(), vanish, on_ready, immediate: false };
+    drive_provider(provider, gate, asked, options)
+}
+
+fn drive_provider(
+    provider: Provider,
+    gate: Arc<Mutex<Gate>>,
+    asked: Arc<Mutex<Vec<(u32, String)>>>,
+    options: MapOptions,
+) -> (Result<MemberMap, MapError>, Vec<(u32, String)>) {
     let mut builder = MapBuilder::new(Box::new(provider), options);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..10_000_000 {
@@ -188,4 +219,118 @@ fn a_missing_last_piece_is_not_a_complete_map() {
     cut.pop();
     let (result, _) = drive(cut, None);
     assert!(!matches!(result, Ok(ref m) if m.complete), "{result:?}");
+}
+
+/// One stored member `name` holding `data` as a ZIP, with the offset where its central directory starts.
+fn stored_zip(name: &str, data: &[u8]) -> (Vec<u8>, usize) {
+    let crc = crc32fast::hash(data);
+    let mut zip = 0x0403_4b50u32.to_le_bytes().to_vec();
+    zip.extend([20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    zip.extend(crc.to_le_bytes());
+    zip.extend((data.len() as u32).to_le_bytes());
+    zip.extend((data.len() as u32).to_le_bytes());
+    zip.extend((name.len() as u16).to_le_bytes());
+    zip.extend(0u16.to_le_bytes());
+    zip.extend(name.as_bytes());
+    zip.extend(data);
+    let cd_at = zip.len();
+    zip.extend(0x0201_4b50u32.to_le_bytes());
+    zip.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    zip.extend(crc.to_le_bytes());
+    zip.extend((data.len() as u32).to_le_bytes());
+    zip.extend((data.len() as u32).to_le_bytes());
+    zip.extend((name.len() as u16).to_le_bytes());
+    zip.extend([0u8; 12]);
+    zip.extend(0u32.to_le_bytes());
+    zip.extend(name.as_bytes());
+    let cd_len = zip.len() - cd_at;
+    zip.extend(0x0605_4b50u32.to_le_bytes());
+    zip.extend([0, 0, 0, 0, 1, 0, 1, 0]);
+    zip.extend((cd_len as u32).to_le_bytes());
+    zip.extend((cd_at as u32).to_le_bytes());
+    zip.extend(0u16.to_le_bytes());
+    (zip, cd_at)
+}
+
+#[test]
+fn byte_split_names_with_multibyte_characters_do_not_panic() {
+    let (zip, _) = stored_zip("m", &[7u8; 40]);
+    let one = [zip.as_slice()];
+    for name in ["\u{e9}abc.001", "\u{e9}.zip.001", "ab.001", "\u{65e5}\u{672c}.001", "x.zip.001"] {
+        // Must return (a map or an error), never panic; only `*.zip.NNN` takes the byte-split path.
+        let result = MemberMap::from_memory(&one, name, None);
+        if name == "x.zip.001" || name == "\u{e9}.zip.001" {
+            assert!(result.is_ok(), "{name}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn extra_pieces_are_charged_against_the_parts_budget() {
+    let (zip, _) = stored_zip("m", &[7u8; 400]);
+    let volumes: Vec<Vec<u8>> = zip.chunks(zip.len().div_ceil(10)).map(<[u8]>::to_vec).collect();
+    assert!(volumes.len() >= 10);
+    let mut options = MapOptions::new("s.zip.001");
+    options.limits.parts = 2;
+    let result = MemberMap::from_memory_with(&refs(&volumes), options);
+    assert!(
+        matches!(result, Err(MapError::Limit { resource: zipfast::progressive::Resource::Parts, .. })),
+        "{result:?}"
+    );
+    let mut options = MapOptions::new("s.zip.001");
+    options.limits.parts = 64;
+    let map = MemberMap::from_memory_with(&refs(&volumes), options).unwrap();
+    assert!(map.members[0].pieces.len() >= 4);
+}
+
+#[test]
+fn a_header_hole_names_the_piece_and_the_local_offset() {
+    let (zip, cd_at) = stored_zip("m", &[7u8; 60]);
+    // Pieces 0..=2 hold the data, piece 3 the central directory, piece 4 the end record.
+    let eocd_at = zip.len() - 22;
+    let mut cuts = vec![0, 30, 60, cd_at];
+    cuts.push(eocd_at);
+    cuts.push(zip.len());
+    let volumes: Vec<Option<Vec<u8>>> = cuts.windows(2).map(|w| Some(zip[w[0]..w[1]].to_vec())).collect();
+    assert_eq!(volumes.len(), 5);
+    let lens: Vec<u64> = volumes.iter().map(|v| v.as_ref().unwrap().len() as u64).collect();
+    let mut options = MapOptions::new("s.zip.001");
+    options.limits.volume_handles = 1;
+    let (result, _) = drive_with(volumes, options, Some(3), None);
+    match result {
+        Err(MapError::HeaderHole { volume, offset }) => {
+            assert_eq!(volume, 3, "the piece holding the directory");
+            assert!(offset < lens[3], "local offset {offset} inside the piece of {} bytes", lens[3]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn cancellation_stops_piece_discovery() {
+    let (zip, _) = stored_zip("m", &[7u8; 400]);
+    let volumes: Vec<Option<Vec<u8>>> = zip.chunks(zip.len().div_ceil(20)).map(|c| Some(c.to_vec())).collect();
+    assert!(volumes.len() >= 20);
+    let options = MapOptions::new("s.zip.001");
+    let control = options.control.clone();
+    let hook = Box::new(move |index: u32| {
+        if index == 2 {
+            control.cancel();
+        }
+    });
+    let gate = Arc::new(Mutex::new(Gate::default()));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    // The provider answers at once, so discovery would run to the end inside one poll without its own check.
+    let provider = Provider {
+        volumes,
+        gate: gate.clone(),
+        asked: asked.clone(),
+        vanish: None,
+        on_ready: Some(hook),
+        immediate: true,
+    };
+    let (result, asked) = drive_provider(provider, gate, asked, options);
+    assert!(matches!(result, Err(MapError::Source(_))), "{result:?}");
+    let furthest = asked.iter().map(|(i, _)| *i).max().unwrap();
+    assert!(furthest <= 3, "opened piece {furthest} after the cancel: {asked:?}");
 }
