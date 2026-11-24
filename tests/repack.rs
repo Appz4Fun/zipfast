@@ -586,16 +586,20 @@ fn bsd_symbol_table_names_are_resolved_once_and_capped() {
     let opts = RepackOptions::default();
     // 200k entries all naming one 1 MiB name: one copy, and the rebuilt table holds the name once
     let shared = write(dir.path(), "shared.a", &bsd_symdef_ar(200_000, 1 << 20, |_| 0));
-    let started = std::time::Instant::now();
+    zipfast::work::take(zipfast::work::Work::ArNameBytes);
     repack(&shared, &dir.path().join("shared.out"), &opts).unwrap();
-    // A name copied once per entry would be 200 GiB of copying, hours of work: this bound only catches that, with
-    // room for a debug build on a loaded machine (a fixed 20 s failed at load average 70 here).
-    assert!(started.elapsed().as_secs() < 600, "took {:?}", started.elapsed());
+    // A name copied once per entry would be 200 GiB of scanning and copying; counted bytes, not time, catch that.
+    let bytes = zipfast::work::take(zipfast::work::Work::ArNameBytes);
+    assert!((1 << 20..4 << 20).contains(&bytes), "{bytes} name bytes handled for one 1 MiB name");
     let out_len = std::fs::metadata(dir.path().join("shared.out")).unwrap().len();
     assert!(out_len < 8 << 20, "rebuilt archive is {out_len} bytes");
     // entries naming every byte of the name: each is a different suffix, so the copies hit the cap
     let suffixes = write(dir.path(), "suffixes.a", &bsd_symdef_ar(200_000, 1 << 20, |i| i as u32));
+    zipfast::work::take(zipfast::work::Work::ArNameBytes);
     assert!(matches!(repack(&suffixes, &dir.path().join("suffixes.out"), &opts), Err(Error::Unsupported(_))));
+    // stopped at the cap (64 MiB scanned, plus the one copy), not run to the end of 200k entries
+    let bytes = zipfast::work::take(zipfast::work::Work::ArNameBytes);
+    assert!(bytes <= 2 * (64 << 20) + (2 << 20), "{bytes} name bytes handled before the cap");
 }
 
 #[test]

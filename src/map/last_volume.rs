@@ -628,6 +628,8 @@ pub fn set_identity(
                 let count = counts.entry((m.raw_name.as_slice(), kind)).or_insert(0);
                 let occurrence = *count;
                 *count += 1;
+                // the occurrence count, the first-volume lookup and the agreement check
+                crate::work::add(crate::work::Work::SetIdentitySteps, 3);
                 (kind == Kind::Spanning || same_volume)
                     .then(|| firsts.get(&(m.raw_name.clone(), kind, occurrence)).copied())
                     .flatten()

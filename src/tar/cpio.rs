@@ -322,6 +322,7 @@ impl State {
     /// Hands out the links still waiting for data at the end: the first as an empty file, the rest as links to it.
     fn flush(&mut self) -> Result<()> {
         let mut out: Vec<(u64, Member)> = Vec::with_capacity(self.waiting_count);
+        crate::work::add(crate::work::Work::CpioWaitingLinks, self.waiting_count as u64);
         for (_, links) in std::mem::take(&mut self.waiting) {
             let mut links = links.into_iter();
             let Some(first) = links.next() else { continue };
@@ -490,6 +491,7 @@ impl Reader {
                 // the names that came before without data link to this one, after it: only this file's
                 if let Some(before) = state.waiting.remove(&key) {
                     state.waiting_count -= before.len();
+                    crate::work::add(crate::work::Work::CpioWaitingLinks, before.len() as u64);
                     // their bookkeeping is freed: only the owner's name stays
                     state.link_bytes -= before.iter().map(|w| w.cost() + 32).sum::<usize>();
                     for earlier in before {

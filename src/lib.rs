@@ -48,6 +48,8 @@ pub mod sevenzip;
 pub mod stream;
 pub mod tar;
 pub mod volume;
+#[doc(hidden)]
+pub mod work;
 pub mod zip;
 
 pub use error::{Error, Result};

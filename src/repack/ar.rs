@@ -356,6 +356,7 @@ fn parse_symtab(kind: SymKind, name: &[u8], data: &[u8]) -> Result<Symtab> {
         let rest = usize::try_from(at).ok().and_then(|at| strings.get(at..)).ok_or_else(bad)?;
         let end = rest.iter().position(|&b| b == 0).ok_or_else(bad)?;
         copied += end as u64 + 1;
+        crate::work::add(crate::work::Work::ArNameBytes, end as u64 + 1);
         if copied > MAX_TABLE {
             return Err(Error::Unsupported("an ar symbol table's names are too large".into()));
         }
@@ -363,6 +364,7 @@ fn parse_symtab(kind: SymKind, name: &[u8], data: &[u8]) -> Result<Symtab> {
         if let Some(&i) = interned.get(name) {
             return Ok(i);
         }
+        crate::work::add(crate::work::Work::ArNameBytes, end as u64);
         names.push(name.to_vec());
         interned.insert(name.to_vec(), names.len() - 1);
         Ok(names.len() - 1)
