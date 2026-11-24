@@ -52,7 +52,8 @@ pub enum TarEntryKind {
     CharDevice,
     BlockDevice,
     Fifo,
-    /// Reserved for the sparse writer (not implemented yet); appending one is an error.
+    /// A sparse file: `size` is the apparent size, `sparse` the data segments; only their bytes follow. GNU and
+    /// pax formats only (pax writes version 1.0, which GNU tar 1.35 uses by default).
     Sparse,
 }
 
@@ -78,6 +79,9 @@ pub struct TarEntry {
     pub link: Vec<u8>,
     pub dev_major: u64,
     pub dev_minor: u64,
+    /// For [`TarEntryKind::Sparse`]: the data segments as `(offset, length)`, ascending, non-empty, not
+    /// overlapping, inside `size`. Everything between them is a hole. `size` is the apparent file size.
+    pub sparse: Vec<(u64, u64)>,
 }
 
 impl TarEntry {
@@ -97,6 +101,7 @@ impl TarEntry {
             link: Vec::new(),
             dev_major: 0,
             dev_minor: 0,
+            sparse: Vec::new(),
         }
     }
 }
@@ -121,6 +126,9 @@ pub struct TarWriterOptions {
     pub mtime: Option<i64>,
     /// `--numeric-owner`: no owner or group names.
     pub numeric_owner: bool,
+    /// The process id GNU tar puts in a pax sparse member's name (`<dir>/GNUSparseFile.<pid>/<name>`); the
+    /// current process id when `None`. Set it for reproducible archives.
+    pub sparse_pid: Option<u32>,
 }
 
 impl Default for TarWriterOptions {
@@ -132,6 +140,7 @@ impl Default for TarWriterOptions {
             group: None,
             mtime: None,
             numeric_owner: false,
+            sparse_pid: None,
         }
     }
 }
@@ -161,27 +170,43 @@ impl<W: Write> TarWriter<W> {
         if self.owed != 0 {
             return Err(Error::Unsupported("a tar member's data is incomplete".into()));
         }
-        if entry.kind == TarEntryKind::Sparse {
-            return Err(Error::Unsupported("sparse tar members are not written yet".into()));
-        }
         if entry.path.is_empty() {
             return Err(Error::Unsupported("a tar member with an empty name".into()));
         }
+        let sparse = entry.kind == TarEntryKind::Sparse;
+        let data_len = if sparse { check_sparse(entry)? } else { 0 };
         let size = if entry.kind == TarEntryKind::File { entry.size } else { 0 };
         let mut name = entry.path.clone();
         if entry.kind == TarEntryKind::Dir && !name.ends_with(b"/") {
             name.push(b'/');
         }
-        let h = Header::resolve(entry, name, size, &self.opts);
-        let blocks = match self.opts.format {
-            TarFormat::Gnu => h.gnu()?,
-            TarFormat::Ustar => h.ustar()?,
-            TarFormat::Pax => h.pax()?,
+        let (blocks, owed) = if sparse {
+            let h = Header::resolve(entry, name, data_len, &self.opts);
+            match self.opts.format {
+                TarFormat::Gnu => (h.gnu_sparse()?, data_len),
+                TarFormat::Pax => {
+                    let map = pax_map(entry);
+                    let pid = self.opts.sparse_pid.unwrap_or_else(std::process::id);
+                    let h = Header { size: map.len() as u64 + data_len, ..h };
+                    let mut blocks = h.pax_sparse(pid)?;
+                    push_data(&mut blocks, &map, false);
+                    (blocks, data_len)
+                }
+                TarFormat::Ustar => return Err(Error::Unsupported("sparse members need the gnu or pax format".into())),
+            }
+        } else {
+            let h = Header::resolve(entry, name, size, &self.opts);
+            let blocks = match self.opts.format {
+                TarFormat::Gnu => h.gnu()?,
+                TarFormat::Ustar => h.ustar()?,
+                TarFormat::Pax => h.pax()?,
+            };
+            (blocks, size)
         };
         for b in &blocks {
             self.put(b)?;
         }
-        self.owed = size;
+        self.owed = owed;
         Ok(())
     }
 
@@ -361,6 +386,56 @@ impl<'a> Header<'a> {
         Ok(out)
     }
 
+    /// An old GNU sparse header (`S`): the first four segments in the header, the rest in extension blocks. The
+    /// map ends with a zero-length segment at the apparent size, as GNU tar writes it.
+    fn gnu_sparse(&self) -> Result<Vec<[u8; BLOCK]>> {
+        let mut out = Vec::new();
+        if self.name.len() > 100 {
+            self.long_record(&mut out, b'L', &self.name)?;
+        }
+        let mut f = self.fields(&self.name, b"", true);
+        f.typeflag = b'S';
+        let mut h = self.block(&f)?;
+        let mut segs = self.e.sparse.clone();
+        segs.push((self.e.size, 0));
+        let mut ext: Vec<[u8; BLOCK]> = Vec::new();
+        for (i, &(off, len)) in segs.iter().enumerate() {
+            let slot: &mut [u8] = if i < 4 {
+                &mut h[386 + 24 * i..386 + 24 * (i + 1)]
+            } else {
+                let j = (i - 4) % 21;
+                if j == 0 {
+                    ext.push([0u8; BLOCK]);
+                }
+                let b = ext.last_mut().expect("pushed above");
+                &mut b[24 * j..24 * (j + 1)]
+            };
+            num(&mut slot[..12], off, true)?;
+            num(&mut slot[12..], len, true)?;
+        }
+        if segs.len() > 4 {
+            h[482] = 1;
+        }
+        for k in 1..ext.len() {
+            ext[k - 1][504] = 1;
+        }
+        num(&mut h[483..495], self.e.size, true)?;
+        let sum: u64 =
+            h.iter().enumerate().map(|(i, &b)| u64::from(if (148..156).contains(&i) { b' ' } else { b })).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        out.push(h);
+        out.extend(ext);
+        Ok(out)
+    }
+
+    /// A pax 1.0 sparse member: an `x` header with the `GNU.sparse.*` records, then the data header named
+    /// `<dir>/GNUSparseFile.<pid>/<base>` (cut to 100 bytes, as GNU tar does). The caller adds the map blocks.
+    fn pax_sparse(&self, pid: u32) -> Result<Vec<[u8; BLOCK]>> {
+        let (dir, base) = dir_and_base(&self.name);
+        let data_name = [dir.as_slice(), format!("/GNUSparseFile.{pid}/").as_bytes(), base].concat();
+        self.pax_with(Some(&data_name))
+    }
+
     /// A `././@LongLink` member (several blocks: header, then the text and a NUL padded to blocks).
     fn long_record(&self, out: &mut Vec<[u8; BLOCK]>, typeflag: u8, text: &[u8]) -> Result<()> {
         let root: &[u8] = if self.numeric { b"" } else { b"root" };
@@ -403,6 +478,12 @@ impl<'a> Header<'a> {
     }
 
     fn pax(&self) -> Result<Vec<[u8; BLOCK]>> {
+        self.pax_with(None)
+    }
+
+    /// `sparse_name`: the data header's name of a pax 1.0 sparse member (then the path travels in
+    /// `GNU.sparse.name` instead of `path`, and the first records describe the sparse layout).
+    fn pax_with(&self, sparse_name: Option<&[u8]>) -> Result<Vec<[u8; BLOCK]>> {
         let mut recs: Vec<u8> = Vec::new();
         let mut rec = |k: &str, v: &[u8]| recs.extend_from_slice(&pax_record(k, v));
         let link = &self.e.link;
@@ -410,10 +491,15 @@ impl<'a> Header<'a> {
         if self.has_link() && wide(link, 100) {
             rec("linkpath", link);
         }
-        if wide(&self.name, 100) {
+        if sparse_name.is_some() {
+            rec("GNU.sparse.major", b"1");
+            rec("GNU.sparse.minor", b"0");
+            rec("GNU.sparse.name", &self.name);
+            rec("GNU.sparse.realsize", self.e.size.to_string().as_bytes());
+        } else if wide(&self.name, 100) {
             rec("path", &self.name);
         }
-        let mut f = self.fields(&self.name, b"", false);
+        let mut f = self.fields(sparse_name.unwrap_or(&self.name), b"", false);
         let field_zero = |v: &mut u64, key: &str, max: u64, rec: &mut dyn FnMut(&str, &[u8])| {
             if *v > max {
                 rec(key, v.to_string().as_bytes());
@@ -546,6 +632,40 @@ fn split_ustar(name: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     Some((&name[..i], &name[i + 1..]))
+}
+
+/// The segments a sparse entry carries, checked; returns the data bytes they hold.
+fn check_sparse(e: &TarEntry) -> Result<u64> {
+    let bad = |m: &str| Err(Error::Unsupported(format!("sparse tar member: {m}")));
+    let mut end = 0u64;
+    let mut total = 0u64;
+    for &(off, len) in &e.sparse {
+        if len == 0 {
+            return bad("empty data segment");
+        }
+        if off < end {
+            return bad("segments out of order or overlapping");
+        }
+        end = match off.checked_add(len) {
+            Some(x) if x <= e.size => x,
+            _ => return bad("segment beyond the apparent size"),
+        };
+        total += len;
+    }
+    Ok(total)
+}
+
+/// The pax 1.0 map at the start of the member's data: the segment count, then offset and length of each (with
+/// the final zero-length segment at the apparent size), one number per line, padded to whole blocks.
+fn pax_map(e: &TarEntry) -> Vec<u8> {
+    let mut t = format!("{}\n", e.sparse.len() + 1);
+    for &(off, len) in &e.sparse {
+        t.push_str(&format!("{off}\n{len}\n"));
+    }
+    t.push_str(&format!("{}\n0\n", e.size));
+    let mut v = t.into_bytes();
+    v.resize(v.len().div_ceil(BLOCK) * BLOCK, 0);
+    v
 }
 
 /// One pax record, `"<len> <key>=<value>\n"`, its length counting its own digits.

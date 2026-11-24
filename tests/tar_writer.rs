@@ -194,13 +194,16 @@ fn blocking_factor_pads_to_records() {
 }
 
 #[test]
-fn short_data_and_sparse_are_errors() {
+fn short_data_and_bad_sparse_are_errors() {
     let mut w = TarWriter::new(Vec::new(), opts(TarFormat::Gnu));
     let mut e = TarEntry::new(&b"f"[..], K::File);
     e.size = 10;
     assert!(w.append(&e, &mut &b"abc"[..]).is_err());
+    // a sparse member needs a map no wider than its apparent size (an empty one over size 0 is a valid hole)
     let mut w = TarWriter::new(Vec::new(), opts(TarFormat::Gnu));
-    assert!(w.begin(&TarEntry::new(&b"s"[..], K::Sparse)).is_err());
+    let mut e = TarEntry::new(&b"s"[..], K::Sparse);
+    e.sparse = vec![(0, 1)];
+    assert!(w.begin(&e).is_err());
 }
 
 #[test]
