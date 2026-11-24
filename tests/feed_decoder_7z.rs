@@ -472,6 +472,36 @@ fn a_header_in_a_hole_stalls_until_it_comes() {
     assert!(out.bytes == plain);
 }
 
+/// An article-sized hole (far larger than a chunk) in a single-reset folder: everything after it arrives and nothing
+/// is decoded or written past the hole (no header there can be trusted), and the repair resumes the stopped decoder
+/// once: nothing is decoded twice, each output byte is written once, and the work after the repair is the tail only.
+#[test]
+fn an_article_sized_hole_waits_and_resumes_without_decoding_twice() {
+    let plain = mixed(3_000_000, 21);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, usize::MAX >> 1);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let article = 750_000usize;
+    let hole = (archive.len() / 3 / article * article)..(archive.len() / 3 / article * article + article);
+    let hole = hole.start as u64..hole.end.min(archive.len()) as u64;
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..hole.start as usize]).unwrap();
+    source.insert(0, hole.end, &archive[hole.end as usize..]).unwrap();
+    source.mark_lost(0, hole.clone());
+    let mut d = FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap();
+    let mut out = Out::new(plain.len(), None);
+    let s = d.run(&mut source, &mut out).unwrap();
+    assert!(s.stalled || !s.needs.is_empty(), "{s:?}");
+    let before = out.written;
+    assert!(before < plain.len() as u64);
+    source.insert(0, hole.start, &archive[hole.start as usize..hole.end as usize]).unwrap();
+    let s = d.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert_eq!(d.stats().redecoded, 0);
+    assert_eq!(out.written, plain.len() as u64, "each output byte written once");
+    assert!(out.bytes == plain);
+}
+
 /// A sink that keeps nothing it is given (the default `read_held`).
 struct WriteOnly {
     out: Out,

@@ -195,6 +195,13 @@ A repair that stops at missing bytes keeps its decoder and what it wrote. At mos
 and every repair after a restore, start from their restart point, so a repair decodes again at most from the restart
 point before its hole (a 7-Zip block, about 4 dictionaries) to the lost range.
 
+**Cost of a hole.** Profiled with `live_feed` on F07, F08 and F10 (drop 2% and 5%): a hole costs what decoding the
+output held behind it costs (about 36 to 78 ms per hole on F08 and F10, where 20 MB of output waits behind the
+hole; 1 to 5 ms on F07, mostly stored chunks). 95% of it is liblzma's decode loop (the decode rate with no hole is
+the same, 250 to 300 MB/s), `redecoded` is 0 and every packed byte is read once, so resuming costs nothing beyond
+the decode itself. It could only fall with chunk-level parallelism after the repair (an independent block per
+thread), or by decoding before the repair, which the framing rule forbids.
+
 **Memory.** Packed bytes from the main decode's restart point on are kept for a repair or a restore (at most 64 MiB
 behind its read position; older ones are released and asked for again as needs when a repair reads them).
 
