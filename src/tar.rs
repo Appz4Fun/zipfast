@@ -1668,10 +1668,11 @@ fn target(
     rel: &Path,
     (ordinal, name): (u64, &str),
     (size, sparse): (Option<u64>, bool),
+    placed: Option<&Extracted>,
     summary: &mut Summary,
     report: &mut impl LegacyReport,
 ) -> Result<Option<(Output, PathBuf)>> {
-    let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(None) };
+    let Some(place) = checked_place(opts, rel, (ordinal, name), placed, summary, report)? else { return Ok(None) };
     // where the data lands: a rename mode's reserved name, else the target
     let landed = match &place.reserved {
         Some(reserved) => reserved.path().to_path_buf(),
@@ -1787,7 +1788,9 @@ impl StagedTar {
                     folder(summary, report, ordinal, &name);
                 }
                 StagedMember::File { relative, name, temporary, size, holes: file_holes, ordinal } => {
-                    let Some(place) = checked_place(opts, &relative, (ordinal, &name), summary, report)? else {
+                    let Some(place) =
+                        checked_place(opts, &relative, (ordinal, &name), Some(&extracted), summary, report)?
+                    else {
                         continue;
                     };
                     let landed = match &place.reserved {
@@ -1834,7 +1837,9 @@ fn link_member(
         return Ok(());
     }
     if opts.mode == Mode::Extract {
-        let Some(place) = checked_place(opts, rel, (ordinal, name), summary, report)? else { return Ok(()) };
+        let Some(place) = checked_place(opts, rel, (ordinal, name), Some(extracted), summary, report)? else {
+            return Ok(());
+        };
         let mut copy = |_| match kind {
             LinkKind::Hard(target) | LinkKind::Copy(target) => holes.copy(target),
             LinkKind::Symbolic(_) => Ok(()),
@@ -1874,10 +1879,12 @@ fn checked_place(
     opts: &Options,
     relative: &Path,
     (ordinal, name): (u64, &str),
+    placed: Option<&Extracted>,
     summary: &mut Summary,
     report: &mut impl LegacyReport,
 ) -> Result<Option<Place>> {
     let mut log = RenameLog {
+        placed,
         budget: &mut summary.rename_budget,
         record: &mut |renamed| {
             report.renamed_member(ordinal, &renamed);
@@ -1977,7 +1984,7 @@ fn run_single(
     let mut out = None;
     if opts.mode == Mode::Extract {
         let rel = PathBuf::from(&name);
-        match target(opts, &rel, (0, &name), (None, false), summary, report)? {
+        match target(opts, &rel, (0, &name), (None, false), None, summary, report)? {
             Some((t, _)) => out = Some(t),
             None => return Ok(()),
         }
@@ -2140,7 +2147,7 @@ fn run_tar(
             // settles its target only when publishing, so it renames once.
             if opts.overwrite.rename().is_none()
                 && opts.dest.join(&rel).parent() == Some(parent.as_path())
-                && checked_place(opts, &rel, (position, &m.name), summary, report)?.is_none()
+                && checked_place(opts, &rel, (position, &m.name), Some(&extracted), summary, report)?.is_none()
             {
                 holes.left = hole_mark;
                 continue;
@@ -2167,7 +2174,15 @@ fn run_tar(
         }
         let mut out = None;
         if opts.mode == Mode::Extract {
-            match target(opts, &rel, (position, &m.name), (Some(m.real_size()), m.sparse.is_some()), summary, report)? {
+            match target(
+                opts,
+                &rel,
+                (position, &m.name),
+                (Some(m.real_size()), m.sparse.is_some()),
+                Some(&extracted),
+                summary,
+                report,
+            )? {
                 Some(t) => out = Some(t),
                 None => {
                     holes.left = hole_mark;

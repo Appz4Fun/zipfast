@@ -447,7 +447,9 @@ impl MemberFilter {
     /// It runs on extraction (not [`Mode::Test`]) of tar, lone compressed files, the legacy ZIP route, 7z and RAR
     /// whole-archive runs, and the checked ZIP route of [`run_with_policy`](crate::extract::run_with_policy). On
     /// the checked ZIP route a rename mode picks its name only when the member is published, so there the hook sees
-    /// the requested path. Folders and members whose target is skipped or blocked don't call it.
+    /// the requested path. With [`Options::flatten`] the path is the flattened one (`dest/name`, not the stored
+    /// folders), on every route, so a skip-existing check tests the file that would be written. Folders and members
+    /// whose target is skipped or blocked don't call it.
     pub fn on_start(mut self, hook: impl Fn(&MemberStart<'_>) -> StartDecision + Send + Sync + 'static) -> Self {
         self.start = Some(Arc::new(hook));
         self
@@ -611,15 +613,18 @@ pub(crate) struct Place {
     pub replace: bool,
     /// The file already created at `path` by a rename mode, to be written in place.
     pub reserved: Option<Reserved>,
+    /// (device, inode) of a symbolic link this run placed at `path`, which the publication replaces by rename: a
+    /// link there is otherwise refused at publication, so one installed while decoding is never replaced
+    pub link: Option<(u64, u64)>,
 }
 
 impl Place {
     fn new(path: PathBuf, replace: bool) -> Self {
-        Self { path, replace, reserved: None }
+        Self { path, replace, reserved: None, link: None }
     }
 
     fn reserved(reserved: Reserved) -> Self {
-        Self { path: reserved.path().to_path_buf(), replace: false, reserved: Some(reserved) }
+        Self { path: reserved.path().to_path_buf(), replace: false, reserved: Some(reserved), link: None }
     }
 }
 
@@ -701,6 +706,9 @@ pub(crate) struct RenameLog<'a> {
     pub(crate) budget: &'a mut RenameBudget,
     /// called once per rename, as soon as it is made
     pub(crate) record: &'a mut dyn FnMut(RenamedOutput),
+    /// the links this run placed, when the runner keeps them: a symbolic link of them in a member's way is replaced
+    /// (renamed over), not refused as a link the run did not make
+    pub(crate) placed: Option<&'a link::Extracted>,
 }
 
 /// The runners whose callers read plain report lines; a rename mode's renames reach the caller as they happen too.
@@ -777,7 +785,7 @@ fn check_target_detailed(
         opts,
         rel,
         dirs.as_deref_mut(),
-        &mut RenameLog { budget: log.budget, record: &mut |r| held.push(r) },
+        &mut RenameLog { budget: log.budget, record: &mut |r| held.push(r), placed: log.placed },
     )?;
     let decision = match &checked {
         DetailedChecked::Write(place) => filter.starts(&MemberStart { path: &place.path }),
@@ -857,7 +865,18 @@ fn place_target(
     }
     let metadata = |e| RarFault::output(IoOperation::Metadata, Some(target.clone()), None, e, false);
     Ok(match fs::symlink_metadata(&target) {
-        Ok(meta) if meta.file_type().is_symlink() => DetailedChecked::Blocked(RarPolicyReason::Symlink),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if !log.placed.is_some_and(|p| p.owns_link(&meta)) {
+                DetailedChecked::Blocked(RarPolicyReason::Symlink)
+            } else if opts.overwrite == Overwrite::Skip {
+                DetailedChecked::Exists
+            } else {
+                // a link this run made: replaced by rename, which never follows it
+                let mut place = Place::new(target, true);
+                place.link = Some(link::identity(&meta));
+                DetailedChecked::Write(place)
+            }
+        }
         Ok(_) if opts.overwrite == Overwrite::Skip => DetailedChecked::Exists,
         Ok(meta) if meta.is_dir() => DetailedChecked::Blocked(RarPolicyReason::Directory),
         Ok(_)
@@ -914,10 +933,11 @@ fn place_renamed(
         Err(e) => return Err(create(&target, e)),
     }
     let meta = fs::symlink_metadata(&target).map_err(|e| metadata(&target, e))?;
-    if meta.file_type().is_symlink() {
+    let own_link = meta.file_type().is_symlink() && log.placed.is_some_and(|p| p.owns_link(&meta));
+    if meta.file_type().is_symlink() && !own_link {
         return Ok(DetailedChecked::Blocked(RarPolicyReason::Symlink));
     }
-    if let RenameMode::Existing(_) = mode {
+    if let (RenameMode::Existing(_), false) = (mode, own_link) {
         let canonical = target.canonicalize().map_err(|e| metadata(&target, e))?;
         if is_protected(opts, &canonical) || meta.is_dir() && holds_protected(opts, &canonical) {
             return Ok(DetailedChecked::Blocked(RarPolicyReason::ProtectedInput));
@@ -1029,7 +1049,7 @@ fn create_target_with(place: Place, size: Option<u64>, sparse: bool) -> crate::e
     };
     preallocate(&file);
     Ok(match staged {
-        Some(path) => Output::staged(file, size, path, place.path),
+        Some(path) => Output::staged(file, size, path, place.path, place.link),
         None => Output::created(file, size, place.path),
     })
 }
@@ -4059,6 +4079,7 @@ impl Run<'_, '_, '_> {
             let order = ctx.entry.order;
             let mut log = RenameLog {
                 budget: &mut self.rename_budget,
+                placed: Some(&self.landing.extracted),
                 record: &mut |r| {
                     renamed = Some(r.clone());
                     self.reports.renamed_at(order, r)
@@ -4315,6 +4336,7 @@ impl Run<'_, '_, '_> {
             let order = ctx.entry.order;
             let mut log = RenameLog {
                 budget: &mut self.rename_budget,
+                placed: Some(&self.landing.extracted),
                 record: &mut |r| {
                     renamed = Some(r.clone());
                     self.reports.renamed_at(order, r)

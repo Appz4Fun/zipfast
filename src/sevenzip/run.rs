@@ -614,6 +614,7 @@ impl Run<'_> {
         let ordinal = self.current;
         let mut log = RenameLog {
             budget: &mut self.summary.rename_budget,
+            placed: Some(&self.extracted),
             record: &mut |renamed| {
                 report.renamed_member(ordinal, &renamed);
                 renames.push(renamed);
@@ -729,7 +730,7 @@ impl Run<'_> {
             crate::output::replace(temporary, reserved.path()).map_err(SevenZipError::Io)?;
             drop(reserved.into_parts());
         } else if place.replace {
-            crate::output::replace(temporary, &place.path).map_err(SevenZipError::Io)?;
+            crate::output::replace_link(temporary, &place.path, place.link).map_err(SevenZipError::Io)?;
         } else if let Err(error) = temporary.persist_noclobber(&place.path) {
             if error.error.kind() == io::ErrorKind::AlreadyExists {
                 if self.opts.overwrite == Overwrite::Skip {

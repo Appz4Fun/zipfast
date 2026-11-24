@@ -333,6 +333,11 @@ impl Extracted {
         }
     }
 
+    /// Whether `meta` (from `symlink_metadata`) is a symbolic link this run placed, by device and inode.
+    pub(crate) fn owns_link(&self, meta: &std::fs::Metadata) -> bool {
+        meta.file_type().is_symlink() && self.links.contains(&identity(meta))
+    }
+
     /// A test run found the member at `rel` whole.
     pub(crate) fn tested(&mut self, rel: &Path) {
         self.record(rel, None);
@@ -359,13 +364,13 @@ impl Extracted {
 }
 
 #[cfg(unix)]
-fn identity(m: &std::fs::Metadata) -> (u64, u64) {
+pub(crate) fn identity(m: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (m.dev(), m.ino())
 }
 
 #[cfg(not(unix))]
-fn identity(_: &std::fs::Metadata) -> (u64, u64) {
+pub(crate) fn identity(_: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
