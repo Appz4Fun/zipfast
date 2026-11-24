@@ -1448,10 +1448,13 @@ impl PartialCore {
                 commit: None,
                 candidate_known: None,
             });
-            let ack = self.anchors.advance(Some(expected.anchor()), intent.anchor()).map_err(|mut e| {
-                e.committed = Some(expected.anchor.clone());
-                e
-            })?;
+            let ack = self
+                .anchors
+                .advance(Some(expected.anchor()), intent.anchor(), &self.native.flush_targets())
+                .map_err(|mut e| {
+                    e.committed = Some(expected.anchor.clone());
+                    e
+                })?;
             op.bundle.acknowledge(intent.anchor(), &ack)?;
             // Opening a group advances the revision but changes no leaf: part results carry over.
             let carried = self.part_results(op);
@@ -1551,7 +1554,7 @@ impl PartialCore {
                 candidate_known: None,
             });
             op.group = None;
-            let ack = self.anchors.advance(Some(intent.anchor()), commit.anchor())?;
+            let ack = self.anchors.advance(Some(intent.anchor()), commit.anchor(), &self.native.flush_targets())?;
             op.bundle.acknowledge(commit.anchor(), &ack)?;
             op.state = commit.clone();
             op.snapshot.head = head;
@@ -1707,10 +1710,12 @@ impl PartialCore {
                 commit: None,
                 candidate_known: Some(intent_known),
             });
-            let ack = self.anchors.advance(Some(expected.anchor()), &anchor).map_err(|mut e| {
-                e.committed = Some(expected.anchor.clone());
-                e
-            })?;
+            let ack = self.anchors.advance(Some(expected.anchor()), &anchor, &self.native.flush_targets()).map_err(
+                |mut e| {
+                    e.committed = Some(expected.anchor.clone());
+                    e
+                },
+            )?;
             data.bundle.acknowledge(&anchor, &ack)?;
             data.state = intent_state.clone();
             data.snapshot = intent;
@@ -1753,7 +1758,7 @@ impl PartialCore {
                 commit: Some(transaction.commit.clone()),
                 candidate_known: Some(transaction.commit_known),
             });
-            let ack = self.anchors.advance(Some(&intent_anchor), &final_anchor)?;
+            let ack = self.anchors.advance(Some(&intent_anchor), &final_anchor, &self.native.flush_targets())?;
             data.bundle.acknowledge(&final_anchor, &ack)?;
             data.state = transaction.commit;
             data.snapshot = transaction.valid;
@@ -2448,10 +2453,12 @@ impl PartialCore {
         op.uncertain =
             Some(Uncertain { expected: previous.clone(), intent: next.clone(), commit: None, candidate_known: None });
         op.pending_compaction = Some(prepared);
-        let ack = self.anchors.advance(Some(previous.anchor()), next.anchor()).map_err(|mut e| {
-            e.committed = Some(previous.anchor.clone());
-            e
-        })?;
+        let ack = self.anchors.advance(Some(previous.anchor()), next.anchor(), &self.native.flush_targets()).map_err(
+            |mut e| {
+                e.committed = Some(previous.anchor.clone());
+                e
+            },
+        )?;
         op.state = next.clone();
         match snapshot {
             Some((snapshot, _lease)) => op.snapshot = snapshot,
@@ -3098,7 +3105,7 @@ impl PreparedCreate {
             // naming them; otherwise a crash leaves an anchor whose state can never be reopened or recreated.
             native.sync()?;
             native.sync_parents()?;
-            let ack = anchors.advance(None, &intent_anchor)?;
+            let ack = anchors.advance(None, &intent_anchor, &native.flush_targets())?;
             bundle.acknowledge(&intent_anchor, &ack)?;
             committed = Some(intent_anchor.clone());
             canceled(&control)?;
@@ -3111,7 +3118,7 @@ impl PreparedCreate {
             snapshot.head.sequence = 1;
             let commit = MutationCommit { transaction: 0, parent: intent_anchor.clone(), valid: snapshot.head.clone() };
             let final_anchor = bundle.append_commit(&commit)?;
-            let ack = anchors.advance(Some(&intent_anchor), &final_anchor)?;
+            let ack = anchors.advance(Some(&intent_anchor), &final_anchor, &native.flush_targets())?;
             bundle.acknowledge(&final_anchor, &ack)?;
             committed = Some(final_anchor.clone());
             let state = state::encode_record(3, 0, Some(&intent_anchor), &snapshot.head, &budget.limits)?;

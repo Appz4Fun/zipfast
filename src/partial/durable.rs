@@ -17,18 +17,24 @@
 //! File syncs of persistent output, with the device cache flush deferred to the next anchor change.
 //!
 //! Every sync of an output, journal file or directory goes through [`sync`], and every anchor CAS first calls
-//! [`barrier`]. Nothing durable is claimed except through an anchor, so the only point where earlier writes must be
-//! on stable storage is just before the CAS that names them; between anchor changes a sync only has to move the
-//! file's data and metadata to the device.
+//! [`barrier`] with the member's descriptors. Nothing durable is claimed except through an anchor, so the only point
+//! where earlier writes must be on stable storage is just before the CAS that names them; between anchor changes a
+//! sync only has to move the file's data and metadata to the device.
 //!
 //! On macOS `fsync(2)` does exactly that, and `F_FULLFSYNC` is `fsync` plus a flush of the drive's whole write
 //! cache (fcntl(2): "Does the same thing as fsync(2) then asks the drive to flush all buffered data to the
-//! permanent storage device"). So [`sync`] issues a plain `fsync` and remembers the file's device, and [`barrier`]
-//! issues one `F_FULLFSYNC` per device synced since the last barrier, which makes every earlier `fsync` of that
-//! device durable. A group commit that synced three journal files, the journal directory and the output then
-//! costs one `F_FULLFSYNC` (two when the output and the state directory are on different devices) instead of
-//! five. Ordering among the plain syncs does not matter, so no `F_BARRIERFSYNC` is needed either: whatever they
-//! wrote is unanchored until the barrier, and recovery ignores unanchored records, pages and output bytes.
+//! permanent storage device"). So [`sync`] issues a plain `fsync` and records, per device, the sequence number of
+//! the latest completed sync; [`barrier`] issues one `F_FULLFSYNC` on each of the member's devices that has a sync
+//! newer than its last completed flush, which makes every earlier `fsync` of that device durable. A group commit
+//! that synced three journal files, the journal directory and the output then costs one `F_FULLFSYNC` (two when
+//! the output and the state directory are on different devices) instead of five. Ordering among the plain syncs
+//! does not matter, so no `F_BARRIERFSYNC` is needed either: whatever they wrote is unanchored until the barrier,
+//! and recovery ignores unanchored records, pages and output bytes.
+//!
+//! No descriptor is kept: a barrier flushes through the member's own held descriptors (output, roots, parents and
+//! bundle directory, which hold every device the member syncs on). A flush that fails leaves its device unflushed,
+//! so the next anchor change of any member on that device flushes it again (an output synced before the failure is
+//! not synced twice, yet is still covered), while members on other devices never touch it.
 //!
 //! Elsewhere `fsync` is already a device-durable sync, so [`sync`] is `File::sync_all` and [`barrier`] does
 //! nothing.
@@ -47,9 +53,14 @@ mod imp {
     use std::os::unix::fs::MetadataExt;
     use std::sync::Mutex;
 
-    /// One descriptor per device synced since the last barrier. The lock is held across the flushes, so a
-    /// barrier returns only once every flush that covers its syncs has completed, whichever thread issued it.
-    static PENDING: Mutex<Vec<(u64, File)>> = Mutex::new(Vec::new());
+    /// Numbers completed syncs; a sync takes its number after its `fsync` returned.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    /// Per device: the number of its latest completed sync, and the number every sync up to which a completed
+    /// flush covers.
+    static DEVICES: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+    /// Held across a barrier's flushes, so a barrier returns only once every flush that covers its syncs has
+    /// completed, whichever thread issued it.
+    static FLUSHING: Mutex<()> = Mutex::new(());
 
     fn full(file: &File) -> std::io::Result<()> {
         DURABLE.fetch_add(1, Ordering::Relaxed);
@@ -67,75 +78,58 @@ mod imp {
         if unsafe { libc::fsync(file.as_raw_fd()) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        #[cfg(test)]
-        let seq = tests::synced();
         let device = file.metadata()?.dev();
-        let mut pending = PENDING.lock().unwrap();
-        if !pending.iter().any(|(d, _)| *d == device) {
-            match file.try_clone() {
-                Ok(held) => pending.push((device, held)),
-                // Out of descriptors: flush now rather than defer.
-                Err(_) => {
-                    drop(pending);
-                    full(file)?;
-                    #[cfg(test)]
-                    tests::flushed(device, seq + 1);
-                    return Ok(());
-                }
-            }
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut devices = DEVICES.lock().unwrap();
+        match devices.iter_mut().find(|(d, _, _)| *d == device) {
+            Some(entry) => entry.1 = entry.1.max(seq),
+            None => devices.push((device, seq, 0)),
         }
+        drop(devices);
         #[cfg(test)]
         tests::remember(device, seq);
         Ok(())
     }
-    pub(in crate::partial) fn barrier() -> std::io::Result<()> {
-        let mut pending = PENDING.lock().unwrap();
-        while let Some((device, file)) = pending.last() {
-            #[cfg(test)]
-            let upto = tests::now();
+    /// Flushes each device of `files` that has a sync no completed flush covers, through that file.
+    pub(in crate::partial) fn barrier(files: &[&File]) -> std::io::Result<()> {
+        let _flushing = FLUSHING.lock().unwrap();
+        let mut done: Vec<u64> = Vec::new();
+        for file in files {
+            let device = file.metadata()?.dev();
+            if done.contains(&device) {
+                continue;
+            }
+            done.push(device);
+            // Every sync numbered up to `start` has completed its fsync.
+            let start = SEQ.load(Ordering::SeqCst);
+            let pending = DEVICES.lock().unwrap().iter().any(|&(d, synced, flushed)| d == device && synced > flushed);
+            if !pending {
+                continue;
+            }
             full(file)?;
-            #[cfg(test)]
-            tests::flushed(*device, upto);
-            let _ = device;
-            pending.pop();
+            if let Some(entry) = DEVICES.lock().unwrap().iter_mut().find(|(d, _, _)| *d == device) {
+                entry.2 = entry.2.max(start);
+            }
         }
         Ok(())
     }
 
-    /// Bookkeeping that lets a test ask whether every sync this thread issued is covered by a completed flush.
     #[cfg(test)]
     pub(in crate::partial) mod tests {
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        static FLUSHED: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
         thread_local! {
             /// Device flushes and plain syncs issued on this thread.
             pub(in crate::partial) static HERE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
             static MINE: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        pub(super) fn synced() -> u64 {
-            SEQ.fetch_add(1, Ordering::SeqCst)
-        }
-        pub(super) fn now() -> u64 {
-            SEQ.load(Ordering::SeqCst)
-        }
         pub(super) fn remember(device: u64, seq: u64) {
             MINE.with(|m| m.borrow_mut().push((device, seq)));
         }
-        /// Every sync numbered below `upto` on `device` completed before this flush began.
-        pub(super) fn flushed(device: u64, upto: u64) {
-            let mut map = FLUSHED.lock().unwrap();
-            let entry = map.get_or_insert_with(HashMap::new).entry(device).or_insert(0);
-            *entry = (*entry).max(upto);
-        }
         /// Syncs issued on this thread that no completed device flush covers yet.
         pub(in crate::partial) fn unflushed_here() -> usize {
-            let map = FLUSHED.lock().unwrap();
+            let devices = super::DEVICES.lock().unwrap();
             MINE.with(|m| {
                 let mut mine = m.borrow_mut();
-                mine.retain(|(device, seq)| map.as_ref().and_then(|f| f.get(device)).is_none_or(|upto| seq >= upto));
+                mine.retain(|&(device, seq)| devices.iter().find(|e| e.0 == device).is_none_or(|e| seq > e.2));
                 mine.len()
             })
         }
@@ -151,7 +145,7 @@ mod imp {
         tests::HERE.with(|h| h.set((h.get().0 + 1, h.get().1)));
         file.sync_all()
     }
-    pub(in crate::partial) fn barrier() -> std::io::Result<()> {
+    pub(in crate::partial) fn barrier(_: &[&File]) -> std::io::Result<()> {
         Ok(())
     }
     #[cfg(test)]

@@ -68,8 +68,30 @@ fn every_anchor_change_follows_one_device_flush_of_every_earlier_sync() {
     assert!(cas.len() >= 7, "genesis, two groups and a compaction: {cas:?}");
     assert!(cas.iter().all(|&n| n == 0), "a CAS ran before its syncs were flushed: {cas:?}");
     let (flushes, syncs) = durable::HERE.with(|h| (h.get().0 - flushes, h.get().1 - syncs));
-    assert!(flushes <= cas.len() as u64, "{flushes} device flushes for {} anchor changes", cas.len());
+    // Elsewhere every sync is a device-durable fsync and there is nothing to defer.
     if cfg!(target_vendor = "apple") {
+        assert!(flushes <= cas.len() as u64, "{flushes} device flushes for {} anchor changes", cas.len());
         assert!(syncs >= 2 * cas.len() as u64, "{syncs} deferred syncs for {} anchor changes", cas.len());
     }
+}
+
+// Catches a device whose flush failed staying pending for, or blocking, members that never synced on it, and a
+// barrier skipping a device whose last flush failed: a barrier over files of a device with nothing unflushed issues
+// no flush, and a sync newer than every flush is flushed by the next barrier that holds that device.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_barrier_flushes_only_devices_of_its_files_with_unflushed_syncs() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(dir.path().join("f")).unwrap();
+    durable::barrier(&[&file]).unwrap();
+    let before = durable::HERE.with(|h| h.get().0);
+    durable::barrier(&[&file, &file]).unwrap();
+    // Other tests may sync on this device meanwhile; then one flush is due, never more.
+    assert!(durable::HERE.with(|h| h.get().0) - before <= 1);
+    durable::sync(&file).unwrap();
+    assert!(durable::unflushed_here() > 0);
+    durable::barrier(&[]).unwrap();
+    assert!(durable::unflushed_here() > 0, "a barrier without the device's files leaves it alone");
+    durable::barrier(&[&file]).unwrap();
+    assert_eq!(durable::unflushed_here(), 0);
 }
