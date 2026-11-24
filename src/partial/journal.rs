@@ -169,6 +169,9 @@ impl Bundle {
     /// anchored by it: the caller anchors a record only after the batch returns, so a file durable before
     /// another of its batch never matters (an unanchored record or page is ignored on recovery).
     pub(super) fn put_batch(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
+        prof!(2, self.put_batch_prof(files))
+    }
+    fn put_batch_prof(&mut self, files: &[(String, Vec<u8>, bool)]) -> PartialResult<()> {
         self.directory.check()?;
         let mut names = Vec::new();
         for (name, bytes, page) in files {
@@ -376,6 +379,9 @@ impl Bundle {
         snapshot: &Snapshot,
         lease: &mut Lease,
     ) -> PartialResult<(Vec<PageRef>, PreparedFiles)> {
+        prof!(4, self.encode_refs_prof(snapshot, lease))
+    }
+    fn encode_refs_prof(&mut self, snapshot: &Snapshot, lease: &mut Lease) -> PartialResult<(Vec<PageRef>, PreparedFiles)> {
         let (pages, encoded) = state::encode_pages(snapshot, &self.budget)?;
         lease.absorb(encoded);
         // The refs replace the copy's page list; the copy is transaction-scoped.

@@ -111,6 +111,15 @@ impl Verification {
         budget: &PartialBudget,
         hash_key: Option<&[u8; 32]>,
     ) -> PartialResult<Self> {
+        crate::partial::prof!(3, Self::after_prof(previous, changed, snapshot, budget, hash_key))
+    }
+    pub fn after_prof(
+        previous: Vec<PartCheck>,
+        changed: &[Range<u64>],
+        snapshot: &Snapshot,
+        budget: &PartialBudget,
+        hash_key: Option<&[u8; 32]>,
+    ) -> PartialResult<Self> {
         // Checks the caller supplied for an abandoned tail are plain, whatever the archive keys.
         let keyed = (snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc)
             || snapshot.evidence.direct.as_ref().is_some_and(|d| d.keyed.is_some()))

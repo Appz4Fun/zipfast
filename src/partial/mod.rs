@@ -207,6 +207,33 @@ fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
     SYNCS.fetch_add(1, Ordering::Relaxed);
     file.sync_all()
 }
+// TEMPORARY profiling (not for commit).
+pub(crate) mod profdata {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub(crate) static NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    pub(crate) static N: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    pub const NAMES: [&str; 12] =
+        ["sync", "cas", "put_batch", "verify", "encode", "check", "hole", "refill", "flush_group", "begin_tx", "finish_tx", "begin_group"];
+    pub(crate) fn add(i: usize, t: std::time::Instant) {
+        NS[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        N[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+#[doc(hidden)]
+pub fn prof_snapshot() -> Vec<(&'static str, u64, u64)> {
+    (0..12)
+        .map(|i| (profdata::NAMES[i], profdata::NS[i].load(Ordering::Relaxed), profdata::N[i].load(Ordering::Relaxed)))
+        .collect()
+}
+macro_rules! prof {
+    ($i:expr, $e:expr) => {{
+        let __t = std::time::Instant::now();
+        let __r = $e;
+        crate::partial::profdata::add($i, __t);
+        __r
+    }};
+}
+pub(crate) use prof;
 fn canceled(control: &SessionControl) -> PartialResult<()> {
     if control.is_canceled() { Err(err(PartialErrorKind::Canceled)) } else { Ok(()) }
 }
@@ -290,6 +317,9 @@ impl PartialCore {
         Ok(Operation { core: self, data })
     }
     fn check(&self, data: &CoreData) -> PartialResult<()> {
+        prof!(5, self.check_inner(data))
+    }
+    fn check_inner(&self, data: &CoreData) -> PartialResult<()> {
         canceled(&self.control)?;
         self.native.check(data.snapshot.head.size)?;
         if stamp(&self.native)? != data.stamp {
@@ -603,6 +633,9 @@ impl PartialCore {
     /// An encrypted member's ciphertext is decrypted first; blocks whose previous ciphertext block is unknown are
     /// reported in `undecryptable`, and ciphertext a remaining hole still needs is kept durably.
     pub(crate) fn fill_packed(&self, volume: u32, offset: u64, bytes: &[u8]) -> PartialResult<PackedFillResult> {
+        prof!(7, self.fill_packed_prof(volume, offset, bytes))
+    }
+        pub(crate) fn fill_packed_prof(&self, volume: u32, offset: u64, bytes: &[u8]) -> PartialResult<PackedFillResult> {
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
         let mut op = self.operation()?;
@@ -832,8 +865,13 @@ impl PartialCore {
         let mut op = self.operation()?;
         self.check(&op)?;
         if op.snapshot.crypt.is_some() {
-            drop(op);
-            return self.fill_packed(volume, offset, bytes);
+            return match self.fill_encrypted_grouped(&mut op, volume, offset, bytes)? {
+                Some(result) => Ok(result),
+                None => {
+                    drop(op);
+                    self.fill_packed(volume, offset, bytes)
+                }
+            };
         }
         // (packed bytes, output offset): a plain member's output is its packed stream.
         let mut segments: Vec<(Range<u64>, u64)> = Vec::new();
@@ -887,12 +925,108 @@ impl PartialCore {
             needs_verification: true,
         })
     }
+    /// The encrypted half of [`Self::fill_packed_grouped`]: the ciphertext is decrypted as `fill_packed` does, and
+    /// when no decrypted run touches alt output (which archive bytes may have to correct or confirm, durably before
+    /// the call returns) the plaintext is written in the open group, and the ciphertext blocks a remaining hole
+    /// still needs join the group's kept list, so both become durable together at the group's commit. Plaintext
+    /// over output the original extraction wrote must still match it. Returns None, having written nothing, when
+    /// the call must take the transaction of `fill_packed` instead (alt output, or no keys).
+    fn fill_encrypted_grouped(
+        &self,
+        op: &mut CoreData,
+        volume: u32,
+        offset: u64,
+        bytes: &[u8],
+    ) -> PartialResult<Option<PackedFillResult>> {
+        let Some(keys) = &self.keys else { return Ok(None) };
+        let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
+        if op.group.is_none() {
+            // The group starts from the state the store holds (an uncertain commit is resolved first).
+            self.reconcile(op)?;
+        }
+        let limit = cipher::stream_produced(&op.snapshot);
+        // (packed bytes, ciphertext stream offset), as in `fill_packed`.
+        let (mut segments, _segments_lease): (Vec<(Range<u64>, u64)>, _) =
+            self.budget.leased_vector(op.snapshot.evidence.parts.len())?;
+        for (part, stream) in cipher::parts_with_stream(&op.snapshot).filter(|(p, _)| p.packed.volume == volume) {
+            let start = offset.max(part.packed.range.start);
+            let stop = end.min(part.packed.range.end);
+            if start >= stop {
+                continue;
+            }
+            let at = stream + (start - part.packed.range.start);
+            let at_end = (at + (stop - start)).min(limit);
+            if at < at_end {
+                segments.push((start..start + (at_end - at), at));
+            }
+        }
+        let (mut decryptions, _decryptions_lease) = self.budget.leased_vector(segments.len())?;
+        for (packed, stream) in &segments {
+            let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
+            decryptions.push(cipher::decrypt(&self.budget, &op.snapshot, keys, *stream, slice)?);
+        }
+        let touches_alt = decryptions.iter().flat_map(|d| d.runs.iter()).any(|(out, plain)| {
+            let run = *out..*out + (plain.end - plain.start) as u64;
+            let first = op.snapshot.known.partition_point(|leaf| leaf.range.end <= run.start);
+            op.snapshot.known[first..]
+                .iter()
+                .take_while(|leaf| leaf.range.start < run.end)
+                .any(|leaf| leaf.provenance == state::Provenance::Alt)
+        });
+        if touches_alt {
+            return Ok(None);
+        }
+        if !self.keys_proven.load(Ordering::Acquire) {
+            let wrapped: Vec<Option<cipher::Decrypted>> = decryptions.drain(..).map(Some).collect();
+            self.prove_keys(op, &wrapped)?;
+            decryptions.extend(wrapped.into_iter().flatten());
+        }
+        let (mut unmapped, _unmapped_lease) = self.budget.leased_vector(segments.len() + 1)?;
+        let mut at = offset;
+        for (packed, _) in &segments {
+            if at < packed.start {
+                unmapped.push(PackedSpan { volume, range: at..packed.start });
+            }
+            at = packed.end;
+        }
+        if at < end {
+            unmapped.push(PackedSpan { volume, range: at..end });
+        }
+        let mut applied = Vec::new();
+        let mut undecryptable = Vec::new();
+        let mut kept = Vec::new();
+        for ((packed, stream), decrypted) in segments.iter().zip(&decryptions) {
+            undecryptable.extend(decrypted.undecryptable.iter().cloned());
+            for (out, plain) in &decrypted.runs {
+                applied.extend(self.group_write(op, *out, &decrypted.plain[plain.clone()], FillMode::Packed)?);
+            }
+            let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
+            kept.extend(cipher::keep(&self.budget, &op.snapshot, *stream, slice)?);
+        }
+        if !kept.is_empty() {
+            if op.group.is_none() {
+                // Nothing was written (every run was known output): the blocks still need a group to join.
+                self.begin_group(op)?;
+            }
+            cipher::merge(&self.budget, &mut op.snapshot.cipher, &kept)?;
+        }
+        Ok(Some(PackedFillResult {
+            revision: op.snapshot.head.revision,
+            applied,
+            corrected: Vec::new(),
+            unmapped,
+            undecryptable,
+            state: op.state.clone(),
+            part_checks: Vec::new(),
+            needs_verification: true,
+        }))
+    }
     pub(crate) fn refill_targets(&self, volume: u32, range: &Range<u64>) -> PartialResult<Vec<Range<u64>>> {
         let mut op = self.operation()?;
         self.check(&op)?;
-        // Grouped refills of a plain member leave the group open: the targets come from the in-memory leaves,
-        // which already hold the group's writes, so a run of refills commits once.
-        if !(self.budget.limits.group_refills && op.snapshot.crypt.is_none()) {
+        // Grouped refills leave the group open: the targets come from the in-memory leaves, which already hold the
+        // group's writes, so a run of refills commits once.
+        if !self.budget.limits.group_refills {
             self.flush_group(&mut op)?;
         }
         if op.uncertain.is_some() {
@@ -1416,6 +1550,9 @@ impl PartialCore {
     /// Anchors the intent of a new group: the committed head with the next sequence and revision. The ledger is
     /// unchanged (grouped writes only add output the committed state calls unknown), so only the record is written.
     fn begin_group(&self, op: &mut CoreData) -> PartialResult<()> {
+        prof!(11, self.begin_group_prof(op))
+    }
+        fn begin_group_prof(&self, op: &mut CoreData) -> PartialResult<()> {
         let next_head = |op: &CoreData| -> PartialResult<state::CommittedState> {
             let mut head = op.snapshot.head.clone();
             head.sequence = head.sequence.checked_add(1).ok_or_else(malformed)?;
@@ -1475,6 +1612,9 @@ impl PartialCore {
     /// keeps the group open (the next operation tries again); an uncertain CAS leaves recovery to `reconcile`,
     /// which rebuilds the snapshot from whichever state the store holds.
     fn flush_group(&self, op: &mut CoreData) -> PartialResult<()> {
+        prof!(8, self.flush_group_prof(op))
+    }
+        fn flush_group_prof(&self, op: &mut CoreData) -> PartialResult<()> {
         if op.group.is_none() {
             if !op.cursor_pending {
                 return Ok(());
@@ -1658,6 +1798,15 @@ impl PartialCore {
         mut valid: Snapshot,
         affected: Vec<Range<u64>>,
     ) -> PartialResult<Transaction> {
+        prof!(9, self.begin_transaction_prof(data, intent, valid, affected))
+    }
+        fn begin_transaction_prof(
+        &self,
+        data: &mut CoreData,
+        mut intent: Snapshot,
+        mut valid: Snapshot,
+        affected: Vec<Range<u64>>,
+    ) -> PartialResult<Transaction> {
         let prior_sequence = data.state.anchor().sequence();
         let result = (|| {
             // These copies live until the transaction finishes (or, on failure,
@@ -1725,6 +1874,9 @@ impl PartialCore {
         })
     }
     fn finish_transaction(&self, data: &mut CoreData, transaction: Transaction) -> PartialResult<()> {
+        prof!(10, self.finish_transaction_prof(data, transaction))
+    }
+        fn finish_transaction_prof(&self, data: &mut CoreData, transaction: Transaction) -> PartialResult<()> {
         let intent_anchor = transaction.intent.anchor.clone();
         let finish = (|| {
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1785,10 +1937,10 @@ impl PartialCore {
     pub(crate) fn hole_report(&self, out: Range<u64>, cause: HoleCause) -> PartialResult<HoleReport> {
         let data = self.operation()?;
         self.check(&data)?;
-        // A grouped hole takes the open group's revision (every write of a group shares it); otherwise the hole
-        // is the next transaction's.
+        // A grouped hole takes the open group's revision (every write of a group shares it), and so does a hole
+        // committed with the group; otherwise the hole is the next transaction's.
         let grouped = self.groups_hole(&data, &cause, &out);
-        let revision = if grouped && data.group.is_some() {
+        let revision = if (grouped || self.commits_hole_with_group(&data, &cause, &out)) && data.group.is_some() {
             data.snapshot.head.revision
         } else {
             data.snapshot.head.revision.checked_add(1).ok_or_else(malformed)?
@@ -1811,8 +1963,19 @@ impl PartialCore {
     /// meets at the end of its produced output, so the group still adds only output the committed state calls
     /// unknown.
     fn groups_hole(&self, data: &CoreData, cause: &HoleCause, out: &Range<u64>) -> bool {
-        self.budget.limits.group_holes
-            && self.grouping()
+        self.budget.limits.group_holes && self.joins_group(data, cause, out)
+    }
+    /// Whether a hole over `out` is recorded in the group and committed with it at once, before it is reported
+    /// (`group_holes` off): one commit for the group's output and the hole, where a separate transaction for the
+    /// hole would follow the group's commit. Each such hole closes its group, so it is the only hole of that group
+    /// and keeps its revision as its id.
+    fn commits_hole_with_group(&self, data: &CoreData, cause: &HoleCause, out: &Range<u64>) -> bool {
+        !self.budget.limits.group_holes && self.joins_group(data, cause, out)
+    }
+    /// A hole the extraction meets at the end of its produced output, while writes are grouped: recording it in
+    /// a group adds only output the committed state calls unknown.
+    fn joins_group(&self, data: &CoreData, cause: &HoleCause, out: &Range<u64>) -> bool {
+        self.grouping()
             && matches!(cause, HoleCause::Missing | HoleCause::CipherNeighbour)
             && out.start == data.snapshot.head.produced
     }
@@ -1832,9 +1995,22 @@ impl PartialCore {
         blocks: &[state::CipherBlock],
         damaged: &[Range<u64>],
     ) -> PartialResult<()> {
+        prof!(6, self.record_hole_inner_prof(report, blocks, damaged))
+    }
+        fn record_hole_inner_prof(
+        &self,
+        report: HoleReport,
+        blocks: &[state::CipherBlock],
+        damaged: &[Range<u64>],
+    ) -> PartialResult<()> {
         let mut data = self.operation()?;
         if damaged.is_empty() && self.groups_hole(&data, &report.cause, &report.out) {
             return self.record_grouped_hole(&mut data, report, blocks);
+        }
+        if damaged.is_empty() && self.commits_hole_with_group(&data, &report.cause, &report.out) {
+            // Durable before it is reported, as a hole of its own transaction is, but in the group's commit.
+            self.record_grouped_hole(&mut data, report, blocks)?;
+            return self.flush_group(&mut data);
         }
         self.check(&data)?;
         self.flush_group(&mut data)?;
@@ -2919,7 +3095,9 @@ impl PartialFile {
         }
         match total {
             Some(total) => Ok(total),
-            None => self.core.fill_packed(volume, range.start, &[]),
+            // Nothing left to refill here. With `group_refills` an open group stays open, so refilling ranges an
+            // earlier refill of the run already covered does not commit it.
+            None => self.core.fill_packed_grouped(volume, range.start, &[]),
         }
     }
     /// The absolute path of the output file this partial writes to: the output root (made absolute when the
