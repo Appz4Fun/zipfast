@@ -380,6 +380,23 @@ direct member has no packed mapping, so `fill_packed`, `refill_from_packed` and 
 wrote, committed or still in the open group, and after a restart what the durable state knows. Compressed decoders
 read their window back through it.
 
+**Solid streams (`SolidStreamSink`).** A solid RAR 5.0 successor started from a `SolidCarry` after a restart
+(`FeedDecoder::resume_solid`), or any solid member or 7z folder member that reads output before its own start,
+needs `FeedSink::read_earlier`, which `DirectSink` (one member) cannot give. `SolidStreamSink` wraps the direct
+partials of the members of one stream, in stream order, the last being the member being decoded: `write_at` and
+`read_held` go to that member's `DirectSink` (member offsets), `read_earlier(stream_offset, buf)` reads the output
+the earlier members' partials know, across member boundaries, and stops at the first byte not known (a hole an
+earlier member skipped and has not repaired), so the decoder fails with `EarlierOutput` rather than reading a
+guess. `stream_slots(&map, index)` gives the layout (member, stream start, size) from the map: RAR 4.x and 5.0
+compressed members back to the stream's first (the sizes before it, as `FeedDecoder::stream_start`), a 7z member's
+folder offset. `SolidStreamSink::open(&partials, &map, index)` opens (or adopts after a restart) every member up to
+`index`; no handle of those members may be live (`Busy` otherwise), so in-session use opens the first member and
+goes on with `next_member(&partials, &map, next)` as the decoder hands over (`next_solid`), keeping the earlier
+handles. `set_cursor` and `commit` act on the current member. After a restart, `open` the member to resume, restore
+its decoder (`resume_solid` from the stored `SolidCarry`, or `restore` from the member's cursor) and run it.
+Output the earlier members hold stays the plaintext they wrote; a carry from a member that skipped a hole is
+`unproven` as before, and the successor stays unproven until its own CRC matches.
+
 **Verification.** `poll_verify` combines the CRC32 of the known leaves and reads back BLAKE2sp, as for any member,
 and returns `Verdict::Ok` once every byte is known and every check the map recorded passes; until then
 `Incomplete`, with the unknown ranges as `holes`. A direct member needs no canonical finish: its checks came from the
