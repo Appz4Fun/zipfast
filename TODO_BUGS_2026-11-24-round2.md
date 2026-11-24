@@ -7,10 +7,10 @@ Each item: a test that fails without its fix; reply on the thread naming the fix
 
 | # | PR | Thread | Where | Sev | Status |
 |---|---|---|---|---|---|
-| A1 | #276 | PRRT_kwDOVi_ME867YJ8a | src/tar/write.rs:721 | P2 | open |
-| A2 | #252 | PRRT_kwDOVi_ME867Lncl | src/sevenzip/run.rs:703 | P2 | open |
-| A3 | #246 | PRRT_kwDOVi_ME867PMnB | src/zip.rs:1041 | P2 | open |
-| A4 | #257 | PRRT_kwDOVi_ME867S4tH | tests/persistent_partials.rs:4652 | P2 (flaky test) | open |
+| A1 | #276 | PRRT_kwDOVi_ME867YJ8a | src/tar/write.rs:721 | P2 | fixed, in review |
+| A2 | #252 | PRRT_kwDOVi_ME867Lncl | src/sevenzip/run.rs:703 | P2 | fixed, in review |
+| A3 | #246 | PRRT_kwDOVi_ME867PMnB | src/zip.rs:1041 | P2 | fixed, in review |
+| A4 | #257 | PRRT_kwDOVi_ME867S4tH | tests/persistent_partials.rs:4652 | P2 (flaky test) | fixed, in review |
 
 - **A1** Eight-byte base-256 fields: values 2^62 .. 2^63-1 set the base-256 sign bit (0x40 of the first byte after the
   0x80 marker), so `(1 << 63) - 1` encodes as eight 0xff bytes = -1, which src/tar.rs::number sign-extends and member
