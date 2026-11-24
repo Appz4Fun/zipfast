@@ -412,6 +412,10 @@ impl Rar4Decoder {
     ) -> DecodeResult<Self> {
         Self::new_with_cancel(dictionary, packed, unpacked, window_limit, Some(cancel))
     }
+    /// Cancels this decoder through `cancel` from now on (a decoder handed to another session's member).
+    pub(crate) fn set_cancel(&mut self, cancel: Option<Cancellation>) {
+        self.work.cancel = cancel;
+    }
     pub(crate) fn new_with_cancel(
         dictionary: u64,
         packed: u64,
