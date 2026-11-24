@@ -5,8 +5,8 @@ branch bugs-round3. Each item: a test that fails without its fix; reply on the t
 
 | # | PR | Thread | Where | Sev | Status |
 |---|---|---|---|---|---|
-| C1 | #280 | PRRT_kwDOVi_ME867Zspn | src/sevenzip/run.rs:1057 | P2 | open |
-| C2 | #280 | PRRT_kwDOVi_ME867Zspv | src/sevenzip/run.rs:1057 | P2 (= follow-up F2) | open |
+| C1 | #280 | PRRT_kwDOVi_ME867Zspn | src/sevenzip/run.rs:1057 | P2 | fixed (this PR) |
+| C2 | #280 | PRRT_kwDOVi_ME867Zspv | src/sevenzip/run.rs:1057 | P2 (= follow-up F2) | fixed (this PR) |
 
 - **C1** Pending links are tracked by archive name (`staged.link`), not by output path (`staged.place.path`). With
   `Overwrite::RenameNew` and an existing destination directory `s`, a solid folder with link `s` then `s/new.txt` renames
