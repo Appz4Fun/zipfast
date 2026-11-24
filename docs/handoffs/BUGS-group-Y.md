@@ -1,5 +1,5 @@
 # BUGS group Y: extraction runs and RAR volumes
-Status: PR open, awaiting cleanroom review (not merged). Branch bugs-extract. Worktree /Users/allen/git.xbmc4lyfe/zipfast-bugsy.
+Status: PR #277 open, awaiting cleanroom review (not merged). Branch bugs-extract. Worktree /Users/allen/git.xbmc4lyfe/zipfast-bugsy.
 
 | Item | Fix | Test (fails without the fix) |
 |---|---|---|
