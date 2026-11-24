@@ -1,6 +1,6 @@
 # BUGS round 2, group R1
 
-Status: PR open, awaiting cleanroom review (not merged).
+Status: PR #280 open, awaiting cleanroom review (not merged).
 Branch: bugs-round2-a. Worktree: /Users/allen/git.xbmc4lyfe/zipfast-r2a.
 
 ## Done
