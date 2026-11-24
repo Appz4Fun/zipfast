@@ -2608,6 +2608,16 @@ fn reopen_with(
     password: Option<&str>,
     progressive_limits: ProgressiveLimits,
 ) -> PartialResult<PartialFile> {
+    reopen_limited(dir, run, password, PartialLimits::default(), progressive_limits)
+}
+#[allow(clippy::result_large_err, reason = "the public partial error type")]
+fn reopen_limited(
+    dir: &Path,
+    run: EncryptedRun,
+    password: Option<&str>,
+    limits: PartialLimits,
+    progressive_limits: ProgressiveLimits,
+) -> PartialResult<PartialFile> {
     drop(run.session);
     let state = partial_state::roundtrip(&run.file.close().unwrap());
     let expected_anchor = run.anchors.current(&run.key).unwrap().unwrap();
@@ -2619,7 +2629,7 @@ fn reopen_with(
             expected_member: run.key,
             expected_anchor,
             protection: run.protection,
-            limits: PartialLimits::default(),
+            limits,
             progressive_limits,
             anchors: run.anchors,
             control: SessionControl::default(),
@@ -4653,4 +4663,32 @@ fn encrypted_grouped_refills_share_one_commit_and_survive_a_reopen() {
     assert!(file.remaining().unwrap().is_empty());
     assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
     assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
+}
+
+/// Catches a grouped encrypted refill dropping the progress it already made: the plaintext is written (and the
+/// group committed, `group_commit_bytes` being 1) before the ciphertext blocks a remaining hole needs are retained,
+/// and a failure there (the interval limit) must still report what was applied, as `fill_packed` does.
+#[test]
+fn a_grouped_encrypted_refill_reports_progress_when_retaining_ciphertext_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Encrypted::new(3000, &CUTS, true);
+    let run = extract_encrypted_with(dir.path(), &fixture, &[990..1010, 1500..1510], PartialLimits::default());
+    let limits = PartialLimits { group_refills: true, group_commit_bytes: 1, ..PartialLimits::default() };
+    // enough intervals to reopen and plan the refill, too few to retain the blocks the refill leaves needed
+    let tight = ProgressiveLimits { hole_intervals: 4, ..ProgressiveLimits::default() };
+    let mut file = reopen_limited(dir.path(), run, Some("pw"), limits, tight).unwrap();
+    let before = file.remaining().unwrap();
+    let mut reader = std::io::Cursor::new(fixture.volumes[0].clone());
+    let error = file.refill_from_packed(0, 0..fixture.volumes[0].len() as u64, &mut reader).unwrap_err();
+    assert!(
+        matches!(&error.kind, PartialErrorKind::Progressive(f) if matches!(f.kind, FailureKind::Limit { resource: Resource::HoleIntervals, .. })),
+        "{error:?}"
+    );
+    let progress = error.packed_progress.expect("the plaintext written before the failure is reported");
+    assert_eq!(progress.applied, vec![976..992]);
+    // what was reported is what the output holds
+    let after = file.remaining().unwrap();
+    assert_ne!(before, after, "the refill wrote output");
+    assert!(after.iter().all(|r| r.start >= 992 || r.end <= 976), "{after:?}");
+    assert_eq!(&fs::read(dir.path().join("out/e.bin")).unwrap()[976..992], &fixture.plain[976..992]);
 }

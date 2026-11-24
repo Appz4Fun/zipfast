@@ -249,26 +249,30 @@ fn main() {
     };
     let mut best = [f64::MAX; 3];
     let mut best_clean = f64::MAX;
+    // refill calls per run (every packed span of every hole report, cipher-neighbour reports included)
+    let mut refills = 0u64;
     for _ in 0..runs {
-        let t = run(&set, &work, &names, &ranges);
+        let (t, n) = run(&set, &work, &names, &ranges);
+        refills = n;
         for i in 0..3 {
             best[i] = best[i].min(t[i]);
         }
         if !ranges.is_empty() {
-            best_clean = best_clean.min(run(&set, &work, &names, &[])[0]);
+            best_clean = best_clean.min(run(&set, &work, &names, &[]).0[0]);
         }
     }
     let count = ranges.len().max(1) as f64;
+    let per_refill = refills.max(1) as f64;
     let hole_mib = ranges.iter().map(|(_, r)| r.end - r.start).sum::<u64>() as f64 / (1 << 20) as f64;
     println!(
         "{label}, {} holes ({hole_mib:.2} MiB): session {:.1} ms (clean {:.1} ms, {:.2} ms per hole), refill {:.1} ms \
-         ({:.2} ms per refill, {:.0} MiB/s), verify {:.1} ms (best of {runs})",
+         ({:.2} ms per refill of {refills}, {:.0} MiB/s), verify {:.1} ms (best of {runs})",
         ranges.len(),
         best[0] * 1e3,
         if ranges.is_empty() { best[0] * 1e3 } else { best_clean * 1e3 },
         if ranges.is_empty() { 0.0 } else { (best[0] - best_clean) * 1e3 / count },
         best[1] * 1e3,
-        best[1] * 1e3 / count,
+        best[1] * 1e3 / per_refill,
         hole_mib / best[1].max(1e-9),
         best[2] * 1e3
     );
@@ -298,8 +302,9 @@ fn end_len(last: bool) -> u64 {
     common::end_block(!last).len() as u64
 }
 
-/// One run: the session with holes, then the refills, then verification. Returns the three phase times.
-fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Range<u64>)]) -> [f64; 3] {
+/// One run: the session with holes, then the refills, then verification. Returns the three phase times and the
+/// number of refill calls made.
+fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Range<u64>)]) -> ([f64; 3], u64) {
     let root = work.join("holes-run");
     let _ = fs::remove_dir_all(&root);
     for sub in ["out", "state", "anchors"] {
@@ -403,5 +408,5 @@ fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Ran
     }
     drop(handles);
     fs::remove_dir_all(&root).unwrap();
-    [session_time, refill_time, verify_time]
+    ([session_time, refill_time, verify_time], refills)
 }

@@ -13,12 +13,14 @@ Status: merging (PR number and merge sha added after merge). Branch hole-cost-li
 - Bench: `persistent_holes_bench` takes ZF_SET, ZF_PASSWORD, ZF_HOLES. Profiling hooks removed.
 
 ## Numbers (Linux server, ms)
+Per-refill figures corrected in bugs-wave1 (bug 4): the first version divided refill time by the injected hole ranges instead of
+the refill calls made; re-run with the fixed bench on F01/F11 (the 'before' rows keep the old ratio, scaled).
 | set | mode | session per hole | refill per refill |
-| F01 5 holes | default before/after | 214 / 215 | 179 / 177 |
-| F01 5 holes | group_holes+group_refills before | -0.1 | 178 |
-| F01 5 holes | group both after | -0.1 | 14.0 |
-| F01 18 holes | group both after | -0.2 | 6.7 (was 162) |
-| F11 33 holes | group both after | -0.1 | 7.0 (was 163) |
+| F01 5 holes (16 refills) | default before/after | 214 / 215 | 55 (was reported as 179 / 177: divided by 5 holes) |
+| F01 5 holes | group_holes+group_refills before | -0.1 | not re-run (about 178 reported, divided by 5 holes) |
+| F01 5 holes | group both after | -0.1 | 4.3 (was reported as 14.0) |
+| F01 18 holes (54 refills) | group both after | -0.2 | 2.3 (was reported as 6.7) |
+| F11 33 holes (99 refills) | group both after | -0.1 | 2.4 (was reported as 7.0) |
 | 1 GiB stored, 64 holes | default | 103 | 60 |
 | 1 GiB stored, 64 holes | group both | 0.4 | 2.2 |
 Target under 3 ms per hole is met with both group limits on; with them off the floor is syncs x fsync (see docs/persistent-partials.md).

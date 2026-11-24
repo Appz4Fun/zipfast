@@ -435,3 +435,52 @@ fn a_repair_after_a_restart_goes_through_the_folder_sink() {
         let _ = std::fs::remove_dir_all(&work);
     }
 }
+
+/// Zero-length members of a folder share their offset with the member after them: the layout of an empty member
+/// stops at it (a later member is no part of it), and keeps the empty members before it, so the in-session hand-off
+/// chain empty -> next member works through `SolidStreamSink::open` and `next_member`.
+#[test]
+fn empty_folder_members_keep_their_place_in_the_stream_layout() {
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("e0.txt", Vec::new()),
+        ("a.bin", mixed(60_000, 41)),
+        ("e1.txt", Vec::new()),
+        ("b.bin", mixed(40_000, 42)),
+    ];
+    let archive = seven_zip(&files, false, usize::MAX);
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    assert!(map.members.iter().all(|m| m.folder.is_some()), "empty members sit in the folder");
+    for (index, want) in [
+        (0usize, vec![(0usize, 0u64, 0u64)]),
+        (1, vec![(0, 0, 0), (1, 0, 60_000)]),
+        (2, vec![(0, 0, 0), (1, 0, 60_000), (2, 60_000, 0)]),
+        (3, vec![(0, 0, 0), (1, 0, 60_000), (2, 60_000, 0), (3, 60_000, 40_000)]),
+    ] {
+        let slots = stream_slots(&map, index).unwrap();
+        assert_eq!(slots.iter().map(|s| (s.member, s.start, s.size)).collect::<Vec<_>>(), want, "member {index}");
+    }
+    let work = work_dir("empty-members");
+    let parts = direct(&work);
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    // open on each empty member, and on the member after one
+    for index in 0..4 {
+        SolidStreamSink::open(&parts, &map, index).unwrap_or_else(|e| panic!("open {index}: {e:?}"));
+    }
+    // in-session: 0 (empty) -> 1 -> 2 (empty) -> 3
+    let mut sink = SolidStreamSink::open(&parts, &map, 0).unwrap();
+    let mut d = FeedDecoder::new(&map, 0, options()).unwrap();
+    for index in 1..4 {
+        let (st, _) = drive(&mut d, &mut source, &mut sink);
+        assert!(st.done && st.crc_ok != Some(false), "member {}: {st:?}", index - 1);
+        sink.commit().unwrap();
+        sink.next_member(&parts, &map, index).unwrap_or_else(|e| panic!("next_member {index}: {e:?}"));
+        d = d.next_solid(&map, index, options()).unwrap();
+    }
+    let (st, _) = drive(&mut d, &mut source, &mut sink);
+    assert!(st.done && st.crc_ok == Some(true), "{st:?}");
+    sink.commit().unwrap();
+    let out = sink.into_files();
+    assert!(std::fs::read(out[3].output_path()).unwrap() == files[3].1);
+    let _ = std::fs::remove_dir_all(&work);
+}

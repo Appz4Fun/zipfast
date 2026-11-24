@@ -33,8 +33,10 @@ pub struct StreamSlot {
 }
 
 /// The members that make up the solid stream (RAR 4.x and 5.0) or folder (7z) of member `index`, up to and
-/// including it, in stream order, with their stream offsets. Members that produce no output through the stream
-/// (directories, stored RAR members, empty members) are left out; another format gives the member alone at 0.
+/// including it, in stream order, with their stream offsets. For RAR, members that produce no output through the
+/// stream (directories, stored members, empty members) are left out. For 7z, every member of the folder up to `index`
+/// is kept in member order, zero-length ones included, so an empty member can be opened and handed over. Another
+/// format gives the member alone at 0.
 pub fn stream_slots(map: &MemberMap, index: usize) -> PartialResult<Vec<StreamSlot>> {
     let member = map.members.get(index).ok_or_else(|| err(PartialErrorKind::InvalidOptions))?;
     let size = |i: usize| map.members[i].unpacked_size.ok_or_else(|| err(PartialErrorKind::InvalidOptions));
@@ -66,12 +68,11 @@ pub fn stream_slots(map: &MemberMap, index: usize) -> PartialResult<Vec<StreamSl
         MapFormat::SevenZip => {
             let FolderSlot { index: folder, offset } =
                 member.folder.ok_or_else(|| err(PartialErrorKind::InvalidOptions))?;
-            for (i, m) in map.members.iter().enumerate() {
+            // by member index, not offset: an empty member shares its offset with the member after it, and every
+            // member up to the requested one (empty ones too) is a link of the hand-off chain
+            for (i, m) in map.members.iter().enumerate().take(index + 1) {
                 if let Some(f) = m.folder.filter(|f| f.index == folder && f.offset <= offset) {
-                    let s = size(i)?;
-                    if s > 0 || i == index {
-                        slots.push(StreamSlot { member: i, start: f.offset, size: s });
-                    }
+                    slots.push(StreamSlot { member: i, start: f.offset, size: size(i)? });
                 }
             }
             slots.sort_by_key(|s| s.start);
