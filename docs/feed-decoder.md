@@ -105,7 +105,7 @@ old frontier, for a 7z member after its folder's first started on its own the fo
 | plain stored (RAR 5.0, RAR 4.x, ZIP method 0, 7z Copy): `OutputMapping::Direct` | output byte = stream byte: the hole's own output is lost; the main decode goes on right after it |
 | AES-CBC stored (RAR 5.0, RAR 4.x AES-128, the first member of a 7zAES-over-Copy folder): `CbcBlocks` | each block needs the ciphertext block before it: the lost output runs from the start of the block the hole begins in to the end of the block after the one it ends in (`[floor16(start), ceil16(end) + 16)`); the main decode restarts there with the block before as IV |
 | WinZip AES stored: `Counter { skip }` | each byte decrypts on its own: exactly the hole's output is lost; the authentication code is caught up after repairs (see [ZIP](#zip)) |
-| ZIP Deflate and Deflate64 (methods 8 and 9; plain, ZipCrypto, WinZip AES), ZipCrypto stored | waits at every hole; see [ZIP](#zip) |
+| ZIP Deflate and Deflate64 (methods 8 and 9; plain, ZipCrypto, WinZip AES), ZipCrypto stored | waits at every hole, or restarts at a later stored block (not ZipCrypto); see [ZIP](#zip) |
 | compressed RAR 5.0 (methods 1-5, AES-256 under them too) | see [compressed RAR 5.0](#compressed-rar-50); solid successors [below](#solid-streams-and-folders) |
 | 7z folders of one LZMA2 coder, alone or over 7zAES, any member of the folder | see [7z LZMA2](#7z-lzma2); members in sequence [below](#solid-streams-and-folders) |
 | compressed RAR 4.x (unpack versions 1.5, 2.0, 2.6, 2.9: LZ, audio, PPMd, filters; AES-128 under them too) | waits at every hole; see [compressed RAR 4.x](#compressed-rar-4x); solid successors [below](#solid-streams-and-folders) |
@@ -246,12 +246,26 @@ each (a member crossing a boundary has a part per piece), and the articles are p
 - **Stored, plain or WinZip AES**: the stored lanes above; holes are skipped and repaired.
 - **Deflate and Deflate64, plain or WinZip AES**: the main decode decrypts (WinZip AES counter mode decrypts each
   byte on its own) and feeds the packed bytes to zipfast's inflater (`inflate64`, which reads both) in order, and
-  writes the output in order. Deflate has no restart point a decoder can find after a hole: a block starts at a bit
-  offset known only by decoding up to it, and the block after a hole copies from output the hole hid. So at a hole
-  the main decode waits (`stalled`, the hole's bytes the first `Next` need, the bytes after it `Ahead`) and goes on
-  with its decoder when they come; nothing is lost, repaired or decoded twice. No resync over the data after a hole is
-  attempted (a stored block's LEN/NLEN after a hole could be found, but its output offset and the window before it
-  cannot be proven before the member's CRC, and the blocks after it copy from the hole's output anyway).
+  writes the output in order. A block starts at a bit offset known only by decoding up to it, and the block after a
+  hole copies from output the hole hid, so at a hole the main decode waits (`stalled`, the hole's bytes the first
+  `Next` need, the bytes after it `Ahead`) and goes on with its decoder when they come; nothing is lost, repaired or
+  decoded twice. Unless a **stored block** after the hole restarts it (next paragraph).
+- **Restart at a stored block** (Deflate, Deflate64; plain or WinZip AES; not ZipCrypto, whose keystream needs every
+  byte before). After a lost hole it scans the bytes after it for a LEN/NLEN pair (NLEN = !LEN) after a byte whose
+  top bits are zero padding. A candidate is decoded to the data's end with a window of zeros, output discarded
+  (counted only): a false candidate dies on the Deflate syntax or does not end exactly at the data's end. A match's
+  length does not depend on its window, so the count is exact and the restart's output offset is the member's size
+  less the count (a restart before the output already written is refused). Then it writes from the stored block,
+  `unproven`, and reports `[written frontier, restart)` as `lost` (the hole's bytes are a `Repair` need, `stalled`
+  is false). A later block that is not stored decodes only when its window (32 KiB, 64 KiB for Deflate64) is the
+  output since the restart or held by the sink; otherwise it waits (a run of stored blocks never needs a window).
+  When the hole's bytes come the main decode goes on from where it stood, its output stopped at the restart's
+  offset: a block boundary there whose stored header ends at the candidate's byte confirms it (the main decode then
+  decodes what the restart wrote again, without writing it, `redecoded`; the CRC of the restart's output joins the
+  member's); anything else refutes it: what the restart wrote is `lost` again and written as a repair (the sink gets
+  those bytes a second time, the one case where it does) and the decode goes on as if there had been no restart.
+  `unproven` clears with the CRC (or the WinZip AES code). A snapshot does not keep a restart: the restored decoder
+  writes its output again. One restart is searched or open at a time; a second hole waits.
 - **ZipCrypto, stored or under Deflate**: its keystream depends on every byte before, so it waits at holes too. A wrong
   password shows once the 12-byte header is read (its last byte is the check byte, `WrongPassword`; one wrong password
   in 256 passes it and fails the CRC).
