@@ -373,7 +373,7 @@ impl Lz {
             u64s(&mut out, &[r.lost.start, r.lost.end]);
         }
         // what a member handed over keeps pinned (the members before it, the member after it)
-        if self.floor > 0 || self.cap.is_some() || self.handoff.is_some() {
+        if self.floor > 0 || self.cap.is_some() || self.handoff.is_some() || self.base.is_some() {
             u64s(&mut out, &[self.floor, self.cap.unwrap_or(u64::MAX)]);
         }
         // a finished main decode's state still to be handed to the next member: where it goes on (a live decoder as
@@ -410,6 +410,12 @@ impl Lz {
                 u64s(&mut out, &[lost.start, lost.end]);
             }
             u64s(&mut out, &[h.floor]);
+        }
+        // the dictionary reset a restart point reaching into earlier members falls back to, kept apart from the
+        // active restart points (those may all be past it)
+        if let Some(base) = self.base {
+            out.push(2);
+            put_opt_cp(&mut out, Some(base));
         }
         out
     }
@@ -490,7 +496,7 @@ impl Lz {
             repairs.push(Repair { kind, lost, blocked: None, lane: None });
         }
         let (floor, cap) = if r.0.is_empty() { (0, u64::MAX) } else { (r.u64()?, r.u64()?) };
-        let handoff = if r.0.is_empty() {
+        let handoff = if r.0.is_empty() || r.0[0] == 2 {
             None
         } else {
             if r.u8()? != 1 || !self.successor || main.is_some() || seek {
@@ -545,6 +551,16 @@ impl Lz {
                 seek: seek_next,
             }))
         };
+        let saved_base = if r.0.first() == Some(&2) {
+            r.u8()?;
+            let cp = get_opt_cp(&mut r)?.ok_or(bad())?;
+            if cp.seeded || cp.packed > self.plain_len || cp.out > self.folder_size {
+                return Err(bad());
+            }
+            Some(cp)
+        } else {
+            None
+        };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
@@ -558,16 +574,17 @@ impl Lz {
             return Err(bad());
         }
         // a dictionary reset a restored lane or repair restarts at (nothing else needs to be held for it)
-        self.base = main
-            .as_ref()
-            .and_then(|l| l.cp)
-            .into_iter()
-            .chain(repairs.iter().filter_map(|r| match r.kind {
-                Kind::Decoded { cp, .. } => Some(cp),
-                Kind::Stored { .. } => None,
-            }))
-            .filter(|cp| !cp.seeded)
-            .min_by_key(|cp| cp.out);
+        self.base = saved_base.or_else(|| {
+            main.as_ref()
+                .and_then(|l| l.cp)
+                .into_iter()
+                .chain(repairs.iter().filter_map(|r| match r.kind {
+                    Kind::Decoded { cp, .. } => Some(cp),
+                    Kind::Stored { .. } => None,
+                }))
+                .filter(|cp| !cp.seeded)
+                .min_by_key(|cp| cp.out)
+        });
         self.main = main;
         self.seek = seek;
         self.write_from = write_from.max(write_from_min).max(self.ss);
@@ -1448,6 +1465,12 @@ impl FeedDecoder {
                                     props: props_before,
                                     seeded: true,
                                 });
+                            }
+                            // a restored restart point whose dictionary the sink no longer gives (earlier members'
+                            // output): go back to the dictionary reset, which needs nothing held
+                            None if lane.restart && lz.base.is_some_and(|b| b.out < c.unpacked_offset) => {
+                                *lane = Lane2::at_cp(lz.base.expect("checked"));
+                                continue;
                             }
                             None if lane.restart => {
                                 let d = lz.dict.min(c.unpacked_offset);

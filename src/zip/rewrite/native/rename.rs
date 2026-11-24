@@ -191,9 +191,17 @@ pub(super) fn build(plan: Plan<'_>, members: &[Member], attempts: &Attempts<'_>)
     if renames.is_empty() {
         return Ok(result);
     }
-    result.try_reserve_exact(members.len())?;
-    result.resize(members.len(), None);
     let limits = options.limits;
+    // Charge the plan capacity before every allocation: the ordinal-indexed result, then each member's temporary
+    // source records and its rebuilt records (kept in the prepared plan until it is dropped).
+    let capacity = limits.common.plan_capacity;
+    let mut retained = add(usage.common.plan.capacity, bytes_for::<Option<Arc<Renamed>>>(members.len())?)?;
+    limit(retained, capacity, CreateLimit::PlanCapacity)?;
+    result.try_reserve_exact(members.len())?;
+    retained = add(usage.common.plan.capacity, bytes_for::<Option<Arc<Renamed>>>(result.capacity())?)?;
+    limit(retained, capacity, CreateLimit::PlanCapacity)?;
+    usage.common.plan.capacity = usage.common.plan.capacity.max(retained);
+    result.resize(members.len(), None);
     for ordinal in 0..members.len() {
         let Action::Rename(index) = actions[ordinal] else { continue };
         let member = members[ordinal];
@@ -202,6 +210,14 @@ pub(super) fn build(plan: Plan<'_>, members: &[Member], attempts: &Attempts<'_>)
         let local_len = member.payload_at - member.local_at;
         let central_len = central_range.end - central_range.start;
         work(options, usage, add(local_len, central_len)? / 64 + 1)?;
+        let name_len = renames[index].name.len() as u64;
+        // the rebuilt records are never longer than the source records plus the new name
+        let rebuilt = add(add(local_len, central_len)?, name_len.saturating_mul(2))?;
+        let rebuilt = add(rebuilt, size_of::<Renamed>() as u64 + 16)?;
+        let peak = add(add(retained, rebuilt)?, add(local_len, central_len)?)?;
+        limit(peak, capacity, CreateLimit::PlanCapacity)?;
+        usage.common.plan.capacity = usage.common.plan.capacity.max(peak);
+        retained = add(retained, rebuilt)?;
         let mut local = Vec::new();
         let mut central = Vec::new();
         local.try_reserve_exact(local_len as usize)?;
