@@ -782,7 +782,7 @@ impl Rar5PasswordCheck {
         if self.kdf_count > 24 {
             return false;
         }
-        let keyed = HmacSha256Key::new(password);
+        let keyed = HmacSha256Key::new(rar_password_prefix_utf8(password));
         let mut salt_block = [0u8; 20];
         salt_block[..16].copy_from_slice(&self.salt);
         salt_block[16..20].copy_from_slice(&1u32.to_be_bytes());
@@ -890,6 +890,39 @@ pub(crate) fn parse_rar5_crypt(
         return Err(Rar5CryptError::KdfLimit(kdf_count));
     }
     Ok(Rar5CryptParams { kdf_count, salt, iv, check, tweaked_crc: flags & 2 != 0 })
+}
+
+/// UnRAR and `rar` use at most this many characters of a RAR password and ignore the rest (`MAXPASSWORD` 128 with
+/// a terminator). Measured by running the binaries: see `docs/rar-passwords.md`.
+pub const RAR_MAX_PASSWORD_CHARS: usize = 127;
+
+/// The first [`RAR_MAX_PASSWORD_CHARS`] Unicode characters of a RAR 5.0 password's UTF-8 bytes. Bytes that are not
+/// valid UTF-8 are cut at that many bytes instead.
+fn rar_password_prefix_utf8(password: &[u8]) -> &[u8] {
+    match std::str::from_utf8(password) {
+        Ok(text) => match text.char_indices().nth(RAR_MAX_PASSWORD_CHARS) {
+            Some((end, _)) => &password[..end],
+            None => password,
+        },
+        Err(_) => &password[..password.len().min(RAR_MAX_PASSWORD_CHARS)],
+    }
+}
+
+/// The first [`RAR_MAX_PASSWORD_CHARS`] characters of a RAR 3.x/4.x password's UTF-16 units; a surrogate pair is
+/// one character and an unpaired surrogate is one character.
+fn rar_password_prefix_utf16(password: &[u16]) -> &[u16] {
+    let mut chars = 0;
+    let mut at = 0;
+    while at < password.len() {
+        if chars == RAR_MAX_PASSWORD_CHARS {
+            return &password[..at];
+        }
+        let pair = (0xD800..0xDC00).contains(&password[at])
+            && password.get(at + 1).is_some_and(|u| (0xDC00..0xE000).contains(u));
+        at += if pair { 2 } else { 1 };
+        chars += 1;
+    }
+    password
 }
 
 /// Derives the RAR5 32-byte AES-256 key and 32-byte `HashKey` (for keyed checksums) from `password`, `kdf_count`, and `salt`.
@@ -1005,6 +1038,7 @@ fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
     }
     // Normalizing a long HMAC key hashes ceil((bytes + 9) / 64) blocks.
     // Setup always hashes the two ipad/opad blocks. No password buffer is allocated.
+    let password = rar_password_prefix_utf8(password);
     let normalization = if password.len() > 64 { (password.len() as u64 + 9).div_ceil(64) } else { 0 };
     control.charge(normalization + 2).map_err(ControlledKdfError::Control)?;
     let keyed = HmacSha256Key::new(password);
@@ -1158,6 +1192,11 @@ impl Sha1 {
     }
 
     fn compress(state: &mut [u32; 5], chunk: &[u8; 64]) {
+        Self::compress_tail(state, chunk);
+    }
+
+    /// One compression; returns the last 16 expanded message words (`w[64..80]`).
+    fn compress_tail(state: &mut [u32; 5], chunk: &[u8; 64]) -> [u32; 16] {
         #[cfg(test)]
         SHA1_COMPRESSIONS.set(SHA1_COMPRESSIONS.get() + 1);
         let mut w = [0u32; 80];
@@ -1187,6 +1226,50 @@ impl Sha1 {
         state[2] = state[2].wrapping_add(c);
         state[3] = state[3].wrapping_add(d);
         state[4] = state[4].wrapping_add(e);
+        let mut tail = [0u32; 16];
+        tail.copy_from_slice(&w[64..80]);
+        tail
+    }
+
+    /// [`update_controlled`](Self::update_controlled) the way RAR 3.x's SHA-1 feeds its key derivation: a block
+    /// hashed straight from `data` (every block after the first one that goes through the 64-byte buffer) is overwritten with the last 16 message words
+    /// it expanded to, so the next round hashes different bytes there. Only passwords whose UTF-16 form plus
+    /// salt (and the counter bytes) reach 64 bytes are affected.
+    fn update_rar<C: KdfControl + ?Sized>(
+        &mut self,
+        mut data: &mut [u8],
+        control: &mut C,
+    ) -> std::result::Result<(), KdfControlError> {
+        self.total_len += data.len() as u64;
+        if self.buf_len + data.len() < 64 {
+            self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+            self.buf_len += data.len();
+            return Ok(());
+        }
+        {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &mut data[take..];
+            if self.buf_len == 64 {
+                control.charge(1)?;
+                Self::compress(&mut self.state, &self.buf);
+                self.buf_len = 0;
+            }
+        }
+        let (blocks, rem) = data.as_chunks_mut::<64>();
+        for b in blocks {
+            control.charge(1)?;
+            let tail = Self::compress_tail(&mut self.state, b);
+            for (dst, word) in b.as_chunks_mut::<4>().0.iter_mut().zip(tail) {
+                *dst = word.to_le_bytes();
+            }
+        }
+        if !rem.is_empty() {
+            self.buf[..rem.len()].copy_from_slice(rem);
+            self.buf_len = rem.len();
+        }
+        Ok(())
     }
 
     fn update(&mut self, data: &[u8]) {
@@ -1263,8 +1346,8 @@ pub fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]
     derive_rar4_key_iv_impl(&units, salt, &mut UnrestrictedKdf).expect("unrestricted RAR4 derivation")
 }
 
-/// [`derive_rar4_key_iv`] for a password given as UTF-16 code units, hashed exactly as given (little-endian,
-/// unpaired surrogates included). For a password that is not valid UTF-8 the caller chooses how its bytes become
+/// [`derive_rar4_key_iv`] for a password given as UTF-16 code units, hashed little-endian, unpaired surrogates
+/// included; a surrogate pair counts as one character and hashes as its code point's low 16 bits, as UnRAR does. For a password that is not valid UTF-8 the caller chooses how its bytes become
 /// units; `derive_rar4_key_iv` is this over `password.encode_utf16()`.
 pub fn derive_rar4_key_iv_utf16(password: &[u16], salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
     derive_rar4_key_iv_impl(password, salt, &mut UnrestrictedKdf).expect("unrestricted RAR4 derivation")
@@ -1352,9 +1435,21 @@ fn derive_rar4_key_iv_impl<C: KdfControl + ?Sized>(
     salt: &[u8; 8],
     control: &mut C,
 ) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
+    let password = rar_password_prefix_utf16(password);
     let mut raw = Vec::with_capacity(password.len() * 2 + 8);
-    for ch in password {
-        raw.extend_from_slice(&ch.to_le_bytes());
+    // UnRAR and `rar` keep two bytes of each character: a character above U+FFFF (a surrogate pair here) is its
+    // code point's low 16 bits, not the pair (measured with both binaries; see `docs/rar-passwords.md`).
+    let mut units = password.iter().copied().peekable();
+    while let Some(unit) = units.next() {
+        let low = match (unit, units.peek()) {
+            (0xD800..=0xDBFF, Some(&next @ 0xDC00..=0xDFFF)) => {
+                units.next();
+                let code = 0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(next) - 0xDC00);
+                code as u16
+            }
+            _ => unit,
+        };
+        raw.extend_from_slice(&low.to_le_bytes());
     }
     raw.extend_from_slice(salt);
 
@@ -1362,7 +1457,7 @@ fn derive_rar4_key_iv_impl<C: KdfControl + ?Sized>(
     let mut sha = Sha1::new();
     let mut iv = [0u8; 16];
     for i in 0..ROUNDS {
-        sha.update_controlled(&raw, control)?;
+        sha.update_rar(&mut raw, control)?;
         let idx = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
         sha.update_controlled(&idx, control)?;
         if i % (ROUNDS / 16) == 0 {
@@ -1964,6 +2059,20 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn rar_password_prefixes_count_characters() {
+        let long: String = "a".repeat(126) + "é😀x";
+        assert_eq!(rar_password_prefix_utf8(long.as_bytes()), ("a".repeat(126) + "é").as_bytes());
+        let units: Vec<u16> = long.encode_utf16().collect();
+        assert_eq!(rar_password_prefix_utf16(&units), &units[..127]);
+        let units: Vec<u16> = ("a".repeat(126) + "😀x").encode_utf16().collect();
+        assert_eq!(rar_password_prefix_utf16(&units).len(), 128, "a pair is one character");
+        assert_eq!(rar_password_prefix_utf16(&units[..127]), &units[..127]);
+        let exact = "b".repeat(127);
+        assert_eq!(rar_password_prefix_utf8(exact.as_bytes()).len(), 127);
+        assert_eq!(rar_password_prefix_utf8(&[0xff; 200]).len(), 127);
+    }
+
     fn kdf_meter(limit: u64) -> KdfMeter {
         KdfMeter { blocks: 0, limit, cancel_at: None }
     }
@@ -1975,7 +2084,8 @@ mod tests {
             let mut meter = kdf_meter(u64::MAX);
             let actual = derive_rar4_key_iv_controlled(password, &[1; 8], &mut meter).unwrap();
             assert_eq!(meter.blocks, SHA1_COMPRESSIONS.get());
-            let raw = password.encode_utf16().count() as u64 * 2 + 11;
+            // each character is two bytes of the hashed message, whatever its UTF-16 length
+            let raw = password.chars().count() as u64 * 2 + 11;
             let expected = 0x40000 * raw / 64
                 + (0..16).map(|i| 1 + u64::from(((i * 0x4000 + 1) * raw) % 64 >= 56)).sum::<u64>()
                 + 1;
@@ -1983,7 +2093,6 @@ mod tests {
             assert_eq!(actual, derive_rar4_key_iv(password, &[1; 8]));
             let known = match password {
                 "pw" => Some(("77005689078b689864882b7665ede966", "510faeafff2ac0c52af181d88b5db8e3")),
-                "é界😀" => Some(("ee60c1ea894c83b3b370f29a6b7b7327", "d2e24a2a07863d9fd52616cbc45dc09e")),
                 _ => None,
             };
             if let Some((key, iv)) = known {
@@ -2024,19 +2133,14 @@ mod tests {
     }
 
     #[test]
-    fn controlled_rar4_hard_derivation_ceiling_charges_actual_attempts_without_refund() {
-        let mut meter = kdf_meter(u64::MAX);
-        SHA1_COMPRESSIONS.set(0);
-        assert!(matches!(
-            derive_rar4_key_iv_controlled(&"x".repeat(4096), &[0; 8], &mut meter),
-            Err(KdfControlError::Limit {
-                resource: crate::progressive::Resource::KdfDerivationBlocks,
-                limit: 4194304,
-                attempted: 4194305
-            })
-        ));
-        assert_eq!(meter.blocks, 1 << 22);
-        assert_eq!(SHA1_COMPRESSIONS.get(), 1 << 22);
+    fn controlled_rar4_long_passwords_cost_what_the_127_character_prefix_costs() {
+        // RAR keeps 127 characters, so the derivation of any longer password stays far under the hard ceiling.
+        let mut long = kdf_meter(u64::MAX);
+        let mut cut = kdf_meter(u64::MAX);
+        let key = derive_rar4_key_iv_controlled(&"x".repeat(4096), &[0; 8], &mut long).unwrap();
+        assert_eq!(key, derive_rar4_key_iv_controlled(&"x".repeat(127), &[0; 8], &mut cut).unwrap());
+        assert_eq!(long.blocks, cut.blocks);
+        assert!(long.blocks < 1 << 21, "{}", long.blocks);
     }
 
     #[test]
