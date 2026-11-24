@@ -22,11 +22,29 @@ let sink = w.finish()?;                  // two zero blocks, padded to the recor
   range), `uname`, `gname`. No atime or ctime records (GNU tar's `delete=atime,delete=ctime`).
 - Directories get a trailing slash when missing. Overrides apply to every member including links.
 
+## Compressors (`CompressedWriter`)
+
+```rust
+let f = CompressedWriter::new(file, Compression::Gzip { level: 6 })?;   // tar -z
+let mut w = TarWriter::new(f, TarWriterOptions::default());
+// ... append entries ...
+w.finish()?.finish()?;                                                    // tar trailer, then compressor trailer
+```
+
+`Compression` is `None`, `Gzip{level 0-9}`, `Bzip2{level 1-9}`, `Xz{level 0-9}`, `Zstd{level 1-22}` (out of range is an
+InvalidInput error). Encoders are flate2, bzip2, liblzma and zstd (all existing dependencies). Dropping a
+`CompressedWriter` without `finish()` leaves a truncated stream.
+
+Gzip writes the header gzip 1.13 writes for piped input (mtime 0, no name, OS 3, XFL 2/4/0 by level) and the same
+CRC32/ISIZE trailer; the deflate body is zlib's, not gzip's own, so the bytes are not identical to `tar -z` output
+(tests compare header and trailer, and that the system gzip decodes to the exact tar). bzip2, xz and zstd are checked
+by decoding with the system tool and with `tar::list`; their byte streams are not claimed to match any CLI.
+
 Design for later work: the writer is generic over the sink, so compressors (B1c) wrap the sink; sparse members
 (B1b) add a `Sparse` entry path in `begin`.
 
 Proof: `tests/tar_writer.rs` compares against archives made by GNU tar 1.35 in docker
 (`tests/fixtures/tar-writer/`, with `make-reference.sh` and a README), and round-trips through `tar::list`.
 
-Not done: sparse files, compressors, `repack` still uses its own private writer (a different, pax/ustar
+Not done: sparse files, `repack` still uses its own private writer (a different, pax/ustar
 dialect with fixed ownership), and pax overflow of device numbers (an error).

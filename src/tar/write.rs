@@ -21,6 +21,8 @@ use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
 
+pub use super::compress::{CompressedWriter, Compression};
+
 const BLOCK: usize = 512;
 const MAX_OCTAL_7: u64 = 0o7777777;
 const MAX_OCTAL_11: u64 = 0o77777777777;

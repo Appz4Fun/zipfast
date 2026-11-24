@@ -34,6 +34,7 @@ use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{self, Codec};
 
+mod compress;
 mod cpio;
 mod iso;
 mod table;
