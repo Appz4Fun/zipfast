@@ -34,6 +34,8 @@ pub(in crate::zip::read) enum Refusal {
     /// A folder above the target is a regular file or another nondirectory (not a symlink): only this member and the
     /// ones below that path fail, as with 7-Zip.
     ParentNotDirectory,
+    /// The start hook asked for a new name, which this route cannot give.
+    StartRename,
 }
 impl Refusal {
     pub(in crate::zip::read) fn fault(self) -> ReadFault {
@@ -43,6 +45,7 @@ impl Refusal {
                 Self::Directory => "output target is a directory",
                 Self::Protected => "output target replaces a protected input",
                 Self::ParentNotDirectory => parent::NONDIRECTORY_PARENT,
+                Self::StartRename => "the start hook's rename is not supported on the checked ZIP route",
             },
         }
     }
