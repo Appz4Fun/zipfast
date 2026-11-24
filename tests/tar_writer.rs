@@ -224,3 +224,98 @@ fn round_trips_through_the_tar_reader() {
         }
     }
 }
+
+/// Bug group X, X1: a pre-epoch fractional time is written as GNU tar writes it (`mtime=-0.5` for half a second
+/// before the epoch, which GNU tar 1.35 produced for `touch -d @-0.5`) and reads back as the same instant.
+#[test]
+fn negative_fractional_pax_time_is_the_signed_decimal() {
+    for (secs, nanos, text) in [
+        (-1i64, 500_000_000u32, "mtime=-0.5\n"),
+        (-2, 500_000_000, "mtime=-1.5\n"),
+        (-1, 250_000_000, "mtime=-0.75\n"),
+        (-3, 0, "mtime=-3\n"),
+    ] {
+        let mut e = TarEntry::new(b"f", K::File);
+        e.mtime = secs;
+        e.mtime_nanos = nanos;
+        e.size = 2;
+        let mut w = TarWriter::new(Vec::new(), opts(TarFormat::Pax));
+        w.append(&e, &mut &b"hi"[..]).unwrap();
+        let tar = w.finish().unwrap();
+        let hay = String::from_utf8_lossy(&tar[512..1024]).into_owned();
+        assert!(hay.contains(text), "{secs}.{nanos}: {hay:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.tar");
+        std::fs::write(&path, &tar).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let o = zipfast::extract::Options {
+            mode: zipfast::extract::Mode::Extract,
+            dest: out.clone(),
+            overwrite: zipfast::extract::Overwrite::Skip,
+            flatten: false,
+            threads: None,
+            protected_paths: Default::default(),
+            parallel_min: None,
+            select: None,
+            windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
+            preexisting_links: Default::default(),
+            refused_link_placeholder: false,
+        };
+        zipfast::extract::run(&path, &o, |_| {}).unwrap();
+        let m = std::fs::metadata(out.join("f")).unwrap().modified().unwrap();
+        let want = if secs < 0 && nanos != 0 {
+            std::time::UNIX_EPOCH - std::time::Duration::new((-(secs + 1)) as u64, 1_000_000_000 - nanos)
+        } else {
+            std::time::UNIX_EPOCH - std::time::Duration::new(secs.unsigned_abs(), 0)
+        };
+        assert_eq!(m, want, "{secs}.{nanos}");
+    }
+}
+
+/// Bug group X, X2: an eight-byte base-256 field keeps its high bits next to the marker; what does not fit is refused.
+#[test]
+fn eight_byte_base256_ids_keep_their_high_bits() {
+    let id_field = |uid: u64| -> Result<[u8; 8], zipfast::error::Error> {
+        let mut e = TarEntry::new(b"f", K::File);
+        e.uid = uid;
+        let mut w = TarWriter::new(Vec::new(), opts(TarFormat::Gnu));
+        w.begin(&e)?;
+        w.write_data(&[])?;
+        let tar = w.finish()?;
+        Ok(tar[108..116].try_into().unwrap())
+    };
+    assert_eq!(id_field(1 << 56).unwrap(), [0x81, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(id_field((1 << 63) - 1).unwrap(), [0xff; 8]);
+    assert_eq!(id_field(0x0123_4567_89ab_cdef).unwrap(), [0x81, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+    assert!(id_field(1 << 63).is_err());
+    assert!(id_field(u64::MAX).is_err());
+}
+
+/// Bug group X, X3: a reader that reports `Interrupted` once does not fail the member.
+#[test]
+fn append_retries_an_interrupted_reader() {
+    struct Flaky(Vec<u8>, bool);
+    impl std::io::Read for Flaky {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.1 {
+                self.1 = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+    let mut e = TarEntry::new(b"f", K::File);
+    e.size = 5;
+    let mut w = TarWriter::new(Vec::new(), opts(TarFormat::Gnu));
+    w.append(&e, &mut Flaky(b"hello".to_vec(), false)).unwrap();
+    let tar = w.finish().unwrap();
+    assert_eq!(&tar[512..517], b"hello");
+}

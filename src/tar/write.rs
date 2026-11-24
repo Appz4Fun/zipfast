@@ -229,7 +229,11 @@ impl<W: Write> TarWriter<W> {
         let mut buf = vec![0u8; 64 << 10];
         while self.owed > 0 {
             let want = buf.len().min(self.owed as usize);
-            let n = data.read(&mut buf[..want])?;
+            let n = match data.read(&mut buf[..want]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
             if n == 0 {
                 return Err(Error::Truncated);
             }
@@ -511,9 +515,15 @@ impl<'a> Header<'a> {
         field_zero(&mut f.size, "size", MAX_OCTAL_11, &mut rec);
         let in_range = (0..=MAX_OCTAL_11 as i64).contains(&self.mtime);
         if !in_range || self.nanos != 0 {
-            let mut v = format!("{}", self.mtime);
-            if self.nanos != 0 {
-                let frac = format!("{:09}", self.nanos);
+            // the signed decimal of mtime + nanos/1e9: a negative time with a fraction is minus its magnitude
+            let (whole, nanos) = if self.mtime < 0 && self.nanos != 0 {
+                (self.mtime.unsigned_abs() - 1, 1_000_000_000 - self.nanos)
+            } else {
+                (self.mtime.unsigned_abs(), self.nanos)
+            };
+            let mut v = format!("{}{whole}", if self.mtime < 0 { "-" } else { "" });
+            if nanos != 0 {
+                let frac = format!("{nanos:09}");
                 v.push('.');
                 v.push_str(frac.trim_end_matches('0'));
             }
@@ -652,6 +662,13 @@ fn check_sparse(e: &TarEntry) -> Result<u64> {
         };
         total += len;
     }
+    // GNU tar pads every data segment to whole blocks but counts the stored size unpadded; only the last
+    // segment may end mid-block, or the stored size and the layout disagree and GNU tar misreads the archive.
+    if let Some((_, rest)) = e.sparse.split_last()
+        && rest.iter().any(|&(_, len)| len % BLOCK as u64 != 0)
+    {
+        return bad("a data segment before the last must be a multiple of 512 bytes");
+    }
     Ok(total)
 }
 
@@ -700,8 +717,15 @@ fn num(field: &mut [u8], v: u64, base256: bool) -> Result<()> {
     }
     field.fill(0);
     let n = field.len();
-    field[n - 8..].copy_from_slice(&v.to_be_bytes());
-    field[0] = 0x80;
+    if n <= 8 && v >> (8 * n - 1) != 0 {
+        return Err(Error::Unsupported("a number too large for the tar field".into()));
+    }
+    if n >= 8 {
+        field[n - 8..].copy_from_slice(&v.to_be_bytes());
+    } else {
+        field.copy_from_slice(&v.to_be_bytes()[8 - n..]);
+    }
+    field[0] |= 0x80;
     Ok(())
 }
 
