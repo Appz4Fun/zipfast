@@ -1352,6 +1352,10 @@ pub(crate) fn run_renaming(
                 }
             }
         }
+        // a cancel from the last member's outcome callback is seen here, as the per-member check never runs again
+        if let Some(cancel) = cancel {
+            cancel.check_io()?;
+        }
         // Members after the gap are unknown: the set as a whole is incomplete.
         if let Some(missing) = &archive.missing {
             let line = Error::MissingVolume(missing.clone()).to_string();

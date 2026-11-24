@@ -236,13 +236,15 @@ fn a_first_piece_without_a_signature_still_routes_as_a_set() {
 }
 
 /// The checked entry points report a split set's members one by one with their listing ordinals, and stop once a
-/// cancellation (here from the first success) is seen.
+/// cancellation is seen: one from the first success stops before the next member, and one from the last member's
+/// success still ends the run as canceled rather than as a success.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn checked_runs_report_members_and_honor_cancellation() {
     use zipfast::extract::{Cancellation, RunEvent};
     use zipfast::zip::ReadFault;
-    for cancel_first in [false, true] {
+    // which member's success cancels the run
+    for cancel_at in [None, Some(0), Some(1)] {
         let dir = tempfile::tempdir().unwrap();
         let cancel = Cancellation::default();
         let mut succeeded = Vec::new();
@@ -255,21 +257,30 @@ fn checked_runs_report_members_and_honor_cancellation() {
             |event: RunEvent<'_>| {
                 if let RunEvent::MemberSucceeded { ordinal, name, .. } = event {
                     succeeded.push((ordinal, name.to_owned()));
-                    if cancel_first {
+                    if cancel_at == Some(ordinal) {
                         cancel.cancel();
                     }
                 }
                 Ok(())
             },
         );
-        if cancel_first {
-            let error = result.unwrap_err();
-            assert!(matches!(error.operation(), Some(ReadFault::Cancelled)), "{error:?}");
-            assert_eq!(succeeded, [(0, "noise.bin".to_owned())]);
-            assert!(!dir.path().join("tiny.txt").exists());
-        } else {
-            assert_eq!(result.unwrap().files(), 2);
-            assert_eq!(succeeded, [(0, "noise.bin".to_owned()), (1, "tiny.txt".to_owned())]);
+        let both = [(0, "noise.bin".to_owned()), (1, "tiny.txt".to_owned())];
+        match cancel_at {
+            None => {
+                assert_eq!(result.unwrap().files(), 2);
+                assert_eq!(succeeded, both);
+            }
+            Some(0) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error.operation(), Some(ReadFault::Cancelled)), "{error:?}");
+                assert_eq!(succeeded, [(0, "noise.bin".to_owned())]);
+                assert!(!dir.path().join("tiny.txt").exists());
+            }
+            _ => {
+                let error = result.unwrap_err();
+                assert!(matches!(error.operation(), Some(ReadFault::Cancelled)), "{error:?}");
+                assert_eq!(succeeded, both);
+            }
         }
     }
 }
