@@ -557,15 +557,22 @@ fn byte_split_volumes() {
         ("b.txt", &b, Kind::ZipCrypto { deflate: true }),
         ("c.txt", &b, Kind::Deflate),
     ]);
-    // A byte split (`s.zip.001`, `s.zip.002`, ... of 100,000 bytes each) is one ZIP cut anywhere: the member map
-    // reads it as the pieces concatenated (one volume), and piece k's byte `o` is that volume's byte
-    // `100_000 * k + o`. Articles of each piece (10,000 bytes here) then fall at those offsets.
-    let volumes = vec![zip];
+    // A byte split (`s.zip.001`, `s.zip.002`, ... of 40,000 bytes each) is one ZIP cut anywhere: the member map
+    // keeps the pieces as volumes, so a member crossing a cut has a part per piece and its needs name the piece.
+    let volumes: Vec<Vec<u8>> = zip.chunks(40_000).map(<[u8]>::to_vec).collect();
+    assert!(volumes.len() > 5, "{}", volumes.len());
+    let map = MemberMap::from_memory(&refs(&volumes), "s.zip.001", Some("pw")).unwrap();
+    assert_eq!(map.volumes as usize, volumes.len());
+    let crossing = map.members[0].pieces.iter().map(|p| p.volume).collect::<Vec<_>>();
+    assert!(crossing.len() > 2 && crossing.windows(2).all(|w| w[1] == w[0] + 1), "{crossing:?}");
+    for p in &map.members[0].pieces {
+        assert!(p.packed.end <= volumes[p.volume as usize].len() as u64);
+    }
     for (member, plain) in [(0, &a), (1, &b), (2, &b)] {
         let o = feed(&Feed {
             what: format!("byte split member {member}"),
             volumes: &volumes,
-            name: "s.zip",
+            name: "s.zip.001",
             password: Some("pw"),
             member,
             plain: Some(plain),

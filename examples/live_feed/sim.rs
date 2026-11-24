@@ -819,16 +819,12 @@ pub fn volumes_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
 pub fn run(config: &Config) -> Result<Report, String> {
     let mut report = Report::default();
     // The "network": the volume files in memory, cut into articles.
-    let mut volumes: Vec<Arc<Vec<u8>>> = config
+    let volumes: Vec<Arc<Vec<u8>>> = config
         .volumes
         .iter()
         .map(|p| fs::read(p).map(Arc::new).map_err(|e| format!("{}: {e}", p.display())))
         .collect::<Result<_, _>>()?;
     let first = config.volumes.first().ok_or("no volumes")?;
-    if byte_split_zip(first) {
-        // a byte-split ZIP is one archive cut anywhere: the map reads it as its pieces concatenated (one volume)
-        volumes = vec![Arc::new(volumes.iter().flat_map(|v| v.iter().copied()).collect())];
-    }
     let refs: Vec<&[u8]> = volumes.iter().map(|v| v.as_slice()).collect();
     let map = MemberMap::from_memory(&refs, first.file_name().unwrap_or_default(), config.password.as_deref())
         .map_err(|e| format!("map: {e:?}"))?;
@@ -1034,11 +1030,6 @@ pub fn run(config: &Config) -> Result<Report, String> {
         report.verified = Some(verify(config, &map, &outputs)?);
     }
     Ok(report)
-}
-
-/// Whether `first` names the first piece of a byte-split ZIP (`name.zip.001`).
-fn byte_split_zip(first: &Path) -> bool {
-    first.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().ends_with(".zip.001"))
 }
 
 /// Where persistent partials' outputs go.

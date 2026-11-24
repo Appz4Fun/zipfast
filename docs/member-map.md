@@ -172,6 +172,20 @@ directory offset that disagrees with the directory's position, a ZIP64 end recor
 points at) are `Malformed`; a local header offset past the end
 of an earlier volume reads as that volume being cut. A split set's `.zip` mapped on its own is `Unsupported`.
 
+### Byte-split ZIP (`.zip.001`)
+
+A ZIP cut at arbitrary offsets (`7z a -v`, `split`) has no disk numbers: it is an ordinary ZIP over the concatenated
+pieces. When the first volume starts with a local header (`PK\x03\x04`) and is named `name.zip.001` (any digit width,
+any case), `MemberMap` opens the pieces in order (names count up, `.999` then `.1000`) until one is missing, which
+gives every piece's length, then runs the single-volume ZIP walk over a view that presents them as one volume. The
+volumes stay open under the same `volume_handles` limit as other sets (the least recently used is closed and asked for
+again, which must give the same length). The map has `volumes` = the piece count, and each member's data is cut at the
+piece boundaries: one `MapPiece` per piece, `volume` the piece index, `packed` and `header` relative to the piece (the
+local header belongs to the piece holding the start of the data; later pieces have an empty `header`). Local headers,
+the directory and AES prefixes may cross cuts. Limits: the first piece must hold at least the 4 signature bytes; a
+missing last piece loses the directory (an error, as for a single ZIP cut short); a missing middle piece is read as the
+end of the set. Decoding needs nothing special: needs name the piece and range.
+
 ## 7z
 
 A 7z set is one archive, possibly cut into plain byte pieces (`name.7z.001`, `name.7z.002`, ...) that concatenate

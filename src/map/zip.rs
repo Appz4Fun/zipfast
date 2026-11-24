@@ -50,6 +50,8 @@ pub(super) struct ZipWalker {
     /// The current entry's local header range and payload range, once parsed.
     local: Option<(std::ops::Range<u64>, std::ops::Range<u64>, LocalHeader)>,
     members: Vec<MapMember>,
+    /// Lengths of the volumes of a byte split, which the walk reads as one concatenated volume.
+    volumes: Option<Vec<u64>>,
 }
 
 /// WinZip AES, decided as the extractor decides it.
@@ -141,7 +143,15 @@ impl ZipWalker {
             scratch: Vec::new(),
             local: None,
             members: Vec::new(),
+            volumes: None,
         }
+    }
+
+    /// Reads the archive as the concatenation of volumes of these lengths (a byte split): members get a piece per
+    /// volume they cross, and the map counts the volumes.
+    pub(super) fn over_volumes(mut self, lens: Vec<u64>) -> Self {
+        self.volumes = Some(lens);
+        self
     }
 
     pub(super) fn poll(
@@ -224,7 +234,7 @@ impl ZipWalker {
                             header_cipher: None,
                             complete: true,
                             end: MapEnd::Complete,
-                            volumes: 1,
+                            volumes: self.volumes.as_ref().map_or(1, |v| v.len() as u32),
                             members: std::mem::take(&mut self.members),
                             folders: Vec::new(),
                         }));
@@ -269,18 +279,43 @@ impl ZipWalker {
         }
     }
 
+    /// The member's data as pieces: one, or for a byte split the data cut at the volume boundaries. The local header
+    /// belongs to the piece holding the start of the data.
+    fn cut(&self, packed: Range<u64>, header: Range<u64>) -> Vec<ZipPiece> {
+        let Some(lens) = &self.volumes else { return vec![ZipPiece { volume: 0, packed, header }] };
+        let mut pieces = Vec::new();
+        let (mut at, mut start) = (packed.start, 0u64);
+        for (volume, &len) in lens.iter().enumerate() {
+            let end = start + len;
+            if at < end && (at < packed.end || pieces.is_empty()) {
+                let take = (packed.end - at).min(end - at);
+                let first = pieces.is_empty();
+                let header = if !first {
+                    0..0
+                } else if header.start >= start {
+                    header.start - start..header.end - start
+                } else {
+                    0..header.end - start
+                };
+                pieces.push(ZipPiece { volume: volume as u32, packed: at - start..at - start + take, header });
+                at += take;
+            }
+            start = end;
+        }
+        if pieces.is_empty() {
+            // Empty data at the very end of the set.
+            let volume = lens.len().saturating_sub(1);
+            let start: u64 = lens.iter().take(volume).sum();
+            let header = header.start.saturating_sub(start)..header.end.saturating_sub(start);
+            pieces.push(ZipPiece { volume: volume as u32, packed: packed.start - start..packed.start - start, header });
+        }
+        pieces
+    }
+
     fn member(&self, entry: &ZipEntry, aes_prefix: Option<usize>) -> Result<MapMember, MapError> {
         let (header, packed, local) = self.local.clone().expect("local header parsed");
         let prefix = aes_prefix.filter(|&prefix| self.scratch.len() == prefix).map(|_| self.scratch.as_slice());
-        zip_member(
-            &self.usage,
-            self.members.len() as u64,
-            entry,
-            Some(&local),
-            prefix,
-            vec![ZipPiece { volume: 0, packed, header }],
-            true,
-        )
+        zip_member(&self.usage, self.members.len() as u64, entry, Some(&local), prefix, self.cut(packed, header), true)
     }
 }
 
