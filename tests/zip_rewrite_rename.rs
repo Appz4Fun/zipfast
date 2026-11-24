@@ -686,3 +686,37 @@ fn matches_seven_zip_rn_for_unicode_extra_and_utf8_flag() {
     matches_seven_zip("utf8.zip", 0, "plain.txt", "utf8.ascii.7z.zip");
     matches_seven_zip("utf8.zip", 0, longer, "utf8.utf8.7z.zip");
 }
+
+/// Rebuilding the records of a member with a large extra and comment is charged to `plan_capacity` before it is
+/// allocated, and the usage reports what the prepared plan retains.
+#[test]
+fn rename_charges_the_rebuilt_records_to_plan_capacity() {
+    use zipfast::zip::create::{CreateError, CreateLimit};
+
+    let mut big = m("a", b"payload");
+    big.central_extra = {
+        let mut field = vec![0xfe, 0xca];
+        field.extend(30_000u16.to_le_bytes());
+        field.extend(vec![7; 30_000]);
+        field
+    };
+    big.local_extra = big.central_extra.clone();
+    big.comment = vec![b'c'; 30_000];
+    let rig = Rig::new(&build(&[big, m("b", b"other")]));
+
+    let publish = |plan_capacity: Option<u64>| {
+        let mut opts = options();
+        if let Some(bytes) = plan_capacity {
+            opts.limits.common.plan_capacity = bytes;
+        }
+        let mut plan = RewritePlan::open(&rig.path, opts).unwrap();
+        let id = rig.id(&plan, 0);
+        plan.rename(&id, EntryName::Utf8("renamed")).unwrap();
+        plan.publish()
+    };
+    // a limit above the small members' bookkeeping and below the ~90 KB of rebuilt records
+    let failure = publish(Some(40_000)).expect_err("the rebuilt records exceed the plan capacity");
+    assert!(matches!(failure.cause, RewriteError::Infrastructure(CreateError::Limit(CreateLimit::PlanCapacity))));
+    let Ok(RewriteOutcome::Replaced(done)) = publish(None) else { panic!("replaced") };
+    assert!(done.usage.common.plan.capacity >= 90_000, "{}", done.usage.common.plan.capacity);
+}

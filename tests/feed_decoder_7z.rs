@@ -1071,3 +1071,49 @@ fn repairs_in_a_single_reset_folder_restart_at_the_nearest_state_reset() {
         }
     }
 }
+
+/// A snapshot taken when the main decode and every repair stand at restart points that reach into earlier members
+/// keeps the dictionary-reset fallback: restored on a sink that holds the member's own output but cannot give the
+/// earlier members' (no `read_earlier`), the repairs still complete (from the fallback) instead of `HeldOutput`.
+#[test]
+fn a_snapshot_keeps_the_dictionary_reset_fallback_past_seeded_restart_points() {
+    let files: Vec<(&str, Vec<u8>)> = vec![("a.txt", text(900_000, 1)), ("b.bin", mixed(2_000_000, 2))];
+    let plain = &files[1].1;
+    let archive = seven_zip(&files, false, usize::MAX >> 1);
+    let volumes = vec![archive];
+    let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+    let map = MemberMap::from_memory(&refs, "set.7z.001", Some(PASSWORD)).unwrap();
+    let options = || FeedOptions { max_needs: usize::MAX, read_chunk: 4096, ..FeedOptions::new(Some(PASSWORD)) };
+    // in order, holes only in the second half: the main decode passes the first megabyte's state resets first, so
+    // its restart point (and every repair's) lies in the earlier member
+    let all = articles(&volumes, 5_000);
+    let half = all.len() / 2;
+    let (missing, present): (Vec<_>, Vec<_>) = all.into_iter().enumerate().partition(|(i, _)| *i > half && i % 9 == 4);
+    let missing: Vec<Article> = missing.into_iter().map(|(_, a)| a).collect();
+    let mut d = FeedDecoder::new(&map, 1, options()).unwrap();
+    let mut out = Out::new(plain.len(), None);
+    out.earlier = files[0].1.clone();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    for (v, off, b) in &missing {
+        source.mark_lost(*v, *off..*off + b.len() as u64);
+    }
+    for (_, (v, off, b)) in &present {
+        source.insert(*v, *off, b).unwrap();
+        d.run(&mut source, &mut out).unwrap();
+    }
+    // the member's own output stays, the earlier members' is gone; the packed bytes are fetched again
+    let snap = FeedSnapshot::from_bytes(&d.snapshot().to_bytes()).unwrap();
+    out.earlier = Vec::new();
+    let mut d = FeedDecoder::restore(&map, 1, options(), &snap).unwrap();
+    for (_, (v, off, b)) in &present {
+        source.insert(*v, *off, b).unwrap();
+    }
+    for (v, off, b) in &missing {
+        source.insert(*v, *off, b).unwrap();
+        d.run(&mut source, &mut out).unwrap_or_else(|e| panic!("{e}"));
+    }
+    d.run(&mut source, &mut out).unwrap_or_else(|e| panic!("{e}"));
+    let s = d.status();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert!(out.bytes == *plain);
+}
