@@ -36,6 +36,10 @@ struct Pre {
     cipher: StoredCipher,
     size: u64,
     frame: CoreFrame,
+    /// the CRC32 its header states, the stream offset where it ends, and the hash of what the replay decoded
+    want_crc: Option<u32>,
+    end: u64,
+    hash: crc32fast::Hasher,
 }
 
 pub(super) struct Rar4 {
@@ -55,6 +59,10 @@ pub(super) struct Rar4 {
     prefix: Vec<Pre>,
     pre_at: usize,
     pre_lane: Option<Lane>,
+    /// the active earlier member's packed bytes before this offset were released to the source
+    pre_released: u64,
+    /// where earlier members' output that failed its CRC (or lies within a window's reach of such) ends
+    pre_suspect: Option<u64>,
     /// a solid member follows: the finished decoder is kept for a hand-off
     successor: bool,
     ended: Option<Box<Rar4Decoder>>,
@@ -78,6 +86,15 @@ impl Rar4 {
         self.frontier().to_le_bytes().to_vec()
     }
 
+    /// The replay starts over: nothing hashed, released or suspect yet.
+    fn reset_replay(&mut self) {
+        for p in &mut self.prefix {
+            p.hash = crc32fast::Hasher::new();
+        }
+        self.pre_released = 0;
+        self.pre_suspect = None;
+    }
+
     pub(super) fn restore(&mut self, blob: &[u8], size: u64) -> Result<(), FeedError> {
         let mut r = Reader(blob);
         let frontier = r.u64()?;
@@ -90,6 +107,7 @@ impl Rar4 {
         self.write_from = frontier;
         self.pre_at = 0;
         self.pre_lane = None;
+        self.reset_replay();
         self.ended = None;
         Ok(())
     }
@@ -140,10 +158,13 @@ impl FeedDecoder {
         let mut prefix = Vec::new();
         if !handed && run.prev.is_some() {
             let decodes = |m: &MapMember| !m.is_dir && matches!(m.method, MapMethod::Compressed { .. });
-            for m in map.members[run.first..index].iter().filter(|m| decodes(m)) {
+            for (k, m) in map.members[run.first..index].iter().filter(|m| decodes(m)).enumerate() {
                 let (geometry, stream_len, cipher, frame) = Self::rar4_parts(m, &options, &usage)?;
                 let size = m.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
-                prefix.push(Pre { geometry, stream_len, cipher, size, frame });
+                let want_crc = m.checks.and_then(|c| c.crc32);
+                let end = run.starts[k] + size;
+                let hash = crc32fast::Hasher::new();
+                prefix.push(Pre { geometry, stream_len, cipher, size, frame, want_crc, end, hash });
             }
         }
         let checks = member.checks.filter(|c| c.crc32.is_some());
@@ -189,6 +210,8 @@ impl FeedDecoder {
                 prefix,
                 pre_at: 0,
                 pre_lane: None,
+                pre_released: 0,
+                pre_suspect: None,
                 successor: run.successor,
                 ended: None,
             })),
@@ -365,12 +388,22 @@ impl FeedDecoder {
                 waits = Some(*hole);
             }
             let ranges = self.geometry.volume_ranges(0..self.stream_len);
+            // a run that stops part way lets go of the packed bytes the lane has consumed (the buffer would
+            // otherwise fill up with an earlier member larger than its limit)
+            let mut consumed = Vec::new();
+            if !matches!(stop, Ok(Stop::Reached) | Err(_)) && lane.pos > r.pre_released {
+                consumed = self.geometry.volume_ranges(r.pre_released..lane.pos);
+                r.pre_released = lane.pos;
+            }
             std::mem::swap(&mut self.geometry, &mut r.prefix[i].geometry);
             std::mem::swap(&mut self.stream_len, &mut r.prefix[i].stream_len);
             std::mem::swap(&mut self.cipher, &mut r.prefix[i].cipher);
+            for (volume, range) in consumed {
+                source.release(volume, range);
+            }
             match stop? {
                 Stop::Reached => {
-                    let mut out = self.out_sink(sink, r.out, 0..0);
+                    let mut out = self.out_sink(sink, r.out, 0..0).hashing(&mut r.prefix[i].hash);
                     let ended = dec.finish_logical(&mut out).map(|_| ()).map_err(|e| decode_error(e, &mut out));
                     r.out = out.at;
                     ended?;
@@ -380,6 +413,13 @@ impl FeedDecoder {
                             error: crate::Error::Corrupt("an earlier solid member decodes to another size"),
                         });
                     }
+                    // the member's CRC proves only its own output: a mismatch makes what the stream's later members
+                    // decode from this window suspect, as long as it lies within a window's reach
+                    let p = &r.prefix[i];
+                    let bad = p.want_crc.is_some_and(|want| p.hash.clone().finalize() != want);
+                    let end = p.end;
+                    r.pre_suspect =
+                        bad.then_some(end).max(r.pre_suspect).filter(|&at| at.saturating_add(r.dictionary) > end);
                     let frame = r.prefix.get(i + 1).map_or(r.frame, |p| p.frame);
                     dec.next_solid_member(frame).map_err(|_| FeedError::Decode {
                         out: 0,
@@ -389,6 +429,7 @@ impl FeedDecoder {
                         source.release(volume, range);
                     }
                     r.pre_at += 1;
+                    r.pre_released = 0;
                     r.out = 0;
                     r.fed = 0;
                 }
@@ -424,11 +465,17 @@ impl FeedDecoder {
                 r.fed = 0;
                 r.pre_at = 0;
                 r.pre_lane = None;
+                r.reset_replay();
                 self.start_rar4(r)?
             }
         };
         match self.rar4_prefix(r, &mut dec, source, sink, &mut next)? {
-            Some(true) => {}
+            Some(true) => {
+                if r.pre_suspect.is_some() {
+                    self.suspect = self.suspect.max(r.pre_suspect);
+                    self.unproven = true;
+                }
+            }
             waiting => {
                 more = waiting.is_none();
                 self.main = Some(lane);
@@ -517,6 +564,9 @@ impl FeedDecoder {
                     if from < to {
                         let chunk = &bytes[(from - at) as usize..(to - at) as usize];
                         let mut o = self.out_sink(sink, r.out, write.clone());
+                        if let Some(p) = r.prefix.get_mut(r.pre_at) {
+                            o = o.hashing(&mut p.hash);
+                        }
                         let fed = dec.feed(chunk, &mut o).map(|_| ()).map_err(|e| decode_error(e, &mut o));
                         r.out = o.at;
                         fed?;
@@ -559,6 +609,9 @@ mod tests {
             cipher: StoredCipher::Plain,
             size: 100_000,
             frame,
+            want_crc: None,
+            end: 100_000,
+            hash: crc32fast::Hasher::new(),
         };
         let mut r = Rar4 {
             dec: None,
@@ -572,6 +625,8 @@ mod tests {
             prefix: vec![pre],
             pre_at: 0,
             pre_lane: None,
+            pre_released: 0,
+            pre_suspect: None,
             successor: false,
             ended: None,
         };
