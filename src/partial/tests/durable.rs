@@ -91,3 +91,62 @@ fn a_barrier_flushes_only_devices_of_its_files_with_unflushed_syncs() {
     assert!(durable::HERE.with(|h| h.get().0) - before <= 1, "one flush per device at most");
     assert_eq!(durable::unflushed_here(), 0, "the barrier covers the sync on its device");
 }
+
+// Catches a direct partial (`DirectPartials`, fed through `DirectSink`) anchoring anything before its syncs are
+// device durable: its genesis, its group commits, a reopen by the same map (adoption) and the final commit all
+// take the same barrier, so every CAS finds every earlier sync of the thread flushed.
+#[test]
+fn direct_members_flush_their_devices_before_every_anchor_change() {
+    use crate::map::{FeedSink, MemberMap};
+    let dir = tempfile::tempdir().unwrap();
+    let (output_root, state_dir) = (dir.path().join("out"), dir.path().join("state"));
+    std::fs::create_dir_all(&output_root).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i * 31 + 7) as u8).collect();
+    let mut spec = super::rar_fixture::FileSpec::new("payload.bin", &data);
+    spec.size = Some(data.len() as u64);
+    let volumes = super::rar_fixture::volumes(&spec, 40_000);
+    let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+    let map = MemberMap::from_memory(&refs, "set.part1.rar", None).unwrap();
+    let store = Arc::new(Checking::default());
+    let parts = DirectPartials::new(DirectOptions {
+        binding: ArchiveBinding { job: [7; 16], archive: [9; 32] },
+        output_root,
+        state_dir,
+        naming: PartialNaming::ArchivePath,
+        limits: PartialLimits { group_commit_bytes: 16_384, ..Default::default() },
+        progressive_limits: ProgressiveLimits::default(),
+        anchors: store.clone(),
+        control: SessionControl::default(),
+        protection: ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory {
+                volumes: (0..volumes.len() as u32)
+                    .map(|index| ProtectedVolume {
+                        index,
+                        name: format!("set.part{}.rar", index + 1).into(),
+                        backing: VolumeBacking::NonFile,
+                    })
+                    .collect(),
+                auxiliary_paths: Vec::new(),
+            },
+        },
+        password: None,
+    })
+    .unwrap();
+    let member = parts.open(&map, 0).unwrap();
+    assert_eq!(member.origin, DirectOrigin::Created);
+    let mut sink = DirectSink::new(member.file);
+    sink.write_at(0, &data[..60_000]).unwrap();
+    sink.commit().unwrap();
+    drop(sink);
+    let member = parts.open(&map, 0).unwrap();
+    assert_eq!(member.origin, DirectOrigin::Adopted);
+    let mut sink = DirectSink::new(member.file);
+    sink.write_at(60_000, &data[60_000..]).unwrap();
+    sink.commit().unwrap();
+    assert!(sink.file().remaining().unwrap().is_empty());
+    let cas = store.cas.lock().unwrap().clone();
+    assert!(cas.len() >= 6, "genesis, several groups and the final commit: {cas:?}");
+    assert!(cas.iter().all(|&n| n == 0), "a direct member's CAS ran before its syncs were flushed: {cas:?}");
+}
