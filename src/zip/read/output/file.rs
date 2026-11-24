@@ -435,9 +435,13 @@ fn acquire(
         // so the hook sees the requested name.
         if allow_blocked
             && let Some(select) = &options.select
-            && select.starts(&crate::extract::MemberStart { path: &options.dest.join(relative) })
-                == crate::extract::StartDecision::Skip
+            && let decision = select.starts(&crate::extract::MemberStart { path: &options.dest.join(relative) })
+            && decision != crate::extract::StartDecision::Write
         {
+            if matches!(decision, crate::extract::StartDecision::RenameTo(_)) {
+                // the checked route binds the output to the entry's own name
+                *blocked = Some(target::Refusal::StartRename);
+            }
             return Ok(false);
         }
         ledger.with_state(|s| s.reserve(binding.encrypted, binding.bytes, 0))?;

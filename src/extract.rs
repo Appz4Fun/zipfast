@@ -408,11 +408,22 @@ pub struct MemberStart<'a> {
 }
 
 /// What [`MemberFilter::on_start`] decides for a member about to be written.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StartDecision {
     /// Write it.
     Write,
+    /// Write it under another name, chosen mid-run (a caller's "auto rename" answer). The path is relative to
+    /// [`Options::dest`], plain components only (no `..`, no root or prefix, not empty), and is checked like any
+    /// output path: its folders are made under the destination's rules, a link or protected input in the way
+    /// blocks the member, and the [`Overwrite`] mode decides what happens when the name is taken. The hook is not
+    /// asked again about the new name. Later hard links and RAR 5 file copies naming this member by its archive
+    /// path resolve to the renamed file. An unsafe name fails this member only, and the run goes on.
+    ///
+    /// Supported on tar, lone compressed files, the legacy ZIP route, 7z and RAR whole-archive runs. The checked
+    /// ZIP route of [`run_with_policy`](crate::extract::run_with_policy) binds each output to the entry's own
+    /// name, and fails the member instead (ZIP has no hard links for a rename to keep resolving).
+    RenameTo(PathBuf),
     /// Don't: nothing is written for it, a renamed name it claimed is let go, and it is reported as skipped
     /// ([`RarSkipReason::Declined`] on typed RAR runs, "declined, skipped" on report lines).
     Skip,
@@ -680,6 +691,7 @@ fn blocked_message(reason: &RarPolicyReason) -> &'static str {
         RarPolicyReason::LinkTarget => "the link's target is absolute or leads out of the destination",
         RarPolicyReason::HardLinkTarget => link::HARD_TARGET,
         RarPolicyReason::ParentIsFile => "a file is in the way",
+        RarPolicyReason::UnsafePath => "the start hook's new name is not a plain path inside the destination",
         _ => unreachable!("unexpected target policy"),
     }
 }
@@ -752,7 +764,7 @@ impl<F: FnMut(&str)> LegacyReport for F {
 fn check_target_detailed(
     opts: &Options,
     rel: &Path,
-    dirs: Option<&mut Dirs>,
+    mut dirs: Option<&mut Dirs>,
     log: &mut RenameLog<'_>,
 ) -> crate::error::RarResult<DetailedChecked> {
     let Some(filter) = opts.select.as_ref().filter(|f| f.start.is_some()) else {
@@ -761,10 +773,30 @@ fn check_target_detailed(
     // Hold this member's renames until the hook decides: a declined one must leave no trace of a new name.
     let budget = log.budget.left();
     let mut held = Vec::new();
-    let checked = place_target(opts, rel, dirs, &mut RenameLog { budget: log.budget, record: &mut |r| held.push(r) })?;
-    if let DetailedChecked::Write(place) = &checked
-        && filter.starts(&MemberStart { path: &place.path }) == StartDecision::Skip
-    {
+    let checked = place_target(
+        opts,
+        rel,
+        dirs.as_deref_mut(),
+        &mut RenameLog { budget: log.budget, record: &mut |r| held.push(r) },
+    )?;
+    let decision = match &checked {
+        DetailedChecked::Write(place) => filter.starts(&MemberStart { path: &place.path }),
+        _ => StartDecision::Write,
+    };
+    if let StartDecision::RenameTo(new) = decision {
+        // like a decline for the name first chosen: a rename mode's claim on it is let go
+        if matches!(opts.overwrite.rename(), Some(rename::RenameMode::Existing(_))) {
+            held.into_iter().for_each(|r| (log.record)(r));
+        } else {
+            log.budget.restore(budget);
+        }
+        drop(checked);
+        if !start_rename_is_safe(&new) {
+            return Ok(DetailedChecked::Blocked(RarPolicyReason::UnsafePath));
+        }
+        return place_target(opts, &new, dirs, log);
+    }
+    if decision == StartDecision::Skip {
         if matches!(opts.overwrite.rename(), Some(rename::RenameMode::Existing(_))) {
             // what was at the name was really moved aside: that rename stands
             held.into_iter().for_each(|r| (log.record)(r));
@@ -776,6 +808,19 @@ fn check_target_detailed(
     }
     held.into_iter().for_each(|r| (log.record)(r));
     Ok(checked)
+}
+
+/// Whether a start hook's new name is a plain relative path: normal components only, at least one.
+fn start_rename_is_safe(new: &Path) -> bool {
+    use std::path::Component;
+    let mut any = false;
+    for c in new.components() {
+        match c {
+            Component::Normal(n) if !n.to_string_lossy().contains([':', '\\']) || cfg!(unix) => any = true,
+            _ => return false,
+        }
+    }
+    any
 }
 
 fn place_target(
