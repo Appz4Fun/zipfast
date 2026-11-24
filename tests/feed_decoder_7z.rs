@@ -852,3 +852,51 @@ fn a_failed_lzma2_hand_off_keeps_the_state() {
     assert!(out.bytes == files[1].1);
     assert_eq!(d1.stats().redecoded, 0);
 }
+
+/// A hole whose loss runs past a whole short member to a restart in the member after it: the short member's main
+/// decode is done as soon as it is handed over, and its snapshot (taken at once, before its own hand-off) restores
+/// and hands over on.
+#[test]
+fn a_member_skipped_whole_by_a_hole_snapshots_and_hands_over() {
+    let files: Vec<(&str, Vec<u8>)> =
+        vec![("a.bin", mixed(300_000, 39)), ("b.txt", text(3_000, 7)), ("c.bin", mixed(300_000, 40))];
+    let sizes: Vec<u64> = files.iter().map(|(_, b)| b.len() as u64).collect();
+    let plain: Vec<u8> = files.iter().flat_map(|(_, b)| b.clone()).collect();
+    let lz = lzma2(&plain, plain.len());
+    let walked = chunks(&lz);
+    // inside the chunk holding output 5,000 bytes before member 0's end, at about that output's place
+    let target = sizes[0] - 5_000;
+    let (p, o) = walked.iter().find(|(_, o)| o.contains(&target)).unwrap();
+    let hole = 32 + p.start + (target - o.start) * (p.end - p.start) / (o.end - o.start);
+    let archive = seven_zip(&files, false, plain.len());
+    let map = MemberMap::from_memory(&[&archive], "set.7z", Some(PASSWORD)).unwrap();
+    let starts = vec![0, sizes[0], sizes[0] + sizes[1], sizes.iter().sum()];
+    let mut outs: Vec<Out> = files.iter().map(|(_, b)| Out::new(b.len(), None)).collect();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..hole as usize]).unwrap();
+    source.insert(0, hole + 8, &archive[hole as usize + 8..]).unwrap();
+    source.mark_lost(0, hole..hole + 8);
+    let mut d0 = FeedDecoder::new(&map, 0, FolderRun::options()).unwrap();
+    let s = d0.run(&mut source, &mut FolderView { outs: &mut outs, i: 0, starts: &starts }).unwrap();
+    assert_eq!(s.frontier, sizes[0], "{s:?}");
+    let d1 = d0.next_solid(&map, 1, FolderRun::options()).unwrap();
+    // the loss covers member 1 whole (and runs on into member 2)
+    assert_eq!(d1.status().lost, vec![0..sizes[1]], "{:?}", d1.status());
+    let snap = FeedSnapshot::from_bytes(&d1.snapshot().to_bytes()).unwrap();
+    let mut d1 = FeedDecoder::restore(&map, 1, FolderRun::options(), &snap).unwrap();
+    let d2 = d1.next_solid(&map, 2, FolderRun::options()).unwrap();
+    assert!(d2.status().lost.first().is_some_and(|r| r.start == 0), "{:?}", d2.status());
+    source.insert(0, 0, &archive).unwrap();
+    let mut ds = [d0, d1, d2];
+    for _ in 0..2 {
+        for (k, d) in ds.iter_mut().enumerate() {
+            d.run(&mut source, &mut FolderView { outs: &mut outs, i: k, starts: &starts }).unwrap();
+        }
+    }
+    for (k, d) in ds.iter().enumerate() {
+        let s = d.status();
+        assert!(s.done && s.crc_ok == Some(true), "member {k}: {s:?}");
+        assert!(outs[k].bytes == files[k].1, "member {k} output");
+        assert_eq!(outs[k].written, sizes[k], "member {k}: each byte written once");
+    }
+}

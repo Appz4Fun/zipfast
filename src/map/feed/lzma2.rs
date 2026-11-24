@@ -727,7 +727,13 @@ impl FeedDecoder {
         for (lost, kind) in overflow {
             self.lz_lose(&mut lz, lost, kind);
         }
-        if lz.main.is_none() && !lz.seek && successor {
+        // a hole's restart past this member's end (it skipped this member whole): the main decode is already done
+        // here, and its lane is the next member's (so a snapshot never holds a main lane past the member's end)
+        if lz.pending.is_empty() && lz.main.as_ref().is_some_and(|l| l.out >= lz.end) {
+            let lane = lz.main.take();
+            self.lz_stash(&mut lz, lane);
+        }
+        if lz.main.is_none() && !lz.seek && successor && lz.handoff.is_none() {
             // nothing goes on here (lost to the folder's end): the next member gets the rest
             lz.handoff = Some(Box::new(Handoff {
                 lane: None,

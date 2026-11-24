@@ -288,7 +288,8 @@ the decoder's state; keep the session (and the hand-off) alive across a set wher
 (at most a chunk's worth) goes to the next member, which writes it first. A member that a successor follows walks
 past its end for a restart after a hole: lost output that runs on into the next member is handed over as lost, with
 its repair (from the restart point before the hole, which then lies in the earlier member; that output is decoded
-again, not written). Lost output can run on through several members. The packed bytes the members share are released
+again, not written). Lost output can run on through several members; a member a hole skips whole is done once it is handed over, and
+hands the restart on to the next. The packed bytes the members share are released
 in turn: a member never releases what the members after it start from, a successor never what the members before it
 may still read. A dictionary taken from output the decoder did not write (held output, an earlier member's) leaves
 the member `unproven` until its CRC matches. `FeedDecoder::new` on a later member still starts at the last dictionary
