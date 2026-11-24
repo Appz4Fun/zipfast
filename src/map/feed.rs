@@ -89,9 +89,9 @@ pub trait FeedSink {
         Ok(0)
     }
 
-    /// Output of the earlier members of the member's solid stream (RAR) at offsets in that stream's output, before
-    /// the member's own start ([`FeedDecoder::stream_start`]): what their decoders wrote, or plaintext known from
-    /// elsewhere. Fills the start of `buf` and returns how many bytes from `stream_offset` it holds, 0 for none.
+    /// Output of the earlier members of the member's solid stream (RAR) or folder (7z) at offsets in that stream's
+    /// output, before the member's own start ([`FeedDecoder::stream_start`]): what their decoders wrote, or plaintext
+    /// known from elsewhere. Fills the start of `buf` and returns how many bytes from `stream_offset` it holds, 0 for none.
     /// Asked only when a window reaches back into earlier members: a solid successor started from a
     /// [`SolidCarry`], or restored from a snapshot, or a restart, repair or hole skip close after its start. The
     /// default holds nothing; those then fail with [`FeedError::EarlierOutput`] (a skip waits instead).
@@ -783,7 +783,7 @@ pub struct FeedDecoder {
     status: FeedStatus,
     /// the member's index in the map
     index: usize,
-    /// where the member's output starts in its solid stream's (RAR) output; 0 otherwise
+    /// where the member's output starts in its solid stream's (RAR) or folder's (7z) output; 0 otherwise
     stream_start: u64,
     /// output written was decoded from a window not proven yet ([`FeedStatus::unproven`])
     unproven: bool,
@@ -1126,7 +1126,8 @@ impl FeedDecoder {
                 keep.insert(range);
             }
         } else if let Some(l) = &self.lzma2 {
-            for range in l.needed(matches!(self.cipher, StoredCipher::Cbc { .. })) {
+            let cbc = matches!(self.cipher, StoredCipher::Cbc { .. });
+            for range in l.needed(cbc).into_iter().chain(l.pinned(cbc)) {
                 keep.insert(range);
             }
         } else if self.rar4.is_some() {
@@ -1413,17 +1414,18 @@ impl FeedDecoder {
     }
 
     /// Where the member's output starts in its solid stream's output ([`FeedSink::read_earlier`] offsets count from
-    /// there): for RAR the sizes of the compressed members before it back to the stream's first; 0 for a member that
-    /// is not a solid successor, and for other formats.
+    /// there): for RAR the sizes of the compressed members before it back to the stream's first (0 for a member that
+    /// is not a solid successor), for 7z its offset in its folder's output; 0 otherwise.
     pub fn stream_start(&self) -> u64 {
         self.stream_start
     }
 
-    /// A decoder of member `index`, the next member of this one's solid stream (RAR), going on from this decoder's
-    /// state: the RAR 5.0 or 4.x decoder with its window, tables and history (and PPMd model), so nothing before the
-    /// new member is decoded again. Once this decoder's main decode has finished (its frontier at its size), however
-    /// its repairs stand: this decoder keeps its lost ranges and repairs them as before, and the new one reads from
-    /// where this one stopped.
+    /// A decoder of member `index`, the next member of this one's solid stream (RAR) or folder (7z), going on from
+    /// this decoder's state: the RAR 5.0 or 4.x decoder with its window, tables and history (and PPMd model), or the
+    /// LZMA2 decoder at this member's end, so nothing before the new member is decoded again. Once this decoder's
+    /// main decode has finished (its frontier at its size), however its repairs stand: this decoder keeps its lost
+    /// ranges and repairs them as before, and the new one reads from where this one stopped. A 7z hole whose lost
+    /// output runs on into the next member hands that part over as lost, repaired by the new decoder.
     ///
     /// The new decoder is [`FeedStatus::unproven`] until its own CRC matches when its window may hold output not
     /// proven: this member's, while it is not done with its CRC matched and skipped a hole over held output (or
@@ -1437,6 +1439,9 @@ impl FeedDecoder {
         if self.rar4.is_some() {
             return self.handoff_rar4(map, index, options);
         }
+        if self.lzma2.is_some() {
+            return self.handoff_lzma2(map, index, options);
+        }
         Err(FeedError::Unsupported(FeedUnsupported::Solid))
     }
 
@@ -1448,6 +1453,9 @@ impl FeedDecoder {
         }
         if let Some(r) = &self.rar4 {
             return r.reach();
+        }
+        if let Some(l) = &self.lzma2 {
+            return l.reach();
         }
         u64::MAX
     }
@@ -1520,6 +1528,8 @@ enum Begin {
     Carry(SolidCarry),
     /// a RAR 4.x solid successor going on from the decoder of the member before (installed after it is set up)
     Rar4,
+    /// a 7z member going on from the LZMA2 state the member before left (installed after it is set up)
+    Lzma2,
 }
 
 /// The state a RAR 5.0 solid successor starts from ([`FeedDecoder::solid_carry`]): about 500 bytes, no plaintext

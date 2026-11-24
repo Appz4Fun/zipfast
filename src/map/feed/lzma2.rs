@@ -196,6 +196,24 @@ impl Lane2 {
     }
 }
 
+/// The LZMA2 state a member hands to the next member of its folder ([`FeedDecoder::next_solid`]).
+pub(super) struct Handoff {
+    /// the main decode where this member's ended (at or past the next member's start), when it goes on: None when
+    /// everything from a hole to the folder's end is lost
+    lane: Option<Lane2>,
+    /// output the main decode decoded past this member's end (folder offsets from it on)
+    spill: Vec<u8>,
+    /// lost output past this member's end and its repair
+    overflow: Vec<(Range<u64>, Kind)>,
+    /// chunk headers walked
+    walked: BTreeMap<u64, Lzma2Chunk>,
+    /// packed (cipher) bytes before this offset may still be read by the members before: never released
+    floor: u64,
+    /// no restart point to go on from (a decoder restored without one): the next member finds its start from the
+    /// folder's, as on its own
+    seek: bool,
+}
+
 pub(super) struct Lz {
     /// the member's first and end folder output offsets
     ss: u64,
@@ -221,15 +239,34 @@ pub(super) struct Lz {
     /// the main decoder as it stood at a hole in a stored chunk, when the main decode went on copying without it: a
     /// chunk after it that needs the lost bytes is repaired from here rather than from the restart point
     parked: Option<Lane2>,
+    /// the next member of the folder starts at this one's end: the main decode keeps what it decodes past the end
+    /// (`spill`), walks past it for restarts, records lost output past it (`overflow`), and leaves its state for a
+    /// hand-off (`handoff`) when it ends
+    successor: bool,
+    spill: Vec<u8>,
+    overflow: Vec<(Range<u64>, Kind)>,
+    handoff: Option<Box<Handoff>>,
+    /// output a hand-off gave, from this member's start, still to be written
+    pending: Vec<u8>,
+    /// packed (cipher) offsets this decoder never releases: before `floor` (the members before may still read
+    /// them) and from `cap` on (handed to the next member)
+    floor: u64,
+    cap: Option<u64>,
+    /// the folder's index in the map
+    folder: u32,
 }
 
 impl Lz {
     pub(super) fn frontier(&self) -> u64 {
         match &self.main {
-            _ if self.seek => 0,
+            _ if self.seek || !self.pending.is_empty() => 0,
             Some(l) => l.out.max(self.write_from).clamp(self.ss, self.end) - self.ss,
             None => self.end - self.ss,
         }
+    }
+
+    pub(super) fn reach(&self) -> u64 {
+        self.dict
     }
 
     pub(super) fn stalled(&self) -> bool {
@@ -238,6 +275,24 @@ impl Lz {
 
     pub(super) fn done(&self) -> bool {
         self.main.is_none() && !self.seek
+    }
+
+    /// How far the main decode walks for a restart: past the member's end into the next member's output when one
+    /// follows (the lost output past the end is handed over).
+    fn walk_end(&self) -> u64 {
+        if self.successor { self.folder_size } else { self.end }
+    }
+
+    /// The packed ranges never to release ([`Self::floor`], [`Self::cap`]).
+    pub(super) fn pinned(&self, cbc: bool) -> Vec<Range<u64>> {
+        let mut out = Vec::new();
+        if self.floor > 0 {
+            out.push(0..self.floor);
+        }
+        if let Some(cap) = self.cap {
+            out.push(self.cipher_range(cap..cap + 1, cbc).start..self.cipher_len);
+        }
+        out
     }
 
     /// The plain packed range `r` as packed stream offsets (under CBC with the block before).
@@ -273,7 +328,19 @@ impl Lz {
         let mut out = Vec::new();
         let u64s = |out: &mut Vec<u8>, v: &[u64]| v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes()));
         match &self.main {
-            _ if self.seek => out.push(1),
+            // output handed over and not written yet: a restore goes on from the handed-over restart point (the
+            // packed bytes from it on are kept for this member), decoding that output again
+            Some(l) if !self.seek && !self.pending.is_empty() && l.cp.is_some() => {
+                let cp = l.cp.expect("checked");
+                out.push(2);
+                u64s(&mut out, &[cp.packed, cp.out]);
+                out.push(0);
+                out.push(cp.props.unwrap_or(0xFF));
+                put_opt_cp(&mut out, Some(cp));
+                out.push(1);
+            }
+            // otherwise a restore finds the member's start again
+            _ if self.seek || !self.pending.is_empty() => out.push(1),
             None => out.push(0),
             Some(l) => {
                 out.push(2);
@@ -292,19 +359,47 @@ impl Lz {
         }
         u64s(&mut out, &[self.write_from, self.repairs.len() as u64]);
         for r in &self.repairs {
-            match r.kind {
-                Kind::Stored { plain } => {
-                    out.push(0);
-                    u64s(&mut out, &[plain]);
-                }
-                Kind::Decoded { cp, until, seed } => {
-                    out.push(1);
-                    put_opt_cp(&mut out, Some(cp));
-                    u64s(&mut out, &[until]);
-                    put_opt_cp(&mut out, seed);
-                }
-            }
+            put_kind(&mut out, &r.kind);
             u64s(&mut out, &[r.lost.start, r.lost.end]);
+        }
+        // what a member handed over keeps pinned (the members before it, the member after it)
+        if self.floor > 0 || self.cap.is_some() || self.handoff.is_some() {
+            u64s(&mut out, &[self.floor, self.cap.unwrap_or(u64::MAX)]);
+        }
+        // a finished main decode's state still to be handed to the next member: where it goes on (a live decoder as
+        // its restart point, decoding again what it decoded past this member's end) and the lost output past the end
+        if let Some(h) = &self.handoff {
+            out.push(1);
+            match &h.lane {
+                None => out.push(0),
+                Some(l) if l.live.is_none() && !l.restart && h.spill.is_empty() => {
+                    out.push(2);
+                    u64s(&mut out, &[l.pos, l.out]);
+                    match &l.chunk {
+                        None => out.push(0),
+                        Some(c) => {
+                            out.push(1);
+                            put_chunk(&mut out, c);
+                        }
+                    }
+                    out.push(l.props.unwrap_or(0xFF));
+                    put_opt_cp(&mut out, l.cp);
+                }
+                Some(l) => match l.cp {
+                    Some(cp) => {
+                        out.push(1);
+                        put_opt_cp(&mut out, Some(cp));
+                    }
+                    // nowhere to restart: the next member finds its start from the folder's
+                    None => out.push(3),
+                },
+            }
+            u64s(&mut out, &[h.overflow.len() as u64]);
+            for (lost, kind) in &h.overflow {
+                put_kind(&mut out, kind);
+                u64s(&mut out, &[lost.start, lost.end]);
+            }
+            u64s(&mut out, &[h.floor]);
         }
         out
     }
@@ -364,15 +459,7 @@ impl Lz {
         let n = r.count(1 + 8 + 16)?;
         let mut repairs = Vec::with_capacity(n);
         for _ in 0..n {
-            let kind = match r.u8()? {
-                0 => Kind::Stored { plain: r.u64()? },
-                1 => {
-                    let cp = get_opt_cp(&mut r)?.ok_or(bad())?;
-                    let until = r.u64()?;
-                    Kind::Decoded { cp, until, seed: get_opt_cp(&mut r)? }
-                }
-                _ => return Err(FeedError::Snapshot("bad flag")),
-            };
+            let kind = get_kind(&mut r)?;
             let lost = r.u64()?..r.u64()?;
             if lost.start >= lost.end || lost.start < self.ss || lost.end > self.end {
                 return Err(bad());
@@ -392,9 +479,71 @@ impl Lz {
             }
             repairs.push(Repair { kind, lost, blocked: None, lane: None });
         }
+        let (floor, cap) = if r.0.is_empty() { (0, u64::MAX) } else { (r.u64()?, r.u64()?) };
+        let handoff = if r.0.is_empty() {
+            None
+        } else {
+            if r.u8()? != 1 || !self.successor || main.is_some() || seek {
+                return Err(bad());
+            }
+            let (lane, seek_next) = match r.u8()? {
+                0 => (None, false),
+                1 => (Some(Lane2::at_cp(get_opt_cp(&mut r)?.ok_or(bad())?)), false),
+                2 => {
+                    let (pos, out) = (r.u64()?, r.u64()?);
+                    let chunk = match r.u8()? {
+                        0 => None,
+                        1 => Some(get_chunk(&mut r)?),
+                        _ => return Err(FeedError::Snapshot("bad flag")),
+                    };
+                    let props = match r.u8()? {
+                        0xFF => None,
+                        p if props_valid(p) => Some(p),
+                        _ => return Err(bad()),
+                    };
+                    let cp = get_opt_cp(&mut r)?;
+                    if pos > self.plain_len || out < self.end || out > self.folder_size {
+                        return Err(bad());
+                    }
+                    (Some(Lane2 { pos, out, chunk, props, live: None, cp, restart: false }), false)
+                }
+                3 => (None, true),
+                _ => return Err(FeedError::Snapshot("bad flag")),
+            };
+            if let Some(cp) = lane.as_ref().and_then(|l| l.cp)
+                && (cp.packed > self.plain_len || cp.out > self.folder_size)
+            {
+                return Err(bad());
+            }
+            let n = r.count(1 + 8 + 16)?;
+            let mut overflow = Vec::with_capacity(n);
+            for _ in 0..n {
+                let kind = get_kind(&mut r)?;
+                let lost = r.u64()?..r.u64()?;
+                if lost.start >= lost.end || lost.start < self.end || lost.end > self.folder_size {
+                    return Err(bad());
+                }
+                overflow.push((lost, kind));
+            }
+            let floor = r.u64()?;
+            Some(Box::new(Handoff {
+                lane,
+                spill: Vec::new(),
+                overflow,
+                walked: BTreeMap::new(),
+                floor,
+                seek: seek_next,
+            }))
+        };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
+        self.handoff = handoff;
+        if floor > self.cipher_len || (cap != u64::MAX && cap > self.plain_len) {
+            return Err(bad());
+        }
+        self.floor = floor;
+        self.cap = (cap != u64::MAX).then_some(cap);
         if write_from > self.end {
             return Err(bad());
         }
@@ -439,6 +588,33 @@ fn get_opt_cp(r: &mut Reader<'_>) -> Result<Option<Cp>, FeedError> {
         }
         _ => Err(FeedError::Snapshot("bad flag")),
     }
+}
+
+fn put_kind(out: &mut Vec<u8>, kind: &Kind) {
+    match *kind {
+        Kind::Stored { plain } => {
+            out.push(0);
+            out.extend_from_slice(&plain.to_le_bytes());
+        }
+        Kind::Decoded { cp, until, seed } => {
+            out.push(1);
+            put_opt_cp(out, Some(cp));
+            out.extend_from_slice(&until.to_le_bytes());
+            put_opt_cp(out, seed);
+        }
+    }
+}
+
+fn get_kind(r: &mut Reader<'_>) -> Result<Kind, FeedError> {
+    Ok(match r.u8()? {
+        0 => Kind::Stored { plain: r.u64()? },
+        1 => {
+            let cp = get_opt_cp(r)?.ok_or(FeedError::Snapshot("out of range"))?;
+            let until = r.u64()?;
+            Kind::Decoded { cp, until, seed: get_opt_cp(r)? }
+        }
+        _ => return Err(FeedError::Snapshot("bad flag")),
+    })
 }
 
 fn put_chunk(out: &mut Vec<u8>, c: &Lzma2Chunk) {
@@ -524,15 +700,112 @@ enum Skip {
 
 impl FeedDecoder {
     /// A decoder of a member of a 7z folder whose coders are one LZMA2 coder, alone or over 7zAES.
+    pub(super) fn handoff_lzma2(
+        &mut self,
+        map: &MemberMap,
+        index: usize,
+        options: FeedOptions,
+    ) -> Result<FeedDecoder, FeedError> {
+        let lz = self.lzma2.as_mut().expect("LZMA2 state");
+        let member = map.members.get(index).ok_or(FeedError::NoSuchMember { index })?;
+        if member.folder.is_none_or(|f| f.index != lz.folder || f.offset != lz.end) {
+            return Err(FeedError::Handoff("not the next member of the folder"));
+        }
+        if lz.handoff.is_none() {
+            return Err(FeedError::Handoff("the main decode has not finished, or was handed over"));
+        }
+        // the next member is set up (keys, limits) before the state leaves this one: a failure keeps it here
+        let suspect = self.carried_suspect();
+        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Lzma2)?;
+        let h = self.lzma2.as_mut().expect("LZMA2 state").handoff.take().expect("checked above");
+        next.install_lzma2(h);
+        next.inherit(suspect);
+        Ok(next)
+    }
+
+    /// Goes on from the state the member before handed over: its main decode, the output it decoded past its end,
+    /// and the lost output past its end with its repairs.
+    fn install_lzma2(&mut self, h: Box<Handoff>) {
+        let size = self.size;
+        let mut lz = self.lzma2.take().expect("LZMA2 state");
+        let successor = lz.successor;
+        let Handoff { lane, spill, overflow, walked, floor, seek } = *h;
+        lz.main = lane.filter(|_| size > 0 || successor);
+        lz.seek = seek && (size > 0 || successor);
+        lz.walked = walked;
+        lz.floor = floor;
+        lz.pending = spill;
+        for (lost, kind) in overflow {
+            self.lz_lose(&mut lz, lost, kind);
+        }
+        // a hole's restart past this member's end (it skipped this member whole): the main decode is already done
+        // here, and its lane is the next member's (so a snapshot never holds a main lane past the member's end)
+        if lz.pending.is_empty() && lz.main.as_ref().is_some_and(|l| l.out >= lz.end) {
+            let lane = lz.main.take();
+            self.lz_stash(&mut lz, lane);
+        }
+        if lz.main.is_none() && !lz.seek && successor && lz.handoff.is_none() {
+            // nothing goes on here (lost to the folder's end): the next member gets the rest
+            lz.handoff = Some(Box::new(Handoff {
+                lane: None,
+                spill: Vec::new(),
+                overflow: std::mem::take(&mut lz.overflow),
+                walked: BTreeMap::new(),
+                floor,
+                seek: false,
+            }));
+        }
+        self.lzma2 = Some(lz);
+        self.status = self.make_status(Vec::new(), false);
+    }
+
+    /// Leaves the main decode's end state for the next member of the folder, when one follows: `lane` where the main
+    /// decode stopped (None when everything to the folder's end is lost).
+    fn lz_stash(&self, lz: &mut Lz, lane: Option<Lane2>) {
+        if !lz.successor {
+            return;
+        }
+        let cbc = matches!(self.cipher, StoredCipher::Cbc { .. });
+        // what this member's repairs may read stays with it; what the next member reads is its own
+        let floor = lz.needed(cbc).iter().map(|r| r.end).max().unwrap_or(0).max(lz.floor);
+        let mut cap = u64::MAX;
+        let walked = match &lane {
+            Some(l) => {
+                let from = l.cp.map_or(l.pos, |c| c.packed).min(l.pos);
+                cap = cap.min(from);
+                lz.walked.range(from..).map(|(&k, &c)| (k, c)).collect()
+            }
+            None => BTreeMap::new(),
+        };
+        for (_, kind) in &lz.overflow {
+            cap = cap.min(match kind {
+                Kind::Stored { plain } => *plain,
+                Kind::Decoded { cp, .. } => cp.packed,
+            });
+        }
+        lz.cap = (cap != u64::MAX).then_some(cap);
+        lz.handoff = Some(Box::new(Handoff {
+            lane,
+            spill: std::mem::take(&mut lz.spill),
+            overflow: std::mem::take(&mut lz.overflow),
+            walked,
+            floor,
+            seek: false,
+        }));
+    }
+
     pub(super) fn new_lzma2(
         map: &MemberMap,
         member: &MapMember,
         options: FeedOptions,
         begin: Begin,
     ) -> Result<Self, FeedError> {
-        if !matches!(begin, Begin::Fresh | Begin::Restore) {
-            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
-        }
+        // a member handed the state of the one before gets it installed after it is set up
+        let handed = match begin {
+            Begin::Fresh | Begin::Restore => false,
+            Begin::Lzma2 => true,
+            _ => return Err(FeedError::Handoff("a hand-off from another layer")),
+        };
         let slot = member.folder.ok_or(FeedError::Malformed("7z member without a folder"))?;
         let folder = map.folders.get(slot.index as usize).ok_or(FeedError::Malformed("7z member's folder"))?;
         let (dict_prop, encrypted) = super::super::open_at::lzma2_coders(&folder.coders)
@@ -577,13 +850,21 @@ impl FeedDecoder {
         let folder_size = folder.unpacked_size;
         let end = slot.offset.checked_add(size).filter(|&e| e <= folder_size);
         let end = end.ok_or(FeedError::Malformed("member runs past its folder's output"))?;
+        // the next member of the folder in the map starts where this one ends (a zero-length one at the folder's end
+        // too)
+        let after = map.members.iter().position(|m| std::ptr::eq(m, member)).map_or(map.members.len(), |i| i + 1);
+        let successor = map.members[after..]
+            .iter()
+            .find_map(|m| m.folder.filter(|f| f.index == slot.index))
+            .is_some_and(|f| f.offset == end);
         let dict = lzma2_dict(dict_prop);
         let need = folder_size.max(4096);
         let dec_prop = (0..=dict_prop).find(|&p| lzma2_dict(p) >= need).unwrap_or(dict_prop);
         if lzma2_dict(dec_prop) > options.max_window {
             return Err(FeedError::Unsupported(FeedUnsupported::Window { size: lzma2_dict(dec_prop) }));
         }
-        let cipher = if encrypted && size > 0 {
+        // an empty member a member follows still reads the stream (to hand it over)
+        let cipher = if encrypted && (size > 0 || successor) {
             let usage = Usage::new(options.limits.clone());
             let keys = derive_keys(
                 member,
@@ -657,9 +938,19 @@ impl FeedDecoder {
                 stalled: false,
                 out_buf: vec![0; OUT_BUF],
                 parked: None,
+                successor,
+                spill: Vec::new(),
+                overflow: Vec::new(),
+                handoff: None,
+                pending: Vec::new(),
+                floor: 0,
+                cap: None,
+                folder: slot.index,
             })),
         };
-        if size > 0 {
+        d.stream_start = slot.offset;
+        if !handed && (size > 0 || successor) {
+            // an empty member a member follows still runs its main decode (to its own start) to hand it over
             let lz = d.lzma2.as_mut().expect("LZMA2 state");
             if slot.offset == 0 {
                 lz.main =
@@ -709,12 +1000,27 @@ impl FeedDecoder {
             self.push_needs(&mut next, cipher.clone(), NeedKind::Next);
             gap = Some(cipher.end..self.stream_len);
         }
+        if !lz.pending.is_empty() {
+            // output the member before decoded past its end: this member's first bytes
+            let bytes = std::mem::take(&mut lz.pending);
+            let (ss, end) = (lz.ss, lz.end);
+            self.lz_emit((ss, end), end, &(lz.write_from..end), ss, &bytes, sink)?;
+            if lz.successor && bytes.len() as u64 > end - ss {
+                lz.spill.extend_from_slice(&bytes[(end - ss) as usize..]);
+            }
+            if lz.main.is_none() {
+                self.lz_stash(lz, None);
+            }
+        }
         while !lz.seek
             && let Some(mut lane) = lz.main.take()
         {
             let write = lz.write_from..lz.end;
-            match self.lz_step(lz, &mut lane, write, lz.end, source, sink)? {
-                Step::Reached => break,
+            match self.lz_step(lz, &mut lane, write, lz.end, true, source, sink)? {
+                Step::Reached => {
+                    self.lz_stash(lz, Some(lane));
+                    break;
+                }
                 Step::End => return Err(corrupt(lane.out, "LZMA2 stream ends before the member")),
                 Step::Budget => {
                     more = true;
@@ -730,7 +1036,10 @@ impl FeedDecoder {
                 Step::Missing { cipher, hole: true } => {
                     match self.lz_skip(lz, &mut lane, Some(cipher), source, sink)? {
                         Skip::Skipped => lz.main = Some(lane),
-                        Skip::Finished => break,
+                        Skip::Finished => {
+                            self.lz_stash(lz, None);
+                            break;
+                        }
                         Skip::Wait(w) => {
                             lz.stalled = w.stalled;
                             for r in &w.needs {
@@ -744,7 +1053,10 @@ impl FeedDecoder {
                 }
                 Step::Undecodable => match self.lz_skip(lz, &mut lane, None, source, sink)? {
                     Skip::Skipped => lz.main = Some(lane),
-                    Skip::Finished => break,
+                    Skip::Finished => {
+                        self.lz_stash(lz, None);
+                        break;
+                    }
                     Skip::Wait(w) => {
                         lz.stalled = w.stalled;
                         for r in &w.needs {
@@ -947,9 +1259,7 @@ impl FeedDecoder {
     /// by the sink. None when not all of it is held (or it reaches before the member).
     fn lz_dict(&self, lz: &Lz, sink: &mut dyn FeedSink, o: u64) -> Option<Vec<u8>> {
         let d = lz.dict.min(o);
-        if o - d < lz.ss {
-            return None;
-        }
+        // before the member: the folder's earlier members' output, when the sink gives it
         read_stream(sink, lz.ss, o - d..o).ok()
     }
 
@@ -957,7 +1267,7 @@ impl FeedDecoder {
     fn lz_dict_held(&self, lz: &Lz, sink: &mut dyn FeedSink, o: u64) -> bool {
         let d = lz.dict.min(o);
         if o - d < lz.ss {
-            return false;
+            return self.lz_dict(lz, sink, o).is_some();
         }
         let r = o - d - lz.ss..o - lz.ss;
         (self.lz_written(r.clone()) && held_probe(sink, r)) || self.lz_dict(lz, sink, o).is_some()
@@ -994,21 +1304,28 @@ impl FeedDecoder {
     }
 
     /// Reads and decodes a lane until its output reaches `end_out` or it stops; output inside `write` (folder
-    /// offsets) is written.
+    /// offsets) is written. The main decode (`main`) of a member the next member of its folder follows keeps the
+    /// output it decodes past the member's end (`Lz::spill`).
+    #[allow(clippy::too_many_arguments)]
     fn lz_step(
         &mut self,
         lz: &mut Lz,
         lane: &mut Lane2,
         write: Range<u64>,
         end_out: u64,
+        main: bool,
         source: &mut dyn PackedSource,
         sink: &mut dyn FeedSink,
     ) -> Result<Step, FeedError> {
         let mut buf = std::mem::take(&mut self.buf);
         let mut out_buf = std::mem::take(&mut lz.out_buf);
-        let result = self.lz_step_with(lz, lane, write, end_out, source, sink, &mut buf, &mut out_buf);
+        let mut spill = (main && lz.successor).then(|| std::mem::take(&mut lz.spill));
+        let result = self.lz_step_with(lz, lane, write, end_out, &mut spill, source, sink, &mut buf, &mut out_buf);
         self.buf = buf;
         lz.out_buf = out_buf;
+        if let Some(spill) = spill {
+            lz.spill = spill;
+        }
         result
     }
 
@@ -1019,12 +1336,22 @@ impl FeedDecoder {
         lane: &mut Lane2,
         write: Range<u64>,
         end_out: u64,
+        spill: &mut Option<Vec<u8>>,
         source: &mut dyn PackedSource,
         sink: &mut dyn FeedSink,
         buf: &mut [u8],
         out_buf: &mut [u8],
     ) -> Result<Step, FeedError> {
         let bounds = (lz.ss, lz.end);
+        let member_end = lz.end;
+        // output past the member's end, kept for the next member
+        let keep = |spill: &mut Option<Vec<u8>>, at: u64, b: &[u8]| {
+            if let Some(sp) = spill.as_mut()
+                && at + b.len() as u64 > member_end
+            {
+                sp.extend_from_slice(&b[member_end.saturating_sub(at) as usize..]);
+            }
+        };
         loop {
             if self.options.control.is_canceled() {
                 return Err(FeedError::Canceled);
@@ -1058,6 +1385,15 @@ impl FeedDecoder {
                             c.props.or(props_before).ok_or_else(|| corrupt(lane.out, "LZMA2 chunk without props"))?;
                         match self.lz_dict(lz, sink, c.unpacked_offset) {
                             Some(dict) => {
+                                // a dictionary this decoder did not write (another copy's output, or an earlier
+                                // member's) is not proven until the member's CRC matches
+                                let from = c.unpacked_offset - dict.len() as u64;
+                                if from < lz.ss || !self.lz_written(from - lz.ss..c.unpacked_offset - lz.ss) {
+                                    self.unproven = true;
+                                    // the dictionary holds that output until it is pushed out of reach, whatever
+                                    // this member's CRC says (a successor inherits it)
+                                    self.seeded = self.seeded.max(Some(c.unpacked_offset));
+                                }
                                 lane.live = Some(Live::seeded(lz.dec_prop, &dict, &c, props, out_buf)?);
                                 lane.cp = Some(Cp {
                                     packed: c.packed_offset,
@@ -1111,6 +1447,7 @@ impl FeedDecoder {
                     live.feed(&hdr[..n], out_buf, *out, &mut |b| {
                         let at = *out;
                         *out += b.len() as u64;
+                        keep(spill, at, b);
                         self.lz_emit(bounds, end_out, &write, at, b, sink)
                     })?;
                 }
@@ -1130,11 +1467,13 @@ impl FeedDecoder {
                 Some(live) => live.feed(bytes, out_buf, *out, &mut |b| {
                     let at = *out;
                     *out += b.len() as u64;
+                    keep(spill, at, b);
                     self.lz_emit(bounds, end_out, &write, at, b, sink)
                 })?,
                 None => {
                     let at = *out;
                     *out += n as u64;
+                    keep(spill, at, bytes);
                     self.lz_emit(bounds, end_out, &write, at, bytes, sink)?;
                 }
             }
@@ -1165,7 +1504,7 @@ impl FeedDecoder {
             if self.options.control.is_canceled() {
                 return Err(FeedError::Canceled);
             }
-            if out >= lz.end {
+            if out >= lz.walk_end() {
                 return Ok(Walk::NoRestart);
             }
             let c = match self.lz_header(lz, source, pos, out)? {
@@ -1191,8 +1530,17 @@ impl FeedDecoder {
         }
     }
 
-    /// Records lost output `lost` (folder offsets, clipped to what the main decode writes) and its repair.
+    /// Records lost output `lost` (folder offsets, clipped to what the main decode writes) and its repair. Lost
+    /// output past the member's end is kept for the next member of the folder, when one follows.
     fn lz_lose(&mut self, lz: &mut Lz, lost: Range<u64>, kind: Kind) -> bool {
+        if lz.successor && lost.end > lz.end {
+            let from = lost.start.max(lz.end);
+            let kind = match kind {
+                Kind::Stored { plain } => Kind::Stored { plain: plain + (from - lost.start) },
+                ref k => k.clone(),
+            };
+            lz.overflow.push((from..lost.end, kind));
+        }
         let start = lost.start.max(lz.write_from);
         let end = lost.end.min(lz.end);
         if start >= end {
@@ -1252,8 +1600,8 @@ impl FeedDecoder {
                     Ok(Skip::Skipped)
                 }
                 Walk::NoRestart => {
-                    let lost =
-                        self.lz_lose(lz, c.unpacked_offset..lz.end, Kind::Decoded { cp, until: lz.plain_len, seed });
+                    let to = lz.walk_end();
+                    let lost = self.lz_lose(lz, c.unpacked_offset..to, Kind::Decoded { cp, until: lz.plain_len, seed });
                     if lost && let Some(p) = lz.parked.take_if(|p| p.cp == Some(cp)) {
                         lz.repairs.last_mut().expect("repair").lane = Some(p);
                     }
@@ -1399,7 +1747,7 @@ impl FeedDecoder {
                     }
                     None => lz.repairs[i].lane.take().unwrap_or_else(|| Lane2::at_cp(cp)),
                 };
-                let stop = match self.lz_step(lz, &mut lane, lost.clone(), lost.end, source, sink)? {
+                let stop = match self.lz_step(lz, &mut lane, lost.clone(), lost.end, false, source, sink)? {
                     Step::Reached => None,
                     Step::Budget => Some(None),
                     Step::Missing { cipher, .. } => Some(Some(cipher)),
