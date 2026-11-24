@@ -597,13 +597,19 @@ impl CrcRuns {
         if bytes.is_empty() || self.broken {
             return;
         }
-        let end = start + bytes.len() as u64;
-        let overlaps = self.runs.range(..end).next_back().is_some_and(|(_, &(e, _))| e > start);
-        if overlaps {
+        self.add_run(start, start + bytes.len() as u64, crc32fast::hash(bytes));
+    }
+
+    /// A run `start..end` whose CRC32 is `crc`, joined with the runs it touches (it must not overlap one).
+    fn add_run(&mut self, start: u64, end: u64, crc: u32) {
+        if start >= end || self.broken {
+            return;
+        }
+        if self.runs.range(..end).next_back().is_some_and(|(_, &(e, _))| e > start) {
             self.broken = true;
             return;
         }
-        let (mut s, mut e, mut crc) = (start, end, crc32fast::hash(bytes));
+        let (mut s, mut e, mut crc) = (start, end, crc);
         if let Some((&ps, &(pe, pc))) = self.runs.range(..start).next_back()
             && pe == start
         {

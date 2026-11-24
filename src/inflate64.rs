@@ -349,6 +349,11 @@ impl Inflater {
         self.blocks
     }
 
+    /// Decoded bytes not handed out yet (a step with little output room leaves some).
+    pub(crate) fn unflushed(&self) -> usize {
+        self.pos - self.flushed
+    }
+
     /// At a block boundary with every decoded byte handed out: the input bits read past it and not used (the
     /// boundary lies that many bits before the end of the input consumed so far). None elsewhere.
     pub(crate) fn boundary(&self) -> Option<u32> {
