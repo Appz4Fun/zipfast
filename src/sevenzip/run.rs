@@ -419,6 +419,7 @@ pub(super) fn print(
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};
@@ -699,7 +700,7 @@ impl Run<'_> {
             // A symbolic link: its verified data is the target.
             let text = std::fs::read(&temporary).map_err(SevenZipError::Io)?;
             let kind = crate::extract::link::LinkKind::Symbolic(text);
-            if let Some(why) = crate::extract::link::refusal(&rel, &kind, &self.extracted) {
+            if let Some(why) = crate::extract::link::refusal_before_place(&rel, &kind, &self.extracted) {
                 self.fail_at(ordinal, &name, why);
                 return Ok(false);
             }

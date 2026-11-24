@@ -40,6 +40,7 @@ pub(super) fn setup(
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     };
     let context = EncryptedReadContext::for_projected(
         &mut s,

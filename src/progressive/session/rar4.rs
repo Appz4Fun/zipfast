@@ -168,6 +168,7 @@ mod tests {
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
+                refused_link_placeholder: false,
             },
             OsString::from("a.rar"),
         )

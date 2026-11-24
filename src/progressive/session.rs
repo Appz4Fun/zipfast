@@ -1174,7 +1174,7 @@ impl ProgressiveSession {
                 Some(Ok(kind)) => {
                     let rel = self.link_rel(&header)?;
                     let extracted = self.output.as_ref().map_or(&self.tested, |output| &output.extracted);
-                    if crate::extract::link::refusal(&rel, &kind, extracted).is_some() {
+                    if crate::extract::link::refusal_before_place(&rel, &kind, extracted).is_some() {
                         return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
                     }
                     self.link_kind = Some(kind);
@@ -1653,7 +1653,9 @@ impl ProgressiveSession {
                     // written mapped as the member names it may point at; an empty target is refused below
                     let text =
                         crate::extract::link::rar4_target(&std::mem::take(&mut self.link_text)).unwrap_or_default();
-                    if !crate::extract::link::contained(&rel, &text) {
+                    // with placeholders the target is checked as the link is placed, after its path
+                    let placeholder = self.output.as_ref().is_some_and(|output| output.extracted.placeholder());
+                    if !placeholder && !crate::extract::link::contained(&rel, &text) {
                         return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
                     }
                     crate::extract::link::LinkKind::Symbolic(text)
@@ -1819,6 +1821,7 @@ mod tests {
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
+                refused_link_placeholder: false,
             },
             "a.rar".into(),
         );
@@ -1944,6 +1947,7 @@ mod tests {
                     compressed_tar: Default::default(),
                     version_naming: Default::default(),
                     preexisting_links: Default::default(),
+                    refused_link_placeholder: false,
                 },
                 "a.rar".into(),
             );

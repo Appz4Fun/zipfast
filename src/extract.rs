@@ -180,6 +180,18 @@ pub struct Options {
     /// while they stay inside the destination (the default, as UnRAR does), or refuse the link whenever its target
     /// passes through one (as 7-Zip does). See [`PreexistingLinks`].
     pub preexisting_links: PreexistingLinks,
+    /// Leave an empty regular file at the path of every symbolic link refused for its target (one that leads out of
+    /// the destination, lexically or through another link, or passes through a link the destination held before
+    /// the run under [`PreexistingLinks::Refuse`]), as 7-Zip 26.06 does ("Dangerous link via another link was
+    /// ignored"). The member is still reported refused (or failed) as without it, and a later member under that
+    /// path then fails, its parent being a file. Off by default: nothing is left.
+    ///
+    /// The placeholder is written as any output file is: its path is checked first (never through a link, under
+    /// the [`Overwrite`] mode, a rename mode's name included, protected paths refused), it is created only where
+    /// nothing is or replaces what is there in one rename, and it is recorded as a file this run wrote. Every
+    /// route that places symbolic links honours it: the whole-archive runners for RAR, 7z, ZIP and tar,
+    /// [`crate::rar5::session::RarSession`] extraction, and progressive sessions. A test run writes nothing.
+    pub refused_link_placeholder: bool,
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -372,6 +384,7 @@ impl MemberRef<'_> {
 ///     compressed_tar: Default::default(),
 ///     version_naming: Default::default(),
 ///     preexisting_links: Default::default(),
+///     refused_link_placeholder: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -3243,28 +3256,60 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
         p.context.link = Some(crate::rar5::Redirection::UnixSymlink(String::from_utf8_lossy(&target).into_owned()));
         // written mapped as the member names it may point at
         let target = link::rar4_target(&target).unwrap_or_default();
-        if !link::contained(&rel, &target) {
+        let placeholder = books.landing.extracted.placeholder();
+        if !placeholder && !link::contained(&rel, &target) {
             let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path };
             return books.fail(&p.context, failure, blocked_message(&RarPolicyReason::LinkTarget));
         }
         // a link the destination held before the run must not carry the target out (a reserved name sits in the
         // same folder, and dropping the place removes it)
         #[cfg(unix)]
-        if let Some(why) = link::foreign_link(books.dest, &place.path, &target, &books.landing.extracted) {
+        if !placeholder
+            && let Some(why) = link::foreign_link(books.dest, &place.path, &target, &books.landing.extracted)
+        {
             let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path.clone() };
             return books.fail(&p.context, failure, why);
         }
-        // a rename mode's reserved file is replaced by the link
-        let (path, replace) = match place.reserved {
-            Some(reserved) => (reserved.into_parts().1, true),
-            None => (place.path, place.replace),
+        // a rename mode's reserved file is replaced by the link (or by the placeholder of a refused one)
+        let (path, replace) = match &place.reserved {
+            Some(reserved) => (reserved.path().to_path_buf(), true),
+            None => (place.path.clone(), place.replace),
         };
-        if let Err(e) = link::create(&path, &target, replace, c.meta.modified()) {
-            return Err(
-                books.terminal(&p.context, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false))
-            );
+        let kind = link::LinkKind::Symbolic(target);
+        let made = if placeholder {
+            link::make_or_stand_in(
+                books.dest,
+                &rel,
+                &kind,
+                &books.landing.extracted,
+                &path,
+                replace,
+                c.meta.modified(),
+                &mut |_| Ok(()),
+            )
+        } else {
+            let link::LinkKind::Symbolic(target) = &kind else { unreachable!() };
+            link::create(&path, target, replace, c.meta.modified()).map(|()| None)
+        };
+        let refused_with = match made {
+            Ok(refused_with) => refused_with,
+            Err(e) => {
+                return Err(
+                    books.terminal(&p.context, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false))
+                );
+            }
+        };
+        if let Some(reserved) = place.reserved {
+            let _ = reserved.into_parts();
         }
-        link::placed(books.dest, &rel, &link::LinkKind::Symbolic(target), &path, &mut books.landing.extracted);
+        if let Some(why) = refused_with {
+            // the placeholder is the run's own file, and the member is refused as without it
+            link::stood_in(books.dest, &rel, &path, &mut books.landing.extracted);
+            let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path };
+            let why = if why == link::UNSAFE_TARGET { blocked_message(&RarPolicyReason::LinkTarget) } else { why };
+            return books.fail(&p.context, failure, why);
+        }
+        link::placed(books.dest, &rel, &kind, &path, &mut books.landing.extracted);
     }
     books.landing.verified(books.dest, p.context.entry.order);
     let drained = if books.reports.typed() { books.catch_up_for_completion() } else { Ok(()) };
@@ -3573,6 +3618,7 @@ fn rar_read_at(
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -3910,7 +3956,7 @@ impl Run<'_, '_, '_> {
     ) -> RunResult<()> {
         self.drain()?;
         let refusal = match &kind {
-            Ok(kind) => link::refusal(rel, kind, &self.landing.extracted),
+            Ok(kind) => link::refusal_before_place(rel, kind, &self.landing.extracted),
             Err(_) => Some(link::HARD_TARGET),
         };
         if let Some(why) = refusal {
@@ -3971,6 +4017,8 @@ impl Run<'_, '_, '_> {
                 if let Some(why) = link::member_failure(&e) {
                     let failure = if e.kind() == io::ErrorKind::Unsupported {
                         RarFailure::Unsupported(RarUnsupported::Redirection { kind: redirection_kind(h) })
+                    } else if matches!(kind, link::LinkKind::Symbolic(_)) {
+                        RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path }
                     } else {
                         RarFailure::Policy { reason: RarPolicyReason::HardLinkTarget, path }
                     };

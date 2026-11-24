@@ -734,11 +734,18 @@ impl ProjectedReadSession {
         let kind = link::LinkKind::Symbolic(text);
         // ZIP holds no hard links, so the run records only the symbolic links it placed
         // testing checks the target as extracting would
-        if let Some(why) = link::refusal(&rel, &kind, extracted) {
+        if let Some(why) = link::refusal_before_place(&rel, &kind, extracted) {
             return refuse(why);
         }
         if options.mode != Mode::Extract {
             return (Ok(()), false, false);
+        }
+        // the destination root is made as for a file (following a root alias, as `create_dir_all` does) when a link,
+        // or a refused link's placeholder, is the first output of the run
+        if let Err(error) = std::fs::create_dir_all(&options.dest) {
+            let fault =
+                ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Directory, offset: 0, error };
+            return (Err(fault.into()), false, false);
         }
         let mut renamed = None;
         let mut budget = crate::extract::RenameBudget::default();

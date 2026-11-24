@@ -587,6 +587,7 @@ impl RangeSource for GrowingFileSource {
 ///     compressed_tar: Default::default(),
 ///     version_naming: Default::default(),
 ///     preexisting_links: Default::default(),
+///     refused_link_placeholder: false,
 /// };
 /// let options = ProgressiveOptions::new(extract, volumes.first_name().to_owned());
 /// let mut session = ProgressiveSession::new(Box::new(volumes), options)?;

@@ -1249,7 +1249,7 @@ pub(crate) fn run_renaming(
                 }
                 // testing checks the target as extracting would
                 let kind = crate::extract::link::LinkKind::Symbolic(text);
-                if let Some(why) = crate::extract::link::refusal(&rel, &kind, &extracted) {
+                if let Some(why) = crate::extract::link::refusal_before_place(&rel, &kind, &extracted) {
                     fail(&mut summary, report, member, why);
                     continue;
                 }

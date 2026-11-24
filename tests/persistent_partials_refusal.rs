@@ -176,6 +176,7 @@ fn extract_options(dest: &Path, first: OsString) -> ProgressiveOptions {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         },
         first,
     )

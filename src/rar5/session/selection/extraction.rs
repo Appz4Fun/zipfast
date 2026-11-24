@@ -72,7 +72,12 @@ pub(super) struct DirectoryOutput {
 
 impl<'a> Extraction<'a> {
     pub(super) fn new(options: &'a Options) -> Self {
-        Self { options, versions: false, dirs: Vec::new(), extracted: crate::extract::link::Extracted::new(options) }
+        Self {
+            options,
+            versions: false,
+            dirs: Vec::new(),
+            extracted: crate::extract::link::Extracted::for_output(options),
+        }
     }
 
     fn member(
@@ -181,7 +186,7 @@ impl<'a> Extraction<'a> {
         let link = match link {
             Some(Ok(kind)) => {
                 let selected = selected_relative(&relative, self.options.flatten);
-                match crate::extract::link::refusal(selected, &kind, &self.extracted) {
+                match crate::extract::link::refusal_before_place(selected, &kind, &self.extracted) {
                     None => Some(Some(kind)),
                     Some(_) => {
                         let reason = match kind {
@@ -403,7 +408,8 @@ impl<'a> Extraction<'a> {
                 };
                 // written mapped as the member names it may point at; an empty target is refused below
                 let text = link::rar4_target(&text).unwrap_or_default();
-                if !link::contained(relative, &text) {
+                // with placeholders the target is checked as the link is placed, after its path
+                if !self.extracted.placeholder() && !link::contained(relative, &text) {
                     return Err(policy(RarPolicyReason::LinkTarget, target.to_path_buf()).into());
                 }
                 (link::LinkKind::Symbolic(text), bytes, checks)
@@ -424,14 +430,30 @@ impl<'a> Extraction<'a> {
         }
         let dest = &self.options.dest;
         let modified = self.options.meta(Meta::from(&session.model.members[index].header)).modified();
-        let create = |path: &Path, replace: bool| link::make(dest, &kind, &self.extracted, path, replace, modified);
+        // a refused symbolic link leaves its placeholder where the link would have gone, with placeholders on
+        let stood_in = std::cell::Cell::new(None);
+        let create = |path: &Path, replace: bool| {
+            let made = link::make_or_stand_in(
+                dest,
+                relative,
+                &kind,
+                &self.extracted,
+                path,
+                replace,
+                modified,
+                &mut |_| Ok(()),
+            );
+            made.map(|refused_with| stood_in.set(stood_in.get().or(refused_with)))
+        };
         // a hard link's or copy's earlier file gone or changed fails this member only
         let failed = |path: &Path, source: io::Error| -> Arc<RarFailure> {
             match link::member_failure(&source) {
                 Some(_) if source.kind() == io::ErrorKind::Unsupported => {
                     Arc::new(RarFailure::Unsupported(RarUnsupported::Rar4Feature("symbolic link")))
                 }
-                Some(link::FOREIGN_LINK | link::LINK_LEAVES) => policy(RarPolicyReason::LinkTarget, path.to_path_buf()),
+                Some(link::FOREIGN_LINK | link::LINK_LEAVES | link::UNSAFE_TARGET) => {
+                    policy(RarPolicyReason::LinkTarget, path.to_path_buf())
+                }
                 Some(_) => policy(RarPolicyReason::HardLinkTarget, path.to_path_buf()),
                 None => output_fault(IoOperation::Publish, path, source),
             }
@@ -489,9 +511,17 @@ impl<'a> Extraction<'a> {
                 }
             }
         })();
+        let stood_in = stood_in.get();
+        // what was placed is a placeholder file when the link was refused
+        let placed = if stood_in.is_some() { PlacedLink::Placeholder } else { placed };
         // also after a failure: staging a hard link may have touched the earlier file
         hooks.linked(index, target, placement.as_deref().ok(), placed);
         let landed = placement?;
+        if stood_in.is_some() {
+            // the placeholder is a file this run wrote; the member is refused as without it
+            link::stood_in(&self.options.dest, relative, &landed, &mut self.extracted);
+            return Err(policy(RarPolicyReason::LinkTarget, target.to_path_buf()).into());
+        }
         link::placed(&self.options.dest, relative, &kind, &landed, &mut self.extracted);
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
     }
@@ -791,6 +821,9 @@ pub(super) enum PlacedLink<'a> {
     Hard { source: Option<(u64, u64)> },
     /// A copy of a file this run extracted.
     Copy,
+    /// The empty regular file a refused symbolic link leaves with
+    /// [`crate::extract::Options::refused_link_placeholder`].
+    Placeholder,
 }
 struct LegacyHooks;
 impl ExtractionHooks for LegacyHooks {
@@ -919,6 +952,7 @@ mod tests {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         }
     }
 

@@ -299,6 +299,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             compressed_tar: Default::default(),
                             version_naming: Default::default(),
                             preexisting_links: Default::default(),
+                            refused_link_placeholder: false,
                         },
                         Some("password"),
                         |_| {},

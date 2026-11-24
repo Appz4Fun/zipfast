@@ -96,6 +96,7 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         };
         let error = extract::run_with_zip_policy(
             &first,
@@ -423,6 +424,7 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
+                refused_link_placeholder: false,
             };
             let result = extract::run_with_zip_policy(
                 &path,
@@ -693,6 +695,7 @@ mod direct_completion {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         }
     }
     #[test]
@@ -855,6 +858,7 @@ mod direct_aliases {
                     compressed_tar: Default::default(),
                     version_naming: Default::default(),
                     preexisting_links: Default::default(),
+                    refused_link_placeholder: false,
                 };
                 let log_path = match alias {
                     0 => source.clone(),
@@ -968,6 +972,7 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         };
         macro_rules! refuse_completion {
             ($session:ident,$context:ident,$token:expr,$admit:expr,$emit:ident) => {{
@@ -1100,6 +1105,7 @@ mod protected_name_completion {
                             compressed_tar: Default::default(),
                             version_naming: Default::default(),
                             preexisting_links: Default::default(),
+                            refused_link_placeholder: false,
                         };
                         let output = || {
                             if extract {

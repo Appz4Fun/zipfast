@@ -25,6 +25,7 @@ fn extract_to(bytes: &[u8], dir: &std::path::Path) -> Vec<String> {
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     };
     extract::run_with_password(&rar, &options, None, |_| {}).unwrap();
     let mut names: Vec<String> =
