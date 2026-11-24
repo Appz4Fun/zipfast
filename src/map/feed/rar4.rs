@@ -124,7 +124,9 @@ impl FeedDecoder {
             Begin::Rar4 if run.prev.is_some() => true,
             _ => return Err(FeedError::Handoff("a hand-off from another layer or place")),
         };
-        let (geometry, stream_len, cipher, frame) = Self::rar4_parts(member, &options)?;
+        // one budget for every key this decoder derives: its member's and the earlier members' it decodes again
+        let usage = Usage::new(options.limits.clone());
+        let (geometry, stream_len, cipher, frame) = Self::rar4_parts(member, &options, &usage)?;
         // a solid stream's decoder holds the largest window its members ask for
         let dictionary = match run.dictionary {
             Some(most) if run.successor || run.prev.is_some() => most.max(frame.dictionary),
@@ -139,7 +141,7 @@ impl FeedDecoder {
         if !handed && run.prev.is_some() {
             let decodes = |m: &MapMember| !m.is_dir && matches!(m.method, MapMethod::Compressed { .. });
             for m in map.members[run.first..index].iter().filter(|m| decodes(m)) {
-                let (geometry, stream_len, cipher, frame) = Self::rar4_parts(m, &options)?;
+                let (geometry, stream_len, cipher, frame) = Self::rar4_parts(m, &options, &usage)?;
                 let size = m.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
                 prefix.push(Pre { geometry, stream_len, cipher, size, frame });
             }
@@ -205,6 +207,7 @@ impl FeedDecoder {
     fn rar4_parts(
         member: &MapMember,
         options: &FeedOptions,
+        usage: &Usage,
     ) -> Result<(Geometry, u64, StoredCipher, CoreFrame), FeedError> {
         if !member.complete {
             return Err(FeedError::IncompleteMember);
@@ -237,13 +240,12 @@ impl FeedDecoder {
                 if !stream_len.is_multiple_of(16) {
                     return Err(FeedError::Malformed("an encrypted packed stream is not whole blocks"));
                 }
-                let usage = Usage::new(options.limits.clone());
                 let keys = derive_keys(
                     member,
                     OutputMapping::CbcBlocks,
                     options.password.as_deref(),
                     &options.limits,
-                    &usage,
+                    usage,
                     &options.control,
                 )
                 .map_err(FeedError::from_extract)?;
@@ -294,6 +296,8 @@ impl FeedDecoder {
         let frame = next.rar4.as_ref().expect("RAR 4.x state").frame;
         dec.next_solid_member(frame)
             .map_err(|_| FeedError::Handoff("the RAR 4.x decoder does not go on into this member"))?;
+        // canceled through the new member's session control from now on, not the earlier member's
+        dec.set_cancel(Some(next.options.control.cancellation_token()));
         next.rar4.as_mut().expect("RAR 4.x state").dec = Some(dec);
         next.inherit(suspect);
         Ok(next)

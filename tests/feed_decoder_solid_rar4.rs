@@ -309,3 +309,95 @@ fn a_failed_rar4_hand_off_keeps_the_decoder() {
     // handed the decoder: nothing before the member decoded again
     assert_eq!(d1.stats().redecoded, 0);
 }
+
+/// Rewrites a RAR 3.x archive as `rar -p` would have written it: each file header gains a salt and the encryption
+/// flag, and each member's packed data is padded to whole AES blocks and encrypted with the keys for `password` and
+/// that salt.
+fn encrypt_rar4(archive: &[u8], password: &str, salt: [u8; 8]) -> Vec<u8> {
+    let (key, iv) = zipfast::crypto::derive_rar4_key_iv(password, &salt);
+    let mut out = archive[..7].to_vec();
+    let mut at = 7;
+    while at + 7 <= archive.len() {
+        let kind = archive[at + 2];
+        let flags = u16::from_le_bytes([archive[at + 3], archive[at + 4]]);
+        let size = usize::from(u16::from_le_bytes([archive[at + 5], archive[at + 6]]));
+        let mut header = archive[at..at + size].to_vec();
+        let data_len = if kind == 0x74 || flags & 0x8000 != 0 {
+            u32::from_le_bytes(archive[at + 7..at + 11].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        let mut data = archive[at + size..at + size + data_len].to_vec();
+        if kind == 0x74 {
+            assert_eq!(flags & 0x100, 0, "no high sizes in these fixtures");
+            let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
+            header.splice(32 + name_len..32 + name_len, salt);
+            header[3..5].copy_from_slice(&(flags | 0x404).to_le_bytes());
+            header[5..7].copy_from_slice(&((size + 8) as u16).to_le_bytes());
+            data.resize(data.len().next_multiple_of(16), 0);
+            data = zipfast::crypto::encrypt_cbc(&key, &iv, &data).unwrap();
+            header[7..11].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            let crc = crc32fast::hash(&header[2..]) as u16;
+            header[..2].copy_from_slice(&crc.to_le_bytes());
+        }
+        out.extend(header);
+        out.extend(data);
+        at += size + data_len;
+    }
+    out
+}
+
+/// One key-derivation budget covers every key a decoder derives: a successor decoding two encrypted earlier members
+/// again derives three keys, which a session budget of two and a half refuses (each alone fits).
+#[test]
+fn a_successor_charges_every_key_it_derives_to_one_budget() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-rar300");
+    let plain = std::fs::read(root.join("solid_rar300.rar")).unwrap();
+    let bytes = encrypt_rar4(&plain, "secret", *b"saltsalt");
+    let map = MemberMap::from_memory(&[&bytes], "solid_rar300.rar", Some("secret")).unwrap();
+    let stream = streams(&map).into_iter().next().expect("a solid stream");
+    assert_eq!(stream.len(), 3);
+    assert!(stream.iter().all(|&i| map.members[i].encrypted));
+    let last = *stream.last().unwrap();
+    // decodes with the default budget
+    assert!(reference(&map, last, std::slice::from_ref(&bytes), Some("secret")).is_some());
+    // a RAR 3.x key ("secret", 8-byte salt) costs about 94,000 blocks
+    let limited = || {
+        let mut o = FeedOptions::new(Some("secret"));
+        o.limits.kdf_session_blocks = 250_000;
+        o
+    };
+    assert!(FeedDecoder::new(&map, stream[0], limited()).is_ok());
+    assert!(matches!(FeedDecoder::new(&map, last, limited()), Err(FeedError::Key(_))));
+}
+
+/// A handed-over decoder answers to the new member's session control: canceling the earlier member's after the
+/// hand-off leaves the new one running.
+#[test]
+fn a_handed_over_rar4_decoder_follows_the_new_members_control() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-rar300");
+    let bytes = std::fs::read(root.join("solid_rar300.rar")).unwrap();
+    let map = MemberMap::from_memory(&[&bytes], "solid_rar300.rar", None).unwrap();
+    let stream = streams(&map).into_iter().next().expect("a solid stream");
+    let last = *stream.last().unwrap();
+    let plain = reference(&map, last, std::slice::from_ref(&bytes), None).expect("it decodes");
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &bytes).unwrap();
+    let first = FeedOptions::default();
+    let mut controls = vec![first.control.clone()];
+    let mut d = FeedDecoder::new(&map, stream[0], first).unwrap();
+    for &i in &stream[1..] {
+        assert!(d.run(&mut source, &mut Out::new(d.size() as usize)).unwrap().done);
+        let options = FeedOptions::default();
+        controls.push(options.control.clone());
+        d = d.next_solid(&map, i, options).unwrap();
+    }
+    // every earlier member's control: the decoder was started under the first one's
+    for c in &controls[..controls.len() - 1] {
+        c.cancel();
+    }
+    let mut out = Out::new(plain.len());
+    let s = d.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert_eq!(out.bytes, plain);
+}

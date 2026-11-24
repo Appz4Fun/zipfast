@@ -272,11 +272,12 @@ after it) is not taken; the last block before it is.
 
 **RAR 4.x.** The decoder (window, tables, distances, PPMd model, filters) goes on into the next member: each member's
 end-of-file marker is read past its output and says where the next starts. The successor is set up (keys, limits)
-before the decoder leaves the member before it, so a hand-off that fails there can be tried again. A successor that was not handed the
+before the decoder leaves the member before it, so a hand-off that fails there can be tried again; the handed decoder
+is canceled through the new member's `FeedOptions::control` from then on. A successor that was not handed the
 decoder (`FeedDecoder::new`, or `restore` from a snapshot) **decodes the stream again from its first member**,
 writing nothing before its own member: those members' packed bytes are asked for again (`Next` needs, members
-released one by one as they are passed), their keys derived again (one RAR 3.x key derivation per encrypted
-member), and their output counted in `redecoded`, so a restore costs the stream's output up to the snapshot's frontier
+released one by one as they are passed), their keys derived again (one RAR 3.x key derivation per encrypted member,
+all charged to the one session budget, `ProgressiveLimits::kdf_session_blocks`), and their output counted in `redecoded`, so a restore costs the stream's output up to the snapshot's frontier
 (`stream_start() + frontier`). While it decodes them again its frontier (and a snapshot's) stays where its own
 output stands. There is no restart point inside a RAR 4.x member, so nothing cheaper exists without
 the decoder's state; keep the session (and the hand-off) alive across a set where you can.
