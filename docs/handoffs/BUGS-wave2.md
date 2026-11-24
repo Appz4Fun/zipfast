@@ -1,7 +1,7 @@
 # BUGS-wave2
 
 Status: PR open, awaiting cleanroom review (not merged by design).
-Branch: bugs-wave2. Worktree: /Users/allen/git.xbmc4lyfe/zipfast-bugs2. PR: see below.
+Branch: bugs-wave2. Worktree: /Users/allen/git.xbmc4lyfe/zipfast-bugs2. PR: #263.
 
 Done (all in 66bb6bc5):
 1. last_volume.rs: SetIdentitySteps now counts every Key comparison (Key::eq), so a linear scan is visible.
