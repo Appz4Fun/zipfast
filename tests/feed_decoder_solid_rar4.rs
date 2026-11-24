@@ -401,3 +401,31 @@ fn a_handed_over_rar4_decoder_follows_the_new_members_control() {
     assert!(s.done && s.crc_ok == Some(true), "{s:?}");
     assert_eq!(out.bytes, plain);
 }
+
+/// A hand-off to another archive's member at the same place (here the same stream rewritten with a password) is
+/// refused, and the decoder stays for the right one.
+#[test]
+fn a_rar4_hand_off_into_another_archive_is_refused() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-rar300");
+    let bytes = std::fs::read(root.join("solid_rar300.rar")).unwrap();
+    let other = encrypt_rar4(&bytes, "secret", *b"saltsalt");
+    let map = MemberMap::from_memory(&[&bytes], "solid_rar300.rar", None).unwrap();
+    let other_map = MemberMap::from_memory(&[&other], "solid_rar300.rar", Some("secret")).unwrap();
+    let stream = streams(&map).into_iter().next().expect("a solid stream");
+    assert_eq!(streams(&other_map).into_iter().next(), Some(stream.clone()));
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &bytes).unwrap();
+    let mut d0 = FeedDecoder::new(&map, stream[0], FeedOptions::default()).unwrap();
+    assert!(d0.run(&mut source, &mut Out::new(d0.size() as usize)).unwrap().done);
+    assert!(matches!(
+        d0.next_solid(&other_map, stream[1], FeedOptions::new(Some("secret"))),
+        Err(FeedError::Handoff(_))
+    ));
+    let plain = reference(&map, stream[1], std::slice::from_ref(&bytes), None).expect("it decodes");
+    let mut d1 = d0.next_solid(&map, stream[1], FeedOptions::default()).unwrap();
+    let mut out = Out::new(plain.len());
+    let s = d1.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+    assert_eq!(out.bytes, plain);
+    assert_eq!(d1.stats().redecoded, 0);
+}

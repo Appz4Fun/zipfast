@@ -273,7 +273,8 @@ after it) is not taken; the last block before it is.
 **RAR 4.x.** The decoder (window, tables, distances, PPMd model, filters) goes on into the next member: each member's
 end-of-file marker is read past its output and says where the next starts. The successor is set up (keys, limits)
 before the decoder leaves the member before it, so a hand-off that fails there can be tried again; the handed decoder
-is canceled through the new member's `FeedOptions::control` from then on. A successor that was not handed the
+is canceled through the new member's `FeedOptions::control` from then on. A map whose member before `index` is not
+this decoder's member (another archive's) is refused (`Handoff`), keeping the decoder. A successor that was not handed the
 decoder (`FeedDecoder::new`, or `restore` from a snapshot) **decodes the stream again from its first member**,
 writing nothing before its own member: those members' packed bytes are asked for again (`Next` needs, members
 released one by one as they are passed), their keys derived again (one RAR 3.x key derivation per encrypted member,

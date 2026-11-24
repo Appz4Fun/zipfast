@@ -280,8 +280,15 @@ impl FeedDecoder {
         if index >= map.members.len() {
             return Err(FeedError::NoSuchMember { index });
         }
-        if solid_run(map, index)?.prev != Some(self.index) {
-            return Err(FeedError::Handoff("not the next member of the solid stream"));
+        let run = solid_run(map, index)?;
+        // the member before it in `map` must be this decoder's member, at this place in the stream: another
+        // archive's member at the same index is not
+        let prev_start = run.starts.len().checked_sub(2).map(|i| run.starts[i]);
+        if run.prev != Some(self.index)
+            || prev_start != Some(self.stream_start)
+            || solid_identity(&map.members[self.index], self.stream_start) != self.identity
+        {
+            return Err(FeedError::Handoff("not the next member of this decoder's solid stream"));
         }
         if self.rar4.as_ref().expect("RAR 4.x state").ended.is_none() {
             return Err(FeedError::Handoff(
