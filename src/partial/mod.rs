@@ -54,6 +54,8 @@ mod writer;
 pub use writer::FillWriter;
 mod direct;
 pub use direct::{DirectMember, DirectOptions, DirectOrigin, DirectPartials, DirectSink};
+mod solid_sink;
+pub use solid_sink::{SolidStreamSink, StreamSlot, stream_slots};
 
 #[derive(Clone)]
 pub struct PartialFile {

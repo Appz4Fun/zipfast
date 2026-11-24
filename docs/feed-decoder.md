@@ -352,6 +352,11 @@ next member in the map, also a zero-length one at the folder's end; a zero-lengt
 its key). The next member is set up (keys, limits) before the state leaves the member before it, so a hand-off that
 fails there can be tried again.
 
+A solid member started in a later process ([`FeedDecoder::resume_solid`], or a restored successor whose window
+reaches back past its start) reads the earlier members' output through [`FeedSink::read_earlier`]. With persistent
+partials, `zipfast::partial::SolidStreamSink` provides it over the members' direct partials (stream offsets mapped
+to member and offset by `stream_start`); see `docs/persistent-partials.md` ("Solid streams").
+
 ## Saving and restoring
 
 `snapshot()` captures the decoder between runs: the main decode's position (under CBC its block and that block's
