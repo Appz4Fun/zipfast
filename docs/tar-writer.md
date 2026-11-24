@@ -11,7 +11,7 @@ let sink = w.finish()?;                  // two zero blocks, padded to the recor
 
 - `TarEntry` is a stat-like description (path bytes, kind, mode, uid/gid, names, mtime and nanoseconds, size, link
   target, device numbers). Kinds: file, dir, symlink, hard link, char/block device, FIFO, and a reserved `Sparse`
-  (appending it is an error until the sparse writer exists).
+  (appending it writes GNU `S` or pax 1.0 sparse members).
 - `TarWriterOptions`: `format` (`Gnu` default, `Ustar`, `Pax`), `blocking_factor` (`-b`, default 20),
   `owner`/`group` (`--owner`/`--group` NAME:ID), `mtime` (`--mtime`), `numeric_owner`.
 - Gnu: `ustar  \0` magic, `././@LongLink` `L`/`K` members for names and link targets over 100 bytes (K first),
@@ -48,3 +48,24 @@ Proof: `tests/tar_writer.rs` compares against archives made by GNU tar 1.35 in d
 
 Not done: sparse files, `repack` still uses its own private writer (a different, pax/ustar
 dialect with fixed ownership), and pax overflow of device numbers (an error).
+
+## Sparse members (WP-B1b)
+
+`TarEntryKind::Sparse` with `entry.size` the apparent size and `entry.sparse` the data segments `(offset, length)`
+(ascending, non-empty, not overlapping, inside `size`); the caller supplies only the segments' bytes, back to back
+(`append` reads that many; `write_data` takes them in any chunks). Segments are validated; ustar is an error.
+
+- Gnu: old GNU header type `S`: four map entries in the header, 21 per extension block, `isextended` at byte 482,
+  real size at 483. The size field is the stored data. A zero-length entry at the apparent size always ends the map
+  (GNU tar writes it even when data runs to the end of the file). Long names use `L` first.
+- Pax: version 1.0, which is GNU tar 1.35's default for `--sparse` (byte-identical to `--sparse-version=1.0`). An
+  `x` header with `GNU.sparse.major=1`, `minor=0`, `name`, `realsize` (then uid, mtime etc. as for any member, and no
+  `path`), then a data header named `<dir>/GNUSparseFile.<pid>/<base>` cut to 100 bytes, whose data starts with the
+  map (`n\n`, then offset and length lines, padded to a block). `TarWriterOptions::sparse_pid` pins the pid
+  (default: this process), because GNU tar puts its own pid there.
+- Versions 0.0 and 0.1 are not written.
+
+References: `tests/fixtures/tar-writer/sparse-gnu.tar` and `sparse-pax10.tar`, made by `make-sparse.sh` from real
+sparse files (one hole, 6 and 30 segments, hole at the end or the start, partial last block, all hole, long name with
+a big uid and fractional mtime). The data granularity is the file system's 4096-byte block, which GNU tar's maps
+follow. `tests/tar_writer_sparse.rs` asserts byte equality and extracts both through zipfast's tar reader.
