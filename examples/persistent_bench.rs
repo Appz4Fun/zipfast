@@ -268,6 +268,7 @@ fn persistent(set: &Path, work: &Path, volumes: u32, size: u64) -> f64 {
         control: SessionControl::default(),
     };
     let syncs = durable_sync_count();
+    let lstats = exclusion_lstat_count();
     let start = Instant::now();
     let mut session = ProgressiveSession::new_partial(
         Box::new(Provider { dir: set.into(), volumes }),
@@ -280,11 +281,12 @@ fn persistent(set: &Path, work: &Path, volumes: u32, size: u64) -> f64 {
     let elapsed = start.elapsed().as_secs_f64();
     let gib = size as f64 / (1u64 << 30) as f64;
     let syncs = durable_sync_count() - syncs;
+    let lstats = exclusion_lstat_count() - lstats;
     let cas = anchors.cas.load(Ordering::Relaxed);
     let current = anchors.current.load(Ordering::Relaxed);
     println!(
         "persistent counts: zipfast syncs {syncs} ({:.0}/GiB), anchor CAS {cas} ({:.0}/GiB), anchor current {current} \
-         ({:.0}/GiB); anchor-store syncs (2 per CAS, 1 per current) {:.0}/GiB",
+         ({:.0}/GiB); anchor-store syncs (2 per CAS, 1 per current) {:.0}/GiB; exclusion lstats {lstats}",
         syncs as f64 / gib,
         cas as f64 / gib,
         current as f64 / gib,

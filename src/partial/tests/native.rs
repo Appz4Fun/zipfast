@@ -320,6 +320,42 @@ fn a_parent_swap_inside_an_open_group_refuses_the_next_write() {
     assert!(file.core.write_original(4, &DATA[4..8]).is_err());
     assert_eq!(fs::read(f.output()).unwrap(), b"replacement");
 }
+// Catches the exclusion registry re-proving every entry's directories (two lstats each) on every source read, and a
+// cached proof outliving the points that must re-prove it: an anchor change, a volume admission, a path check. A
+// directory renamed while the proof is cached is still caught before the group that wrote under it commits.
+#[test]
+fn the_exclusion_directory_proof_is_cached_until_an_anchor_change_or_authority_point() {
+    use crate::partial::native::PROOF_LSTATS;
+    let lstats = || PROOF_LSTATS.with(|c| c.get());
+    let f = Fixture::new();
+    let file = f.create().unwrap();
+    let exclusions = &file.core.budget.exclusions;
+    exclusions.check_input(&[], &[]).unwrap();
+    let proven = lstats();
+    for _ in 0..100 {
+        exclusions.check_input(&[], &[]).unwrap();
+    }
+    assert_eq!(lstats(), proven, "reads share one proof");
+    // The group's intent is an anchor change.
+    file.core.write_original(0, &DATA[..4]).unwrap();
+    exclusions.check_input(&[], &[]).unwrap();
+    let after_intent = lstats();
+    assert!(after_intent > proven, "an anchor change expires the proof");
+    exclusions.check_input(&[], &[]).unwrap();
+    assert_eq!(lstats(), after_intent);
+    exclusions.expire_proof();
+    exclusions.check_input(&[], &[]).unwrap();
+    assert!(lstats() > after_intent, "an admission re-proves");
+    let anchored = file.core.anchors.current().unwrap();
+    fs::rename(f.dir.path().join("out"), f.dir.path().join("old-out")).unwrap();
+    fs::create_dir(f.dir.path().join("out")).unwrap();
+    assert!(exclusions.check_input(&[], &[]).is_ok(), "a read inside the proof does not look");
+    assert!(exclusions.check_input(&[f.dir.path().join("elsewhere")], &[]).is_err(), "a path check proves");
+    exclusions.expire_proof();
+    assert!(exclusions.check_input(&[], &[]).is_err(), "an admission proves");
+    assert!(file.state().is_err(), "the group's commit is refused");
+    assert_eq!(file.core.anchors.current().unwrap(), anchored, "nothing written after the rename is anchored");
+}
 // Catches every write in a group paying the full protection check (a realpath per protected path): writes after the
 // group opened run only the held-file checks, and the group's commit runs the full check again.
 #[test]

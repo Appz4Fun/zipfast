@@ -194,6 +194,13 @@ static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 pub fn durable_sync_count() -> u64 {
     SYNCS.load(Ordering::Relaxed)
 }
+/// Path `lstat`s the exclusion registry issued in this process to re-prove its directory facts (see
+/// `PartialExclusions::check_input_revision`). For benchmarks and diagnostics.
+static EXCLUSION_LSTATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub fn exclusion_lstat_count() -> u64 {
+    EXCLUSION_LSTATS.load(Ordering::Relaxed)
+}
 fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
     SYNCS.fetch_add(1, Ordering::Relaxed);
     file.sync_all()
