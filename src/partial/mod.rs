@@ -962,20 +962,40 @@ impl PartialCore {
         let mut applied = Vec::new();
         let mut undecryptable = Vec::new();
         let mut kept = Vec::new();
-        for ((packed, stream), decrypted) in segments.iter().zip(&decryptions) {
-            undecryptable.extend(decrypted.undecryptable.iter().cloned());
-            for (out, plain) in &decrypted.runs {
-                applied.extend(self.group_write(op, *out, &decrypted.plain[plain.clone()], FillMode::Packed)?);
+        let outcome = (|| -> PartialResult<()> {
+            for ((packed, stream), decrypted) in segments.iter().zip(&decryptions) {
+                undecryptable.extend(decrypted.undecryptable.iter().cloned());
+                for (out, plain) in &decrypted.runs {
+                    applied.extend(self.group_write(op, *out, &decrypted.plain[plain.clone()], FillMode::Packed)?);
+                }
+                let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
+                kept.extend(cipher::keep(&self.budget, &op.snapshot, *stream, slice)?);
             }
-            let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
-            kept.extend(cipher::keep(&self.budget, &op.snapshot, *stream, slice)?);
-        }
-        if !kept.is_empty() {
-            if op.group.is_none() {
-                // Nothing was written (every run was known output): the blocks still need a group to join.
-                self.begin_group(op)?;
+            if !kept.is_empty() {
+                if op.group.is_none() {
+                    // Nothing was written (every run was known output): the blocks still need a group to join.
+                    self.begin_group(op)?;
+                }
+                cipher::merge(&self.budget, &mut op.snapshot.cipher, &kept)?;
             }
-            cipher::merge(&self.budget, &mut op.snapshot.cipher, &kept)?;
+            Ok(())
+        })();
+        if let Err(mut error) = outcome {
+            // Output applied before the failure is in the group (durable once it commits, as for the success
+            // return): report it, like `fill_packed` does.
+            if !applied.is_empty() && error.packed_progress.is_none() {
+                error.packed_progress = Some(Box::new(PackedFillResult {
+                    revision: op.snapshot.head.revision,
+                    applied,
+                    corrected: Vec::new(),
+                    unmapped,
+                    undecryptable,
+                    state: op.state.clone(),
+                    part_checks: Vec::new(),
+                    needs_verification: true,
+                }));
+            }
+            return Err(error);
         }
         Ok(Some(PackedFillResult {
             revision: op.snapshot.head.revision,

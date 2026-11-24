@@ -482,8 +482,10 @@ fn an_article_sized_hole_waits_and_resumes_without_decoding_twice() {
     let refs = [archive.as_slice()];
     let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
     let article = 750_000usize;
-    let hole = (archive.len() / 3 / article * article)..(archive.len() / 3 / article * article + article);
-    let hole = hole.start as u64..hole.end.min(archive.len()) as u64;
+    // the second article of the archive: an interior boundary, with a nonempty prefix before it (the archive is
+    // about 1.7 MB, so a boundary computed from a third of its length would be 0)
+    assert!(archive.len() > 2 * article, "the archive has an interior article");
+    let hole = article as u64..(2 * article).min(archive.len()) as u64;
     let mut source = ArticleBuffer::new(usize::MAX);
     source.insert(0, 0, &archive[..hole.start as usize]).unwrap();
     source.insert(0, hole.end, &archive[hole.end as usize..]).unwrap();
@@ -493,6 +495,7 @@ fn an_article_sized_hole_waits_and_resumes_without_decoding_twice() {
     let s = d.run(&mut source, &mut out).unwrap();
     assert!(s.stalled || !s.needs.is_empty(), "{s:?}");
     let before = out.written;
+    assert!(before > 0, "the prefix before the hole was decoded and written: {s:?}");
     assert!(before < plain.len() as u64);
     source.insert(0, hole.start, &archive[hole.start as usize..hole.end as usize]).unwrap();
     let s = d.run(&mut source, &mut out).unwrap();
