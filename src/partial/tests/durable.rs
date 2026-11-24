@@ -1,0 +1,152 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+use super::state::Fixture;
+use crate::partial::*;
+use crate::progressive::*;
+use std::sync::{Arc, Mutex};
+
+/// An in-memory anchor store that records, at each CAS, how many syncs of this thread no device flush covers.
+#[derive(Default)]
+struct Checking {
+    value: Mutex<Option<StateAnchor>>,
+    cas: Mutex<Vec<usize>>,
+}
+impl StateAnchorStore for Checking {
+    fn current(&self, _: &MemberKey) -> PartialResult<Option<StateAnchor>> {
+        Ok(self.value.lock().unwrap().clone())
+    }
+    fn compare_exchange(&self, _: &MemberKey, expected: Option<&StateAnchor>, next: &StateAnchor) -> PartialResult<()> {
+        self.cas.lock().unwrap().push(durable::unflushed_here());
+        let mut value = self.value.lock().unwrap();
+        if value.as_ref() != expected {
+            return Err(err(PartialErrorKind::AnchorConflict));
+        }
+        *value = Some(next.clone());
+        Ok(())
+    }
+}
+
+// Catches an anchor CAS that runs while a sync it depends on is not device durable yet (on macOS, a plain fsync not
+// yet covered by an F_FULLFSYNC), and the group commit paying a device flush per file again: through genesis, two
+// group commits, a hole, a refill and a compaction, every CAS finds every earlier sync of the thread flushed, and
+// the thread issues at most one device flush per anchor change (one device here).
+#[test]
+fn every_anchor_change_follows_one_device_flush_of_every_earlier_sync() {
+    let f = Fixture::new();
+    let store = Arc::new(Checking::default());
+    let mut options = f.options(
+        PartialLimits { group_commit_bytes: 8, ..Default::default() },
+        ProgressiveLimits { read_chunk: 4, ..Default::default() },
+        SessionControl::default(),
+    );
+    options.anchors = store.clone();
+    let (flushes, syncs) = durable::HERE.with(|h| h.get());
+    let core = PartialCore::create(f.spec(), f.checks.clone(), options).unwrap();
+    for at in (0..8).step_by(4) {
+        core.write_original(at, &b"abcdefghijklmnop"[at as usize..at as usize + 4]).unwrap();
+    }
+    core.compact().unwrap();
+    for at in (8..16).step_by(4) {
+        core.write_original(at, &b"abcdefghijklmnop"[at as usize..at as usize + 4]).unwrap();
+    }
+    core.state().unwrap();
+    let cas = store.cas.lock().unwrap().clone();
+    assert!(cas.len() >= 7, "genesis, two groups and a compaction: {cas:?}");
+    assert!(cas.iter().all(|&n| n == 0), "a CAS ran before its syncs were flushed: {cas:?}");
+    let (flushes, syncs) = durable::HERE.with(|h| (h.get().0 - flushes, h.get().1 - syncs));
+    // Elsewhere every sync is a device-durable fsync and there is nothing to defer.
+    if cfg!(target_vendor = "apple") {
+        assert!(flushes <= cas.len() as u64, "{flushes} device flushes for {} anchor changes", cas.len());
+        assert!(syncs >= 2 * cas.len() as u64, "{syncs} deferred syncs for {} anchor changes", cas.len());
+    }
+}
+
+// Catches a barrier flushing devices it holds no file of, and a barrier leaving a sync on its own device unflushed.
+// Only this thread's flush count and its own syncs are asserted on: tests beside it may flush the same device at
+// any time, which only ever covers more.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_barrier_flushes_only_devices_of_its_files_with_unflushed_syncs() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(dir.path().join("f")).unwrap();
+    durable::sync(&file).unwrap();
+    let before = durable::HERE.with(|h| h.get().0);
+    durable::barrier(&[]).unwrap();
+    assert_eq!(durable::HERE.with(|h| h.get().0), before, "a barrier without files flushes nothing");
+    durable::barrier(&[&file, &file]).unwrap();
+    assert!(durable::HERE.with(|h| h.get().0) - before <= 1, "one flush per device at most");
+    assert_eq!(durable::unflushed_here(), 0, "the barrier covers the sync on its device");
+}
+
+// Catches a direct partial (`DirectPartials`, fed through `DirectSink`) anchoring anything before its syncs are
+// device durable: its genesis, its group commits, a reopen by the same map (adoption) and the final commit all
+// take the same barrier, so every CAS finds every earlier sync of the thread flushed.
+#[test]
+fn direct_members_flush_their_devices_before_every_anchor_change() {
+    use crate::map::{FeedSink, MemberMap};
+    let dir = tempfile::tempdir().unwrap();
+    let (output_root, state_dir) = (dir.path().join("out"), dir.path().join("state"));
+    std::fs::create_dir_all(&output_root).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i * 31 + 7) as u8).collect();
+    let mut spec = super::rar_fixture::FileSpec::new("payload.bin", &data);
+    spec.size = Some(data.len() as u64);
+    let volumes = super::rar_fixture::volumes(&spec, 40_000);
+    let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+    let map = MemberMap::from_memory(&refs, "set.part1.rar", None).unwrap();
+    let store = Arc::new(Checking::default());
+    let parts = DirectPartials::new(DirectOptions {
+        binding: ArchiveBinding { job: [7; 16], archive: [9; 32] },
+        output_root,
+        state_dir,
+        naming: PartialNaming::ArchivePath,
+        limits: PartialLimits { group_commit_bytes: 16_384, ..Default::default() },
+        progressive_limits: ProgressiveLimits::default(),
+        anchors: store.clone(),
+        control: SessionControl::default(),
+        protection: ProtectionDeclaration::Complete {
+            epoch: 1,
+            inventory: ProtectionInventory {
+                volumes: (0..volumes.len() as u32)
+                    .map(|index| ProtectedVolume {
+                        index,
+                        name: format!("set.part{}.rar", index + 1).into(),
+                        backing: VolumeBacking::NonFile,
+                    })
+                    .collect(),
+                auxiliary_paths: Vec::new(),
+            },
+        },
+        password: None,
+    })
+    .unwrap();
+    let member = parts.open(&map, 0).unwrap();
+    assert_eq!(member.origin, DirectOrigin::Created);
+    let mut sink = DirectSink::new(member.file);
+    sink.write_at(0, &data[..60_000]).unwrap();
+    sink.commit().unwrap();
+    drop(sink);
+    let member = parts.open(&map, 0).unwrap();
+    assert_eq!(member.origin, DirectOrigin::Adopted);
+    let mut sink = DirectSink::new(member.file);
+    sink.write_at(60_000, &data[60_000..]).unwrap();
+    sink.commit().unwrap();
+    assert!(sink.file().remaining().unwrap().is_empty());
+    let cas = store.cas.lock().unwrap().clone();
+    assert!(cas.len() >= 6, "genesis, several groups and the final commit: {cas:?}");
+    assert!(cas.iter().all(|&n| n == 0), "a direct member's CAS ran before its syncs were flushed: {cas:?}");
+}

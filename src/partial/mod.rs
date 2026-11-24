@@ -19,6 +19,7 @@
 #![doc = include_str!("../../docs/persistent-partials.md")]
 mod anchor;
 mod cipher;
+mod durable;
 mod held;
 pub use held::{HeldOptions, HeldOutput, HeldScan, HeldSkip, load_held};
 mod journal;
@@ -187,12 +188,20 @@ impl std::ops::DerefMut for Operation<'_> {
         self.data.as_mut().unwrap()
     }
 }
-/// File and directory syncs issued by persistent partial output in this process (output, journal, pages and
-/// bundle directories; not the caller's anchor store). For benchmarks and diagnostics.
-static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Device-durable file and directory syncs issued by persistent partial output in this process (output, journal,
+/// pages and bundle directories; not the caller's anchor store): `F_FULLFSYNC` on macOS, `fsync` elsewhere. On
+/// macOS the files of one transaction get a plain `fsync` each and the device flush is issued once, just before the
+/// next anchor CAS (see `docs/persistent-partials.md`); those plain syncs are counted by [`ordering_sync_count`].
+/// For benchmarks and diagnostics.
 #[doc(hidden)]
 pub fn durable_sync_count() -> u64 {
-    SYNCS.load(Ordering::Relaxed)
+    durable::DURABLE.load(Ordering::Relaxed)
+}
+/// Plain `fsync`s on macOS whose device flush was deferred to the next anchor change; 0 elsewhere. For benchmarks
+/// and diagnostics.
+#[doc(hidden)]
+pub fn ordering_sync_count() -> u64 {
+    durable::ORDERED.load(Ordering::Relaxed)
 }
 /// Path `lstat`s the exclusion registry issued in this process to re-prove its directory facts (see
 /// `PartialExclusions::check_input_revision`). For benchmarks and diagnostics.
@@ -202,8 +211,7 @@ pub fn exclusion_lstat_count() -> u64 {
     EXCLUSION_LSTATS.load(Ordering::Relaxed)
 }
 fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
-    SYNCS.fetch_add(1, Ordering::Relaxed);
-    file.sync_all()
+    durable::sync(file)
 }
 fn canceled(control: &SessionControl) -> PartialResult<()> {
     if control.is_canceled() { Err(err(PartialErrorKind::Canceled)) } else { Ok(()) }
@@ -1440,10 +1448,13 @@ impl PartialCore {
                 commit: None,
                 candidate_known: None,
             });
-            let ack = self.anchors.advance(Some(expected.anchor()), intent.anchor()).map_err(|mut e| {
-                e.committed = Some(expected.anchor.clone());
-                e
-            })?;
+            let ack = self
+                .anchors
+                .advance(Some(expected.anchor()), intent.anchor(), &self.native.flush_targets())
+                .map_err(|mut e| {
+                    e.committed = Some(expected.anchor.clone());
+                    e
+                })?;
             op.bundle.acknowledge(intent.anchor(), &ack)?;
             // Opening a group advances the revision but changes no leaf: part results carry over.
             let carried = self.part_results(op);
@@ -1543,7 +1554,7 @@ impl PartialCore {
                 candidate_known: None,
             });
             op.group = None;
-            let ack = self.anchors.advance(Some(intent.anchor()), commit.anchor())?;
+            let ack = self.anchors.advance(Some(intent.anchor()), commit.anchor(), &self.native.flush_targets())?;
             op.bundle.acknowledge(commit.anchor(), &ack)?;
             op.state = commit.clone();
             op.snapshot.head = head;
@@ -1699,10 +1710,12 @@ impl PartialCore {
                 commit: None,
                 candidate_known: Some(intent_known),
             });
-            let ack = self.anchors.advance(Some(expected.anchor()), &anchor).map_err(|mut e| {
-                e.committed = Some(expected.anchor.clone());
-                e
-            })?;
+            let ack = self.anchors.advance(Some(expected.anchor()), &anchor, &self.native.flush_targets()).map_err(
+                |mut e| {
+                    e.committed = Some(expected.anchor.clone());
+                    e
+                },
+            )?;
             data.bundle.acknowledge(&anchor, &ack)?;
             data.state = intent_state.clone();
             data.snapshot = intent;
@@ -1745,7 +1758,7 @@ impl PartialCore {
                 commit: Some(transaction.commit.clone()),
                 candidate_known: Some(transaction.commit_known),
             });
-            let ack = self.anchors.advance(Some(&intent_anchor), &final_anchor)?;
+            let ack = self.anchors.advance(Some(&intent_anchor), &final_anchor, &self.native.flush_targets())?;
             data.bundle.acknowledge(&final_anchor, &ack)?;
             data.state = transaction.commit;
             data.snapshot = transaction.valid;
@@ -2440,10 +2453,12 @@ impl PartialCore {
         op.uncertain =
             Some(Uncertain { expected: previous.clone(), intent: next.clone(), commit: None, candidate_known: None });
         op.pending_compaction = Some(prepared);
-        let ack = self.anchors.advance(Some(previous.anchor()), next.anchor()).map_err(|mut e| {
-            e.committed = Some(previous.anchor.clone());
-            e
-        })?;
+        let ack = self.anchors.advance(Some(previous.anchor()), next.anchor(), &self.native.flush_targets()).map_err(
+            |mut e| {
+                e.committed = Some(previous.anchor.clone());
+                e
+            },
+        )?;
         op.state = next.clone();
         match snapshot {
             Some((snapshot, _lease)) => op.snapshot = snapshot,
@@ -3002,6 +3017,7 @@ impl PartialFile {
 }
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) mod tests {
+    mod durable;
     mod ledger;
     mod native;
     #[path = "../../../tests/common/mod.rs"]
@@ -3089,7 +3105,7 @@ impl PreparedCreate {
             // naming them; otherwise a crash leaves an anchor whose state can never be reopened or recreated.
             native.sync()?;
             native.sync_parents()?;
-            let ack = anchors.advance(None, &intent_anchor)?;
+            let ack = anchors.advance(None, &intent_anchor, &native.flush_targets())?;
             bundle.acknowledge(&intent_anchor, &ack)?;
             committed = Some(intent_anchor.clone());
             canceled(&control)?;
@@ -3102,7 +3118,7 @@ impl PreparedCreate {
             snapshot.head.sequence = 1;
             let commit = MutationCommit { transaction: 0, parent: intent_anchor.clone(), valid: snapshot.head.clone() };
             let final_anchor = bundle.append_commit(&commit)?;
-            let ack = anchors.advance(Some(&intent_anchor), &final_anchor)?;
+            let ack = anchors.advance(Some(&intent_anchor), &final_anchor, &native.flush_targets())?;
             bundle.acknowledge(&final_anchor, &ack)?;
             committed = Some(final_anchor.clone());
             let state = state::encode_record(3, 0, Some(&intent_anchor), &snapshot.head, &budget.limits)?;
