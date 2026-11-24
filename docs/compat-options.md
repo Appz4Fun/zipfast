@@ -1,6 +1,6 @@
 # 7-Zip and UnRAR compatibility options
 
-Five fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
+Six fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
 `7z` and `unrar` modes) get their behaviour where zipfast's own default differs. Every default keeps zipfast's
 behaviour, so a caller that sets them to `Default::default()` (or `None`) sees no change.
 
@@ -12,6 +12,7 @@ fallback_mtime: None,
 compressed_tar: Default::default(),
 version_naming: Default::default(),
 preexisting_links: Default::default(),
+refused_link_placeholder: false,
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -106,6 +107,27 @@ The link is refused when that leads out of the destination, whichever choice is 
 | `e -> x/file.txt` | refused | refused |
 
 UnRAR also makes `e`; zipfast never makes a link that leads out of the destination.
+
+## `refused_link_placeholder`: an empty file where a link was refused
+
+When 7-Zip refuses a dangerous link ("Dangerous link via another link was ignored") it writes an empty regular file
+at the link's path. A later member under that path then fails, its parent being a file, and 7-Zip exits 2. zipfast
+leaves nothing by default, so the later member's folder is created as a real one. With `d/` already in the
+destination and an archive holding `s -> d/inner`, then `s/new.txt`, under `PreexistingLinks::Refuse`:
+
+| | `refused_link_placeholder: false` (default) | `true`, 7-Zip 26.06 |
+|---|---|---|
+| `s -> d/inner` | refused, nothing at `s` | refused, `s` an empty file |
+| `s/new.txt` | written in a new folder `s/` | fails: `s` is not a folder |
+
+It applies to every symbolic link refused for its target: one that leads out of the destination, lexically
+(`../x`, an absolute target) or through another link, or one `PreexistingLinks::Refuse` refuses. A refused hard
+link or file copy leaves nothing. The placeholder is checked and written as any output file is: never through a
+link, under the `Overwrite` mode (a rename mode gives it the renamed name, `Skip` leaves what is there), and
+recorded as a file this run wrote. The member is reported refused, or failed, as it is without the option. A test
+run writes nothing. The whole-archive runners for RAR, 7z, ZIP and tar, `RarSession` extraction and progressive
+sessions honour it (a progressive session still stops at the refused link, as without the option).
+`tests/links.rs` and `tests/rar5_links.rs` check these points.
 
 ## 7z wrong passwords: how the member failed
 

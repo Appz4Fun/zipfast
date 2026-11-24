@@ -44,6 +44,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite, threads: usize) -> Opt
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     }
 }
 
@@ -761,4 +762,106 @@ fn progressive_file_copies_are_charged_against_the_output_budget() {
     let dest = tmp.path().join("roomy");
     progressive_with(&arc, &dest, Mode::Extract, |o| o.limits.output_write_bytes = 30).unwrap();
     assert_eq!(fs::read(dest.join("c2")).unwrap(), b"0123456789");
+}
+
+/// The A1 case on every RAR 5.0 writer: with `d -> sub` already in the destination, `s -> d/inner` is refused
+/// under `PreexistingLinks::Refuse` and `up -> ../outside` for leaving the destination. With
+/// `refused_link_placeholder` each leaves an empty file, so the later `s/new.txt` fails as its parent is a file;
+/// without, nothing is left and `s/new.txt` lands in a new folder `s/`. A progressive session stops at the first
+/// refusal, as it does without the option, with the placeholder written.
+#[test]
+fn refused_links_leave_placeholders_on_every_writer() {
+    use zipfast::extract::PreexistingLinks;
+    use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = write(
+        tmp.path(),
+        &[
+            link("s", 1, "d/inner"),
+            FileSpec::new("s/new.txt", b"new"),
+            link("up", 1, "../outside"),
+            FileSpec::new("z", b"z"),
+        ],
+    );
+    let prepare = |name: String| {
+        let dest = tmp.path().join(name);
+        fs::create_dir_all(dest.join("sub/inner")).unwrap();
+        std::os::unix::fs::symlink("sub", dest.join("d")).unwrap();
+        dest
+    };
+    let opts = |dest: &Path, placeholder: bool| Options {
+        preexisting_links: PreexistingLinks::Refuse,
+        refused_link_placeholder: placeholder,
+        ..options(dest, Mode::Extract, Overwrite::Always, 1)
+    };
+    let check = |dest: &Path, placeholder: bool, failed: &[u64], writer: &str| {
+        assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "{writer} {placeholder}");
+        assert_eq!(fs::read_dir(dest.join("sub/inner")).unwrap().count(), 0, "{writer}: nothing through d");
+        let s = fs::symlink_metadata(dest.join("s")).unwrap();
+        if placeholder {
+            assert_eq!(failed, [0, 1, 2], "{writer}");
+            for name in ["s", "up"] {
+                let m = fs::symlink_metadata(dest.join(name)).unwrap();
+                assert!(m.file_type().is_file() && m.len() == 0, "{writer}: {name} is an empty file");
+            }
+        } else {
+            assert_eq!(failed, [0, 2], "{writer}");
+            assert!(s.is_dir(), "{writer}");
+            assert_eq!(fs::read(dest.join("s/new.txt")).unwrap(), b"new", "{writer}");
+            assert!(fs::symlink_metadata(dest.join("up")).is_err(), "{writer}");
+        }
+    };
+    for placeholder in [false, true] {
+        // the legacy run
+        let dest = prepare(format!("legacy-{placeholder}"));
+        let s = extract::run(&arc, &opts(&dest, placeholder), |_| {}).unwrap();
+        let legacy: Vec<u64> = ["s:", "s/new.txt:", "up:"]
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| s.errors.iter().any(|e| e.starts_with(*p)))
+            .map(|(i, _)| i as u64)
+            .collect();
+        check(&dest, placeholder, &legacy, "legacy");
+        // the typed run
+        let dest = prepare(format!("typed-{placeholder}"));
+        let mut events = Vec::new();
+        extract::run_rar_with_outcomes(&arc, &opts(&dest, placeholder), None, |e| events.push(event(e))).unwrap();
+        check(&dest, placeholder, &failed(&events), "typed");
+        // RarSession
+        let dest = prepare(format!("session-{placeholder}"));
+        let mut session = RarSession::open(&arc, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let mut events = Vec::new();
+        session
+            .extract_selected(&all, &opts(&dest, placeholder), RarDecodeLimits::default(), |e| events.push(event(e)))
+            .unwrap();
+        check(&dest, placeholder, &failed(&events), "session");
+        // a progressive session stops at `s`
+        let dest = prepare(format!("progressive-{placeholder}"));
+        assert!(progressive_options(&arc, opts(&dest, placeholder)).is_err());
+        let s = fs::symlink_metadata(dest.join("s"));
+        assert_eq!(s.is_ok(), placeholder, "progressive {placeholder}");
+        if placeholder {
+            let s = s.unwrap();
+            assert!(s.file_type().is_file() && s.len() == 0);
+        }
+    }
+}
+
+/// As [`progressive`], with the caller's own options.
+fn progressive_options(arc: &Path, options: Options) -> Result<(), zipfast::progressive::ProgressiveFailure> {
+    use std::task::{Context, Poll};
+    use zipfast::progressive::*;
+    let volume = (arc.file_name().unwrap().to_owned(), fs::read(arc).unwrap().into_boxed_slice());
+    let opts = ProgressiveOptions::new(options, arc.file_name().unwrap().to_owned());
+    let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
+    loop {
+        match session.poll_event(&mut Context::from_waker(std::task::Waker::noop())) {
+            Poll::Pending => std::thread::yield_now(),
+            Poll::Ready(Ok(None)) => return Ok(()),
+            Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => return Err(failure),
+            Poll::Ready(Ok(Some(_))) => {}
+            Poll::Ready(Err(failure)) => return Err(failure),
+        }
+    }
 }

@@ -150,6 +150,7 @@ fn options(dir: &std::path::Path) -> ProgressiveOptions {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         },
         OsString::from("a.part01.rar"),
     )

@@ -63,6 +63,7 @@ fn options(dest: &Path, mode: Mode, select: Option<MemberFilter>) -> Options {
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     }
 }
 

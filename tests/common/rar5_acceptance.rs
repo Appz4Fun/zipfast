@@ -669,6 +669,7 @@ fn session(f: &Fixture, fill: HoleFill) -> (ProgressiveSession, Shared) {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         },
         "a.part01.rar".into(),
     );

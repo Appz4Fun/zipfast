@@ -933,7 +933,7 @@ impl Guard {
                             None => false,
                         }
                 }
-                PlacedLink::Hard { .. } | PlacedLink::Copy => now.regular(),
+                PlacedLink::Hard { .. } | PlacedLink::Copy | PlacedLink::Placeholder => now.regular(),
             };
             if !fits {
                 return Err(RarDiagnosticFailure::PublicationUnverified { ordinal });

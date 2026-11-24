@@ -249,15 +249,21 @@ impl OutputContext {
                 std::io::Error::other("progressive output budget")
             })
         };
-        let made = link::make_charging(root, kind, &self.extracted, &target.path, replace, modified, &mut charge);
+        let rel = target.path.strip_prefix(root).map_err(|_| invalid())?.to_path_buf();
+        let made =
+            link::make_or_stand_in(root, &rel, kind, &self.extracted, &target.path, replace, modified, &mut charge);
         if let Some(failure) = over {
             return Err(failure);
         }
-        made.map_err(|e| match link::member_failure(&e) {
+        let refused_with = made.map_err(|e| match link::member_failure(&e) {
             Some(_) if e.kind() != std::io::ErrorKind::Unsupported => ProgressiveFailure::new(FailureKind::UnsafePath),
             _ => out(OutputOperation::Publish, e, 0),
         })?;
-        let rel = target.path.strip_prefix(root).map_err(|_| invalid())?.to_path_buf();
+        if refused_with.is_some() {
+            // a refused symbolic link left its placeholder, a file this session wrote; the member is refused still
+            link::stood_in(root, &rel, &target.path, &mut self.extracted);
+            return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+        }
         link::placed(root, &rel, kind, &target.path, &mut self.extracted);
         Ok(())
     }

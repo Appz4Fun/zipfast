@@ -107,6 +107,7 @@ pub(crate) fn main() -> ExitCode {
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
+                refused_link_placeholder: false,
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }

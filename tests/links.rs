@@ -44,6 +44,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite) -> Options {
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     }
 }
 
@@ -511,5 +512,129 @@ fn preexisting_links_are_followed_inside_or_refused_by_policy() {
             }
         }
         assert!(fs::symlink_metadata(dest.join("e")).is_err(), "{policy:?}");
+    }
+}
+
+/// The A1 case, as 7-Zip 26.06 extracts it: with `d -> sub` already in the destination, `s -> d/inner` is refused
+/// under `PreexistingLinks::Refuse`. With `refused_link_placeholder` it leaves an empty file at `s`, so the later
+/// `s/new.txt` fails as its parent is a file; without, nothing is left and `s/new.txt` lands in a new folder `s/`.
+#[test]
+fn a_refused_link_leaves_a_placeholder_only_when_asked() {
+    use zipfast::extract::PreexistingLinks;
+    for placeholder in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        write_tar(&archive, tar(&[("s", b'2', b"d/inner"), ("s/new.txt", b'0', b"new"), ("z", b'0', b"z")]), false);
+        let dest = dir.path().join("out");
+        fs::create_dir_all(dest.join("sub/inner")).unwrap();
+        std::os::unix::fs::symlink("sub", dest.join("d")).unwrap();
+        let opts = Options {
+            preexisting_links: PreexistingLinks::Refuse,
+            refused_link_placeholder: placeholder,
+            ..options(&dest, Mode::Extract, Overwrite::Always)
+        };
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        let refused = "s: the link's target passes through a link that was not extracted by this run";
+        assert_eq!(s.errors[0], refused, "placeholder={placeholder}");
+        assert_eq!(fs::read(dest.join("z")).unwrap(), b"z", "placeholder={placeholder}");
+        let meta = fs::symlink_metadata(dest.join("s")).unwrap();
+        if placeholder {
+            assert_eq!(s.errors.len(), 2, "{:?}", s.errors);
+            assert!(s.errors[1].starts_with("s/new.txt: "), "{:?}", s.errors);
+            assert!(meta.file_type().is_file() && meta.len() == 0, "an empty regular file at s");
+        } else {
+            assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
+            assert!(meta.is_dir());
+            assert_eq!(fs::read(dest.join("s/new.txt")).unwrap(), b"new");
+        }
+        assert_eq!(fs::read_dir(dest.join("sub/inner")).unwrap().count(), 0, "nothing through d");
+    }
+}
+
+/// A link refused for leading out of the destination (lexically, or through a link already there) leaves its
+/// placeholder too, over a file in the way only when the overwrite mode replaces it; `Skip` leaves the file. A
+/// test run writes nothing. Under a rename mode the placeholder takes the renamed name.
+#[test]
+fn escaping_links_leave_placeholders_under_the_overwrite_rules() {
+    use zipfast::extract::RenameStyle;
+    let members: &[(&str, u8, &[u8])] =
+        &[("up", b'2', b"../outside"), ("abs", b'2', b"/etc/passwd"), ("via", b'2', b"x/f"), ("up/f", b'0', b"f")];
+    for overwrite in [Overwrite::Always, Overwrite::Skip, Overwrite::RenameNew(RenameStyle::Underscore)] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("outside")).unwrap();
+        let archive = dir.path().join("a.tar");
+        write_tar(&archive, tar(members), false);
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        std::os::unix::fs::symlink("../outside", dest.join("x")).unwrap();
+        fs::write(dest.join("abs"), b"before").unwrap();
+        let opts = Options { refused_link_placeholder: true, ..options(&dest, Mode::Extract, overwrite) };
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        let empty = |name: &str| {
+            let m = fs::symlink_metadata(dest.join(name)).unwrap();
+            assert!(m.file_type().is_file() && m.len() == 0, "{overwrite:?}: {name} is an empty file");
+        };
+        empty("up");
+        empty("via");
+        assert!(s.errors.iter().any(|e| e.starts_with("up: the link's target is absolute")), "{:?}", s.errors);
+        assert!(s.errors.iter().any(|e| e.starts_with("via: the link's target leads out")), "{:?}", s.errors);
+        assert!(s.errors.iter().any(|e| e.starts_with("up/f: ")), "{overwrite:?}: {:?}", s.errors);
+        match overwrite {
+            Overwrite::Always => {
+                empty("abs");
+                assert!(s.errors.iter().any(|e| e.starts_with("abs: the link's target is absolute")));
+            }
+            Overwrite::Skip => assert_eq!(fs::read(dest.join("abs")).unwrap(), b"before"),
+            _ => {
+                assert_eq!(fs::read(dest.join("abs")).unwrap(), b"before");
+                empty("abs_1");
+            }
+        }
+        assert_eq!(fs::read_dir(dir.path().join("outside")).unwrap().count(), 0, "{overwrite:?}");
+        // a test run leaves nothing
+        let tested = dir.path().join("tested");
+        let opts = Options { refused_link_placeholder: true, ..options(&tested, Mode::Test, overwrite) };
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
+        // `via` leads out only through the destination's own `x`, which this one lacks
+        assert_eq!(s.errors.len(), 2, "{overwrite:?}: {:?}", s.errors);
+        assert!(!tested.join("up").exists());
+    }
+}
+
+/// ZIP's escaping links leave placeholders on the legacy run and the checked route alike, and a test run still
+/// refuses them without writing anything.
+#[test]
+fn zip_escaping_links_leave_placeholders() {
+    let opts = |dest: &Path, mode| Options { refused_link_placeholder: true, ..options(dest, mode, Overwrite::Always) };
+    let empty = |path: &Path| {
+        let m = fs::symlink_metadata(path).unwrap();
+        assert!(m.file_type().is_file() && m.len() == 0, "{path:?} is an empty file");
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("legacy");
+    let s = extract::run(&fixture("escape.zip"), &opts(&dest, Mode::Extract), |_| {}).unwrap();
+    assert!(s.errors.len() >= 2 && s.errors.iter().all(|e| e.contains("leads out")), "{:?}", s.errors);
+    empty(&dest.join("up"));
+    empty(&dest.join("abs"));
+    assert_eq!(fs::read(dest.join("ok.txt")).unwrap(), b"ok\n");
+    let tested = dir.path().join("tested");
+    let s = extract::run(&fixture("escape.zip"), &opts(&tested, Mode::Test), |_| {}).unwrap();
+    assert!(s.errors.len() >= 2, "{:?}", s.errors);
+    assert!(!tested.join("up").exists());
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let dest = dir.path().join("checked");
+        let report = zipfast::zip::run_with_policy(
+            &fixture("escape.zip"),
+            &opts(&dest, Mode::Extract),
+            None,
+            &extract::Cancellation::default(),
+            &Default::default(),
+            |_: zipfast::zip::ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(report.failed(), 2);
+        empty(&dest.join("up"));
+        empty(&dest.join("abs"));
     }
 }

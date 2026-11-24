@@ -176,6 +176,7 @@ fn options(dest: &Path) -> ProgressiveOptions {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         },
         volume_name(0),
     );

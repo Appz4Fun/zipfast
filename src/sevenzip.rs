@@ -714,6 +714,7 @@ mod header_key_tests {
             compressed_tar: Default::default(),
             version_naming: Default::default(),
             preexisting_links: Default::default(),
+            refused_link_placeholder: false,
         };
         let whole = compressions(|| {
             let summary = run(first, &options, Some("password"), &cancel, &limits, |_| {}).unwrap();

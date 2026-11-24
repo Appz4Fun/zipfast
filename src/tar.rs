@@ -1822,7 +1822,7 @@ fn link_member(
     report: &mut impl LegacyReport,
 ) -> Result<()> {
     // testing checks the target as extracting would
-    if let Some(why) = link::refusal(rel, kind, extracted) {
+    if let Some(why) = link::refusal_before_place(rel, kind, extracted) {
         fail_member(summary, report, ordinal, name, why, Error::UnsafePath(name.to_owned()));
         return Ok(());
     }
@@ -2464,6 +2464,7 @@ mod tests {
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
+                refused_link_placeholder: false,
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);
@@ -2524,6 +2525,7 @@ mod tests {
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
+                refused_link_placeholder: false,
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);

@@ -238,6 +238,9 @@ pub(crate) struct Extracted {
     links: std::collections::BTreeSet<(u64, u64)>,
     /// what a link's target may do with links the destination held before the run
     preexisting: PreexistingLinks,
+    /// a refused symbolic link leaves an empty regular file at its path
+    /// ([`crate::extract::Options::refused_link_placeholder`])
+    placeholder: bool,
     /// where each extracted file landed, and the members that landed there
     landed: BTreeMap<PathBuf, Vec<PathBuf>>,
     bytes: usize,
@@ -268,9 +271,24 @@ fn normalised(rel: &Path) -> bool {
 }
 
 impl Extracted {
-    /// No records yet, with the link settings of `options`.
+    /// No records yet, with the link settings of `options`. A test run never writes a placeholder.
     pub(crate) fn new(options: &crate::extract::Options) -> Self {
-        Self { preexisting: options.preexisting_links, ..Self::default() }
+        Self {
+            preexisting: options.preexisting_links,
+            placeholder: options.refused_link_placeholder && options.mode == crate::extract::Mode::Extract,
+            ..Self::default()
+        }
+    }
+
+    /// As [`Extracted::new`], for a writer that always extracts whatever `options.mode` says.
+    pub(crate) fn for_output(options: &crate::extract::Options) -> Self {
+        Self { placeholder: options.refused_link_placeholder, ..Self::new(options) }
+    }
+
+    /// Whether a refused symbolic link leaves an empty regular file at its path: its lexical target check then
+    /// waits until its path is checked ([`refusal_before_place`]).
+    pub(crate) fn placeholder(&self) -> bool {
+        self.placeholder
     }
     fn forget(&mut self, rel: &Path) {
         // the record's own key, which is what was charged: never another spelling of it
@@ -436,6 +454,91 @@ pub(crate) fn refusal(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Opt
     }
 }
 
+/// [`refusal`] for a writer that goes on to place the link with [`publish`] (or [`make_or_stand_in`]): with
+/// placeholders on, a symbolic link whose target leaves the destination is not refused yet, so its path is checked
+/// as any output's and the placeholder takes it; the placing refuses it then.
+pub(crate) fn refusal_before_place(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Option<&'static str> {
+    match kind {
+        LinkKind::Symbolic(_) if extracted.placeholder => None,
+        _ => refusal(rel, kind, extracted),
+    }
+}
+
+/// Whether `error` from placing `kind` is a refused symbolic link, which a placeholder stands in for.
+fn refused_symbolic(kind: &LinkKind, error: &io::Error) -> Option<&'static str> {
+    match kind {
+        LinkKind::Symbolic(_) if error.kind() != io::ErrorKind::Unsupported => member_failure(error),
+        _ => None,
+    }
+}
+
+/// Makes the link `kind` for the member at `rel` at `path`, as [`make_charging`] does after checking a symbolic
+/// link's target lexically too ([`contained`]). With placeholders on, a symbolic link refused for its target leaves an
+/// empty regular file at `path` instead, made as the link would be (only where nothing is, or replacing what is
+/// there in one rename with `replace`, never through a link), and `Ok(Some(why))` says why the link was refused;
+/// the caller records the file with [`stood_in`] and reports the member refused. Without, the refusal is the error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_or_stand_in(
+    dest: &Path,
+    rel: &Path,
+    kind: &LinkKind,
+    extracted: &Extracted,
+    path: &Path,
+    replace: bool,
+    modified: Option<SystemTime>,
+    charge: &mut dyn FnMut(u64) -> io::Result<()>,
+) -> io::Result<Option<&'static str>> {
+    let made = match kind {
+        LinkKind::Symbolic(target) if !contained(rel, target) => Err(refused(UNSAFE_TARGET)),
+        _ => make_charging(dest, kind, extracted, path, replace, modified, charge),
+    };
+    match made {
+        Ok(()) => Ok(None),
+        Err(e)
+            if extracted.placeholder
+                && let Some(why) = refused_symbolic(kind, &e) =>
+        {
+            stand_in(path, replace)?;
+            Ok(Some(why))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Records the placeholder [`make_or_stand_in`] left at `path` (an absolute path under `dest`) for the member at
+/// `rel`: a regular file this run wrote, as any other.
+pub(crate) fn stood_in(dest: &Path, rel: &Path, path: &Path, extracted: &mut Extracted) {
+    extracted.replaced(rel);
+    if let Ok(landed) = path.strip_prefix(dest) {
+        extracted.replaced(landed);
+    }
+    extracted.file(dest, rel, path);
+}
+
+/// An empty regular file at `path`: created only where nothing is (`O_EXCL`, which never follows a link), or with
+/// `replace` staged beside it the same way and renamed over what is there, which never follows a link either.
+fn stand_in(path: &Path, replace: bool) -> io::Result<()> {
+    let new = |at: &Path| std::fs::OpenOptions::new().write(true).create_new(true).open(at).map(drop);
+    if !replace {
+        return new(path);
+    }
+    let parent = path.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    for _ in 0..64 {
+        let n = NEXT_STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stage = parent.join(format!(".zipfast-placeholder-{}-{n}", std::process::id()));
+        match new(&stage) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        return std::fs::rename(&stage, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&stage);
+        });
+    }
+    Err(io::ErrorKind::AlreadyExists.into())
+}
+
 /// Places a checked link member: a symbolic link, or a hard link to the earlier member (a copy where the file
 /// system takes no hard link), or a copy of it. `place` comes from the run's target check, so the overwrite choice,
 /// a rename mode and the refusal to write through a link in the way are already settled. A rename mode's reserved
@@ -467,29 +570,24 @@ pub(crate) fn publish_charging(
         None => (place.path.clone(), place.replace),
     };
     // on failure the reservation is dropped, which removes the empty file while it is still the one created
-    make_charging(dest, kind, extracted, &path, replace, modified, charge)?;
+    let refused_with = make_or_stand_in(dest, rel, kind, extracted, &path, replace, modified, charge)?;
     if let Some(reserved) = place.reserved {
         let _ = reserved.into_parts();
     }
-    placed(dest, rel, kind, &path, extracted);
+    match refused_with {
+        None => placed(dest, rel, kind, &path, extracted),
+        Some(why) => {
+            // the placeholder is the run's own file, and the member is refused as without it
+            stood_in(dest, rel, &path, extracted);
+            return Err(refused(why));
+        }
+    }
     Ok(())
 }
 
 /// Makes the link `kind` at `path`, replacing what is there only with `replace`. A symbolic link takes the archived
 /// `modified` time; a hard link is the earlier file, with its own time. Nothing is recorded: see [`placed`].
-pub(crate) fn make(
-    dest: &Path,
-    kind: &LinkKind,
-    extracted: &Extracted,
-    path: &Path,
-    replace: bool,
-    modified: Option<SystemTime>,
-) -> io::Result<()> {
-    make_charging(dest, kind, extracted, path, replace, modified, &mut |_| Ok(()))
-}
-
-/// [`make`], asking `charge` first, with the copy's length, whenever the link has to be made as a copy.
-pub(crate) fn make_charging(
+fn make_charging(
     dest: &Path,
     kind: &LinkKind,
     extracted: &Extracted,

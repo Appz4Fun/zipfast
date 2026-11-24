@@ -34,6 +34,7 @@ fn additive_context_keeps_legacy_options() {
         compressed_tar: Default::default(),
         version_naming: Default::default(),
         preexisting_links: Default::default(),
+        refused_link_placeholder: false,
     };
     let _ = EncryptedReadContext::new(EncryptedReadOptions::default()).unwrap();
 }
