@@ -285,3 +285,20 @@ fn checked_runs_report_members_and_honor_cancellation() {
         }
     }
 }
+
+/// The 7-Zip fixture with its second piece removed. `7zz l -slt bytesplit.zip.001` (7-Zip 26.06, which reads only
+/// the pieces up to the gap) reports `Errors: 1`, "Unexpected end of archive", and lists one member: `noise.bin`,
+/// Size = 3000, Packed Size = 3000, CRC = F1915F9E, Method = Store.
+#[test]
+fn the_7zip_fixture_without_its_second_piece_lists_like_7zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = first().parent().unwrap().to_owned();
+    for n in ["001", "003", "004"] {
+        fs::copy(src.join(format!("bytesplit.zip.{n}")), dir.path().join(format!("bytesplit.zip.{n}"))).unwrap();
+    }
+    let listing = extract::list_detailed(&dir.path().join("bytesplit.zip.001"), None).unwrap();
+    assert!(listing.unexpected_end());
+    assert!(listing.missing_volume.unwrap().ends_with("bytesplit.zip.002"));
+    assert_eq!(names(&listing.entries), [("noise.bin", 3000)]);
+    assert_eq!(listing.entries[0].crc32, Some(0xF191_5F9E));
+}

@@ -753,3 +753,24 @@ fn session_exposes_the_encryption_record() {
     let session = RarSession::open(&archive, None, RarSessionOptions::default()).unwrap();
     assert!(session.entries().next().unwrap().rar5_crypt_record().is_none());
 }
+
+/// `rar5-psw.rar` (a real RAR 5 archive with encrypted files and plain headers): `7zz l -slt -pXX` (7-Zip 26.06)
+/// prints `Method = v6:m3:128K AES:15:3` for `stest1.txt` and `Method = v6:m0:128K AES:15:3` for `stest2.txt`. The
+/// record's fields give the `AES:<kdf_count>:<flags>` part; flags are printed even when 0 (the synthetic test above).
+#[test]
+fn a_real_encrypted_archive_gives_the_aes_part_of_7zips_method_string() {
+    use zipfast::rar5::session::{RarSession, RarSessionOptions};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5-compat/rar5-psw.rar");
+    let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let parts: Vec<_> = session
+        .entries()
+        .map(|m| {
+            let r = m.rar5_crypt_record().unwrap();
+            (m.name().to_owned(), format!("AES:{}:{}", r.kdf_count, r.flags))
+        })
+        .collect();
+    assert_eq!(
+        parts,
+        [("stest1.txt".to_owned(), "AES:15:3".to_owned()), ("stest2.txt".to_owned(), "AES:15:3".to_owned())]
+    );
+}
