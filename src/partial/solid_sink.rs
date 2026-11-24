@@ -66,12 +66,11 @@ pub fn stream_slots(map: &MemberMap, index: usize) -> PartialResult<Vec<StreamSl
         MapFormat::SevenZip => {
             let FolderSlot { index: folder, offset } =
                 member.folder.ok_or_else(|| err(PartialErrorKind::InvalidOptions))?;
-            for (i, m) in map.members.iter().enumerate() {
+            // by member index, not offset: an empty member shares its offset with the member after it, and every
+            // member up to the requested one (empty ones too) is a link of the hand-off chain
+            for (i, m) in map.members.iter().enumerate().take(index + 1) {
                 if let Some(f) = m.folder.filter(|f| f.index == folder && f.offset <= offset) {
-                    let s = size(i)?;
-                    if s > 0 || i == index {
-                        slots.push(StreamSlot { member: i, start: f.offset, size: s });
-                    }
+                    slots.push(StreamSlot { member: i, start: f.offset, size: size(i)? });
                 }
             }
             slots.sort_by_key(|s| s.start);
