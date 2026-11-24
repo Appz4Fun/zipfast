@@ -347,8 +347,8 @@ fn a_last_volume_directory_decides_over_a_rar_stored_in_the_first() {
 
 #[test]
 fn many_members_match_in_linear_time() {
-    // Work-bound rather than wall-clock: identifying four times the members must take about four times as long,
-    // not sixteen. The best of three runs of each size keeps a busy machine from deciding the ratio.
+    // Work-bound rather than wall-clock: identifying four times the members must take about four times the matching
+    // steps, not sixteen.
     fn archive_of(n: usize) -> Vec<u8> {
         let names: Vec<String> = (0..n).map(|i| format!("f{i:06}")).collect();
         let specs: Vec<FileSpec<'_>> = names.iter().map(|n| FileSpec::new(n, b"x")).collect();
@@ -363,26 +363,19 @@ fn many_members_match_in_linear_time() {
     options.limits.header_allocation = 1 << 30;
     options.limits.metadata_bytes = 1 << 30;
     options.limits.parts = 1 << 20;
-    let best = |rar: &[u8], n: usize| -> f64 {
-        (0..3)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                let s =
-                    set_identity(Some(HeldVolume::whole(rar)), Some(HeldVolume::whole(rar)), options.clone()).unwrap();
-                assert_eq!(s.members.len(), n, "each member matched with itself, none duplicated");
-                assert!(s.members.iter().all(|m| m.checks.is_some() && m.size_from == Some(FactSource::First)));
-                started.elapsed().as_secs_f64()
-            })
-            .fold(f64::INFINITY, f64::min)
+    // Matching work is counted, not timed: one step per lookup or compare, so it grows with the member count.
+    let steps = |rar: &[u8], n: usize| -> u64 {
+        zipfast::work::take(zipfast::work::Work::SetIdentitySteps);
+        let s = set_identity(Some(HeldVolume::whole(rar)), Some(HeldVolume::whole(rar)), options.clone()).unwrap();
+        assert_eq!(s.members.len(), n, "each member matched with itself, none duplicated");
+        assert!(s.members.iter().all(|m| m.checks.is_some() && m.size_from == Some(FactSource::First)));
+        zipfast::work::take(zipfast::work::Work::SetIdentitySteps)
     };
     let (small, large) = (archive_of(4_000), archive_of(16_000));
-    let (t_small, t_large) = (best(&small, 4_000), best(&large, 16_000));
-    // Linear work gives a ratio near 4; matching every member against all earlier ones gives near 16.
-    assert!(
-        t_large < t_small * 9.0,
-        "4x the members took {:.1}x as long ({t_small:.3}s, {t_large:.3}s)",
-        t_large / t_small
-    );
+    let (w_small, w_large) = (steps(&small, 4_000), steps(&large, 16_000));
+    assert!(w_small >= 4_000, "the counter sees the matching ({w_small})");
+    // Linear work gives exactly 4x; matching every member against all earlier ones gives near 16x.
+    assert!(w_large <= w_small * 5, "4x the members took {w_large} steps against {w_small}");
     // Cancellation is honoured.
     options.control.cancel();
     assert!(set_identity(Some(HeldVolume::whole(&large)), Some(HeldVolume::whole(&large)), options).is_err());

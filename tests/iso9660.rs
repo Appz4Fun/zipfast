@@ -274,10 +274,12 @@ fn a_folder_that_loops_back_is_read_once() {
         img[19 * SECTOR..19 * SECTOR + d.len()].copy_from_slice(&d);
         img[20 * SECTOR..20 * SECTOR + 2].copy_from_slice(b"hi");
     });
-    let start = std::time::Instant::now();
+    zipfast::work::take(zipfast::work::Work::IsoFolders);
     let (s, dir) = run_image(&bytes);
     let s = s.unwrap();
-    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    // the root, and the folder at 19: each scheduled once however many entries point back at them
+    let folders = zipfast::work::take(zipfast::work::Work::IsoFolders);
+    assert!(folders <= 2, "{folders} folders read");
     assert_eq!(fs::read(dir.path().join("out/F.TXT")).unwrap(), b"hi", "{:?}", s.errors);
 }
 

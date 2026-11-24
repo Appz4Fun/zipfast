@@ -312,7 +312,7 @@ fn the_format_is_found_by_its_magic() {
 
 /// Many links waiting for data that never comes, and as many files whose data comes with their only other link:
 /// each member is handled on its own, so the reading stays linear (it used to rescan every waiting link for each
-/// file, quadratic in their number). A generous bound, far above linear time and far below quadratic.
+/// file, quadratic in their number). Counted work, not time: a rescan would show as more links handled than there are waiting.
 #[test]
 fn many_waiting_links_are_read_in_linear_time() {
     const N: u32 = 50_000;
@@ -327,15 +327,16 @@ fn many_waiting_links_are_read_in_linear_time() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("many.cpio");
     fs::write(&path, &bytes).unwrap();
-    let start = std::time::Instant::now();
+    zipfast::work::take(zipfast::work::Work::CpioWaitingLinks);
     let listing = extract::list(&path).unwrap();
-    let took = start.elapsed();
+    // every waiting link is handled once, at the end (the others' data came with their only other link)
+    let handled = zipfast::work::take(zipfast::work::Work::CpioWaitingLinks);
+    assert_eq!(handled, u64::from(N), "waiting links handled");
     assert_eq!(listing.len(), 2 * N as usize);
     // the waiting ones come out at the end, in archive order, each an empty file of its own
     assert_eq!(listing[N as usize].name, "w0");
     assert_eq!(listing.last().unwrap().name, format!("w{}", N - 1));
     assert!(listing[N as usize..].iter().all(|e| e.link.is_none() && e.size == 0));
-    assert!(took < std::time::Duration::from_secs(15), "{took:?}");
 }
 
 /// A file's links waiting for data come out as links to the member that carries it, right after it, and the

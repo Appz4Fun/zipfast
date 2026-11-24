@@ -536,6 +536,7 @@ pub(super) fn open(file: File, len: u64) -> Result<State> {
                 }
                 // each folder is read once: a folder reached again (a loop) is passed over
                 if seen.insert(fext) {
+                    crate::work::add(crate::work::Work::IsoFolders, 1);
                     folders.push((fext, fsize, Some(me), depth + 1));
                 }
             }
