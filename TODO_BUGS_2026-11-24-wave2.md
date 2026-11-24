@@ -6,11 +6,11 @@ test that fails without its fix, then reply on and resolve each thread.
 
 | # | PR | Thread | Where | Severity | Status |
 |---|---|---|---|---|---|
-| 1 | #258 | PRRT_kwDOVi_ME867TEEG | src/map/last_volume.rs:632 | P2 (test no longer guards the regression) | open |
-| 2 | #259 | PRRT_kwDOVi_ME867TLcy | src/map/zip_byte_split.rs:35 | P2 (panic on UTF-8 names) | open |
-| 3 | #259 | PRRT_kwDOVi_ME867TLc5 | src/map/zip.rs:300 | P2 (parts budget bypass) | open |
-| 4 | #259 | PRRT_kwDOVi_ME867TLc_ | src/map/zip_byte_split.rs:182 | P2 (wrong error coordinates) | open |
-| 5 | #259 | PRRT_kwDOVi_ME867TLdH | src/map/zip_byte_split.rs:169 | P2 (cancellation ignored) | open |
+| 1 | #258 | PRRT_kwDOVi_ME867TEEG | src/map/last_volume.rs:632 | P2 (test no longer guards the regression) | fixed in 66bb6bc5 |
+| 2 | #259 | PRRT_kwDOVi_ME867TLcy | src/map/zip_byte_split.rs:35 | P2 (panic on UTF-8 names) | fixed in 66bb6bc5 |
+| 3 | #259 | PRRT_kwDOVi_ME867TLc5 | src/map/zip.rs:300 | P2 (parts budget bypass) | fixed in 66bb6bc5 |
+| 4 | #259 | PRRT_kwDOVi_ME867TLc_ | src/map/zip_byte_split.rs:182 | P2 (wrong error coordinates) | fixed in 66bb6bc5 |
+| 5 | #259 | PRRT_kwDOVi_ME867TLdH | src/map/zip_byte_split.rs:169 | P2 (cancellation ignored) | fixed in 66bb6bc5 |
 
 ## 1. The set_identity work counter adds a fixed cost (#258)
 `SetIdentitySteps` is bumped by a constant 3 per last-volume member, regardless of the matching work. Replacing
