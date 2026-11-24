@@ -1087,20 +1087,55 @@ impl Entry {
     }
 }
 
-#[derive(Default)]
+/// What a listing (or a staged run) holds for its members: at most a million entries and 64 MiB of member names
+/// and link or redirection targets together, since a target (a tar `K` record or pax `linkpath`, a RAR 5.0
+/// redirection, a ZIP symbolic link's data) is kept beside its name.
 pub(crate) struct ListingBudget {
     entries: usize,
-    name_bytes: usize,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl Default for ListingBudget {
+    fn default() -> Self {
+        Self::with_limits(1_000_000, 64 << 20)
+    }
 }
 
 impl ListingBudget {
+    pub(crate) fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self { entries: 0, bytes: 0, max_entries, max_bytes }
+    }
+
     pub(crate) fn record(&mut self, name: &str) -> Result<()> {
+        self.record_with_link(name, "")
+    }
+
+    /// One member kept with its link or redirection target (empty when it has none).
+    pub(crate) fn record_with_link(&mut self, name: &str, link: &str) -> Result<()> {
         self.entries += 1;
-        self.name_bytes += name.len();
-        if self.entries > 1_000_000 || self.name_bytes > 64 << 20 {
-            return Err(Error::Unsupported("archive listing exceeds the entry or name byte limit".into()));
+        self.record_bytes(name.len().saturating_add(link.len()))
+    }
+
+    /// The bytes of a target kept for a member that is otherwise accounted for (its name is already held).
+    pub(crate) fn record_link_bytes(&mut self, len: usize) -> Result<()> {
+        self.record_bytes(len)
+    }
+
+    fn record_bytes(&mut self, len: usize) -> Result<()> {
+        self.bytes = self.bytes.saturating_add(len);
+        if self.entries > self.max_entries || self.bytes > self.max_bytes {
+            return Err(Error::Unsupported(
+                "archive listing exceeds the entry or name and link target byte limit".into(),
+            ));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -2689,7 +2724,7 @@ fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<En
             }
             return Ok(());
         }
-        budget.record(&h.name)?;
+        budget.record_with_link(&h.name, h.redirection.as_ref().map_or("", Redirection::target))?;
         let crc32 = if h.split_after() { None } else { h.crc32 };
         let dir = h.is_dir();
         let mode = Meta::from(&h).mode;
@@ -5361,6 +5396,23 @@ mod tests {
             budget.record(&name).unwrap();
         }
         assert!(matches!(budget.record("a"), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn listing_budget_counts_link_targets_with_names() {
+        let mut budget = ListingBudget::default();
+        let target = "t".repeat(1 << 20);
+        budget.record_with_link("link", &target).unwrap();
+        let redirection = Redirection::HardLink("earlier".into());
+        budget.record_with_link("copy", redirection.target()).unwrap();
+        assert_eq!(budget.bytes(), 4 + (1 << 20) + 4 + 7);
+        assert_eq!(Redirection::Unknown(9).target(), "");
+        // 63 more MiB of targets fill the budget; a ZIP target counted on its own then goes over
+        for _ in 0..62 {
+            budget.record_with_link("", &target).unwrap();
+        }
+        budget.record_link_bytes((1 << 20) - 15).unwrap();
+        assert!(matches!(budget.record_link_bytes(1), Err(Error::Unsupported(_))));
     }
 }
 
