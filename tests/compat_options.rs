@@ -65,6 +65,7 @@ fn options(mode: Mode, dest: &Path) -> Options {
         fallback_mtime: None,
         compressed_tar: CompressedTar::Members,
         version_naming: VersionNaming::Semicolon,
+        preexisting_links: Default::default(),
     }
 }
 
@@ -443,6 +444,7 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
     let seven = |dest: &Path| Options {
         select: take(),
         version_naming: VersionNaming::SevenZipDir,
+        preexisting_links: Default::default(),
         ..options(Mode::Extract, dest)
     };
     let out = tmp.path().join("seven");
@@ -472,6 +474,7 @@ fn r5extra_comes_out_as_7zip_writes_it() {
     let opts = Options {
         select: Some(MemberFilter::all().with_versions()),
         version_naming: VersionNaming::SevenZipDir,
+        preexisting_links: Default::default(),
         ..options(Mode::Extract, &out)
     };
     extract::run(&fixture("rar5-compat", "r5extra.rar"), &opts, |_| {}).unwrap();

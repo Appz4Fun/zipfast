@@ -100,7 +100,13 @@ it holds ciphertext. On the portable path it loses:
    not group- or world-writable unless sticky, and the spool file to be owned by us with mode exactly 0600 and no ACL.
    Portable only requires a directory and a regular file: NFS with squashed owners, SMB and shared FUSE mounts report
    owners and modes that cannot be checked, and an inherited ACL may let others open the file before it is unlinked.
-   Only ciphertext is spooled, so what could leak is ciphertext that is already in the archive.
+   Two consequences go beyond ciphertext that is already in the archive. The stdout stage (`ZipReadStage` for
+   print/stdout output) uses the same temp directory and holds **decoded plaintext**: another user who opened it
+   before the unlink can keep reading what is written to it. And a writable descriptor obtained the same way lets
+   that user **change the ciphertext between the HMAC pass and the decrypting pass**, which rereads the spool; for a
+   stored AE-2 member (no CRC) the change is not detected. Callers that need confidentiality or integrity against
+   other local users on such storage must use `StagedStorage::NativeOnly`, which refuses a temp directory outside
+   the native allow-list instead of falling back.
 2. **The unlink race.** In a shared writable directory without a sticky bit another user can move the spool away
    and put their own file under its name between our identity check and our `unlinkat`; we then remove their file.
    After the unlink the portable path requires the spool name to be gone (`ENOENT`) and our descriptor to have no

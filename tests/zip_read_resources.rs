@@ -298,6 +298,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             fallback_mtime: None,
                             compressed_tar: Default::default(),
                             version_naming: Default::default(),
+                            preexisting_links: Default::default(),
                         },
                         Some("password"),
                         |_| {},

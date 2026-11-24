@@ -48,6 +48,7 @@ fn options(dest: &Path) -> Options {
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     }
 }
 
@@ -220,10 +221,14 @@ fn link_member(name: &[u8], target: &[u8]) -> Vec<u8> {
 }
 
 fn progressive(path: &Path, dest: &Path) -> Result<Vec<String>, zipfast::progressive::ProgressiveFailure> {
+    progressive_with(path, options(dest))
+}
+
+fn progressive_with(path: &Path, options: Options) -> Result<Vec<String>, zipfast::progressive::ProgressiveFailure> {
     use std::task::{Context, Poll};
     use zipfast::progressive::*;
     let volume = (path.file_name().unwrap().to_owned(), fs::read(path).unwrap().into_boxed_slice());
-    let opts = ProgressiveOptions::new(options(dest), path.file_name().unwrap().to_owned());
+    let opts = ProgressiveOptions::new(options, path.file_name().unwrap().to_owned());
     let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
     let waker = std::task::Waker::noop();
     let mut outcomes = Vec::new();
@@ -677,6 +682,135 @@ fn a_moved_folder_is_never_trusted_under_another_spelling() {
             };
             let _ = extract::run(&path, &opts, |_| {});
             assert_eq!(common::links_leading_out(&dest), Vec::<PathBuf>::new(), "nfd={nfd} threads={threads}");
+        }
+    }
+}
+
+/// A link whose target names a member with a raw non-UTF-8 name points at that member where it was written (its
+/// name mapped to U+E080..U+E0FF), on every route, rather than at the raw bytes.
+#[test]
+fn link_targets_are_mapped_like_raw_member_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.rar");
+    fs::write(&path, archive(&[header(0x74, 3, b"caf\xe9", b"data", 0o100644, &[]), link_member(b"link", b"caf\xe9")]))
+        .unwrap();
+    let written = "caf\u{E0E9}";
+    let check = |route: &str, out: &Path| {
+        assert_eq!(fs::read(out.join(written)).unwrap(), b"data", "{route}");
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(written), "{route}");
+        assert_eq!(fs::read(out.join("link")).unwrap(), b"data", "{route}: the link resolves to the member");
+    };
+    let out = dir.path().join("run");
+    let summary = extract::run(&path, &options(&out), |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    check("run", &out);
+
+    let out = dir.path().join("selected");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (2, 0));
+    check("selected", &out);
+
+    let out = dir.path().join("progressive");
+    let outcomes = progressive(&path, &out).unwrap();
+    assert_eq!(outcomes.iter().filter(|o| *o == "verified").count(), 2, "{outcomes:?}");
+    check("progressive", &out);
+}
+
+/// A link already in the destination that leads out (`alias -> ../outside`): an archive link whose target passes
+/// through it (`new -> alias/secret`, or `new -> alias`) is refused on every route, while a chain through a link
+/// the same run placed is still made.
+#[test]
+fn link_targets_through_preexisting_links_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("outside")).unwrap();
+    for (n, target) in [&b"alias/secret"[..], b"alias", b"./sub/../alias/x"].into_iter().enumerate() {
+        let path = dir.path().join(format!("{n}.rar"));
+        let blocks = [link_member(b"new", target), link_member(b"mine", b"sub"), link_member(b"chain", b"mine/x")];
+        fs::write(&path, archive(&blocks)).unwrap();
+        let label = String::from_utf8_lossy(target);
+        let prepare = |route: &str| {
+            let out = dir.path().join(format!("{n}-{route}"));
+            fs::create_dir_all(out.join("sub")).unwrap();
+            std::os::unix::fs::symlink("../outside", out.join("alias")).unwrap();
+            out
+        };
+        let check = |route: &str, out: &Path| {
+            assert!(fs::symlink_metadata(out.join("new")).is_err(), "{label} {route}");
+            assert_eq!(fs::read_link(out.join("chain")).unwrap(), Path::new("mine/x"), "{label} {route}");
+        };
+
+        let out = prepare("run");
+        let summary = extract::run(&path, &options(&out), |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), 1, "{label}: {:?}", summary.errors);
+        check("run", &out);
+
+        let out = prepare("selected");
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!((summary.files, summary.failed), (2, 1), "{label}");
+        check("selected", &out);
+
+        let out = prepare("progressive");
+        let failure = progressive(&path, &out).unwrap_err();
+        assert!(matches!(failure.kind, zipfast::progressive::FailureKind::UnsafePath), "{label}: {failure:?}");
+        assert!(fs::symlink_metadata(out.join("new")).is_err(), "{label}");
+    }
+}
+
+/// A link already in the destination that stays inside (`d -> sub`) is followed by default, as UnRAR 7.30 does:
+/// `f -> d/file.txt` is made, and so are `l -> d` and `m -> l/file.txt`. Under `PreexistingLinks::Refuse` (7-Zip's
+/// rule) `f` and `l` are refused on every route; `m` is then made, with nothing at `l` to pass through.
+#[test]
+fn preexisting_links_inside_the_destination_follow_the_policy() {
+    use zipfast::extract::PreexistingLinks;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    let blocks = [link_member(b"f", b"d/file.txt"), link_member(b"l", b"d"), link_member(b"m", b"l/file.txt")];
+    fs::write(&path, archive(&blocks)).unwrap();
+    for policy in [PreexistingLinks::FollowInside, PreexistingLinks::Refuse] {
+        let follow = policy == PreexistingLinks::FollowInside;
+        let prepare = |route: &str| {
+            let out = dir.path().join(format!("{policy:?}-{route}"));
+            fs::create_dir_all(out.join("sub")).unwrap();
+            fs::write(out.join("sub/file.txt"), b"pre").unwrap();
+            std::os::unix::fs::symlink("sub", out.join("d")).unwrap();
+            (out.clone(), Options { preexisting_links: policy, ..options(&out) })
+        };
+        let check = |route: &str, out: &Path| {
+            assert_eq!(fs::read_link(out.join("m")).unwrap(), Path::new("l/file.txt"), "{policy:?} {route}");
+            for name in ["f", "l"] {
+                assert_eq!(fs::symlink_metadata(out.join(name)).is_ok(), follow, "{policy:?} {route} {name}");
+            }
+            if follow {
+                assert_eq!(fs::read(out.join("f")).unwrap(), b"pre");
+                assert_eq!(fs::read(out.join("m")).unwrap(), b"pre");
+            }
+        };
+
+        let (out, opts) = prepare("run");
+        let summary = extract::run(&path, &opts, |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), if follow { 0 } else { 2 }, "{policy:?}: {:?}", summary.errors);
+        check("run", &out);
+
+        let (out, opts) = prepare("selected");
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(summary.failed, if follow { 0 } else { 2 }, "{policy:?}");
+        check("selected", &out);
+
+        let (out, opts) = prepare("progressive");
+        let outcome = progressive_with(&path, opts);
+        if follow {
+            outcome.unwrap();
+            check("progressive", &out);
+        } else {
+            let failure = outcome.unwrap_err();
+            assert!(matches!(failure.kind, zipfast::progressive::FailureKind::UnsafePath), "{failure:?}");
+            assert!(fs::symlink_metadata(out.join("f")).is_err());
         }
     }
 }

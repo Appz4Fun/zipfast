@@ -43,6 +43,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite, threads: usize) -> Opt
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     }
 }
 
@@ -185,12 +186,19 @@ fn rename_existing_never_links_through_a_symlink_that_replaced_a_folder() {
     );
     let opts = options(&dest, Mode::Extract, Overwrite::RenameExisting(RenameStyle::Underscore), 1);
     let s = extract::run(&arc, &opts, |_| {}).unwrap();
-    assert_eq!(fs::read_link(dest.join("d")).unwrap(), Path::new("ext"));
+    // `ext` (in the destination before the run) leads out, so `d -> ext` is refused before it is made; the folder
+    // had already moved aside, so the hard links to `d/f` are refused too (#189)
+    assert!(fs::symlink_metadata(dest.join("d")).is_err());
     assert_eq!(fs::read(dest.join("d_1/f")).unwrap(), b"mine");
-    // refused as files no longer recorded, before any device and inode check: the link replaced the folder, so
-    // every record under it went (#189)
-    let why = "the hard link's target is not a file extracted earlier in this run";
-    assert_eq!(s.errors, [format!("h: {why}"), format!("c: {why}")]);
+    let changed = "the hard link's target is no longer the file extracted earlier";
+    assert_eq!(
+        s.errors,
+        [
+            "d: the link's target leads out of the destination through another link".to_string(),
+            format!("h: {changed}"),
+            format!("c: {changed}"),
+        ]
+    );
     assert!(fs::symlink_metadata(dest.join("h")).is_err() && fs::symlink_metadata(dest.join("c")).is_err());
     assert_eq!(fs::metadata(outside.join("f")).unwrap().nlink(), 1);
 }
@@ -401,8 +409,10 @@ fn rar_session_hard_links_follow_renames_and_never_a_replaced_folder() {
         tmp.path(),
         &[dir("d"), FileSpec::new("d/f", b"mine"), link("d", 1, "ext"), link("h", 4, "d/f"), FileSpec::new("z", b"z")],
     );
-    assert_eq!(extract(&arc, &dest, Overwrite::RenameExisting(RenameStyle::Underscore)), [3]);
-    assert_eq!(fs::read_link(dest.join("d")).unwrap(), Path::new("ext"));
+    let failed = extract(&arc, &dest, Overwrite::RenameExisting(RenameStyle::Underscore));
+    // `d -> ext` leads out through a link the destination already held, so it is refused too
+    assert_eq!(failed, [2, 3]);
+    assert!(fs::symlink_metadata(dest.join("d")).is_err());
     assert_eq!(fs::read(dest.join("z")).unwrap(), b"z");
     assert_eq!(fs::metadata(outside.join("f")).unwrap().nlink(), 1);
 }

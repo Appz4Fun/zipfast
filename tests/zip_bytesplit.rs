@@ -39,6 +39,7 @@ fn options(dest: &Path, mode: Mode) -> Options {
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     }
 }
 
@@ -203,4 +204,83 @@ fn streamed_members_before_a_gap_are_found_by_their_descriptors() {
     assert_eq!(fs::read(dir.path().join("b.txt")).unwrap().len(), 5);
     assert!(result.errors.iter().any(|e| e.starts_with("c.bin: missing volume")), "{:?}", result.errors);
     assert!(!dir.path().join("c.bin").exists());
+}
+
+/// A set whose first piece is too short to hold the ZIP signature still routes as a byte-split set on the checked
+/// entry points and in inspection, not as a single-file ZIP of the first piece.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_first_piece_without_a_signature_still_routes_as_a_set() {
+    use zipfast::extract::Cancellation;
+    let dir = tempfile::tempdir().unwrap();
+    let zip = stored_zip(&[("a.txt", b"one"), ("b.txt", b"two")]);
+    fs::write(dir.path().join("short.zip.001"), &zip[..2]).unwrap();
+    fs::write(dir.path().join("short.zip.002"), &zip[2..]).unwrap();
+    let first = dir.path().join("short.zip.001");
+    match extract::inspect(&first).unwrap() {
+        Inspection::Other(entries) => assert_eq!(names(&entries), [("a.txt", 3), ("b.txt", 3)]),
+        _ => panic!("a byte-split ZIP inspects as a listing"),
+    }
+    let out = dir.path().join("out");
+    let report = extract::run_with_policy(
+        &first,
+        &options(&out, Mode::Extract),
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |_: extract::RunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(report.files(), 2);
+    assert_eq!(fs::read(out.join("b.txt")).unwrap(), b"two");
+}
+
+/// The checked entry points report a split set's members one by one with their listing ordinals, and stop once a
+/// cancellation is seen: one from the first success stops before the next member, and one from the last member's
+/// success still ends the run as canceled rather than as a success.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn checked_runs_report_members_and_honor_cancellation() {
+    use zipfast::extract::{Cancellation, RunEvent};
+    use zipfast::zip::ReadFault;
+    // which member's success cancels the run
+    for cancel_at in [None, Some(0), Some(1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Cancellation::default();
+        let mut succeeded = Vec::new();
+        let result = extract::run_with_policy(
+            &first(),
+            &options(dir.path(), Mode::Extract),
+            None,
+            &cancel,
+            &Default::default(),
+            |event: RunEvent<'_>| {
+                if let RunEvent::MemberSucceeded { ordinal, name, .. } = event {
+                    succeeded.push((ordinal, name.to_owned()));
+                    if cancel_at == Some(ordinal) {
+                        cancel.cancel();
+                    }
+                }
+                Ok(())
+            },
+        );
+        let both = [(0, "noise.bin".to_owned()), (1, "tiny.txt".to_owned())];
+        match cancel_at {
+            None => {
+                assert_eq!(result.unwrap().files(), 2);
+                assert_eq!(succeeded, both);
+            }
+            Some(0) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error.operation(), Some(ReadFault::Cancelled)), "{error:?}");
+                assert_eq!(succeeded, [(0, "noise.bin".to_owned())]);
+                assert!(!dir.path().join("tiny.txt").exists());
+            }
+            _ => {
+                let error = result.unwrap_err();
+                assert!(matches!(error.operation(), Some(ReadFault::Cancelled)), "{error:?}");
+                assert_eq!(succeeded, both);
+            }
+        }
+    }
 }

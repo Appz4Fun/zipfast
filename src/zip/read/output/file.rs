@@ -382,11 +382,13 @@ fn acquire(
     blocked: &mut Option<target::Refusal>,
     allow_blocked: bool,
 ) -> ZipReadResult<Option<Prepared>> {
-    ledger.with_state(|s| s.reserve(binding.encrypted, binding.bytes, 2))?;
+    // descriptors now; payload storage only once the start hook accepts the member, so a member over the spool
+    // limit that the hook skips never charges (or fails on) its decoded size
+    ledger.with_state(|s| s.reserve(binding.encrypted, 0, 2))?;
     let mut preparing = Preparing {
         ledger,
         encrypted: binding.encrypted,
-        bytes: binding.bytes,
+        bytes: 0,
         parent: None,
         directory: None,
         inode: None,
@@ -427,6 +429,20 @@ fn acquire(
             target::Target::Blocked(refusal) => return Err(refusal.fault().into()),
             _ => {}
         }
+        // A run's start hook (`MemberFilter::on_start`) is asked here: after the target checks, so a target that
+        // Skip keeps or that is blocked is never offered, and before anything is staged or decoded. It sees the path
+        // the member is published at (flattened when flattening); a rename mode picks its name only at publication,
+        // so the hook sees the requested name.
+        if allow_blocked
+            && let Some(select) = &options.select
+            && select.starts(&crate::extract::MemberStart { path: &options.dest.join(relative) })
+                == crate::extract::StartDecision::Skip
+        {
+            return Ok(false);
+        }
+        ledger.with_state(|s| s.reserve(binding.encrypted, binding.bytes, 0))?;
+        preparing.bytes = binding.bytes;
+        let parent = preparing.parent.as_mut().unwrap();
         let tilde = !parent.target().to_bytes().contains(&b'~');
         if select_backend(
             &ledger,
@@ -501,7 +517,9 @@ fn acquire(
                 mode: binding.mode,
                 mtime: binding.mtime,
                 overwrite: options.overwrite,
-                sync: context.options.publication != Publication::Bulk,
+                // Bulk drops the per-file flush only in a run, which flushes the directories once at its end; a
+                // standalone stage has no such boundary and keeps its own.
+                sync: context.options.publication != Publication::Bulk || !allow_blocked,
             };
             preparing.finished = true;
             Ok(Some(Prepared::Portable(ready)))
@@ -524,9 +542,10 @@ fn acquire(
             // normally without poisoning this completed selected action.
             let parent = preparing.parent.take();
             preparing.finished = true;
+            let reserved = preparing.bytes;
             ledger.with_state(|s| {
                 s.retire_fd(true);
-                s.release_bytes(binding.encrypted, binding.bytes);
+                s.release_bytes(binding.encrypted, reserved);
             });
             // No parent is held when a nondirectory above the target refused it.
             if let Some(parent) = parent {

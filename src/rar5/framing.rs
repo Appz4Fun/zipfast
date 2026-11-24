@@ -23,6 +23,7 @@ use std::{ops::Range, path::PathBuf};
 
 #[path = "reader/rar4.rs"]
 mod rar4;
+pub(crate) use rar4::link_target as rar4_link_target;
 
 #[derive(Debug)]
 pub(crate) enum FramingError {

@@ -131,6 +131,14 @@ impl SourceDriver {
     pub(super) fn backing_count(&self) -> usize {
         self.original.as_ref().map_or(0, |original| original.backing_count)
     }
+    /// The descriptors this driver and its replacement lanes hold now (what [`Resource::VolumeHandles`] bounds),
+    /// read without charging bookkeeping.
+    pub(crate) fn held_handles(&self) -> u64 {
+        let retained = self.retained.as_ref().map_or(0, |r| r.slots.iter().map(|o| o.backing_count).sum::<usize>());
+        let lanes =
+            self.replacements.iter().map(|(_, lane)| lane.native.handle_count() + lane.backing_count()).sum::<usize>();
+        (self.external_handles + self.native.handle_count() + self.backing_count() + retained + lanes) as u64
+    }
     pub(super) fn retained_backing_count(&self) -> ProgressiveResult<usize> {
         let Some(retained) = &self.retained else {
             return Ok(0);

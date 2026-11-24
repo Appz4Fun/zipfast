@@ -1408,6 +1408,7 @@ mod tests {
                     fallback_mtime: None,
                     compressed_tar: Default::default(),
                     version_naming: Default::default(),
+                    preexisting_links: Default::default(),
                 },
                 "a.rar".into(),
             );
@@ -1743,6 +1744,7 @@ mod tests {
                 fallback_mtime: None,
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
+                preexisting_links: Default::default(),
             };
             let run = crate::extract::run_with_password(
                 &fixtures.join(format!("testfile5{set}.part01.rar")),

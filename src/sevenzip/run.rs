@@ -348,7 +348,7 @@ pub(super) fn run(
         report,
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
-        extracted: Default::default(),
+        extracted: crate::extract::link::Extracted::new(&opts),
         active: None,
         password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],
@@ -418,6 +418,7 @@ pub(super) fn print(
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};
@@ -431,7 +432,7 @@ pub(super) fn print(
         report: &mut report,
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
-        extracted: Default::default(),
+        extracted: crate::extract::link::Extracted::new(&options),
         active: None,
         password_proven: map.header_encrypted,
         buf: vec![0; CHUNK],
@@ -568,7 +569,12 @@ impl Run<'_> {
                 }
             }
         }
-        self.close_folder()
+        self.close_folder()?;
+        // canceled from the last folder's deferred outcomes
+        if self.cancel.is_canceled() {
+            return Err(SevenZipError::Canceled);
+        }
+        Ok(())
     }
 
     /// Where a member is to go, or None when it is not written (already reported). Folders above it are made.
@@ -777,14 +783,19 @@ impl Run<'_> {
             drop(held);
             return self.store.reset().map_err(SevenZipError::Io);
         }
+        // A cancellation from an earlier member's outcome stops the deferred members still to come.
+        let canceled = |run: &Self| if run.cancel.is_canceled() { Err(SevenZipError::Canceled) } else { Ok(()) };
         for (ordinal, spool) in held {
+            canceled(self)?;
             self.print_spooled(ordinal, spool)?;
         }
         self.store.reset().map_err(SevenZipError::Io)?;
         for (name, size, ordinal) in tested {
+            canceled(self)?;
             self.succeeded(ordinal, &name, size);
         }
         for staged in staged {
+            canceled(self)?;
             self.publish(staged)?;
         }
         Ok(())

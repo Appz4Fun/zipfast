@@ -468,3 +468,30 @@ fn recovery_output_guard_charges_metadata_and_keeps_attempt_and_cancel_bounds() 
     assert_eq!(output.metadata().unwrap().len(), 0);
     assert!(!target.exists());
 }
+
+/// Recovery charges the local names and extra fields it reads to the planning work budget, as an ordinary rewrite
+/// preflight does: a ceiling one unit below what a run needs stops it with `PlanWork`.
+#[test]
+fn recovery_layout_reads_are_charged_to_planning_work() {
+    use zipfast::zip::create::{CreateError, CreateLimit};
+    use zipfast::zip::rewrite::RewriteError;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("old.zip");
+    fs::write(&source, fixture()).unwrap();
+    let report = RecoveryPlan::open(&source, &root.path().join("a.zip"), RecoveryOptions::default()).unwrap().recover();
+    let Ok(RecoveryOutcome::Published(archive)) = report.outcome else { panic!("{:?}", report.outcome) };
+    let usage = archive.usage;
+    assert!(usage.layout_read_bytes > 0);
+    assert!(usage.common.plan.work >= usage.layout_read_bytes, "{usage:?}");
+    let mut options = RecoveryOptions::default();
+    options.limits.common.plan_work = usage.common.plan.work - 1;
+    let report = RecoveryPlan::open(&source, &root.path().join("b.zip"), options).unwrap().recover();
+    let failure = report.outcome.unwrap_err();
+    assert!(
+        matches!(failure.cause, RewriteError::Infrastructure(CreateError::Limit(CreateLimit::PlanWork))),
+        "{:?}",
+        failure.cause
+    );
+    assert!(failure.usage.common.plan.work < usage.common.plan.work);
+    assert!(!root.path().join("b.zip").exists());
+}

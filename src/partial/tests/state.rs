@@ -63,10 +63,10 @@ impl StateAnchorStore for Store {
         Ok(())
     }
 }
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub(super) dir: tempfile::TempDir,
     store: Arc<Store>,
-    pub(super) member: MemberKey,
+    pub(crate) member: MemberKey,
     evidence: InitialEvidence,
     checks: MemberChecks,
     size: u64,
@@ -99,6 +99,18 @@ fn sized_header(name: &str, size: u64, crc: u32) -> Vec<u8> {
 impl Fixture {
     pub(super) fn new() -> Self {
         Self::new_in(None)
+    }
+    /// Runs `f` while an operation holds `core`'s data, as a caller's read or write does.
+    pub(crate) fn while_busy<R>(core: &PartialCore, f: impl FnOnce() -> R) -> R {
+        let _operation = core.operation().unwrap();
+        f()
+    }
+    /// A fixture and the core of its member, for tests outside this module.
+    pub(crate) fn with_core() -> (Self, Arc<PartialCore>) {
+        let f = Self::new();
+        let options = f.options(PartialLimits::default(), ProgressiveLimits::default(), SessionControl::default());
+        let core = PartialCore::create(f.spec(), f.checks.clone(), options).unwrap();
+        (f, core)
     }
     fn new_in(parent: Option<&std::path::Path>) -> Self {
         Self::sized_in(parent, 16)
@@ -1817,4 +1829,22 @@ fn grouped_refills_join_the_open_group_and_corrections_keep_their_transaction() 
     let result = file.refill_from_packed(0, start..start + 8, &mut std::io::Cursor::new(volume)).unwrap();
     assert_eq!(result.corrected, vec![0..4]);
     assert_eq!(&fs::read(f.output()).unwrap()[..8], b"abcdefgh");
+}
+
+/// While an operation holds a core's data its packed spans are unknown, not empty: the session must not record an
+/// empty span list for a member released at that moment.
+#[test]
+fn packed_parts_are_unknown_while_an_operation_holds_the_core() {
+    let f = Fixture::new();
+    let core = PartialCore::create(
+        f.spec(),
+        f.checks.clone(),
+        f.options(PartialLimits::default(), ProgressiveLimits::default(), SessionControl::default()),
+    )
+    .unwrap();
+    assert!(core.packed_parts().is_some());
+    let operation = core.operation().unwrap();
+    assert!(core.packed_parts().is_none());
+    drop(operation);
+    assert!(core.packed_parts().is_some());
 }

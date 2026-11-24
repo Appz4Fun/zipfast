@@ -2006,12 +2006,14 @@ impl PartialCore {
     /// operation or touching the output, so unrelated members never fail a declaration; a member busy in another
     /// operation answers true and is then tried for real.
     /// Packed ranges of every part recorded so far, for a session that releases this core.
-    pub(crate) fn packed_parts(&self) -> Vec<PackedSpan> {
+    /// The packed spans of the recorded parts; None while an operation on a handle holds the core's data, which
+    /// says nothing about its evidence.
+    pub(crate) fn packed_parts(&self) -> Option<Vec<PackedSpan>> {
         self.data
             .lock()
             .unwrap()
             .as_ref()
-            .map_or_else(Vec::new, |data| data.snapshot.evidence.parts.iter().map(|part| part.packed.clone()).collect())
+            .map(|data| data.snapshot.evidence.parts.iter().map(|part| part.packed.clone()).collect())
     }
     pub(crate) fn touches(&self, volume: u32, range: &Range<u64>) -> bool {
         self.data.lock().unwrap().as_ref().is_none_or(|data| {
@@ -2166,11 +2168,14 @@ impl PartialCore {
         if supplied.as_ref().is_some_and(|c| c.size != head.size || (c.crc32.is_none() && c.blake2sp.is_none())) {
             return Err(err(PartialErrorKind::InvalidOptions));
         }
+        // An encrypted RAR5 member's archive checks are keyed: plaintext checks are never compared with them.
+        let keyed = data.snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc);
         if let Some(previous) = head.tail {
             // Abandoning again is idempotent when it changes nothing: the same supplied checks, or none (or ones
-            // that agree) when the archive's were kept.
+            // that agree, or any when the kept ones are keyed, as on the first call) when the archive's were kept.
             let same = match previous {
                 TailChecks::Supplied => supplied.as_ref() == Some(&head.checks),
+                _ if keyed => true,
                 _ => supplied.as_ref().is_none_or(|c| {
                     c.crc32.is_none_or(|v| head.checks.crc32.is_none_or(|h| h == v))
                         && c.blake2sp.is_none_or(|v| head.checks.blake2sp.is_none_or(|h| h == v))
@@ -2190,7 +2195,6 @@ impl PartialCore {
         }
         let archive = head.checks.crc32.is_some() || head.checks.blake2sp.is_some();
         // Checks the archive gave win. Supplied ones must agree with them where both are plain values.
-        let keyed = data.snapshot.crypt.is_some_and(|crypt| crypt.tweaked_crc);
         let differs = |a: Option<&[u8]>, b: Option<&[u8]>| a.zip(b).is_some_and(|(a, b)| a != b);
         if archive
             && !keyed
@@ -2990,13 +2994,13 @@ impl PartialFile {
     }
 }
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-mod tests {
+pub(crate) mod tests {
     mod ledger;
     mod native;
     #[path = "../../../tests/common/mod.rs"]
     mod rar_fixture;
     mod serde;
-    pub(super) mod state;
+    pub(crate) mod state;
     mod verify;
 }
 

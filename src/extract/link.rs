@@ -29,6 +29,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::extract::PreexistingLinks;
+
 /// The longest target taken, in bytes (`PATH_MAX` less its NUL).
 pub(crate) const MAX_TARGET: u64 = 4095;
 
@@ -54,6 +56,12 @@ pub(crate) fn contained(rel: &Path, target: &[u8]) -> bool {
     true
 }
 
+/// A RAR 4.x symbolic link's target as it is written, mapped like the member names it may point at (see
+/// `crate::rar5::framing::rar4_link_target`); None when it can't keep its meaning, which refuses the link.
+pub(crate) fn rar4_target(target: &[u8]) -> Option<Vec<u8>> {
+    crate::rar5::framing::rar4_link_target(target)
+}
+
 /// Creates the link at `path`, with the archived `modified` time when there is one (set on the link itself, best
 /// effort, as `lutimes` does). With `replace` the file there is replaced in one rename, which never follows a link;
 /// without, the link is only created where nothing is.
@@ -69,14 +77,12 @@ pub(crate) fn create(path: &Path, target: &[u8], replace: bool, modified: Option
         return Ok(());
     }
     let parent = path.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let name = path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..64 {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut stage = std::ffi::OsString::from(".");
-        stage.push(name);
-        stage.push(format!(".{}-{n}.zipfast-link", std::process::id()));
-        let stage = parent.join(stage);
+        // a short stage name of its own: one built from the destination name could pass the name length limit
+        let stage = parent.join(format!(".zipfast-link-{}-{n}", std::process::id()));
         match std::os::unix::fs::symlink(target, &stage) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -227,6 +233,11 @@ struct Landed {
 #[derive(Default)]
 pub(crate) struct Extracted {
     records: BTreeMap<PathBuf, Option<Landed>>,
+    /// device and inode of each symbolic link this run placed: the only links another link's target may pass
+    /// through (see [`foreign_link`])
+    links: std::collections::BTreeSet<(u64, u64)>,
+    /// what a link's target may do with links the destination held before the run
+    preexisting: PreexistingLinks,
     /// where each extracted file landed, and the members that landed there
     landed: BTreeMap<PathBuf, Vec<PathBuf>>,
     bytes: usize,
@@ -257,6 +268,10 @@ fn normalised(rel: &Path) -> bool {
 }
 
 impl Extracted {
+    /// No records yet, with the link settings of `options`.
+    pub(crate) fn new(options: &crate::extract::Options) -> Self {
+        Self { preexisting: options.preexisting_links, ..Self::default() }
+    }
     fn forget(&mut self, rel: &Path) {
         // the record's own key, which is what was charged: never another spelling of it
         let Some((key, old)) = self.records.remove_entry(rel) else { return };
@@ -336,6 +351,82 @@ fn identity(_: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
+/// What one recorded symbolic link takes against [`MAX_RECORDED`].
+const LINK_COST: usize = 64;
+
+/// The message for a link whose target passes through a symbolic link that was in the destination before the run,
+/// under [`PreexistingLinks::Refuse`].
+pub(crate) const FOREIGN_LINK: &str = "the link's target passes through a link that was not extracted by this run";
+
+/// The message for a link whose target, followed through the links on its way, leads out of the destination.
+pub(crate) const LINK_LEAVES: &str = "the link's target leads out of the destination through another link";
+
+/// How many links resolving one target may follow before it is refused (a loop, or a chain too long to check).
+const MAX_HOPS: usize = 40;
+
+/// Why the symbolic link to be placed at `path` (under `dest`) is refused for where its `target` really goes, or
+/// None. Lexical containment ([`contained`]) treats every folder on the way as a real one; this follows the links
+/// that are there now, as the system will: those the destination held before the run (`alias -> ../outside`) and
+/// those this run placed (checked when they were made, and followed again as they are now). The target is refused
+/// if any step leaves the destination, and under [`PreexistingLinks::Refuse`] as soon as it meets a link this run
+/// did not place. The walk stops at the first part that doesn't exist: whatever is created there later is checked then.
+#[cfg(unix)]
+pub(crate) fn foreign_link(dest: &Path, path: &Path, target: &[u8], extracted: &Extracted) -> Option<&'static str> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let parts = |bytes: &[u8]| -> Vec<Vec<u8>> { bytes.split(|&b| b == b'/').map(<[u8]>::to_vec).collect() };
+    let Some(mut at) = path.parent().map(Path::to_path_buf) else { return Some(LINK_LEAVES) };
+    let mut pending: std::collections::VecDeque<Vec<u8>> = parts(target).into();
+    let mut real_dest = None;
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        match part.as_slice() {
+            b"" | b"." => continue,
+            b".." => {
+                if !at.pop() || !at.starts_with(dest) {
+                    return Some(LINK_LEAVES);
+                }
+                continue;
+            }
+            name => at.push(std::ffi::OsStr::from_bytes(name)),
+        }
+        let m = match std::fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        if !m.file_type().is_symlink() {
+            continue;
+        }
+        if extracted.preexisting == PreexistingLinks::Refuse && !extracted.links.contains(&identity(&m)) {
+            return Some(FOREIGN_LINK);
+        }
+        hops += 1;
+        let Ok(next) = std::fs::read_link(&at) else { return Some(LINK_LEAVES) };
+        if hops > MAX_HOPS {
+            return Some(LINK_LEAVES);
+        }
+        at.pop();
+        let next = next.into_os_string().into_vec();
+        let rest = if next.first() == Some(&b'/') {
+            // an absolute target stays inside only if it names the destination, as given or as it really is
+            let next = Path::new(std::ffi::OsStr::from_bytes(&next));
+            let real = real_dest.get_or_insert_with(|| std::fs::canonicalize(dest).ok());
+            let Some(rest) =
+                next.strip_prefix(dest).ok().or_else(|| real.as_ref().and_then(|r| next.strip_prefix(r).ok()))
+            else {
+                return Some(LINK_LEAVES);
+            };
+            at = dest.to_path_buf();
+            parts(rest.as_os_str().as_bytes())
+        } else {
+            parts(&next)
+        };
+        for part in rest.into_iter().rev() {
+            pending.push_front(part);
+        }
+    }
+    None
+}
+
 /// Why a link member is refused before anything is written, or None when it may be placed at `rel`.
 pub(crate) fn refusal(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Option<&'static str> {
     match kind {
@@ -407,6 +498,8 @@ fn make_charging(
     charge: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     match kind {
+        #[cfg(unix)]
+        LinkKind::Symbolic(target) if let Some(why) = foreign_link(dest, path, target, extracted) => Err(refused(why)),
         LinkKind::Symbolic(target) => create(path, target, replace, modified),
         LinkKind::Hard(source) | LinkKind::Copy(source) => {
             let landed = extracted.records.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
@@ -416,13 +509,23 @@ fn make_charging(
 }
 
 /// Records a link member placed at `path` (an absolute path under `dest`) for the member at `rel`: a symbolic link
-/// ends the records at and below both names, and a hard link or copy is a file later hard links may take.
+/// ends the records at and below both names (and later links may pass through it), and a hard link or copy is a
+/// file later hard links may take.
 pub(crate) fn placed(dest: &Path, rel: &Path, kind: &LinkKind, path: &Path, extracted: &mut Extracted) {
     match kind {
         LinkKind::Symbolic(_) => {
             extracted.replaced(rel);
             if let Ok(landed) = path.strip_prefix(dest) {
                 extracted.replaced(landed);
+            }
+            // bounded like the file records: past the bound a link is not recorded, and a later link through it
+            // is refused
+            if let Ok(m) = std::fs::symlink_metadata(path)
+                && m.file_type().is_symlink()
+                && let Some(bytes) = extracted.bytes.checked_add(LINK_COST).filter(|&b| b <= MAX_RECORDED)
+                && extracted.links.insert(identity(&m))
+            {
+                extracted.bytes = bytes;
             }
         }
         LinkKind::Hard(_) | LinkKind::Copy(_) => extracted.file(dest, rel, path),
@@ -442,12 +545,10 @@ static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// A free name beside `path` for staging.
 fn stage_beside(path: &Path) -> io::Result<std::path::PathBuf> {
     let parent = path.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let name = path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let n = NEXT_STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut stage = std::ffi::OsString::from(".");
-    stage.push(name);
-    stage.push(format!(".{}-{n}.zipfast-hardlink", std::process::id()));
-    Ok(parent.join(stage))
+    // a short name of its own, as for symbolic links: one built from the destination name could pass the limit
+    Ok(parent.join(format!(".zipfast-hardlink-{}-{n}", std::process::id())))
 }
 
 /// A hard link at `path` to the file the earlier member landed as (or with `copy` a copy of it): reached from
@@ -798,5 +899,18 @@ mod tests {
         assert_eq!(e.records.len(), n);
         e.replaced(Path::new("d7"));
         assert_eq!(e.records.len(), n - n / 100);
+    }
+
+    /// Replacing a file whose name is near the 255-byte component limit with a link works: the stage name is not
+    /// built from the destination name.
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_long_name_with_a_link_fits_the_name_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("n".repeat(240));
+        std::fs::write(&path, b"old").unwrap();
+        create(&path, b"target", true, None).unwrap();
+        assert_eq!(std::fs::read_link(&path).unwrap(), Path::new("target"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

@@ -166,3 +166,12 @@ fn large_stated_dictionaries_are_not_refused() {
     let (props, packed) = encode(true, &data);
     assert_eq!(lzma_decode(&props, &packed, None, 1 << 40).unwrap(), data);
 }
+
+/// A stated size is not reserved up front: a stream that stops short of a huge stated size is truncated, not an
+/// allocation failure.
+#[test]
+fn a_huge_stated_size_grows_output_as_it_is_produced() {
+    let data = sample(1000);
+    let (props, packed) = encode(true, &data);
+    assert_eq!(lzma_decode(&props, &packed, Some(1 << 62), u64::MAX), Err(LzmaError::Truncated));
+}

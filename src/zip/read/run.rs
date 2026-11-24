@@ -251,6 +251,8 @@ impl ProjectedReadSession {
         }
         // Directories a Publication::Bulk run published into, flushed once when the run ends.
         let mut bulk_dirs = std::collections::BTreeSet::<PathBuf>::new();
+        // the symbolic links this run placed: a later link's target may pass through them, not through others
+        let mut links = crate::extract::link::Extracted::new(options);
         // Counter and limit faults inside the loop return early; the directories already published into are still
         // flushed before that fault is returned.
         let looped = (|| -> ZipReadResult<()> {
@@ -315,7 +317,7 @@ impl ProjectedReadSession {
                         continue;
                     }
                     let (result, skipped, local_refusal) =
-                        self.member(ordinal, options, password, cancel, context, &mut bulk_dirs);
+                        self.member(ordinal, options, password, cancel, context, &mut bulk_dirs, &mut links);
                     let bytes = self.owner.entries[ordinal].size;
                     let mut fault = result.err().map(|error| {
                         let local = (continued(&error) || local_refusal)
@@ -381,9 +383,13 @@ impl ProjectedReadSession {
         })();
         if let Err(error) = looped {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            let _ = sync_directories(&bulk_dirs, &options.dest, cancel);
+            let _ = sync_directories(&bulk_dirs, &anchored_root(options, context), cancel);
             return Err(error);
         }
+        // Flush before directory finalization, which may restore archived modes (0300, 0000) that no longer let a
+        // directory be opened for its flush.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let synced = sync_directories(&bulk_dirs, &anchored_root(options, context), cancel);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(mut index) = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.auxiliary.take_directories()? {
             if !cancel.is_canceled() && !context.ledger.with_state(|s| s.poisoned) {
@@ -422,7 +428,7 @@ impl ProjectedReadSession {
             action.active_record_charged = false;
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Err(fault) = sync_directories(&bulk_dirs, &options.dest, cancel)
+        if let Err(fault) = synced
             && terminal.is_none()
         {
             terminal = Some(fault.into());
@@ -558,6 +564,7 @@ impl ProjectedReadSession {
         context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.run_bound = true;
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     fn member(
         &mut self,
         ordinal: usize,
@@ -566,6 +573,7 @@ impl ProjectedReadSession {
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
         bulk_dirs: &mut std::collections::BTreeSet<PathBuf>,
+        links: &mut crate::extract::link::Extracted,
     ) -> (ZipReadResult<()>, bool, bool) {
         context.ledger.with_state(|s| s.active_encrypted = Some(self.owner.entries[ordinal].encrypted()));
         let Some(action) = context.action.as_mut() else { return (Err(ReadFault::InvalidPlan.into()), false, false) };
@@ -585,7 +593,7 @@ impl ProjectedReadSession {
         let max = action.caller_max.unwrap_or(u64::MAX);
         let e = &self.owner.entries[ordinal];
         if e.is_link() {
-            return self.link_member(ordinal, options, password, cancel, context);
+            return self.link_member(ordinal, options, password, cancel, context, links);
         }
         let relative = match policy::PolicyPath::normalized(&context.ledger, &e.name, e.host != 3, cancel) {
             Ok(path) => path,
@@ -610,20 +618,8 @@ impl ProjectedReadSession {
             {
                 let mode = e.unix_mode();
                 let mtime = e.mtime.map(|s| (s, e.nanos));
-                // The start hook (`MemberFilter::on_start`) decides before anything is staged or decoded; a target
-                // Skip leaves alone is not asked about. A rename mode picks its name only when the member is
-                // published, so the hook sees the requested path here.
-                if let Some(select) = &options.select {
-                    let requested = options.dest.join(relative.path());
-                    let kept = options.overwrite == crate::extract::Overwrite::Skip
-                        && std::fs::symlink_metadata(&requested).is_ok();
-                    if !kept
-                        && select.starts(&crate::extract::MemberStart { path: &requested })
-                            == crate::extract::StartDecision::Skip
-                    {
-                        return Ok(true);
-                    }
-                }
+                // The start hook (`MemberFilter::on_start`) is asked inside staging, once the target checks passed
+                // and before anything is staged or decoded (see `output::file::acquire`).
                 let (stage, blocked) = ZipReadStage::prepare_run_file(
                     self.stage_entry(ordinal)?,
                     relative.path(),
@@ -652,10 +648,16 @@ impl ProjectedReadSession {
                     context.options.publication == Publication::Bulk && stage.backend() == StagedBackend::Portable;
                 let published = stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx));
                 if bulk && matches!(published, Ok(true)) {
-                    // The published name's directory and every directory between it and the destination root.
-                    let mut dir = options.dest.join(relative.path());
-                    while dir.pop() && dir.starts_with(&options.dest) {
-                        if !bulk_dirs.insert(dir.clone()) {
+                    // The published name's directory and every directory between it and the destination root, where
+                    // the file really went: a flattened member lands in the root, and a relative destination is
+                    // anchored to the run's frozen working directory, as publication itself is.
+                    let root = anchored_root(options, context);
+                    let mut dir = if options.flatten { root.clone() } else { root.join(relative.path()) };
+                    if !options.flatten {
+                        dir.pop();
+                    }
+                    loop {
+                        if !dir.starts_with(&root) || !bulk_dirs.insert(dir.clone()) || !dir.pop() {
                             break;
                         }
                     }
@@ -707,6 +709,7 @@ impl ProjectedReadSession {
         password: Option<&str>,
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
+        extracted: &mut crate::extract::link::Extracted,
     ) -> (ZipReadResult<()>, bool, bool) {
         use crate::extract::link;
         let refuse = |reason: &'static str| (Err(ReadFault::CheckedFormat { reason }.into()), false, true);
@@ -729,10 +732,9 @@ impl ProjectedReadSession {
         };
         let rel = if options.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
         let kind = link::LinkKind::Symbolic(text);
-        // ZIP holds no hard links, so the run keeps no record of the files it wrote
-        let mut extracted = link::Extracted::default();
+        // ZIP holds no hard links, so the run records only the symbolic links it placed
         // testing checks the target as extracting would
-        if let Some(why) = link::refusal(&rel, &kind, &extracted) {
+        if let Some(why) = link::refusal(&rel, &kind, extracted) {
             return refuse(why);
         }
         if options.mode != Mode::Extract {
@@ -751,7 +753,7 @@ impl ProjectedReadSession {
             Ok(crate::extract::Checked::Blocked(why)) => return refuse(why),
             Err(error) => return (Err(ReadFault::Legacy(error).into()), false, false),
         };
-        match link::publish(&options.dest, &rel, place, &kind, modified, &mut extracted) {
+        match link::publish(&options.dest, &rel, place, &kind, modified, extracted) {
             Ok(()) => (Ok(()), false, false),
             Err(error) if let Some(why) = link::member_failure(&error) => refuse(why),
             Err(error) => (
@@ -1082,6 +1084,16 @@ pub(crate) fn with_opened_context(
 #[cfg(test)]
 pub(super) fn final_completion_control_layout() -> [usize; 2] {
     [std::mem::size_of::<Completion>(), std::mem::size_of::<policy::FrozenPolicy>()]
+}
+
+/// The destination root as publication resolves it: a relative destination is anchored to the run's frozen working
+/// directory, so a later change of the process's working directory doesn't move it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn anchored_root(options: &Options, context: &EncryptedReadContext) -> PathBuf {
+    match context.action.as_ref().and_then(|a| a.policy.as_ref()) {
+        Some(policy) => policy.cwd().join(&options.dest),
+        None => options.dest.clone(),
+    }
 }
 
 /// Flushes each directory a [`Publication::Bulk`] run published into, once, after the run. The destination root is

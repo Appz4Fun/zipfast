@@ -1185,6 +1185,7 @@ mod takeover {
                 fallback_mtime: None,
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
+                preexisting_links: Default::default(),
             },
             name(0),
         );

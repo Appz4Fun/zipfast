@@ -42,6 +42,7 @@ fn opts(mode: Mode, dest: &Path, threads: usize) -> Options {
         fallback_mtime: None,
         compressed_tar: zipfast::extract::CompressedTar::Members,
         version_naming: zipfast::extract::VersionNaming::Semicolon,
+        preexisting_links: Default::default(),
     }
 }
 

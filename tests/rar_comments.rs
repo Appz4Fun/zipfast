@@ -129,6 +129,13 @@ fn rar2_main_header_comments_stored_and_compressed() {
     let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
     assert_eq!(session.volumes().next().unwrap().comment_header(), None);
     assert_eq!(session.comment(0).unwrap().as_deref(), Some(&text[..]));
+    // The comment header's own CRC covers its fields: a changed unpacked size is caught there (the main header's
+    // CRC covers only its first 13 bytes).
+    let mut bytes = rar2_commented(text.len() as u16, 20, 0x30, crc32fast::hash(text) as u16, text);
+    bytes[20 + 7] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    let failure = comment_of(&path).unwrap_err();
+    assert!(matches!(&*failure, RarFailure::Integrity { reason: RarIntegrityReason::HeaderCrc, .. }), "{failure:?}");
 
     // Genuine RAR 1.5 and RAR 2.0 compressed streams, embedded as comments.
     for fixture in ["rar4-legacy/readme_154_normal.rar", "rar4-legacy/AUTOREJ.RAR"] {

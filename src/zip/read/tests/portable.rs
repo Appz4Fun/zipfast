@@ -82,6 +82,7 @@ fn run(archive: &Path, dest: &Path, overwrite: Overwrite, storage: StagedStorage
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     };
     let overrides = EncryptedReadOverrides { staged_storage: storage, ..Default::default() };
     crate::zip::run_with_policy(
@@ -274,6 +275,7 @@ fn run_with_context_restores_the_stream_setting() {
         fallback_mtime: None,
         compressed_tar: Default::default(),
         version_naming: Default::default(),
+        preexisting_links: Default::default(),
     };
     let mut context = EncryptedReadContext::new(Default::default()).unwrap();
     assert!(!context.options.stream_staged_aes);

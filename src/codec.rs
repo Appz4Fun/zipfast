@@ -133,11 +133,8 @@ pub(crate) fn decode(
     use liblzma::stream::{Action, Status, Stream};
     let mut stream = Stream::new_raw_decoder(filters).map_err(|_| LzmaError::Allocation)?;
     let target = size.unwrap_or(max_output);
+    // Output grows as it is produced, even with a stated size: a corrupt stream may state one it never reaches.
     let mut out = Vec::new();
-    if let Some(size) = size {
-        let size = usize::try_from(size).map_err(|_| LzmaError::Allocation)?;
-        out.try_reserve_exact(size).map_err(|_| LzmaError::Allocation)?;
-    }
     let mut chunk = Vec::new();
     chunk.try_reserve_exact(STEP).map_err(|_| LzmaError::Allocation)?;
     chunk.resize(STEP, 0);
@@ -154,8 +151,8 @@ pub(crate) fn decode(
         consumed += (stream.total_in() - i) as usize;
         let written = &chunk[..(stream.total_out() - o) as usize];
         if out.len() + written.len() > out.capacity() {
-            // Grow geometrically, but never past one byte over the cap.
-            let limit = usize::try_from(target.saturating_add(1)).unwrap_or(usize::MAX);
+            // Grow geometrically, but never past the stated size or one byte over the cap.
+            let limit = usize::try_from(target.saturating_add(u64::from(size.is_none()))).unwrap_or(usize::MAX);
             let want = out.capacity().saturating_mul(2).max(out.len() + written.len()).min(limit);
             out.try_reserve_exact(want.max(out.len() + written.len()) - out.len())
                 .map_err(|_| LzmaError::Allocation)?;

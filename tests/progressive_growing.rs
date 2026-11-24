@@ -84,6 +84,7 @@ fn options(dest: &Path) -> ProgressiveOptions {
             fallback_mtime: None,
             compressed_tar: Default::default(),
             version_naming: Default::default(),
+            preexisting_links: Default::default(),
         },
         OsString::from(NAMES[0]),
     )

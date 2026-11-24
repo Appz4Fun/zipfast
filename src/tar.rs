@@ -759,6 +759,8 @@ enum Content {
 
 struct Reader {
     src: Source,
+    /// the run's cancellation, also checked between the publications of a staged (compressed) tar
+    cancel: Option<Cancellation>,
     content: Content,
     /// the start of the data, read to tell tar from a lone compressed file: one header block for tar
     first: Option<Vec<u8>>,
@@ -793,7 +795,7 @@ impl Reader {
         cancel: Option<Cancellation>,
         whole: bool,
     ) -> Result<Reader> {
-        let mut src = Source::open(path, threads, limit, cancel)?;
+        let mut src = Source::open(path, threads, limit, cancel.clone())?;
         let mut first = vec![0u8; BLOCK];
         let n = src.read(&mut first)?;
         first.truncate(n);
@@ -847,6 +849,7 @@ impl Reader {
         let Some(content) = content else { return Err(Error::NotAnArchive) };
         Ok(Reader {
             src,
+            cancel,
             content,
             first: Some(first),
             unread: 0,
@@ -1663,9 +1666,14 @@ impl StagedTar {
         holes: &mut HoleBudget,
         summary: &mut Summary,
         report: &mut impl LegacyReport,
+        cancel: Option<&Cancellation>,
     ) -> Result<()> {
-        let mut extracted = Extracted::default();
+        let mut extracted = Extracted::new(opts);
         for member in self.members {
+            // a cancellation from an earlier member's outcome stops the rest from being published
+            if let Some(cancel) = cancel {
+                cancel.check_io()?;
+            }
             match member {
                 StagedMember::Link { relative, name, kind, ordinal, meta } => {
                     let member = (ordinal, name.as_str(), &meta);
@@ -1896,7 +1904,7 @@ fn run_tar(
 ) -> Result<()> {
     let mut staged = (opts.mode == Mode::Extract && reader.src.codec().is_some()).then(StagedTar::default);
     // the files written so far, for hard links (a staged run tracks them as it publishes)
-    let mut extracted = Extracted::default();
+    let mut extracted = Extracted::new(opts);
     // the next member's position in a listing, which leaves out volume labels
     let mut ordinal = 0u64;
     let mut holes = HoleBudget::new();
@@ -1916,7 +1924,7 @@ fn run_tar(
                     }
                 }
                 if let Some(staged) = staged {
-                    staged.publish(opts, &mut holes, summary, report)?;
+                    staged.publish(opts, &mut holes, summary, report, reader.cancel.as_ref())?;
                 }
                 return Ok(());
             }
@@ -2317,6 +2325,7 @@ mod tests {
                 fallback_mtime: None,
                 compressed_tar: Default::default(),
                 version_naming: Default::default(),
+                preexisting_links: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);

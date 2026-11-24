@@ -629,3 +629,54 @@ fn a_quick_open_locator_is_checked_as_unrar_checks_it() {
         assert_eq!(session.headers().filter(|h| !h.is_service()).count(), 2, "{what}");
     }
 }
+
+/// A RAR 4.x block: CRC-16 of everything after it, type, flags, size, then `body`.
+fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0, 0, kind];
+    bytes.extend(flags.to_le_bytes());
+    bytes.extend(((body.len() + 7) as u16).to_le_bytes());
+    bytes.extend(body);
+    let crc = crc32fast::hash(&bytes[2..]) as u16;
+    bytes[..2].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+/// UnRAR's unknown-size sentinels: an unpacked size of 0xffffffff without the large-file flag, or all ones in both
+/// halves with it, lists as no size; any other value is the size.
+#[test]
+fn rar4_unknown_size_sentinels_list_as_no_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown.rar");
+    for (low, high, size) in [
+        (0xffff_ffffu32, None, None),
+        (0xffff_ffff, Some(0xffff_ffffu32), None),
+        (0xffff_ffff, Some(0), Some(0xffff_ffffu64)),
+        (3, None, Some(3)),
+    ] {
+        let data = b"abc";
+        let mut body = (data.len() as u32).to_le_bytes().to_vec();
+        body.extend(low.to_le_bytes());
+        body.push(2); // Win32 host
+        body.extend(crc32fast::hash(data).to_le_bytes());
+        body.extend(0x5a21_0000u32.to_le_bytes()); // DOS time
+        body.extend([20, 0x30]); // unpack version 2.0, stored
+        body.extend(1u16.to_le_bytes());
+        body.extend(0x20u32.to_le_bytes());
+        let mut flags = 0x8000;
+        if let Some(high) = high {
+            flags |= 0x100;
+            body.extend(0u32.to_le_bytes());
+            body.extend(high.to_le_bytes());
+        }
+        body.push(b'a');
+        let mut bytes = b"Rar!\x1a\x07\x00".to_vec();
+        bytes.extend(rar4_block(0x73, 0, &[0; 6]));
+        bytes.extend(rar4_block(0x74, flags, &body));
+        bytes.extend(data);
+        bytes.extend(rar4_block(0x7b, 0x4000, &[]));
+        fs::write(&path, &bytes).unwrap();
+        let session = RarSession::open(&path, None, single()).unwrap();
+        let member = session.entries().next().unwrap();
+        assert_eq!(member.unpacked_size(), size, "{low:x} {high:?}");
+    }
+}
