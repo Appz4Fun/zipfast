@@ -38,6 +38,7 @@ mod cpio;
 mod iso;
 mod table;
 mod wim;
+pub mod write;
 mod xar;
 
 pub use wim::WimInfo;
