@@ -272,6 +272,9 @@ struct Run<'a> {
     report: &'a mut dyn LegacyReport,
     summary: Summary,
     dirs: Dirs,
+    /// Destination-relative paths of links staged for their folder's CRC and not published yet: a later member under
+    /// one must not create its parents before the link takes the path, so it fails as under a published link.
+    pending_links: Vec<PathBuf>,
     active: Option<Active>,
     /// The password is known to be right: the encrypted headers decoded and passed their CRC, or some encrypted
     /// data has decoded and checked out.
@@ -348,6 +351,7 @@ pub(super) fn run(
         report,
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
+        pending_links: Vec::new(),
         extracted: crate::extract::link::Extracted::new(&opts),
         active: None,
         password_proven: map.header_encrypted,
@@ -433,6 +437,7 @@ pub(super) fn print(
         report: &mut report,
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
+        pending_links: Vec::new(),
         extracted: crate::extract::link::Extracted::new(&options),
         active: None,
         password_proven: map.header_encrypted,
@@ -609,6 +614,10 @@ impl Run<'_> {
         if self.opts.mode != Mode::Extract || member.is_dir {
             return Ok(Some((rel, None)));
         }
+        if self.pending_links.iter().any(|link| rel.starts_with(link) && rel != *link) {
+            self.fail(name, "a parent is a link in the same archive that is not placed yet");
+            return Ok(None);
+        }
         let report = &mut *self.report;
         let renames = &mut self.summary.renames;
         let ordinal = self.current;
@@ -765,6 +774,7 @@ impl Run<'_> {
             })
         });
         let staged = std::mem::take(&mut active.staged);
+        self.pending_links.clear();
         let tested = std::mem::take(&mut active.tested);
         let held = std::mem::take(&mut active.held);
         if !good {
@@ -1043,6 +1053,9 @@ impl Run<'_> {
             modified: self.opts.meta(meta(member)).modified(),
         };
         if active.defer {
+            if let Some(link) = &staged.link {
+                self.pending_links.push(link.clone());
+            }
             active.staged.push(staged);
         } else {
             self.publish(staged)?;

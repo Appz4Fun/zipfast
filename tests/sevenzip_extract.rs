@@ -461,11 +461,13 @@ struct Built {
     props: usize,
     /// A folder CRC to store (else the per-file CRCs are stored).
     folder_crc: Option<u32>,
+    /// Names of the files stored as symbolic links (their data is the target).
+    symlinks: &'static [&'static str],
 }
 
 impl Default for Built {
     fn default() -> Self {
-        Self { chain: 1, props: 0, folder_crc: None }
+        Self { chain: 1, props: 0, folder_crc: None, symlinks: &[] }
     }
 }
 
@@ -537,6 +539,16 @@ impl Built {
         h.push(0x11);
         num(&mut h, names.len() as u64);
         h.extend(names);
+        if !self.symlinks.is_empty() {
+            // attributes: Unix mode in the high half, flagged by 0x8000
+            h.push(0x15);
+            num(&mut h, 2 + 4 * files.len() as u64);
+            h.extend([1, 0]);
+            for name in &files {
+                let mode: u32 = if self.symlinks.contains(name) { 0o120_777 } else { 0o100_644 };
+                h.extend((mode << 16 | 0x8000).to_le_bytes());
+            }
+        }
         h.extend([0x00, 0x00]);
         let mut start = [0u8; 20];
         start[..8].copy_from_slice(&(packed.len() as u64).to_le_bytes());
@@ -1330,4 +1342,25 @@ fn a_wrong_password_reports_held_members_in_archive_order() {
         assert!(right.errors.is_empty(), "{:?}", right.errors);
         assert_eq!(right.files, 3);
     }
+}
+
+/// Bug group R1, A2: in a folder that stores its own CRC, a member under a refused link is refused as under a
+/// published link, the placeholder still takes the link's path, and the members after it extract.
+#[cfg(unix)]
+#[test]
+fn a_member_under_a_deferred_refused_link_fails_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<(&str, &[u8])> = vec![("s", b"../outside"), ("s/new.txt", b"new"), ("other.txt", b"other")];
+    let all: Vec<u8> = files.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+    let built = Built { folder_crc: Some(crc32fast::hash(&all)), symlinks: &["s"], ..Built::default() };
+    let archive = write(dir.path(), &built.archive(&[files]));
+    let out = dir.path().join("out");
+    let mut options = opts(Mode::Extract, &out);
+    options.refused_link_placeholder = true;
+    let summary = extract::run(&archive, &options, |_| {}).unwrap();
+    assert!(summary.errors.iter().any(|e| e.starts_with("s/new.txt: ")), "{:?}", summary.errors);
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("s")).unwrap(), b"");
+    assert!(!out.join("s/new.txt").exists());
+    assert_eq!(fs::read(out.join("other.txt")).unwrap(), b"other");
 }

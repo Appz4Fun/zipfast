@@ -290,7 +290,9 @@ fn eight_byte_base256_ids_keep_their_high_bits() {
         Ok(tar[108..116].try_into().unwrap())
     };
     assert_eq!(id_field(1 << 56).unwrap(), [0x81, 0, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(id_field((1 << 63) - 1).unwrap(), [0xff; 8]);
+    assert_eq!(id_field((1 << 62) - 1).unwrap(), [0xbf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    assert!(id_field(1 << 62).is_err());
+    assert!(id_field((1 << 63) - 1).is_err());
     assert_eq!(id_field(0x0123_4567_89ab_cdef).unwrap(), [0x81, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
     assert!(id_field(1 << 63).is_err());
     assert!(id_field(u64::MAX).is_err());

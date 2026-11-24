@@ -1038,6 +1038,10 @@ pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
             if read.is_err() {
                 text.clear();
             }
+            // The listing keeps the lossy decoding, so charge that length (each invalid byte becomes three).
+            if let std::borrow::Cow::Owned(decoded) = String::from_utf8_lossy(&text) {
+                text = decoded.into_bytes();
+            }
             budget.record_link_bytes(text.len())?;
         }
         targets.push(text);

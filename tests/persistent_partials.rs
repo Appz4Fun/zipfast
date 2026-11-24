@@ -4646,12 +4646,12 @@ fn encrypted_grouped_refills_share_one_commit_and_survive_a_reopen() {
     let fill_all = |limits: PartialLimits, dir: &Path| {
         let fixture = Encrypted::new(3000, &CUTS, true);
         let mut run = extract_encrypted_with(dir, &fixture, &[990..1010, 1500..1510], limits);
-        let before = zipfast::partial::durable_sync_count();
+        let before = zipfast::partial::durable_sync_count_this_thread();
         for (volume, bytes) in fixture.volumes.iter().take(2).enumerate() {
             let mut reader = std::io::Cursor::new(bytes.clone());
             run.file.refill_from_packed(volume as u32, 0..bytes.len() as u64, &mut reader).unwrap();
         }
-        (fixture, run, zipfast::partial::durable_sync_count() - before)
+        (fixture, run, zipfast::partial::durable_sync_count_this_thread() - before)
     };
     let plain_dir = tempfile::tempdir().unwrap();
     let (_, _, plain_syncs) = fill_all(PartialLimits::default(), plain_dir.path());
