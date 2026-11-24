@@ -52,6 +52,8 @@ use std::{
 pub use types::*;
 mod writer;
 pub use writer::FillWriter;
+mod direct;
+pub use direct::{DirectMember, DirectOptions, DirectOrigin, DirectPartials, DirectSink};
 
 #[derive(Clone)]
 pub struct PartialFile {
@@ -330,7 +332,8 @@ impl PartialCore {
             revision: 0,
             relative_output: spec.relative_output.clone(),
             size: spec.size,
-            produced: 0,
+            // A direct member's whole output is writable from birth; nothing is produced into it in order.
+            produced: if spec.evidence.direct.is_some() { spec.size } else { 0 },
             member_finished: false,
             tail: None,
             checks: checks.clone(),
@@ -590,6 +593,10 @@ impl PartialCore {
         // The result's copy of the state lives as long as the call does.
         let _result_lease =
             self.budget.metadata_lease(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
+        if op.snapshot.evidence.direct.is_some() {
+            // A direct member records no packed mapping: archive bytes cannot be placed.
+            return Err(err(PartialErrorKind::UnsupportedMethod));
+        }
         let keys = match (&op.snapshot.crypt, &self.keys) {
             (None, _) => None,
             (Some(_), Some(keys)) => Some(keys),
@@ -1010,7 +1017,8 @@ impl PartialCore {
             ledger::Ledger { known: &mut base, size: op.snapshot.head.size, budget: &self.budget }
                 .plan_fill(range.clone())?
         };
-        if mode == FillMode::Alt {
+        // A direct member's unknown output is writable as it is: nothing was ever produced into it from an archive.
+        if mode == FillMode::Alt && op.snapshot.evidence.direct.is_none() {
             for range in &plan.unknown {
                 let mut at = range.start;
                 while at < range.end {
@@ -1064,7 +1072,8 @@ impl PartialCore {
                     range: at..stop,
                     crc: hasher.clone().finalize(),
                     hasher,
-                    provenance: if mode == FillMode::Alt {
+                    // A direct member's output is the decoded member itself.
+                    provenance: if mode == FillMode::Alt && op.snapshot.evidence.direct.is_none() {
                         state::Provenance::Alt
                     } else {
                         state::Provenance::Original
@@ -1237,7 +1246,7 @@ impl PartialCore {
         self.compare_known(op, offset, bytes, if mode == FillMode::Packed { FillMode::Alt } else { mode })?;
         let plan = ledger::Ledger { known: &mut op.snapshot.known, size: op.snapshot.head.size, budget: &self.budget }
             .plan_fill(range.clone())?;
-        if matches!(mode, FillMode::Alt | FillMode::Packed) {
+        if matches!(mode, FillMode::Alt | FillMode::Packed) && op.snapshot.evidence.direct.is_none() {
             // Holes reported before the group still cover these ranges: grouped writes only make holes smaller,
             // and the reports are trimmed when the group commits.
             for range in &plan.unknown {
@@ -1289,7 +1298,8 @@ impl PartialCore {
                     range: at..stop,
                     crc: hasher.clone().finalize(),
                     hasher,
-                    provenance: if mode == FillMode::Alt {
+                    // A direct member's output is the decoded member itself.
+                    provenance: if mode == FillMode::Alt && op.snapshot.evidence.direct.is_none() {
                         state::Provenance::Alt
                     } else {
                         state::Provenance::Original
@@ -2121,6 +2131,10 @@ impl PartialCore {
         self.check(&data)?;
         self.flush_group(&mut data)?;
         self.reconcile(&mut data)?;
+        if data.snapshot.evidence.direct.is_some() {
+            // Nothing is extracted into a direct member: there is no tail to take over, only output to write.
+            return Err(err(PartialErrorKind::UnsupportedMethod));
+        }
         let head = &data.snapshot.head;
         if supplied.as_ref().is_some_and(|c| c.size != head.size || (c.crc32.is_none() && c.blake2sp.is_none())) {
             return Err(err(PartialErrorKind::InvalidOptions));
@@ -2426,6 +2440,33 @@ impl PartialCore {
         }
         Ok(held::held_from_snapshot(&op.snapshot, self.output_path().to_path_buf()))
     }
+    /// Reads output known from `offset` on (written through this handle, committed or in the open group, or known
+    /// from the durable state it was opened with) into `buf`: the contiguous run of known bytes from `offset`, at
+    /// most `buf.len()`. Returns how many bytes were read, 0 when `offset` is not known.
+    pub(crate) fn read_known(&self, offset: u64, buf: &mut [u8]) -> PartialResult<usize> {
+        let op = self.operation()?;
+        self.check_write(&op)?;
+        let known = &op.snapshot.known;
+        let mut end = offset;
+        let want = offset.saturating_add(buf.len() as u64);
+        for leaf in &known[known.partition_point(|leaf| leaf.range.end <= offset)..] {
+            if leaf.range.start > end || end >= want {
+                break;
+            }
+            end = leaf.range.end;
+        }
+        let n = (end.min(want) - offset) as usize;
+        let mut at = 0;
+        while at < n {
+            let count = crate::output::range::read_at(&self.native.output.file, offset + at as u64, &mut buf[at..n])
+                .map_err(|e| io_error(OutputOperation::Read, e))?;
+            if count == 0 {
+                return Err(err(PartialErrorKind::OutputChanged));
+            }
+            at += count;
+        }
+        Ok(n)
+    }
     fn remaining(&self) -> PartialResult<Vec<Range<u64>>> {
         let mut op = self.operation()?;
         self.check(&op)?;
@@ -2466,7 +2507,12 @@ impl PartialCore {
         }
         let mut bundle = Bundle::open(&spec, &current, &budget)?;
         let mut snapshot = bundle.snapshot(state)?;
+        let direct_keyed = snapshot.evidence.direct.as_ref().and_then(|d| d.keyed);
         let keys = match (keys, &snapshot.crypt, &context.password) {
+            (Some(keys), _, _) if direct_keyed.is_some() => Some(keys),
+            (None, _, Some(password)) if direct_keyed.is_some() => {
+                Some(direct::derive_hash_keys(password, direct_keyed.as_ref().unwrap(), &budget, &context.control)?)
+            }
             (Some(keys), Some(_), _) => Some(keys),
             (None, Some(params), Some(password)) if snapshot.evidence.format == crate::rar5::RarFormat::Rar4 => {
                 let salt = params.salt[..8].try_into().expect("8-byte RAR4 salt");

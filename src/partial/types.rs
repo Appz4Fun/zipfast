@@ -340,6 +340,25 @@ pub(crate) struct InitialEvidence {
     pub parts: Vec<PlainPart>,
     pub admissions: Vec<SourceAdmission>,
     pub headers: Vec<HeaderWitness>,
+    /// Set for a member created from a member map ([`super::DirectPartials`]): its output is plaintext written at
+    /// output offsets, with no packed mapping, header witnesses or source admissions; `parts` is one synthetic part
+    /// covering the whole output.
+    pub direct: Option<DirectFacts>,
+}
+/// What a direct partial records about its member besides its name, size and checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirectFacts {
+    /// The container format (1 ZIP, 4 RAR 4.x, 5 RAR 5.0, 7 7z), for diagnostics and the member identity.
+    pub container: u8,
+    /// RAR 5.0 checks keyed with the password: the KDF parameters that derive the hash key again on reopen. They
+    /// are archive header values, never key material.
+    pub keyed: Option<KeyedChecks>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KeyedChecks {
+    pub kdf_count: u8,
+    pub salt: [u8; 16],
+    pub check: Option<([u8; 8], [u8; 4])>,
 }
 #[derive(Clone)]
 pub(crate) struct CreateSpec {

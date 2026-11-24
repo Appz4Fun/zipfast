@@ -247,18 +247,18 @@ The simulation:
   `--drop-articles` names exactly which articles fail (indices over the whole set, volume by volume).
 - **Decoding.** After every delivery or failure, each member's `FeedDecoder` runs over the shared `ArticleBuffer`.
   Its `FeedStatus::needs` choose the next delivery (see below).
-- **Output.** With `persistent-partials`, each member the persistent path admits (stored RAR, no `-hp`) writes
-  into a `PartialFile`. A genesis session reads the headers and is told every data byte is a hole, so each member
-  starts at full size with its whole output one hole per volume piece. The decoder's `write_at` then fills those
-  holes through a `FillWriter`, and the writes join the open group commit. `read_held` gives back what was
-  written. Every member's handle stays open until its feed is done. Each one holds about five descriptors, and the
-  defaults (`PartialLimits::open_partials` 16, `open_files` 64) refuse the 17th member. The example raises both
-  to fit the set: `open_partials` to the member count plus one, `open_files` to 64 plus eight per member. RustyGet
-  must do the same, or close and reopen handles (`PartialFile::open`) beyond the 4096 ceiling. Other members, or
-  every member with `--sink file`, write a preallocated plain file instead (`plain/member-NNNNN.out`, named by
-  member index alone, synced once, not durable). `--group-holes` sets `PartialLimits::group_holes`, which affects the genesis holes.
-  `--group-refills` sets `group_refills`, which only affects `refill_from_packed`. The feed path never calls that:
-  its repairs are plaintext fills, which join the group anyway.
+- **Output.** With `persistent-partials`, each stored member of a RAR set without `-hp` (plain or AES for RAR 5.0,
+  plain for RAR 4.x) writes into a `PartialFile` that `DirectPartials` creates straight from the member map (see
+  `docs/persistent-partials.md`, "Partials from a member map"): born at full size with nothing written, no session
+  and no header read again. The decoder's `write_at` reaches it through a `DirectSink`, whose writes join the open
+  group commit; `read_held` gives back what the partial holds. Every member's handle stays open until its feed is
+  done; each holds about six descriptors, so the example sizes the limits with `PartialLimits::for_members` (the
+  defaults, 16 open partials and 64 files, run out at about ten members). RustyGet must do the same, or close and
+  reopen handles beyond the 4096 ceiling. Other members, or every member with `--sink file`, write a preallocated
+  plain file instead (`plain/member-NNNNN.out`, named by member index alone, synced once, not durable).
+  `--group-holes` and `--group-refills` set `PartialLimits::group_holes` and `group_refills`; the feed path records no
+  hole and calls no `refill_from_packed`, so neither changes anything here (lost output is just unknown output, and
+  repairs are plaintext writes, which join the group anyway). `genesis_ms` is the time to create the partials.
 - **Report.** stdout gets one tab-separated line per run (`--header` prints the column names first): wall time,
   MB/s, bytes written, `redecoded`, packed bytes read, holes met, repair writes (`refills`: writes into a range a
   status listed as lost) and their bytes, the

@@ -31,6 +31,9 @@ const MAGIC: &[u8; 8] = b"ZFPART1\0";
 pub(super) const PAGE_MAX: usize = 1_048_576;
 /// Header witness page tag of a RAR4 member.
 const FORMAT_RAR4: u8 = 4;
+/// Header witness page tag of a direct member (created from a member map): no witnesses follow the count, and the
+/// tag is followed by the [`DirectFacts`]. Its validity ledger lists only known leaves; unknown output is implicit.
+const FORMAT_DIRECT: u8 = 0xD1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageKind {
     Geometry = 1,
@@ -601,6 +604,9 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
     // which makes each window's extents depend only on the leaves inside it.
     let window = validity_window(snapshot.head.size, budget.limits.state_pages);
     let aligned = window.is_some();
+    // A direct member lists only its known leaves: the output nothing has written yet is implicit, so a member
+    // born with all of it unknown records nothing for it, whatever its size.
+    let sparse = snapshot.evidence.direct.is_some();
     let mut extent_count = snapshot.known.len() as u64;
     let mut end = 0;
     for leaf in &snapshot.known {
@@ -611,10 +617,15 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         {
             return Err(malformed());
         }
-        extent_count = extent_count.checked_add(gap_pieces(end, leaf.range.start, aligned)).ok_or_else(malformed)?;
+        if !sparse {
+            extent_count =
+                extent_count.checked_add(gap_pieces(end, leaf.range.start, aligned)).ok_or_else(malformed)?;
+        }
         end = leaf.range.end;
     }
-    extent_count = extent_count.checked_add(gap_pieces(end, snapshot.head.size, aligned)).ok_or_else(malformed)?;
+    if !sparse {
+        extent_count = extent_count.checked_add(gap_pieces(end, snapshot.head.size, aligned)).ok_or_else(malformed)?;
+    }
     budget.limits.check(
         PartialResource::LedgerBytes,
         extent_count.checked_mul(21).and_then(|n| n.checked_add(8)).ok_or_else(malformed)?,
@@ -645,7 +656,7 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
     };
     let mut end = 0;
     for leaf in &snapshot.known {
-        while end < leaf.range.start {
+        while !sparse && end < leaf.range.start {
             let stop = gap_piece_end(end, leaf.range.start, aligned);
             extent(&mut validity, end..stop, 0, 0)?;
             end = stop;
@@ -653,7 +664,7 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         extent(&mut validity, leaf.range.clone(), leaf.provenance as u8, leaf.crc)?;
         end = leaf.range.end;
     }
-    while end < snapshot.head.size {
+    while !sparse && end < snapshot.head.size {
         let stop = gap_piece_end(end, snapshot.head.size, aligned);
         extent(&mut validity, end..stop, 0, 0)?;
         end = stop;
@@ -707,7 +718,28 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
     }
     // Trailing format tag, written only for RAR4 members so that RAR5 states stay byte-identical and readable by
     // builds that predate RAR4 support. States without it are RAR5.
-    if snapshot.evidence.format == crate::rar5::RarFormat::Rar4 {
+    if let Some(direct) = &snapshot.evidence.direct {
+        headers.reserve(48)?;
+        headers.u8(FORMAT_DIRECT)?;
+        headers.u8(1)?;
+        headers.u8(direct.container)?;
+        match &direct.keyed {
+            None => headers.u8(0)?,
+            Some(keyed) => {
+                headers.u8(1)?;
+                headers.u8(keyed.kdf_count)?;
+                headers.raw(&keyed.salt)?;
+                match &keyed.check {
+                    None => headers.u8(0)?,
+                    Some((value, sum)) => {
+                        headers.u8(1)?;
+                        headers.raw(value)?;
+                        headers.raw(sum)?;
+                    }
+                }
+            }
+        }
+    } else if snapshot.evidence.format == crate::rar5::RarFormat::Rar4 {
         headers.u8(FORMAT_RAR4)?;
     }
     let total = geometry
@@ -842,6 +874,51 @@ pub(super) fn decode_pages(
         });
     }
     d.end()?;
+    let mut d = Decoder::new(&buffers[2]);
+    let count = d.count(usize::MAX, 24)?;
+    let mut headers = budget.vector(count)?;
+    for _ in 0..count {
+        let volume = d.u32()?;
+        let packed = d.range()?;
+        let raw = d.blob(budget.limits.ledger_bytes as usize)?;
+        budget.metadata(raw.len() as u64)?;
+        let bytes = raw.to_vec();
+        if packed.end - packed.start != bytes.len() as u64 {
+            return Err(malformed());
+        }
+        headers.push(HeaderWitness { volume, packed, bytes });
+    }
+    let mut format = crate::rar5::RarFormat::Rar5;
+    let mut direct = None;
+    if d.at < d.bytes.len() {
+        match d.u8()? {
+            FORMAT_RAR4 => format = crate::rar5::RarFormat::Rar4,
+            FORMAT_DIRECT => {
+                if d.u8()? != 1 {
+                    return Err(err(PartialErrorKind::StateVersion));
+                }
+                let container = d.u8()?;
+                let keyed = match d.u8()? {
+                    0 => None,
+                    1 => {
+                        let kdf_count = d.u8()?;
+                        let salt = d.take(16)?.try_into().unwrap();
+                        let check = match d.u8()? {
+                            0 => None,
+                            1 => Some((d.take(8)?.try_into().unwrap(), d.take(4)?.try_into().unwrap())),
+                            _ => return Err(malformed()),
+                        };
+                        Some(KeyedChecks { kdf_count, salt, check })
+                    }
+                    _ => return Err(malformed()),
+                };
+                direct = Some(DirectFacts { container, keyed });
+            }
+            _ => return Err(err(PartialErrorKind::StateVersion)),
+        }
+    }
+    d.end()?;
+    let sparse = direct.is_some();
     let mut d = Decoder::new(&buffers[1]);
     let count = d.count(usize::MAX, 21)?;
     let mut known = Vec::new();
@@ -850,7 +927,8 @@ pub(super) fn decode_pages(
         let range = d.range()?;
         let tag = d.u8()?;
         let crc = d.u32()?;
-        if range.start != end || range.end > head.size || range.is_empty() || range.end - range.start > 65_536 {
+        let placed = if sparse { range.start >= end } else { range.start == end };
+        if !placed || range.end > head.size || range.is_empty() || range.end - range.start > 65_536 {
             return Err(malformed());
         }
         end = range.end;
@@ -883,7 +961,7 @@ pub(super) fn decode_pages(
         };
         known.push(KnownLeaf { range, crc, hasher: crate::crc32::Hasher::new(), provenance, _lease: lease });
     }
-    if end != head.size {
+    if !sparse && end != head.size {
         return Err(malformed());
     }
     let count = d.count(budget.limits.journal_records as usize, 36)?;
@@ -947,29 +1025,7 @@ pub(super) fn decode_pages(
         }
     }
     d.end()?;
-    let mut d = Decoder::new(&buffers[2]);
-    let count = d.count(usize::MAX, 24)?;
-    let mut headers = budget.vector(count)?;
-    for _ in 0..count {
-        let volume = d.u32()?;
-        let packed = d.range()?;
-        let raw = d.blob(budget.limits.ledger_bytes as usize)?;
-        budget.metadata(raw.len() as u64)?;
-        let bytes = raw.to_vec();
-        if packed.end - packed.start != bytes.len() as u64 {
-            return Err(malformed());
-        }
-        headers.push(HeaderWitness { volume, packed, bytes });
-    }
-    let mut format = crate::rar5::RarFormat::Rar5;
-    if d.at < d.bytes.len() {
-        if d.u8()? != FORMAT_RAR4 {
-            return Err(err(PartialErrorKind::StateVersion));
-        }
-        format = crate::rar5::RarFormat::Rar4;
-    }
-    d.end()?;
-    let evidence = InitialEvidence { format, metadata: head.metadata, parts, admissions, headers };
+    let evidence = InitialEvidence { format, metadata: head.metadata, parts, admissions, headers, direct };
     let mut snapshot = Snapshot { head, name, evidence, known, holes, crypt: None, cipher };
     snapshot.crypt = validate_evidence(&snapshot.name, snapshot.head.size, &snapshot.evidence, budget)?;
     if !snapshot.cipher.is_empty() && snapshot.crypt.is_none() {
@@ -991,6 +1047,27 @@ pub(super) fn validate_evidence(
         framing::{HeaderParser, ParserStep},
         reader::Block,
     };
+    if evidence.direct.is_some() {
+        // One synthetic part over the whole output, no packed bytes behind it, no part checks (the member checks
+        // are in the head), and nothing parsed from an archive.
+        let whole = PlainPart {
+            ordinal: 0,
+            packed: PackedSpan { volume: 0, range: 0..0 },
+            out: 0..size,
+            final_part: true,
+            crc32: None,
+            blake2sp: None,
+        };
+        if evidence.parts != [whole]
+            || !evidence.headers.is_empty()
+            || !evidence.admissions.is_empty()
+            || evidence.format != crate::rar5::RarFormat::Rar5
+            || name.is_empty()
+        {
+            return Err(malformed());
+        }
+        return Ok(None);
+    }
     if evidence.parts.is_empty() || evidence.headers.is_empty() || evidence.admissions.is_empty() {
         return Err(malformed());
     }

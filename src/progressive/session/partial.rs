@@ -607,6 +607,7 @@ impl ProgressiveSession {
                 parts: vec![plain],
                 admissions: vec![admission],
                 headers: vec![witness],
+                direct: None,
             },
         };
         self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<(MemberKey, Arc<PartialCore>)>() as u64)?;

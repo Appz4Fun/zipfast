@@ -257,7 +257,7 @@ Only a directory the session created (in either way) gets the entry's modified t
 
 After a restart (see above) the walk meets the same members: refused members are refused again with the same reasons, directories are found (`created: false`), and members before and after them are adopted with the same keys.
 
-Lost headers and volumes, compressed members as persistent partials, encrypted RAR4 members as persistent partials, encrypted-header recovery and the full 500 MB acceptance workload remain later stages. This API does not silently emulate them.
+On this session path, lost headers and volumes, compressed members as persistent partials, encrypted RAR4 members as persistent partials, encrypted-header recovery and the full 500 MB acceptance workload remain later stages. This API does not silently emulate them. A caller that decodes members itself keeps any member's output persistent with `DirectPartials` (see "Partials from a member map" below).
 
 ## Taking over an unfinished member
 
@@ -328,3 +328,82 @@ creates, renames, compacts or deletes, and never takes a bundle over.
 To reuse held output in the other copy's own partial, fill its holes from the held file with `fill`, `fill_writer`
 or `fill_from` over `good`; the member's checks at the end prove the result.
 
+
+## Partials from a member map
+
+A downloader that decodes members itself, such as one feeding `zipfast::map::FeedDecoder` as articles arrive (see
+`docs/feed-decoder.md`), has no session to create its partials. `DirectPartials` creates them straight from a
+`MemberMap`: no session, no header read again, no per-piece hole transactions.
+
+```rust,ignore
+use zipfast::partial::{DirectOptions, DirectPartials, DirectSink, PartialLimits};
+
+let parts = DirectPartials::new(DirectOptions {
+    binding, output_root, state_dir, naming: PartialNaming::ArchivePath,
+    limits: PartialLimits::for_members(members.len()),
+    progressive_limits: ProgressiveLimits::default(),
+    anchors, control: SessionControl::default(),
+    protection,            // Complete: the set's volumes and other inputs
+    password,              // only to verify RAR 5.0 checks keyed with it; never stored
+})?;
+let member = parts.open(&map, index)?;   // DirectOrigin::Created, or Adopted after a restart
+let mut sink = DirectSink::new(member.file);
+decoder.run(&mut articles, &mut sink)?;  // writes join the open group commit
+```
+
+**Birth.** `open` creates the output file exclusively at its full size (never over an existing file:
+`AlreadyExists`), at the member's sanitized archive path under `output_root` (`relative_output`; `open_at` takes
+another relative path), with its state bundle and anchor, in the same durable genesis a session's member gets: the
+intent is anchored before the output reaches its full size, and the output and its directories are synced before
+the commit is. Every parent directory is opened without following symbolic links and checked against the
+declaration first, the output and bundle are bound by native identity, and the bundle and output are locked, as
+for a session's member. The member is born with all of `[0, size)` unknown, and nothing is recorded for that: a
+direct state's validity ledger lists only known output, so the genesis costs the same for 1 KB and 1 GiB (a few
+hundred bytes of state and about a dozen syncs). The member's checks (the map's CRC32 and BLAKE2sp, and for RAR 5.0
+members whose checks are keyed, the KDF parameters that derive the key again) and the name, size, modified time and
+Unix mode are recorded at birth. Directories and members of unknown size are refused.
+
+**Writing.** Output is plaintext at output offsets, in any order and in pieces: `DirectSink` (a `FeedSink`),
+`PartialFile::fill`, `fill_writer` or `fill_from`. Any unknown byte may be written; a byte already known must be
+written with the same value (`OverlapMismatch` otherwise) and is not written again, so a decoder restored from an
+older snapshot that offers committed output again rewrites nothing. `DirectSink::applied_bytes` counts the bytes it
+wrote. Writes join group commits exactly as extraction writes do (`group_commit_bytes`, `group_commit_interval`):
+one anchored intent, then output with no durable work, then one commit. `remaining()` lists the unknown output:
+what the decoder lost to holes and has not repaired, and what it has not reached. There are no `Hole` records; a
+direct member has no packed mapping, so `fill_packed`, `refill_from_packed` and `abandon_tail` are
+`UnsupportedMethod`, and `declare_hole` finds nothing to declare.
+
+**Reading back.** `DirectSink::read_held` gives back the contiguous known output from an offset: what this handle
+wrote, committed or still in the open group, and after a restart what the durable state knows. Compressed decoders
+read their window back through it.
+
+**Verification.** `poll_verify` combines the CRC32 of the known leaves and reads back BLAKE2sp, as for any member,
+and returns `Verdict::Ok` once every byte is known and every check the map recorded passes; until then
+`Incomplete`, with the unknown ranges as `holes`. A direct member needs no canonical finish: its checks came from the
+map. A member whose map records no check stays `Incomplete { missing_checks: true }`. Checks keyed with the
+password (RAR 5.0 encrypted members) need `DirectOptions::password` (or `PartialOpenContext::password` on reopen);
+without it verification ends in `PasswordRequired`. Hash keys are derived once per KDF salt and count for a set.
+
+**Restart.** `DirectPartials::open` with the same binding, roots and anchor store finds a member whose key the store
+holds and adopts it (`DirectOrigin::Adopted`): it reopens the output and bundle (the native identities recorded at
+birth must match), rehashes the known output and checks that the state records this output path, name, size,
+checks and facts (`BindingMismatch(Member)` otherwise). `PartialFile::open` with the anchored state reopens it too.
+The member key is the binding, the member's ordinal and a digest of what the map says about it (container, name,
+sizes, checks, method, piece positions), so another archive's member of the same name is another member: creating
+it finds the existing output and fails with `AlreadyExists`. After a crash the member holds what was committed:
+output an open group wrote is unknown again and must be written again. A decoder snapshot (`FeedSnapshot`) saved
+right after a commit (`PartialFile::state` commits the open group) never claims more than is durable; restored, the
+decoder writes everything past its frontier again, and what the partial already knows is skipped.
+
+**Limits.** Every member of a `DirectPartials` shares one budget: `open_partials` and `open_files` count all its
+live handles together, as a session's members do. A live handle holds five descriptors (output, lock, bundle,
+output root and state root) plus one per directory between the output root and the output, so the defaults
+(`open_files` 64, `open_partials` 16) run out at about ten members held open. `PartialLimits::for_members(n)` raises
+`open_partials` to `n` and `open_files` to `8n + 16`, each capped at 4096 (about 500 members); past that, drop the
+handles of members that are done and open them again when needed. The process's descriptor limit must allow as
+many. The same helper sizes a persistent session that keeps its members' handles.
+
+Tests: `tests/persistent_direct.rs` (a member whose handles are dropped mid-feed and a process aborted with a group
+open, both resumed from a decoder snapshot taken at a commit, with lost articles repaired late: exact output,
+`Verdict::Ok`, nothing durable written again, the genesis and commit syncs; a 40 MB member born with the same state
+as a 100 KB one; 40 members held open with `for_members`, the defaults refusing; a wrong byte verifying `Bad`).

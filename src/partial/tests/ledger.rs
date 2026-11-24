@@ -157,6 +157,7 @@ impl Fixture {
                 parts,
                 admissions,
                 headers,
+                direct: None,
             },
             checks,
         }
