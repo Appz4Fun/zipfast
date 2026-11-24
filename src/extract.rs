@@ -371,6 +371,7 @@ impl MemberRef<'_> {
 ///     fallback_mtime: None,
 ///     compressed_tar: Default::default(),
 ///     version_naming: Default::default(),
+///     preexisting_links: Default::default(),
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```

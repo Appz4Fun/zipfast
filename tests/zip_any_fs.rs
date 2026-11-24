@@ -478,6 +478,7 @@ fn start_hook_sees_published_paths_and_never_blocked_targets() {
 /// The start hook is asked before the member's payload storage is admitted: a member larger than the live spool
 /// limit that the hook skips never charges its decoded size, so the run goes on to the other members.
 #[test]
+#[allow(clippy::result_large_err)] // The public checked result.
 fn a_start_hook_skip_comes_before_payload_storage_is_admitted() {
     use zipfast::extract::{MemberFilter, StartDecision};
     let work = tempfile::tempdir().unwrap();

@@ -1,6 +1,6 @@
 # 7-Zip and UnRAR compatibility options
 
-Four fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
+Five fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
 `7z` and `unrar` modes) get their behaviour where zipfast's own default differs. Every default keeps zipfast's
 behaviour, so a caller that sets them to `Default::default()` (or `None`) sees no change.
 
@@ -11,6 +11,7 @@ special_entries: Default::default(),
 fallback_mtime: None,
 compressed_tar: Default::default(),
 version_naming: Default::default(),
+preexisting_links: Default::default(),
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -91,6 +92,20 @@ Older file revisions (`rar -ver`) are written only when the run takes them (`Mem
 with `SevenZipDir`. `r5extra.rar` (both members revision 3) comes out as `[VER]/3/owned.txt` and
 `[VER]/3/timed.txt` under 7-Zip and under zipfast with these choices. `VersionNaming::name(name, version)` gives the
 name for a caller's own listing.
+
+## `preexisting_links`: archive links through links already in the destination
+
+Before an archive's symbolic link is made, its target is followed through the links on its way as they exist then.
+The link is refused when that leads out of the destination, whichever choice is made. With `d -> sub` and
+`x -> ../outside` already in the destination:
+
+| archive link | `PreexistingLinks::FollowInside` (default), UnRAR 7.30 | `PreexistingLinks::Refuse`, 7-Zip 26.06 |
+|---|---|---|
+| `f -> d/file.txt` | made | refused |
+| `l -> d`, then `m -> l/file.txt` | both made | `l` refused, `m` made (nothing at `l`) |
+| `e -> x/file.txt` | refused | refused |
+
+UnRAR also makes `e`; zipfast never makes a link that leads out of the destination.
 
 ## 7z wrong passwords: how the member failed
 

@@ -182,7 +182,8 @@ fn start(archive: Vec<u8>, workspace: &Path) -> PartialResult<(ProgressiveSessio
         dest: workspace.join("output"), overwrite: zipfast::extract::Overwrite::Always,
         flatten: false, threads: Some(1), protected_paths: Default::default(), parallel_min: None, select: None,
         windows_safe_names: false, special_entries: Default::default(), fallback_mtime: None,
-        compressed_tar: Default::default(), version_naming: Default::default() };
+        compressed_tar: Default::default(), version_naming: Default::default(),
+        preexisting_links: Default::default() };
     let session = ProgressiveSession::new_partial(
         Box::new(CompleteProvider { source: Some(MemorySource { bytes: archive }) }),
         ProgressiveOptions::new(extract, "example.rar".into()),
