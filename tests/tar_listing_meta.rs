@@ -112,3 +112,31 @@ fn pax_records_share_one_budget_across_the_listing() {
     assert!(meta[..kept].iter().all(|t| !t.pax_records_truncated));
     assert!(meta[kept..].iter().all(|t| t.pax_records_truncated && t.pax_records.is_empty()));
 }
+
+/// `gpax.tgz` was written by GNU tar 1.35 (`tar --format=pax --owner=builder:1234 --group=staff:56`). 7-Zip 26.06
+/// (`7zz l -slt gpax.tar`, the tar inside) lists `f.txt` with: User = builder, Group = staff, User ID = 1234,
+/// Group ID = 56, Characteristics = `0 POSIX ASCII PAX atime ctime`, Comment = `./PaxHeaders/f.txt_`, Created and
+/// Accessed with nanoseconds, and empty Device Major and Minor.
+#[test]
+fn a_gnu_tar_pax_tgz_lists_the_owner_and_records_like_its_tar() {
+    let tar = list("gpax.tar");
+    let tgz = list("gpax.tgz");
+    assert_eq!((tar.len(), tgz.len()), (1, 1));
+    for e in [&tar[0], &tgz[0]] {
+        assert_eq!(e.name, "f.txt");
+        assert!(e.atime.is_some_and(|(_, ns)| ns != 0) && e.ctime.is_some_and(|(_, ns)| ns != 0));
+        let t = e.tar.as_deref().unwrap();
+        assert_eq!(t.magic, TarMagic::Ustar);
+        assert_eq!(t.typeflag, b'0');
+        assert_eq!(
+            (t.user.as_deref(), t.group.as_deref(), t.uid, t.gid),
+            (Some("builder"), Some("staff"), Some(1234), Some(56))
+        );
+        assert_eq!((t.device_major, t.device_minor), (None, None));
+        assert_eq!(t.pax_header_name.as_deref(), Some("./PaxHeaders/f.txt"));
+        let keys: Vec<_> = t.pax_records.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"atime") && keys.contains(&"ctime"), "{keys:?}");
+    }
+    assert_eq!(tar[0].tar, tgz[0].tar);
+    assert_eq!((tar[0].atime, tar[0].ctime), (tgz[0].atime, tgz[0].ctime));
+}
