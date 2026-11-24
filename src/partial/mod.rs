@@ -832,8 +832,13 @@ impl PartialCore {
         let mut op = self.operation()?;
         self.check(&op)?;
         if op.snapshot.crypt.is_some() {
-            drop(op);
-            return self.fill_packed(volume, offset, bytes);
+            return match self.fill_encrypted_grouped(&mut op, volume, offset, bytes)? {
+                Some(result) => Ok(result),
+                None => {
+                    drop(op);
+                    self.fill_packed(volume, offset, bytes)
+                }
+            };
         }
         // (packed bytes, output offset): a plain member's output is its packed stream.
         let mut segments: Vec<(Range<u64>, u64)> = Vec::new();
@@ -887,12 +892,108 @@ impl PartialCore {
             needs_verification: true,
         })
     }
+    /// The encrypted half of [`Self::fill_packed_grouped`]: the ciphertext is decrypted as `fill_packed` does, and
+    /// when no decrypted run touches alt output (which archive bytes may have to correct or confirm, durably before
+    /// the call returns) the plaintext is written in the open group, and the ciphertext blocks a remaining hole
+    /// still needs join the group's kept list, so both become durable together at the group's commit. Plaintext
+    /// over output the original extraction wrote must still match it. Returns None, having written nothing, when
+    /// the call must take the transaction of `fill_packed` instead (alt output, or no keys).
+    fn fill_encrypted_grouped(
+        &self,
+        op: &mut CoreData,
+        volume: u32,
+        offset: u64,
+        bytes: &[u8],
+    ) -> PartialResult<Option<PackedFillResult>> {
+        let Some(keys) = &self.keys else { return Ok(None) };
+        let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
+        if op.group.is_none() {
+            // The group starts from the state the store holds (an uncertain commit is resolved first).
+            self.reconcile(op)?;
+        }
+        let limit = cipher::stream_produced(&op.snapshot);
+        // (packed bytes, ciphertext stream offset), as in `fill_packed`.
+        let (mut segments, _segments_lease): (Vec<(Range<u64>, u64)>, _) =
+            self.budget.leased_vector(op.snapshot.evidence.parts.len())?;
+        for (part, stream) in cipher::parts_with_stream(&op.snapshot).filter(|(p, _)| p.packed.volume == volume) {
+            let start = offset.max(part.packed.range.start);
+            let stop = end.min(part.packed.range.end);
+            if start >= stop {
+                continue;
+            }
+            let at = stream + (start - part.packed.range.start);
+            let at_end = (at + (stop - start)).min(limit);
+            if at < at_end {
+                segments.push((start..start + (at_end - at), at));
+            }
+        }
+        let (mut decryptions, _decryptions_lease) = self.budget.leased_vector(segments.len())?;
+        for (packed, stream) in &segments {
+            let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
+            decryptions.push(cipher::decrypt(&self.budget, &op.snapshot, keys, *stream, slice)?);
+        }
+        let touches_alt = decryptions.iter().flat_map(|d| d.runs.iter()).any(|(out, plain)| {
+            let run = *out..*out + (plain.end - plain.start) as u64;
+            let first = op.snapshot.known.partition_point(|leaf| leaf.range.end <= run.start);
+            op.snapshot.known[first..]
+                .iter()
+                .take_while(|leaf| leaf.range.start < run.end)
+                .any(|leaf| leaf.provenance == state::Provenance::Alt)
+        });
+        if touches_alt {
+            return Ok(None);
+        }
+        if !self.keys_proven.load(Ordering::Acquire) {
+            let wrapped: Vec<Option<cipher::Decrypted>> = decryptions.drain(..).map(Some).collect();
+            self.prove_keys(op, &wrapped)?;
+            decryptions.extend(wrapped.into_iter().flatten());
+        }
+        let (mut unmapped, _unmapped_lease) = self.budget.leased_vector(segments.len() + 1)?;
+        let mut at = offset;
+        for (packed, _) in &segments {
+            if at < packed.start {
+                unmapped.push(PackedSpan { volume, range: at..packed.start });
+            }
+            at = packed.end;
+        }
+        if at < end {
+            unmapped.push(PackedSpan { volume, range: at..end });
+        }
+        let mut applied = Vec::new();
+        let mut undecryptable = Vec::new();
+        let mut kept = Vec::new();
+        for ((packed, stream), decrypted) in segments.iter().zip(&decryptions) {
+            undecryptable.extend(decrypted.undecryptable.iter().cloned());
+            for (out, plain) in &decrypted.runs {
+                applied.extend(self.group_write(op, *out, &decrypted.plain[plain.clone()], FillMode::Packed)?);
+            }
+            let slice = &bytes[(packed.start - offset) as usize..(packed.end - offset) as usize];
+            kept.extend(cipher::keep(&self.budget, &op.snapshot, *stream, slice)?);
+        }
+        if !kept.is_empty() {
+            if op.group.is_none() {
+                // Nothing was written (every run was known output): the blocks still need a group to join.
+                self.begin_group(op)?;
+            }
+            cipher::merge(&self.budget, &mut op.snapshot.cipher, &kept)?;
+        }
+        Ok(Some(PackedFillResult {
+            revision: op.snapshot.head.revision,
+            applied,
+            corrected: Vec::new(),
+            unmapped,
+            undecryptable,
+            state: op.state.clone(),
+            part_checks: Vec::new(),
+            needs_verification: true,
+        }))
+    }
     pub(crate) fn refill_targets(&self, volume: u32, range: &Range<u64>) -> PartialResult<Vec<Range<u64>>> {
         let mut op = self.operation()?;
         self.check(&op)?;
-        // Grouped refills of a plain member leave the group open: the targets come from the in-memory leaves,
-        // which already hold the group's writes, so a run of refills commits once.
-        if !(self.budget.limits.group_refills && op.snapshot.crypt.is_none()) {
+        // Grouped refills leave the group open: the targets come from the in-memory leaves, which already hold the
+        // group's writes, so a run of refills commits once.
+        if !self.budget.limits.group_refills {
             self.flush_group(&mut op)?;
         }
         if op.uncertain.is_some() {
@@ -2919,7 +3020,7 @@ impl PartialFile {
         }
         match total {
             Some(total) => Ok(total),
-            None => self.core.fill_packed(volume, range.start, &[]),
+            None => self.core.fill_packed_grouped(volume, range.start, &[]),
         }
     }
     /// The absolute path of the output file this partial writes to: the output root (made absolute when the
