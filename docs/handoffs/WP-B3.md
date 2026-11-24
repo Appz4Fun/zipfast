@@ -1,6 +1,6 @@
 # WP-B3: long RAR passwords
 
-Status: merging. Branch rar-long-password. Worktree /Users/allen/git.xbmc4lyfe/zipfast-b3. PR: see below.
+Status: merged. Branch rar-long-password. Worktree /Users/allen/git.xbmc4lyfe/zipfast-b3. PR: 264.
 
 Done: experiments (rar 7.20 for RAR5, rar 6.24 for RAR4 (7.x cannot write RAR4), unrar 7.30 mac + Linux docker);
 findings in docs/rar-passwords.md (truncate to 127 characters, rar truncates too, characters not bytes/units);
