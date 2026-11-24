@@ -30,6 +30,10 @@ use std::ops::Range;
 mod lzma2;
 mod rar4;
 mod rar5;
+mod zip;
+
+/// Bytes of the WinZip AES authentication code after the ciphertext.
+const AES_TAG: u64 = 10;
 
 /// What a [`PackedSource`] answers for a read of packed bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,8 +172,14 @@ pub struct FeedStatus {
     /// Output written so far was decoded from a window not proven yet: seeded from held output past a hole (a RAR
     /// 5.0 skip), or handed over from an earlier solid member that was not done with its CRC matched (a hole it
     /// skipped, a repair still to come). Cleared once the member is done with `crc_ok` true; a member without a CRC
-    /// stays unproven.
+    /// stays unproven. WinZip AES members are unproven until their authentication code matches (or, when it cannot
+    /// be checked, their CRC).
     pub unproven: bool,
+    /// WinZip AES: whether the authentication code (HMAC-SHA1 over the ciphertext, after it) matched, once the member
+    /// is done. None for other members, and when it could not be checked: a compressed member restored from a
+    /// snapshot past its data's start, or a stored one whose skipped holes left ciphertext to hash again that the
+    /// sink does not give back ([`FeedSink::read_held`]).
+    pub auth_ok: Option<bool>,
 }
 
 /// Work counters over the decoder's life (restored with a snapshot).
@@ -240,7 +250,8 @@ pub enum FeedUnsupported {
     Compressed { id: u16 },
     /// 7z data coded by its folder's coders.
     Coders,
-    /// ZipCrypto: its keystream depends on every earlier byte, so a hole loses the rest of the member.
+    /// A sequential cipher the decoder cannot read in order. (ZIP members under ZipCrypto are decoded in order by
+    /// the ZIP layer, which waits at holes, and are not refused.)
     SequentialCipher,
     /// RAR 4.x encryption other than AES-128.
     LegacyRar4Cipher,
@@ -748,13 +759,16 @@ enum LayerTag {
     Rar5 = 4,
     Lzma2 = 5,
     Rar4 = 6,
+    Zip = 7,
 }
 
 /// A feed-driven decoder of one member. See the module docs and `docs/feed-decoder.md`.
 ///
 /// Supported: stored members whose output maps directly to packed offsets (plain stored RAR, ZIP and 7z Copy;
 /// AES-CBC stored RAR 5.0, RAR 4.x and 7zAES over Copy; WinZip AES stored). A hole costs exactly its own output
-/// (widened to whole blocks, plus one block, under CBC), and repairing it reads and writes only that.
+/// (widened to whole blocks, plus one block, under CBC), and repairing it reads and writes only that. Compressed
+/// members of RAR 5.0, RAR 4.x, 7z LZMA2 folders and ZIP (Deflate, Deflate64; ZipCrypto and WinZip AES under them,
+/// and ZipCrypto stored) have layers of their own; see `docs/feed-decoder.md`.
 pub struct FeedDecoder {
     size: u64,
     stream_len: u64,
@@ -801,6 +815,23 @@ pub struct FeedDecoder {
     lzma2: Option<Box<lzma2::Lz>>,
     /// a compressed RAR 4.x member's decoder state
     rar4: Option<Box<rar4::Rar4>>,
+    /// a ZIP Deflate or Deflate64 member's (or a stored ZipCrypto member's) decoder state
+    zip: Option<Box<zip::Zip>>,
+    /// a WinZip AES stored member's authentication code
+    mac: Option<Box<StoredMac>>,
+}
+
+/// The authentication code of a WinZip AES stored member: HMAC-SHA1 over the ciphertext in order. The main decode
+/// hashes as it reads while it has met no hole; after that the code is caught up from the output held
+/// ([`FeedSink::read_held`], encrypted again) as holes are repaired.
+struct StoredMac {
+    hmac: crate::crypto::HmacSha1,
+    /// the ciphertext (counted as output offsets) hashed so far
+    pos: u64,
+    tag: Vec<u8>,
+    verdict: Option<bool>,
+    /// the sink does not give back the output to catch up from: the code cannot be checked
+    gave_up: bool,
 }
 
 impl std::fmt::Debug for FeedDecoder {
@@ -837,6 +868,12 @@ impl FeedDecoder {
         }
         if member.method == MapMethod::Coders && map.format == super::MapFormat::SevenZip {
             return Self::new_lzma2(map, member, options, begin);
+        }
+        if map.format == super::MapFormat::Zip
+            && (matches!(member.method, MapMethod::Compressed { .. })
+                || matches!(member.mapping, OutputMapping::Sequential { .. }))
+        {
+            return Self::new_zip(map, index, options, begin);
         }
         if !matches!(begin, Begin::Fresh | Begin::Restore) {
             return Err(FeedError::Unsupported(FeedUnsupported::Solid));
@@ -878,6 +915,7 @@ impl FeedDecoder {
         }
         let usage = Usage::new(options.limits.clone());
         let mut hash_key = None;
+        let mut mac = None;
         // an empty member needs no key, unless its CRC is keyed with the password
         let keyed_crc = member.checks.is_some_and(|c| c.keyed && c.crc32.is_some());
         let cipher = if member.encrypted && (size > 0 || keyed_crc) {
@@ -887,7 +925,16 @@ impl FeedDecoder {
             hash_key = keys.hash_key;
             match keys.key {
                 MemberKey::Cbc { aes, iv } => StoredCipher::Cbc { aes, iv },
-                MemberKey::Ctr { aes, skip, .. } => StoredCipher::Ctr { aes, skip },
+                MemberKey::Ctr { aes, skip, mac_key } => {
+                    mac = Some(Box::new(StoredMac {
+                        hmac: crate::crypto::HmacSha1::new(&mac_key),
+                        pos: 0,
+                        tag: Vec::new(),
+                        verdict: None,
+                        gave_up: false,
+                    }));
+                    StoredCipher::Ctr { aes, skip }
+                }
                 MemberKey::None | MemberKey::ZipCrypto { .. } => {
                     return Err(FeedError::Malformed("cipher parameters do not match the output mapping"));
                 }
@@ -926,12 +973,15 @@ impl FeedDecoder {
             status: FeedStatus::default(),
             index: 0,
             stream_start: 0,
-            unproven: false,
+            // the authentication code proves WinZip AES output, once read after it
+            unproven: mac.is_some(),
             suspect: None,
             seeded: None,
             rar5: None,
             lzma2: None,
             rar4: None,
+            zip: None,
+            mac,
         };
         if size > 0 {
             decoder.main = Some(decoder.lane_at(0, size));
@@ -982,6 +1032,9 @@ impl FeedDecoder {
         }
         if self.rar4.is_some() {
             (next, repair, more, next_gap) = self.run_rar4(source, sink)?;
+        }
+        if self.zip.is_some() {
+            (next, repair, more, next_gap) = self.run_zip(source, sink)?;
         }
         // the main decode
         while !self.layered()
@@ -1049,6 +1102,9 @@ impl FeedDecoder {
                 }
             }
         }
+        if !more && self.mac.is_some() {
+            self.verify_mac(source, sink, &mut next)?;
+        }
         let mut needs = next;
         needs.extend(repair);
         if let Some(gap) = next_gap {
@@ -1087,7 +1143,79 @@ impl FeedDecoder {
 
     /// Whether a compressed layer decodes the member (rather than the stored lanes).
     fn layered(&self) -> bool {
-        self.rar5.is_some() || self.lzma2.is_some() || self.rar4.is_some()
+        self.rar5.is_some() || self.lzma2.is_some() || self.rar4.is_some() || self.zip.is_some()
+    }
+
+    /// A WinZip AES stored member's authentication code: caught up over the output written in order (from the held
+    /// output, encrypted again), then compared with the code after the ciphertext once all of it is hashed.
+    fn verify_mac(
+        &mut self,
+        source: &mut dyn PackedSource,
+        sink: &mut dyn FeedSink,
+        next: &mut Vec<NeedBytes>,
+    ) -> Result<(), FeedError> {
+        let StoredCipher::Ctr { aes, skip } = self.cipher else { return Ok(()) };
+        let frontier = self.main.as_ref().map_or(self.size, |l| self.lane_out(l));
+        let lost = self.lost.ranges();
+        let Some(m) = self.mac.as_mut() else { return Ok(()) };
+        if m.verdict.is_some() || m.gave_up {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; 0];
+        while m.pos < self.size {
+            if self.options.control.is_canceled() {
+                return Err(FeedError::Canceled);
+            }
+            // up to the frontier, and not into a lost range
+            let mut limit = frontier;
+            for r in &lost {
+                if r.end > m.pos {
+                    limit = limit.min(r.start);
+                    break;
+                }
+            }
+            if m.pos >= limit {
+                return Ok(());
+            }
+            let n = (limit - m.pos).min(256 << 10) as usize;
+            buf.resize(n, 0);
+            match sink.read_held(m.pos, &mut buf[..n]) {
+                Ok(got) if got > 0 && got <= n => {
+                    ctr_xor(&aes, m.pos, &mut buf[..got]);
+                    m.hmac.update(&buf[..got]).ok_or(FeedError::Malformed("WinZip AES data size"))?;
+                    m.pos += got as u64;
+                }
+                _ => {
+                    m.gave_up = true;
+                    return Ok(());
+                }
+            }
+        }
+        // the authentication code after the ciphertext
+        let tag_at = skip + self.size;
+        while (m.tag.len() as u64) < AES_TAG {
+            let at = tag_at + m.tag.len() as u64;
+            let span = self.geometry.locate(at).ok_or(FeedError::Malformed("WinZip AES data size"))?;
+            let left = (span.stream.end.min(tag_at + AES_TAG) - at) as usize;
+            let mut b = [0u8; AES_TAG as usize];
+            match source.read_packed(span.volume, span.packed_start + (at - span.stream.start), &mut b[..left]) {
+                PackedRead::Data(n) if n > 0 && n <= left => {
+                    self.stats.packed_read += n as u64;
+                    m.tag.extend_from_slice(&b[..n]);
+                }
+                PackedRead::Data(_) => return Err(FeedError::SourceContract("Data count of 0 or past the buffer")),
+                PackedRead::NotYet { len } | PackedRead::Hole { len } => {
+                    let len = len.clamp(1, left as u64);
+                    for (volume, range) in self.geometry.volume_ranges(at..at + len) {
+                        next.push(NeedBytes { volume, range, kind: NeedKind::Next });
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        use subtle::ConstantTimeEq;
+        m.verdict = Some(bool::from(m.hmac.finish()[..AES_TAG as usize].ct_eq(&m.tag)));
+        Ok(())
     }
 
     fn make_status(&self, needs: Vec<NeedBytes>, more: bool) -> FeedStatus {
@@ -1095,9 +1223,16 @@ impl FeedDecoder {
             (Some(r), _, _) => r.frontier(),
             (_, Some(l), _) => l.frontier(),
             (_, _, Some(r)) if self.main.is_some() => r.frontier(),
+            _ if self.zip.is_some() => match (&self.zip, &self.main) {
+                (Some(z), Some(_)) => z.frontier(),
+                _ => self.size,
+            },
             _ => self.main.as_ref().map_or(self.size, |l| self.lane_out(l)),
         };
-        let done = self.main.is_none() && self.lost.is_empty() && self.lzma2.as_ref().is_none_or(|l| l.done());
+        let done = self.main.is_none()
+            && self.lost.is_empty()
+            && self.lzma2.as_ref().is_none_or(|l| l.done())
+            && self.mac.as_ref().is_none_or(|m| m.verdict.is_some() || m.gave_up);
         let crc_ok = if done {
             self.want_crc.and_then(|want| {
                 let crc = self.crc.whole(self.size)?;
@@ -1112,9 +1247,18 @@ impl FeedDecoder {
         };
         let stalled = self.rar5.as_ref().is_some_and(|r| r.stalled())
             || self.lzma2.as_ref().is_some_and(|l| l.stalled())
-            || self.rar4.as_ref().is_some_and(|r| r.stalled());
-        let unproven = self.unproven && !(done && crc_ok == Some(true));
-        FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, stalled, crc_ok, unproven }
+            || self.rar4.as_ref().is_some_and(|r| r.stalled())
+            || self.zip.as_ref().is_some_and(|z| z.stalled());
+        let auth_ok = match (&self.zip, &self.mac) {
+            (Some(z), _) if done && z.authenticated() => z.auth(),
+            (_, Some(m)) if done => m.verdict,
+            _ => None,
+        };
+        // proven by a matching CRC or authentication code, with neither failing
+        let proven =
+            done && crc_ok != Some(false) && auth_ok != Some(false) && (crc_ok == Some(true) || auth_ok == Some(true));
+        let unproven = self.unproven && !proven;
+        FeedStatus { frontier, lost: self.lost.ranges(), needs, more, done, stalled, crc_ok, unproven, auth_ok }
     }
 
     /// Tells the source which stream bytes no lane will read again: everything before the main decode except what
@@ -1134,6 +1278,11 @@ impl FeedDecoder {
             // nothing before the main decode is read again (a restore reads the member from its start again)
             if let Some(l) = &self.main {
                 keep.insert(l.pos..self.stream_len);
+            }
+        } else if let Some(z) = &self.zip {
+            // nothing before the main decode is read again, but a restore in this session starts at the checkpoint
+            if let Some(l) = &self.main {
+                keep.insert(z.keep_from(l.pos)..self.stream_len);
             }
         } else {
             if let Some(l) = &self.main {
@@ -1264,6 +1413,14 @@ impl FeedDecoder {
         match self.cipher {
             StoredCipher::Plain => self.emit(at, bytes, sink),
             StoredCipher::Ctr { aes, skip } => {
+                // the authentication code hashes the ciphertext in order: inline while the reads are in order
+                if let Some(m) = self.mac.as_mut()
+                    && m.verdict.is_none()
+                    && m.pos == at - skip
+                {
+                    m.hmac.update(bytes).ok_or(FeedError::Malformed("WinZip AES data size"))?;
+                    m.pos += bytes.len() as u64;
+                }
                 ctr_xor(&aes, at - skip, bytes);
                 self.emit(at - skip, bytes, sink)
             }
@@ -1317,7 +1474,12 @@ impl FeedDecoder {
                 (Some(r), _, _) => Some(r.to_bytes()),
                 (_, Some(l), _) => Some(l.to_bytes()),
                 (_, _, Some(r)) => Some(r.to_bytes()),
-                _ => None,
+                _ => match (&self.zip, &self.mac) {
+                    (Some(z), _) => Some(z.to_bytes()),
+                    // a stored member's authentication verdict, once reached (it is caught up again otherwise)
+                    (_, Some(m)) => m.verdict.map(|ok| vec![b'M', u8::from(ok)]),
+                    _ => None,
+                },
             },
         }
     }
@@ -1357,6 +1519,19 @@ impl FeedDecoder {
             r.restore(snapshot.layer.as_deref().ok_or(FeedError::Snapshot("no RAR 4.x state"))?, size)?;
             if snapshot.main.is_none() {
                 d.main = None;
+            }
+        }
+        if let Some(z) = d.zip.as_mut() {
+            z.restore(snapshot.layer.as_deref().ok_or(FeedError::Snapshot("no ZIP state"))?, size)?;
+            if snapshot.main.is_none() {
+                d.main = None;
+            }
+        }
+        if let Some(m) = d.mac.as_mut() {
+            match snapshot.layer.as_deref() {
+                None => {}
+                Some([b'M', ok @ (0 | 1)]) => m.verdict = Some(*ok == 1),
+                Some(_) => return Err(FeedError::Snapshot("bad authentication state")),
             }
         }
         d.main = match snapshot.main {

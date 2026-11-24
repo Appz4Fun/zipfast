@@ -492,3 +492,56 @@ fn damaged_7zip_streams_never_panic_or_hang() {
         let _ = inflate(Variant::Deflate, &random);
     }
 }
+
+/// With block stops, every boundary a step stops at is a restart point: a decoder resumed there from the output
+/// before it (its window) and the input from the boundary's bit decodes the rest exactly, in Deflate and Deflate64.
+#[test]
+fn block_boundaries_resume_from_the_window_and_a_bit_offset() {
+    let mut data = words(3, 400_000);
+    data.extend(noise(4, 70_000));
+    data.extend(words(5, 300_000));
+    let streams = [
+        (Variant::Deflate, deflate(&data, 6)),
+        (Variant::Deflate64, zip_members("d64.zip").into_iter().find(|m| m.0 == "runs.bin").unwrap().2),
+    ];
+    for (variant, stream) in streams {
+        let mut inf = Inflater::new(variant);
+        inf.set_block_stops(true);
+        let (mut at, mut out, mut boundaries) = (0usize, Vec::new(), Vec::new());
+        let mut buf = vec![0; 10_000];
+        loop {
+            let step = inf.step(&stream[at..(at + 3_000).min(stream.len())], &mut buf).unwrap();
+            at += step.consumed;
+            out.extend_from_slice(&buf[..step.produced]);
+            if let Some(count) = inf.boundary() {
+                boundaries.push((at as u64 * 8 - u64::from(count), out.len()));
+            }
+            if step.done {
+                break;
+            }
+        }
+        boundaries.dedup();
+        assert!(boundaries.len() >= 3, "{variant:?}: {} boundaries", boundaries.len());
+        assert_eq!(inf.blocks() as usize, boundaries.len() + 1);
+        for &(bit, total) in &boundaries {
+            let window = if variant == Variant::Deflate64 { 1 << 16 } else { 1 << 15 };
+            let mut resumed = Inflater::resume(variant, &out[total.saturating_sub(window)..total], total as u64);
+            let mut from = (bit / 8) as usize;
+            if bit % 8 != 0 {
+                resumed.preload(stream[from], (bit % 8) as u32);
+                from += 1;
+            }
+            let mut rest = Vec::new();
+            loop {
+                let step = resumed.step(&stream[from..], &mut buf).unwrap();
+                from += step.consumed;
+                rest.extend_from_slice(&buf[..step.produced]);
+                if step.done {
+                    break;
+                }
+                assert!(step.consumed > 0 || step.produced > 0);
+            }
+            assert!(rest == out[total..], "{variant:?}: resumed at bit {bit}");
+        }
+    }
+}

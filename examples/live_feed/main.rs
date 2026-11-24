@@ -14,7 +14,7 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Live extraction of a multi-volume RAR 5.0, RAR 4.x or 7z set from simulated Usenet articles, through
+//! Live extraction of a multi-volume RAR 5.0, RAR 4.x, 7z or ZIP set from simulated Usenet articles, through
 //! `ArticleBuffer` -> `FeedDecoder` -> `FeedSink` (a persistent partial with `--features persistent-partials`).
 //! A reference integration for downloaders; see `docs/feed-decoder.md` ("Live feed example") and `sim.rs`.
 //!

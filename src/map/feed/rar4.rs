@@ -192,6 +192,8 @@ impl FeedDecoder {
                 successor: run.successor,
                 ended: None,
             })),
+            zip: None,
+            mac: None,
         };
         d.stream_start = run.start;
         // an empty member of a solid stream still has its end-of-file marker read, which says where the next starts

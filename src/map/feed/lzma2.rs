@@ -921,6 +921,8 @@ impl FeedDecoder {
             seeded: None,
             rar5: None,
             rar4: None,
+            zip: None,
+            mac: None,
             lzma2: Some(Box::new(Lz {
                 ss: slot.offset,
                 end,

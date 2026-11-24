@@ -77,15 +77,16 @@ has contiguous bytes (holes skipped where the layer allows), then retries each l
 | `done` | every output byte is written |
 | `stalled` | a compressed main decode waits at a hole it cannot skip; the hole's bytes are the first `Next` need |
 | `crc_ok` | once done: whether the output matches the member's CRC32 (keyed with the password where the map says so, as RAR 5.0 AES members' are); None without one |
-| `unproven` | output written so far was decoded from a window not proven yet: seeded from held output past a hole, or handed over from an earlier solid member that was not done with its CRC matched; cleared once done with `crc_ok` true |
+| `unproven` | output written so far was decoded from a window not proven yet: seeded from held output past a hole, or handed over from an earlier solid member that was not done with its CRC matched; WinZip AES output until its authentication code matches; cleared once done with `crc_ok` or `auth_ok` true and neither false |
+| `auth_ok` | WinZip AES, once done: whether the authentication code matched; None for other members and when it could not be checked (see [ZIP](#zip)) |
 
 `NeedBytes` ranges are exact: a `Next` need is the run of bytes from the frontier the source reported absent, a
 `Repair` need the missing bytes a repair stopped at. Both are cut at piece (volume) boundaries.
 
 The CRC is kept per run of contiguous output and joined (`crc32::combine`) as holes are repaired, so the verdict
-needs no second pass. Members with only a BLAKE2sp hash, and WinZip AE-2 entries (no CRC), report `crc_ok: None`;
-the WinZip authentication code and RAR part checks are not checked here (use `MemberReader` or a persistent
-partial's verify for those).
+needs no second pass. Members with only a BLAKE2sp hash, and WinZip AE-2 entries (no CRC), report `crc_ok: None`.
+The WinZip AES authentication code is checked (`auth_ok`, see [ZIP](#zip)); RAR part checks are not checked here (use
+`MemberReader` or a persistent partial's verify for those).
 
 `FeedOptions`: `password`, `limits` (KDF budgets and password sizes, as for maps), `control` (a `SessionControl`:
 cancels a run between reads and a key derivation in progress), `read_chunk` (the largest read, default 256 KiB),
@@ -103,12 +104,12 @@ old frontier, for a 7z member after its folder's first started on its own the fo
 |---|---|
 | plain stored (RAR 5.0, RAR 4.x, ZIP method 0, 7z Copy): `OutputMapping::Direct` | output byte = stream byte: the hole's own output is lost; the main decode goes on right after it |
 | AES-CBC stored (RAR 5.0, RAR 4.x AES-128, the first member of a 7zAES-over-Copy folder): `CbcBlocks` | each block needs the ciphertext block before it: the lost output runs from the start of the block the hole begins in to the end of the block after the one it ends in (`[floor16(start), ceil16(end) + 16)`); the main decode restarts there with the block before as IV |
-| WinZip AES stored: `Counter { skip }` | each byte decrypts on its own: exactly the hole's output is lost |
-| ZipCrypto | refused (`FeedUnsupported::SequentialCipher`): its keystream needs every earlier byte |
+| WinZip AES stored: `Counter { skip }` | each byte decrypts on its own: exactly the hole's output is lost; the authentication code is caught up after repairs (see [ZIP](#zip)) |
+| ZIP Deflate and Deflate64 (methods 8 and 9; plain, ZipCrypto, WinZip AES), ZipCrypto stored | waits at every hole; see [ZIP](#zip) |
 | compressed RAR 5.0 (methods 1-5, AES-256 under them too) | see [compressed RAR 5.0](#compressed-rar-50); solid successors [below](#solid-streams-and-folders) |
 | 7z folders of one LZMA2 coder, alone or over 7zAES, any member of the folder | see [7z LZMA2](#7z-lzma2); members in sequence [below](#solid-streams-and-folders) |
 | compressed RAR 4.x (unpack versions 1.5, 2.0, 2.6, 2.9: LZ, audio, PPMd, filters; AES-128 under them too) | waits at every hole; see [compressed RAR 4.x](#compressed-rar-4x); solid successors [below](#solid-streams-and-folders) |
-| ZIP compressed members, other 7z coder chains | refused (`Compressed`, `Coders`); see [next](#next) |
+| other ZIP methods (bzip2, LZMA, PPMd, ...), other 7z coder chains | refused (`Compressed`, `Coders`); see [next](#next) |
 
 A repair reads only the lost range's bytes (under CBC, also the block before it as IV) and writes only the lost
 output. A repair that stops at bytes still missing keeps what it decoded, needs only the rest, and next time asks
@@ -212,6 +213,47 @@ up to it, writing nothing before it, and that cost is counted in `stats().redeco
 the decoder passed are released as it goes (memory stays bounded), so a restored decoder asks for the member's packed
 bytes from its start again (`Next` needs). The 1.5/2.0 engines and PPMd hold up to 4 KiB of input back as lookahead,
 so their output can trail the bytes fed by that much.
+
+## ZIP
+
+ZIP members, single files and split sets alike (Info-ZIP `.z01` ... `.zip` sets, mapped as `MemberMap` maps them;
+see [member maps](member-map.md)), are decoded member by member: ZIP has no solid streams. Sizes come from the central
+directory, so members written with data descriptors (flag bit 3, zeros in the local header) feed as any other. A
+byte-split set (`name.zip.001`, `.002`, ...) is one ZIP cut anywhere: map the pieces concatenated as one volume, and
+place each piece's articles at its start (the sum of the earlier pieces' sizes) plus their own offset.
+
+- **Stored, plain or WinZip AES**: the stored lanes above; holes are skipped and repaired.
+- **Deflate and Deflate64, plain or WinZip AES**: the main decode decrypts (WinZip AES counter mode decrypts each
+  byte on its own) and feeds the packed bytes to zipfast's inflater (`inflate64`, which reads both) in order, and
+  writes the output in order. Deflate has no restart point a decoder can find after a hole: a block starts at a bit
+  offset known only by decoding up to it, and the block after a hole copies from output the hole hid. So at a hole
+  the main decode waits (`stalled`, the hole's bytes the first `Next` need, the bytes after it `Ahead`) and goes on
+  with its decoder when they come; nothing is lost, repaired or decoded twice. No resync over the data after a hole is
+  attempted (a stored block's LEN/NLEN after a hole could be found, but its output offset and the window before it
+  cannot be proven before the member's CRC, and the blocks after it copy from the hole's output anyway).
+- **ZipCrypto, stored or under Deflate**: its keystream depends on every byte before, so it waits at holes too. A wrong
+  password shows once the 12-byte header is read (its last byte is the check byte, `WrongPassword`; one wrong password
+  in 256 passes it and fails the CRC).
+
+**Checkpoints.** After every Deflate block the main decode notes the block boundary it passed with its output written:
+the boundary's bit offset in the packed stream and the output offset there, 16 bytes, no window. A restore reads the
+window back from the sink (`read_held`, the 32 KiB of output before the boundary for Deflate, 64 KiB for Deflate64;
+`HeldOutput` when not held), starts the inflater at the boundary's bit and decodes up to the old frontier without
+writing: `redecoded` is at most one block (the encoders end blocks every 16 to 64 Ki symbols; under 20 KB on the test
+content). The packed bytes from the checkpoint on are kept (not released), so a restore in the same session reads
+nothing again; one after a restart asks for them from the checkpoint (`Next` needs). A ZipCrypto member's keystream
+cannot be rebuilt at a checkpoint without the bytes before it (keeping its keys in a snapshot would leak them), so a
+restore reads the member's packed bytes from its start again (decrypting only: nothing is inflated or written before
+the checkpoint); those are `Next` needs after a restart.
+
+**WinZip AES authentication.** The authentication code (HMAC-SHA1 over the ciphertext, the 10 bytes after it) is
+hashed in order as the main decode reads, and compared once its bytes are read: `auth_ok`, and `done` waits for them
+(they are a `Next` need once the output is written). Until then the output is `unproven` (AE-2 members record no CRC,
+so the code is all there is). A stored member skips holes, so its code is caught up after the repairs from the output
+held (`read_held`, encrypted again); with a sink that holds nothing it cannot be (`auth_ok: None`, then the CRC alone
+proves an AE-1 member). A restore of a stored member catches it up the same way. A restored Deflate member whose
+checkpoint is past the data's start does not read the ciphertext before it again, so its code is not checked
+(`auth_ok: None`): an AE-1 member is proven by its CRC, an AE-2 member stays `unproven`.
 
 ## Solid streams and folders
 
@@ -318,14 +360,16 @@ member or layer is `FeedError::Snapshot`. An LZMA2 member restores at its restar
 old frontier without writing and goes on; repairs restart from their restart points. A compressed RAR 4.x member restores at its start (above). A compressed RAR 5.0 member restores at its checkpoint, reading its window back
 with `read_held` (`FeedError::HeldOutput` when the sink does not give it), decodes up to the old frontier without
 writing (counted in `redecoded`: at most the output since the last block boundary before the snapshot) and goes
-on; it never decodes from the member's start unless the snapshot was taken there. Persistent partials (`docs/persistent-partials.md`) remain the durable,
+on; it never decodes from the member's start unless the snapshot was taken there. A ZIP Deflate member restores at its
+last block boundary (above), a ZipCrypto one reads its packed bytes from the start again. Persistent partials (`docs/persistent-partials.md`) remain the durable,
 journaled store for output; a snapshot is the decoder's position over it. Kept as a direct partial's cursor
 (`PartialFile::set_cursor`), it commits atomically with the output it describes.
 
 ## Live feed example
 
-`examples/live_feed/` is a reference integration for a downloader: it takes a multi-volume RAR 5.0, RAR 4.x or 7z
-set, plays it as a Usenet download and extracts while the articles arrive. `sim.rs` holds everything (it is also what
+`examples/live_feed/` is a reference integration for a downloader: it takes a multi-volume RAR 5.0, RAR 4.x, 7z or
+ZIP set (a single `.zip`, an Info-ZIP `.z01` ... `.zip` set, or a byte split `.zip.001`, which it maps as the pieces
+concatenated), plays it as a Usenet download and extracts while the articles arrive. `sim.rs` holds everything (it is also what
 `tests/live_feed.rs` runs on small fixtures); `main.rs` is its command line.
 
 ```text
@@ -404,6 +448,9 @@ not meet its restart), `HeldOutput { range }` (a checkpoint's window the sink do
 ## Next
 
 - 7z LZMA2 under BCJ or Delta (a chain of coders), LZMA (not LZMA2) folders.
+- ZIP: a Deflate skip past a hole with held output past it (as RAR 5.0 does: find the block boundary after the hole
+  whose decode matches the held output), and checking a restored WinZip AES Deflate member's code by reading its
+  ciphertext again.
 - A skip without held output past the hole is impossible for compressed RAR data (see above). RAR 4.x members have no
   restart search at all: a resync over RAR 2.9 LZ blocks (tables at block starts) and cheap decoder checkpoints would
   let holes be skipped and restores (also of solid successors) start near their frontier.
@@ -472,6 +519,23 @@ the first `Next` need, nothing lost), and once the missing articles come (with a
 which the released bytes are asked for from the member's start and given again) the output is exact, CRC verified,
 each byte written once, and `redecoded` is at most the frontier at the snapshot (0 to 164 KB on the fixtures). A solid
 successor on its own decodes its stream again (below), an encrypted member without a password is `PasswordRequired`.
+
+ZIP (`tests/feed_decoder_zip.rs`): Deflate members written forward (data descriptors) and to a seekable sink (sizes
+in the local headers), 0.7 to 2 MB of text with incompressible stretches; ZipCrypto Deflate and stored; WinZip AES
+AE-1 and AE-2, Deflate and stored; a byte split; the Info-ZIP split fixtures (`deflated`, `crypt`: stored ZipCrypto
+across the boundary, with a data descriptor); and the Deflate64 fixtures (plain, ZipCrypto, WinZip AES, checked against
+their SHA-256). Each is cut into articles of 700 to 750,000 bytes, shuffled, every second to fifth missing: the main
+decode waits at the first hole (stored AES skips it), the needs are exactly the missing articles' bytes the member reads
+from the hole on (the first `Next`), and once the missing ones come, with a snapshot round trip half way (the restored
+decoder given back whatever it asks for again), the output is exact, CRC (and authentication code) verified, each byte
+written once, and `redecoded` is what the restore decoded again, at most one block (0 to 20 KB). Plain and AES restores
+read nothing again; ZipCrypto restores read the packed bytes before their checkpoint again. Also: a restore 1.2 MB into
+a 2 MB member, in the session and in a new one that holds only the bytes from the checkpoint on (`HeldOutput` without
+the window), a hole stalling with nothing lost and counted once, a damaged authentication code (`auth_ok: Some(false)`),
+wrong passwords, and the buffer holding only the bytes from the last block boundary on. `src/inflate64/tests.rs`
+resumes Deflate and Deflate64 streams at every block boundary from the window and the bit offset. `tests/live_feed.rs`
+runs a mixed ZIP (Deflate, AES, ZipCrypto Deflate and stored), its byte split and the Info-ZIP split fixtures through
+the live feed example, also with a restart part way.
 
 Restarts (`tests/persistent_direct.rs`, see `docs/persistent-partials.md`): every container is fed into persistent
 partials, restarted part way and restored from each partial's cursor, and on the z-fixtures `live_feed --restart-at 15`

@@ -68,7 +68,7 @@ pub(crate) struct Fixture {
     store: Arc<Store>,
     pub(crate) member: MemberKey,
     evidence: InitialEvidence,
-    pub(super) checks: MemberChecks,
+    checks: MemberChecks,
     size: u64,
 }
 /// The file block header of a stored member of `size` bytes, without its data.
@@ -442,24 +442,6 @@ fn process_kill_child() {
         }
     } else {
         core.write_original(0, b"abcdefghijklmnop").unwrap();
-    }
-}
-// Catches the deferred device flush leaving an anchor pointing at bytes only plainly synced: a kill at the barrier
-// before each anchor change of two 8-byte groups reopens from the anchor before it, with consistent state, and
-// loses at most the one group (8 bytes, `group_commit_bytes`) that was not yet committed.
-#[test]
-fn a_kill_at_the_anchor_barrier_loses_at_most_the_open_group() {
-    // n-th barrier: 1 and 2 are genesis, then each group's intent and commit.
-    for (phase, sequence, committed, written) in
-        [("barrier:3", 1, 0, 0), ("barrier:4", 2, 0, 8), ("barrier:5", 3, 8, 8), ("barrier:6", 4, 8, 16)]
-    {
-        let (file, _root, path) = crash_and_reopen(phase, true, sequence, committed, written);
-        assert!(written as u64 - committed <= 8, "{phase}: lost more than one group");
-        for at in (committed..16).step_by(4) {
-            file.core.write_original(at, &b"abcdefghijklmnop"[at as usize..at as usize + 4]).unwrap();
-        }
-        assert!(file.remaining().unwrap().is_empty(), "{phase}");
-        assert_eq!(fs::read(path.join("out/member.bin")).unwrap(), b"abcdefghijklmnop", "{phase}");
     }
 }
 /// One transaction per write, as before group commits.
@@ -1206,7 +1188,7 @@ pub(crate) fn journal_sync(file: &fs::File, names: &[&str], directory: bool) -> 
         }
         JOURNAL_FAULT.set(None);
     }
-    crate::partial::durable::sync(file)
+    file.sync_all()
 }
 fn prepared_public_fill(f: &Fixture) -> PartialFile {
     let file = f.create().unwrap();

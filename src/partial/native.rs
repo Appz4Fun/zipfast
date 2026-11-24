@@ -833,15 +833,6 @@ impl PersistentNative {
     pub(crate) fn written(&self) {
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
-    /// Every descriptor this member syncs through, one per device it can sync on: the output, the roots, the
-    /// bundle directory (its journal files are inside it) and the parents. An anchor change of this member flushes
-    /// each of their devices that has a sync not yet flushed (see `durable`).
-    pub(super) fn flush_targets(&self) -> Vec<&std::fs::File> {
-        let mut files =
-            vec![&self.output.file, &self.bundle.held.file, &self.root.held.file, &self.state_root.held.file];
-        files.extend(self.parents.iter().map(|p| &p.held.file));
-        files
-    }
     pub(super) fn sync_parents(&self) -> PartialResult<()> {
         for file in [&self.root.held.file, &self.state_root.held.file, &self.bundle.held.file] {
             super::sync_file(file).map_err(|e| io_error(OutputOperation::Flush, e))?;
