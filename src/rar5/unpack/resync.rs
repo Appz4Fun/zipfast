@@ -1117,9 +1117,12 @@ impl Unpacker {
     /// resumed from it holds unfiltered in its window.
     pub(crate) fn record_filters_from(&mut self, resync: &Resync) {
         self.record_filters();
+        let base = self.file_base;
         if let Some(seen) = &mut self.seen {
-            for f in &resync.filters {
-                seen.push(super::SeenFilterRec { start: f.start, len: f.len, kind: f.kind });
+            // an earlier file's filters were not undone in the window (see `resume_seeded`): a checkpoint holds its
+            // output as the window does
+            for f in resync.filters.iter().filter(|f| f.start >= base) {
+                seen.push(super::SeenFilterRec { start: f.start, len: f.len, kind: f.kind, base });
             }
         }
     }

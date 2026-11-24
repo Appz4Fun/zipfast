@@ -41,11 +41,9 @@ pub(super) struct Cp {
 }
 
 impl Cp {
-    fn start() -> Self {
-        Cp {
-            packed: 0,
-            state: UnpackCheckpoint { sp: 0, history: [0; 4], last_len: 0, lens: None, filters: Vec::new() },
-        }
+    /// The start of a stream (at stream offset `sp`, for a restore placeholder of a solid successor).
+    fn start(sp: u64) -> Self {
+        Cp { packed: 0, state: UnpackCheckpoint { sp, history: [0; 4], last_len: 0, lens: None, filters: Vec::new() } }
     }
 }
 
@@ -78,6 +76,15 @@ pub(super) struct Rar5 {
     skip_failed: Option<(u64, usize, usize)>,
     /// unpacked / packed, for estimates
     ratio: f64,
+    /// where the member's output starts in its solid stream's (0 alone; checkpoints count stream offsets), and the
+    /// starts of the stream's members up to this one (a recorded filter addresses from its member's start)
+    start: u64,
+    starts: Vec<u64>,
+    /// a solid member follows: the main decoder is kept at the end for a hand-off ([`FeedDecoder::next_solid`]),
+    /// its state there as a checkpoint at the successor's start
+    successor: bool,
+    ended: Option<Box<Unpacker>>,
+    carry: Option<Cp>,
 }
 
 /// An [`Sink`] writing the part of the decoder's output inside `write` to the feed sink.
@@ -124,23 +131,6 @@ impl OutSink<'_> {
     }
 }
 
-/// Reads held output `range` from the sink, all of it or an error naming it.
-pub(super) fn read_back(sink: &mut dyn FeedSink, range: Range<u64>) -> Result<Vec<u8>, FeedError> {
-    let len = usize::try_from(range.end - range.start).map_err(|_| FeedError::HeldOutput { range: range.clone() })?;
-    let mut buf = vec![0; len];
-    let mut got = 0;
-    while got < len {
-        let n = sink
-            .read_held(range.start + got as u64, &mut buf[got..])
-            .map_err(|_| FeedError::HeldOutput { range: range.clone() })?;
-        if n == 0 || n > len - got {
-            return Err(FeedError::HeldOutput { range });
-        }
-        got += n;
-    }
-    Ok(buf)
-}
-
 /// Reads up to `max` bytes of held output from `at`, stopping where the sink holds no more.
 fn read_some(sink: &mut dyn FeedSink, at: u64, max: u64) -> Vec<u8> {
     let mut buf = vec![0; max as usize];
@@ -158,6 +148,10 @@ fn read_some(sink: &mut dyn FeedSink, at: u64, max: u64) -> Vec<u8> {
 impl Rar5 {
     pub(super) fn frontier(&self) -> u64 {
         self.out.max(self.write_from)
+    }
+
+    pub(super) fn reach(&self) -> u64 {
+        self.window.reach
     }
 
     pub(super) fn stalled(&self) -> bool {
@@ -178,6 +172,19 @@ impl Rar5 {
         out
     }
 
+    /// The member output offset of a checkpoint (its stream offset less the member's start).
+    fn cp_out(&self, cp: &Cp) -> u64 {
+        cp.state.sp - self.start
+    }
+
+    /// The carry for a solid successor: its start and the checkpoint there, serialized.
+    pub(super) fn carry_blob(&self) -> Option<(u64, Vec<u8>)> {
+        let cp = self.carry.as_ref()?;
+        let mut out = Vec::new();
+        put_cp(&mut out, cp);
+        Some((cp.state.sp, out))
+    }
+
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_cp(&mut out, &self.base);
@@ -189,30 +196,54 @@ impl Rar5 {
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
+        // a finished member with a solid successor keeps the successor's start
+        if let Some(cp) = &self.carry {
+            put_cp(&mut out, cp);
+        }
         out
     }
 
     pub(super) fn restore(&mut self, blob: &[u8], size: u64, stream_len: u64) -> Result<(), FeedError> {
         let mut r = Reader(blob);
         let bad = || FeedError::Snapshot("out of range");
-        let base = get_cp(&mut r)?;
+        let start = self.start;
+        let base = get_cp(&mut r, &self.starts)?;
         let frontier = r.u64()?;
-        if base.packed > stream_len || base.state.sp > frontier || frontier > size {
+        if base.packed > stream_len || base.state.sp < start || base.state.sp - start > frontier || frontier > size {
             return Err(bad());
         }
         let n = r.count(8 * 4 + 8 * 7 + 4)?;
         let mut repairs = Vec::with_capacity(n);
         for _ in 0..n {
-            let from = get_cp(&mut r)?;
+            let from = get_cp(&mut r, &self.starts)?;
             let (until_packed, until_out, s, e) = (r.u64()?, r.u64()?, r.u64()?, r.u64()?);
-            if from.packed > until_packed || until_packed > stream_len || from.state.sp > s || s > e || e != until_out {
+            if from.packed > until_packed
+                || until_packed > stream_len
+                || from.state.sp < start
+                || from.state.sp - start > s
+                || s > e
+                || e != until_out
+            {
                 return Err(bad());
             }
             repairs.push(Repair { from, until_packed, until_out, lost: s..e, blocked: None });
         }
+        let carry = if r.0.is_empty() {
+            None
+        } else {
+            let mut starts = self.starts.clone();
+            starts.push(start + size);
+            let cp = get_cp(&mut r, &starts)?;
+            if !self.successor || cp.packed != 0 || cp.state.sp != start + size || frontier != size {
+                return Err(bad());
+            }
+            Some(cp)
+        };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
+        self.carry = carry;
+        self.ended = None;
         self.dec = None;
         self.base = base;
         self.out = frontier;
@@ -221,6 +252,16 @@ impl Rar5 {
         self.repairs = repairs;
         Ok(())
     }
+}
+
+/// The checkpoint a carry holds, checked against the successor's place.
+fn carry_cp(carry: &SolidCarry, starts: &[u64]) -> Result<Cp, FeedError> {
+    let mut r = Reader(&carry.cp);
+    let cp = get_cp(&mut r, starts)?;
+    if !r.0.is_empty() || cp.packed != 0 || cp.state.sp != carry.next_start {
+        return Err(FeedError::Snapshot("a carry that does not decode"));
+    }
+    Ok(cp)
 }
 
 fn put_cp(out: &mut Vec<u8>, cp: &Cp) {
@@ -246,7 +287,9 @@ fn put_cp(out: &mut Vec<u8>, cp: &Cp) {
     }
 }
 
-fn get_cp(r: &mut Reader<'_>) -> Result<Cp, FeedError> {
+/// A checkpoint as [`put_cp`] wrote it; `starts` are the member starts of its solid stream, ascending, which give each
+/// recorded filter its member.
+fn get_cp(r: &mut Reader<'_>, starts: &[u64]) -> Result<Cp, FeedError> {
     let packed = r.u64()?;
     let sp = r.u64()?;
     let history = [r.u64()?, r.u64()?, r.u64()?, r.u64()?];
@@ -264,7 +307,8 @@ fn get_cp(r: &mut Reader<'_>) -> Result<Cp, FeedError> {
         if start.checked_add(len).is_none_or(|end| end > sp) {
             return Err(FeedError::Snapshot("filter past its checkpoint"));
         }
-        filters.push(SeenFilterRec::from_code(start, len, code).ok_or(FeedError::Snapshot("bad filter"))?);
+        let base = starts.iter().rev().copied().find(|&s| s <= start).unwrap_or(0);
+        filters.push(SeenFilterRec::from_code(start, len, code, base).ok_or(FeedError::Snapshot("bad filter"))?);
     }
     Ok(Cp { packed, state: UnpackCheckpoint { sp, history, last_len, lens, filters } })
 }
@@ -274,12 +318,33 @@ fn get_cp(r: &mut Reader<'_>) -> Result<Cp, FeedError> {
 pub(super) type RunOut = (Vec<NeedBytes>, Vec<NeedBytes>, bool, Option<Range<u64>>);
 
 impl FeedDecoder {
-    /// A decoder of a compressed RAR 5.0 member.
-    pub(super) fn new_rar5(member: &MapMember, options: FeedOptions) -> Result<Self, FeedError> {
+    /// A decoder of a compressed RAR 5.0 member: at its start, or for a solid successor from the state the member
+    /// before left (`begin`).
+    pub(super) fn new_rar5(
+        map: &MemberMap,
+        index: usize,
+        options: FeedOptions,
+        begin: Begin,
+    ) -> Result<Self, FeedError> {
+        let member = &map.members[index];
         let size = member.unpacked_size.ok_or(FeedError::Unsupported(FeedUnsupported::UnknownSize))?;
-        if member.solid {
-            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
-        }
+        let run = solid_run(map, index)?;
+        let solid = run.prev.is_some();
+        // a successor starts at the carry's checkpoint (a decoder handed over in-session is installed after)
+        let base = match begin {
+            Begin::Fresh if solid => return Err(FeedError::Unsupported(FeedUnsupported::Solid)),
+            Begin::Fresh => Cp::start(0),
+            Begin::Restore => Cp::start(run.start),
+            Begin::Carry(carry) => {
+                // taken at the end of the member before, in this stream
+                let prev = run.prev.ok_or(FeedError::Handoff("a carry for a member that is not a solid successor"))?;
+                let prev_start = run.starts[run.starts.len() - 2];
+                if carry.next_start != run.start || carry.from != solid_identity(&map.members[prev], prev_start) {
+                    return Err(FeedError::Handoff("a carry of another stream or place in it"));
+                }
+                carry_cp(&carry, &run.starts)?
+            }
+        };
         if !member.complete {
             return Err(FeedError::IncompleteMember);
         }
@@ -293,7 +358,10 @@ impl FeedDecoder {
         let geometry = Geometry::new(member);
         let stream_len = geometry.covered();
         let dictionary = member.dictionary.ok_or(FeedError::Malformed("RAR 5.0 member without a dictionary size"))?;
-        let window = window_for(dictionary, Some(size), false).map_err(|error| FeedError::Decode { out: 0, error })?;
+        // a solid stream's members share one window, sized for its largest dictionary
+        let stream = solid || run.successor;
+        let dictionary = if stream { run.dictionary.unwrap_or(dictionary).max(dictionary) } else { dictionary };
+        let window = window_for(dictionary, Some(size), stream).map_err(|error| FeedError::Decode { out: 0, error })?;
         if window.size > options.max_window {
             return Err(FeedError::Unsupported(FeedUnsupported::Window { size: window.size }));
         }
@@ -338,17 +406,22 @@ impl FeedDecoder {
             crc: CrcRuns::default(),
             stats: FeedStats::default(),
             released: RangeSet::default(),
-            identity: member_identity(member),
+            identity: solid_identity(member, run.start),
             options,
             buf: vec![0; chunk],
             scratch: Vec::new(),
             run_written: 0,
             failed: false,
             status: FeedStatus::default(),
+            index: 0,
+            stream_start: run.start,
+            unproven: false,
+            suspect: None,
+            seeded: None,
             rar5: Some(Box::new(Rar5 {
                 window,
                 dec: None,
-                base: Cp::start(),
+                base,
                 out: 0,
                 fed: 0,
                 write_from: 0,
@@ -356,11 +429,23 @@ impl FeedDecoder {
                 stalled: false,
                 skip_failed: None,
                 ratio,
+                start: run.start,
+                starts: run.starts.clone(),
+                successor: run.successor,
+                ended: None,
+                carry: None,
             })),
             lzma2: None,
             rar4: None,
         };
-        if size > 0 {
+        // An empty member of a solid stream still has its blocks decoded: they may set the tables the next member's
+        // first block goes on with. One without packed bytes passes the stream on as it got it.
+        let feeds = size > 0 || (stream_len > 0 && (solid || run.successor));
+        let r = d.rar5.as_mut().expect("RAR 5.0 state");
+        if !feeds && r.successor {
+            r.carry = Some(r.base.clone());
+        }
+        if feeds {
             d.main = Some(d.packed_lane(0, stream_len));
         }
         d.status = d.make_status(Vec::new(), false);
@@ -383,13 +468,15 @@ impl FeedDecoder {
         }
     }
 
-    /// A decoder restarted at `cp`, its window read back from the sink.
-    fn restore_dec(&self, window: Window, cp: &Cp, sink: &mut dyn FeedSink) -> Result<Box<Unpacker>, FeedError> {
+    /// A decoder restarted at `cp`, its window read back from the sink (and from the earlier members' output, for a
+    /// solid successor whose window reaches before it).
+    fn restore_dec(&self, r: &Rar5, cp: &Cp, sink: &mut dyn FeedSink) -> Result<Box<Unpacker>, FeedError> {
+        let (window, start) = (r.window, r.start);
         let sp = cp.state.sp;
         let from = cp.state.filters.iter().map(|f| f.start).fold(sp.saturating_sub(window.reach), u64::min);
-        let known = if sp > from { read_back(sink, from..sp)? } else { Vec::new() };
-        let mut dec = Unpacker::from_checkpoint(window, &cp.state, Some(self.size), from, &known)
-            .map_err(|error| FeedError::Decode { out: sp, error })?;
+        let known = if sp > from { read_stream(sink, start, from..sp)? } else { Vec::new() };
+        let mut dec = Unpacker::from_checkpoint(window, &cp.state, start, Some(self.size), from, &known)
+            .map_err(|error| FeedError::Decode { out: sp.saturating_sub(start), error })?;
         dec.set_threads(0, u64::MAX);
         Ok(Box::new(dec))
     }
@@ -418,10 +505,10 @@ impl FeedDecoder {
                 Some(dec) => dec,
                 None => {
                     let base = r.base.clone();
-                    let dec = self.restore_dec(r.window, &base, sink)?;
+                    let dec = self.restore_dec(r, &base, sink)?;
                     lane = self.packed_lane(base.packed, self.stream_len);
                     r.fed = base.packed;
-                    r.out = base.state.sp;
+                    r.out = r.cp_out(&base);
                     dec
                 }
             };
@@ -442,6 +529,17 @@ impl FeedDecoder {
                         let ended = dec.finish(&mut out).map_err(|e| out.fail(e));
                         r.out = out.at;
                         ended?;
+                        if r.successor {
+                            // the next file of the stream starts here: the decoder goes on, or a successor restarts
+                            // from its state at this point
+                            dec.next_file(None);
+                            let cp = dec.checkpoint().ok_or(FeedError::Decode {
+                                out: r.out,
+                                error: crate::Error::Corrupt("no restart point at the end of a solid member"),
+                            })?;
+                            r.carry = Some(Cp { packed: 0, state: cp });
+                            r.ended = Some(dec);
+                        }
                         break;
                     }
                     Stop::Budget => {
@@ -516,9 +614,9 @@ impl FeedDecoder {
         }
         // the bytes it waited for are there: it goes on, and may pass them
         r.repairs[i].blocked = None;
-        let mut dec = self.restore_dec(r.window, &rep.from, sink)?;
+        let mut dec = self.restore_dec(r, &rep.from, sink)?;
         let mut lane = self.packed_lane(rep.from.packed, rep.until_packed);
-        let (mut fed, mut out) = (rep.from.packed, rep.from.state.sp);
+        let (mut fed, mut out) = (rep.from.packed, r.cp_out(&rep.from));
         let feed_end = rep.until_packed;
         let mut cp = rep.from.clone();
         let stop = self.pump5_until(
@@ -535,9 +633,10 @@ impl FeedDecoder {
         let keep = |r: &mut Rar5, lost: &mut RangeSet| {
             let written = out.clamp(rep.lost.start, rep.lost.end);
             lost.remove(rep.lost.start..written);
+            let cp_out = r.cp_out(&cp);
             let rp = &mut r.repairs[i];
             rp.lost.start = written;
-            if cp.state.sp <= written {
+            if cp_out <= written {
                 rp.from = cp.clone();
             }
         };
@@ -636,22 +735,25 @@ impl FeedDecoder {
             return Ok(None);
         }
         r.skip_failed = Some(tried);
-        // the window before the frontier and the held output past it
-        let base = out_h.saturating_sub(r.window.reach);
-        let mut known = match read_back(sink, base..out_h) {
+        // the window before the frontier and the held output past it, at stream offsets (a solid successor's window
+        // reaches into the earlier members' output)
+        let s0 = r.start;
+        let at = s0 + out_h;
+        let base = at.saturating_sub(r.window.reach);
+        let mut known = match read_stream(sink, s0, base..at) {
             Ok(k) => k,
             Err(_) => return Ok(None),
         };
         known.extend_from_slice(&donor);
-        let known_end = out_h + donor.len() as u64;
+        let known_end = at + donor.len() as u64;
         // The restart is the last block start at or before the target, and the search must follow the packed bytes
         // to the target: so targets just past where the hole's output is thought to end, nearest first (a restart
         // close after the hole loses the least), then as far as the packed bytes held after it are thought to reach.
         let hole_len = first.saturating_sub(r.fed);
         let ratio = r.ratio.max(1e-3);
         let covered = ((hole_len + packed.len() as u64) as f64 * ratio) as u64;
-        let reach = out_h.saturating_add((covered as f64 * 0.95) as u64).min(known_end);
-        let hole_out = out_h.saturating_add((hole_len as f64 * ratio) as u64);
+        let reach = at.saturating_add((covered as f64 * 0.95) as u64).min(known_end);
+        let hole_out = at.saturating_add((hole_len as f64 * ratio) as u64);
         let mut targets: Vec<u64> = [128u64 << 10, 512 << 10, 2 << 20, 8 << 20]
             .iter()
             .map(|d| hole_out.saturating_add(*d))
@@ -659,14 +761,18 @@ impl FeedDecoder {
             .collect();
         targets.push(reach);
         let mut found = None;
-        for target in targets {
-            if target <= out_h {
+        let end = s0 + self.size;
+        let mut i = 0;
+        while i < targets.len() {
+            let target = targets[i];
+            i += 1;
+            if target <= at {
                 continue;
             }
             if self.options.control.is_canceled() {
                 return Err(FeedError::Canceled);
             }
-            let estimate = (((target - out_h) as f64 / ratio) as u64).saturating_sub(hole_len);
+            let estimate = (((target - at) as f64 / ratio) as u64).saturating_sub(hole_len);
             let options = NearOptions {
                 estimate: Some(estimate.min(packed.len() as u64) as usize),
                 guard: false,
@@ -674,23 +780,31 @@ impl FeedDecoder {
                 ..NearOptions::default()
             };
             let res = resync_near(&packed, base, &known, r.window, target, &options);
-            if let Ok(near) = res
-                && near.resync.output_offset > out_h
-            {
-                found = Some(near);
-                break;
+            match res {
+                // a restart at the member's end has no block after it (under AES only the cipher's padding): the
+                // last block before it then
+                Ok(near) if near.resync.output_offset >= end => {
+                    if i == targets.len() && end - 1 > at {
+                        targets.push(end - 1);
+                    }
+                }
+                Ok(near) if near.resync.output_offset > at => {
+                    found = Some(near);
+                    break;
+                }
+                _ => {}
             }
         }
         let Some(near) = found else { return Ok(None) };
         let restart = near.resync;
         // Seeded from the held output, noting rather than refusing what a filter the search did not see may have
         // changed: the member's CRC decides (`crc_ok`).
-        let dec = Unpacker::resume_seeded(r.window, &restart, 0, base, &known, Some(self.size), false);
+        let dec = Unpacker::resume_seeded(r.window, &restart, s0, base, &known, Some(self.size), false);
         let Ok(mut dec) = dec else { return Ok(None) };
         dec.set_threads(0, u64::MAX);
         dec.record_filters_from(&restart);
         let until_packed = first + restart.packed_offset as u64;
-        let until_out = restart.output_offset;
+        let until_out = restart.output_offset - s0;
         // Repairs never overlap, so no output byte is written twice: output an earlier repair already covers (a
         // hole skipped again after a restore) is left to it.
         let mut from_out = out_h;
@@ -715,10 +829,59 @@ impl FeedDecoder {
             r.base = Cp { packed: until_packed, state: cp };
         }
         self.stats.holes += 1;
+        // what follows was decoded from held output: unproven until the member's CRC matches; the window holds that
+        // output until it is pushed out of reach, whatever the CRC says (a successor inherits it)
+        self.unproven = true;
+        self.seeded = self.seeded.max(Some(restart.output_offset));
         r.skip_failed = None;
         r.fed = until_packed;
         r.out = until_out;
         Ok(Some((Box::new(dec), self.packed_lane(until_packed, self.stream_len))))
+    }
+
+    /// [`FeedDecoder::next_solid`] for a RAR 5.0 member: the decoder kept at the member's end goes on into the next
+    /// member, or (restored from a snapshot since) the next member restarts from the state saved there.
+    pub(super) fn handoff_rar5(
+        &mut self,
+        map: &MemberMap,
+        index: usize,
+        options: FeedOptions,
+    ) -> Result<FeedDecoder, FeedError> {
+        if index >= map.members.len() {
+            return Err(FeedError::NoSuchMember { index });
+        }
+        if solid_run(map, index)?.prev != Some(self.index) {
+            return Err(FeedError::Handoff("not the next member of the solid stream"));
+        }
+        let carry = self.solid_carry().ok_or(FeedError::Handoff("the main decode has not finished"))?;
+        // the successor is set up (keys, limits) before the live decoder leaves this one: a failure keeps it here
+        let mut next = FeedDecoder::new_begin(map, index, options, Begin::Carry(carry.clone()))?;
+        let r = self.rar5.as_mut().expect("RAR 5.0 state");
+        if let Some(dec) = r.ended.take()
+            && let Err(dec) = next.install_rar5(dec)
+        {
+            r.ended = Some(dec);
+        }
+        next.inherit(carry.suspect);
+        Ok(next)
+    }
+
+    /// Makes `dec`, the decoder the member before kept at its end, this successor's main decoder (it then goes on
+    /// without reading its window back). Gives it back when it does not fit.
+    fn install_rar5(&mut self, mut dec: Box<Unpacker>) -> Result<(), Box<Unpacker>> {
+        let size = self.size;
+        let feeds = self.main.is_some();
+        let r = self.rar5.as_mut().expect("RAR 5.0 state");
+        if dec.window_size() != r.window.size || r.dec.is_some() {
+            return Err(dec);
+        }
+        dec.next_file(Some(size));
+        if feeds {
+            r.dec = Some(dec);
+        } else if r.successor {
+            r.ended = Some(dec);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -817,7 +980,7 @@ mod tests {
     use super::*;
 
     fn with_filter(sp: u64, start: u64, len: u64) -> Result<Cp, FeedError> {
-        let mut cp = Cp::start();
+        let mut cp = Cp::start(0);
         cp.state.sp = sp;
         let mut out = Vec::new();
         put_cp(&mut out, &cp);
@@ -827,7 +990,7 @@ mod tests {
         out.extend_from_slice(&start.to_le_bytes());
         out.extend_from_slice(&len.to_le_bytes());
         out.push(1);
-        get_cp(&mut Reader(&out))
+        get_cp(&mut Reader(&out), &[0])
     }
 
     #[test]
