@@ -325,7 +325,6 @@ fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Ran
         control: SessionControl::default(),
     };
     let s0 = durable_sync_count();
-    let p0 = prof_snapshot();
     let l0 = exclusion_lstat_count();
     let start = Instant::now();
     let mut session = ProgressiveSession::new_partial(
@@ -356,7 +355,6 @@ fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Ran
     drop(session);
     let session_time = start.elapsed().as_secs_f64();
     let s1 = durable_sync_count();
-    let p1 = prof_snapshot();
     let c1 = anchors.cas.load(Ordering::Relaxed);
     assert!(!handles.is_empty(), "a partial handle");
     // As RustyGet does after a repair: one refill per packed span of each reported hole, on the hole's member.
@@ -378,7 +376,6 @@ fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Ran
     }
     let refill_time = start.elapsed().as_secs_f64();
     let s2 = durable_sync_count();
-    let p2 = prof_snapshot();
     let c2 = anchors.cas.load(Ordering::Relaxed);
     let start = Instant::now();
     for (file, _) in &mut handles {
@@ -403,17 +400,6 @@ fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Ran
             reports.len(),
             exclusion_lstat_count() - l0
         );
-    }
-    if std::env::var_os("ZF_PROF").is_some() {
-        for (phase, a, b) in [("session", &p0, &p1), ("refill", &p1, &p2)] {
-            let line: Vec<String> = a
-                .iter()
-                .zip(b.iter())
-                .filter(|(x, y)| y.2 > x.2)
-                .map(|(x, y)| format!("{} {:.1}ms/{}", x.0, (y.1 - x.1) as f64 / 1e6, y.2 - x.2))
-                .collect();
-            eprintln!("  prof {phase} ({} hole events, {refills} refills): {}", reports.len(), line.join(", "));
-        }
     }
     drop(handles);
     fs::remove_dir_all(&root).unwrap();

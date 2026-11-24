@@ -207,33 +207,6 @@ fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
     SYNCS.fetch_add(1, Ordering::Relaxed);
     file.sync_all()
 }
-// TEMPORARY profiling (not for commit).
-pub(crate) mod profdata {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    pub(crate) static NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-    pub(crate) static N: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-    pub const NAMES: [&str; 12] =
-        ["sync", "cas", "put_batch", "verify", "encode", "check", "hole", "refill", "flush_group", "begin_tx", "finish_tx", "begin_group"];
-    pub(crate) fn add(i: usize, t: std::time::Instant) {
-        NS[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        N[i].fetch_add(1, Ordering::Relaxed);
-    }
-}
-#[doc(hidden)]
-pub fn prof_snapshot() -> Vec<(&'static str, u64, u64)> {
-    (0..12)
-        .map(|i| (profdata::NAMES[i], profdata::NS[i].load(Ordering::Relaxed), profdata::N[i].load(Ordering::Relaxed)))
-        .collect()
-}
-macro_rules! prof {
-    ($i:expr, $e:expr) => {{
-        let __t = std::time::Instant::now();
-        let __r = $e;
-        crate::partial::profdata::add($i, __t);
-        __r
-    }};
-}
-pub(crate) use prof;
 fn canceled(control: &SessionControl) -> PartialResult<()> {
     if control.is_canceled() { Err(err(PartialErrorKind::Canceled)) } else { Ok(()) }
 }
@@ -317,9 +290,6 @@ impl PartialCore {
         Ok(Operation { core: self, data })
     }
     fn check(&self, data: &CoreData) -> PartialResult<()> {
-        prof!(5, self.check_inner(data))
-    }
-    fn check_inner(&self, data: &CoreData) -> PartialResult<()> {
         canceled(&self.control)?;
         self.native.check(data.snapshot.head.size)?;
         if stamp(&self.native)? != data.stamp {
@@ -633,9 +603,6 @@ impl PartialCore {
     /// An encrypted member's ciphertext is decrypted first; blocks whose previous ciphertext block is unknown are
     /// reported in `undecryptable`, and ciphertext a remaining hole still needs is kept durably.
     pub(crate) fn fill_packed(&self, volume: u32, offset: u64, bytes: &[u8]) -> PartialResult<PackedFillResult> {
-        prof!(7, self.fill_packed_prof(volume, offset, bytes))
-    }
-        pub(crate) fn fill_packed_prof(&self, volume: u32, offset: u64, bytes: &[u8]) -> PartialResult<PackedFillResult> {
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
         let mut op = self.operation()?;
@@ -1550,9 +1517,6 @@ impl PartialCore {
     /// Anchors the intent of a new group: the committed head with the next sequence and revision. The ledger is
     /// unchanged (grouped writes only add output the committed state calls unknown), so only the record is written.
     fn begin_group(&self, op: &mut CoreData) -> PartialResult<()> {
-        prof!(11, self.begin_group_prof(op))
-    }
-        fn begin_group_prof(&self, op: &mut CoreData) -> PartialResult<()> {
         let next_head = |op: &CoreData| -> PartialResult<state::CommittedState> {
             let mut head = op.snapshot.head.clone();
             head.sequence = head.sequence.checked_add(1).ok_or_else(malformed)?;
@@ -1612,9 +1576,6 @@ impl PartialCore {
     /// keeps the group open (the next operation tries again); an uncertain CAS leaves recovery to `reconcile`,
     /// which rebuilds the snapshot from whichever state the store holds.
     fn flush_group(&self, op: &mut CoreData) -> PartialResult<()> {
-        prof!(8, self.flush_group_prof(op))
-    }
-        fn flush_group_prof(&self, op: &mut CoreData) -> PartialResult<()> {
         if op.group.is_none() {
             if !op.cursor_pending {
                 return Ok(());
@@ -1798,15 +1759,6 @@ impl PartialCore {
         mut valid: Snapshot,
         affected: Vec<Range<u64>>,
     ) -> PartialResult<Transaction> {
-        prof!(9, self.begin_transaction_prof(data, intent, valid, affected))
-    }
-        fn begin_transaction_prof(
-        &self,
-        data: &mut CoreData,
-        mut intent: Snapshot,
-        mut valid: Snapshot,
-        affected: Vec<Range<u64>>,
-    ) -> PartialResult<Transaction> {
         let prior_sequence = data.state.anchor().sequence();
         let result = (|| {
             // These copies live until the transaction finishes (or, on failure,
@@ -1874,9 +1826,6 @@ impl PartialCore {
         })
     }
     fn finish_transaction(&self, data: &mut CoreData, transaction: Transaction) -> PartialResult<()> {
-        prof!(10, self.finish_transaction_prof(data, transaction))
-    }
-        fn finish_transaction_prof(&self, data: &mut CoreData, transaction: Transaction) -> PartialResult<()> {
         let intent_anchor = transaction.intent.anchor.clone();
         let finish = (|| {
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1937,10 +1886,10 @@ impl PartialCore {
     pub(crate) fn hole_report(&self, out: Range<u64>, cause: HoleCause) -> PartialResult<HoleReport> {
         let data = self.operation()?;
         self.check(&data)?;
-        // A grouped hole takes the open group's revision (every write of a group shares it), and so does a hole
-        // committed with the group; otherwise the hole is the next transaction's.
+        // A grouped hole takes the open group's revision (every write of a group shares it); otherwise the hole
+        // is the next transaction's.
         let grouped = self.groups_hole(&data, &cause, &out);
-        let revision = if (grouped || self.commits_hole_with_group(&data, &cause, &out)) && data.group.is_some() {
+        let revision = if grouped && data.group.is_some() {
             data.snapshot.head.revision
         } else {
             data.snapshot.head.revision.checked_add(1).ok_or_else(malformed)?
@@ -1963,19 +1912,8 @@ impl PartialCore {
     /// meets at the end of its produced output, so the group still adds only output the committed state calls
     /// unknown.
     fn groups_hole(&self, data: &CoreData, cause: &HoleCause, out: &Range<u64>) -> bool {
-        self.budget.limits.group_holes && self.joins_group(data, cause, out)
-    }
-    /// Whether a hole over `out` is recorded in the group and committed with it at once, before it is reported
-    /// (`group_holes` off): one commit for the group's output and the hole, where a separate transaction for the
-    /// hole would follow the group's commit. Each such hole closes its group, so it is the only hole of that group
-    /// and keeps its revision as its id.
-    fn commits_hole_with_group(&self, data: &CoreData, cause: &HoleCause, out: &Range<u64>) -> bool {
-        !self.budget.limits.group_holes && self.joins_group(data, cause, out)
-    }
-    /// A hole the extraction meets at the end of its produced output, while writes are grouped: recording it in
-    /// a group adds only output the committed state calls unknown.
-    fn joins_group(&self, data: &CoreData, cause: &HoleCause, out: &Range<u64>) -> bool {
-        self.grouping()
+        self.budget.limits.group_holes
+            && self.grouping()
             && matches!(cause, HoleCause::Missing | HoleCause::CipherNeighbour)
             && out.start == data.snapshot.head.produced
     }
@@ -1995,22 +1933,9 @@ impl PartialCore {
         blocks: &[state::CipherBlock],
         damaged: &[Range<u64>],
     ) -> PartialResult<()> {
-        prof!(6, self.record_hole_inner_prof(report, blocks, damaged))
-    }
-        fn record_hole_inner_prof(
-        &self,
-        report: HoleReport,
-        blocks: &[state::CipherBlock],
-        damaged: &[Range<u64>],
-    ) -> PartialResult<()> {
         let mut data = self.operation()?;
         if damaged.is_empty() && self.groups_hole(&data, &report.cause, &report.out) {
             return self.record_grouped_hole(&mut data, report, blocks);
-        }
-        if damaged.is_empty() && self.commits_hole_with_group(&data, &report.cause, &report.out) {
-            // Durable before it is reported, as a hole of its own transaction is, but in the group's commit.
-            self.record_grouped_hole(&mut data, report, blocks)?;
-            return self.flush_group(&mut data);
         }
         self.check(&data)?;
         self.flush_group(&mut data)?;
@@ -3095,8 +3020,6 @@ impl PartialFile {
         }
         match total {
             Some(total) => Ok(total),
-            // Nothing left to refill here. With `group_refills` an open group stays open, so refilling ranges an
-            // earlier refill of the run already covered does not commit it.
             None => self.core.fill_packed_grouped(volume, range.start, &[]),
         }
     }

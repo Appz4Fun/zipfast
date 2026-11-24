@@ -72,7 +72,8 @@ impl AnchorBinding {
             return Err(err(PartialErrorKind::BindingMismatch(BindingField::Anchor)));
         }
         advance_epoch();
-        crate::partial::prof!(1, self.store.compare_exchange(&self.member, expected, next))
+        self.store
+            .compare_exchange(&self.member, expected, next)
             .map_err(|_| err(PartialErrorKind::AnchorCommitUncertain))?;
         Ok(AnchorAck { anchor: next.clone() })
     }

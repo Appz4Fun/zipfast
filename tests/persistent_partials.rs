@@ -2553,11 +2553,20 @@ struct EncryptedRun {
     session: ProgressiveSession,
 }
 fn extract_encrypted(dir: &Path, fixture: &Encrypted, holes: &[Range<u64>]) -> EncryptedRun {
+    extract_encrypted_with(dir, fixture, holes, PartialLimits::default())
+}
+fn extract_encrypted_with(
+    dir: &Path,
+    fixture: &Encrypted,
+    holes: &[Range<u64>],
+    limits: PartialLimits,
+) -> EncryptedRun {
     let (provider, _) = fixture.provider(holes);
     let protection = provider.protection.clone();
     let anchors = Arc::new(Anchors::default());
     let mut partial = partial_options(&dir.join("state"));
     partial.anchors = anchors.clone();
+    partial.limits = limits;
     let mut opts = options(&dir.join("out"));
     opts.set_password(Some("pw".into())).unwrap();
     let mut session = ProgressiveSession::new_partial(Box::new(provider), opts, partial).unwrap();
@@ -4618,4 +4627,30 @@ fn a_long_hole_stops_at_damage_declared_inside_it() {
     assert!(file.remaining().unwrap().is_empty());
     assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
     assert_eq!(fs::read(dir.path().join("out").join("big.bin")).unwrap(), data);
+}
+
+/// Catches a grouped refill of an encrypted member paying a transaction per fill, and one losing the plaintext or
+/// the kept ciphertext across a close and reopen. Both volumes refill in one open group, committed at close.
+#[test]
+fn encrypted_grouped_refills_share_one_commit_and_survive_a_reopen() {
+    let fill_all = |limits: PartialLimits, dir: &Path| {
+        let fixture = Encrypted::new(3000, &CUTS, true);
+        let mut run = extract_encrypted_with(dir, &fixture, &[990..1010, 1500..1510], limits);
+        let before = zipfast::partial::durable_sync_count();
+        for (volume, bytes) in fixture.volumes.iter().take(2).enumerate() {
+            let mut reader = std::io::Cursor::new(bytes.clone());
+            run.file.refill_from_packed(volume as u32, 0..bytes.len() as u64, &mut reader).unwrap();
+        }
+        (fixture, run, zipfast::partial::durable_sync_count() - before)
+    };
+    let plain_dir = tempfile::tempdir().unwrap();
+    let (_, _, plain_syncs) = fill_all(PartialLimits::default(), plain_dir.path());
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, run, grouped_syncs) =
+        fill_all(PartialLimits { group_refills: true, ..PartialLimits::default() }, dir.path());
+    assert!(grouped_syncs < plain_syncs, "grouped {grouped_syncs} syncs, ungrouped {plain_syncs}");
+    let mut file = reopen(dir.path(), run, Some("pw")).unwrap();
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(&mut file), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dir.path().join("out/e.bin")).unwrap(), fixture.plain);
 }
