@@ -226,8 +226,8 @@ so their output can trail the bytes fed by that much.
 ZIP members, single files and split sets alike (Info-ZIP `.z01` ... `.zip` sets, mapped as `MemberMap` maps them;
 see [member maps](member-map.md)), are decoded member by member: ZIP has no solid streams. Sizes come from the central
 directory, so members written with data descriptors (flag bit 3, zeros in the local header) feed as any other. A
-byte-split set (`name.zip.001`, `.002`, ...) is one ZIP cut anywhere: map the pieces concatenated as one volume, and
-place each piece's articles at its start (the sum of the earlier pieces' sizes) plus their own offset.
+byte-split set (`name.zip.001`, `.002`, ...) is one ZIP cut anywhere: `MemberMap` maps it as its pieces, one volume
+each (a member crossing a boundary has a part per piece), and the articles are placed per piece like any split set.
 
 - **Stored, plain or WinZip AES**: the stored lanes above; holes are skipped and repaired.
 - **Deflate and Deflate64, plain or WinZip AES**: the main decode decrypts (WinZip AES counter mode decrypts each
@@ -380,8 +380,7 @@ journaled store for output; a snapshot is the decoder's position over it. Kept a
 ## Live feed example
 
 `examples/live_feed/` is a reference integration for a downloader: it takes a multi-volume RAR 5.0, RAR 4.x, 7z or
-ZIP set (a single `.zip`, an Info-ZIP `.z01` ... `.zip` set, or a byte split `.zip.001`, which it maps as the pieces
-concatenated), plays it as a Usenet download and extracts while the articles arrive. `sim.rs` holds everything (it is also what
+ZIP set (a single `.zip`, an Info-ZIP `.z01` ... `.zip` set, or a byte split `.zip.001`), plays it as a Usenet download and extracts while the articles arrive. `sim.rs` holds everything (it is also what
 `tests/live_feed.rs` runs on small fixtures); `main.rs` is its command line.
 
 ```text

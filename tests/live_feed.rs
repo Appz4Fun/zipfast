@@ -100,6 +100,8 @@ fn rar4_and_7z_volume_fixtures_through_the_live_feed() {
     let sets = [
         fixture("rar4-volumes", &["multi.part1.rar", "multi.part2.rar", "multi.part3.rar"]),
         fixture("7z", &["multi_volume.7z.001", "multi_volume.7z.002"]),
+        // a byte-split ZIP, mapped per piece (articles are cut within each piece)
+        fixture("zip-bytesplit", &["bytesplit.zip.001", "bytesplit.zip.002", "bytesplit.zip.003", "bytesplit.zip.004"]),
     ];
     for (i, volumes) in sets.into_iter().enumerate() {
         for seed in 1..4 {

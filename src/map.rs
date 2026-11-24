@@ -55,6 +55,7 @@ mod open_at;
 mod rebuild;
 pub(crate) mod sevenzip;
 pub(crate) mod zip;
+mod zip_byte_split;
 pub(crate) mod zip_split;
 
 pub use feed::{
@@ -1099,6 +1100,7 @@ enum Engine {
     Rar(Box<crate::rar5::map::RarWalker>),
     Zip(Box<zip::ZipWalker>),
     ZipSplit(Box<zip_split::ZipSplitWalker>),
+    ZipBytes(Box<zip_byte_split::ZipByteSplitWalker>),
     SevenZip(Box<sevenzip::SevenZipWalker>),
     Done,
 }
@@ -1207,6 +1209,16 @@ impl Core {
                                 )));
                                 continue;
                             }
+                            if self.magic == b"PK\x03\x04"
+                                && !self.single
+                                && zip_byte_split::is_first_piece_name(&self.options.first_name)
+                            {
+                                self.engine = Engine::ZipBytes(Box::new(zip_byte_split::ZipByteSplitWalker::new(
+                                    self.usage.clone(),
+                                    &self.options,
+                                )));
+                                continue;
+                            }
                             let split_start = self.magic == zip_split::SPLIT_MARKER
                                 || (self.magic == b"PK\x03\x04" && zip_split::is_split_name(&self.options.first_name));
                             if split_start && !self.single {
@@ -1278,6 +1290,7 @@ impl Core {
                 Engine::Rar(walker) => return walker.poll(input, cx),
                 Engine::Zip(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
                 Engine::ZipSplit(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
+                Engine::ZipBytes(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
                 Engine::SevenZip(walker) => return walker.poll(input, cx, &self.options).map_ok(Walked::Map),
                 Engine::Done => return Poll::Ready(Err(MapError::AlreadyFinished)),
             }
