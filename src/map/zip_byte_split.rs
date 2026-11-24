@@ -28,11 +28,12 @@ use std::task::{Context, Poll};
 pub(super) fn is_first_piece_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else { return false };
     let digits = name.bytes().rev().take_while(u8::is_ascii_digit).count();
-    let stem = &name[..name.len() - digits];
+    // Bytes, not str slices: a multi-byte character may straddle the suffix boundary.
+    let (stem, number) = name.as_bytes().split_at(name.len() - digits);
     (2..=18).contains(&digits)
-        && name[name.len() - digits..].parse::<u64>() == Ok(1)
+        && number.iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0')) == 1
         && stem.len() > 4
-        && stem[stem.len() - 5..].eq_ignore_ascii_case(".zip.")
+        && stem[stem.len() - 5..].eq_ignore_ascii_case(b".zip.")
 }
 
 pub(super) struct ZipByteSplitWalker {
@@ -165,6 +166,12 @@ impl ZipByteSplitWalker {
             }
             // The directory is at the end of the set: every piece's length is needed.
             loop {
+                // A provider answering synchronously never returns to the caller's loop, so check here too.
+                if options.control.is_canceled() {
+                    return Poll::Ready(Err(MapError::Source(Box::new(ProgressiveFailure::new(
+                        FailureKind::Canceled,
+                    )))));
+                }
                 let index = self.lens.len() as u32;
                 match self.open(input, cx, index) {
                     Err(e) => return Poll::Ready(Err(MapError::from_failure(index, e))),
@@ -179,7 +186,22 @@ impl ZipByteSplitWalker {
         let mut walker = self.walker.take().expect("walker");
         let result = walker.poll(&mut Joined { input, set: self }, cx, options);
         self.walker = Some(walker);
-        result
+        match result {
+            // The single-volume walker names the concatenated offset in volume 0: name the piece and local offset.
+            Poll::Ready(Err(MapError::HeaderHole { offset, .. })) => {
+                let (mut volume, mut local) = (0u32, offset);
+                for (index, &len) in self.lens.iter().enumerate() {
+                    if local < len {
+                        volume = index as u32;
+                        break;
+                    }
+                    local -= len;
+                    volume = index as u32;
+                }
+                Poll::Ready(Err(MapError::HeaderHole { volume, offset: local }))
+            }
+            other => other,
+        }
     }
 }
 

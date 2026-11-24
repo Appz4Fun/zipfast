@@ -516,6 +516,23 @@ pub fn set_identity(
         Whole,
         Spanning,
     }
+    /// A matching key. Every comparison of two keys is counted as `SetIdentitySteps`, so the count follows the
+    /// matching work however the lookup is done: a hash probe compares about one key, a scan compares many.
+    struct Key(Vec<u8>, Kind, usize);
+    impl PartialEq for Key {
+        fn eq(&self, other: &Self) -> bool {
+            crate::work::add(crate::work::Work::SetIdentitySteps, 1);
+            self.0 == other.0 && self.1 == other.1 && self.2 == other.2
+        }
+    }
+    impl Eq for Key {}
+    impl std::hash::Hash for Key {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+            self.1.hash(state);
+            self.2.hash(state);
+        }
+    }
     /// Checked between entries of long loops: an archive may list hundreds of thousands of members.
     const CANCEL_EVERY: usize = 4096;
     let control = options.control.clone();
@@ -525,7 +542,7 @@ pub fn set_identity(
     let mut format = None;
     let mut members: Vec<SetMember> = Vec::new();
     // Each first-volume entry by (raw name, kind, occurrence among equal names and kinds): its index in `members`.
-    let mut firsts: HashMap<(Vec<u8>, Kind, usize), usize> = HashMap::new();
+    let mut firsts: HashMap<Key, usize> = HashMap::new();
     let mut first_volume_number = None;
     let mut first_is_rar = false;
     // A first-volume RAR error waits for the last volume: a ZIP or 7z directory there identifies the set even
@@ -555,7 +572,7 @@ pub fn set_identity(
                         part.encrypted,
                         part.checks,
                     );
-                    firsts.insert((part.raw_name.clone(), kind, occurrence), members.len());
+                    firsts.insert(Key(part.raw_name.clone(), kind, occurrence), members.len());
                     members.push(member);
                 }
             }
@@ -628,10 +645,8 @@ pub fn set_identity(
                 let count = counts.entry((m.raw_name.as_slice(), kind)).or_insert(0);
                 let occurrence = *count;
                 *count += 1;
-                // the occurrence count, the first-volume lookup and the agreement check
-                crate::work::add(crate::work::Work::SetIdentitySteps, 3);
                 (kind == Kind::Spanning || same_volume)
-                    .then(|| firsts.get(&(m.raw_name.clone(), kind, occurrence)).copied())
+                    .then(|| firsts.get(&Key(m.raw_name.clone(), kind, occurrence)).copied())
                     .flatten()
                     // Two members of one name (one ending in a middle volume, another starting there) are
                     // one member only when every whole-member fact both state agrees.
