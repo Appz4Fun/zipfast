@@ -1,6 +1,6 @@
 # BUGS round 2, group R2: RAR4 solid replay
 
-Status: in review (PR opened, not merged; a cleanroom reviewer reviews it first).
+Status: in review (PR #279, not merged; a cleanroom reviewer reviews it first).
 Branch: bugs-round2-b. Worktree: /Users/allen/git.xbmc4lyfe/zipfast-r2b.
 
 ## Done
