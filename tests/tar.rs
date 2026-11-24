@@ -1010,3 +1010,22 @@ fn a_lone_compressed_file_keeps_the_gzip_time_or_the_archive_time() {
     assert_eq!(mtime(&out.join("plain")), at);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Bug group X, X5: with `Overwrite::Always`, a compressed tar that holds a symlink and then a regular file of the
+/// same name reports that member and carries on, as the uncompressed route does.
+#[cfg(unix)]
+#[test]
+fn compressed_tar_symlink_then_file_of_same_name_continues() {
+    let dir = tmp("staged-symlink-then-file");
+    let out = dir.join("out");
+    fs::create_dir(&out).unwrap();
+    let tar = Tar::default().symlink("a", "elsewhere").file("a", b"data").file("b.txt", b"after").end();
+    let archive = dir.join("a.tar.gz");
+    fs::write(&archive, gzip(&tar)).unwrap();
+    let options = Options { overwrite: Overwrite::Always, ..opts(Mode::Extract, &out) };
+    let summary = extract::run(&archive, &options, |_| {}).unwrap();
+    assert_eq!(fs::read(out.join("b.txt")).unwrap(), b"after", "the member after the collision is dropped");
+    assert!(fs::symlink_metadata(out.join("a")).is_ok());
+    assert!(summary.files >= 1);
+    fs::remove_dir_all(&dir).unwrap();
+}

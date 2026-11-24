@@ -69,3 +69,6 @@ References: `tests/fixtures/tar-writer/sparse-gnu.tar` and `sparse-pax10.tar`, m
 sparse files (one hole, 6 and 30 segments, hole at the end or the start, partial last block, all hole, long name with
 a big uid and fractional mtime). The data granularity is the file system's 4096-byte block, which GNU tar's maps
 follow. `tests/tar_writer_sparse.rs` asserts byte equality and extracts both through zipfast's tar reader.
+
+Sparse layout limit: every data segment before the last must be a multiple of 512 bytes (GNU tar pads each segment
+to whole blocks but counts the stored size unpadded); other layouts are refused before any header is written.

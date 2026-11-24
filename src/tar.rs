@@ -29,7 +29,7 @@ use crate::extract::{
     Options, Overwrite, Place, RenameLog, RunError, SpecialEntries, Summary, check_target, create_sparse_target,
     create_target, finish_dirs, finish_file, make_member_dirs,
 };
-use crate::output::{Output, replace, temporary};
+use crate::output::{Output, replace, replace_link, temporary};
 use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{self, Codec};
@@ -1802,7 +1802,7 @@ impl StagedTar {
                         replace(temporary, reserved.path())?;
                         drop(reserved.into_parts());
                     } else if place.replace {
-                        replace(temporary, &place.path)?;
+                        replace_link(temporary, &place.path, place.link)?;
                     } else if let Err(error) = temporary.persist_noclobber(place.path) {
                         if opts.overwrite == Overwrite::Skip && error.error.kind() == io::ErrorKind::AlreadyExists {
                             skipped(summary, report, ordinal, &name);

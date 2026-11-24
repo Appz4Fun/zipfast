@@ -185,3 +185,20 @@ fn refuses_what_cannot_be_written() {
     w.begin(&ok.entry).unwrap();
     assert!(w.write_data(&[0u8; 101]).is_err());
 }
+
+/// Bug group X, X4: GNU tar pads each data segment to whole blocks but counts the stored size unpadded, so a
+/// segment before the last one that ends mid-block cannot be laid out; it is refused before any byte is written.
+#[test]
+fn unaligned_middle_segment_is_refused_before_any_header() {
+    for format in [TarFormat::Gnu, TarFormat::Pax] {
+        let mut e = sparse(b"s", 8192, &[(0, vec![1; 100]), (4096, vec![2; 100])]).entry;
+        e.sparse = vec![(0, 100), (4096, 100)];
+        let mut w = TarWriter::new(Vec::new(), TarWriterOptions { format, ..TarWriterOptions::default() });
+        assert!(w.begin(&e).is_err(), "{format:?}");
+        assert!(w.finish().unwrap().iter().all(|&b| b == 0), "{format:?}: bytes written before the refusal");
+        // block-multiple middle segments and an unaligned last one are fine
+        e.sparse = vec![(0, 512), (4096, 100)];
+        let mut w = TarWriter::new(Vec::new(), TarWriterOptions { format, ..TarWriterOptions::default() });
+        w.begin(&e).unwrap();
+    }
+}
