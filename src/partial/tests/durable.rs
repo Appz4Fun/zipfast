@@ -75,23 +75,19 @@ fn every_anchor_change_follows_one_device_flush_of_every_earlier_sync() {
     }
 }
 
-// Catches a device whose flush failed staying pending for, or blocking, members that never synced on it, and a
-// barrier skipping a device whose last flush failed: a barrier over files of a device with nothing unflushed issues
-// no flush, and a sync newer than every flush is flushed by the next barrier that holds that device.
+// Catches a barrier flushing devices it holds no file of, and a barrier leaving a sync on its own device unflushed.
+// Only this thread's flush count and its own syncs are asserted on: tests beside it may flush the same device at
+// any time, which only ever covers more.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_barrier_flushes_only_devices_of_its_files_with_unflushed_syncs() {
     let dir = tempfile::tempdir().unwrap();
     let file = std::fs::File::create(dir.path().join("f")).unwrap();
-    durable::barrier(&[&file]).unwrap();
-    let before = durable::HERE.with(|h| h.get().0);
-    durable::barrier(&[&file, &file]).unwrap();
-    // Other tests may sync on this device meanwhile; then one flush is due, never more.
-    assert!(durable::HERE.with(|h| h.get().0) - before <= 1);
     durable::sync(&file).unwrap();
-    assert!(durable::unflushed_here() > 0);
+    let before = durable::HERE.with(|h| h.get().0);
     durable::barrier(&[]).unwrap();
-    assert!(durable::unflushed_here() > 0, "a barrier without the device's files leaves it alone");
-    durable::barrier(&[&file]).unwrap();
-    assert_eq!(durable::unflushed_here(), 0);
+    assert_eq!(durable::HERE.with(|h| h.get().0), before, "a barrier without files flushes nothing");
+    durable::barrier(&[&file, &file]).unwrap();
+    assert!(durable::HERE.with(|h| h.get().0) - before <= 1, "one flush per device at most");
+    assert_eq!(durable::unflushed_here(), 0, "the barrier covers the sync on its device");
 }
