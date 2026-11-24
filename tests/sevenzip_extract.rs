@@ -1364,3 +1364,40 @@ fn a_member_under_a_deferred_refused_link_fails_alone() {
     assert!(!out.join("s/new.txt").exists());
     assert_eq!(fs::read(out.join("other.txt")).unwrap(), b"other");
 }
+
+/// C1: a pending link is held by the path it will take, not its archive name. With the rename mode and a directory
+/// `s` already there, the link `s` lands at `s_1`, and `s/new.txt` goes into the real directory `s`.
+#[cfg(unix)]
+#[test]
+fn a_renamed_pending_link_does_not_block_members_under_its_archive_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<(&str, &[u8])> = vec![("s", b"target.txt"), ("s/new.txt", b"new")];
+    let all: Vec<u8> = files.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+    let built = Built { folder_crc: Some(crc32fast::hash(&all)), symlinks: &["s"], ..Built::default() };
+    let archive = write(dir.path(), &built.archive(&[files]));
+    let out = dir.path().join("out");
+    fs::create_dir_all(out.join("s")).unwrap();
+    let mut options = opts(Mode::Extract, &out);
+    options.overwrite = Overwrite::RenameNew(zipfast::extract::RenameStyle::Underscore);
+    let summary = extract::run(&archive, &options, |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 0, "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("s/new.txt")).unwrap(), b"new");
+    assert_eq!(fs::read_link(out.join("s_1")).unwrap(), Path::new("target.txt"));
+}
+
+/// C2: a refused link without a placeholder leaves nothing at its path, so a member under it extracts into a real
+/// directory; with the placeholder the link's path is a file and the member fails alone.
+#[cfg(unix)]
+#[test]
+fn a_refused_link_without_a_placeholder_does_not_block_members_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<(&str, &[u8])> = vec![("s", b"../outside"), ("s/new.txt", b"new")];
+    let all: Vec<u8> = files.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+    let built = Built { folder_crc: Some(crc32fast::hash(&all)), symlinks: &["s"], ..Built::default() };
+    let archive = write(dir.path(), &built.archive(&[files]));
+    let out = dir.path().join("out");
+    let summary = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].starts_with("s: "), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("s/new.txt")).unwrap(), b"new");
+}

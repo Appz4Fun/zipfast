@@ -1054,7 +1054,14 @@ impl Run<'_> {
         };
         if active.defer {
             if let Some(link) = &staged.link {
-                self.pending_links.push(link.clone());
+                // Only a link that will occupy its path holds it: one refused without a placeholder leaves nothing.
+                // Held by the output path chosen for it (a rename mode may have moved it), not by its archive name.
+                let text = std::fs::read(&staged.temporary).map_err(SevenZipError::Io)?;
+                let kind = crate::extract::link::LinkKind::Symbolic(text);
+                if crate::extract::link::refusal_before_place(link, &kind, &self.extracted).is_none() {
+                    let out = staged.place.path.strip_prefix(&self.opts.dest).unwrap_or(link).to_path_buf();
+                    self.pending_links.push(out);
+                }
             }
             active.staged.push(staged);
         } else {
