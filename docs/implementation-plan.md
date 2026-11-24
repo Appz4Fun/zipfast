@@ -375,3 +375,38 @@ Report: PR number, head sha, what changed, test results (with numbers), anything
 
 Review prompt for a second, independent worker (optional, catches what Codex misses): give it the diff and the WP
 spec only, not the implementer's report, and ask for correctness bugs with a failing test sketch for each.
+
+---
+
+## 7. Execution status (2026-11-24)
+
+Executed overnight with at most 3 parallel worker agents (Sonnet, low effort), PR then squash-merge, followed by a Codex
+bug sweep per wave and a cleanroom review of every bug-fix PR. Tracker: `docs/handoffs/ORCHESTRATOR.md`; per-WP notes:
+`docs/handoffs/WP-*.md`; bug lists: `TODO_BUGS_2026-11-24*.md` (repo root and `docs/handoffs/`).
+
+| WP | PR | Result |
+|---|---|---|
+| A1 Linux hole cost | #257 | Grouped encrypted refills; ~2-4 ms/refill with group_holes+group_refills on Linux; ungrouped floor = syncs x fsync latency |
+| A2 7z hole cost | #255 | Catch-up decode is inherent (redecoded 0); documented |
+| A3 solid stream sink | #256 | `SolidStreamSink` for `resume_solid` after restart |
+| A4 7z repair re-decode | #265 | Restart points at state resets + shared waits: 13-20 MB -> 1 MB redecoded in tests |
+| A6 `.zip.001` map | #259 | Per-piece mapping |
+| A7 Deflate resync | #269 | Restart at a later stored block, unproven until CRC |
+| B0 compat triage | #262 | `docs/validation/compat-gaps.md` |
+| B1a/b/c tar writer | #261, #268, #267 | GNU tar 1.35 byte-exact (gnu, ustar, pax, sparse); gzip/bzip2/xz/zstd encoders |
+| B2 later RAR volume | #275 | Restart from earlier volumes like UnRAR 7.30 |
+| B3 long passwords | #264 | 127-char truncation; RAR4 KDF fix for long passwords |
+| B4 ZIP rename | #274 | `RewritePlan::rename`, 7z rn parity |
+| B5 in-run rename | #266 | `StartDecision::RenameTo` |
+| B6 listing follow-ups | #271 | Already done; pinned to 7zz output |
+| B7 old Prybar items | #270 | P8 placed-link replacement |
+| C1 work counters | #258 | Timing asserts -> work counts |
+| C2 RAR5 speed | #272, #273 | Profiled; decoder already near its limits (decode_rest 94-97%); no change |
+| C4 external #227 | #227 | Merged |
+| Bug sweeps | #260, #263, #276, #277, #278, #279, #280, #281 | 28 Codex findings fixed, each with a failing-first test; all cleanroom-approved; 0 unresolved threads |
+
+**Not done (need a decision or another team):** A5 (one CAS for several members: ask RustyGet), B8 (WIM LZMS: needs
+approval), C3 (32-bit: only if needed), B9.1 (Prybar re-run against main), B9.2 (opt-in keep partial output on a failed
+member: deliberate difference, confirm with Prybar), B9.3 (confirm `.z01`/`.zip.001` `-so`), the remaining `-slt`
+mismatches (need Prybar's current list), checked-ZIP-route support for P8 and `RenameTo`, and follow-up F1 (restarted
+later-volume run with an ordinal selection and an unreadable earlier volume selects nothing).
