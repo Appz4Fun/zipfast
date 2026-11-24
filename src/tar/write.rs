@@ -717,7 +717,8 @@ fn num(field: &mut [u8], v: u64, base256: bool) -> Result<()> {
     }
     field.fill(0);
     let n = field.len();
-    if n <= 8 && v >> (8 * n - 1) != 0 {
+    // The marker takes the top bit and the next one is the sign, so 8n - 2 value bits remain.
+    if n <= 8 && v >> (8 * n - 2) != 0 {
         return Err(Error::Unsupported("a number too large for the tar field".into()));
     }
     if n >= 8 {

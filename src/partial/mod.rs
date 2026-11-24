@@ -203,8 +203,22 @@ static EXCLUSION_LSTATS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub fn exclusion_lstat_count() -> u64 {
     EXCLUSION_LSTATS.load(Ordering::Relaxed)
 }
-fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+thread_local! {
+    static THREAD_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Counts one durable sync in the process-wide and the calling thread's totals.
+fn count_sync() {
     SYNCS.fetch_add(1, Ordering::Relaxed);
+    THREAD_SYNCS.with(|n| n.set(n.get() + 1));
+}
+/// [`durable_sync_count`] for syncs issued by the calling thread only, so a test that measures the syncs of its own
+/// operation is not disturbed by other tests running in parallel.
+#[doc(hidden)]
+pub fn durable_sync_count_this_thread() -> u64 {
+    THREAD_SYNCS.with(std::cell::Cell::get)
+}
+fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    count_sync();
     file.sync_all()
 }
 fn canceled(control: &SessionControl) -> PartialResult<()> {

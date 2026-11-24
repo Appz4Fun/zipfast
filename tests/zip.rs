@@ -954,3 +954,24 @@ fn a_dot_folder_entry_stands_for_the_destination() {
     assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"hello");
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Bug group R1, A3: the listing keeps the lossy text of a link target, so the budget charges that text, in which
+/// every invalid byte takes three bytes.
+#[test]
+fn listing_budget_charges_the_decoded_link_target() {
+    let dir = tmp("lossy-budget");
+    let target = vec![0xffu8; 4000];
+    let names: Vec<String> = (0..8000).map(|i| format!("l{i}")).collect();
+    // raw targets: 32 MB, inside the 64 MiB budget; decoded: 96 MB, outside it
+    let build = |count: usize| {
+        let entries: Vec<Z<'_>> =
+            names[..count].iter().map(|n| Z { mode: Some(0o120777), ..Z::new(n, &target) }).collect();
+        let path = dir.join(format!("links{count}.zip"));
+        fs::write(&path, zip(&entries)).unwrap();
+        path
+    };
+    let listing = zipfast::zip::list(&build(3000)).unwrap();
+    assert_eq!(listing.len(), 3000);
+    let err = zipfast::zip::list(&build(8000)).unwrap_err();
+    assert!(err.to_string().contains("byte limit"), "{err}");
+}
