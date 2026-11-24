@@ -32,6 +32,12 @@ const OUT_BUF: usize = 64 << 10;
 /// when a repair needs them.
 const KEEP_BACK: u64 = 64 << 20;
 
+/// Output between two restart points taken inside the dictionary window of the member's start: a restart point whose
+/// dictionary reaches into earlier members (read back with `FeedSink::read_earlier`) is only recorded this far past the
+/// one before it. A decoder restarting at the nearest restart point before a hole then decodes at most this much (plus
+/// the run to the next state reset) again, where it would otherwise decode from the folder's start.
+const CP_INTERVAL: u64 = 1 << 20;
+
 /// A restart point: a chunk start where a decoder can begin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Cp {
@@ -254,6 +260,10 @@ pub(super) struct Lz {
     cap: Option<u64>,
     /// the folder's index in the map
     folder: u32,
+    /// the dictionary reset the main decode began at (or passed): a decoder from here needs nothing held. A restart
+    /// point whose dictionary lies in earlier members (see [`CP_INTERVAL`]) falls back to it when the sink no longer
+    /// gives that output. None for a decoder restored or handed over past its last dictionary reset.
+    base: Option<Cp>,
 }
 
 impl Lz {
@@ -547,6 +557,17 @@ impl Lz {
         if write_from > self.end {
             return Err(bad());
         }
+        // a dictionary reset a restored lane or repair restarts at (nothing else needs to be held for it)
+        self.base = main
+            .as_ref()
+            .and_then(|l| l.cp)
+            .into_iter()
+            .chain(repairs.iter().filter_map(|r| match r.kind {
+                Kind::Decoded { cp, .. } => Some(cp),
+                Kind::Stored { .. } => None,
+            }))
+            .filter(|cp| !cp.seeded)
+            .min_by_key(|cp| cp.out);
         self.main = main;
         self.seek = seek;
         self.write_from = write_from.max(write_from_min).max(self.ss);
@@ -731,6 +752,7 @@ impl FeedDecoder {
         let successor = lz.successor;
         let Handoff { lane, spill, overflow, walked, floor, seek } = *h;
         lz.main = lane.filter(|_| size > 0 || successor);
+        lz.base = lz.main.as_ref().and_then(|l| l.cp).filter(|cp| !cp.seeded);
         lz.seek = seek && (size > 0 || successor);
         lz.walked = walked;
         lz.floor = floor;
@@ -948,6 +970,7 @@ impl FeedDecoder {
                 floor: 0,
                 cap: None,
                 folder: slot.index,
+                base: None,
             })),
         };
         d.stream_start = slot.offset;
@@ -957,6 +980,7 @@ impl FeedDecoder {
             if slot.offset == 0 {
                 lz.main =
                     Some(Lane2 { pos: 0, out: 0, chunk: None, props: None, live: None, cp: None, restart: false });
+                lz.base = Some(Cp { packed: 0, out: 0, props: None, seeded: false });
             } else {
                 lz.seek = true;
             }
@@ -1120,6 +1144,7 @@ impl FeedDecoder {
                     cp: None,
                     restart: false,
                 });
+                lz.base = Some(Cp { packed: d.packed_offset, out: d.unpacked_offset, props: None, seeded: false });
                 lz.seek = false;
                 lz.write_from = lz.ss;
                 return Ok(None);
@@ -1275,6 +1300,25 @@ impl FeedDecoder {
         (self.lz_written(r.clone()) && held_probe(sink, r)) || self.lz_dict(lz, sink, o).is_some()
     }
 
+    /// Whether the dictionary of a decoder restarting at state reset `o` (folder offsets, reaching before the member's
+    /// start) looks held: samples of the earlier members' part through `read_earlier`, and the member's own part
+    /// (written, probed at both ends). A probe, not a proof: the restart reads it all, and falls back to the
+    /// dictionary reset when it fails.
+    fn lz_probe_earlier(&self, lz: &Lz, sink: &mut dyn FeedSink, o: u64) -> bool {
+        let from = o - lz.dict.min(o);
+        let mut one = [0u8; 1];
+        let early = from..o.min(lz.ss);
+        let (a, b) = (early.start, early.end - 1);
+        if ![a, a + (b - a) / 2, b].into_iter().all(|at| matches!(sink.read_earlier(at, &mut one), Ok(1))) {
+            return false;
+        }
+        if o <= lz.ss {
+            return true;
+        }
+        let r = from.max(lz.ss) - lz.ss..o - lz.ss;
+        self.lz_written(r.clone()) && held_probe(sink, r)
+    }
+
     /// Writes decoded output at folder offset `at`: the part inside `write` and the member, the rest counted as
     /// decoded again. Output at or past `end_out` is not counted.
     #[allow(clippy::too_many_arguments)]
@@ -1382,6 +1426,7 @@ impl FeedDecoder {
                         lane.live = Some(live);
                         lane.cp =
                             Some(Cp { packed: c.packed_offset, out: c.unpacked_offset, props: None, seeded: false });
+                        lz.base = lane.cp;
                     } else if state {
                         let props =
                             c.props.or(props_before).ok_or_else(|| corrupt(lane.out, "LZMA2 chunk without props"))?;
@@ -1425,14 +1470,20 @@ impl FeedDecoder {
                     if c.reset.resets_dictionary() {
                         lane.cp =
                             Some(Cp { packed: c.packed_offset, out: c.unpacked_offset, props: None, seeded: false });
+                        lz.base = lane.cp;
                     } else if state {
                         let d = lz.dict.min(c.unpacked_offset);
                         let from = c.unpacked_offset - d;
-                        // a restart point must be restorable: its dictionary lies in the member (a state reset before a
-                        // later member's start cannot be one) and the sink gives the output written there back
-                        let held = from >= lz.ss && {
+                        // a restart point must be restorable: the sink gives the output written in the member back, and
+                        // (before the member's start) the earlier members' output, probed here and recorded only
+                        // every CP_INTERVAL of output and with a dictionary reset to fall back to
+                        let held = if from >= lz.ss {
                             let r = from - lz.ss..c.unpacked_offset - lz.ss;
                             self.lz_written(r.clone()) && held_probe(sink, r)
+                        } else {
+                            lz.base.is_some()
+                                && lane.cp.is_none_or(|cp| c.unpacked_offset - cp.out >= CP_INTERVAL)
+                                && self.lz_probe_earlier(lz, sink, c.unpacked_offset)
                         };
                         if held {
                             lane.cp = Some(Cp {
@@ -1685,6 +1736,35 @@ impl FeedDecoder {
         }
     }
 
+    /// The bytes still missing that another repair is blocked on, when they lie in the packed range a decoder
+    /// restarting at packed offset `from` reads to reach folder output `out_end` (at most `until`): such a decoder
+    /// cannot get past them either.
+    fn lz_shared_block(
+        &mut self,
+        lz: &Lz,
+        i: usize,
+        from: u64,
+        until: u64,
+        out_end: u64,
+        source: &mut dyn PackedSource,
+    ) -> Result<Option<Range<u64>>, FeedError> {
+        // the chunk holding the last lost byte ends the packed range read (when its header is still walked)
+        let to = lz
+            .walked
+            .values()
+            .find(|c| c.unpacked().contains(&(out_end - 1)))
+            .map_or(until, |c| c.packed().end.min(until));
+        for (j, r) in lz.repairs.iter().enumerate() {
+            if let (true, Some(b)) = (j != i, r.blocked)
+                && (from..to).contains(&b)
+                && let Some(len) = self.probe(b, self.stream_len, source)?
+            {
+                return Ok(Some(b..b + len));
+            }
+        }
+        Ok(None)
+    }
+
     /// Tries repair `i`: Some(true) when its lost output is written, Some(false) when bytes are still missing (its
     /// need is added), None when the run's budget ran out.
     fn lz_repair(
@@ -1741,13 +1821,37 @@ impl FeedDecoder {
             }
             Kind::Decoded { cp, seed, until } => {
                 let seed = seed.filter(|s| s.out == lost.start && self.lz_dict_held(lz, sink, s.out));
+                // a decoder started afresh passes the packed bytes from its restart point to the chunk holding the end of
+                // the lost range; where another repair is already blocked on bytes still missing in there, it would only
+                // decode up to them again (the repairs of one folder often share a restart point), so it waits for them
+                if seed.is_none()
+                    && lz.repairs[i].lane.is_none()
+                    && let Some(need) = self.lz_shared_block(lz, i, cp.packed, until, lost.end, source)?
+                {
+                    self.push_needs(needs, need, NeedKind::Repair);
+                    return Ok(Some(false));
+                }
                 let mut lane = match seed {
                     Some(s) => {
                         lz.repairs[i].lane = None;
                         lz.repairs[i].kind = Kind::Decoded { cp: s, until, seed: None };
                         Lane2::at_cp(s)
                     }
-                    None => lz.repairs[i].lane.take().unwrap_or_else(|| Lane2::at_cp(cp)),
+                    None => match lz.repairs[i].lane.take() {
+                        Some(lane) => lane,
+                        None => {
+                            // a restart point whose dictionary lies in earlier members: the sink may not give it
+                            // any more (a restore with another sink), then the dictionary reset serves
+                            let reaches = cp.seeded && cp.out - lz.dict.min(cp.out) < lz.ss;
+                            match lz.base {
+                                Some(base) if reaches && base.out <= cp.out && !self.lz_dict_held(lz, sink, cp.out) => {
+                                    lz.repairs[i].kind = Kind::Decoded { cp: base, until, seed: None };
+                                    Lane2::at_cp(base)
+                                }
+                                _ => Lane2::at_cp(cp),
+                            }
+                        }
+                    },
                 };
                 let stop = match self.lz_step(lz, &mut lane, lost.clone(), lost.end, false, source, sink)? {
                     Step::Reached => None,

@@ -202,6 +202,20 @@ the same, 250 to 300 MB/s), `redecoded` is 0 and every packed byte is read once,
 the decode itself. It could only fall with chunk-level parallelism after the repair (an independent block per
 thread), or by decoding before the repair, which the framing rule forbids.
 
+**Restart points and repair cost (single-reset folders).** A repair decodes from the nearest restart point before
+its hole. Only two kinds of chunk can be one: a dictionary reset, and a chunk that resets the LZMA state (control
+0xA0 and up) with the dictionary read back from held output (probed with `read_held`; the part before the member's
+start through `read_earlier`, probed at three offsets, recorded at most once per 1 MiB of output, with the folder's
+dictionary reset to fall back to when the sink no longer gives it, as after a restore with another sink). A chunk that
+resets nothing needs liblzma's probability and match state, which it does not expose, so **a dictionary-only checkpoint
+every N MiB cannot exist**: a folder 7-Zip wrote as one block (a dictionary reset at the start, no state reset after
+it) has no restart point but its start, and a repair there decodes from the start. Folders with state resets (a
+stored chunk, then LZMA again, as after incompressible data) restart at the nearest one. Memory is one restart point
+(32 bytes) per lane, no more. Repairs that share a restart point and are blocked on the same missing bytes no longer
+each decode up to them: the later ones wait for the bytes (as needs) instead (test
+`repairs_in_a_single_reset_folder_restart_at_the_nearest_state_reset`: 13 to 19 MB decoded again by 20 repairs, now
+1 MB).
+
 **Memory.** Packed bytes from the main decode's restart point on are kept for a repair or a restore (at most 64 MiB
 behind its read position; older ones are released and asked for again as needs when a repair reads them).
 

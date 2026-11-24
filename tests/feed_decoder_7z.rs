@@ -218,11 +218,13 @@ struct Out {
     seen: Vec<bool>,
     written: u64,
     donor: Option<Vec<u8>>,
+    /// the folder's output before the member (what a `SolidStreamSink` gives back through `read_earlier`)
+    earlier: Vec<u8>,
 }
 
 impl Out {
     fn new(size: usize, donor: Option<Vec<u8>>) -> Self {
-        Self { bytes: vec![0; size], seen: vec![false; size], written: 0, donor }
+        Self { bytes: vec![0; size], seen: vec![false; size], written: 0, donor, earlier: Vec::new() }
     }
 }
 
@@ -247,6 +249,16 @@ impl FeedSink for Out {
             (false, None) => return Ok(0),
         }
         Ok(run)
+    }
+
+    fn read_earlier(&mut self, at: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let at = at as usize;
+        if at >= self.earlier.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(self.earlier.len() - at);
+        buf[..n].copy_from_slice(&self.earlier[at..at + n]);
+        Ok(n)
     }
 }
 
@@ -276,6 +288,8 @@ fn inside(needs: &[NeedBytes], missing: &[Article]) -> bool {
 }
 
 struct Report {
+    /// decoded again from the first repair on (the main decode's own start is not counted)
+    repair_redecoded: u64,
     stalled: bool,
     holes: u64,
     lost: u64,
@@ -285,11 +299,25 @@ struct Report {
 /// Feeds member `member` of the set from shuffled articles of `article` bytes, every `every`th missing at first,
 /// then the missing ones; checks the output and returns what happened.
 fn feed(volumes: &[Vec<u8>], member: usize, plain: &[u8], article: usize, every: usize, donor: bool) -> Report {
+    feed_with(volumes, member, plain, &[], article, every, donor)
+}
+
+/// [`feed`] with the folder's output before the member given back by the sink (`earlier`).
+fn feed_with(
+    volumes: &[Vec<u8>],
+    member: usize,
+    plain: &[u8],
+    earlier: &[u8],
+    article: usize,
+    every: usize,
+    donor: bool,
+) -> Report {
     let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
     let map = MemberMap::from_memory(&refs, "set.7z.001", Some(PASSWORD)).unwrap();
     let options = FeedOptions { max_needs: usize::MAX, read_chunk: 4096, ..FeedOptions::new(Some(PASSWORD)) };
     let mut d = FeedDecoder::new(&map, member, options).unwrap();
     let mut out = Out::new(plain.len(), donor.then(|| plain.to_vec()));
+    out.earlier = earlier.to_vec();
     let mut all = articles(volumes, article);
     // fixed; FEED7Z_SEED varies it (to run many shuffles in a loop)
     let extra: u64 = std::env::var("FEED7Z_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -312,7 +340,9 @@ fn feed(volumes: &[Vec<u8>], member: usize, plain: &[u8], article: usize, every:
     } else {
         assert_eq!(s.needs[0].kind, NeedKind::Next);
     }
+    let before_repairs = d.stats().redecoded;
     let report = Report {
+        repair_redecoded: 0,
         stalled: s.stalled,
         holes: d.stats().holes,
         lost: s.lost.iter().map(|r| r.end - r.start).sum(),
@@ -335,7 +365,12 @@ fn feed(volumes: &[Vec<u8>], member: usize, plain: &[u8], article: usize, every:
     assert!(out.bytes == plain, "output differs");
     assert_eq!(out.written, plain.len() as u64, "each output byte written once");
     // holes skipped over the decoder's whole life (a restored decoder skips again those it meets again)
-    Report { redecoded: d.stats().redecoded, holes: d.stats().holes, ..report }
+    Report {
+        redecoded: d.stats().redecoded,
+        repair_redecoded: d.stats().redecoded - before_repairs,
+        holes: d.stats().holes,
+        ..report
+    }
 }
 
 #[test]
@@ -998,4 +1033,41 @@ fn a_seeded_lzma2_dictionary_stays_unproven_past_the_members_own_crc() {
     let s = d1.run(&mut source, &mut FolderView { outs: &mut outs, i: 1, starts: &starts }).unwrap();
     assert!(s.done && s.crc_ok == Some(true) && !s.unproven, "{s:?}");
     assert!(outs[1].bytes == files[1].1);
+}
+
+/// A folder that resets its dictionary only at its start, with a state reset after every stored (noise) stretch: a
+/// repair in a later member restarts at the nearest state reset before its hole (its dictionary read back from the
+/// sink, the earlier members' part through `read_earlier`), not at the folder's start, and repairs blocked on the same
+/// missing bytes do not each decode up to them. All the repairs of the member with state resets decode again about
+/// one checkpoint interval (1 MiB) together, where each decoded from the folder's start (about 1 MB and more) before.
+#[test]
+fn repairs_in_a_single_reset_folder_restart_at_the_nearest_state_reset() {
+    let files: Vec<(&str, Vec<u8>)> =
+        vec![("a.txt", text(900_000, 1)), ("b.bin", mixed(2_000_000, 2)), ("c.txt", text(900_000, 4))];
+    let folder: Vec<u8> = files.iter().flat_map(|(_, b)| b.clone()).collect();
+    for encrypted in [false, true] {
+        let archive = seven_zip(&files, encrypted, usize::MAX >> 1);
+        let volumes: Vec<Vec<u8>> = archive.chunks(5_000_000).map(<[u8]>::to_vec).collect();
+        let mut start = 0;
+        for (i, (_, plain)) in files.iter().enumerate() {
+            for (article, every) in [(3_000, 11), (20_000, 9)] {
+                let r = feed_with(&volumes, i, plain, &folder[..start], article, every, false);
+                eprintln!(
+                    "member {i} aes {encrypted} article {article}: {} holes, {} decoded again by repairs",
+                    r.holes, r.repair_redecoded
+                );
+                if i == 1 {
+                    // state resets after every noise stretch: all the repairs together decode again about one
+                    // checkpoint interval (1 MiB: the first repair's decoder, reached past the member's start), where
+                    // every one decoded from the folder's start before (13 to 19 MB here)
+                    assert!(r.repair_redecoded <= (1 << 20) + 400_000, "{}", r.repair_redecoded);
+                } else if i == 2 {
+                    // one long text stretch: no state reset after the folder's start to restart at, so a repair
+                    // decodes from the start (up to the member's size) each
+                    assert!(r.repair_redecoded <= (r.holes + 1) * 3_000_000, "{}", r.repair_redecoded);
+                }
+            }
+            start += plain.len();
+        }
+    }
 }
