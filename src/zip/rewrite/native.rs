@@ -39,12 +39,15 @@ use unix::{NameState, Parent, PublishError, Stage, Stamp};
 mod names;
 mod preflight;
 pub(in crate::zip) mod recovery;
+mod rename;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Action {
     Keep,
     Remove,
     Replace(usize),
+    /// Keep the payload; rewrite the name records (index into `renames`).
+    Rename(usize),
 }
 
 /// A read-only plan against the originally opened archive. Admitting edits
@@ -57,6 +60,7 @@ pub struct RewritePlan {
     actions: Vec<Action>,
     inputs: Vec<PlannedEntry>,
     appends: Vec<usize>,
+    renames: Vec<rename::Spec>,
     names: names::Exact,
     variable_capacity: u64,
     options: RewriteOptions,
@@ -149,6 +153,7 @@ impl RewritePlan {
             actions,
             inputs: Vec::new(),
             appends: Vec::new(),
+            renames: Vec::new(),
             names,
             variable_capacity: 0,
             options,
@@ -275,6 +280,12 @@ impl RewritePlan {
             }
         } else {
             self.names.check_append(raw, &self.metadata, &self.inputs, options, &mut self.usage)?;
+            for spec in &self.renames {
+                work(options, &mut self.usage, raw.len().min(spec.name.len()) as u64 + 1)?;
+                if *spec.name == *raw {
+                    return Err(RewriteError::NameConflict);
+                }
+            }
         }
         let held = source.as_ref().is_some_and(|(_, file, _)| file.is_some());
         let retained = add(self.usage.common.plan.retained_handles, u64::from(held))?;
@@ -324,7 +335,8 @@ impl RewritePlan {
         total = add(total, self.names.capacity()?)?;
         total = add(total, bytes_for::<Action>(self.actions.capacity())?)?;
         total = add(total, bytes_for::<PlannedEntry>(self.inputs.capacity())?)?;
-        Ok(add(total, bytes_for::<usize>(self.appends.capacity())?)?)
+        total = add(total, bytes_for::<usize>(self.appends.capacity())?)?;
+        Ok(add(total, bytes_for::<rename::Spec>(self.renames.capacity())?)?)
     }
 
     /// Verify and publish the plan. All layout and known feasibility checks
@@ -573,6 +585,7 @@ impl RewritePlan {
             actions: &self.actions,
             appends: &self.appends,
             entries: &plan.written,
+            renamed: &plan.renamed,
             prefix: plan.prefix,
             summary,
             repairs: None,
@@ -737,8 +750,30 @@ fn output_count(count: u64, limits: CreateLimits) -> Result<()> {
     Ok(())
 }
 
-fn raw_entry(metadata: &Metadata, member: Member, ordinal: usize) -> PreparedRaw {
+pub(super) fn raw_entry(
+    metadata: &Metadata,
+    member: Member,
+    ordinal: usize,
+    renamed: Option<&Arc<crate::zip::write::raw::Renamed>>,
+) -> PreparedRaw {
     let old = metadata.view(ordinal);
+    if let Some(renamed) = renamed {
+        let (central_header, extra_at, zip64_extra) =
+            rename::central_facts(renamed).expect("rebuilt central record was parsed at preflight");
+        return PreparedRaw {
+            source_ordinal: ordinal,
+            local: member.local_at..member.end,
+            central: 0..renamed.central.len() as u64,
+            extra_at,
+            central_header,
+            local_version: member.local_version,
+            zip64_extra,
+            wide_sizes: member.wide_sizes,
+            packed: old.packed_size(),
+            decoded: old.size(),
+            rename: Some(Arc::clone(renamed)),
+        };
+    }
     PreparedRaw {
         source_ordinal: ordinal,
         local: member.local_at..member.end,
@@ -750,6 +785,7 @@ fn raw_entry(metadata: &Metadata, member: Member, ordinal: usize) -> PreparedRaw
         wide_sizes: member.wide_sizes,
         packed: old.packed_size(),
         decoded: old.size(),
+        rename: None,
     }
 }
 
@@ -822,9 +858,10 @@ impl OutputPlan<'_> {
             attempts.check_cancel().at(RewriteStage::Write)?;
             let written = match action {
                 Action::Remove => continue,
-                Action::Keep => {
+                Action::Keep | Action::Rename(_) => {
                     active_repair.set(self.repairs.and_then(|repairs| repairs[ordinal]));
-                    let raw = raw_entry(self.metadata, prepared.members[ordinal], ordinal);
+                    let renamed = prepared.renamed.get(ordinal).and_then(Option::as_ref);
+                    let raw = raw_entry(self.metadata, prepared.members[ordinal], ordinal, renamed);
                     writer
                         .add_preserved(&raw, &mut source)
                         .map(WrittenEntry::Preserved)

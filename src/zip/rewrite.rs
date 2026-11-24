@@ -164,17 +164,31 @@ pub enum RewriteError {
     Metadata(crate::Error),
     Writer(WriteError),
     SourceChanged,
-    InputChanged { input: usize },
-    InputAliasesArchive { input: usize },
+    InputChanged {
+        input: usize,
+    },
+    InputAliasesArchive {
+        input: usize,
+    },
     OutputAliasesArchive,
-    InputAliasesStage { input: usize },
+    InputAliasesStage {
+        input: usize,
+    },
     UnsupportedLayout(&'static str),
-    AmbiguousDirectory { profile: Profile },
+    AmbiguousDirectory {
+        profile: Profile,
+    },
     ForeignEntryId,
     DuplicateEdit,
     ReplacementName,
     NameConflict,
-    CannotFullyVerify { source_ordinal: usize },
+    /// The new name cannot be encoded consistently with the member's comment.
+    RenameEncoding(&'static str),
+    /// A rename that this plan cannot perform.
+    RenameUnsupported(&'static str),
+    CannotFullyVerify {
+        source_ordinal: usize,
+    },
     Verification(&'static str),
     Limit(RewriteLimit),
 }
@@ -197,6 +211,8 @@ impl fmt::Display for RewriteError {
             Self::DuplicateEdit => f.write_str("ZIP entry already has an edit"),
             Self::ReplacementName => f.write_str("replacement must use the original raw name and encoding"),
             Self::NameConflict => f.write_str("introduced ZIP member name conflict"),
+            Self::RenameEncoding(reason) => write!(f, "ZIP rename encoding conflict: {reason}"),
+            Self::RenameUnsupported(reason) => write!(f, "unsupported ZIP rename: {reason}"),
             Self::CannotFullyVerify { source_ordinal } => {
                 write!(f, "cannot fully verify retained ZIP member {source_ordinal}")
             }

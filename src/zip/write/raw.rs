@@ -14,7 +14,7 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use zip_container::CentralHeader;
 
@@ -35,6 +35,23 @@ pub(in crate::zip) struct PreparedRaw {
     pub(crate) wide_sizes: bool,
     pub(crate) packed: u64,
     pub(crate) decoded: u64,
+    /// New name records for a renamed member. When present, `central`,
+    /// `extra_at`, `central_header` and `zip64_extra` describe the rebuilt
+    /// central record, in coordinates of `Renamed::central`.
+    pub(crate) rename: Option<Arc<Renamed>>,
+}
+
+/// Rebuilt header records for a member whose name changed. The payload and
+/// any data descriptor are still copied from the source.
+#[derive(Debug)]
+pub(in crate::zip) struct Renamed {
+    /// Source offset where the original local header (fixed part, name and
+    /// extra) ends and the packed payload starts.
+    pub(crate) header_end: u64,
+    /// Complete replacement local header.
+    pub(crate) local_header: Vec<u8>,
+    /// Complete replacement central record before offset relocation.
+    pub(crate) central: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +105,57 @@ impl PreparedRaw {
         Ok(Proof { widened, offset64_at, extra_growth: growth })
     }
 
+    /// Bytes this member's local record occupies in the output.
+    pub(in crate::zip) fn output_local_len(&self) -> u64 {
+        match &self.rename {
+            Some(renamed) => renamed.local_header.len() as u64 + (self.local.end - renamed.header_end),
+            None => self.local.end - self.local.start,
+        }
+    }
+
+    /// The rebuilt central record of a renamed member with its local offset
+    /// (and any ZIP64 widening in `proof`) applied.
+    pub(in crate::zip) fn relocated_central(&self, at: u64, proof: Proof) -> Vec<u8> {
+        let renamed = self.rename.as_ref().expect("renamed member");
+        let mut out = renamed.central.clone();
+        if let Some(wide_at) = proof.offset64_at {
+            let wide_at = wide_at as usize;
+            if let Some((extra_at, size)) = self.zip64_extra {
+                let replaced = if proof.widened { 0 } else { 8 };
+                out.splice(wide_at..wide_at + replaced, at.to_le_bytes());
+                if proof.widened {
+                    let len_at = (self.extra_at + u64::from(extra_at) + 2) as usize;
+                    out[len_at..len_at + 2].copy_from_slice(&(size + 8).to_le_bytes());
+                }
+            } else {
+                let mut extra = [1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                extra[4..].copy_from_slice(&at.to_le_bytes());
+                out.splice(wide_at..wide_at, extra);
+            }
+        }
+        if proof.extra_growth != 0 {
+            let len = self.central_header.extra_len + proof.extra_growth;
+            out[30..32].copy_from_slice(&len.to_le_bytes());
+        }
+        if proof.widened && self.central_header.version_needed < 45 {
+            out[6..8].copy_from_slice(&45_u16.to_le_bytes());
+        }
+        let offset = if proof.offset64_at.is_some() { u32::MAX } else { at as u32 };
+        out[42..46].copy_from_slice(&offset.to_le_bytes());
+        out
+    }
+
+    /// Bytes of the local header with the minimum version raised if the
+    /// member's central offset had to become ZIP64.
+    pub(in crate::zip) fn output_local_header(&self, proof: Proof) -> Vec<u8> {
+        let renamed = self.rename.as_ref().expect("renamed member");
+        let mut head = renamed.local_header.clone();
+        if proof.widened && self.local_version < 45 {
+            head[4..6].copy_from_slice(&45_u16.to_le_bytes());
+        }
+        head
+    }
+
     pub(in crate::zip) fn output_central_len(&self, proof: Proof) -> Result<u64, WriteError> {
         add(self.central.end - self.central.start, u64::from(proof.extra_growth))
     }
@@ -120,7 +188,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         let usage = self.output.work.usage;
         let entries = add(usage.entries, 1)?;
         let central = add(self.central.len() as u64, raw.output_central_len(proof)?)?;
-        let local_len = raw.local.end - raw.local.start;
+        let local_len = raw.output_local_len();
         let total_packed = add(usage.packed_bytes, raw.packed)?;
         let total_decoded = add(usage.decoded_bytes, raw.decoded)?;
         let limits = self.output.work.limits;
@@ -157,6 +225,13 @@ impl<W: Write + Seek> ZipWriter<W> {
         proof: Proof,
         source: &mut Source<'_>,
     ) -> Result<(), WriteError> {
+        if let Some(renamed) = &raw.rename {
+            let head = raw.output_local_header(proof);
+            self.output.write(&head, IoStage::LocalHeader)?;
+            self.copy_local(renamed.header_end..raw.local.end, source)?;
+            self.central.extend_from_slice(&raw.relocated_central(at, proof));
+            return self.output.work.check_canceled();
+        }
         if proof.widened && raw.local_version < 45 {
             let start = raw.local.start;
             self.copy_local(start..start + 4, source)?;
@@ -269,6 +344,7 @@ mod tests {
             wide_sizes: false,
             packed: 0,
             decoded: 0,
+            rename: None,
         };
         (raw, bytes)
     }
@@ -302,6 +378,38 @@ mod tests {
                 assert_eq!(&writer.central[42..46], &(at as u32).to_le_bytes());
                 assert_eq!(&writer.central[46..54], &[1, 0, 4, 0, 0, 0, 0, 0]);
                 assert_eq!(&writer.output.sink.get_ref()[4..6], &[20, 0]);
+            }
+        }
+    }
+
+    #[test]
+    fn renamed_records_relocate_exactly_like_raw_copies() {
+        for disk in [false, true] {
+            for at in [100, u64::from(u32::MAX) - 1, u64::from(u32::MAX), u64::from(u32::MAX) + 1] {
+                let (raw, bytes) = source(disk);
+                let read = |from: u64, out: &mut [u8]| {
+                    out.copy_from_slice(&bytes[from as usize..from as usize + out.len()]);
+                    Ok(out.len())
+                };
+                let mut plain = ZipWriter::new(Cursor::new(Vec::new()), WriterOptions::default()).unwrap();
+                plain.output.position = at;
+                plain.add_preserved(&raw, &mut |from, out| read(from, out)).unwrap();
+
+                let central = bytes[30..].to_vec();
+                let renamed = Renamed { header_end: 30, local_header: bytes[..30].to_vec(), central };
+                let mut twin = PreparedRaw {
+                    central: 0..renamed.central.len() as u64,
+                    extra_at: 46,
+                    rename: Some(Arc::new(renamed)),
+                    zip64_extra: raw.zip64_extra,
+                    ..PreparedRaw { rename: None, ..raw }
+                };
+                twin.central_header = raw.central_header;
+                let mut moved = ZipWriter::new(Cursor::new(Vec::new()), WriterOptions::default()).unwrap();
+                moved.output.position = at;
+                moved.add_preserved(&twin, &mut |from, out| read(from, out)).unwrap();
+                assert_eq!(moved.central, plain.central, "disk {disk} at {at}");
+                assert_eq!(moved.output.sink.get_ref(), plain.output.sink.get_ref());
             }
         }
     }

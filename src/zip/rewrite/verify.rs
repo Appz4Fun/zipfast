@@ -23,7 +23,9 @@ use crate::zip::create::native::{
     verify::{Payload, Reader as PayloadReader, check_directory},
 };
 use crate::zip::create::{CreateError, CreateLimit};
-use crate::zip::write::raw::{Proof, RawWritten};
+use std::sync::Arc;
+
+use crate::zip::write::raw::{Proof, RawWritten, Renamed};
 use crate::zip::write::{EntryWritten, WriteSummary};
 use crate::zip::{EntryMetadata, Metadata};
 
@@ -55,6 +57,8 @@ pub(super) struct Manifest<'a> {
     pub(super) actions: &'a [super::native::Action],
     pub(super) appends: &'a [usize],
     pub(super) entries: &'a [WrittenEntry],
+    /// Rebuilt name records by source ordinal; empty without renames.
+    pub(super) renamed: &'a [Option<Arc<Renamed>>],
     pub(super) prefix: u64,
     pub(super) summary: WriteSummary,
     pub(super) repairs: Option<&'a [Option<layout::recovery::DescriptorRepair>]>,
@@ -138,27 +142,43 @@ impl Manifest<'_> {
                     wide |= reader.check_new(central, &self.inputs[*input], receipt, next, &mut buffers[0])?;
                     EntryVerification::NewVerified
                 }
-                (WrittenEntry::Preserved(raw), Action::Keep) => {
+                (WrittenEntry::Preserved(raw), Action::Keep | Action::Rename(_)) => {
                     check(
                         raw.ordinal == ordinal as u64 && raw.source_ordinal == source_ordinal,
                         "retained receipt has the wrong ordinal",
                     )?;
                     let source = self.metadata.view(raw.source_ordinal);
                     let member = self.members[raw.source_ordinal];
-                    let mut comparison = Comparison::new(old, stage, options, attempts, usage, &mut buffers);
-                    wide |= verify_retained(
-                        &mut comparison,
-                        source,
-                        member,
-                        central,
-                        *raw,
-                        next,
-                        self.repairs.and_then(|repairs| repairs[raw.source_ordinal]),
+                    let renamed = self.renamed.get(raw.source_ordinal).and_then(Option::as_ref);
+                    check(
+                        matches!(action, Action::Rename(_)) == renamed.is_some(),
+                        "rename record disagrees with the edit plan",
                     )?;
+                    let mut comparison = Comparison::new(old, stage, options, attempts, usage, &mut buffers);
+                    wide |= if let Some(renamed) = renamed {
+                        let prepared = crate::zip::rewrite::native::raw_entry(
+                            self.metadata,
+                            member,
+                            raw.source_ordinal,
+                            Some(renamed),
+                        );
+                        verify_renamed(&mut comparison, source, &prepared, member, central, *raw, next)?
+                    } else {
+                        verify_retained(
+                            &mut comparison,
+                            source,
+                            member,
+                            central,
+                            *raw,
+                            next,
+                            self.repairs.and_then(|repairs| repairs[raw.source_ordinal]),
+                        )?
+                    };
                     if member.directory {
                         EntryVerification::RetainedDirectoryVerified
                     } else if options.verification == Verification::Full {
-                        let at = add(local_at, member.payload_at - member.local_at)?;
+                        let head = renamed.map_or(member.payload_at - member.local_at, |r| r.local_header.len() as u64);
+                        let at = add(local_at, head)?;
                         let mut reader = PayloadReader::new(stage, limits, attempts, &mut usage.common.verification);
                         reader.check_payload(at, declared_payload(source), &mut buffers[0])?;
                         EntryVerification::RetainedPayloadVerified
@@ -277,6 +297,14 @@ impl<'a, 'b> Comparison<'a, 'b> {
         Ok(())
     }
 
+    /// Compare staged bytes of any length with `expected`.
+    fn literal_long(&mut self, at: u64, expected: &[u8]) -> Result<()> {
+        for (index, chunk) in expected.chunks(BUFFER).enumerate() {
+            self.literal(add(at, (index * BUFFER) as u64)?, chunk)?;
+        }
+        Ok(())
+    }
+
     fn literal(&mut self, at: u64, expected: &[u8]) -> Result<()> {
         let actual = &mut self.buffers[0][..expected.len()];
         self.stage.read(at, actual)?;
@@ -306,6 +334,43 @@ impl Segments<'_, '_, '_> {
         self.output = add(self.output, bytes.len() as u64)?;
         Ok(())
     }
+}
+
+/// A renamed member keeps its payload and descriptor bytes. Its headers
+/// must equal the rebuilt records with only the offset relocation applied.
+fn verify_renamed(
+    comparison: &mut Comparison<'_, '_>,
+    source: EntryMetadata<'_>,
+    prepared: &crate::zip::write::raw::PreparedRaw,
+    member: Member,
+    central: &CentralRecord,
+    receipt: RawWritten,
+    boundary: u64,
+) -> Result<bool> {
+    let renamed = prepared.rename.as_ref().expect("renamed member");
+    let new_offset = central.resolved.local_header_offset;
+    let proof =
+        prepared.proof(new_offset).map_err(|_| RewriteError::Verification("renamed member cannot be relocated"))?;
+    let old = source.header();
+    check(
+        receipt.proof == proof
+            && receipt.local_offset == new_offset
+            && receipt.local_len == prepared.output_local_len()
+            && receipt.packed == source.packed_size()
+            && receipt.decoded == source.size()
+            && receipt.method == old.method
+            && receipt.crc == old.crc32
+            && add(receipt.local_offset, receipt.local_len)? == boundary,
+        "renamed receipt or patch proof differs",
+    )?;
+    let head = prepared.output_local_header(proof);
+    comparison.literal_long(new_offset, &head)?;
+    comparison.copy(renamed.header_end..member.end, add(new_offset, head.len() as u64)?)?;
+    let expected = prepared.relocated_central(new_offset, proof);
+    let new_raw = central.source.raw_range();
+    check(new_raw.end - new_raw.start == expected.len() as u64, "renamed central span differs")?;
+    comparison.literal_long(new_raw.start, &expected)?;
+    Ok(member.wide_sizes || proof.offset64_at.is_some() || old.disk_start == u16::MAX)
 }
 
 fn verify_retained(

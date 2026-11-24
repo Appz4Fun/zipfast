@@ -203,6 +203,10 @@ pub(super) fn validate(plan: &RewritePlan, usage: &mut RewriteUsage, order: &mut
             input_name(plan.appends[index - old], false)
         } else if let Action::Replace(input) = plan.actions[index] {
             input_name(input, false)
+        } else if let Action::Rename(spec) = plan.actions[index] {
+            let bytes = &plan.renames[spec].name;
+            let raw = bytes.strip_suffix(b"/").unwrap_or(bytes);
+            Name { raw, key: raw, directory: layout::raw_directory(plan.metadata.view(index)), introduced: true }
         } else {
             let entry = plan.metadata.view(index);
             let bytes = entry.raw_name();

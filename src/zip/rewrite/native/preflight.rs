@@ -23,13 +23,16 @@ pub(super) struct Prepared {
     pub(super) members: Vec<Member>,
     pub(super) outcomes: VerificationSummary,
     pub(super) written: Vec<WrittenEntry>,
+    /// Rebuilt name records by source ordinal. Empty without renames.
+    pub(super) renamed: Vec<Option<Arc<crate::zip::write::raw::Renamed>>>,
 }
 
 impl RewritePlan {
     pub(super) fn preflight(&mut self, receipts: Option<&mut Vec<EntryWritten>>) -> Result<Prepared> {
         let options = &self.options;
         let limits = options.limits;
-        let changed = !self.inputs.is_empty() || self.actions.iter().any(|action| matches!(action, Action::Remove));
+        let changed = !self.inputs.is_empty()
+            || self.actions.iter().any(|action| matches!(action, Action::Remove | Action::Rename(_)));
         let entries = self.usage.common.plan.entries;
         let count = usize::try_from(entries).map_err(|_| CreateError::Overflow)?;
         if changed {
@@ -106,6 +109,19 @@ impl RewritePlan {
         self.usage.common.plan.work += layout_work;
         let prefix = layout?;
         check_source(&self.parent, &self.file, self.stamp, &attempts)?;
+        let renamed = rename::build(
+            rename::Plan {
+                file: &self.file,
+                metadata: &self.metadata,
+                actions: &self.actions,
+                renames: &self.renames,
+                options,
+                usage: &mut self.usage,
+            },
+            &members,
+            &attempts,
+        )?;
+        check_source(&self.parent, &self.file, self.stamp, &attempts)?;
         if changed {
             // Borrow the plan's names and edit indices while charging the
             // reusable sorting scratch independently.
@@ -123,7 +139,7 @@ impl RewritePlan {
             for (ordinal, action) in edited.enumerate() {
                 work(options, &mut loop_usage, 1)?;
                 match action {
-                    Action::Keep => {
+                    Action::Keep | Action::Rename(_) => {
                         let old = self.metadata.view(ordinal);
                         if options.verification == Verification::Full {
                             if !matches!(old.header().method, METHOD_STORED | METHOD_DEFLATE)
@@ -135,8 +151,14 @@ impl RewritePlan {
                             full_packed = add(full_packed, old.packed_size())?;
                         }
                         if changed {
-                            let projection = old.raw_unicode_path().map_or(0, |name| name.len() as u64);
-                            feasibility.preserved(raw_entry(&self.metadata, members[ordinal], ordinal), projection)?;
+                            let renamed = renamed.get(ordinal).and_then(Option::as_ref);
+                            let projection = if renamed.is_some() {
+                                0
+                            } else {
+                                old.raw_unicode_path().map_or(0, |name| name.len() as u64)
+                            };
+                            feasibility
+                                .preserved(raw_entry(&self.metadata, members[ordinal], ordinal, renamed), projection)?;
                         }
                     }
                     Action::Replace(input) => {
@@ -154,7 +176,7 @@ impl RewritePlan {
         })();
         self.usage = loop_usage;
         result?;
-        Ok(Prepared { prefix, members, written, outcomes })
+        Ok(Prepared { prefix, members, written, outcomes, renamed })
     }
 }
 
@@ -216,7 +238,7 @@ impl<'a> Feasibility<'a> {
     pub(super) fn preserved(&mut self, entry: PreparedRaw, projection: u64) -> Result<()> {
         let proof = entry.proof(self.local).map_err(rewrite_writer_error)?;
         let central = entry.output_central_len(proof).map_err(rewrite_writer_error)?;
-        let local = entry.local.end - entry.local.start;
+        let local = entry.output_local_len();
         let offset_was_wide = entry.central_header.local_header_offset == u32::MAX;
         let old_central = entry.central.end - entry.central.start;
         let max_skipped = if offset_was_wide {
@@ -229,7 +251,11 @@ impl<'a> Feasibility<'a> {
                 + 2
                 + 2 * u64::from(entry.zip64_extra.is_some())
         };
-        let read = add(local, old_central)?.checked_sub(max_skipped).ok_or(CreateError::Overflow)?;
+        let read = match &entry.rename {
+            // Only the payload and descriptor are read from the source.
+            Some(renamed) => entry.local.end - renamed.header_end,
+            None => add(local, old_central)?.checked_sub(max_skipped).ok_or(CreateError::Overflow)?,
+        };
         self.copy = add(self.copy, read)?;
         self.comparison = add(self.comparison, read)?;
         self.wide |= entry.wide_sizes || proof.offset64_at.is_some() || entry.central_header.disk_start == u16::MAX;

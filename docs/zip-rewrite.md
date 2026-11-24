@@ -10,6 +10,22 @@ Use `metadata()` to select a source occurrence by `EntryId`. IDs belong
 to one opened plan, and an occurrence accepts one replacement or removal.
 Replacements keep the original encoded name and UTF-8 flag. The caller
 supplies the new contents, method, timestamps, permissions and comment.
+`RewritePlan::rename(&id, EntryName)` renames one occurrence and keeps its
+payload, data descriptor, CRC, sizes, timestamps, attributes, comment and
+other extras byte-for-byte. The local and central names are replaced, so later
+local offsets shift. Like `7z rn`, any Info-ZIP Unicode Path extra (0x7075) is
+dropped from both records, and bit 11 is set only for a non-ASCII
+`EntryName::Utf8` name. A member whose comment has non-ASCII bytes keeps its
+flag, because the flag also selects the comment encoding, and a name that
+cannot live with that flag fails with `RenameEncoding`. Unlike 7-Zip, no NTFS
+timestamp extra is added. The new name follows the rules for new entries and
+must keep the old trailing slash. It conflicts with any name held by an
+unedited member, append or earlier rename. The name of a removed or renamed
+member is free. Renaming a directory does not rename its children, and
+renames need `CollisionPolicy::Exact`. The relocated ZIP64 offset rules above
+apply unchanged. Renamed members have no write receipts and verify as retained
+members, including under `Full`.
+
 Appends follow admission order after the original central slots. The output
 local records follow the resulting central order. Untouched duplicates,
 raw names, comments, attributes and well-framed unknown member extras are

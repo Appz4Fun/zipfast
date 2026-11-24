@@ -17,7 +17,7 @@
 use std::{fs::File, path::Path, sync::Arc};
 
 use crate::zip::create::CollisionPath;
-use crate::zip::write::EntryOptions;
+use crate::zip::write::{EntryName, EntryOptions};
 use crate::zip::{EntryId, Metadata};
 
 use super::*;
@@ -90,6 +90,9 @@ impl RewritePlan {
     }
 
     pub fn remove(&mut self, _: &EntryId) -> Result<(), RewriteError> {
+        match self.unavailable {}
+    }
+    pub fn rename(&mut self, _: &EntryId, _: EntryName<'_>) -> Result<(), RewriteError> {
         match self.unavailable {}
     }
     pub fn usage(&self) -> RewriteUsage {
