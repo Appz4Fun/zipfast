@@ -674,7 +674,7 @@ impl FeedDecoder {
                             break;
                         }
                         Stop::Missing { stream, len, hole } => {
-                            if hole && let Some((d2, l2)) = self.skip_hole(r, stream + len, source, sink)? {
+                            if hole && let Some((d2, l2)) = self.skip_hole(r, stream, stream + len, source, sink)? {
                                 dec = d2;
                                 lane = l2;
                                 continue;
@@ -813,7 +813,7 @@ impl FeedDecoder {
     ) -> Result<Abandoned, FeedError> {
         r.base = origin.clone();
         r.skip_exhausted = false;
-        if let Some((dec, lane)) = self.skip_hole(r, r.fed, source, sink)? {
+        if let Some((dec, lane)) = self.skip_hole(r, r.fed, r.fed, source, sink)? {
             return Ok(Abandoned::Restart(dec, lane));
         }
         if !r.skip_exhausted {
@@ -836,10 +836,12 @@ impl FeedDecoder {
 
     /// Skips the hole that ends at stream offset `hole_end` when the sink holds the output past the main decode's
     /// frontier: finds the restart after the hole in the packed bytes after it ([`resync_near`]) and starts a decoder
-    /// there, recording the lost output and its repair. None when it cannot (yet).
+    /// there, recording the lost output and its repair, which waits at `hole_start` (the first missing byte). None
+    /// when it cannot (yet).
     fn skip_hole(
         &mut self,
         r: &mut Rar5,
+        hole_start: u64,
         hole_end: u64,
         source: &mut dyn PackedSource,
         sink: &mut dyn FeedSink,
@@ -1023,12 +1025,14 @@ impl FeedDecoder {
             }
         }
         if from_out < until_out && !r.repairs.iter().any(|x| x.lost.start < until_out && from_out < x.lost.end) {
+            // blocked at the hole from the start: the repair probes for its bytes before restoring its decoder
+            // (which reads a dictionary's worth of output back), instead of restoring it only to stop at the hole
             r.repairs.push(Repair {
                 from: r.base.clone(),
                 until_packed,
                 until_out,
                 lost: from_out..until_out,
-                blocked: None,
+                blocked: Some(hole_start),
             });
             self.lost.insert(from_out..until_out);
         }

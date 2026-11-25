@@ -1140,9 +1140,9 @@ fn skip_retries_at_a_hole_do_not_read_the_held_output_again() {
     }
     let size = feed.plain.len() as u64;
     eprintln!("read back {} for {size} output over {runs} runs, {} holes", sink.read_back, decoder.stats().holes);
-    // Before: 7.20 MB read back here (12x the output: held output and window again on every retry). After: 3.53 MB,
-    // mostly the window before each hole, read once per hole and once per repair restore.
-    assert!(sink.read_back < 6 * size, "read back {} for {size} output", sink.read_back);
+    // Before: 7.20 MB read back here (12x the output: held output and window again on every retry, and each repair
+    // restored once just to stop at its hole). After: 2.89 MB, mostly the window before each hole, read once.
+    assert!(sink.read_back < 5 * size, "read back {} for {size} output", sink.read_back);
 }
 
 /// The core of "never read an article twice" for dupe recovery: lost output another copy already gave us is retired
