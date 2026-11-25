@@ -190,6 +190,29 @@ fn blake_frontier_runs_are_charged_to_the_partial_budget() {
     f.feed(std::slice::from_ref(&(0..100)), 0, &[1; 10], budget);
     assert!(f.run(&(0..100)).is_some());
 }
+/// Codex review of #284: verifying continues an unfinished run with the run's own hash and budget, so a ledger with
+/// room for the read buffer but not for a second hasher still verifies.
+#[test]
+fn a_read_back_continuing_a_run_takes_over_its_budget() {
+    let f = Fixture::new(65_537, true, false, true);
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
+    let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
+    f.hole(&file, 0..65_537);
+    f.finish_missing_member(&file);
+    // Out of order: the runs stop at 40,000, holding their hashers' budget.
+    file.fill(40_000, &f.data[40_000..]).unwrap();
+    file.fill(0, &f.data[..40_000]).unwrap();
+    let budget = &file.core.budget;
+    let mut hogs = Vec::new();
+    while let Ok(lease) = budget.reserve(PartialResource::LedgerBytes, 4096) {
+        hogs.push(lease);
+    }
+    // Room for one read buffer (4,096 bytes), not for a buffer and another hasher's storage.
+    hogs.pop();
+    let Verdict::Ok { parts, .. } = drive(&mut file) else { panic!("verifies within the budget the runs hold") };
+    assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
+    drop(hogs);
+}
 /// Emulates a reopened handle: no hash was kept while writing, so BLAKE2sp checks read the output back.
 fn forget_blake(file: &PartialFile) {
     file.core.operation().unwrap().blake = Default::default();

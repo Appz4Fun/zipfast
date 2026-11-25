@@ -157,6 +157,12 @@ impl BlakeFrontier {
     pub(super) fn run(&self, range: &Range<u64>) -> Option<&BlakeRun> {
         self.runs.iter().find(|run| run.range == *range)
     }
+
+    /// Removes the run for `range`, handing over its hash and the budget it holds.
+    fn take_run(&mut self, range: &Range<u64>) -> Option<BlakeRun> {
+        let i = self.runs.iter().position(|run| run.range == *range)?;
+        Some(self.runs.swap_remove(i))
+    }
 }
 struct Readback {
     range: Range<u64>,
@@ -166,6 +172,8 @@ struct Readback {
     hash: crate::blake2sp::Blake2sp,
     buffer: Vec<u8>,
     _lease: Reservation,
+    /// The budget a [`BlakeRun`] held for the hash this read-back continues, moved over with it.
+    _hash_lease: Option<Reservation>,
 }
 fn complete(snapshot: &Snapshot, range: &Range<u64>) -> bool {
     let mut at = range.start;
@@ -334,7 +342,12 @@ impl Verification {
             || self.member_crc == CheckResult::Pending
             || self.member_blake == CheckResult::Pending
     }
-    fn read_one(&mut self, core: &PartialCore, snapshot: &Snapshot, frontier: &BlakeFrontier) -> PartialResult<bool> {
+    fn read_one(
+        &mut self,
+        core: &PartialCore,
+        snapshot: &Snapshot,
+        frontier: &mut BlakeFrontier,
+    ) -> PartialResult<bool> {
         if self.active.is_none() {
             let range = self
                 .parts
@@ -350,22 +363,29 @@ impl Verification {
                 return Err(err(PartialErrorKind::InvalidOptions));
             }
             // A range whose run hashed it as it was written needs no read-back; a run that stopped short is
-            // continued from its end, so only the bytes past it are read.
-            let (from, hash) = match frontier.run(&range).map(|run| (run.at, &run.hash)) {
-                Some((_, Ok(digest))) => {
-                    let digest = *digest;
+            // continued from its end, so only the bytes past it are read. Its hash and the budget it holds move into
+            // the read-back (reserved for the buffer first, so a refusal leaves the run as it was).
+            let continued = match frontier.run(&range).map(|run| (run.at, run.hash.as_ref().ok().copied())) {
+                Some((_, Some(digest))) => {
                     self.settle(&range, digest, snapshot);
                     return Ok(self.more(snapshot));
                 }
-                Some((at, Err(hash))) => (at, hash.clone()),
-                None => (range.start, crate::blake2sp::Blake2sp::new()),
+                Some((at, None)) => Some(at),
+                None => None,
             };
+            let from = continued.unwrap_or(range.start);
             let n = (range.end - from).min(core.read_chunk as u64) as usize;
-            let lease = core.budget.reserve(PartialResource::LedgerBytes, BLAKE_STORAGE + n as u64)?;
+            let storage = if continued.is_some() { 0 } else { BLAKE_STORAGE };
+            let lease = core.budget.reserve(PartialResource::LedgerBytes, storage + n as u64)?;
             core.budget.metadata(BLAKE_STORAGE)?;
             let mut buffer = core.budget.vector(n)?;
             buffer.resize(n, 0);
-            self.active = Some(Readback { at: from, from, range, hash, buffer, _lease: lease });
+            let (hash, hash_lease) = match continued.and_then(|_| frontier.take_run(&range)) {
+                Some(BlakeRun { hash: Err(hash), lease, .. }) => (hash, lease),
+                _ => (crate::blake2sp::Blake2sp::new(), None),
+            };
+            self.active =
+                Some(Readback { at: from, from, range, hash, buffer, _lease: lease, _hash_lease: hash_lease });
         }
         let active = self.active.as_mut().unwrap();
         if active.at < active.range.end {
@@ -454,7 +474,7 @@ impl PartialCore {
             return Ok(Poll::Ready(bad));
         }
         let data = op.data.as_mut().unwrap();
-        let pending = data.verification.as_mut().unwrap().read_one(self, &data.snapshot, &data.blake)?;
+        let pending = data.verification.as_mut().unwrap().read_one(self, &data.snapshot, &mut data.blake)?;
         self.check(&op)?;
         if pending {
             return Ok(Poll::Pending);
