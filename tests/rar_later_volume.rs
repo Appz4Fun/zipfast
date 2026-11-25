@@ -353,3 +353,38 @@ fn a_session_opened_at_a_later_volume_restarts_at_the_first_when_asked() {
     assert_eq!(names, ["a.bin"]);
     assert_eq!(from.as_deref(), Some("set.part1.rar"));
 }
+
+/// Restart discovery is read under the session's cancellation and budget, and opens volumes without blocking.
+#[test]
+fn session_restart_discovery_honours_cancellation_budgets_and_fifos() {
+    use zipfast::rar5::session::{RarCatalogueLimits, RarSession, RarSessionOptions};
+    let set = stage("rar4-volumes", &["multi.part1.rar", "multi.part2.rar", "multi.part3.rar"]);
+    let named = set.path().join("multi.part2.rar");
+    // Already canceled: nothing is scanned.
+    let cancel = zipfast::extract::Cancellation::default();
+    cancel.cancel();
+    let options = RarSessionOptions { restart_from_first_volume: true, cancel, ..RarSessionOptions::default() };
+    let failure = RarSession::open(&named, None, options).err().expect("canceled");
+    assert!(format!("{failure:?}").contains("Canceled"), "{failure:?}");
+    // A header-block budget too small for the probes is a limit failure, not an unbounded walk.
+    let limits = RarCatalogueLimits { header_blocks: 1, ..RarCatalogueLimits::default() };
+    let options = RarSessionOptions { restart_from_first_volume: true, limits, ..RarSessionOptions::default() };
+    let failure = RarSession::open(&named, None, options).err().expect("limit");
+    assert!(format!("{failure:?}").contains("Limit"), "{failure:?}");
+    // A FIFO in place of the first volume: the probe neither blocks nor restarts.
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["multi.part2.rar", "multi.part3.rar"] {
+        fs::copy(fixtures("rar4-volumes").join(name), dir.path().join(name)).unwrap();
+    }
+    let fifo = dir.path().join("multi.part1.rar");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let named = dir.path().join("multi.part2.rar");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let options = RarSessionOptions { restart_from_first_volume: true, ..RarSessionOptions::default() };
+        let opened = RarSession::open(&named, None, options).map(|s| s.restarted_from().is_none());
+        let _ = tx.send(opened.ok());
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("RarSession::open must not block on a FIFO");
+    assert_eq!(got, Some(true), "no restart through a FIFO");
+}

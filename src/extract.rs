@@ -3664,7 +3664,7 @@ pub(crate) fn restart_volume(path: &Path, password: Option<&str>) -> Option<Path
 
 /// How many members start in the volumes from `from` up to (not including) `until`: the listing positions a run
 /// restarted at `from` counts before `until`'s own first member.
-pub(crate) fn members_before(from: &Path, until: &Path, password: Option<&str>) -> Option<u64> {
+fn members_before(from: &Path, until: &Path, password: Option<&str>) -> Option<u64> {
     let mut count = 0u64;
     let mut current = from.to_path_buf();
     for _ in 0..4096 {
