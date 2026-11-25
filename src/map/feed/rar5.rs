@@ -20,7 +20,8 @@
 
 use super::*;
 use crate::rar5::unpack::{
-    CHECKPOINT_LENS, NearOptions, SeenFilterRec, Sink, UnpackCheckpoint, Unpacker, Window, resync_near, window_for,
+    CHECKPOINT_LENS, NearError, NearOptions, SeenFilterRec, Sink, UnpackCheckpoint, Unpacker, Window, resync_near,
+    window_for,
 };
 
 /// The most held output read past a hole to skip it.
@@ -32,6 +33,8 @@ const AFTER_MAX: u64 = 8 << 20;
 /// The work one restart search of a skip may spend (`NearOptions::work`; 2^30 is about a second), so a skip costs
 /// the same however loaded the machine is.
 const SKIP_WORK: u64 = 1 << 30;
+/// A guarded restart is checked from a filter's longest reach before it (`NearOptions::guard`).
+const GUARD_REACH: u64 = 4 << 20;
 
 /// A restart point: the decoder state between two blocks and the stream offset of the next block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +81,9 @@ struct SkipCache {
     packed: Vec<u8>,
     lane: Lane,
     window: Vec<u8>,
+    /// targets whose search ran out of work at this hole: tried again they would spend the same work and stop at the
+    /// same place, so they are not
+    exhausted: Vec<u64>,
 }
 
 pub(super) struct Rar5 {
@@ -869,9 +875,9 @@ impl FeedDecoder {
         // A retry at the same hole keeps what the last attempt read (held output, decrypted packed bytes and the
         // lane after them, the window): it reads only what is new, and asks the retry gate before searching again.
         let cached = r.skip_cache.take().filter(|c| c.hole_end == hole_end && c.out == out_h);
-        let (mut donor, mut packed, lane, window) = match cached {
-            Some(c) => (c.donor, c.packed, Some(c.lane), Some(c.window)),
-            None => (Vec::new(), Vec::new(), None, None),
+        let (mut donor, mut packed, lane, window, mut exhausted) = match cached {
+            Some(c) => (c.donor, c.packed, Some(c.lane), Some(c.window), c.exhausted),
+            None => (Vec::new(), Vec::new(), None, None, Vec::new()),
         };
         let held_max = (self.size - out_h).min(DONOR_MAX);
         // Held output is read in two steps: enough to know a skip is worth trying, then (below) only as far as the
@@ -968,12 +974,18 @@ impl FeedDecoder {
         let grown = |held: usize, after: usize| {
             (held != usize::MAX && donor.len() > held) || tried.2 >= after.saturating_mul(2).min(after + (4 << 20))
         };
-        let keep = |r: &mut Rar5, donor: Vec<u8>, packed: Vec<u8>, lane: Lane, window: Vec<u8>| {
-            r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window });
+        let keep = |r: &mut Rar5, donor: Vec<u8>, packed: Vec<u8>, lane: Lane, window: Vec<u8>, exhausted: Vec<u64>| {
+            r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window, exhausted });
         };
         if r.skip_failed.is_some_and(|(end, held, after)| end == hole_end && !grown(held, after)) {
             r.skip_exhausted = full;
-            keep(r, donor, packed, lane, window);
+            keep(r, donor, packed, lane, window, exhausted);
+            return Ok(None);
+        }
+        // a guarded restart is checked from a filter's reach (4 MiB) before it: until that much is held after the hole
+        // (or all there is), a guarded search cannot succeed, so none is run yet
+        if r.abandons > 0 && (packed.len() as u64) < GUARD_REACH && !full {
+            keep(r, donor, packed, lane, window, exhausted);
             return Ok(None);
         }
         r.skip_failed = Some(tried);
@@ -999,11 +1011,13 @@ impl FeedDecoder {
         targets.push(reach);
         let mut found = None;
         let end = s0 + self.size;
+        // one attempt spends at most SKIP_WORK across all its targets (each search reports what it spent)
+        let mut work_left = SKIP_WORK;
         let mut i = 0;
-        while i < targets.len() {
+        while i < targets.len() && work_left > 0 {
             let target = targets[i];
             i += 1;
-            if target <= at {
+            if target <= at || exhausted.contains(&target) {
                 continue;
             }
             if self.options.control.is_canceled() {
@@ -1015,7 +1029,7 @@ impl FeedDecoder {
                 // after a seeded restart went wrong (a filter the search did not see), only a guarded restart: checked
                 // from a filter's reach before it, so no filter declared earlier covers what it decodes
                 guard: r.abandons > 0,
-                work: SKIP_WORK,
+                work: work_left,
                 ..NearOptions::default()
             };
             let res = resync_near(&packed, base, &known, r.window, target, &options);
@@ -1023,6 +1037,7 @@ impl FeedDecoder {
                 // a restart at the member's end has no block after it (under AES only the cipher's padding): the
                 // last block before it then
                 Ok(near) if near.resync.output_offset >= end => {
+                    work_left = work_left.saturating_sub(near.work);
                     if i == targets.len() && end - 1 > at {
                         targets.push(end - 1);
                     }
@@ -1031,12 +1046,17 @@ impl FeedDecoder {
                     found = Some(near);
                     break;
                 }
-                _ => {}
+                Ok(near) => work_left = work_left.saturating_sub(near.work),
+                Err(NearError::Exhausted { .. }) => {
+                    exhausted.push(target);
+                    work_left = 0;
+                }
+                Err(NearError::NotFound { .. }) => {}
             }
         }
         let Some(near) = found else {
             r.skip_exhausted = full;
-            keep(r, donor, packed, lane, window);
+            keep(r, donor, packed, lane, window, exhausted);
             return Ok(None);
         };
         let restart = near.resync;
