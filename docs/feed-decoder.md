@@ -101,8 +101,9 @@ refused (`FeedError::FillLost`) for now.
 **A seeded restart that disagrees.** After a skip, the output decoded from the seeded restart is checked against the
 held output; a mismatch (a filter the search did not see, a false restart, held output that differs) abandons that
 restart where it went wrong: what it wrote matched and stays, another restart is searched from the packed bytes after
-it, and failing that the rest is repaired from the checkpoint before the hole once its bytes come. The decoder no
-longer fails. A retry at the same hole keeps the held output, packed bytes and window the last attempt read, and
+it, and while no restart is found yet the main decode waits for more packed bytes and searches again (each abandon in a
+row pushes the next search further past the trouble, a filter's reach); only once the search has read all it may is
+the rest repaired from the checkpoint before the hole once its bytes come. The decoder no longer fails. A retry at the same hole keeps the held output, packed bytes and window the last attempt read, and
 reads held output only as far as the packed bytes after the hole can reach.
 
 `NeedBytes` ranges are exact: a `Next` need is the run of bytes from the frontier the source reported absent, a

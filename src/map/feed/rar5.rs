@@ -59,6 +59,16 @@ struct Repair {
     blocked: Option<u64>,
 }
 
+/// What became of the main decode after an abandoned seeded restart.
+enum Abandoned {
+    /// restarted: decode on with this decoder, reading this lane
+    Restart(Box<Unpacker>, Lane),
+    /// no restart yet: wait for more packed bytes and search again
+    Wait,
+    /// the search read all it may: the rest is one repair, and the main decode is over
+    Over,
+}
+
 /// What a RAR 5.0 skip attempt read at a hole: the held output past the frontier, the decrypted packed bytes after
 /// the hole with the lane positioned after them, and the window before the frontier.
 struct SkipCache {
@@ -90,6 +100,13 @@ pub(super) struct Rar5 {
     seeded_skip: Option<(Cp, u64)>,
     /// what the last skip attempt at a hole read, kept for the next attempt at the same hole
     skip_cache: Option<SkipCache>,
+    /// the main decode waits to restart after a seeded restart it abandoned (its state is untrusted from `fed`):
+    /// the checkpoint before the hole first skipped, which the repairs start from
+    resync: Option<Cp>,
+    /// seeded restarts abandoned in a row: each pushes the next search further past the trouble (a filter's reach)
+    abandons: u32,
+    /// the last skip search that failed had read every packed byte it may read: more will not help
+    skip_exhausted: bool,
     /// unpacked / packed, for estimates
     ratio: f64,
     /// where the member's output starts in its solid stream's (0 alone; checkpoints count stream offsets), and the
@@ -487,6 +504,9 @@ impl FeedDecoder {
                 skip_failed: None,
                 seeded_skip: None,
                 skip_cache: None,
+                resync: None,
+                abandons: 0,
+                skip_exhausted: false,
                 ratio,
                 start: run.start,
                 starts: run.starts.clone(),
@@ -562,98 +582,110 @@ impl FeedDecoder {
         let (mut next, mut repair, mut more, mut gap) = (Vec::new(), Vec::new(), false, None);
         r.stalled = false;
         if let Some(mut lane) = self.main.take() {
-            let mut dec = match r.dec.take() {
-                Some(dec) => dec,
-                None => {
-                    let base = r.base.clone();
-                    let dec = self.restore_dec(r, &base, sink)?;
-                    lane = self.packed_lane(base.packed, self.stream_len);
-                    r.fed = base.packed;
-                    r.out = r.cp_out(&base);
-                    dec
-                }
-            };
-            loop {
-                let write = r.write_from..self.size;
-                let pumped = self.pump5(
-                    &mut lane,
-                    &mut dec,
-                    (&mut r.fed, &mut r.out),
-                    write.clone(),
-                    Some(&mut r.base),
-                    source,
-                    sink,
-                );
-                let stop = match pumped {
-                    // A seeded restart that disagrees with the held output (a filter the search did not see, a
-                    // false restart, held output that differs): what it wrote so far matched, but its state cannot
-                    // be trusted from here. Search again from the bytes after it; the repair of what lies between
-                    // starts from the checkpoint before the hole skipped, which the seeded state never touched.
-                    Err(FeedError::Decode { .. }) if r.seeded_skip.is_some() => {
-                        let (origin, _) = r.seeded_skip.take().expect("a seeded skip");
-                        r.base = origin.clone();
-                        if let Some((d2, l2)) = self.skip_hole(r, r.fed, source, sink)? {
-                            dec = d2;
-                            lane = l2;
-                            continue;
+            'main: {
+                let mut dec = match (r.resync.take(), r.dec.take()) {
+                    // waiting to restart after an abandoned seeded restart: search again
+                    (Some(origin), _) => match self.after_abandon(r, origin, source, sink)? {
+                        Abandoned::Restart(d, l) => {
+                            lane = l;
+                            d
                         }
-                        // No restart after it: the rest is repaired from that checkpoint once the hole's bytes come
-                        // (the main decode is over; nothing is written twice).
-                        let at = r.out;
-                        if at < self.size && !r.repairs.iter().any(|x| x.lost.start < self.size && at < x.lost.end) {
-                            r.repairs.push(Repair {
-                                from: origin,
-                                until_packed: self.stream_len,
-                                until_out: self.size,
-                                lost: at..self.size,
-                                blocked: None,
-                            });
-                            self.lost.insert(at..self.size);
+                        Abandoned::Over => break 'main,
+                        Abandoned::Wait => {
+                            r.stalled = true;
+                            gap = Some(r.fed..self.stream_len);
+                            self.main = Some(lane);
+                            break 'main;
                         }
-                        break;
+                    },
+                    (None, Some(dec)) => dec,
+                    (None, None) => {
+                        let base = r.base.clone();
+                        let dec = self.restore_dec(r, &base, sink)?;
+                        lane = self.packed_lane(base.packed, self.stream_len);
+                        r.fed = base.packed;
+                        r.out = r.cp_out(&base);
+                        dec
                     }
-                    other => other?,
                 };
-                if r.seeded_skip.as_ref().is_some_and(|&(_, end)| r.out >= end) {
-                    r.seeded_skip = None;
-                }
-                match stop {
-                    Stop::Reached => {
-                        let mut out = self.out_sink(sink, r.out, write);
-                        let ended = dec.finish(&mut out).map_err(|e| out.fail(e));
-                        r.out = out.at;
-                        ended?;
-                        if r.successor {
-                            // the next file of the stream starts here: the decoder goes on, or a successor restarts
-                            // from its state at this point
-                            dec.next_file(None);
-                            let cp = dec.checkpoint().ok_or(FeedError::Decode {
-                                out: r.out,
-                                error: crate::Error::Corrupt("no restart point at the end of a solid member"),
-                            })?;
-                            r.carry = Some(Cp { packed: 0, state: cp });
-                            r.ended = Some(dec);
+                loop {
+                    let write = r.write_from..self.size;
+                    let pumped = self.pump5(
+                        &mut lane,
+                        &mut dec,
+                        (&mut r.fed, &mut r.out),
+                        write.clone(),
+                        Some(&mut r.base),
+                        source,
+                        sink,
+                    );
+                    let stop = match pumped {
+                        // A seeded restart that disagrees with the held output (a filter the search did not see, a
+                        // false restart, held output that differs): what it wrote so far matched, but its state cannot
+                        // be trusted from here. Search again from the bytes after it; the repair of what lies between
+                        // starts from the checkpoint before the hole skipped, which the seeded state never touched.
+                        Err(FeedError::Decode { .. }) if r.seeded_skip.is_some() => {
+                            let (origin, _) = r.seeded_skip.take().expect("a seeded skip");
+                            r.abandons = r.abandons.saturating_add(1);
+                            match self.after_abandon(r, origin, source, sink)? {
+                                Abandoned::Restart(d, l) => {
+                                    dec = d;
+                                    lane = l;
+                                    continue;
+                                }
+                                Abandoned::Over => break,
+                                Abandoned::Wait => {
+                                    r.stalled = true;
+                                    gap = Some(r.fed..self.stream_len);
+                                    self.main = Some(self.packed_lane(r.fed, self.stream_len));
+                                    break;
+                                }
+                            }
                         }
-                        break;
+                        other => other?,
+                    };
+                    if r.seeded_skip.as_ref().is_some_and(|&(_, end)| r.out >= end) {
+                        r.seeded_skip = None;
+                        r.abandons = 0;
                     }
-                    Stop::Budget => {
-                        more = true;
-                        self.main = Some(lane);
-                        r.dec = Some(dec);
-                        break;
-                    }
-                    Stop::Missing { stream, len, hole } => {
-                        if hole && let Some((d2, l2)) = self.skip_hole(r, stream + len, source, sink)? {
-                            dec = d2;
-                            lane = l2;
-                            continue;
+                    match stop {
+                        Stop::Reached => {
+                            let mut out = self.out_sink(sink, r.out, write);
+                            let ended = dec.finish(&mut out).map_err(|e| out.fail(e));
+                            r.out = out.at;
+                            ended?;
+                            if r.successor {
+                                // the next file of the stream starts here: the decoder goes on, or a successor restarts
+                                // from its state at this point
+                                dec.next_file(None);
+                                let cp = dec.checkpoint().ok_or(FeedError::Decode {
+                                    out: r.out,
+                                    error: crate::Error::Corrupt("no restart point at the end of a solid member"),
+                                })?;
+                                r.carry = Some(Cp { packed: 0, state: cp });
+                                r.ended = Some(dec);
+                            }
+                            break;
                         }
-                        r.stalled = hole;
-                        self.push_needs(&mut next, stream..stream + len, NeedKind::Next);
-                        gap = Some(stream + len..lane.end);
-                        self.main = Some(lane);
-                        r.dec = Some(dec);
-                        break;
+                        Stop::Budget => {
+                            more = true;
+                            self.main = Some(lane);
+                            r.dec = Some(dec);
+                            break;
+                        }
+                        Stop::Missing { stream, len, hole } => {
+                            if hole && let Some((d2, l2)) = self.skip_hole(r, stream + len, source, sink)? {
+                                dec = d2;
+                                lane = l2;
+                                continue;
+                            }
+                            r.stalled = hole;
+                            self.push_needs(&mut next, stream..stream + len, NeedKind::Next);
+                            gap = Some(stream + len..lane.end);
+                            self.main = Some(lane);
+                            r.dec = Some(dec);
+                            break;
+                        }
                     }
                 }
             }
@@ -767,6 +799,41 @@ impl FeedDecoder {
         }
     }
 
+    /// After a seeded restart was abandoned (its output disagreed with the held output from `r.out` on): search for
+    /// another restart from the packed bytes after it, with the repairs starting from `origin`, the checkpoint
+    /// before the hole first skipped. Without one yet the main decode waits for more packed bytes and searches
+    /// again on a later run (the retry gate decides); only once the search has read every packed byte it may is
+    /// the rest handed to one repair from `origin` (the main decode is over; nothing is written twice).
+    fn after_abandon(
+        &mut self,
+        r: &mut Rar5,
+        origin: Cp,
+        source: &mut dyn PackedSource,
+        sink: &mut dyn FeedSink,
+    ) -> Result<Abandoned, FeedError> {
+        r.base = origin.clone();
+        r.skip_exhausted = false;
+        if let Some((dec, lane)) = self.skip_hole(r, r.fed, source, sink)? {
+            return Ok(Abandoned::Restart(dec, lane));
+        }
+        if !r.skip_exhausted {
+            r.resync = Some(origin);
+            return Ok(Abandoned::Wait);
+        }
+        let at = r.out;
+        if at < self.size && !r.repairs.iter().any(|x| x.lost.start < self.size && at < x.lost.end) {
+            r.repairs.push(Repair {
+                from: origin,
+                until_packed: self.stream_len,
+                until_out: self.size,
+                lost: at..self.size,
+                blocked: None,
+            });
+            self.lost.insert(at..self.size);
+        }
+        Ok(Abandoned::Over)
+    }
+
     /// Skips the hole that ends at stream offset `hole_end` when the sink holds the output past the main decode's
     /// frontier: finds the restart after the hole in the packed bytes after it ([`resync_near`]) and starts a decoder
     /// there, recording the lost output and its repair. None when it cannot (yet).
@@ -844,6 +911,8 @@ impl FeedDecoder {
             }
         }
         self.buf = buf;
+        // every packed byte the search may read is read (up to AFTER_MAX or the stream's end): more will not help
+        let full = lane.pos >= lane.end;
         if packed.is_empty() {
             return Ok(None);
         }
@@ -870,6 +939,7 @@ impl FeedDecoder {
             r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window });
         };
         if r.skip_failed.is_some_and(|(end, held, after)| end == hole_end && !grown(held, after)) {
+            r.skip_exhausted = full;
             keep(r, donor, packed, lane, window);
             return Ok(None);
         }
@@ -886,9 +956,11 @@ impl FeedDecoder {
         let covered = ((hole_len + packed.len() as u64) as f64 * ratio) as u64;
         let reach = at.saturating_add((covered as f64 * 0.95) as u64).min(known_end);
         let hole_out = at.saturating_add((hole_len as f64 * ratio) as u64);
+        // after seeded restarts abandoned in a row, past where they went wrong: a filter there reaches further
+        let push = if r.abandons > 0 { (128u64 << 10) << r.abandons.min(6) } else { 0 };
         let mut targets: Vec<u64> = [128u64 << 10, 512 << 10, 2 << 20, 8 << 20]
             .iter()
-            .map(|d| hole_out.saturating_add(*d))
+            .map(|d| hole_out.saturating_add(*d + push))
             .filter(|&t| t < reach)
             .collect();
         targets.push(reach);
@@ -928,6 +1000,7 @@ impl FeedDecoder {
             }
         }
         let Some(near) = found else {
+            r.skip_exhausted = full;
             keep(r, donor, packed, lane, window);
             return Ok(None);
         };
