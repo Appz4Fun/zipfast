@@ -1081,7 +1081,8 @@ impl FeedDecoder {
     /// output from there: the main decode then goes on after it (stored layers; under AES-CBC the range ends on a
     /// 16-byte block or the member's end) or is over (a compressed RAR 5.0 member, filled to its end).
     ///
-    /// Stored layers and compressed RAR 5.0; 7z LZMA2 and ZIP Deflate repairs are refused (`FillLost`) for now.
+    /// Stored layers and compressed RAR 5.0; for RAR 4.x and 7z LZMA2 (which wait at holes) only the rest from the
+    /// frontier to the member's end. ZIP Deflate, and RAR 4.x / LZMA2 lost ranges, are refused (`FillLost`) for now.
     pub fn fill_lost(&mut self, range: Range<u64>, bytes: &[u8]) -> Result<(), FeedError> {
         if self.failed {
             return Err(FeedError::AlreadyFailed);
@@ -1092,14 +1093,27 @@ impl FeedDecoder {
         if range.is_empty() {
             return Ok(());
         }
-        if self.lzma2.is_some() || self.zip.is_some() || self.rar4.is_some() {
-            return Err(FeedError::FillLost("this layer's repairs cannot be retired yet"));
-        }
         // Output from the main decode's frontier on (it waits at a hole the caller holds the rest past): the main
         // decode goes on after the range (stored layers) or is over (to the member's end).
         let frontier = self.status.frontier;
-        let ahead = self.main.is_some() && range.start == frontier && range.end <= self.size;
-        if ahead {
+        let ahead = !self.status.done && frontier < self.size && range.start == frontier && range.end <= self.size;
+        // RAR 4.x and 7z LZMA2 wait at holes rather than skip them: the rest from the frontier ends their main decode
+        // (their repairs, ZIP Deflate's too, are not retired yet).
+        let waiting_layer = self.lzma2.is_some() || self.rar4.is_some();
+        if (self.zip.is_some() || waiting_layer) && !(ahead && range.end == self.size && waiting_layer) {
+            return Err(FeedError::FillLost("this layer's repairs cannot be retired yet"));
+        }
+        if ahead && waiting_layer {
+            self.main = None;
+            if let Some(r) = self.rar4.as_mut() {
+                r.end_main(self.size);
+            }
+            if let Some(lz) = self.lzma2.as_mut()
+                && !lz.end_main()
+            {
+                return Err(FeedError::FillLost("the 7z folder is still being walked for a restart"));
+            }
+        } else if ahead {
             if range.end < self.size {
                 if self.rar5.is_some() {
                     return Err(FeedError::FillLost(

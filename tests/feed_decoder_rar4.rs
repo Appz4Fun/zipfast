@@ -282,3 +282,72 @@ fn an_encrypted_rar4_member_needs_its_password() {
     let vols = vec![bytes.clone()];
     assert!(!whole(&map, i, &vols, Some("password")).is_empty());
 }
+
+/// Held mode for RAR 4.x (it waits at holes): the rest from the stalled frontier, held from another copy, retired
+/// with `fill_lost` finishes the member with its CRC checked; the missing article is never fetched.
+#[test]
+fn fill_lost_to_the_end_finishes_a_rar4_member_waiting_at_a_hole() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut tried = 0;
+    for dir in ["rar4", "rar4-rar300", "rar4-volumes"] {
+        let Ok(_) = std::fs::read_dir(root.join(dir)) else { continue };
+        for set in sets(&root.join(dir)) {
+            let vols: Vec<Vec<u8>> = set.iter().map(|p| std::fs::read(p).unwrap()).collect();
+            let refs: Vec<&[u8]> = vols.iter().map(Vec::as_slice).collect();
+            let Ok(map) = MemberMap::from_memory(&refs, set[0].file_name().unwrap(), None) else { continue };
+            if map.format != MapFormat::Rar4 {
+                continue;
+            }
+            for (i, m) in map.members.iter().enumerate() {
+                let big = m.unpacked_size.is_some_and(|s| s > 4096);
+                if !matches!(m.method, MapMethod::Compressed { .. }) || !big || m.solid || m.encrypted || !m.complete {
+                    continue;
+                }
+                let Some(piece) = m.pieces.iter().find(|p| p.packed.end - p.packed.start > 64) else { continue };
+                // the reference output, from a full feed (members the feed decoder cannot decode, such as those with
+                // RAR 4.x VM filters, are skipped)
+                let plain = {
+                    let Ok(mut d) = FeedDecoder::new(&map, i, FeedOptions::default()) else { continue };
+                    let n = d.size() as usize;
+                    let mut out = Out { bytes: vec![0; n], seen: vec![false; n], written: 0 };
+                    let mut all = ArticleBuffer::new(usize::MAX);
+                    for (v, b) in vols.iter().enumerate() {
+                        all.insert(v as u32, 0, b).unwrap();
+                    }
+                    match d.run(&mut all, &mut out) {
+                        Ok(s) if s.done && s.crc_ok == Some(true) => out.bytes,
+                        _ => continue,
+                    }
+                };
+                // a hole in the middle of the member's first sizeable piece
+                let mid = (piece.packed.start + piece.packed.end) / 2;
+                let hole = mid..(mid + 32).min(piece.packed.end);
+                let mut source2 = ArticleBuffer::new(usize::MAX);
+                for (v, b) in vols.iter().enumerate() {
+                    if v as u32 == piece.volume {
+                        source2.insert(v as u32, 0, &b[..hole.start as usize]).unwrap();
+                        source2.insert(v as u32, hole.end, &b[hole.end as usize..]).unwrap();
+                        source2.mark_lost(v as u32, hole.clone());
+                    } else {
+                        source2.insert(v as u32, 0, b).unwrap();
+                    }
+                }
+                let mut d = FeedDecoder::new(&map, i, FeedOptions::default()).unwrap();
+                let n = plain.len();
+                let mut out = Out { bytes: vec![0; n], seen: vec![false; n], written: 0 };
+                let s = d.run(&mut source2, &mut out).unwrap();
+                if s.done {
+                    continue; // the hole fell where nothing was needed
+                }
+                let f = s.frontier as usize;
+                out.write_at(f as u64, &plain[f..]).unwrap();
+                d.fill_lost(f as u64..n as u64, &plain[f..]).unwrap();
+                let s = d.run(&mut source2, &mut out).unwrap();
+                assert!(s.done && s.crc_ok == Some(true), "{set:?} member {i}: {s:?}");
+                assert_eq!(out.bytes, plain);
+                tried += 1;
+            }
+        }
+    }
+    assert!(tried > 0, "no RAR 4.x member was exercised");
+}

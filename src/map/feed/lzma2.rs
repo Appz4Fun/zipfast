@@ -279,6 +279,17 @@ impl Lz {
         self.dict
     }
 
+    /// Ends the main decode (the caller holds the output from its frontier to the member's end); false while the
+    /// folder is still being walked for a restart, when there is no main decode to end yet.
+    pub(super) fn end_main(&mut self) -> bool {
+        if self.seek || !self.pending.is_empty() {
+            return false;
+        }
+        self.main = None;
+        self.stalled = false;
+        true
+    }
+
     pub(super) fn stalled(&self) -> bool {
         self.stalled
     }

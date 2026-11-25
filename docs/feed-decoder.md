@@ -93,9 +93,10 @@ lost output (another copy's, written to its output): the range leaves `lost`, it
 more keeps the rest, decoding to its restart and writing only what is still lost), and its CRC joins the member's, so
 the member reaches `done` with `crc_ok` without the missing packed bytes and without reading output back. It also
 takes the rest from the frontier of a main decode waiting at a hole (stored layers go on after it; under AES-CBC it
-ends on a 16-byte block or the member's end; a compressed RAR 5.0 member is filled to its end). Bytes are taken as
-given (a wrong one is `crc_ok: Some(false)`); run again for fresh needs. 7z LZMA2 and ZIP Deflate repairs are refused
-(`FeedError::FillLost`) for now.
+ends on a 16-byte block or the member's end; a compressed RAR 5.0 member is filled to its end). RAR 4.x and 7z LZMA2,
+which wait at holes, take the rest from the frontier to the member's end. Bytes are taken as given (a wrong one is
+`crc_ok: Some(false)`); run again for fresh needs. ZIP Deflate, and lost ranges inside RAR 4.x and 7z LZMA2 members, are
+refused (`FeedError::FillLost`) for now.
 
 **A seeded restart that disagrees.** After a skip, the output decoded from the seeded restart is checked against the
 held output; a mismatch (a filter the search did not see, a false restart, held output that differs) abandons that

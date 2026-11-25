@@ -78,6 +78,14 @@ impl Rar4 {
         self.dictionary
     }
 
+    /// Ends the main decode: the caller holds the output from its frontier to the member's end.
+    pub(super) fn end_main(&mut self, size: u64) {
+        self.dec = None;
+        self.stalled = false;
+        self.out = size;
+        self.write_from = self.write_from.max(size);
+    }
+
     pub(super) fn stalled(&self) -> bool {
         self.stalled
     }
