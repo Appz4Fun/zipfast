@@ -72,6 +72,20 @@ enum Abandoned {
     Over,
 }
 
+/// A skip target whose search ran out of work at a hole. Tried again with the same packed bytes it would spend the
+/// same work and stop at the same place, so it waits until twice as many are held; one that runs out twice at the
+/// same place is dropped for good.
+#[derive(Clone, Copy)]
+struct Exhausted {
+    target: u64,
+    /// packed bytes held when it ran out
+    held: usize,
+    /// how far back the search had got (`NearError::Exhausted::lowest`)
+    lowest: usize,
+    /// times it ran out at `lowest`
+    times: u32,
+}
+
 /// What a RAR 5.0 skip attempt read at a hole: the held output past the frontier, the decrypted packed bytes after
 /// the hole with the lane positioned after them, and the window before the frontier.
 struct SkipCache {
@@ -81,9 +95,8 @@ struct SkipCache {
     packed: Vec<u8>,
     lane: Lane,
     window: Vec<u8>,
-    /// targets whose search ran out of work at this hole, with the packed bytes held then: tried again with the same
-    /// bytes they would spend the same work and stop at the same place, so they wait until twice as many are held
-    exhausted: Vec<(u64, usize)>,
+    /// targets whose search ran out of work at this hole: see [`Exhausted`]
+    exhausted: Vec<Exhausted>,
 }
 
 pub(super) struct Rar5 {
@@ -974,14 +987,10 @@ impl FeedDecoder {
         let grown = |held: usize, after: usize| {
             (held != usize::MAX && donor.len() > held) || tried.2 >= after.saturating_mul(2).min(after + (4 << 20))
         };
-        let keep = |r: &mut Rar5,
-                    donor: Vec<u8>,
-                    packed: Vec<u8>,
-                    lane: Lane,
-                    window: Vec<u8>,
-                    exhausted: Vec<(u64, usize)>| {
-            r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window, exhausted });
-        };
+        let keep =
+            |r: &mut Rar5, donor: Vec<u8>, packed: Vec<u8>, lane: Lane, window: Vec<u8>, exhausted: Vec<Exhausted>| {
+                r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window, exhausted });
+            };
         if r.skip_failed.is_some_and(|(end, held, after)| end == hole_end && !grown(held, after)) {
             r.skip_exhausted = full;
             keep(r, donor, packed, lane, window, exhausted);
@@ -1021,13 +1030,12 @@ impl FeedDecoder {
         if r.abandons > 0 {
             targets.reverse();
         }
-        // a target that ran out of work is tried again only once twice the packed bytes are held
-        let tried_out = |exhausted: &[(u64, usize)], target: u64| {
-            exhausted.iter().any(|&(t, held)| t == target && packed.len() < held.saturating_mul(2))
+        let tried_out = |exhausted: &[Exhausted], target: u64| {
+            exhausted.iter().any(|e| e.target == target && (e.times >= 2 || packed.len() < e.held.saturating_mul(2)))
         };
-        // One attempt spends at most SKIP_WORK across all its targets, each an equal share of what is left (so a
-        // target that runs out does not starve the others).
-        let mut work_left = SKIP_WORK;
+        // Each target searched gets a whole SKIP_WORK (less finds nothing on real sets); an attempt spends at most
+        // four of them, a guarded one (past an abandoned restart, which has never pinned on filtered stretches) one.
+        let mut work_left = if r.abandons > 0 { SKIP_WORK } else { 4 * SKIP_WORK };
         let mut i = 0;
         while i < targets.len() && work_left > 0 {
             let target = targets[i];
@@ -1035,9 +1043,7 @@ impl FeedDecoder {
             if target <= at || tried_out(&exhausted, target) {
                 continue;
             }
-            let remaining =
-                targets[i - 1..].iter().filter(|&&t| t > at && !tried_out(&exhausted, t)).count().max(1) as u64;
-            let share = (work_left / remaining).max(SKIP_WORK / 16);
+            let share = SKIP_WORK.min(work_left);
             if self.options.control.is_canceled() {
                 return Err(FeedError::Canceled);
             }
@@ -1065,9 +1071,15 @@ impl FeedDecoder {
                     break;
                 }
                 Ok(near) => work_left = work_left.saturating_sub(near.work.max(1)),
-                Err(NearError::Exhausted { .. }) => {
-                    exhausted.retain(|&(t, _)| t != target);
-                    exhausted.push((target, packed.len()));
+                Err(NearError::Exhausted { lowest }) => {
+                    match exhausted.iter_mut().find(|e| e.target == target) {
+                        Some(e) if e.lowest == lowest => {
+                            e.times += 1;
+                            e.held = packed.len();
+                        }
+                        Some(e) => *e = Exhausted { target, held: packed.len(), lowest, times: 1 },
+                        None => exhausted.push(Exhausted { target, held: packed.len(), lowest, times: 1 }),
+                    }
                     work_left = work_left.saturating_sub(share);
                 }
                 // what a search that found nothing spent is not reported: charge its share, keeping the bound
