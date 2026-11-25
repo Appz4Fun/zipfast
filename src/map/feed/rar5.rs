@@ -851,6 +851,12 @@ impl FeedDecoder {
     ) -> Result<Abandoned, FeedError> {
         r.base = origin.clone();
         r.skip_exhausted = false;
+        // repairs of holes skipped since then start from checkpoints of the abandoned seeded decode: they decode from
+        // the trusted checkpoint instead (to the same restart, writing only their own lost output)
+        for rep in r.repairs.iter_mut().filter(|x| x.from.packed > origin.packed) {
+            rep.from = origin.clone();
+            rep.blocked = None;
+        }
         if let Some((dec, lane)) = self.skip_hole(r, r.fed, r.fed, source, sink)? {
             return Ok(Abandoned::Restart(dec, lane));
         }
@@ -1102,7 +1108,9 @@ impl FeedDecoder {
         let until_out = restart.output_offset - s0;
         // Repairs never overlap, so no output byte is written twice: output an earlier repair already covers (a
         // hole skipped again after a restore) is left to it.
-        let origin = r.base.clone();
+        // the trusted checkpoint an abandon repairs from: the one before the first hole skipped while an earlier
+        // seeded restart is still being checked (not this seeded state)
+        let origin = r.seeded_skip.as_ref().map_or_else(|| r.base.clone(), |(o, _)| o.clone());
         let mut from_out = out_h;
         for x in &r.repairs {
             if x.lost.start <= from_out && from_out < x.lost.end {

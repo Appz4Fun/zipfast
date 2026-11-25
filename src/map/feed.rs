@@ -1096,7 +1096,10 @@ impl FeedDecoder {
         // Output from the main decode's frontier on (it waits at a hole the caller holds the rest past): the main
         // decode goes on after the range (stored layers) or is over (to the member's end).
         let frontier = self.status.frontier;
-        let ahead = !self.status.done && frontier < self.size && range.start == frontier && range.end <= self.size;
+        // only while a main decode still runs: once it is over (a RAR 5.0 repair to the end took the rest), the
+        // frontier no longer marks what is unwritten, and the fill must lie in lost output
+        let live = self.main.is_some() || self.lzma2.as_ref().is_some_and(|l| !l.done());
+        let ahead = live && frontier < self.size && range.start == frontier && range.end <= self.size;
         // RAR 4.x and 7z LZMA2 wait at holes rather than skip them: the rest from the frontier ends their main decode
         // (their repairs, ZIP Deflate's too, are not retired yet).
         let waiting_layer = self.lzma2.is_some() || self.rar4.is_some();
