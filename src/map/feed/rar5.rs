@@ -857,11 +857,14 @@ impl FeedDecoder {
         let held_max = (self.size - out_h).min(DONOR_MAX);
         // Held output is read in two steps: enough to know a skip is worth trying, then (below) only as far as the
         // packed bytes read after the hole can reach, not up to DONOR_MAX.
+        // whether the sink held less than was asked for: only then can more held output later make a retry worth it
+        let mut held_short = false;
         let mut extend = |donor: &mut Vec<u8>, to: u64| {
             let to = to.min(held_max);
             if (donor.len() as u64) < to {
                 let more = read_some(sink, out_h + donor.len() as u64, to - donor.len() as u64);
                 donor.extend_from_slice(&more);
+                held_short |= (donor.len() as u64) < to;
             }
         };
         extend(&mut donor, DONOR_MIN);
@@ -934,9 +937,14 @@ impl FeedDecoder {
             },
         };
         // a search that failed is tried again only once more is held: output past the frontier or packed bytes
-        let tried = (hole_end, donor.len(), packed.len());
-        let grown =
-            |held: usize, after: usize| tried.1 > held || tried.2 >= after.saturating_mul(2).min(after + (4 << 20));
+        // A failed search is tried again only once more is held: packed bytes after the hole (twice as many, or 4 MiB
+        // more), or held output past what the sink lacked last time. Held output read further because more packed
+        // bytes reach further is not new: counting it would search again on every article.
+        let held_mark = if held_short { donor.len() } else { usize::MAX };
+        let tried = (hole_end, held_mark, packed.len());
+        let grown = |held: usize, after: usize| {
+            (held != usize::MAX && donor.len() > held) || tried.2 >= after.saturating_mul(2).min(after + (4 << 20))
+        };
         let keep = |r: &mut Rar5, donor: Vec<u8>, packed: Vec<u8>, lane: Lane, window: Vec<u8>| {
             r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window });
         };
@@ -981,7 +989,9 @@ impl FeedDecoder {
             let estimate = (((target - at) as f64 / ratio) as u64).saturating_sub(hole_len);
             let options = NearOptions {
                 estimate: Some(estimate.min(packed.len() as u64) as usize),
-                guard: false,
+                // after a seeded restart went wrong (a filter the search did not see), only a guarded restart: checked
+                // from a filter's reach before it, so no filter declared earlier covers what it decodes
+                guard: r.abandons > 0,
                 work: SKIP_WORK,
                 ..NearOptions::default()
             };
