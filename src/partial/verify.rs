@@ -88,6 +88,15 @@ impl BlakeFrontier {
         ranges.dedup();
         ranges
     }
+    /// Gives the ledger budget back before a write's own reservations when it runs short (under a quarter free):
+    /// unfinished runs are dropped (their ranges are read back when verified); finished digests hold no budget.
+    pub(super) fn yield_budget(&mut self, budget: &PartialBudget) {
+        let (room, limit) = budget.room(PartialResource::LedgerBytes);
+        if room < limit / 4 {
+            self.runs.retain(|run| run.hash.is_ok());
+        }
+    }
+
     /// Follows a write for the ranges [`Self::refresh`] built.
     pub(super) fn feed_checked(&mut self, offset: u64, bytes: &[u8], budget: &PartialBudget) {
         let ranges = std::mem::take(&mut self.ranges);
@@ -138,9 +147,14 @@ impl BlakeFrontier {
     fn begin(&mut self, range: &Range<u64>, piece: &[u8], budget: &PartialBudget) {
         let at = range.start + piece.len() as u64;
         // The hasher and the run's slot are charged as a read-back's hasher is; refused, the range is read back.
+        // The cache never takes the ledger's second half: a run begins only if half is still free after it.
         let lease = if at == range.end {
             None
         } else {
+            let (room, limit) = budget.room(PartialResource::LedgerBytes);
+            if room < BLAKE_STORAGE.saturating_add(limit / 2) {
+                return;
+            }
             match budget.reserve(PartialResource::LedgerBytes, BLAKE_STORAGE) {
                 Ok(lease) => Some(lease),
                 Err(_) => return,

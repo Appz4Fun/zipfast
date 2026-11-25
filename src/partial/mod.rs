@@ -1128,6 +1128,8 @@ impl PartialCore {
         })
     }
     fn write_data(&self, op: &mut CoreData, offset: u64, bytes: &[u8], mode: FillMode) -> PartialResult<Written> {
+        // the BLAKE2sp cache is optional: it steps aside before this write's own reservations when the ledger runs short
+        op.blake.yield_budget(&self.budget);
         let alternate = mode != FillMode::Original;
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
@@ -1380,6 +1382,7 @@ impl PartialCore {
         // Packed joins a group only from `fill_packed_grouped`, over output that is all holes (no correction).
         debug_assert!(matches!(mode, FillMode::Original | FillMode::Alt | FillMode::Packed));
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
+        op.blake.yield_budget(&self.budget);
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
         if end > op.snapshot.head.size || self.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));

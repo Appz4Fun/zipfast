@@ -213,6 +213,34 @@ fn a_read_back_continuing_a_run_takes_over_its_budget() {
     assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
     drop(hogs);
 }
+/// Codex review of #284: the optional cache gives the ledger back before a write's own reservations when the budget
+/// runs short, so it never makes a fill fail; the evicted ranges are read back when verified.
+#[test]
+fn unfinished_blake_runs_step_aside_when_a_write_needs_the_ledger() {
+    let f = Fixture::new(65_537, true, false, true);
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
+    let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
+    f.hole(&file, 0..65_537);
+    f.finish_missing_member(&file);
+    file.fill(40_000, &f.data[40_000..50_000]).unwrap();
+    file.fill(0, &f.data[..30_000]).unwrap();
+    let unfinished =
+        |file: &PartialFile| file.core.operation().unwrap().blake.runs.iter().filter(|r| r.hash.is_err()).count();
+    assert!(unfinished(&file) > 0, "runs follow the in-order prefix");
+    // Leave under a quarter of the ledger free, then write: the runs give their budget back first.
+    let budget = &file.core.budget;
+    let (_, limit) = budget.room(PartialResource::LedgerBytes);
+    let mut hogs = Vec::new();
+    while budget.room(PartialResource::LedgerBytes).0 > limit / 5 {
+        hogs.push(budget.reserve(PartialResource::LedgerBytes, limit / 64).unwrap());
+    }
+    file.fill(30_000, &f.data[30_000..40_000]).unwrap();
+    assert_eq!(unfinished(&file), 0, "evicted before the write's reservations");
+    drop(hogs);
+    file.fill(50_000, &f.data[50_000..]).unwrap();
+    let Verdict::Ok { parts, .. } = drive(&mut file) else { panic!("verifies by read-back") };
+    assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
+}
 /// Emulates a reopened handle: no hash was kept while writing, so BLAKE2sp checks read the output back.
 fn forget_blake(file: &PartialFile) {
     file.core.operation().unwrap().blake = Default::default();
