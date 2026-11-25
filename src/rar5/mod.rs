@@ -387,26 +387,51 @@ impl UnixOwner {
         self.user.as_ref().map_or(0, Vec::capacity) + self.group.as_ref().map_or(0, Vec::capacity)
     }
 
-    /// Parses the record body after its type. Flags: 0x1 user name, 0x2 group name, 0x4 numeric user id, 0x8 numeric
-    /// group id, in that order; each name is a length then the bytes.
-    fn parse(r: &mut Cursor<'_>) -> Result<Self> {
+    /// Parses the record body after its type, borrowing the names. Flags: 0x1 user name, 0x2 group name, 0x4
+    /// numeric user id, 0x8 numeric group id, in that order; each name is a length then the bytes.
+    fn parse_borrowed<'a>(r: &mut Cursor<'a>) -> Result<RawOwner<'a>> {
         let flags = r.vint()?;
-        let mut owner = Self::default();
-        if flags & 0x1 != 0 {
+        let name = |bit: u64, r: &mut Cursor<'a>| -> Result<Option<&'a [u8]>> {
+            if flags & bit == 0 {
+                return Ok(None);
+            }
             let len = r.vsize()?;
-            owner.user = Some(r.bytes(len)?.to_vec());
+            Ok(Some(r.bytes(len)?))
+        };
+        let user = name(0x1, r)?;
+        let group = name(0x2, r)?;
+        let uid = if flags & 0x4 != 0 { Some(r.vint()?) } else { None };
+        let gid = if flags & 0x8 != 0 { Some(r.vint()?) } else { None };
+        Ok(RawOwner { user, group, uid, gid })
+    }
+
+    /// Parses the record body after its type.
+    #[cfg(test)]
+    fn parse(r: &mut Cursor<'_>) -> Result<Self> {
+        Self::parse_borrowed(r).map(RawOwner::owned)
+    }
+}
+
+/// A Unix owner record as parsed, its names still borrowed from the header bytes.
+struct RawOwner<'a> {
+    user: Option<&'a [u8]>,
+    group: Option<&'a [u8]>,
+    uid: Option<u64>,
+    gid: Option<u64>,
+}
+
+impl RawOwner<'_> {
+    fn name_bytes(&self) -> u64 {
+        (self.user.map_or(0, <[u8]>::len) + self.group.map_or(0, <[u8]>::len)) as u64
+    }
+
+    fn owned(self) -> UnixOwner {
+        UnixOwner {
+            user: self.user.map(<[u8]>::to_vec),
+            group: self.group.map(<[u8]>::to_vec),
+            uid: self.uid,
+            gid: self.gid,
         }
-        if flags & 0x2 != 0 {
-            let len = r.vsize()?;
-            owner.group = Some(r.bytes(len)?.to_vec());
-        }
-        if flags & 0x4 != 0 {
-            owner.uid = Some(r.vint()?);
-        }
-        if flags & 0x8 != 0 {
-            owner.gid = Some(r.vint()?);
-        }
-        Ok(owner)
     }
 }
 
@@ -854,7 +879,18 @@ fn parse_file_extra(
                 f.sub_data.try_reserve_exact(data.len()).map_err(|_| FileParseError::Allocation)?;
                 f.sub_data.extend_from_slice(data);
             }
-            FHEXTRA_UOWNER => f.owner = UnixOwner::parse(&mut r).ok(),
+            FHEXTRA_UOWNER => {
+                // Informational: a malformed record leaves no owner. The names are charged to a progressive
+                // session's metadata budget before they are copied out.
+                if let Ok(raw) = UnixOwner::parse_borrowed(&mut r) {
+                    if let Some(usage) = usage {
+                        usage
+                            .charge(crate::progressive::Resource::MetadataBytes, raw.name_bytes())
+                            .map_err(FileParseError::Progressive)?;
+                    }
+                    f.owner = Some(raw.owned());
+                }
+            }
             // service data of other passes and anything newer are skipped
             _ => {}
         }
@@ -969,6 +1005,29 @@ mod owner_tests {
         assert_eq!((owner.uid, owner.gid), (Some(1000), Some(100)));
         let ids = parse(&[0x0c, 0, 0]).unwrap();
         assert_eq!((ids.user, ids.group, ids.uid, ids.gid), (None, None, Some(0), Some(0)));
+    }
+
+    /// A progressive session charges the decoded names to its metadata budget, before copying them out.
+    #[test]
+    fn owner_names_are_charged_to_a_progressive_metadata_budget() {
+        use crate::progressive::{ProgressiveLimits, Resource, Usage};
+        let mut record = vec![0x06, 0x03, 100];
+        record.extend([b'u'; 100]);
+        record.push(100);
+        record.extend([b'g'; 100]);
+        let mut extra = vec![0x80 | (record.len() & 0x7f) as u8, (record.len() >> 7) as u8];
+        extra.extend(&record);
+        let tight = Usage::new(ProgressiveLimits { metadata_bytes: 150, ..ProgressiveLimits::default() });
+        let mut f = super::FileHeader::default();
+        assert!(matches!(
+            super::parse_file_extra(&mut f, &extra, false, Some(&tight)),
+            Err(super::FileParseError::Progressive(_))
+        ));
+        let ample = Usage::new(ProgressiveLimits::default());
+        let mut f = super::FileHeader::default();
+        assert!(super::parse_file_extra(&mut f, &extra, false, Some(&ample)).is_ok());
+        assert_eq!(f.owner.as_ref().and_then(|o| o.user.as_ref()).map(Vec::len), Some(100));
+        assert_eq!(ample.used(Resource::MetadataBytes), 200);
     }
 
     #[test]
