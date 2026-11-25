@@ -1128,7 +1128,32 @@ impl FeedDecoder {
                 if matches!(self.cipher, StoredCipher::Cbc { .. }) && !range.end.is_multiple_of(16) {
                     return Err(FeedError::FillLost("under AES-CBC a fill ahead ends on a 16-byte block"));
                 }
-                self.main = Some(self.lane_at(range.end, self.size));
+                // Under CBC the block after the range needs the range's last ciphertext block as its IV. When the
+                // main lane knows its chaining value at the frontier, encrypting the filled plaintext gives that block
+                // exactly, so nothing inside the retired range is asked for again; otherwise the lane reads it.
+                let chained = match (&self.cipher, self.main.as_ref()) {
+                    (StoredCipher::Cbc { aes, .. }, Some(lane))
+                        if lane.next == range.start && lane.pos == range.start && lane.rem.is_empty() =>
+                    {
+                        lane.iv.map(|iv| {
+                            bytes.as_chunks::<16>().0.iter().fold(iv, |prev, block| {
+                                let mut x = [0u8; 16];
+                                for (o, (p, c)) in x.iter_mut().zip(block.iter().zip(prev)) {
+                                    *o = p ^ c;
+                                }
+                                aes.encrypt_block(&x)
+                            })
+                        })
+                    }
+                    _ => None,
+                };
+                let mut lane = self.lane_at(range.end, self.size);
+                if let Some(iv) = chained {
+                    lane.pos = range.end;
+                    lane.iv = Some(iv);
+                    lane.rem.clear();
+                }
+                self.main = Some(lane);
             } else {
                 self.main = None;
                 if let Some(r) = self.rar5.as_mut() {

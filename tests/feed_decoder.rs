@@ -1272,3 +1272,44 @@ fn a_decoder_waiting_after_an_abandoned_restart_always_names_a_need_and_finishes
         assert_eq!(sink.out, feed.plain, "{encrypted} {held_to}");
     }
 }
+
+/// Codex review of #288: a block-aligned fill ahead under AES-CBC carries the chaining value over (the filled
+/// plaintext encrypted with the key gives the range's last ciphertext block), so the decoder never asks again for
+/// ciphertext inside the range it retired, even when those bytes stay lost.
+#[test]
+fn a_cbc_fill_ahead_keeps_the_chaining_value() {
+    let case = &cases()[1]; // RAR 5.0 AES stored
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+    let member = &map.members[0];
+    let size = case.plain.len() as u64;
+    let insert = |source: &mut ArticleBuffer, stream: std::ops::Range<u64>| {
+        for span in member.packed_spans(stream).unwrap() {
+            let bytes = &case.volumes[span.volume as usize][span.packed.start as usize..span.packed.end as usize];
+            source.insert(span.volume, span.packed.start, bytes).unwrap();
+        }
+    };
+    let mut decoder = FeedDecoder::new(&map, 0, all_needs(case.password)).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    let mut sink = Once::default();
+    // the ciphertext of 0..4096 exactly: the main decode stops on a block boundary, knowing its chaining value
+    for span in member.packed_spans(0..4096).unwrap() {
+        let end = span.packed.end.min(span.packed.start + (4096 - span.stream.start.min(4096)));
+        let bytes = &case.volumes[span.volume as usize][span.packed.start as usize..end as usize];
+        source.insert(span.volume, span.packed.start, bytes).unwrap();
+    }
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert_eq!(status.frontier, 4096, "{status:?}");
+    // the other copy's plaintext for 4096..8192
+    sink.write_at(4096, &case.plain[4096..8192]).unwrap();
+    decoder.fill_lost(4096..8192, &case.plain[4096..8192]).unwrap();
+    // this copy's ciphertext for that range never comes; everything after it does
+    for span in member.packed_spans(4096..8192).unwrap() {
+        source.mark_lost(span.volume, span.packed.clone());
+    }
+    // packed_spans under CBC start one block early (the IV): asking from 8208 gives the ciphertext from 8192 on, so
+    // the block before it (8176..8192, inside the retired range) is never supplied
+    insert(&mut source, 8208..size);
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert!(status.done && status.lost.is_empty() && status.crc_ok == Some(true), "{status:?}");
+    assert_eq!(sink.out, case.plain);
+}
