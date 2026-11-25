@@ -35,6 +35,7 @@ fn additive_context_keeps_legacy_options() {
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     };
     let _ = EncryptedReadContext::new(EncryptedReadOptions::default()).unwrap();
 }

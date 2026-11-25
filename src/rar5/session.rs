@@ -81,11 +81,21 @@ pub struct RarSessionOptions {
     /// Follow the end header's "more volumes" mark to later volumes (the default). With false the session holds
     /// only the named volume, as UnRAR's `l` does without `-v`: a member split past it is catalogued as incomplete.
     pub follow_volumes: bool,
+    /// Opened at a later volume whose first member continues from an earlier one, start the catalogue at the set's
+    /// first volume instead, as UnRAR 7.30 does for `x`/`t` from a later volume, when every volume back to one that
+    /// starts no continued member exists and opens (otherwise the named volume, as before).
+    /// [`RarSession::restarted_from`] says where it started. Off by default.
+    pub restart_from_first_volume: bool,
 }
 
 impl Default for RarSessionOptions {
     fn default() -> Self {
-        Self { limits: RarCatalogueLimits::default(), cancel: Cancellation::default(), follow_volumes: true }
+        Self {
+            limits: RarCatalogueLimits::default(),
+            cancel: Cancellation::default(),
+            follow_volumes: true,
+            restart_from_first_volume: false,
+        }
     }
 }
 
@@ -747,9 +757,23 @@ pub struct RarSession {
     options: RarSessionOptions,
     token: Arc<selection::SessionToken>,
     invalid_binding: Option<Arc<RarFailure>>,
+    restarted_from: Option<PathBuf>,
+    members_before_named: u64,
 }
 
 impl RarSession {
+    /// The earlier volume the catalogue started at instead of the one named, with
+    /// [`RarSessionOptions::restart_from_first_volume`]; None when it started at the named volume.
+    pub fn restarted_from(&self) -> Option<&Path> {
+        self.restarted_from.as_deref()
+    }
+
+    /// How many members start in the volumes before the one named, after a restart (0 without one): UnRAR's
+    /// listing positions, which count from the volume named, are the catalogue's positions minus this.
+    pub fn members_before_named(&self) -> u64 {
+        self.members_before_named
+    }
+
     /// Read the volume headers and check their source binding. Member
     /// payloads are neither decoded nor checked by catalogue construction.
     #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
@@ -783,6 +807,17 @@ impl RarSession {
         options: RarSessionOptions,
         _output: Option<&File>,
     ) -> Result<Self, RarRunError> {
+        let restarted_from = if options.restart_from_first_volume && options.follow_volumes {
+            crate::extract::restart_volume(first, password)
+        } else {
+            None
+        };
+        let members_before_named = restarted_from
+            .as_deref()
+            .and_then(|from| crate::extract::members_before(from, first, password))
+            .unwrap_or(0);
+        let start = restarted_from.clone();
+        let first = start.as_deref().unwrap_or(first);
         let mut catalogue = Catalogue {
             session: Self {
                 archive: RarArchiveMetadata::default(),
@@ -796,6 +831,8 @@ impl RarSession {
                 options: options.clone(),
                 token: Arc::new(selection::SessionToken { _private: 0 }),
                 invalid_binding: None,
+                restarted_from,
+                members_before_named,
             },
             options,
             owned_capacity: 0,

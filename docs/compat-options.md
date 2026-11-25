@@ -1,6 +1,6 @@
 # 7-Zip and UnRAR compatibility options
 
-Six fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
+Seven fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
 `7z` and `unrar` modes) get their behaviour where zipfast's own default differs. Every default keeps zipfast's
 behaviour, so a caller that sets them to `Default::default()` (or `None`) sees no change.
 
@@ -13,6 +13,7 @@ compressed_tar: Default::default(),
 version_naming: Default::default(),
 preexisting_links: Default::default(),
 refused_link_placeholder: false,
+restart_from_first_volume: false,
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -148,3 +149,16 @@ failure for encrypted headers):
 The first sign in a folder decides for every later member of it. On the checked dispatcher the member's error is
 `ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes, seven_zip: Some(failure) }`; ZIP's own password failures
 have `seven_zip: None`. `EncryptedFailure::seven_zip_message()` returns 7-Zip's text.
+
+## Starting from a later RAR volume
+
+UnRAR 7.30 `x`/`t` given a later volume (`multi.part2.rar`, `name.r00`) whose first member continues from an earlier
+one starts over at the set's first volume when every volume back to it exists and opens, and extracts everything;
+with a volume missing in between it extracts what starts in the given and later volumes and reports the continued
+member as needing a previous volume (`RarSkipReason::MissingStart`). The whole-archive runners (`extract::run`,
+`run_rar_with_outcomes` and the dispatchers) do it with `Options::restart_from_first_volume`, and a `RarSession` when
+opened with `RarSessionOptions::restart_from_first_volume`. Both are off by default: the run starts at the volume given
+and walks forward only, as 7-Zip 26.06 does (`7z x multi.part2.rar` reports file2 as a data error, extracts file3 and
+never opens part1). With the session option, `RarSession::restarted_from()` then names the volume it started at
+(None when it started at the one given). A selection by listing position (`MemberRef::ordinal`) counts from the
+volume given, as UnRAR's listing of that volume does; a session restarted at the first volume lists from there.

@@ -300,6 +300,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             version_naming: Default::default(),
                             preexisting_links: Default::default(),
                             refused_link_placeholder: false,
+                            restart_from_first_volume: false,
                         },
                         Some("password"),
                         |_| {},

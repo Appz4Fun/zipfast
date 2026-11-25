@@ -2555,6 +2555,7 @@ mod tests {
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
                 refused_link_placeholder: false,
+                restart_from_first_volume: false,
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);
@@ -2616,6 +2617,7 @@ mod tests {
                 version_naming: Default::default(),
                 preexisting_links: Default::default(),
                 refused_link_placeholder: false,
+                restart_from_first_volume: false,
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);

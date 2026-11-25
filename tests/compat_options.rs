@@ -67,6 +67,7 @@ fn options(mode: Mode, dest: &Path) -> Options {
         version_naming: VersionNaming::Semicolon,
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     }
 }
 
@@ -447,6 +448,7 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
         version_naming: VersionNaming::SevenZipDir,
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
         ..options(Mode::Extract, dest)
     };
     let out = tmp.path().join("seven");
@@ -478,6 +480,7 @@ fn r5extra_comes_out_as_7zip_writes_it() {
         version_naming: VersionNaming::SevenZipDir,
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
         ..options(Mode::Extract, &out)
     };
     extract::run(&fixture("rar5-compat", "r5extra.rar"), &opts, |_| {}).unwrap();

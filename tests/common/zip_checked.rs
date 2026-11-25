@@ -72,6 +72,7 @@ pub fn options(dest: &Path, extract: bool) -> zipfast::extract::Options {
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     }
 }
 

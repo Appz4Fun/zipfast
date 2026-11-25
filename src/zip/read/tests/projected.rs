@@ -1685,6 +1685,7 @@ fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     };
     for case in 0..6 {
         let cancel = Cancellation::default();
@@ -1792,6 +1793,7 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     };
     for supplied_context in [false, true] {
         OBSERVATIONS.with(|s| s.set(Default::default()));
