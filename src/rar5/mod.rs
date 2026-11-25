@@ -382,6 +382,11 @@ pub struct UnixOwner {
 }
 
 impl UnixOwner {
+    /// Heap bytes the names hold (a catalogue charges them for each header copy it keeps).
+    pub(crate) fn heap_capacity(&self) -> usize {
+        self.user.as_ref().map_or(0, Vec::capacity) + self.group.as_ref().map_or(0, Vec::capacity)
+    }
+
     /// Parses the record body after its type. Flags: 0x1 user name, 0x2 group name, 0x4 numeric user id, 0x8 numeric
     /// group id, in that order; each name is a length then the bytes.
     fn parse(r: &mut Cursor<'_>) -> Result<Self> {
