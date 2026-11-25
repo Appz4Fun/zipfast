@@ -401,8 +401,8 @@ its decoder (`resume_solid` from the stored `SolidCarry`, or `restore` from the 
 Output the earlier members hold stays the plaintext they wrote; a carry from a member that skipped a hole is
 `unproven` as before, and the successor stays unproven until its own CRC matches.
 
-**Verification.** `poll_verify` combines the CRC32 of the known leaves and reads back BLAKE2sp, as for any member,
-and returns `Verdict::Ok` once every byte is known and every check the map recorded passes; until then
+**Verification.** `poll_verify` combines the CRC32 of the known leaves and checks BLAKE2sp as for any member (see
+"Streaming BLAKE2sp" below), and returns `Verdict::Ok` once every byte is known and every check the map recorded passes; until then
 `Incomplete`, with the unknown ranges as `holes`. A direct member needs no canonical finish: its checks came from the
 map. A member whose map records no check stays `Incomplete { missing_checks: true }`. Checks keyed with the
 password (RAR 5.0 encrypted members) need `DirectOptions::password` (or `PartialOpenContext::password` on reopen);
@@ -471,3 +471,20 @@ back after reopen; a member whose handles are dropped mid-feed and a process abo
 open, both resumed from a decoder snapshot taken at a commit, with lost articles repaired late: exact output,
 `Verdict::Ok`, nothing durable written again, the genesis and commit syncs; a 40 MB member born with the same state
 as a 100 KB one; 40 members held open with `for_members`, the defaults refusing; a wrong byte verifying `Bad`).
+
+## Streaming BLAKE2sp
+
+BLAKE2sp cannot be combined from pieces the way CRC32 leaves are, so `poll_verify` used to read a BLAKE2sp member
+back in full. Now every write into a handle's output (the session's extraction, `fill`, a `FillWriter`, refills)
+also feeds a hash for each range a BLAKE2sp check covers (each part's, the member's), following writes that
+continue that range in order from its start; a range that reaches its end keeps only the digest. So:
+
+- output written in order (an extraction with no holes, or holes filled before anything after them) verifies with
+  no read-back at all (`VerifyPath::ExtentCombine`);
+- output written out of order (a hole filled after later bytes arrived) reads back only from the first byte that
+  arrived ahead of the in-order prefix to the range's end (`VerifyPath::TargetedReadback`);
+- a write inside a range already hashed (a correction) drops that range's hash, which is then read back in full.
+
+The hashes live in memory with the handle: a handle reopened after a restart (`PartialFile::open`) reads back as
+before (`VerifyPath::ReopenRehash` / `WholeReadback`). Each costs about 1 KiB per checked range while it runs.
+

@@ -83,19 +83,92 @@ fn crc_verdict_distinguishes_part_and_member_scope() {
         }
     }
 }
+/// Output written in order is hashed as it lands: verifying its BLAKE2sp reads nothing back (RustyGet: the check at
+/// download end no longer re-reads the member).
 #[test]
-fn blake_verification_uses_readback() {
+fn blake_of_output_written_in_order_verifies_without_readback() {
+    use crate::progressive::Resource;
     let f = Fixture::new(65_537, true, false, true);
-    let limits = ProgressiveLimits { read_chunk: 4096, verify_bytes: 65_554, ..ProgressiveLimits::default() };
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
     let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
     f.hole(&file, 0..65_537);
     f.finish_missing_member(&file);
-    file.fill(0, &f.data).unwrap();
+    for (at, piece) in f.data.chunks(10_000).enumerate() {
+        file.fill(at as u64 * 10_000, piece).unwrap();
+    }
     let Verdict::Ok { path, parts, metadata, .. } = drive(&mut file) else { panic!("complete BLAKE must verify") };
-    assert_eq!(path, VerifyPath::WholeReadback);
+    assert_eq!(path, VerifyPath::ExtentCombine);
     assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
     assert!(matches!(metadata.modified, AttributeResult::Applied));
-    assert!(file.core.budget.usage.charge(crate::progressive::Resource::VerifyBytes, 1).is_err());
+    // The whole read-back budget is still there: nothing was read.
+    let cap = ProgressiveLimits::default().verify_bytes;
+    assert!(file.core.budget.usage.charge(Resource::VerifyBytes, cap).is_ok(), "no output was read back");
+}
+/// Output written out of order: the hash follows the prefix up to the first byte written ahead of it, and only the
+/// bytes past that point are read back.
+#[test]
+fn blake_reads_back_only_past_the_in_order_prefix() {
+    use crate::progressive::Resource;
+    let f = Fixture::new(65_537, true, false, true);
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
+    let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
+    f.hole(&file, 0..65_537);
+    f.finish_missing_member(&file);
+    // The tail lands first (a later article), then the head fills up to it.
+    file.fill(40_000, &f.data[40_000..]).unwrap();
+    file.fill(0, &f.data[..40_000]).unwrap();
+    let Verdict::Ok { path, parts, .. } = drive(&mut file) else { panic!("complete BLAKE must verify") };
+    assert_eq!(path, VerifyPath::TargetedReadback);
+    assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
+    let read = used(&file.core.budget.usage, Resource::VerifyBytes, ProgressiveLimits::default().verify_bytes);
+    assert_eq!(read, 65_537 - 40_000);
+}
+/// Wrong bytes written in order fail the BLAKE2sp check just as a read-back would.
+#[test]
+fn blake_frontier_still_fails_wrong_bytes() {
+    let f = Fixture::new(4_000, false, false, true);
+    let mut file = f.create();
+    f.hole(&file, 0..4_000);
+    f.finish_missing_member(&file);
+    let mut data = f.data.clone();
+    data[3_999] ^= 1;
+    file.fill(0, &data).unwrap();
+    assert!(matches!(drive(&mut file), Verdict::Bad { which: ChecksumAlgorithm::Blake2sp, .. }));
+}
+#[test]
+fn blake_frontier_follows_each_checked_range_in_order() {
+    use crate::partial::verify::BlakeFrontier;
+    let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+    let digest = |bytes: &[u8]| {
+        let mut h = crate::blake2sp::Blake2sp::new();
+        h.update(bytes);
+        h.finish()
+    };
+    let state = |f: &BlakeFrontier, r: std::ops::Range<u64>| {
+        f.run(&r).map(|run| (run.at, run.hash.as_ref().map(|d| *d).unwrap_or_else(|h| h.clone().finish())))
+    };
+    // A part check over 0..400, another over 400..1000, and the member check over 0..1000.
+    let ranges = [0..400, 0..1000, 400..1000];
+    let mut f = BlakeFrontier::default();
+    f.feed(&ranges, 100, &data[100..200]); // ahead of every start: nothing
+    assert!(f.runs.is_empty());
+    f.feed(&ranges, 0, &data[..100]);
+    f.feed(&ranges, 600, &data[600..700]); // ahead: ignored
+    f.feed(&ranges, 100, &data[100..500]); // crosses a part boundary: finishes 0..400, begins 400..1000
+    assert_eq!(state(&f, 0..400), Some((400, digest(&data[..400]))));
+    assert!(f.run(&(0..400)).unwrap().hash.is_ok(), "a finished run keeps only its digest");
+    assert_eq!(state(&f, 0..1000), Some((500, digest(&data[..500]))));
+    assert_eq!(state(&f, 400..1000), Some((500, digest(&data[400..500]))));
+    f.feed(&ranges, 450, &data[450..460]); // a correction inside 400..1000 and 0..1000
+    assert!(f.run(&(400..1000)).is_none() && f.run(&(0..1000)).is_none());
+    assert!(f.run(&(0..400)).is_some(), "a range the correction does not touch keeps its digest");
+    f.feed(&ranges, 0, &data[..10]); // a write at the start begins 0..400 and 0..1000 again
+    assert_eq!(state(&f, 0..400), Some((10, digest(&data[..10]))));
+    assert_eq!(state(&f, 0..1000), Some((10, digest(&data[..10]))));
+}
+/// Emulates a reopened handle: no hash was kept while writing, so BLAKE2sp checks read the output back.
+fn forget_blake(file: &PartialFile) {
+    file.core.operation().unwrap().blake = Default::default();
 }
 fn deferred(reopen: bool) {
     let f = Fixture::new(33, true, false, true);
@@ -140,6 +213,7 @@ fn changed_revision_invalidates_verify() {
     f.hole(&file, 0..33);
     f.finish_missing_member(&file);
     file.fill(0, &f.data[..17]).unwrap();
+    forget_blake(&file);
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     assert!(file.poll_verify(&mut cx).is_pending());
@@ -224,6 +298,7 @@ fn blake_readback_cap_is_exact_and_chunk_bounded() {
         f.hole(&file, 0..33);
         f.finish_missing_member(&file);
         file.fill(0, &f.data).unwrap();
+        forget_blake(&file);
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut polls = 0;
@@ -254,6 +329,7 @@ fn crc_combine_and_targeted_readback_report_actual_work() {
         f.hole(&file, 0..33);
         f.finish_missing_member(&file);
         file.fill(0, &f.data).unwrap();
+        forget_blake(&file);
         let Verdict::Ok { path, parts, .. } = drive(&mut file) else { panic!("verified") };
         assert_eq!(path, if targeted { VerifyPath::TargetedReadback } else { VerifyPath::ExtentCombine });
         assert_eq!(parts[1].blake2sp, CheckResult::Missing);

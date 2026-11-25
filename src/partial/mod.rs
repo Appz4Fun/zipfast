@@ -140,6 +140,8 @@ struct CoreData {
     cursor_pending: bool,
     /// Charge of the cursor bytes held in `snapshot`.
     cursor_lease: Option<Lease>,
+    /// BLAKE2sp of checked output ranges, hashed as they are written (see [`verify::BlakeFrontier`]).
+    blake: verify::BlakeFrontier,
 }
 /// A group of writes committed together. While it is open, `CoreData::state` is the anchored intent (the state
 /// before the group, conservatively), and `CoreData::snapshot` runs ahead of it with every grouped write: their
@@ -1311,6 +1313,8 @@ impl PartialCore {
             Err(error) => return Err(error),
         };
         let mut completed = 0usize;
+        let blake_ranges = verify::BlakeFrontier::ranges(&op.snapshot);
+        let mut blake = std::mem::take(&mut op.blake);
         let write = (|| {
             for range in &plan.unknown {
                 let mut at = range.start;
@@ -1328,6 +1332,9 @@ impl PartialCore {
                     if n == 0 {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
+                    if !blake_ranges.is_empty() {
+                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n]);
+                    }
                     completed += n;
                     at += n as u64;
                     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1336,6 +1343,7 @@ impl PartialCore {
             }
             Ok(())
         })();
+        op.blake = blake;
         let refresh = (|| {
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             tests::state::fault_post_write_stamp().map_err(|e| io_error(OutputOperation::Metadata, e))?;
@@ -1470,6 +1478,8 @@ impl PartialCore {
         }
         let intent = op.group.as_ref().unwrap().intent.anchor.clone();
         let mut completed = 0usize;
+        let blake_ranges = verify::BlakeFrontier::ranges(&op.snapshot);
+        let mut blake = std::mem::take(&mut op.blake);
         let write = (|| {
             for range in &plan.unknown {
                 let mut at = range.start;
@@ -1488,6 +1498,9 @@ impl PartialCore {
                     if n == 0 {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
+                    if !blake_ranges.is_empty() {
+                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n]);
+                    }
                     completed += n;
                     at += n as u64;
                     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1496,6 +1509,7 @@ impl PartialCore {
             }
             Ok(())
         })();
+        op.blake = blake;
         let refresh = (|| {
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             tests::state::fault_post_write_stamp().map_err(|e| io_error(OutputOperation::Metadata, e))?;
@@ -2759,6 +2773,7 @@ impl PartialCore {
                 group: None,
                 cursor_pending: false,
                 cursor_lease: None,
+                blake: verify::BlakeFrontier::default(),
             })),
             keys,
             keys_proven: AtomicBool::new(keys_proven),
@@ -3259,6 +3274,7 @@ impl PreparedCreate {
                 group: None,
                 cursor_pending: false,
                 cursor_lease: None,
+                blake: verify::BlakeFrontier::default(),
             })
         })()
         .map_err(|mut error: PartialError| {
