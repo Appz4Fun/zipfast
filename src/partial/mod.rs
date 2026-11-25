@@ -140,6 +140,8 @@ struct CoreData {
     cursor_pending: bool,
     /// Charge of the cursor bytes held in `snapshot`.
     cursor_lease: Option<Lease>,
+    /// BLAKE2sp of checked output ranges, hashed as they are written (see [`verify::BlakeFrontier`]).
+    blake: verify::BlakeFrontier,
 }
 /// A group of writes committed together. While it is open, `CoreData::state` is the anchored intent (the state
 /// before the group, conservatively), and `CoreData::snapshot` runs ahead of it with every grouped write: their
@@ -1126,6 +1128,8 @@ impl PartialCore {
         })
     }
     fn write_data(&self, op: &mut CoreData, offset: u64, bytes: &[u8], mode: FillMode) -> PartialResult<Written> {
+        // the BLAKE2sp cache is optional: it steps aside before this write's own reservations when the ledger runs short
+        op.blake.yield_budget(&self.budget);
         let alternate = mode != FillMode::Original;
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
@@ -1311,6 +1315,8 @@ impl PartialCore {
             Err(error) => return Err(error),
         };
         let mut completed = 0usize;
+        let mut blake = std::mem::take(&mut op.blake);
+        let hashing = blake.refresh(&op.snapshot);
         let write = (|| {
             for range in &plan.unknown {
                 let mut at = range.start;
@@ -1328,6 +1334,9 @@ impl PartialCore {
                     if n == 0 {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
+                    if hashing {
+                        blake.feed_checked(at, &bytes[(at - offset) as usize..][..n], &self.budget);
+                    }
                     completed += n;
                     at += n as u64;
                     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1336,6 +1345,7 @@ impl PartialCore {
             }
             Ok(())
         })();
+        op.blake = blake;
         let refresh = (|| {
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             tests::state::fault_post_write_stamp().map_err(|e| io_error(OutputOperation::Metadata, e))?;
@@ -1372,6 +1382,7 @@ impl PartialCore {
         // Packed joins a group only from `fill_packed_grouped`, over output that is all holes (no correction).
         debug_assert!(matches!(mode, FillMode::Original | FillMode::Alt | FillMode::Packed));
         self.budget.limits.check(PartialResource::FillBytes, bytes.len() as u64)?;
+        op.blake.yield_budget(&self.budget);
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(malformed)?;
         if end > op.snapshot.head.size || self.read_chunk == 0 {
             return Err(err(PartialErrorKind::InvalidOptions));
@@ -1470,6 +1481,8 @@ impl PartialCore {
         }
         let intent = op.group.as_ref().unwrap().intent.anchor.clone();
         let mut completed = 0usize;
+        let mut blake = std::mem::take(&mut op.blake);
+        let hashing = blake.refresh(&op.snapshot);
         let write = (|| {
             for range in &plan.unknown {
                 let mut at = range.start;
@@ -1488,6 +1501,9 @@ impl PartialCore {
                     if n == 0 {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
+                    if hashing {
+                        blake.feed_checked(at, &bytes[(at - offset) as usize..][..n], &self.budget);
+                    }
                     completed += n;
                     at += n as u64;
                     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1496,6 +1512,7 @@ impl PartialCore {
             }
             Ok(())
         })();
+        op.blake = blake;
         let refresh = (|| {
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             tests::state::fault_post_write_stamp().map_err(|e| io_error(OutputOperation::Metadata, e))?;
@@ -2759,6 +2776,7 @@ impl PartialCore {
                 group: None,
                 cursor_pending: false,
                 cursor_lease: None,
+                blake: verify::BlakeFrontier::default(),
             })),
             keys,
             keys_proven: AtomicBool::new(keys_proven),
@@ -3259,6 +3277,7 @@ impl PreparedCreate {
                 group: None,
                 cursor_pending: false,
                 cursor_lease: None,
+                blake: verify::BlakeFrontier::default(),
             })
         })()
         .map_err(|mut error: PartialError| {

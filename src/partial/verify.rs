@@ -35,12 +35,159 @@ pub(super) struct Verification {
 // BLAKE2sp holds eight fixed lanes and a 512-byte round. Reserve a conservative
 // 4096 bytes for those internal allocations before constructing the existing hasher.
 const BLAKE_STORAGE: u64 = 4096;
+/// BLAKE2sp hashes of the output's checked ranges, fed by every write as it lands (RustyGet: verify without reading
+/// the output back). BLAKE2sp cannot combine pieces as CRC-32 leaves do, so each checked range (a part's, the
+/// member's) has one run that follows the writes continuing it from its start: a write past the run is caught up by
+/// a read-back from the run's end when verified, and a write inside what the run hashed (a correction) drops it.
+/// A run that reaches its range's end keeps only the digest. In memory only: a reopened handle reads back as before.
+#[derive(Default)]
+pub(super) struct BlakeFrontier {
+    pub(super) runs: Vec<BlakeRun>,
+    /// The checked ranges, sorted by start, and what they were built from (parts appended, size, member check,
+    /// encryption): rebuilt only when that changes, not for every write.
+    ranges: Vec<Range<u64>>,
+    built: Option<(usize, u64, bool, bool)>,
+}
+pub(super) struct BlakeRun {
+    pub(super) range: Range<u64>,
+    /// End of the bytes hashed, from `range.start`.
+    pub(super) at: u64,
+    /// The hash so far, or the digest once `at` reached `range.end`.
+    pub(super) hash: Result<[u8; 32], crate::blake2sp::Blake2sp>,
+    /// The budget an unfinished hash holds (`BLAKE_STORAGE`, as a read-back's), let go once it is a digest.
+    lease: Option<Reservation>,
+}
+impl BlakeFrontier {
+    /// Brings the checked ranges up to date with `snapshot` (cheap when nothing changed); true when there are any.
+    pub(super) fn refresh(&mut self, snapshot: &Snapshot) -> bool {
+        let key = (
+            snapshot.evidence.parts.len(),
+            snapshot.head.size,
+            snapshot.head.checks.blake2sp.is_some(),
+            snapshot.crypt.is_some(),
+        );
+        if self.built != Some(key) {
+            self.ranges = Self::ranges(snapshot);
+            self.built = Some(key);
+        }
+        !self.ranges.is_empty()
+    }
+
+    /// The checked ranges of `snapshot` that have a BLAKE2sp check on plaintext, without repeats.
+    pub(super) fn ranges(snapshot: &Snapshot) -> Vec<Range<u64>> {
+        let mut ranges = Vec::new();
+        if snapshot.crypt.is_none() {
+            for part in snapshot.evidence.parts.iter().filter(|p| p.blake2sp.is_some()) {
+                ranges.push(if part.final_part { 0..snapshot.head.size } else { part.out.clone() });
+            }
+        }
+        if snapshot.head.checks.blake2sp.is_some() {
+            ranges.push(0..snapshot.head.size);
+        }
+        ranges.sort_by_key(|r| (r.start, r.end));
+        ranges.dedup();
+        ranges
+    }
+    /// Gives the ledger budget back before a write's own reservations when it runs short (under a quarter free):
+    /// unfinished runs are dropped (their ranges are read back when verified); finished digests hold no budget.
+    pub(super) fn yield_budget(&mut self, budget: &PartialBudget) {
+        let (room, limit) = budget.room(PartialResource::LedgerBytes);
+        if room < limit / 4 {
+            self.runs.retain(|run| run.hash.is_ok());
+        }
+    }
+
+    /// Follows a write for the ranges [`Self::refresh`] built.
+    pub(super) fn feed_checked(&mut self, offset: u64, bytes: &[u8], budget: &PartialBudget) {
+        let ranges = std::mem::take(&mut self.ranges);
+        self.feed(&ranges, offset, bytes, budget);
+        self.ranges = ranges;
+    }
+
+    /// Follows a write of `bytes` at output `offset` that landed on disk, for the checked `ranges`. A hash is
+    /// begun only if `budget` grants it `BLAKE_STORAGE`; without it that range is read back when verified.
+    pub(super) fn feed(&mut self, ranges: &[Range<u64>], offset: u64, bytes: &[u8], budget: &PartialBudget) {
+        let end = offset.saturating_add(bytes.len() as u64);
+        // ranges are sorted by start: only those starting before the write's end can meet it
+        let upto = ranges.partition_point(|r| r.start < end);
+        for range in &ranges[..upto] {
+            let (from, to) = (offset.max(range.start), end.min(range.end));
+            if from >= to {
+                continue;
+            }
+            let piece = &bytes[(from - offset) as usize..(to - offset) as usize];
+            let slot = self.runs.iter().position(|run| run.range == *range);
+            match slot.map(|i| (i, self.runs[i].at)) {
+                // Continues the run.
+                Some((i, at)) if from == at => {
+                    let run = &mut self.runs[i];
+                    if let Err(hash) = &mut run.hash {
+                        hash.update(piece);
+                        run.at = to;
+                        if to == range.end {
+                            run.hash = Ok(hash.clone().finish());
+                            run.lease = None;
+                        }
+                    }
+                }
+                // Past the run: read back when verified.
+                Some((_, at)) if from > at => {}
+                // Inside what the run hashed: dropped, unless the write begins the range again.
+                Some((i, _)) => {
+                    self.runs.swap_remove(i);
+                    if from == range.start {
+                        self.begin(range, piece, budget);
+                    }
+                }
+                None if from == range.start => self.begin(range, piece, budget),
+                None => {}
+            }
+        }
+    }
+    fn begin(&mut self, range: &Range<u64>, piece: &[u8], budget: &PartialBudget) {
+        let at = range.start + piece.len() as u64;
+        // The hasher and the run's slot are charged as a read-back's hasher is; refused, the range is read back.
+        // The cache never takes the ledger's second half: a run begins only if half is still free after it.
+        let lease = if at == range.end {
+            None
+        } else {
+            let (room, limit) = budget.room(PartialResource::LedgerBytes);
+            if room < BLAKE_STORAGE.saturating_add(limit / 2) {
+                return;
+            }
+            match budget.reserve(PartialResource::LedgerBytes, BLAKE_STORAGE) {
+                Ok(lease) => Some(lease),
+                Err(_) => return,
+            }
+        };
+        if self.runs.try_reserve(1).is_err() {
+            return;
+        }
+        let mut hash = crate::blake2sp::Blake2sp::new();
+        hash.update(piece);
+        let hash = if at == range.end { Ok(hash.finish()) } else { Err(hash) };
+        self.runs.push(BlakeRun { range: range.clone(), at, hash, lease });
+    }
+    pub(super) fn run(&self, range: &Range<u64>) -> Option<&BlakeRun> {
+        self.runs.iter().find(|run| run.range == *range)
+    }
+
+    /// Removes the run for `range`, handing over its hash and the budget it holds.
+    fn take_run(&mut self, range: &Range<u64>) -> Option<BlakeRun> {
+        let i = self.runs.iter().position(|run| run.range == *range)?;
+        Some(self.runs.swap_remove(i))
+    }
+}
 struct Readback {
     range: Range<u64>,
+    /// Where the read-back began: the range's start, or a [`BlakeFrontier`]'s end.
+    from: u64,
     at: u64,
     hash: crate::blake2sp::Blake2sp,
     buffer: Vec<u8>,
     _lease: Reservation,
+    /// The budget a [`BlakeRun`] held for the hash this read-back continues, moved over with it.
+    _hash_lease: Option<Reservation>,
 }
 fn complete(snapshot: &Snapshot, range: &Range<u64>) -> bool {
     let mut at = range.start;
@@ -209,7 +356,12 @@ impl Verification {
             || self.member_crc == CheckResult::Pending
             || self.member_blake == CheckResult::Pending
     }
-    fn read_one(&mut self, core: &PartialCore, snapshot: &Snapshot) -> PartialResult<bool> {
+    fn read_one(
+        &mut self,
+        core: &PartialCore,
+        snapshot: &Snapshot,
+        frontier: &mut BlakeFrontier,
+    ) -> PartialResult<bool> {
         if self.active.is_none() {
             let range = self
                 .parts
@@ -224,18 +376,30 @@ impl Verification {
             if core.read_chunk == 0 && !range.is_empty() {
                 return Err(err(PartialErrorKind::InvalidOptions));
             }
-            let n = (range.end - range.start).min(core.read_chunk as u64) as usize;
-            let lease = core.budget.reserve(PartialResource::LedgerBytes, BLAKE_STORAGE + n as u64)?;
+            // A range whose run hashed it as it was written needs no read-back; a run that stopped short is
+            // continued from its end, so only the bytes past it are read. Its hash and the budget it holds move into
+            // the read-back (reserved for the buffer first, so a refusal leaves the run as it was).
+            let continued = match frontier.run(&range).map(|run| (run.at, run.hash.as_ref().ok().copied())) {
+                Some((_, Some(digest))) => {
+                    self.settle(&range, digest, snapshot);
+                    return Ok(self.more(snapshot));
+                }
+                Some((at, None)) => Some(at),
+                None => None,
+            };
+            let from = continued.unwrap_or(range.start);
+            let n = (range.end - from).min(core.read_chunk as u64) as usize;
+            let storage = if continued.is_some() { 0 } else { BLAKE_STORAGE };
+            let lease = core.budget.reserve(PartialResource::LedgerBytes, storage + n as u64)?;
             core.budget.metadata(BLAKE_STORAGE)?;
             let mut buffer = core.budget.vector(n)?;
             buffer.resize(n, 0);
-            self.active = Some(Readback {
-                at: range.start,
-                range,
-                hash: crate::blake2sp::Blake2sp::new(),
-                buffer,
-                _lease: lease,
-            });
+            let (hash, hash_lease) = match continued.and_then(|_| frontier.take_run(&range)) {
+                Some(BlakeRun { hash: Err(hash), lease, .. }) => (hash, lease),
+                _ => (crate::blake2sp::Blake2sp::new(), None),
+            };
+            self.active =
+                Some(Readback { at: from, from, range, hash, buffer, _lease: lease, _hash_lease: hash_lease });
         }
         let active = self.active.as_mut().unwrap();
         if active.at < active.range.end {
@@ -251,7 +415,7 @@ impl Verification {
             active.hash.update(&active.buffer[..count]);
             active.at += count as u64;
             if self.readback != Some(VerifyPath::WholeReadback) {
-                self.readback = Some(if active.range == (0..snapshot.head.size) {
+                self.readback = Some(if active.from == 0 && active.range == (0..snapshot.head.size) {
                     VerifyPath::WholeReadback
                 } else {
                     VerifyPath::TargetedReadback
@@ -260,24 +424,31 @@ impl Verification {
         }
         if active.at == active.range.end {
             let active = self.active.take().unwrap();
-            let hash = active.hash.finish();
-            for (checks, part) in self.parts.iter_mut().zip(&snapshot.evidence.parts) {
-                if checks.range == active.range
-                    && let Some(expected) = part.blake2sp
-                {
-                    checks.blake2sp = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
-                }
-            }
-            if active.range == (0..snapshot.head.size)
-                && let Some(expected) = snapshot.head.checks.blake2sp
+            self.settle(&active.range, active.hash.finish(), snapshot);
+        }
+        Ok(self.more(snapshot))
+    }
+    /// Records the BLAKE2sp `hash` of output `range` against every check over that range.
+    fn settle(&mut self, range: &Range<u64>, hash: [u8; 32], snapshot: &Snapshot) {
+        for (checks, part) in self.parts.iter_mut().zip(&snapshot.evidence.parts) {
+            if checks.range == *range
+                && let Some(expected) = part.blake2sp
             {
-                let hash = self.key.as_ref().map_or(hash, |key| crate::crypto::rar5_tweak_blake2sp(&hash, key));
-                self.member_blake = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
+                checks.blake2sp = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
             }
         }
-        Ok(self.active.is_some()
+        if *range == (0..snapshot.head.size)
+            && let Some(expected) = snapshot.head.checks.blake2sp
+        {
+            let hash = self.key.as_ref().map_or(hash, |key| crate::crypto::rar5_tweak_blake2sp(&hash, key));
+            self.member_blake = if hash == expected { CheckResult::Passed } else { CheckResult::Failed };
+        }
+    }
+    /// Whether a BLAKE2sp check can still make progress now.
+    fn more(&self, snapshot: &Snapshot) -> bool {
+        self.active.is_some()
             || self.parts.iter().any(|p| p.blake2sp == CheckResult::Pending && complete(snapshot, &p.range))
-            || (self.member_blake == CheckResult::Pending && complete(snapshot, &(0..snapshot.head.size))))
+            || (self.member_blake == CheckResult::Pending && complete(snapshot, &(0..snapshot.head.size)))
     }
     fn bad(&self, snapshot: &Snapshot) -> Option<Verdict> {
         for (part, checks) in snapshot.evidence.parts.iter().zip(&self.parts) {
@@ -317,7 +488,7 @@ impl PartialCore {
             return Ok(Poll::Ready(bad));
         }
         let data = op.data.as_mut().unwrap();
-        let pending = data.verification.as_mut().unwrap().read_one(self, &data.snapshot)?;
+        let pending = data.verification.as_mut().unwrap().read_one(self, &data.snapshot, &mut data.blake)?;
         self.check(&op)?;
         if pending {
             return Ok(Poll::Pending);

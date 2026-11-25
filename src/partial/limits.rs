@@ -208,6 +208,12 @@ impl PartialBudget {
             held: Arc::new(Mutex::new(Vec::new())),
         })
     }
+    /// How much of `resource` is still free (its limit less what is reserved), and the limit.
+    pub(super) fn room(&self, resource: PartialResource) -> (u64, u64) {
+        let limit = self.limits.value(resource);
+        let used = self.counters.lock().unwrap()[resource as usize];
+        (limit.saturating_sub(used), limit)
+    }
     pub(super) fn reserve(&self, resource: PartialResource, amount: u64) -> PartialResult<Reservation> {
         {
             let mut pool = self.prepaid.lock().unwrap();

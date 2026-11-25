@@ -83,19 +83,167 @@ fn crc_verdict_distinguishes_part_and_member_scope() {
         }
     }
 }
+/// Output written in order is hashed as it lands: verifying its BLAKE2sp reads nothing back (RustyGet: the check at
+/// download end no longer re-reads the member).
 #[test]
-fn blake_verification_uses_readback() {
+fn blake_of_output_written_in_order_verifies_without_readback() {
+    use crate::progressive::Resource;
     let f = Fixture::new(65_537, true, false, true);
-    let limits = ProgressiveLimits { read_chunk: 4096, verify_bytes: 65_554, ..ProgressiveLimits::default() };
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
     let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
     f.hole(&file, 0..65_537);
     f.finish_missing_member(&file);
-    file.fill(0, &f.data).unwrap();
+    for (at, piece) in f.data.chunks(10_000).enumerate() {
+        file.fill(at as u64 * 10_000, piece).unwrap();
+    }
     let Verdict::Ok { path, parts, metadata, .. } = drive(&mut file) else { panic!("complete BLAKE must verify") };
-    assert_eq!(path, VerifyPath::WholeReadback);
+    assert_eq!(path, VerifyPath::ExtentCombine);
     assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
     assert!(matches!(metadata.modified, AttributeResult::Applied));
-    assert!(file.core.budget.usage.charge(crate::progressive::Resource::VerifyBytes, 1).is_err());
+    // The whole read-back budget is still there: nothing was read.
+    let cap = ProgressiveLimits::default().verify_bytes;
+    assert!(file.core.budget.usage.charge(Resource::VerifyBytes, cap).is_ok(), "no output was read back");
+}
+/// Output written out of order: the hash follows the prefix up to the first byte written ahead of it, and only the
+/// bytes past that point are read back.
+#[test]
+fn blake_reads_back_only_past_the_in_order_prefix() {
+    use crate::progressive::Resource;
+    let f = Fixture::new(65_537, true, false, true);
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
+    let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
+    f.hole(&file, 0..65_537);
+    f.finish_missing_member(&file);
+    // The tail lands first (a later article), then the head fills up to it.
+    file.fill(40_000, &f.data[40_000..]).unwrap();
+    file.fill(0, &f.data[..40_000]).unwrap();
+    let Verdict::Ok { path, parts, .. } = drive(&mut file) else { panic!("complete BLAKE must verify") };
+    assert_eq!(path, VerifyPath::TargetedReadback);
+    assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
+    let read = used(&file.core.budget.usage, Resource::VerifyBytes, ProgressiveLimits::default().verify_bytes);
+    assert_eq!(read, 65_537 - 40_000);
+}
+/// Wrong bytes written in order fail the BLAKE2sp check just as a read-back would.
+#[test]
+fn blake_frontier_still_fails_wrong_bytes() {
+    let f = Fixture::new(4_000, false, false, true);
+    let mut file = f.create();
+    f.hole(&file, 0..4_000);
+    f.finish_missing_member(&file);
+    let mut data = f.data.clone();
+    data[3_999] ^= 1;
+    file.fill(0, &data).unwrap();
+    assert!(matches!(drive(&mut file), Verdict::Bad { which: ChecksumAlgorithm::Blake2sp, .. }));
+}
+#[test]
+fn blake_frontier_follows_each_checked_range_in_order() {
+    use crate::partial::verify::BlakeFrontier;
+    let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+    let digest = |bytes: &[u8]| {
+        let mut h = crate::blake2sp::Blake2sp::new();
+        h.update(bytes);
+        h.finish()
+    };
+    let state = |f: &BlakeFrontier, r: std::ops::Range<u64>| {
+        f.run(&r).map(|run| (run.at, run.hash.as_ref().map(|d| *d).unwrap_or_else(|h| h.clone().finish())))
+    };
+    // A part check over 0..400, another over 400..1000, and the member check over 0..1000.
+    let ranges = [0..400, 0..1000, 400..1000];
+    let fixture = Fixture::new(64, false, false, true);
+    let file = fixture.create();
+    let budget = &file.core.budget;
+    let mut f = BlakeFrontier::default();
+    f.feed(&ranges, 100, &data[100..200], budget); // ahead of every start: nothing
+    assert!(f.runs.is_empty());
+    f.feed(&ranges, 0, &data[..100], budget);
+    f.feed(&ranges, 600, &data[600..700], budget); // ahead: ignored
+    f.feed(&ranges, 100, &data[100..500], budget); // crosses a part boundary: finishes 0..400, begins 400..1000
+    assert_eq!(state(&f, 0..400), Some((400, digest(&data[..400]))));
+    assert!(f.run(&(0..400)).unwrap().hash.is_ok(), "a finished run keeps only its digest");
+    assert_eq!(state(&f, 0..1000), Some((500, digest(&data[..500]))));
+    assert_eq!(state(&f, 400..1000), Some((500, digest(&data[400..500]))));
+    f.feed(&ranges, 450, &data[450..460], budget); // a correction inside 400..1000 and 0..1000
+    assert!(f.run(&(400..1000)).is_none() && f.run(&(0..1000)).is_none());
+    assert!(f.run(&(0..400)).is_some(), "a range the correction does not touch keeps its digest");
+    f.feed(&ranges, 0, &data[..10], budget); // a write at the start begins 0..400 and 0..1000 again
+    assert_eq!(state(&f, 0..400), Some((10, digest(&data[..10]))));
+    assert_eq!(state(&f, 0..1000), Some((10, digest(&data[..10]))));
+}
+/// A hash is begun only when the budget grants it; refused, the range is simply read back when verified.
+#[test]
+fn blake_frontier_runs_are_charged_to_the_partial_budget() {
+    use crate::partial::verify::BlakeFrontier;
+    let fixture = Fixture::new(64, false, false, true);
+    let file = fixture.create();
+    let budget = &file.core.budget;
+    let mut hogs = Vec::new();
+    while let Ok(lease) = budget.reserve(PartialResource::LedgerBytes, 4096) {
+        hogs.push(lease);
+    }
+    let mut f = BlakeFrontier::default();
+    f.feed(std::slice::from_ref(&(0..100)), 0, &[1; 10], budget);
+    assert!(f.runs.is_empty(), "no budget, no hash");
+    // A range finished in one write needs no hasher held, so it costs nothing.
+    f.feed(std::slice::from_ref(&(0..10)), 0, &[1; 10], budget);
+    assert!(f.run(&(0..10)).is_some_and(|run| run.hash.is_ok()));
+    drop(hogs);
+    f.feed(std::slice::from_ref(&(0..100)), 0, &[1; 10], budget);
+    assert!(f.run(&(0..100)).is_some());
+}
+/// Codex review of #284: verifying continues an unfinished run with the run's own hash and budget, so a ledger with
+/// room for the read buffer but not for a second hasher still verifies.
+#[test]
+fn a_read_back_continuing_a_run_takes_over_its_budget() {
+    let f = Fixture::new(65_537, true, false, true);
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
+    let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
+    f.hole(&file, 0..65_537);
+    f.finish_missing_member(&file);
+    // Out of order: the runs stop at 40,000, holding their hashers' budget.
+    file.fill(40_000, &f.data[40_000..]).unwrap();
+    file.fill(0, &f.data[..40_000]).unwrap();
+    let budget = &file.core.budget;
+    let mut hogs = Vec::new();
+    while let Ok(lease) = budget.reserve(PartialResource::LedgerBytes, 4096) {
+        hogs.push(lease);
+    }
+    // Room for one read buffer (4,096 bytes), not for a buffer and another hasher's storage.
+    hogs.pop();
+    let Verdict::Ok { parts, .. } = drive(&mut file) else { panic!("verifies within the budget the runs hold") };
+    assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
+    drop(hogs);
+}
+/// Codex review of #284: the optional cache gives the ledger back before a write's own reservations when the budget
+/// runs short, so it never makes a fill fail; the evicted ranges are read back when verified.
+#[test]
+fn unfinished_blake_runs_step_aside_when_a_write_needs_the_ledger() {
+    let f = Fixture::new(65_537, true, false, true);
+    let limits = ProgressiveLimits { read_chunk: 4096, ..ProgressiveLimits::default() };
+    let mut file = f.create_with(PartialLimits::default(), limits).unwrap();
+    f.hole(&file, 0..65_537);
+    f.finish_missing_member(&file);
+    file.fill(40_000, &f.data[40_000..50_000]).unwrap();
+    file.fill(0, &f.data[..30_000]).unwrap();
+    let unfinished =
+        |file: &PartialFile| file.core.operation().unwrap().blake.runs.iter().filter(|r| r.hash.is_err()).count();
+    assert!(unfinished(&file) > 0, "runs follow the in-order prefix");
+    // Leave under a quarter of the ledger free, then write: the runs give their budget back first.
+    let budget = &file.core.budget;
+    let (_, limit) = budget.room(PartialResource::LedgerBytes);
+    let mut hogs = Vec::new();
+    while budget.room(PartialResource::LedgerBytes).0 > limit / 5 {
+        hogs.push(budget.reserve(PartialResource::LedgerBytes, limit / 64).unwrap());
+    }
+    file.fill(30_000, &f.data[30_000..40_000]).unwrap();
+    assert_eq!(unfinished(&file), 0, "evicted before the write's reservations");
+    drop(hogs);
+    file.fill(50_000, &f.data[50_000..]).unwrap();
+    let Verdict::Ok { parts, .. } = drive(&mut file) else { panic!("verifies by read-back") };
+    assert!(parts.iter().all(|p| p.blake2sp == CheckResult::Passed));
+}
+/// Emulates a reopened handle: no hash was kept while writing, so BLAKE2sp checks read the output back.
+fn forget_blake(file: &PartialFile) {
+    file.core.operation().unwrap().blake = Default::default();
 }
 fn deferred(reopen: bool) {
     let f = Fixture::new(33, true, false, true);
@@ -140,6 +288,7 @@ fn changed_revision_invalidates_verify() {
     f.hole(&file, 0..33);
     f.finish_missing_member(&file);
     file.fill(0, &f.data[..17]).unwrap();
+    forget_blake(&file);
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     assert!(file.poll_verify(&mut cx).is_pending());
@@ -224,6 +373,7 @@ fn blake_readback_cap_is_exact_and_chunk_bounded() {
         f.hole(&file, 0..33);
         f.finish_missing_member(&file);
         file.fill(0, &f.data).unwrap();
+        forget_blake(&file);
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut polls = 0;
@@ -254,6 +404,7 @@ fn crc_combine_and_targeted_readback_report_actual_work() {
         f.hole(&file, 0..33);
         f.finish_missing_member(&file);
         file.fill(0, &f.data).unwrap();
+        forget_blake(&file);
         let Verdict::Ok { path, parts, .. } = drive(&mut file) else { panic!("verified") };
         assert_eq!(path, if targeted { VerifyPath::TargetedReadback } else { VerifyPath::ExtentCombine });
         assert_eq!(parts[1].blake2sp, CheckResult::Missing);
