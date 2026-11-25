@@ -951,6 +951,7 @@ impl FeedDecoder {
             buf: vec![0; chunk],
             scratch: Vec::new(),
             run_written: 0,
+            held_prefix: 0,
             failed: false,
             status: FeedStatus::default(),
             index: 0,

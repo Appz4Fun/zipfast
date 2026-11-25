@@ -60,7 +60,7 @@ pub(crate) mod zip_split;
 
 pub use feed::{
     ArticleBuffer, BufferFull, FeedDecoder, FeedError, FeedOptions, FeedSink, FeedSnapshot, FeedStats, FeedStatus,
-    FeedUnsupported, NeedBytes, NeedKind, PackedRead, PackedSource, SolidCarry,
+    FeedUnsupported, NeedBytes, NeedKind, PackedRead, PackedSource, SolidCarry, VolumeFiles,
 };
 pub use last_volume::{
     FactSource, HeldVolume, IdentityMember, IdentityScope, LastVolumeIdentity, SetFacts, SetIdentity, SetMember,

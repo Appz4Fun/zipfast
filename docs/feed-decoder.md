@@ -45,6 +45,14 @@ the bytes already held; `BufferFull` when the limit would be passed, storing not
 itself and inserts them when they are needed), `mark_lost(volume, range)` (answered `Hole` until inserted) and
 `held()`. It drops what the decoder releases: fed in order, it holds only the article being read.
 
+`VolumeFiles::new()` reads the volume files a downloader is still writing, so extraction keeps up with the download
+without holding articles in memory or waiting for a finished volume: `set_file(volume, file)` (a handle that reads
+the file being written), `mark_written(volume, range)` after each article's write returns (it is read from disk from
+then on), `mark_lost(volume, range)` for articles that will not come (answered `Hole` until written; written bytes
+stay readable). Bytes neither written nor lost are `NotYet` and listed by `absent`, so a need is always for bytes
+not on disk yet: the decoder never asks for what the writer already wrote. A failed or short read is a `Hole`
+(damaged, not late). Releases are ignored.
+
 ## Output: a sink
 
 `FeedSink::write_at(offset, bytes)` gets member output at member offsets. The main decode writes in order; a repair
@@ -411,6 +419,29 @@ on; it never decodes from the member's start unless the snapshot was taken there
 last block boundary (above), a ZipCrypto one reads its packed bytes from the start again. Persistent partials (`docs/persistent-partials.md`) remain the durable,
 journaled store for output; a snapshot is the decoder's position over it. Kept as a direct partial's cursor
 (`PartialFile::set_cursor`), it commits atomically with the output it describes.
+
+## Continuing another copy (failover)
+
+When the copy being extracted dies part way (copy A), the next copy of the same file (copy B, another container,
+another posting) continues A's extraction: B is asked only for what lies past A's output and for real holes, never
+for anything A already produced. Map each copy on its own (`MemberMap::from_memory` / `MapBuilder` over B's header
+bytes): offsets, volumes and cuts come from B's map, so B's volume layout may differ from A's completely. Match the
+member by name and size, or by `map::set_identity` keys (sizes, method, dictionary, checks) when names are
+obfuscated. A's output `0..F` stays in its persistent partial (or wherever A wrote it).
+
+| B's member | call sequence | what B is asked for |
+|---|---|---|
+| stored (RAR, ZIP method 0, 7z Copy) | `FeedDecoder::open_at(&map_b, m, F, options)`, then `set_prefix_crc32(crc of 0..F)` if you have it, then `run` as usual with a sink writing into A's partial | B's packed bytes for `F..size` only |
+| AES-CBC stored (RAR 5.0, RAR 4.x AES, 7zAES over Copy) | the same; the decoder starts at the block holding `F` (`status().frontier`, at most 15 bytes before `F`, written again with the same bytes) | the IV block before it, then `F..size` |
+| WinZip AES stored | the same; the authentication code is caught up from `read_held` (A's output) | `F..size` and the 10-byte code |
+| RAR 5.0 compressed (AES under it too) | plan with `map::open_at(&map_b, m, F, &OpenAtOptions { seed: Seed::HeldPlaintext { strict: false }, .. })`, fetch its `spans`, then `complete_rar5(&map_b, &plan, packed_from, packed, known_base, known, &near)` with A's output as `known`; feed `decoder` from `feed_from`. Or, with no plan: `FeedDecoder::new` over a source that answers B's bytes before the plan's `fetch_from` as holes and a sink whose `read_held` gives A's output: the hole skip restarts near `F` seeded from it ([above](#compressed-rar-50)) | from about `F`'s estimated packed position minus the search region; the output is `unproven` until the member's CRC/BLAKE2sp proves it (fall back to `Seed::Checked` when it fails) |
+| 7z LZMA2 (7zAES under it too) | `map::open_at` (`Start::Lzma2`), walk chunk headers (`Lzma2Framing::HeaderWalk`: `Lzma2IndexBuilder::for_folder` or `MemberMap::lzma2_chunks`) or fetch from the folder's start under 7zAES (`FromStart`), then `complete_lzma2` with A's output as the dictionary | chunk headers before `F` (a few bytes per 64 KiB chunk), then the folder from the restart chunk to its end marker |
+| RAR 4.x compressed, other ZIP methods, ZipCrypto, other 7z coders | no restart inside the member: `open_at` refuses (`StartOnly`, `Unsupported`); decode B from its start, or fill A's holes from B's output with `PartialFile::fill` once B's extraction passes them | the whole member |
+
+A stored member's bytes in B are plaintext (or decrypt on their own), so a failover there costs exactly B's bytes
+past `F`. With persistent partials, A's partial keeps every check: B's output written with `fill` (or a
+`FillWriter`) into A's partial verifies with A's leaves and B's writes together, with no read-back of A's output
+(see "Streaming BLAKE2sp" in `docs/persistent-partials.md` once that lands).
 
 ## Live feed example
 

@@ -27,6 +27,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::ops::Range;
 
+pub use files::VolumeFiles;
+
+mod files;
 mod lzma2;
 mod rar4;
 mod rar5;
@@ -825,6 +828,8 @@ pub struct FeedDecoder {
     zip: Option<Box<zip::Zip>>,
     /// a WinZip AES stored member's authentication code
     mac: Option<Box<StoredMac>>,
+    /// [`FeedDecoder::open_at`]: the output before the main decode's start, which the caller held (0 otherwise)
+    held_prefix: u64,
 }
 
 /// The authentication code of a WinZip AES stored member: HMAC-SHA1 over the ciphertext in order. The main decode
@@ -856,6 +861,61 @@ impl FeedDecoder {
     /// shows here where the member records a check value.
     pub fn new(map: &MemberMap, index: usize, options: FeedOptions) -> Result<Self, FeedError> {
         Self::new_begin(map, index, options, Begin::Fresh)
+    }
+
+    /// A decoder of stored member `index` of `map` whose output before `at` the caller already holds, typically
+    /// from another copy of the same file (a failover: this copy continues the other's extraction). The main decode
+    /// starts at `at` (under AES-CBC at the 16-byte block holding it, reading the ciphertext block before as its
+    /// IV), so none of this copy's packed bytes before that are read or listed as needs, and no output before it is
+    /// written. [`FeedStatus::frontier`] says where it starts.
+    ///
+    /// Under AES-CBC the output from that block start to `at` (at most 15 bytes the caller holds) is written again,
+    /// with the same bytes. Give the CRC32 of the output before the start with [`Self::set_prefix_crc32`] to have the
+    /// member's CRC checked when done (`crc_ok`); without it `crc_ok` is None and the output is proven elsewhere (a
+    /// persistent partial's verify, which already holds the prefix's checks). A WinZip AES authentication code is
+    /// caught up from [`FeedSink::read_held`] as after a skipped hole.
+    ///
+    /// Compressed and sequentially encrypted members restart only at chosen points: see `map::open_at` with
+    /// `complete_rar5` / `complete_lzma2`; they are `Unsupported` here.
+    pub fn open_at(map: &MemberMap, index: usize, at: u64, options: FeedOptions) -> Result<Self, FeedError> {
+        let member = map.members.get(index).ok_or(FeedError::NoSuchMember { index })?;
+        let refused = match (member.method, member.mapping) {
+            (MapMethod::Compressed { id }, _) => Some(FeedUnsupported::Compressed { id }),
+            (MapMethod::Coders, _) => Some(FeedUnsupported::Coders),
+            (_, OutputMapping::Sequential { .. }) => Some(FeedUnsupported::SequentialCipher),
+            _ => None,
+        };
+        if let Some(what) = refused {
+            return Err(FeedError::Unsupported(what));
+        }
+        let mut decoder = Self::new(map, index, options)?;
+        if decoder.rar5.is_some() || decoder.lzma2.is_some() || decoder.rar4.is_some() || decoder.zip.is_some() {
+            return Err(FeedError::Unsupported(FeedUnsupported::Solid));
+        }
+        if at > decoder.size {
+            return Err(FeedError::Malformed("open_at past the member's end"));
+        }
+        let start = match decoder.cipher {
+            StoredCipher::Cbc { .. } => at & !15,
+            _ => at,
+        };
+        if start == 0 {
+            return Ok(decoder);
+        }
+        decoder.main = (start < decoder.size).then(|| decoder.lane_at(start, decoder.size));
+        decoder.held_prefix = start;
+        decoder.status = decoder.make_status(Vec::new(), false);
+        Ok(decoder)
+    }
+
+    /// The CRC32 (unkeyed) of the output before an [`Self::open_at`] decoder's start, `0..status().frontier` as it
+    /// was opened, so the member's CRC is checked when done. Call it before the first run.
+    pub fn set_prefix_crc32(&mut self, crc32: u32) -> Result<(), FeedError> {
+        if self.held_prefix == 0 || self.stats.written > 0 || self.crc.runs.contains_key(&0) {
+            return Err(FeedError::Malformed("a prefix CRC needs a fresh open_at decoder"));
+        }
+        self.crc.add_run(0, self.held_prefix, crc32);
+        Ok(())
     }
 
     fn new_begin(map: &MemberMap, index: usize, options: FeedOptions, begin: Begin) -> Result<Self, FeedError> {
@@ -975,6 +1035,7 @@ impl FeedDecoder {
             buf: vec![0; chunk],
             scratch: Vec::new(),
             run_written: 0,
+            held_prefix: 0,
             failed: false,
             status: FeedStatus::default(),
             index: 0,
