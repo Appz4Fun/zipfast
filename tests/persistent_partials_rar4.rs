@@ -980,6 +980,43 @@ fn restart_resumes_a_rar4_aes_stored_member_at_every_crash_point() {
     }
 }
 
+/// RustyGet M6e: after a restart, the source answers every hole whole (as RustyGet's `HoledVolume` does inside
+/// member data), and a hole now covers bytes the first session read. The resume of an AES member reads the 16-byte
+/// ciphertext block before its next byte without a long-hole allowance; when that block lies inside the hole, the
+/// source still answers to the hole's end. A persistent session trims such an answer to the read (the block becomes
+/// unknown) instead of failing the run as a source contract violation.
+#[test]
+fn restart_of_an_aes_member_trims_a_long_hole_answer_to_its_resume_read() {
+    let gold = gold(8000);
+    let intact = Set::aes_split(Naming::Parts, &gold, &[2000, 2000, 2000, 2000], "pw");
+    let mut holed = Set::aes_split(Naming::Parts, &gold, &[2000, 2000, 2000, 2000], "pw");
+    for v in 0..holed.payloads.len() {
+        let p = holed.payloads[v].clone();
+        holed.hole(v, p.start + 32..p.end - 32);
+    }
+    holed.long_holes = true;
+    let pw = Some("pw");
+    let total = {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = Seen::default();
+        assert!(run(&mut session_with(&intact, dir.path(), &Arc::default(), pw), &mut seen, None));
+        seen.events
+    };
+    for crash_at in 1..total {
+        let dir = tempfile::tempdir().unwrap();
+        let anchors = Arc::new(Anchors::default());
+        let mut first = session_with(&intact, dir.path(), &anchors, pw);
+        let mut before = Seen::default();
+        assert!(!run(&mut first, &mut before, Some(crash_at)));
+        crash((first, std::mem::take(&mut before.files)));
+        let mut second = session_with(&holed, dir.path(), &anchors, pw);
+        let mut after = Seen::default();
+        // `run` panics on a SessionTerminated failure such as SourceContract.
+        assert!(run(&mut second, &mut after, None), "crash at {crash_at}");
+        assert_eq!(after.outcomes.len(), 1, "crash at {crash_at}");
+    }
+}
+
 /// A wrong password on the persistent RAR4 AES route: RAR 3.x AES has no check value, so the member decrypts to
 /// garbage and the session fails on its final CRC-32. No member finishes, so nothing is published: the in-place
 /// partial output holds no decrypted bytes and is never reported complete.
