@@ -632,9 +632,15 @@ fn lzma2_failover_never_restarts_in_a_stored_run_the_state_continues_over() {
     for s in &map.folders[0].packed {
         stream.extend_from_slice(&vols[s.volume as usize][s.packed.start as usize..s.packed.end as usize]);
     }
-    let index = map.lzma2_chunks(0, &refs, Default::default()).unwrap();
+    let full = map.lzma2_chunks(0, &refs, Default::default()).unwrap();
     let opts = Lzma2DecodeOptions { max_output: 1 << 34, ..Lzma2DecodeOptions::default() };
-    for frac in [0.25f64, 0.5, 0.9] {
+    // the full framing, and one cut off 1 MiB past each target (walked over another copy's held bytes)
+    for (frac, cut) in [0.25f64, 0.5, 0.9].into_iter().flat_map(|f| [(f, false), (f, true)]) {
+        let mut index = full.clone();
+        if cut {
+            let limit = (plain.len() as f64 * frac) as u64 + (1 << 20);
+            index.chunks.retain(|c| c.unpacked_offset <= limit);
+        }
         let target = (plain.len() as f64 * frac) as u64;
         let plan = open_at(&map, 0, target, &OpenAtOptions::default()).unwrap();
         let Start::Lzma2 { ref donor, .. } = plan.start else { panic!("{:?}", plan.start) };
@@ -659,6 +665,7 @@ fn lzma2_failover_never_restarts_in_a_stored_run_the_state_continues_over() {
             }
         };
         let s = r.output as usize;
-        assert!(r.bytes == plain[s..s + r.bytes.len()] && s + r.bytes.len() == plain.len(), "{frac}");
+        assert!(r.bytes == plain[s..s + r.bytes.len()] && s + r.bytes.len() == plain.len(), "{frac} {cut}");
+        eprintln!("{frac} cut={cut}: restart {} MB before the target", (target - r.output) >> 20);
     }
 }

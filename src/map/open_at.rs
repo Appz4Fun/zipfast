@@ -679,95 +679,110 @@ fn resume_lzma2(
         matches!(c.reset, Lzma2Reset::State | Lzma2Reset::StateProps | Lzma2Reset::DictStateProps)
     };
     let restartable = |c: &super::Lzma2Chunk| c.kind == Lzma2ChunkKind::Stored || resets(c);
-    // A restart: an LZMA chunk that resets the state, or a stored chunk only when the index shows that the next
-    // LZMA chunk after it resets the state too (or none follows). A stored chunk resets nothing: 7-Zip (-mmt) goes on
-    // after a run of stored chunks with an LZMA chunk that continues the state from before them, which a restart in
-    // the run cannot have.
-    let valid = |i: usize| {
+    // A restart: an LZMA chunk that resets the state, or a stored chunk unless the index shows that the next LZMA
+    // chunk after it continues the state (a stored chunk resets nothing: 7-Zip -mmt goes on after a run of stored
+    // chunks with an LZMA chunk that continues the state from before them). Some(true): proven; None: the index ends
+    // before the next LZMA chunk (one walked over another copy's held bytes), so it is tried and given up if decoding
+    // meets such a chunk.
+    let valid = |i: usize| -> Option<bool> {
         let c = &starts[i];
         if c.kind != Lzma2ChunkKind::Stored {
-            return resets(c);
+            return Some(resets(c));
         }
         match starts[i + 1..].iter().find(|n| n.kind != Lzma2ChunkKind::Stored) {
-            Some(next) => resets(next),
-            // the index ends in stored chunks: proven only when it runs to the stream's end
-            None => matches!(starts.last(), Some(l) if l.unpacked_offset + l.unpacked_len == total),
+            Some(next) => Some(resets(next)),
+            None if matches!(starts.last(), Some(l) if l.unpacked_offset + l.unpacked_len == total) => Some(true),
+            None => None,
         }
     };
-    // The last such chunk start at or before the target whose header is held.
-    let before = |i: usize| starts[i].unpacked_offset <= folder_target && valid(i);
-    let Some(k) = (0..starts.len()).rev().find(|&i| before(i) && starts[i].packed_offset >= packed_from) else {
-        return Err(match (0..starts.len()).rev().find(|&i| before(i)) {
-            Some(i) => OpenAtError::FetchFrom { packed: starts[i].packed_offset, output: starts[i].unpacked_offset },
-            None => need_framing(),
-        });
-    };
-    let start = starts[k];
-    // The props in effect there, from the chunk that set them (the walk resumed below starts after it).
-    let inherited = starts[..=k].iter().rev().find_map(|c| c.props);
-    let rel = usize::try_from(start.packed_offset - packed_from).map_err(|_| need_framing())?;
-    // From there the chunks run to the end marker at the stream's last byte and fill the folder's output.
-    let idx = Lzma2Index::from_bytes(
-        &packed[rel..],
-        Lzma2IndexOptions {
-            start: Lzma2Start::Resume(Lzma2Position { packed: 0, unpacked: start.unpacked_offset }),
-            ..Lzma2IndexOptions::default()
-        },
-    );
-    let ends_right =
-        matches!(idx.end, Lzma2End::EndMarker { offset } if rel as u64 + offset + 1 == packed.len() as u64);
-    if !ends_right || idx.chunks.is_empty() || idx.end_position().unpacked != total {
-        return Err(OpenAtError::Decode(format!(
-            "the LZMA2 chunks from folder output {} do not run to the stream's end marker",
-            start.unpacked_offset
-        )));
-    }
-    let bytes = &packed[rel..];
-    let chunks = &idx.chunks;
-    let known_at = |at: u64, len: u64| -> Option<&[u8]> {
-        let s = usize::try_from(at.checked_sub(known_base)?).ok()?;
-        known.get(s..s.checked_add(usize::try_from(len).ok()?)?)
-    };
-    let output = start.unpacked_offset;
-    let dictionary = known_at(known_base, output.saturating_sub(known_base))
-        .filter(|_| known_base <= output)
-        .ok_or(OpenAtError::NeedMore { needed: 0..output })?;
-    let decode_err = |e: Lzma2DecodeError| OpenAtError::Decode(format!("{e:?}"));
-    let limit = options.max_output;
-    let over = |n: u64| if n > limit { Err(OpenAtError::OutputLimit { limit }) } else { Ok(()) };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chunks.len() {
-        let c = chunks[i];
-        if c.kind == Lzma2ChunkKind::Stored {
-            let pl = c.payload();
-            over(out.len() as u64 + (pl.end - pl.start))?;
-            out.extend_from_slice(&bytes[pl.start as usize..pl.end as usize]);
-            i += 1;
-        } else if restartable(&c) {
-            // only the last dictionary-sized bytes are used: the known output's tail, then what was resumed
-            let need = usize::try_from(lzma2_dictionary(dict_prop)).unwrap_or(usize::MAX);
-            let from_known = need.saturating_sub(out.len()).min(dictionary.len());
-            let mut dict = Vec::with_capacity(from_known + out.len().min(need));
-            dict.extend_from_slice(&dictionary[dictionary.len() - from_known..]);
-            dict.extend_from_slice(&out[out.len().saturating_sub(need)..]);
-            // the decoder's own bound is what is left of the limit
-            let mut left = options.clone();
-            left.max_output = limit - out.len() as u64;
-            let decoded = idx
-                .decode_with_dictionary_props(i..chunks.len(), bytes, 0, dict_prop, &dict, inherited, &left)
-                .map_err(decode_err)?;
-            over(out.len() as u64 + decoded.len() as u64)?;
-            out.extend(decoded);
-            break;
-        } else {
+    let attempt = |k: usize| -> Result<Result<Lzma2Resume, u64>, OpenAtError> {
+        let start = starts[k];
+        // The props in effect there, from the chunk that set them (the walk resumed below starts after it).
+        let inherited = starts[..=k].iter().rev().find_map(|c| c.props);
+        let rel = usize::try_from(start.packed_offset - packed_from).map_err(|_| need_framing())?;
+        // From there the chunks run to the end marker at the stream's last byte and fill the folder's output.
+        let idx = Lzma2Index::from_bytes(
+            &packed[rel..],
+            Lzma2IndexOptions {
+                start: Lzma2Start::Resume(Lzma2Position { packed: 0, unpacked: start.unpacked_offset }),
+                ..Lzma2IndexOptions::default()
+            },
+        );
+        let ends_right =
+            matches!(idx.end, Lzma2End::EndMarker { offset } if rel as u64 + offset + 1 == packed.len() as u64);
+        if !ends_right || idx.chunks.is_empty() || idx.end_position().unpacked != total {
             return Err(OpenAtError::Decode(format!(
-                "LZMA2 chunk at folder output {} continues the state of the chunk before it",
-                c.unpacked_offset
+                "the LZMA2 chunks from folder output {} do not run to the stream's end marker",
+                start.unpacked_offset
             )));
         }
+        let bytes = &packed[rel..];
+        let chunks = &idx.chunks;
+        let known_at = |at: u64, len: u64| -> Option<&[u8]> {
+            let s = usize::try_from(at.checked_sub(known_base)?).ok()?;
+            known.get(s..s.checked_add(usize::try_from(len).ok()?)?)
+        };
+        let output = start.unpacked_offset;
+        let dictionary = known_at(known_base, output.saturating_sub(known_base))
+            .filter(|_| known_base <= output)
+            .ok_or(OpenAtError::NeedMore { needed: 0..output })?;
+        let decode_err = |e: Lzma2DecodeError| OpenAtError::Decode(format!("{e:?}"));
+        let limit = options.max_output;
+        let over = |n: u64| if n > limit { Err(OpenAtError::OutputLimit { limit }) } else { Ok(()) };
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chunks.len() {
+            let c = chunks[i];
+            if c.kind == Lzma2ChunkKind::Stored {
+                let pl = c.payload();
+                over(out.len() as u64 + (pl.end - pl.start))?;
+                out.extend_from_slice(&bytes[pl.start as usize..pl.end as usize]);
+                i += 1;
+            } else if restartable(&c) {
+                // only the last dictionary-sized bytes are used: the known output's tail, then what was resumed
+                let need = usize::try_from(lzma2_dictionary(dict_prop)).unwrap_or(usize::MAX);
+                let from_known = need.saturating_sub(out.len()).min(dictionary.len());
+                let mut dict = Vec::with_capacity(from_known + out.len().min(need));
+                dict.extend_from_slice(&dictionary[dictionary.len() - from_known..]);
+                dict.extend_from_slice(&out[out.len().saturating_sub(need)..]);
+                // the decoder's own bound is what is left of the limit
+                let mut left = options.clone();
+                left.max_output = limit - out.len() as u64;
+                let decoded = idx
+                    .decode_with_dictionary_props(i..chunks.len(), bytes, 0, dict_prop, &dict, inherited, &left)
+                    .map_err(decode_err)?;
+                over(out.len() as u64 + decoded.len() as u64)?;
+                out.extend(decoded);
+                break;
+            } else {
+                // an LZMA chunk that continues the state from before the restart
+                return Ok(Err(c.unpacked_offset));
+            }
+        }
+        Ok(Ok(Lzma2Resume { output, feed_from: start.packed_offset, bytes: out, redecode: folder_target - output }))
+    };
+    // The latest candidate at or before the target first; one whose header lies before the bytes held is fetched.
+    for k in (0..starts.len()).rev() {
+        let c = &starts[k];
+        let proof = valid(k);
+        if c.unpacked_offset > folder_target || proof == Some(false) {
+            continue;
+        }
+        if c.packed_offset < packed_from {
+            return Err(OpenAtError::FetchFrom { packed: c.packed_offset, output: c.unpacked_offset });
+        }
+        match attempt(k)? {
+            Ok(resume) => return Ok(resume),
+            // an unproven stored restart that met such a chunk: an earlier candidate then
+            Err(_) if proof.is_none() => {}
+            Err(at) => {
+                return Err(OpenAtError::Decode(format!(
+                    "LZMA2 chunk at folder output {at} continues the state of the chunk before it"
+                )));
+            }
+        }
     }
-    Ok(Lzma2Resume { output, feed_from: start.packed_offset, bytes: out, redecode: folder_target - output })
+    Err(need_framing())
 }
 
 #[cfg(test)]
