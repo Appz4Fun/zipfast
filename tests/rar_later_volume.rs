@@ -388,3 +388,19 @@ fn session_restart_discovery_honours_cancellation_budgets_and_fifos() {
     let got = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("RarSession::open must not block on a FIFO");
     assert_eq!(got, Some(true), "no restart through a FIFO");
 }
+
+/// Codex review of #286: an output descriptor that aliases an earlier volume the restart probe opens is refused, as
+/// for any input the session opens, not taken as "no restart".
+#[test]
+fn a_restart_probe_refuses_an_output_aliasing_an_earlier_volume() {
+    use zipfast::rar5::session::{RarSession, RarSessionOptions};
+    let set = stage("rar4-volumes", &["multi.part1.rar", "multi.part2.rar", "multi.part3.rar"]);
+    let alias = set.path().join("out.bin");
+    fs::hard_link(set.path().join("multi.part1.rar"), &alias).unwrap();
+    let output = fs::OpenOptions::new().append(true).open(&alias).unwrap();
+    let options = RarSessionOptions { restart_from_first_volume: true, ..RarSessionOptions::default() };
+    let failure = RarSession::open_with_output_file(&set.path().join("multi.part2.rar"), None, options, &output)
+        .err()
+        .expect("an output aliasing part1 is refused");
+    assert!(format!("{failure:?}").contains("OutputAliasesInput"), "{failure:?}");
+}

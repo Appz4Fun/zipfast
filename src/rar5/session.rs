@@ -1112,11 +1112,12 @@ impl Catalogue {
     }
 
     /// Whether the first member in the volume at `path` continues from an earlier volume; None when the volume
-    /// cannot be read as one. Only cancellation and the catalogue's limits are errors.
+    /// cannot be read as one. Only cancellation, the catalogue's limits and an output aliasing the volume are errors.
     fn probe_continues(&mut self, path: &Path, password: Option<&str>) -> RarResult<Option<bool>> {
         fn soft(fault: RarFault) -> RarResult<Option<bool>> {
             match fault.failure.as_ref() {
-                RarFailure::Canceled | RarFailure::Limit { .. } => Err(fault),
+                // an output that aliases a volume this probe opened is refused as for any input the session opens
+                RarFailure::Canceled | RarFailure::Limit { .. } | RarFailure::OutputAliasesInput => Err(fault),
                 _ => Ok(None),
             }
         }
