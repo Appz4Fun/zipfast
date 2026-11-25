@@ -192,6 +192,11 @@ pub struct Options {
     /// route that places symbolic links honours it: the whole-archive runners for RAR, 7z, ZIP and tar,
     /// [`crate::rar5::session::RarSession`] extraction, and progressive sessions. A test run writes nothing.
     pub refused_link_placeholder: bool,
+    /// RAR, run from a later volume whose first member continues from an earlier one: start over at the set's
+    /// first volume, as UnRAR 7.30 `x`/`t` does, when every volume back to one that starts no continued member
+    /// exists and opens. Off (the default) the run starts at the volume given and walks forward only, as 7-Zip does:
+    /// the continued member is reported as lacking its start (`RarSkipReason::MissingStart`).
+    pub restart_from_first_volume: bool,
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -385,6 +390,7 @@ impl MemberRef<'_> {
 ///     version_naming: Default::default(),
 ///     preexisting_links: Default::default(),
 ///     refused_link_placeholder: false,
+///     restart_from_first_volume: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -3643,7 +3649,7 @@ fn starts_with_continuation(path: &Path, password: Option<&str>) -> Option<bool>
 /// volume, the volume before it (by name) back to one that doesn't, if each of them exists and opens. UnRAR then
 /// extracts the whole set; with a volume missing in between it extracts only what starts at `path`, and reports the
 /// continued member as lacking its start.
-fn restart_volume(path: &Path, password: Option<&str>) -> Option<PathBuf> {
+pub(crate) fn restart_volume(path: &Path, password: Option<&str>) -> Option<PathBuf> {
     let mut current = path.to_path_buf();
     if !starts_with_continuation(&current, password)? {
         return None;
@@ -3694,7 +3700,7 @@ fn rar_run_shared_open<'a>(
     let mut first_volume = open()?;
     // As UnRAR: extracting or testing from a later volume starts over at the set's first volume when every volume
     // before it is there.
-    let restart = restart_volume(first, password);
+    let restart = if opts.restart_from_first_volume { restart_volume(first, password) } else { None };
     // A selection by listing position (`MemberRef::ordinal`) means the positions the listing of the volume given
     // shows, which start at that volume: the restarted run shifts its own count by the members before it.
     let skipped = match restart.as_deref() {
@@ -3793,6 +3799,7 @@ fn rar_read_at(
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};

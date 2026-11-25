@@ -41,6 +41,7 @@ pub(super) fn setup(
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     };
     let context = EncryptedReadContext::for_projected(
         &mut s,

@@ -106,6 +106,7 @@ fn check_archive(archive: &Path, refuse: bool) {
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     };
     let mut seen = 0;
     REFUSE_WINDOW.store(refuse, Ordering::Relaxed);

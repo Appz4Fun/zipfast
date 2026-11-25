@@ -45,6 +45,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite) -> Options {
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     }
 }
 
@@ -531,6 +532,7 @@ fn a_refused_link_leaves_a_placeholder_only_when_asked() {
         let opts = Options {
             preexisting_links: PreexistingLinks::Refuse,
             refused_link_placeholder: placeholder,
+            restart_from_first_volume: false,
             ..options(&dest, Mode::Extract, Overwrite::Always)
         };
         let s = extract::run(&archive, &opts, |_| {}).unwrap();

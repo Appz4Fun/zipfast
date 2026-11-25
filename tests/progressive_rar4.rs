@@ -74,6 +74,7 @@ fn options(dir: &std::path::Path) -> ProgressiveOptions {
             version_naming: Default::default(),
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
+            restart_from_first_volume: false,
         },
         OsString::from("a.rar"),
     )

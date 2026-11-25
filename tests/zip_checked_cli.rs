@@ -597,6 +597,7 @@ fn r2_prefixed_zip_public_policy_context_and_selected_caps() {
             version_naming: Default::default(),
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
+            restart_from_first_volume: false,
         };
         for cap in [0, 24, 25] {
             let mut overrides = EncryptedReadOverrides::default();

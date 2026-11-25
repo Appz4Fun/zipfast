@@ -81,11 +81,21 @@ pub struct RarSessionOptions {
     /// Follow the end header's "more volumes" mark to later volumes (the default). With false the session holds
     /// only the named volume, as UnRAR's `l` does without `-v`: a member split past it is catalogued as incomplete.
     pub follow_volumes: bool,
+    /// Opened at a later volume whose first member continues from an earlier one, start the catalogue at the set's
+    /// first volume instead, as UnRAR 7.30 does for `x`/`t` from a later volume, when every volume back to one that
+    /// starts no continued member exists and opens (otherwise the named volume, as before).
+    /// [`RarSession::restarted_from`] says where it started. Off by default.
+    pub restart_from_first_volume: bool,
 }
 
 impl Default for RarSessionOptions {
     fn default() -> Self {
-        Self { limits: RarCatalogueLimits::default(), cancel: Cancellation::default(), follow_volumes: true }
+        Self {
+            limits: RarCatalogueLimits::default(),
+            cancel: Cancellation::default(),
+            follow_volumes: true,
+            restart_from_first_volume: false,
+        }
     }
 }
 
@@ -747,9 +757,23 @@ pub struct RarSession {
     options: RarSessionOptions,
     token: Arc<selection::SessionToken>,
     invalid_binding: Option<Arc<RarFailure>>,
+    restarted_from: Option<PathBuf>,
+    members_before_named: u64,
 }
 
 impl RarSession {
+    /// The earlier volume the catalogue started at instead of the one named, with
+    /// [`RarSessionOptions::restart_from_first_volume`]; None when it started at the named volume.
+    pub fn restarted_from(&self) -> Option<&Path> {
+        self.restarted_from.as_deref()
+    }
+
+    /// How many members start in the volumes before the one named, after a restart (0 without one): UnRAR's
+    /// listing positions, which count from the volume named, are the catalogue's positions minus this.
+    pub fn members_before_named(&self) -> u64 {
+        self.members_before_named
+    }
+
     /// Read the volume headers and check their source binding. Member
     /// payloads are neither decoded nor checked by catalogue construction.
     #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
@@ -796,6 +820,8 @@ impl RarSession {
                 options: options.clone(),
                 token: Arc::new(selection::SessionToken { _private: 0 }),
                 invalid_binding: None,
+                restarted_from: None,
+                members_before_named: 0,
             },
             options,
             owned_capacity: 0,
@@ -822,7 +848,18 @@ impl RarSession {
             catalogue.session.password.push_str(password);
             catalogue.owned_capacity = catalogue.session.password.capacity() as u64;
             catalogue.update_capacity()?;
-            catalogue.scan(first, Some(password))
+            // Restart discovery reads under the catalogue's budget and cancellation, with its source checks.
+            let restart = if catalogue.options.restart_from_first_volume && catalogue.options.follow_volumes {
+                catalogue.restart_volume(first, Some(password))?
+            } else {
+                None
+            };
+            catalogue.scan(restart.as_deref().unwrap_or(first), Some(password))?;
+            if let Some(from) = restart {
+                catalogue.session.members_before_named = catalogue.members_before(first);
+                catalogue.session.restarted_from = Some(from);
+            }
+            RarResult::Ok(())
         })();
         if let Err(fault) = result {
             let partial = RarRunSummary {
@@ -1052,6 +1089,69 @@ struct Catalogue {
 }
 
 impl Catalogue {
+    /// The volume to start at instead of `first` (see [`RarSessionOptions::restart_from_first_volume`]): back by name
+    /// while each volume's first member continues from an earlier one, to one that does not. None when `first`
+    /// does not start with a continued member, or a volume on the way is missing, unreadable or not a RAR volume.
+    /// Probes open without blocking, check the source as the scan does, and count against the catalogue's budget.
+    fn restart_volume(&mut self, first: &Path, password: Option<&str>) -> RarResult<Option<PathBuf>> {
+        let mut current = std::path::absolute(first)
+            .map_err(|error| RarFault::input(IoOperation::Open, Some(first.to_path_buf()), None, error))?;
+        if self.probe_continues(&current, password)? != Some(true) {
+            return Ok(None);
+        }
+        for _ in 0..MAX_VOLUMES {
+            let Some(previous) = crate::volume::previous_volume(&current) else { return Ok(None) };
+            current = previous;
+            match self.probe_continues(&current, password)? {
+                Some(true) => {}
+                Some(false) => return Ok(Some(current)),
+                None => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the first member in the volume at `path` continues from an earlier volume; None when the volume
+    /// cannot be read as one. Only cancellation, the catalogue's limits and an output aliasing the volume are errors.
+    fn probe_continues(&mut self, path: &Path, password: Option<&str>) -> RarResult<Option<bool>> {
+        fn soft(fault: RarFault) -> RarResult<Option<bool>> {
+            match fault.failure.as_ref() {
+                // an output that aliases a volume this probe opened is refused as for any input the session opens
+                RarFailure::Canceled | RarFailure::Limit { .. } | RarFailure::OutputAliasesInput => Err(fault),
+                _ => Ok(None),
+            }
+        }
+        check_cancel(&self.options.cancel)?;
+        let Ok(file) = open_read_only(path) else { return Ok(None) };
+        let stamp = match SourceStamp::capture_for_output(&file, path, self.output_identity) {
+            Ok(stamp) => stamp,
+            Err(fault) => return soft(fault),
+        };
+        let mut volume = match Volume::open_catalogue(path, file, stamp.len, password, &mut self.scan_budget()) {
+            Ok(volume) => volume,
+            Err(fault) => return soft(fault),
+        };
+        loop {
+            match volume.next_catalogue(&mut self.scan_budget()) {
+                Ok(Some((Block::File(header), _, _))) => return Ok(Some(header.split_before())),
+                Ok(Some((Block::End { .. }, _, _))) | Ok(None) => return Ok(Some(false)),
+                Ok(Some(_)) => {}
+                Err(fault) => return soft(fault),
+            }
+        }
+    }
+
+    /// Members that start in the volumes scanned before `named` (UnRAR's listing of `named` counts from there).
+    fn members_before(&self, named: &Path) -> u64 {
+        let Ok(named) = std::path::absolute(named) else { return 0 };
+        let Some(index) = self.session.volumes.iter().position(|v| v.path == named) else { return 0 };
+        self.session
+            .headers
+            .iter()
+            .filter(|h| h.volume < index && !h.header.service && !h.header.split_before())
+            .count() as u64
+    }
+
     fn scan(&mut self, first: &Path, password: Option<&str>) -> RarResult<()> {
         if !cfg!(unix) {
             return Err(RarFault::new(

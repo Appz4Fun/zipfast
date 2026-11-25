@@ -44,6 +44,7 @@ fn opts(mode: Mode, dest: &Path, threads: usize) -> Options {
         version_naming: zipfast::extract::VersionNaming::Semicolon,
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     }
 }
 

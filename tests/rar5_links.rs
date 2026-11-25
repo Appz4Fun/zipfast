@@ -45,6 +45,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite, threads: usize) -> Opt
         version_naming: Default::default(),
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
+        restart_from_first_volume: false,
     }
 }
 
@@ -792,6 +793,7 @@ fn refused_links_leave_placeholders_on_every_writer() {
     let opts = |dest: &Path, placeholder: bool| Options {
         preexisting_links: PreexistingLinks::Refuse,
         refused_link_placeholder: placeholder,
+        restart_from_first_volume: false,
         ..options(dest, Mode::Extract, Overwrite::Always, 1)
     };
     let check = |dest: &Path, placeholder: bool, failed: &[u64], writer: &str| {

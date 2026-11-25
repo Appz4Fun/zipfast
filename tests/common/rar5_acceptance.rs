@@ -670,6 +670,7 @@ fn session(f: &Fixture, fill: HoleFill) -> (ProgressiveSession, Shared) {
             version_naming: Default::default(),
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
+            restart_from_first_volume: false,
         },
         "a.part01.rar".into(),
     );
