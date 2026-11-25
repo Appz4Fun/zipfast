@@ -494,6 +494,8 @@ impl SourceDriver {
                 usage: &mut usage,
                 verify: matches!(read.purpose, OriginalReadPurpose::Refill),
                 hole_max: 0,
+                // Reads of retained originals (refills, re-checks) keep the strict contract.
+                trim_long_holes: false,
                 #[cfg(feature = "persistent-partials")]
                 exclusions: exclusions.as_deref(),
                 #[cfg(feature = "persistent-partials")]

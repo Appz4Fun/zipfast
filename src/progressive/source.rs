@@ -415,6 +415,10 @@ struct RangeOperation<'a> {
     /// The longest `Hole` the source may answer for this read, when the session allows one longer than the
     /// buffer (0: no longer than the buffer). See [`SourceDriver::allow_long_hole`].
     hole_max: u64,
+    /// Whether a `Hole` longer than the read, inside the volume, is trimmed to the read rather than refused: true in
+    /// a persistent session (outside verification), whose sources may answer holes whole (RustyGet M6e: an AES
+    /// member's 16-byte resume read inside a hole). The rest of the hole is answered again by the next read.
+    trim_long_holes: bool,
     #[cfg(feature = "persistent-partials")]
     exclusions: Option<&'a crate::partial::PartialExclusions>,
     #[cfg(feature = "persistent-partials")]
@@ -510,7 +514,7 @@ fn poll_available(
     let count = (length - offset).min(buf.len() as u64);
     // A hole may run past the buffer when the session allows it, but never past the volume's current length.
     let hole_max = op.hole_max.min(length - offset).max(count);
-    let limits = HoleLimits { max: hole_max, long: op.hole_max > 0, length };
+    let limits = HoleLimits { max: hole_max, long: op.hole_max > 0 || op.trim_long_holes, length };
     op.usage.check(Resource::ReadChunk, count)?;
     op.usage.charge(Resource::SourceRequests, 1)?;
     op.gate.arm();
@@ -553,8 +557,9 @@ fn poll_available(
 struct HoleLimits {
     /// The longest hole accepted as answered (at least the buffer).
     max: u64,
-    /// Whether the session allowed a long hole: a longer answer inside the volume is then trimmed to `max` (the rest
-    /// is read again), since the source cannot see where the part ends or what the caller declared.
+    /// Whether the session allowed a long hole, or trims long answers on every read (a persistent session): a longer
+    /// answer inside the volume is then trimmed to `max` (the rest is read again), since the source cannot see where
+    /// the part ends, how much the read needs or what the caller declared.
     long: bool,
     /// The volume's length.
     length: u64,
@@ -1166,6 +1171,10 @@ impl SourceDriver {
         // A hole longer than the buffer is allowed for this read only, and not for verification reads.
         let hole_max = if verify { 0 } else { std::mem::take(&mut self.hole_allowance) };
         #[cfg(feature = "persistent-partials")]
+        let trim_long_holes = !verify && self.partial_exclusions.is_some();
+        #[cfg(not(feature = "persistent-partials"))]
+        let trim_long_holes = false;
+        #[cfg(feature = "persistent-partials")]
         let mut hole_max = hole_max;
         #[cfg(feature = "persistent-partials")]
         let buf = if verify || self.pending_partial_read.is_some() {
@@ -1201,6 +1210,7 @@ impl SourceDriver {
                 usage: &mut self.usage,
                 verify,
                 hole_max,
+                trim_long_holes,
                 #[cfg(feature = "persistent-partials")]
                 exclusions: self.partial_exclusions.as_deref(),
                 #[cfg(feature = "persistent-partials")]
@@ -2424,6 +2434,7 @@ mod partial_callback_tests {
                 usage: &mut usage,
                 verify: false,
                 hole_max: 0,
+                trim_long_holes: false,
                 exclusions: Some(&exclusions),
                 pending: &mut pending,
                 native: None,
