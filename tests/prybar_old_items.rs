@@ -40,6 +40,7 @@ fn options(dest: &Path, overwrite: Overwrite) -> Options {
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
     }
 }
 
@@ -85,7 +86,9 @@ fn tar_replaces_a_link_this_run_placed() {
         fs::write(&archive, tar(&[("a", b'2', b"x"), ("a", later.0, later.1)])).unwrap();
         let dest = dir.path().join("out");
         fs::create_dir(&dest).unwrap();
-        let s = extract::run(&archive, &options(&dest, Overwrite::Always), |_| {}).unwrap();
+        // UnRAR's behaviour, which a caller opts into
+        let opts = Options { replace_placed_links: true, ..options(&dest, Overwrite::Always) };
+        let s = extract::run(&archive, &opts, |_| {}).unwrap();
         assert!(s.errors.is_empty(), "{:?}: {:?}", later.0, s.errors);
         if later.0 == b'0' {
             assert_eq!(fs::read(dest.join("a")).unwrap(), b"data");
@@ -115,7 +118,8 @@ fn fixture(name: &str) -> std::path::PathBuf {
 
 /// Each ZIP route: the legacy runner and the checked one.
 fn run_zip(route: &str, archive: &Path, dest: &Path, overwrite: Overwrite) -> Vec<String> {
-    let opts = options(dest, overwrite);
+    // these tests check the replacement of a link this run placed, which a caller opts into
+    let opts = Options { replace_placed_links: true, ..options(dest, overwrite) };
     if route == "legacy" {
         extract::run(archive, &opts, |_| {}).unwrap().errors
     } else {
@@ -253,4 +257,18 @@ fn flatten_start_hook_paths_are_flat_for_7z_and_rar() {
             assert_eq!(path.parent(), Some(out.path()), "{archive:?}: {path:?}");
         }
     }
+}
+
+/// By default a link this run placed, met where a later member goes, is refused as 7-Zip 26.06 does ("Dangerous link
+/// via another link was ignored"): the member fails and the link stays.
+#[test]
+fn by_default_a_link_this_run_placed_is_refused_as_7zip_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("a.tar");
+    fs::write(&archive, tar(&[("a", b'2', b"x"), ("a", b'0', b"data")])).unwrap();
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    let s = extract::run(&archive, &options(&dest, Overwrite::Always), |_| {}).unwrap();
+    assert!(!s.errors.is_empty(), "the second member is refused");
+    assert_eq!(fs::read_link(dest.join("a")).unwrap(), Path::new("x"), "the link this run placed stays");
 }

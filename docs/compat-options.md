@@ -1,6 +1,6 @@
 # 7-Zip and UnRAR compatibility options
 
-Seven fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
+Eight fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
 `7z` and `unrar` modes) get their behaviour where zipfast's own default differs. Every default keeps zipfast's
 behaviour, so a caller that sets them to `Default::default()` (or `None`) sees no change.
 
@@ -14,6 +14,7 @@ version_naming: Default::default(),
 preexisting_links: Default::default(),
 refused_link_placeholder: false,
 restart_from_first_volume: false,
+replace_placed_links: false,
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -109,9 +110,10 @@ The link is refused when that leads out of the destination, whichever choice is 
 
 UnRAR also makes `e`; zipfast never makes a link that leads out of the destination.
 
-A symbolic link this run placed itself (same device and inode as the link it made) is not a pre-existing link: a
-later member of the same name replaces it by rename, never following it, as a file replaces a file (tar, ZIP, 7z and
-RAR runs; `Overwrite::Skip` keeps it). A link from before the run is still refused (`a symlink is in the way`). The
+With `Options::replace_placed_links` (UnRAR 7.30 `e -y`), a symbolic link this run placed itself (same device and
+inode as the link it made) is not a pre-existing link: a later member of the same name replaces it by rename, never
+following it, as a file replaces a file (tar, ZIP, 7z and RAR runs; `Overwrite::Skip` keeps it). Off (the default) it
+is refused, as 7-Zip 26.06 does (`7z e dirlink_unix.rar`: "Dangerous link via another link was ignored", exit 2). A link from before the run is still refused (`a symlink is in the way`). The
 checked ZIP route (`run_with_policy`) does this for a link over a link, but still refuses a file over a link it placed.
 
 ## `refused_link_placeholder`: an empty file where a link was refused

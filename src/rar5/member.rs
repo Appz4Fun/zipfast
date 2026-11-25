@@ -1411,6 +1411,7 @@ mod tests {
                     preexisting_links: Default::default(),
                     refused_link_placeholder: false,
                     restart_from_first_volume: false,
+                    replace_placed_links: false,
                 },
                 "a.rar".into(),
             );
@@ -1749,6 +1750,7 @@ mod tests {
                 preexisting_links: Default::default(),
                 refused_link_placeholder: false,
                 restart_from_first_volume: false,
+                replace_placed_links: false,
             };
             let run = crate::extract::run_with_password(
                 &fixtures.join(format!("testfile5{set}.part01.rar")),

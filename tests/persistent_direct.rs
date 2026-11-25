@@ -453,6 +453,7 @@ fn straight(work: &Path, volumes: &[Vec<u8>], first: &str, password: Option<&str
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
     };
     zipfast::extract::run_with_password(&names[0], &options, password, |_| {}).unwrap();
     let mut files = Vec::new();
