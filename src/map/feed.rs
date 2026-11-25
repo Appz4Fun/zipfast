@@ -938,7 +938,9 @@ impl FeedDecoder {
     /// Under AES-CBC, the ciphertext block just before an [`Self::open_at`] decoder's start (its IV), when the caller
     /// has it: a twin copy's packed bytes are the same ciphertext, so the block before the start is in the article
     /// the other copy already gave. The decoder then reads nothing before its start. Call it before the first run;
-    /// refused for other layers and at the member's start.
+    /// refused for other layers and at the member's start. For a twin, also give this copy's source the other copy's
+    /// article holding the block that straddles where its output stopped (byte for byte the same here): the up to 15
+    /// bytes from the start to `at` are decrypted from it, so this copy is asked for nothing before `at`.
     pub fn set_open_iv(&mut self, previous_block: [u8; 16]) -> Result<(), FeedError> {
         let start = self.held_prefix;
         let fresh = self.stats.written == 0 && self.stats.packed_read == 0;
