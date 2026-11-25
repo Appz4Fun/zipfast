@@ -1313,8 +1313,8 @@ impl PartialCore {
             Err(error) => return Err(error),
         };
         let mut completed = 0usize;
-        let blake_ranges = verify::BlakeFrontier::ranges(&op.snapshot);
         let mut blake = std::mem::take(&mut op.blake);
+        let hashing = blake.refresh(&op.snapshot);
         let write = (|| {
             for range in &plan.unknown {
                 let mut at = range.start;
@@ -1332,8 +1332,8 @@ impl PartialCore {
                     if n == 0 {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
-                    if !blake_ranges.is_empty() {
-                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n], &self.budget);
+                    if hashing {
+                        blake.feed_checked(at, &bytes[(at - offset) as usize..][..n], &self.budget);
                     }
                     completed += n;
                     at += n as u64;
@@ -1478,8 +1478,8 @@ impl PartialCore {
         }
         let intent = op.group.as_ref().unwrap().intent.anchor.clone();
         let mut completed = 0usize;
-        let blake_ranges = verify::BlakeFrontier::ranges(&op.snapshot);
         let mut blake = std::mem::take(&mut op.blake);
+        let hashing = blake.refresh(&op.snapshot);
         let write = (|| {
             for range in &plan.unknown {
                 let mut at = range.start;
@@ -1498,8 +1498,8 @@ impl PartialCore {
                     if n == 0 {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
-                    if !blake_ranges.is_empty() {
-                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n], &self.budget);
+                    if hashing {
+                        blake.feed_checked(at, &bytes[(at - offset) as usize..][..n], &self.budget);
                     }
                     completed += n;
                     at += n as u64;

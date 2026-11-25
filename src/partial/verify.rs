@@ -43,6 +43,10 @@ const BLAKE_STORAGE: u64 = 4096;
 #[derive(Default)]
 pub(super) struct BlakeFrontier {
     pub(super) runs: Vec<BlakeRun>,
+    /// The checked ranges, sorted by start, and what they were built from (parts appended, size, member check,
+    /// encryption): rebuilt only when that changes, not for every write.
+    ranges: Vec<Range<u64>>,
+    built: Option<(usize, u64, bool, bool)>,
 }
 pub(super) struct BlakeRun {
     pub(super) range: Range<u64>,
@@ -54,6 +58,21 @@ pub(super) struct BlakeRun {
     lease: Option<Reservation>,
 }
 impl BlakeFrontier {
+    /// Brings the checked ranges up to date with `snapshot` (cheap when nothing changed); true when there are any.
+    pub(super) fn refresh(&mut self, snapshot: &Snapshot) -> bool {
+        let key = (
+            snapshot.evidence.parts.len(),
+            snapshot.head.size,
+            snapshot.head.checks.blake2sp.is_some(),
+            snapshot.crypt.is_some(),
+        );
+        if self.built != Some(key) {
+            self.ranges = Self::ranges(snapshot);
+            self.built = Some(key);
+        }
+        !self.ranges.is_empty()
+    }
+
     /// The checked ranges of `snapshot` that have a BLAKE2sp check on plaintext, without repeats.
     pub(super) fn ranges(snapshot: &Snapshot) -> Vec<Range<u64>> {
         let mut ranges = Vec::new();
@@ -69,11 +88,20 @@ impl BlakeFrontier {
         ranges.dedup();
         ranges
     }
+    /// Follows a write for the ranges [`Self::refresh`] built.
+    pub(super) fn feed_checked(&mut self, offset: u64, bytes: &[u8], budget: &PartialBudget) {
+        let ranges = std::mem::take(&mut self.ranges);
+        self.feed(&ranges, offset, bytes, budget);
+        self.ranges = ranges;
+    }
+
     /// Follows a write of `bytes` at output `offset` that landed on disk, for the checked `ranges`. A hash is
     /// begun only if `budget` grants it `BLAKE_STORAGE`; without it that range is read back when verified.
     pub(super) fn feed(&mut self, ranges: &[Range<u64>], offset: u64, bytes: &[u8], budget: &PartialBudget) {
         let end = offset.saturating_add(bytes.len() as u64);
-        for range in ranges {
+        // ranges are sorted by start: only those starting before the write's end can meet it
+        let upto = ranges.partition_point(|r| r.start < end);
+        for range in &ranges[..upto] {
             let (from, to) = (offset.max(range.start), end.min(range.end));
             if from >= to {
                 continue;
