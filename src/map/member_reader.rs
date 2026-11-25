@@ -364,6 +364,7 @@ enum Cipher {
 }
 
 /// A member's data key, derived from the password.
+#[derive(Clone)]
 pub(super) enum MemberKey {
     None,
     /// AES-CBC: the key and the IV of block 0.
@@ -484,6 +485,99 @@ pub(super) fn derive_keys(
         _ => return Err(ExtractFromError::Malformed("cipher parameters do not match the output mapping")),
     };
     Ok(DerivedKeys { key, hash_key, verified })
+}
+
+/// Data keys derived from a password for one key-derivation input (RAR 5.0: salt and KDF count; RAR 4.x: salt; 7zAES:
+/// salt and cycles; WinZip AES: salt and strength), reusable for another member with the same input: a twin copy of
+/// the file in another posting, or the next member of a set. Reusing them skips the key derivation (PBKDF2 or SHA-256
+/// rounds, tens of milliseconds); each member's own IV still comes from its map. Opaque: the keys never leave it.
+/// Get them from [`super::FeedDecoder::keys`] and hand them over in [`super::FeedOptions::keys`]; they are used only
+/// for a member whose key-derivation input matches, and derived again otherwise. They were derived with the password
+/// of the decoder they came from.
+#[derive(Clone)]
+pub struct FeedKeys(std::sync::Arc<KeySet>);
+
+struct KeySet {
+    identity: KdfIdentity,
+    key: MemberKey,
+    hash_key: Option<[u8; 32]>,
+    verified: bool,
+}
+
+impl std::fmt::Debug for FeedKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FeedKeys(..)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum KdfIdentity {
+    Rar5 { kdf_count: u8, salt: [u8; 16] },
+    Rar4 { salt: [u8; 8] },
+    SevenZip { num_cycles_power: u8, salt: Vec<u8> },
+    WinZip { strength: u8, salt: Vec<u8> },
+}
+
+fn kdf_identity(member: &MapMember) -> Option<KdfIdentity> {
+    Some(match member.cipher.as_ref()? {
+        CipherParams::Rar5 { kdf_count, salt, .. } => KdfIdentity::Rar5 { kdf_count: *kdf_count, salt: *salt },
+        CipherParams::Rar4 { salt } => KdfIdentity::Rar4 { salt: *salt },
+        CipherParams::SevenZipAes { num_cycles_power, salt, .. } => {
+            KdfIdentity::SevenZip { num_cycles_power: *num_cycles_power, salt: salt.clone() }
+        }
+        CipherParams::WinZipAes { strength, salt, .. } => {
+            KdfIdentity::WinZip { strength: *strength, salt: salt.clone() }
+        }
+        _ => return None,
+    })
+}
+
+/// [`derive_keys`], reusing `reuse` when it was derived for the same key-derivation input; also gives the keys to
+/// reuse for another member (None for a member without a reusable key).
+pub(super) fn derive_keys_reusing(
+    member: &MapMember,
+    mapping: OutputMapping,
+    password: Option<&str>,
+    limits: &crate::progressive::ProgressiveLimits,
+    usage: &Usage,
+    control: &crate::progressive::SessionControl,
+    reuse: Option<&FeedKeys>,
+) -> Result<(DerivedKeys, Option<FeedKeys>), ExtractFromError> {
+    let identity = kdf_identity(member);
+    if let (Some(keys), Some(id)) = (reuse, identity.as_ref())
+        && keys.0.identity == *id
+    {
+        // the key and the keyed-check key depend only on the input; the IV is the member's own
+        let key = match (&keys.0.key, &member.cipher, mapping) {
+            (MemberKey::Cbc { aes, .. }, Some(CipherParams::Rar5 { iv: Some(iv), .. }), OutputMapping::CbcBlocks)
+            | (MemberKey::Cbc { aes, .. }, Some(CipherParams::SevenZipAes { iv, .. }), OutputMapping::CbcBlocks) => {
+                MemberKey::Cbc { aes: *aes, iv: *iv }
+            }
+            (MemberKey::Cbc { .. }, Some(CipherParams::Rar4 { .. }), OutputMapping::CbcBlocks) => keys.0.key.clone(),
+            (
+                MemberKey::Ctr { aes, mac_key, .. },
+                Some(CipherParams::WinZipAes { .. }),
+                OutputMapping::Counter { skip },
+            ) => MemberKey::Ctr { aes: *aes, skip, mac_key: mac_key.clone() },
+            _ => {
+                let derived = derive_keys(member, mapping, password, limits, usage, control)?;
+                return Ok((derived, None));
+            }
+        };
+        let derived = DerivedKeys { key, hash_key: keys.0.hash_key, verified: keys.0.verified };
+        return Ok((derived, Some(keys.clone())));
+    }
+    let derived = derive_keys(member, mapping, password, limits, usage, control)?;
+    let reusable =
+        identity.filter(|_| matches!(derived.key, MemberKey::Cbc { .. } | MemberKey::Ctr { .. })).map(|identity| {
+            FeedKeys(std::sync::Arc::new(KeySet {
+                identity,
+                key: derived.key.clone(),
+                hash_key: derived.hash_key,
+                verified: derived.verified,
+            }))
+        });
+    Ok((derived, reusable))
 }
 
 struct PartHash {

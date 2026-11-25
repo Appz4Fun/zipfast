@@ -19,7 +19,7 @@
 //! ([`NeedBytes`]). Holes are skipped where the layer allows and repaired when their bytes come; the decoder's state
 //! can be saved and restored. See `docs/feed-decoder.md`.
 
-use super::member_reader::{MemberKey, derive_keys, validate};
+use super::member_reader::{FeedKeys, MemberKey, derive_keys, derive_keys_reusing, validate};
 use super::{CipherParams, ExtractFromError, MapMember, MapMethod, MemberMap, OutputMapping, UnsupportedRead};
 use crate::crypto::AesKey;
 use crate::progressive::{ProgressiveLimits, SessionControl, Usage};
@@ -222,6 +222,9 @@ pub struct FeedOptions {
     /// The largest RAR 5.0 window (dictionary) a compressed member may allocate (default 1 GiB). A repair runs a
     /// second decoder with its own window while it lasts.
     pub max_window: u64,
+    /// Keys derived earlier for the same password and key-derivation input ([`FeedDecoder::keys`] of a twin copy's
+    /// decoder, or of an earlier member): used instead of deriving again when they match the member (default none).
+    pub keys: Option<FeedKeys>,
 }
 
 impl Default for FeedOptions {
@@ -234,6 +237,7 @@ impl Default for FeedOptions {
             max_needs: 64,
             run_budget: None,
             max_window: 1 << 30,
+            keys: None,
         }
     }
 }
@@ -834,6 +838,12 @@ pub struct FeedDecoder {
     mac: Option<Box<StoredMac>>,
     /// [`FeedDecoder::open_at`]: the output before the main decode's start, which the caller held (0 otherwise)
     held_prefix: u64,
+    /// [`FeedDecoder::open_at`]: the output offset asked for (the start is at or before it under CBC)
+    open_from: u64,
+    /// output before this is not hashed into the CRC runs: the caller's prefix CRC covers it
+    crc_floor: u64,
+    /// the keys derived for this member, to hand to a twin's decoder
+    keys: Option<FeedKeys>,
 }
 
 /// The authentication code of a WinZip AES stored member: HMAC-SHA1 over the ciphertext in order. The main decode
@@ -908,18 +918,39 @@ impl FeedDecoder {
         }
         decoder.main = (start < decoder.size).then(|| decoder.lane_at(start, decoder.size));
         decoder.held_prefix = start;
+        decoder.open_from = at;
         decoder.status = decoder.make_status(Vec::new(), false);
         Ok(decoder)
     }
 
-    /// The CRC32 (unkeyed) of the output before an [`Self::open_at`] decoder's start, `0..status().frontier` as it
-    /// was opened, so the member's CRC is checked when done. Call it before the first run.
+    /// The CRC32 (unkeyed) of the output the caller holds before an [`Self::open_at`] decoder's offset (`0..at`, the
+    /// offset it was opened at), so the member's CRC is checked when done. Under AES-CBC the decoder writes the few
+    /// bytes from its block start to `at` again; they are not hashed twice. Call it before the first run.
     pub fn set_prefix_crc32(&mut self, crc32: u32) -> Result<(), FeedError> {
-        if self.held_prefix == 0 || self.stats.written > 0 || self.crc.runs.contains_key(&0) {
+        if self.open_from == 0 || self.stats.written > 0 || self.crc.runs.contains_key(&0) {
             return Err(FeedError::Malformed("a prefix CRC needs a fresh open_at decoder"));
         }
-        self.crc.add_run(0, self.held_prefix, crc32);
+        self.crc.add_run(0, self.open_from, crc32);
+        self.crc_floor = self.open_from;
         Ok(())
+    }
+
+    /// Under AES-CBC, the ciphertext block just before an [`Self::open_at`] decoder's start (its IV), when the caller
+    /// has it: a twin copy's packed bytes are the same ciphertext, so the block before the start is in the article
+    /// the other copy already gave. The decoder then reads nothing before its start. Call it before the first run;
+    /// refused for other layers and at the member's start.
+    pub fn set_open_iv(&mut self, previous_block: [u8; 16]) -> Result<(), FeedError> {
+        let start = self.held_prefix;
+        let fresh = self.stats.written == 0 && self.stats.packed_read == 0;
+        match (&self.cipher, self.main.as_mut()) {
+            (StoredCipher::Cbc { .. }, Some(lane)) if start > 0 && fresh && lane.next == start => {
+                lane.pos = start;
+                lane.iv = Some(previous_block);
+                lane.rem.clear();
+                Ok(())
+            }
+            _ => Err(FeedError::Malformed("an IV is given only to a fresh AES-CBC open_at decoder past the start")),
+        }
     }
 
     fn new_begin(map: &MemberMap, index: usize, options: FeedOptions, begin: Begin) -> Result<Self, FeedError> {
@@ -988,10 +1019,19 @@ impl FeedDecoder {
         let mut mac = None;
         // an empty member needs no key, unless its CRC is keyed with the password
         let keyed_crc = member.checks.is_some_and(|c| c.keyed && c.crc32.is_some());
+        let mut derived_keys = None;
         let cipher = if member.encrypted && (size > 0 || keyed_crc) {
-            let keys =
-                derive_keys(member, mapping, options.password.as_deref(), &options.limits, &usage, &options.control)
-                    .map_err(FeedError::from_extract)?;
+            let (keys, reusable) = derive_keys_reusing(
+                member,
+                mapping,
+                options.password.as_deref(),
+                &options.limits,
+                &usage,
+                &options.control,
+                options.keys.as_ref(),
+            )
+            .map_err(FeedError::from_extract)?;
+            derived_keys = reusable;
             hash_key = keys.hash_key;
             match keys.key {
                 MemberKey::Cbc { aes, iv } => StoredCipher::Cbc { aes, iv },
@@ -1040,6 +1080,9 @@ impl FeedDecoder {
             scratch: Vec::new(),
             run_written: 0,
             held_prefix: 0,
+            open_from: 0,
+            crc_floor: 0,
+            keys: None,
             failed: false,
             status: FeedStatus::default(),
             index: 0,
@@ -1054,11 +1097,19 @@ impl FeedDecoder {
             zip: None,
             mac,
         };
+        decoder.keys = derived_keys;
         if size > 0 {
             decoder.main = Some(decoder.lane_at(0, size));
         }
         decoder.status = decoder.make_status(Vec::new(), false);
         Ok(decoder)
+    }
+
+    /// The keys derived for this member (None when it is not encrypted, or its cipher's keys cannot be reused), to
+    /// hand to another member's decoder in [`FeedOptions::keys`]: a twin copy's in a failover, which then skips the
+    /// key derivation.
+    pub fn keys(&self) -> Option<FeedKeys> {
+        self.keys.clone()
     }
 
     /// The member's output size.
@@ -1616,7 +1667,9 @@ impl FeedDecoder {
         }
         let bytes = &bytes[..(end - out) as usize];
         sink.write_at(out, bytes).map_err(|error| FeedError::Write { out, error })?;
-        self.crc.add(out, bytes);
+        // bytes below the floor are the caller's, already in its prefix CRC (an open_at under CBC writes them again)
+        let skip = self.crc_floor.saturating_sub(out).min(bytes.len() as u64) as usize;
+        self.crc.add(out + skip as u64, &bytes[skip..]);
         self.stats.written += bytes.len() as u64;
         self.run_written += bytes.len() as u64;
         Ok(())

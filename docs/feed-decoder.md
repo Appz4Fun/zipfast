@@ -450,11 +450,15 @@ obfuscated. A's output `0..F` stays in its persistent partial (or wherever A wro
 | B's member | call sequence | what B is asked for |
 |---|---|---|
 | stored (RAR, ZIP method 0, 7z Copy) | `FeedDecoder::open_at(&map_b, m, F, options)`, then `set_prefix_crc32(crc of 0..F)` if you have it, then `run` as usual with a sink writing into A's partial | B's packed bytes for `F..size` only |
-| AES-CBC stored (RAR 5.0, RAR 4.x AES, 7zAES over Copy) | the same; the decoder starts at the block holding `F` (`status().frontier`, at most 15 bytes before `F`, written again with the same bytes) | the IV block before it, then `F..size` |
+| AES-CBC stored (RAR 5.0, RAR 4.x AES, 7zAES over Copy) | the same; the decoder starts at the block holding `F` (`status().frontier`, at most 15 bytes before `F`, written again with the same bytes, not hashed twice). For a twin, `set_open_iv(block)` with the ciphertext block before that start from A's last article (the same ciphertext) | `F..size` only with `set_open_iv`; otherwise the IV block before it too |
 | WinZip AES stored | the same; the authentication code is caught up from `read_held` (A's output) | `F..size` and the 10-byte code |
 | RAR 5.0 compressed (AES under it too) | plan with `map::open_at(&map_b, m, F, &OpenAtOptions { seed: Seed::HeldPlaintext { strict: false }, .. })`, fetch its `spans`, then `complete_rar5(&map_b, &plan, packed_from, packed, known_base, known, &near)` with A's output as `known`; feed `decoder` from `feed_from`. Or, with no plan: `FeedDecoder::new` over a source that answers B's bytes before the plan's `fetch_from` as holes and a sink whose `read_held` gives A's output: the hole skip restarts near `F` seeded from it ([above](#compressed-rar-50)) | from about `F`'s estimated packed position minus the search region; the output is `unproven` until the member's CRC/BLAKE2sp proves it (fall back to `Seed::Checked` when it fails) |
 | 7z LZMA2 (7zAES under it too) | `map::open_at` (`Start::Lzma2`), walk chunk headers (`Lzma2Framing::HeaderWalk`: `Lzma2IndexBuilder::for_folder` or `MemberMap::lzma2_chunks`) or fetch from the folder's start under 7zAES (`FromStart`), then `complete_lzma2` with A's output as the dictionary | chunk headers before `F` (a few bytes per 64 KiB chunk), then the folder from the restart chunk to its end marker |
 | RAR 4.x compressed, other ZIP methods, ZipCrypto, other 7z coders | no restart inside the member: `open_at` refuses (`StartOnly`, `Unsupported`); decode B from its start, or fill A's holes from B's output with `PartialFile::fill` once B's extraction passes them | the whole member |
+
+`set_prefix_crc32` takes the CRC32 of the output the caller holds, `0..F`. For a twin (same password, salt and KDF
+input) pass A's decoder's `keys()` in `FeedOptions::keys`: B's decoder skips the key derivation (RAR 5.0 PBKDF2, about
+18 ms on a Coffee Lake, 4 ms on an M4); keys that do not match the member are ignored and derived again.
 
 A stored member's bytes in B are plaintext (or decrypt on their own), so a failover there costs exactly B's bytes
 past `F`. With persistent partials, A's partial keeps every check: B's output written with `fill` (or a

@@ -946,7 +946,8 @@ fn open_at_continues_another_copys_output_without_reading_before_it() {
                 assert_eq!(start, at, "{} at {at}", case.what);
             }
             if start > 0 {
-                decoder.set_prefix_crc32(crc32fast::hash(&case.plain[..start as usize])).unwrap();
+                // the caller's CRC of what it holds, 0..at (under CBC the decoder writes start..at again)
+                decoder.set_prefix_crc32(crc32fast::hash(&case.plain[..at as usize])).unwrap();
             }
             assert!(decoder.set_prefix_crc32(0).is_err(), "a second (or needless) prefix CRC is refused");
             // The first byte of B each volume may be asked for: its span for `start..`, then to the volume's end.
@@ -1312,4 +1313,66 @@ fn a_cbc_fill_ahead_keeps_the_chaining_value() {
     let status = decoder.run(&mut source, &mut sink).unwrap();
     assert!(status.done && status.lost.is_empty() && status.crc_ok == Some(true), "{status:?}");
     assert_eq!(sink.out, case.plain);
+}
+
+/// A twin's failover under AES-CBC: the caller hands over the ciphertext block before the start (the IV, from the
+/// other copy's last article), so nothing of this copy before the start is read; and the other copy's derived keys,
+/// so no key derivation runs.
+#[test]
+fn open_at_takes_the_iv_and_the_keys_from_the_other_copy() {
+    let case = &cases()[1]; // RAR 5.0 AES stored, 4 volumes
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+    let member = &map.members[0];
+    let size = case.plain.len() as u64;
+    // copy A's keys, from a decoder of the same member (a twin carries the same salt and KDF count)
+    let a = FeedDecoder::new(&map, 0, FeedOptions::new(case.password)).unwrap();
+    let keys = a.keys().expect("an AES member's keys are reusable");
+    // too little KDF budget to derive a key: only reused keys can open it
+    let starved = || {
+        let mut o = all_needs(case.password);
+        o.limits.kdf_session_blocks = 1;
+        o
+    };
+    assert!(FeedDecoder::open_at(&map, 0, 20_001, starved()).is_err(), "deriving needs the KDF budget");
+    for at in [16u64, 7_000, 20_001, size - 1] {
+        let options = FeedOptions { keys: Some(keys.clone()), ..starved() };
+        let mut decoder = FeedDecoder::open_at(&map, 0, at, options).unwrap();
+        let start = decoder.status().frontier;
+        // the IV: the ciphertext block before the start, from the other copy's bytes (the same ciphertext)
+        let iv_span = member.packed_spans(start - 16..start).unwrap();
+        let mut iv = Vec::new();
+        for span in &iv_span {
+            iv.extend_from_slice(
+                &case.volumes[span.volume as usize][span.packed.start as usize..span.packed.end as usize],
+            );
+        }
+        let iv: [u8; 16] = iv[iv.len() - 16..].try_into().unwrap();
+        decoder.set_open_iv(iv).unwrap();
+        decoder.set_prefix_crc32(crc32fast::hash(&case.plain[..at as usize])).unwrap();
+        let floor: Vec<(u32, u64)> =
+            member.packed_spans(start..size).unwrap().iter().map(|s| (s.volume, s.packed.start + 16)).collect();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        let mut sink = Once { out: case.plain[..start as usize].to_vec(), ..Default::default() };
+        for _ in 0..10_000 {
+            let status = decoder.run(&mut source, &mut sink).unwrap();
+            if status.done {
+                break;
+            }
+            for need in &status.needs {
+                // the IV block was given: nothing before the start's own bytes is asked for
+                let first = floor.iter().find(|(v, _)| *v == need.volume).map(|&(_, f)| f - 16);
+                assert!(first.is_some_and(|f| need.range.start >= f), "at {at}: {need:?}");
+                let bytes = &case.volumes[need.volume as usize][need.range.start as usize..need.range.end as usize];
+                source.insert(need.volume, need.range.start, bytes).unwrap();
+            }
+        }
+        let status = decoder.status().clone();
+        assert!(status.done && status.crc_ok == Some(true), "at {at}: {status:?}");
+        assert_eq!(sink.out, case.plain, "at {at}");
+        assert_eq!(
+            decoder.stats().packed_read,
+            member.packed_spans(start..size).unwrap().iter().map(|s| s.packed.end - s.packed.start).sum::<u64>() - 16,
+            "at {at}: only the bytes from the start, not the IV block"
+        );
+    }
 }
