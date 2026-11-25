@@ -924,3 +924,156 @@ fn a_snapshot_after_a_skip_restores_at_the_restart_not_before_the_hole() {
     assert_eq!(sink.out, whole);
     assert!(sink.seen.iter().all(|s| *s));
 }
+
+/// Copy B continues copy A's extraction (a failover): `open_at` starts the main decode where A's output stops, so
+/// none of B's packed bytes before that are ever needed, and with A's prefix CRC the member's CRC is still checked.
+#[test]
+fn open_at_continues_another_copys_output_without_reading_before_it() {
+    for case in cases() {
+        let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+        let member = &map.members[0];
+        let size = case.plain.len() as u64;
+        let cbc = member.mapping == OutputMapping::CbcBlocks;
+        for at in [1, 15, 16, 17, 7_000, 20_001, size - 1, size] {
+            let mut decoder = FeedDecoder::open_at(&map, 0, at, all_needs(case.password)).unwrap();
+            let start = decoder.status().frontier;
+            if cbc {
+                assert_eq!(start, at & !15, "{} at {at}", case.what);
+            } else {
+                assert_eq!(start, at, "{} at {at}", case.what);
+            }
+            if start > 0 {
+                decoder.set_prefix_crc32(crc32fast::hash(&case.plain[..start as usize])).unwrap();
+            }
+            assert!(decoder.set_prefix_crc32(0).is_err(), "a second (or needless) prefix CRC is refused");
+            // The first byte of B each volume may be asked for: its span for `start..`, then to the volume's end.
+            let first: Vec<(u32, u64)> =
+                member.packed_spans(start..size).unwrap().iter().map(|span| (span.volume, span.packed.start)).collect();
+            let mut source = ArticleBuffer::new(usize::MAX);
+            let mut sink = Once { out: case.plain[..start as usize].to_vec(), ..Default::default() };
+            let mut asked = 0u64;
+            for _ in 0..10_000 {
+                let status = decoder.run(&mut source, &mut sink).unwrap();
+                if status.done {
+                    break;
+                }
+                assert!(!status.needs.is_empty(), "{} at {at}: stuck without needs", case.what);
+                for need in &status.needs {
+                    let floor = first.iter().find(|(v, _)| *v == need.volume).map(|&(_, f)| f);
+                    assert!(
+                        floor.is_some_and(|f| need.range.start >= f),
+                        "{} at {at}: needs {need:?} before {first:?}",
+                        case.what
+                    );
+                    let bytes = &case.volumes[need.volume as usize][need.range.start as usize..need.range.end as usize];
+                    source.insert(need.volume, need.range.start, bytes).unwrap();
+                    asked += bytes.len() as u64;
+                }
+            }
+            let status = decoder.status().clone();
+            assert!(status.done, "{} at {at}: {status:?}", case.what);
+            assert_eq!(status.crc_ok, Some(true), "{} at {at}", case.what);
+            assert_eq!(sink.out, case.plain, "{} at {at}", case.what);
+            assert_eq!(decoder.stats().written, size - start, "{} at {at}", case.what);
+            // Only what the rest needs: B's bytes from the start's span on (plus a WinZip AES code).
+            let rest: u64 =
+                member.packed_spans(start..size).unwrap().iter().map(|s| s.packed.end - s.packed.start).sum();
+            assert!(asked <= rest + 10, "{} at {at}: asked {asked} for {rest}", case.what);
+        }
+    }
+}
+
+#[test]
+fn open_at_refuses_compressed_members_and_offsets_past_the_end() {
+    let plain = data(20_000, 3);
+    let volumes = rar5_compressed(&plain, false, 1 << 20);
+    let map = MemberMap::from_memory(&refs(&volumes), "c.part1.rar", None).unwrap();
+    assert!(matches!(
+        FeedDecoder::open_at(&map, 0, 100, FeedOptions::new(None)),
+        Err(FeedError::Unsupported(FeedUnsupported::Compressed { .. }))
+    ));
+    let case = &cases()[0];
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, None).unwrap();
+    let past = case.plain.len() as u64 + 1;
+    assert!(matches!(FeedDecoder::open_at(&map, 0, past, FeedOptions::new(None)), Err(FeedError::Malformed(_))));
+    // At 0 it is a fresh decoder, and a prefix CRC has nothing to cover.
+    let mut fresh = FeedDecoder::open_at(&map, 0, 0, FeedOptions::new(None)).unwrap();
+    assert_eq!(fresh.status().frontier, 0);
+    assert!(fresh.set_prefix_crc32(0).is_err());
+}
+
+/// RustyGet: extraction straight from the volume files as the downloader writes them. Articles land in shuffled
+/// order (one lost, then written late); the decoder reads each from disk once, the moment it is written, and never
+/// waits for a finished volume.
+#[test]
+fn volume_files_feed_the_decoder_as_articles_are_written() {
+    use std::os::unix::fs::FileExt;
+    for case in cases() {
+        let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+        let member = &map.members[0];
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = VolumeFiles::new();
+        let mut writers = Vec::new();
+        for (i, volume) in case.volumes.iter().enumerate() {
+            let path = dir.path().join(format!("v{i}"));
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(volume.len() as u64).unwrap();
+            source.set_file(i as u32, std::fs::File::open(&path).unwrap());
+            writers.push(file);
+        }
+        let mut all = articles(&case.volumes, 1_000);
+        shuffle(&mut all, 11);
+        let late = all.remove(all.len() / 2);
+        source.mark_lost(late.0, late.1..late.1 + late.2.len() as u64);
+        let mut decoder = FeedDecoder::new(&map, 0, all_needs(case.password)).unwrap();
+        let mut sink = Once::default();
+        for (v, off, bytes) in &all {
+            writers[*v as usize].write_all_at(bytes, *off).unwrap();
+            source.mark_written(*v, *off..*off + bytes.len() as u64);
+            let status = decoder.run(&mut source, &mut sink).unwrap();
+            // Written bytes are never needed.
+            for need in &status.needs {
+                assert!(
+                    source.written(need.volume).iter().all(|w| w.end <= need.range.start || need.range.end <= w.start),
+                    "{}: {need:?} is written",
+                    case.what
+                );
+            }
+        }
+        writers[late.0 as usize].write_all_at(&late.2, late.1).unwrap();
+        source.mark_written(late.0, late.1..late.1 + late.2.len() as u64);
+        let status = decoder.run(&mut source, &mut sink).unwrap();
+        assert!(status.done && status.lost.is_empty(), "{}: {status:?}", case.what);
+        assert_eq!(status.crc_ok, Some(true), "{}", case.what);
+        assert_eq!(sink.out, case.plain, "{}", case.what);
+        // Each packed byte read from disk once (under CBC a hole costs a few blocks read twice around it).
+        let stats = decoder.stats();
+        let extra = stats.packed_read.saturating_sub(member.packed_size);
+        let bound = 64 * (stats.holes + 1) + 16;
+        assert!(extra <= bound, "{}: read {extra} bytes twice over {} holes", case.what, stats.holes);
+    }
+}
+
+#[test]
+fn volume_files_answer_written_lost_and_late_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v0");
+    std::fs::write(&path, vec![7u8; 100]).unwrap();
+    let mut source = VolumeFiles::new();
+    source.set_file(0, std::fs::File::open(&path).unwrap());
+    source.mark_written(0, 10..20);
+    source.mark_lost(0, 0..30); // only 0..10 and 20..30 become lost: 10..20 is written
+    let mut buf = [0u8; 64];
+    assert_eq!(source.read_packed(0, 12, &mut buf), PackedRead::Data(8));
+    assert_eq!(source.read_packed(0, 0, &mut buf), PackedRead::Hole { len: 10 });
+    assert_eq!(source.read_packed(0, 25, &mut buf), PackedRead::Hole { len: 5 });
+    assert_eq!(source.read_packed(0, 40, &mut buf), PackedRead::NotYet { len: u64::MAX });
+    assert_eq!(source.absent(0, 0..50), Some(vec![0..10, 20..50]));
+    source.mark_written(0, 20..30);
+    assert_eq!(source.read_packed(0, 25, &mut buf), PackedRead::Data(5));
+    // Reported written past the file's end: the bytes are damaged, not late.
+    source.mark_written(0, 150..160);
+    assert_eq!(source.read_packed(0, 150, &mut buf), PackedRead::Hole { len: 10 });
+    // A volume never given a file.
+    assert_eq!(source.read_packed(9, 0, &mut buf), PackedRead::NotYet { len: u64::MAX });
+}
