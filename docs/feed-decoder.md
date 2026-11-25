@@ -88,6 +88,22 @@ has contiguous bytes (holes skipped where the layer allows), then retries each l
 | `unproven` | output written so far was decoded from a window not proven yet: seeded from held output past a hole, or handed over from an earlier solid member that was not done with its CRC matched; WinZip AES output until its authentication code matches; cleared once done with `crc_ok` or `auth_ok` true and neither false |
 | `auth_ok` | WinZip AES, once done: whether the authentication code matched; None for other members and when it could not be checked (see [ZIP](#zip)) |
 
+**Retiring lost output the caller holds.** `fill_lost(range, bytes)` takes plaintext the caller already has for
+lost output (another copy's, written to its output): the range leaves `lost`, its repair is dropped (a repair covering
+more keeps the rest, decoding to its restart and writing only what is still lost), and its CRC joins the member's, so
+the member reaches `done` with `crc_ok` without the missing packed bytes and without reading output back. It also
+takes the rest from the frontier of a main decode waiting at a hole (stored layers go on after it; under AES-CBC it
+ends on a 16-byte block or the member's end; a compressed RAR 5.0 member is filled to its end). Bytes are taken as
+given (a wrong one is `crc_ok: Some(false)`); run again for fresh needs. 7z LZMA2 and ZIP Deflate repairs are refused
+(`FeedError::FillLost`) for now.
+
+**A seeded restart that disagrees.** After a skip, the output decoded from the seeded restart is checked against the
+held output; a mismatch (a filter the search did not see, a false restart, held output that differs) abandons that
+restart where it went wrong: what it wrote matched and stays, another restart is searched from the packed bytes after
+it, and failing that the rest is repaired from the checkpoint before the hole once its bytes come. The decoder no
+longer fails. A retry at the same hole keeps the held output, packed bytes and window the last attempt read, and
+reads held output only as far as the packed bytes after the hole can reach.
+
 `NeedBytes` ranges are exact: a `Next` need is the run of bytes from the frontier the source reported absent, a
 `Repair` need the missing bytes a repair stopped at. Both are cut at piece (volume) boundaries.
 

@@ -564,6 +564,8 @@ struct Held {
     out: Vec<u8>,
     seen: Vec<bool>,
     donor: Vec<u8>,
+    /// bytes given back by `read_held`
+    read_back: u64,
 }
 
 impl FeedSink for Held {
@@ -590,6 +592,7 @@ impl FeedSink for Held {
             }
             n += 1;
         }
+        self.read_back += n as u64;
         Ok(n)
     }
 }
@@ -1076,4 +1079,140 @@ fn volume_files_answer_written_lost_and_late_bytes() {
     assert_eq!(source.read_packed(0, 150, &mut buf), PackedRead::Hole { len: 10 });
     // A volume never given a file.
     assert_eq!(source.read_packed(9, 0, &mut buf), PackedRead::NotYet { len: u64::MAX });
+}
+
+/// prybar-fc's bench (RAR5 -m3, 20 holes, held mode): a seeded restart whose output disagrees with the held output
+/// (here the other copy differs in scattered bytes; in the bench a filter the search did not see) must not fail the
+/// decoder. The restart is abandoned at the mismatch, another is searched from there, and failing that the rest is
+/// repaired from the checkpoint before the hole once its bytes come; every byte still lands once and exactly.
+#[test]
+fn a_seeded_restart_that_disagrees_with_held_output_does_not_fail_the_decoder() {
+    for encrypted in [false, true] {
+        let (feed, _) = compressed_feed(encrypted, 9, 12);
+        let mut decoder = FeedDecoder::new(&feed.map, 0, all_needs(feed.password)).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        for (v, off, b) in &feed.missing {
+            source.mark_lost(*v, *off..*off + b.len() as u64);
+        }
+        let mut donor = feed.plain.clone();
+        for at in (20_000..donor.len()).step_by(40_000) {
+            donor[at] ^= 0x5a;
+        }
+        let mut sink = Held { donor, ..Held::default() };
+        for (v, off, b) in &feed.present {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        for (i, w) in sink.seen.iter().enumerate() {
+            if *w {
+                assert_eq!(sink.out[i], feed.plain[i], "{encrypted}: byte {i} written wrong");
+            }
+        }
+        for (v, off, b) in &feed.missing {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        let status = decoder.status().clone();
+        assert!(status.done && status.crc_ok == Some(true), "{encrypted}: {status:?}");
+        assert_eq!(sink.out, feed.plain, "{encrypted}");
+    }
+}
+
+/// prybar-fc's bench: every run at a hole re-read the held output, the packed bytes after it and the window before
+/// asking whether anything had grown. A retry at the same hole now reads only what is new.
+#[test]
+fn skip_retries_at_a_hole_do_not_read_the_held_output_again() {
+    let (feed, _) = compressed_feed(false, 9, 12);
+    let mut decoder = FeedDecoder::new(&feed.map, 0, all_needs(None)).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    for (v, off, b) in &feed.missing {
+        source.mark_lost(*v, *off..*off + b.len() as u64);
+    }
+    let mut sink = Held { donor: feed.plain.clone(), ..Held::default() };
+    // In volume order, one article per run: each hole is met with few packed bytes after it, and retried.
+    let mut present = feed.present.clone();
+    present.sort_by_key(|(v, off, _)| (*v, *off));
+    let mut runs = 0u64;
+    for (v, off, b) in &present {
+        source.insert(*v, *off, b).unwrap();
+        decoder.run(&mut source, &mut sink).unwrap();
+        runs += 1;
+    }
+    let size = feed.plain.len() as u64;
+    eprintln!("read back {} for {size} output over {runs} runs, {} holes", sink.read_back, decoder.stats().holes);
+    // Before: 7.20 MB read back here (12x the output: held output and window again on every retry). After: 3.53 MB,
+    // mostly the window before each hole, read once per hole and once per repair restore.
+    assert!(sink.read_back < 6 * size, "read back {} for {size} output", sink.read_back);
+}
+
+/// The core of "never read an article twice" for dupe recovery: lost output another copy already gave us is retired
+/// with `fill_lost`, so the member finishes (done, crc_ok) without fetching the missing articles or reading the
+/// output back.
+#[test]
+fn fill_lost_retires_held_output_so_the_member_finishes_without_its_missing_articles() {
+    // RAR 5.0 compressed, held mode (a twin's output past the frontier): holes are skipped, then filled from the twin.
+    for encrypted in [false, true] {
+        let (feed, _) = compressed_feed(encrypted, 9, 12);
+        let mut decoder = FeedDecoder::new(&feed.map, 0, all_needs(feed.password)).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        for (v, off, b) in &feed.missing {
+            source.mark_lost(*v, *off..*off + b.len() as u64);
+        }
+        let mut sink = Held { donor: feed.plain.clone(), ..Held::default() };
+        for (v, off, b) in &feed.present {
+            source.insert(*v, *off, b).unwrap();
+            decoder.run(&mut source, &mut sink).unwrap();
+        }
+        let lost = decoder.status().lost.clone();
+        assert!(!lost.is_empty(), "{encrypted}: holes were skipped");
+        // A wrong length and a range that is not lost are refused.
+        assert!(matches!(decoder.fill_lost(lost[0].clone(), &[]), Err(FeedError::FillLost(_))));
+        let written = 0..lost[0].start.min(1);
+        if !written.is_empty() {
+            assert!(matches!(decoder.fill_lost(written, &[0]), Err(FeedError::FillLost(_))));
+        }
+        for range in &lost {
+            let bytes = &feed.plain[range.start as usize..range.end as usize];
+            sink.write_at(range.start, bytes).unwrap(); // the caller's output holds the twin's bytes
+            decoder.fill_lost(range.clone(), bytes).unwrap();
+        }
+        // A main decode still waiting at a hole near the end (no packed bytes after it to restart from): the twin
+        // holds the rest too.
+        let frontier = decoder.status().frontier;
+        let size = feed.plain.len() as u64;
+        if frontier < size {
+            let bytes = &feed.plain[frontier as usize..];
+            sink.write_at(frontier, bytes).unwrap();
+            decoder.fill_lost(frontier..size, bytes).unwrap();
+        }
+        let status = decoder.run(&mut source, &mut sink).unwrap();
+        assert!(status.done && status.lost.is_empty() && status.needs.is_empty(), "{encrypted}: {status:?}");
+        assert_eq!(status.crc_ok, Some(true), "{encrypted}");
+        assert_eq!(sink.out, feed.plain, "{encrypted}");
+    }
+    // Stored AES (CBC): a hole's lost blocks filled from the twin.
+    let case = &cases()[1];
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+    let mut decoder = FeedDecoder::new(&map, 0, all_needs(case.password)).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    let mut all = articles(&case.volumes, 1_000);
+    let gone = all.remove(17);
+    source.mark_lost(gone.0, gone.1..gone.1 + gone.2.len() as u64);
+    let mut sink = Once::default();
+    for (v, off, b) in &all {
+        source.insert(*v, *off, b).unwrap();
+        decoder.run(&mut source, &mut sink).unwrap();
+    }
+    let lost = decoder.status().lost.clone();
+    assert_eq!(lost.len(), 1);
+    let range = lost[0].clone();
+    // A wrong byte is taken as given and caught by the CRC.
+    let mut wrong = case.plain[range.start as usize..range.end as usize].to_vec();
+    wrong[0] ^= 1;
+    let mut probe = FeedDecoder::restore(&map, 0, all_needs(case.password), &decoder.snapshot()).unwrap();
+    probe.fill_lost(range.clone(), &wrong).unwrap();
+    assert_eq!(probe.run(&mut source, &mut Once::default()).unwrap().crc_ok, Some(false));
+    decoder.fill_lost(range.clone(), &case.plain[range.start as usize..range.end as usize]).unwrap();
+    let status = decoder.run(&mut source, &mut sink).unwrap();
+    assert!(status.done && status.crc_ok == Some(true), "{status:?}");
 }

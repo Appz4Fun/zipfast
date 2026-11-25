@@ -298,6 +298,9 @@ pub enum FeedError {
     Snapshot(&'static str),
     /// An earlier run failed; the decoder is unusable (restore a snapshot instead).
     AlreadyFailed,
+    /// [`FeedDecoder::fill_lost`] was given a range that is not lost, bytes of the wrong length, or a layer whose
+    /// repairs it cannot retire yet (7z LZMA2, ZIP Deflate).
+    FillLost(&'static str),
     /// The compressed data does not decode (at output offset `out`), or a repair did not meet the restart it was
     /// to reach.
     Decode {
@@ -334,6 +337,7 @@ impl std::fmt::Display for FeedError {
             Self::Canceled => f.write_str("canceled"),
             Self::Snapshot(what) => write!(f, "snapshot: {what}"),
             Self::AlreadyFailed => f.write_str("the decoder failed earlier"),
+            Self::FillLost(why) => write!(f, "fill_lost: {why}"),
             Self::Decode { out, error } => write!(f, "decoding at output {out}: {error}"),
             Self::HeldOutput { range } => write!(f, "restoring needs held output {range:?}"),
             Self::EarlierOutput { range } => write!(f, "needs earlier solid members' output {range:?}"),
@@ -1065,6 +1069,65 @@ impl FeedDecoder {
     /// The status as of the last run (or construction).
     pub fn status(&self) -> &FeedStatus {
         &self.status
+    }
+
+    /// Retires lost output `range` with plaintext the caller holds (`bytes`, exactly the range), typically another
+    /// copy's output of the same file, which the caller's output already has there: the decoder neither asks for
+    /// its packed bytes nor writes it, and its CRC joins the member's, so the member can reach `done` with `crc_ok`
+    /// with no refetch and no read-back. A repair covering more than `range` keeps the rest. The bytes are taken as
+    /// given: a wrong byte shows as `crc_ok: Some(false)`. Run the decoder again for fresh needs.
+    ///
+    /// `range` may also start at the main decode's frontier ([`FeedStatus::frontier`]) when the caller holds the
+    /// output from there: the main decode then goes on after it (stored layers; under AES-CBC the range ends on a
+    /// 16-byte block or the member's end) or is over (a compressed RAR 5.0 member, filled to its end).
+    ///
+    /// Stored layers and compressed RAR 5.0; 7z LZMA2 and ZIP Deflate repairs are refused (`FillLost`) for now.
+    pub fn fill_lost(&mut self, range: Range<u64>, bytes: &[u8]) -> Result<(), FeedError> {
+        if self.failed {
+            return Err(FeedError::AlreadyFailed);
+        }
+        if bytes.len() as u64 != range.end.saturating_sub(range.start) {
+            return Err(FeedError::FillLost("the bytes are not the range's length"));
+        }
+        if range.is_empty() {
+            return Ok(());
+        }
+        if self.lzma2.is_some() || self.zip.is_some() || self.rar4.is_some() {
+            return Err(FeedError::FillLost("this layer's repairs cannot be retired yet"));
+        }
+        // Output from the main decode's frontier on (it waits at a hole the caller holds the rest past): the main
+        // decode goes on after the range (stored layers) or is over (to the member's end).
+        let frontier = self.status.frontier;
+        let ahead = self.main.is_some() && range.start == frontier && range.end <= self.size;
+        if ahead {
+            if range.end < self.size {
+                if self.rar5.is_some() {
+                    return Err(FeedError::FillLost(
+                        "a compressed main decode is filled ahead only to the member's end",
+                    ));
+                }
+                if matches!(self.cipher, StoredCipher::Cbc { .. }) && !range.end.is_multiple_of(16) {
+                    return Err(FeedError::FillLost("under AES-CBC a fill ahead ends on a 16-byte block"));
+                }
+                self.main = Some(self.lane_at(range.end, self.size));
+            } else {
+                self.main = None;
+                if let Some(r) = self.rar5.as_mut() {
+                    r.end_main(self.size);
+                }
+            }
+        } else if !self.lost.containing(range.start).is_some_and(|l| l.end >= range.end) {
+            return Err(FeedError::FillLost("the range is neither lost output nor the rest from the frontier"));
+        }
+        if let Some(r) = self.rar5.as_mut() {
+            r.retire(&range);
+        }
+        // stored layers: repairs follow the lost ranges; a stop recorded inside the range is moot
+        self.blocked.retain(|at, _| !range.contains(at));
+        self.lost.remove(range.clone());
+        self.crc.add(range.start, bytes);
+        self.status = self.make_status(Vec::new(), false);
+        Ok(())
     }
 
     /// Work counters.

@@ -59,6 +59,17 @@ struct Repair {
     blocked: Option<u64>,
 }
 
+/// What a RAR 5.0 skip attempt read at a hole: the held output past the frontier, the decrypted packed bytes after
+/// the hole with the lane positioned after them, and the window before the frontier.
+struct SkipCache {
+    hole_end: u64,
+    out: u64,
+    donor: Vec<u8>,
+    packed: Vec<u8>,
+    lane: Lane,
+    window: Vec<u8>,
+}
+
 pub(super) struct Rar5 {
     window: Window,
     /// the main decoder; None until it is restored from `base` (after a snapshot, or at the start)
@@ -74,6 +85,11 @@ pub(super) struct Rar5 {
     stalled: bool,
     /// a skip that failed: the hole's end, the held output and the packed bytes after the hole it had
     skip_failed: Option<(u64, usize, usize)>,
+    /// the main decode runs from a seeded restart whose output is still checked against the held output: the
+    /// checkpoint before the hole it skipped (trusted, unlike the seeded state) and the output offset the check ends at
+    seeded_skip: Option<(Cp, u64)>,
+    /// what the last skip attempt at a hole read, kept for the next attempt at the same hole
+    skip_cache: Option<SkipCache>,
     /// unpacked / packed, for estimates
     ratio: f64,
     /// where the member's output starts in its solid stream's (0 alone; checkpoints count stream offsets), and the
@@ -157,6 +173,34 @@ fn read_some(sink: &mut dyn FeedSink, at: u64, max: u64) -> Vec<u8> {
 }
 
 impl Rar5 {
+    /// Ends the main decode: the caller holds the output from its frontier to the member's end.
+    pub(super) fn end_main(&mut self, size: u64) {
+        self.dec = None;
+        self.seeded_skip = None;
+        self.skip_cache = None;
+        self.stalled = false;
+        self.out = size;
+    }
+
+    /// Drops lost output `range` (held by the caller) from the repairs: a repair keeps only the parts of its lost
+    /// range outside it, still decoding to its restart but writing only those.
+    pub(super) fn retire(&mut self, range: &Range<u64>) {
+        let mut kept = Vec::with_capacity(self.repairs.len() + 1);
+        for rep in self.repairs.drain(..) {
+            if rep.lost.end <= range.start || rep.lost.start >= range.end {
+                kept.push(rep);
+                continue;
+            }
+            if rep.lost.start < range.start {
+                kept.push(Repair { lost: rep.lost.start..range.start, ..rep.clone() });
+            }
+            if range.end < rep.lost.end {
+                kept.push(Repair { lost: range.end..rep.lost.end, ..rep });
+            }
+        }
+        self.repairs = kept;
+    }
+
     pub(super) fn frontier(&self) -> u64 {
         self.out.max(self.write_from)
     }
@@ -441,6 +485,8 @@ impl FeedDecoder {
                 repairs: Vec::new(),
                 stalled: false,
                 skip_failed: None,
+                seeded_skip: None,
+                skip_cache: None,
                 ratio,
                 start: run.start,
                 starts: run.starts.clone(),
@@ -529,7 +575,7 @@ impl FeedDecoder {
             };
             loop {
                 let write = r.write_from..self.size;
-                let stop = self.pump5(
+                let pumped = self.pump5(
                     &mut lane,
                     &mut dec,
                     (&mut r.fed, &mut r.out),
@@ -537,7 +583,40 @@ impl FeedDecoder {
                     Some(&mut r.base),
                     source,
                     sink,
-                )?;
+                );
+                let stop = match pumped {
+                    // A seeded restart that disagrees with the held output (a filter the search did not see, a
+                    // false restart, held output that differs): what it wrote so far matched, but its state cannot
+                    // be trusted from here. Search again from the bytes after it; the repair of what lies between
+                    // starts from the checkpoint before the hole skipped, which the seeded state never touched.
+                    Err(FeedError::Decode { .. }) if r.seeded_skip.is_some() => {
+                        let (origin, _) = r.seeded_skip.take().expect("a seeded skip");
+                        r.base = origin.clone();
+                        if let Some((d2, l2)) = self.skip_hole(r, r.fed, source, sink)? {
+                            dec = d2;
+                            lane = l2;
+                            continue;
+                        }
+                        // No restart after it: the rest is repaired from that checkpoint once the hole's bytes come
+                        // (the main decode is over; nothing is written twice).
+                        let at = r.out;
+                        if at < self.size && !r.repairs.iter().any(|x| x.lost.start < self.size && at < x.lost.end) {
+                            r.repairs.push(Repair {
+                                from: origin,
+                                until_packed: self.stream_len,
+                                until_out: self.size,
+                                lost: at..self.size,
+                                blocked: None,
+                            });
+                            self.lost.insert(at..self.size);
+                        }
+                        break;
+                    }
+                    other => other?,
+                };
+                if r.seeded_skip.as_ref().is_some_and(|&(_, end)| r.out >= end) {
+                    r.seeded_skip = None;
+                }
                 match stop {
                     Stop::Reached => {
                         let mut out = self.out_sink(sink, r.out, write);
@@ -658,7 +737,16 @@ impl FeedDecoder {
         };
         match stop {
             Stop::Reached => {
-                if out != rep.until_out || fed != rep.until_packed {
+                // a repair to the member's end (the rest after an abandoned seeded restart) flushes the decoder as the
+                // main decode does at its end; it may stop at the end of the data, before a cipher's padding
+                let to_end = rep.until_out == self.size && rep.until_packed == self.stream_len;
+                if to_end {
+                    let mut o = self.out_sink(sink, out, rep.lost.clone());
+                    let ended = dec.finish(&mut o).map_err(|e| o.fail(e));
+                    out = o.at;
+                    ended?;
+                }
+                if out != rep.until_out || (fed != rep.until_packed && !to_end) {
                     return Err(FeedError::Decode {
                         out,
                         error: crate::Error::Corrupt("a repair did not meet the restart after its hole"),
@@ -690,7 +778,24 @@ impl FeedDecoder {
         sink: &mut dyn FeedSink,
     ) -> Result<Option<(Box<Unpacker>, Lane)>, FeedError> {
         let out_h = r.out;
-        let donor = read_some(sink, out_h, (self.size - out_h).min(DONOR_MAX));
+        // A retry at the same hole keeps what the last attempt read (held output, decrypted packed bytes and the
+        // lane after them, the window): it reads only what is new, and asks the retry gate before searching again.
+        let cached = r.skip_cache.take().filter(|c| c.hole_end == hole_end && c.out == out_h);
+        let (mut donor, mut packed, lane, window) = match cached {
+            Some(c) => (c.donor, c.packed, Some(c.lane), Some(c.window)),
+            None => (Vec::new(), Vec::new(), None, None),
+        };
+        let held_max = (self.size - out_h).min(DONOR_MAX);
+        // Held output is read in two steps: enough to know a skip is worth trying, then (below) only as far as the
+        // packed bytes read after the hole can reach, not up to DONOR_MAX.
+        let mut extend = |donor: &mut Vec<u8>, to: u64| {
+            let to = to.min(held_max);
+            if (donor.len() as u64) < to {
+                let more = read_some(sink, out_h + donor.len() as u64, to - donor.len() as u64);
+                donor.extend_from_slice(&more);
+            }
+        };
+        extend(&mut donor, DONOR_MIN);
         if (donor.len() as u64) < DONOR_MIN.min(self.size - out_h) || donor.is_empty() {
             return Ok(None);
         }
@@ -704,11 +809,10 @@ impl FeedDecoder {
         if after >= self.stream_len {
             return Ok(None);
         }
-        let mut lane = self.packed_lane(after, self.stream_len);
-        let want = (donor.len() as f64 / r.ratio.max(1e-3) * 2.0) as u64 + (1 << 20);
-        lane.end = lane.end.min(lane.pos.saturating_add(want.min(AFTER_MAX)));
-        let mut packed = Vec::new();
         let first = after;
+        let mut lane = lane.unwrap_or_else(|| self.packed_lane(after, self.stream_len));
+        let want = (held_max as f64 / r.ratio.max(1e-3) * 2.0) as u64 + (1 << 20);
+        lane.end = self.stream_len.min(first.saturating_add(want.min(AFTER_MAX)));
         let mut buf = std::mem::take(&mut self.buf);
         let mut scratch = Vec::new();
         while lane.pos < lane.end {
@@ -743,23 +847,35 @@ impl FeedDecoder {
         if packed.is_empty() {
             return Ok(None);
         }
+        // the held output the packed bytes after the hole can reach (the search's farthest target), with a margin
+        let span = first.saturating_sub(r.fed) + packed.len() as u64;
+        extend(&mut donor, (span as f64 * r.ratio.max(1e-3) * 1.25) as u64 + (1 << 20));
+        // the window before the frontier, at stream offsets (a solid successor's window reaches into the earlier
+        // members' output): read once per hole
+        let s0 = r.start;
+        let at = s0 + out_h;
+        let base = at.saturating_sub(r.window.reach);
+        let window = match window {
+            Some(w) => w,
+            None => match read_stream(sink, s0, base..at) {
+                Ok(k) => k,
+                Err(_) => return Ok(None),
+            },
+        };
         // a search that failed is tried again only once more is held: output past the frontier or packed bytes
         let tried = (hole_end, donor.len(), packed.len());
         let grown =
             |held: usize, after: usize| tried.1 > held || tried.2 >= after.saturating_mul(2).min(after + (4 << 20));
+        let keep = |r: &mut Rar5, donor: Vec<u8>, packed: Vec<u8>, lane: Lane, window: Vec<u8>| {
+            r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window });
+        };
         if r.skip_failed.is_some_and(|(end, held, after)| end == hole_end && !grown(held, after)) {
+            keep(r, donor, packed, lane, window);
             return Ok(None);
         }
         r.skip_failed = Some(tried);
-        // the window before the frontier and the held output past it, at stream offsets (a solid successor's window
-        // reaches into the earlier members' output)
-        let s0 = r.start;
-        let at = s0 + out_h;
-        let base = at.saturating_sub(r.window.reach);
-        let mut known = match read_stream(sink, s0, base..at) {
-            Ok(k) => k,
-            Err(_) => return Ok(None),
-        };
+        let mut known = Vec::with_capacity(window.len() + donor.len());
+        known.extend_from_slice(&window);
         known.extend_from_slice(&donor);
         let known_end = at + donor.len() as u64;
         // The restart is the last block start at or before the target, and the search must follow the packed bytes
@@ -811,7 +927,10 @@ impl FeedDecoder {
                 _ => {}
             }
         }
-        let Some(near) = found else { return Ok(None) };
+        let Some(near) = found else {
+            keep(r, donor, packed, lane, window);
+            return Ok(None);
+        };
         let restart = near.resync;
         // Seeded from the held output, noting rather than refusing what a filter the search did not see may have
         // changed: the member's CRC decides (`crc_ok`).
@@ -823,6 +942,7 @@ impl FeedDecoder {
         let until_out = restart.output_offset - s0;
         // Repairs never overlap, so no output byte is written twice: output an earlier repair already covers (a
         // hole skipped again after a restore) is left to it.
+        let origin = r.base.clone();
         let mut from_out = out_h;
         for x in &r.repairs {
             if x.lost.start <= from_out && from_out < x.lost.end {
@@ -850,6 +970,7 @@ impl FeedDecoder {
         self.unproven = true;
         self.seeded = self.seeded.max(Some(restart.output_offset));
         r.skip_failed = None;
+        r.seeded_skip = Some((origin, known_end - s0));
         r.fed = until_packed;
         r.out = until_out;
         Ok(Some((Box::new(dec), self.packed_lane(until_packed, self.stream_len))))
