@@ -81,9 +81,9 @@ struct SkipCache {
     packed: Vec<u8>,
     lane: Lane,
     window: Vec<u8>,
-    /// targets whose search ran out of work at this hole: tried again they would spend the same work and stop at the
-    /// same place, so they are not
-    exhausted: Vec<u64>,
+    /// targets whose search ran out of work at this hole, with the packed bytes held then: tried again with the same
+    /// bytes they would spend the same work and stop at the same place, so they wait until twice as many are held
+    exhausted: Vec<(u64, usize)>,
 }
 
 pub(super) struct Rar5 {
@@ -974,7 +974,12 @@ impl FeedDecoder {
         let grown = |held: usize, after: usize| {
             (held != usize::MAX && donor.len() > held) || tried.2 >= after.saturating_mul(2).min(after + (4 << 20))
         };
-        let keep = |r: &mut Rar5, donor: Vec<u8>, packed: Vec<u8>, lane: Lane, window: Vec<u8>, exhausted: Vec<u64>| {
+        let keep = |r: &mut Rar5,
+                    donor: Vec<u8>,
+                    packed: Vec<u8>,
+                    lane: Lane,
+                    window: Vec<u8>,
+                    exhausted: Vec<(u64, usize)>| {
             r.skip_cache = Some(SkipCache { hole_end, out: out_h, donor, packed, lane, window, exhausted });
         };
         if r.skip_failed.is_some_and(|(end, held, after)| end == hole_end && !grown(held, after)) {
@@ -1011,15 +1016,28 @@ impl FeedDecoder {
         targets.push(reach);
         let mut found = None;
         let end = s0 + self.size;
-        // one attempt spends at most SKIP_WORK across all its targets (each search reports what it spent)
+        // A guarded search past an abandoned restart looks farthest first: the near targets lie in the filtered
+        // stretch that made the restart go wrong.
+        if r.abandons > 0 {
+            targets.reverse();
+        }
+        // a target that ran out of work is tried again only once twice the packed bytes are held
+        let tried_out = |exhausted: &[(u64, usize)], target: u64| {
+            exhausted.iter().any(|&(t, held)| t == target && packed.len() < held.saturating_mul(2))
+        };
+        // One attempt spends at most SKIP_WORK across all its targets, each an equal share of what is left (so a
+        // target that runs out does not starve the others).
         let mut work_left = SKIP_WORK;
         let mut i = 0;
         while i < targets.len() && work_left > 0 {
             let target = targets[i];
             i += 1;
-            if target <= at || exhausted.contains(&target) {
+            if target <= at || tried_out(&exhausted, target) {
                 continue;
             }
+            let remaining =
+                targets[i - 1..].iter().filter(|&&t| t > at && !tried_out(&exhausted, t)).count().max(1) as u64;
+            let share = (work_left / remaining).max(SKIP_WORK / 16);
             if self.options.control.is_canceled() {
                 return Err(FeedError::Canceled);
             }
@@ -1029,7 +1047,7 @@ impl FeedDecoder {
                 // after a seeded restart went wrong (a filter the search did not see), only a guarded restart: checked
                 // from a filter's reach before it, so no filter declared earlier covers what it decodes
                 guard: r.abandons > 0,
-                work: work_left,
+                work: share.min(work_left),
                 ..NearOptions::default()
             };
             let res = resync_near(&packed, base, &known, r.window, target, &options);
@@ -1037,7 +1055,7 @@ impl FeedDecoder {
                 // a restart at the member's end has no block after it (under AES only the cipher's padding): the
                 // last block before it then
                 Ok(near) if near.resync.output_offset >= end => {
-                    work_left = work_left.saturating_sub(near.work);
+                    work_left = work_left.saturating_sub(near.work.max(1));
                     if i == targets.len() && end - 1 > at {
                         targets.push(end - 1);
                     }
@@ -1046,12 +1064,14 @@ impl FeedDecoder {
                     found = Some(near);
                     break;
                 }
-                Ok(near) => work_left = work_left.saturating_sub(near.work),
+                Ok(near) => work_left = work_left.saturating_sub(near.work.max(1)),
                 Err(NearError::Exhausted { .. }) => {
-                    exhausted.push(target);
-                    work_left = 0;
+                    exhausted.retain(|&(t, _)| t != target);
+                    exhausted.push((target, packed.len()));
+                    work_left = work_left.saturating_sub(share);
                 }
-                Err(NearError::NotFound { .. }) => {}
+                // what a search that found nothing spent is not reported: charge its share, keeping the bound
+                Err(NearError::NotFound { .. }) => work_left = work_left.saturating_sub(share / 4),
             }
         }
         let Some(near) = found else {
