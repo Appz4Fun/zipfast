@@ -593,6 +593,7 @@ impl FeedDecoder {
                         Abandoned::Over => break 'main,
                         Abandoned::Wait => {
                             r.stalled = true;
+                            self.wait_need(r, source, &mut next)?;
                             gap = Some(r.fed..self.stream_len);
                             self.main = Some(lane);
                             break 'main;
@@ -636,6 +637,7 @@ impl FeedDecoder {
                                 Abandoned::Over => break,
                                 Abandoned::Wait => {
                                     r.stalled = true;
+                                    self.wait_need(r, source, &mut next)?;
                                     gap = Some(r.fed..self.stream_len);
                                     self.main = Some(self.packed_lane(r.fed, self.stream_len));
                                     break;
@@ -799,6 +801,23 @@ impl FeedDecoder {
         }
     }
 
+    /// While the main decode waits for another restart: the first packed byte the search lacks is required input
+    /// (`Next`), so a caller fetching what `needs` names keeps it going.
+    fn wait_need(
+        &mut self,
+        r: &Rar5,
+        source: &mut dyn PackedSource,
+        next: &mut Vec<NeedBytes>,
+    ) -> Result<(), FeedError> {
+        let at = r.skip_cache.as_ref().map_or(r.fed, |c| c.lane.pos);
+        if at < self.stream_len
+            && let Some(len) = self.probe(at, self.stream_len, source)?
+        {
+            self.push_needs(next, at..at + len, NeedKind::Next);
+        }
+        Ok(())
+    }
+
     /// After a seeded restart was abandoned (its output disagreed with the held output from `r.out` on): search for
     /// another restart from the packed bytes after it, with the repairs starting from `origin`, the checkpoint
     /// before the hole first skipped. Without one yet the main decode waits for more packed bytes and searches
@@ -869,6 +888,9 @@ impl FeedDecoder {
         };
         extend(&mut donor, DONOR_MIN);
         if (donor.len() as u64) < DONOR_MIN.min(self.size - out_h) || donor.is_empty() {
+            // too little held output to seed a restart: waiting for packed bytes will not help (after an abandoned
+            // restart, the rest is repaired from the trusted checkpoint instead)
+            r.skip_exhausted = true;
             return Ok(None);
         }
 
@@ -879,6 +901,7 @@ impl FeedDecoder {
             _ => hole_end,
         };
         if after >= self.stream_len {
+            r.skip_exhausted = true;
             return Ok(None);
         }
         let first = after;

@@ -1146,3 +1146,22 @@ fn fill_lost_to_the_end_finishes_a_folder_waiting_at_a_hole() {
     assert!(out.bytes == plain);
     assert_eq!(out.written, plain.len() as u64, "each output byte once");
 }
+
+/// A 7z member the folder's next member goes on from keeps its hand-off: filling it to its end is refused (the last
+/// member of the folder may be filled).
+#[test]
+fn fill_lost_to_the_end_is_refused_for_a_member_with_a_successor() {
+    let a = mixed(400_000, 31);
+    let b = mixed(300_000, 32);
+    let archive = seven_zip(&[("a.bin", a.clone()), ("b.bin", b.clone())], false, 1 << 16);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..archive.len() / 3]).unwrap();
+    let mut d = FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap();
+    let mut out = Out::new(a.len(), None);
+    let s = d.run(&mut source, &mut out).unwrap();
+    let f = s.frontier;
+    assert!(f < a.len() as u64, "{s:?}");
+    assert!(matches!(d.fill_lost(f..a.len() as u64, &a[f as usize..]), Err(FeedError::FillLost(_))));
+}

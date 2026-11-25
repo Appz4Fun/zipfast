@@ -1111,7 +1111,9 @@ impl FeedDecoder {
             if let Some(lz) = self.lzma2.as_mut()
                 && !lz.end_main()
             {
-                return Err(FeedError::FillLost("the 7z folder is still being walked for a restart"));
+                return Err(FeedError::FillLost(
+                    "a 7z member with a successor in its folder, or a folder still being walked for a restart",
+                ));
             }
         } else if ahead {
             if range.end < self.size {

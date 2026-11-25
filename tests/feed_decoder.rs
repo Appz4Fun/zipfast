@@ -1216,3 +1216,59 @@ fn fill_lost_retires_held_output_so_the_member_finishes_without_its_missing_arti
     let status = decoder.run(&mut source, &mut sink).unwrap();
     assert!(status.done && status.crc_ok == Some(true), "{status:?}");
 }
+
+/// A source that answers reads but cannot tell what is absent (the trait's default `absent`): the decoder's needs
+/// alone must keep the caller fetching.
+struct NoAbsent<'a>(&'a mut ArticleBuffer);
+
+impl PackedSource for NoAbsent<'_> {
+    fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead {
+        self.0.read_packed(volume, offset, buf)
+    }
+}
+
+/// Codex review of #288: while the main decode waits for another restart after an abandoned one, it names the bytes
+/// it waits for (`Next`); and with too little held output past the abandon point it falls back to repairing from the
+/// trusted checkpoint instead of waiting for ever.
+#[test]
+fn a_decoder_waiting_after_an_abandoned_restart_always_names_a_need_and_finishes() {
+    for (encrypted, held_to) in [(false, usize::MAX), (true, usize::MAX), (false, 300_000)] {
+        let (feed, volumes) = compressed_feed(encrypted, 9, 12);
+        let mut decoder = FeedDecoder::new(&feed.map, 0, all_needs(feed.password)).unwrap();
+        let mut buffer = ArticleBuffer::new(usize::MAX);
+        for (v, off, b) in &feed.missing {
+            buffer.mark_lost(*v, *off..*off + b.len() as u64);
+        }
+        let mut donor = feed.plain.clone();
+        for at in (20_000..donor.len()).step_by(40_000) {
+            donor[at] ^= 0x5a;
+        }
+        donor.truncate(held_to.min(donor.len()));
+        let mut sink = Held { donor, ..Held::default() };
+        let mut present = feed.present.clone();
+        present.sort_by_key(|(v, off, _)| (*v, *off));
+        for (v, off, b) in &present {
+            buffer.insert(*v, *off, b).unwrap();
+            let status = decoder.run(&mut NoAbsent(&mut buffer), &mut sink).unwrap();
+            assert!(status.done || !status.needs.is_empty(), "{encrypted} {held_to}: waiting with no need: {status:?}");
+        }
+        for (v, off, b) in &feed.missing {
+            buffer.insert(*v, *off, b).unwrap();
+        }
+        // fetch whatever is still named until done
+        for _ in 0..1_000 {
+            let status = decoder.run(&mut NoAbsent(&mut buffer), &mut sink).unwrap();
+            if status.done {
+                break;
+            }
+            assert!(!status.needs.is_empty(), "{encrypted} {held_to}: stuck: {status:?}");
+            for need in &status.needs {
+                let bytes = &volumes[need.volume as usize][need.range.start as usize..need.range.end as usize];
+                let _ = buffer.insert(need.volume, need.range.start, bytes);
+            }
+        }
+        let status = decoder.status().clone();
+        assert!(status.done && status.crc_ok == Some(true), "{encrypted} {held_to}: {status:?}");
+        assert_eq!(sink.out, feed.plain, "{encrypted} {held_to}");
+    }
+}

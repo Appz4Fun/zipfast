@@ -280,9 +280,10 @@ impl Lz {
     }
 
     /// Ends the main decode (the caller holds the output from its frontier to the member's end); false while the
-    /// folder is still being walked for a restart, when there is no main decode to end yet.
+    /// folder is still being walked for a restart, or when the folder's next member goes on from this one.
     pub(super) fn end_main(&mut self) -> bool {
-        if self.seek || !self.pending.is_empty() {
+        // a member the folder's next member goes on from needs its hand-off and keeps the input it starts from
+        if self.seek || !self.pending.is_empty() || self.successor {
             return false;
         }
         self.main = None;
