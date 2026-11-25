@@ -50,6 +50,8 @@ pub(super) struct BlakeRun {
     pub(super) at: u64,
     /// The hash so far, or the digest once `at` reached `range.end`.
     pub(super) hash: Result<[u8; 32], crate::blake2sp::Blake2sp>,
+    /// The budget an unfinished hash holds (`BLAKE_STORAGE`, as a read-back's), let go once it is a digest.
+    lease: Option<Reservation>,
 }
 impl BlakeFrontier {
     /// The checked ranges of `snapshot` that have a BLAKE2sp check on plaintext, without repeats.
@@ -67,8 +69,9 @@ impl BlakeFrontier {
         ranges.dedup();
         ranges
     }
-    /// Follows a write of `bytes` at output `offset` that landed on disk, for the checked `ranges`.
-    pub(super) fn feed(&mut self, ranges: &[Range<u64>], offset: u64, bytes: &[u8]) {
+    /// Follows a write of `bytes` at output `offset` that landed on disk, for the checked `ranges`. A hash is
+    /// begun only if `budget` grants it `BLAKE_STORAGE`; without it that range is read back when verified.
+    pub(super) fn feed(&mut self, ranges: &[Range<u64>], offset: u64, bytes: &[u8], budget: &PartialBudget) {
         let end = offset.saturating_add(bytes.len() as u64);
         for range in ranges {
             let (from, to) = (offset.max(range.start), end.min(range.end));
@@ -86,6 +89,7 @@ impl BlakeFrontier {
                         run.at = to;
                         if to == range.end {
                             run.hash = Ok(hash.clone().finish());
+                            run.lease = None;
                         }
                     }
                 }
@@ -95,20 +99,32 @@ impl BlakeFrontier {
                 Some((i, _)) => {
                     self.runs.swap_remove(i);
                     if from == range.start {
-                        self.begin(range, piece);
+                        self.begin(range, piece, budget);
                     }
                 }
-                None if from == range.start => self.begin(range, piece),
+                None if from == range.start => self.begin(range, piece, budget),
                 None => {}
             }
         }
     }
-    fn begin(&mut self, range: &Range<u64>, piece: &[u8]) {
+    fn begin(&mut self, range: &Range<u64>, piece: &[u8], budget: &PartialBudget) {
+        let at = range.start + piece.len() as u64;
+        // The hasher and the run's slot are charged as a read-back's hasher is; refused, the range is read back.
+        let lease = if at == range.end {
+            None
+        } else {
+            match budget.reserve(PartialResource::LedgerBytes, BLAKE_STORAGE) {
+                Ok(lease) => Some(lease),
+                Err(_) => return,
+            }
+        };
+        if self.runs.try_reserve(1).is_err() {
+            return;
+        }
         let mut hash = crate::blake2sp::Blake2sp::new();
         hash.update(piece);
-        let at = range.start + piece.len() as u64;
         let hash = if at == range.end { Ok(hash.finish()) } else { Err(hash) };
-        self.runs.push(BlakeRun { range: range.clone(), at, hash });
+        self.runs.push(BlakeRun { range: range.clone(), at, hash, lease });
     }
     pub(super) fn run(&self, range: &Range<u64>) -> Option<&BlakeRun> {
         self.runs.iter().find(|run| run.range == *range)

@@ -149,22 +149,46 @@ fn blake_frontier_follows_each_checked_range_in_order() {
     };
     // A part check over 0..400, another over 400..1000, and the member check over 0..1000.
     let ranges = [0..400, 0..1000, 400..1000];
+    let fixture = Fixture::new(64, false, false, true);
+    let file = fixture.create();
+    let budget = &file.core.budget;
     let mut f = BlakeFrontier::default();
-    f.feed(&ranges, 100, &data[100..200]); // ahead of every start: nothing
+    f.feed(&ranges, 100, &data[100..200], budget); // ahead of every start: nothing
     assert!(f.runs.is_empty());
-    f.feed(&ranges, 0, &data[..100]);
-    f.feed(&ranges, 600, &data[600..700]); // ahead: ignored
-    f.feed(&ranges, 100, &data[100..500]); // crosses a part boundary: finishes 0..400, begins 400..1000
+    f.feed(&ranges, 0, &data[..100], budget);
+    f.feed(&ranges, 600, &data[600..700], budget); // ahead: ignored
+    f.feed(&ranges, 100, &data[100..500], budget); // crosses a part boundary: finishes 0..400, begins 400..1000
     assert_eq!(state(&f, 0..400), Some((400, digest(&data[..400]))));
     assert!(f.run(&(0..400)).unwrap().hash.is_ok(), "a finished run keeps only its digest");
     assert_eq!(state(&f, 0..1000), Some((500, digest(&data[..500]))));
     assert_eq!(state(&f, 400..1000), Some((500, digest(&data[400..500]))));
-    f.feed(&ranges, 450, &data[450..460]); // a correction inside 400..1000 and 0..1000
+    f.feed(&ranges, 450, &data[450..460], budget); // a correction inside 400..1000 and 0..1000
     assert!(f.run(&(400..1000)).is_none() && f.run(&(0..1000)).is_none());
     assert!(f.run(&(0..400)).is_some(), "a range the correction does not touch keeps its digest");
-    f.feed(&ranges, 0, &data[..10]); // a write at the start begins 0..400 and 0..1000 again
+    f.feed(&ranges, 0, &data[..10], budget); // a write at the start begins 0..400 and 0..1000 again
     assert_eq!(state(&f, 0..400), Some((10, digest(&data[..10]))));
     assert_eq!(state(&f, 0..1000), Some((10, digest(&data[..10]))));
+}
+/// A hash is begun only when the budget grants it; refused, the range is simply read back when verified.
+#[test]
+fn blake_frontier_runs_are_charged_to_the_partial_budget() {
+    use crate::partial::verify::BlakeFrontier;
+    let fixture = Fixture::new(64, false, false, true);
+    let file = fixture.create();
+    let budget = &file.core.budget;
+    let mut hogs = Vec::new();
+    while let Ok(lease) = budget.reserve(PartialResource::LedgerBytes, 4096) {
+        hogs.push(lease);
+    }
+    let mut f = BlakeFrontier::default();
+    f.feed(std::slice::from_ref(&(0..100)), 0, &[1; 10], budget);
+    assert!(f.runs.is_empty(), "no budget, no hash");
+    // A range finished in one write needs no hasher held, so it costs nothing.
+    f.feed(std::slice::from_ref(&(0..10)), 0, &[1; 10], budget);
+    assert!(f.run(&(0..10)).is_some_and(|run| run.hash.is_ok()));
+    drop(hogs);
+    f.feed(std::slice::from_ref(&(0..100)), 0, &[1; 10], budget);
+    assert!(f.run(&(0..100)).is_some());
 }
 /// Emulates a reopened handle: no hash was kept while writing, so BLAKE2sp checks read the output back.
 fn forget_blake(file: &PartialFile) {

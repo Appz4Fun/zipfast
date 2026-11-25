@@ -1333,7 +1333,7 @@ impl PartialCore {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
                     if !blake_ranges.is_empty() {
-                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n]);
+                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n], &self.budget);
                     }
                     completed += n;
                     at += n as u64;
@@ -1499,7 +1499,7 @@ impl PartialCore {
                         return Err(io_error(OutputOperation::Write, std::io::ErrorKind::WriteZero.into()));
                     }
                     if !blake_ranges.is_empty() {
-                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n]);
+                        blake.feed(&blake_ranges, at, &bytes[(at - offset) as usize..][..n], &self.budget);
                     }
                     completed += n;
                     at += n as u64;
