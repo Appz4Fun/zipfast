@@ -78,6 +78,7 @@ pub const FHEXTRA_HASH: u64 = 0x02;
 pub const FHEXTRA_HTIME: u64 = 0x03;
 pub const FHEXTRA_VERSION: u64 = 0x04;
 pub const FHEXTRA_REDIR: u64 = 0x05;
+pub const FHEXTRA_UOWNER: u64 = 0x06;
 pub const FHEXTRA_SUBDATA: u64 = 0x07;
 
 /// A cursor over one header's bytes. Every read is checked; running off the end is corruption, since the header's
@@ -369,6 +370,41 @@ pub struct Rar5CryptRecord {
     pub kdf_count: u8,
 }
 
+/// RAR 5.0 Unix owner record (file header extra record 0x06): the owner and group names and numeric ids, each when
+/// stored. Names are the stored bytes (UnRAR prints them as `Unix owner: user:group`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnixOwner {
+    pub user: Option<Vec<u8>>,
+    pub group: Option<Vec<u8>>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+}
+
+impl UnixOwner {
+    /// Parses the record body after its type. Flags: 0x1 user name, 0x2 group name, 0x4 numeric user id, 0x8 numeric
+    /// group id, in that order; each name is a length then the bytes.
+    fn parse(r: &mut Cursor<'_>) -> Result<Self> {
+        let flags = r.vint()?;
+        let mut owner = Self::default();
+        if flags & 0x1 != 0 {
+            let len = r.vsize()?;
+            owner.user = Some(r.bytes(len)?.to_vec());
+        }
+        if flags & 0x2 != 0 {
+            let len = r.vsize()?;
+            owner.group = Some(r.bytes(len)?.to_vec());
+        }
+        if flags & 0x4 != 0 {
+            owner.uid = Some(r.vint()?);
+        }
+        if flags & 0x8 != 0 {
+            owner.gid = Some(r.vint()?);
+        }
+        Ok(owner)
+    }
+}
+
 /// A file or service header.
 #[derive(Clone, Debug, Default)]
 pub struct FileHeader {
@@ -413,6 +449,9 @@ pub struct FileHeader {
     /// RAR 5.0: set on an older revision of a file kept alongside the current one (`rar -ver`), from the version
     /// record. A record holding 0 is no version, as UnRAR reads it.
     pub version: Option<u64>,
+    /// RAR 5.0: the Unix owner record. None without one, or when it is malformed (the record is informational, so a
+    /// damaged one does not fail the header).
+    pub owner: Option<UnixOwner>,
     /// A service header's SubData: the stream name of an `STM` header, the `Protect+` tag of a RAR 4.x `RR`, and
     /// so on. Empty for file headers.
     pub sub_data: Vec<u8>,
@@ -810,7 +849,8 @@ fn parse_file_extra(
                 f.sub_data.try_reserve_exact(data.len()).map_err(|_| FileParseError::Allocation)?;
                 f.sub_data.extend_from_slice(data);
             }
-            // owner, service data of other passes and anything newer are skipped
+            FHEXTRA_UOWNER => f.owner = UnixOwner::parse(&mut r).ok(),
+            // service data of other passes and anything newer are skipped
             _ => {}
         }
     }
@@ -905,4 +945,32 @@ pub(crate) fn main_metadata(extra: &[u8]) -> (Option<Vec<u8>>, Option<RarTime>) 
         return parse(&mut r).unwrap_or_default();
     }
     (None, None)
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::{Cursor, UnixOwner};
+
+    fn parse(bytes: &[u8]) -> Option<UnixOwner> {
+        UnixOwner::parse(&mut Cursor::new(bytes)).ok()
+    }
+
+    #[test]
+    fn owner_record_fields_follow_their_flags() {
+        let all = [0x0f, 4, b'u', b's', b'e', b'r', 5, b'g', b'r', b'o', b'u', b'p', 0xe8, 0x07, 100];
+        let owner = parse(&all).unwrap();
+        assert_eq!(owner.user.as_deref(), Some(&b"user"[..]));
+        assert_eq!(owner.group.as_deref(), Some(&b"group"[..]));
+        assert_eq!((owner.uid, owner.gid), (Some(1000), Some(100)));
+        let ids = parse(&[0x0c, 0, 0]).unwrap();
+        assert_eq!((ids.user, ids.group, ids.uid, ids.gid), (None, None, Some(0), Some(0)));
+    }
+
+    #[test]
+    fn a_truncated_or_overlong_owner_record_is_rejected_without_panicking() {
+        assert!(parse(&[]).is_none());
+        assert!(parse(&[0x01, 9, b'u']).is_none());
+        assert!(parse(&[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).is_none());
+        assert!(parse(&[0x04]).is_none());
+    }
 }
