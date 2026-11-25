@@ -113,6 +113,10 @@ pub enum OpenAtError {
     NeedMore { needed: Range<u64> },
     /// No LZMA2 chunk chain running to the folder's end marker was found in the packed bytes held.
     NoChain,
+    /// 7z LZMA2: the nearest restart the framing allows lies before the packed bytes held (a run of stored chunks the
+    /// next LZMA chunk continues the state over is no restart): fetch the folder's packed stream from `packed` (that
+    /// restart chunk's header) and supply known output from `output` less the dictionary, then complete again.
+    FetchFrom { packed: u64, output: u64 },
     /// Decoding failed.
     Decode(String),
     /// The resumed output would exceed [`Lzma2DecodeOptions::max_output`].
@@ -131,6 +135,12 @@ impl std::fmt::Display for OpenAtError {
             Self::Resync(e) => write!(f, "{e}"),
             Self::NeedMore { needed } => write!(f, "known plaintext from output offset {} is needed", needed.start),
             Self::NoChain => write!(f, "no LZMA2 chunk chain to the folder's end in the packed bytes held"),
+            Self::FetchFrom { packed, output } => {
+                write!(
+                    f,
+                    "the nearest LZMA2 restart is at packed offset {packed} (folder output {output}): fetch from there"
+                )
+            }
             Self::Decode(e) => write!(f, "decoding failed: {e}"),
             Self::OutputLimit { limit } => write!(f, "the resumed output would exceed {limit} bytes"),
         }
@@ -396,12 +406,11 @@ pub fn open_at(map: &MemberMap, member: usize, offset: u64, options: &OpenAtOpti
                 fetch_from = (fetch_from & !15).saturating_sub(16);
             }
             let stream_target = restart.stream_start + offset;
-            // a seeded window needs the plaintext it holds: the dictionary before the target
-            let donor_from = if seeded {
-                stream_target.saturating_sub(dictionary)
-            } else {
-                stream_target.saturating_sub(dictionary.saturating_add(RAR5_FILTER_REACH).saturating_mul(2))
-            };
+            // A seeded window needs the plaintext it holds, the dictionary before the restart; a guarded restart is
+            // checked from a filter's reach before it, whose window needs a dictionary before that too. So, as for a
+            // checked plan: the dictionary and a filter's reach before the target, twice (the restart lands before it).
+            let donor_from =
+                stream_target.saturating_sub(dictionary.saturating_add(RAR5_FILTER_REACH).saturating_mul(2));
             let first = fetch_from..(estimate.saturating_add(1 << 20)).min(packed_len);
             plan(
                 Start::Rar5 { stream_target, estimate, first, donor: donor_from..stream_target },
@@ -518,7 +527,14 @@ pub fn complete_rar5(
     }
     let seed = plan.seed;
     let options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
-    let found = match resync_near(packed, known_base, known, window, stream_target, &options) {
+    let mut searched = resync_near(packed, known_base, known, window, stream_target, &options);
+    // A seeded (not strict) plan takes the nearest unguarded restart when no guarded one is found: its output is
+    // unverified anyway, and the decoder notes it (`SeedSuspect::Unguarded`) before decoding.
+    if searched.is_err() && options.guard && matches!(seed, Seed::HeldPlaintext { strict: false }) {
+        searched =
+            resync_near(packed, known_base, known, window, stream_target, &NearOptions { guard: false, ..options });
+    }
+    let found = match searched {
         Ok(found) => found,
         Err(_) if from_start => return fresh(),
         Err(e) => return Err(OpenAtError::Resync(e)),
@@ -659,15 +675,33 @@ fn resume_lzma2(
         }
         None => return Err(need_framing()),
     };
-    let restartable = |c: &super::Lzma2Chunk| {
-        c.kind == Lzma2ChunkKind::Stored
-            || matches!(c.reset, Lzma2Reset::State | Lzma2Reset::StateProps | Lzma2Reset::DictStateProps)
+    let resets = |c: &super::Lzma2Chunk| {
+        matches!(c.reset, Lzma2Reset::State | Lzma2Reset::StateProps | Lzma2Reset::DictStateProps)
     };
-    // The last restartable chunk start at or before the target whose header is held.
-    let k = starts
-        .iter()
-        .rposition(|c| c.unpacked_offset <= folder_target && c.packed_offset >= packed_from && restartable(c))
-        .ok_or_else(need_framing)?;
+    let restartable = |c: &super::Lzma2Chunk| c.kind == Lzma2ChunkKind::Stored || resets(c);
+    // A restart: an LZMA chunk that resets the state, or a stored chunk only when the index shows that the next
+    // LZMA chunk after it resets the state too (or none follows). A stored chunk resets nothing: 7-Zip (-mmt) goes on
+    // after a run of stored chunks with an LZMA chunk that continues the state from before them, which a restart in
+    // the run cannot have.
+    let valid = |i: usize| {
+        let c = &starts[i];
+        if c.kind != Lzma2ChunkKind::Stored {
+            return resets(c);
+        }
+        match starts[i + 1..].iter().find(|n| n.kind != Lzma2ChunkKind::Stored) {
+            Some(next) => resets(next),
+            // the index ends in stored chunks: proven only when it runs to the stream's end
+            None => matches!(starts.last(), Some(l) if l.unpacked_offset + l.unpacked_len == total),
+        }
+    };
+    // The last such chunk start at or before the target whose header is held.
+    let before = |i: usize| starts[i].unpacked_offset <= folder_target && valid(i);
+    let Some(k) = (0..starts.len()).rev().find(|&i| before(i) && starts[i].packed_offset >= packed_from) else {
+        return Err(match (0..starts.len()).rev().find(|&i| before(i)) {
+            Some(i) => OpenAtError::FetchFrom { packed: starts[i].packed_offset, output: starts[i].unpacked_offset },
+            None => need_framing(),
+        });
+    };
     let start = starts[k];
     // The props in effect there, from the chunk that set them (the walk resumed below starts after it).
     let inherited = starts[..=k].iter().rev().find_map(|c| c.props);
@@ -783,9 +817,10 @@ mod tests {
             assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
             let r = resume_lzma2(&b, from as u64, &stream[from..], 0, &plain, None, &opts());
             assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+            // with the framing, the only real restart is the stream's start, before the bytes held: fetch from there
             let framing = Lzma2Index::from_bytes(&stream, Lzma2IndexOptions::default());
             let r = resume_lzma2(&b, from as u64, &stream[from..], 0, &known, Some(&framing), &opts());
-            assert!(matches!(r, Err(OpenAtError::NeedMore { .. })), "{r:?}");
+            assert!(matches!(r, Err(OpenAtError::FetchFrom { packed: 0, output: 0 })), "{r:?}");
             // from the stream's start the framing is walked, and the output is right
             let r = resume_lzma2(&b, 0, &stream, 0, &known, None, &opts()).unwrap();
             assert_eq!((r.output, r.bytes), (0, plain));

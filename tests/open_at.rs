@@ -210,6 +210,57 @@ fn a_seeded_rar5_plan_fetches_near_the_target() {
     assert!(r.checked);
 }
 
+/// prybar-fc's compressed failover bench: with known plaintext that does not reach a guarded restart's check (here
+/// only 256 KiB before the target), a seeded plan takes the nearest unguarded restart instead of failing; its output
+/// is unverified and, on filter-free content, exact.
+#[test]
+fn a_seeded_rar5_plan_falls_back_to_an_unguarded_restart() {
+    use zipfast::rar5::testenc;
+    let mut plain = Vec::with_capacity(900_000);
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    while plain.len() < 900_000 {
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            plain.push(x as u8);
+        }
+        let back = plain.len() - 1_000.min(plain.len());
+        let repeat = plain[back..back + 200.min(plain.len() - back)].to_vec();
+        plain.extend(repeat);
+    }
+    plain.truncate(900_000);
+    let data = testenc::tuned_stream(&testenc::lz(&plain, 1 << 17, 16), 2_000);
+    let mut spec = FileSpec::new("c.bin", &data);
+    spec.method = 3;
+    spec.size = Some(plain.len() as u64);
+    let bytes = archive_with(&[(spec, crc32fast::hash(&plain))], false);
+    let map = MemberMap::from_memory(&[&bytes], "c.rar", None).unwrap();
+    let target = 700_000u64;
+    let packed_len = map.members[0].packed_size;
+    let options = OpenAtOptions {
+        seed: Seed::HeldPlaintext { strict: false },
+        search: Some(packed_len / 3),
+        ..Default::default()
+    };
+    let plan = open_at(&map, 0, target, &options).unwrap();
+    let held = fetch(&[&bytes], &plan.spans);
+    let known_base = target - (256 << 10);
+    let known = &plain[known_base as usize..target as usize];
+    let mut r = complete_rar5(&map, &plan, plan.fetch_from, &held, known_base, known, &NearOptions::default())
+        .expect("an unguarded restart when no guarded one can be checked");
+    assert!(!r.checked);
+    assert!(r.output <= target);
+    let mut out = Collect(Vec::new());
+    r.decoder.feed(&held[(r.feed_from - plan.fetch_from) as usize..], &mut out).unwrap();
+    r.decoder.finish(&mut out).unwrap();
+    assert_eq!(out.0, plain[r.output as usize..]);
+    // strict refuses what is not guarded
+    let strict = OpenAtOptions { seed: Seed::HeldPlaintext { strict: true }, ..options };
+    let plan = open_at(&map, 0, target, &strict).unwrap();
+    assert!(complete_rar5(&map, &plan, plan.fetch_from, &held, known_base, known, &NearOptions::default()).is_err());
+}
+
 /// Completes a RAR 5.0 plan with the whole plaintext known, decodes to the end and checks the output; returns the
 /// restart's member output offset.
 fn handover(map: &MemberMap, plan: &OpenAt, held: &[u8], stream_plain: &[u8]) -> u64 {
@@ -559,5 +610,55 @@ fn handovers_on_the_z_fixtures() {
                 assert_eq!(res.bytes, plain[res.output as usize..], "{set} member {i} target {target}");
             }
         }
+    }
+}
+
+/// prybar-fc's 7z failover fixture (7-Zip -mx5 -mmt, 310 MB): a run of stored chunks that the next LZMA chunk continues
+/// the state over is no restart; complete_lzma2 names the nearest real one (`FetchFrom`), and from there the output is
+/// exact. Set ZIPFAST_FEED_FIXTURES to the directory holding payload.bin and 7z_lzma2/.
+#[test]
+fn lzma2_failover_never_restarts_in_a_stored_run_the_state_continues_over() {
+    let Some(dir) = std::env::var_os("ZIPFAST_FEED_FIXTURES").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: set ZIPFAST_FEED_FIXTURES to prybar-fc's feed fixtures directory");
+        return;
+    };
+    let plain = std::fs::read(dir.join("payload.bin")).unwrap();
+    let mut names: Vec<_> = std::fs::read_dir(dir.join("7z_lzma2")).unwrap().map(|e| e.unwrap().path()).collect();
+    names.sort();
+    let vols: Vec<Vec<u8>> = names.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let refs: Vec<&[u8]> = vols.iter().map(Vec::as_slice).collect();
+    let map = MemberMap::from_memory(&refs, "set.7z.001", None).unwrap();
+    let mut stream = Vec::new();
+    for s in &map.folders[0].packed {
+        stream.extend_from_slice(&vols[s.volume as usize][s.packed.start as usize..s.packed.end as usize]);
+    }
+    let index = map.lzma2_chunks(0, &refs, Default::default()).unwrap();
+    let opts = Lzma2DecodeOptions { max_output: 1 << 34, ..Lzma2DecodeOptions::default() };
+    for frac in [0.25f64, 0.5, 0.9] {
+        let target = (plain.len() as f64 * frac) as u64;
+        let plan = open_at(&map, 0, target, &OpenAtOptions::default()).unwrap();
+        let Start::Lzma2 { ref donor, .. } = plan.start else { panic!("{:?}", plan.start) };
+        let mut from = plan.fetch_from;
+        let mut known_base = donor.start;
+        let r = loop {
+            match complete_lzma2(
+                &map,
+                &plan,
+                from,
+                &stream[from as usize..],
+                known_base,
+                &plain[known_base as usize..donor.end as usize],
+                Some(&index),
+                &opts,
+            ) {
+                Err(OpenAtError::FetchFrom { packed, output }) if packed < from => {
+                    from = packed;
+                    known_base = output.saturating_sub(1 << 26).min(known_base);
+                }
+                other => break other.unwrap(),
+            }
+        };
+        let s = r.output as usize;
+        assert!(r.bytes == plain[s..s + r.bytes.len()] && s + r.bytes.len() == plain.len(), "{frac}");
     }
 }
