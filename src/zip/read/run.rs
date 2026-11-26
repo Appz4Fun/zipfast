@@ -638,6 +638,15 @@ impl ProjectedReadSession {
                 if let Err(error) =
                     self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel))
                 {
+                    // Options::keep_broken: a member that fails on its own data (a wrong password, a CRC or a cut)
+                    // keeps what was staged, published as a verified file would be, and is reported failed all the
+                    // same; a canceled run publishes nothing
+                    if continued(&error) && options.keep_broken && !cancel.is_canceled() {
+                        return match stage.publish_broken(mode, mtime, cancel, context, |cx| self.check_source(cx)) {
+                            Ok(_) => Err(error),
+                            Err(published) => Err(published),
+                        };
+                    }
                     return Err(if continued(&error) {
                         stage.finish_member_error(error, context, cancel, |cx| self.check_source(cx))
                     } else {

@@ -191,3 +191,102 @@ fn an_attempted_continuation_without_checks_still_fails() {
         }
     }
 }
+
+/// prybar on #292: a single-file ZIP goes through the checked route (`run_with_policy`), which kept nothing.
+/// `7z x -pwrong` leaves every file of a wrong-password ZIP empty; with `keep_broken` so does zipfast, for WinZip AES and
+/// ZipCrypto alike, reporting every member failed.
+#[test]
+fn the_checked_zip_route_keeps_wrong_password_files_empty_when_asked() {
+    for name in ["d64_aes.zip", "d64_zipcrypto.zip"] {
+        let path = Path::new(FIXTURES).join("deflate64").join(name);
+        for keep in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let mut failed = 0;
+            let report = extract::run_with_policy(
+                &path,
+                &options(&out, keep, 1),
+                Some("wrong"),
+                &extract::Cancellation::default(),
+                &Default::default(),
+                |event: extract::RunEvent<'_>| {
+                    if matches!(event, extract::RunEvent::MemberFailed { .. }) {
+                        failed += 1;
+                    }
+                    Ok(())
+                },
+            );
+            assert!(report.is_ok(), "{name} {keep}: {report:?}");
+            assert_eq!(failed, 2, "{name} {keep}");
+            for file in ["small.txt", "text.txt"] {
+                match fs::read(out.join(file)) {
+                    Ok(kept) => assert!(keep && kept.is_empty(), "{name} {keep}: {file} is {} bytes", kept.len()),
+                    Err(_) => assert!(!keep, "{name}: {file} kept empty when asked"),
+                }
+            }
+        }
+    }
+}
+
+/// One stored ZIP member, its CRC that of `crc_of` (so a mismatch can be made), as a single-file archive.
+fn stored_zip(name: &str, data: &[u8], crc_of: &[u8]) -> Vec<u8> {
+    let crc = crc32fast::hash(crc_of);
+    let mut local = Vec::new();
+    local.extend_from_slice(b"PK\x03\x04");
+    local.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0x21, 0x50]); // version, flags, stored, DOS time/date
+    local.extend_from_slice(&crc.to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(name.as_bytes());
+    local.extend_from_slice(data);
+    let mut central = Vec::new();
+    central.extend_from_slice(b"PK\x01\x02");
+    central.extend_from_slice(&[20, 3, 20, 0, 0, 0, 0, 0, 0, 0, 0x21, 0x50]);
+    central.extend_from_slice(&crc.to_le_bytes());
+    central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    central.extend_from_slice(&[0; 8]); // extra, comment, disk, internal attributes
+    central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+    central.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+    central.extend_from_slice(name.as_bytes());
+    let mut out = local.clone();
+    let at = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// The checked ZIP route keeps a member whose data fails its CRC, every byte written, when asked (7-Zip: "CRC
+/// Failed", the file kept); without the option it is removed.
+#[test]
+fn the_checked_zip_route_keeps_a_crc_failure_when_asked() {
+    let data: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
+    let mut wrong = data.clone();
+    wrong[100] ^= 1;
+    for keep in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crc.zip");
+        fs::write(&path, stored_zip("bad.bin", &data, &wrong)).unwrap();
+        let out = dir.path().join("out");
+        let report = extract::run_with_policy(
+            &path,
+            &options(&out, keep, 1),
+            None,
+            &extract::Cancellation::default(),
+            &Default::default(),
+            |_: extract::RunEvent<'_>| Ok(()),
+        );
+        assert!(report.is_ok(), "{keep}: {report:?}");
+        match fs::read(out.join("bad.bin")) {
+            Ok(kept) => assert!(keep && kept == data, "{keep}: {} bytes", kept.len()),
+            Err(_) => assert!(!keep, "kept when asked"),
+        }
+    }
+}
