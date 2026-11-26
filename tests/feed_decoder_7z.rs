@@ -1117,3 +1117,51 @@ fn a_snapshot_keeps_the_dictionary_reset_fallback_past_seeded_restart_points() {
     assert!(s.done && s.crc_ok == Some(true), "{s:?}");
     assert!(out.bytes == *plain);
 }
+
+/// Held mode for a layer that waits at holes: the caller holds another copy's output from the stalled frontier to
+/// the member's end, retires it with `fill_lost`, and the member is done with its CRC checked, the hole never fetched.
+#[test]
+fn fill_lost_to_the_end_finishes_a_folder_waiting_at_a_hole() {
+    let plain = mixed(3_000_000, 21);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, usize::MAX >> 1);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let article = 750_000usize;
+    let hole = article as u64..(2 * article).min(archive.len()) as u64;
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..hole.start as usize]).unwrap();
+    source.insert(0, hole.end, &archive[hole.end as usize..]).unwrap();
+    source.mark_lost(0, hole.clone());
+    let mut d = FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap();
+    let mut out = Out::new(plain.len(), None);
+    let s = d.run(&mut source, &mut out).unwrap();
+    let frontier = s.frontier;
+    assert!(frontier > 0 && frontier < plain.len() as u64, "{s:?}");
+    // Interior output is refused for this layer; the rest from the frontier is taken.
+    assert!(matches!(d.fill_lost(0..1, &plain[..1]), Err(FeedError::FillLost(_))));
+    out.write_at(frontier, &plain[frontier as usize..]).unwrap();
+    d.fill_lost(frontier..plain.len() as u64, &plain[frontier as usize..]).unwrap();
+    let s = d.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true) && s.needs.is_empty(), "{s:?}");
+    assert!(out.bytes == plain);
+    assert_eq!(out.written, plain.len() as u64, "each output byte once");
+}
+
+/// A 7z member the folder's next member goes on from keeps its hand-off: filling it to its end is refused (the last
+/// member of the folder may be filled).
+#[test]
+fn fill_lost_to_the_end_is_refused_for_a_member_with_a_successor() {
+    let a = mixed(400_000, 31);
+    let b = mixed(300_000, 32);
+    let archive = seven_zip(&[("a.bin", a.clone()), ("b.bin", b.clone())], false, 1 << 16);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..archive.len() / 3]).unwrap();
+    let mut d = FeedDecoder::new(&map, 0, FeedOptions::default()).unwrap();
+    let mut out = Out::new(a.len(), None);
+    let s = d.run(&mut source, &mut out).unwrap();
+    let f = s.frontier;
+    assert!(f < a.len() as u64, "{s:?}");
+    assert!(matches!(d.fill_lost(f..a.len() as u64, &a[f as usize..]), Err(FeedError::FillLost(_))));
+}
