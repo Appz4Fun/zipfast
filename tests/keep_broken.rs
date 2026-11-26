@@ -290,3 +290,55 @@ fn the_checked_zip_route_keeps_a_crc_failure_when_asked() {
         }
     }
 }
+
+/// prybar on #292: RarSession (`extract_selected`, and the controlled route prybar's UnRAR mode runs) keeps a member
+/// failing its checksum with what was written when asked (UnRAR `-kb`), reporting it failed; removed by default.
+#[test]
+fn rar_sessions_keep_a_checksum_failure_when_asked() {
+    use zipfast::extract::RarEntryOutcome;
+    use zipfast::rar5::session::*;
+    struct Replace;
+    impl RarExtractObserver for Replace {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            Ok(RarOverwriteDecision::Replace)
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, _: RarDiagnostic<'_>) {}
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..20_000usize).map(|i| (i * 7 + i / 251) as u8).collect();
+    let mut rar = common::archive(&[FileSpec::new("bad.bin", &data)]);
+    let at = rar.windows(64).position(|w| w == &data[1000..1064]).unwrap();
+    rar[at] ^= 0x55;
+    let path = dir.path().join("crc.rar");
+    fs::write(&path, &rar).unwrap();
+    let mut want = data.clone();
+    want[1000] ^= 0x55;
+    for keep in [true, false] {
+        let out = dir.path().join(format!("selected-{keep}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary =
+            session.extract_selected(&all, &options(&out, keep, 1), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(summary.failed, 1, "selected {keep}");
+        assert_eq!(fs::read(out.join("bad.bin")).ok(), keep.then(|| want.clone()), "selected {keep}");
+
+        let out = dir.path().join(format!("controlled-{keep}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let report = session.extract_selected_controlled(
+            &selected,
+            &options(&out, keep, 1),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Replace,
+        );
+        let summary = report.finish().outcome.unwrap();
+        assert_eq!(summary.failed, 1, "controlled {keep}");
+        assert_eq!(fs::read(out.join("bad.bin")).ok(), keep.then(|| want.clone()), "controlled {keep}");
+    }
+}
