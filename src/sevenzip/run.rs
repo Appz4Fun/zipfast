@@ -425,6 +425,7 @@ pub(super) fn print(
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};
@@ -624,7 +625,7 @@ impl Run<'_> {
         let ordinal = self.current;
         let mut log = RenameLog {
             budget: &mut self.summary.rename_budget,
-            placed: Some(&self.extracted),
+            placed: self.opts.replace_placed_links.then_some(&self.extracted),
             record: &mut |renamed| {
                 report.renamed_member(ordinal, &renamed);
                 renames.push(renamed);

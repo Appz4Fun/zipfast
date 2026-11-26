@@ -197,6 +197,11 @@ pub struct Options {
     /// exists and opens. Off (the default) the run starts at the volume given and walks forward only, as 7-Zip does:
     /// the continued member is reported as lacking its start (`RarSkipReason::MissingStart`).
     pub restart_from_first_volume: bool,
+    /// A symbolic link this run placed, met where a later member goes (`link` then `link` again, or `link/x`), is
+    /// replaced by rename, as UnRAR 7.30 `e -y` does. Off (the default) it is refused, as 7-Zip 26.06 does ("Dangerous
+    /// link via another link was ignored"): the member fails. Applies to the whole-archive runners for RAR, 7z, ZIP
+    /// and tar.
+    pub replace_placed_links: bool,
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -391,6 +396,7 @@ impl MemberRef<'_> {
 ///     preexisting_links: Default::default(),
 ///     refused_link_placeholder: false,
 ///     restart_from_first_volume: false,
+///     replace_placed_links: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -3800,6 +3806,7 @@ fn rar_read_at(
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -4173,7 +4180,7 @@ impl Run<'_, '_, '_> {
             let order = ctx.entry.order;
             let mut log = RenameLog {
                 budget: &mut self.rename_budget,
-                placed: Some(&self.landing.extracted),
+                placed: self.opts.replace_placed_links.then_some(&self.landing.extracted),
                 record: &mut |r| {
                     renamed = Some(r.clone());
                     self.reports.renamed_at(order, r)
@@ -4430,7 +4437,7 @@ impl Run<'_, '_, '_> {
             let order = ctx.entry.order;
             let mut log = RenameLog {
                 budget: &mut self.rename_budget,
-                placed: Some(&self.landing.extracted),
+                placed: self.opts.replace_placed_links.then_some(&self.landing.extracted),
                 record: &mut |r| {
                     renamed = Some(r.clone());
                     self.reports.renamed_at(order, r)
@@ -4481,7 +4488,7 @@ impl Run<'_, '_, '_> {
                         let rel = old.path.strip_prefix(&self.opts.dest).unwrap_or(&old.path).to_path_buf();
                         let mut log = RenameLog {
                             budget: &mut self.rename_budget,
-                            placed: Some(&self.landing.extracted),
+                            placed: self.opts.replace_placed_links.then_some(&self.landing.extracted),
                             record: &mut |_| {},
                         };
                         let checked = place_target(self.opts, &rel, Some(&mut self.dirs), &mut log);

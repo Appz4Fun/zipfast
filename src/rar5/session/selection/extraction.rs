@@ -61,6 +61,8 @@ pub(super) struct Extraction<'a> {
     dirs: Vec<DirectoryOutput>,
     /// the files this run published, where each landed: the files a hard link or file copy may take
     extracted: crate::extract::link::Extracted,
+    /// [`Options::replace_placed_links`], where the route can do it (the controlled route binds regular files only)
+    pub(super) replace_placed_links: bool,
 }
 
 pub(super) struct DirectoryOutput {
@@ -77,6 +79,7 @@ impl<'a> Extraction<'a> {
             versions: false,
             dirs: Vec::new(),
             extracted: crate::extract::link::Extracted::for_output(options),
+            replace_placed_links: options.replace_placed_links,
         }
     }
 
@@ -265,12 +268,17 @@ impl<'a> Extraction<'a> {
             return Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written });
         }
         hooks.before_publication(index, initial);
+        // a link this run placed there is replaced (inspect_target let it through): publication checks it is still it
+        let link = fs::symlink_metadata(&target)
+            .ok()
+            .filter(|meta| self.replace_placed_links && self.extracted.owns_link(meta))
+            .map(|meta| crate::extract::link::identity(&meta));
         if hooks.observe_publication() {
-            file.publish_selected_observed(initial.is_some(), |held, published| {
+            file.publish_selected_observed(initial.is_some(), link, |held, published| {
                 hooks.published(index, &target, held, published)
             })
         } else {
-            file.publish_selected(initial.is_some())
+            file.publish_selected(initial.is_some(), link)
         }
         .map_err(|error| own_fault(error.detailed(false)))?;
         self.extracted.file(&self.options.dest, &selected, &target);
@@ -558,6 +566,11 @@ impl<'a> Extraction<'a> {
             Err(source) => return Err(output_fault(IoOperation::Metadata, target, source)),
         };
         if metadata.file_type().is_symlink() {
+            // A symbolic link this run placed is replaced by rename (never followed) when asked, as UnRAR 7.30 `e -y`
+            // does; otherwise, and for any other link, the member is refused, as 7-Zip 26.06 does.
+            if self.replace_placed_links && self.extracted.owns_link(&metadata) {
+                return named.map(|()| Some(SourceStamp::from_entry_metadata(&metadata)));
+            }
             return Err(policy(RarPolicyReason::Symlink, target.to_path_buf()));
         }
         let identity = (metadata.dev(), metadata.ino());
@@ -954,6 +967,7 @@ mod tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
         }
     }
 

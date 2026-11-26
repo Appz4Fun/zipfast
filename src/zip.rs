@@ -1262,7 +1262,7 @@ pub(crate) fn run_renaming(
                 }
                 if opts.mode == Mode::Extract {
                     let mut log = RenameLog {
-                        placed: Some(&extracted),
+                        placed: opts.replace_placed_links.then_some(&extracted),
                         budget: &mut summary.rename_budget,
                         record: &mut |renamed| {
                             report.renamed_member(member.0, &renamed);
@@ -1307,7 +1307,7 @@ pub(crate) fn run_renaming(
             let mut target = None;
             if opts.mode == Mode::Extract {
                 let mut log = RenameLog {
-                    placed: Some(&extracted),
+                    placed: opts.replace_placed_links.then_some(&extracted),
                     budget: &mut summary.rename_budget,
                     record: &mut |renamed| {
                         report.renamed_member(member.0, &renamed);

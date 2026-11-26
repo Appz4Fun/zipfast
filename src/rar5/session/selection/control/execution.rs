@@ -46,6 +46,9 @@ impl RarSession {
                 control.prepare(self, selection, options);
             }
             let mut extraction = Extraction::new(options);
+            // the controlled route binds and publishes over regular files only: a link this run placed is refused
+            // there as any other link is (Options::replace_placed_links is for the other routes)
+            extraction.replace_placed_links = false;
             extraction.versions = selection.takes_versions();
             let mut driver =
                 Driver { extraction, control, observer, retained: 0, event_bytes: 0, source_paths: Vec::new() };
@@ -716,6 +719,7 @@ mod tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
         }
     }
     struct Fault {
@@ -969,6 +973,7 @@ mod directory_fault_tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1049,6 +1054,7 @@ mod trailing_directory_tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

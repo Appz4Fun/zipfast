@@ -51,6 +51,7 @@ fn options(dest: &Path) -> Options {
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
     }
 }
 
@@ -814,5 +815,70 @@ fn preexisting_links_inside_the_destination_follow_the_policy() {
             assert!(matches!(failure.kind, zipfast::progressive::FailureKind::UnsafePath), "{failure:?}");
             assert!(fs::symlink_metadata(out.join("f")).is_err());
         }
+    }
+}
+
+/// prybar's P8: `dirlink_unix.rar` flattened (`e -y`) puts two links at `link`. With `replace_placed_links` the second
+/// replaces the first, which this run placed, as UnRAR 7.30 does, on the whole-archive and the selected route alike;
+/// without it the second is refused (7-Zip 26.06) and the first stays.
+#[test]
+fn a_flattened_second_link_replaces_the_first_only_when_asked() {
+    let path = fixture("dirlink_unix.rar");
+    let dir = tempfile::tempdir().unwrap();
+    for replace in [true, false] {
+        let flat = |dest: &Path| Options { flatten: true, replace_placed_links: replace, ..options(dest) };
+        // `emptydir/link -> link` lands first at `link`, then `link -> emptydir`
+        let want = if replace { "emptydir" } else { "link" };
+        let out = dir.path().join(format!("run-{replace}"));
+        let summary = extract::run(&path, &flat(&out), |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), usize::from(!replace), "run {replace}: {:?}", summary.errors);
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(want), "run {replace}");
+
+        let out = dir.path().join(format!("selected-{replace}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &flat(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(summary.failed, u64::from(!replace), "selected {replace}: {summary:?}");
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(want), "selected {replace}");
+        assert_eq!(fs::read(out.join("file")).unwrap().len(), 8, "selected {replace}");
+    }
+}
+
+/// Codex on #291: a regular file landing on a link this run placed (`a -> x`, then a file `a`) replaces it through
+/// `extract_selected` too, when asked; publication carries the link's identity, so only that link is replaced. The
+/// controlled route binds regular files only: it refuses the link there, as before, whatever the option.
+#[test]
+fn a_file_over_a_link_this_run_placed_replaces_it_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    let file = header(0x74, 3, b"a", b"data", 0o100644, &[]);
+    fs::write(&path, archive(&[link_member(b"a", b"x"), file])).unwrap();
+    for replace in [true, false] {
+        let opts = |dest: &Path| Options { replace_placed_links: replace, ..options(dest) };
+        let out = dir.path().join(format!("selected-{replace}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &opts(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(summary.failed, u64::from(!replace), "{replace}: {summary:?}");
+        if replace {
+            assert_eq!(fs::read(out.join("a")).unwrap(), b"data");
+        } else {
+            assert_eq!(fs::read_link(out.join("a")).unwrap(), Path::new("x"));
+        }
+
+        let out = dir.path().join(format!("controlled-{replace}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let report = session.extract_selected_controlled(
+            &selected,
+            &opts(&out),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Replace,
+        );
+        let summary = report.finish().outcome.unwrap();
+        assert_eq!(summary.failed, 1, "controlled {replace}: the link is refused there");
+        assert_eq!(fs::read_link(out.join("a")).unwrap(), Path::new("x"), "controlled {replace}");
     }
 }

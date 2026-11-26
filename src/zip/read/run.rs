@@ -752,7 +752,7 @@ impl ProjectedReadSession {
         let mut log = crate::extract::RenameLog {
             budget: &mut budget,
             record: &mut |r| renamed = Some(r),
-            placed: Some(extracted),
+            placed: options.replace_placed_links.then_some(extracted),
         };
         let checked = crate::extract::check_target(options, &rel, None, &mut log);
         if let Some(action) = context.action.as_mut() {
