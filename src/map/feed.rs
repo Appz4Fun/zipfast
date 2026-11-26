@@ -19,7 +19,7 @@
 //! ([`NeedBytes`]). Holes are skipped where the layer allows and repaired when their bytes come; the decoder's state
 //! can be saved and restored. See `docs/feed-decoder.md`.
 
-use super::member_reader::{MemberKey, derive_keys, validate};
+use super::member_reader::{FeedKeys, MemberKey, derive_keys, derive_keys_reusing, validate};
 use super::{CipherParams, ExtractFromError, MapMember, MapMethod, MemberMap, OutputMapping, UnsupportedRead};
 use crate::crypto::AesKey;
 use crate::progressive::{ProgressiveLimits, SessionControl, Usage};
@@ -222,6 +222,9 @@ pub struct FeedOptions {
     /// The largest RAR 5.0 window (dictionary) a compressed member may allocate (default 1 GiB). A repair runs a
     /// second decoder with its own window while it lasts.
     pub max_window: u64,
+    /// Keys derived earlier for the same password and key-derivation input ([`FeedDecoder::keys`] of a twin copy's
+    /// decoder, or of an earlier member): used instead of deriving again when they match the member (default none).
+    pub keys: Option<FeedKeys>,
 }
 
 impl Default for FeedOptions {
@@ -234,6 +237,7 @@ impl Default for FeedOptions {
             max_needs: 64,
             run_budget: None,
             max_window: 1 << 30,
+            keys: None,
         }
     }
 }
@@ -834,6 +838,14 @@ pub struct FeedDecoder {
     mac: Option<Box<StoredMac>>,
     /// [`FeedDecoder::open_at`]: the output before the main decode's start, which the caller held (0 otherwise)
     held_prefix: u64,
+    /// [`FeedDecoder::open_at`]: the output offset asked for (the start is at or before it under CBC)
+    open_from: u64,
+    /// output before this is not hashed into the CRC runs: the caller's prefix CRC covers it
+    crc_floor: u64,
+    /// [`FeedDecoder::set_open_iv`]: the ciphertext block before `held_prefix`, for any lane starting there
+    open_iv: Option<[u8; 16]>,
+    /// the keys derived for this member, to hand to a twin's decoder
+    keys: Option<FeedKeys>,
 }
 
 /// The authentication code of a WinZip AES stored member: HMAC-SHA1 over the ciphertext in order. The main decode
@@ -908,18 +920,43 @@ impl FeedDecoder {
         }
         decoder.main = (start < decoder.size).then(|| decoder.lane_at(start, decoder.size));
         decoder.held_prefix = start;
+        decoder.open_from = at;
         decoder.status = decoder.make_status(Vec::new(), false);
         Ok(decoder)
     }
 
-    /// The CRC32 (unkeyed) of the output before an [`Self::open_at`] decoder's start, `0..status().frontier` as it
-    /// was opened, so the member's CRC is checked when done. Call it before the first run.
+    /// The CRC32 (unkeyed) of the output the caller holds before an [`Self::open_at`] decoder's offset (`0..at`, the
+    /// offset it was opened at), so the member's CRC is checked when done. The decoder never writes output before
+    /// `at` (under AES-CBC it decrypts the few bytes from its block start but keeps the caller's). Call it before the first run.
     pub fn set_prefix_crc32(&mut self, crc32: u32) -> Result<(), FeedError> {
-        if self.held_prefix == 0 || self.stats.written > 0 || self.crc.runs.contains_key(&0) {
+        if self.open_from == 0 || self.stats.written > 0 || self.crc.runs.contains_key(&0) {
             return Err(FeedError::Malformed("a prefix CRC needs a fresh open_at decoder"));
         }
-        self.crc.add_run(0, self.held_prefix, crc32);
+        self.crc.add_run(0, self.open_from, crc32);
+        self.crc_floor = self.open_from;
         Ok(())
+    }
+
+    /// Under AES-CBC, the ciphertext block just before an [`Self::open_at`] decoder's start (its IV), when the caller
+    /// has it: a twin copy's packed bytes are the same ciphertext, so the block before the start is in the article
+    /// the other copy already gave. The decoder then reads nothing before its start. Call it before the first run;
+    /// refused for other layers and at the member's start. For a twin, also give this copy's source the other copy's
+    /// article holding the block that straddles where its output stopped (byte for byte the same here): the up to 15
+    /// bytes from the start to `at` are decrypted from it (and not written: the caller's are kept), so this copy is asked for nothing before `at`.
+    pub fn set_open_iv(&mut self, previous_block: [u8; 16]) -> Result<(), FeedError> {
+        let start = self.held_prefix;
+        let fresh = self.stats.written == 0 && self.stats.packed_read == 0;
+        match (&self.cipher, self.main.as_mut()) {
+            (StoredCipher::Cbc { .. }, Some(lane)) if start > 0 && fresh && lane.next == start => {
+                lane.pos = start;
+                lane.iv = Some(previous_block);
+                lane.rem.clear();
+                // a repair of the opening block (a hole the main decode skipped) starts from it too
+                self.open_iv = Some(previous_block);
+                Ok(())
+            }
+            _ => Err(FeedError::Malformed("an IV is given only to a fresh AES-CBC open_at decoder past the start")),
+        }
     }
 
     fn new_begin(map: &MemberMap, index: usize, options: FeedOptions, begin: Begin) -> Result<Self, FeedError> {
@@ -988,10 +1025,19 @@ impl FeedDecoder {
         let mut mac = None;
         // an empty member needs no key, unless its CRC is keyed with the password
         let keyed_crc = member.checks.is_some_and(|c| c.keyed && c.crc32.is_some());
+        let mut derived_keys = None;
         let cipher = if member.encrypted && (size > 0 || keyed_crc) {
-            let keys =
-                derive_keys(member, mapping, options.password.as_deref(), &options.limits, &usage, &options.control)
-                    .map_err(FeedError::from_extract)?;
+            let (keys, reusable) = derive_keys_reusing(
+                member,
+                mapping,
+                options.password.as_deref(),
+                &options.limits,
+                &usage,
+                &options.control,
+                options.keys.as_ref(),
+            )
+            .map_err(FeedError::from_extract)?;
+            derived_keys = reusable;
             hash_key = keys.hash_key;
             match keys.key {
                 MemberKey::Cbc { aes, iv } => StoredCipher::Cbc { aes, iv },
@@ -1040,6 +1086,10 @@ impl FeedDecoder {
             scratch: Vec::new(),
             run_written: 0,
             held_prefix: 0,
+            open_from: 0,
+            crc_floor: 0,
+            open_iv: None,
+            keys: None,
             failed: false,
             status: FeedStatus::default(),
             index: 0,
@@ -1054,11 +1104,19 @@ impl FeedDecoder {
             zip: None,
             mac,
         };
+        decoder.keys = derived_keys;
         if size > 0 {
             decoder.main = Some(decoder.lane_at(0, size));
         }
         decoder.status = decoder.make_status(Vec::new(), false);
         Ok(decoder)
+    }
+
+    /// The keys derived for this member (None when it is not encrypted, or its cipher's keys cannot be reused), to
+    /// hand to another member's decoder in [`FeedOptions::keys`]: a twin copy's in a failover, which then skips the
+    /// key derivation.
+    pub fn keys(&self) -> Option<FeedKeys> {
+        self.keys.clone()
     }
 
     /// The member's output size.
@@ -1169,7 +1227,7 @@ impl FeedDecoder {
         // stored layers: repairs follow the lost ranges; a stop recorded inside the range is moot
         self.blocked.retain(|at, _| !range.contains(at));
         self.lost.remove(range.clone());
-        self.crc.add(range.start, bytes);
+        self.hash_output(range.start, bytes);
         self.status = self.make_status(Vec::new(), false);
         Ok(())
     }
@@ -1499,6 +1557,8 @@ impl FeedDecoder {
                 let end = out_end.checked_next_multiple_of(16).unwrap_or(u64::MAX).min(self.stream_len);
                 if out == 0 {
                     Lane { pos: 0, end, next: 0, iv: Some(iv), rem: Vec::new() }
+                } else if let Some(iv) = self.open_iv.filter(|_| out == self.held_prefix) {
+                    Lane { pos: out, end, next: out, iv: Some(iv), rem: Vec::new() }
                 } else {
                     Lane { pos: out - 16, end, next: out, iv: None, rem: Vec::new() }
                 }
@@ -1608,15 +1668,28 @@ impl FeedDecoder {
         }
     }
 
+    /// Hashes output at `out` into the CRC runs. Bytes below the floor are the caller's, already in its prefix CRC (an
+    /// open_at under CBC writes them again, and `fill_lost` may retire them again).
+    fn hash_output(&mut self, out: u64, bytes: &[u8]) {
+        let skip = self.crc_floor.saturating_sub(out).min(bytes.len() as u64) as usize;
+        self.crc.add(out + skip as u64, &bytes[skip..]);
+    }
+
     /// Writes output at `out`, clipped to the member.
     fn emit(&mut self, out: u64, bytes: &[u8], sink: &mut dyn FeedSink) -> Result<(), FeedError> {
         let end = (out + bytes.len() as u64).min(self.size);
         if out >= end {
             return Ok(());
         }
-        let bytes = &bytes[..(end - out) as usize];
+        // An open_at decoder never writes before the offset it was opened at: the caller holds that output (under
+        // CBC the decoder decrypts the few bytes from its block start again, unverified by the prefix CRC).
+        let out_from = out.max(self.open_from);
+        if out_from >= end {
+            return Ok(());
+        }
+        let (out, bytes) = (out_from, &bytes[(out_from - out) as usize..(end - out) as usize]);
         sink.write_at(out, bytes).map_err(|error| FeedError::Write { out, error })?;
-        self.crc.add(out, bytes);
+        self.hash_output(out, bytes);
         self.stats.written += bytes.len() as u64;
         self.run_written += bytes.len() as u64;
         Ok(())
@@ -1644,6 +1717,12 @@ impl FeedDecoder {
             unproven: self.unproven,
             suspect: self.suspect,
             seeded: self.seeded,
+            open: OpenAt {
+                held_prefix: self.held_prefix,
+                open_from: self.open_from,
+                crc_floor: self.crc_floor,
+                iv: self.open_iv,
+            },
             layer: match (&self.rar5, &self.lzma2, &self.rar4) {
                 (Some(r), _, _) => Some(r.to_bytes()),
                 (_, Some(l), _) => Some(l.to_bytes()),
@@ -1679,6 +1758,18 @@ impl FeedDecoder {
         }
         let size = d.size;
         let bad = || FeedError::Snapshot("out of range");
+        let open = snapshot.open;
+        let held = open.held_prefix;
+        let open_ok = open.open_from <= size
+            && held <= open.open_from
+            && open.crc_floor <= open.open_from
+            && (open.iv.is_none()
+                || (held > 0 && held.is_multiple_of(16) && matches!(d.cipher, StoredCipher::Cbc { .. })))
+            && (held == 0 || !d.layered());
+        if !open_ok {
+            return Err(bad());
+        }
+        (d.held_prefix, d.open_from, d.crc_floor, d.open_iv) = (held, open.open_from, open.crc_floor, open.iv);
         if let Some(r) = d.rar5.as_mut() {
             let blob = snapshot.layer.as_deref().ok_or(FeedError::Snapshot("no RAR 5.0 state"))?;
             r.restore(blob, size, d.stream_len)?;
@@ -2100,12 +2191,23 @@ pub struct FeedSnapshot {
     suspect: Option<u64>,
     /// [`FeedDecoder::seeded`]
     seeded: Option<u64>,
+    /// an [`FeedDecoder::open_at`] decoder's start, offset asked for, CRC floor and caller's IV (v4)
+    open: OpenAt,
     /// a compressed layer's state: RAR 5.0 checkpoints and repairs, LZMA2 restart points and repairs
     layer: Option<Vec<u8>>,
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"ZFFD";
-const SNAPSHOT_VERSION: u8 = 3;
+const SNAPSHOT_VERSION: u8 = 4;
+
+/// What [`FeedDecoder::open_at`] and the calls after it set, kept by a snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OpenAt {
+    held_prefix: u64,
+    open_from: u64,
+    crc_floor: u64,
+    iv: Option<[u8; 16]>,
+}
 /// The most lost ranges or CRC runs a snapshot may list.
 const SNAPSHOT_MAX_RANGES: u64 = 1 << 20;
 
@@ -2168,6 +2270,16 @@ impl FeedSnapshot {
         out.push(u8::from(self.unproven));
         put_opt_u64(&mut out, self.suspect);
         put_opt_u64(&mut out, self.seeded);
+        for v in [self.open.held_prefix, self.open.open_from, self.open.crc_floor] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        match self.open.iv {
+            None => out.push(0),
+            Some(iv) => {
+                out.push(1);
+                out.extend_from_slice(&iv);
+            }
+        }
         out
     }
 
@@ -2235,6 +2347,17 @@ impl FeedSnapshot {
         } else {
             (false, None, None)
         };
+        let open = if version >= 4 {
+            let (held_prefix, open_from, crc_floor) = (r.u64()?, r.u64()?, r.u64()?);
+            let iv = match r.u8()? {
+                0 => None,
+                1 => Some(r.take(16)?.try_into().expect("16 bytes")),
+                _ => return Err(FeedError::Snapshot("bad flag")),
+            };
+            OpenAt { held_prefix, open_from, crc_floor, iv }
+        } else {
+            OpenAt::default()
+        };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
@@ -2252,6 +2375,7 @@ impl FeedSnapshot {
             unproven,
             suspect,
             seeded,
+            open,
             layer,
         })
     }

@@ -71,6 +71,7 @@ pub use lzma2::{
     Lzma2DecodeOptions, Lzma2Decoder, Lzma2End, Lzma2Error, Lzma2Index, Lzma2IndexBuilder, Lzma2IndexOptions,
     Lzma2Piece, Lzma2Position, Lzma2Reset, Lzma2Stage, Lzma2Start, Lzma2Step, find_stored_chunk_chains,
 };
+pub use member_reader::FeedKeys;
 pub use member_reader::{
     ExtractFromError, ExtractedFrom, MemberReader, UnsupportedRead, extract_member_from, extract_member_from_with,
 };
