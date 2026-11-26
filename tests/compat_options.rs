@@ -812,3 +812,60 @@ fn masked_unix_modes_apply_to_7z_and_rar_members() {
     extract::run_with_password(&rar, &masked, None, |_| {}).unwrap();
     assert_eq!(mode_of(&out.join("f")), 0o775);
 }
+
+/// Codex on #301: under literal backslashes a folder named `\` or `.\` is a folder of that name, not the destination
+/// root (by format both name the root and are passed over).
+#[test]
+fn literal_backslashes_keep_backslash_named_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("dirs.zip");
+    let entries: &[(&str, &[u8], Option<u32>)] = &[("\\/", b"", None), (".\\/", b"", None), ("f.txt", b"f", None)];
+    fs::write(&archive, stored_zip(entries)).unwrap();
+    let literal = Options { backslashes: extract::Backslashes::Literal, ..options(Mode::Extract, tmp.path()) };
+    for out in both_routes(&archive, &literal, &tmp.path().join("literal")) {
+        assert_eq!(paths(&out), [".\\/", "\\/", "f.txt"], "{out:?}");
+    }
+    let legacy = tmp.path().join("by-format");
+    extract::run_with_password(&archive, &options(Mode::Extract, &legacy), None, |_| {}).unwrap();
+    assert_eq!(paths(&legacy), ["f.txt"]);
+}
+
+/// Codex on #301: under literal backslashes a Windows-made RAR 5.0 hard link or file copy finds its target by the
+/// same literal name the target was written under (never a different `d_x.txt`).
+#[test]
+fn literal_backslashes_map_rar5_link_targets_as_names() {
+    fn redirection(kind: u64, target: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for v in [5, kind, 0, target.len() as u64] {
+            common::vint(v, &mut body);
+        }
+        body.extend(target.as_bytes());
+        let mut extra = Vec::new();
+        common::vint(body.len() as u64, &mut extra);
+        extra.extend(body);
+        extra
+    }
+    let windows = |mut spec: FileSpec<'static>| {
+        spec.unix_mode = None;
+        spec
+    };
+    let link = |name: &'static str, kind| {
+        windows(FileSpec { extra: redirection(kind, "d\\x.txt"), ..FileSpec::new(name, b"") })
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let rar = tmp.path().join("links.rar");
+    let files = [
+        windows(FileSpec::new("d_x.txt", b"decoy")),
+        windows(FileSpec::new("d\\x.txt", b"target")),
+        link("hard.txt", 4),
+        link("copy.txt", 5),
+    ];
+    fs::write(&rar, archive(&files)).unwrap();
+    let out = tmp.path().join("out");
+    let literal = Options { backslashes: extract::Backslashes::Literal, ..options(Mode::Extract, &out) };
+    let summary = extract::run_with_password(&rar, &literal, None, |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("d\\x.txt")).unwrap(), b"target");
+    assert_eq!(fs::read(out.join("hard.txt")).unwrap(), b"target");
+    assert_eq!(fs::read(out.join("copy.txt")).unwrap(), b"target");
+}

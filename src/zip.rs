@@ -1214,7 +1214,7 @@ pub(crate) fn run_renaming(
             }
             let member = (ordinal as u64, e.name.as_str());
             summary.matched += 1;
-            if e.is_dir() && crate::path::names_root(&e.name) {
+            if e.is_dir() && crate::path::names_root_with(&e.name, !opts.literal_backslashes()) {
                 continue;
             }
             let rel = match sanitize_with(&e.name, opts.zip_windows_names(e.host), opts.windows_safe_names) {

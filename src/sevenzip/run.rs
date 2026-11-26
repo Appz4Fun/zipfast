@@ -596,7 +596,7 @@ impl Run<'_> {
 
     /// Where a member is to go, or None when it is not written (already reported). Folders above it are made.
     fn place(&mut self, member: &MapMember, name: &str) -> Outcome<Option<(PathBuf, Option<Place>)>> {
-        if member.is_dir && crate::path::names_root(name) {
+        if member.is_dir && crate::path::names_root_with(name, !self.opts.literal_backslashes()) {
             return Ok(None);
         }
         // as 7-Zip writes 7z names: a `\` separates folders too, unless `Options::backslashes` keeps it in the name

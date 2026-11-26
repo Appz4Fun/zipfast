@@ -792,7 +792,7 @@ impl ProjectedReadSession {
         }
         self.check_source(context)?;
         let entry = &self.owner.entries[ordinal];
-        if crate::path::names_root(&entry.name) {
+        if crate::path::names_root_with(&entry.name, !options.literal_backslashes()) {
             return Ok(());
         }
         let relative =

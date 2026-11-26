@@ -4553,7 +4553,13 @@ impl Run<'_, '_, '_> {
         // a member decoded to a caller's sink is never a link placed or checked here
         if let Some(redirection) = h.redirection.as_ref().filter(|_| self.selection.is_none())
             && let Some(kind) =
-                link::from_rar5(redirection, !h.is_unix(), self.opts.windows_safe_names, self.opts.flatten)
+                // a target is an earlier member's name, mapped as member names are (Options::backslashes too)
+                link::from_rar5(
+                    redirection,
+                    !h.is_unix() && !self.opts.literal_backslashes(),
+                    self.opts.windows_safe_names,
+                    self.opts.flatten,
+                )
         {
             return self.rar5_link(vol, h, ctx, &rel, kind);
         }
