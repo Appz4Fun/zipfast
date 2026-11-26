@@ -843,3 +843,42 @@ fn a_flattened_second_link_replaces_the_first_only_when_asked() {
         assert_eq!(fs::read(out.join("file")).unwrap().len(), 8, "selected {replace}");
     }
 }
+
+/// Codex on #291: a regular file landing on a link this run placed (`a -> x`, then a file `a`) replaces it through
+/// `extract_selected` too, when asked; publication carries the link's identity, so only that link is replaced. The
+/// controlled route binds regular files only: it refuses the link there, as before, whatever the option.
+#[test]
+fn a_file_over_a_link_this_run_placed_replaces_it_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.rar");
+    let file = header(0x74, 3, b"a", b"data", 0o100644, &[]);
+    fs::write(&path, archive(&[link_member(b"a", b"x"), file])).unwrap();
+    for replace in [true, false] {
+        let opts = |dest: &Path| Options { replace_placed_links: replace, ..options(dest) };
+        let out = dir.path().join(format!("selected-{replace}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &opts(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(summary.failed, u64::from(!replace), "{replace}: {summary:?}");
+        if replace {
+            assert_eq!(fs::read(out.join("a")).unwrap(), b"data");
+        } else {
+            assert_eq!(fs::read_link(out.join("a")).unwrap(), Path::new("x"));
+        }
+
+        let out = dir.path().join(format!("controlled-{replace}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let report = session.extract_selected_controlled(
+            &selected,
+            &opts(&out),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Replace,
+        );
+        let summary = report.finish().outcome.unwrap();
+        assert_eq!(summary.failed, 1, "controlled {replace}: the link is refused there");
+        assert_eq!(fs::read_link(out.join("a")).unwrap(), Path::new("x"), "controlled {replace}");
+    }
+}

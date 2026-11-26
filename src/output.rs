@@ -293,21 +293,24 @@ impl WriteFile {
         self.pending.as_ref().and_then(PendingPath::target)
     }
 
+    /// `link`: the identity of a symbolic link this run placed at the target, which a replacement may take the place
+    /// of (any other link there is refused).
     #[cfg(unix)]
-    pub(crate) fn publish_selected(self, replace: bool) -> Result<(), OutputError> {
-        self.publish_selected_observed(replace, |_, _| {})
+    pub(crate) fn publish_selected(self, replace: bool, link: Option<(u64, u64)>) -> Result<(), OutputError> {
+        self.publish_selected_observed(replace, link, |_, _| {})
     }
 
     #[cfg(unix)]
     pub(crate) fn publish_selected_observed(
         self,
         replace: bool,
+        link: Option<(u64, u64)>,
         mut observe: impl FnMut(&File, bool),
     ) -> Result<(), OutputError> {
         self.publish_selected_with(
             |temporary, target| {
                 if replace {
-                    replace_detailed(temporary, target)?;
+                    replace_over(temporary, target, link)?;
                 } else {
                     temporary.persist_noclobber(target).map_err(|error| OutputError::Io {
                         operation: IoOperation::Publish,
