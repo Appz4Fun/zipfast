@@ -705,6 +705,21 @@ impl Run<'_> {
         Ok((temporary, Output::new(file, Some(size))))
     }
 
+    /// [`crate::extract::Options::keep_broken`]: a file that failed its CRC (already reported) takes its name with what
+    /// was decoded, as a verified one would. Best effort: when that fails, it is removed as without the option.
+    fn keep_broken(&mut self, (temporary, output): (tempfile::TempPath, Output), place: Place, member: &MapMember) {
+        let meta = self.opts.meta(meta(member));
+        if output.finish(|file| crate::extract::keep_written(file, &meta)).is_err() {
+            return;
+        }
+        let _ = match place.reserved {
+            Some(reserved) if cfg!(unix) && !reserved.still_ours() => return,
+            Some(reserved) => crate::output::replace(temporary, reserved.path()).map(|()| drop(reserved.into_parts())),
+            None if place.replace => crate::output::replace_link(temporary, &place.path, place.link),
+            None => temporary.persist_noclobber(&place.path).map_err(|error| error.error),
+        };
+    }
+
     /// Gives a verified file its name: replacing what is there only when that was asked for, never through a link.
     /// False when it was not published (already reported).
     fn publish(&mut self, staged: Staged) -> Outcome<bool> {
@@ -936,7 +951,7 @@ impl Run<'_> {
                 return self.data_failure(active, name, &why, encrypted, take);
             }
         }
-        let target = match take {
+        let mut target = match take {
             // printing writes no file, so the name needs no checking: it is only reported
             true if self.print.is_some() => Some((PathBuf::new(), None)),
             true => self.place(member, name)?,
@@ -978,6 +993,14 @@ impl Run<'_> {
         if !crc_ok {
             if let Some(spool) = spool.as_mut() {
                 self.store.release(spool).map_err(SevenZipError::Io)?;
+            }
+            // Options::keep_broken: what was decoded stays, as 7-Zip keeps a file that fails its CRC (a wrong
+            // password's garbage included); reported failed all the same
+            if let (Some(staged), Some((_, Some(place)))) = (staged.take(), target.take())
+                && self.opts.keep_broken
+                && !is_link(member)
+            {
+                self.keep_broken(staged, place, member);
             }
             if encrypted && !self.password_proven {
                 // Decrypted garbage: the password does not open this folder. The rest of the folder fails the same

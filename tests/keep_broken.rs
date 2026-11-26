@@ -115,3 +115,20 @@ fn a_zip_entry_cut_off_by_a_missing_volume_keeps_what_was_written_when_asked() {
         }
     }
 }
+
+/// prybar P2 (`7z x -pwrong encrypted_files.7z`): `baz.txt` fails its CRC ("CRC Failed in encrypted file. Wrong
+/// password?") and 7-Zip keeps it, garbage and all; `foo.txt` fails to decode ("Data Error") and is not kept. The
+/// unencrypted files come out either way.
+#[test]
+fn a_7z_file_failing_its_crc_under_a_wrong_password_is_kept_when_asked() {
+    let path = Path::new(FIXTURES).join("7z/encrypted_files.7z");
+    let dir = tempfile::tempdir().unwrap();
+    for keep in [true, false] {
+        let out = dir.path().join(format!("{keep}"));
+        let summary = extract::run_with_password(&path, &options(&out, keep, 1), Some("wrong"), |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), 2, "{keep}: {:?}", summary.errors);
+        assert!(out.join("bar.txt").is_file() && out.join("7zFormat.txt").is_file(), "{keep}");
+        assert_eq!(out.join("baz.txt").is_file(), keep, "{keep}: baz.txt kept only when asked");
+        assert!(!out.join("foo.txt").exists(), "{keep}: a data error is not kept");
+    }
+}
