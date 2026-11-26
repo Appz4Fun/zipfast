@@ -45,8 +45,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zipfast::map::{
-    ArticleBuffer, FeedDecoder, FeedError, FeedOptions, FeedSink, FeedStatus, MemberMap, NeedKind, PackedRead,
-    PackedSource,
+    ArticleBuffer, FeedDecoder, FeedError, FeedOptions, FeedSink, FeedStatus, FeedThreads, MemberMap, NeedKind,
+    PackedRead, PackedSource,
 };
 
 /// The decoded size of a Usenet article as most posters cut them.
@@ -57,6 +57,8 @@ pub const ARTICLE: u64 = 750_000;
 pub struct Config {
     /// The set's volumes, first first.
     pub volumes: Vec<PathBuf>,
+    /// `FeedOptions::threads`: LZMA2 workers (0: none).
+    pub threads: usize,
     pub password: Option<String>,
     /// Decoded article size in bytes.
     pub article: u64,
@@ -98,6 +100,7 @@ impl Config {
     pub fn new(volumes: Vec<PathBuf>, work: PathBuf) -> Self {
         Self {
             volumes,
+            threads: 0,
             password: None,
             article: ARTICLE,
             seed: 1,
@@ -851,7 +854,11 @@ pub fn run(config: &Config) -> Result<Report, String> {
     for (index, m) in map.members.iter().enumerate() {
         let Some(size) = m.unpacked_size.filter(|&s| s > 0 && !m.is_dir) else { continue };
         report.members += 1;
-        let options = FeedOptions { max_needs: config.max_needs, ..FeedOptions::new(config.password.as_deref()) };
+        let options = FeedOptions {
+            max_needs: config.max_needs,
+            threads: if config.threads == 0 { FeedThreads::One } else { FeedThreads::Count(config.threads) },
+            ..FeedOptions::new(config.password.as_deref())
+        };
         match FeedDecoder::new(&map, index, options) {
             Ok(d) => decoders.push((index, size, d)),
             Err(FeedError::Unsupported(why)) => eprintln!("member {index} ({:?}): not fed: {why:?}", m.name),
@@ -1089,7 +1096,11 @@ fn restart(
     let mut reopened =
         if partial.is_empty() { HashMap::new() } else { persistent::create(config, map, &partial, dest)? };
     for (index, name, size, is_partial, path, lost, refills, refill_bytes) in old {
-        let options = FeedOptions { max_needs: config.max_needs, ..FeedOptions::new(config.password.as_deref()) };
+        let options = FeedOptions {
+            max_needs: config.max_needs,
+            threads: if config.threads == 0 { FeedThreads::One } else { FeedThreads::Count(config.threads) },
+            ..FeedOptions::new(config.password.as_deref())
+        };
         let (out, decoder, lost) = if is_partial {
             #[cfg(feature = "persistent-partials")]
             {

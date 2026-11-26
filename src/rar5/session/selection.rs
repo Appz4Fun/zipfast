@@ -832,6 +832,16 @@ fn mark_volumes(words: &mut VolumeSet, parts: &[Part]) {
     }
 }
 
+/// The volumes a selected member's published bytes depend on: its own parts, plus the solid history behind a
+/// compressed RAR 5.0 member (what the run decoded before it). Publication checks exactly these.
+fn member_volumes(run: &SelectedRun, session: &RarSession, index: usize) -> VolumeSet {
+    let member = &session.model.members[index];
+    // a compressed member depends on its solid history (RAR 5.0 and 4.x alike)
+    let mut words = if member.header.method != 0 { run.history_volumes } else { [0; VOLUME_WORDS] };
+    mark_volumes(&mut words, &session.model.parts[member.parts.clone()]);
+    words
+}
+
 fn check_volumes(session: &mut RarSession, words: &VolumeSet) -> Result<(), Arc<RarFailure>> {
     for (word, mut bits) in words.iter().copied().enumerate() {
         while bits != 0 {
