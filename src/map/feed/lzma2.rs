@@ -283,8 +283,9 @@ impl Lz {
     /// The output of blocks the main decode went past that workers have not finished, as repairs (folder offsets,
     /// clipped to what this member writes).
     fn par_unfinished(&self) -> Vec<(Range<u64>, Kind)> {
-        let (Some(par), Some(main)) = (self.par.as_ref(), self.main.as_ref()) else { return Vec::new() };
-        par.passed_unfinished(main.out)
+        let Some(par) = self.par.as_ref() else { return Vec::new() };
+        // a finished main decode (None) has passed every block
+        par.passed_unfinished(self.main.as_ref().map_or(u64::MAX, |main| main.out))
             .into_iter()
             .filter_map(|(lost, cp, until)| {
                 let lost = lost.start.max(self.write_from)..lost.end.min(self.end);
@@ -1122,6 +1123,12 @@ impl FeedDecoder {
         while !lz.seek
             && let Some(mut lane) = lz.main.take()
         {
+            // the budget spent on worker output (the main decode checks its own as it writes)
+            if lz.par.is_some() && self.options.run_budget.is_some_and(|b| self.run_written >= b) {
+                more = true;
+                lz.main = Some(lane);
+                break;
+            }
             let write = lz.write_from..lz.end;
             // at a block it has not begun (between chunks, no decoder): a free worker may take it first
             if lz.par.is_some() && lane.chunk.is_none() && lane.live.is_none() {
@@ -1222,6 +1229,10 @@ impl FeedDecoder {
             self.par_round(lz, source, sink, lz.main.is_none())?;
             for r in lz.par.as_mut().map(|p| p.take_waiting()).unwrap_or_default() {
                 self.push_needs(&mut next, r, NeedKind::Next);
+            }
+            // stopped at the budget with workers still going: run again
+            if self.options.run_budget.is_some_and(|b| self.run_written >= b) && self.par_pending(lz) {
+                more = true;
             }
         }
         if !more {

@@ -42,6 +42,10 @@ const QUEUE: usize = 16;
 /// A worker's output chunk.
 const CHUNK: usize = 1 << 20;
 
+/// Packed reads a worker may have queued before the caller's thread stops feeding it (each at most
+/// [`super::FeedOptions::read_chunk`]): input is bounded by the read size, not by the block.
+const INPUT_QUEUE: usize = 4;
+
 /// How long the main decode, at a block it has not begun while every worker is busy, waits for one to free up before
 /// decoding the block itself.
 const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
@@ -69,6 +73,8 @@ pub(super) struct Par {
     waiting: Vec<Range<u64>>,
     /// the end marker (plain packed, folder output), once walked
     stream_end: Option<(u64, u64)>,
+    /// blocks given up while ahead of the main decode: it decodes them itself, so no worker takes them again
+    given_up: std::collections::BTreeSet<u64>,
 }
 
 struct Block {
@@ -78,8 +84,11 @@ struct Block {
     end: Option<(u64, u64)>,
     /// plain packed offset up to which the worker was fed
     sent: u64,
-    /// the worker's input; dropped once the block is fed whole (the worker then ends) or given up
-    input: Option<mpsc::Sender<Vec<u8>>>,
+    /// the worker's input (bounded, [`INPUT_QUEUE`]); dropped once the block is fed whole (the worker then ends) or
+    /// given up
+    input: Option<mpsc::SyncSender<Vec<u8>>>,
+    /// the last feed stopped at a full input queue: more is to come once the worker takes some
+    backlog: bool,
     /// folder output offset written up to
     written: u64,
     state: State,
@@ -112,6 +121,7 @@ impl Par {
                 rx,
                 waiting: Vec::new(),
                 stream_end: None,
+                given_up: Default::default(),
             })
         })
     }
@@ -214,9 +224,13 @@ impl FeedDecoder {
             self.par_feed(lz, &mut par, source)?;
             self.par_fail(lz, &mut par);
             if wait {
-                // every running block fed whole: the rest is decoding time
-                while par.blocks.values().any(|b| b.state == State::Running && b.input.is_none()) {
+                // every running block fed whole, or held back only by its input queue: the rest is decoding time
+                // (fed on as the workers take their input), until the run's budget is spent
+                while !self.par_over_budget()
+                    && par.blocks.values().any(|b| b.state == State::Running && (b.input.is_none() || b.backlog))
+                {
                     self.par_collect(lz, &mut par, sink, true)?;
+                    self.par_feed(lz, &mut par, source)?;
                     self.par_fail(lz, &mut par);
                 }
             }
@@ -230,6 +244,9 @@ impl FeedDecoder {
     /// message and writes what came. False when nothing came (workers short of input, say): the main decode then
     /// decodes the block itself.
     pub(super) fn par_wait(&mut self, lz: &mut Lz, sink: &mut dyn FeedSink) -> Result<bool, FeedError> {
+        if self.par_over_budget() {
+            return Ok(false);
+        }
         let Some(mut par) = lz.par.take() else { return Ok(false) };
         let result = (|| {
             let Ok(msg) = par.rx.recv_timeout(WAIT) else { return Ok(false) };
@@ -241,7 +258,17 @@ impl FeedDecoder {
         result
     }
 
-    /// Writes what the workers sent; `block`: wait for at least one message.
+    /// The run's write budget ([`super::FeedOptions::run_budget`]) is spent: worker output waits for the next run.
+    fn par_over_budget(&self) -> bool {
+        self.options.run_budget.is_some_and(|b| self.run_written >= b)
+    }
+
+    /// Workers still have work: a run stopped at its budget has more to do.
+    pub(super) fn par_pending(&self, lz: &Lz) -> bool {
+        lz.par.as_ref().is_some_and(|p| !p.idle())
+    }
+
+    /// Writes what the workers sent, until the run's budget is spent; `block`: wait (up to [`WAIT`]) for a message.
     fn par_collect(
         &mut self,
         lz: &mut Lz,
@@ -251,9 +278,14 @@ impl FeedDecoder {
     ) -> Result<(), FeedError> {
         let mut first = block;
         loop {
+            if self.par_over_budget() {
+                return Ok(());
+            }
             let msg = if first {
                 first = false;
-                match par.rx.recv() {
+                // bounded: a worker that took its queued input without output yet (a few small reads inside one chunk)
+                // waits for more, which the caller's thread feeds once this returns
+                match par.rx.recv_timeout(WAIT) {
                     Ok(m) => m,
                     Err(_) => return Ok(()),
                 }
@@ -325,7 +357,22 @@ impl FeedDecoder {
                     par.stream_end = Some((pos, out));
                     break;
                 }
-                Hdr::Missing { .. } => break,
+                // a block whose end is not walked waits on this header: its bytes are needed (the main decode stops at
+                // that block); a hole there gives the block up (the main decode reads it itself, with its own
+                // fallback), since its end can never be walked
+                Hdr::Missing { cipher, hole } => {
+                    if let Some((_, b)) = par.blocks.range_mut(..=out).next_back()
+                        && b.end.is_none()
+                        && b.state == State::Running
+                    {
+                        if hole {
+                            b.state = State::Failed;
+                        } else {
+                            par.waiting.push(cipher);
+                        }
+                    }
+                    break;
+                }
             };
             let spaced = par
                 .resets
@@ -363,12 +410,12 @@ impl FeedDecoder {
         let candidates: Vec<(u64, u64)> = par
             .resets
             .range(first..lz.end)
-            .filter(|(out, _)| !par.blocks.contains_key(out))
+            .filter(|(out, _)| !par.blocks.contains_key(out) && !par.given_up.contains(out))
             .take(free)
             .map(|(&o, &p)| (o, p))
             .collect();
         for (out, packed) in candidates {
-            let (input_tx, input_rx) = mpsc::channel();
+            let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
             let tx = par.tx.clone();
             let prop = lz.dec_prop;
             let spawned =
@@ -380,7 +427,15 @@ impl FeedDecoder {
             let end = par.resets.range(out + 1..).next().map(|(&o, &p)| (p, o)).or(par.stream_end);
             par.blocks.insert(
                 out,
-                Block { packed, end, sent: packed, input: Some(input_tx), written: out, state: State::Running },
+                Block {
+                    packed,
+                    end,
+                    sent: packed,
+                    input: Some(input_tx),
+                    backlog: false,
+                    written: out,
+                    state: State::Running,
+                },
             );
         }
     }
@@ -395,6 +450,7 @@ impl FeedDecoder {
             if b.state != State::Running || b.input.is_none() {
                 continue;
             }
+            b.backlog = false;
             loop {
                 let stop = b.end.map_or(walked, |(p, _)| p).min(lz.plain_len);
                 if b.sent >= stop {
@@ -408,10 +464,18 @@ impl FeedDecoder {
                 match self.lz_read(lz, source, b.sent, &mut bytes)? {
                     Got::Data(n) => {
                         bytes.truncate(n);
-                        b.sent += n as u64;
-                        if b.input.as_ref().is_none_or(|tx| tx.send(bytes).is_err()) {
-                            b.state = State::Failed;
-                            break;
+                        let Some(tx) = b.input.as_ref() else { break };
+                        match tx.try_send(bytes) {
+                            Ok(()) => b.sent += n as u64,
+                            // the worker has enough queued: fed on once it takes some (the bytes are read again then)
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                b.backlog = true;
+                                break;
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                b.state = State::Failed;
+                                break;
+                            }
                         }
                     }
                     Got::Missing { hole: false, cipher } => {
@@ -444,6 +508,9 @@ impl FeedDecoder {
                 continue;
             }
             let b = par.blocks.remove(&out).expect("listed");
+            if ahead {
+                par.given_up.insert(out);
+            }
             if let (false, Some((packed_end, out_end))) = (ahead, b.end)
                 && b.written < out_end
             {

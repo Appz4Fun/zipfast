@@ -1191,3 +1191,76 @@ fn fill_lost_to_the_end_is_refused_for_a_member_with_a_successor() {
     assert!(f < a.len() as u64, "{s:?}");
     assert!(matches!(d.fill_lost(f..a.len() as u64, &a[f as usize..]), Err(FeedError::FillLost(_))));
 }
+
+/// Codex on #295: with workers, every region not yet arrived (anywhere: a block's payload, the header that ends a
+/// block a worker owns) leaves the decoder either done or naming what it needs, never stuck with no need; and a
+/// snapshot taken then (the main decode possibly finished, workers short of input) restores to a decoder that
+/// finishes with the CRC checked once the region comes.
+#[test]
+fn workers_never_stall_without_a_need_and_snapshots_keep_their_blocks() {
+    let plain = mixed(1_200_000, 21);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let options = || FeedOptions {
+        max_needs: usize::MAX,
+        read_chunk: 4096,
+        threads: FeedThreads::Count(3),
+        ..FeedOptions::default()
+    };
+    let gap = 3000usize;
+    let mut at = 64usize;
+    while at + gap < archive.len() {
+        let mut d = FeedDecoder::new(&map, 0, options()).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        source.insert(0, 0, &archive[..at]).unwrap();
+        source.insert(0, (at + gap) as u64, &archive[at + gap..]).unwrap();
+        let mut out = Out::new(plain.len(), None);
+        let mut s = d.run(&mut source, &mut out).unwrap().clone();
+        while s.more {
+            s = d.run(&mut source, &mut out).unwrap().clone();
+        }
+        assert!(s.done || !s.needs.is_empty(), "gap at {at}: stuck with no need: {s:?}");
+        let snap = FeedSnapshot::from_bytes(&d.snapshot().to_bytes()).unwrap();
+        let mut d = FeedDecoder::restore(&map, 0, options(), &snap).unwrap();
+        source.insert(0, at as u64, &archive[at..at + gap]).unwrap();
+        let mut s = d.run(&mut source, &mut out).unwrap().clone();
+        while s.more {
+            s = d.run(&mut source, &mut out).unwrap().clone();
+        }
+        assert!(s.done && s.crc_ok == Some(true), "gap at {at}: {s:?}");
+        assert!(out.bytes == plain, "gap at {at}: output differs");
+        at += 37_001;
+    }
+}
+
+/// Codex on #295: [`FeedOptions::run_budget`] holds with workers: a run writes about the budget (plus the worker
+/// output already in hand when it ran out) and says `more`, rather than writing the whole member.
+#[test]
+fn workers_keep_to_the_run_budget() {
+    let plain = mixed(4_000_000, 23);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let budget = 400_000u64;
+    let options = FeedOptions { run_budget: Some(budget), threads: FeedThreads::Count(3), ..FeedOptions::default() };
+    let mut d = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut out = Out::new(plain.len(), None);
+    let mut runs = 0;
+    loop {
+        let before = out.written;
+        let s = d.run(&mut source, &mut out).unwrap().clone();
+        runs += 1;
+        // the budget, plus at most a few blocks' output the workers had sent when it ran out
+        assert!(out.written - before <= budget + 4 * 160_000, "run {runs} wrote {}", out.written - before);
+        if !s.more {
+            assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+            break;
+        }
+        assert!(runs < 1000, "no progress");
+    }
+    assert!(runs >= 5, "{runs} runs");
+    assert!(out.bytes == plain);
+}
