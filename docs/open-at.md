@@ -134,7 +134,13 @@ decoded output together; `OpenAtError::OutputLimit` past it), and `redecode` is 
 usable chunk start the result is `NeedMore`. A stored chunk is a restart only when the framing shows that the next LZMA chunk after
 it resets the state (7-Zip `-mmt` goes on after a run of stored chunks with an LZMA chunk that continues the state from
 before them): when the nearest such restart lies before the packed bytes held, the result is
-`FetchFrom { packed, output }`: fetch from `packed`, supply output from `output` less the dictionary, and complete again. A member's output is the folder's from its `stream_start`. A folder
+`FetchFrom { packed, output }`: fetch from `packed`, supply output from `output` less the dictionary, and complete again.
+A framing index that ends before the folder's end (one walked only up to past the target) is walked on over the packed
+bytes held when they go on from where it ends; a stored candidate the index still cannot rule out is tried, and once one
+meets an LZMA chunk that continues the state, the rest of that last stored run is given up with it (they would all
+meet it). The stream's first chunk is always a restart. When decoding reaches an LZMA chunk whose dictionary the known
+output does not cover (from the restart less the dictionary, unless a chunk since resets it), the result is
+`NeedMore` for that range, not a decode error. The search is one pass back over the index. A member's output is the folder's from its `stream_start`. A folder
 counts as LZMA2 only with exactly one LZMA2 coder, alone or under 7zAES.
 
 Which volume bytes a plan never needs, per article, is what `ContainerRebuilder` reports as `Unneeded` with the plan
