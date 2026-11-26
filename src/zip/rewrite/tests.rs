@@ -658,6 +658,8 @@ fn recovery_rechecks_source_and_stage_before_publication() {
             move |event, stage| {
                 if event == Event::AfterVerify {
                     let path = if source_change { mutated_source.as_path() } else { stage.unwrap() };
+                    // A same-size rewrite shows only in mtime and ctime, so it must land in a later tick.
+                    crate::test_stamps::await_stamp_tick(path);
                     OpenOptions::new().write(true).open(path)?.write_at(b"x", 0)?;
                 }
                 Ok(())

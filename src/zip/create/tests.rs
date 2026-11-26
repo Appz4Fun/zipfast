@@ -538,6 +538,8 @@ fn source_reopen_rejects_removal_replacement_symlinks_and_fifos() {
     for action in 0..5 {
         let (dir, source, output, plan) = simple_plan(CreateOptions::default());
         let original = dir.path().join("original");
+        // A hard link (action 4) keeps the inode, size and mtime: only ctime shows it, so it must land in a later tick.
+        crate::test_stamps::await_stamp_tick(&source);
         std::fs::rename(&source, &original).unwrap();
         match action {
             0 => {}
