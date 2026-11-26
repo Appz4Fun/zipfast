@@ -318,6 +318,9 @@ impl Lz {
         }
         self.main = None;
         self.stalled = false;
+        // the caller holds the rest of the output (a fill to the member's end): workers have nothing left to write
+        // (the frontier stops at the first block they have not finished), and must not ask for its packed bytes
+        self.par = None;
         true
     }
 

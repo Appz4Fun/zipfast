@@ -1264,3 +1264,76 @@ fn workers_keep_to_the_run_budget() {
     assert!(runs >= 5, "{runs} runs");
     assert!(out.bytes == plain);
 }
+
+/// Codex on #295: with workers, a fill of the rest from the frontier (`fill_lost` to the member's end) finishes the
+/// member, workers waiting for packed bytes the fill replaced included: nothing more is asked for.
+#[test]
+fn fill_lost_to_the_end_retires_waiting_workers() {
+    let plain = mixed(1_200_000, 25);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let options = FeedOptions { threads: FeedThreads::Count(3), ..FeedOptions::default() };
+    let gap = archive.len() * 2 / 3..archive.len() * 2 / 3 + 3000;
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..gap.start]).unwrap();
+    source.insert(0, gap.end as u64, &archive[gap.end..]).unwrap();
+    let mut d = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut out = Out::new(plain.len(), None);
+    let mut s = d.run(&mut source, &mut out).unwrap().clone();
+    while s.more {
+        s = d.run(&mut source, &mut out).unwrap().clone();
+    }
+    assert!(!s.done && !s.needs.is_empty(), "{s:?}");
+    let frontier = s.frontier as usize;
+    // the caller writes what is not written yet (workers may have finished blocks past the frontier)
+    let mut at = frontier;
+    while at < plain.len() {
+        let written = out.seen[at];
+        let run = out.seen[at..].iter().take_while(|&&w| w == written).count();
+        if !written {
+            out.write_at(at as u64, &plain[at..at + run]).unwrap();
+        }
+        at += run;
+    }
+    d.fill_lost(frontier as u64..plain.len() as u64, &plain[frontier..]).unwrap();
+    let s = d.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true) && s.needs.is_empty(), "{s:?}");
+    assert!(out.bytes == plain);
+}
+
+/// Codex on #295: cancellation stops a run while workers still have output to write, after the main decode is over
+/// (it jumps the blocks workers own, so the last of the output comes only from them).
+#[test]
+fn cancellation_stops_workers_output() {
+    struct CancelAt {
+        out: Out,
+        control: zipfast::progressive::SessionControl,
+        at: u64,
+    }
+    impl FeedSink for CancelAt {
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+            self.out.write_at(offset, bytes)?;
+            if self.out.written >= self.at {
+                self.control.cancel();
+            }
+            Ok(())
+        }
+        fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.out.read_held(offset, buf)
+        }
+    }
+    let plain = mixed(4_000_000, 27);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let options = FeedOptions { threads: FeedThreads::Count(3), ..FeedOptions::default() };
+    let control = options.control.clone();
+    let mut d = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut sink = CancelAt { out: Out::new(plain.len(), None), control, at: 3_500_000 };
+    let result = d.run(&mut source, &mut sink);
+    assert!(matches!(result, Err(FeedError::Canceled)), "{result:?}");
+    assert!(sink.out.written < plain.len() as u64, "every byte written after the cancel");
+}

@@ -251,6 +251,9 @@ impl FeedDecoder {
     /// message and writes what came. False when nothing came (workers short of input, say): the main decode then
     /// decodes the block itself.
     pub(super) fn par_wait(&mut self, lz: &mut Lz, sink: &mut dyn FeedSink) -> Result<bool, FeedError> {
+        if self.options.control.is_canceled() {
+            return Err(FeedError::Canceled);
+        }
         if self.par_over_budget() {
             return Ok(false);
         }
@@ -285,6 +288,10 @@ impl FeedDecoder {
     ) -> Result<(), FeedError> {
         let mut first = block;
         loop {
+            // workers can hold a whole block's output after the main decode is over: cancellation stops writing it
+            if self.options.control.is_canceled() {
+                return Err(FeedError::Canceled);
+            }
             if self.par_over_budget() {
                 return Ok(());
             }

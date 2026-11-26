@@ -636,6 +636,22 @@ struct CrcRuns {
 }
 
 impl CrcRuns {
+    /// [`Self::add`] of only the parts of `bytes` (output from `start`) no run covers yet: output a fill hands over
+    /// that was written already (by LZMA2 workers past the frontier) is not hashed twice.
+    fn add_uncovered(&mut self, start: u64, bytes: &[u8]) {
+        let end = start.saturating_add(bytes.len() as u64);
+        let mut cur = start;
+        while cur < end && !self.broken {
+            if let Some((_, &(run_end, _))) = self.runs.range(..=cur).next_back().filter(|(_, (e, _))| *e > cur) {
+                cur = run_end.min(end);
+                continue;
+            }
+            let next = self.runs.range(cur + 1..).next().map_or(end, |(&s, _)| s.min(end));
+            self.add(cur, &bytes[(cur - start) as usize..(next - start) as usize]);
+            cur = next;
+        }
+    }
+
     fn add(&mut self, start: u64, bytes: &[u8]) {
         if bytes.is_empty() || self.broken {
             return;
@@ -1259,7 +1275,9 @@ impl FeedDecoder {
         // stored layers: repairs follow the lost ranges; a stop recorded inside the range is moot
         self.blocked.retain(|at, _| !range.contains(at));
         self.lost.remove(range.clone());
-        self.hash_output(range.start, bytes);
+        // what is already in the CRC runs (written by workers past an LZMA2 frontier) is not hashed again
+        let skip = self.crc_floor.saturating_sub(range.start).min(bytes.len() as u64) as usize;
+        self.crc.add_uncovered(range.start + skip as u64, &bytes[skip..]);
         self.status = self.make_status(Vec::new(), false);
         Ok(())
     }
