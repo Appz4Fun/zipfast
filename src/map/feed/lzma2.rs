@@ -75,6 +75,9 @@ struct Repair {
 /// The most repairs that keep their decoder between runs.
 const LIVE_REPAIRS: usize = 8;
 
+#[path = "lzma2_par.rs"]
+mod par;
+
 /// liblzma's raw LZMA2 decoder, fed the chunks from a restart point.
 struct Live {
     stream: liblzma::stream::Stream,
@@ -264,15 +267,42 @@ pub(super) struct Lz {
     /// point whose dictionary lies in earlier members (see [`CP_INTERVAL`]) falls back to it when the sink no longer
     /// gives that output. None for a decoder restored or handed over past its last dictionary reset.
     base: Option<Cp>,
+    /// workers decoding independent blocks ahead of the main decode ([`super::FeedOptions::threads`])
+    par: Option<Box<par::Par>>,
 }
 
 impl Lz {
     pub(super) fn frontier(&self) -> u64 {
         match &self.main {
             _ if self.seek || !self.pending.is_empty() => 0,
-            Some(l) => l.out.max(self.write_from).clamp(self.ss, self.end) - self.ss,
-            None => self.end - self.ss,
+            Some(l) => self.par_floor(l.out.max(self.write_from)).clamp(self.ss, self.end) - self.ss,
+            None => self.par_floor(self.end).clamp(self.ss, self.end) - self.ss,
         }
+    }
+
+    /// The output of blocks the main decode went past that workers have not finished, as repairs (folder offsets,
+    /// clipped to what this member writes).
+    fn par_unfinished(&self) -> Vec<(Range<u64>, Kind)> {
+        let Some(par) = self.par.as_ref() else { return Vec::new() };
+        // a finished main decode (None) has passed every block
+        par.passed_unfinished(self.main.as_ref().map_or(u64::MAX, |main| main.out))
+            .into_iter()
+            .filter_map(|(lost, cp, until)| {
+                let lost = lost.start.max(self.write_from)..lost.end.min(self.end);
+                (lost.start < lost.end).then_some((lost, Kind::Decoded { cp, until, seed: None }))
+            })
+            .collect()
+    }
+
+    /// The member output (member offsets) of those blocks: lost, for a snapshot.
+    pub(super) fn par_unfinished_lost(&self) -> Vec<Range<u64>> {
+        self.par_unfinished().into_iter().map(|(r, _)| r.start - self.ss..r.end - self.ss).collect()
+    }
+
+    /// `out` (folder offset), held back to the first block a worker has not finished: output before the frontier
+    /// is all written.
+    fn par_floor(&self, out: u64) -> u64 {
+        self.par.as_ref().and_then(|p| p.written_floor()).map_or(out, |w| out.min(w))
     }
 
     pub(super) fn reach(&self) -> u64 {
@@ -288,6 +318,9 @@ impl Lz {
         }
         self.main = None;
         self.stalled = false;
+        // the caller holds the rest of the output (a fill to the member's end): workers have nothing left to write
+        // (the frontier stops at the first block they have not finished), and must not ask for its packed bytes
+        self.par = None;
         true
     }
 
@@ -296,7 +329,7 @@ impl Lz {
     }
 
     pub(super) fn done(&self) -> bool {
-        self.main.is_none() && !self.seek
+        self.main.is_none() && !self.seek && self.par.as_ref().is_none_or(|p| p.idle())
     }
 
     /// How far the main decode walks for a restart: past the member's end into the next member's output when one
@@ -343,6 +376,10 @@ impl Lz {
             };
             out.push(self.cipher_range(range, cbc));
         }
+        // the packed bytes running workers are still to be fed (the main decode may have gone past their blocks)
+        for r in self.par.as_ref().map(|p| p.unfed()).unwrap_or_default() {
+            out.push(self.cipher_range(r.start..r.end.min(self.plain_len).max(r.start + 1), cbc));
+        }
         out
     }
 
@@ -379,10 +416,16 @@ impl Lz {
                 out.push(u8::from(l.live.is_some() || l.restart));
             }
         }
-        u64s(&mut out, &[self.write_from, self.repairs.len() as u64]);
+        // blocks the main decode went past that workers have not finished are kept as repairs (no worker is kept)
+        let unfinished = self.par_unfinished();
+        u64s(&mut out, &[self.write_from, (self.repairs.len() + unfinished.len()) as u64]);
         for r in &self.repairs {
             put_kind(&mut out, &r.kind);
             u64s(&mut out, &[r.lost.start, r.lost.end]);
+        }
+        for (lost, kind) in &unfinished {
+            put_kind(&mut out, kind);
+            u64s(&mut out, &[lost.start, lost.end]);
         }
         // what a member handed over keeps pinned (the members before it, the member after it)
         if self.floor > 0 || self.cap.is_some() || self.handoff.is_some() || self.base.is_some() {
@@ -1005,6 +1048,7 @@ impl FeedDecoder {
                 cap: None,
                 folder: slot.index,
                 base: None,
+                par: None,
             })),
         };
         d.stream_start = slot.offset;
@@ -1018,6 +1062,11 @@ impl FeedDecoder {
             } else {
                 lz.seek = true;
             }
+        }
+        // workers only for a member no folder member goes on from (the hand-off needs one decoder's state)
+        if !successor {
+            let threads = d.options.threads.count();
+            d.lzma2.as_mut().expect("LZMA2 state").par = par::Par::new(threads);
         }
         d.status = d.make_status(Vec::new(), false);
         Ok(d)
@@ -1072,11 +1121,57 @@ impl FeedDecoder {
                 self.lz_stash(lz, None);
             }
         }
+        // workers: what they decoded is written, new blocks are taken, arrived bytes fed
+        self.par_round(lz, source, sink, false)?;
         while !lz.seek
             && let Some(mut lane) = lz.main.take()
         {
+            // the budget spent on worker output (the main decode checks its own as it writes)
+            if lz.par.is_some() && self.options.run_budget.is_some_and(|b| self.run_written >= b) {
+                more = true;
+                lz.main = Some(lane);
+                break;
+            }
             let write = lz.write_from..lz.end;
-            match self.lz_step(lz, &mut lane, write, lz.end, true, source, sink)? {
+            // at a block it has not begun (between chunks, no decoder): a free worker may take it first
+            if lz.par.is_some() && lane.chunk.is_none() && lane.live.is_none() {
+                let at_block = lane.out;
+                lz.main = Some(lane);
+                self.par_round(lz, source, sink, false)?;
+                // every worker busy and the block not taken: wait a little for one to free up rather than decode it
+                // here (which would leave the workers' output unwritten meanwhile)
+                while lz.par.as_ref().is_some_and(|p| p.all_busy() && p.next_owned(at_block) != Some(at_block))
+                    && self.par_wait(lz, sink)?
+                {
+                    self.par_round(lz, source, sink, false)?;
+                }
+                lane = lz.main.take().expect("put back");
+            }
+            // the main decode stops at the first block a worker owns, and goes on from its end once that is known
+            let owned = lz.par.as_ref().and_then(|p| p.next_owned(lane.out)).filter(|&o| o < lz.end);
+            if owned == Some(lane.out) {
+                match lz.par.as_ref().and_then(|p| p.owned_end(lane.out)) {
+                    Some((packed, out)) => {
+                        let cp = Cp { packed, out, props: None, seeded: false };
+                        lz.base = Some(cp);
+                        lz.main = Some(Lane2::at_cp(cp));
+                        continue;
+                    }
+                    None => {
+                        // its end (the next dictionary reset) is not walked yet: walk now, else wait for its bytes
+                        let at = lane.out;
+                        lz.main = Some(lane);
+                        self.par_round(lz, source, sink, false)?;
+                        if lz.par.as_ref().and_then(|p| p.owned_end(at)).is_some() {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            match self.lz_step(lz, &mut lane, write, owned.unwrap_or(lz.end), true, source, sink)? {
+                // stopped at a block a worker owns
+                Step::Reached if lane.out < lz.end => lz.main = Some(lane),
                 Step::Reached => {
                     self.lz_stash(lz, Some(lane));
                     break;
@@ -1131,6 +1226,17 @@ impl FeedDecoder {
         }
         if lz.main.as_ref().is_none_or(|l| l.live.is_some()) {
             lz.parked = None;
+        }
+        // the workers again (the main decode moved), waiting for them once it is done; the bytes they wait for
+        if lz.par.is_some() {
+            self.par_round(lz, source, sink, lz.main.is_none())?;
+            for r in lz.par.as_mut().map(|p| p.take_waiting()).unwrap_or_default() {
+                self.push_needs(&mut next, r, NeedKind::Next);
+            }
+            // stopped at the budget with workers still going: run again
+            if self.options.run_budget.is_some_and(|b| self.run_written >= b) && self.par_pending(lz) {
+                more = true;
+            }
         }
         if !more {
             let mut i = 0;
@@ -1371,14 +1477,28 @@ impl FeedDecoder {
         }
         let (s, e) = (at.max(write.start).max(ss), end.min(write.end));
         let mut written = 0;
-        if s < e {
-            let b = &bytes[(s - at) as usize..(e - at) as usize];
-            sink.write_at(s - ss, b).map_err(|error| FeedError::Write { out: s - ss, error })?;
-            self.crc.add(s - ss, b);
-            written = e - s;
-            self.stats.written += written;
-            self.run_written += written;
+        // output a worker already wrote (and its CRC run holds) is not written or hashed again: only the parts of
+        // s..e no CRC run covers are
+        let mut cur = s;
+        while cur < e {
+            let covered = (!self.crc.broken)
+                .then(|| self.crc.runs.range(..=cur - ss).next_back().map(|(_, &(r_end, _))| r_end + ss))
+                .flatten()
+                .filter(|&r_end| r_end > cur);
+            if let Some(r_end) = covered {
+                cur = r_end.min(e);
+                continue;
+            }
+            let next = if self.crc.broken { None } else { self.crc.runs.range(cur - ss + 1..).next() };
+            let piece_end = next.map_or(e, |(&r_start, _)| (r_start + ss).min(e));
+            let b = &bytes[(cur - at) as usize..(piece_end - at) as usize];
+            sink.write_at(cur - ss, b).map_err(|error| FeedError::Write { out: cur - ss, error })?;
+            self.crc.add(cur - ss, b);
+            written += piece_end - cur;
+            cur = piece_end;
         }
+        self.stats.written += written;
+        self.run_written += written;
         self.stats.redecoded += (end - at) - written;
         Ok(())
     }
