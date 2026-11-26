@@ -836,11 +836,8 @@ fn mark_volumes(words: &mut VolumeSet, parts: &[Part]) {
 /// compressed RAR 5.0 member (what the run decoded before it). Publication checks exactly these.
 fn member_volumes(run: &SelectedRun, session: &RarSession, index: usize) -> VolumeSet {
     let member = &session.model.members[index];
-    let mut words = if member.header.format == RarFormat::Rar5 && member.header.method != 0 {
-        run.history_volumes
-    } else {
-        [0; VOLUME_WORDS]
-    };
+    // a compressed member depends on its solid history (RAR 5.0 and 4.x alike)
+    let mut words = if member.header.method != 0 { run.history_volumes } else { [0; VOLUME_WORDS] };
     mark_volumes(&mut words, &session.model.parts[member.parts.clone()]);
     words
 }
