@@ -1010,6 +1010,10 @@ impl ZipReadStage {
         }
         Ok(())
     }
+    /// Bytes staged so far: what a kept broken member publishes.
+    pub(crate) fn written(&self) -> u64 {
+        self.reservation.written
+    }
     /// [`crate::extract::Options::keep_broken`]: publishes a member whose read failed on its own data with what was
     /// written, under every check [`Self::publish`] makes but the read's completion.
     pub(crate) fn publish_broken(

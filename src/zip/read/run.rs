@@ -635,27 +635,30 @@ impl ProjectedReadSession {
                     return Ok(true);
                 };
                 context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.backend = Some(stage.backend());
+                // Options::keep_broken: a member that fails on its own data (a wrong password, a CRC or a cut) keeps
+                // what was staged, published as a verified file would be (the same directory sync and rename
+                // handling), and is reported failed all the same; a canceled run publishes nothing
+                let mut broken = None;
                 if let Err(error) =
                     self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel))
                 {
-                    // Options::keep_broken: a member that fails on its own data (a wrong password, a CRC or a cut)
-                    // keeps what was staged, published as a verified file would be, and is reported failed all the
-                    // same; a canceled run publishes nothing
                     if continued(&error) && options.keep_broken && !cancel.is_canceled() {
-                        return match stage.publish_broken(mode, mtime, cancel, context, |cx| self.check_source(cx)) {
-                            Ok(_) => Err(error),
-                            Err(published) => Err(published),
-                        };
-                    }
-                    return Err(if continued(&error) {
-                        stage.finish_member_error(error, context, cancel, |cx| self.check_source(cx))
+                        broken = Some((error, stage.written()));
                     } else {
-                        stage.finish_error(error, context)
-                    });
+                        return Err(if continued(&error) {
+                            stage.finish_member_error(error, context, cancel, |cx| self.check_source(cx))
+                        } else {
+                            stage.finish_error(error, context)
+                        });
+                    }
                 }
                 let bulk =
                     context.options.publication == Publication::Bulk && stage.backend() == StagedBackend::Portable;
-                let published = stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx));
+                let published = if broken.is_some() {
+                    stage.publish_broken(mode, mtime, cancel, context, |cx| self.check_source(cx))
+                } else {
+                    stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx))
+                };
                 if bulk && matches!(published, Ok(true)) {
                     // The published name's directory and every directory between it and the destination root, where
                     // the file really went: a flattened member lands in the root, and a relative destination is
@@ -678,7 +681,15 @@ impl ProjectedReadSession {
                 {
                     local_refusal = true;
                 }
-                published.map(|published| !published)
+                match (broken, published) {
+                    // kept: the member still fails, but its target now holds what was read
+                    (Some((error, written)), Ok(true)) => {
+                        Err(error.with_publication(PublicationState::Published, written))
+                    }
+                    (Some((error, _)), Ok(false)) => Err(error),
+                    (_, Err(error)) => Err(error),
+                    (None, Ok(published)) => Ok(!published),
+                }
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             Err(ReadFault::UnsupportedIdentity.into())

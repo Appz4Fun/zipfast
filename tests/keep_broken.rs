@@ -230,6 +230,34 @@ fn the_checked_zip_route_keeps_wrong_password_files_empty_when_asked() {
 
 /// One stored ZIP member, its CRC that of `crc_of` (so a mismatch can be made), as a single-file archive.
 fn stored_zip(name: &str, data: &[u8], crc_of: &[u8]) -> Vec<u8> {
+    stored_zip_members(&[(name, data, crc_of)])
+}
+
+/// Stored ZIP members `(name, data, crc_of)`, in order, as a single-file archive.
+fn stored_zip_members(members: &[(&str, &[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for &(name, data, crc_of) in members {
+        let offset = out.len() as u32;
+        let (local, entry) = stored_member(name, data, crc_of, offset);
+        out.extend_from_slice(&local);
+        central.extend_from_slice(&entry);
+    }
+    let at = out.len() as u32;
+    let count = members.len() as u16;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// A stored member's local header and data, and its central directory entry.
+fn stored_member(name: &str, data: &[u8], crc_of: &[u8], offset: u32) -> (Vec<u8>, Vec<u8>) {
     let crc = crc32fast::hash(crc_of);
     let mut local = Vec::new();
     local.extend_from_slice(b"PK\x03\x04");
@@ -250,17 +278,9 @@ fn stored_zip(name: &str, data: &[u8], crc_of: &[u8]) -> Vec<u8> {
     central.extend_from_slice(&(name.len() as u16).to_le_bytes());
     central.extend_from_slice(&[0; 8]); // extra, comment, disk, internal attributes
     central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
-    central.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+    central.extend_from_slice(&offset.to_le_bytes()); // local header offset
     central.extend_from_slice(name.as_bytes());
-    let mut out = local.clone();
-    let at = out.len() as u32;
-    out.extend_from_slice(&central);
-    out.extend_from_slice(b"PK\x05\x06");
-    out.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
-    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
-    out.extend_from_slice(&at.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out
+    (local, central)
 }
 
 /// The checked ZIP route keeps a member whose data fails its CRC, every byte written, when asked (7-Zip: "CRC
@@ -341,4 +361,37 @@ fn rar_sessions_keep_a_checksum_failure_when_asked() {
         assert_eq!(summary.failed, 1, "controlled {keep}");
         assert_eq!(fs::read(out.join("bad.bin")).ok(), keep.then(|| want.clone()), "controlled {keep}");
     }
+}
+
+/// Codex on #294: a kept member that cannot be published because every renamed name is taken fails only itself, as a
+/// verified member would; the run goes on to the next member.
+#[test]
+fn the_checked_zip_route_fails_only_a_kept_member_out_of_renamed_names() {
+    use zipfast::extract::RenameStyle;
+    let data: Vec<u8> = (0..3000u32).map(|i| (i * 5) as u8).collect();
+    let mut wrong = data.clone();
+    wrong[10] ^= 1;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crc.zip");
+    fs::write(&path, stored_zip_members(&[("bad.bin", &data, &wrong), ("good.bin", b"good", b"good")])).unwrap();
+    let out = dir.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("bad.bin"), b"old").unwrap();
+    for n in 1..=extract::RENAME_LIMIT {
+        fs::File::create(out.join(format!("bad_{n}.bin"))).unwrap();
+        fs::File::create(out.join(format!("bad.bin_{n}"))).unwrap();
+    }
+    let mut opts = options(&out, true, 1);
+    opts.overwrite = Overwrite::RenameNew(RenameStyle::Underscore);
+    let report = extract::run_with_policy(
+        &path,
+        &opts,
+        None,
+        &extract::Cancellation::default(),
+        &Default::default(),
+        |_: extract::RunEvent<'_>| Ok(()),
+    );
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(fs::read(out.join("bad.bin")).unwrap(), b"old");
+    assert_eq!(fs::read(out.join("good.bin")).unwrap(), b"good", "the run stopped at the kept member");
 }
