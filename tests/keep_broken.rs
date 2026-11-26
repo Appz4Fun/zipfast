@@ -47,6 +47,8 @@ fn options(dest: &Path, keep: bool, threads: usize) -> Options {
         replace_placed_links: false,
         keep_broken: keep,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     }
 }
 

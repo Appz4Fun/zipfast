@@ -425,6 +425,8 @@ fn frozen_policy_keeps_namespace_keys_after_inode_replacement_and_exact_configur
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let cancel = Cancellation::default();
     let mut session = ProjectedReadSession::open(&source, &cancel).unwrap();
@@ -512,6 +514,8 @@ fn frozen_relative_destination_cwd_and_context_first_teardown_are_exact() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let binding = session.owner.source.as_ref().unwrap();
     let before = context.ledger.with_state(|s| s.live_fds);

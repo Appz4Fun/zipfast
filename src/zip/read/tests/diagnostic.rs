@@ -1189,6 +1189,8 @@ fn direct_setup_output(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     (file, session, options, context)
 }
