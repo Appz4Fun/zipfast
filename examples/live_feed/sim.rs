@@ -726,7 +726,11 @@ impl Sink {
     fn finish(self) -> Result<(bool, u64), String> {
         match self.out {
             Out::File(f) => {
-                f.file.sync_all().map_err(|e| e.to_string())?;
+                // LIVE_FEED_NO_SYNC=1 leaves the output unsynced: decode and write cost alone, comparable with an
+                // extraction that does not sync (`zipfast x`)
+                if std::env::var_os("LIVE_FEED_NO_SYNC").is_none() {
+                    f.file.sync_all().map_err(|e| e.to_string())?;
+                }
                 Ok((true, 1))
             }
             // counted through `durable_sync_count`
