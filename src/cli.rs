@@ -112,6 +112,8 @@ pub(crate) fn main() -> ExitCode {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                unix_modes: Default::default(),
+                backslashes: Default::default(),
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }

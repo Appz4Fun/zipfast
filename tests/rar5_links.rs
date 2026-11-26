@@ -49,6 +49,8 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite, threads: usize) -> Opt
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     }
 }
 
@@ -800,6 +802,8 @@ fn refused_links_leave_placeholders_on_every_writer() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
         ..options(dest, Mode::Extract, Overwrite::Always, 1)
     };
     let check = |dest: &Path, placeholder: bool, failed: &[u64], writer: &str| {

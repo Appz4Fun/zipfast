@@ -60,6 +60,15 @@ pub trait PackedSource {
     /// Reads packed bytes of volume `volume` from byte `offset` into `buf` (never empty).
     fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead;
 
+    /// The packed bytes of volume `volume` from byte `offset` on, at most `max` of them, lent without a copy when the
+    /// source holds them in memory: a stored member's output is then written straight from them. None (the default)
+    /// when it does not hold them, or cannot lend: the decoder then reads them with [`Self::read_packed`], which also
+    /// says whether they are yet to come or lost. A lent slice is never empty.
+    fn borrow_packed(&mut self, volume: u32, offset: u64, max: usize) -> Option<&[u8]> {
+        let _ = (volume, offset, max);
+        None
+    }
+
     /// The parts of `range` of volume `volume` the source does not hold, in order, when it can tell without
     /// reading. The decoder lists them as [`NeedKind::Ahead`]. The default, None, lists nothing ahead.
     fn absent(&self, volume: u32, range: Range<u64>) -> Option<Vec<Range<u64>>> {
@@ -225,6 +234,37 @@ pub struct FeedOptions {
     /// Keys derived earlier for the same password and key-derivation input ([`FeedDecoder::keys`] of a twin copy's
     /// decoder, or of an earlier member): used instead of deriving again when they match the member (default none).
     pub keys: Option<FeedKeys>,
+    /// Worker threads that decode a 7z LZMA2 member's independent blocks (the dictionary resets 7-Zip `-mmt` writes)
+    /// ahead of the main decode, as their packed bytes arrive (default [`FeedThreads::One`]: none).
+    pub threads: FeedThreads,
+}
+
+/// [`FeedOptions::threads`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FeedThreads {
+    /// Everything on the caller's thread.
+    #[default]
+    One,
+    /// `min(4, available cores / 3)` workers, at least one: room left for downloading, yEnc and PAR2. A stream with
+    /// no dictionary reset past its start (one block) runs on the caller's thread alone.
+    Auto,
+    /// This many workers (at most 64).
+    Count(usize),
+}
+
+impl FeedThreads {
+    /// Worker threads besides the caller's: 0 for [`Self::One`].
+    pub fn count(self) -> usize {
+        match self {
+            Self::One => 0,
+            Self::Auto => {
+                let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+                (cores / 3).clamp(1, 4)
+            }
+            Self::Count(n) => n.min(64),
+        }
+    }
 }
 
 impl Default for FeedOptions {
@@ -238,6 +278,7 @@ impl Default for FeedOptions {
             run_budget: None,
             max_window: 1 << 30,
             keys: None,
+            threads: FeedThreads::One,
         }
     }
 }
@@ -458,6 +499,25 @@ impl ArticleBuffer {
         Ok(())
     }
 
+    /// [`Self::insert`] taking the bytes: when none of them is held yet (the usual case, each article once) they are
+    /// kept without a copy.
+    pub fn insert_owned(&mut self, volume: u32, offset: u64, bytes: Vec<u8>) -> Result<(), BufferFull> {
+        let end = offset.saturating_add(bytes.len() as u64);
+        let v = self.volumes.entry(volume).or_default();
+        let overlaps_before =
+            v.chunks.range(..offset).next_back().is_some_and(|(&s, c)| s.saturating_add(c.len() as u64) > offset);
+        if bytes.is_empty() || overlaps_before || v.chunks.range(offset..end).next().is_some() {
+            return self.insert(volume, offset, &bytes);
+        }
+        if self.held.saturating_add(bytes.len()) > self.limit {
+            return Err(BufferFull { held: self.held, limit: self.limit });
+        }
+        self.held += bytes.len();
+        v.lost.remove(offset..end);
+        v.chunks.insert(offset, bytes);
+        Ok(())
+    }
+
     /// Marks `range` of volume `volume` lost: reads of bytes not held there answer [`PackedRead::Hole`].
     pub fn mark_lost(&mut self, volume: u32, range: Range<u64>) {
         if range.start < range.end {
@@ -467,6 +527,14 @@ impl ArticleBuffer {
 }
 
 impl PackedSource for ArticleBuffer {
+    fn borrow_packed(&mut self, volume: u32, offset: u64, max: usize) -> Option<&[u8]> {
+        let v = self.volumes.get(&volume)?;
+        let (&s, c) = v.chunks.range(..=offset).next_back()?;
+        let from = usize::try_from(offset - s).ok().filter(|&from| from < c.len())?;
+        let n = (c.len() - from).min(max);
+        (n > 0).then(|| &c[from..from + n])
+    }
+
     fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead {
         let Some(v) = self.volumes.get(&volume) else {
             return PackedRead::NotYet { len: u64::MAX - offset };
@@ -604,6 +672,22 @@ struct CrcRuns {
 }
 
 impl CrcRuns {
+    /// [`Self::add`] of only the parts of `bytes` (output from `start`) no run covers yet: output a fill hands over
+    /// that was written already (by LZMA2 workers past the frontier) is not hashed twice.
+    fn add_uncovered(&mut self, start: u64, bytes: &[u8]) {
+        let end = start.saturating_add(bytes.len() as u64);
+        let mut cur = start;
+        while cur < end && !self.broken {
+            if let Some((_, &(run_end, _))) = self.runs.range(..=cur).next_back().filter(|(_, (e, _))| *e > cur) {
+                cur = run_end.min(end);
+                continue;
+            }
+            let next = self.runs.range(cur + 1..).next().map_or(end, |(&s, _)| s.min(end));
+            self.add(cur, &bytes[(cur - start) as usize..(next - start) as usize]);
+            cur = next;
+        }
+    }
+
     fn add(&mut self, start: u64, bytes: &[u8]) {
         if bytes.is_empty() || self.broken {
             return;
@@ -1227,7 +1311,9 @@ impl FeedDecoder {
         // stored layers: repairs follow the lost ranges; a stop recorded inside the range is moot
         self.blocked.retain(|at, _| !range.contains(at));
         self.lost.remove(range.clone());
-        self.hash_output(range.start, bytes);
+        // what is already in the CRC runs (written by workers past an LZMA2 frontier) is not hashed again
+        let skip = self.crc_floor.saturating_sub(range.start).min(bytes.len() as u64) as usize;
+        self.crc.add_uncovered(range.start + skip as u64, &bytes[skip..]);
         self.status = self.make_status(Vec::new(), false);
         Ok(())
     }
@@ -1622,6 +1708,21 @@ impl FeedDecoder {
             let left = (span.stream.end.min(lane.end) - lane.pos).min(buf.len() as u64) as usize;
             let (volume, packed) = (span.volume, span.packed_start + (lane.pos - span.stream.start));
             let piece_left = span.stream.end.min(lane.end) - lane.pos;
+            // plain stored output is written straight from bytes the source can lend: no copy
+            if matches!(self.cipher, StoredCipher::Plain) {
+                // at most a read's worth, as a read: the budget and cancellation are checked as often
+                let max = left;
+                if let Some(bytes) = source.borrow_packed(volume, packed, max) {
+                    if bytes.is_empty() || bytes.len() > max {
+                        return Err(FeedError::SourceContract("lent slice empty or past the request"));
+                    }
+                    let (at, n) = (lane.pos, bytes.len());
+                    lane.pos += n as u64;
+                    self.stats.packed_read += n as u64;
+                    self.emit(at, bytes, sink)?;
+                    continue;
+                }
+            }
             match source.read_packed(volume, packed, &mut buf[..left]) {
                 PackedRead::Data(n) => {
                     if n == 0 || n > left {
@@ -1709,7 +1810,14 @@ impl FeedDecoder {
                 StoredCipher::Cbc { .. } => (l.next, l.iv),
                 _ => (l.pos, None),
             }),
-            lost: self.lost.ranges(),
+            // with the output of LZMA2 blocks workers had not finished, which a restore repairs
+            lost: {
+                let mut lost = self.lost.clone();
+                for r in self.lzma2.as_ref().map(|l| l.par_unfinished_lost()).unwrap_or_default() {
+                    lost.insert(r);
+                }
+                lost.ranges()
+            },
             crc: self.crc.runs.iter().map(|(&s, &(e, c))| (s, e, c)).collect(),
             crc_broken: self.crc.broken,
             stats: self.stats,

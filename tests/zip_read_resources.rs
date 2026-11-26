@@ -304,6 +304,8 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             replace_placed_links: false,
                             keep_broken: false,
                             attempt_continued_members: false,
+                            unix_modes: Default::default(),
+                            backslashes: Default::default(),
                         },
                         Some("password"),
                         |_| {},

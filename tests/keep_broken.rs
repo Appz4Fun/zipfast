@@ -47,6 +47,8 @@ fn options(dest: &Path, keep: bool, threads: usize) -> Options {
         replace_placed_links: false,
         keep_broken: keep,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     }
 }
 
@@ -190,4 +192,240 @@ fn an_attempted_continuation_without_checks_still_fails() {
             Err(_) => assert!(!keep, "the tail is kept when asked"),
         }
     }
+}
+
+/// prybar on #292: a single-file ZIP goes through the checked route (`run_with_policy`), which kept nothing.
+/// `7z x -pwrong` leaves every file of a wrong-password ZIP empty; with `keep_broken` so does zipfast, for WinZip AES and
+/// ZipCrypto alike, reporting every member failed.
+#[test]
+fn the_checked_zip_route_keeps_wrong_password_files_empty_when_asked() {
+    for name in ["d64_aes.zip", "d64_zipcrypto.zip"] {
+        let path = Path::new(FIXTURES).join("deflate64").join(name);
+        for keep in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let mut failed = 0;
+            let report = extract::run_with_policy(
+                &path,
+                &options(&out, keep, 1),
+                Some("wrong"),
+                &extract::Cancellation::default(),
+                &Default::default(),
+                |event: extract::RunEvent<'_>| {
+                    if matches!(event, extract::RunEvent::MemberFailed { .. }) {
+                        failed += 1;
+                    }
+                    Ok(())
+                },
+            );
+            assert!(report.is_ok(), "{name} {keep}: {report:?}");
+            assert_eq!(failed, 2, "{name} {keep}");
+            for file in ["small.txt", "text.txt"] {
+                match fs::read(out.join(file)) {
+                    Ok(kept) => assert!(keep && kept.is_empty(), "{name} {keep}: {file} is {} bytes", kept.len()),
+                    Err(_) => assert!(!keep, "{name}: {file} kept empty when asked"),
+                }
+            }
+        }
+    }
+}
+
+/// One stored ZIP member, its CRC that of `crc_of` (so a mismatch can be made), as a single-file archive.
+fn stored_zip(name: &str, data: &[u8], crc_of: &[u8]) -> Vec<u8> {
+    stored_zip_members(&[(name, data, crc_of)])
+}
+
+/// Stored ZIP members `(name, data, crc_of)`, in order, as a single-file archive.
+fn stored_zip_members(members: &[(&str, &[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for &(name, data, crc_of) in members {
+        let offset = out.len() as u32;
+        let (local, entry) = stored_member(name, data, crc_of, offset);
+        out.extend_from_slice(&local);
+        central.extend_from_slice(&entry);
+    }
+    let at = out.len() as u32;
+    let count = members.len() as u16;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// A stored member's local header and data, and its central directory entry.
+fn stored_member(name: &str, data: &[u8], crc_of: &[u8], offset: u32) -> (Vec<u8>, Vec<u8>) {
+    let crc = crc32fast::hash(crc_of);
+    let mut local = Vec::new();
+    local.extend_from_slice(b"PK\x03\x04");
+    local.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0x21, 0x50]); // version, flags, stored, DOS time/date
+    local.extend_from_slice(&crc.to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    local.extend_from_slice(&0u16.to_le_bytes());
+    local.extend_from_slice(name.as_bytes());
+    local.extend_from_slice(data);
+    let mut central = Vec::new();
+    central.extend_from_slice(b"PK\x01\x02");
+    central.extend_from_slice(&[20, 3, 20, 0, 0, 0, 0, 0, 0, 0, 0x21, 0x50]);
+    central.extend_from_slice(&crc.to_le_bytes());
+    central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    central.extend_from_slice(&[0; 8]); // extra, comment, disk, internal attributes
+    central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes());
+    central.extend_from_slice(&offset.to_le_bytes()); // local header offset
+    central.extend_from_slice(name.as_bytes());
+    (local, central)
+}
+
+/// The checked ZIP route keeps a member whose data fails its CRC, every byte written, when asked (7-Zip: "CRC
+/// Failed", the file kept); without the option it is removed.
+#[test]
+fn the_checked_zip_route_keeps_a_crc_failure_when_asked() {
+    let data: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
+    let mut wrong = data.clone();
+    wrong[100] ^= 1;
+    for keep in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crc.zip");
+        fs::write(&path, stored_zip("bad.bin", &data, &wrong)).unwrap();
+        let out = dir.path().join("out");
+        let report = extract::run_with_policy(
+            &path,
+            &options(&out, keep, 1),
+            None,
+            &extract::Cancellation::default(),
+            &Default::default(),
+            |_: extract::RunEvent<'_>| Ok(()),
+        );
+        assert!(report.is_ok(), "{keep}: {report:?}");
+        match fs::read(out.join("bad.bin")) {
+            Ok(kept) => assert!(keep && kept == data, "{keep}: {} bytes", kept.len()),
+            Err(_) => assert!(!keep, "kept when asked"),
+        }
+    }
+}
+
+/// prybar on #292: RarSession (`extract_selected`, and the controlled route prybar's UnRAR mode runs) keeps a member
+/// failing its checksum with what was written when asked (UnRAR `-kb`), reporting it failed; removed by default.
+#[test]
+fn rar_sessions_keep_a_checksum_failure_when_asked() {
+    use zipfast::extract::RarEntryOutcome;
+    use zipfast::rar5::session::*;
+    struct Replace;
+    impl RarExtractObserver for Replace {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            Ok(RarOverwriteDecision::Replace)
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, _: RarDiagnostic<'_>) {}
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..20_000usize).map(|i| (i * 7 + i / 251) as u8).collect();
+    let mut rar = common::archive(&[FileSpec::new("bad.bin", &data)]);
+    let at = rar.windows(64).position(|w| w == &data[1000..1064]).unwrap();
+    rar[at] ^= 0x55;
+    let path = dir.path().join("crc.rar");
+    fs::write(&path, &rar).unwrap();
+    let mut want = data.clone();
+    want[1000] ^= 0x55;
+    for keep in [true, false] {
+        let out = dir.path().join(format!("selected-{keep}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary =
+            session.extract_selected(&all, &options(&out, keep, 1), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(summary.failed, 1, "selected {keep}");
+        assert_eq!(fs::read(out.join("bad.bin")).ok(), keep.then(|| want.clone()), "selected {keep}");
+
+        let out = dir.path().join(format!("controlled-{keep}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let report = session.extract_selected_controlled(
+            &selected,
+            &options(&out, keep, 1),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Replace,
+        );
+        let summary = report.finish().outcome.unwrap();
+        assert_eq!(summary.failed, 1, "controlled {keep}");
+        assert_eq!(fs::read(out.join("bad.bin")).ok(), keep.then(|| want.clone()), "controlled {keep}");
+    }
+}
+
+/// Codex on #294: a kept member that cannot be published because every renamed name is taken fails only itself, as a
+/// verified member would; the run goes on to the next member.
+#[test]
+fn the_checked_zip_route_fails_only_a_kept_member_out_of_renamed_names() {
+    use zipfast::extract::RenameStyle;
+    let data: Vec<u8> = (0..3000u32).map(|i| (i * 5) as u8).collect();
+    let mut wrong = data.clone();
+    wrong[10] ^= 1;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crc.zip");
+    fs::write(&path, stored_zip_members(&[("bad.bin", &data, &wrong), ("good.bin", b"good", b"good")])).unwrap();
+    let out = dir.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("bad.bin"), b"old").unwrap();
+    for n in 1..=extract::RENAME_LIMIT {
+        fs::File::create(out.join(format!("bad_{n}.bin"))).unwrap();
+        fs::File::create(out.join(format!("bad.bin_{n}"))).unwrap();
+    }
+    let mut opts = options(&out, true, 1);
+    opts.overwrite = Overwrite::RenameNew(RenameStyle::Underscore);
+    let report = extract::run_with_policy(
+        &path,
+        &opts,
+        None,
+        &extract::Cancellation::default(),
+        &Default::default(),
+        |_: extract::RunEvent<'_>| Ok(()),
+    );
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(fs::read(out.join("bad.bin")).unwrap(), b"old");
+    assert_eq!(fs::read(out.join("good.bin")).unwrap(), b"good", "the run stopped at the kept member");
+}
+
+/// Codex on #294: a member kept broken is not a target a later hard link or file copy may resolve to: those fail
+/// too (in RarSession as in the whole-archive runner), rather than being reported verified on unchecked data.
+#[test]
+fn links_to_a_kept_broken_member_are_not_verified() {
+    use zipfast::rar5::session::*;
+    fn redirection(kind: u64, target: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for v in [5, kind, 0, target.len() as u64] {
+            common::vint(v, &mut body);
+        }
+        body.extend(target.as_bytes());
+        let mut extra = Vec::new();
+        common::vint(body.len() as u64, &mut extra);
+        extra.extend(body);
+        extra
+    }
+    let data: Vec<u8> = (0..20_000usize).map(|i| (i * 7 + i / 251) as u8).collect();
+    let link = |name, kind| FileSpec { extra: redirection(kind, "bad.bin"), ..FileSpec::new(name, b"") };
+    let mut rar = common::archive(&[FileSpec::new("bad.bin", &data), link("hard.bin", 4), link("copy.bin", 5)]);
+    let at = rar.windows(64).position(|w| w == &data[1000..1064]).unwrap();
+    rar[at] ^= 0x55;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("links.rar");
+    fs::write(&path, &rar).unwrap();
+    let out = dir.path().join("selected");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(&out, true, 1), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert!(out.join("bad.bin").exists(), "the broken member is kept");
+    assert_eq!(summary.failed, 3, "{summary:?}");
 }
