@@ -26,7 +26,7 @@ mod sim;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: live_feed [--password PW] [--article BYTES] [--seed N] [--lateness N|all] [--window N] \
+const USAGE: &str = "usage: live_feed [--password PW] [--threads N] [--article BYTES] [--seed N] [--lateness N|all] [--window N] \
 [--drop FRACTION] [--drop-articles I,J,..] [--repair-delay N] [--sink auto|file|partial] [--group-holes] [--group-refills] \
 [--group-commit-mib N] [--max-needs N] [--buffer-mib N] [--restart-at N] [--work DIR] [--keep] [--no-verify] [--runs N] \
 [--label NAME] [--header] <set dir | volume...>";
@@ -63,6 +63,7 @@ fn real_main() -> Result<bool, String> {
         }
         match arg.as_str() {
             "--password" => config.password = Some(value(&arg)?),
+            "--threads" => config.threads = num(&arg, value(&arg)?)?,
             "--article" => config.article = num(&arg, value(&arg)?)?,
             "--seed" => config.seed = num(&arg, value(&arg)?)?,
             "--lateness" => {

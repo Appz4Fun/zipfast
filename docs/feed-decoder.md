@@ -246,6 +246,31 @@ each decode up to them: the later ones wait for the bytes (as needs) instead (te
 behind its read position; older ones are released and asked for again as needs when a repair reads them).
 
 
+### Worker threads (`FeedOptions::threads`)
+
+7-Zip with `-mmt` writes LZMA2 as independent blocks, each starting with a chunk that resets the dictionary (64 MiB
+at `-mx5`, four times the dictionary). With `FeedOptions::threads` set to `FeedThreads::Auto` (`min(4, cores / 3)`
+workers) or `Count(n)`, worker threads decode the blocks ahead of the main decode as their packed bytes arrive: the
+decoder walks chunk headers ahead, and each dictionary reset it finds (including one the main decode stands at and
+has not begun) starts a block a free worker takes. A worker is fed the block's bytes as they arrive, decodes them
+with its own decoder and sends the output back; the caller's thread writes it through the sink at its offset and
+into the CRC runs, so workers never touch the source or the sink. The main decode stops at a block a worker owns and
+goes on from the block's end (the next reset, or the end marker) once the walk has found it, decoding nothing twice.
+
+- A block a worker cannot finish (a hole in its bytes, data that does not decode) goes back to the main decode if it
+  has not reached it (which skips what the worker already wrote), or to the repairs, decoded from the block's own
+  dictionary reset, which needs no held output.
+- The source keeps every unfinished block's packed bytes (`needed`), and the frontier stays at the first block not
+  written, so `done` means every byte is written and checked.
+- A snapshot keeps no worker: blocks the main decode went past that are unfinished become repairs and lost output in
+  the snapshot, and a restored decoder decodes the rest again, writing only output the CRC runs do not hold.
+- Only a member no folder member goes on from uses workers (a hand-off needs one decoder's state); a stream with no
+  reset past its start runs on the caller's thread alone. Default: `FeedThreads::One`.
+
+Measured on a 32-core Xeon 8581C at 2.1 GHz (FeedDecoder, `live_feed`, no drops, file sink): a 2.1 GB set at
+`-mx5 -mmt` (32 blocks) 75 MB/s on one thread, 127 MB/s with two workers, 169 MB/s with four; a 100 MB set at
+`-md4m` (6 blocks) 87, 155 and 183 MB/s. Incompressible data (stored chunks) already runs at about 400 MB/s on one.
+
 ## Compressed RAR 4.x
 
 The main decode feeds the packed bytes (decrypted first under AES-128) to the RAR 2.9/3.x decoder (and its RAR 1.5
