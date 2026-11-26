@@ -41,6 +41,10 @@ const QUEUE: usize = 16;
 /// How far ahead of the main decode (folder output) the header walk looks for blocks.
 const LOOKAHEAD: u64 = 1 << 30;
 
+/// The least folder output between the dictionary resets that start blocks: closer ones stay inside the block before
+/// them (it decodes them as the main decode would), so a stream of tiny resets never starts a thread every few bytes.
+const MIN_BLOCK: u64 = 128 << 10;
+
 /// Workers for one member: decoding blocks ahead of the main decode.
 pub(super) struct Par {
     /// worker threads that may run at once
@@ -284,7 +288,12 @@ impl FeedDecoder {
                 }
                 Hdr::Missing { .. } => break,
             };
-            if matches!(c.reset, Lzma2Reset::Dict | Lzma2Reset::DictStateProps) {
+            let spaced = par
+                .resets
+                .range(..c.unpacked_offset)
+                .next_back()
+                .is_none_or(|(&o, _)| c.unpacked_offset - o >= MIN_BLOCK);
+            if matches!(c.reset, Lzma2Reset::Dict | Lzma2Reset::DictStateProps) && spaced {
                 par.resets.insert(c.unpacked_offset, c.packed_offset);
                 // the block before it ends here
                 if let Some((_, b)) = par.blocks.range_mut(..c.unpacked_offset).next_back()
