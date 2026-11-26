@@ -21,18 +21,40 @@ use crate::error::RarUnsupported;
 use crate::rar5::session::{ScanBudget, allocation};
 
 impl HeaderParser {
+    fn rar4_header(&self) -> &[u8] {
+        if matches!(self.phase, Phase::LegacyBody) { &self.buffer[8..8 + self.size] } else { &self.buffer[..] }
+    }
+    fn rar4_mismatch(&self) -> bool {
+        let header = self.rar4_header();
+        self.rar4_crc_end(header)
+            .is_some_and(|end| crate::crc32::hash(&header[2..end]) as u16 != u16::from_le_bytes([header[0], header[1]]))
+    }
     pub(super) fn parse_rar4(
         &mut self,
         budget: Option<&ScanBudget<'_>>,
     ) -> std::result::Result<PhysicalFrame, FramingError> {
+        // DamagedInput::Salvage: a clear header that fails its checksum is read as it stands, as UnRAR does; a
+        // feature it then seems to use is damage, not something unsupported.
+        let damaged = self.salvage && !self.legacy_headers && self.rar4_mismatch();
+        self.parse_rar4_checked(budget, damaged).map_err(|error| match error {
+            FramingError::Rar(fault) if damaged && matches!(*fault.failure, RarFailure::Unsupported(_)) => {
+                self.framing("damaged RAR4 header", Error::Corrupt("damaged RAR4 header")).into()
+            }
+            other => other,
+        })
+    }
+    fn parse_rar4_checked(
+        &mut self,
+        budget: Option<&ScanBudget<'_>>,
+        damaged: bool,
+    ) -> std::result::Result<PhysicalFrame, FramingError> {
+        let mismatch = !damaged && self.rar4_mismatch();
         let header =
             if matches!(self.phase, Phase::LegacyBody) { &self.buffer[8..8 + self.size] } else { &self.buffer[..] };
         let kind = header[2];
         let flags = u16::from_le_bytes([header[3], header[4]]);
         let size = header.len();
-        if let Some(end) = self.rar4_crc_end(header)
-            && crate::crc32::hash(&header[2..end]) as u16 != u16::from_le_bytes([header[0], header[1]])
-        {
+        if mismatch {
             return Err(self
                 .fault(RarIntegrityReason::HeaderCrc, Error::BadChecksum("RAR4 header CRC".into()), true)
                 .into());
@@ -65,6 +87,7 @@ impl HeaderParser {
             data_end,
             header_crypt: None,
             end_record: None,
+            damaged,
         };
         frame.block = match kind {
             0x73 => {
@@ -170,6 +193,9 @@ impl HeaderParser {
             // Old comment, AV, old subblock, old recovery record and sign blocks hold no members. A map walk skips
             // them by their declared sizes, already bounded above, like unknown blocks marked skippable.
             0x75..=0x79 if self.map_lenient => Block::Unknown,
+            // A damaged header of a type that holds no member is passed over by its size, as UnRAR does.
+            0x75..=0x79 if damaged => Block::Unknown,
+            _ if damaged && !matches!(kind, 0x73 | 0x74 | 0x7a | 0x7b) => Block::Unknown,
             0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
             _ if flags & 0x4000 != 0 => Block::Unknown,
             _ => return Err(self.rar4_unsupported("header type").into()),

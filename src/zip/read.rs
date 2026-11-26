@@ -799,8 +799,16 @@ pub struct ZipRunReport {
     run_usage: RunUsage,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     diagnostic_usage: ZipDiagnosticUsage,
+    damaged_headers: u64,
 }
 impl ZipRunReport {
+    /// RAR headers the run read past under [`crate::extract::Options::damaged_input`] (counted up to 4096; each was
+    /// also sent as a `LegacyDiagnostic` line). Non-zero means the archive's headers are damaged: UnRAR's "Corrupt
+    /// header is found", 7-Zip's "Headers Error".
+    pub fn damaged_headers(&self) -> u64 {
+        self.damaged_headers
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn from_legacy(summary: &crate::extract::Summary) -> Self {
         Self {
@@ -811,6 +819,7 @@ impl ZipRunReport {
             failed: summary.errors.len() as u64,
             volumes: summary.volumes,
             decoded_bytes: summary.bytes as u128,
+            damaged_headers: summary.damaged_headers.len() as u64,
             ..Default::default()
         }
     }

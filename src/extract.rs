@@ -229,6 +229,109 @@ pub struct Options {
     /// it (the default), or a character of the name in every format but RAR 4.x, as 7-Zip 26.06 on Unix reads it.
     /// See [`Backslashes`].
     pub backslashes: Backslashes,
+    /// What a RAR 4.x or RAR 5.0 header that fails its checksum or doesn't parse does to the run: refuse the archive
+    /// (the default, as before), or read on as UnRAR 7.30 does ([`DamagedInput::Salvage`]), or also look for the next
+    /// valid header past the damage ([`DamagedInput::Resync`]). Whatever was passed over or used despite its checksum
+    /// is reported in [`Summary::damaged_headers`] (and [`Listing::damaged_headers`],
+    /// [`crate::rar5::session::RarArchiveMetadata::damaged_headers`]), so a caller can warn and exit as UnRAR or
+    /// 7-Zip would ("Corrupt header is found", "Headers Error").
+    ///
+    /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+    /// checked dispatchers), by [`list_detailed_with_options`], and by [`crate::rar5::session::RarSession`] through
+    /// [`crate::rar5::session::RarSessionOptions::damaged_input`]. Progressive and persistent-partial sessions refuse a
+    /// damaged header whatever this says. 7z and ZIP ignore it.
+    pub damaged_input: DamagedInput,
+}
+
+/// What a damaged RAR header does to a run; see [`Options::damaged_input`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DamagedInput {
+    /// A header that fails its checksum or doesn't parse fails the run, as before.
+    #[default]
+    Refuse,
+    /// As UnRAR 7.30 `x`/`t`/`l`: a header whose checksum fails but which parses is used as read (its member's own
+    /// data checksum still decides whether the member is good) and reported ([`HeaderDamageKind::ChecksumMismatch`]);
+    /// a RAR 4.x block of an unknown type whose checksum fails is passed over by its size; a header that can't be
+    /// read, or a volume cut short, ends that volume without failing the run, what came before standing
+    /// ([`HeaderDamageKind::Unreadable`], [`HeaderDamageKind::UnexpectedEnd`]). A RAR 5.0 volume without its end of
+    /// archive header is reported as ending unexpectedly, as 7-Zip 26.06 does. Encrypted headers are never salvaged:
+    /// there a checksum failure is how a wrong password shows.
+    Salvage,
+    /// [`Self::Salvage`], and where a header can't be read the rest of the volume is searched, in one bounded
+    /// linear pass, for the next header that passes its checksum, and reading goes on from there. Neither UnRAR
+    /// 7.30 nor 7-Zip 26.06 does this: it recovers the members after a damaged stretch (a hole a downloader is
+    /// still to repair, garbage between blocks).
+    Resync,
+}
+
+impl DamagedInput {
+    pub(crate) fn salvages(self) -> bool {
+        !matches!(self, Self::Refuse)
+    }
+}
+
+/// A RAR header a [`DamagedInput::Salvage`] or [`DamagedInput::Resync`] run read past.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct HeaderDamage {
+    /// The volume holding the header.
+    pub volume: PathBuf,
+    /// Where the header starts in that volume.
+    pub offset: u64,
+    pub kind: HeaderDamageKind,
+    /// The member the header names, when it parsed as a file header (UnRAR's "NAME - the file header is corrupt").
+    pub name: Option<String>,
+    /// Where reading went on in the same volume after the damage ([`DamagedInput::Resync`]); `None` when the rest of
+    /// the volume was passed over (or, for [`HeaderDamageKind::ChecksumMismatch`], nothing was).
+    pub resumed_at: Option<u64>,
+}
+
+/// What was wrong with a [`HeaderDamage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HeaderDamageKind {
+    /// The header failed its checksum but parsed, and was used as read (or, for a RAR 4.x block of an unknown type,
+    /// passed over by its size).
+    ChecksumMismatch,
+    /// The header could not be read: its framing or fields are invalid.
+    Unreadable,
+    /// The volume ends inside a header or its data, or (RAR 5.0) without its end of archive header.
+    UnexpectedEnd,
+}
+
+impl std::fmt::Display for HeaderDamage {
+    /// One line naming the volume, where and what: `a.rar: damaged header at 144 (b.txt): checksum mismatch, read as
+    /// it stands`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: damaged header at {}", self.volume.display(), self.offset)?;
+        if let Some(name) = &self.name {
+            write!(f, " ({})", name.escape_default())?;
+        }
+        f.write_str(match self.kind {
+            HeaderDamageKind::ChecksumMismatch => ": checksum mismatch, read as it stands",
+            HeaderDamageKind::Unreadable => ": unreadable",
+            HeaderDamageKind::UnexpectedEnd => ": unexpected end of archive",
+        })?;
+        match self.resumed_at {
+            Some(at) => write!(f, ", reading on at {at}"),
+            None if self.kind == HeaderDamageKind::Unreadable => f.write_str(", rest of the volume passed over"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// At most this many [`HeaderDamage`] records are kept per run or catalogue; [`Summary::damaged_headers`] says
+/// whether any were, so the flag holds even past the cap.
+pub(crate) const MAX_HEADER_DAMAGE: usize = 4096;
+
+pub(crate) fn keep_damage(into: &mut Vec<HeaderDamage>, from: impl IntoIterator<Item = HeaderDamage>) {
+    for damage in from {
+        if into.len() >= MAX_HEADER_DAMAGE {
+            return;
+        }
+        into.push(damage);
+    }
 }
 
 /// The permission bits a run gives what it writes; see [`Options::unix_modes`]. A member without stored Unix
@@ -488,6 +591,7 @@ impl MemberRef<'_> {
 ///     replace_placed_links: false,
 ///     keep_broken: false,
 ///     attempt_continued_members: false,
+///     damaged_input: Default::default(),
 ///     salvage_truncated_zip: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
@@ -678,6 +782,10 @@ pub struct Summary {
     /// Members renamed by [`Overwrite::RenameNew`] or [`Overwrite::RenameExisting`], in the order the names were
     /// claimed. Empty for the other modes.
     pub renames: Vec<RenamedOutput>,
+    /// RAR headers read past under [`Options::damaged_input`] (at most 4096 kept); empty under
+    /// [`DamagedInput::Refuse`]. Non-empty means the archive's headers are damaged: UnRAR says "Corrupt header is
+    /// found" (exit 3) and 7-Zip "Headers Error" (exit 2).
+    pub damaged_headers: Vec<HeaderDamage>,
     /// the rename attempts this run has left
     pub(crate) rename_budget: RenameBudget,
     /// folders whose times and permissions are set once everything inside them is written
@@ -1342,9 +1450,12 @@ impl ListingBudget {
 fn walk(
     vol: Volume,
     password: Option<&str>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>,
 ) -> Result<u64> {
-    walk_until(vol, password, None, |vol, block| {
+    let mut observer = SelectedReadObserver::default();
+    walk_until_observed(vol, password, None, &mut observer, damaged, damage, |vol, block, _, _| {
         on_block(vol, block)?;
         Ok(false)
     })
@@ -1357,14 +1468,25 @@ fn walk_until(
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<bool>,
 ) -> Result<u64> {
     let mut observer = SelectedReadObserver::default();
-    walk_until_observed(vol, password, cancel, &mut observer, |vol, block, _, _| on_block(vol, block))
+    walk_until_observed(
+        vol,
+        password,
+        cancel,
+        &mut observer,
+        DamagedInput::Refuse,
+        &mut Vec::new(),
+        |vol, block, _, _| on_block(vol, block),
+    )
 }
 
+#[allow(clippy::too_many_arguments)] // one walk for listing, selected reads and salvage
 fn walk_until_observed(
     mut vol: Volume,
     password: Option<&str>,
     cancel: Option<&Cancellation>,
     observer: &mut SelectedReadObserver<'_>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
     mut on_block: impl FnMut(&mut Volume, Block, u32, &mut SelectedReadObserver<'_>) -> Result<bool>,
 ) -> Result<u64> {
     let format = vol.format();
@@ -1379,7 +1501,9 @@ fn walk_until_observed(
                 cancel.check_io()?;
             }
             observer.notify(index, &vol.path, SelectedReadRole::Header, cancel)?;
-            let Some(block) = vol.next_block()? else { break };
+            let next = vol.next_block();
+            keep_damage(damage, vol.take_damage());
+            let Some(block) = next? else { break };
             match block {
                 Block::End { more_volumes, .. } => {
                     more = more_volumes;
@@ -1415,7 +1539,7 @@ fn walk_until_observed(
             return Ok(volumes);
         }
         observer.notify(observer.volume_index(volumes)?, &next, SelectedReadRole::Header, cancel)?;
-        vol = Volume::open_with_password(&next, password)?;
+        vol = Volume::open_damaged(&next, password, damaged)?;
         if vol.format() != format {
             return Err(Error::Corrupt("RAR volume format changed"));
         }
@@ -1428,7 +1552,13 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
         run.reports.volume()?;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
-        while let Some((block, crypt)) = vol.next_block_detailed()? {
+        loop {
+            let next = vol.next_block_detailed();
+            let damage = vol.take_damage();
+            if !damage.is_empty() {
+                run.reports.damaged(damage);
+            }
+            let Some((block, crypt)) = next? else { break };
             match block {
                 Block::End { more_volumes, .. } => {
                     more = more_volumes;
@@ -1480,7 +1610,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                 RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into()
             );
         }
-        vol = Volume::open_detailed(&next, run.password)?;
+        vol = Volume::open_detailed_damaged(&next, run.password, run.opts.damaged_input)?;
         if vol.format() != format {
             return Err(RarFault::new(
                 RarFailure::integrity(
@@ -1661,7 +1791,7 @@ impl LegacyRoute {
             Self::Rar { signature, .. } => {
                 let mut reports = Reports::legacy(report);
                 let result = rar_run_shared_open(first, options, password, Some(cancel), &mut reports, || {
-                    Volume::from_held_signature_detailed(first, signature, password)
+                    Volume::from_held_signature_detailed(first, signature, password, options.damaged_input)
                 });
                 let Reports::Legacy { summary, .. } = reports else { unreachable!() };
                 legacy_result(result, summary)
@@ -1674,9 +1804,12 @@ impl LegacyRoute {
             Self::SevenZip => crate::sevenzip::list(first, password),
             Self::SplitZip => crate::zip::list(first),
             Self::TruncatedZip => crate::zip::list_truncated(first),
-            Self::Rar { signature, .. } => {
-                rar_list_from_volume(Volume::from_held_signature(first, signature, password)?, password)
-            }
+            Self::Rar { signature, .. } => rar_list_from_volume(
+                Volume::from_held_signature(first, signature, password, DamagedInput::Refuse)?,
+                password,
+                DamagedInput::Refuse,
+                &mut Vec::new(),
+            ),
         }
     }
 }
@@ -2165,7 +2298,8 @@ impl SelectedEntry {
                 });
             }
             CheckedRoute::Legacy(LegacyRoute::Rar { signature, path: held_path }) => {
-                let volume = Volume::from_held_signature(&held_path, signature, password).map_err(ReadFault::Legacy)?;
+                let volume = Volume::from_held_signature(&held_path, signature, password, DamagedInput::Refuse)
+                    .map_err(ReadFault::Legacy)?;
                 let (header, chain_start) =
                     rar_selected_header_from_volume(volume, index, password, &cancel).map_err(ReadFault::Legacy)?;
                 if header.is_dir() || header.redirection.is_some() {
@@ -2600,18 +2734,30 @@ pub struct Listing {
     /// ([`crate::zip::list_detailed_with_options`] with [`Options::salvage_truncated_zip`]). 7-Zip prints "Unexpected
     /// end of archive" and exits nonzero here.
     pub truncated: bool,
+    /// RAR headers the listing read past under [`Options::damaged_input`] ([`list_detailed_with_options`]), at most
+    /// 4096 kept: `entries` holds the members listed past them. Empty otherwise.
+    pub damaged_headers: Vec<HeaderDamage>,
 }
 
 impl Listing {
-    /// Whether the archive ended before it should have (7-Zip's "Unexpected end of archive").
+    /// Whether the archive ended before it should have (7-Zip's "Unexpected end of archive"), a RAR volume cut short
+    /// or without its end header included.
     pub fn unexpected_end(&self) -> bool {
-        self.missing_volume.is_some() || self.truncated
+        self.missing_volume.is_some()
+            || self.truncated
+            || self.damaged_headers.iter().any(|d| d.kind == HeaderDamageKind::UnexpectedEnd)
+    }
+
+    /// Whether headers were read past ([`Self::damaged_headers`]): UnRAR's "Corrupt header is found", 7-Zip's
+    /// "Headers Error".
+    pub fn headers_damaged(&self) -> bool {
+        !self.damaged_headers.is_empty()
     }
 }
 
 /// [`list_with_password`], with the listing's warnings.
 pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
-    let whole = |entries| Listing { entries, missing_volume: None, truncated: false };
+    let whole = |entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers: Vec::new() };
     match sniff(first)? {
         Format::Zip => return crate::zip::list_detailed(first),
         Format::Tar => return crate::tar::list(first).map(whole),
@@ -2621,6 +2767,22 @@ pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
     match rar_list(first, password) {
         Err(Error::NotAnArchive) => crate::zip::list_detailed(first),
         other => other.map(whole),
+    }
+}
+
+/// [`list_detailed`] under `options`: a RAR archive's damaged headers are read past as
+/// [`Options::damaged_input`] says ([`Listing::damaged_headers`] says what was), and a ZIP cut short is listed from
+/// its local headers with [`Options::salvage_truncated_zip`]. The other options don't change a listing.
+pub fn list_detailed_with_options(first: &Path, password: Option<&str>, options: &Options) -> Result<Listing> {
+    match sniff(first)? {
+        Format::Zip => return crate::zip::list_detailed_with_options(first, options),
+        Format::Tar | Format::SevenZip => return list_detailed(first, password),
+        Format::Other => {}
+    }
+    let mut damaged_headers = Vec::new();
+    match rar_list_damaged(first, password, options.damaged_input, &mut damaged_headers) {
+        Err(Error::NotAnArchive) => crate::zip::list_detailed_with_options(first, options),
+        other => other.map(|entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers }),
     }
 }
 
@@ -2938,13 +3100,28 @@ fn zip_run(
 }
 
 fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
-    rar_list_from_volume(Volume::open_with_password(first, password)?, password)
+    rar_list_damaged(first, password, DamagedInput::Refuse, &mut Vec::new())
 }
 
-fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<Entry>> {
+fn rar_list_damaged(
+    first: &Path,
+    password: Option<&str>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
+) -> Result<Vec<Entry>> {
+    let volume = Volume::open_damaged(first, password, damaged)?;
+    rar_list_from_volume(volume, password, damaged, damage)
+}
+
+fn rar_list_from_volume(
+    volume: Volume,
+    password: Option<&str>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
+) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut budget = ListingBudget::default();
-    walk(volume, password, |_, block| {
+    walk(volume, password, damaged, damage, |_, block| {
         let Block::File(h) = block else { return Ok(()) };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
@@ -3830,7 +4007,9 @@ fn rar_run_shared<'a>(
     password: Option<&str>,
     reports: &mut Reports<'a>,
 ) -> RunResult<()> {
-    rar_run_shared_open(first, opts, password, None, reports, || Volume::open_detailed(first, password))
+    rar_run_shared_open(first, opts, password, None, reports, || {
+        Volume::open_detailed_damaged(first, password, opts.damaged_input)
+    })
 }
 
 /// Whether the first member in the volume at `path` continues from an earlier volume.
@@ -3909,7 +4088,7 @@ fn rar_run_shared_open<'a>(
     };
     let first = restart.as_deref().unwrap_or(first);
     if restart.is_some() {
-        first_volume = Volume::open_detailed(first, password)?;
+        first_volume = Volume::open_detailed_damaged(first, password, opts.damaged_input)?;
     }
     let mut opts = match opts.protecting_detailed(first) {
         Ok(opts) => opts,
@@ -4003,6 +4182,7 @@ fn rar_read_at(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        damaged_input: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
@@ -4018,49 +4198,57 @@ fn rar_read_at(
     let mut complete = false;
     observer.notify(0, first, SelectedReadRole::Header, Some(cancel))?;
     let volume = Volume::open_with_password(first, run.password)?;
-    walk_until_observed(volume, run.password, Some(cancel), observer, |volume, block, volume_index, observer| {
-        let Block::File(header) = block else { return Ok(false) };
-        if !header.split_before() {
-            if run.pending.is_some() {
+    walk_until_observed(
+        volume,
+        run.password,
+        Some(cancel),
+        observer,
+        DamagedInput::Refuse,
+        &mut Vec::new(),
+        |volume, block, volume_index, observer| {
+            let Block::File(header) = block else { return Ok(false) };
+            if !header.split_before() {
+                if run.pending.is_some() {
+                    return Err(Error::Truncated);
+                }
+                selected = next == index;
+                prerequisite = (chain_start..index).contains(&next)
+                    && header.method != 0
+                    && !header.is_dir()
+                    && header.redirection.is_none();
+                next += 1;
+                if selected && (header.name != name || header.is_dir() || header.redirection.is_some()) {
+                    return Err(Error::Corrupt("RAR5 entry changed since it was selected"));
+                }
+            }
+            if !selected && !prerequisite {
+                return Ok(false);
+            }
+            if header.split_before() && run.pending.is_none() {
                 return Err(Error::Truncated);
             }
-            selected = next == index;
-            prerequisite = (chain_start..index).contains(&next)
-                && header.method != 0
-                && !header.is_dir()
-                && header.redirection.is_none();
-            next += 1;
-            if selected && (header.name != name || header.is_dir() || header.redirection.is_some()) {
-                return Err(Error::Corrupt("RAR5 entry changed since it was selected"));
+            if let Some(selection) = &mut run.selection {
+                selection.emit = selected;
             }
-        }
-        if !selected && !prerequisite {
-            return Ok(false);
-        }
-        if header.split_before() && run.pending.is_none() {
-            return Err(Error::Truncated);
-        }
-        if let Some(selection) = &mut run.selection {
-            selection.emit = selected;
-        }
-        observer.notify(
-            volume_index,
-            &volume.path,
-            if selected { SelectedReadRole::Selected } else { SelectedReadRole::Prerequisite },
-            Some(cancel),
-        )?;
-        let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
-        let before = summary.files;
-        let crypt = header.crypt.map(Ok);
-        let split_after = header.split_after();
-        run.file_block(volume, header, crypt).map_err(RunFault::into_legacy)?;
-        let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
-        if let Some(error) = summary.errors.first() {
-            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone())));
-        }
-        complete = selected && !split_after && summary.files > before && run.pending.is_none();
-        Ok(complete)
-    })?;
+            observer.notify(
+                volume_index,
+                &volume.path,
+                if selected { SelectedReadRole::Selected } else { SelectedReadRole::Prerequisite },
+                Some(cancel),
+            )?;
+            let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
+            let before = summary.files;
+            let crypt = header.crypt.map(Ok);
+            let split_after = header.split_after();
+            run.file_block(volume, header, crypt).map_err(RunFault::into_legacy)?;
+            let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
+            if let Some(error) = summary.errors.first() {
+                return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone())));
+            }
+            complete = selected && !split_after && summary.files > before && run.pending.is_none();
+            Ok(complete)
+        },
+    )?;
     if !complete {
         return Err(Error::Truncated);
     }

@@ -17,9 +17,11 @@ restart_from_first_volume: false,
 replace_placed_links: false,
 keep_broken: false,
 attempt_continued_members: false,
+damaged_input: Default::default(),
 salvage_truncated_zip: false,
 unix_modes: Default::default(),
 backslashes: Default::default(),
+damaged_input: Default::default(),
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -224,3 +226,56 @@ on the checked route as ever, option or not. `extract::run` honours the option t
 `zip::list_detailed_with_options` lists such a file (`Listing::truncated`, `Listing::unexpected_end`). The other
 listings (`inspect_projected_cancelable`, `zipfast l`) and `SelectedEntry` take no `Options` and still refuse it.
 `tests/zip_salvage_truncated.rs` checks each point.
+
+## `damaged_input`: RAR archives with damaged headers
+
+`DamagedInput::Refuse` (the default) fails a RAR 4.x or RAR 5.0 run, listing or catalogue at the first header that
+fails its checksum or doesn't parse, as before. `DamagedInput::Salvage` reads on the way UnRAR 7.30 does, and
+`DamagedInput::Resync` also looks past an unreadable header. Whatever was read past comes back as `HeaderDamage`
+records (volume, offset, `HeaderDamageKind`, the member name when the header parsed, where reading resumed), so a
+caller can warn and exit as the tools do: UnRAR prints "Corrupt header is found" / "NAME - the file header is
+corrupt" and exits 3, 7-Zip prints "Headers Error" (or "Unexpected end of archive") and exits 2.
+
+What UnRAR 7.30 (`x`, `t`, `l`) does, from archives with one byte changed, cut short or with bytes inserted, and what
+`Salvage` does:
+
+| damage | UnRAR 7.30 | 7-Zip 26.06 | `Salvage` |
+|---|---|---|---|
+| a file header fails its checksum but parses (a CRC byte, or its name, changed) | "the file header is corrupt"; the member is listed and extracted as the header reads (a changed name is the name written), its data checksum deciding; the rest follows; exit 3 | "Headers Error", stops there, exit 2 | the same as UnRAR: `ChecksumMismatch` with the name, the member listed and extracted as read |
+| the main header fails its checksum | "Main archive header is corrupt", reads on | "Headers Error" | `ChecksumMismatch`, reads on |
+| a RAR 4.x block's type byte changed (checksum fails, type unknown) | the block is passed over by its size, the rest extracted | "Headers Error" | `ChecksumMismatch`, passed over by its size |
+| a header that can't be read (size field changed, garbage inserted before it) | "Corrupt header is found" or "Unexpected end of archive", nothing after it is read, exit 3 | "Headers Error", stops | `Unreadable` (or `UnexpectedEnd`), the rest of the volume passed over, what came before stands |
+| the volume ends inside a header or its data | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there |
+| a RAR 5.0 volume without its end header | no message | "Unexpected end of archive", exit 2 | `UnexpectedEnd` at the volume's length |
+| only a member's data damaged | "checksum error", the rest extracted | "CRC Failed" | as before, with any `damaged_input`: the member fails, nothing is recorded as header damage |
+| a RAR 4.x archive cut inside its main header | "Main archive header is corrupt", lists "0 files" (`Details: RAR 1.5`) | | opens with no members, `UnexpectedEnd` |
+
+Neither tool looks past an unreadable header for the next one. `Resync` does, for callers (RustyGet) that would rather
+recover the members after a damaged stretch, such as a hole still waiting for repair or garbage between blocks: from
+the byte after the unreadable header it searches the rest of the volume for a file, service or end header (never a
+main header) of at most 64 KiB whose checksum passes, and reads on from there (`HeaderDamage::resumed_at`). Each
+search is one forward pass, read in chunks from 4 KiB doubling to 1 MiB, and the checksum work of all the searches in a
+volume together is bounded by 16 times the volume's length plus 1 MiB, so a volume stays linear whatever its bytes are;
+past that bound the search gives up and passes over the rest of the volume. A RAR 4.x
+header checksum is 16 bits, so in a long damaged stretch a resync can land on a false header: what it reads from it
+fails its own checks (a member's data checksum, the next header's framing) and the search goes on.
+
+Encrypted headers (`-hp`) are never salvaged, by either choice: there a failed checksum is how a wrong password shows.
+A member whose data fails its checksum fails as before (`keep_broken` keeps what was written).
+
+Where it applies:
+
+- the whole-archive RAR runners (`extract::run`, `run_with_password`, `run_rar_with_outcomes`, and `run_with_policy`
+  / `run_with_zip_policy` through the legacy route): `Summary::damaged_headers`, `RarRunSummary::damaged_headers`, and
+  `ZipRunReport::damaged_headers()` (a count; each record is also sent as a `LegacyDiagnostic` line);
+- listing: `extract::list_detailed_with_options` (`Listing::damaged_headers`, `Listing::headers_damaged()`, and
+  `Listing::unexpected_end()` for `UnexpectedEnd`);
+- `RarSession`, through `RarSessionOptions::damaged_input`: the catalogue reads past the damage, its members list and
+  extract (`extract_selected`, `extract_selected_controlled`, printing) as any other, and
+  `RarArchiveMetadata::damaged_headers()` says what was read past;
+- `Volume::open_damaged` and `Volume::take_damage` for callers walking blocks themselves.
+
+Progressive and persistent-partial sessions still refuse a damaged header whatever `damaged_input` says; listings that
+take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
+`--resync` (for `l`, `t`, `x`, `e`), prints each damaged header and a warning, and exits 1.
+`tests/rar_salvage.rs` checks each point.

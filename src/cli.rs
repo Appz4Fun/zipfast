@@ -46,6 +46,9 @@ switches:
   -q  quiet: report only errors
   -p<pw>  decrypt encrypted archives with password
   -mt<n>  use up to n threads (default: one per core)
+  --salvage  read a RAR archive with damaged headers as UnRAR does: use a header that fails its
+             checksum, stop a volume at one that can't be read, and warn
+  --resync   as --salvage, and look past an unreadable header for the next valid one
 ";
 
 pub(crate) fn main() -> ExitCode {
@@ -61,9 +64,12 @@ pub(crate) fn main() -> ExitCode {
     let mut quiet = false;
     let mut threads = None;
     let mut password: Option<String> = None;
+    let mut damaged = extract::DamagedInput::Refuse;
     let mut paths = Vec::new();
     for arg in &args[1..] {
         match arg.as_str() {
+            "--salvage" => damaged = extract::DamagedInput::Salvage,
+            "--resync" => damaged = extract::DamagedInput::Resync,
             "-o+" | "-y" => overwrite = Overwrite::Always,
             "-o-" => overwrite = Overwrite::Skip,
             "-q" | "-idq" => quiet = true,
@@ -89,6 +95,7 @@ pub(crate) fn main() -> ExitCode {
     };
     let dest = paths.get(1).cloned().unwrap_or_else(|| PathBuf::from("."));
     match command.as_str() {
+        "l" | "v" if damaged != extract::DamagedInput::Refuse => salvage_list(&archive, password.as_deref(), damaged),
         "l" | "v" => list(&archive, password.as_deref()),
         "t" | "x" | "e" => {
             let mode = if command == "t" { Mode::Test } else { Mode::Extract };
@@ -112,6 +119,7 @@ pub(crate) fn main() -> ExitCode {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                damaged_input: damaged,
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
@@ -188,6 +196,61 @@ fn repack(args: &[String]) -> ExitCode {
     }
 }
 
+/// `l --salvage` / `l --resync`: the listing, then a warning for every damaged header read past.
+fn salvage_list(archive: &Path, password: Option<&str>, damaged: extract::DamagedInput) -> ExitCode {
+    let options = Options { damaged_input: damaged, ..listing_options() };
+    match extract::list_detailed_with_options(archive, password, &options) {
+        Ok(listing) => {
+            let code = legacy_list_result(archive, Ok(listing.entries.clone()));
+            damage_warning(&listing.damaged_headers, listing.damaged_headers.len() as u64);
+            if listing.headers_damaged() { ExitCode::from(1) } else { code }
+        }
+        Err(e) => legacy_list_result(archive, Err(e)),
+    }
+}
+
+/// Options for a listing: only `damaged_input` matters there.
+fn listing_options() -> Options {
+    Options {
+        mode: Mode::Test,
+        dest: PathBuf::new(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: None,
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+        windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
+        preexisting_links: Default::default(),
+        refused_link_placeholder: false,
+        restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
+        damaged_input: Default::default(),
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
+    }
+}
+
+/// The warning for a run or listing that read past damaged headers; `lines` are printed (a run has already sent
+/// them as diagnostics, so it passes none).
+fn damage_warning(lines: &[extract::HeaderDamage], count: u64) {
+    for damage in lines {
+        eprintln!("{damage}");
+    }
+    if count > 0 {
+        eprintln!(
+            "warning: the archive's headers are damaged ({count} read past); what is listed or extracted may be incomplete"
+        );
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn legacy_list(archive: &Path, password: Option<&str>) -> ExitCode {
     legacy_list_result(archive, extract::list_with_password(archive, password))
@@ -239,7 +302,8 @@ fn legacy_run_result(
                     if s.skipped > 0 { format!(", {} skipped", s.skipped) } else { String::new() }
                 );
             }
-            if s.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
+            damage_warning(&[], s.damaged_headers.len() as u64);
+            if s.errors.is_empty() && s.damaged_headers.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
         }
         Err(e) => {
             eprintln!("{}: {e}", archive.display());
@@ -349,8 +413,11 @@ fn run(archive: &Path, opts: &Options, password: Option<&str>, quiet: bool) -> E
     if !prepared && let Err(error) = &result {
         early(format_args!("{}: {}\n", archive.display(), ErrorText(error, None)));
     }
+    if let Ok(report) = &result {
+        damage_warning(&[], report.damaged_headers());
+    }
     match result {
-        Ok(report) if report.failed() == 0 => ExitCode::SUCCESS,
+        Ok(report) if report.failed() == 0 && report.damaged_headers() == 0 => ExitCode::SUCCESS,
         Ok(_) => ExitCode::from(1),
         Err(_) => ExitCode::from(2),
     }

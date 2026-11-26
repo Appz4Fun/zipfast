@@ -71,6 +71,8 @@ pub(crate) struct PhysicalFrame {
     pub(crate) header_crypt: Option<std::result::Result<crate::crypto::Rar5CryptParams, crate::crypto::Rar5CryptError>>,
     /// The end of archive header's fields, for an end frame.
     pub(crate) end_record: Option<super::RarEndRecord>,
+    /// The header failed its checksum and was parsed anyway ([`HeaderParser::set_salvage`]).
+    pub(crate) damaged: bool,
 }
 #[allow(
     clippy::large_enum_variant,
@@ -126,6 +128,9 @@ pub(crate) struct HeaderParser {
     /// Progressive sessions that opted in through [`crate::progressive::ProgressiveOptions::rar4_unknown_part_crc`]:
     /// a RAR 4.x file part that continues into the next volume and stores 0 as its CRC has no part check.
     rar4_unknown_part_crc: bool,
+    /// [`crate::extract::DamagedInput::Salvage`]: a clear header that fails its checksum is parsed anyway, and its
+    /// frame says so ([`PhysicalFrame::damaged`]).
+    salvage: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -155,7 +160,12 @@ impl HeaderParser {
             legacy_headers: false,
             map_lenient: false,
             rar4_unknown_part_crc: false,
+            salvage: false,
         }
+    }
+    /// See [`Self::salvage`]. Encrypted headers are never salvaged: a checksum failure there is a wrong key.
+    pub(crate) fn set_salvage(&mut self, on: bool) {
+        self.salvage = on;
     }
     pub(crate) fn format(&self) -> RarFormat {
         self.format
@@ -436,6 +446,13 @@ impl HeaderParser {
                     let kind = self.buffer[2];
                     let flags = u16::from_le_bytes([self.buffer[3], self.buffer[4]]);
                     let size = usize::from(u16::from_le_bytes([self.buffer[5], self.buffer[6]]));
+                    if self.salvage
+                        && size >= 7
+                        && self.complete_len.is_some_and(|len| self.at.saturating_add(size as u64) > len)
+                    {
+                        // salvage tells a volume cut short from a header that can't be read
+                        return Err(self.fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false).into());
+                    }
                     if size < 7
                         || self
                             .at
@@ -514,7 +531,8 @@ impl HeaderParser {
                     let plain_end = base + 4 + self.size_len + self.size;
                     let stored = u32::from_le_bytes(self.buffer[base..base + 4].try_into().unwrap());
                     let actual = crate::crc32::hash(&self.buffer[base + 4..plain_end]);
-                    if actual != stored {
+                    let damaged = actual != stored && self.salvage && !self.encrypted();
+                    if actual != stored && !damaged {
                         return Err(FramingError::Checksum {
                             expected: stored,
                             actual,
@@ -530,7 +548,8 @@ impl HeaderParser {
                         });
                     }
                     let header_end = self.at + self.need as u64;
-                    let frame = self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end)?;
+                    let mut frame = self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end)?;
+                    frame.damaged = damaged;
                     self.ended = matches!(frame.block, Block::End { .. });
                     self.at = frame.data_end;
                     self.reset();
@@ -566,6 +585,7 @@ impl HeaderParser {
             data_end,
             header_crypt: None,
             end_record: None,
+            damaged: false,
         };
         frame.block = match kind {
             HEAD_MAIN => {
