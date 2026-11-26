@@ -275,6 +275,9 @@ struct Run<'a> {
     /// Destination-relative paths of links staged for their folder's CRC and not published yet: a later member under
     /// one must not create its parents before the link takes the path, so it fails as under a published link.
     pending_links: Vec<PathBuf>,
+    /// the folders placing the current member created, deepest first, and its target: removed again (when empty)
+    /// if the member leaves nothing there, as 7-Zip creates a file's folders only as its data comes
+    fresh_dirs: Option<(PathBuf, Vec<PathBuf>)>,
     active: Option<Active>,
     /// The password is known to be right: the encrypted headers decoded and passed their CRC, or some encrypted
     /// data has decoded and checked out.
@@ -352,6 +355,7 @@ pub(super) fn run(
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
         pending_links: Vec::new(),
+        fresh_dirs: None,
         extracted: crate::extract::link::Extracted::new(&opts),
         active: None,
         password_proven: map.header_encrypted,
@@ -441,6 +445,7 @@ pub(super) fn print(
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
         pending_links: Vec::new(),
+        fresh_dirs: None,
         extracted: crate::extract::link::Extracted::new(&options),
         active: None,
         password_proven: map.header_encrypted,
@@ -632,6 +637,17 @@ impl Run<'_> {
                 renames.push(renamed);
             },
         };
+        // the folders checking the target creates
+        let target = self.opts.dest.join(&rel);
+        let fresh: Vec<PathBuf> = target
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != self.opts.dest && std::fs::symlink_metadata(dir).is_err())
+            .map(Path::to_path_buf)
+            .collect();
+        if !fresh.is_empty() {
+            self.fresh_dirs = Some((target, fresh));
+        }
         let checked = crate::extract::check_target(self.opts, &rel, Some(&mut self.dirs), &mut log);
         match checked.map_err(legacy_error)? {
             Checked::Write(place) => Ok(Some((rel, Some(place)))),
@@ -917,7 +933,25 @@ impl Run<'_> {
         let mut active = self.active.take().expect("an active folder");
         let result = self.member_in(&mut active, member, &name, offset, size, take);
         self.active = Some(active);
+        self.drop_fresh_dirs();
         result
+    }
+
+    /// The folders the member's placing created, when it left nothing at its target (it failed before any file was
+    /// kept): removed while empty, so a wrong password leaves no empty folders (7-Zip 26.06). A member held for its
+    /// folder's CRC has its staged file in there, so its folders stay.
+    fn drop_fresh_dirs(&mut self) {
+        let Some((target, fresh)) = self.fresh_dirs.take() else { return };
+        if std::fs::symlink_metadata(&target).is_ok() {
+            return;
+        }
+        for dir in fresh {
+            if std::fs::remove_dir(&dir).is_err() {
+                break;
+            }
+        }
+        // the folders known to exist are looked at again
+        self.dirs.forget();
     }
 
     fn member_in(

@@ -178,8 +178,10 @@ length) and its times set, and the member is still reported failed:
 | Runner | Kept | Checked against 7-Zip 26.06 |
 | --- | --- | --- |
 | RAR | a CRC or BLAKE2sp mismatch, a missing volume, a decoder or size failure, once the file was placed (empty when nothing was written yet) | `r5misc.rar` `blake.bin` (CRC Failed), `multi_broken.part1.rar` `file2.txt` (missing volume: empty), `r5solid.rar` (Data Error: both empty) |
-| ZIP | a missing or truncated volume, a CRC or data failure; the bytes before the cut are written first, and a streamed member cut off before its descriptor is read to the cut | `s.zip.001` / `streamed.zip.001` `c.bin` (Unexpected end of data: the 11,832 bytes of the first piece) |
+| ZIP | a missing or truncated volume, a CRC or data failure; the bytes before the cut are written first, and a streamed member cut off before its descriptor is read to the cut | `s.zip.001` / `streamed.zip.001` `c.bin` (Unexpected end of data: the 11,832 bytes of the first piece); `-pwrong aes.zip` / `crypto.zip` (every file empty) |
 | 7z | a member CRC failure, including a wrong password shown by the CRC; a decode failure ("Data Error") is not kept, as 7-Zip keeps none | `-pwrong encrypted_files.7z`: `baz.txt` kept, `foo.txt` not |
 
-Not kept: links, and a failure writing the output (that stops the run). A RAR member whose filter is unsupported is
+Not kept: links, and a failure writing the output (that stops the run). Whatever the option, a 7z member that fails
+before anything of it is kept no longer leaves the folders its placing created (`-pwrong aes.7z` leaves no empty
+`text/`, as 7-Zip leaves none). A RAR member whose filter is unsupported is
 kept empty; 7-Zip writes its data unfiltered (`generic_delta_padding_mutation.rar`), which zipfast does not.

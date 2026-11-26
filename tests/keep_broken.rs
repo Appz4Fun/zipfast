@@ -132,3 +132,18 @@ fn a_7z_file_failing_its_crc_under_a_wrong_password_is_kept_when_asked() {
         assert!(!out.join("foo.txt").exists(), "{keep}: a data error is not kept");
     }
 }
+
+/// prybar P2b (`7z x -pwrong aes.7z`): every member of the solid AES folder fails ("Data Error in encrypted file.
+/// Wrong password?") and 7-Zip leaves nothing, not even their folder `text/`; zipfast no longer leaves it empty. The
+/// folder is made again, and stays, with the right password.
+#[test]
+fn a_7z_member_failing_a_wrong_password_leaves_no_empty_folder() {
+    let path = Path::new(FIXTURES).join("7z-extract/aes.7z");
+    let dir = tempfile::tempdir().unwrap();
+    for keep in [true, false] {
+        let out = dir.path().join(format!("{keep}"));
+        let summary = extract::run_with_password(&path, &options(&out, keep, 1), Some("wrong"), |_| {}).unwrap();
+        assert!(!summary.errors.is_empty(), "{keep}");
+        assert!(!out.join("text").exists(), "{keep}: no folder left for the failed members");
+    }
+}
