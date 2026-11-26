@@ -769,8 +769,29 @@ fn a_resync_gap_breaks_the_solid_history() {
     service[offsets[1] + 5] = 3;
     let mut main = bytes.clone();
     main[offsets[1] + 5] = 1;
-    for (what, damaged) in [("hole", hole), ("service", service), ("main", main)] {
-        let listed = ["a.bin", "c.bin"];
+    // or its file flags given the folder bit, so that it reads as a folder whose data is never decoded
+    let mut folder = bytes.clone();
+    let flags = {
+        // CRC32, then the header size, type, header flags and data size, each a one-byte or longer vint
+        let mut at = offsets[1] + 4;
+        for _ in 0..4 {
+            while bytes[at] & 0x80 != 0 {
+                at += 1;
+            }
+            at += 1;
+        }
+        at
+    };
+    assert_eq!(folder[flags], 0x06, "b.bin's file flags (CRC32, mtime)");
+    folder[flags] |= 0x01;
+    let without_b = vec!["a.bin", "c.bin"];
+    let cases = [
+        ("hole", hole, without_b.clone()),
+        ("service", service, without_b.clone()),
+        ("main", main, without_b),
+        ("folder", folder, vec!["a.bin", "b.bin", "c.bin"]),
+    ];
+    for (what, damaged, listed) in cases {
         for choice in [DamagedInput::Salvage, DamagedInput::Resync] {
             if what == "hole" && choice == DamagedInput::Salvage {
                 continue; // the volume ends at the hole: nothing after it is read

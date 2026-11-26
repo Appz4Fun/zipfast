@@ -981,12 +981,14 @@ impl Volume {
                         _ => None,
                     };
                     let (offset, kind) = (frame.extent.start, HeaderDamageKind::ChecksumMismatch);
-                    // a damaged header read as a file is decoded in turn; read as anything else (a service, an
-                    // unknown block, a main or end header that claims data) its data, which may be a member's, is
-                    // skipped
-                    let passed_over = match frame.block {
-                        Block::File(_) => false,
-                        Block::Main(_) | Block::End { .. } => frame.data_end > frame.extent.end,
+                    // A damaged header keeps the solid history only when its data, if any, is decoded into it in turn:
+                    // it reads as a compressed file (not a folder, link or stored file). Read as anything else (a
+                    // service, an unknown block, a folder, a main or end header that claims data) its data, which
+                    // may be a member's compressed stream, is skipped unread.
+                    let carries_data = frame.data_end > frame.extent.end;
+                    let passed_over = match &frame.block {
+                        Block::File(h) => carries_data && (h.method == 0 || h.is_dir() || h.redirection.is_some()),
+                        Block::Main(_) | Block::End { .. } => carries_data,
                         _ => true,
                     };
                     self.record_damage_of(offset, kind, name, None, passed_over);
