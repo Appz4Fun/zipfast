@@ -1422,6 +1422,8 @@ mod tests {
                     replace_placed_links: false,
                     keep_broken: false,
                     attempt_continued_members: false,
+                    unix_modes: Default::default(),
+                    backslashes: Default::default(),
                 },
                 "a.rar".into(),
             );
@@ -1763,6 +1765,8 @@ mod tests {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                unix_modes: Default::default(),
+                backslashes: Default::default(),
             };
             let run = crate::extract::run_with_password(
                 &fixtures.join(format!("testfile5{set}.part01.rar")),
