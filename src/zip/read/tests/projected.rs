@@ -398,7 +398,7 @@ fn aes_public_reads_authenticate_before_callbacks_and_reuse_retained_temp() {
         m.decoded = Some(&plain);
         m.central_extra = &aes;
         let (_file, mut s) = opened(&[m]);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::tempdir();
         let overrides = EncryptedReadOverrides { temp_dir: Some(temp.path().to_path_buf()), ..Default::default() };
         let mut c = context(&mut s, Some(1 << 20), &overrides);
         assert_eq!(c.temp.is_some(), size > 65536);
@@ -454,7 +454,7 @@ fn temp_choice_scope_eligibility_and_clear_zero_output_reservation() {
     .unwrap();
     assert!(matches!(error.operation(), Some(ReadFault::InvalidPlan)));
     assert_eq!(error.bootstrap_usage().unwrap().phase(), BootstrapPhase::ActionPlan);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let over = EncryptedReadOverrides {
         temp_dir: Some(temp.path().into()),
         members: Some(0),
@@ -783,7 +783,7 @@ fn initial_legacy_proof_failure_is_not_recaptured_to_bless_metadata() {
 fn mixed_all_record_geometry_paths_spools_outputs_and_override_intersections() {
     let (_file, s) = opened(&[Member::stored(b"entry", b"one")]);
     let stamp = s.owner.source.as_ref().ok().unwrap().stamp;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let aes = ZipEntry {
         name: "a".into(),
         method: 99,
@@ -888,7 +888,7 @@ fn explicit_zero_encrypted_allocation_does_not_block_preplan_path_or_clear_works
     m.decoded = Some(&plain);
     m.central_extra = &extra;
     let (_file, mut s) = opened(&[m]);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let limits = EncryptedReadLimits { allocation_attempts: 0, ..Default::default() };
     let mut c = EncryptedReadContext::new(
         EncryptedReadOptions::default().with_limits(limits).with_temp_dir(temp.path().into()),
@@ -1689,6 +1689,9 @@ fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     for case in 0..6 {
         let cancel = Cancellation::default();
@@ -1800,6 +1803,9 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     for supplied_context in [false, true] {
         OBSERVATIONS.with(|s| s.set(Default::default()));

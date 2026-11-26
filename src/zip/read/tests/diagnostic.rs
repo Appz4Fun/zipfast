@@ -405,7 +405,7 @@ fn two_actual_writer_types_and_unused_descriptor_admission() {
 fn native_fifo_tty_and_nonterminal_character_classification() {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let path = std::ffi::CString::new(root.path().join("fifo").as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
@@ -827,8 +827,8 @@ fn frozen_cwd_current_target_alias_is_checked_in_isolated_process() {
         }
     }
     let old_cwd = std::env::current_dir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let other = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
+    let other = super::tempdir();
     std::env::set_current_dir(root.path()).unwrap();
     let (_file, mut session, mut options, old) = super::run::setup(&[Member::stored(b"a", b"data")]);
     drop(old);
@@ -945,7 +945,7 @@ fn owning_retired_source_native_namespace_matrix_and_inside_write() {
         for mutation in 0..5 {
             let (file, _session, options, old) = super::run::setup(&[Member::stored(b"a", b"a")]);
             drop(old);
-            let backup = tempfile::tempdir().unwrap();
+            let backup = super::tempdir();
             let saved = backup.path().join("saved");
             super::super::run::OWNED_HOOK.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move |at, path| {
@@ -1189,6 +1189,9 @@ fn direct_setup_output(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     (file, session, options, context)
 }
@@ -1598,7 +1601,7 @@ fn direct_prepared_file_policy_rejects_changed_output_options_before_stage_creat
     for field in 0..4 {
         let (file, mut session, mut options, _context) = direct_setup();
         let cancel = Cancellation::default();
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         options.mode = crate::extract::Mode::Extract;
         options.dest = root.path().join("original");
         let mut context = EncryptedReadContext::for_projected(
@@ -1651,10 +1654,10 @@ fn direct_frozen_cwd_and_replaced_target_are_checked_before_skip_completion() {
         return;
     }
     let old = std::env::current_dir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let other = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
+    let other = super::tempdir();
     std::env::set_current_dir(root.path()).unwrap();
-    std::fs::create_dir("out").unwrap();
+    super::private_dir("out").unwrap();
     std::fs::write("out/entry", b"prior").unwrap();
     let (_file, mut session, mut options, unused) = direct_setup();
     drop(unused);
@@ -1888,8 +1891,8 @@ fn r1_run_ended_keeps_original_protected_cwd_for_borrowed_and_retired_sources() 
     for extract in [false, true] {
         for owned in [false, true] {
             for replace in [false, true] {
-                let root = tempfile::tempdir().unwrap();
-                let other = tempfile::tempdir().unwrap();
+                let root = super::tempdir();
+                let other = super::tempdir();
                 std::env::set_current_dir(root.path()).unwrap();
                 let (_file, mut session, mut options, old) = direct_setup();
                 drop(old);
@@ -1980,7 +1983,7 @@ fn r1_final_policy_and_cwd_retire_once_after_each_observer_failure() {
             for phase in 0..3 {
                 let (_file, mut session, mut options, old) = direct_setup();
                 drop(old);
-                let dest = tempfile::tempdir().unwrap();
+                let dest = super::tempdir();
                 options.dest = dest.path().to_path_buf();
                 options.mode = if extract { crate::extract::Mode::Extract } else { crate::extract::Mode::Test };
                 options.protected_paths.insert(".".into());
@@ -2035,7 +2038,7 @@ fn direct_policy_usage_receipt_matches_after_prepare_refusal() {
 #[allow(clippy::result_large_err)]
 fn direct_policy_usage_receipt(refusal: bool, staged: bool) {
     let (_file, mut session, mut options, mut context) = direct_setup();
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     if staged {
         options.mode = crate::extract::Mode::Extract;
         options.dest = dest.path().to_path_buf();

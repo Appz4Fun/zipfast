@@ -78,6 +78,7 @@ pub const FHEXTRA_HASH: u64 = 0x02;
 pub const FHEXTRA_HTIME: u64 = 0x03;
 pub const FHEXTRA_VERSION: u64 = 0x04;
 pub const FHEXTRA_REDIR: u64 = 0x05;
+pub const FHEXTRA_UOWNER: u64 = 0x06;
 pub const FHEXTRA_SUBDATA: u64 = 0x07;
 
 /// A cursor over one header's bytes. Every read is checked; running off the end is corruption, since the header's
@@ -369,6 +370,71 @@ pub struct Rar5CryptRecord {
     pub kdf_count: u8,
 }
 
+/// RAR 5.0 Unix owner record (file header extra record 0x06): the owner and group names and numeric ids, each when
+/// stored. Names are the stored bytes (UnRAR prints them as `Unix owner: user:group`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnixOwner {
+    pub user: Option<Vec<u8>>,
+    pub group: Option<Vec<u8>>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+}
+
+impl UnixOwner {
+    /// Heap bytes the names hold (a catalogue charges them for each header copy it keeps).
+    pub(crate) fn heap_capacity(&self) -> usize {
+        self.user.as_ref().map_or(0, Vec::capacity) + self.group.as_ref().map_or(0, Vec::capacity)
+    }
+
+    /// Parses the record body after its type, borrowing the names. Flags: 0x1 user name, 0x2 group name, 0x4
+    /// numeric user id, 0x8 numeric group id, in that order; each name is a length then the bytes.
+    fn parse_borrowed<'a>(r: &mut Cursor<'a>) -> Result<RawOwner<'a>> {
+        let flags = r.vint()?;
+        let name = |bit: u64, r: &mut Cursor<'a>| -> Result<Option<&'a [u8]>> {
+            if flags & bit == 0 {
+                return Ok(None);
+            }
+            let len = r.vsize()?;
+            Ok(Some(r.bytes(len)?))
+        };
+        let user = name(0x1, r)?;
+        let group = name(0x2, r)?;
+        let uid = if flags & 0x4 != 0 { Some(r.vint()?) } else { None };
+        let gid = if flags & 0x8 != 0 { Some(r.vint()?) } else { None };
+        Ok(RawOwner { user, group, uid, gid })
+    }
+
+    /// Parses the record body after its type.
+    #[cfg(test)]
+    fn parse(r: &mut Cursor<'_>) -> Result<Self> {
+        Self::parse_borrowed(r).map(RawOwner::owned)
+    }
+}
+
+/// A Unix owner record as parsed, its names still borrowed from the header bytes.
+struct RawOwner<'a> {
+    user: Option<&'a [u8]>,
+    group: Option<&'a [u8]>,
+    uid: Option<u64>,
+    gid: Option<u64>,
+}
+
+impl RawOwner<'_> {
+    fn name_bytes(&self) -> u64 {
+        (self.user.map_or(0, <[u8]>::len) + self.group.map_or(0, <[u8]>::len)) as u64
+    }
+
+    fn owned(self) -> UnixOwner {
+        UnixOwner {
+            user: self.user.map(<[u8]>::to_vec),
+            group: self.group.map(<[u8]>::to_vec),
+            uid: self.uid,
+            gid: self.gid,
+        }
+    }
+}
+
 /// A file or service header.
 #[derive(Clone, Debug, Default)]
 pub struct FileHeader {
@@ -413,6 +479,9 @@ pub struct FileHeader {
     /// RAR 5.0: set on an older revision of a file kept alongside the current one (`rar -ver`), from the version
     /// record. A record holding 0 is no version, as UnRAR reads it.
     pub version: Option<u64>,
+    /// RAR 5.0: the Unix owner record. None without one, or when it is malformed (the record is informational, so a
+    /// damaged one does not fail the header).
+    pub owner: Option<UnixOwner>,
     /// A service header's SubData: the stream name of an `STM` header, the `Protect+` tag of a RAR 4.x `RR`, and
     /// so on. Empty for file headers.
     pub sub_data: Vec<u8>,
@@ -810,7 +879,19 @@ fn parse_file_extra(
                 f.sub_data.try_reserve_exact(data.len()).map_err(|_| FileParseError::Allocation)?;
                 f.sub_data.extend_from_slice(data);
             }
-            // owner, service data of other passes and anything newer are skipped
+            FHEXTRA_UOWNER => {
+                // Informational: a malformed record leaves no owner. The names are charged to a progressive
+                // session's metadata budget before they are copied out.
+                if let Ok(raw) = UnixOwner::parse_borrowed(&mut r) {
+                    if let Some(usage) = usage {
+                        usage
+                            .charge(crate::progressive::Resource::MetadataBytes, raw.name_bytes())
+                            .map_err(FileParseError::Progressive)?;
+                    }
+                    f.owner = Some(raw.owned());
+                }
+            }
+            // service data of other passes and anything newer are skipped
             _ => {}
         }
     }
@@ -905,4 +986,55 @@ pub(crate) fn main_metadata(extra: &[u8]) -> (Option<Vec<u8>>, Option<RarTime>) 
         return parse(&mut r).unwrap_or_default();
     }
     (None, None)
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::{Cursor, UnixOwner};
+
+    fn parse(bytes: &[u8]) -> Option<UnixOwner> {
+        UnixOwner::parse(&mut Cursor::new(bytes)).ok()
+    }
+
+    #[test]
+    fn owner_record_fields_follow_their_flags() {
+        let all = [0x0f, 4, b'u', b's', b'e', b'r', 5, b'g', b'r', b'o', b'u', b'p', 0xe8, 0x07, 100];
+        let owner = parse(&all).unwrap();
+        assert_eq!(owner.user.as_deref(), Some(&b"user"[..]));
+        assert_eq!(owner.group.as_deref(), Some(&b"group"[..]));
+        assert_eq!((owner.uid, owner.gid), (Some(1000), Some(100)));
+        let ids = parse(&[0x0c, 0, 0]).unwrap();
+        assert_eq!((ids.user, ids.group, ids.uid, ids.gid), (None, None, Some(0), Some(0)));
+    }
+
+    /// A progressive session charges the decoded names to its metadata budget, before copying them out.
+    #[test]
+    fn owner_names_are_charged_to_a_progressive_metadata_budget() {
+        use crate::progressive::{ProgressiveLimits, Resource, Usage};
+        let mut record = vec![0x06, 0x03, 100];
+        record.extend([b'u'; 100]);
+        record.push(100);
+        record.extend([b'g'; 100]);
+        let mut extra = vec![0x80 | (record.len() & 0x7f) as u8, (record.len() >> 7) as u8];
+        extra.extend(&record);
+        let tight = Usage::new(ProgressiveLimits { metadata_bytes: 150, ..ProgressiveLimits::default() });
+        let mut f = super::FileHeader::default();
+        assert!(matches!(
+            super::parse_file_extra(&mut f, &extra, false, Some(&tight)),
+            Err(super::FileParseError::Progressive(_))
+        ));
+        let ample = Usage::new(ProgressiveLimits::default());
+        let mut f = super::FileHeader::default();
+        assert!(super::parse_file_extra(&mut f, &extra, false, Some(&ample)).is_ok());
+        assert_eq!(f.owner.as_ref().and_then(|o| o.user.as_ref()).map(Vec::len), Some(100));
+        assert_eq!(ample.used(Resource::MetadataBytes), 200);
+    }
+
+    #[test]
+    fn a_truncated_or_overlong_owner_record_is_rejected_without_panicking() {
+        assert!(parse(&[]).is_none());
+        assert!(parse(&[0x01, 9, b'u']).is_none());
+        assert!(parse(&[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).is_none());
+        assert!(parse(&[0x04]).is_none());
+    }
 }

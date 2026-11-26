@@ -49,6 +49,9 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite) -> Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     }
 }
 
@@ -539,6 +542,9 @@ fn a_refused_link_leaves_a_placeholder_only_when_asked() {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
             ..options(&dest, Mode::Extract, Overwrite::Always)
         };
         let s = extract::run(&archive, &opts, |_| {}).unwrap();

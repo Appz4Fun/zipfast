@@ -757,6 +757,9 @@ mod tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         }
     }
     struct Fault {
@@ -1013,6 +1016,9 @@ mod directory_fault_tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1096,6 +1102,9 @@ mod trailing_directory_tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

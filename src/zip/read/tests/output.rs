@@ -21,7 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 
 #[test]
 fn atomic_birth_and_backend_are_native() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = super::tempdir();
     let directory = File::open(parent.path()).unwrap();
     native_policy::backend(directory.as_raw_fd()).unwrap();
     let path = CString::new(parent.path().as_os_str().as_bytes()).unwrap();
@@ -48,7 +48,7 @@ fn apfs_ownership_gate_and_atomic_abi_layout() {
 #[cfg(target_os = "macos")]
 #[test]
 fn inherited_allow_ace_is_suppressed_at_atomic_birth() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = super::tempdir();
     let status = std::process::Command::new("/bin/chmod")
         .args(["+a", "everyone allow read,write,file_inherit,directory_inherit"])
         .arg(parent.path())
@@ -72,7 +72,7 @@ fn inherited_allow_ace_is_suppressed_at_atomic_birth() {
 #[cfg(target_os = "macos")]
 #[test]
 fn shared_cipher_birth_does_not_inherit_a_mutator_ace() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = super::tempdir();
     assert!(
         std::process::Command::new("/bin/chmod")
             .args(["+a", "everyone allow read,write,file_inherit,directory_inherit"])
@@ -403,14 +403,14 @@ fn stdout_preparation_freezes_the_actual_descriptor() {
 #[cfg(target_os = "macos")]
 #[test]
 fn darwin_full_birth_path_limit_refuses_before_create_attempt() {
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let mut parent = root.path().to_owned();
     while parent.as_os_str().as_bytes().len() + 201 < 1000 {
         parent.push("p".repeat(200));
     }
     let remaining = 1000 - parent.as_os_str().as_bytes().len() - 1;
     parent.push("p".repeat(remaining));
-    std::fs::create_dir_all(&parent).unwrap();
+    super::private_dirs(&parent).unwrap();
     let (ledger, _) = super::spool::ledger(0);
     let cancel = Cancellation::default();
     let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(&parent), &cancel).unwrap();
@@ -437,7 +437,7 @@ fn darwin_full_birth_path_limit_refuses_before_create_attempt() {
 #[cfg(target_os = "macos")]
 #[test]
 fn atomic_abi_matches_installed_sdk_headers() {
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let source = root.path().join("abi.c");
     let binary = root.path().join("abi");
     std::fs::write(
@@ -518,7 +518,7 @@ fn controlled_sink_admission_failure_poison_stops_later_payload() {
 #[cfg(target_os = "macos")]
 #[test]
 fn native_acl_writeback_preserves_actual_parent_creation_policy_and_absence() {
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     assert!(
         std::process::Command::new("/bin/chmod")
             .args(["+a", "everyone allow read,write,file_inherit,directory_inherit"])
@@ -641,7 +641,7 @@ fn statically_ineligible_stdout_reports_original_cap_without_temp_acquisition() 
 #[test]
 fn file_binding_rejects_foreign_tuple_before_effects_and_borrows_operational_name() {
     use std::io::Write;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let destination = std::fs::canonicalize(root.path()).unwrap();
     let mut member = fixture::Member::stored(b"dir/test?.txt", b"data");
     member.made_by = 0x0014;
@@ -680,6 +680,9 @@ fn file_binding_rejects_foreign_tuple_before_effects_and_borrows_operational_nam
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let before = context.run_usage();
     assert!(session.stage_entry(0).unwrap().bind_file(Path::new("foreign"), &options, &cancel, &mut context).is_err());
@@ -734,7 +737,7 @@ fn normal_stdout_close_admission_stays_primary_after_successful_emergency_close(
 #[test]
 fn required_default_mode_and_best_effort_archive_errno_preserve_incumbent_baseline() {
     use output::metadata::{MetadataPlan, MetadataStep};
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let parent = File::open(root.path()).unwrap();
     let path = CString::new(root.path().as_os_str().as_bytes()).unwrap();
     let probe = std::fs::OpenOptions::new().write(true).create_new(true).open(root.path().join("probe")).unwrap();
@@ -835,9 +838,9 @@ fn controlled_source_reservation_is_once_borrowed_and_precedes_storage() {
 #[test]
 fn held_parent_accepts_configured_root_alias_and_refuses_archive_relative_symlink() {
     use std::os::unix::fs::symlink;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let real = root.path().join("real");
-    std::fs::create_dir(&real).unwrap();
+    super::private_dir(&real).unwrap();
     let alias = root.path().join("alias");
     symlink(&real, &alias).unwrap();
     for relative in [Path::new("new/sub/file"), Path::new("escape/file")] {
@@ -878,7 +881,7 @@ fn held_parent_accepts_configured_root_alias_and_refuses_archive_relative_symlin
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn private_directory_control(mask: Option<libc::mode_t>) {
     use shared::LedgerAccess;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let mut state = budget::LedgerState::new(&Default::default()).unwrap();
     super::core::bind_plan(
         &mut state,
@@ -967,7 +970,7 @@ fn private_directory_restrictive_umask_is_process_isolated() {
 fn empty_named_stage_moves_inside_private_directory_before_plaintext() {
     use shared::LedgerAccess;
     use std::io::Write;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let cancel = Cancellation::default();
     let mut state = budget::LedgerState::new(&Default::default()).unwrap();
     super::core::bind_plan(
@@ -1038,7 +1041,7 @@ fn empty_named_stage_moves_inside_private_directory_before_plaintext() {
 #[test]
 fn original_file_stage_is_private_during_fill_and_finish_error_preserves_prior_target() {
     use std::io::Write;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let target = root.path().join("entry");
     std::fs::write(&target, b"prior").unwrap();
     let bytes = fixture::build(&[fixture::Member::stored(b"entry", b"data")], &[0], b"", b"", false).bytes;
@@ -1066,6 +1069,9 @@ fn original_file_stage_is_private_during_fill_and_finish_error_preserves_prior_t
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -1102,7 +1108,7 @@ fn original_file_stage_is_private_during_fill_and_finish_error_preserves_prior_t
 #[allow(clippy::result_large_err)] // Exercises fixed5376-byte allocator-independent production terminal evidence.
 fn original_file_publication_requires_completion_and_two_fresh_source_observations() {
     use std::io::Write;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let target = root.path().join("entry");
     std::fs::write(&target, b"prior").unwrap();
     let bytes = fixture::build(&[fixture::Member::stored(b"entry", b"data")], &[0], b"", b"", false).bytes;
@@ -1130,6 +1136,9 @@ fn original_file_publication_requires_completion_and_two_fresh_source_observatio
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -1189,7 +1198,7 @@ fn file_fixture(overwrite: crate::extract::Overwrite, prior: Option<&[u8]>) -> F
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn file_fixture_ready(overwrite: crate::extract::Overwrite, prior: Option<&[u8]>, read: bool) -> FileFixture {
     use std::io::Write;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     if let Some(prior) = prior {
         std::fs::write(root.path().join("entry"), prior).unwrap();
     }
@@ -1218,6 +1227,9 @@ fn file_fixture_ready(overwrite: crate::extract::Overwrite, prior: Option<&[u8]>
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -1329,9 +1341,9 @@ fn actual_original_named_aes_pipeline_has_five_reserved_fds_and_one_under_refuse
         let bytes = fixture::build(&[member], &[0], b"", b"", false).bytes;
         let mut source = tempfile::NamedTempFile::new().unwrap();
         source.write_all(&bytes).unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         std::fs::write(root.path().join("entry"), b"prior").unwrap();
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = super::tempdir();
         let cancel = Cancellation::default();
         let mut session = ProjectedReadSession::open(source.path(), &cancel).unwrap();
         let options = crate::extract::Options {
@@ -1354,6 +1366,9 @@ fn actual_original_named_aes_pipeline_has_five_reserved_fds_and_one_under_refuse
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let overrides = EncryptedReadOverrides { temp_dir: Some(temporary.path().to_owned()), ..Default::default() };
         let mut context = EncryptedReadContext::for_projected(
@@ -1434,9 +1449,9 @@ fn actual_named_cipher_unresolved_pair_refuses_cleanup_reopen_and_retains_u_with
     let bytes = fixture::build(&[member], &[0], b"", b"", false).bytes;
     let mut source = tempfile::NamedTempFile::new().unwrap();
     source.write_all(&bytes).unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     std::fs::write(root.path().join("entry"), b"prior").unwrap();
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = super::tempdir();
     let cancel = Cancellation::default();
     let mut session = ProjectedReadSession::open(source.path(), &cancel).unwrap();
     let options = crate::extract::Options {
@@ -1459,6 +1474,9 @@ fn actual_named_cipher_unresolved_pair_refuses_cleanup_reopen_and_retains_u_with
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let overrides = EncryptedReadOverrides { temp_dir: Some(temporary.path().to_owned()), ..Default::default() };
     let mut context = EncryptedReadContext::for_projected(
@@ -1839,7 +1857,7 @@ fn wrong_original_metadata_tuple_refuses_before_any_metadata_setter_or_callback(
 #[test]
 fn empty_move_after_real_effect_eintr_checks_both_names_and_cleans_without_retry() {
     use std::io::Write;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     std::fs::write(root.path().join("entry"), b"prior").unwrap();
     let bytes = fixture::build(&[fixture::Member::stored(b"entry", b"data")], &[0], b"", b"", false).bytes;
     let mut source = tempfile::NamedTempFile::new().unwrap();
@@ -1866,6 +1884,9 @@ fn empty_move_after_real_effect_eintr_checks_both_names_and_cleans_without_retry
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -1975,9 +1996,9 @@ fn final_rename_after_real_effect_eintr_is_unknown_without_target_rollback_or_re
 fn fullpath_ambiguous_birth_after_parent_retarget_cannot_retire_from_old_parent_absence() {
     use std::io::Write;
     for directory_birth in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         let destination = root.path().join("dest");
-        std::fs::create_dir(&destination).unwrap();
+        super::private_dir(&destination).unwrap();
         let retained = root.path().join("retained");
         let path = destination.clone();
         let moved = retained.clone();
@@ -1990,7 +2011,7 @@ fn fullpath_ambiguous_birth_after_parent_retarget_cannot_retire_from_old_parent_
                 }
                 calls.set(calls.get() + 1);
                 std::fs::rename(&path, &moved).unwrap();
-                std::fs::create_dir(&path).unwrap();
+                super::private_dir(&path).unwrap();
                 if directory_birth {
                     native_policy::atomic_directory(fd, parent, leaf).unwrap();
                 } else {
@@ -2026,6 +2047,9 @@ fn fullpath_ambiguous_birth_after_parent_retarget_cannot_retire_from_old_parent_
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                salvage_truncated_zip: false,
+                unix_modes: Default::default(),
+                backslashes: Default::default(),
             };
             let mut context = EncryptedReadContext::for_projected(
                 &mut session,
@@ -2115,7 +2139,7 @@ fn linux_actual_parent_access_default_acl_gid_and_mode_parity_survive_private_st
         data
     }
     for mode in [None, Some(0u32), Some(0o644)] {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         let parent = File::open(root.path()).unwrap();
         parent.set_permissions(std::fs::Permissions::from_mode(0o2770)).unwrap();
         for (name, value) in [(c"system.posix_acl_access", acl(1)), (c"system.posix_acl_default", acl(6))] {
@@ -2165,6 +2189,9 @@ fn linux_actual_parent_access_default_acl_gid_and_mode_parity_survive_private_st
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let mut context = EncryptedReadContext::for_projected(
             &mut session,
@@ -2218,7 +2245,7 @@ fn mac_native_inherited_acl_and_maximum_aces_match_incumbent_creation_after_publ
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     for entries in [1, 128] {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         for _ in 0..entries {
             let result = std::process::Command::new("/bin/chmod")
                 .args(["+a#", "0", "everyone allow read,write,search,file_inherit,directory_inherit"])
@@ -2258,6 +2285,9 @@ fn mac_native_inherited_acl_and_maximum_aces_match_incumbent_creation_after_publ
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let mut context = EncryptedReadContext::for_projected(
             &mut session,
@@ -2307,7 +2337,7 @@ fn preparation_each_instrumented_boundary_retires_or_reports_unobserved_empty_di
     use std::io::Write;
     use std::rc::Rc;
     fn one(fail: Option<usize>, unobserved_directory: bool) -> (usize, usize) {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         std::fs::write(root.path().join("entry"), b"prior").unwrap();
         let bytes = fixture::build(&[fixture::Member::stored(b"entry", b"data")], &[0], b"", b"", false).bytes;
         let mut source = tempfile::NamedTempFile::new().unwrap();
@@ -2334,6 +2364,9 @@ fn preparation_each_instrumented_boundary_retires_or_reports_unobserved_empty_di
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let mut context = EncryptedReadContext::for_projected(
             &mut session,
@@ -2438,7 +2471,7 @@ fn retained_and_generic_receipts_release_borrows_before_real_read_and_publicatio
     source.write_all(&bytes).unwrap();
     let cancel = Cancellation::default();
     for generic in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         let options = crate::extract::Options {
             dest: root.path().to_owned(),
             overwrite: crate::extract::Overwrite::Always,
@@ -2459,6 +2492,9 @@ fn retained_and_generic_receipts_release_borrows_before_real_read_and_publicatio
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         if generic {
             let mut selected = crate::extract::SelectedEntry::open(source.path(), 0, None, 100).unwrap();
@@ -2528,7 +2564,7 @@ fn named_actual_link_stage_replacement_and_directory_retarget_never_publish_or_u
             }
             _ => {
                 std::fs::rename(&private, &moved).unwrap();
-                std::fs::create_dir(&private).unwrap();
+                super::private_dir(&private).unwrap();
                 std::fs::write(private.join("foreign"), b"foreign-directory").unwrap();
             }
         }
@@ -2575,7 +2611,7 @@ fn stdout_preparation_fixture(
     let bytes = fixture::build(&[member], &[0], b"", b"", false).bytes;
     let mut source = tempfile::NamedTempFile::new().unwrap();
     source.write_all(&bytes).unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let cancel = Cancellation::default();
     let mut session = ProjectedReadSession::open(source.path(), &cancel).unwrap();
     let overrides = EncryptedReadOverrides {

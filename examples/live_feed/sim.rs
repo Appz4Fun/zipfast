@@ -729,6 +729,11 @@ impl Sink {
     fn finish(self) -> Result<(bool, u64), String> {
         match self.out {
             Out::File(f) => {
+                // LIVE_FEED_NO_SYNC=1 leaves the output unsynced: decode and write cost alone, comparable with an
+                // extraction that does not sync (`zipfast x`)
+                if std::env::var_os("LIVE_FEED_NO_SYNC").is_some() {
+                    return Ok((true, 0));
+                }
                 f.file.sync_all().map_err(|e| e.to_string())?;
                 Ok((true, 1))
             }
@@ -1150,6 +1155,9 @@ fn verify(config: &Config, map: &MemberMap, outputs: &[(usize, u64, PathBuf)]) -
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     zipfast::extract::run_with_password(&config.volumes[0], &options, config.password.as_deref(), |_| {})
         .map_err(|e| format!("straight extraction: {e}"))?;

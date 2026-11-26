@@ -60,6 +60,15 @@ pub trait PackedSource {
     /// Reads packed bytes of volume `volume` from byte `offset` into `buf` (never empty).
     fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead;
 
+    /// The packed bytes of volume `volume` from byte `offset` on, at most `max` of them, lent without a copy when the
+    /// source holds them in memory: a stored member's output is then written straight from them. None (the default)
+    /// when it does not hold them, or cannot lend: the decoder then reads them with [`Self::read_packed`], which also
+    /// says whether they are yet to come or lost. A lent slice is never empty.
+    fn borrow_packed(&mut self, volume: u32, offset: u64, max: usize) -> Option<&[u8]> {
+        let _ = (volume, offset, max);
+        None
+    }
+
     /// The parts of `range` of volume `volume` the source does not hold, in order, when it can tell without
     /// reading. The decoder lists them as [`NeedKind::Ahead`]. The default, None, lists nothing ahead.
     fn absent(&self, volume: u32, range: Range<u64>) -> Option<Vec<Range<u64>>> {
@@ -490,6 +499,25 @@ impl ArticleBuffer {
         Ok(())
     }
 
+    /// [`Self::insert`] taking the bytes: when none of them is held yet (the usual case, each article once) they are
+    /// kept without a copy.
+    pub fn insert_owned(&mut self, volume: u32, offset: u64, bytes: Vec<u8>) -> Result<(), BufferFull> {
+        let end = offset.saturating_add(bytes.len() as u64);
+        let v = self.volumes.entry(volume).or_default();
+        let overlaps_before =
+            v.chunks.range(..offset).next_back().is_some_and(|(&s, c)| s.saturating_add(c.len() as u64) > offset);
+        if bytes.is_empty() || overlaps_before || v.chunks.range(offset..end).next().is_some() {
+            return self.insert(volume, offset, &bytes);
+        }
+        if self.held.saturating_add(bytes.len()) > self.limit {
+            return Err(BufferFull { held: self.held, limit: self.limit });
+        }
+        self.held += bytes.len();
+        v.lost.remove(offset..end);
+        v.chunks.insert(offset, bytes);
+        Ok(())
+    }
+
     /// Marks `range` of volume `volume` lost: reads of bytes not held there answer [`PackedRead::Hole`].
     pub fn mark_lost(&mut self, volume: u32, range: Range<u64>) {
         if range.start < range.end {
@@ -499,6 +527,14 @@ impl ArticleBuffer {
 }
 
 impl PackedSource for ArticleBuffer {
+    fn borrow_packed(&mut self, volume: u32, offset: u64, max: usize) -> Option<&[u8]> {
+        let v = self.volumes.get(&volume)?;
+        let (&s, c) = v.chunks.range(..=offset).next_back()?;
+        let from = usize::try_from(offset - s).ok().filter(|&from| from < c.len())?;
+        let n = (c.len() - from).min(max);
+        (n > 0).then(|| &c[from..from + n])
+    }
+
     fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead {
         let Some(v) = self.volumes.get(&volume) else {
             return PackedRead::NotYet { len: u64::MAX - offset };
@@ -1672,6 +1708,21 @@ impl FeedDecoder {
             let left = (span.stream.end.min(lane.end) - lane.pos).min(buf.len() as u64) as usize;
             let (volume, packed) = (span.volume, span.packed_start + (lane.pos - span.stream.start));
             let piece_left = span.stream.end.min(lane.end) - lane.pos;
+            // plain stored output is written straight from bytes the source can lend: no copy
+            if matches!(self.cipher, StoredCipher::Plain) {
+                // at most a read's worth, as a read: the budget and cancellation are checked as often
+                let max = left;
+                if let Some(bytes) = source.borrow_packed(volume, packed, max) {
+                    if bytes.is_empty() || bytes.len() > max {
+                        return Err(FeedError::SourceContract("lent slice empty or past the request"));
+                    }
+                    let (at, n) = (lane.pos, bytes.len());
+                    lane.pos += n as u64;
+                    self.stats.packed_read += n as u64;
+                    self.emit(at, bytes, sink)?;
+                    continue;
+                }
+            }
             match source.read_packed(volume, packed, &mut buf[..left]) {
                 PackedRead::Data(n) => {
                     if n == 0 || n > left {

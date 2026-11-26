@@ -140,7 +140,11 @@ impl<'a> Extraction<'a> {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
         let relative = hooks.project(header, self.options.version_naming)?;
-        let meta = self.options.meta(Meta::from(header));
+        let meta = if header.is_dir() {
+            self.options.dir_meta(Meta::from(header))
+        } else {
+            self.options.meta(Meta::from(header))
+        };
         if header.is_dir() {
             let outcome = run.test(session, index, None)?;
             if !self.options.flatten && matches!(outcome, RarOutcome::Directory) {
@@ -1000,6 +1004,9 @@ mod tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         }
     }
 

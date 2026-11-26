@@ -45,6 +45,9 @@ pub(super) fn setup(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let context = EncryptedReadContext::for_projected(
         &mut s,
@@ -156,7 +159,7 @@ fn staged_crc_member_fault_then_good_requires_normal_retirement() {
     bad.crc = Some(1);
     let (_file, mut s, mut o, old) = setup(&[bad, Member::stored(b"good", b"good")]);
     drop(old);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     o.mode = Mode::Extract;
     o.dest = dest.path().to_path_buf();
     let mut c = EncryptedReadContext::for_projected(
@@ -197,7 +200,7 @@ fn staged_password_auth_size_and_member_cap_then_good() {
         bad.central_extra = &extra;
         let (_file, mut session, mut options, old) = setup(&[bad, Member::stored(b"good", b"good")]);
         drop(old);
-        let dest = tempfile::tempdir().unwrap();
+        let dest = super::tempdir();
         options.mode = Mode::Extract;
         options.dest = dest.path().to_path_buf();
         let overrides = if case == 3 {
@@ -250,7 +253,7 @@ fn structured_symlink_and_protected_block_then_good() {
         let (_file, mut session, mut options, old) =
             setup(&[Member::stored(b"blocked", b"bad"), Member::stored(b"good", b"good")]);
         drop(old);
-        let dest = tempfile::tempdir().unwrap();
+        let dest = super::tempdir();
         options.mode = Mode::Extract;
         options.overwrite = Overwrite::Always;
         options.dest = dest.path().to_path_buf();
@@ -375,7 +378,7 @@ fn directories_use_depth_then_original_ordinal_and_restore_zero() {
     let members = [dir(b"a/", 0), dir(b"b/", 0o710), dir(b"a/deep/", 0o700), dir(b"a/", 0o751), dir(b"zero/", 0)];
     let (_file, mut session, mut options, old) = setup(&members);
     drop(old);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     options.mode = Mode::Extract;
     options.dest = dest.path().to_path_buf();
     let mut context = EncryptedReadContext::for_projected(
@@ -415,7 +418,7 @@ fn directory_index_allocation_is_before_output_effects() {
     c.external = 0o040755 << 16;
     let (_file, mut session, mut options, old) = setup(&[a, b, c]);
     drop(old);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     options.mode = Mode::Extract;
     options.dest = dest.path().to_path_buf();
     let mut context = EncryptedReadContext::for_projected(
@@ -508,7 +511,7 @@ fn normal_member_retirement_admission_fault_keeps_owned_provenance() {
     bad.crc = Some(1);
     let (_file, mut session, mut options, old) = setup(&[bad]);
     drop(old);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     options.mode = Mode::Extract;
     options.dest = dest.path().to_path_buf();
     let mut context = EncryptedReadContext::for_projected(
@@ -564,7 +567,7 @@ fn actual_many_member_stage_helper_inventory() {
     let members = names.iter().map(|n| Member::stored(n.as_bytes(), b"data")).collect::<Vec<_>>();
     let (_file, mut session, mut options, old) = setup(&members);
     drop(old);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     options.mode = Mode::Extract;
     options.dest = dest.path().to_path_buf();
     let mut context = EncryptedReadContext::for_projected(
@@ -608,7 +611,7 @@ fn actual_sixteen_encrypted_members_fit_staged_source_allowance() {
         .collect::<Vec<_>>();
     let (file, _session, mut options, old) = setup(&members);
     drop(old);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     options.mode = Mode::Extract;
     options.dest = dest.path().to_path_buf();
     let result = crate::zip::run_with_policy(
@@ -635,7 +638,7 @@ fn actual_sixteen_encrypted_members_fit_staged_source_allowance() {
 fn record_refusal_precedes_stage_effect_and_activation_cannot_replay() {
     let (_file, mut session, mut options, old) = setup(&[Member::stored(b"a", b"a")]);
     drop(old);
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     options.mode = Mode::Extract;
     options.dest = root.path().join("not-created");
     let mut context = EncryptedReadContext::for_projected(
@@ -704,8 +707,8 @@ fn mixed_clear_aes_directory_and_large_aes_spool_inventory() {
     dir.external = 0o040755 << 16;
     let (_file, mut session, mut options, old) = setup(&[Member::stored(b"clear", b"abc"), a, dir, b]);
     drop(old);
-    let dest = tempfile::tempdir().unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
+    let temp = super::tempdir();
     options.mode = Mode::Extract;
     options.dest = dest.path().to_path_buf();
     let mut context = EncryptedReadContext::for_projected(

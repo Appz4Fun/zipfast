@@ -212,6 +212,85 @@ pub struct Options {
     /// "Data Error"; with [`Self::keep_broken`] the file stays). Off (the default) it is passed over as lacking its
     /// start (`RarSkipReason::MissingStart`). [`Self::restart_from_first_volume`] goes back for the start instead.
     pub attempt_continued_members: bool,
+    /// A ZIP whose end record is missing (one file cut short, not a split or spanned set) is read by walking its
+    /// local headers, as 7-Zip 26.06 does: the members whose headers lie before the cut are tested or extracted, the
+    /// one the cut reaches fails as truncated (kept with [`Self::keep_broken`]), and the run reports the archive
+    /// truncated. Off (the default) such a file is refused as not a ZIP archive, because this reads what the checked
+    /// route (which needs the central directory) refuses. An archive whose central directory is found is read as
+    /// ever.
+    pub salvage_truncated_zip: bool,
+    /// Which permission bits the files and folders a run writes get from the archive: the stored ones (the default),
+    /// or those narrowed by a file-creation mask, as 7-Zip 26.06 on Unix sets them. See [`UnixModes`].
+    ///
+    /// Honoured by the whole-archive runners for RAR, 7z, ZIP (legacy and checked) and tar, and by
+    /// [`crate::rar5::session::RarSession`] extraction.
+    pub unix_modes: UnixModes,
+    /// What a `\` in a member name is: a folder separator or a character of the name, as each format's own tools read
+    /// it (the default), or a character of the name in every format but RAR 4.x, as 7-Zip 26.06 on Unix reads it.
+    /// See [`Backslashes`].
+    pub backslashes: Backslashes,
+}
+
+/// The permission bits a run gives what it writes; see [`Options::unix_modes`]. A member without stored Unix
+/// permissions gets what the system's own file creation gives either way (`0o666` or `0o777` less the process's
+/// umask).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UnixModes {
+    /// The archive's permission bits as stored, without the setuid, setgid and sticky bits (`mode & 0o777`).
+    #[default]
+    Stored,
+    /// The stored bits narrowed by `umask`, the caller's file-creation mask, as 7-Zip 26.06 on Unix sets them:
+    /// `mode & 0o777 & !umask` for a file, and `(mode | 0o700) & 0o777 & !umask` for a folder (7-Zip must be able
+    /// to write into it). Never setuid, setgid or sticky.
+    Masked { umask: u32 },
+}
+
+impl UnixModes {
+    /// The bits a file with stored `mode` is given.
+    pub(crate) fn file(self, mode: u32) -> u32 {
+        match self {
+            Self::Stored => mode & 0o777,
+            Self::Masked { umask } => mode & 0o777 & !umask,
+        }
+    }
+
+    /// The bits a folder with stored `mode` is given.
+    pub(crate) fn folder(self, mode: u32) -> u32 {
+        match self {
+            Self::Stored => mode & 0o777,
+            Self::Masked { umask } => (mode | 0o700) & 0o777 & !umask,
+        }
+    }
+}
+
+/// What a `\` in a member name is; see [`Options::backslashes`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Backslashes {
+    /// As each format's own tools read it: a folder separator in a ZIP name written on Windows (whose drive letter
+    /// is refused and whose `<>:"|?*` are written `_`), in a RAR 4.x name and in a 7z name; written `_` in a RAR 5.0
+    /// name written on Windows; a character of the name otherwise.
+    #[default]
+    ByFormat,
+    /// A character of the name in ZIP, 7z and RAR 5.0 names whatever system made the archive, as 7-Zip 26.06 on Unix
+    /// reads it: a ZIP name written on Windows is then read as one written on Unix, `<>:"|?*` and a leading `c:`
+    /// kept as written. RAR 4.x names still separate folders with `\`, as 7-Zip reads them too. Only `/` then
+    /// separates folders, so a name like `..\x` is the single name `..\x`, never a step out of the destination.
+    /// Honoured on Unix only: on Windows a `\` is a separator whatever this says.
+    Literal,
+}
+
+impl Options {
+    /// Whether a `\` is a character of a ZIP, 7z or RAR 5.0 name (see [`Backslashes::Literal`]).
+    pub(crate) fn literal_backslashes(&self) -> bool {
+        cfg!(unix) && self.backslashes == Backslashes::Literal
+    }
+
+    /// Whether a ZIP name from `host` (the high byte of "version made by") is read as written on Windows.
+    pub(crate) fn zip_windows_names(&self, host: u8) -> bool {
+        host != 3 && !self.literal_backslashes()
+    }
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -409,6 +488,9 @@ impl MemberRef<'_> {
 ///     replace_placed_links: false,
 ///     keep_broken: false,
 ///     attempt_continued_members: false,
+///     salvage_truncated_zip: false,
+///     unix_modes: Default::default(),
+///     backslashes: Default::default(),
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -535,9 +617,23 @@ impl Options {
             .is_none_or(|filter| filter.selects(&MemberRef { name, raw_name: None, is_dir, ordinal, version }))
     }
 
-    /// `meta` with [`Self::fallback_mtime`] as its time when it has none.
+    /// `meta` for a file: [`Self::fallback_mtime`] as its time when it has none, and its mode as
+    /// [`Self::unix_modes`] gives it.
     pub(crate) fn meta(&self, meta: Meta) -> Meta {
-        meta.or_time(self.fallback_mtime)
+        let mut meta = meta.or_time(self.fallback_mtime);
+        if self.unix_modes != UnixModes::Stored {
+            meta.mode = meta.mode.map(|mode| self.unix_modes.file(mode));
+        }
+        meta
+    }
+
+    /// [`Self::meta`] for a folder.
+    pub(crate) fn dir_meta(&self, meta: Meta) -> Meta {
+        let mut meta = meta.or_time(self.fallback_mtime);
+        if self.unix_modes != UnixModes::Stored {
+            meta.mode = meta.mode.map(|mode| self.unix_modes.folder(mode));
+        }
+        meta
     }
 
     /// Whether an extracting RAR run writes older file revisions ([`MemberFilter::with_versions`]).
@@ -1465,6 +1561,9 @@ pub(crate) enum LegacyRoute {
     /// A raw byte-split ZIP (`name.zip.001`, `name.zip.002`, ...) or an Info-ZIP spanned set (`name.z01`, ...,
     /// `name.zip`), read as the pieces concatenated.
     SplitZip,
+    /// One ZIP file whose end record the checked route can't find (cut short), read by walking its local headers:
+    /// only with [`Options::salvage_truncated_zip`].
+    TruncatedZip,
     Rar {
         signature: crate::rar5::reader::HeldSignature,
         path: PathBuf,
@@ -1549,10 +1648,13 @@ impl LegacyRoute {
                 let limits = crate::sevenzip::SevenZipLimits::default();
                 crate::sevenzip::run_reporting(first, options, password, cancel, &limits, report)
             }
-            Self::SplitZip => {
+            Self::SplitZip | Self::TruncatedZip => {
                 cancel.check_io().map_err(Error::from)?;
                 if options.mode == Mode::Extract {
                     fs::create_dir_all(&options.dest).map_err(Error::from)?;
+                }
+                if matches!(self, Self::TruncatedZip) {
+                    return crate::zip::run_truncated(first, options, password, Some(cancel), report);
                 }
                 crate::zip::run_renaming(first, options, password, Some(cancel), report)
             }
@@ -1571,6 +1673,7 @@ impl LegacyRoute {
             Self::Tar => crate::tar::list(first),
             Self::SevenZip => crate::sevenzip::list(first, password),
             Self::SplitZip => crate::zip::list(first),
+            Self::TruncatedZip => crate::zip::list_truncated(first),
             Self::Rar { signature, .. } => {
                 rar_list_from_volume(Volume::from_held_signature(first, signature, password)?, password)
             }
@@ -2049,7 +2152,7 @@ impl SelectedEntry {
                     cancel,
                 });
             }
-            CheckedRoute::Legacy(LegacyRoute::SplitZip) => {
+            CheckedRoute::Legacy(LegacyRoute::SplitZip | LegacyRoute::TruncatedZip) => {
                 let (archive, windows_names, meta) =
                     split_zip_selected(path, index, max_bytes, &cancel).map_err(ReadFault::Legacy)?;
                 return Ok(Self {
@@ -2493,18 +2596,22 @@ pub struct Listing {
     /// missing another volume, whose `entries` are all those its central directory lists. 7-Zip prints "Unexpected
     /// end of archive" (or "Missing volume") and exits nonzero here.
     pub missing_volume: Option<PathBuf>,
+    /// One ZIP file cut short, its end record gone, listed from its local headers before the cut
+    /// ([`crate::zip::list_detailed_with_options`] with [`Options::salvage_truncated_zip`]). 7-Zip prints "Unexpected
+    /// end of archive" and exits nonzero here.
+    pub truncated: bool,
 }
 
 impl Listing {
     /// Whether the archive ended before it should have (7-Zip's "Unexpected end of archive").
     pub fn unexpected_end(&self) -> bool {
-        self.missing_volume.is_some()
+        self.missing_volume.is_some() || self.truncated
     }
 }
 
 /// [`list_with_password`], with the listing's warnings.
 pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
-    let whole = |entries| Listing { entries, missing_volume: None };
+    let whole = |entries| Listing { entries, missing_volume: None, truncated: false };
     match sniff(first)? {
         Format::Zip => return crate::zip::list_detailed(first),
         Format::Tar => return crate::tar::list(first).map(whole),
@@ -2599,7 +2706,12 @@ pub fn run_with_zip_policy(
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
     match checked_route(first, cancel)? {
         CheckedRoute::Zip(opened) => crate::zip::read::with_opened_policy(
-            opened.into_zip_projected(cancel)?,
+            match opened.into_zip_projected(cancel) {
+                Err(error) if salvages_truncated(first, options, &error) => {
+                    return legacy_zip_report(LegacyRoute::TruncatedZip, first, options, password, cancel, observe);
+                }
+                opened => opened?,
+            },
             options,
             password,
             cancel,
@@ -2622,7 +2734,12 @@ pub fn run_with_zip_context(
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
     match checked_route(first, cancel)? {
         CheckedRoute::Zip(opened) => crate::zip::read::with_opened_context(
-            opened.into_zip_projected(cancel)?,
+            match opened.into_zip_projected(cancel) {
+                Err(error) if salvages_truncated(first, options, &error) => {
+                    return legacy_zip_report(LegacyRoute::TruncatedZip, first, options, password, cancel, observe);
+                }
+                opened => opened?,
+            },
             options,
             password,
             cancel,
@@ -2631,6 +2748,17 @@ pub fn run_with_zip_context(
         ),
         CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, cancel, observe),
     }
+}
+/// [`Options::salvage_truncated_zip`]: the checked route found no end record (and nothing else went wrong: no
+/// cleanup fault, no source change) in one file, not a split set, that starts with a local header. It is then read
+/// by walking its local headers ([`LegacyRoute::TruncatedZip`]); an intact archive never gets here.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn salvages_truncated(first: &Path, options: &Options, error: &crate::zip::ZipReadError) -> bool {
+    options.salvage_truncated_zip
+        && matches!(error.operation(), Some(crate::zip::ReadFault::CheckedFormat { reason: "not a ZIP archive" }))
+        && error.cleanup_errors().len() == 0
+        && !error.is_source_changed()
+        && crate::zip::salvageable(first)
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
@@ -3280,10 +3408,10 @@ impl From<&FileHeader> for Checks {
 }
 
 impl Checks {
-    /// [`Checks::from`], with `fallback` as the time restored when the header has none.
-    fn with_fallback(h: &FileHeader, fallback: Option<SystemTime>) -> Self {
+    /// [`Checks::from`], with the time and mode `opts` restore ([`Options::meta`]).
+    fn with_options(h: &FileHeader, opts: &Options) -> Self {
         let mut checks = Checks::from(h);
-        checks.meta = checks.meta.or_time(fallback);
+        checks.meta = opts.meta(checks.meta);
         checks
     }
 }
@@ -3875,6 +4003,9 @@ fn rar_read_at(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -4371,7 +4502,9 @@ impl Run<'_, '_, '_> {
         // (`h.name` was moved into `ctx`)
         let output = crate::path::rar_output_name(&ctx.entry.name, h.format == RarFormat::Rar4).map(|name| {
             // a RAR 5.0 name separates folders with `/` only: a Windows-made `\\` is a name character, written `_`
-            if h.format != RarFormat::Rar4 && h.is_windows() && name.contains('\\') {
+            // (kept as it is under `Options::backslashes`)
+            if h.format != RarFormat::Rar4 && h.is_windows() && name.contains('\\') && !self.opts.literal_backslashes()
+            {
                 std::borrow::Cow::Owned(name.replace('\\', "_"))
             } else {
                 name
@@ -4396,7 +4529,7 @@ impl Run<'_, '_, '_> {
         } else {
             match crate::path::sanitize_with(
                 output.as_deref().unwrap_or(&ctx.entry.name),
-                !h.is_unix(),
+                !h.is_unix() && !(h.format != RarFormat::Rar4 && self.opts.literal_backslashes()),
                 self.opts.windows_safe_names,
             ) {
                 Ok(rel) => rel,
@@ -4433,7 +4566,7 @@ impl Run<'_, '_, '_> {
                     self.fail_in_order(&ctx, failure, why)?;
                     return Ok(());
                 }
-                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.meta(Meta::from(h))));
+                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.dir_meta(Meta::from(h))));
             }
             return self.reports.directory(&ctx);
         }
@@ -4461,7 +4594,13 @@ impl Run<'_, '_, '_> {
         // a member decoded to a caller's sink is never a link placed or checked here
         if let Some(redirection) = h.redirection.as_ref().filter(|_| self.selection.is_none())
             && let Some(kind) =
-                link::from_rar5(redirection, !h.is_unix(), self.opts.windows_safe_names, self.opts.flatten)
+                // a target is an earlier member's name, mapped as member names are (Options::backslashes too)
+                link::from_rar5(
+                    redirection,
+                    !h.is_unix() && !self.opts.literal_backslashes(),
+                    self.opts.windows_safe_names,
+                    self.opts.flatten,
+                )
         {
             return self.rar5_link(vol, h, ctx, &rel, kind);
         }
@@ -4820,7 +4959,7 @@ impl Run<'_, '_, '_> {
         if let Some(key) = p.key.clone() {
             self.queued_paths.insert(key);
         }
-        let checks = Checks::with_fallback(h, self.opts.fallback_mtime);
+        let checks = Checks::with_options(h, self.opts);
         self.queued.push_back((p, checks));
         let mut stream = self.stream.take();
         let mut books = Books {
@@ -5199,7 +5338,7 @@ impl Run<'_, '_, '_> {
                 landing: &mut self.landing,
                 dest: &self.opts.dest,
             },
-            &Checks::with_fallback(h, self.opts.fallback_mtime),
+            &Checks::with_options(h, self.opts),
             p,
         )
     }

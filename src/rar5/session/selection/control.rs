@@ -54,6 +54,13 @@ impl Default for RarExtractControlLimits {
         }
     }
 }
+/// Limits on the proof work and storage that keep lending the diagnostic File safe.
+///
+/// [`Self::targets`], [`Self::parents`], [`Self::capacity`] and [`Self::work`] left at their defaults are floors that
+/// grow, when the run is prepared, with what the selection justifies: its member count, and the length and depth of
+/// each member's absolute target path (each counted up to `PATH_MAX`, the longest path a probe can name). They stay
+/// bounded by the selection, so by the archive's catalogue ([`crate::rar5::session::RarCatalogueLimits`]). Any other value is an
+/// exact limit.
 #[derive(Clone, Copy, Debug)]
 pub struct RarDiagnosticLimits {
     pub targets: u64,
@@ -64,14 +71,24 @@ pub struct RarDiagnosticLimits {
     pub io_attempts: u64,
     pub checkpoint_attempts: u64,
 }
+impl RarDiagnosticLimits {
+    /// The default [`Self::targets`], which scales with the selection.
+    pub const DEFAULT_TARGETS: u64 = 65536;
+    /// The default [`Self::parents`], which scales with the selection.
+    pub const DEFAULT_PARENTS: u64 = 131072;
+    /// The default [`Self::capacity`], which scales with the selection.
+    pub const DEFAULT_CAPACITY: u64 = 64 << 20;
+    /// The default [`Self::work`], which scales with the selection.
+    pub const DEFAULT_WORK: u64 = 1 << 30;
+}
 impl Default for RarDiagnosticLimits {
     fn default() -> Self {
         Self {
-            targets: 65536,
-            parents: 131072,
-            capacity: 64 << 20,
+            targets: Self::DEFAULT_TARGETS,
+            parents: Self::DEFAULT_PARENTS,
+            capacity: Self::DEFAULT_CAPACITY,
             open_handles: 8,
-            work: 1 << 30,
+            work: Self::DEFAULT_WORK,
             io_attempts: 1 << 24,
             checkpoint_attempts: 1 << 20,
         }
@@ -311,6 +328,8 @@ pub struct RarExtractControl {
     diagnostic: Option<File>,
     overwrite: RarOverwriteMode,
     limits: RarExtractControlLimits,
+    /// The diagnostic limits in force: `limits.diagnostics`, with its defaults scaled to the prepared run.
+    diagnostics: RarDiagnosticLimits,
     usage: RarExtractControlUsage,
     state: RarDiagnosticState,
     failure: Option<RarDiagnosticFailure>,
@@ -325,6 +344,7 @@ impl RarExtractControl {
             diagnostic,
             overwrite,
             limits,
+            diagnostics: limits.diagnostics,
             state: RarDiagnosticState::PendingTargets,
             failure: None,
             teardown_failure: None,
@@ -361,6 +381,7 @@ impl RarExtractControl {
         self.usage =
             RarExtractControlUsage { diagnostic_files: u64::from(self.diagnostic.is_some()), ..Default::default() };
         self.state = RarDiagnosticState::PendingTargets;
+        self.diagnostics = self.limits.diagnostics;
         self.teardown_failure = None;
         Ok(aftermath)
     }

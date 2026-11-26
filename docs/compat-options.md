@@ -17,6 +17,9 @@ restart_from_first_volume: false,
 replace_placed_links: false,
 keep_broken: false,
 attempt_continued_members: false,
+salvage_truncated_zip: false,
+unix_modes: Default::default(),
+backslashes: Default::default(),
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -197,3 +200,27 @@ it is extracted from what this volume holds and fails: a stored member writes th
 ("CRC Failed": `win-oldvol.r00` `split.bin`), a compressed one fails without decoding ("Data Error":
 `multi.part2.rar` `file2.txt`). With `keep_broken` the file stays, matching 7-Zip's tree; the run's later members come
 out as usual. (`restart_from_first_volume`, UnRAR's behaviour, goes back for the start instead.)
+
+## `salvage_truncated_zip`: a ZIP cut short, read from its local headers
+
+A single ZIP file cut short (`head -c 30000` of an archive holding one 50,000-byte deflated member) has lost its
+central directory and end record. By default zipfast refuses it as not a ZIP archive (`ReadFault::CheckedFormat`,
+`Error::NotAnArchive` from `extract::run`), because the checked route needs the central directory. 7-Zip 26.06 walks
+the local headers from the start instead: it extracts what it can, says "Unexpected end of archive" and exits 2, and
+`7zz x` keeps 29,955 bytes of the cut member.
+
+With `Options::salvage_truncated_zip`, when the checked route finds no end record (and nothing else went wrong) in one
+file that starts with a local header (or the spanning marker before one), and is not a split or spanned set, the file
+is read by walking its local headers (`LegacyRoute::TruncatedZip`, the walk byte-split sets cut short already use):
+
+- the members whose local headers lie before the cut are tested or extracted;
+- the one the cut reaches fails as `archive is truncated` (not "missing volume"), and keeps what decoded with
+  `keep_broken`; without it the partial file is removed;
+- the run then reports `archive is truncated` as a `LegacyError`, as a byte-split set cut short reports its missing
+  piece.
+
+Events come as for other legacy runs (`LegacyDiagnostic`, `LegacyError`). An archive whose end record is found is read
+on the checked route as ever, option or not. `extract::run` honours the option too, and
+`zip::list_detailed_with_options` lists such a file (`Listing::truncated`, `Listing::unexpected_end`). The other
+listings (`inspect_projected_cancelable`, `zipfast l`) and `SelectedEntry` take no `Options` and still refuse it.
+`tests/zip_salvage_truncated.rs` checks each point.

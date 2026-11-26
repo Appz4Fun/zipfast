@@ -117,7 +117,7 @@ fn namespace_trust_and_swap_boundaries() {
     use std::os::unix::fs::PermissionsExt;
     let cancel = crate::extract::Cancellation::default();
     for mode in [0o700, 0o755, 0o777, 0o1777] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::tempdir();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
         let (ledger, _) = ledger(0);
         let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
@@ -132,7 +132,7 @@ fn namespace_trust_and_swap_boundaries() {
     }
     // A detected link/mode change before unlink prevents any usable owner.
     for change_links in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::tempdir();
         let path = temp.path().to_owned();
         let (ledger, _) = ledger(0);
         let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
@@ -377,7 +377,7 @@ fn collisions_are_exclusive_finite_and_per_namespace() {
 fn observed_name_swap_refuses_unlink_and_preserves_replacement() {
     use std::cell::Cell;
     use std::rc::Rc;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let path = temp.path().to_owned();
     let changed = Rc::new(Cell::new(false));
     let flag = changed.clone();
@@ -549,7 +549,7 @@ fn partial_named_cleanup_preserves_stat_and_unlink_operation_labels() {
     for fail_stat in [true, false] {
         let cancel = crate::extract::Cancellation::default();
         let (ledger, _) = ledger(0);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::tempdir();
         let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
         let unlinks = Rc::new(Cell::new(0));
         let seen_unlinks = unlinks.clone();
@@ -606,7 +606,7 @@ fn partial_cleanup_policy_refusal_is_a_stat_without_an_unlink_retry() {
     use std::{cell::Cell, os::unix::fs::PermissionsExt, rc::Rc};
     let cancel = crate::extract::Cancellation::default();
     let (ledger, _) = ledger(0);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let path = temp.path().to_owned();
     let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
     let unlinks = Rc::new(Cell::new(0));
@@ -637,4 +637,37 @@ fn partial_cleanup_policy_refusal_is_a_stat_without_an_unlink_retry() {
         assert_eq!(s.encrypted.usage.live_spool_bytes, 1);
         assert_eq!(s.run.usage.emergency_cleanup, 1);
     });
+}
+
+/// prybar: a temporary directory others may write in (as umask 002 leaves one) is refused with a typed reason naming
+/// it as the spool's directory, not a generic identity fault; with the sticky bit (as /tmp) it is used.
+#[test]
+fn an_untrusted_spool_directory_is_refused_with_its_reason() {
+    use std::os::unix::fs::PermissionsExt;
+    for (mode, refused) in [(0o777, true), (0o775, true), (0o1777, false), (0o700, false)] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let cancel = crate::extract::Cancellation::default();
+        let (ledger, _) = ledger(0);
+        let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
+        let result =
+            spool::OwnedCiphertext::copy(&ledger, &directory, &mut std::io::repeat(1), 1, &mut [0; 64], &cancel);
+        match result {
+            Err(error) => {
+                assert!(refused, "{mode:o}: {error:?}");
+                assert!(
+                    matches!(
+                        error.operation(),
+                        Some(ReadFault::UntrustedDirectory {
+                            object: OwnedObject::CiphertextDirectory,
+                            reason: DirectoryDistrust::OthersMayWrite
+                        })
+                    ),
+                    "{mode:o}: {error:?}"
+                );
+            }
+            Ok(_) => assert!(!refused, "{mode:o} accepted"),
+        }
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }
