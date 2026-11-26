@@ -198,6 +198,14 @@ pub enum ReadFault {
     },
     UnsupportedCheckedFormat,
     UnsupportedIdentity,
+    /// A directory the read stages or spools in was refused before anything was created in it: `object` says which
+    /// ([`OwnedObject::CiphertextDirectory`], the temporary directory encrypted data spools in, or
+    /// [`OwnedObject::OutputParent`] and the like, where output is staged), `reason` why. Typically a temporary
+    /// directory that is group- or world-writable without the sticky bit (as under umask 002).
+    UntrustedDirectory {
+        object: OwnedObject,
+        reason: DirectoryDistrust,
+    },
     UnsupportedStorage,
     UnsupportedMethod {
         method: u16,
@@ -236,6 +244,28 @@ pub enum CloseDisposition {
     Unresolved,
     NotApplicable,
 }
+/// Why [`ReadFault::UntrustedDirectory`] refused a directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DirectoryDistrust {
+    /// it is not a directory
+    NotADirectory,
+    /// it belongs to another user (neither this process's user nor root)
+    OtherOwner,
+    /// group- or world-writable without the sticky bit: another user could replace what is staged there
+    OthersMayWrite,
+}
+
+impl fmt::Display for DirectoryDistrust {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotADirectory => "not a directory",
+            Self::OtherOwner => "owned by another user",
+            Self::OthersMayWrite => "group- or world-writable without the sticky bit",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum OwnedObject {
