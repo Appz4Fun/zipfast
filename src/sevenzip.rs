@@ -720,6 +720,8 @@ mod header_key_tests {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let whole = compressions(|| {
             let summary = run(first, &options, Some("password"), &cancel, &limits, |_| {}).unwrap();

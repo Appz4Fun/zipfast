@@ -2077,7 +2077,7 @@ fn run_tar(
                 if opts.mode == Mode::Extract && !opts.flatten {
                     if let Some(staged) = &mut staged {
                         staged.budget.record(&m.name)?;
-                        let meta = opts.meta(m.meta());
+                        let meta = opts.dir_meta(m.meta());
                         staged.members.push(StagedMember::Directory {
                             relative: rel,
                             meta,
@@ -2090,7 +2090,7 @@ fn run_tar(
                         fail_member(summary, report, position, &m.name, why, Error::UnsafePath(m.name.clone()));
                         continue;
                     }
-                    summary.dir_meta.push((opts.dest.join(&rel), opts.meta(m.meta())));
+                    summary.dir_meta.push((opts.dest.join(&rel), opts.dir_meta(m.meta())));
                 }
                 folder(summary, report, position, &m.name);
                 continue;
@@ -2560,6 +2560,8 @@ mod tests {
                 keep_broken: false,
                 attempt_continued_members: false,
                 salvage_truncated_zip: false,
+                unix_modes: Default::default(),
+                backslashes: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);
@@ -2626,6 +2628,8 @@ mod tests {
                 keep_broken: false,
                 attempt_continued_members: false,
                 salvage_truncated_zip: false,
+                unix_modes: Default::default(),
+                backslashes: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);

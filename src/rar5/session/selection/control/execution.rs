@@ -47,8 +47,15 @@ impl RarSession {
             }
             let mut extraction = Extraction::new(options);
             extraction.versions = selection.takes_versions();
-            let mut driver =
-                Driver { extraction, control, observer, retained: 0, event_bytes: 0, source_paths: Vec::new() };
+            let mut driver = Driver {
+                extraction,
+                control,
+                observer,
+                retained: 0,
+                event_bytes: 0,
+                source_paths: Vec::new(),
+                reported: [0; VOLUME_WORDS],
+            };
             let result = self.execute_driver(selection, decode, &mut driver);
             // I2: only the incumbent drain body is exempt from the new control ceilings.
             driver.control.close_parent();
@@ -80,6 +87,8 @@ struct Driver<'a, O: ?Sized> {
     retained: u64,
     event_bytes: u64,
     source_paths: Vec<Vec<u8>>,
+    /// The volumes the member about to be reported depends on ([`member_volumes`]), checked after its callback.
+    reported: VolumeSet,
 }
 impl<O: RarExtractObserver + ?Sized> SelectedDriver for Driver<'_, O> {
     fn prepare(&mut self, session: &RarSession) -> Result<(), SelectedStop> {
@@ -145,12 +154,17 @@ impl<O: RarExtractObserver + ?Sized> SelectedDriver for Driver<'_, O> {
         };
         let result = self.extraction.member_controlled(run, session, index, entry, &mut hooks);
         drop(hooks);
+        self.reported = member_volumes(run, session, index);
         self.control.usage.capacity = add_capacity(self.retained, self.event_bytes)?;
         result
     }
     fn entry(&mut self, event: &RarEntryOutcome, session: &mut RarSession) -> Result<(), SelectedStop> {
         self.observer.entry(event, RarDiagnostic { control: self.control, sources: Some(&session.volumes) });
-        sources(self.control, session, &self.source_paths)?;
+        // Only the reported member's volumes: a volume no member has read yet has affected no output, and the
+        // member that reads it checks it first (the native route's `check_volumes` before and after decoding, and
+        // this control's checks around each of that member's callbacks). Checking the whole set here made a run
+        // quadratic in its volumes.
+        sources(self.control, session, &self.source_paths, &self.reported)?;
         self.control.usage.capacity = self.retained;
         self.event_bytes = 0;
         Ok(())
@@ -168,12 +182,27 @@ fn linear_work(bytes: usize, passes: u64) -> Result<u64, RarExtractControlError>
 fn add_capacity(a: u64, b: u64) -> Result<u64, RarExtractControlError> {
     a.checked_add(b).ok_or(RarExtractControlError::CounterOverflow)
 }
-fn sources(control: &mut RarExtractControl, session: &mut RarSession, paths: &[Vec<u8>]) -> Result<(), SelectedStop> {
+/// Check that each volume in `volumes` is still the file the session opened, through its held descriptor and its
+/// path, charging the control for each. A failure binds the session: every later check fails too.
+fn sources(
+    control: &mut RarExtractControl,
+    session: &mut RarSession,
+    paths: &[Vec<u8>],
+    volumes: &VolumeSet,
+) -> Result<(), SelectedStop> {
     check_cancel(&session.options.cancel).map_err(|e| SelectedStop::Native(Arc::from(e.failure)))?;
     if let Some(failure) = &session.invalid_binding {
         return Err(SelectedStop::Native(Arc::clone(failure)));
     }
-    for (i, path) in paths.iter().enumerate() {
+    let marked = volumes.iter().copied().enumerate().flat_map(|(word, mut bits)| {
+        std::iter::from_fn(move || {
+            let bit = (bits != 0).then(|| bits.trailing_zeros() as usize)?;
+            bits &= bits - 1;
+            Some(word * 64 + bit)
+        })
+    });
+    for i in marked {
+        let Some(path) = paths.get(i) else { continue };
         control.native_charge(RarResource::ExtractControlWork, add_capacity(path.len() as u64, 1)?)?;
         let volume = &session.volumes[i];
         let result = (|| {
@@ -568,6 +597,7 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
     fn complete_directory(
         &mut self,
         session: &mut RarSession,
+        volumes: &VolumeSet,
         root: &Path,
         path: &Path,
         identity: (u64, u64),
@@ -575,7 +605,9 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
         if !self.trailing_directory_fallback {
             return Ok(None);
         }
-        sources(self.control, session, self.source_paths)?;
+        // `volumes`: the folder's own parts. A folder publishes no data, so no other volume can affect it; any
+        // volume a later member reads is checked by that member.
+        sources(self.control, session, self.source_paths, volumes)?;
         self.directory_binding(root, path, identity)?;
         // Preparation has created the terminal slash's prefix. Reproduce the
         // actual final native attempt; only its EEXIST is a member failure.
@@ -594,7 +626,7 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
                 return Err(self.directory_uncertain());
             }
         };
-        sources(self.control, session, self.source_paths)?;
+        sources(self.control, session, self.source_paths, volumes)?;
         self.directory_binding(root, path, identity)?;
         Ok(Some(failure))
     }
@@ -605,6 +637,7 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
     fn replace(
         &mut self,
         session: &mut RarSession,
+        volumes: &VolumeSet,
         entry: &RarEntryIdentity,
         target: &Path,
         initial: Option<SourceStamp>,
@@ -631,17 +664,20 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
                     .map_err(SelectedStop::Decision)?
             }
         };
-        sources(self.control, session, self.source_paths)?;
+        // the member's own parts and solid history: what it has read and will read before publishing
+        sources(self.control, session, self.source_paths, volumes)?;
         self.binding(target, Some(initial))?;
         Ok(decision == RarOverwriteDecision::Replace)
     }
     fn recheck(
         &mut self,
         session: &mut RarSession,
+        volumes: &VolumeSet,
         target: &Path,
         initial: Option<SourceStamp>,
     ) -> Result<(), SelectedStop> {
-        sources(self.control, session, self.source_paths)?;
+        // exactly the volumes the native route just checked for this publication
+        sources(self.control, session, self.source_paths, volumes)?;
         self.binding(target, initial)
     }
     fn release_parent(&mut self) {
@@ -722,6 +758,8 @@ mod tests {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         }
     }
     struct Fault {
@@ -979,6 +1017,8 @@ mod directory_fault_tests {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1063,6 +1103,8 @@ mod trailing_directory_tests {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

@@ -433,6 +433,8 @@ pub(super) fn print(
         keep_broken: false,
         attempt_continued_members: false,
         salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};
@@ -595,10 +597,13 @@ impl Run<'_> {
 
     /// Where a member is to go, or None when it is not written (already reported). Folders above it are made.
     fn place(&mut self, member: &MapMember, name: &str) -> Outcome<Option<(PathBuf, Option<Place>)>> {
-        if member.is_dir && crate::path::names_root(name) {
+        if member.is_dir && crate::path::names_root_with(name, !self.opts.literal_backslashes()) {
             return Ok(None);
         }
-        let rel = match crate::path::sanitize_with(&name.replace('\\', "/"), false, self.opts.windows_safe_names) {
+        // as 7-Zip writes 7z names: a `\` separates folders too, unless `Options::backslashes` keeps it in the name
+        let written: std::borrow::Cow<'_, str> =
+            if self.opts.literal_backslashes() { name.into() } else { name.replace('\\', "/").into() };
+        let rel = match crate::path::sanitize_with(&written, false, self.opts.windows_safe_names) {
             Ok(rel) => rel,
             Err(e) => {
                 self.fail(name, &e.to_string());
@@ -687,7 +692,7 @@ impl Run<'_> {
                     self.fail(&name, why);
                     return Ok(());
                 }
-                self.summary.dir_meta.push((self.opts.dest.join(&rel), self.opts.meta(meta(member))));
+                self.summary.dir_meta.push((self.opts.dest.join(&rel), self.opts.dir_meta(meta(member))));
             }
             self.summary.dirs += 1;
             self.report.member(LegacyMember::Succeeded { ordinal: self.current, name: &name, bytes: 0 });

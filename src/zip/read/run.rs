@@ -308,7 +308,7 @@ impl ProjectedReadSession {
                             let entry = &self.owner.entries[ordinal];
                             let depth = entry
                                 .name
-                                .split(|c| c == '/' || entry.host != 3 && c == '\\')
+                                .split(|c| c == '/' || options.zip_windows_names(entry.host) && c == '\\')
                                 .filter(|part| !part.is_empty() && *part != ".")
                                 .count();
                             index.push_bounded((ordinal, depth))?;
@@ -595,13 +595,14 @@ impl ProjectedReadSession {
         if e.is_link() {
             return self.link_member(ordinal, options, password, cancel, context, links);
         }
-        let relative = match policy::PolicyPath::normalized(&context.ledger, &e.name, e.host != 3, cancel) {
-            Ok(path) => path,
-            Err(policy::PathFailure::Unsafe) => {
-                return (Err(ReadFault::CheckedFormat { reason: "invalid ZIP target name" }.into()), false, true);
-            }
-            Err(policy::PathFailure::Fault(f)) => return (Err(f.into()), false, false),
-        };
+        let relative =
+            match policy::PolicyPath::normalized(&context.ledger, &e.name, options.zip_windows_names(e.host), cancel) {
+                Ok(path) => path,
+                Err(policy::PathFailure::Unsafe) => {
+                    return (Err(ReadFault::CheckedFormat { reason: "invalid ZIP target name" }.into()), false, true);
+                }
+                Err(policy::PathFailure::Fault(f)) => return (Err(f.into()), false, false),
+            };
         let mut local_refusal = false;
         let mut result = (|| -> ZipReadResult<bool> {
             let e = &self.owner.entries[ordinal];
@@ -616,17 +617,18 @@ impl ProjectedReadSession {
             }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
-                let mode = e.unix_mode();
+                let mode = e.unix_mode().map(|mode| options.unix_modes.file(mode));
                 let mtime = e.mtime.map(|s| (s, e.nanos));
+                let windows_names = options.zip_windows_names(e.host);
+                let mut entry = self.stage_entry(ordinal)?;
+                // As `Options::unix_modes` and `Options::backslashes` give them, for the staged name check and the
+                // mode published.
+                entry.mode = mode;
+                entry.windows_names = windows_names;
                 // The start hook (`MemberFilter::on_start`) is asked inside staging, once the target checks passed
                 // and before anything is staged or decoded (see `output::file::acquire`).
-                let (stage, blocked) = ZipReadStage::prepare_run_file(
-                    self.stage_entry(ordinal)?,
-                    relative.path(),
-                    options,
-                    cancel,
-                    context,
-                )?;
+                let (stage, blocked) =
+                    ZipReadStage::prepare_run_file(entry, relative.path(), options, cancel, context)?;
                 if let Some(fault) = blocked {
                     local_refusal = true;
                     return Err(fault.into());
@@ -635,18 +637,31 @@ impl ProjectedReadSession {
                     return Ok(true);
                 };
                 context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.backend = Some(stage.backend());
+                // Options::keep_broken: a member that fails on its own data (a wrong password, a CRC or a cut) keeps
+                // what was staged, published as a verified file would be (the same directory sync and rename
+                // handling), and is reported failed all the same; a canceled run publishes nothing
+                let mut broken = None;
                 if let Err(error) =
                     self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel))
                 {
-                    return Err(if continued(&error) {
-                        stage.finish_member_error(error, context, cancel, |cx| self.check_source(cx))
+                    if continued(&error) && options.keep_broken && !cancel.is_canceled() {
+                        // boxed: the error is large (kilobytes), and it waits across publication
+                        broken = Some((Box::new(error), stage.written()));
                     } else {
-                        stage.finish_error(error, context)
-                    });
+                        return Err(if continued(&error) {
+                            stage.finish_member_error(error, context, cancel, |cx| self.check_source(cx))
+                        } else {
+                            stage.finish_error(error, context)
+                        });
+                    }
                 }
                 let bulk =
                     context.options.publication == Publication::Bulk && stage.backend() == StagedBackend::Portable;
-                let published = stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx));
+                let published = if broken.is_some() {
+                    stage.publish_broken(mode, mtime, cancel, context, |cx| self.check_source(cx))
+                } else {
+                    stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx))
+                };
                 if bulk && matches!(published, Ok(true)) {
                     // The published name's directory and every directory between it and the destination root, where
                     // the file really went: a flattened member lands in the root, and a relative destination is
@@ -669,7 +684,15 @@ impl ProjectedReadSession {
                 {
                     local_refusal = true;
                 }
-                published.map(|published| !published)
+                match (broken, published) {
+                    // kept: the member still fails, but its target now holds what was read
+                    (Some((error, written)), Ok(true)) => {
+                        Err((*error).with_publication(PublicationState::Published, written))
+                    }
+                    (Some((error, _)), Ok(false)) => Err(*error),
+                    (_, Err(error)) => Err(error),
+                    (None, Ok(published)) => Ok(!published),
+                }
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             Err(ReadFault::UnsupportedIdentity.into())
@@ -727,7 +750,8 @@ impl ProjectedReadSession {
         if let Err(error) = read {
             return (Err(error), false, false);
         }
-        let Ok(rel) = crate::path::sanitize_with(&name, host != 3, options.windows_safe_names) else {
+        let Ok(rel) = crate::path::sanitize_with(&name, options.zip_windows_names(host), options.windows_safe_names)
+        else {
             return refuse("invalid ZIP target name");
         };
         let rel = if options.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
@@ -789,15 +813,15 @@ impl ProjectedReadSession {
         }
         self.check_source(context)?;
         let entry = &self.owner.entries[ordinal];
-        if crate::path::names_root(&entry.name) {
+        if crate::path::names_root_with(&entry.name, !options.literal_backslashes()) {
             return Ok(());
         }
-        let relative = policy::PolicyPath::normalized(&context.ledger, &entry.name, entry.host != 3, cancel).map_err(
-            |failure| match failure {
-                policy::PathFailure::Unsafe => ReadFault::CheckedFormat { reason: "invalid ZIP directory name" },
-                policy::PathFailure::Fault(f) => f,
-            },
-        )?;
+        let relative =
+            policy::PolicyPath::normalized(&context.ledger, &entry.name, options.zip_windows_names(entry.host), cancel)
+                .map_err(|failure| match failure {
+                    policy::PathFailure::Unsafe => ReadFault::CheckedFormat { reason: "invalid ZIP directory name" },
+                    policy::PathFailure::Fault(f) => f,
+                })?;
         let mut result = self.directory_path(ordinal, relative.path(), options, cancel, context, finalizing);
         if let Err(fault) = relative.finish(&context.ledger) {
             result = Err(match result {
@@ -912,7 +936,7 @@ impl ProjectedReadSession {
                         Err(f) => return Err(f.into()),
                     }
                 }
-                if let Some(mode) = entry.unix_mode().map(|m| m & 0o777) {
+                if let Some(mode) = entry.unix_mode().map(|m| options.unix_modes.folder(m)) {
                     match op(ReadIoOperation::DescriptorMode, &mut || {
                         native_policy::cvt(unsafe { libc::chmod(path.as_ptr(), mode as libc::mode_t) })
                     }) {

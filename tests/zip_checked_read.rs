@@ -102,6 +102,8 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let error = extract::run_with_zip_policy(
             &first,
@@ -435,6 +437,8 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
                 keep_broken: false,
                 attempt_continued_members: false,
                 salvage_truncated_zip: false,
+                unix_modes: Default::default(),
+                backslashes: Default::default(),
             };
             let result = extract::run_with_zip_policy(
                 &path,
@@ -711,6 +715,8 @@ mod direct_completion {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         }
     }
     #[test]
@@ -879,6 +885,8 @@ mod direct_aliases {
                     keep_broken: false,
                     attempt_continued_members: false,
                     salvage_truncated_zip: false,
+                    unix_modes: Default::default(),
+                    backslashes: Default::default(),
                 };
                 let log_path = match alias {
                     0 => source.clone(),
@@ -998,6 +1006,8 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         macro_rules! refuse_completion {
             ($session:ident,$context:ident,$token:expr,$admit:expr,$emit:ident) => {{
@@ -1136,6 +1146,8 @@ mod protected_name_completion {
                             keep_broken: false,
                             attempt_continued_members: false,
                             salvage_truncated_zip: false,
+                            unix_modes: Default::default(),
+                            backslashes: Default::default(),
                         };
                         let output = || {
                             if extract {

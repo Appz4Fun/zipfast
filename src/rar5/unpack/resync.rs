@@ -694,8 +694,10 @@ pub fn resync_near(
     near_in(packed, known_base, known, window, target, options, &mut work, started)
 }
 
-/// [`resync_near`] with `options` (guarded); when it finds no restart, the nearest unguarded one. Both searches
-/// share one work budget and one deadline, so the caller's bounds hold for the pair, and the report counts both.
+/// [`resync_near`] with `options` (guarded); when it finds no restart, the nearest unguarded one. The pair keeps to
+/// the caller's one work budget and deadline, and the report counts both searches; the guarded search gets half the
+/// budget, so a guarded search that runs out (as on big solid streams it can) still leaves the unguarded one, which
+/// is far cheaper, the rest.
 pub(crate) fn resync_near_or_unguarded(
     packed: &[u8],
     known_base: u64,
@@ -705,12 +707,35 @@ pub(crate) fn resync_near_or_unguarded(
     options: &NearOptions,
 ) -> std::result::Result<ResyncNear, NearError> {
     let started = std::time::Instant::now();
-    let mut work = Work::new(options.work, usize::MAX, options.deadline.map(|d| started + d));
-    match near_in(packed, known_base, known, window, target, options, &mut work, started) {
-        // out of budget or time: nothing is left for a second search
-        Err(NearError::NotFound { .. }) if options.guard => {
-            let unguarded = NearOptions { guard: false, ..options.clone() };
-            near_in(packed, known_base, known, window, target, &unguarded, &mut work, started)
+    guarded_then_unguarded(options, started, |options, work| {
+        near_in(packed, known_base, known, window, target, options, work, started)
+    })
+}
+
+/// The budget split of [`resync_near_or_unguarded`], over any `search` (given the options to search with and the
+/// work left): guarded with half of `options.work`, then, when that found nothing or ran out of work (not out of
+/// time), unguarded with what the whole budget has left. `search` reports its work as `options.work` less what is
+/// left, which comes out right for both: the guarded search is given its half as its budget, the unguarded one the
+/// whole budget with what the first spent already gone.
+fn guarded_then_unguarded<T>(
+    options: &NearOptions,
+    started: std::time::Instant,
+    mut search: impl FnMut(&NearOptions, &mut Work) -> std::result::Result<T, NearError>,
+) -> std::result::Result<T, NearError> {
+    let deadline = options.deadline.map(|d| started + d);
+    if !options.guard {
+        return search(options, &mut Work::new(options.work, usize::MAX, deadline));
+    }
+    let share = options.work / 2;
+    let guarded = NearOptions { work: share, ..options.clone() };
+    let mut work = Work::new(share, usize::MAX, deadline);
+    match search(&guarded, &mut work) {
+        Err(NearError::NotFound { .. } | NearError::Exhausted { .. })
+            if deadline.is_none_or(|d| std::time::Instant::now() < d) =>
+        {
+            let spent = share - work.left.min(share);
+            work.left = options.work - spent;
+            search(&NearOptions { guard: false, ..options.clone() }, &mut work)
         }
         result => result,
     }
@@ -1426,5 +1451,36 @@ impl Unpacker {
         u.tables_ready = true;
         u.stop_at_last = true;
         Ok(u)
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    /// A search that, guarded, spends `guarded_cost` and finds nothing (or runs out when that is past its budget),
+    /// and, unguarded, finds a restart for `unguarded_cost`: returns the work it reported.
+    fn run(total: u64, guarded_cost: u64, unguarded_cost: u64) -> std::result::Result<(bool, u64), NearError> {
+        let options = NearOptions { work: total, ..Default::default() };
+        guarded_then_unguarded(&options, std::time::Instant::now(), |o, work| {
+            let cost = if o.guard { guarded_cost } else { unguarded_cost };
+            if work.left < cost {
+                work.left = 0;
+                return Err(NearError::Exhausted { lowest: 0 });
+            }
+            work.left -= cost;
+            if o.guard { Err(NearError::NotFound { lowest: 0 }) } else { Ok((o.guard, o.work - work.left)) }
+        })
+    }
+
+    /// prybar on #290: a guarded search that runs out of work still leaves the unguarded one its share (it got none
+    /// when the two shared the budget whole), and the work reported is both together, within the budget.
+    #[test]
+    fn an_exhausted_guarded_search_still_falls_back() {
+        assert_eq!(run(1000, 10_000, 300), Ok((false, 800)));
+        // a guarded search that finds nothing cheaply leaves the rest
+        assert_eq!(run(1000, 100, 700), Ok((false, 800)));
+        // neither fits: out of work
+        assert!(matches!(run(1000, 10_000, 600), Err(NearError::Exhausted { .. })));
     }
 }

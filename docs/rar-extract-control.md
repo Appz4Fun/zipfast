@@ -63,7 +63,22 @@ source/target/parent proof before lending the exact retained File. Quiet
 callbacks and report construction do not request a refresh. Engine mutation
 hooks separately charge the observations needed to retain expected bindings.
 A sticky first proof failure revokes future writers and releases guard storage.
-It never replaces a native error or stops otherwise valid extraction.
+It never replaces a native error or stops otherwise valid extraction. Running
+out of a proof ceiling is such a failure: `snapshot().state` becomes
+`Muted(Limit)` and `diagnostic_failure()` names the `RarDiagnosticLimit`.
+
+Proof cost per member does not grow with the members before it. Each path is
+one binding however many members share it. A hook reaches the names it changes
+through the member's own records and their neighbours in path order, and it
+never walks every recorded target. A writer lent during the run re-proves the
+current member's names and parents, every binding this member's engine changes
+updated, and a constant rotating window of the other bindings and volumes.
+Every volume's and every target's identity was compared with the diagnostic
+File when it was admitted, and those identities are fixed. A writer requested
+after the run (from the terminal report) re-proves every binding and volume, as
+before. So a foreign change to a name the run has finished with is reported by
+a later rotation or by the terminal writer, not necessarily by the very next
+mid-run writer.
 
 End the lent File borrow after each bounded, no-wait emission. End it before
 waiting for input/readiness and before any retry or partial-write continuation;

@@ -44,6 +44,8 @@ fn setup(dir: &Path) -> OutputContext {
             keep_broken: false,
             attempt_continued_members: false,
             salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         },
         "input.rar".into(),
     );

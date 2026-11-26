@@ -113,6 +113,8 @@ pub(crate) fn main() -> ExitCode {
                 keep_broken: false,
                 attempt_continued_members: false,
                 salvage_truncated_zip: false,
+                unix_modes: Default::default(),
+                backslashes: Default::default(),
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }

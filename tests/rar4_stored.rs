@@ -79,6 +79,8 @@ fn options(path: &std::path::Path, mode: Mode) -> Options {
         keep_broken: false,
         attempt_continued_members: false,
         salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     }
 }
 

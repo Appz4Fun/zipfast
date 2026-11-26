@@ -1343,10 +1343,10 @@ fn run_archive(
             }
             let member = (ordinal as u64, e.name.as_str());
             summary.matched += 1;
-            if e.is_dir() && crate::path::names_root(&e.name) {
+            if e.is_dir() && crate::path::names_root_with(&e.name, !opts.literal_backslashes()) {
                 continue;
             }
-            let rel = match sanitize_with(&e.name, e.host != HOST_UNIX, opts.windows_safe_names) {
+            let rel = match sanitize_with(&e.name, opts.zip_windows_names(e.host), opts.windows_safe_names) {
                 Ok(rel) => rel,
                 Err(err) => {
                     fail(&mut summary, report, member, &err.to_string());
@@ -1360,7 +1360,7 @@ fn run_archive(
                         fail(&mut summary, report, member, why);
                         continue;
                     }
-                    summary.dir_meta.push((opts.dest.join(&rel), opts.meta(e.meta())));
+                    summary.dir_meta.push((opts.dest.join(&rel), opts.dir_meta(e.meta())));
                 }
                 summary.dirs += 1;
                 report.member(LegacyMember::Succeeded { ordinal: member.0, name: member.1, bytes: 0 });

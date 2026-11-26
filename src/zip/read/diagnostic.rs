@@ -594,7 +594,12 @@ impl<'a> BoundScope<'a> {
         sinks: &[Option<Descriptor>; 2],
     ) -> Result<(), DiagnosticBoundaryFault> {
         let (name, host) = self.entries.name_host(ordinal);
-        let relative = match policy::PolicyPath::normalized(&self.context.ledger, name, host != 3, self.cancel) {
+        let relative = match policy::PolicyPath::normalized(
+            &self.context.ledger,
+            name,
+            self.options.zip_windows_names(host),
+            self.cancel,
+        ) {
             Ok(p) => p,
             Err(policy::PathFailure::Unsafe) => return Ok(()),
             Err(policy::PathFailure::Fault(f)) => return Err(DiagnosticBoundaryFault::Admission(f)),
