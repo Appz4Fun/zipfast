@@ -63,8 +63,12 @@ held bytes or the known plaintext do not reach far enough back: fetch from earli
 target (from an earlier copy) and wants to download as little of the new copy as it can. The plan fetches packed
 bytes from shortly before the target's estimated packed position: by default a filter's reach (4 MiB of output) at
 twice the member's average packing ratio plus `SEED_SEARCH` (2 MiB), enough for a guarded restart; `search` sets it.
-Its `donor` is the dictionary's worth of output before the target, and `complete_rar5` starts the decoder with
-`Unpacker::resume_seeded`: the window is filled from the held plaintext instead of being followed from far back.
+Its `donor` is, as for a checked plan, the dictionary and a filter's reach before the target, twice: the window of a
+guarded restart's check lies that far back. `complete_rar5` starts the decoder with `Unpacker::resume_seeded`: the
+window is filled from the held plaintext instead of being followed from far back. When the plaintext given does not
+reach a guarded restart's check, the nearest unguarded restart is taken instead (noted as `SeedSuspect::Unguarded`;
+`strict` refuses it). A failover should pass `OpenAtOptions::estimate` (copy A's packed position of the target): the
+average packing ratio can be several MB off on mixed content, leaving the target outside the bytes fetched first.
 A smaller `search` fetches less but can give an unguarded restart (below).
 
 The output is then **unverified**: `Rar5Resume::checked` is false unless the follow happened to cover the window.
@@ -127,7 +131,16 @@ folder's packed size, or under 7zAES the AES coder's output size, which leaves o
 the folder's end with the known output before the restart as the dictionary (only its last dictionary-sized bytes are
 used): `bytes` is the folder's output from `output` on, bounded by `Lzma2DecodeOptions::max_output` (stored and
 decoded output together; `OpenAtError::OutputLimit` past it), and `redecode` is `folder_target - output`. Without a
-usable chunk start the result is `NeedMore`. A member's output is the folder's from its `stream_start`. A folder
+usable chunk start the result is `NeedMore`. A stored chunk is a restart only when the framing shows that the next LZMA chunk after
+it resets the state (7-Zip `-mmt` goes on after a run of stored chunks with an LZMA chunk that continues the state from
+before them): when the nearest such restart lies before the packed bytes held, the result is
+`FetchFrom { packed, output }`: fetch from `packed`, supply output from `output` less the dictionary, and complete again.
+A framing index that ends before the folder's end (one walked only up to past the target) is walked on over the packed
+bytes held when they go on from where it ends; a stored candidate the index still cannot rule out is tried, and once one
+meets an LZMA chunk that continues the state, the rest of that last stored run is given up with it (they would all
+meet it). The stream's first chunk is always a restart. When decoding reaches an LZMA chunk whose dictionary the known
+output does not cover (from the restart less the dictionary, unless a chunk since resets it), the result is
+`NeedMore` for that range, not a decode error. The search is one pass back over the index. A member's output is the folder's from its `stream_start`. A folder
 counts as LZMA2 only with exactly one LZMA2 coder, alone or under 7zAES.
 
 Which volume bytes a plan never needs, per article, is what `ContainerRebuilder` reports as `Unneeded` with the plan
