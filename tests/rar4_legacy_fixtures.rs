@@ -819,7 +819,7 @@ fn preexisting_links_inside_the_destination_follow_the_policy() {
 }
 
 /// prybar's P8: `dirlink_unix.rar` flattened (`e -y`) puts two links at `link`. With `replace_placed_links` the second
-/// replaces the first, which this run placed, as UnRAR 7.30 does, on the whole-archive and the selected route alike;
+/// replaces the first, which this run placed, as UnRAR 7.30 does, on the whole-archive, selected and controlled routes;
 /// without it the second is refused (7-Zip 26.06) and the first stays.
 #[test]
 fn a_flattened_second_link_replaces_the_first_only_when_asked() {
@@ -841,12 +841,28 @@ fn a_flattened_second_link_replaces_the_first_only_when_asked() {
         assert_eq!(summary.failed, u64::from(!replace), "selected {replace}: {summary:?}");
         assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(want), "selected {replace}");
         assert_eq!(fs::read(out.join("file")).unwrap().len(), 8, "selected {replace}");
+
+        // prybar's UnRAR mode runs the controlled route: the same decision there (-y replaces)
+        let out = dir.path().join(format!("controlled-{replace}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let report = session.extract_selected_controlled(
+            &selected,
+            &flat(&out),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Replace,
+        );
+        let summary = report.finish().outcome.unwrap();
+        assert_eq!(summary.failed, u64::from(!replace), "controlled {replace}: {summary:?}");
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(want), "controlled {replace}");
     }
 }
 
 /// Codex on #291: a regular file landing on a link this run placed (`a -> x`, then a file `a`) replaces it through
-/// `extract_selected` too, when asked; publication carries the link's identity, so only that link is replaced. The
-/// controlled route binds regular files only: it refuses the link there, as before, whatever the option.
+/// `extract_selected` and `extract_selected_controlled` too, when asked; publication carries the link's identity, so
+/// only that link is replaced. Without the option both refuse it.
 #[test]
 fn a_file_over_a_link_this_run_placed_replaces_it_when_asked() {
     let dir = tempfile::tempdir().unwrap();
@@ -878,7 +894,11 @@ fn a_file_over_a_link_this_run_placed_replaces_it_when_asked() {
             &mut Replace,
         );
         let summary = report.finish().outcome.unwrap();
-        assert_eq!(summary.failed, 1, "controlled {replace}: the link is refused there");
-        assert_eq!(fs::read_link(out.join("a")).unwrap(), Path::new("x"), "controlled {replace}");
+        assert_eq!(summary.failed, u64::from(!replace), "controlled {replace}: {summary:?}");
+        if replace {
+            assert_eq!(fs::read(out.join("a")).unwrap(), b"data", "controlled");
+        } else {
+            assert_eq!(fs::read_link(out.join("a")).unwrap(), Path::new("x"), "controlled");
+        }
     }
 }
