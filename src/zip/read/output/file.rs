@@ -671,6 +671,7 @@ impl ZipReadStage {
                     uid,
                     descriptor: (0, 0, 0, 0),
                     terminal: false,
+                    broken: false,
                     named: Some(named),
                 }))
             }
@@ -991,12 +992,16 @@ impl ZipReadStage {
             Some(Prepared::Portable(ready)) => (ready.mode, ready.mtime),
             None => return Err(ReadFault::InvalidPlan),
         };
+        // a broken member kept (Options::keep_broken) ends where its read failed: no more than reserved was written
+        let whole = if self.broken {
+            self.reservation.written <= self.reservation.bytes
+        } else {
+            action.consumed && action.completed && self.reservation.written == self.reservation.bytes
+        };
         if !action.controlled_output
             || action.raw_output
-            || !action.consumed
-            || !action.completed
+            || !whole
             || action.output != budget::PlannedOutput::StagedFiles
-            || self.reservation.written != self.reservation.bytes
             || mode.map(|m| m & 0o777) != ready_mode.map(|m| m & 0o777)
             || !same_time(mtime, ready_mtime)
             || self.file.as_ref().is_none_or(|file| file_handle(file) != self.reservation.handle)
@@ -1005,6 +1010,28 @@ impl ZipReadStage {
         }
         Ok(())
     }
+    /// Bytes staged so far: what a kept broken member publishes.
+    pub(crate) fn written(&self) -> u64 {
+        self.reservation.written
+    }
+    /// [`crate::extract::Options::keep_broken`]: publishes a member whose read failed on its own data with what was
+    /// written, under every check [`Self::publish`] makes but the read's completion.
+    pub(crate) fn publish_broken(
+        mut self,
+        mode: Option<u32>,
+        mtime: Option<(i64, u32)>,
+        cancel: &Cancellation,
+        context: &mut EncryptedReadContext,
+        final_check: impl FnMut(&mut EncryptedReadContext) -> ZipReadResult<()>,
+    ) -> ZipReadResult<bool> {
+        self.broken = true;
+        let written = self.reservation.written;
+        if let Some(ready) = native_mut(&mut self.named) {
+            ready.inode.keep_length(written);
+        }
+        self.publish(mode, mtime, cancel, context, final_check)
+    }
+
     /// Publishes only after exact original read completion and fresh successful
     /// checked-source observations at both final boundaries.
     pub fn publish(
@@ -1039,7 +1066,7 @@ impl ZipReadStage {
                         identity: self.reservation.identity,
                         uid: ready.child.uid,
                         gid: ready.child.gid,
-                        bytes: self.reservation.bytes,
+                        bytes: if self.broken { self.reservation.written } else { self.reservation.bytes },
                         baseline: ready.child.mode,
                         mode,
                         mtime,
@@ -1209,7 +1236,7 @@ impl ZipReadStage {
                     ledger,
                     encrypted,
                     self.file.as_ref().ok_or(ReadFault::InvalidPlan)?,
-                    self.reservation.bytes,
+                    if self.broken { self.reservation.written } else { self.reservation.bytes },
                     cancel,
                 )
                 .map_err(ZipReadError::from);
