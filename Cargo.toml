@@ -17,7 +17,7 @@
 [workspace]
 members = ["crates/zipview", "crates/zip-container"]
 default-members = ["."]
-exclude = ["crates/zipview/fuzz"]
+exclude = ["crates/zipview/fuzz", "fuzz"]
 resolver = "3"
 
 [package]
