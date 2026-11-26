@@ -43,7 +43,7 @@ fn native(
 #[cfg(target_os = "macos")]
 #[test]
 fn canonical_requested_names_match_native_reference() {
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let cwd = std::fs::canonicalize(root.path()).unwrap();
     std::fs::write(cwd.join("MixedCase"), b"bytes").unwrap();
     std::fs::hard_link(cwd.join("MixedCase"), cwd.join("second")).unwrap();
@@ -80,7 +80,7 @@ fn canonical_requested_names_match_native_reference() {
 #[test]
 fn canonical_thirty_three_success_and_thirty_four_failure() {
     for n in [31, 32, 33, 34] {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         let cwd = std::fs::canonicalize(root.path()).unwrap();
         std::fs::write(cwd.join("target"), b"bytes").unwrap();
         for i in 0..n {
@@ -121,7 +121,7 @@ fn canonical_counter_is_exact_and_refuses_before_one_under() {
 #[test]
 fn second_pass_replacement_or_failure_is_terminal_including_optional_keys() {
     for failure in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         let cwd = std::fs::canonicalize(root.path()).unwrap();
         let target = cwd.join("target");
         std::fs::write(&target, b"old").unwrap();
@@ -147,7 +147,7 @@ fn second_pass_replacement_or_failure_is_terminal_including_optional_keys() {
 #[cfg(target_os = "macos")]
 #[test]
 fn canonical_is_allocation_free_and_uses_one_phase_window() {
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let cwd = std::fs::canonicalize(root.path()).unwrap();
     std::fs::write(cwd.join("target"), b"bytes").unwrap();
     symlink("target", cwd.join("alias")).unwrap();
@@ -179,10 +179,10 @@ fn canonical_is_allocation_free_and_uses_one_phase_window() {
 #[cfg(target_os = "macos")]
 #[test]
 fn canonical_ordinary_errors_fifo_and_path_components_match_native() {
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let cwd = std::fs::canonicalize(root.path()).unwrap();
     std::fs::write(cwd.join("file"), b"bytes").unwrap();
-    std::fs::create_dir(cwd.join("directory")).unwrap();
+    super::private_dir(cwd.join("directory")).unwrap();
     symlink("directory", cwd.join("alias")).unwrap();
     let fifo = cwd.join("fifo");
     let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
@@ -393,7 +393,7 @@ fn admitted_phase_scratch_is_native_aligned_and_retires_before_payload_workspace
 #[test]
 fn frozen_policy_keeps_namespace_keys_after_inode_replacement_and_exact_configuration() {
     use std::io::Write;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let cwd = std::fs::canonicalize(root.path()).unwrap();
     let source = cwd.join("source.zip");
     let bytes = fixture::build(&[fixture::Member::stored(b"entry", b"data")], &[0], b"", b"", false).bytes;
@@ -454,7 +454,7 @@ fn frozen_policy_keeps_namespace_keys_after_inode_replacement_and_exact_configur
     std::fs::write(&victim, b"new").unwrap();
     let (canonical, identity) = native(&victim, &cwd, u128::MAX).0.unwrap();
     assert!(snapshot.protects(&canonical, identity));
-    std::fs::create_dir(cwd.join("missing")).unwrap();
+    super::private_dir(cwd.join("missing")).unwrap();
     std::fs::write(cwd.join("missing/later"), b"later").unwrap();
     let (canonical, identity) = native(&cwd.join("missing/later"), &cwd, u128::MAX).0.unwrap();
     assert!(snapshot.protects(&canonical, identity));
@@ -593,7 +593,7 @@ fn actual_parent_policy_tolerates_own_names_and_rejects_security_mutation() {
     use shared::LedgerAccess;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let directory = std::fs::File::open(root.path()).unwrap();
     let mut state = budget::LedgerState::new(&Default::default()).unwrap();
     super::core::bind_plan(
@@ -641,7 +641,7 @@ fn actual_parent_policy_tolerates_own_names_and_rejects_security_mutation() {
 fn empty_actual_parent_probe_captures_creation_policy_and_retires_its_namespace() {
     use shared::LedgerAccess;
     use std::os::fd::AsRawFd;
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     let parent = File::open(root.path()).unwrap();
     let mut state = budget::LedgerState::new(&Default::default()).unwrap();
     super::core::bind_plan(
@@ -682,7 +682,7 @@ fn empty_probe_every_native_boundary_fails_closed_without_repeating_close() {
     use std::cell::Cell;
     use std::rc::Rc;
     for fault_at in 1..=if cfg!(target_os = "linux") { 19 } else { 17 } {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::tempdir();
         let parent = File::open(root.path()).unwrap();
         let mut state = budget::LedgerState::new(&Default::default()).unwrap();
         super::core::bind_plan(
@@ -798,7 +798,7 @@ fn linux_canonical(
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_actual_procfd_canonical_exact_eight_and_original_source_shortcut_six() {
-    let root = tempfile::tempdir().unwrap();
+    let root = super::tempdir();
     std::fs::write(root.path().join("a"), b"data").unwrap();
     std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
     let mut identities = Vec::new();
@@ -831,8 +831,8 @@ fn linux_actual_procfd_canonical_exact_eight_and_original_source_shortcut_six() 
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_procfd_metadata_only_paths_match_native_fifo_relative_and_symlink_failures() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir(root.path().join("d")).unwrap();
+    let root = super::tempdir();
+    super::private_dir(root.path().join("d")).unwrap();
     std::fs::write(root.path().join("d/file"), b"data").unwrap();
     let fifo = root.path().join("fifo");
     let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();

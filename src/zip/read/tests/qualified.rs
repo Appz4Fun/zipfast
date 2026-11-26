@@ -119,7 +119,7 @@ fn qualified_mac_other_uid_birth_retained_fd_and_postauth_mutation_control() {
     assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let parent = root.path().join("data");
-    std::fs::create_dir(&parent).unwrap();
+    super::private_dir(&parent).unwrap();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(
         Command::new("/bin/chmod")

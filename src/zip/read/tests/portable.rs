@@ -124,11 +124,11 @@ fn names(dir: &Path) -> Vec<String> {
 
 #[test]
 fn unsupported_filesystem_falls_back_to_portable() {
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (plain, secret) = archive(&zip);
     let _forced = Forced::new(0);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     let report = run(&zip, dest.path(), Overwrite::Skip, StagedStorage::Auto).unwrap();
     assert_eq!((report.files(), report.failed(), report.portable_files(), report.native_files()), (2, 0, 2, 0));
     assert_eq!(std::fs::read(dest.path().join("a.txt")).unwrap(), plain);
@@ -142,7 +142,7 @@ fn unsupported_filesystem_falls_back_to_portable() {
     let modified = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     assert!((1_704_067_200..1_735_689_600).contains(&modified), "{modified}");
     // The native-only policy keeps the old refusal.
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     let error = run(&zip, dest.path(), Overwrite::Skip, StagedStorage::NativeOnly).unwrap_err();
     assert!(matches!(error.operation(), Some(ReadFault::UnsupportedStorage)), "{error:?}");
     assert!(names(dest.path()).is_empty());
@@ -150,7 +150,7 @@ fn unsupported_filesystem_falls_back_to_portable() {
 
 #[test]
 fn portable_no_replace_ladder_keeps_every_overwrite_mode() {
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (plain, _) = archive(&zip);
     for rung in 0..=2 {
@@ -161,7 +161,7 @@ fn portable_no_replace_ladder_keeps_every_overwrite_mode() {
             Overwrite::RenameNew(RenameStyle::Underscore),
             Overwrite::RenameExisting(RenameStyle::Parenthesized),
         ] {
-            let dest = tempfile::tempdir().unwrap();
+            let dest = super::tempdir();
             std::fs::write(dest.path().join("a.txt"), b"old").unwrap();
             let report = run(&zip, dest.path(), overwrite, StagedStorage::Auto).unwrap();
             assert_eq!(report.failed(), 0, "rung {rung} {overwrite:?}");
@@ -195,7 +195,7 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
 fn portable_rename_refuses_existing_name_on_every_rung() {
     use crate::zip::read::native_policy::{Published, rename_portable};
     use std::os::fd::AsRawFd;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = super::tempdir();
     let handle = std::fs::File::open(dir.path()).unwrap();
     let fd = handle.as_raw_fd();
     for rung in 0..=2 {
@@ -222,7 +222,7 @@ fn portable_rename_refuses_existing_name_on_every_rung() {
 fn portable_rename_refuses_a_substituted_stage() {
     use crate::zip::read::native_policy::rename_portable;
     use std::os::fd::AsRawFd;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = super::tempdir();
     let handle = std::fs::File::open(dir.path()).unwrap();
     let fd = handle.as_raw_fd();
     for (rung, replace) in [(0, false), (1, false), (2, false), (0, true)] {
@@ -243,13 +243,13 @@ fn portable_rename_refuses_a_substituted_stage() {
 #[test]
 fn portable_link_publication_retires_a_stage_it_could_not_unlink() {
     use crate::zip::read::native_policy::PORTABLE_UNLINK_FAILS;
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (plain, secret) = archive(&zip);
     let _forced = Forced::new(1);
     PORTABLE_UNLINK_FAILS.with(|f| f.set(true));
     for overwrite in [Overwrite::Skip, Overwrite::RenameNew(RenameStyle::Underscore)] {
-        let dest = tempfile::tempdir().unwrap();
+        let dest = super::tempdir();
         let report = run(&zip, dest.path(), overwrite, StagedStorage::Auto).unwrap();
         assert_eq!((report.files(), report.failed()), (2, 0), "{overwrite:?}");
         assert_eq!(names(dest.path()), ["a.txt", "s.bin"], "{overwrite:?}");
@@ -262,10 +262,10 @@ fn portable_link_publication_retires_a_stage_it_could_not_unlink() {
 /// `run_with_context` plans streaming only for its own run; the caller's context gets its setting back.
 #[test]
 fn run_with_context_restores_the_stream_setting() {
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (_, secret) = archive(&zip);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     let options = Options {
         mode: Mode::Extract,
         dest: dest.path().into(),
@@ -305,7 +305,7 @@ fn run_with_context_restores_the_stream_setting() {
 
 #[test]
 fn portable_tampered_aes_leaves_nothing() {
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (plain, _) = archive(&zip);
     let mut bytes = std::fs::read(&zip).unwrap();
@@ -314,7 +314,7 @@ fn portable_tampered_aes_leaves_nothing() {
     bytes[at + 5 + extra + 8 + 2 + 2_000] ^= 1;
     std::fs::write(&zip, bytes).unwrap();
     let _forced = Forced::new(0);
-    let dest = tempfile::tempdir().unwrap();
+    let dest = super::tempdir();
     let report = run(&zip, dest.path(), Overwrite::Skip, StagedStorage::Auto).unwrap();
     assert_eq!((report.files(), report.failed()), (1, 1));
     assert_eq!(names(dest.path()), ["a.txt"]);
@@ -348,10 +348,10 @@ fn callback_read(zip: &Path, storage: StagedStorage, temp: &Path) -> ZipReadResu
 /// outside the native allow-list it falls back to a portable spool under `Auto` and stays refused under `NativeOnly`.
 #[test]
 fn spool_on_unsupported_temp_dir_falls_back_unless_native_only() {
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (_, secret) = archive(&zip);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let _forced = Forced::new(0);
     for storage in [StagedStorage::Auto, StagedStorage::PortableOnly] {
         let (out, usage) = callback_read(&zip, storage, temp.path()).unwrap();
@@ -369,7 +369,7 @@ fn spool_on_unsupported_temp_dir_falls_back_unless_native_only() {
 #[test]
 fn spool_on_real_portable_temp_dir() {
     let Some(base) = std::env::var_os("ZIPFAST_ANYFS_DEST") else { return };
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (_, secret) = archive(&zip);
     let temp = tempfile::tempdir_in(base).unwrap();
@@ -383,10 +383,10 @@ fn spool_on_real_portable_temp_dir() {
 #[test]
 fn portable_spool_swapped_before_unlink_fails_the_read() {
     use crate::zip::read::spool::hooks::HOOK;
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     archive(&zip);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let dir = temp.path().to_path_buf();
     let _forced = Forced::new(0);
     let mut swapped = false;
@@ -449,13 +449,13 @@ fn stdout_read(zip: &Path, ordinal: usize, password: Option<&str>, temp: &Path, 
 /// real filesystem (exFAT renumbers the unlinked stage's inode) with `ZIPFAST_ANYFS_DEST`.
 #[test]
 fn stdout_through_portable_temp_dir() {
-    let work = tempfile::tempdir().unwrap();
+    let work = super::tempdir();
     let zip = work.path().join("a.zip");
     let (plain, secret) = archive(&zip);
     let real = std::env::var_os("ZIPFAST_ANYFS_DEST");
     let temp = match &real {
         Some(base) => tempfile::tempdir_in(base).unwrap(),
-        None => tempfile::tempdir().unwrap(),
+        None => super::tempdir(),
     };
     let _forced = real.is_none().then(|| Forced::new(0));
     assert_eq!(stdout_read(&zip, 0, Some("pw"), temp.path(), u64::MAX).unwrap(), plain);
