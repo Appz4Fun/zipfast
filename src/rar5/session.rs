@@ -1395,13 +1395,20 @@ impl Catalogue {
             if self.session.archive.damaged_headers.len() >= crate::extract::MAX_HEADER_DAMAGE {
                 break;
             }
-            let bytes = size_of::<crate::extract::HeaderDamage>()
-                + d.volume.capacity()
-                + d.name.as_ref().map_or(0, String::capacity);
-            self.owned_capacity = add(self.owned_capacity, bytes as u64)?;
+            let kept = &mut self.session.archive.damaged_headers;
+            // the vector grows by doubling, up to the cap, and every slot it holds is charged
+            let grow = if kept.len() == kept.capacity() {
+                kept.capacity().saturating_mul(2).clamp(4, crate::extract::MAX_HEADER_DAMAGE) - kept.capacity()
+            } else {
+                0
+            };
+            let slots = (grow * size_of::<crate::extract::HeaderDamage>()) as u64;
+            let owned = (d.volume.capacity() + d.name.as_ref().map_or(0, String::capacity)) as u64;
+            self.owned_capacity = add(add(self.owned_capacity, slots)?, owned)?;
             self.update_capacity()?;
-            self.session.archive.damaged_headers.try_reserve(1).map_err(|_| allocation())?;
-            self.session.archive.damaged_headers.push(d);
+            let kept = &mut self.session.archive.damaged_headers;
+            kept.try_reserve_exact(grow).map_err(|_| allocation())?;
+            kept.push(d);
         }
         Ok(())
     }

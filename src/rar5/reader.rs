@@ -53,17 +53,30 @@ pub(crate) enum ReadDataError<E> {
 
 type ParsedBlock = (Block, MemberCrypt, Option<FileWire>);
 
+/// The longest member name a [`HeaderDamage`] keeps.
+const MAX_DAMAGE_NAME: usize = 1024;
+
 /// [`Volume::resync`] reads the volume this many bytes at a time.
 const RESYNC_CHUNK: usize = 1 << 20;
-/// The first chunk a resync reads: most land on a header within it.
-const RESYNC_FIRST_CHUNK: usize = 4096;
-/// The longest header a resync checks: real file headers are far shorter.
-const RESYNC_HEADER_MAX: usize = 1 << 16;
-/// Checksum bytes a resync may hash per byte it scans (plus 1 MiB), keeping it linear.
+/// The first chunk a resync reads: most land on a header within it, and a run of resyncs close together reads little.
+const RESYNC_FIRST_CHUNK: usize = 64;
+/// Bytes past each chunk a resync reads, so that every position in the chunk shows its header's fixed fields.
+const RESYNC_LOOKAHEAD: usize = 32;
+/// The longest RAR 5.0 file or service header a resync checks: real ones, names and extra records included, are far
+/// shorter. An end header is at most [`RESYNC_END_MAX`].
+const RESYNC_HEADER_MAX: usize = 8 << 10;
+const RESYNC_END_MAX: usize = 32;
+/// The longest RAR 4.x file or service header a resync checks: 32 fixed bytes, a name of at most 2 KiB, and room for
+/// the high sizes, salt and extended times.
+const RESYNC_RAR4_HEADER_MAX: usize = 32 + 2048 + 64;
+/// Work (bytes read and checksummed) all the resyncs in a volume may do per byte of the volume (plus 1 MiB), keeping
+/// them linear.
 const RESYNC_WORK_PER_BYTE: u64 = 16;
 
-/// The length of the header [`Volume::resync`] would check at the start of `b` (at least 8 bytes when the volume
-/// has them), from its first bytes alone: a file, service or end header of a plausible size. None when it is none.
+/// The length of the header [`Volume::resync`] would check at the start of `b` (up to [`RESYNC_LOOKAHEAD`] bytes of
+/// it), from its fixed fields alone: a file, service or end header of a plausible size and with plausible fields. None
+/// when it is none. Random bytes pass about once in a few thousand positions, with a short header, so that checking
+/// what passes costs about a byte per byte scanned.
 fn resync_shape(b: &[u8], format: RarFormat) -> Option<usize> {
     if b.len() < 7 {
         return None;
@@ -77,6 +90,10 @@ fn resync_shape(b: &[u8], format: RarFormat) -> Option<usize> {
                 size |= usize::from(byte & 0x7f) << (7 * size_len);
                 size_len += 1;
                 if byte & 0x80 == 0 {
+                    // RAR writes the shortest form: a last byte of 0 after a continued one is not a size it wrote
+                    if byte == 0 && size_len > 1 {
+                        return None;
+                    }
                     break;
                 }
                 if size_len == 3 {
@@ -84,16 +101,36 @@ fn resync_shape(b: &[u8], format: RarFormat) -> Option<usize> {
                 }
             }
             let kind = *b.get(4 + size_len)?;
-            ((3..=RESYNC_HEADER_MAX).contains(&size) && matches!(kind, 2 | 3 | 5)).then_some(4 + size_len + size)
+            // header flags: one byte, with only the defined bits (extra, data, skip, split before and after, child,
+            // inherited)
+            let flags = *b.get(5 + size_len)?;
+            let most = match kind {
+                2 | 3 => RESYNC_HEADER_MAX,
+                5 => RESYNC_END_MAX,
+                _ => return None,
+            };
+            ((3..=most).contains(&size) && flags < 0x80).then_some(4 + size_len + size)
         }
         RarFormat::Rar4 => {
             let size = usize::from(u16::from_le_bytes([b[5], b[6]]));
-            let (least, long) = match b[2] {
-                0x74 | 0x7a => (32, b[4] & 0x80 != 0),
-                0x7b => (7, true),
-                _ => return None,
-            };
-            (long && size >= least).then_some(size)
+            match b[2] {
+                0x74 | 0x7a => {
+                    // LONG_BLOCK; host OS 0..=5; unpack version 15..=36 (RAR 1.5 to 3.6 formats); method 0x30..=0x35;
+                    // a name that fits in the header
+                    let fields = b.get(..28)?;
+                    let name = usize::from(u16::from_le_bytes([fields[26], fields[27]]));
+                    let plausible = fields[4] & 0x80 != 0
+                        && fields[15] <= 5
+                        && (15..=36).contains(&fields[24])
+                        && (0x30..=0x35).contains(&fields[25])
+                        && name > 0
+                        && 32 + name <= size
+                        && size <= RESYNC_RAR4_HEADER_MAX;
+                    plausible.then_some(size)
+                }
+                0x7b => (7..=20).contains(&size).then_some(size),
+                _ => None,
+            }
         }
     }
 }
@@ -396,6 +433,8 @@ pub struct Volume {
     held_block: Option<ParsedBlock>,
     /// Checksum work the resyncs in this volume have left, once one has run.
     resync_work: Option<u64>,
+    /// The run's cancellation, for a resync's search.
+    cancel: Option<crate::extract::Cancellation>,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
@@ -556,6 +595,7 @@ impl Volume {
             damage_closed: false,
             held_block: None,
             resync_work: None,
+            cancel: None,
             sfx: next.saturating_sub(match format {
                 RarFormat::Rar5 => SIGNATURE.len(),
                 RarFormat::Rar4 => SIGNATURE_V4.len(),
@@ -678,6 +718,17 @@ impl Volume {
     }
 
     fn record_damage(&mut self, offset: u64, kind: HeaderDamageKind, name: Option<String>, resumed_at: Option<u64>) {
+        // a damaged header's name is kept for the message only: at most 1 KiB of it
+        let name = name.map(|mut name| {
+            if name.len() > MAX_DAMAGE_NAME {
+                let mut end = MAX_DAMAGE_NAME;
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                name.truncate(end);
+            }
+            name
+        });
         if self.damage.len() < crate::extract::MAX_HEADER_DAMAGE {
             self.damage.push(HeaderDamage { volume: self.path.clone(), offset, kind, name, resumed_at });
         }
@@ -768,13 +819,17 @@ impl Volume {
         let mut chunk = RESYNC_FIRST_CHUNK;
         let mut pos = from;
         let found = 'scan: loop {
-            if pos >= self.len || work == 0 {
+            if pos >= self.len {
                 break None;
             }
             let scan = (self.len - pos).min(chunk as u64) as usize;
-            // eight bytes past the chunk, so that every position in it shows its header's shape
-            let want = (self.len - pos).min(scan as u64 + 8) as usize;
-            self.resync_read(&mut budget, &mut window, want, pos)?;
+            let want = (self.len - pos).min((scan + RESYNC_LOOKAHEAD) as u64) as usize;
+            // the bytes read count as work too, so a run of resyncs close together stays linear
+            let Some(left) = work.checked_sub(want as u64) else { break None };
+            work = left;
+            if !self.resync_read(&mut budget, &mut window, want, pos)? {
+                break None;
+            }
             for i in 0..scan {
                 let Some(total) = resync_shape(&window[i..], self.format) else { continue };
                 let at = pos + i as u64;
@@ -786,7 +841,9 @@ impl Volume {
                 let checks = if let Some(h) = window.get(i..i + total) {
                     resync_checks(h, self.format)
                 } else {
-                    self.resync_read(&mut budget, &mut header, total, at)?;
+                    if !self.resync_read(&mut budget, &mut header, total, at)? {
+                        break 'scan None;
+                    }
                     resync_checks(&header, self.format)
                 };
                 if checks {
@@ -800,25 +857,38 @@ impl Volume {
         Ok(found)
     }
 
+    /// `len` bytes at `at` into `out`, for a resync; false when a catalogue's read budget has no room for them (the
+    /// resync then gives up rather than fail the catalogue). Cancellation is checked before every read.
     fn resync_read(
         &mut self,
         budget: &mut Option<&mut ScanBudget<'_>>,
         out: &mut Vec<u8>,
         len: usize,
         at: u64,
-    ) -> RarResult<()> {
+    ) -> RarResult<bool> {
+        if self.cancel.as_ref().is_some_and(crate::extract::Cancellation::is_canceled) {
+            return Err(RarFault::new(RarFailure::Canceled, crate::extract::canceled_error()));
+        }
         if let Some(budget) = budget.as_deref_mut() {
             budget.check()?;
-            budget.check_read(len)?;
+            if budget.check_read(len).is_err() {
+                return Ok(false);
+            }
         }
         out.clear();
         out.try_reserve_exact(len).map_err(|_| allocation())?;
         out.resize(len, 0);
         match budget.as_deref_mut() {
-            Some(budget) => budget.read(&self.src.file, &self.path, out, at),
+            Some(budget) => budget.read(&self.src.file, &self.path, out, at)?,
             None => read_at_detailed(&self.src.file, out, at)
-                .map_err(|e| read_failure(e, Some(self.path.clone()), RarIntegrityReason::TruncatedHeader)),
+                .map_err(|e| read_failure(e, Some(self.path.clone()), RarIntegrityReason::TruncatedHeader))?,
         }
+        Ok(true)
+    }
+
+    /// The run's cancellation, checked while a resync searches ([`DamagedInput::Resync`]).
+    pub(crate) fn set_cancel(&mut self, cancel: Option<crate::extract::Cancellation>) {
+        self.cancel = cancel;
     }
 
     fn next_block_raw(
@@ -831,7 +901,7 @@ impl Volume {
         let mut parser = self.parser.take().unwrap_or_else(|| {
             let mut parser = HeaderParser::new(self.path.clone(), self.next, Some(self.len), budget.is_some());
             parser.set_format(self.format);
-            parser.set_salvage(self.damaged_input.salvages());
+            parser.set_salvage(self.damaged_input);
             parser
         });
         let result = (|| {
@@ -1086,6 +1156,7 @@ mod tests {
             damage_closed: false,
             held_block: None,
             resync_work: None,
+            cancel: None,
         };
         let (send, recv) = sync_channel(1);
         let (spare, _) = channel();
@@ -1130,6 +1201,7 @@ mod tests {
             damage_closed: false,
             held_block: None,
             resync_work: None,
+            cancel: None,
         };
         let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
         else {

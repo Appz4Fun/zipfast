@@ -545,3 +545,176 @@ fn resync_through_many_false_headers_stays_bounded() {
     assert_eq!(session.extract_selected(&selected, &opts, RarDecodeLimits::default(), |_| {}).unwrap().files, 3);
     assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
 }
+
+/// Deterministic noise, like compressed data (xorshift).
+fn noise(len: usize, mut seed: u64) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect()
+}
+
+/// The case resync is for: a damaged header followed by megabytes of what looks like compressed data, then intact
+/// members. The search must cross it within its work bound and find the next header.
+#[test]
+fn resync_crosses_megabytes_of_random_data() {
+    for (format, (bytes, at)) in [("rar5", rar5()), ("rar4", rar4())] {
+        for (len, seed) in [(256 << 10, 1), (4 << 20, 2), (16 << 20, 3)] {
+            let mut damaged = bytes[..at[1]].to_vec();
+            damaged.extend(noise(len, seed));
+            damaged.extend(&bytes[at[1]..]);
+            let case = case(&damaged);
+            let summary = extract(&case, DamagedInput::Resync).unwrap();
+            assert_eq!(written(&case), ["a.txt", "b.txt", "c.txt"], "{format} {len}");
+            assert_bytes(&case, "b.txt", B);
+            let last = summary.damaged_headers.last().unwrap();
+            assert_eq!(last.resumed_at, Some((at[1] + len) as u64), "{format} {len}: {:?}", summary.damaged_headers);
+        }
+    }
+}
+
+/// A catalogue's resync that runs out of the catalogue's read budget gives up on the rest of that volume instead of
+/// failing the whole session.
+#[test]
+fn session_resync_out_of_read_budget_gives_up_instead_of_failing() {
+    let (bytes, at) = rar5();
+    let mut damaged = bytes[..at[1]].to_vec();
+    damaged.extend(vec![0; 2 << 20]);
+    damaged.extend(&bytes[at[1]..]);
+    let case = case(&damaged);
+    let mut options = RarSessionOptions { damaged_input: DamagedInput::Resync, ..Default::default() };
+    options.limits.read_bytes = 1 << 20;
+    let session = RarSession::open(&case.archive, None, options).unwrap();
+    assert_eq!(session.entries().map(|m| m.name().to_owned()).collect::<Vec<_>>(), ["a.txt"]);
+    let damage = session.archive().damaged_headers();
+    assert_eq!((damage.len(), damage[0].resumed_at), (1, None));
+}
+
+/// A damaged RAR 5.0 encryption header is never read as it stands (its salt and KDF parameters would make every
+/// later header look like a wrong password): it is an unreadable header, and nothing after it is read.
+#[test]
+fn a_damaged_encryption_header_is_not_salvaged() {
+    let mut fields = Vec::new();
+    common::vint(0, &mut fields); // encryption version
+    common::vint(0, &mut fields); // flags: no password check
+    fields.push(15); // KDF count
+    fields.extend([7; 16]); // salt
+    let mut bytes = SIG.to_vec();
+    bytes.extend(main_block(false, None));
+    let crypt = bytes.len();
+    bytes.extend(common::block(4, 0, &fields, &[], &[], false));
+    bytes.extend(garbage(64));
+    bytes[crypt + 10] ^= 0x5a;
+    let case = case(&bytes);
+    assert!(
+        extract::run_with_password(
+            &case.archive,
+            &options(&case.out, Mode::Test, DamagedInput::Refuse),
+            Some("pw"),
+            |_| {}
+        )
+        .is_err()
+    );
+    let opts = options(&case.out, Mode::Test, DamagedInput::Salvage);
+    let summary = extract::run_with_password(&case.archive, &opts, Some("pw"), |_| {}).unwrap();
+    assert_eq!(kinds(&summary.damaged_headers), [HeaderDamageKind::Unreadable]);
+    assert_eq!(summary.damaged_headers[0].offset, crypt as u64);
+}
+
+/// A RAR 4.x header whose damage sets the embedded-comment flag is damage, not an unsupported feature: Salvage ends
+/// the volume there and Resync goes on to the next member.
+#[test]
+fn a_damaged_rar4_comment_flag_is_damage_not_unsupported() {
+    let (mut bytes, at) = rar4();
+    bytes[at[1] + 3] |= 0x08;
+    let case = case(&bytes);
+    assert!(extract(&case, DamagedInput::Refuse).is_err());
+    let summary = extract(&case, DamagedInput::Salvage).unwrap();
+    assert_eq!(written(&case), ["a.txt"]);
+    assert_eq!(kinds(&summary.damaged_headers), [HeaderDamageKind::Unreadable]);
+    fs::remove_dir_all(&case.out).unwrap();
+    let summary = extract(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(written(&case), ["a.txt", "c.txt"]);
+    assert_eq!(summary.damaged_headers[0].resumed_at, Some(at[2] as u64));
+}
+
+/// Canceling a whole-archive run while a resync searches a long damaged stretch fails the run as canceled, never as
+/// a success.
+#[test]
+fn canceling_during_a_resync_cancels_the_run() {
+    let (bytes, at) = rar5();
+    let mut damaged = bytes[..at[1]].to_vec();
+    damaged.extend(noise(8 << 20, 9));
+    let case = case(&damaged);
+    let cancel = extract::Cancellation::default();
+    let opts = options(&case.out, Mode::Extract, DamagedInput::Resync);
+    let result = extract::run_with_policy(
+        &case.archive,
+        &opts,
+        None,
+        &cancel,
+        &Default::default(),
+        |event: extract::RunEvent<'_>| {
+            if matches!(event, extract::RunEvent::MemberSucceeded { .. }) {
+                cancel.cancel();
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err(), "{result:?}");
+    let uncanceled = extract::Cancellation::default();
+    let report = extract::run_with_policy(
+        &case.archive,
+        &opts,
+        None,
+        &uncanceled,
+        &Default::default(),
+        |_: extract::RunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    // the stretch where b.txt's header should be is unreadable, and the search finds nothing after it
+    assert_eq!(report.damaged_headers(), 1);
+}
+
+/// A catalogue charges the damage records it keeps to its retained capacity: every slot of the vector holding them
+/// (3000 records sit in 4096 slots) and each record's path.
+#[test]
+fn session_charges_damage_records_to_its_capacity() {
+    let (bytes, at) = rar5();
+    let mut damaged = bytes[..at[1]].to_vec();
+    let false_header = common::block(2, 0, &[0xff], &[], &[], false);
+    for _ in 0..3000 {
+        damaged.extend(&false_header);
+    }
+    damaged.extend(&bytes[at[1]..]);
+    let clean = case(&bytes);
+    let damaged = case(&damaged);
+    let resync = RarSessionOptions { damaged_input: DamagedInput::Resync, ..Default::default() };
+    let session = RarSession::open(&damaged.archive, None, resync.clone()).unwrap();
+    let baseline = RarSession::open(&clean.archive, None, resync).unwrap();
+    let records = session.archive().damaged_headers();
+    assert_eq!(records.len(), 3000);
+    let paths: u64 = records.iter().map(|d| d.volume.as_os_str().len() as u64).sum();
+    let charged = session.usage().capacity - baseline.usage().capacity;
+    let slots = 4096 * size_of::<extract::HeaderDamage>() as u64;
+    assert!(charged >= slots + paths, "{charged} < {slots} + {paths}");
+}
+
+/// A damage record keeps at most 1 KiB of a damaged header's name, whatever the header claims.
+#[test]
+fn damage_records_keep_at_most_a_kibibyte_of_name() {
+    let long = "n".repeat(4000);
+    let mut bytes = SIG.to_vec();
+    bytes.extend(main_block(false, None));
+    let at = bytes.len();
+    bytes.extend(file_block(&FileSpec::new(&long, A), A, hash(A), false, false));
+    bytes.extend(end_block(false));
+    bytes[at] ^= 0x5a;
+    let case = case(&bytes);
+    let summary = extract::run(&case.archive, &options(&case.out, Mode::Test, DamagedInput::Salvage), |_| {}).unwrap();
+    assert_eq!(summary.damaged_headers[0].name.as_deref().map(str::len), Some(1024));
+}

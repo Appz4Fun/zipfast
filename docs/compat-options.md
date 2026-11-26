@@ -251,16 +251,25 @@ What UnRAR 7.30 (`x`, `t`, `l`) does, from archives with one byte changed, cut s
 | a RAR 4.x archive cut inside its main header | "Main archive header is corrupt", lists "0 files" (`Details: RAR 1.5`) | | opens with no members, `UnexpectedEnd` |
 
 Neither tool looks past an unreadable header for the next one. `Resync` does, for callers (RustyGet) that would rather
-recover the members after a damaged stretch, such as a hole still waiting for repair or garbage between blocks: from
-the byte after the unreadable header it searches the rest of the volume for a file, service or end header (never a
-main header) of at most 64 KiB whose checksum passes, and reads on from there (`HeaderDamage::resumed_at`). Each
-search is one forward pass, read in chunks from 4 KiB doubling to 1 MiB, and the checksum work of all the searches in a
-volume together is bounded by 16 times the volume's length plus 1 MiB, so a volume stays linear whatever its bytes are;
-past that bound the search gives up and passes over the rest of the volume. A RAR 4.x
+recover the members after a damaged stretch, such as a hole still waiting for repair, garbage between blocks, or the
+rest of a member's compressed data after its header was hit: from the byte after the unreadable header it searches the
+rest of the volume for a file, service or end header (never a main header) whose fixed fields are plausible (RAR 5.0:
+a one-byte flags field, a file or service header of at most 8 KiB, an end header of at most 32 bytes; RAR 4.x: a
+known host, unpack version and method, and a name that fits) and whose checksum passes, and reads on from there
+(`HeaderDamage::resumed_at`). Under `Resync` a damaged header of an unknown type is unreadable too, rather than passed
+over by the size it claims, so the search starts from it. Each search is one forward pass, read in chunks from 64 bytes
+doubling to 1 MiB; all the searches in a volume together may read and checksum at most 16 times the volume's length
+plus 1 MiB, so a volume stays linear whatever its bytes are, and megabytes of random (compressed-looking) data are
+crossed well within that. Past the bound, or when a `RarSession` catalogue's read budget (`RarCatalogueLimits::
+read_bytes`) has no room left, the search gives up and passes over the rest of the volume rather than fail. A RAR 4.x
 header checksum is 16 bits, so in a long damaged stretch a resync can land on a false header: what it reads from it
-fails its own checks (a member's data checksum, the next header's framing) and the search goes on.
+fails its own checks (a member's data checksum, the next header's framing) and the search goes on. A whole-archive
+run checks its `Cancellation` while it searches.
 
 Encrypted headers (`-hp`) are never salvaged, by either choice: there a failed checksum is how a wrong password shows.
+A RAR 5.0 encryption header that fails its checksum is never read as it stands either (its salt and KDF parameters
+would make every later header look like a wrong password): it is an unreadable header. A damage record keeps at most
+1 KiB of a member's name.
 A member whose data fails its checksum fails as before (`keep_broken` keeps what was written).
 
 Where it applies:

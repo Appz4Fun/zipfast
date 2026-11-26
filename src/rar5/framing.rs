@@ -131,6 +131,9 @@ pub(crate) struct HeaderParser {
     /// [`crate::extract::DamagedInput::Salvage`]: a clear header that fails its checksum is parsed anyway, and its
     /// frame says so ([`PhysicalFrame::damaged`]).
     salvage: bool,
+    /// [`crate::extract::DamagedInput::Resync`]: a damaged header of an unknown type is unreadable (the search for
+    /// the next header goes on from it) rather than passed over by the size it claims.
+    resync: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -161,11 +164,13 @@ impl HeaderParser {
             map_lenient: false,
             rar4_unknown_part_crc: false,
             salvage: false,
+            resync: false,
         }
     }
     /// See [`Self::salvage`]. Encrypted headers are never salvaged: a checksum failure there is a wrong key.
-    pub(crate) fn set_salvage(&mut self, on: bool) {
-        self.salvage = on;
+    pub(crate) fn set_salvage(&mut self, damaged: crate::extract::DamagedInput) {
+        self.salvage = damaged.salvages();
+        self.resync = damaged == crate::extract::DamagedInput::Resync;
     }
     pub(crate) fn format(&self) -> RarFormat {
         self.format
@@ -461,7 +466,8 @@ impl HeaderParser {
                     {
                         return Err(self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")).into());
                     }
-                    if self.embedded_comment(kind, flags) {
+                    // under salvage the body decides, once its checksum is known: a damaged flag is damage
+                    if !self.salvage && self.embedded_comment(kind, flags) {
                         return Err(self.rar4_unsupported("embedded comment").into());
                     }
                     if let Some(budget) = budget {
@@ -531,7 +537,9 @@ impl HeaderParser {
                     let plain_end = base + 4 + self.size_len + self.size;
                     let stored = u32::from_le_bytes(self.buffer[base..base + 4].try_into().unwrap());
                     let actual = crate::crc32::hash(&self.buffer[base + 4..plain_end]);
-                    let damaged = actual != stored && self.salvage && !self.encrypted();
+                    // never an encryption header: its salt and KDF parameters are what every later header needs
+                    let crypt = self.buffer.get(base + 4 + self.size_len) == Some(&(HEAD_CRYPT as u8));
+                    let damaged = actual != stored && self.salvage && !self.encrypted() && !crypt;
                     if actual != stored && !damaged {
                         return Err(FramingError::Checksum {
                             expected: stored,
@@ -549,6 +557,9 @@ impl HeaderParser {
                     }
                     let header_end = self.at + self.need as u64;
                     let mut frame = self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end)?;
+                    if damaged && self.resync && matches!(frame.block, Block::Unknown) {
+                        return Err(self.framing("damaged header", Error::Corrupt("damaged header")).into());
+                    }
                     frame.damaged = damaged;
                     self.ended = matches!(frame.block, Block::End { .. });
                     self.at = frame.data_end;

@@ -1552,7 +1552,12 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
         run.reports.volume()?;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
+        vol.set_cancel(run.cancel.clone());
         loop {
+            // a resync (DamagedInput::Resync) may have searched a long way, at the open too
+            if run.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
+                return Err(RarFault::new(RarFailure::Canceled, canceled_error()).into());
+            }
             let next = vol.next_block_detailed();
             let damage = vol.take_damage();
             if !damage.is_empty() {

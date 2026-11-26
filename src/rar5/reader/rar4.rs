@@ -194,7 +194,10 @@ impl HeaderParser {
             // them by their declared sizes, already bounded above, like unknown blocks marked skippable.
             0x75..=0x79 if self.map_lenient => Block::Unknown,
             // A damaged header of a type that holds no member is passed over by its size, as UnRAR does.
-            0x75..=0x79 if damaged => Block::Unknown,
+            0x75..=0x79 if damaged && !self.resync => Block::Unknown,
+            _ if damaged && self.resync => {
+                return Err(self.framing("damaged RAR4 header", Error::Corrupt("damaged RAR4 header")).into());
+            }
             _ if damaged && !matches!(kind, 0x73 | 0x74 | 0x7a | 0x7b) => Block::Unknown,
             0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
             _ if flags & 0x4000 != 0 => Block::Unknown,
