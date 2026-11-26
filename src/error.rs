@@ -167,6 +167,10 @@ pub enum RarUnsupported {
     /// [`crate::extract::Options::select`] was set on a run that chooses members its own way. Only the whole-archive
     /// runners apply it.
     MemberFilter,
+    /// [`crate::extract::UnsupportedFilters::WriteUnfiltered`]: a RAR 3.x/4.x member used a VM filter zipfast
+    /// doesn't run, and was written in full with that filter's blocks left as decoded. Its checksum was not checked
+    /// (it can't match). 7-Zip reports this as "Unsupported Method" and exits 2.
+    FilterWrittenUnfiltered,
 }
 
 #[derive(Clone, Debug)]
