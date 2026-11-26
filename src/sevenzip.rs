@@ -719,6 +719,8 @@ mod header_key_tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         let whole = compressions(|| {
             let summary = run(first, &options, Some("password"), &cancel, &limits, |_| {}).unwrap();

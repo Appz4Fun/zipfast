@@ -71,6 +71,8 @@ fn options(mode: Mode, dest: &Path) -> Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     }
 }
 
@@ -455,6 +457,8 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
         ..options(Mode::Extract, dest)
     };
     let out = tmp.path().join("seven");
@@ -490,6 +494,8 @@ fn r5extra_comes_out_as_7zip_writes_it() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
         ..options(Mode::Extract, &out)
     };
     extract::run(&fixture("rar5-compat", "r5extra.rar"), &opts, |_| {}).unwrap();
@@ -608,4 +614,201 @@ fn a_7z_member_outcome_carries_the_failure() {
     let mut text = String::new();
     fs::File::open(tmp.path().join("mixed/p.txt")).unwrap().read_to_string(&mut text).unwrap();
     assert!(!text.is_empty());
+}
+
+// ---- `unix_modes` and `backslashes`: how 7-Zip 26.06 on Linux writes names and modes ----
+//
+// `7z x` under umask 022 gives a file stored 0777 mode 0755 and one stored 0666 mode 0644 (under umask 002, 0775 and
+// 0664), drops setuid, setgid and sticky from files and folders alike, and gives a folder stored 0500 mode 0700
+// (u+rwx first); the same in ZIP, 7z, RAR and tar. It writes `d\x\y.txt`, `a?b.txt` and `..\up.txt` of a ZIP made on
+// Windows (host 0) as those single names, as it does for a ZIP made on Unix, and keeps a `\` in 7z and RAR 5.0 names
+// whatever system made them.
+
+/// A stored ZIP of `(name, data, mode)` entries: host Unix with the mode, or host MS-DOS (0) without one; a name
+/// ending in `/` or `\` is a folder (MS-DOS attribute 0x10 for host 0).
+fn stored_zip(entries: &[(&str, &[u8], Option<u32>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data, mode) in entries {
+        let crc = crc32fast::hash(data);
+        let at = out.len() as u32;
+        let common = |v: &mut Vec<u8>| {
+            v.extend(0x0800u16.to_le_bytes());
+            v.extend(0u16.to_le_bytes());
+            v.extend(0u16.to_le_bytes());
+            v.extend(((40u16 << 9) | (1 << 5) | 1).to_le_bytes());
+            v.extend(crc.to_le_bytes());
+            v.extend((data.len() as u32).to_le_bytes());
+            v.extend((data.len() as u32).to_le_bytes());
+            v.extend((name.len() as u16).to_le_bytes());
+        };
+        out.extend(0x0403_4b50u32.to_le_bytes());
+        out.extend(20u16.to_le_bytes());
+        common(&mut out);
+        out.extend(0u16.to_le_bytes());
+        out.extend(name.as_bytes());
+        out.extend(*data);
+        central.extend(0x0201_4b50u32.to_le_bytes());
+        central.extend(((if mode.is_some() { 3u16 << 8 } else { 0 }) | 20).to_le_bytes());
+        central.extend(20u16.to_le_bytes());
+        common(&mut central);
+        central.extend([0; 8]);
+        let folder = name.ends_with('/') || name.ends_with('\\');
+        let external = match mode {
+            Some(mode) => (mode << 16) | (u32::from(folder) * 0x10),
+            None => u32::from(folder) * 0x10,
+        };
+        central.extend(external.to_le_bytes());
+        central.extend(at.to_le_bytes());
+        central.extend(name.as_bytes());
+    }
+    let cd = out.len() as u32;
+    out.extend(&central);
+    out.extend(0x0605_4b50u32.to_le_bytes());
+    out.extend([0; 4]);
+    out.extend((entries.len() as u16).to_le_bytes());
+    out.extend((entries.len() as u16).to_le_bytes());
+    out.extend((central.len() as u32).to_le_bytes());
+    out.extend(cd.to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out
+}
+
+/// Every path under `root`, `/`-separated, with `/` after a folder.
+fn paths(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                out.push(format!("{name}/"));
+                walk(root, &path, out);
+            } else {
+                out.push(name);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if root.exists() {
+        walk(root, root, &mut out);
+    }
+    out.sort();
+    out
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// Extracts `archive` through the legacy runner and the checked dispatcher with `options`, each into its own folder.
+fn both_routes(archive: &Path, options: &Options, out: &Path) -> [PathBuf; 2] {
+    let legacy = out.join("legacy");
+    extract::run_with_password(archive, &Options { dest: legacy.clone(), ..options.clone() }, None, |_| {}).unwrap();
+    let checked = out.join("checked");
+    extract::run_with_zip_policy(
+        archive,
+        &Options { dest: checked.clone(), ..options.clone() },
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |_: zipfast::zip::ZipRunEvent<'_>| Ok(()),
+    )
+    .unwrap();
+    [legacy, checked]
+}
+
+#[test]
+fn literal_backslashes_keep_a_windows_zip_name_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("dos.zip");
+    let entries: &[(&str, &[u8], Option<u32>)] = &[
+        ("d\\x\\y.txt", b"y", None),
+        ("a?b.txt", b"q", None),
+        ("..\\up.txt", b"u", None),
+        ("\\abs.txt", b"a", None),
+        ("e/f\\g", b"g", None),
+        ("plain\\", b"", None),
+    ];
+    fs::write(&archive, stored_zip(entries)).unwrap();
+    let literal = Options { backslashes: extract::Backslashes::Literal, ..options(Mode::Extract, tmp.path()) };
+    for out in both_routes(&archive, &literal, &tmp.path().join("literal")) {
+        assert_eq!(
+            paths(&out),
+            ["..\\up.txt", "\\abs.txt", "a?b.txt", "d\\x\\y.txt", "e/", "e/f\\g", "plain\\/"],
+            "{out:?}"
+        );
+        assert_eq!(fs::read(out.join("d\\x\\y.txt")).unwrap(), b"y");
+    }
+    // By format: separators, `_` for `?`, and the names that climb out or start at the root refused.
+    let by_format = options(Mode::Extract, tmp.path());
+    let legacy = tmp.path().join("by-format");
+    let _ = extract::run_with_password(&archive, &Options { dest: legacy.clone(), ..by_format }, None, |_| {});
+    assert_eq!(paths(&legacy), ["a_b.txt", "d/", "d/x/", "d/x/y.txt", "e/", "e/f/", "e/f/g", "plain/"]);
+    assert!(!tmp.path().join("up.txt").exists());
+}
+
+#[test]
+fn literal_backslashes_keep_a_windows_rar5_name_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rar = tmp.path().join("win.rar");
+    let mut spec = FileSpec::new("t/x\\y", b"payload");
+    spec.unix_mode = None;
+    fs::write(&rar, archive(&[spec])).unwrap();
+    let out = tmp.path().join("out");
+    let literal = Options { backslashes: extract::Backslashes::Literal, ..options(Mode::Extract, &out) };
+    extract::run_with_password(&rar, &literal, None, |_| {}).unwrap();
+    assert_eq!(paths(&out), ["t/", "t/x\\y"]);
+    let by_format = tmp.path().join("by-format");
+    extract::run_with_password(&rar, &options(Mode::Extract, &by_format), None, |_| {}).unwrap();
+    assert_eq!(paths(&by_format), ["t/", "t/x_y"]);
+}
+
+#[test]
+fn masked_unix_modes_narrow_stored_modes_by_the_umask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("modes.zip");
+    let entries: &[(&str, &[u8], Option<u32>)] = &[
+        ("d/", b"", Some(0o40500)),
+        ("s/", b"", Some(0o41777)),
+        ("d/f777", b"a", Some(0o100777)),
+        ("d/f666", b"b", Some(0o100666)),
+        ("d/f4755", b"c", Some(0o104755)),
+        ("d/f640", b"d", Some(0o100640)),
+    ];
+    fs::write(&archive, stored_zip(entries)).unwrap();
+    for (umask, expected) in [
+        (0o022, [0o700, 0o755, 0o755, 0o644, 0o755, 0o640]),
+        (0o002, [0o700, 0o775, 0o775, 0o664, 0o755, 0o640]),
+        (0o077, [0o700, 0o700, 0o700, 0o600, 0o700, 0o600]),
+    ] {
+        let masked = Options { unix_modes: extract::UnixModes::Masked { umask }, ..options(Mode::Extract, tmp.path()) };
+        for out in both_routes(&archive, &masked, &tmp.path().join(format!("{umask:o}"))) {
+            let found = ["d", "s", "d/f777", "d/f666", "d/f4755", "d/f640"].map(|name| mode_of(&out.join(name)));
+            assert_eq!(found, expected, "umask {umask:o} {out:?}");
+        }
+    }
+    // Stored: the permission bits as stored, without setuid, setgid and sticky.
+    for out in both_routes(&archive, &options(Mode::Extract, tmp.path()), &tmp.path().join("stored")) {
+        let found = ["d", "s", "d/f777", "d/f666", "d/f4755"].map(|name| mode_of(&out.join(name)));
+        assert_eq!(found, [0o500, 0o777, 0o777, 0o666, 0o755], "{out:?}");
+    }
+}
+
+#[test]
+fn masked_unix_modes_apply_to_7z_and_rar_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    // tree.7z: text/run.sh is stored 0755.
+    let out = tmp.path().join("7z");
+    let masked = Options { unix_modes: extract::UnixModes::Masked { umask: 0o027 }, ..options(Mode::Extract, &out) };
+    extract::run_with_password(&fixture("7z-extract", "tree.7z"), &masked, None, |_| {}).unwrap();
+    assert_eq!(mode_of(&out.join("text/run.sh")), 0o750);
+    let rar = tmp.path().join("modes.rar");
+    let mut spec = FileSpec::new("f", b"x");
+    spec.unix_mode = Some(0o100777);
+    fs::write(&rar, archive(&[spec])).unwrap();
+    let out = tmp.path().join("rar");
+    let masked = Options { unix_modes: extract::UnixModes::Masked { umask: 0o002 }, ..options(Mode::Extract, &out) };
+    extract::run_with_password(&rar, &masked, None, |_| {}).unwrap();
+    assert_eq!(mode_of(&out.join("f")), 0o775);
 }

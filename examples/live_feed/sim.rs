@@ -1139,6 +1139,8 @@ fn verify(config: &Config, map: &MemberMap, outputs: &[(usize, u64, PathBuf)]) -
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     zipfast::extract::run_with_password(&config.volumes[0], &options, config.password.as_deref(), |_| {})
         .map_err(|e| format!("straight extraction: {e}"))?;

@@ -110,6 +110,8 @@ fn check_archive(archive: &Path, refuse: bool) {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     let mut seen = 0;
     REFUSE_WINDOW.store(refuse, Ordering::Relaxed);
