@@ -1371,6 +1371,8 @@ pub(crate) fn run_renaming(
             if archive.last_size_unknown && ordinal + 1 == entries.len() {
                 entry.size = if entry.effective_method() == METHOD_STORED { entry.packed } else { u64::MAX };
             }
+            // a failure writing the output, told apart from a failure reading the entry: it is never kept
+            let mut output_failed = false;
             let read = match target.as_mut() {
                 Some(out) => read_entry(
                     &mut archive.file,
@@ -1378,7 +1380,12 @@ pub(crate) fn run_renaming(
                     &entry,
                     password,
                     &mut buf,
-                    &mut |chunk| Ok(out.write(chunk)?),
+                    &mut |chunk| {
+                        out.write(chunk).map_err(|error| {
+                            output_failed = true;
+                            Error::Io(error)
+                        })
+                    },
                     cancel,
                 ),
                 None => read_entry(&mut archive.file, archive.len, &entry, password, &mut buf, &mut |_| Ok(()), cancel),
@@ -1399,8 +1406,9 @@ pub(crate) fn run_renaming(
                     let gap = archive.gap_crossed(e);
                     // Options::keep_broken: what was written of an entry whose data fails stays (a failure writing
                     // the output stops the run, and the output is removed as always)
-                    let writing = gap.is_none()
-                        && matches!(&err, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof);
+                    let writing = output_failed
+                        || gap.is_none()
+                            && matches!(&err, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof);
                     // a canceled run publishes nothing of the member in progress, whatever the read met
                     let canceled = cancel.is_some_and(Cancellation::is_canceled);
                     match target {
