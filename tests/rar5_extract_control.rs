@@ -1163,6 +1163,8 @@ fn unrelated_ctime_changes_after_known_unlink_still_revoke_diagnostics() {
             if entry.entry.order == 0 {
                 diagnostic.writer().expect("known unlink was admitted").write_all(b"first\n").unwrap();
                 let before = fs::metadata(&self.b).unwrap();
+                // Only ctime shows a link and unlink, so it must land in a later tick.
+                common::stamps::await_stamp_tick(&self.b);
                 fs::hard_link(&self.b, &self.extra).unwrap();
                 fs::remove_file(&self.extra).unwrap();
                 let after = fs::metadata(&self.b).unwrap();

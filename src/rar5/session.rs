@@ -2070,6 +2070,8 @@ mod tests {
         let held = open_read_only(&path).unwrap();
         let stamp = SourceStamp::capture(&held, &path).unwrap();
         let original_time = held.metadata().unwrap().modified().unwrap();
+        // Same size and the old mtime: only ctime shows the change, so it must land in a later tick.
+        crate::test_stamps::await_stamp_tick(&path);
         let mut output = OpenOptions::new().write(true).open(&path).unwrap();
         output.write_all(b"new").unwrap();
         output.set_times(FileTimes::new().set_modified(original_time)).unwrap();
