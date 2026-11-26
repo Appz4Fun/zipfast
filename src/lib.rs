@@ -24,6 +24,8 @@ extern crate self as zipfast;
 
 #[cfg(test)]
 mod test_alloc;
+#[cfg(all(test, unix))]
+mod test_stamps;
 
 mod batch;
 pub mod blake2sp;
