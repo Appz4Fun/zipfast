@@ -386,6 +386,11 @@ pub(crate) struct Rar4Decoder {
     vm_code: Vec<u8>,
     /// decoded bytes held from the first waiting block's start until it can be filtered
     hold: Vec<u8>,
+    /// [`crate::extract::UnsupportedFilters::WriteUnfiltered`]: a block an unrecognised VM program filters is
+    /// written as decoded, instead of failing the member
+    write_unfiltered: bool,
+    /// a block of this member was written unfiltered
+    unfiltered: bool,
     hold_start: u64,
     /// the member's unpack version, and the RAR 1.5 or 2.0 engine that decodes it
     version: u8,
@@ -495,6 +500,8 @@ impl Rar4Decoder {
             filters: filters::Filters::default(),
             vm_code: Vec::new(),
             hold: Vec::new(),
+            write_unfiltered: false,
+            unfiltered: false,
             hold_start: 0,
             version: 29,
             memory_limit: PPM_MEMORY_MAX,
@@ -654,6 +661,7 @@ impl Rar4Decoder {
                 block.start.checked_sub(self.chain_base).ok_or(Rar4DecodeError::Malformed("RAR4 filter block"))?;
             let mut data = self.hold[from..from + block.len].to_vec();
             self.work.tick(block.len as u64)?;
+            self.unfiltered |= block.kind == filters::Kind::Other;
             data = filters::run(&block, data, offset).map_err(Rar4DecodeError::Malformed)?;
             self.filters.pending.pop_front();
             // a block filtered again in place runs the next filter on the first's output
@@ -663,6 +671,7 @@ impl Rar4Decoder {
             {
                 let next = next.clone();
                 self.work.tick(next.len as u64)?;
+                self.unfiltered |= next.kind == filters::Kind::Other;
                 data = filters::run(&next, data, offset).map_err(Rar4DecodeError::Malformed)?;
                 self.filters.pending.pop_front();
             }
@@ -687,7 +696,7 @@ impl Rar4Decoder {
         let at = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
         let code = std::mem::take(&mut self.vm_code);
         self.work.tick(code.len() as u64)?;
-        self.filters.add(first, &code, at).map_err(|reason| {
+        self.filters.add(first, &code, at, self.write_unfiltered).map_err(|reason| {
             if reason.contains("other than") {
                 Rar4DecodeError::Unsupported(Rar4UnsupportedMode::VmFilter)
             } else {
@@ -700,6 +709,15 @@ impl Rar4Decoder {
             return Err(Rar4DecodeError::WindowLimit { requested: held, allowed: self.memory_limit });
         }
         Ok(())
+    }
+    /// What becomes of a block an unrecognised VM program filters (see [`crate::extract::UnsupportedFilters`]):
+    /// the member fails (`false`, the default), or the block is written as decoded, as 7-Zip writes it.
+    pub(crate) fn set_write_unfiltered(&mut self, on: bool) {
+        self.write_unfiltered = on;
+    }
+    /// Whether a block of the member just decoded was written unfiltered, clearing it for the next member.
+    pub(crate) fn take_unfiltered(&mut self) -> bool {
+        std::mem::take(&mut self.unfiltered)
     }
     /// Bounds what the decoder takes beyond its window: a PPM model and the block a filter holds back. At most
     /// the 256 MiB a PPM block may ask for.

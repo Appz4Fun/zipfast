@@ -119,6 +119,7 @@ impl<'a> Extraction<'a> {
         hooks: &mut impl ExtractionHooks,
     ) -> Result<RarOutcome, SelectedStop> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
+        run.write_unfiltered = self.options.unsupported_filters == crate::extract::UnsupportedFilters::WriteUnfiltered;
         let member = &session.model.members[index];
         let header = &member.header;
         if let Some(version) = header.version.filter(|_| !self.versions) {
@@ -241,8 +242,10 @@ impl<'a> Extraction<'a> {
         // recheck and hook alike), with what was written, and reported failed; a canceled run publishes nothing
         let (verified, broken) = match outcome {
             RarOutcome::Verified { bytes, checks, .. } => (Some((bytes, checks)), None),
+            // UnsupportedFilters::WriteUnfiltered: written in full, published as keep_broken publishes, and failed
             RarOutcome::Failed(failure)
-                if self.options.keep_broken && check_cancel(&session.options.cancel).is_ok() =>
+                if (self.options.keep_broken || super::unfiltered_written(&failure))
+                    && check_cancel(&session.options.cancel).is_ok() =>
             {
                 (None, Some(failure))
             }
@@ -1005,6 +1008,7 @@ mod tests {
             keep_broken: false,
             attempt_continued_members: false,
             damaged_input: Default::default(),
+            unsupported_filters: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),

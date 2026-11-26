@@ -675,6 +675,7 @@ fn session(f: &Fixture, fill: HoleFill) -> (ProgressiveSession, Shared) {
             keep_broken: false,
             attempt_continued_members: false,
             damaged_input: Default::default(),
+            unsupported_filters: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
