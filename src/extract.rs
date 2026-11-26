@@ -229,6 +229,32 @@ pub struct Options {
     /// it (the default), or a character of the name in every format but RAR 4.x, as 7-Zip 26.06 on Unix reads it.
     /// See [`Backslashes`].
     pub backslashes: Backslashes,
+    /// What becomes of a RAR 3.x/4.x member whose data a VM program other than the standard filters (E8, E8E9,
+    /// ITANIUM, DELTA, RGB, AUDIO) filters: it fails (the default), or it is written with the block that program
+    /// filters left as decoded, as 7-Zip 26.06 writes it. See [`UnsupportedFilters`].
+    pub unsupported_filters: UnsupportedFilters,
+}
+
+/// What becomes of a RAR 3.x/4.x member that uses a VM filter zipfast doesn't run; see
+/// [`Options::unsupported_filters`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UnsupportedFilters {
+    /// The member fails as unsupported (`RarUnsupported::Rar4Feature("VM/filter payload")`) and nothing of it is
+    /// kept, [`Options::keep_broken`] aside.
+    #[default]
+    Fail,
+    /// The member is decoded and written in full, each block such a program filters written as decoded
+    /// (unfiltered), as 7-Zip 26.06 `x`/`e` writes it ("ERROR: Unsupported Method", exit 2). Its checksum is not
+    /// checked, since the data can't match it, and it is reported failed with
+    /// `RarFailure::Unsupported(RarUnsupported::FilterWrittenUnfiltered)`, its file kept with its times set. A
+    /// solid stream's later members decode as usual: RAR 3.x filters act on the output, never on the history.
+    ///
+    /// Honoured by the whole-archive runners for RAR ([`run`], [`run_with_password`], [`run_rar_with_outcomes`])
+    /// and by [`crate::rar5::session::RarSession::extract_selected`] and `extract_selected_controlled`. Progressive
+    /// and persistent-partial sessions, `RarSession` test and print runs, `SelectedEntry` and `FeedDecoder` fail
+    /// such a member as unsupported whatever this says.
+    WriteUnfiltered,
 }
 
 /// The permission bits a run gives what it writes; see [`Options::unix_modes`]. A member without stored Unix
@@ -488,6 +514,7 @@ impl MemberRef<'_> {
 ///     replace_placed_links: false,
 ///     keep_broken: false,
 ///     attempt_continued_members: false,
+///     unsupported_filters: Default::default(),
 ///     salvage_truncated_zip: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
@@ -3016,6 +3043,8 @@ pub(crate) struct Pending {
     keep: Option<Meta>,
     /// [`Options::attempt_continued_members`]: its start is in an earlier volume, so it fails whatever its checks say
     orphan: bool,
+    /// [`UnsupportedFilters::WriteUnfiltered`]: a block was written unfiltered, so it is kept unchecked and fails
+    unfiltered: bool,
 }
 
 /// A symbolic link being extracted: created once its target is decoded and checked.
@@ -3058,6 +3087,7 @@ impl Pending {
             link: None,
             keep: None,
             orphan: false,
+            unfiltered: false,
         }
     }
 
@@ -3491,6 +3521,9 @@ impl Books<'_, '_> {
     }
 }
 
+/// What a member written unfiltered ([`UnsupportedFilters::WriteUnfiltered`]) is reported with.
+const UNFILTERED_MESSAGE: &str = "unsupported method: VM filter, written unfiltered";
+
 /// A file's last part is in: checks it whole and finishes it, or hands it to a worker for that when its bytes were
 /// gathered.
 fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> RunResult<()> {
@@ -3524,6 +3557,21 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
     }
     if p.passive {
         return Ok(());
+    }
+    // UnsupportedFilters::WriteUnfiltered: written in full but never checked (its checksum can't match), kept with
+    // its times and reported failed, as 7-Zip writes it ("Unsupported Method")
+    if p.unfiltered {
+        let failure = RarFailure::Unsupported(RarUnsupported::FilterWrittenUnfiltered);
+        if p.link.take().is_some() {
+            p.discard();
+            return books.fail(&p.context, failure, UNFILTERED_MESSAGE);
+        }
+        if let Some(out) = p.out.take()
+            && let Err(e) = out.finish_detailed(|file| finish_file(file, &c.meta))
+        {
+            return Err(books.terminal(&p.context, e.detailed(false)));
+        }
+        return books.fail(&p.context, failure, UNFILTERED_MESSAGE);
     }
     if let Err(failure) = p.verify_checks(c.size, c.crc32, c.blake2sp, c.keyed) {
         let reason = match &failure {
@@ -4003,6 +4051,7 @@ fn rar_read_at(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        unsupported_filters: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
@@ -5165,7 +5214,10 @@ impl Run<'_, '_, '_> {
             let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
             let limit = if self.selection.is_some() { RAR_SELECTED_WINDOW_LIMIT } else { 4 << 20 };
             match rar4_part_decoder(&mut self.rar4, h, vol.main.is_solid(), limit, cancel) {
-                Ok(decoder) => Some(decoder),
+                Ok(mut decoder) => {
+                    decoder.set_write_unfiltered(self.opts.unsupported_filters == UnsupportedFilters::WriteUnfiltered);
+                    Some(decoder)
+                }
                 Err(error) => {
                     rar4_error = Some(error);
                     None
@@ -5301,6 +5353,9 @@ impl Run<'_, '_, '_> {
             return Ok(());
         }
         self.stream = stream.or(self.stream.take());
+        if !split_after && let Some(decoder) = rar4.as_mut() {
+            p.unfiltered = decoder.take_unfiltered();
+        }
         if let Some(decoder) = rar4
             && (split_after || (vol.main.is_solid() && decoder.has_boundary()))
         {
