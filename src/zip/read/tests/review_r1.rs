@@ -61,12 +61,12 @@ fn r1_i1_directory_metadata_uses_original_cwd_in_isolated_process() {
     }
     let original_cwd = std::env::current_dir().unwrap();
     for (spelling, mode) in [("out", 0o751), ("", 0)] {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
+        let a = super::tempdir();
+        let b = super::tempdir();
         let path_a = a.path().join(spelling).join("folder");
         let path_b = b.path().join(spelling).join("folder");
-        std::fs::create_dir_all(&path_a).unwrap();
-        std::fs::create_dir_all(&path_b).unwrap();
+        super::private_dirs(&path_a).unwrap();
+        super::private_dirs(&path_b).unwrap();
         std::fs::set_permissions(&path_b, std::fs::Permissions::from_mode(0o705)).unwrap();
         let b_stamp = std::fs::metadata(&path_b).unwrap();
         let mut dir = Member::stored(b"folder/", b"");
@@ -170,7 +170,7 @@ fn r1_i2_member_postwrite_boundaries_stop_all_callbacks_borrowed_and_owned() {
                 let (file, mut session, mut options, old) =
                     super::run::setup(&[member, Member::stored(b"unvisited", b"x")]);
                 drop(old);
-                let dest = tempfile::tempdir().unwrap();
+                let dest = super::tempdir();
                 let diagnostic = tempfile::NamedTempFile::new().unwrap();
                 if mutation == 2 {
                     options.mode = Mode::Extract;
@@ -254,7 +254,7 @@ fn r1_i3_missing_and_empty_password_precedes_existing_skip() {
         member.central_extra = &extra;
         let (_file, mut session, mut options, old) = super::run::setup(&[member]);
         drop(old);
-        let dest = tempfile::tempdir().unwrap();
+        let dest = super::tempdir();
         std::fs::write(dest.path().join("a"), b"original").unwrap();
         options.mode = Mode::Extract;
         options.dest = dest.path().to_path_buf();
@@ -323,7 +323,7 @@ fn r1_i5_finalization_cancellation_preserves_prior_diagnostic_publication() {
         dir.external = 0o040755 << 16;
         let (_file, mut session, mut options, old) = super::run::setup(&[dir, Member::stored(b"a", b"data")]);
         drop(old);
-        let dest = tempfile::tempdir().unwrap();
+        let dest = super::tempdir();
         options.mode = Mode::Extract;
         options.dest = dest.path().to_path_buf();
         let mut c = context(&mut session, &options, Some("pw"));
