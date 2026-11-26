@@ -70,10 +70,13 @@ pub(crate) struct CipherBlocks {
     last: bool,
     ended: bool,
     padding: usize,
+    /// any packed byte came: an empty member (RAR writes no block for 0 bytes, packed size 0) ends without one
+    fed: bool,
 }
 
 impl CipherBlocks {
     pub(crate) fn feed(&mut self, mut data: &[u8], decoder: &mut Unpacker, sink: &mut dyn Sink) -> Result<()> {
+        self.fed |= !data.is_empty();
         while !data.is_empty() {
             if self.ended {
                 if data.len() > 15 - self.padding {
@@ -103,7 +106,12 @@ impl CipherBlocks {
         Ok(())
     }
 
+    /// The member's blocks ended whole. No packed byte at all is a whole empty member (an encrypted solid member of 0
+    /// bytes stores nothing; a header claiming more fails its size check instead).
     pub(crate) fn finish(&self) -> Result<()> {
+        if !self.fed {
+            return Ok(());
+        }
         if !self.ended || self.left != 0 || !self.header.is_empty() {
             return Err(Error::Truncated);
         }
