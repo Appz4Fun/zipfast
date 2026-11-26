@@ -188,10 +188,14 @@ fn session(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>) -> Outco
 
 /// A progressive session over the sealed archive: each member's outcome, or the failure that stopped the session.
 fn progressive(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>) -> Result<Outcomes, String> {
+    progressive_with(arc, options(dest, mode), password)
+}
+
+fn progressive_with(arc: &Path, extract: Options, password: Option<&str>) -> Result<Outcomes, String> {
     use std::task::{Context, Poll};
     use zipfast::progressive::*;
     let volume = (arc.file_name().unwrap().to_owned(), fs::read(arc).unwrap().into_boxed_slice());
-    let mut opts = ProgressiveOptions::new(options(dest, mode), arc.file_name().unwrap().to_owned());
+    let mut opts = ProgressiveOptions::new(extract, arc.file_name().unwrap().to_owned());
     opts.set_password(password.map(str::to_owned)).unwrap();
     let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
     let mut outcomes = Vec::new();
@@ -379,4 +383,21 @@ fn an_older_revision_of_an_unverifiable_link_is_skipped_on_a_progressive_session
     assert_eq!(outcomes.last().map(String::as_str), Some("ok"), "{outcomes:?}");
     assert_eq!(fs::read(dest.join("plain")).unwrap(), b"plain");
     assert!(fs::symlink_metadata(dest.join("old")).is_err(), "the older revision is not placed");
+}
+
+/// Codex on #307: with Overwrite::Skip and an existing target, an encrypted link with no check value is skipped (as
+/// any member whose target exists is), not refused for its missing check value, so later members still extract.
+#[test]
+fn an_unverifiable_link_over_an_existing_target_is_skipped_on_a_progressive_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("skip.rar");
+    fs::write(&path, archive(&[link("old", 1, "plain", false), FileSpec::new("plain", b"plain")])).unwrap();
+    let dest = dir.path().join("out");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("old"), b"kept").unwrap();
+    let extract = Options { overwrite: zipfast::extract::Overwrite::Skip, ..options(&dest, Mode::Extract) };
+    let outcomes = progressive_with(&path, extract, Some(PASSWORD)).expect("the session goes on");
+    assert_eq!(outcomes.last().map(String::as_str), Some("ok"), "{outcomes:?}");
+    assert_eq!(fs::read(dest.join("plain")).unwrap(), b"plain");
+    assert_eq!(fs::read(dest.join("old")).unwrap(), b"kept", "the existing target is left alone");
 }

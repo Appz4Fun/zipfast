@@ -1155,6 +1155,7 @@ impl ProgressiveSession {
         // A RAR 5.0 redirection is checked as soon as its header is in: a symbolic link's target must stay inside
         // the destination, and a hard link or file copy must take a file this session published or tested.
         self.link_kind = None;
+        let mut unverified_link = None;
         if let Some(redirection) = header.redirection.as_ref().filter(|_| refusal.is_none()) {
             let unsupported = || {
                 ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
@@ -1178,23 +1179,12 @@ impl ProgressiveSession {
                         return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
                     }
                     // An encrypted link is placed only on a password its check value verifies: the member's cipher
-                    // refuses no password or a wrong one, and one with no usable check value is refused here, as a
-                    // link has no data to check a password against (`crate::extract::link::rar5_password`).
-                    // (only for a member that is processed: an older revision is skipped below, placed or tested never)
-                    let older_revision =
-                        header.version.is_some() && self.options.extract.mode != crate::extract::Mode::Test;
-                    if header.encrypted
-                        && !older_revision
-                        && self.options.password().is_some_and(|p| !p.is_empty())
-                        && let Some(verifier) = header.crypt.as_ref().and_then(crate::extract::link::rar5_unverifiable)
-                    {
-                        return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
-                            crate::error::RarFailure::EncryptedIntegrity {
-                                scope: crate::error::RarScope::Member { index: Some(member.ordinal) },
-                                reason: crate::error::RarIntegrityReason::UnverifiableLinkPassword,
-                                verifier,
-                            },
-                        ))));
+                    // refuses no password or a wrong one, and one with no usable check value is refused, as a link has
+                    // no data to check a password against (`crate::extract::link::rar5_password`). The refusal waits
+                    // for the disposition: a member that is skipped (an older revision, an existing target) is never
+                    // placed or tested, so it is skipped as before.
+                    if header.encrypted && self.options.password().is_some_and(|p| !p.is_empty()) {
+                        unverified_link = header.crypt.as_ref().and_then(crate::extract::link::rar5_unverifiable);
                     }
                     self.link_kind = Some(kind);
                 }
@@ -1261,6 +1251,17 @@ impl ProgressiveSession {
             }
             self.link_text.clear();
             self.disposition = Disposition::Link;
+        }
+        if let Some(verifier) = unverified_link
+            && matches!(self.disposition, Disposition::Link | Disposition::Test)
+        {
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                crate::error::RarFailure::EncryptedIntegrity {
+                    scope: crate::error::RarScope::Member { index: Some(member.ordinal) },
+                    reason: crate::error::RarIntegrityReason::UnverifiableLinkPassword,
+                    verifier,
+                },
+            ))));
         }
         let context = crate::extract::EntryContext {
             entry: crate::extract::RarEntryIdentity {
