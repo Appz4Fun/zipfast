@@ -112,7 +112,8 @@ UnRAR also makes `e`; zipfast never makes a link that leads out of the destinati
 
 With `Options::replace_placed_links` (UnRAR 7.30 `e -y`), a symbolic link this run placed itself (same device and
 inode as the link it made) is not a pre-existing link: a later member of the same name replaces it by rename, never
-following it, as a file replaces a file (tar, ZIP, 7z and RAR runs; `Overwrite::Skip` keeps it). Off (the default) it
+following it, as a file replaces a file (tar, ZIP, 7z and RAR runs, and `RarSession::extract_selected`, which takes
+the same `Options`; `Overwrite::Skip` keeps it). Off (the default) it
 is refused, as 7-Zip 26.06 does (`7z e dirlink_unix.rar`: "Dangerous link via another link was ignored", exit 2). A link from before the run is still refused (`a symlink is in the way`). The
 checked ZIP route (`run_with_policy`) does this for a link over a link, but still refuses a file over a link it placed.
 

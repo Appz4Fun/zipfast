@@ -817,3 +817,29 @@ fn preexisting_links_inside_the_destination_follow_the_policy() {
         }
     }
 }
+
+/// prybar's P8: `dirlink_unix.rar` flattened (`e -y`) puts two links at `link`. With `replace_placed_links` the second
+/// replaces the first, which this run placed, as UnRAR 7.30 does, on the whole-archive and the selected route alike;
+/// without it the second is refused (7-Zip 26.06) and the first stays.
+#[test]
+fn a_flattened_second_link_replaces_the_first_only_when_asked() {
+    let path = fixture("dirlink_unix.rar");
+    let dir = tempfile::tempdir().unwrap();
+    for replace in [true, false] {
+        let flat = |dest: &Path| Options { flatten: true, replace_placed_links: replace, ..options(dest) };
+        // `emptydir/link -> link` lands first at `link`, then `link -> emptydir`
+        let want = if replace { "emptydir" } else { "link" };
+        let out = dir.path().join(format!("run-{replace}"));
+        let summary = extract::run(&path, &flat(&out), |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), usize::from(!replace), "run {replace}: {:?}", summary.errors);
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(want), "run {replace}");
+
+        let out = dir.path().join(format!("selected-{replace}"));
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let summary = session.extract_selected(&all, &flat(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+        assert_eq!(summary.failed, u64::from(!replace), "selected {replace}: {summary:?}");
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(want), "selected {replace}");
+        assert_eq!(fs::read(out.join("file")).unwrap().len(), 8, "selected {replace}");
+    }
+}

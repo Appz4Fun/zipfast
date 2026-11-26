@@ -558,6 +558,11 @@ impl<'a> Extraction<'a> {
             Err(source) => return Err(output_fault(IoOperation::Metadata, target, source)),
         };
         if metadata.file_type().is_symlink() {
+            // A symbolic link this run placed is replaced by rename (never followed) when asked, as UnRAR 7.30 `e -y`
+            // does; otherwise, and for any other link, the member is refused, as 7-Zip 26.06 does.
+            if self.options.replace_placed_links && self.extracted.owns_link(&metadata) {
+                return named.map(|()| Some(SourceStamp::from_entry_metadata(&metadata)));
+            }
             return Err(policy(RarPolicyReason::Symlink, target.to_path_buf()));
         }
         let identity = (metadata.dev(), metadata.ino());
