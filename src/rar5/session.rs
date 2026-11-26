@@ -364,6 +364,11 @@ impl<'a> RarHeader<'a> {
         self.0.header.service
     }
 
+    /// RAR 5.0: the Unix owner record (owner and group names, numeric ids), when the header has one.
+    pub fn owner(&self) -> Option<&'a super::UnixOwner> {
+        self.0.header.owner.as_ref()
+    }
+
     /// For a service header, its type name: `CMT`, `QO`, `RR`, `ACL`, `STM` or another.
     pub fn service_name(&self) -> Option<&'a str> {
         self.is_service().then_some(self.0.header.name.as_str())
@@ -1372,7 +1377,10 @@ impl Catalogue {
             let names = add(self.session.usage.name_bytes, name_bytes)?;
             limit(names, self.options.limits.name_bytes, RarResource::CatalogueNameBytes)?;
             let allocation = add(
-                add(header.name.capacity() as u64, wire.name.capacity() as u64)?,
+                add(
+                    add(header.name.capacity() as u64, wire.name.capacity() as u64)?,
+                    header.owner.as_ref().map_or(0, |o| o.heap_capacity() as u64),
+                )?,
                 add(target.map_or(0, |t| t.capacity() as u64), crate::rar5::RAW_NAME_OWNER_BYTES as u64)?,
             )?;
             let part_minimum = u64::from(self.session.model.parts.len() == self.session.model.parts.capacity())
@@ -1429,7 +1437,10 @@ impl Catalogue {
             .map_or(0, |name| (name.capacity() + crate::rar5::RAW_NAME_OWNER_BYTES) as u64);
         let allocation = add(
             add(header.name.capacity() as u64, target_name(&header).map_or(0, |t| t.capacity() as u64))?,
-            add(header.sub_data.capacity() as u64, unowned_name)?,
+            add(
+                add(header.sub_data.capacity() as u64, unowned_name)?,
+                header.owner.as_ref().map_or(0, |o| o.heap_capacity() as u64),
+            )?,
         )?;
         let base = add(self.capacity_without::<HeaderRecord>(self.session.headers.capacity())?, allocation)?;
         reserve_one(&mut self.session.headers, base, self.options.limits.capacity)?;
