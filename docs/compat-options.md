@@ -264,7 +264,9 @@ crossed well within that. Past the bound, or when a `RarSession` catalogue's rea
 read_bytes`) has no room left, the search gives up and passes over the rest of the volume rather than fail. A RAR 4.x
 header checksum is 16 bits, so in a long damaged stretch a resync can land on a false header: what it reads from it
 fails its own checks (a member's data checksum, the next header's framing) and the search goes on. A whole-archive
-run checks its `Cancellation` while it searches.
+run checks its `Cancellation` while it searches. Bytes passed over (an unreadable stretch, a resync) break a solid
+archive's history: a solid member after them fails as lacking it (`RarFailure::SolidHistoryUnavailable`) until a
+non-solid member starts a new history, in the whole-archive runners and in `RarSession` alike.
 
 Encrypted headers (`-hp`) are never salvaged, by either choice: there a failed checksum is how a wrong password shows.
 A RAR 5.0 encryption header that fails its checksum is never read as it stands either (its salt and KDF parameters
@@ -286,5 +288,5 @@ Where it applies:
 
 Progressive and persistent-partial sessions still refuse a damaged header whatever `damaged_input` says; listings that
 take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
-`--resync` (for `l`, `t`, `x`, `e`), prints each damaged header and a warning, and exits 1.
+`--resync` (for `l`, `t`, `x`, `e`; a listing of anything but RAR stays as it is), prints each damaged header and a warning, and exits 1.
 `tests/rar_salvage.rs` checks each point.

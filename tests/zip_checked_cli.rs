@@ -144,6 +144,12 @@ fn listing_hardlink_source_alias_refuses() {
     alias_case(&["v"], true, true, false);
 }
 #[test]
+fn salvage_listing_source_alias_refuses() {
+    // `--salvage` / `--resync` change only how a RAR archive is listed: a ZIP keeps its checked listing
+    alias_case(&["l", "--salvage"], true, false, false);
+    alias_case(&["v", "--resync"], true, true, false);
+}
+#[test]
 fn unknown_arg_source_alias_refuses() {
     alias_case(&["t", "-unknown"], false, true, false);
 }

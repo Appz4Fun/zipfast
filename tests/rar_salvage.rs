@@ -716,5 +716,73 @@ fn damage_records_keep_at_most_a_kibibyte_of_name() {
     bytes[at] ^= 0x5a;
     let case = case(&bytes);
     let summary = extract::run(&case.archive, &options(&case.out, Mode::Test, DamagedInput::Salvage), |_| {}).unwrap();
-    assert_eq!(summary.damaged_headers[0].name.as_deref().map(str::len), Some(1024));
+    let name = summary.damaged_headers[0].name.as_ref().unwrap();
+    assert_eq!(name.len(), 1024);
+    assert!(name.capacity() <= 1024, "the record holds {} bytes for its name", name.capacity());
+}
+
+/// A solid archive whose middle member's header is lost: the member after the gap continues a history that is no
+/// longer whole, so it must fail as such, never decode against the history from before the gap. Its header carries
+/// no CRC32 here, so only that rule stands between it and silently wrong bytes.
+#[test]
+fn a_resync_gap_breaks_the_solid_history() {
+    use zipfast::rar5::testenc::{self, Op};
+    let ops: [Vec<Op>; 3] = [vec![Op::Lit(b'a'); 100], vec![Op::Lit(b'b'); 100], vec![Op::Match(100, 100)]];
+    let mut all = Vec::new();
+    let mut plain = Vec::new();
+    let mut at = 0;
+    for o in &ops {
+        all.extend(o.iter().cloned());
+        let model = testenc::model(&all);
+        plain.push(model[at..].to_vec());
+        at = model.len();
+    }
+    assert_eq!(plain[2], vec![b'b'; 100]);
+    let streams: Vec<Vec<u8>> = ops.iter().map(|o| testenc::block(o, true, true)).collect();
+    let names = ["a.bin", "b.bin", "c.bin"];
+    let mut bytes = SIG.to_vec();
+    bytes.extend(common::main_block_flags(false, None, true));
+    let mut offsets = Vec::new();
+    for i in 0..3 {
+        offsets.push(bytes.len());
+        let spec = FileSpec {
+            method: 3,
+            size: Some(plain[i].len() as u64),
+            solid: i > 0,
+            no_crc: i == 2,
+            ..FileSpec::new(names[i], &streams[i])
+        };
+        bytes.extend(file_block(&spec, &streams[i], hash(&plain[i]), false, false));
+    }
+    bytes.extend(end_block(false));
+    let intact = case(&bytes);
+    extract(&intact, DamagedInput::Resync).unwrap();
+    assert_eq!(fs::read(intact.out.join("c.bin")).unwrap(), plain[2]);
+
+    bytes[offsets[1]..offsets[1] + 16].fill(0);
+    let case = case(&bytes);
+    let summary = extract(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(fs::read(case.out.join("a.bin")).unwrap(), plain[0]);
+    assert!(!case.out.join("c.bin").exists(), "c.bin decoded against the history from before the gap");
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+
+    let mut session = RarSession::open(
+        &case.archive,
+        None,
+        RarSessionOptions { damaged_input: DamagedInput::Resync, ..Default::default() },
+    )
+    .unwrap();
+    assert_eq!(session.entries().map(|m| m.name().to_owned()).collect::<Vec<_>>(), ["a.bin", "c.bin"]);
+    let selected = session.select(|_| true).unwrap();
+    let out = case.out.join("session");
+    let summary = session
+        .extract_selected(
+            &selected,
+            &options(&out, Mode::Extract, DamagedInput::Resync),
+            RarDecodeLimits::default(),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!((summary.files, summary.failed), (1, 1));
+    assert!(!out.join("c.bin").exists());
 }

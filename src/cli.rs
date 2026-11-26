@@ -198,6 +198,14 @@ fn repack(args: &[String]) -> ExitCode {
 
 /// `l --salvage` / `l --resync`: the listing, then a warning for every damaged header read past.
 fn salvage_list(archive: &Path, password: Option<&str>, damaged: extract::DamagedInput) -> ExitCode {
+    // Only a RAR archive lists differently under salvage: anything else keeps its own listing, a ZIP's checked one
+    // (which refuses an output that aliases the archive) included.
+    let route = extract::checked_route(archive, &extract::Cancellation::default());
+    if !matches!(route, Ok(extract::CheckedRoute::Legacy(extract::LegacyRoute::Rar { .. }))) {
+        drop(route);
+        return list(archive, password);
+    }
+    drop(route);
     let options = Options { damaged_input: damaged, ..listing_options() };
     match extract::list_detailed_with_options(archive, password, &options) {
         Ok(listing) => {

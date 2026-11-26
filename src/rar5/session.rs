@@ -1292,7 +1292,12 @@ impl Catalogue {
             let mut comment = None;
             loop {
                 let parsed = volume.next_catalogue(&mut self.scan_budget());
-                self.keep_damage(volume.take_damage())?;
+                let damage = volume.take_damage();
+                // bytes passed over break the solid history: a solid member after them chains to nothing
+                if damage.iter().any(|d| d.kind != crate::extract::HeaderDamageKind::ChecksumMismatch) {
+                    self.history_barrier = true;
+                }
+                self.keep_damage(damage)?;
                 let Some((block, crypt, wire)) = parsed? else { break };
                 match block {
                     Block::File(header) => {

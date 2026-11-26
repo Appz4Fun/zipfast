@@ -717,19 +717,19 @@ impl Volume {
         std::mem::take(&mut self.damage)
     }
 
-    fn record_damage(&mut self, offset: u64, kind: HeaderDamageKind, name: Option<String>, resumed_at: Option<u64>) {
-        // a damaged header's name is kept for the message only: at most 1 KiB of it
-        let name = name.map(|mut name| {
-            if name.len() > MAX_DAMAGE_NAME {
-                let mut end = MAX_DAMAGE_NAME;
-                while !name.is_char_boundary(end) {
-                    end -= 1;
-                }
-                name.truncate(end);
+    fn record_damage(&mut self, offset: u64, kind: HeaderDamageKind, name: Option<&str>, resumed_at: Option<u64>) {
+        if self.damage.len() >= crate::extract::MAX_HEADER_DAMAGE {
+            return;
+        }
+        // a damaged header's name is kept for the message only: a copy of at most 1 KiB of it
+        let name = name.map(|name| {
+            let mut end = name.len().min(MAX_DAMAGE_NAME);
+            while !name.is_char_boundary(end) {
+                end -= 1;
             }
-            name
+            name[..end].to_owned()
         });
-        if self.damage.len() < crate::extract::MAX_HEADER_DAMAGE {
+        {
             self.damage.push(HeaderDamage { volume: self.path.clone(), offset, kind, name, resumed_at });
         }
     }
@@ -966,10 +966,11 @@ impl Volume {
                 self.next = frame.data_end;
                 if frame.damaged {
                     let name = match &frame.block {
-                        Block::File(h) | Block::Service(h) => Some(h.name.clone()),
+                        Block::File(h) | Block::Service(h) => Some(h.name.as_str()),
                         _ => None,
                     };
-                    self.record_damage(frame.extent.start, HeaderDamageKind::ChecksumMismatch, name, None);
+                    let (offset, kind) = (frame.extent.start, HeaderDamageKind::ChecksumMismatch);
+                    self.record_damage(offset, kind, name, None);
                 }
                 if matches!(frame.block, Block::Crypt) {
                     if budget.is_some() && (!catalogue_main || self.header_key.is_some()) {

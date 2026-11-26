@@ -1561,7 +1561,17 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
             let next = vol.next_block_detailed();
             let damage = vol.take_damage();
             if !damage.is_empty() {
+                // bytes were passed over: whatever solid history they held is lost, so a solid member after the
+                // gap fails as lacking it instead of decoding against the history from before the gap (a member
+                // still being continued keeps its decoder: its own checks decide)
+                let gap = damage.iter().any(|d| d.kind != HeaderDamageKind::ChecksumMismatch);
                 run.reports.damaged(damage);
+                if gap && run.pending.is_none() {
+                    run.drain()?;
+                    run.stream = None;
+                    run.rar4 = None;
+                    run.unavailable = Some((None, None));
+                }
             }
             let Some((block, crypt)) = next? else { break };
             match block {
