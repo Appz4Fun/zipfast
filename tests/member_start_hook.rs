@@ -49,6 +49,7 @@ fn options(dest: &Path, overwrite: Overwrite, select: MemberFilter) -> Options {
         restart_from_first_volume: false,
         replace_placed_links: false,
         keep_broken: false,
+        attempt_continued_members: false,
     }
 }
 

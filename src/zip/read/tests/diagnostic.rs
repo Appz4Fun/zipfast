@@ -1188,6 +1188,7 @@ fn direct_setup_output(
         restart_from_first_volume: false,
         replace_placed_links: false,
         keep_broken: false,
+        attempt_continued_members: false,
     };
     (file, session, options, context)
 }

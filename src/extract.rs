@@ -207,6 +207,11 @@ pub struct Options {
     /// with its times set, as 7-Zip 26.06 `x`/`e` and UnRAR 7.30 `-kb` do. The member is still reported failed. Off
     /// (the default) such a file is removed, so a later run never takes it for finished.
     pub keep_broken: bool,
+    /// A RAR run started at a later volume meets a member continued from an earlier one: it is extracted from what
+    /// this volume holds, and fails (its checks can't pass without its start), as 7-Zip 26.06 `x` does ("CRC Failed",
+    /// "Data Error"; with [`Self::keep_broken`] the file stays). Off (the default) it is passed over as lacking its
+    /// start (`RarSkipReason::MissingStart`). [`Self::restart_from_first_volume`] goes back for the start instead.
+    pub attempt_continued_members: bool,
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -403,6 +408,7 @@ impl MemberRef<'_> {
 ///     restart_from_first_volume: false,
 ///     replace_placed_links: false,
 ///     keep_broken: false,
+///     attempt_continued_members: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -3852,6 +3858,7 @@ fn rar_read_at(
         restart_from_first_volume: false,
         replace_placed_links: false,
         keep_broken: false,
+        attempt_continued_members: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -4106,7 +4113,7 @@ impl Run<'_, '_, '_> {
             self.drain_batch()?;
         }
         // a continuation of some other member, after one that wants its next part, is taken as a member of its own
-        if !self.end_pending()? && continuation {
+        if !self.end_pending()? && continuation && !self.opts.attempt_continued_members {
             if self.reports.typed() {
                 self.drain()?;
             }
@@ -4561,6 +4568,19 @@ impl Run<'_, '_, '_> {
             }
             _ => key,
         };
+        // Options::attempt_continued_members: a compressed member whose start is in an earlier volume can't be decoded
+        // (its decoder state is there too): it fails as 7-Zip's "Data Error", kept empty with Options::keep_broken
+        if h.split_before() && h.method != 0 && self.opts.attempt_continued_members {
+            if let Some(place) = place.take().filter(|_| self.opts.keep_broken && !link) {
+                let meta = self.opts.meta(Meta::from(h));
+                if let Ok(out) = create_target_detailed(place, None) {
+                    let _ = out.finish_detailed(|file| keep_written(file, &meta));
+                }
+            }
+            let failure = ctx.integrity(RarIntegrityReason::Decoder("its start is in an earlier volume"), false);
+            let cause = self.fail_in_order(&ctx, failure, "data error: its start is in an earlier volume")?;
+            return self.pass_over(vol, h, ctx, cipher, Some(cause));
+        }
         // a file a later hard link or file copy may take, once it is verified
         if self.selection.is_none() && !h.is_rar4_symlink() {
             let landed = place.as_ref().map(|place| place.path.clone());

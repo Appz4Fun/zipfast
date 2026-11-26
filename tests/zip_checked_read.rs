@@ -100,6 +100,7 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
             restart_from_first_volume: false,
             replace_placed_links: false,
             keep_broken: false,
+            attempt_continued_members: false,
         };
         let error = extract::run_with_zip_policy(
             &first,
@@ -431,6 +432,7 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
                 restart_from_first_volume: false,
                 replace_placed_links: false,
                 keep_broken: false,
+                attempt_continued_members: false,
             };
             let result = extract::run_with_zip_policy(
                 &path,
@@ -705,6 +707,7 @@ mod direct_completion {
             restart_from_first_volume: false,
             replace_placed_links: false,
             keep_broken: false,
+            attempt_continued_members: false,
         }
     }
     #[test]
@@ -871,6 +874,7 @@ mod direct_aliases {
                     restart_from_first_volume: false,
                     replace_placed_links: false,
                     keep_broken: false,
+                    attempt_continued_members: false,
                 };
                 let log_path = match alias {
                     0 => source.clone(),
@@ -988,6 +992,7 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
             restart_from_first_volume: false,
             replace_placed_links: false,
             keep_broken: false,
+            attempt_continued_members: false,
         };
         macro_rules! refuse_completion {
             ($session:ident,$context:ident,$token:expr,$admit:expr,$emit:ident) => {{
@@ -1124,6 +1129,7 @@ mod protected_name_completion {
                             restart_from_first_volume: false,
                             replace_placed_links: false,
                             keep_broken: false,
+                            attempt_continued_members: false,
                         };
                         let output = || {
                             if extract {

@@ -1825,6 +1825,7 @@ mod tests {
                 restart_from_first_volume: false,
                 replace_placed_links: false,
                 keep_broken: false,
+                attempt_continued_members: false,
             },
             "a.rar".into(),
         );
@@ -1954,6 +1955,7 @@ mod tests {
                     restart_from_first_volume: false,
                     replace_placed_links: false,
                     keep_broken: false,
+                    attempt_continued_members: false,
                 },
                 "a.rar".into(),
             );

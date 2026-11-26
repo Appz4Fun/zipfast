@@ -46,6 +46,7 @@ fn options(dest: &Path, keep: bool, threads: usize) -> Options {
         restart_from_first_volume: false,
         replace_placed_links: false,
         keep_broken: keep,
+        attempt_continued_members: false,
     }
 }
 
@@ -145,5 +146,25 @@ fn a_7z_member_failing_a_wrong_password_leaves_no_empty_folder() {
         let summary = extract::run_with_password(&path, &options(&out, keep, 1), Some("wrong"), |_| {}).unwrap();
         assert!(!summary.errors.is_empty(), "{keep}");
         assert!(!out.join("text").exists(), "{keep}: no folder left for the failed members");
+    }
+}
+
+/// prybar N4 (`7z x multi.part2.rar`): the run starts at the second volume, where `file2.txt` continues from the first.
+/// With `attempt_continued_members` it fails as 7-Zip's "Data Error" (a compressed member can't be decoded without its
+/// start) instead of being passed over, kept empty with `keep_broken`; `file3.txt` comes out either way.
+#[test]
+fn a_member_continued_from_an_earlier_volume_fails_as_7zip_when_attempted() {
+    let path = Path::new(FIXTURES).join("rar4-volumes/multi.part2.rar");
+    let dir = tempfile::tempdir().unwrap();
+    for (attempt, keep) in [(true, true), (true, false), (false, true)] {
+        let out = dir.path().join(format!("{attempt}-{keep}"));
+        let opts = Options { attempt_continued_members: attempt, ..options(&out, keep, 1) };
+        let summary = extract::run(&path, &opts, |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), usize::from(attempt), "{attempt} {keep}: {:?}", summary.errors);
+        assert_eq!(fs::read(out.join("file3.txt")).unwrap().len(), 18, "{attempt} {keep}");
+        match fs::read(out.join("file2.txt")) {
+            Ok(kept) => assert!(attempt && keep && kept.is_empty(), "{attempt} {keep}: kept empty only then"),
+            Err(_) => assert!(!(attempt && keep), "{attempt} {keep}"),
+        }
     }
 }

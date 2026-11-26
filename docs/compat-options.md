@@ -16,6 +16,7 @@ refused_link_placeholder: false,
 restart_from_first_volume: false,
 replace_placed_links: false,
 keep_broken: false,
+attempt_continued_members: false,
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -185,3 +186,12 @@ Not kept: links, and a failure writing the output (that stops the run). Whatever
 before anything of it is kept no longer leaves the folders its placing created (`-pwrong aes.7z` leaves no empty
 `text/`, as 7-Zip leaves none). A RAR member whose filter is unsupported is
 kept empty; 7-Zip writes its data unfiltered (`generic_delta_padding_mutation.rar`), which zipfast does not.
+
+## `attempt_continued_members`: a member continued from an earlier volume
+
+A RAR run started at a later volume meets a member whose start is in an earlier one. By default it is passed over as
+lacking its start (`RarSkipReason::MissingStart`). With `Options::attempt_continued_members`, as 7-Zip 26.06 `x` does,
+it is extracted from what this volume holds and fails: a stored member writes the bytes it has and fails its checksum
+("CRC Failed": `win-oldvol.r00` `split.bin`), a compressed one fails without decoding ("Data Error":
+`multi.part2.rar` `file2.txt`). With `keep_broken` the file stays, matching 7-Zip's tree; the run's later members come
+out as usual. (`restart_from_first_volume`, UnRAR's behaviour, goes back for the start instead.)

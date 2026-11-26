@@ -2558,6 +2558,7 @@ mod tests {
                 restart_from_first_volume: false,
                 replace_placed_links: false,
                 keep_broken: false,
+                attempt_continued_members: false,
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);
@@ -2622,6 +2623,7 @@ mod tests {
                 restart_from_first_volume: false,
                 replace_placed_links: false,
                 keep_broken: false,
+                attempt_continued_members: false,
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);

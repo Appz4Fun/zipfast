@@ -1688,6 +1688,7 @@ fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
         restart_from_first_volume: false,
         replace_placed_links: false,
         keep_broken: false,
+        attempt_continued_members: false,
     };
     for case in 0..6 {
         let cancel = Cancellation::default();
@@ -1798,6 +1799,7 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         restart_from_first_volume: false,
         replace_placed_links: false,
         keep_broken: false,
+        attempt_continued_members: false,
     };
     for supplied_context in [false, true] {
         OBSERVATIONS.with(|s| s.set(Default::default()));
