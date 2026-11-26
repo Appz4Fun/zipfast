@@ -111,6 +111,44 @@ fn crc_member_fault_then_good_continues() {
     assert_eq!((report.failed(), report.files(), failures), (1, 1, 1));
 }
 
+/// Codex on #294: a member kept by `Options::keep_broken` still fails, and its error says the target was published,
+/// with the bytes it holds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_kept_broken_member_fails_as_published() {
+    let mut bad = Member::stored(b"bad", b"bad data");
+    bad.crc = Some(1);
+    let (_file, mut s, mut o, old) = setup(&[bad, Member::stored(b"good", b"good")]);
+    drop(old);
+    let dest = tempfile::tempdir().unwrap();
+    o.mode = Mode::Extract;
+    o.dest = dest.path().to_path_buf();
+    o.keep_broken = true;
+    let mut c = EncryptedReadContext::for_projected(
+        &mut s,
+        ProjectedReadScope::AllRegular,
+        None,
+        ZipReadOutput::StagedFiles { destination: &o.dest },
+        Some("pw"),
+        &Default::default(),
+        &Cancellation::default(),
+    )
+    .unwrap();
+    let mut states = Vec::new();
+    let report = s
+        .run_with_context(&o, Some("pw"), &Cancellation::default(), &mut c, |e: ZipRunEvent<'_>| {
+            if let ZipRunEvent::MemberFailed { error, .. } = e {
+                states.push((error.publication_state(), error.accepted_output_bytes()));
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((report.files(), report.failed()), (1, 1));
+    assert_eq!(states, [(PublicationState::Published, 8)]);
+    assert_eq!(std::fs::read(dest.path().join("bad")).unwrap(), b"bad data");
+    assert_eq!(std::fs::read(dest.path().join("good")).unwrap(), b"good");
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn staged_crc_member_fault_then_good_requires_normal_retirement() {
