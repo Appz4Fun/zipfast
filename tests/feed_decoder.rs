@@ -1481,3 +1481,23 @@ fn a_late_opening_block_is_repaired_from_the_callers_iv() {
         assert_eq!(decoder.status().crc_ok, Some(true), "at {at}: {:?}", decoder.status());
     }
 }
+
+/// An AES-CBC `open_at` decoder at an offset inside a block, given the prefix CRC of `0..at`, retires its first output
+/// with `fill_lost` (another copy's plaintext from the block start): the bytes from the block start to `at` are not
+/// hashed twice, so the member's CRC still matches.
+#[test]
+fn fill_lost_at_an_open_at_start_keeps_the_crc_floor() {
+    let case = &cases()[1];
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+    for at in [7_005u64, 20_001] {
+        let (mut decoder, start, _) = open_twin(case, &map, at);
+        assert!(start < at, "a start inside a block");
+        let fill = start..start + 4096;
+        decoder.fill_lost(fill.clone(), &case.plain[fill.start as usize..fill.end as usize]).unwrap();
+        let mut sink = case.plain[..fill.end as usize].to_vec();
+        let mut source = TwinCopy { volumes: &case.volumes, holes: Vec::new(), floor: Vec::new() };
+        run_to_end(&mut decoder, &mut source, &mut sink, |_| {});
+        assert_eq!(sink, case.plain, "at {at}");
+        assert_eq!(decoder.status().crc_ok, Some(true), "at {at}: {:?}", decoder.status());
+    }
+}

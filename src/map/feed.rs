@@ -1227,7 +1227,7 @@ impl FeedDecoder {
         // stored layers: repairs follow the lost ranges; a stop recorded inside the range is moot
         self.blocked.retain(|at, _| !range.contains(at));
         self.lost.remove(range.clone());
-        self.crc.add(range.start, bytes);
+        self.hash_output(range.start, bytes);
         self.status = self.make_status(Vec::new(), false);
         Ok(())
     }
@@ -1668,6 +1668,13 @@ impl FeedDecoder {
         }
     }
 
+    /// Hashes output at `out` into the CRC runs. Bytes below the floor are the caller's, already in its prefix CRC (an
+    /// open_at under CBC writes them again, and `fill_lost` may retire them again).
+    fn hash_output(&mut self, out: u64, bytes: &[u8]) {
+        let skip = self.crc_floor.saturating_sub(out).min(bytes.len() as u64) as usize;
+        self.crc.add(out + skip as u64, &bytes[skip..]);
+    }
+
     /// Writes output at `out`, clipped to the member.
     fn emit(&mut self, out: u64, bytes: &[u8], sink: &mut dyn FeedSink) -> Result<(), FeedError> {
         let end = (out + bytes.len() as u64).min(self.size);
@@ -1676,9 +1683,7 @@ impl FeedDecoder {
         }
         let bytes = &bytes[..(end - out) as usize];
         sink.write_at(out, bytes).map_err(|error| FeedError::Write { out, error })?;
-        // bytes below the floor are the caller's, already in its prefix CRC (an open_at under CBC writes them again)
-        let skip = self.crc_floor.saturating_sub(out).min(bytes.len() as u64) as usize;
-        self.crc.add(out + skip as u64, &bytes[skip..]);
+        self.hash_output(out, bytes);
         self.stats.written += bytes.len() as u64;
         self.run_written += bytes.len() as u64;
         Ok(())
