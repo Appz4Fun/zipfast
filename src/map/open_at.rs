@@ -527,13 +527,14 @@ pub fn complete_rar5(
     }
     let seed = plan.seed;
     let options = NearOptions { estimate: Some(estimate.saturating_sub(packed_from) as usize), ..near.clone() };
-    let mut searched = resync_near(packed, known_base, known, window, stream_target, &options);
     // A seeded (not strict) plan takes the nearest unguarded restart when no guarded one is found: its output is
-    // unverified anyway, and the decoder notes it (`SeedSuspect::Unguarded`) before decoding.
-    if searched.is_err() && options.guard && matches!(seed, Seed::HeldPlaintext { strict: false }) {
-        searched =
-            resync_near(packed, known_base, known, window, stream_target, &NearOptions { guard: false, ..options });
-    }
+    // unverified anyway, and the decoder notes it (`SeedSuspect::Unguarded`) before decoding. Both searches share
+    // the caller's work budget and deadline.
+    let searched = if matches!(seed, Seed::HeldPlaintext { strict: false }) {
+        crate::rar5::unpack::resync_near_or_unguarded(packed, known_base, known, window, stream_target, &options)
+    } else {
+        resync_near(packed, known_base, known, window, stream_target, &options)
+    };
     let found = match searched {
         Ok(found) => found,
         Err(_) if from_start => return fresh(),
@@ -703,6 +704,12 @@ fn resume_lzma2(
         let start = starts[k];
         // The props in effect there, from the chunk that set them (the walk resumed below starts after it).
         let inherited = starts[..=k].iter().rev().find_map(|c| c.props);
+        // Nothing before the last dictionary reset at or before the restart can be referenced.
+        let reset_floor = starts[..=k]
+            .iter()
+            .rev()
+            .find(|c| matches!(c.reset, Lzma2Reset::Dict | Lzma2Reset::DictStateProps))
+            .map_or(0, |c| c.unpacked_offset);
         let rel = usize::try_from(start.packed_offset - packed_from).map_err(|_| need_framing())?;
         // From there the chunks run to the end marker at the stream's last byte and fill the folder's output.
         let idx = Lzma2Index::from_bytes(
@@ -754,11 +761,10 @@ fn resume_lzma2(
                     (_, Some(at)) => (0, at.max(out.len().saturating_sub(need))),
                     (_, None) => (need.saturating_sub(out.len()), out.len().saturating_sub(need)),
                 };
-                let dict_from = output.saturating_sub(from_known as u64);
-                let dictionary: &[u8] = match from_known {
+                let dict_from = output.saturating_sub(from_known as u64).max(reset_floor.min(output));
+                let dictionary: &[u8] = match output - dict_from {
                     0 => &[],
-                    _ => known_at(dict_from, output - dict_from)
-                        .ok_or(OpenAtError::NeedMore { needed: dict_from..output })?,
+                    n => known_at(dict_from, n).ok_or(OpenAtError::NeedMore { needed: dict_from..output })?,
                 };
                 let mut dict = Vec::with_capacity(dictionary.len() + out.len() - resumed_from);
                 dict.extend_from_slice(dictionary);
@@ -954,6 +960,55 @@ mod tests {
         );
         assert!(matches!(short, Err(OpenAtError::NeedMore { ref needed }) if *needed == (0..out)), "{short:?}");
         let r = resume_lzma2(&b, from, held, 0, &plain[..target as usize], Some(&framing), &opts()).unwrap();
+        assert_eq!((r.output, r.bytes.as_slice()), (out, &plain[out as usize..]));
+    }
+
+    /// Codex on #290: nothing before a dictionary reset can be referenced, so the known output needs to reach back
+    /// only to the last reset before the restart, not a whole dictionary (here a stream whose first chunk resets the
+    /// dictionary at output 5000, after another one).
+    #[test]
+    fn the_dictionary_needed_stops_at_an_earlier_dictionary_reset() {
+        let prefix: Vec<u8> = (0..5000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let mut first = lzma2_encode(&prefix);
+        assert_eq!(first.pop(), Some(0), "the end marker");
+        let text: Vec<u8> =
+            (0..60_000u32).flat_map(|i| format!("line {} of {}\n", i % 977, i % 13).into_bytes()).collect();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..150_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let tail = [&text[..], &noise, &text].concat();
+        let stream = [first, lzma2_encode(&tail)].concat();
+        let plain = [&prefix[..], &tail].concat();
+        let framing = Lzma2Index::from_bytes(&stream, Lzma2IndexOptions::default());
+        let total = plain.len() as u64;
+        let target = total - 1000;
+        let b = Lzma2Bounds { total, stream_end: stream.len() as u64, target, dict_prop: 18 };
+        let restart = framing
+            .chunks
+            .iter()
+            .rev()
+            .find(|c| c.unpacked_offset <= target && c.kind != Lzma2ChunkKind::Stored)
+            .copied()
+            .unwrap();
+        assert_eq!(restart.reset, Lzma2Reset::State, "{:?}", framing.chunks);
+        let (out, from) = (restart.unpacked_offset, restart.packed_offset);
+        // the known output from the reset at 5000 is the whole usable dictionary (2 MiB would reach back to 0)
+        let r = resume_lzma2(
+            &b,
+            from,
+            &stream[from as usize..],
+            5000,
+            &plain[5000..target as usize],
+            Some(&framing),
+            &opts(),
+        )
+        .unwrap();
         assert_eq!((r.output, r.bytes.as_slice()), (out, &plain[out as usize..]));
     }
 

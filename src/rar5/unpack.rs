@@ -32,6 +32,7 @@ mod parallel;
 mod resync;
 use super::reader::Piece;
 use parallel::{Boundary, Done, Job, OWN, Packed, Part, Pool, Slot, block_bytes};
+pub(crate) use resync::resync_near_or_unguarded;
 pub use resync::{NearError, NearOptions, Resync, ResyncError, ResyncNear, resync, resync_near};
 
 /// Where decoded output goes.

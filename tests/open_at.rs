@@ -251,6 +251,9 @@ fn a_seeded_rar5_plan_falls_back_to_an_unguarded_restart() {
         .expect("an unguarded restart when no guarded one can be checked");
     assert!(!r.checked);
     assert!(r.output <= target);
+    // the guarded search and the unguarded one share the caller's budget, and the report counts both
+    let near = r.near.as_ref().expect("a searched restart");
+    assert!(near.work > 0 && near.work <= NearOptions::default().work, "{near:?}");
     let mut out = Collect(Vec::new());
     r.decoder.feed(&held[(r.feed_from - plan.fetch_from) as usize..], &mut out).unwrap();
     r.decoder.finish(&mut out).unwrap();
