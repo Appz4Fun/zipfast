@@ -760,16 +760,17 @@ fn a_resync_gap_breaks_the_solid_history() {
     extract(&intact, DamagedInput::Resync).unwrap();
     assert_eq!(fs::read(intact.out.join("c.bin")).unwrap(), plain[2]);
 
-    // b.bin's header zeroed (a hole, searched past), or its type byte turned from file (2) into service (3) so that
-    // it parses but its data is skipped: either way c.bin must not decode against a.bin's history alone
+    // b.bin's header zeroed (a hole, searched past), or its type byte turned from file (2) into service (3) or main
+    // (1) so that it parses but its data is skipped: either way c.bin must not decode against a.bin's history alone
     let mut hole = bytes.clone();
     hole[offsets[1]..offsets[1] + 16].fill(0);
     let mut service = bytes.clone();
     assert_eq!(service[offsets[1] + 5], 2, "b.bin's header type");
     service[offsets[1] + 5] = 3;
-    for (what, damaged, listed) in
-        [("hole", hole, vec!["a.bin", "c.bin"]), ("service", service, vec!["a.bin", "c.bin"])]
-    {
+    let mut main = bytes.clone();
+    main[offsets[1] + 5] = 1;
+    for (what, damaged) in [("hole", hole), ("service", service), ("main", main)] {
+        let listed = ["a.bin", "c.bin"];
         for choice in [DamagedInput::Salvage, DamagedInput::Resync] {
             if what == "hole" && choice == DamagedInput::Salvage {
                 continue; // the volume ends at the hole: nothing after it is read

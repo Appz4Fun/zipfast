@@ -982,8 +982,13 @@ impl Volume {
                     };
                     let (offset, kind) = (frame.extent.start, HeaderDamageKind::ChecksumMismatch);
                     // a damaged header read as a file is decoded in turn; read as anything else (a service, an
-                    // unknown block) its data, which may be a member's, is skipped
-                    let passed_over = !matches!(frame.block, Block::File(_) | Block::Main(_) | Block::End { .. });
+                    // unknown block, a main or end header that claims data) its data, which may be a member's, is
+                    // skipped
+                    let passed_over = match frame.block {
+                        Block::File(_) => false,
+                        Block::Main(_) | Block::End { .. } => frame.data_end > frame.extent.end,
+                        _ => true,
+                    };
                     self.record_damage_of(offset, kind, name, None, passed_over);
                 }
                 if matches!(frame.block, Block::Crypt) {
