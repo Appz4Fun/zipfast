@@ -71,6 +71,7 @@ fn options(mode: Mode, dest: &Path) -> Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }
@@ -457,6 +458,7 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
         ..options(Mode::Extract, dest)
@@ -494,6 +496,7 @@ fn r5extra_comes_out_as_7zip_writes_it() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
         ..options(Mode::Extract, &out)

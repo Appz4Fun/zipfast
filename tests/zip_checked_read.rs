@@ -101,6 +101,7 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         };
@@ -435,6 +436,7 @@ fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
             };
@@ -712,6 +714,7 @@ mod direct_completion {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         }
@@ -881,6 +884,7 @@ mod direct_aliases {
                     replace_placed_links: false,
                     keep_broken: false,
                     attempt_continued_members: false,
+                    salvage_truncated_zip: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
                 };
@@ -1001,6 +1005,7 @@ fn native_print_refuses_diagnostics_that_alias_actual_stdout() {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         };
@@ -1140,6 +1145,7 @@ mod protected_name_completion {
                             replace_placed_links: false,
                             keep_broken: false,
                             attempt_continued_members: false,
+                            salvage_truncated_zip: false,
                             unix_modes: Default::default(),
                             backslashes: Default::default(),
                         };

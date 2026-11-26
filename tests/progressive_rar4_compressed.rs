@@ -76,6 +76,7 @@ fn opts_for(dir: &std::path::Path) -> zipfast::extract::Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }
