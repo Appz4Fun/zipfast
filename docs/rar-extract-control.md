@@ -110,13 +110,19 @@ mutation. Finish the report before reusing the session or resetting control.
 
 | Optional diagnostic default | Ceiling |
 | --- | --- |
-| Selected targets | 65,536 |
-| Parent/path records | 131,072 |
-| Live proof buffer capacity | 64 MiB |
+| Selected targets | 65,536, or the selected member count |
+| Parent/path records | 131,072, or 2 per target path component plus 3 per member |
+| Live proof buffer capacity | 64 MiB, or twice the records, bindings and projections the targets can need |
 | Owned plus uncertain guard handles | 8 |
-| Aggregate proof work | 2^30 units |
+| Aggregate proof work | 2^30 units, or 64 per target path byte per (component + 10) |
 | Aggregate proof I/O attempts | 2^24 |
 | I/O attempts per validation operation | 2^20 |
+
+The first four diagnostic defaults are floors: when the run is prepared, a limit
+left at its default (`RarDiagnosticLimits::DEFAULT_*`) rises to what the
+selection justifies, from each selected member's absolute target length and
+depth (counted up to `PATH_MAX`, the longest path a probe can name). The result
+is bounded by the selection, so by the catalogue. Any other value is exact.
 
 These are separate component ledgers, not process RSS/global syscall bounds.
 Actual allocator capacities are charged and fallibly reserved before new work.
@@ -127,8 +133,11 @@ Admission/scan/compare work and retry attempts are checked before execution;
 work units include bytes/visits in the new control paths, with conservative
 precharged bounds for shared normalization and standard-library path traversal. Empty selections do
 not allocate native per-run probe storage. Catalogue defaults remain 64
-volumes, 1,000,000 entries, 64 MiB names and 128 MiB capacity; decoder defaults
-remain 8 GiB packed/decoded and 256 MiB window.
+volumes, 1,000,000 entries and 64 MiB names; the 128 MiB default capacity is a
+floor that grows by `RarCatalogueLimits::CAPACITY_PER_BLOCK` per header block
+and `CAPACITY_PER_HEADER_BYTE` per header byte read, so it stays bounded by the
+header block and read byte limits (any other capacity is exact). Decoder
+defaults remain 8 GiB packed/decoded and 256 MiB window.
 
 Each new successful handle acquisition reserves a cleanup ticket. The owner
 consumes that File with IntoRawFd and invokes pinned libc close exactly once,

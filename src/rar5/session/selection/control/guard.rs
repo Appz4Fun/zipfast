@@ -280,7 +280,7 @@ impl RarExtractControl {
 
     pub(super) fn proof_work(&mut self, n: u64) -> Result<(), RarDiagnosticFailure> {
         let next = checked(self.usage.diagnostics.work, n)?;
-        if next > self.limits.diagnostics.work {
+        if next > self.diagnostics.work {
             return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Work));
         }
         self.usage.diagnostics.work = next;
@@ -302,7 +302,7 @@ impl RarExtractControl {
     }
     fn proof_capacity(&mut self, bytes: u64) -> Result<(), RarDiagnosticFailure> {
         let next = checked(self.usage.diagnostics.capacity, bytes)?;
-        if next > self.limits.diagnostics.capacity {
+        if next > self.diagnostics.capacity {
             return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
         }
         self.usage.diagnostics.capacity = next;
@@ -326,7 +326,7 @@ impl RarExtractControl {
             .ok_or(RarDiagnosticFailure::CounterOverflow)?;
         let current = self.usage.diagnostics.capacity;
         let requested = checked(current, minimum as u64)?;
-        if requested > self.limits.diagnostics.capacity {
+        if requested > self.diagnostics.capacity {
             return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
         }
         items.try_reserve_exact(additional).map_err(RarDiagnosticFailure::Allocation)?;
@@ -539,6 +539,7 @@ impl Guard {
             self.sources.push(SourceProbe { path });
         }
         let cwd = cwd(c, attempts)?;
+        c.diagnostics = scaled_limits(c.limits.diagnostics, session, selection, options, &cwd)?;
         for (word, mut bits) in selection.bits.iter().copied().enumerate() {
             c.proof_work(1)?;
             while bits != 0 {
@@ -556,14 +557,14 @@ impl Guard {
                     continue;
                 }
                 let targets = checked(c.usage.diagnostics.targets, 1)?;
-                if targets > c.limits.diagnostics.targets {
+                if targets > c.diagnostics.targets {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Targets));
                 }
                 if !super::super::extraction::projectable_name(header, &session.model.members[index].wire.name) {
                     return Err(RarDiagnosticFailure::ProjectionUnavailable { ordinal: index as u64 });
                 }
                 // Temporary projection capacity is charged while live, then released.
-                if checked(c.usage.diagnostics.capacity, header.name.len() as u64)? > c.limits.diagnostics.capacity {
+                if checked(c.usage.diagnostics.capacity, header.name.len() as u64)? > c.diagnostics.capacity {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
                 }
                 let name = header
@@ -584,7 +585,7 @@ impl Guard {
                 c.proof_work(projection_work)?;
                 let target_capacity = super::super::extraction::target_capacity(options, &relative, options.flatten)
                     .ok_or(RarDiagnosticFailure::CounterOverflow)?;
-                if checked(c.usage.diagnostics.capacity, target_capacity as u64)? > c.limits.diagnostics.capacity {
+                if checked(c.usage.diagnostics.capacity, target_capacity as u64)? > c.diagnostics.capacity {
                     return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
                 }
                 c.proof_work(target_capacity as u64)?;
@@ -652,7 +653,7 @@ impl Guard {
         attempts: &mut u64,
     ) -> Result<Option<Stamp>, RarDiagnosticFailure> {
         let parents = checked(c.usage.diagnostics.parents, 1)?;
-        if parents > c.limits.diagnostics.parents {
+        if parents > c.diagnostics.parents {
             return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Parents));
         }
         c.reserve_proof(&mut self.records, 1)?;
@@ -826,7 +827,7 @@ impl Guard {
         c.proof_work(1)?;
         if self.same.len() == self.same.capacity() {
             let entry = size_of::<((u64, u64), usize)>() as u64 + 1;
-            if checked(c.usage.diagnostics.capacity, entry)? > c.limits.diagnostics.capacity {
+            if checked(c.usage.diagnostics.capacity, entry)? > c.diagnostics.capacity {
                 return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Capacity));
             }
             let before = self.same.capacity();
@@ -1532,7 +1533,7 @@ impl Guard {
         attempts: &mut u64,
     ) -> Result<(), RarDiagnosticFailure> {
         let parents = checked(c.usage.diagnostics.parents, 1)?;
-        if parents > c.limits.diagnostics.parents {
+        if parents > c.diagnostics.parents {
             return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Parents));
         }
         c.reserve_proof(&mut self.bindings, 1)?;
@@ -1770,6 +1771,63 @@ fn cwd(c: &mut RarExtractControl, attempts: &mut u64) -> Result<[u8; 4096], RarD
         return Err(metadata(io::Error::last_os_error()));
     }
     Ok(bytes)
+}
+/// Proof work per step of a member's target path, where a step is one byte of the path for one of its components
+/// (each prefix is admitted, compared and re-validated) or for one of the [`ROTATION`] re-validations around it.
+const WORK_PER_PATH_STEP: u64 = 64;
+
+/// `configured` with each of its default target, parent, capacity and work limits raised to what the selection
+/// justifies, as [`RarDiagnosticLimits`] describes. A member's target is at most the absolute destination, a
+/// separator and its name (with room for a version suffix), and has at most one component per separator in them;
+/// both are counted up to `PATH_MAX`, as a probe can't name a longer path. The pass costs one step per selected name
+/// byte, which the catalogue already bounds.
+fn scaled_limits(
+    configured: RarDiagnosticLimits,
+    session: &RarSession,
+    selection: &RarSelection,
+    options: &crate::extract::Options,
+    cwd: &[u8],
+) -> Result<RarDiagnosticLimits, RarDiagnosticFailure> {
+    const VERSION_SUFFIX: u64 = 24;
+    let path_max = libc::PATH_MAX as u64;
+    let dest = options.dest.as_os_str().as_bytes();
+    let (mut base_len, mut base_depth) = (dest.len() as u64 + 1, dest.iter().filter(|&&b| b == b'/').count() as u64);
+    if !dest.starts_with(b"/") {
+        let cwd = &cwd[..cwd.iter().position(|&b| b == 0).unwrap_or(cwd.len())];
+        base_len = checked(base_len, cwd.len() as u64 + 1)?;
+        base_depth = checked(base_depth, cwd.iter().filter(|&&b| b == b'/').count() as u64 + 1)?;
+    }
+    let (mut members, mut components, mut steps, mut stored) = (0u64, 0u64, 0u64, 0u64);
+    for (word, mut bits) in selection.bits.iter().copied().enumerate() {
+        while bits != 0 {
+            let index = word * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let name = session.model.members[index].header.name.as_bytes();
+            let name_depth = name.iter().filter(|&&b| b == b'/' || b == b'\\').count() as u64 + 1;
+            let len = checked(checked(base_len, name.len() as u64)?, VERSION_SUFFIX)?.min(path_max);
+            let depth = checked(base_depth, name_depth)?.min(len);
+            members = checked(members, 1)?;
+            components = checked(components, depth)?;
+            steps = checked(steps, (depth + ROTATION as u64 + 2).saturating_mul(len))?;
+            // two records per component (a followed twin for a link) and, at worst, a binding per name component
+            // holding up to the whole path, then the temporary projections, each room to double
+            let records = (2 * depth + 3).saturating_mul(size_of::<Record>() as u64);
+            let bindings = name_depth.min(depth).saturating_mul(size_of::<Binding>() as u64 + len + 1 + 32);
+            stored = checked(stored, records.saturating_add(bindings).saturating_mul(2).saturating_add(4 * len))?;
+        }
+    }
+    let raise = |value: u64, default: u64, justified: u64| if value == default { value.max(justified) } else { value };
+    Ok(RarDiagnosticLimits {
+        targets: raise(configured.targets, RarDiagnosticLimits::DEFAULT_TARGETS, members),
+        parents: raise(
+            configured.parents,
+            RarDiagnosticLimits::DEFAULT_PARENTS,
+            components.saturating_mul(2).saturating_add(members.saturating_mul(3)),
+        ),
+        capacity: raise(configured.capacity, RarDiagnosticLimits::DEFAULT_CAPACITY, stored.saturating_mul(2)),
+        work: raise(configured.work, RarDiagnosticLimits::DEFAULT_WORK, steps.saturating_mul(WORK_PER_PATH_STEP)),
+        ..configured
+    })
 }
 fn project_bytes(
     c: &mut RarExtractControl,
