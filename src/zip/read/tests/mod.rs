@@ -19,6 +19,29 @@
 #[path = "../../../../tests/common/zip_parity_fixture.rs"]
 mod fixture;
 
+/// A temporary directory only its owner can write, whatever the umask: the spool and staging rightly refuse a group-
+/// or world-writable parent, and `tempfile::tempdir()` follows the umask (0775 under umask 002, as Ubuntu gives
+/// ordinary users).
+#[cfg(unix)]
+pub(super) fn tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+}
+
+/// `path` and its missing parents, made private (0700) whatever the umask, as [`tempdir`].
+#[cfg(unix)]
+pub(super) fn private_dirs(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path.as_ref())
+}
+
+/// One new private (0700) directory, as `std::fs::create_dir` but whatever the umask.
+#[cfg(unix)]
+pub(super) fn private_dir(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path.as_ref())
+}
+
 mod core;
 
 #[cfg(unix)]

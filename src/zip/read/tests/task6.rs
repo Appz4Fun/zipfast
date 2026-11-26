@@ -115,7 +115,7 @@ fn actual_public_projected_all_six_codecs_one_byte_clear_zipcrypto_authenticated
                 let bytes = fixture::build(&[member], &[0], b"", b"", false).bytes;
                 if let Some(directory) = std::env::var_os("ZIPFAST_TASK6_EXPORT_FIXTURES") {
                     let directory = std::path::PathBuf::from(directory);
-                    std::fs::create_dir_all(&directory).unwrap();
+                    super::private_dirs(&directory).unwrap();
                     let path = directory.join(format!("method{method}-u{size}-mode{mode}.zip"));
                     assert!(!path.exists(), "fixture exports are append-only");
                     std::fs::write(path, &bytes).unwrap();
