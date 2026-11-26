@@ -160,3 +160,20 @@ fn explicit_diagnostic_limits_stay_exact() {
         );
     }
 }
+
+/// Codex on #305: the scaling pass is proof work too. Against an explicit work limit it is charged name by name, so
+/// a tiny limit over many members is reported as spent (never exceeded) before the pass runs through them all.
+#[test]
+fn a_tiny_explicit_work_limit_covers_the_scaling_pass() {
+    let limits = RarExtractControlLimits {
+        diagnostics: RarDiagnosticLimits { work: 50, ..Default::default() },
+        ..Default::default()
+    };
+    let finished = run(2000, 8, 0, limits);
+    assert!(
+        matches!(finished.diagnostic_failure, Some(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Work))),
+        "{:?}",
+        finished.diagnostic_failure
+    );
+    assert!(finished.usage.diagnostics.work <= 50, "{:?}", finished.usage.diagnostics);
+}

@@ -539,7 +539,7 @@ impl Guard {
             self.sources.push(SourceProbe { path });
         }
         let cwd = cwd(c, attempts)?;
-        c.diagnostics = scaled_limits(c.limits.diagnostics, session, selection, options, &cwd)?;
+        c.diagnostics = scaled_limits(c, session, selection, options, &cwd)?;
         for (word, mut bits) in selection.bits.iter().copied().enumerate() {
             c.proof_work(1)?;
             while bits != 0 {
@@ -1780,15 +1780,30 @@ const WORK_PER_PATH_STEP: u64 = 64;
 /// justifies, as [`RarDiagnosticLimits`] describes. A member's target is at most the absolute destination, a
 /// separator and its name (with room for a version suffix), and has at most one component per separator in them;
 /// both are counted up to `PATH_MAX`, as a probe can't name a longer path. The pass costs one step per selected name
-/// byte, which the catalogue already bounds.
+/// byte, which the catalogue already bounds, and is charged as proof work: name by name against an explicit work limit
+/// (so a small one stops it early), else once against the scaled one. With every scaled limit explicit there is no
+/// pass at all.
 fn scaled_limits(
-    configured: RarDiagnosticLimits,
+    c: &mut RarExtractControl,
     session: &RarSession,
     selection: &RarSelection,
     options: &crate::extract::Options,
     cwd: &[u8],
 ) -> Result<RarDiagnosticLimits, RarDiagnosticFailure> {
     const VERSION_SUFFIX: u64 = 24;
+    let configured = c.limits.diagnostics;
+    let defaults = [
+        configured.targets == RarDiagnosticLimits::DEFAULT_TARGETS,
+        configured.parents == RarDiagnosticLimits::DEFAULT_PARENTS,
+        configured.capacity == RarDiagnosticLimits::DEFAULT_CAPACITY,
+        configured.work == RarDiagnosticLimits::DEFAULT_WORK,
+    ];
+    if !defaults.contains(&true) {
+        return Ok(configured);
+    }
+    // an explicit work limit is enforced exactly, the pass included
+    let charge_inline = !defaults[3];
+    let mut scanned = 0u64;
     let path_max = libc::PATH_MAX as u64;
     let dest = options.dest.as_os_str().as_bytes();
     let (mut base_len, mut base_depth) = (dest.len() as u64 + 1, dest.iter().filter(|&&b| b == b'/').count() as u64);
@@ -1803,6 +1818,12 @@ fn scaled_limits(
             let index = word * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let name = session.model.members[index].header.name.as_bytes();
+            let cost = name.len() as u64 + 1;
+            if charge_inline {
+                c.proof_work(cost)?;
+            } else {
+                scanned = checked(scanned, cost)?;
+            }
             let name_depth = name.iter().filter(|&&b| b == b'/' || b == b'\\').count() as u64 + 1;
             let len = checked(checked(base_len, name.len() as u64)?, VERSION_SUFFIX)?.min(path_max);
             let depth = checked(base_depth, name_depth)?.min(len);
@@ -1817,7 +1838,7 @@ fn scaled_limits(
         }
     }
     let raise = |value: u64, default: u64, justified: u64| if value == default { value.max(justified) } else { value };
-    Ok(RarDiagnosticLimits {
+    let scaled = RarDiagnosticLimits {
         targets: raise(configured.targets, RarDiagnosticLimits::DEFAULT_TARGETS, members),
         parents: raise(
             configured.parents,
@@ -1827,7 +1848,12 @@ fn scaled_limits(
         capacity: raise(configured.capacity, RarDiagnosticLimits::DEFAULT_CAPACITY, stored.saturating_mul(2)),
         work: raise(configured.work, RarDiagnosticLimits::DEFAULT_WORK, steps.saturating_mul(WORK_PER_PATH_STEP)),
         ..configured
-    })
+    };
+    if !charge_inline {
+        c.diagnostics = scaled;
+        c.proof_work(scanned)?;
+    }
+    Ok(scaled)
 }
 fn project_bytes(
     c: &mut RarExtractControl,
