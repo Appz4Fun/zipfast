@@ -926,8 +926,8 @@ impl FeedDecoder {
     }
 
     /// The CRC32 (unkeyed) of the output the caller holds before an [`Self::open_at`] decoder's offset (`0..at`, the
-    /// offset it was opened at), so the member's CRC is checked when done. Under AES-CBC the decoder writes the few
-    /// bytes from its block start to `at` again; they are not hashed twice. Call it before the first run.
+    /// offset it was opened at), so the member's CRC is checked when done. The decoder never writes output before
+    /// `at` (under AES-CBC it decrypts the few bytes from its block start but keeps the caller's). Call it before the first run.
     pub fn set_prefix_crc32(&mut self, crc32: u32) -> Result<(), FeedError> {
         if self.open_from == 0 || self.stats.written > 0 || self.crc.runs.contains_key(&0) {
             return Err(FeedError::Malformed("a prefix CRC needs a fresh open_at decoder"));
@@ -942,7 +942,7 @@ impl FeedDecoder {
     /// the other copy already gave. The decoder then reads nothing before its start. Call it before the first run;
     /// refused for other layers and at the member's start. For a twin, also give this copy's source the other copy's
     /// article holding the block that straddles where its output stopped (byte for byte the same here): the up to 15
-    /// bytes from the start to `at` are decrypted from it, so this copy is asked for nothing before `at`.
+    /// bytes from the start to `at` are decrypted from it (and not written: the caller's are kept), so this copy is asked for nothing before `at`.
     pub fn set_open_iv(&mut self, previous_block: [u8; 16]) -> Result<(), FeedError> {
         let start = self.held_prefix;
         let fresh = self.stats.written == 0 && self.stats.packed_read == 0;
@@ -1681,7 +1681,13 @@ impl FeedDecoder {
         if out >= end {
             return Ok(());
         }
-        let bytes = &bytes[..(end - out) as usize];
+        // An open_at decoder never writes before the offset it was opened at: the caller holds that output (under
+        // CBC the decoder decrypts the few bytes from its block start again, unverified by the prefix CRC).
+        let out_from = out.max(self.open_from);
+        if out_from >= end {
+            return Ok(());
+        }
+        let (out, bytes) = (out_from, &bytes[(out_from - out) as usize..(end - out) as usize]);
         sink.write_at(out, bytes).map_err(|error| FeedError::Write { out, error })?;
         self.hash_output(out, bytes);
         self.stats.written += bytes.len() as u64;
