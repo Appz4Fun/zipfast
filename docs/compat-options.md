@@ -1,6 +1,6 @@
 # 7-Zip and UnRAR compatibility options
 
-Eight fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
+Fields of `extract::Options`, and one typed error detail, let a caller that imitates 7-Zip or UnRAR (Prybar's
 `7z` and `unrar` modes) get their behaviour where zipfast's own default differs. Every default keeps zipfast's
 behaviour, so a caller that sets them to `Default::default()` (or `None`) sees no change.
 
@@ -17,6 +17,7 @@ restart_from_first_volume: false,
 replace_placed_links: false,
 keep_broken: false,
 attempt_continued_members: false,
+unsupported_filters: Default::default(),
 salvage_truncated_zip: false,
 unix_modes: Default::default(),
 backslashes: Default::default(),
@@ -190,7 +191,8 @@ length) and its times set, and the member is still reported failed:
 Not kept: links, and a failure writing the output (that stops the run). Whatever the option, a 7z member that fails
 before anything of it is kept no longer leaves the folders its placing created (`-pwrong aes.7z` leaves no empty
 `text/`, as 7-Zip leaves none). A RAR member whose filter is unsupported is
-kept empty; 7-Zip writes its data unfiltered (`generic_delta_padding_mutation.rar`), which zipfast does not.
+kept empty; 7-Zip writes its data unfiltered (`generic_delta_padding_mutation.rar`), which zipfast does with
+`unsupported_filters` (below).
 
 ## `attempt_continued_members`: a member continued from an earlier volume
 
@@ -224,3 +226,39 @@ on the checked route as ever, option or not. `extract::run` honours the option t
 `zip::list_detailed_with_options` lists such a file (`Listing::truncated`, `Listing::unexpected_end`). The other
 listings (`inspect_projected_cancelable`, `zipfast l`) and `SelectedEntry` take no `Options` and still refuse it.
 `tests/zip_salvage_truncated.rs` checks each point.
+
+## `unsupported_filters`: a RAR 3.x/4.x member using a VM filter zipfast doesn't run
+
+RAR 3.x/4.x carries filters as programs for its virtual machine. zipfast runs the standard ones (E8, E8E9, ITANIUM,
+DELTA, RGB, AUDIO), recognised by their program's length and CRC-32; any other program is unsupported. By default
+(`UnsupportedFilters::Fail`) such a member fails as `RarFailure::Unsupported(RarUnsupported::Rar4Feature("VM/filter
+payload"))` and nothing of it is written (`keep_broken` keeps it empty).
+
+7-Zip 26.06 decodes the member anyway and writes each block such a program filters as decoded, unfiltered; the
+standard filters in the same member still apply. With `UnsupportedFilters::WriteUnfiltered` zipfast does the same:
+
+| `generic_delta_padding_mutation.rar` | 7-Zip 26.06 | zipfast, `WriteUnfiltered` |
+| --- | --- | --- |
+| `7z x` / `7z e` | "ERROR: Unsupported Method : itanium_synthetic_bundles.bin", exit 2, the 1 MiB file written (SHA-256 `aff2543c…76c5`) with its time | the same file, with its time; the member reported failed with `RarFailure::Unsupported(RarUnsupported::FilterWrittenUnfiltered)` |
+| `7z t` | the same error, exit 2 | the same failure, nothing written |
+| `7z x -so` | the same error, exit 2, the same bytes streamed | not covered: `SelectedEntry` takes no `Options` |
+
+The member's checksum is not checked (the unfiltered data can't match it), so the failure says the file is written
+but unverified: a caller imitating 7-Zip prints "Unsupported Method" and exits 2. It reaches every report a RAR run
+makes: a line in `Summary::errors` ("unsupported method: VM filter, written unfiltered"), `RarOutcome::Failed` in
+`run_rar_with_outcomes` and `RarSession` extraction events. Only a member a block of which was actually written
+unfiltered gets it.
+
+In a solid stream the following members decode as usual, since RAR 3.x filters act on the output and never on the
+history the stream goes on from. 7-Zip agrees: with one of `tiny_e8e9.exe`'s two filter programs in
+`solid_e8_filter_member_offset.rar` changed (its check byte still holding) and a third member continuing the stream,
+it reports only `tiny_e8e9.exe` and writes the third member whole. A program whose check byte (the XOR of its other
+bytes) doesn't hold is damaged data: 7-Zip reports "Data Error", and with `WriteUnfiltered` zipfast fails the member as
+corrupt data, writing nothing (by default it fails as unsupported, as before).
+
+Honoured by the whole-archive runners (`extract::run`, `run_with_password`, `run_rar_with_outcomes` and the
+dispatchers) and by `RarSession::extract_selected` and `extract_selected_controlled`, where the file is published as
+a verified one would be (every recheck and hook alike). `RarSession` test and print runs, progressive and
+persistent-partial sessions, `SelectedEntry` and `FeedDecoder` take no such choice (progressive sessions have no
+outcome for a member written but unverified) and fail the member as unsupported. `tests/rar_unsupported_filters.rs`
+checks each point.
