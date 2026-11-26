@@ -643,7 +643,8 @@ impl ProjectedReadSession {
                     self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel))
                 {
                     if continued(&error) && options.keep_broken && !cancel.is_canceled() {
-                        broken = Some((error, stage.written()));
+                        // boxed: the error is large (kilobytes), and it waits across publication
+                        broken = Some((Box::new(error), stage.written()));
                     } else {
                         return Err(if continued(&error) {
                             stage.finish_member_error(error, context, cancel, |cx| self.check_source(cx))
@@ -684,9 +685,9 @@ impl ProjectedReadSession {
                 match (broken, published) {
                     // kept: the member still fails, but its target now holds what was read
                     (Some((error, written)), Ok(true)) => {
-                        Err(error.with_publication(PublicationState::Published, written))
+                        Err((*error).with_publication(PublicationState::Published, written))
                     }
-                    (Some((error, _)), Ok(false)) => Err(error),
+                    (Some((error, _)), Ok(false)) => Err(*error),
                     (_, Err(error)) => Err(error),
                     (None, Ok(published)) => Ok(!published),
                 }
