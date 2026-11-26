@@ -180,6 +180,7 @@ impl ZipEntry {
             size: self.size,
             local_at: self.local_at,
             aes_info: self.aes_info,
+            keep_cut: false,
         }
     }
 
@@ -218,6 +219,9 @@ struct ReadDescription<'a> {
     size: u64,
     local_at: u64,
     aes_info: Option<(u8, u16, u16)>,
+    /// the bytes before a cut (a missing volume, a truncated file) are passed on before the read fails, for
+    /// [`crate::extract::Options::keep_broken`]; otherwise only whole reads are
+    keep_cut: bool,
 }
 
 impl ReadDescription<'_> {
@@ -711,8 +715,11 @@ fn read_entry(
             while left > 0 {
                 check()?;
                 let n = (left.min(buf.len() as u64)) as usize;
-                file.read_exact(&mut buf[..n])?;
-                emit(&buf[..n])?;
+                let got = fill(file, &mut buf[..n], e.keep_cut)?;
+                emit(&buf[..got])?;
+                if got < n {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
                 left -= n as u64;
             }
         }
@@ -722,9 +729,10 @@ fn read_entry(
             let mut done = false;
             while !done {
                 let n = (left.min(buf.len() as u64)) as usize;
-                file.read_exact(&mut buf[..n])?;
+                let got = fill(file, &mut buf[..n], e.keep_cut)?;
+                let cut = got < n;
                 left -= n as u64;
-                let mut input = &buf[..n];
+                let mut input = &buf[..got];
                 loop {
                     check()?;
                     let (before_in, before_out) = (z.total_in(), z.total_out());
@@ -744,6 +752,9 @@ fn read_entry(
                         continue;
                     }
                     if input.is_empty() {
+                        if cut {
+                            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                        }
                         if left == 0 {
                             return Err(Error::Corrupt("deflate data ends early"));
                         }
@@ -783,6 +794,32 @@ fn read_entry(
         return Err(Error::BadChecksum(e.name.to_owned()));
     }
     Ok(())
+}
+
+/// Fills `buf`: whole (an error otherwise), or with `keep_cut` as much as is there before a cut (the count; the next
+/// read meets the cut).
+fn fill(file: &mut impl Read, buf: &mut [u8], keep_cut: bool) -> std::io::Result<usize> {
+    if keep_cut {
+        return read_up_to(file, buf);
+    }
+    file.read_exact(buf)?;
+    Ok(buf.len())
+}
+
+/// Reads into `buf` until it is full, the input ends or fails: the count read (short: it ended or failed there).
+fn read_up_to(file: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match file.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // what was read before the failure first; the caller's next read meets it again
+            Err(_) if got > 0 => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
 }
 
 // The buffered codecs may consume several input windows before producing
@@ -1330,7 +1367,13 @@ pub(crate) fn run_renaming(
                     }
                 }
             }
-            let entry = e.read_description();
+            let mut entry = e.read_description();
+            entry.keep_cut = opts.keep_broken;
+            // The last member of a walk cut off before its descriptor has no known size: what is there of it is
+            // read (it then fails at the gap), so a kept file (Options::keep_broken) holds it, as 7-Zip's does.
+            if archive.last_size_unknown && ordinal + 1 == entries.len() {
+                entry.size = if entry.effective_method() == METHOD_STORED { entry.packed } else { u64::MAX };
+            }
             let read = match target.as_mut() {
                 Some(out) => read_entry(
                     &mut archive.file,
@@ -1356,8 +1399,18 @@ pub(crate) fn run_renaming(
                     report.member(LegacyMember::Succeeded { ordinal: member.0, name: member.1, bytes: e.size });
                 }
                 Err(err) => {
-                    drop(target);
-                    if let Some(missing) = archive.gap_crossed(e) {
+                    let gap = archive.gap_crossed(e);
+                    // Options::keep_broken: what was written of an entry whose data fails stays (a failure writing
+                    // the output stops the run, and the output is removed as always)
+                    let writing = gap.is_none()
+                        && matches!(&err, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof);
+                    match target {
+                        Some(out) if opts.keep_broken && !writing => {
+                            let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta())));
+                        }
+                        target => drop(target),
+                    }
+                    if let Some(missing) = gap {
                         fail(&mut summary, report, member, &Error::MissingVolume(missing).to_string());
                         continue;
                     }

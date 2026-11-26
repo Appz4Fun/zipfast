@@ -719,6 +719,7 @@ mod tests {
             refused_link_placeholder: false,
             restart_from_first_volume: false,
             replace_placed_links: false,
+            keep_broken: false,
         }
     }
     struct Fault {
@@ -973,6 +974,7 @@ mod directory_fault_tests {
             refused_link_placeholder: false,
             restart_from_first_volume: false,
             replace_placed_links: false,
+            keep_broken: false,
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1054,6 +1056,7 @@ mod trailing_directory_tests {
             refused_link_placeholder: false,
             restart_from_first_volume: false,
             replace_placed_links: false,
+            keep_broken: false,
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

@@ -426,6 +426,7 @@ pub(super) fn print(
         refused_link_placeholder: false,
         restart_from_first_volume: false,
         replace_placed_links: false,
+        keep_broken: false,
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};

@@ -202,6 +202,11 @@ pub struct Options {
     /// link via another link was ignored"): the member fails. Applies to the whole-archive runners for RAR, 7z, ZIP
     /// and tar.
     pub replace_placed_links: bool,
+    /// A file whose extraction fails once its output was created (a CRC or BLAKE2sp mismatch, a missing or truncated
+    /// volume, a decoder error, a wrong password found only by its checksum) keeps what was written, or stays empty,
+    /// with its times set, as 7-Zip 26.06 `x`/`e` and UnRAR 7.30 `-kb` do. The member is still reported failed. Off
+    /// (the default) such a file is removed, so a later run never takes it for finished.
+    pub keep_broken: bool,
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -397,6 +402,7 @@ impl MemberRef<'_> {
 ///     refused_link_placeholder: false,
 ///     restart_from_first_volume: false,
 ///     replace_placed_links: false,
+///     keep_broken: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -1027,6 +1033,17 @@ pub(crate) fn create_target(place: Place, size: Option<u64>) -> Result<Output> {
 /// which would fill its holes with real space.
 pub(crate) fn create_sparse_target(place: Place, size: Option<u64>) -> Result<Output> {
     create_target_with(place, size, true).map_err(crate::error::RarFault::into_legacy)
+}
+
+/// A broken file kept ([`Options::keep_broken`]): cut to what was written (a preallocated file is longer), then its
+/// times and mode set.
+pub(crate) fn keep_written(file: &File, meta: &Meta) {
+    use std::io::Seek;
+    let mut handle = file;
+    if let Ok(written) = handle.stream_position() {
+        let _ = file.set_len(written);
+    }
+    finish_file(file, meta);
 }
 
 pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::error::RarResult<Output> {
@@ -2861,6 +2878,8 @@ pub(crate) struct Pending {
     cancel: Option<Cancellation>,
     /// a RAR4 symbolic link: where it goes and its target, gathered as it is decoded
     link: Option<LinkOut>,
+    /// [`Options::keep_broken`]: given up on, what was written stays, with these times
+    keep: Option<Meta>,
 }
 
 /// A symbolic link being extracted: created once its target is decoded and checked.
@@ -2901,6 +2920,7 @@ impl Pending {
             rar4_identity: h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)),
             cancel: None,
             link: None,
+            keep: None,
         }
     }
 
@@ -2912,13 +2932,36 @@ impl Pending {
         Ok(())
     }
 
-    /// Gives up on this file: what was written of it is removed, so a later run doesn't take it for finished.
+    /// Gives up on this file: what was written of it is removed, so a later run doesn't take it for finished (kept
+    /// with [`Options::keep_broken`]).
     fn discard(&mut self) {
         self.failed = true;
+        if let Some(meta) = self.keep.take() {
+            self.keep_broken(&meta);
+        }
         self.place = None;
         self.mem = None;
         self.link = None;
         drop(self.out.take());
+    }
+
+    /// [`Options::keep_broken`]: publishes what was written of a file given up on (an empty file when it was placed
+    /// but nothing was written yet). Best effort: a failure here leaves the file removed, as without the option.
+    fn keep_broken(&mut self, meta: &Meta) {
+        if self.link.is_some() || self.hidden {
+            return;
+        }
+        let out = match self.out.take() {
+            Some(out) => Some(out),
+            None => self.place.take().and_then(|place| create_target_detailed(place, None).ok()),
+        };
+        let Some(mut out) = out else { return };
+        if let Some(mem) = self.mem.take()
+            && out.write_detailed(&mem).is_err()
+        {
+            return;
+        }
+        let _ = out.finish_detailed(|file| keep_written(file, meta));
     }
 
     pub(crate) fn hash_key(&self, keyed: bool) -> Option<&[u8; 32]> {
@@ -3321,6 +3364,7 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
                 blake2sp: c.blake2sp,
                 out: p.place.take(),
                 meta: c.meta,
+                keep: p.keep.is_some(),
             },
         };
         let Some(batch) = books.batch.as_mut() else {
@@ -3807,6 +3851,7 @@ fn rar_read_at(
         refused_link_placeholder: false,
         restart_from_first_volume: false,
         replace_placed_links: false,
+        keep_broken: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -4011,6 +4056,7 @@ impl Run<'_, '_, '_> {
                 blake2sp: h.blake2sp,
                 out,
                 meta: self.opts.meta(Meta::from(h)),
+                keep: self.opts.keep_broken,
             },
         };
         let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads, self.cancel.clone()));
@@ -4532,6 +4578,7 @@ impl Run<'_, '_, '_> {
         p.cipher = cipher;
         p.cancel = self.cancel.clone();
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
+        p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.meta(Meta::from(h)));
         p.place = place;
         if link && let Some(place) = p.place.take() {
             self.dirs.forget();

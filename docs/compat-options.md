@@ -15,6 +15,7 @@ preexisting_links: Default::default(),
 refused_link_placeholder: false,
 restart_from_first_volume: false,
 replace_placed_links: false,
+keep_broken: false,
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with

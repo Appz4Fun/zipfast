@@ -84,6 +84,7 @@ fn options(dest: &std::path::Path) -> ProgressiveOptions {
             refused_link_placeholder: false,
             restart_from_first_volume: false,
             replace_placed_links: false,
+            keep_broken: false,
         },
         OsString::from("a.rar"),
     );

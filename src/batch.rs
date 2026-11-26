@@ -70,6 +70,8 @@ pub(crate) struct JobData {
     /// where it is written, created by the worker
     pub out: Option<Place>,
     pub meta: Meta,
+    /// [`crate::extract::Options::keep_broken`]: a file that fails keeps what was written
+    pub keep: bool,
 }
 
 /// How a file went.
@@ -287,7 +289,7 @@ fn run_job(
     cancel: Option<&Cancellation>,
 ) -> Outcome {
     let canceled = || cancel.is_some_and(Cancellation::is_canceled);
-    let JobData { packed, method, dictionary, size, size_checked, crc32, blake2sp, out, meta } = data;
+    let JobData { packed, method, dictionary, size, size_checked, crc32, blake2sp, out, meta, keep } = data;
     let mut hasher = crate::crc32::Hasher::new();
     let mut blake = blake2sp.map(|_| Blake2sp::new());
     let mut out = match out.map(|place| create_target_detailed(place, Some(size))).transpose() {
@@ -330,12 +332,23 @@ fn run_job(
         drop(out);
         return Outcome::Canceled;
     }
+    // Options::keep_broken: a file that fails keeps what was written (dropped unfinished, it is removed)
+    let mut out = out;
+    let keep_broken = |out: &mut Option<crate::output::Output>| {
+        if let Some(o) = out.take().filter(|_| keep) {
+            let _ = o.finish_detailed(|file| crate::extract::keep_written(file, &meta));
+        }
+    };
     if let Err(fault) = decoded {
+        keep_broken(&mut out);
         let (reason, legacy) = fault.into_parts();
         return Outcome::Failed { reason, legacy: LegacyFailure::Decoder(legacy) };
     }
     let crc_bad = crc32.is_some_and(|want| hasher.finalize() != want);
     let blake_bad = blake2sp.zip(blake).is_some_and(|(want, got)| got.finish() != want);
+    if crc_bad || blake_bad || bytes != size {
+        keep_broken(&mut out);
+    }
     if crc_bad || blake_bad {
         let reason = RarIntegrityReason::FinalChecks { crc32: crc_bad, blake2sp: blake_bad };
         return Outcome::Failed {

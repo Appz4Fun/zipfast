@@ -302,6 +302,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             refused_link_placeholder: false,
                             restart_from_first_volume: false,
                             replace_placed_links: false,
+                            keep_broken: false,
                         },
                         Some("password"),
                         |_| {},

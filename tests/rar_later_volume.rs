@@ -54,6 +54,7 @@ fn options(dest: &Path, mode: Mode) -> Options {
         // These tests check UnRAR's behaviour, which a caller opts into.
         restart_from_first_volume: true,
         replace_placed_links: false,
+        keep_broken: false,
     }
 }
 
