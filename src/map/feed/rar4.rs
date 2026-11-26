@@ -200,6 +200,7 @@ impl FeedDecoder {
             held_prefix: 0,
             open_from: 0,
             crc_floor: 0,
+            open_iv: None,
             keys: None,
             failed: false,
             status: FeedStatus::default(),

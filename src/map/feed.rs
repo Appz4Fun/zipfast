@@ -842,6 +842,8 @@ pub struct FeedDecoder {
     open_from: u64,
     /// output before this is not hashed into the CRC runs: the caller's prefix CRC covers it
     crc_floor: u64,
+    /// [`FeedDecoder::set_open_iv`]: the ciphertext block before `held_prefix`, for any lane starting there
+    open_iv: Option<[u8; 16]>,
     /// the keys derived for this member, to hand to a twin's decoder
     keys: Option<FeedKeys>,
 }
@@ -949,6 +951,8 @@ impl FeedDecoder {
                 lane.pos = start;
                 lane.iv = Some(previous_block);
                 lane.rem.clear();
+                // a repair of the opening block (a hole the main decode skipped) starts from it too
+                self.open_iv = Some(previous_block);
                 Ok(())
             }
             _ => Err(FeedError::Malformed("an IV is given only to a fresh AES-CBC open_at decoder past the start")),
@@ -1084,6 +1088,7 @@ impl FeedDecoder {
             held_prefix: 0,
             open_from: 0,
             crc_floor: 0,
+            open_iv: None,
             keys: None,
             failed: false,
             status: FeedStatus::default(),
@@ -1552,6 +1557,8 @@ impl FeedDecoder {
                 let end = out_end.checked_next_multiple_of(16).unwrap_or(u64::MAX).min(self.stream_len);
                 if out == 0 {
                     Lane { pos: 0, end, next: 0, iv: Some(iv), rem: Vec::new() }
+                } else if let Some(iv) = self.open_iv.filter(|_| out == self.held_prefix) {
+                    Lane { pos: out, end, next: out, iv: Some(iv), rem: Vec::new() }
                 } else {
                     Lane { pos: out - 16, end, next: out, iv: None, rem: Vec::new() }
                 }
@@ -1699,6 +1706,12 @@ impl FeedDecoder {
             unproven: self.unproven,
             suspect: self.suspect,
             seeded: self.seeded,
+            open: OpenAt {
+                held_prefix: self.held_prefix,
+                open_from: self.open_from,
+                crc_floor: self.crc_floor,
+                iv: self.open_iv,
+            },
             layer: match (&self.rar5, &self.lzma2, &self.rar4) {
                 (Some(r), _, _) => Some(r.to_bytes()),
                 (_, Some(l), _) => Some(l.to_bytes()),
@@ -1734,6 +1747,18 @@ impl FeedDecoder {
         }
         let size = d.size;
         let bad = || FeedError::Snapshot("out of range");
+        let open = snapshot.open;
+        let held = open.held_prefix;
+        let open_ok = open.open_from <= size
+            && held <= open.open_from
+            && open.crc_floor <= open.open_from
+            && (open.iv.is_none()
+                || (held > 0 && held.is_multiple_of(16) && matches!(d.cipher, StoredCipher::Cbc { .. })))
+            && (held == 0 || !d.layered());
+        if !open_ok {
+            return Err(bad());
+        }
+        (d.held_prefix, d.open_from, d.crc_floor, d.open_iv) = (held, open.open_from, open.crc_floor, open.iv);
         if let Some(r) = d.rar5.as_mut() {
             let blob = snapshot.layer.as_deref().ok_or(FeedError::Snapshot("no RAR 5.0 state"))?;
             r.restore(blob, size, d.stream_len)?;
@@ -2155,12 +2180,23 @@ pub struct FeedSnapshot {
     suspect: Option<u64>,
     /// [`FeedDecoder::seeded`]
     seeded: Option<u64>,
+    /// an [`FeedDecoder::open_at`] decoder's start, offset asked for, CRC floor and caller's IV (v4)
+    open: OpenAt,
     /// a compressed layer's state: RAR 5.0 checkpoints and repairs, LZMA2 restart points and repairs
     layer: Option<Vec<u8>>,
 }
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"ZFFD";
-const SNAPSHOT_VERSION: u8 = 3;
+const SNAPSHOT_VERSION: u8 = 4;
+
+/// What [`FeedDecoder::open_at`] and the calls after it set, kept by a snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OpenAt {
+    held_prefix: u64,
+    open_from: u64,
+    crc_floor: u64,
+    iv: Option<[u8; 16]>,
+}
 /// The most lost ranges or CRC runs a snapshot may list.
 const SNAPSHOT_MAX_RANGES: u64 = 1 << 20;
 
@@ -2223,6 +2259,16 @@ impl FeedSnapshot {
         out.push(u8::from(self.unproven));
         put_opt_u64(&mut out, self.suspect);
         put_opt_u64(&mut out, self.seeded);
+        for v in [self.open.held_prefix, self.open.open_from, self.open.crc_floor] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        match self.open.iv {
+            None => out.push(0),
+            Some(iv) => {
+                out.push(1);
+                out.extend_from_slice(&iv);
+            }
+        }
         out
     }
 
@@ -2290,6 +2336,17 @@ impl FeedSnapshot {
         } else {
             (false, None, None)
         };
+        let open = if version >= 4 {
+            let (held_prefix, open_from, crc_floor) = (r.u64()?, r.u64()?, r.u64()?);
+            let iv = match r.u8()? {
+                0 => None,
+                1 => Some(r.take(16)?.try_into().expect("16 bytes")),
+                _ => return Err(FeedError::Snapshot("bad flag")),
+            };
+            OpenAt { held_prefix, open_from, crc_floor, iv }
+        } else {
+            OpenAt::default()
+        };
         if !r.0.is_empty() {
             return Err(FeedError::Snapshot("trailing bytes"));
         }
@@ -2307,6 +2364,7 @@ impl FeedSnapshot {
             unproven,
             suspect,
             seeded,
+            open,
             layer,
         })
     }

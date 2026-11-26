@@ -1376,3 +1376,108 @@ fn open_at_takes_the_iv_and_the_keys_from_the_other_copy() {
         );
     }
 }
+
+/// Copy B of a twin failover: its volumes, ranges it reports as holes until cleared, and the first packed byte (per
+/// volume) the decoder may read, which it must never read before.
+struct TwinCopy<'a> {
+    volumes: &'a [Vec<u8>],
+    holes: Vec<(u32, Range<u64>)>,
+    floor: Vec<(u32, u64)>,
+}
+
+impl PackedSource for TwinCopy<'_> {
+    fn read_packed(&mut self, volume: u32, offset: u64, buf: &mut [u8]) -> PackedRead {
+        if let Some(&(_, f)) = self.floor.iter().find(|(v, _)| *v == volume) {
+            assert!(offset >= f, "read volume {volume} at {offset}, before the start's own bytes at {f}");
+        }
+        let mut end = self.volumes[volume as usize].len() as u64;
+        for (v, r) in &self.holes {
+            if *v == volume && r.contains(&offset) {
+                return PackedRead::Hole { len: r.end - offset };
+            }
+            if *v == volume && r.start > offset {
+                end = end.min(r.start);
+            }
+        }
+        let n = (end.saturating_sub(offset) as usize).min(buf.len());
+        buf[..n].copy_from_slice(&self.volumes[volume as usize][offset as usize..offset as usize + n]);
+        PackedRead::Data(n)
+    }
+}
+
+fn open_twin(case: &Case, map: &MemberMap, at: u64) -> (FeedDecoder, u64, Vec<(u32, u64)>) {
+    let member = &map.members[0];
+    let mut decoder = FeedDecoder::open_at(map, 0, at, all_needs(case.password)).unwrap();
+    let start = decoder.status().frontier;
+    let mut iv = Vec::new();
+    for span in member.packed_spans(start - 16..start).unwrap() {
+        iv.extend_from_slice(&case.volumes[span.volume as usize][span.packed.start as usize..span.packed.end as usize]);
+    }
+    decoder.set_open_iv(iv[iv.len() - 16..].try_into().unwrap()).unwrap();
+    decoder.set_prefix_crc32(crc32fast::hash(&case.plain[..at as usize])).unwrap();
+    let size = case.plain.len() as u64;
+    // the spans begin with the IV block before the start's own bytes (perhaps in an earlier volume)
+    let mut skip = 16;
+    let mut floor = Vec::new();
+    for span in member.packed_spans(start..size).unwrap() {
+        let take = skip.min(span.packed.end - span.packed.start);
+        skip -= take;
+        if span.packed.start + take < span.packed.end {
+            floor.push((span.volume, span.packed.start + take));
+        }
+    }
+    (decoder, start, floor)
+}
+
+fn run_to_end(
+    decoder: &mut FeedDecoder,
+    source: &mut TwinCopy,
+    sink: &mut Vec<u8>,
+    mut between: impl FnMut(&mut TwinCopy),
+) {
+    for _ in 0..10_000 {
+        if decoder.run(source, sink).unwrap().done {
+            return;
+        }
+        between(source);
+    }
+    panic!("never done: {:?}", decoder.status());
+}
+
+/// The CRC floor and the caller's IV of an AES-CBC `open_at` decoder survive a snapshot taken before its first run
+/// (and its serialized form): the bytes from the block start to `at` are still not hashed twice.
+#[test]
+fn an_open_at_snapshot_keeps_the_crc_floor_and_the_iv() {
+    let case = &cases()[1]; // RAR 5.0 AES stored, 4 volumes
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+    for at in [7_000u64, 20_001] {
+        let (decoder, start, floor) = open_twin(case, &map, at);
+        let bytes = decoder.snapshot().to_bytes();
+        let snap = FeedSnapshot::from_bytes(&bytes).unwrap();
+        let mut decoder = FeedDecoder::restore(&map, 0, all_needs(case.password), &snap).unwrap();
+        let mut source = TwinCopy { volumes: &case.volumes, holes: Vec::new(), floor };
+        let mut sink = case.plain[..start as usize].to_vec();
+        run_to_end(&mut decoder, &mut source, &mut sink, |_| {});
+        assert_eq!(sink, case.plain, "at {at}");
+        assert_eq!(decoder.status().crc_ok, Some(true), "at {at}: {:?}", decoder.status());
+    }
+}
+
+/// The opening ciphertext block of an AES-CBC `open_at` decoder given the caller's IV arrives late (a hole the main
+/// decode skips): its repair starts from the caller's IV too, so nothing before the start is ever read.
+#[test]
+fn a_late_opening_block_is_repaired_from_the_callers_iv() {
+    let case = &cases()[1];
+    let map = MemberMap::from_memory(&refs(&case.volumes), case.name, case.password).unwrap();
+    for at in [7_000u64, 20_001] {
+        let (mut decoder, start, floor) = open_twin(case, &map, at);
+        let (volume, first) = floor[0];
+        let hole = (volume, first..first + 16);
+        let mut source = TwinCopy { volumes: &case.volumes, holes: vec![hole], floor };
+        let mut sink = case.plain[..start as usize].to_vec();
+        run_to_end(&mut decoder, &mut source, &mut sink, |s| s.holes.clear());
+        assert!(decoder.stats().holes > 0, "at {at}: the opening block was a hole");
+        assert_eq!(sink, case.plain, "at {at}");
+        assert_eq!(decoder.status().crc_ok, Some(true), "at {at}: {:?}", decoder.status());
+    }
+}
