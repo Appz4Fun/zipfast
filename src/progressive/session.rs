@@ -1180,7 +1180,11 @@ impl ProgressiveSession {
                     // An encrypted link is placed only on a password its check value verifies: the member's cipher
                     // refuses no password or a wrong one, and one with no usable check value is refused here, as a
                     // link has no data to check a password against (`crate::extract::link::rar5_password`).
+                    // (only for a member that is processed: an older revision is skipped below, placed or tested never)
+                    let older_revision =
+                        header.version.is_some() && self.options.extract.mode != crate::extract::Mode::Test;
                     if header.encrypted
+                        && !older_revision
                         && self.options.password().is_some_and(|p| !p.is_empty())
                         && let Some(verifier) = header.crypt.as_ref().and_then(crate::extract::link::rar5_unverifiable)
                     {

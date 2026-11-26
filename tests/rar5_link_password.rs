@@ -362,3 +362,20 @@ fn encrypted_hard_links_and_copies_are_gated_too() {
         }
     }
 }
+
+/// Codex on #307: an older revision of an encrypted link with no check value is skipped by a progressive session as
+/// any older revision is, not refused for its missing check value (which would end the session), so later members
+/// still extract.
+#[test]
+fn an_older_revision_of_an_unverifiable_link_is_skipped_on_a_progressive_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.rar");
+    let mut old = link("old", 1, "plain", false);
+    old.extra.extend([3, 4, 0, 1]); // a version record (extra type 4): an older revision
+    fs::write(&path, archive(&[old, FileSpec::new("plain", b"plain")])).unwrap();
+    let dest = dir.path().join("out");
+    let outcomes = progressive(&path, &dest, Mode::Extract, Some(PASSWORD)).expect("the session goes on");
+    assert_eq!(outcomes.last().map(String::as_str), Some("ok"), "{outcomes:?}");
+    assert_eq!(fs::read(dest.join("plain")).unwrap(), b"plain");
+    assert!(fs::symlink_metadata(dest.join("old")).is_err(), "the older revision is not placed");
+}
