@@ -130,13 +130,23 @@ fn observe_storage_parent(parent: &File, path: &CStr) -> std::io::Result<libc::s
 }
 #[cfg(unix)]
 pub(super) fn trusted_dir(s: &libc::stat, uid: libc::uid_t, portable: bool) -> bool {
-    // Portable spool directories (NFS with squashed owners, SMB, shared FUSE mounts) need only be directories.
-    if portable {
-        return s.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    dir_distrust(s, uid, portable).is_none()
+}
+/// Why a directory is not trusted to stage or spool in, if it is not.
+#[cfg(unix)]
+pub(super) fn dir_distrust(s: &libc::stat, uid: libc::uid_t, portable: bool) -> Option<DirectoryDistrust> {
+    if s.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        Some(DirectoryDistrust::NotADirectory)
+    } else if portable {
+        // Portable spool directories (NFS with squashed owners, SMB, shared FUSE mounts) need only be directories.
+        None
+    } else if s.st_uid != uid && s.st_uid != 0 {
+        Some(DirectoryDistrust::OtherOwner)
+    } else if s.st_mode & 0o022 != 0 && s.st_mode & libc::S_ISVTX == 0 {
+        Some(DirectoryDistrust::OthersMayWrite)
+    } else {
+        None
     }
-    s.st_mode & libc::S_IFMT == libc::S_IFDIR
-        && (s.st_uid == uid || s.st_uid == 0)
-        && (s.st_mode & 0o022 == 0 || s.st_mode & libc::S_ISVTX != 0)
 }
 /// Our held spool after its name was unlinked: no links, except on filesystems whose open-unlinked files still
 /// report one (see `keeps_unlinked_link`).
@@ -631,8 +641,10 @@ impl<'a> PrivateCiphertextFile<'a> {
                     Err(fault) => return Err(fault),
                 }
             }
-            if !trusted_dir(&s, uid, portable) {
-                return Err(policy());
+            // refused before anything is created in it: say which directory and why (a changed identity later on
+            // stays a policy fault)
+            if let Some(reason) = dir_distrust(&s, uid, portable) {
+                return Err(ReadFault::UntrustedDirectory { object: scope.parent, reason });
             }
             nfs = portable && keeps_unlinked_link(parent.as_raw_fd());
             let acquired = create_private_at(

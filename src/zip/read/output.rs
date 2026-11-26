@@ -127,6 +127,8 @@ pub struct ZipReadStage {
     uid: u32,
     descriptor: (usize, u64, u64, u32),
     terminal: bool,
+    /// [`crate::extract::Options::keep_broken`]: published though its read failed, with what was written
+    broken: bool,
     /// The prepared named stage, on either backend; one inline slot sized by the larger.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     named: Option<file::Prepared>,
@@ -241,6 +243,7 @@ impl ZipReadStage {
                     uid,
                     descriptor,
                     terminal: false,
+                    broken: false,
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
                     named: None,
                 })

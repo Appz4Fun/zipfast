@@ -47,8 +47,16 @@ pub(crate) fn rar_output_name(name: &str, rar4: bool) -> Option<std::borrow::Cow
 
 /// Whether a folder member's name is only `.` and separators, as in the `./` that bsdtar and Windows `tar.exe`
 /// write first when archiving the current directory: it stands for the destination itself, so it is passed over.
+#[cfg(test)]
 pub(crate) fn names_root(name: &str) -> bool {
-    !name.is_empty() && name.split(['/', '\\']).all(|part| part.is_empty() || part == ".")
+    names_root_with(name, true)
+}
+
+/// [`names_root`], with `\\` a separator only when `backslash_separates` (not under `Options::backslashes` literal,
+/// where `\\` or `.\\` is a folder's own name).
+pub(crate) fn names_root_with(name: &str, backslash_separates: bool) -> bool {
+    let separator = |c: char| c == '/' || backslash_separates && c == '\\';
+    !name.is_empty() && name.split(separator).all(|part| part.is_empty() || part == ".")
 }
 
 /// `windows_names`: the archive was made on Windows, so a backslash is a separator there and a drive letter or
