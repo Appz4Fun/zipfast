@@ -25,7 +25,7 @@
 //! [`fine_grained_stamps`] and skips, with a printed note, where it is false.
 
 use std::fs::{File, Metadata};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -73,7 +73,9 @@ pub(crate) fn fine_grained_stamps(dir: &Path) -> bool {
         PROBES.fetch_add(1, Ordering::Relaxed);
         let fine = probe(dir).unwrap_or_else(|e| panic!("probing file stamps under {}: {e}", dir.display()));
         if !fine {
-            eprintln!(
+            // Straight to stderr, not eprintln!: the test harness captures that, and this note should always show.
+            let _ = writeln!(
+                io::stderr(),
                 "note: file times (probed under {}) move on a coarse tick, so a same-size rewrite within one tick is \
                  invisible to zipfast's change checks: change tests wait for the next tick",
                 dir.display()
