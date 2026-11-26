@@ -90,7 +90,7 @@ impl RarSession {
         let result = (|| {
             check_cancel(&self.options.cancel)?;
             let words = self.model.members.len().div_ceil(64);
-            let capacity = self.options.limits.capacity;
+            let capacity = self.options.limits.capacity_for(&self.usage);
             let check_capacity = |words| {
                 limit(add(self.usage.capacity, vector_bytes::<u64>(words)?)?, capacity, RarResource::CatalogueCapacity)
             };
