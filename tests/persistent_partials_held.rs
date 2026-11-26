@@ -153,6 +153,9 @@ fn session(
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         },
         primary_name(0),
     );
@@ -394,8 +397,11 @@ fn load_held_rehashes_an_output_that_is_not_the_recorded_file() {
     let mut bytes = std::fs::read(&output).unwrap();
     let (out2, _) = piece(&primary, 2);
     bytes[out2.start as usize + 5] ^= 1;
-    std::fs::remove_file(&output).unwrap();
-    std::fs::write(&output, &bytes).unwrap();
+    // written beside it and renamed over it, so the copy has another inode while the original still exists (a
+    // file written after removing the original can be given its inode number again, on Linux ext4 at once)
+    let copy = dir.path().join("out/movie.bin.copy");
+    std::fs::write(&copy, &bytes).unwrap();
+    std::fs::rename(&copy, &output).unwrap();
     let scanned = scan(dir.path(), false);
     let good = &scanned.held[0].good;
     assert!(good.iter().all(|r| r.end <= out2.start || r.start >= out2.end), "{good:?} keeps the changed leaf");

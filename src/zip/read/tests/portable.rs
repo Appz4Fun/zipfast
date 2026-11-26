@@ -85,6 +85,9 @@ fn run(archive: &Path, dest: &Path, overwrite: Overwrite, storage: StagedStorage
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let overrides = EncryptedReadOverrides { staged_storage: storage, ..Default::default() };
     crate::zip::run_with_policy(
@@ -280,6 +283,9 @@ fn run_with_context_restores_the_stream_setting() {
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let mut context = EncryptedReadContext::new(Default::default()).unwrap();
     assert!(!context.options.stream_staged_aes);

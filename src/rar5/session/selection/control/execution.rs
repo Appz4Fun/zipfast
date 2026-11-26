@@ -378,8 +378,9 @@ impl<O: ?Sized> Hooks<'_, O> {
             path: target.to_path_buf(),
         }))
     }
-    /// `folder`: a rename mode may find a folder at the target, which it moves aside or leaves alone.
-    fn bind(&mut self, target: &Path, initial: SourceStamp, folder: bool) -> Result<(), SelectedStop> {
+    /// `folder`: a rename mode may find a folder at the target, which it moves aside or leaves alone. `link`: the
+    /// target is a symbolic link this run placed, which the member may replace ([`Options::replace_placed_links`]).
+    fn bind(&mut self, target: &Path, initial: SourceStamp, folder: bool, link: bool) -> Result<(), SelectedStop> {
         self.control.native_charge(RarResource::ExtractControlWork, linear_work(target.as_os_str().len(), 2)?)?;
         self.parent_path = self.bytes(target.parent().expect("sanitized parent"))?;
         self.leaf = self.bytes(Path::new(target.file_name().expect("sanitized leaf")))?;
@@ -407,7 +408,7 @@ impl<O: ?Sized> Hooks<'_, O> {
             .io(IoOperation::Metadata, target, || guard::stat_at(fd, unsafe { std::slice::from_raw_parts(leaf, n) }))?;
         let kind_ok = |s: &guard::Stamp| {
             let kind = s.mode & libc::S_IFMT;
-            kind == libc::S_IFREG || folder && kind == libc::S_IFDIR
+            kind == libc::S_IFREG || folder && kind == libc::S_IFDIR || link && kind == libc::S_IFLNK
         };
         if observed.filter(kind_ok).map(guard::Stamp::source) != Some(initial) {
             return Err(Self::changed(target));
@@ -607,12 +608,13 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
         entry: &RarEntryIdentity,
         target: &Path,
         initial: Option<SourceStamp>,
+        owned_link: bool,
         legacy: Overwrite,
     ) -> Result<bool, SelectedStop> {
         let Some(initial) = initial else {
             return Ok(true);
         };
-        self.bind(target, initial, legacy.rename().is_some())?;
+        self.bind(target, initial, legacy.rename().is_some(), owned_link)?;
         // A rename mode in the options settles every conflict without the control's mode or the observer: the
         // existing file is never replaced, only kept (`RenameNew`) or moved aside (`RenameExisting`).
         let decision = match self.control.overwrite {
@@ -716,6 +718,9 @@ mod tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         }
     }
     struct Fault {
@@ -969,6 +974,9 @@ mod directory_fault_tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1049,6 +1057,9 @@ mod trailing_directory_tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

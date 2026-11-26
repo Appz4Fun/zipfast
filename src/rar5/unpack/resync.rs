@@ -690,8 +690,43 @@ pub fn resync_near(
     options: &NearOptions,
 ) -> std::result::Result<ResyncNear, NearError> {
     let started = std::time::Instant::now();
-    let deadline = options.deadline.map(|d| started + d);
-    let mut work = Work::new(options.work, usize::MAX, deadline);
+    let mut work = Work::new(options.work, usize::MAX, options.deadline.map(|d| started + d));
+    near_in(packed, known_base, known, window, target, options, &mut work, started)
+}
+
+/// [`resync_near`] with `options` (guarded); when it finds no restart, the nearest unguarded one. Both searches
+/// share one work budget and one deadline, so the caller's bounds hold for the pair, and the report counts both.
+pub(crate) fn resync_near_or_unguarded(
+    packed: &[u8],
+    known_base: u64,
+    known: &[u8],
+    window: Window,
+    target: u64,
+    options: &NearOptions,
+) -> std::result::Result<ResyncNear, NearError> {
+    let started = std::time::Instant::now();
+    let mut work = Work::new(options.work, usize::MAX, options.deadline.map(|d| started + d));
+    match near_in(packed, known_base, known, window, target, options, &mut work, started) {
+        // out of budget or time: nothing is left for a second search
+        Err(NearError::NotFound { .. }) if options.guard => {
+            let unguarded = NearOptions { guard: false, ..options.clone() };
+            near_in(packed, known_base, known, window, target, &unguarded, &mut work, started)
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn near_in(
+    packed: &[u8],
+    known_base: u64,
+    known: &[u8],
+    window: Window,
+    target: u64,
+    options: &NearOptions,
+    work: &mut Work,
+    started: std::time::Instant,
+) -> std::result::Result<ResyncNear, NearError> {
     let known_end = known_base.saturating_add(known.len() as u64);
     let target = target.min(known_end);
     if target <= known_base {
@@ -737,16 +772,16 @@ pub fn resync_near(
         // declared before).
         let cover = target.checked_sub(window.reach.saturating_add(MAX_FILTER_LEN)).filter(|&l| l > known_base);
         let found = match cover {
-            Some(l) => search_near(packed, &known, window, l, est, &mut pre, &mut work),
-            None => search_near(packed, &known, window, known_base + 1, 0, &mut pre, &mut work),
+            Some(l) => search_near(packed, &known, window, l, est, &mut pre, work),
+            None => search_near(packed, &known, window, known_base + 1, 0, &mut pre, work),
         };
         match found {
             Ok(found) if checked(&found.0, found.1) && (found.0.guarded || found.1 <= known_base) => {
-                return done(found, &mut work);
+                return done(found, work);
             }
             Ok(found) => keep(found, &mut fallback),
             Err(NearError::NotFound { .. }) => {}
-            Err(e) => return fallback.map_or(Err(e), |f| done(f, &mut work)),
+            Err(e) => return fallback.map_or(Err(e), |f| done(f, work)),
         }
     }
     // Then a guarded restart: an anchor a filter's longest length before the target, followed to it.
@@ -755,25 +790,25 @@ pub fn resync_near(
     // anchor plus a filter's length, so the anchor is looked for that much before the restart instead (twice).
     for _ in 0..3 {
         let Some(l) = limit.filter(|&l| l > known_base) else { break };
-        match search_near(packed, &known, window, l, est, &mut pre, &mut work) {
-            Ok(found) if found.0.guarded => return done(found, &mut work),
+        match search_near(packed, &known, window, l, est, &mut pre, work) {
+            Ok(found) if found.0.guarded => return done(found, work),
             Ok(found) => {
                 limit = found.0.output_offset.checked_sub(MAX_FILTER_LEN).filter(|&next| next < l);
                 keep(found, &mut fallback);
             }
             Err(NearError::NotFound { .. }) => break,
-            Err(e) => return fallback.map_or(Err(e), |f| done(f, &mut work)),
+            Err(e) => return fallback.map_or(Err(e), |f| done(f, work)),
         }
     }
     if let Some(f) = fallback.take_if(|f| f.0.guarded) {
-        return done(f, &mut work);
+        return done(f, work);
     }
-    match search_near(packed, &known, window, target, est, &mut pre, &mut work) {
+    match search_near(packed, &known, window, target, est, &mut pre, work) {
         Ok(found) => {
             let better = fallback.as_ref().is_none_or(|f| found.0.output_offset >= f.0.output_offset);
-            done(if better { found } else { fallback.expect("checked") }, &mut work)
+            done(if better { found } else { fallback.expect("checked") }, work)
         }
-        Err(e) => fallback.map_or(Err(e), |f| done(f, &mut work)),
+        Err(e) => fallback.map_or(Err(e), |f| done(f, work)),
     }
 }
 

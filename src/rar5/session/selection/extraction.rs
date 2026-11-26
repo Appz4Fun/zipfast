@@ -206,7 +206,11 @@ impl<'a> Extraction<'a> {
         }
         let initial = self.inspect_target(session, &target)?;
         hooks.before_path(index);
-        if !hooks.replace(session, entry, &target, initial, self.options.overwrite)? {
+        // a link this run placed at the target, which Options::replace_placed_links lets the member replace
+        let owned_link = initial.is_some()
+            && self.options.replace_placed_links
+            && fs::symlink_metadata(&target).is_ok_and(|meta| self.extracted.owns_link(&meta));
+        if !hooks.replace(session, entry, &target, initial, owned_link, self.options.overwrite)? {
             return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
         }
         if let Some(kind) = link {
@@ -265,12 +269,17 @@ impl<'a> Extraction<'a> {
             return Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written });
         }
         hooks.before_publication(index, initial);
+        // a link this run placed there is replaced (inspect_target let it through): publication checks it is still it
+        let link = fs::symlink_metadata(&target)
+            .ok()
+            .filter(|meta| self.options.replace_placed_links && self.extracted.owns_link(meta))
+            .map(|meta| crate::extract::link::identity(&meta));
         if hooks.observe_publication() {
-            file.publish_selected_observed(initial.is_some(), |held, published| {
+            file.publish_selected_observed(initial.is_some(), link, |held, published| {
                 hooks.published(index, &target, held, published)
             })
         } else {
-            file.publish_selected(initial.is_some())
+            file.publish_selected(initial.is_some(), link)
         }
         .map_err(|error| own_fault(error.detailed(false)))?;
         self.extracted.file(&self.options.dest, &selected, &target);
@@ -558,6 +567,11 @@ impl<'a> Extraction<'a> {
             Err(source) => return Err(output_fault(IoOperation::Metadata, target, source)),
         };
         if metadata.file_type().is_symlink() {
+            // A symbolic link this run placed is replaced by rename (never followed) when asked, as UnRAR 7.30 `e -y`
+            // does; otherwise, and for any other link, the member is refused, as 7-Zip 26.06 does.
+            if self.options.replace_placed_links && self.extracted.owns_link(&metadata) {
+                return named.map(|()| Some(SourceStamp::from_entry_metadata(&metadata)));
+            }
             return Err(policy(RarPolicyReason::Symlink, target.to_path_buf()));
         }
         let identity = (metadata.dev(), metadata.ino());
@@ -787,12 +801,16 @@ pub(super) trait ExtractionHooks {
     ) -> Result<Option<Arc<RarFailure>>, SelectedStop> {
         Ok(None)
     }
+    /// `owned_link`: what is at the target is a symbolic link this run placed, which the member may replace
+    /// ([`Options::replace_placed_links`]).
+    #[allow(clippy::too_many_arguments)]
     fn replace(
         &mut self,
         session: &mut RarSession,
         entry: &RarEntryIdentity,
         target: &Path,
         initial: Option<SourceStamp>,
+        owned_link: bool,
         legacy: Overwrite,
     ) -> Result<bool, SelectedStop>;
     fn recheck(
@@ -853,6 +871,7 @@ impl ExtractionHooks for LegacyHooks {
         _: &RarEntryIdentity,
         _: &Path,
         initial: Option<SourceStamp>,
+        _: bool,
         legacy: Overwrite,
     ) -> Result<bool, SelectedStop> {
         Ok(initial.is_none() || legacy != Overwrite::Skip)
@@ -954,6 +973,9 @@ mod tests {
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         }
     }
 

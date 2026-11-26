@@ -68,6 +68,9 @@ fn options(mode: Mode, dest: &Path) -> Options {
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     }
 }
 
@@ -449,6 +452,9 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
         ..options(Mode::Extract, dest)
     };
     let out = tmp.path().join("seven");
@@ -481,6 +487,9 @@ fn r5extra_comes_out_as_7zip_writes_it() {
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
         ..options(Mode::Extract, &out)
     };
     extract::run(&fixture("rar5-compat", "r5extra.rar"), &opts, |_| {}).unwrap();

@@ -677,6 +677,9 @@ fn file_binding_rejects_foreign_tuple_before_effects_and_borrows_operational_nam
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let before = context.run_usage();
     assert!(session.stage_entry(0).unwrap().bind_file(Path::new("foreign"), &options, &cancel, &mut context).is_err());
@@ -1060,6 +1063,9 @@ fn original_file_stage_is_private_during_fill_and_finish_error_preserves_prior_t
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -1121,6 +1127,9 @@ fn original_file_publication_requires_completion_and_two_fresh_source_observatio
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -1206,6 +1215,9 @@ fn file_fixture_ready(overwrite: crate::extract::Overwrite, prior: Option<&[u8]>
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -1339,6 +1351,9 @@ fn actual_original_named_aes_pipeline_has_five_reserved_fds_and_one_under_refuse
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         };
         let overrides = EncryptedReadOverrides { temp_dir: Some(temporary.path().to_owned()), ..Default::default() };
         let mut context = EncryptedReadContext::for_projected(
@@ -1441,6 +1456,9 @@ fn actual_named_cipher_unresolved_pair_refuses_cleanup_reopen_and_retains_u_with
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let overrides = EncryptedReadOverrides { temp_dir: Some(temporary.path().to_owned()), ..Default::default() };
     let mut context = EncryptedReadContext::for_projected(
@@ -1845,6 +1863,9 @@ fn empty_move_after_real_effect_eintr_checks_both_names_and_cleans_without_retry
         preexisting_links: Default::default(),
         refused_link_placeholder: false,
         restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let mut context = EncryptedReadContext::for_projected(
         &mut session,
@@ -2002,6 +2023,9 @@ fn fullpath_ambiguous_birth_after_parent_retarget_cannot_retire_from_old_parent_
                 preexisting_links: Default::default(),
                 refused_link_placeholder: false,
                 restart_from_first_volume: false,
+                replace_placed_links: false,
+                keep_broken: false,
+                attempt_continued_members: false,
             };
             let mut context = EncryptedReadContext::for_projected(
                 &mut session,
@@ -2138,6 +2162,9 @@ fn linux_actual_parent_access_default_acl_gid_and_mode_parity_survive_private_st
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         };
         let mut context = EncryptedReadContext::for_projected(
             &mut session,
@@ -2228,6 +2255,9 @@ fn mac_native_inherited_acl_and_maximum_aces_match_incumbent_creation_after_publ
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         };
         let mut context = EncryptedReadContext::for_projected(
             &mut session,
@@ -2301,6 +2331,9 @@ fn preparation_each_instrumented_boundary_retires_or_reports_unobserved_empty_di
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         };
         let mut context = EncryptedReadContext::for_projected(
             &mut session,
@@ -2423,6 +2456,9 @@ fn retained_and_generic_receipts_release_borrows_before_real_read_and_publicatio
             preexisting_links: Default::default(),
             refused_link_placeholder: false,
             restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
         };
         if generic {
             let mut selected = crate::extract::SelectedEntry::open(source.path(), 0, None, 100).unwrap();
