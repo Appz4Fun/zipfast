@@ -117,7 +117,7 @@ fn namespace_trust_and_swap_boundaries() {
     use std::os::unix::fs::PermissionsExt;
     let cancel = crate::extract::Cancellation::default();
     for mode in [0o700, 0o755, 0o777, 0o1777] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::tempdir();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
         let (ledger, _) = ledger(0);
         let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
@@ -132,7 +132,7 @@ fn namespace_trust_and_swap_boundaries() {
     }
     // A detected link/mode change before unlink prevents any usable owner.
     for change_links in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::tempdir();
         let path = temp.path().to_owned();
         let (ledger, _) = ledger(0);
         let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
@@ -377,7 +377,7 @@ fn collisions_are_exclusive_finite_and_per_namespace() {
 fn observed_name_swap_refuses_unlink_and_preserves_replacement() {
     use std::cell::Cell;
     use std::rc::Rc;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let path = temp.path().to_owned();
     let changed = Rc::new(Cell::new(false));
     let flag = changed.clone();
@@ -549,7 +549,7 @@ fn partial_named_cleanup_preserves_stat_and_unlink_operation_labels() {
     for fail_stat in [true, false] {
         let cancel = crate::extract::Cancellation::default();
         let (ledger, _) = ledger(0);
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::tempdir();
         let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
         let unlinks = Rc::new(Cell::new(0));
         let seen_unlinks = unlinks.clone();
@@ -606,7 +606,7 @@ fn partial_cleanup_policy_refusal_is_a_stat_without_an_unlink_retry() {
     use std::{cell::Cell, os::unix::fs::PermissionsExt, rc::Rc};
     let cancel = crate::extract::Cancellation::default();
     let (ledger, _) = ledger(0);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = super::tempdir();
     let path = temp.path().to_owned();
     let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
     let unlinks = Rc::new(Cell::new(0));
