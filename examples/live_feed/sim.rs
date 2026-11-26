@@ -45,8 +45,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zipfast::map::{
-    ArticleBuffer, FeedDecoder, FeedError, FeedOptions, FeedSink, FeedStatus, MemberMap, NeedKind, PackedRead,
-    PackedSource,
+    ArticleBuffer, FeedDecoder, FeedError, FeedOptions, FeedSink, FeedStatus, FeedThreads, MemberMap, NeedKind,
+    PackedRead, PackedSource,
 };
 
 /// The decoded size of a Usenet article as most posters cut them.
@@ -57,6 +57,8 @@ pub const ARTICLE: u64 = 750_000;
 pub struct Config {
     /// The set's volumes, first first.
     pub volumes: Vec<PathBuf>,
+    /// `FeedOptions::threads`: LZMA2 workers (0: none).
+    pub threads: usize,
     pub password: Option<String>,
     /// Decoded article size in bytes.
     pub article: u64,
@@ -98,6 +100,7 @@ impl Config {
     pub fn new(volumes: Vec<PathBuf>, work: PathBuf) -> Self {
         Self {
             volumes,
+            threads: 0,
             password: None,
             article: ARTICLE,
             seed: 1,
@@ -726,6 +729,11 @@ impl Sink {
     fn finish(self) -> Result<(bool, u64), String> {
         match self.out {
             Out::File(f) => {
+                // LIVE_FEED_NO_SYNC=1 leaves the output unsynced: decode and write cost alone, comparable with an
+                // extraction that does not sync (`zipfast x`)
+                if std::env::var_os("LIVE_FEED_NO_SYNC").is_some() {
+                    return Ok((true, 0));
+                }
                 f.file.sync_all().map_err(|e| e.to_string())?;
                 Ok((true, 1))
             }
@@ -846,7 +854,11 @@ pub fn run(config: &Config) -> Result<Report, String> {
     for (index, m) in map.members.iter().enumerate() {
         let Some(size) = m.unpacked_size.filter(|&s| s > 0 && !m.is_dir) else { continue };
         report.members += 1;
-        let options = FeedOptions { max_needs: config.max_needs, ..FeedOptions::new(config.password.as_deref()) };
+        let options = FeedOptions {
+            max_needs: config.max_needs,
+            threads: if config.threads == 0 { FeedThreads::One } else { FeedThreads::Count(config.threads) },
+            ..FeedOptions::new(config.password.as_deref())
+        };
         match FeedDecoder::new(&map, index, options) {
             Ok(d) => decoders.push((index, size, d)),
             Err(FeedError::Unsupported(why)) => eprintln!("member {index} ({:?}): not fed: {why:?}", m.name),
@@ -1084,7 +1096,11 @@ fn restart(
     let mut reopened =
         if partial.is_empty() { HashMap::new() } else { persistent::create(config, map, &partial, dest)? };
     for (index, name, size, is_partial, path, lost, refills, refill_bytes) in old {
-        let options = FeedOptions { max_needs: config.max_needs, ..FeedOptions::new(config.password.as_deref()) };
+        let options = FeedOptions {
+            max_needs: config.max_needs,
+            threads: if config.threads == 0 { FeedThreads::One } else { FeedThreads::Count(config.threads) },
+            ..FeedOptions::new(config.password.as_deref())
+        };
         let (out, decoder, lost) = if is_partial {
             #[cfg(feature = "persistent-partials")]
             {
@@ -1139,6 +1155,9 @@ fn verify(config: &Config, map: &MemberMap, outputs: &[(usize, u64, PathBuf)]) -
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     zipfast::extract::run_with_password(&config.volumes[0], &options, config.password.as_deref(), |_| {})
         .map_err(|e| format!("straight extraction: {e}"))?;

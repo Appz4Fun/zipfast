@@ -76,6 +76,9 @@ fn opts(mode: Mode, dest: &Path) -> Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     }
 }
 
@@ -1420,4 +1423,24 @@ fn a_refused_link_without_a_placeholder_does_not_block_members_under_it() {
     assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
     assert!(summary.errors[0].starts_with("s: "), "{:?}", summary.errors);
     assert_eq!(fs::read(out.join("s/new.txt")).unwrap(), b"new");
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_backslashes_keep_a_7z_name_whole() {
+    // 7-Zip 26.06 on Linux writes `t/x\y` of a 7z archive as the file `x\y` in `t`, and `..\back.txt` as that name.
+    let dir = tempfile::tempdir().unwrap();
+    let archive = write(dir.path(), &Built::default().archive(&[vec![("t/x\\y", b"one"), ("..\\back.txt", b"two")]]));
+    let out = dir.path().join("out");
+    let literal = Options { backslashes: extract::Backslashes::Literal, ..opts(Mode::Extract, &out) };
+    let summary = extract::run(&archive, &literal, |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (2, 0), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("t/x\\y")).unwrap(), b"one");
+    assert_eq!(fs::read(out.join("..\\back.txt")).unwrap(), b"two");
+    assert!(!dir.path().join("back.txt").exists());
+    // By format a `\` separates folders, and the name that climbs out is refused.
+    let split = dir.path().join("split");
+    let summary = extract::run(&archive, &opts(Mode::Extract, &split), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (1, 1), "{:?}", summary.errors);
+    assert_eq!(fs::read(split.join("t/x/y")).unwrap(), b"one");
 }

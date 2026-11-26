@@ -166,3 +166,11 @@ See [qualification evidence](validation/encrypted-streaming-2026-11-13.md) and t
 `extract::run_with_zip_policy` and `run_with_zip_context` retain the incumbent non-ZIP engine. Their legacy observer skips `prepare`; its scope is unbound and cannot admit checked sinks or use checked `emit`. Use the consumer's existing legacy output path. Legacy allocation, parsing and callback behavior are not checked ZIP resource guarantees.
 
 `LegacyDiagnostic { message }` forwards the original mixed callback stream, which includes skips/progress as well as failures. After a successful legacy `Summary`, `LegacyError { message, .. }` borrows each original `Summary.errors` string in order, before `RunEnded`. These are legacy strings, not new typed archive-error classifications. Normal renderers that already print `LegacyDiagnostic` ignore `LegacyError` to avoid duplicates. Quiet renderers ignore mixed diagnostics and print only `LegacyError`; silent renderers ignore both. Counts remain the summary's counts. Plain closure observers receive both event kinds and must choose the channel they render; the adapter does not print either implicitly. The first observer failure stops later callbacks, error replay and `RunEnded`, while retaining the available summary counts; the incumbent legacy operation itself keeps its existing completion behavior.
+
+## A ZIP cut short (opt-in salvage)
+
+With `Options::salvage_truncated_zip` (off by default), a single ZIP file whose end record the checked reader can't
+find (`ReadFault::CheckedFormat { reason: "not a ZIP archive" }`, no cleanup fault, no source change) and that starts
+with a local header is handed to the legacy reader, which walks its local headers as 7-Zip does. That run is a legacy
+run: its events are the legacy events above, and none of the checked guarantees apply to it. An archive whose end
+record is found never takes this path. See `docs/compat-options.md` (`salvage_truncated_zip`).

@@ -269,6 +269,9 @@ fn negative_fractional_pax_time_is_the_signed_decimal() {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         };
         zipfast::extract::run(&path, &o, |_| {}).unwrap();
         let m = std::fs::metadata(out.join("f")).unwrap().modified().unwrap();

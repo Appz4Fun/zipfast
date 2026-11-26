@@ -140,7 +140,11 @@ impl<'a> Extraction<'a> {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
         let relative = hooks.project(header, self.options.version_naming)?;
-        let meta = self.options.meta(Meta::from(header));
+        let meta = if header.is_dir() {
+            self.options.dir_meta(Meta::from(header))
+        } else {
+            self.options.meta(Meta::from(header))
+        };
         if header.is_dir() {
             let outcome = run.test(session, index, None)?;
             if !self.options.flatten && matches!(outcome, RarOutcome::Directory) {
@@ -164,8 +168,12 @@ impl<'a> Extraction<'a> {
                     return Err(policy(RarPolicyReason::TargetChanged, path).into());
                 }
                 hooks.created(&path);
+                // a folder has no data: its own parts (where its header lies) are all it read
+                let mut sources = [0; VOLUME_WORDS];
+                mark_volumes(&mut sources, &session.model.parts[session.model.members[index].parts.clone()]);
+                let identity = (observed.dev(), observed.ino());
                 if let Some(failure) =
-                    hooks.complete_directory(session, &self.options.dest, &path, (observed.dev(), observed.ino()))?
+                    hooks.complete_directory(session, &sources, &self.options.dest, &path, identity)?
                 {
                     return Ok(RarOutcome::Failed(failure));
                 }
@@ -210,7 +218,8 @@ impl<'a> Extraction<'a> {
         let owned_link = initial.is_some()
             && self.options.replace_placed_links
             && fs::symlink_metadata(&target).is_ok_and(|meta| self.extracted.owns_link(&meta));
-        if !hooks.replace(session, entry, &target, initial, owned_link, self.options.overwrite)? {
+        let sources = member_volumes(run, session, index);
+        if !hooks.replace(session, &sources, entry, &target, initial, owned_link, self.options.overwrite)? {
             return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
         }
         if let Some(kind) = link {
@@ -228,8 +237,24 @@ impl<'a> Extraction<'a> {
             output.as_mut().unwrap().write_detailed(chunk).map_err(|error| error.detailed(false))
         };
         let outcome = run.test(session, index, Some(&mut sink))?;
-        let RarOutcome::Verified { bytes, checks, .. } = outcome else {
-            return Ok(outcome);
+        // Options::keep_broken: a member that fails on its own data is published as a verified one would be (every
+        // recheck and hook alike), with what was written, and reported failed; a canceled run publishes nothing
+        let (verified, broken) = match outcome {
+            RarOutcome::Verified { bytes, checks, .. } => (Some((bytes, checks)), None),
+            RarOutcome::Failed(failure)
+                if self.options.keep_broken && check_cancel(&session.options.cancel).is_ok() =>
+            {
+                (None, Some(failure))
+            }
+            outcome => return Ok(outcome),
+        };
+        // only a verified member is a target later links may resolve to (a kept broken one is not, as in the
+        // whole-archive runner)
+        let whole = verified.is_some();
+        let done = move || match (verified, broken) {
+            (Some((bytes, checks)), _) => RarOutcome::Verified { bytes, checks, output: RarOutput::Written },
+            (None, Some(failure)) => RarOutcome::Failed(failure),
+            (None, None) => unreachable!("one of the two"),
         };
         let output = match output {
             Some(output) => output,
@@ -246,16 +271,9 @@ impl<'a> Extraction<'a> {
         event(Event::BeforePublish, &target).map_err(|source| output_fault(IoOperation::Publish, &target, source))?;
 
         check_cancel(&session.options.cancel).map_err(own_fault)?;
-        let mut sources = if session.model.members[index].header.format == RarFormat::Rar5
-            && session.model.members[index].header.method != 0
-        {
-            run.history_volumes
-        } else {
-            [0; VOLUME_WORDS]
-        };
-        mark_volumes(&mut sources, &session.model.parts[session.model.members[index].parts.clone()]);
+        let sources = member_volumes(run, session, index);
         check_volumes(session, &sources)?;
-        hooks.recheck(session, &target, initial)?;
+        hooks.recheck(session, &sources, &target, initial)?;
         if self.inspect_target(session, &target)? != initial {
             return Err(policy(RarPolicyReason::TargetChanged, target).into());
         }
@@ -265,8 +283,10 @@ impl<'a> Extraction<'a> {
         let selected = selected_relative(&relative, self.options.flatten).to_path_buf();
         if let Some(mode) = self.options.overwrite.rename() {
             let landed = self.publish_renamed(run, session, index, file, &target, initial, mode, hooks)?;
-            self.extracted.file(&self.options.dest, &selected, &landed);
-            return Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written });
+            if whole {
+                self.extracted.file(&self.options.dest, &selected, &landed);
+            }
+            return Ok(done());
         }
         hooks.before_publication(index, initial);
         // a link this run placed there is replaced (inspect_target let it through): publication checks it is still it
@@ -282,8 +302,10 @@ impl<'a> Extraction<'a> {
             file.publish_selected(initial.is_some(), link)
         }
         .map_err(|error| own_fault(error.detailed(false)))?;
-        self.extracted.file(&self.options.dest, &selected, &target);
-        Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
+        if whole {
+            self.extracted.file(&self.options.dest, &selected, &target);
+        }
+        Ok(done())
     }
 
     /// Publishes a verified stage for a rename mode. Nothing is replaced: every name is claimed with a no-replace
@@ -433,7 +455,7 @@ impl<'a> Extraction<'a> {
         let mut sources = [0; VOLUME_WORDS];
         mark_volumes(&mut sources, &session.model.parts[session.model.members[index].parts.clone()]);
         check_volumes(session, &sources)?;
-        hooks.recheck(session, target, initial)?;
+        hooks.recheck(session, &sources, target, initial)?;
         if self.inspect_target(session, target)? != initial {
             return Err(policy(RarPolicyReason::TargetChanged, target.to_path_buf()).into());
         }
@@ -795,6 +817,7 @@ pub(super) trait ExtractionHooks {
     fn complete_directory(
         &mut self,
         _session: &mut RarSession,
+        _sources: &VolumeSet,
         _root: &Path,
         _path: &Path,
         _identity: (u64, u64),
@@ -802,20 +825,24 @@ pub(super) trait ExtractionHooks {
         Ok(None)
     }
     /// `owned_link`: what is at the target is a symbolic link this run placed, which the member may replace
-    /// ([`Options::replace_placed_links`]).
+    /// ([`Options::replace_placed_links`]). `sources`: the volumes the member's bytes depend on
+    /// ([`member_volumes`]), which must not change across a callback.
     #[allow(clippy::too_many_arguments)]
     fn replace(
         &mut self,
         session: &mut RarSession,
+        sources: &VolumeSet,
         entry: &RarEntryIdentity,
         target: &Path,
         initial: Option<SourceStamp>,
         owned_link: bool,
         legacy: Overwrite,
     ) -> Result<bool, SelectedStop>;
+    /// `sources`: the volumes the member's published bytes depend on, just checked by the native route.
     fn recheck(
         &mut self,
         _session: &mut RarSession,
+        _sources: &VolumeSet,
         _target: &Path,
         _initial: Option<SourceStamp>,
     ) -> Result<(), SelectedStop> {
@@ -868,6 +895,7 @@ impl ExtractionHooks for LegacyHooks {
     fn replace(
         &mut self,
         _: &mut RarSession,
+        _: &VolumeSet,
         _: &RarEntryIdentity,
         _: &Path,
         initial: Option<SourceStamp>,
@@ -976,6 +1004,9 @@ mod tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
         }
     }
 

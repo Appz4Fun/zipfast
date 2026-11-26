@@ -1689,6 +1689,9 @@ fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     for case in 0..6 {
         let cancel = Cancellation::default();
@@ -1800,6 +1803,9 @@ fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
     };
     for supplied_context in [false, true] {
         OBSERVATIONS.with(|s| s.set(Default::default()));

@@ -302,6 +302,11 @@ fn feed(volumes: &[Vec<u8>], member: usize, plain: &[u8], article: usize, every:
     feed_with(volumes, member, plain, &[], article, every, donor)
 }
 
+thread_local! {
+    /// [`FeedOptions::threads`] for [`feed_with`] in this test's thread
+    static THREADS: std::cell::Cell<FeedThreads> = const { std::cell::Cell::new(FeedThreads::One) };
+}
+
 /// [`feed`] with the folder's output before the member given back by the sink (`earlier`).
 fn feed_with(
     volumes: &[Vec<u8>],
@@ -314,7 +319,8 @@ fn feed_with(
 ) -> Report {
     let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
     let map = MemberMap::from_memory(&refs, "set.7z.001", Some(PASSWORD)).unwrap();
-    let options = FeedOptions { max_needs: usize::MAX, read_chunk: 4096, ..FeedOptions::new(Some(PASSWORD)) };
+    let threads = THREADS.with(std::cell::Cell::get);
+    let options = FeedOptions { max_needs: usize::MAX, read_chunk: 4096, threads, ..FeedOptions::new(Some(PASSWORD)) };
     let mut d = FeedDecoder::new(&map, member, options).unwrap();
     let mut out = Out::new(plain.len(), donor.then(|| plain.to_vec()));
     out.earlier = earlier.to_vec();
@@ -353,7 +359,8 @@ fn feed_with(
     for (k, (v, off, b)) in missing.iter().enumerate() {
         if k == half {
             let snap = FeedSnapshot::from_bytes(&d.snapshot().to_bytes()).unwrap();
-            let options = FeedOptions { max_needs: usize::MAX, read_chunk: 4096, ..FeedOptions::new(Some(PASSWORD)) };
+            let options =
+                FeedOptions { max_needs: usize::MAX, read_chunk: 4096, threads, ..FeedOptions::new(Some(PASSWORD)) };
             d = FeedDecoder::restore(&map, member, options, &snap).unwrap();
         }
         source.insert(*v, *off, b).unwrap();
@@ -393,6 +400,25 @@ fn lzma2_folders_feed_shuffled_with_holes_skipped_and_repaired() {
             }
         }
     }
+}
+
+/// `FeedOptions::threads`: workers decode the independent blocks (dictionary resets) ahead of the main decode. In
+/// order, shuffled, with holes repaired and a snapshot round trip half way, plain and under 7zAES, the output is
+/// the same, every byte written once, and the CRC matches.
+#[test]
+fn workers_decode_independent_blocks_with_the_same_output() {
+    THREADS.with(|t| t.set(FeedThreads::Count(3)));
+    let plain = mixed(2_000_000, 5);
+    for encrypted in [false, true] {
+        let archive = seven_zip(&[("m.bin", plain.clone())], encrypted, 250_000);
+        let volumes: Vec<Vec<u8>> = archive.chunks(600_000).map(<[u8]>::to_vec).collect();
+        // all present (every = never missing), then with holes
+        for (article, every) in [(4_096, usize::MAX), (1_500, 11), (20_000, 9)] {
+            let r = feed(&volumes, 0, &plain, article, every, false);
+            eprintln!("aes {encrypted} article {article} every {every}: {} holes, {} lost", r.holes, r.lost);
+        }
+    }
+    THREADS.with(|t| t.set(FeedThreads::One));
 }
 
 #[test]
@@ -1164,4 +1190,150 @@ fn fill_lost_to_the_end_is_refused_for_a_member_with_a_successor() {
     let f = s.frontier;
     assert!(f < a.len() as u64, "{s:?}");
     assert!(matches!(d.fill_lost(f..a.len() as u64, &a[f as usize..]), Err(FeedError::FillLost(_))));
+}
+
+/// Codex on #295: with workers, every region not yet arrived (anywhere: a block's payload, the header that ends a
+/// block a worker owns) leaves the decoder either done or naming what it needs, never stuck with no need; and a
+/// snapshot taken then (the main decode possibly finished, workers short of input) restores to a decoder that
+/// finishes with the CRC checked once the region comes.
+#[test]
+fn workers_never_stall_without_a_need_and_snapshots_keep_their_blocks() {
+    let plain = mixed(1_200_000, 21);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let options = || FeedOptions {
+        max_needs: usize::MAX,
+        read_chunk: 4096,
+        threads: FeedThreads::Count(3),
+        ..FeedOptions::default()
+    };
+    let gap = 3000usize;
+    let mut at = 64usize;
+    while at + gap < archive.len() {
+        let mut d = FeedDecoder::new(&map, 0, options()).unwrap();
+        let mut source = ArticleBuffer::new(usize::MAX);
+        source.insert(0, 0, &archive[..at]).unwrap();
+        source.insert(0, (at + gap) as u64, &archive[at + gap..]).unwrap();
+        let mut out = Out::new(plain.len(), None);
+        let mut s = d.run(&mut source, &mut out).unwrap().clone();
+        while s.more {
+            s = d.run(&mut source, &mut out).unwrap().clone();
+        }
+        assert!(s.done || !s.needs.is_empty(), "gap at {at}: stuck with no need: {s:?}");
+        let snap = FeedSnapshot::from_bytes(&d.snapshot().to_bytes()).unwrap();
+        let mut d = FeedDecoder::restore(&map, 0, options(), &snap).unwrap();
+        source.insert(0, at as u64, &archive[at..at + gap]).unwrap();
+        let mut s = d.run(&mut source, &mut out).unwrap().clone();
+        while s.more {
+            s = d.run(&mut source, &mut out).unwrap().clone();
+        }
+        assert!(s.done && s.crc_ok == Some(true), "gap at {at}: {s:?}");
+        assert!(out.bytes == plain, "gap at {at}: output differs");
+        at += 37_001;
+    }
+}
+
+/// Codex on #295: [`FeedOptions::run_budget`] holds with workers: a run writes about the budget (plus the worker
+/// output already in hand when it ran out) and says `more`, rather than writing the whole member.
+#[test]
+fn workers_keep_to_the_run_budget() {
+    let plain = mixed(4_000_000, 23);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let budget = 400_000u64;
+    let options = FeedOptions { run_budget: Some(budget), threads: FeedThreads::Count(3), ..FeedOptions::default() };
+    let mut d = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut out = Out::new(plain.len(), None);
+    let mut runs = 0;
+    loop {
+        let before = out.written;
+        let s = d.run(&mut source, &mut out).unwrap().clone();
+        runs += 1;
+        // the budget, plus at most a few blocks' output the workers had sent when it ran out
+        assert!(out.written - before <= budget + 4 * 160_000, "run {runs} wrote {}", out.written - before);
+        if !s.more {
+            assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+            break;
+        }
+        assert!(runs < 1000, "no progress");
+    }
+    assert!(runs >= 5, "{runs} runs");
+    assert!(out.bytes == plain);
+}
+
+/// Codex on #295: with workers, a fill of the rest from the frontier (`fill_lost` to the member's end) finishes the
+/// member, workers waiting for packed bytes the fill replaced included: nothing more is asked for.
+#[test]
+fn fill_lost_to_the_end_retires_waiting_workers() {
+    let plain = mixed(1_200_000, 25);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let options = FeedOptions { threads: FeedThreads::Count(3), ..FeedOptions::default() };
+    let gap = archive.len() * 2 / 3..archive.len() * 2 / 3 + 3000;
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive[..gap.start]).unwrap();
+    source.insert(0, gap.end as u64, &archive[gap.end..]).unwrap();
+    let mut d = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut out = Out::new(plain.len(), None);
+    let mut s = d.run(&mut source, &mut out).unwrap().clone();
+    while s.more {
+        s = d.run(&mut source, &mut out).unwrap().clone();
+    }
+    assert!(!s.done && !s.needs.is_empty(), "{s:?}");
+    let frontier = s.frontier as usize;
+    // the caller writes what is not written yet (workers may have finished blocks past the frontier)
+    let mut at = frontier;
+    while at < plain.len() {
+        let written = out.seen[at];
+        let run = out.seen[at..].iter().take_while(|&&w| w == written).count();
+        if !written {
+            out.write_at(at as u64, &plain[at..at + run]).unwrap();
+        }
+        at += run;
+    }
+    d.fill_lost(frontier as u64..plain.len() as u64, &plain[frontier..]).unwrap();
+    let s = d.run(&mut source, &mut out).unwrap();
+    assert!(s.done && s.crc_ok == Some(true) && s.needs.is_empty(), "{s:?}");
+    assert!(out.bytes == plain);
+}
+
+/// Codex on #295: cancellation stops a run while workers still have output to write, after the main decode is over
+/// (it jumps the blocks workers own, so the last of the output comes only from them).
+#[test]
+fn cancellation_stops_workers_output() {
+    struct CancelAt {
+        out: Out,
+        control: zipfast::progressive::SessionControl,
+        at: u64,
+    }
+    impl FeedSink for CancelAt {
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+            self.out.write_at(offset, bytes)?;
+            if self.out.written >= self.at {
+                self.control.cancel();
+            }
+            Ok(())
+        }
+        fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.out.read_held(offset, buf)
+        }
+    }
+    let plain = mixed(4_000_000, 27);
+    let archive = seven_zip(&[("m.bin", plain.clone())], false, 150_000);
+    let refs = [archive.as_slice()];
+    let map = MemberMap::from_memory(&refs, "set.7z", None).unwrap();
+    let options = FeedOptions { threads: FeedThreads::Count(3), ..FeedOptions::default() };
+    let control = options.control.clone();
+    let mut d = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut source = ArticleBuffer::new(usize::MAX);
+    source.insert(0, 0, &archive).unwrap();
+    let mut sink = CancelAt { out: Out::new(plain.len(), None), control, at: 3_500_000 };
+    let result = d.run(&mut source, &mut sink);
+    assert!(matches!(result, Err(FeedError::Canceled)), "{result:?}");
+    assert!(sink.out.written < plain.len() as u64, "every byte written after the cancel");
 }
