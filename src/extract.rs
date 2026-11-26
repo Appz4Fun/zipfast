@@ -212,6 +212,13 @@ pub struct Options {
     /// "Data Error"; with [`Self::keep_broken`] the file stays). Off (the default) it is passed over as lacking its
     /// start (`RarSkipReason::MissingStart`). [`Self::restart_from_first_volume`] goes back for the start instead.
     pub attempt_continued_members: bool,
+    /// A ZIP whose end record is missing (one file cut short, not a split or spanned set) is read by walking its
+    /// local headers, as 7-Zip 26.06 does: the members whose headers lie before the cut are tested or extracted, the
+    /// one the cut reaches fails as truncated (kept with [`Self::keep_broken`]), and the run reports the archive
+    /// truncated. Off (the default) such a file is refused as not a ZIP archive, because this reads what the checked
+    /// route (which needs the central directory) refuses. An archive whose central directory is found is read as
+    /// ever.
+    pub salvage_truncated_zip: bool,
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -409,6 +416,7 @@ impl MemberRef<'_> {
 ///     replace_placed_links: false,
 ///     keep_broken: false,
 ///     attempt_continued_members: false,
+///     salvage_truncated_zip: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -1465,6 +1473,9 @@ pub(crate) enum LegacyRoute {
     /// A raw byte-split ZIP (`name.zip.001`, `name.zip.002`, ...) or an Info-ZIP spanned set (`name.z01`, ...,
     /// `name.zip`), read as the pieces concatenated.
     SplitZip,
+    /// One ZIP file whose end record the checked route can't find (cut short), read by walking its local headers:
+    /// only with [`Options::salvage_truncated_zip`].
+    TruncatedZip,
     Rar {
         signature: crate::rar5::reader::HeldSignature,
         path: PathBuf,
@@ -1549,10 +1560,13 @@ impl LegacyRoute {
                 let limits = crate::sevenzip::SevenZipLimits::default();
                 crate::sevenzip::run_reporting(first, options, password, cancel, &limits, report)
             }
-            Self::SplitZip => {
+            Self::SplitZip | Self::TruncatedZip => {
                 cancel.check_io().map_err(Error::from)?;
                 if options.mode == Mode::Extract {
                     fs::create_dir_all(&options.dest).map_err(Error::from)?;
+                }
+                if matches!(self, Self::TruncatedZip) {
+                    return crate::zip::run_truncated(first, options, password, Some(cancel), report);
                 }
                 crate::zip::run_renaming(first, options, password, Some(cancel), report)
             }
@@ -1571,6 +1585,7 @@ impl LegacyRoute {
             Self::Tar => crate::tar::list(first),
             Self::SevenZip => crate::sevenzip::list(first, password),
             Self::SplitZip => crate::zip::list(first),
+            Self::TruncatedZip => crate::zip::list_truncated(first),
             Self::Rar { signature, .. } => {
                 rar_list_from_volume(Volume::from_held_signature(first, signature, password)?, password)
             }
@@ -2049,7 +2064,7 @@ impl SelectedEntry {
                     cancel,
                 });
             }
-            CheckedRoute::Legacy(LegacyRoute::SplitZip) => {
+            CheckedRoute::Legacy(LegacyRoute::SplitZip | LegacyRoute::TruncatedZip) => {
                 let (archive, windows_names, meta) =
                     split_zip_selected(path, index, max_bytes, &cancel).map_err(ReadFault::Legacy)?;
                 return Ok(Self {
@@ -2493,18 +2508,22 @@ pub struct Listing {
     /// missing another volume, whose `entries` are all those its central directory lists. 7-Zip prints "Unexpected
     /// end of archive" (or "Missing volume") and exits nonzero here.
     pub missing_volume: Option<PathBuf>,
+    /// One ZIP file cut short, its end record gone, listed from its local headers before the cut
+    /// ([`crate::zip::list_detailed_with_options`] with [`Options::salvage_truncated_zip`]). 7-Zip prints "Unexpected
+    /// end of archive" and exits nonzero here.
+    pub truncated: bool,
 }
 
 impl Listing {
     /// Whether the archive ended before it should have (7-Zip's "Unexpected end of archive").
     pub fn unexpected_end(&self) -> bool {
-        self.missing_volume.is_some()
+        self.missing_volume.is_some() || self.truncated
     }
 }
 
 /// [`list_with_password`], with the listing's warnings.
 pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
-    let whole = |entries| Listing { entries, missing_volume: None };
+    let whole = |entries| Listing { entries, missing_volume: None, truncated: false };
     match sniff(first)? {
         Format::Zip => return crate::zip::list_detailed(first),
         Format::Tar => return crate::tar::list(first).map(whole),
@@ -2599,7 +2618,12 @@ pub fn run_with_zip_policy(
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
     match checked_route(first, cancel)? {
         CheckedRoute::Zip(opened) => crate::zip::read::with_opened_policy(
-            opened.into_zip_projected(cancel)?,
+            match opened.into_zip_projected(cancel) {
+                Err(error) if salvages_truncated(first, options, &error) => {
+                    return legacy_zip_report(LegacyRoute::TruncatedZip, first, options, password, cancel, observe);
+                }
+                opened => opened?,
+            },
             options,
             password,
             cancel,
@@ -2622,7 +2646,12 @@ pub fn run_with_zip_context(
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
     match checked_route(first, cancel)? {
         CheckedRoute::Zip(opened) => crate::zip::read::with_opened_context(
-            opened.into_zip_projected(cancel)?,
+            match opened.into_zip_projected(cancel) {
+                Err(error) if salvages_truncated(first, options, &error) => {
+                    return legacy_zip_report(LegacyRoute::TruncatedZip, first, options, password, cancel, observe);
+                }
+                opened => opened?,
+            },
             options,
             password,
             cancel,
@@ -2631,6 +2660,17 @@ pub fn run_with_zip_context(
         ),
         CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, cancel, observe),
     }
+}
+/// [`Options::salvage_truncated_zip`]: the checked route found no end record (and nothing else went wrong: no
+/// cleanup fault, no source change) in one file, not a split set, that starts with a local header. It is then read
+/// by walking its local headers ([`LegacyRoute::TruncatedZip`]); an intact archive never gets here.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn salvages_truncated(first: &Path, options: &Options, error: &crate::zip::ZipReadError) -> bool {
+    options.salvage_truncated_zip
+        && matches!(error.operation(), Some(crate::zip::ReadFault::CheckedFormat { reason: "not a ZIP archive" }))
+        && error.cleanup_errors().len() == 0
+        && !error.is_source_changed()
+        && crate::zip::salvageable(first)
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
@@ -3875,6 +3915,7 @@ fn rar_read_at(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};

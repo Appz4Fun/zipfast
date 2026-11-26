@@ -50,6 +50,7 @@ fn options(dest: &Path, overwrite: Overwrite, select: MemberFilter) -> Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
     }
 }
 

@@ -334,6 +334,9 @@ pub struct Archive {
     /// For each entry of a spanned set whose local header is on an absent disk, that disk's volume: such a member
     /// is never read, and fails as missing it. Empty when no entry is.
     lost: Vec<Option<PathBuf>>,
+    /// One file cut short, its end record gone, read by walking its local headers ([`Archive::open_truncated`]): a
+    /// member whose bytes reach the end fails as truncated, and so does the run.
+    truncated: bool,
     pub entries: Vec<ZipEntry>,
 }
 
@@ -371,7 +374,56 @@ impl Archive {
             None => (read_projected_legacy(&mut file, len, cancel)?.0, false),
         };
         let holes = if missing.is_some() { std::iter::once(len..u64::MAX).collect() } else { Vec::new() };
-        Ok(Archive { file, len, pieces, missing, last_size_unknown, holes, lost: Vec::new(), entries })
+        Ok(Archive {
+            file,
+            len,
+            pieces,
+            missing,
+            last_size_unknown,
+            holes,
+            lost: Vec::new(),
+            truncated: false,
+            entries,
+        })
+    }
+
+    /// [`Self::open_cancelable`], and with `salvage` ([`Options::salvage_truncated_zip`]) one file (not a split or
+    /// spanned set) whose end record can't be found is read by walking its local headers ([`Self::open_truncated`]).
+    pub(crate) fn open_salvaging(path: &Path, salvage: bool, cancel: Option<&Cancellation>) -> Result<Archive> {
+        match Self::open_cancelable(path, cancel) {
+            Err(Error::NotAnArchive) if salvage && !is_split_set(path) => Self::open_truncated(path, cancel),
+            other => other,
+        }
+    }
+
+    /// One file cut short, its central directory or end record gone, read as 7-Zip reads it: by walking the local
+    /// headers from its start. The members are those whose local headers lie before the cut; one whose bytes reach
+    /// the cut fails as truncated, and so does the run. A file that doesn't start with a local header (or the
+    /// spanning marker before one) is not a ZIP archive.
+    pub(crate) fn open_truncated(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        check_cancel(cancel)?;
+        let mut head = [0u8; 8];
+        let got = crate::tar::read_full(&mut file, &mut head)?;
+        let start = local_walk_start(&head[..got]).ok_or(Error::NotAnArchive)?;
+        let mut file = byte_split::ArchiveSource::File(file);
+        let (entries, last_size_unknown) = byte_split::scan_local_headers(&mut file, start, len)?;
+        if entries.is_empty() {
+            return Err(Error::Truncated);
+        }
+        check_cancel(cancel)?;
+        Ok(Archive {
+            file,
+            len,
+            pieces: Vec::new(),
+            missing: None,
+            last_size_unknown,
+            holes: std::iter::once(len..u64::MAX).collect(),
+            lost: Vec::new(),
+            truncated: true,
+            entries,
+        })
     }
 
     /// The `present` disks of a spanned set read as one, up to the absent volume `missing`, with no central directory
@@ -386,14 +438,28 @@ impl Archive {
         let mut file = byte_split::ArchiveSource::Split(split);
         let (entries, last_size_unknown) = byte_split::scan_local_headers(&mut file, start, len)?;
         let holes = std::iter::once(len..u64::MAX).collect();
-        Ok(Archive { file, len, pieces, missing: Some(missing), last_size_unknown, holes, lost: Vec::new(), entries })
+        Ok(Archive {
+            file,
+            len,
+            pieces,
+            missing: Some(missing),
+            last_size_unknown,
+            holes,
+            lost: Vec::new(),
+            truncated: false,
+            entries,
+        })
     }
 
-    /// The missing piece a failed read of `e` ran into, when its bytes reach a hole of a set cut short or missing a
-    /// volume: that piece is the cause, not the entry. The payload starts past the local header, its name and its
-    /// extra field.
-    fn gap_crossed(&mut self, e: &ZipEntry) -> Option<PathBuf> {
-        let missing = self.missing.clone()?;
+    /// The cause of a failed read of `e`, when its bytes reach a hole of a set cut short or missing a volume (that
+    /// piece is missing), or the end of one file cut short (it is truncated): the cut is the cause, not the entry.
+    /// The payload starts past the local header, its name and its extra field.
+    fn gap_crossed(&mut self, e: &ZipEntry) -> Option<Error> {
+        let cause = match &self.missing {
+            Some(missing) => Error::MissingVolume(missing.clone()),
+            None if self.truncated => Error::Truncated,
+            None => return None,
+        };
         let crosses = data_at(&mut self.file, self.len, &e.read_description()).map_or(true, |start| {
             // a streamed member also needs its descriptor: 16 bytes, 24 with ZIP64 sizes
             let zip64 = e.packed >= u64::from(u32::MAX) || e.size >= u64::from(u32::MAX);
@@ -405,7 +471,7 @@ impl Archive {
             let end = start.saturating_add(e.packed).saturating_add(descriptor);
             self.holes.iter().any(|hole| e.local_at < hole.end && end > hole.start)
         });
-        crosses.then_some(missing)
+        crosses.then_some(cause)
     }
 
     /// The absent volume the entry at `index` starts on, if any: it can't be read at all.
@@ -482,6 +548,7 @@ impl Archive {
             last_size_unknown: false,
             holes,
             lost,
+            truncated: false,
             entries,
         })
     }
@@ -1030,6 +1097,30 @@ pub(crate) fn is_headless_spanned(path: &Path) -> bool {
     spanned::Headless::open(path).is_some()
 }
 
+/// Where a walk of the local headers starts in a file with this head: at its first local header, past the spanning
+/// marker of a single-segment set. `None` when the head starts with neither.
+fn local_walk_start(head: &[u8]) -> Option<u64> {
+    let start = if head.starts_with(spanned::SPLIT_MARKER) { 4 } else { 0 };
+    (head.get(start..start + 4) == Some(b"PK\x03\x04".as_slice())).then_some(start as u64)
+}
+
+/// Whether the file at `path` is one that [`Archive::open_truncated`] can walk: not a split or spanned set, and
+/// starting with a local header. [`Options::salvage_truncated_zip`] falls back to it only then.
+pub(crate) fn salvageable(path: &Path) -> bool {
+    if is_split_set(path) {
+        return false;
+    }
+    let mut head = [0u8; 8];
+    File::open(path)
+        .and_then(|mut file| crate::tar::read_full(&mut file, &mut head))
+        .is_ok_and(|got| local_walk_start(&head[..got]).is_some())
+}
+
+/// Whether `path` names a split or spanned set in any form, which [`Archive::open_cancelable`] reads across volumes.
+fn is_split_set(path: &Path) -> bool {
+    is_spanned(path) || is_headless_spanned(path) || is_byte_split(path)
+}
+
 pub(crate) fn is_byte_split(path: &Path) -> bool {
     byte_split::is_split_set(path) || spanned::is_spanned(path)
 }
@@ -1041,8 +1132,23 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
 /// [`list`], also saying whether the archive ended unexpectedly: a byte-split set cut short by a missing piece,
 /// listed from the local headers before the gap.
 pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
-    let mut archive = Archive::open(path)?;
+    list_archive(Archive::open(path)?)
+}
+
+/// [`list_detailed`], and with [`Options::salvage_truncated_zip`] one file whose end record is missing (cut short)
+/// is listed from its local headers, as 7-Zip lists it: [`crate::extract::Listing::truncated`] then says so.
+pub fn list_detailed_with_options(path: &Path, options: &Options) -> Result<crate::extract::Listing> {
+    list_archive(Archive::open_salvaging(path, options.salvage_truncated_zip, None)?)
+}
+
+/// The entries of one ZIP file cut short, from its local headers ([`Archive::open_truncated`]).
+pub(crate) fn list_truncated(path: &Path) -> Result<Vec<Entry>> {
+    list_archive(Archive::open_truncated(path, None)?).map(|listing| listing.entries)
+}
+
+fn list_archive(mut archive: Archive) -> Result<crate::extract::Listing> {
     let missing_volume = archive.missing.clone();
+    let truncated = archive.truncated;
     // A symbolic link's target is its data: read for a listing when it is small, stored or deflated, and not
     // encrypted; otherwise left empty.
     let mut targets = Vec::with_capacity(archive.entries.len());
@@ -1115,7 +1221,7 @@ pub fn list_detailed(path: &Path) -> Result<crate::extract::Listing> {
             }
         })
         .collect();
-    Ok(crate::extract::Listing { entries, missing_volume })
+    Ok(crate::extract::Listing { entries, missing_volume, truncated })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1164,8 +1270,31 @@ pub(crate) fn run_renaming(
     cancel: Option<&Cancellation>,
     report: &mut impl crate::extract::LegacyReport,
 ) -> std::result::Result<Summary, RunError> {
+    let archive = Archive::open_salvaging(path, opts.salvage_truncated_zip, cancel)?;
+    run_archive(archive, path, opts, password, cancel, report)
+}
+
+/// [`run_renaming`] for one file cut short, read by walking its local headers ([`Archive::open_truncated`]): the
+/// checked route found no end record and [`Options::salvage_truncated_zip`] is on.
+pub(crate) fn run_truncated(
+    path: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    cancel: Option<&Cancellation>,
+    report: &mut impl crate::extract::LegacyReport,
+) -> std::result::Result<Summary, RunError> {
+    run_archive(Archive::open_truncated(path, cancel)?, path, opts, password, cancel, report)
+}
+
+fn run_archive(
+    mut archive: Archive,
+    path: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    cancel: Option<&Cancellation>,
+    report: &mut impl crate::extract::LegacyReport,
+) -> std::result::Result<Summary, RunError> {
     use crate::extract::LegacyMember;
-    let mut archive = Archive::open_cancelable(path, cancel)?;
     let mut opts = opts.protecting(path)?;
     // Protect every piece of a byte-split set, not only the first.
     for piece in &archive.pieces {
@@ -1275,9 +1404,9 @@ pub(crate) fn run_renaming(
                 );
                 // a target reaching a missing volume fails only this link, as for a file
                 if read.is_err()
-                    && let Some(missing) = archive.gap_crossed(e)
+                    && let Some(cause) = archive.gap_crossed(e)
                 {
-                    fail(&mut summary, report, member, &Error::MissingVolume(missing).to_string());
+                    fail(&mut summary, report, member, &cause.to_string());
                     continue;
                 }
                 match read {
@@ -1417,8 +1546,8 @@ pub(crate) fn run_renaming(
                         }
                         target => drop(target),
                     }
-                    if let Some(missing) = gap {
-                        fail(&mut summary, report, member, &Error::MissingVolume(missing).to_string());
+                    if let Some(cause) = gap {
+                        fail(&mut summary, report, member, &cause.to_string());
                         continue;
                     }
                     match err {
@@ -1440,6 +1569,12 @@ pub(crate) fn run_renaming(
         // Members after the gap are unknown: the set as a whole is incomplete.
         if let Some(missing) = &archive.missing {
             let line = Error::MissingVolume(missing.clone()).to_string();
+            report.line(&line);
+            summary.errors.push(line);
+        }
+        // One file cut short (Options::salvage_truncated_zip): members past the cut are unknown, as for a set.
+        if archive.truncated {
+            let line = Error::Truncated.to_string();
             report.line(&line);
             summary.errors.push(line);
         }

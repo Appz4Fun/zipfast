@@ -1189,6 +1189,7 @@ fn direct_setup_output(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
     };
     (file, session, options, context)
 }

@@ -124,6 +124,7 @@ fn times(archive: &Path) -> Vec<(String, i64, i64)> {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
     };
     let summary = extract::run(archive, &options, |_| {}).unwrap();
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);

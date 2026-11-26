@@ -71,6 +71,7 @@ fn options(mode: Mode, dest: &Path) -> Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
     }
 }
 
@@ -455,6 +456,7 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
         ..options(Mode::Extract, dest)
     };
     let out = tmp.path().join("seven");
@@ -490,6 +492,7 @@ fn r5extra_comes_out_as_7zip_writes_it() {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        salvage_truncated_zip: false,
         ..options(Mode::Extract, &out)
     };
     extract::run(&fixture("rar5-compat", "r5extra.rar"), &opts, |_| {}).unwrap();

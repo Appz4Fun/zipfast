@@ -601,6 +601,7 @@ fn r2_prefixed_zip_public_policy_context_and_selected_caps() {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            salvage_truncated_zip: false,
         };
         for cap in [0, 24, 25] {
             let mut overrides = EncryptedReadOverrides::default();
