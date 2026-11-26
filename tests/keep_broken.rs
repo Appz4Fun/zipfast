@@ -395,3 +395,35 @@ fn the_checked_zip_route_fails_only_a_kept_member_out_of_renamed_names() {
     assert_eq!(fs::read(out.join("bad.bin")).unwrap(), b"old");
     assert_eq!(fs::read(out.join("good.bin")).unwrap(), b"good", "the run stopped at the kept member");
 }
+
+/// Codex on #294: a member kept broken is not a target a later hard link or file copy may resolve to: those fail
+/// too (in RarSession as in the whole-archive runner), rather than being reported verified on unchecked data.
+#[test]
+fn links_to_a_kept_broken_member_are_not_verified() {
+    use zipfast::rar5::session::*;
+    fn redirection(kind: u64, target: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for v in [5, kind, 0, target.len() as u64] {
+            common::vint(v, &mut body);
+        }
+        body.extend(target.as_bytes());
+        let mut extra = Vec::new();
+        common::vint(body.len() as u64, &mut extra);
+        extra.extend(body);
+        extra
+    }
+    let data: Vec<u8> = (0..20_000usize).map(|i| (i * 7 + i / 251) as u8).collect();
+    let link = |name, kind| FileSpec { extra: redirection(kind, "bad.bin"), ..FileSpec::new(name, b"") };
+    let mut rar = common::archive(&[FileSpec::new("bad.bin", &data), link("hard.bin", 4), link("copy.bin", 5)]);
+    let at = rar.windows(64).position(|w| w == &data[1000..1064]).unwrap();
+    rar[at] ^= 0x55;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("links.rar");
+    fs::write(&path, &rar).unwrap();
+    let out = dir.path().join("selected");
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let summary = session.extract_selected(&all, &options(&out, true, 1), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert!(out.join("bad.bin").exists(), "the broken member is kept");
+    assert_eq!(summary.failed, 3, "{summary:?}");
+}

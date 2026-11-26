@@ -239,6 +239,9 @@ impl<'a> Extraction<'a> {
             }
             outcome => return Ok(outcome),
         };
+        // only a verified member is a target later links may resolve to (a kept broken one is not, as in the
+        // whole-archive runner)
+        let whole = verified.is_some();
         let done = move || match (verified, broken) {
             (Some((bytes, checks)), _) => RarOutcome::Verified { bytes, checks, output: RarOutput::Written },
             (None, Some(failure)) => RarOutcome::Failed(failure),
@@ -278,7 +281,9 @@ impl<'a> Extraction<'a> {
         let selected = selected_relative(&relative, self.options.flatten).to_path_buf();
         if let Some(mode) = self.options.overwrite.rename() {
             let landed = self.publish_renamed(run, session, index, file, &target, initial, mode, hooks)?;
-            self.extracted.file(&self.options.dest, &selected, &landed);
+            if whole {
+                self.extracted.file(&self.options.dest, &selected, &landed);
+            }
             return Ok(done());
         }
         hooks.before_publication(index, initial);
@@ -295,7 +300,9 @@ impl<'a> Extraction<'a> {
             file.publish_selected(initial.is_some(), link)
         }
         .map_err(|error| own_fault(error.detailed(false)))?;
-        self.extracted.file(&self.options.dest, &selected, &target);
+        if whole {
+            self.extracted.file(&self.options.dest, &selected, &target);
+        }
         Ok(done())
     }
 
