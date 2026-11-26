@@ -51,6 +51,7 @@ fn options(dest: &Path, keep_broken: bool) -> Options {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        unsupported_filters: Default::default(),
     }
 }
 
