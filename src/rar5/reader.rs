@@ -718,6 +718,17 @@ impl Volume {
     }
 
     fn record_damage(&mut self, offset: u64, kind: HeaderDamageKind, name: Option<&str>, resumed_at: Option<u64>) {
+        self.record_damage_of(offset, kind, name, resumed_at, kind != HeaderDamageKind::ChecksumMismatch);
+    }
+
+    fn record_damage_of(
+        &mut self,
+        offset: u64,
+        kind: HeaderDamageKind,
+        name: Option<&str>,
+        resumed_at: Option<u64>,
+        passed_over: bool,
+    ) {
         if self.damage.len() >= crate::extract::MAX_HEADER_DAMAGE {
             return;
         }
@@ -730,7 +741,7 @@ impl Volume {
             name[..end].to_owned()
         });
         {
-            self.damage.push(HeaderDamage { volume: self.path.clone(), offset, kind, name, resumed_at });
+            self.damage.push(HeaderDamage { volume: self.path.clone(), offset, kind, name, resumed_at, passed_over });
         }
     }
 
@@ -970,7 +981,10 @@ impl Volume {
                         _ => None,
                     };
                     let (offset, kind) = (frame.extent.start, HeaderDamageKind::ChecksumMismatch);
-                    self.record_damage(offset, kind, name, None);
+                    // a damaged header read as a file is decoded in turn; read as anything else (a service, an
+                    // unknown block) its data, which may be a member's, is skipped
+                    let passed_over = !matches!(frame.block, Block::File(_) | Block::Main(_) | Block::End { .. });
+                    self.record_damage_of(offset, kind, name, None, passed_over);
                 }
                 if matches!(frame.block, Block::Crypt) {
                     if budget.is_some() && (!catalogue_main || self.header_key.is_some()) {

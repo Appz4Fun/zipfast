@@ -285,6 +285,10 @@ pub struct HeaderDamage {
     /// Where reading went on in the same volume after the damage ([`DamagedInput::Resync`]); `None` when the rest of
     /// the volume was passed over (or, for [`HeaderDamageKind::ChecksumMismatch`], nothing was).
     pub resumed_at: Option<u64>,
+    /// Whether bytes that may belong to a member were passed over here unread: the damage was unreadable or cut
+    /// short, or the damaged header read as something other than a file header (a file header whose type byte was
+    /// hit can read as a service header, whose data is skipped). A solid archive's history is lost past it.
+    pub(crate) passed_over: bool,
 }
 
 /// What was wrong with a [`HeaderDamage`].
@@ -1564,7 +1568,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                 // bytes were passed over: whatever solid history they held is lost, so a solid member after the
                 // gap fails as lacking it instead of decoding against the history from before the gap (a member
                 // still being continued keeps its decoder: its own checks decide)
-                let gap = damage.iter().any(|d| d.kind != HeaderDamageKind::ChecksumMismatch);
+                let gap = damage.iter().any(|d| d.passed_over);
                 run.reports.damaged(damage);
                 if gap && run.pending.is_none() {
                     run.drain()?;

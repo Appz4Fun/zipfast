@@ -759,30 +759,36 @@ fn a_resync_gap_breaks_the_solid_history() {
     extract(&intact, DamagedInput::Resync).unwrap();
     assert_eq!(fs::read(intact.out.join("c.bin")).unwrap(), plain[2]);
 
-    bytes[offsets[1]..offsets[1] + 16].fill(0);
-    let case = case(&bytes);
-    let summary = extract(&case, DamagedInput::Resync).unwrap();
-    assert_eq!(fs::read(case.out.join("a.bin")).unwrap(), plain[0]);
-    assert!(!case.out.join("c.bin").exists(), "c.bin decoded against the history from before the gap");
-    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    // b.bin's header zeroed (a hole, searched past), or its type byte turned from file (2) into service (3) so that
+    // it parses but its data is skipped: either way c.bin must not decode against a.bin's history alone
+    let mut hole = bytes.clone();
+    hole[offsets[1]..offsets[1] + 16].fill(0);
+    let mut service = bytes.clone();
+    assert_eq!(service[offsets[1] + 5], 2, "b.bin's header type");
+    service[offsets[1] + 5] = 3;
+    for (what, damaged, listed) in
+        [("hole", hole, vec!["a.bin", "c.bin"]), ("service", service, vec!["a.bin", "c.bin"])]
+    {
+        for choice in [DamagedInput::Salvage, DamagedInput::Resync] {
+            if what == "hole" && choice == DamagedInput::Salvage {
+                continue; // the volume ends at the hole: nothing after it is read
+            }
+            let case = case(&damaged);
+            let summary = extract(&case, choice).unwrap();
+            assert_eq!(fs::read(case.out.join("a.bin")).unwrap(), plain[0], "{what} {choice:?}");
+            assert!(!case.out.join("c.bin").exists(), "{what} {choice:?}: c.bin decoded against stale history");
+            assert_eq!(summary.errors.len(), 1, "{what} {choice:?}: {:?}", summary.errors);
 
-    let mut session = RarSession::open(
-        &case.archive,
-        None,
-        RarSessionOptions { damaged_input: DamagedInput::Resync, ..Default::default() },
-    )
-    .unwrap();
-    assert_eq!(session.entries().map(|m| m.name().to_owned()).collect::<Vec<_>>(), ["a.bin", "c.bin"]);
-    let selected = session.select(|_| true).unwrap();
-    let out = case.out.join("session");
-    let summary = session
-        .extract_selected(
-            &selected,
-            &options(&out, Mode::Extract, DamagedInput::Resync),
-            RarDecodeLimits::default(),
-            |_| {},
-        )
-        .unwrap();
-    assert_eq!((summary.files, summary.failed), (1, 1));
-    assert!(!out.join("c.bin").exists());
+            let options_session = RarSessionOptions { damaged_input: choice, ..Default::default() };
+            let mut session = RarSession::open(&case.archive, None, options_session).unwrap();
+            let names: Vec<String> = session.entries().map(|m| m.name().to_owned()).collect();
+            assert_eq!(names, listed, "{what} {choice:?}");
+            let selected = session.select(|_| true).unwrap();
+            let out = case.out.join("session");
+            let opts = options(&out, Mode::Extract, choice);
+            let summary = session.extract_selected(&selected, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
+            assert_eq!((summary.files, summary.failed), (1, 1), "{what} {choice:?}");
+            assert!(!out.join("c.bin").exists(), "{what} {choice:?}");
+        }
+    }
 }

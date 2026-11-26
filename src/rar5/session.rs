@@ -1294,7 +1294,7 @@ impl Catalogue {
                 let parsed = volume.next_catalogue(&mut self.scan_budget());
                 let damage = volume.take_damage();
                 // bytes passed over break the solid history: a solid member after them chains to nothing
-                if damage.iter().any(|d| d.kind != crate::extract::HeaderDamageKind::ChecksumMismatch) {
+                if damage.iter().any(|d| d.passed_over) {
                     self.history_barrier = true;
                 }
                 self.keep_damage(damage)?;
