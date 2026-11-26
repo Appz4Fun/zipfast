@@ -302,6 +302,11 @@ fn feed(volumes: &[Vec<u8>], member: usize, plain: &[u8], article: usize, every:
     feed_with(volumes, member, plain, &[], article, every, donor)
 }
 
+thread_local! {
+    /// [`FeedOptions::threads`] for [`feed_with`] in this test's thread
+    static THREADS: std::cell::Cell<FeedThreads> = const { std::cell::Cell::new(FeedThreads::One) };
+}
+
 /// [`feed`] with the folder's output before the member given back by the sink (`earlier`).
 fn feed_with(
     volumes: &[Vec<u8>],
@@ -314,7 +319,8 @@ fn feed_with(
 ) -> Report {
     let refs: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
     let map = MemberMap::from_memory(&refs, "set.7z.001", Some(PASSWORD)).unwrap();
-    let options = FeedOptions { max_needs: usize::MAX, read_chunk: 4096, ..FeedOptions::new(Some(PASSWORD)) };
+    let threads = THREADS.with(std::cell::Cell::get);
+    let options = FeedOptions { max_needs: usize::MAX, read_chunk: 4096, threads, ..FeedOptions::new(Some(PASSWORD)) };
     let mut d = FeedDecoder::new(&map, member, options).unwrap();
     let mut out = Out::new(plain.len(), donor.then(|| plain.to_vec()));
     out.earlier = earlier.to_vec();
@@ -353,7 +359,8 @@ fn feed_with(
     for (k, (v, off, b)) in missing.iter().enumerate() {
         if k == half {
             let snap = FeedSnapshot::from_bytes(&d.snapshot().to_bytes()).unwrap();
-            let options = FeedOptions { max_needs: usize::MAX, read_chunk: 4096, ..FeedOptions::new(Some(PASSWORD)) };
+            let options =
+                FeedOptions { max_needs: usize::MAX, read_chunk: 4096, threads, ..FeedOptions::new(Some(PASSWORD)) };
             d = FeedDecoder::restore(&map, member, options, &snap).unwrap();
         }
         source.insert(*v, *off, b).unwrap();
@@ -393,6 +400,25 @@ fn lzma2_folders_feed_shuffled_with_holes_skipped_and_repaired() {
             }
         }
     }
+}
+
+/// `FeedOptions::threads`: workers decode the independent blocks (dictionary resets) ahead of the main decode. In
+/// order, shuffled, with holes repaired and a snapshot round trip half way, plain and under 7zAES, the output is
+/// the same, every byte written once, and the CRC matches.
+#[test]
+fn workers_decode_independent_blocks_with_the_same_output() {
+    THREADS.with(|t| t.set(FeedThreads::Count(3)));
+    let plain = mixed(2_000_000, 5);
+    for encrypted in [false, true] {
+        let archive = seven_zip(&[("m.bin", plain.clone())], encrypted, 250_000);
+        let volumes: Vec<Vec<u8>> = archive.chunks(600_000).map(<[u8]>::to_vec).collect();
+        // all present (every = never missing), then with holes
+        for (article, every) in [(4_096, usize::MAX), (1_500, 11), (20_000, 9)] {
+            let r = feed(&volumes, 0, &plain, article, every, false);
+            eprintln!("aes {encrypted} article {article} every {every}: {} holes, {} lost", r.holes, r.lost);
+        }
+    }
+    THREADS.with(|t| t.set(FeedThreads::One));
 }
 
 #[test]

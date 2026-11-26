@@ -225,6 +225,37 @@ pub struct FeedOptions {
     /// Keys derived earlier for the same password and key-derivation input ([`FeedDecoder::keys`] of a twin copy's
     /// decoder, or of an earlier member): used instead of deriving again when they match the member (default none).
     pub keys: Option<FeedKeys>,
+    /// Worker threads that decode a 7z LZMA2 member's independent blocks (the dictionary resets 7-Zip `-mmt` writes)
+    /// ahead of the main decode, as their packed bytes arrive (default [`FeedThreads::One`]: none).
+    pub threads: FeedThreads,
+}
+
+/// [`FeedOptions::threads`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FeedThreads {
+    /// Everything on the caller's thread.
+    #[default]
+    One,
+    /// `min(4, available cores / 3)` workers, at least one: room left for downloading, yEnc and PAR2. A stream with
+    /// no dictionary reset past its start (one block) runs on the caller's thread alone.
+    Auto,
+    /// This many workers (at most 64).
+    Count(usize),
+}
+
+impl FeedThreads {
+    /// Worker threads besides the caller's: 0 for [`Self::One`].
+    pub fn count(self) -> usize {
+        match self {
+            Self::One => 0,
+            Self::Auto => {
+                let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+                (cores / 3).clamp(1, 4)
+            }
+            Self::Count(n) => n.min(64),
+        }
+    }
 }
 
 impl Default for FeedOptions {
@@ -238,6 +269,7 @@ impl Default for FeedOptions {
             run_budget: None,
             max_window: 1 << 30,
             keys: None,
+            threads: FeedThreads::One,
         }
     }
 }
@@ -1709,7 +1741,14 @@ impl FeedDecoder {
                 StoredCipher::Cbc { .. } => (l.next, l.iv),
                 _ => (l.pos, None),
             }),
-            lost: self.lost.ranges(),
+            // with the output of LZMA2 blocks workers had not finished, which a restore repairs
+            lost: {
+                let mut lost = self.lost.clone();
+                for r in self.lzma2.as_ref().map(|l| l.par_unfinished_lost()).unwrap_or_default() {
+                    lost.insert(r);
+                }
+                lost.ranges()
+            },
             crc: self.crc.runs.iter().map(|(&s, &(e, c))| (s, e, c)).collect(),
             crc_broken: self.crc.broken,
             stats: self.stats,
