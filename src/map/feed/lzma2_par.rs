@@ -50,6 +50,11 @@ const INPUT_QUEUE: usize = 4;
 /// decoding the block itself.
 const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Workers from which the main decode waits ([`WAIT`]) for one to free up rather than decode a block itself: with
+/// fewer, its own decoding adds more than the output it would write meanwhile (measured on Zen 3: one worker 113 MB/s
+/// decoding vs 94 MB/s waiting; even at two; ahead from four).
+const WAIT_FROM_THREADS: usize = 3;
+
 /// How far ahead of the main decode (folder output) the header walk looks for blocks.
 const LOOKAHEAD: u64 = 1 << 30;
 
@@ -171,9 +176,11 @@ impl Par {
             .collect()
     }
 
-    /// Every worker is busy.
+    /// Every worker is busy, and there are enough of them ([`WAIT_FROM_THREADS`]) that the main decode should wait
+    /// for one rather than decode the next block itself.
     pub(super) fn all_busy(&self) -> bool {
-        self.blocks.values().filter(|b| b.state == State::Running).count() >= self.threads
+        self.threads >= WAIT_FROM_THREADS
+            && self.blocks.values().filter(|b| b.state == State::Running).count() >= self.threads
     }
 
     /// No worker is running.
