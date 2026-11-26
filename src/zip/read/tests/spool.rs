@@ -638,3 +638,36 @@ fn partial_cleanup_policy_refusal_is_a_stat_without_an_unlink_retry() {
         assert_eq!(s.run.usage.emergency_cleanup, 1);
     });
 }
+
+/// prybar: a temporary directory others may write in (as umask 002 leaves one) is refused with a typed reason naming
+/// it as the spool's directory, not a generic identity fault; with the sticky bit (as /tmp) it is used.
+#[test]
+fn an_untrusted_spool_directory_is_refused_with_its_reason() {
+    use std::os::unix::fs::PermissionsExt;
+    for (mode, refused) in [(0o777, true), (0o775, true), (0o1777, false), (0o700, false)] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let cancel = crate::extract::Cancellation::default();
+        let (ledger, _) = ledger(0);
+        let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
+        let result =
+            spool::OwnedCiphertext::copy(&ledger, &directory, &mut std::io::repeat(1), 1, &mut [0; 64], &cancel);
+        match result {
+            Err(error) => {
+                assert!(refused, "{mode:o}: {error:?}");
+                assert!(
+                    matches!(
+                        error.operation(),
+                        Some(ReadFault::UntrustedDirectory {
+                            object: OwnedObject::CiphertextDirectory,
+                            reason: DirectoryDistrust::OthersMayWrite
+                        })
+                    ),
+                    "{mode:o}: {error:?}"
+                );
+            }
+            Ok(_) => assert!(!refused, "{mode:o} accepted"),
+        }
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}

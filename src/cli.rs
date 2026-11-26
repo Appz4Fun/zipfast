@@ -569,6 +569,16 @@ impl std::fmt::Display for ErrorText<'_> {
             Some(ReadFault::Io { error, .. }) => write!(f, "{error}"),
             Some(ReadFault::Legacy(error)) => write!(f, "{error}"),
             Some(ReadFault::Cancelled) => f.write_str("operation cancelled"),
+            // name the directory (encrypted data spools in the temporary one) and why it was refused
+            Some(ReadFault::UntrustedDirectory { object: crate::zip::OwnedObject::CiphertextDirectory, reason }) => {
+                let dir = std::env::var_os("ZIPFAST_ZIP_TEMP_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+                write!(
+                    f,
+                    "temporary directory {} refused: {reason} (set ZIPFAST_ZIP_TEMP_DIR or TMPDIR to a private one)",
+                    dir.display()
+                )
+            }
+            Some(ReadFault::UntrustedDirectory { reason, .. }) => write!(f, "output directory refused: {reason}"),
             Some(ReadFault::Allocation { capacity }) => {
                 write!(f, "could not allocate {capacity} bytes for ZIP processing")
             }
