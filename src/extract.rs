@@ -3014,8 +3014,12 @@ impl Pending {
         if let Some(b) = self.blake.as_mut() {
             b.update(chunk);
         }
-        if let Some(out) = self.out.as_mut() {
-            out.write_detailed(chunk).map_err(|e| e.detailed(false))?;
+        if let Some(out) = self.out.as_mut()
+            && let Err(error) = out.write_detailed(chunk)
+        {
+            // a failure writing the output stops the run: what was written is never kept (Options::keep_broken)
+            self.keep = None;
+            return Err(error.detailed(false));
         }
         if let Some(link) = self.link.as_mut() {
             // more than a target may hold fails the size check or the target check
@@ -5536,6 +5540,21 @@ mod tests {
             p.discard();
             assert_eq!(path.exists(), !canceled, "canceled {canceled}");
         }
+    }
+
+    /// Codex on #292: a failure writing the output stops the run, and the member is never kept, `keep_broken` or not.
+    #[test]
+    fn a_member_whose_output_write_failed_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member");
+        std::fs::write(&path, b"").unwrap();
+        let mut p = Pending::new(&FileHeader::default(), empty_context());
+        p.keep = Some(Meta::default());
+        // a read-only handle: every write to it fails
+        p.out = Some(crate::output::Output::created(File::open(&path).unwrap(), Some(4), path.clone()));
+        assert!(p.take(b"data").is_err(), "the write fails");
+        p.discard();
+        assert!(!path.exists(), "a member whose output failed is removed, not kept");
     }
 
     #[cfg(unix)]

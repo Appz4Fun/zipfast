@@ -1401,8 +1401,10 @@ pub(crate) fn run_renaming(
                     // the output stops the run, and the output is removed as always)
                     let writing = gap.is_none()
                         && matches!(&err, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof);
+                    // a canceled run publishes nothing of the member in progress, whatever the read met
+                    let canceled = cancel.is_some_and(Cancellation::is_canceled);
                     match target {
-                        Some(out) if opts.keep_broken && !writing => {
+                        Some(out) if opts.keep_broken && !writing && !canceled => {
                             let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta())));
                         }
                         target => drop(target),
