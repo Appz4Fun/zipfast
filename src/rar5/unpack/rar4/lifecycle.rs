@@ -388,6 +388,7 @@ impl Rar4Decoder {
         self.finishing = false;
         self.vm_code.clear();
         self.hold.clear();
+        self.unfiltered = false;
         self.filters.next_member();
         if self.track_boundary && frame.unpacked == 0 && frame.packed != 0 {
             self.in_tail = true;

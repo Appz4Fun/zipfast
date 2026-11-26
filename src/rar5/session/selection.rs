@@ -388,6 +388,15 @@ struct SelectedRun {
     history_volumes: VolumeSet,
     buffer: Vec<u8>,
     decrypted: Vec<u8>,
+    /// [`crate::extract::UnsupportedFilters::WriteUnfiltered`], set by extraction: a RAR 3.x/4.x member using a VM
+    /// filter zipfast doesn't run is written unfiltered and fails with [`unfiltered_written`]
+    write_unfiltered: bool,
+}
+
+/// The failure of a member written unfiltered ([`crate::extract::UnsupportedFilters::WriteUnfiltered`]): its data
+/// decoded in full, so a solid stream's history goes on from it.
+pub(super) fn unfiltered_written(failure: &RarFailure) -> bool {
+    matches!(failure, RarFailure::Unsupported(RarUnsupported::FilterWrittenUnfiltered))
 }
 
 impl SelectedRun {
@@ -415,6 +424,7 @@ impl SelectedRun {
             history_volumes: [0; VOLUME_WORDS],
             buffer,
             decrypted,
+            write_unfiltered: false,
         })
     }
 
@@ -459,6 +469,9 @@ impl SelectedRun {
                     if is_terminal(&failure) {
                         return Err(failure);
                     }
+                    if unfiltered_written(&failure) {
+                        continue;
+                    }
                     self.decoder = None;
                     self.rar4 = None;
                     self.failed = Some((predecessor, failure));
@@ -477,7 +490,7 @@ impl SelectedRun {
             }
             Err(failure) if is_terminal(&failure) => Err(failure),
             Err(failure) => {
-                if compressed {
+                if compressed && !unfiltered_written(&failure) {
                     self.decoder = None;
                     self.rar4 = None;
                     self.failed = Some((index, Arc::clone(&failure)));
@@ -552,7 +565,7 @@ impl SelectedRun {
         });
         check_volumes(session, &used_volumes)?;
         check_cancel(&session.options.cancel).map_err(|fault| Arc::from(fault.failure))?;
-        if compressed && result.is_ok() {
+        if compressed && result.as_ref().map_or_else(|failure| unfiltered_written(failure), |_| true) {
             self.history_volumes = used_volumes;
         }
         result
@@ -610,10 +623,11 @@ impl SelectedRun {
         let mut rar4 = if compressed && header.format == RarFormat::Rar4 {
             let first = &session.model.parts[member.parts.start];
             let solid = member.has_successor || session.volumes[first.volume].metadata.main.is_solid();
-            Some(
-                self.rar4_decoder(session, member, solid)
-                    .map_err(|error| *error.detailed(pending.context().scope()).failure)?,
-            )
+            let mut decoder = self
+                .rar4_decoder(session, member, solid)
+                .map_err(|error| *error.detailed(pending.context().scope()).failure)?;
+            decoder.set_write_unfiltered(self.write_unfiltered);
+            Some(decoder)
         } else {
             None
         };
@@ -727,9 +741,14 @@ impl SelectedRun {
             let result = decoder.finish(&mut sink);
             sink.finish(result, decoder.take_size_failure())?;
         }
+        let unfiltered = rar4.as_mut().is_some_and(Rar4Decoder::take_unfiltered);
         if let Some(decoder) = rar4.filter(Rar4Decoder::has_boundary) {
             // the next member of the solid stream goes on from here
             self.rar4 = Some(decoder);
+        }
+        if unfiltered {
+            // written in full, unchecked: its checksum can't match data a filter was meant to change
+            return Err(RarFailure::Unsupported(RarUnsupported::FilterWrittenUnfiltered));
         }
         let final_checks = parts.last().expect("catalogue members have a part").checks;
         let checks = pending.verify_selected(

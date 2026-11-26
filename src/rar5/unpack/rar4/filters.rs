@@ -15,7 +15,8 @@
 // rights and limitations under the RPL.
 
 //! RAR 3.x VM standard filters, recognised as UnRAR does by their program's length and CRC-32, run natively: E8,
-//! E8E9, ITANIUM, DELTA, RGB and AUDIO. A program of any other kind would need the VM itself and is refused.
+//! E8E9, ITANIUM, DELTA, RGB and AUDIO. A program of any other kind would need the VM itself: it is refused, or
+//! (when the caller asks for 7-Zip's behaviour) its block is written as decoded, unfiltered.
 //! Ported from RustyGet's `archive_native/rar3.rs`.
 
 use super::ppm::Bits;
@@ -33,14 +34,16 @@ pub(super) enum Kind {
     Delta,
     Rgb,
     Audio,
-    /// a program of its own
+    /// a program of its own: its block is written unfiltered, when that is allowed at all
     Other,
+    /// a program whose first byte isn't the XOR of the rest: damaged data, never run nor written past
+    Damaged,
 }
 
 fn kind_of(code: &[u8]) -> Kind {
     let xor = code.iter().skip(1).fold(0u8, |x, b| x ^ b);
     if code.first() != Some(&xor) {
-        return Kind::Other;
+        return Kind::Damaged;
     }
     match (code.len(), crate::crc32::hash(code)) {
         (53, 0xad57_6887) => Kind::E8,
@@ -122,8 +125,9 @@ impl Filters {
     }
 
     /// Parses one filter record (the VM code the stream carries) whose block is placed relative to `at`, the
-    /// stream position of the next byte decoded.
-    pub(super) fn add(&mut self, first: u32, code: &[u8], at: u64) -> Result<(), &'static str> {
+    /// stream position of the next byte decoded. A program other than a standard filter is refused, unless
+    /// `unfiltered` lets its block through as decoded.
+    pub(super) fn add(&mut self, first: u32, code: &[u8], at: u64, unfiltered: bool) -> Result<(), &'static str> {
         let mut bits = Bits { data: code, addr: 0, bit: 0 };
         let mut pos = if first & 0x80 != 0 {
             let n = vm_number(&mut bits) as usize;
@@ -186,8 +190,13 @@ impl Filters {
         }
         pos = pos.min(self.kinds.len() - 1);
         let kind = self.kinds[pos];
-        if kind == Kind::Other {
-            return Err("RAR4 VM program other than a standard filter");
+        match kind {
+            // 7-Zip 26.06 reports a program failing its XOR check as a data error, not as an unsupported method
+            Kind::Damaged if unfiltered => return Err("RAR4 VM program fails its check byte"),
+            Kind::Other | Kind::Damaged if !unfiltered => {
+                return Err("RAR4 VM program other than a standard filter");
+            }
+            _ => {}
         }
         let len = len as usize;
         if len > VM_MEM {
@@ -365,7 +374,9 @@ pub(super) fn run(f: &Block, mut data: Vec<u8>, offset: u64) -> Result<Vec<u8>, 
             }
             out
         }
-        Kind::Other => return Err("RAR4 VM program other than a standard filter"),
+        // written as decoded (Filters::add lets such a block through only when that was asked for)
+        Kind::Other => data,
+        Kind::Damaged => return Err("RAR4 VM program fails its check byte"),
     })
 }
 
@@ -433,7 +444,7 @@ mod tests {
         filters.old_lengths.push(0);
         // the last filter again (no number), its start 0, a length of 100, then register 4 given as 7
         let code = pack(&[(0, 6), (0b01, 2), (100, 8), (1 << 4, 7), (7, 6)]);
-        filters.add(0x20 | 0x10, &code, 1000).unwrap();
+        filters.add(0x20 | 0x10, &code, 1000, false).unwrap();
         let block = filters.pending.back().unwrap();
         assert_eq!((block.start, block.len, block.regs[4]), (1000, 100, 100));
     }
