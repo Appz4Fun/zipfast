@@ -14,7 +14,8 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! File-stamp granularity helpers for library tests.
+//! File-stamp granularity helpers for tests: the library's unit tests use it as `crate::test_stamps`, the integration
+//! tests as `common::stamps` (the same file, through `#[path]`).
 //!
 //! zipfast notices that a file changed under it by comparing a stamp of its device, inode, size, mtime, ctime and mode
 //! (`zip::create::unix::Stamp`). Where file times move on a coarse tick (Linux before multigrain timestamps, 6.12-era
@@ -32,17 +33,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Same-size rewrites the probe makes; each one must change the stamp.
-const REWRITES: usize = 8;
+pub(crate) const REWRITES: usize = 8;
 /// Longest wait for a tick; coarse ticks are a few milliseconds (one jiffy), and 2 s for FAT-like filesystems.
 const TICK_DEADLINE: Duration = Duration::from_secs(5);
 
 static FINE: OnceLock<bool> = OnceLock::new();
 /// Probes made for the cached answer (one per process).
-static PROBES: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static PROBES: AtomicUsize = AtomicUsize::new(0);
 
 /// The stamp fields zipfast compares when it checks a regular file for a change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stamp {
+pub(crate) struct Stamp {
     dev: u64,
     ino: u64,
     len: u64,
@@ -51,7 +52,7 @@ struct Stamp {
 }
 
 impl Stamp {
-    fn of(meta: &Metadata) -> Self {
+    pub(crate) fn of(meta: &Metadata) -> Self {
         Self {
             dev: meta.dev(),
             ino: meta.ino(),
@@ -82,7 +83,7 @@ pub(crate) fn fine_grained_stamps(dir: &Path) -> bool {
     })
 }
 
-fn probe(dir: &Path) -> io::Result<bool> {
+pub(crate) fn probe(dir: &Path) -> io::Result<bool> {
     let file = tempfile::Builder::new().prefix(".zipfast-stamp-probe").tempfile_in(dir)?;
     let file = file.as_file();
     file.write_all_at(&[0; 64], 0)?;
@@ -126,50 +127,5 @@ fn await_tick(dir: &Path, target: impl FnOnce() -> io::Result<Metadata>) {
         }
         assert!(Instant::now() < deadline, "file times under {} did not move in {TICK_DEADLINE:?}", dir.display());
         std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn answer_is_cached_for_the_process() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        let first = fine_grained_stamps(a.path());
-        assert_eq!(fine_grained_stamps(b.path()), first);
-        assert_eq!(fine_grained_stamps(a.path()), first);
-        assert_eq!(PROBES.load(Ordering::Relaxed), 1, "the answer is probed once per process");
-        assert_eq!(std::fs::read_dir(a.path()).unwrap().count(), 0, "the probe removes its file");
-    }
-
-    // APFS keeps nanosecond file times, and so do Linux kernels with multigrain timestamps (6.13 on ext4, xfs,
-    // btrfs and tmpfs); 6.12-era Linux hosts move on a coarse tick, so only macOS asserts the answer.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_file_times_are_fine_grained() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(fine_grained_stamps(dir.path()));
-        assert!(probe(dir.path()).unwrap());
-    }
-
-    #[test]
-    fn same_size_rewrite_after_the_tick_changes_the_stamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file");
-        std::fs::write(&path, [0; 64]).unwrap();
-        for i in 1..=REWRITES {
-            let before = Stamp::of(&std::fs::metadata(&path).unwrap());
-            let file = File::options().write(true).open(&path).unwrap();
-            if i % 2 == 0 {
-                await_stamp_tick(&path);
-            } else {
-                await_file_stamp_tick(dir.path(), &file);
-            }
-            file.write_all_at(&[i as u8; 64], 0).unwrap();
-            assert_ne!(Stamp::of(&std::fs::metadata(&path).unwrap()), before, "rewrite {i}");
-        }
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "tick files are removed");
     }
 }
