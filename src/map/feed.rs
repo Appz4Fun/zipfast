@@ -1660,7 +1660,8 @@ impl FeedDecoder {
             let piece_left = span.stream.end.min(lane.end) - lane.pos;
             // plain stored output is written straight from bytes the source can lend: no copy
             if matches!(self.cipher, StoredCipher::Plain) {
-                let max = usize::try_from(piece_left).unwrap_or(usize::MAX);
+                // at most a read's worth, as a read: the budget and cancellation are checked as often
+                let max = left;
                 if let Some(bytes) = source.borrow_packed(volume, packed, max) {
                     if bytes.is_empty() || bytes.len() > max {
                         return Err(FeedError::SourceContract("lent slice empty or past the request"));

@@ -145,3 +145,30 @@ fn insert_owned_keeps_bytes_and_falls_back_on_overlap() {
     b.insert_owned(1, 0, Vec::new()).unwrap();
     assert_eq!(b.held(), 30);
 }
+
+/// Codex on #302: a lent slice is at most a read's worth, so a run still yields at its budget (with `more`) when one
+/// article holds the whole member.
+#[test]
+fn lending_keeps_to_the_run_budget() {
+    let data: Vec<u8> = (0..2_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+    let zip = stored_zip("movie.mkv", &data);
+    let map = MemberMap::from_memory(&[&zip], "set.zip", None).unwrap();
+    let mut source = Counting { inner: ArticleBuffer::new(usize::MAX), lend: true, lent: 0, copied: 0 };
+    source.inner.insert_owned(0, 0, zip.clone()).unwrap();
+    let options = FeedOptions { run_budget: Some(300_000), read_chunk: 64 << 10, ..FeedOptions::default() };
+    let mut d = FeedDecoder::new(&map, 0, options).unwrap();
+    let mut out = Out(Vec::new());
+    let mut runs = 0;
+    loop {
+        let before = source.lent;
+        let s = d.run(&mut source, &mut out).unwrap().clone();
+        runs += 1;
+        assert!(source.lent - before <= 300_000 + (64 << 10), "run {runs} lent {}", source.lent - before);
+        if !s.more {
+            assert!(s.done && s.crc_ok == Some(true), "{s:?}");
+            break;
+        }
+    }
+    assert!(runs >= 6, "{runs} runs");
+    assert!(out.0 == data);
+}
