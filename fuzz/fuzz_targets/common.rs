@@ -18,7 +18,26 @@
 //! format and how many volumes the rest is cut into), mapped and fed member by member through `FeedDecoder`. Every
 //! step must return an error or a result, never panic, and stay within its bounds.
 
-use zipfast::map::{ArticleBuffer, FeedDecoder, FeedOptions, MemberMap};
+use zipfast::map::{ArticleBuffer, FeedDecoder, FeedOptions, FeedSink, MemberMap};
+
+/// The most output a member may write: a member declaring more is skipped, and a write past it fails (a decoder that
+/// writes more than it declared stops there), so a small, highly compressible input can't exhaust the worker.
+const OUTPUT_LIMIT: u64 = 64 << 20;
+
+/// A `Vec` sink that refuses output past [`OUTPUT_LIMIT`] before allocating it.
+struct Capped(Vec<u8>);
+
+impl FeedSink for Capped {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        if offset.saturating_add(bytes.len() as u64) > OUTPUT_LIMIT {
+            return Err(std::io::Error::other("fuzz output limit"));
+        }
+        self.0.write_at(offset, bytes)
+    }
+    fn read_held(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read_held(offset, buf)
+    }
+}
 
 pub fn run(data: &[u8], holes: bool) {
     let Some((&head, rest)) = data.split_first() else { return };
@@ -33,6 +52,9 @@ pub fn run(data: &[u8], holes: bool) {
     let volumes: Vec<&[u8]> = rest.chunks(size).collect();
     let Ok(map) = MemberMap::from_memory(&volumes, name, Some("password")) else { return };
     for index in 0..map.members.len().min(4) {
+        if map.members[index].unpacked_size.is_some_and(|size| size > OUTPUT_LIMIT) {
+            continue;
+        }
         let Ok(mut decoder) = FeedDecoder::new(&map, index, FeedOptions::new(Some("password"))) else { continue };
         let mut source = ArticleBuffer::new(1 << 26);
         for (v, bytes) in volumes.iter().enumerate() {
@@ -49,16 +71,12 @@ pub fn run(data: &[u8], holes: bool) {
                 at = end;
             }
         }
-        let mut sink: Vec<u8> = Vec::new();
+        let mut sink = Capped(Vec::new());
         for _ in 0..64 {
             match decoder.run(&mut source, &mut sink) {
                 Ok(status) if status.done || (!status.more && status.needs.is_empty()) => break,
                 Ok(_) => {}
                 Err(_) => break,
-            }
-            // the decoder may only ask for bounded output
-            if sink.len() > 1 << 28 {
-                break;
             }
         }
         let _ = decoder.snapshot().to_bytes();
