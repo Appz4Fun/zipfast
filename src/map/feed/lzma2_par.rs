@@ -35,8 +35,16 @@
 use super::*;
 use std::sync::mpsc;
 
-/// Output chunks a worker may have waiting for the caller's thread before it blocks.
+/// Output chunks a worker may have waiting for the caller's thread before it blocks: with [`CHUNK`]-sized chunks,
+/// about 16 MiB per worker, so workers keep decoding while the caller's thread is busy.
 const QUEUE: usize = 16;
+
+/// A worker's output chunk.
+const CHUNK: usize = 1 << 20;
+
+/// How long the main decode, at a block it has not begun while every worker is busy, waits for one to free up before
+/// decoding the block itself.
+const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How far ahead of the main decode (folder output) the header walk looks for blocks.
 const LOOKAHEAD: u64 = 1 << 30;
@@ -153,6 +161,11 @@ impl Par {
             .collect()
     }
 
+    /// Every worker is busy.
+    pub(super) fn all_busy(&self) -> bool {
+        self.blocks.values().filter(|b| b.state == State::Running).count() >= self.threads
+    }
+
     /// No worker is running.
     pub(super) fn idle(&self) -> bool {
         self.blocks.values().all(|b| b.state != State::Running)
@@ -168,7 +181,7 @@ fn worker(prop: u8, start: u64, input: mpsc::Receiver<Vec<u8>>, tx: mpsc::SyncSe
             return;
         }
     };
-    let mut buf = vec![0u8; OUT_BUF];
+    let mut buf = vec![0u8; CHUNK];
     for bytes in input {
         let sent = live.feed(&bytes, &mut buf, start, &mut |out| {
             tx.send((start, Msg::Out(out.to_vec()))).map_err(|_| corrupt(start, "LZMA2 worker's caller is gone"))
@@ -213,6 +226,21 @@ impl FeedDecoder {
         result
     }
 
+    /// At a block the main decode has not begun while every worker is busy: waits up to [`WAIT`] for a worker's
+    /// message and writes what came. False when nothing came (workers short of input, say): the main decode then
+    /// decodes the block itself.
+    pub(super) fn par_wait(&mut self, lz: &mut Lz, sink: &mut dyn FeedSink) -> Result<bool, FeedError> {
+        let Some(mut par) = lz.par.take() else { return Ok(false) };
+        let result = (|| {
+            let Ok(msg) = par.rx.recv_timeout(WAIT) else { return Ok(false) };
+            self.par_message(lz, &mut par, sink, msg)?;
+            self.par_collect(lz, &mut par, sink, false)?;
+            Ok(true)
+        })();
+        lz.par = Some(par);
+        result
+    }
+
     /// Writes what the workers sent; `block`: wait for at least one message.
     fn par_collect(
         &mut self,
@@ -235,28 +263,39 @@ impl FeedDecoder {
                     Err(_) => return Ok(()),
                 }
             };
-            let (start, msg) = msg;
-            let Some(b) = par.blocks.get_mut(&start) else { continue };
-            if b.state != State::Running {
-                continue;
-            }
-            match msg {
-                Msg::Out(bytes) => {
-                    let at = b.written;
-                    b.written += bytes.len() as u64;
-                    let (ss, end, write) = (lz.ss, lz.end, lz.write_from..lz.end);
-                    self.lz_emit((ss, end), end, &write, at, &bytes, sink)?;
-                }
-                Msg::Done => {
-                    // the worker ends once fed whole: its output must fill the block exactly
-                    b.state = match b.end {
-                        Some((_, out_end)) if b.written == out_end => State::Finished,
-                        _ => State::Failed,
-                    };
-                }
-                Msg::Failed => b.state = State::Failed,
-            }
+            self.par_message(lz, par, sink, msg)?;
         }
+    }
+
+    /// One message from a worker: its output written, or its end.
+    fn par_message(
+        &mut self,
+        lz: &mut Lz,
+        par: &mut Par,
+        sink: &mut dyn FeedSink,
+        (start, msg): (u64, Msg),
+    ) -> Result<(), FeedError> {
+        let Some(b) = par.blocks.get_mut(&start) else { return Ok(()) };
+        if b.state != State::Running {
+            return Ok(());
+        }
+        match msg {
+            Msg::Out(bytes) => {
+                let at = b.written;
+                b.written += bytes.len() as u64;
+                let (ss, end, write) = (lz.ss, lz.end, lz.write_from..lz.end);
+                self.lz_emit((ss, end), end, &write, at, &bytes, sink)?;
+            }
+            Msg::Done => {
+                // the worker ends once fed whole: its output must fill the block exactly
+                b.state = match b.end {
+                    Some((_, out_end)) if b.written == out_end => State::Finished,
+                    _ => State::Failed,
+                };
+            }
+            Msg::Failed => b.state = State::Failed,
+        }
+        Ok(())
     }
 
     /// Walks chunk headers ahead of the main decode, recording dictionary resets and the ends of owned blocks.

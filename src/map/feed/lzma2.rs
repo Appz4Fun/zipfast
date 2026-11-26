@@ -1125,8 +1125,16 @@ impl FeedDecoder {
             let write = lz.write_from..lz.end;
             // at a block it has not begun (between chunks, no decoder): a free worker may take it first
             if lz.par.is_some() && lane.chunk.is_none() && lane.live.is_none() {
+                let at_block = lane.out;
                 lz.main = Some(lane);
                 self.par_round(lz, source, sink, false)?;
+                // every worker busy and the block not taken: wait a little for one to free up rather than decode it
+                // here (which would leave the workers' output unwritten meanwhile)
+                while lz.par.as_ref().is_some_and(|p| p.all_busy() && p.next_owned(at_block) != Some(at_block))
+                    && self.par_wait(lz, sink)?
+                {
+                    self.par_round(lz, source, sink, false)?;
+                }
                 lane = lz.main.take().expect("put back");
             }
             // the main decode stops at the first block a worker owns, and goes on from its end once that is known
