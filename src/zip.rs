@@ -180,6 +180,7 @@ impl ZipEntry {
             size: self.size,
             local_at: self.local_at,
             aes_info: self.aes_info,
+            keep_cut: false,
         }
     }
 
@@ -218,6 +219,9 @@ struct ReadDescription<'a> {
     size: u64,
     local_at: u64,
     aes_info: Option<(u8, u16, u16)>,
+    /// the bytes before a cut (a missing volume, a truncated file) are passed on before the read fails, for
+    /// [`crate::extract::Options::keep_broken`]; otherwise only whole reads are
+    keep_cut: bool,
 }
 
 impl ReadDescription<'_> {
@@ -576,7 +580,12 @@ fn data_at(file: &mut (impl Read + Seek), len: u64, e: &ReadDescription<'_>) -> 
         _ => Error::Truncated,
     })?;
     let layout = local_layout(header, e.local_at, len).map_err(|_| Error::Truncated)?;
-    Ok(layout.payload_range(e.packed, len).map_err(|_| Error::Truncated)?.start)
+    match layout.payload_range(e.packed, len) {
+        Ok(range) => Ok(range.start),
+        // Options::keep_broken: a payload running past what is there (a missing volume) is read to the cut
+        Err(_) if e.keep_cut => Ok(layout.payload_range(0, len).map_err(|_| Error::Truncated)?.start),
+        Err(_) => Err(Error::Truncated),
+    }
 }
 
 /// Reads an entry's data, decompressed, into `sink`, and checks its size and CRC.
@@ -711,8 +720,11 @@ fn read_entry(
             while left > 0 {
                 check()?;
                 let n = (left.min(buf.len() as u64)) as usize;
-                file.read_exact(&mut buf[..n])?;
-                emit(&buf[..n])?;
+                let (got, cut) = fill(file, &mut buf[..n], e.keep_cut)?;
+                emit(&buf[..got])?;
+                if let Some(cut) = cut {
+                    return Err(cut.into());
+                }
                 left -= n as u64;
             }
         }
@@ -722,9 +734,9 @@ fn read_entry(
             let mut done = false;
             while !done {
                 let n = (left.min(buf.len() as u64)) as usize;
-                file.read_exact(&mut buf[..n])?;
+                let (got, mut cut) = fill(file, &mut buf[..n], e.keep_cut)?;
                 left -= n as u64;
-                let mut input = &buf[..n];
+                let mut input = &buf[..got];
                 loop {
                     check()?;
                     let (before_in, before_out) = (z.total_in(), z.total_out());
@@ -744,6 +756,9 @@ fn read_entry(
                         continue;
                     }
                     if input.is_empty() {
+                        if let Some(cut) = cut.take() {
+                            return Err(cut.into());
+                        }
                         if left == 0 {
                             return Err(Error::Corrupt("deflate data ends early"));
                         }
@@ -783,6 +798,25 @@ fn read_entry(
         return Err(Error::BadChecksum(e.name.to_owned()));
     }
     Ok(())
+}
+
+/// Fills `buf`: whole (an error otherwise), or with `keep_cut` as much as is there before a cut, with what cut it
+/// (the input's end, or its own I/O error, kept as it is so a failing source still stops the run).
+fn fill(file: &mut impl Read, buf: &mut [u8], keep_cut: bool) -> std::io::Result<(usize, Option<std::io::Error>)> {
+    if !keep_cut {
+        file.read_exact(buf)?;
+        return Ok((buf.len(), None));
+    }
+    let mut got = 0;
+    while got < buf.len() {
+        match file.read(&mut buf[got..]) {
+            Ok(0) => return Ok((got, Some(std::io::ErrorKind::UnexpectedEof.into()))),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Ok((got, Some(e))),
+        }
+    }
+    Ok((got, None))
 }
 
 // The buffered codecs may consume several input windows before producing
@@ -1330,7 +1364,15 @@ pub(crate) fn run_renaming(
                     }
                 }
             }
-            let entry = e.read_description();
+            let mut entry = e.read_description();
+            entry.keep_cut = opts.keep_broken;
+            // The last member of a walk cut off before its descriptor has no known size: what is there of it is
+            // read (it then fails at the gap), so a kept file (Options::keep_broken) holds it, as 7-Zip's does.
+            if archive.last_size_unknown && ordinal + 1 == entries.len() {
+                entry.size = if entry.effective_method() == METHOD_STORED { entry.packed } else { u64::MAX };
+            }
+            // a failure writing the output, told apart from a failure reading the entry: it is never kept
+            let mut output_failed = false;
             let read = match target.as_mut() {
                 Some(out) => read_entry(
                     &mut archive.file,
@@ -1338,7 +1380,12 @@ pub(crate) fn run_renaming(
                     &entry,
                     password,
                     &mut buf,
-                    &mut |chunk| Ok(out.write(chunk)?),
+                    &mut |chunk| {
+                        out.write(chunk).map_err(|error| {
+                            output_failed = true;
+                            Error::Io(error)
+                        })
+                    },
                     cancel,
                 ),
                 None => read_entry(&mut archive.file, archive.len, &entry, password, &mut buf, &mut |_| Ok(()), cancel),
@@ -1356,8 +1403,21 @@ pub(crate) fn run_renaming(
                     report.member(LegacyMember::Succeeded { ordinal: member.0, name: member.1, bytes: e.size });
                 }
                 Err(err) => {
-                    drop(target);
-                    if let Some(missing) = archive.gap_crossed(e) {
+                    let gap = archive.gap_crossed(e);
+                    // Options::keep_broken: what was written of an entry whose data fails stays (a failure writing
+                    // the output stops the run, and the output is removed as always)
+                    let writing = output_failed
+                        || gap.is_none()
+                            && matches!(&err, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof);
+                    // a canceled run publishes nothing of the member in progress, whatever the read met
+                    let canceled = cancel.is_some_and(Cancellation::is_canceled);
+                    match target {
+                        Some(out) if opts.keep_broken && !writing && !canceled => {
+                            let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta())));
+                        }
+                        target => drop(target),
+                    }
+                    if let Some(missing) = gap {
                         fail(&mut summary, report, member, &Error::MissingVolume(missing).to_string());
                         continue;
                     }
@@ -1400,6 +1460,32 @@ mod tests {
 
     use std::io::{self, Write};
     use std::ops::Range;
+
+    /// Codex on #292: a partial read followed by a real input error gives the bytes and that error, not a made-up
+    /// end of input, so a failing source still stops the run (`keep_cut` or not); a short input gives an end.
+    #[test]
+    fn fill_keeps_the_input_error_after_a_partial_read() {
+        struct Failing(usize);
+        impl io::Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                let n = self.0.min(buf.len());
+                buf[..n].fill(7);
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let mut buf = [0u8; 16];
+        let (got, cut) = fill(&mut Failing(5), &mut buf, true).unwrap();
+        assert_eq!((got, cut.and_then(|e| e.raw_os_error())), (5, Some(libc::EIO)));
+        let (got, cut) = fill(&mut &[1u8, 2, 3][..], &mut buf, true).unwrap();
+        assert_eq!((got, cut.map(|e| e.kind())), (3, Some(io::ErrorKind::UnexpectedEof)));
+        let (got, cut) = fill(&mut &[1u8; 20][..], &mut buf, true).unwrap();
+        assert!(got == 16 && cut.is_none());
+        assert_eq!(fill(&mut Failing(5), &mut buf, false).unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
 
     #[test]
     fn unix_extra_seconds_follows_the_dos_year() {

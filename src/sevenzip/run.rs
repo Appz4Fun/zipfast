@@ -275,6 +275,9 @@ struct Run<'a> {
     /// Destination-relative paths of links staged for their folder's CRC and not published yet: a later member under
     /// one must not create its parents before the link takes the path, so it fails as under a published link.
     pending_links: Vec<PathBuf>,
+    /// the folders placing the current member created, deepest first, and its target: removed again (when empty)
+    /// if the member leaves nothing there, as 7-Zip creates a file's folders only as its data comes
+    fresh_dirs: Option<(PathBuf, Vec<PathBuf>)>,
     active: Option<Active>,
     /// The password is known to be right: the encrypted headers decoded and passed their CRC, or some encrypted
     /// data has decoded and checked out.
@@ -352,6 +355,7 @@ pub(super) fn run(
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
         pending_links: Vec::new(),
+        fresh_dirs: None,
         extracted: crate::extract::link::Extracted::new(&opts),
         active: None,
         password_proven: map.header_encrypted,
@@ -426,6 +430,8 @@ pub(super) fn print(
         refused_link_placeholder: false,
         restart_from_first_volume: false,
         replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let set = Rc::new(RefCell::new(VolumeSet::new(first, map.volumes)));
     let mut report = |_: &str| {};
@@ -440,6 +446,7 @@ pub(super) fn print(
         summary: Summary { volumes: u64::from(map.volumes), ..Summary::default() },
         dirs: Dirs::default(),
         pending_links: Vec::new(),
+        fresh_dirs: None,
         extracted: crate::extract::link::Extracted::new(&options),
         active: None,
         password_proven: map.header_encrypted,
@@ -631,6 +638,17 @@ impl Run<'_> {
                 renames.push(renamed);
             },
         };
+        // the folders checking the target creates
+        let target = self.opts.dest.join(&rel);
+        let fresh: Vec<PathBuf> = target
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != self.opts.dest && std::fs::symlink_metadata(dir).is_err())
+            .map(Path::to_path_buf)
+            .collect();
+        if !fresh.is_empty() {
+            self.fresh_dirs = Some((target, fresh));
+        }
         let checked = crate::extract::check_target(self.opts, &rel, Some(&mut self.dirs), &mut log);
         match checked.map_err(legacy_error)? {
             Checked::Write(place) => Ok(Some((rel, Some(place)))),
@@ -702,6 +720,26 @@ impl Run<'_> {
         let parent = place.path.parent().ok_or(SevenZipError::Corrupt("7z output path"))?;
         let (file, temporary) = crate::output::temporary(parent).map_err(SevenZipError::Io)?.into_parts();
         Ok((temporary, Output::new(file, Some(size))))
+    }
+
+    /// [`crate::extract::Options::keep_broken`]: a file that failed its CRC (already reported) takes its name with what
+    /// was decoded, as a verified one would. Best effort: when that fails, it is removed as without the option.
+    fn keep_broken(&mut self, (temporary, output): (tempfile::TempPath, Output), place: Place, member: &MapMember) {
+        let meta = self.opts.meta(meta(member));
+        if output.finish(|file| crate::extract::keep_written(file, &meta)).is_err() {
+            return;
+        }
+        Self::put_kept(temporary, place);
+    }
+
+    /// A kept broken file takes its name: as a verified one would, never through a link; best effort.
+    fn put_kept(temporary: tempfile::TempPath, place: Place) {
+        let _ = match place.reserved {
+            Some(reserved) if cfg!(unix) && !reserved.still_ours() => return,
+            Some(reserved) => crate::output::replace(temporary, reserved.path()).map(|()| drop(reserved.into_parts())),
+            None if place.replace => crate::output::replace_link(temporary, &place.path, place.link),
+            None => temporary.persist_noclobber(&place.path).map_err(|error| error.error),
+        };
     }
 
     /// Gives a verified file its name: replacing what is there only when that was asked for, never through a link.
@@ -781,9 +819,24 @@ impl Run<'_> {
         let held = std::mem::take(&mut active.held);
         if !good {
             let why = active.failed.clone().unwrap_or_else(|| "checksum error in its solid block".to_owned());
+            // Options::keep_broken: every member held for the folder decoded whole and only the folder's CRC failed:
+            // they stay, as 7-Zip keeps them (not after a decode failure, and never a link)
+            let staged = if self.opts.keep_broken && complete {
+                let (kept, rest): (Vec<_>, Vec<_>) = staged.into_iter().partition(|s| s.link.is_none());
+                let names: Vec<(u64, String)> = kept.iter().map(|s| (s.ordinal, s.name.clone())).collect();
+                for s in kept {
+                    Self::put_kept(s.temporary, s.place);
+                }
+                (rest, names)
+            } else {
+                (staged, Vec::new())
+            };
+            let (staged, kept_names) = staged;
+            // kept or not, every member held for the folder failed with it
             let mut failed: Vec<(u64, &str)> = staged
                 .iter()
                 .map(|s| (s.ordinal, s.name.as_str()))
+                .chain(kept_names.iter().map(|(o, n)| (*o, n.as_str())))
                 .chain(tested.iter().map(|(n, _, o)| (*o, n.as_str())))
                 .collect();
             failed.sort_by_key(|(o, _)| *o);
@@ -901,7 +954,25 @@ impl Run<'_> {
         let mut active = self.active.take().expect("an active folder");
         let result = self.member_in(&mut active, member, &name, offset, size, take);
         self.active = Some(active);
+        self.drop_fresh_dirs();
         result
+    }
+
+    /// The folders the member's placing created, when it left nothing at its target (it failed before any file was
+    /// kept): removed while empty, so a wrong password leaves no empty folders (7-Zip 26.06). A member held for its
+    /// folder's CRC has its staged file in there, so its folders stay.
+    fn drop_fresh_dirs(&mut self) {
+        let Some((target, fresh)) = self.fresh_dirs.take() else { return };
+        if std::fs::symlink_metadata(&target).is_ok() {
+            return;
+        }
+        for dir in fresh {
+            if std::fs::remove_dir(&dir).is_err() {
+                break;
+            }
+        }
+        // the folders known to exist are looked at again
+        self.dirs.forget();
     }
 
     fn member_in(
@@ -935,7 +1006,7 @@ impl Run<'_> {
                 return self.data_failure(active, name, &why, encrypted, take);
             }
         }
-        let target = match take {
+        let mut target = match take {
             // printing writes no file, so the name needs no checking: it is only reported
             true if self.print.is_some() => Some((PathBuf::new(), None)),
             true => self.place(member, name)?,
@@ -977,6 +1048,14 @@ impl Run<'_> {
         if !crc_ok {
             if let Some(spool) = spool.as_mut() {
                 self.store.release(spool).map_err(SevenZipError::Io)?;
+            }
+            // Options::keep_broken: what was decoded stays, as 7-Zip keeps a file that fails its CRC (a wrong
+            // password's garbage included); reported failed all the same
+            if let (Some(staged), Some((_, Some(place)))) = (staged.take(), target.take())
+                && self.opts.keep_broken
+                && !is_link(member)
+            {
+                self.keep_broken(staged, place, member);
             }
             if encrypted && !self.password_proven {
                 // Decrypted garbage: the password does not open this folder. The rest of the folder fails the same

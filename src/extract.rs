@@ -202,6 +202,16 @@ pub struct Options {
     /// link via another link was ignored"): the member fails. Applies to the whole-archive runners for RAR, 7z, ZIP
     /// and tar.
     pub replace_placed_links: bool,
+    /// A file whose extraction fails once its output was created (a CRC or BLAKE2sp mismatch, a missing or truncated
+    /// volume, a decoder error, a wrong password found only by its checksum) keeps what was written, or stays empty,
+    /// with its times set, as 7-Zip 26.06 `x`/`e` and UnRAR 7.30 `-kb` do. The member is still reported failed. Off
+    /// (the default) such a file is removed, so a later run never takes it for finished.
+    pub keep_broken: bool,
+    /// A RAR run started at a later volume meets a member continued from an earlier one: it is extracted from what
+    /// this volume holds, and fails (its checks can't pass without its start), as 7-Zip 26.06 `x` does ("CRC Failed",
+    /// "Data Error"; with [`Self::keep_broken`] the file stays). Off (the default) it is passed over as lacking its
+    /// start (`RarSkipReason::MissingStart`). [`Self::restart_from_first_volume`] goes back for the start instead.
+    pub attempt_continued_members: bool,
 }
 
 /// How an archive's symbolic link is checked against symbolic links already in the destination; see
@@ -397,6 +407,8 @@ impl MemberRef<'_> {
 ///     refused_link_placeholder: false,
 ///     restart_from_first_volume: false,
 ///     replace_placed_links: false,
+///     keep_broken: false,
+///     attempt_continued_members: false,
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -1027,6 +1039,17 @@ pub(crate) fn create_target(place: Place, size: Option<u64>) -> Result<Output> {
 /// which would fill its holes with real space.
 pub(crate) fn create_sparse_target(place: Place, size: Option<u64>) -> Result<Output> {
     create_target_with(place, size, true).map_err(crate::error::RarFault::into_legacy)
+}
+
+/// A broken file kept ([`Options::keep_broken`]): cut to what was written (a preallocated file is longer), then its
+/// times and mode set.
+pub(crate) fn keep_written(file: &File, meta: &Meta) {
+    use std::io::Seek;
+    let mut handle = file;
+    if let Ok(written) = handle.stream_position() {
+        let _ = file.set_len(written);
+    }
+    finish_file(file, meta);
 }
 
 pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::error::RarResult<Output> {
@@ -2861,6 +2884,10 @@ pub(crate) struct Pending {
     cancel: Option<Cancellation>,
     /// a RAR4 symbolic link: where it goes and its target, gathered as it is decoded
     link: Option<LinkOut>,
+    /// [`Options::keep_broken`]: given up on, what was written stays, with these times
+    keep: Option<Meta>,
+    /// [`Options::attempt_continued_members`]: its start is in an earlier volume, so it fails whatever its checks say
+    orphan: bool,
 }
 
 /// A symbolic link being extracted: created once its target is decoded and checked.
@@ -2901,6 +2928,8 @@ impl Pending {
             rar4_identity: h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)),
             cancel: None,
             link: None,
+            keep: None,
+            orphan: false,
         }
     }
 
@@ -2912,13 +2941,38 @@ impl Pending {
         Ok(())
     }
 
-    /// Gives up on this file: what was written of it is removed, so a later run doesn't take it for finished.
+    /// Gives up on this file: what was written of it is removed, so a later run doesn't take it for finished (kept
+    /// with [`Options::keep_broken`]).
     fn discard(&mut self) {
         self.failed = true;
+        // a canceled run publishes nothing of the member in progress, kept or not
+        let canceled = self.cancel.as_ref().is_some_and(Cancellation::is_canceled);
+        if let Some(meta) = self.keep.take().filter(|_| !canceled) {
+            self.keep_broken(&meta);
+        }
         self.place = None;
         self.mem = None;
         self.link = None;
         drop(self.out.take());
+    }
+
+    /// [`Options::keep_broken`]: publishes what was written of a file given up on (an empty file when it was placed
+    /// but nothing was written yet). Best effort: a failure here leaves the file removed, as without the option.
+    fn keep_broken(&mut self, meta: &Meta) {
+        if self.link.is_some() || self.hidden {
+            return;
+        }
+        let out = match self.out.take() {
+            Some(out) => Some(out),
+            None => self.place.take().and_then(|place| create_target_detailed(place, None).ok()),
+        };
+        let Some(mut out) = out else { return };
+        if let Some(mem) = self.mem.take()
+            && out.write_detailed(&mem).is_err()
+        {
+            return;
+        }
+        let _ = out.finish_detailed(|file| keep_written(file, meta));
     }
 
     pub(crate) fn hash_key(&self, keyed: bool) -> Option<&[u8; 32]> {
@@ -2963,8 +3017,12 @@ impl Pending {
         if let Some(b) = self.blake.as_mut() {
             b.update(chunk);
         }
-        if let Some(out) = self.out.as_mut() {
-            out.write_detailed(chunk).map_err(|e| e.detailed(false))?;
+        if let Some(out) = self.out.as_mut()
+            && let Err(error) = out.write_detailed(chunk)
+        {
+            // a failure writing the output stops the run: what was written is never kept (Options::keep_broken)
+            self.keep = None;
+            return Err(error.detailed(false));
         }
         if let Some(link) = self.link.as_mut() {
             // more than a target may hold fails the size check or the target check
@@ -3308,6 +3366,13 @@ impl Books<'_, '_> {
 /// A file's last part is in: checks it whole and finishes it, or hands it to a worker for that when its bytes were
 /// gathered.
 fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> RunResult<()> {
+    // Options::attempt_continued_members: without its start the file is never whole, whatever checks it carries (a
+    // stored member may record none); kept with Options::keep_broken
+    if p.orphan && !p.passive {
+        p.discard();
+        let failure = p.context.integrity(RarIntegrityReason::Decoder("its start is in an earlier volume"), false);
+        return books.fail(&p.context, failure, "checksum error: its start is in an earlier volume");
+    }
     if let Some(packed) = p.mem.take() {
         let job = Job {
             context: p.context,
@@ -3321,6 +3386,7 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
                 blake2sp: c.blake2sp,
                 out: p.place.take(),
                 meta: c.meta,
+                keep: p.keep.is_some(),
             },
         };
         let Some(batch) = books.batch.as_mut() else {
@@ -3807,6 +3873,8 @@ fn rar_read_at(
         refused_link_placeholder: false,
         restart_from_first_volume: false,
         replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -4011,6 +4079,7 @@ impl Run<'_, '_, '_> {
                 blake2sp: h.blake2sp,
                 out,
                 meta: self.opts.meta(Meta::from(h)),
+                keep: self.opts.keep_broken,
             },
         };
         let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads, self.cancel.clone()));
@@ -4060,7 +4129,7 @@ impl Run<'_, '_, '_> {
             self.drain_batch()?;
         }
         // a continuation of some other member, after one that wants its next part, is taken as a member of its own
-        if !self.end_pending()? && continuation {
+        if !self.end_pending()? && continuation && !self.opts.attempt_continued_members {
             if self.reports.typed() {
                 self.drain()?;
             }
@@ -4515,6 +4584,19 @@ impl Run<'_, '_, '_> {
             }
             _ => key,
         };
+        // Options::attempt_continued_members: a compressed member whose start is in an earlier volume can't be decoded
+        // (its decoder state is there too): it fails as 7-Zip's "Data Error", kept empty with Options::keep_broken
+        if h.split_before() && h.method != 0 && self.opts.attempt_continued_members {
+            if let Some(place) = place.take().filter(|_| self.opts.keep_broken && !link) {
+                let meta = self.opts.meta(Meta::from(h));
+                if let Ok(out) = create_target_detailed(place, None) {
+                    let _ = out.finish_detailed(|file| keep_written(file, &meta));
+                }
+            }
+            let failure = ctx.integrity(RarIntegrityReason::Decoder("its start is in an earlier volume"), false);
+            let cause = self.fail_in_order(&ctx, failure, "data error: its start is in an earlier volume")?;
+            return self.pass_over(vol, h, ctx, cipher, Some(cause));
+        }
         // a file a later hard link or file copy may take, once it is verified
         if self.selection.is_none() && !h.is_rar4_symlink() {
             let landed = place.as_ref().map(|place| place.path.clone());
@@ -4532,6 +4614,8 @@ impl Run<'_, '_, '_> {
         p.cipher = cipher;
         p.cancel = self.cancel.clone();
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
+        p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.meta(Meta::from(h)));
+        p.orphan = h.split_before() && self.opts.attempt_continued_members;
         p.place = place;
         if link && let Some(place) = p.place.take() {
             self.dirs.forget();
@@ -5446,6 +5530,44 @@ mod tests {
     }
 
     use super::*;
+
+    /// Options::keep_broken keeps what a failed member wrote, but a canceled run publishes nothing of the member in
+    /// progress (Codex on #292): its `discard` on cancellation leaves no file.
+    #[test]
+    fn a_kept_member_is_not_published_once_canceled() {
+        for canceled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("member");
+            let mut p = Pending::new(&FileHeader::default(), empty_context());
+            p.place = Some(Place::new(path.clone(), false));
+            p.keep = Some(Meta::default());
+            let cancel = Cancellation::default();
+            if canceled {
+                cancel.cancel();
+            }
+            p.cancel = Some(cancel);
+            p.open(None).unwrap();
+            p.take(b"partial").ok();
+            p.discard();
+            assert_eq!(path.exists(), !canceled, "canceled {canceled}");
+        }
+    }
+
+    /// Codex on #292: a failure writing the output stops the run, and the member is never kept, `keep_broken` or not.
+    #[test]
+    fn a_member_whose_output_write_failed_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member");
+        std::fs::write(&path, b"").unwrap();
+        let mut p = Pending::new(&FileHeader::default(), empty_context());
+        p.keep = Some(Meta::default());
+        // a read-only handle: every write to it fails
+        p.out = Some(crate::output::Output::created(File::open(&path).unwrap(), Some(4), path.clone()));
+        assert!(p.take(b"data").is_err(), "the write fails");
+        p.discard();
+        assert!(!path.exists(), "a member whose output failed is removed, not kept");
+    }
+
     #[cfg(unix)]
     #[test]
     fn persistent_metadata_attributes_are_independent() {

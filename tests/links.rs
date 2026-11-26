@@ -47,6 +47,8 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite) -> Options {
         refused_link_placeholder: false,
         restart_from_first_volume: false,
         replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     }
 }
 
@@ -535,6 +537,8 @@ fn a_refused_link_leaves_a_placeholder_only_when_asked() {
             refused_link_placeholder: placeholder,
             restart_from_first_volume: false,
             replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
             ..options(&dest, Mode::Extract, Overwrite::Always)
         };
         let s = extract::run(&archive, &opts, |_| {}).unwrap();

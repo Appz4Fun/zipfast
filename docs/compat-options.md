@@ -15,6 +15,8 @@ preexisting_links: Default::default(),
 refused_link_placeholder: false,
 restart_from_first_volume: false,
 replace_placed_links: false,
+keep_broken: false,
+attempt_continued_members: false,
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -167,3 +169,29 @@ and walks forward only, as 7-Zip 26.06 does (`7z x multi.part2.rar` reports file
 never opens part1). With the session option, `RarSession::restarted_from()` then names the volume it started at
 (None when it started at the one given). A selection by listing position (`MemberRef::ordinal`) counts from the
 volume given, as UnRAR's listing of that volume does; a session restarted at the first volume lists from there.
+
+## `keep_broken`: a failed file keeps what was written
+
+By default a file whose extraction fails is removed, so a later run never takes it for finished. With
+`Options::keep_broken`, as 7-Zip 26.06 `x`/`e` and UnRAR 7.30 `-kb` do, it stays with what was written (cut to that
+length) and its times set, and the member is still reported failed:
+
+| Runner | Kept | Checked against 7-Zip 26.06 |
+| --- | --- | --- |
+| RAR | a CRC or BLAKE2sp mismatch, a missing volume, a decoder or size failure, once the file was placed (empty when nothing was written yet) | `r5misc.rar` `blake.bin` (CRC Failed), `multi_broken.part1.rar` `file2.txt` (missing volume: empty), `r5solid.rar` (Data Error: both empty) |
+| ZIP | a missing or truncated volume, a CRC or data failure; the bytes before the cut are written first, and a streamed member cut off before its descriptor is read to the cut | `s.zip.001` / `streamed.zip.001` `c.bin` (Unexpected end of data: the 11,832 bytes of the first piece); `-pwrong aes.zip` / `crypto.zip` (every file empty) |
+| 7z | a member CRC failure, including a wrong password shown by the CRC; a decode failure ("Data Error") is not kept, as 7-Zip keeps none | `-pwrong encrypted_files.7z`: `baz.txt` kept, `foo.txt` not |
+
+Not kept: links, and a failure writing the output (that stops the run). Whatever the option, a 7z member that fails
+before anything of it is kept no longer leaves the folders its placing created (`-pwrong aes.7z` leaves no empty
+`text/`, as 7-Zip leaves none). A RAR member whose filter is unsupported is
+kept empty; 7-Zip writes its data unfiltered (`generic_delta_padding_mutation.rar`), which zipfast does not.
+
+## `attempt_continued_members`: a member continued from an earlier volume
+
+A RAR run started at a later volume meets a member whose start is in an earlier one. By default it is passed over as
+lacking its start (`RarSkipReason::MissingStart`). With `Options::attempt_continued_members`, as 7-Zip 26.06 `x` does,
+it is extracted from what this volume holds and fails: a stored member writes the bytes it has and fails its checksum
+("CRC Failed": `win-oldvol.r00` `split.bin`), a compressed one fails without decoding ("Data Error":
+`multi.part2.rar` `file2.txt`). With `keep_broken` the file stays, matching 7-Zip's tree; the run's later members come
+out as usual. (`restart_from_first_volume`, UnRAR's behaviour, goes back for the start instead.)

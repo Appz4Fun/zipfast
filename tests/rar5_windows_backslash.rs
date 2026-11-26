@@ -28,6 +28,8 @@ fn extract_to(bytes: &[u8], dir: &std::path::Path) -> Vec<String> {
         refused_link_placeholder: false,
         restart_from_first_volume: false,
         replace_placed_links: false,
+        keep_broken: false,
+        attempt_continued_members: false,
     };
     extract::run_with_password(&rar, &options, None, |_| {}).unwrap();
     let mut names: Vec<String> =

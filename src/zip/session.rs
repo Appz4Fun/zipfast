@@ -771,6 +771,7 @@ impl<'a> EntryMetadata<'a> {
             size: self.size(),
             local_at: self.physical_local_header_offset(),
             aes_info: self.aes_info(),
+            keep_cut: false,
         }
     }
 }

@@ -1175,6 +1175,7 @@ fn checked_read_inner(
                         size: e.size,
                         local_at: e.local_at,
                         aes_info: e.aes_info,
+                        keep_cut: false,
                     },
                     false,
                     false,
