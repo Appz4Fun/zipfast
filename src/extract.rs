@@ -2886,6 +2886,8 @@ pub(crate) struct Pending {
     link: Option<LinkOut>,
     /// [`Options::keep_broken`]: given up on, what was written stays, with these times
     keep: Option<Meta>,
+    /// [`Options::attempt_continued_members`]: its start is in an earlier volume, so it fails whatever its checks say
+    orphan: bool,
 }
 
 /// A symbolic link being extracted: created once its target is decoded and checked.
@@ -2927,6 +2929,7 @@ impl Pending {
             cancel: None,
             link: None,
             keep: None,
+            orphan: false,
         }
     }
 
@@ -3363,6 +3366,13 @@ impl Books<'_, '_> {
 /// A file's last part is in: checks it whole and finishes it, or hands it to a worker for that when its bytes were
 /// gathered.
 fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> RunResult<()> {
+    // Options::attempt_continued_members: without its start the file is never whole, whatever checks it carries (a
+    // stored member may record none); kept with Options::keep_broken
+    if p.orphan && !p.passive {
+        p.discard();
+        let failure = p.context.integrity(RarIntegrityReason::Decoder("its start is in an earlier volume"), false);
+        return books.fail(&p.context, failure, "checksum error: its start is in an earlier volume");
+    }
     if let Some(packed) = p.mem.take() {
         let job = Job {
             context: p.context,
@@ -4605,6 +4615,7 @@ impl Run<'_, '_, '_> {
         p.cancel = self.cancel.clone();
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.meta(Meta::from(h)));
+        p.orphan = h.split_before() && self.opts.attempt_continued_members;
         p.place = place;
         if link && let Some(place) = p.place.take() {
             self.dirs.forget();

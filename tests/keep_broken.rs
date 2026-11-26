@@ -168,3 +168,26 @@ fn a_member_continued_from_an_earlier_volume_fails_as_7zip_when_attempted() {
         }
     }
 }
+
+/// Codex on #292: a stored member continued from an earlier volume that records neither its size nor a checksum has
+/// nothing to fail, yet it is never whole: attempted, it is reported failed all the same, its tail kept only with
+/// `keep_broken`.
+#[test]
+fn an_attempted_continuation_without_checks_still_fails() {
+    let data: Vec<u8> = (0..3000u32).map(|i| (i * 11) as u8).collect();
+    let spec = FileSpec { no_crc: true, size_unknown: true, ..FileSpec::new("tail.bin", &data) };
+    let dir = tempfile::tempdir().unwrap();
+    for (i, v) in common::volumes(&spec, 1000).iter().enumerate() {
+        fs::write(dir.path().join(format!("set.part{}.rar", i + 1)), v).unwrap();
+    }
+    for keep in [false, true] {
+        let out = dir.path().join(format!("out-{keep}"));
+        let opts = Options { attempt_continued_members: true, ..options(&out, keep, 1) };
+        let summary = extract::run(&dir.path().join("set.part2.rar"), &opts, |_| {}).unwrap();
+        assert_eq!((summary.files, summary.errors.len()), (0, 1), "{keep}: {:?}", summary.errors);
+        match fs::read(out.join("tail.bin")) {
+            Ok(kept) => assert!(keep && kept == data[1000..], "{keep}: {} bytes", kept.len()),
+            Err(_) => assert!(!keep, "the tail is kept when asked"),
+        }
+    }
+}
