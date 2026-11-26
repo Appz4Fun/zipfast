@@ -145,6 +145,22 @@ run writes nothing. The whole-archive runners for RAR, 7z, ZIP and tar, `RarSess
 sessions honour it (a progressive session still stops at the refused link, as without the option).
 `tests/links.rs` and `tests/rar5_links.rs` check these points.
 
+## Encrypted RAR 5.0 links and a wrong password (no option)
+
+`rar a -p` encrypts file data but leaves headers in the clear, so a link member's target (its redirection record)
+is readable whatever the password. 7-Zip 26.06 creates such links with a wrong password; UnRAR 7.30 reports the
+wrong password for the member and creates nothing. zipfast does as UnRAR does, on every route (`extract::run*`,
+`RarSession` test and extraction, progressive sessions), and has no switch for 7-Zip's behaviour: a caller that
+wants it (Prybar's 7z mode) handles it itself.
+
+A redirection member whose header carries an encryption record (Unix or Windows symbolic link, junction, hard
+link, file copy) is placed, or passes a test, only when its password check value verifies the password. No
+password fails it as `RarFailure::PasswordRequired`, a wrong one as `RarFailure::WrongPassword`, as an encrypted
+data member fails; nothing is created. A record without a check value, or with a check value whose checksum doesn't
+match, can't verify any password, and a link has no data to check one against: the member is refused as
+`RarFailure::EncryptedIntegrity` with `RarIntegrityReason::UnverifiableLinkPassword`, even with the right password.
+A progressive session stops at such a member, as it does at a wrong password.
+
 ## 7z wrong passwords: how the member failed
 
 7z keeps no password check value, so a wrong password shows by its effect, and 7-Zip words the two effects

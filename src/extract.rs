@@ -4602,6 +4602,20 @@ impl Run<'_, '_, '_> {
                     self.opts.flatten,
                 )
         {
+            // its target is in the clear: an encrypted link is placed only on a password its check value verifies
+            match link::rar5_password(h, self.password, ctx.scope()) {
+                Ok(evidence) => ctx.password = evidence,
+                Err(failure) => {
+                    let why = match failure {
+                        RarFailure::PasswordRequired { .. } => "encrypted (password required)",
+                        RarFailure::WrongPassword { .. } => "wrong password",
+                        RarFailure::EncryptedIntegrity { .. } => "the password can't be verified for a link",
+                        _ => "invalid encryption record",
+                    };
+                    let cause = self.fail_in_order(&ctx, failure, why)?;
+                    return self.past_link(vol, h, ctx, Some(cause));
+                }
+            }
             return self.rar5_link(vol, h, ctx, &rel, kind);
         }
         if let Some(link) = &h.redirection {

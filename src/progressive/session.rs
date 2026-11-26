@@ -1177,6 +1177,21 @@ impl ProgressiveSession {
                     if crate::extract::link::refusal_before_place(&rel, &kind, extracted).is_some() {
                         return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
                     }
+                    // An encrypted link is placed only on a password its check value verifies: the member's cipher
+                    // refuses no password or a wrong one, and one with no usable check value is refused here, as a
+                    // link has no data to check a password against (`crate::extract::link::rar5_password`).
+                    if header.encrypted
+                        && self.options.password().is_some_and(|p| !p.is_empty())
+                        && let Some(verifier) = header.crypt.as_ref().and_then(crate::extract::link::rar5_unverifiable)
+                    {
+                        return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                            crate::error::RarFailure::EncryptedIntegrity {
+                                scope: crate::error::RarScope::Member { index: Some(member.ordinal) },
+                                reason: crate::error::RarIntegrityReason::UnverifiableLinkPassword,
+                                verifier,
+                            },
+                        ))));
+                    }
                     self.link_kind = Some(kind);
                 }
             }

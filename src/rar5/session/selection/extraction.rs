@@ -136,6 +136,11 @@ impl<'a> Extraction<'a> {
         if link.is_none() && (member.issue.is_some() || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
+        // an encrypted link is placed only on a password its check value verifies, before anything is touched
+        let evidence = match link {
+            Some(_) => super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?,
+            None => crate::error::RarPasswordEvidence::NotEncrypted,
+        };
         if !projectable_name(header, &member.wire.name) {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
@@ -224,7 +229,7 @@ impl<'a> Extraction<'a> {
         }
         if let Some(kind) = link {
             let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
-            return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind);
+            return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind, evidence);
         }
         let mut output = None;
         let mut sink = |chunk: &[u8]| {
@@ -420,16 +425,13 @@ impl<'a> Extraction<'a> {
         initial: Option<SourceStamp>,
         hooks: &mut impl ExtractionHooks,
         kind: Option<crate::extract::link::LinkKind>,
+        password: crate::error::RarPasswordEvidence,
     ) -> Result<RarOutcome, SelectedStop> {
         use crate::extract::link;
         let (kind, bytes, checks) = match kind {
             Some(kind) => {
-                let checks = RarVerification {
-                    size_checked: false,
-                    crc32_checked: false,
-                    blake2sp_checked: false,
-                    password: crate::error::RarPasswordEvidence::NotEncrypted,
-                };
+                let checks =
+                    RarVerification { size_checked: false, crc32_checked: false, blake2sp_checked: false, password };
                 (kind, 0, checks)
             }
             None => {
