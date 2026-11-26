@@ -174,6 +174,27 @@ fn a_missing_middle_piece_lists_and_extracts_what_comes_before_it() {
     assert!(result.errors[1].starts_with("missing volume"), "{:?}", result.errors);
 }
 
+/// Codex on #292: with `keep_broken`, `b.txt`, which runs into the missing piece, keeps the stored bytes the first
+/// piece holds instead of staying empty (the payload's declared end past what is there no longer stops the read).
+#[test]
+fn a_missing_middle_piece_keeps_what_comes_before_it_with_keep_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = vec![b'a'; 700];
+    let b = vec![b'b'; 700];
+    let c = vec![b'c'; 700];
+    let zip = stored_zip(&[("a.txt", &a), ("b.txt", &b), ("c.txt", &c)]);
+    for (i, piece) in zip.chunks(1024).enumerate() {
+        fs::write(dir.path().join(format!("gap.zip.{:03}", i + 1)), piece).unwrap();
+    }
+    fs::remove_file(dir.path().join("gap.zip.002")).unwrap();
+    let out = dir.path().join("out");
+    let opts = extract::Options { keep_broken: true, ..options(&out, Mode::Extract) };
+    let result = extract::run(&dir.path().join("gap.zip.001"), &opts, |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (1, 2), "{:?}", result.errors);
+    let kept = fs::read(out.join("b.txt")).unwrap();
+    assert!(!kept.is_empty() && kept.len() < 700 && kept.iter().all(|&x| x == b'b'), "{} bytes", kept.len());
+}
+
 #[test]
 fn a_listing_cut_short_by_a_missing_piece_says_so() {
     let dir = tempfile::tempdir().unwrap();

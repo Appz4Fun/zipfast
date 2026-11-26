@@ -580,7 +580,12 @@ fn data_at(file: &mut (impl Read + Seek), len: u64, e: &ReadDescription<'_>) -> 
         _ => Error::Truncated,
     })?;
     let layout = local_layout(header, e.local_at, len).map_err(|_| Error::Truncated)?;
-    Ok(layout.payload_range(e.packed, len).map_err(|_| Error::Truncated)?.start)
+    match layout.payload_range(e.packed, len) {
+        Ok(range) => Ok(range.start),
+        // Options::keep_broken: a payload running past what is there (a missing volume) is read to the cut
+        Err(_) if e.keep_cut => Ok(layout.payload_range(0, len).map_err(|_| Error::Truncated)?.start),
+        Err(_) => Err(Error::Truncated),
+    }
 }
 
 /// Reads an entry's data, decompressed, into `sink`, and checks its size and CRC.
@@ -715,10 +720,10 @@ fn read_entry(
             while left > 0 {
                 check()?;
                 let n = (left.min(buf.len() as u64)) as usize;
-                let got = fill(file, &mut buf[..n], e.keep_cut)?;
+                let (got, cut) = fill(file, &mut buf[..n], e.keep_cut)?;
                 emit(&buf[..got])?;
-                if got < n {
-                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                if let Some(cut) = cut {
+                    return Err(cut.into());
                 }
                 left -= n as u64;
             }
@@ -729,8 +734,7 @@ fn read_entry(
             let mut done = false;
             while !done {
                 let n = (left.min(buf.len() as u64)) as usize;
-                let got = fill(file, &mut buf[..n], e.keep_cut)?;
-                let cut = got < n;
+                let (got, mut cut) = fill(file, &mut buf[..n], e.keep_cut)?;
                 left -= n as u64;
                 let mut input = &buf[..got];
                 loop {
@@ -752,8 +756,8 @@ fn read_entry(
                         continue;
                     }
                     if input.is_empty() {
-                        if cut {
-                            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                        if let Some(cut) = cut.take() {
+                            return Err(cut.into());
                         }
                         if left == 0 {
                             return Err(Error::Corrupt("deflate data ends early"));
@@ -796,30 +800,23 @@ fn read_entry(
     Ok(())
 }
 
-/// Fills `buf`: whole (an error otherwise), or with `keep_cut` as much as is there before a cut (the count; the next
-/// read meets the cut).
-fn fill(file: &mut impl Read, buf: &mut [u8], keep_cut: bool) -> std::io::Result<usize> {
-    if keep_cut {
-        return read_up_to(file, buf);
+/// Fills `buf`: whole (an error otherwise), or with `keep_cut` as much as is there before a cut, with what cut it
+/// (the input's end, or its own I/O error, kept as it is so a failing source still stops the run).
+fn fill(file: &mut impl Read, buf: &mut [u8], keep_cut: bool) -> std::io::Result<(usize, Option<std::io::Error>)> {
+    if !keep_cut {
+        file.read_exact(buf)?;
+        return Ok((buf.len(), None));
     }
-    file.read_exact(buf)?;
-    Ok(buf.len())
-}
-
-/// Reads into `buf` until it is full, the input ends or fails: the count read (short: it ended or failed there).
-fn read_up_to(file: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut got = 0;
     while got < buf.len() {
         match file.read(&mut buf[got..]) {
-            Ok(0) => break,
+            Ok(0) => return Ok((got, Some(std::io::ErrorKind::UnexpectedEof.into()))),
             Ok(n) => got += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            // what was read before the failure first; the caller's next read meets it again
-            Err(_) if got > 0 => break,
-            Err(e) => return Err(e),
+            Err(e) => return Ok((got, Some(e))),
         }
     }
-    Ok(got)
+    Ok((got, None))
 }
 
 // The buffered codecs may consume several input windows before producing
@@ -1453,6 +1450,32 @@ mod tests {
 
     use std::io::{self, Write};
     use std::ops::Range;
+
+    /// Codex on #292: a partial read followed by a real input error gives the bytes and that error, not a made-up
+    /// end of input, so a failing source still stops the run (`keep_cut` or not); a short input gives an end.
+    #[test]
+    fn fill_keeps_the_input_error_after_a_partial_read() {
+        struct Failing(usize);
+        impl io::Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                let n = self.0.min(buf.len());
+                buf[..n].fill(7);
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let mut buf = [0u8; 16];
+        let (got, cut) = fill(&mut Failing(5), &mut buf, true).unwrap();
+        assert_eq!((got, cut.and_then(|e| e.raw_os_error())), (5, Some(libc::EIO)));
+        let (got, cut) = fill(&mut &[1u8, 2, 3][..], &mut buf, true).unwrap();
+        assert_eq!((got, cut.map(|e| e.kind())), (3, Some(io::ErrorKind::UnexpectedEof)));
+        let (got, cut) = fill(&mut &[1u8; 20][..], &mut buf, true).unwrap();
+        assert!(got == 16 && cut.is_none());
+        assert_eq!(fill(&mut Failing(5), &mut buf, false).unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
 
     #[test]
     fn unix_extra_seconds_follows_the_dos_year() {

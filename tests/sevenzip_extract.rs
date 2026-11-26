@@ -644,6 +644,22 @@ fn a_bad_folder_crc_holds_back_the_whole_block() {
     assert_eq!((summary.files, summary.errors.len()), (2, 0));
 }
 
+/// Codex on #292: with `keep_broken`, members that decoded whole but whose folder CRC fails stay (still reported
+/// failed), as 7-Zip keeps them.
+#[test]
+fn a_bad_folder_crc_keeps_the_block_with_keep_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = Built { folder_crc: Some(0xDEAD_BEEF), ..Built::default() };
+    let archive = write(dir.path(), &built.archive(&[vec![("a.txt", b"one"), ("b.txt", b"two")]]));
+    let out = dir.path().join("out");
+    let summary =
+        extract::run(&archive, &extract::Options { keep_broken: true, ..opts(Mode::Extract, &out) }, |_| {}).unwrap();
+    assert_eq!(summary.files, 0);
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"one");
+    assert_eq!(fs::read(out.join("b.txt")).unwrap(), b"two");
+}
+
 #[test]
 fn default_bounds_on_coders_and_properties() {
     let dir = tempfile::tempdir().unwrap();

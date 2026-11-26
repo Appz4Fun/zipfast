@@ -729,6 +729,11 @@ impl Run<'_> {
         if output.finish(|file| crate::extract::keep_written(file, &meta)).is_err() {
             return;
         }
+        Self::put_kept(temporary, place);
+    }
+
+    /// A kept broken file takes its name: as a verified one would, never through a link; best effort.
+    fn put_kept(temporary: tempfile::TempPath, place: Place) {
         let _ = match place.reserved {
             Some(reserved) if cfg!(unix) && !reserved.still_ours() => return,
             Some(reserved) => crate::output::replace(temporary, reserved.path()).map(|()| drop(reserved.into_parts())),
@@ -814,9 +819,24 @@ impl Run<'_> {
         let held = std::mem::take(&mut active.held);
         if !good {
             let why = active.failed.clone().unwrap_or_else(|| "checksum error in its solid block".to_owned());
+            // Options::keep_broken: every member held for the folder decoded whole and only the folder's CRC failed:
+            // they stay, as 7-Zip keeps them (not after a decode failure, and never a link)
+            let staged = if self.opts.keep_broken && complete {
+                let (kept, rest): (Vec<_>, Vec<_>) = staged.into_iter().partition(|s| s.link.is_none());
+                let names: Vec<(u64, String)> = kept.iter().map(|s| (s.ordinal, s.name.clone())).collect();
+                for s in kept {
+                    Self::put_kept(s.temporary, s.place);
+                }
+                (rest, names)
+            } else {
+                (staged, Vec::new())
+            };
+            let (staged, kept_names) = staged;
+            // kept or not, every member held for the folder failed with it
             let mut failed: Vec<(u64, &str)> = staged
                 .iter()
                 .map(|s| (s.ordinal, s.name.as_str()))
+                .chain(kept_names.iter().map(|(o, n)| (*o, n.as_str())))
                 .chain(tested.iter().map(|(n, _, o)| (*o, n.as_str())))
                 .collect();
             failed.sort_by_key(|(o, _)| *o);

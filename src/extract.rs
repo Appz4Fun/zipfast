@@ -2942,7 +2942,9 @@ impl Pending {
     /// with [`Options::keep_broken`]).
     fn discard(&mut self) {
         self.failed = true;
-        if let Some(meta) = self.keep.take() {
+        // a canceled run publishes nothing of the member in progress, kept or not
+        let canceled = self.cancel.as_ref().is_some_and(Cancellation::is_canceled);
+        if let Some(meta) = self.keep.take().filter(|_| !canceled) {
             self.keep_broken(&meta);
         }
         self.place = None;
@@ -5513,6 +5515,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// Options::keep_broken keeps what a failed member wrote, but a canceled run publishes nothing of the member in
+    /// progress (Codex on #292): its `discard` on cancellation leaves no file.
+    #[test]
+    fn a_kept_member_is_not_published_once_canceled() {
+        for canceled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("member");
+            let mut p = Pending::new(&FileHeader::default(), empty_context());
+            p.place = Some(Place::new(path.clone(), false));
+            p.keep = Some(Meta::default());
+            let cancel = Cancellation::default();
+            if canceled {
+                cancel.cancel();
+            }
+            p.cancel = Some(cancel);
+            p.open(None).unwrap();
+            p.take(b"partial").ok();
+            p.discard();
+            assert_eq!(path.exists(), !canceled, "canceled {canceled}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn persistent_metadata_attributes_are_independent() {
