@@ -228,8 +228,24 @@ impl<'a> Extraction<'a> {
             output.as_mut().unwrap().write_detailed(chunk).map_err(|error| error.detailed(false))
         };
         let outcome = run.test(session, index, Some(&mut sink))?;
-        let RarOutcome::Verified { bytes, checks, .. } = outcome else {
-            return Ok(outcome);
+        // Options::keep_broken: a member that fails on its own data is published as a verified one would be (every
+        // recheck and hook alike), with what was written, and reported failed; a canceled run publishes nothing
+        let (verified, broken) = match outcome {
+            RarOutcome::Verified { bytes, checks, .. } => (Some((bytes, checks)), None),
+            RarOutcome::Failed(failure)
+                if self.options.keep_broken && check_cancel(&session.options.cancel).is_ok() =>
+            {
+                (None, Some(failure))
+            }
+            outcome => return Ok(outcome),
+        };
+        // only a verified member is a target later links may resolve to (a kept broken one is not, as in the
+        // whole-archive runner)
+        let whole = verified.is_some();
+        let done = move || match (verified, broken) {
+            (Some((bytes, checks)), _) => RarOutcome::Verified { bytes, checks, output: RarOutput::Written },
+            (None, Some(failure)) => RarOutcome::Failed(failure),
+            (None, None) => unreachable!("one of the two"),
         };
         let output = match output {
             Some(output) => output,
@@ -265,8 +281,10 @@ impl<'a> Extraction<'a> {
         let selected = selected_relative(&relative, self.options.flatten).to_path_buf();
         if let Some(mode) = self.options.overwrite.rename() {
             let landed = self.publish_renamed(run, session, index, file, &target, initial, mode, hooks)?;
-            self.extracted.file(&self.options.dest, &selected, &landed);
-            return Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written });
+            if whole {
+                self.extracted.file(&self.options.dest, &selected, &landed);
+            }
+            return Ok(done());
         }
         hooks.before_publication(index, initial);
         // a link this run placed there is replaced (inspect_target let it through): publication checks it is still it
@@ -282,8 +300,10 @@ impl<'a> Extraction<'a> {
             file.publish_selected(initial.is_some(), link)
         }
         .map_err(|error| own_fault(error.detailed(false)))?;
-        self.extracted.file(&self.options.dest, &selected, &target);
-        Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
+        if whole {
+            self.extracted.file(&self.options.dest, &selected, &target);
+        }
+        Ok(done())
     }
 
     /// Publishes a verified stage for a rename mode. Nothing is replaced: every name is claimed with a no-replace

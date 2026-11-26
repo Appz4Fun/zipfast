@@ -247,6 +247,10 @@ impl NamedFile {
         }
         error.map_or(Ok(()), Err)
     }
+    /// A broken member kept (`Options::keep_broken`) is published at the length written, never more than reserved.
+    pub(in crate::zip::read) fn keep_length(&mut self, written: u64) {
+        self.bytes = self.bytes.min(written);
+    }
     pub(in crate::zip::read) fn published(&mut self) {
         debug_assert!(!self.fd_reserved && self.close_resolved && self.file.is_none());
         self.location = Location::None;
