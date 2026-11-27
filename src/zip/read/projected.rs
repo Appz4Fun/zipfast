@@ -1198,6 +1198,7 @@ fn checked_read_inner(
                         local_at: e.local_at,
                         aes_info: e.aes_info,
                         keep_cut: false,
+                        seven_zip_cut: false,
                     },
                     false,
                     false,

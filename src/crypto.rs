@@ -2209,6 +2209,49 @@ pub(crate) fn decrypt_winzip_aes_in_place<E>(
     Ok(Some(range))
 }
 
+/// The salt and password verifier a WinZip AES member of `strength` starts with, in bytes (None for an unknown
+/// strength).
+pub(crate) fn winzip_aes_header_len(strength: u8) -> Option<usize> {
+    (1..=3).contains(&strength).then(|| (usize::from(strength) + 1) * 4 + 2)
+}
+
+/// A WinZip AES member that a cut ends inside of, `data` being the bytes of it there and `packed` its declared size,
+/// decrypted in place as 7-Zip 26.06 decrypts it: its password verifier is checked, and the ciphertext there (up to
+/// where the authentication code would start) is decrypted without that code, which isn't there to check. The returned
+/// range is the plaintext; None when the salt and verifier aren't all there or the verifier doesn't match.
+pub(crate) fn decrypt_winzip_aes_cut_in_place<E>(
+    password: &str,
+    strength: u8,
+    data: &mut [u8],
+    packed: u64,
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<Option<std::ops::Range<usize>>, E> {
+    use subtle::ConstantTimeEq;
+
+    check()?;
+    let Some(header) = winzip_aes_header_len(strength) else { return Ok(None) };
+    if data.len() < header {
+        return Ok(None);
+    }
+    let key_len = (usize::from(strength) + 1) * 8;
+    let salt_len = key_len / 2;
+    let tag_at = usize::try_from(packed.saturating_sub(10)).unwrap_or(usize::MAX);
+    let range = header..data.len().min(tag_at).max(header);
+    let Some(derived) = derive_winzip_fixed(password.as_bytes(), &data[..salt_len], key_len) else {
+        return Ok(None);
+    };
+    if !bool::from(derived[2 * key_len..2 * key_len + 2].ct_eq(&data[salt_len..header])) {
+        return Ok(None);
+    }
+    let Some(cipher) = AesKey::new(&derived[..key_len]) else { return Ok(None) };
+    let mut counter = [0; 16];
+    for chunk in data[range.clone()].chunks_mut(64 << 10) {
+        check()?;
+        winzip_ctr_xor(&cipher, &mut counter, chunk);
+    }
+    Ok(Some(range))
+}
+
 /// Parses WinZip AES extra field `0x9901`: `(strength, actual_method)`.
 pub fn aes_extra(extra: &[u8]) -> Option<(u8, u16)> {
     let (strength, _, method) = aes_extra_info(extra)?;

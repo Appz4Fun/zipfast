@@ -214,8 +214,10 @@ pub struct Options {
     pub attempt_continued_members: bool,
     /// A ZIP whose end record is missing (one file cut short, not a split or spanned set) is read by walking its
     /// local headers, as 7-Zip 26.06 does: the members whose headers lie before the cut are tested or extracted, the
-    /// one the cut reaches fails as truncated (kept with [`Self::keep_broken`]), and the run reports the archive
-    /// truncated. Off (the default) such a file is refused as not a ZIP archive, because this reads what the checked
+    /// one the cut reaches fails as truncated (kept with [`Self::keep_broken`]; under [`DamagedInput::SevenZip`] it
+    /// then holds what 7-Zip keeps of it: a Deflate stream decoded as though bytes 0xFF followed, an encrypted member
+    /// decrypted without its authentication code, nothing of one whose encryption header the cut reaches), and the
+    /// run reports the archive truncated. Off (the default) such a file is refused as not a ZIP archive, because this reads what the checked
     /// route (which needs the central directory) refuses. An archive whose central directory is found is read as
     /// ever.
     pub salvage_truncated_zip: bool,
@@ -250,7 +252,8 @@ pub struct Options {
     /// [`crate::progressive::ProgressiveOptions::extract`] (reported as
     /// [`crate::progressive::ProgressiveEvent::HeaderDamaged`]; only bytes the source delivered are judged, a header
     /// still to come is waited on and one in a hole is `HeaderHole`). Persistent-partial sessions refuse a damaged
-    /// header whatever this says. 7z and ZIP ignore it.
+    /// header whatever this says. 7z ignores it; ZIP reads only [`DamagedInput::SevenZip`], which with
+    /// [`Self::salvage_truncated_zip`] and [`Self::keep_broken`] keeps a member cut short as 7-Zip keeps it.
     pub damaged_input: DamagedInput,
     /// What becomes of the bytes decoded of a member that then fails: withheld (the default) or handed over as UnRAR
     /// and 7-Zip do. For these runners it is a RAR member cut off by a missing volume: with
@@ -484,6 +487,14 @@ pub enum DamagedInput {
     /// byte was changed into one of these is passed over, with what it covered, and nothing is reported. A sound
     /// old-style block is passed over under [`Self::Salvage`] and [`Self::Resync`] too, as UnRAR 7.30 does, but is
     /// refused as unsupported under [`Self::Refuse`].
+    ///
+    /// A file header whose data the volume's end cuts short (a truncated archive) is listed and read with the data
+    /// there, as 7-Zip lists it (a header the end cuts is not): with [`Options::keep_broken`] the member keeps what
+    /// 7-Zip keeps of it (nothing of a compressed RAR 3.x/4.x member, which isn't decoded; the bytes there of a stored
+    /// one; a RAR 5.0 member as under [`Self::Salvage`]) and fails as truncated, and with [`UnverifiedOutput::Emit`]
+    /// a [`SelectedEntry`] or [`crate::rar5::session::RarSession::print_selected`] hands over the same bytes. A RAR
+    /// 3.x/4.x member cut off by a missing volume keeps nothing of a compressed one either, as `7z x`. See
+    /// `docs/compat-options.md`, "Cut members in 7z mode".
     SevenZip,
 }
 
@@ -837,6 +848,14 @@ pub struct SelectOptions {
     /// bytes as they decode, so for them it only adds that sign to the error. The default hands a 7z member over
     /// only once it checks out and fails a RAR member using such a filter as unsupported.
     pub unverified_output: UnverifiedOutput,
+    /// As [`Options::damaged_input`], only [`DamagedInput::SevenZip`] (anything else reads as
+    /// [`DamagedInput::Refuse`]): a RAR member the archive's end cuts short inside its data opens, as 7-Zip 26.06
+    /// lists it, and so does a member of one ZIP file whose end record is gone, found by walking its local headers
+    /// (as [`Options::salvage_truncated_zip`]). Its read fails as truncated; with [`UnverifiedOutput::Emit`] the sink
+    /// first gets what 7-Zip `x -so` prints of it (the stored bytes there; what decodes of a ZIP or RAR 5.0 member;
+    /// nothing of a compressed RAR 3.x/4.x one), with [`UnverifiedOutput::Withhold`] nothing of it. See
+    /// `docs/compat-options.md`, "Cut members in 7z mode".
+    pub damaged_input: DamagedInput,
 }
 
 impl SelectOptions {
@@ -862,6 +881,17 @@ impl SelectOptions {
         self.unverified_output = unverified_output;
         self
     }
+
+    /// Sets [`Self::damaged_input`].
+    pub fn damaged_input(mut self, damaged_input: DamagedInput) -> Self {
+        self.damaged_input = damaged_input;
+        self
+    }
+
+    /// The RAR reading [`Self::damaged_input`] selects: [`DamagedInput::SevenZip`] or [`DamagedInput::Refuse`].
+    fn rar_damaged_input(self) -> DamagedInput {
+        if self.damaged_input == DamagedInput::SevenZip { DamagedInput::SevenZip } else { DamagedInput::Refuse }
+    }
 }
 
 impl From<&Options> for SelectOptions {
@@ -870,6 +900,7 @@ impl From<&Options> for SelectOptions {
             special_entries: options.special_entries,
             compressed_tar: options.compressed_tar,
             unverified_output: options.unverified_output,
+            damaged_input: options.damaged_input,
         }
     }
 }
@@ -1887,24 +1918,6 @@ fn walk(
     })
 }
 
-fn walk_until(
-    vol: Volume,
-    password: Option<&str>,
-    cancel: Option<&Cancellation>,
-    mut on_block: impl FnMut(&mut Volume, Block) -> Result<bool>,
-) -> Result<u64> {
-    let mut observer = SelectedReadObserver::default();
-    walk_until_observed(
-        vol,
-        password,
-        cancel,
-        &mut observer,
-        DamagedInput::Refuse,
-        &mut Vec::new(),
-        |vol, block, _, _| on_block(vol, block),
-    )
-}
-
 #[allow(clippy::too_many_arguments)] // one walk for listing, selected reads and salvage
 fn walk_until_observed(
     mut vol: Volume,
@@ -2299,6 +2312,7 @@ enum SelectedSource {
         chain_start: usize,
         name: String,
         rar4: bool,
+        damaged: DamagedInput,
     },
     /// A 7z member: read by decoding its folder up to it (see [`crate::sevenzip::print_selected_with`]).
     SevenZip {
@@ -2308,6 +2322,12 @@ enum SelectedSource {
     /// A member of a split ZIP set (Info-ZIP `.z01`... `.zip`, or a byte split `.zip.001`...), read through the
     /// set's volumes as `extract::run` reads them.
     SplitZip {
+        path: PathBuf,
+        archive: Box<crate::zip::Archive>,
+    },
+    /// A member of one ZIP file cut short, its end record gone, found by walking its local headers: only with
+    /// [`SelectOptions::damaged_input`] [`DamagedInput::SevenZip`], as 7-Zip 26.06 reads it.
+    TruncatedZip {
         path: PathBuf,
         archive: Box<crate::zip::Archive>,
     },
@@ -2326,6 +2346,20 @@ fn split_zip_selected(
     cancel: &Cancellation,
 ) -> Result<(Box<crate::zip::Archive>, bool, Meta)> {
     let archive = crate::zip::Archive::open_cancelable(path, Some(cancel))?;
+    let entry = archive.selected_entry(index, limit)?;
+    let meta = Meta { mtime: entry.mtime, nanos: entry.nanos, mode: entry.unix_mode() };
+    let windows_names = entry.host != 3;
+    Ok((Box::new(archive), windows_names, meta))
+}
+
+/// One ZIP file cut short, opened for one selected entry by walking its local headers, as [`split_zip_selected`].
+fn truncated_zip_selected(
+    path: &Path,
+    index: usize,
+    limit: u64,
+    cancel: &Cancellation,
+) -> Result<(Box<crate::zip::Archive>, bool, Meta)> {
+    let archive = crate::zip::Archive::open_truncated(path, Some(cancel))?;
     let entry = archive.selected_entry(index, limit)?;
     let meta = Meta { mtime: entry.mtime, nanos: entry.nanos, mode: entry.unix_mode() };
     let windows_names = entry.host != 3;
@@ -2605,7 +2639,7 @@ impl SelectedEntry {
                     cancel,
                 });
             }
-            Format::Other => match rar_selected_header(path, index, password, &cancel) {
+            Format::Other => match rar_selected_header(path, index, password, &cancel, select.rar_damaged_input()) {
                 Ok((header, chain_start)) => {
                     if header.is_dir() || header.redirection.is_some() {
                         return Err(Error::Unsupported("the selected RAR5 entry is not a regular file".into()));
@@ -2624,6 +2658,7 @@ impl SelectedEntry {
                             chain_start,
                             rar4: header.format == RarFormat::Rar4,
                             name: header.name,
+                            damaged: select.rar_damaged_input(),
                         },
                         cancel,
                     });
@@ -2662,7 +2697,24 @@ impl SelectedEntry {
             }
             Format::Zip => {}
         }
-        let archive = crate::zip::read::ProjectedOwner::open_legacy(path, &cancel)?;
+        let archive = match crate::zip::read::ProjectedOwner::open_legacy(path, &cancel) {
+            // DamagedInput::SevenZip: one file cut short is read from its local headers, as on the checked route
+            Err(Error::NotAnArchive)
+                if select.damaged_input == DamagedInput::SevenZip && crate::zip::salvageable(path) =>
+            {
+                let (archive, windows_names, meta) = truncated_zip_selected(path, index, limit, &cancel)?;
+                return Ok(Self {
+                    meta,
+                    windows_names,
+                    index,
+                    limit,
+                    unverified: select.unverified_output,
+                    source: SelectedSource::TruncatedZip { path: path.to_path_buf(), archive },
+                    cancel,
+                });
+            }
+            archive => archive?,
+        };
         let entry =
             archive.entries().get(index).ok_or_else(|| Error::Unsupported("entry index is out of range".into()))?;
         crate::zip::check_selected_legacy(entry, limit)?;
@@ -2784,10 +2836,11 @@ impl SelectedEntry {
                 });
             }
             CheckedRoute::Legacy(LegacyRoute::Rar { signature, path: held_path }) => {
-                let volume = Volume::from_held_signature(&held_path, signature, password, DamagedInput::Refuse)
+                let damaged = select.rar_damaged_input();
+                let volume =
+                    Volume::from_held_signature(&held_path, signature, password, damaged).map_err(ReadFault::Legacy)?;
+                let (header, chain_start) = rar_selected_header_from_volume(volume, index, password, &cancel, damaged)
                     .map_err(ReadFault::Legacy)?;
-                let (header, chain_start) =
-                    rar_selected_header_from_volume(volume, index, password, &cancel).map_err(ReadFault::Legacy)?;
                 if header.is_dir() || header.redirection.is_some() {
                     return Err(ReadFault::Legacy(Error::Unsupported(
                         "the selected RAR5 entry is not a regular file".into(),
@@ -2811,12 +2864,30 @@ impl SelectedEntry {
                         chain_start,
                         rar4: header.format == RarFormat::Rar4,
                         name: header.name,
+                        damaged,
                     },
                     cancel,
                 });
             }
         };
-        let owner = opened.into_zip(&cancel)?;
+        let owner = match opened.into_zip(&cancel) {
+            // DamagedInput::SevenZip: one file whose end record is gone is read by walking its local headers, as
+            // 7-Zip lists and reads it (Options::salvage_truncated_zip in a whole-archive run)
+            Err(error) if select.damaged_input == DamagedInput::SevenZip && salvages_cut_zip(path, &error) => {
+                let (archive, windows_names, meta) =
+                    truncated_zip_selected(path, index, max_bytes, &cancel).map_err(ReadFault::Legacy)?;
+                return Ok(Self {
+                    meta,
+                    windows_names,
+                    index,
+                    limit: max_bytes,
+                    unverified: select.unverified_output,
+                    source: SelectedSource::TruncatedZip { path: path.to_path_buf(), archive },
+                    cancel,
+                });
+            }
+            owner => owner?,
+        };
         let selection = (|| -> crate::zip::ZipReadResult<_> {
             let entry =
                 owner.entries().get(index).ok_or(ReadFault::CheckedFormat { reason: "entry index is out of range" })?;
@@ -2912,7 +2983,9 @@ impl SelectedEntry {
             SelectedSource::Tar(selected) => &selected.name,
             SelectedSource::Rar { name, .. } => name,
             SelectedSource::SevenZip { name, .. } => name,
-            SelectedSource::SplitZip { archive, .. } => &archive.entries[self.index].name,
+            SelectedSource::SplitZip { archive, .. } | SelectedSource::TruncatedZip { archive, .. } => {
+                &archive.entries[self.index].name
+            }
         }
     }
 
@@ -2998,7 +3071,7 @@ impl SelectedEntry {
                 observer.notify(0, selected.source_path(), SelectedReadRole::Selected, Some(&self.cancel))?;
                 selected.read(&mut checked_sink)
             }
-            SelectedSource::Rar { path, chain_start, name, .. } => {
+            SelectedSource::Rar { path, chain_start, name, damaged, .. } => {
                 let selection = RarSelection {
                     sink: &mut checked_sink,
                     emit: false,
@@ -3007,11 +3080,16 @@ impl SelectedEntry {
                     decoded_left: self.limit,
                     cancel: &self.cancel,
                 };
-                rar_read_at(&path, chain_start, self.index, &name, password, selection, observer, emit)
+                rar_read_at(&path, chain_start, self.index, &name, password, selection, observer, emit, damaged)
             }
             SelectedSource::SplitZip { path, mut archive } => {
                 observer.notify(0, &path, SelectedReadRole::Selected, Some(&self.cancel))?;
                 archive.read_at_cancelable(self.index, password, self.limit, Some(&self.cancel), &mut checked_sink)
+            }
+            // what is there of a member the cut reaches goes to the sink only with UnverifiedOutput::Emit
+            SelectedSource::TruncatedZip { path, mut archive } => {
+                observer.notify(0, &path, SelectedReadRole::Selected, Some(&self.cancel))?;
+                archive.read_truncated_at(self.index, password, self.limit, Some(&self.cancel), emit, &mut checked_sink)
             }
             SelectedSource::SevenZip { path, name } => {
                 observer.notify(0, &path, SelectedReadRole::Selected, Some(&self.cancel))?;
@@ -3063,20 +3141,23 @@ fn rar_selected_header(
     index: usize,
     password: Option<&str>,
     cancel: &Cancellation,
+    damaged: DamagedInput,
 ) -> Result<(FileHeader, usize)> {
-    let volume = Volume::open_with_password(path, password)?;
-    rar_selected_header_from_volume(volume, index, password, cancel)
+    let volume = Volume::open_damaged(path, password, damaged)?;
+    rar_selected_header_from_volume(volume, index, password, cancel, damaged)
 }
 fn rar_selected_header_from_volume(
     volume: Volume,
     index: usize,
     password: Option<&str>,
     cancel: &Cancellation,
+    damaged: DamagedInput,
 ) -> Result<(FileHeader, usize)> {
     let mut current = 0;
     let mut chain_start = None;
     let mut header = None;
-    walk_until(volume, password, Some(cancel), |_, block| {
+    let mut observer = SelectedReadObserver::default();
+    walk_until_observed(volume, password, Some(cancel), &mut observer, damaged, &mut Vec::new(), |_, block, _, _| {
         if let Block::File(file) = block
             && !file.split_before()
         {
@@ -3461,8 +3542,13 @@ pub fn run_with_zip_context(
 /// by walking its local headers ([`LegacyRoute::TruncatedZip`]); an intact archive never gets here.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn salvages_truncated(first: &Path, options: &Options, error: &crate::zip::ZipReadError) -> bool {
-    options.salvage_truncated_zip
-        && matches!(error.operation(), Some(crate::zip::ReadFault::CheckedFormat { reason: "not a ZIP archive" }))
+    options.salvage_truncated_zip && salvages_cut_zip(first, error)
+}
+/// The checked route found no end record in one file that [`salvages_truncated`] may read by walking its local
+/// headers (whatever the options say).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn salvages_cut_zip(first: &Path, error: &crate::zip::ZipReadError) -> bool {
+    matches!(error.operation(), Some(crate::zip::ReadFault::CheckedFormat { reason: "not a ZIP archive" }))
         && error.cleanup_errors().len() == 0
         && !error.is_source_changed()
         && crate::zip::salvageable(first)
@@ -4182,6 +4268,24 @@ fn emit_cut_short(
     }
 }
 
+/// [`DamagedInput::SevenZip`]: the data of a member the archive's end cuts short has all been fed; what 7-Zip 26.06
+/// `x` keeps of it goes to `p` too. A cipher block cut short is dropped (7-Zip decrypts whole blocks only), and of a
+/// compressed RAR 5.0 member (`stream`, given only with [`UnverifiedOutput::Emit`]) every symbol starting before the
+/// end is decoded, as for UnRAR ([`emit_cut_short`]; 7-Zip's last few bytes can differ). A compressed RAR 3.x/4.x
+/// member never gets here: 7-Zip keeps none of it, so it isn't decoded. What `flush_cut` returns is the sink's own
+/// failure (a symbol that doesn't decode just ends it).
+fn emit_seven_zip_cut(
+    p: &mut Pending,
+    selection: Option<&mut RarSelection<'_>>,
+    stream: Option<&mut Unpacker>,
+) -> std::result::Result<(), MemberDecodeError> {
+    if let Some(cipher) = p.cipher.as_mut() {
+        cipher.rem.clear();
+    }
+    let Some(stream) = stream.filter(|_| p.compressed) else { return Ok(()) };
+    with_member_sink(p, selection, |sink| stream.flush_cut(sink))
+}
+
 fn with_rar4_member_sink(
     pending: &mut Pending,
     selection: Option<&mut RarSelection<'_>>,
@@ -4899,6 +5003,7 @@ fn rar_read_at(
     selection: RarSelection<'_>,
     observer: &mut SelectedReadObserver<'_>,
     unfiltered: bool,
+    damaged: DamagedInput,
 ) -> Result<()> {
     let opts = Options {
         mode: Mode::Test,
@@ -4921,7 +5026,7 @@ fn rar_read_at(
         keep_broken: false,
         attempt_continued_members: false,
         encrypted_links: Default::default(),
-        damaged_input: Default::default(),
+        damaged_input: damaged,
         // SelectOptions::unverified_output: a VM filter zipfast doesn't run leaves its block unfiltered, as 7-Zip `x -so`
         unsupported_filters: if unfiltered { UnsupportedFilters::WriteUnfiltered } else { UnsupportedFilters::Fail },
         unverified_output: Default::default(),
@@ -4941,17 +5046,21 @@ fn rar_read_at(
     let mut prerequisite = false;
     let mut complete = false;
     observer.notify(0, first, SelectedReadRole::Header, Some(cancel))?;
-    let volume = Volume::open_with_password(first, run.password)?;
+    let volume = Volume::open_damaged(first, run.password, damaged)?;
     run.rar5_keys = volume.rar5_keys().clone();
     walk_until_observed(
         volume,
         run.password,
         Some(cancel),
         observer,
-        DamagedInput::Refuse,
+        damaged,
         &mut Vec::new(),
         |volume, block, volume_index, observer| {
-            let Block::File(header) = block else { return Ok(false) };
+            let Block::File(mut header) = block else { return Ok(false) };
+            // DamagedInput::SevenZip: a member the archive's end cuts short is read from the bytes there
+            if let Some(crate::rar5::HeaderCut::Data { present }) = header.cut {
+                header.packed_size = present;
+            }
             if !header.split_before() {
                 if run.pending.is_some() {
                     return Err(Error::Truncated);
@@ -5106,7 +5215,10 @@ impl Run<'_, '_, '_> {
         }
         let mut sink = PendingSink { pending: p, fault: None };
         if let Some(decoder) = self.rar4.as_mut() {
-            let _ = decoder.flush_decoded(&mut sink);
+            // DamagedInput::SevenZip: 7-Zip 26.06 writes nothing more of a compressed RAR 3.x/4.x member cut off
+            if self.opts.damaged_input != DamagedInput::SevenZip {
+                let _ = decoder.flush_decoded(&mut sink);
+            }
         } else if let Some(stream) = self.stream.as_mut() {
             let _ = stream.flush_cut(&mut sink);
         }
@@ -5136,10 +5248,12 @@ impl Run<'_, '_, '_> {
     /// [`DamagedInput::Salvage`]: whether `h` is a member the end of an archive cut short ends inside the data of
     /// ([`crate::rar5::HeaderCut::Data`]), decoded on this thread as UnRAR 7.30 decodes it, reading on past the end as
     /// zeros ([`emit_cut_short`]): its checks decide on those bytes, as UnRAR's do, and a file kept with
-    /// [`Options::keep_broken`] holds what `unrar x -kb` keeps. A `SelectedEntry` never meets one (it reads as under
-    /// [`DamagedInput::Refuse`]).
+    /// [`Options::keep_broken`] holds what `unrar x -kb` keeps. A `SelectedEntry` meets one only under
+    /// [`DamagedInput::SevenZip`] ([`SelectOptions::damaged_input`]), which reads it as 7-Zip does
+    /// ([`emit_seven_zip_cut`]).
     fn reads_past_cut(&self, h: &FileHeader) -> bool {
-        self.selection.is_none() && matches!(h.cut, Some(crate::rar5::HeaderCut::Data { .. }))
+        (self.selection.is_none() || self.opts.damaged_input == DamagedInput::SevenZip)
+            && matches!(h.cut, Some(crate::rar5::HeaderCut::Data { .. }))
     }
 
     /// Whether `h` can go to the workers whole: a small file standing alone in one volume.
@@ -6201,6 +6315,12 @@ impl Run<'_, '_, '_> {
             }
             return Ok(());
         }
+        let seven_zip_cut = cut_short && self.opts.damaged_input == DamagedInput::SevenZip;
+        if seven_zip_cut && p.compressed && h.format == RarFormat::Rar4 {
+            // 7-Zip 26.06 writes nothing of a compressed RAR 3.x/4.x member cut short: it isn't decoded
+            self.lost_history(&p.context, None);
+            return self.fail_seven_zip_cut(h, p);
+        }
         if let Some(selection) = &mut self.selection {
             selection.cancel.check_io().map_err(|e| invariant("selected RAR cancellation", e.into()))?;
             selection.packed_left = selection.packed_left.checked_sub(h.packed_size).ok_or_else(|| {
@@ -6325,7 +6445,15 @@ impl Run<'_, '_, '_> {
                 };
                 // a member cut short: its last cipher block's bytes go on undecrypted (emit_cut_short)
                 if cut_short { Ok(()) } else { padding }.and_then(|()| {
-                    if cut_short {
+                    if seven_zip_cut {
+                        // what 7-Zip keeps of it; it fails below whatever its checks would say
+                        let emit = match &self.selection {
+                            Some(selection) => selection.unverified,
+                            None => self.opts.unverified_output == UnverifiedOutput::Emit,
+                        };
+                        emit_seven_zip_cut(&mut p, self.selection.as_mut(), stream.as_mut().filter(|_| emit))
+                            .map_err(|error| sink_fault(error, &p, None))
+                    } else if cut_short {
                         // its checks decide below, on what UnRAR decodes of it
                         emit_cut_short(&mut p, rar4.as_mut(), stream.as_mut())
                     } else if let Some(decoder) = rar4.as_mut() {
@@ -6403,6 +6531,9 @@ impl Run<'_, '_, '_> {
             if p.compressed {
                 self.lost_history(&p.context, None);
             }
+            if seven_zip_cut {
+                return self.fail_seven_zip_cut(h, p);
+            }
             return self.finish_file_checks(h, p);
         }
         self.stream = stream.or(self.stream.take());
@@ -6431,6 +6562,26 @@ impl Run<'_, '_, '_> {
             return Ok(());
         }
         self.finish_file_checks(h, p)
+    }
+
+    /// [`DamagedInput::SevenZip`]: a member the archive's end cuts short inside its data fails as the cut, as 7-Zip
+    /// 26.06 fails it ("Data Error", or "CRC Failed" for a stored RAR 4.x member) whatever its checks would say of
+    /// what decoded ([`emit_seven_zip_cut`]); a file kept with [`Options::keep_broken`] holds what 7-Zip's does,
+    /// nothing of a compressed RAR 3.x/4.x member.
+    fn fail_seven_zip_cut(&mut self, h: &FileHeader, mut p: Pending) -> RunResult<()> {
+        if p.compressed && h.format == RarFormat::Rar4 {
+            p.declared = Some(0);
+        }
+        p.discard();
+        let failure = p.context.integrity(RarIntegrityReason::TruncatedData, false);
+        if self.selection.is_some() {
+            // a selected read fails with it, after what went to its sink
+            return Err(RarFault::new(failure, Error::Truncated).into());
+        }
+        if !p.passive && !p.hidden {
+            self.fail_in_order(&p.context, failure, "archive is truncated")?;
+        }
+        Ok(())
     }
 
     /// A file's last part is in: checks it whole and finishes it.
