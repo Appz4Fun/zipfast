@@ -47,6 +47,7 @@ fn options(dest: &Path, keep: bool, threads: usize) -> Options {
         replace_placed_links: false,
         keep_broken: keep,
         attempt_continued_members: false,
+        encrypted_links: Default::default(),
         damaged_input: Default::default(),
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),

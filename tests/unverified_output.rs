@@ -70,6 +70,7 @@ fn options(dest: &Path, keep: bool, unverified: UnverifiedOutput, threads: usize
         replace_placed_links: false,
         keep_broken: keep,
         attempt_continued_members: false,
+        encrypted_links: Default::default(),
         damaged_input: Default::default(),
         unsupported_filters: Default::default(),
         unverified_output: unverified,

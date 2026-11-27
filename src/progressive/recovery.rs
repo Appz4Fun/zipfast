@@ -1252,6 +1252,7 @@ mod tests {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                encrypted_links: Default::default(),
                 damaged_input: Default::default(),
                 unsupported_filters: Default::default(),
                 unverified_output: Default::default(),
