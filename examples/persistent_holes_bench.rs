@@ -223,6 +223,7 @@ fn options(dest: &Path, first: &OsString) -> ProgressiveOptions {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
             salvage_truncated_zip: false,

@@ -304,6 +304,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             replace_placed_links: false,
                             keep_broken: false,
                             attempt_continued_members: false,
+                            encrypted_links: Default::default(),
                             damaged_input: Default::default(),
                             unsupported_filters: Default::default(),
                             salvage_truncated_zip: false,
