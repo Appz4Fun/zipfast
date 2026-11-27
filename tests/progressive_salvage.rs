@@ -382,6 +382,10 @@ fn cases() -> Vec<(&'static str, Volumes)> {
         let mut damaged_main = bytes.clone();
         damaged_main[main] ^= 0x5a;
         cases.push((if format == "rar5" { "rar5 main crc" } else { "rar4 main crc" }, one(damaged_main)));
+        // the main header's type byte hit: it reads as a block of an unknown type
+        let mut retyped = bytes.clone();
+        retyped[if format == "rar5" { main + 5 } else { main + 2 }] = if format == "rar5" { 6 } else { 0x70 };
+        cases.push((if format == "rar5" { "rar5 main type" } else { "rar4 main type" }, one(retyped)));
         let mut junk = bytes[..at[1]].to_vec();
         junk.extend(garbage(300));
         junk.extend(&bytes[at[1]..]);

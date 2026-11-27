@@ -141,6 +141,11 @@ impl ProgressiveSession {
             self.main_seen = true;
             return Ok(false);
         }
+        if !self.main_seen && !matches!(frame.block, Block::Main(_)) {
+            // the volume's first header is damaged and reads as something else (a main header whose type byte was
+            // hit): read on with an empty main header, as the whole-archive runners do
+            self.main_seen = true;
+        }
         Ok(true)
     }
     /// The header at the parser's offset is damage of `kind`: searched past under `Resync`, else the rest of the
