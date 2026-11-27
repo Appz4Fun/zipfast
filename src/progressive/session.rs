@@ -458,6 +458,7 @@ impl ProgressiveSession {
             return Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage })));
         }
         if matches!(self.phase, Phase::Done) {
+            self.extraction_active = false;
             return Poll::Ready(Ok(None));
         }
         self.control.register(cx.waker());
@@ -473,7 +474,10 @@ impl ProgressiveSession {
                     | Ok(None
                         | Some(ProgressiveEvent::MemberFinished { .. } | ProgressiveEvent::SessionTerminated { .. }))
             )
-        ) {
+        ) || matches!(self.phase, Phase::Done)
+        {
+            // a session that reached its end is no longer extracting, whatever its last event (a damaged end
+            // header's HeaderDamaged, say)
             self.extraction_active = false;
         }
         result

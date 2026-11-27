@@ -878,3 +878,51 @@ fn damage_found_by_the_last_read_is_delivered() {
         assert_eq!(out.damage, [(0, at[3] as u64, HeaderDamageKind::ChecksumMismatch, None, None)], "{route:?}");
     }
 }
+
+/// A session whose last event is a `HeaderDamaged` (its end header failed its checksum) has ended: the artifacts it
+/// handed out can be verified afterwards, not refused as if extraction were still going on.
+#[test]
+fn artifacts_verify_after_a_session_that_ended_on_damage() {
+    let (mut bytes, at) = rar5();
+    bytes[at[3]] ^= 0x5a;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    let mut options =
+        ProgressiveOptions::new(extract_options(&dest, Mode::Extract, DamagedInput::Salvage), OsString::from("a.rar"));
+    options.artifact_aftermath = ArtifactAftermath::RetainProvisional;
+    let revealed = Arc::new(AtomicU64::new(u64::MAX));
+    let provider =
+        Provider { volumes: vec![bytes], revealed, gate: 0..0, open: Arc::new(AtomicBool::new(true)), hole: false };
+    let mut session = ProgressiveSession::new(Box::new(provider), options).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut artifacts = Vec::new();
+    let mut last = None;
+    loop {
+        match session.poll_event(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Ok(Some(event))) => {
+                last = Some(matches!(event, ProgressiveEvent::HeaderDamaged { .. }));
+                if let ProgressiveEvent::MemberFinished { outcome: MemberOutcome::Provisional(artifact), .. } = event {
+                    artifacts.push(artifact);
+                }
+            }
+            Poll::Ready(Err(failure)) => panic!("{failure}"),
+        }
+    }
+    assert_eq!(last, Some(true), "the last event is the end header's damage");
+    assert_eq!(artifacts.len(), 3);
+    for mut artifact in artifacts {
+        let verdict = loop {
+            match session.poll_verify(&mut artifact, &mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(verdict) => break verdict,
+            }
+        };
+        if let Err(failure) = &verdict {
+            assert!(!matches!(failure.kind, FailureKind::InvalidCapability), "{failure}");
+        }
+        artifact.discard().unwrap();
+    }
+}
