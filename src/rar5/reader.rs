@@ -93,6 +93,30 @@ impl SourceError {
     }
 }
 
+/// Reads `buf.len()` bytes of a volume at `at`. Every read of a volume's bytes goes through this (here and in
+/// [`crate::batch::stored_detailed`]), so a test can check that each byte is read once.
+pub(crate) fn read_volume(file: &File, buf: &mut [u8], at: u64) -> std::result::Result<(), PositionReadError> {
+    #[cfg(all(test, unix))]
+    count_read(file, at, buf.len());
+    read_at_detailed(file, buf, at)
+}
+
+/// A volume read in tests: the file's (device, inode), where, and how many bytes.
+#[cfg(all(test, unix))]
+pub(crate) type VolumeRead = ((u64, u64), u64, u64);
+
+/// Every volume read in tests.
+#[cfg(all(test, unix))]
+pub(crate) static VOLUME_READS: std::sync::Mutex<Vec<VolumeRead>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, unix))]
+fn count_read(file: &File, at: u64, len: usize) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = file.metadata() {
+        VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).push(((meta.dev(), meta.ino()), at, len as u64));
+    }
+}
+
 /// Bytes read from a volume at a time. Headers and the data of small files after them come in together, so a
 /// run of small files takes one read for several of them.
 const READ: usize = 1 << 20;
@@ -207,7 +231,7 @@ fn read_ahead(
         let n = (len - at).min(READ as u64) as usize;
         let mut buf = spares.lock().ok().and_then(|s| s.try_recv().ok()).unwrap_or_default();
         buf.resize(n, 0);
-        let read = read_at_detailed(file, &mut buf, at).map(|()| buf);
+        let read = read_volume(file, &mut buf, at).map(|()| buf);
         let failed = read.is_err();
         if send.send(read).is_err() || failed {
             return;
@@ -217,17 +241,11 @@ fn read_ahead(
 }
 
 impl Source {
-    fn new(file: File, len: u64) -> Source {
-        Source {
-            file,
-            len,
-            piece: Piece::new(Vec::new(), None),
-            at: 0,
-            off: 0,
-            sequential: false,
-            ahead: None,
-            readers: 1,
-        }
+    /// A source whose first piece is `head`, the volume's first bytes as they were read to find its signature, so
+    /// they aren't read again. At most `len` of them are kept.
+    fn new(file: File, len: u64, mut head: Vec<u8>) -> Source {
+        head.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+        Source { file, len, piece: Piece::new(head, None), at: 0, off: 0, sequential: false, ahead: None, readers: 1 }
     }
 
     /// What is left of the piece in use.
@@ -303,7 +321,7 @@ impl Source {
                     // the first piece after a move is read here; read on past it, and the thread takes over
                     let mut buf = used;
                     buf.resize((self.len - from).min(READ as u64) as usize, 0);
-                    read_at_detailed(&self.file, &mut buf, from).map_err(SourceError::Read)?;
+                    read_volume(&self.file, &mut buf, from).map_err(SourceError::Read)?;
                     self.sequential = true;
                     Piece::new(buf, None)
                 }
@@ -350,30 +368,41 @@ fn signature_location(head: &[u8]) -> Result<(u64, RarFormat)> {
     super::framing::SignatureParser::default().advance(head).1.ok_or(Error::NotAnArchive)
 }
 
+fn signature_fault(e: Error) -> RarFault {
+    let failure = match e {
+        Error::NotAnArchive => RarFailure::NotRar,
+        _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
+    };
+    RarFault::new(failure, e)
+}
+
 #[cfg(all(test, unix))]
 thread_local! {
     pub(crate) static VOLUME_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Recognition and its initial held data handle cannot become separated.
+/// Recognition and its initial held data handle cannot become separated. The bytes read to recognize it (from the
+/// start of the file) are kept, so the volume doesn't read them again.
 pub(crate) struct HeldSignature {
     file: File,
     len: u64,
     next: u64,
     format: RarFormat,
+    head: Vec<u8>,
 }
 impl HeldSignature {
-    pub(crate) fn recognize(file: File, len: u64, head: &[u8]) -> std::result::Result<Self, File> {
-        match signature_location(head) {
-            Ok((next, format)) => Ok(Self { file, len, next, format }),
+    pub(crate) fn recognize(file: File, len: u64, head: Vec<u8>) -> std::result::Result<Self, File> {
+        match signature_location(&head) {
+            Ok((next, format)) => Ok(Self { file, len, next, format, head }),
             Err(_) => Err(file),
         }
     }
 }
 impl Volume {
     pub(crate) fn from_held_signature(path: &Path, signature: HeldSignature, password: Option<&str>) -> Result<Self> {
-        let HeldSignature { file, len, next, format } = signature;
-        Self::initialize_held(path, file, len, password, next, format, false, None).map_err(RarFault::into_legacy)
+        let HeldSignature { file, len, next, format, head } = signature;
+        Self::initialize_held(path, file, len, password, (head, next, format), false, None)
+            .map_err(RarFault::into_legacy)
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn from_held_signature_detailed(
@@ -381,8 +410,34 @@ impl Volume {
         signature: HeldSignature,
         password: Option<&str>,
     ) -> RarResult<Self> {
-        let HeldSignature { file, len, next, format } = signature;
-        Self::initialize_held(path, file, len, password, next, format, true, None)
+        let HeldSignature { file, len, next, format, head } = signature;
+        Self::initialize_held(path, file, len, password, (head, next, format), true, None)
+    }
+    /// Opens the volume in `file` (at `path`), whose first bytes `head` were read already (to tell its format): they
+    /// are kept rather than read again, and only what the signature search needs past them is read.
+    pub(crate) fn open_head(path: &Path, file: File, head: Vec<u8>, password: Option<&str>) -> Result<Volume> {
+        Self::open_head_impl(path, file, head, password, false).map_err(RarFault::into_legacy)
+    }
+    pub(crate) fn open_head_detailed(
+        path: &Path,
+        file: File,
+        head: Vec<u8>,
+        password: Option<&str>,
+    ) -> RarResult<Volume> {
+        Self::open_head_impl(path, file, head, password, true)
+    }
+    fn open_head_impl(
+        path: &Path,
+        file: File,
+        head: Vec<u8>,
+        password: Option<&str>,
+        detailed: bool,
+    ) -> RarResult<Volume> {
+        #[cfg(all(test, unix))]
+        VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
+        let len = volume_length(path, || file.metadata())?;
+        let found = Self::probe_head(path, &file, len, head)?;
+        Self::initialize_held(path, file, len, password, found, detailed, None)
     }
     pub fn open(path: &Path) -> Result<Volume> {
         Self::open_with_password(path, None)
@@ -402,9 +457,12 @@ impl Volume {
         #[cfg(all(test, unix))]
         VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
         let len = volume_length(path, || file.metadata())?;
-        Self::open_file(path, file, len, password, detailed, None)
+        let found = Self::probe_head(path, &file, len, Vec::new())?;
+        Self::initialize_held(path, file, len, password, found, detailed, None)
     }
 
+    /// Opens a volume for the catalogue, whose reads are counted by `budget`: it reads the signature's bytes, and
+    /// searches the rest of the window only when they aren't one.
     pub(super) fn open_catalogue(
         path: &Path,
         file: File,
@@ -412,52 +470,51 @@ impl Volume {
         password: Option<&str>,
         budget: &mut ScanBudget<'_>,
     ) -> RarResult<Self> {
-        Self::open_file(path, file, len, password, true, Some(budget))
-    }
-
-    fn open_file(
-        path: &Path,
-        file: File,
-        len: u64,
-        password: Option<&str>,
-        detailed: bool,
-        mut budget: Option<&mut ScanBudget<'_>>,
-    ) -> RarResult<Volume> {
-        let first = if let Some(budget) = budget.as_deref_mut() {
-            let mut first = [0; SIGNATURE.len()];
-            let used = len.min(SIGNATURE.len() as u64) as usize;
-            budget.read(&file, path, &mut first[..used], 0)?;
-            Some((first, used))
-        } else {
-            None
-        };
-        let (next, format) = if let Some((first, _)) = first
-            && first == *SIGNATURE
-        {
+        let mut first = [0; SIGNATURE.len()];
+        let used = len.min(SIGNATURE.len() as u64) as usize;
+        budget.read(&file, path, &mut first[..used], 0)?;
+        let (next, format) = if first == *SIGNATURE {
             (SIGNATURE.len() as u64, RarFormat::Rar5)
-        } else if let Some((first, _)) = first
-            && first.starts_with(SIGNATURE_V4)
-        {
+        } else if first.starts_with(SIGNATURE_V4) {
             (SIGNATURE_V4.len() as u64, RarFormat::Rar4)
         } else {
-            Self::probe_signature(path, &file, len, first, budget.as_deref_mut())?
+            Self::probe_signature(path, &file, len, (first, used), budget)?
         };
-        Self::initialize_held(path, file, len, password, next, format, detailed, budget)
+        Self::initialize_held(path, file, len, password, (Vec::new(), next, format), true, Some(budget))
     }
-    #[allow(clippy::too_many_arguments)] // Shared post-recognition legacy initialization.
+
+    /// The signature's end and the format, searched for in the volume's first bytes: `head` (read already, from the
+    /// start of the file), and as much more of the window as the search needs. The bytes read are returned with it,
+    /// for the volume's first piece, so nothing is read twice.
+    fn probe_head(path: &Path, file: &File, len: u64, mut head: Vec<u8>) -> RarResult<(Vec<u8>, u64, RarFormat)> {
+        head.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+        if let Ok((next, format)) = signature_location(&head) {
+            return Ok((head, next, format));
+        }
+        let want = len.min(SIGNATURE_PROBE_BYTES) as usize;
+        let have = head.len();
+        if have < want {
+            head.try_reserve_exact(want - have).map_err(|_| allocation())?;
+            head.resize(want, 0);
+            read_volume(file, &mut head[have..], have as u64)
+                .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
+        }
+        let (next, format) = signature_location(&head).map_err(signature_fault)?;
+        Ok((head, next, format))
+    }
+
     fn initialize_held(
         path: &Path,
         file: File,
         len: u64,
         password: Option<&str>,
-        next: u64,
-        format: RarFormat,
+        (head, next, format): (Vec<u8>, u64, RarFormat),
         detailed: bool,
         budget: Option<&mut ScanBudget<'_>>,
     ) -> RarResult<Volume> {
         let mut vol = Volume {
             path: path.to_path_buf(),
-            src: Source::new(file, len),
+            src: Source::new(file, len, head),
             next,
             len,
             main: MainHeader::default(),
@@ -486,33 +543,20 @@ impl Volume {
         Ok(vol)
     }
 
+    /// The catalogue's search of the rest of the signature window, past the `first` bytes it read.
     fn probe_signature(
         path: &Path,
         file: &File,
         len: u64,
-        first: Option<([u8; SIGNATURE.len()], usize)>,
-        budget: Option<&mut ScanBudget<'_>>,
+        (first, used): ([u8; SIGNATURE.len()], usize),
+        budget: &mut ScanBudget<'_>,
     ) -> RarResult<(u64, RarFormat)> {
         let len = len.min(SIGNATURE_PROBE_BYTES) as usize;
-        if let (Some(budget), Some((_, used))) = (&budget, first) {
-            budget.check_read(len - used)?;
-        }
+        budget.check_read(len - used)?;
         let mut head = header_buffer(len)?;
-        if let Some(budget) = budget {
-            let (first, used) = first.expect("catalogue probe reads the signature prefix");
-            head[..used].copy_from_slice(&first[..used]);
-            budget.read(file, path, &mut head[used..], used as u64)?;
-        } else {
-            read_at_detailed(file, &mut head, 0)
-                .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
-        }
-        signature_location(&head).map_err(|e| {
-            let failure = match e {
-                Error::NotAnArchive => RarFailure::NotRar,
-                _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
-            };
-            RarFault::new(failure, e)
-        })
+        head[..used].copy_from_slice(&first[..used]);
+        budget.read(file, path, &mut head[used..], used as u64)?;
+        signature_location(&head).map_err(signature_fault)
     }
 
     /// The next block, or None at the physical end of the volume.
@@ -680,8 +724,21 @@ impl Volume {
         result
     }
 
+    /// The bytes from `at` on (no more than `len`) that the volume holds already from its last read: a caller that
+    /// reads the range itself can take these and start past them.
+    pub(crate) fn held_at(&self, at: u64, len: u64) -> &[u8] {
+        let bytes = self.src.piece.bytes();
+        match at.checked_sub(self.src.at).and_then(|skip| usize::try_from(skip).ok()) {
+            Some(skip) if skip < bytes.len() => {
+                let n = usize::try_from(len).unwrap_or(usize::MAX).min(bytes.len() - skip);
+                &bytes[skip..skip + n]
+            }
+            _ => &[],
+        }
+    }
+
     /// The open volume, for reads by position.
-    pub fn file(&mut self) -> &File {
+    pub fn file(&self) -> &File {
         &self.src.file
     }
 
@@ -816,7 +873,7 @@ mod tests {
         let file = File::open(&path).unwrap();
         let mut volume = Volume {
             path: path.clone(),
-            src: Source::new(file, 1),
+            src: Source::new(file, 1, Vec::new()),
             next: 0,
             len: 1,
             main: MainHeader::default(),
@@ -855,7 +912,7 @@ mod tests {
         std::fs::write(&path, b"one byte").unwrap();
         let mut volume = Volume {
             path: path.clone(),
-            src: Source::new(File::open(&path).unwrap(), 1),
+            src: Source::new(File::open(&path).unwrap(), 1, Vec::new()),
             next: 0,
             len: 1,
             main: MainHeader::default(),
@@ -896,7 +953,7 @@ mod tests {
         for readers in [1, 2, 3] {
             // from the start, from just past it (read on through), and from a far place (started again there)
             for start in [0, 13, 5 * READ + 77] {
-                let mut src = Source::new(File::open(&path).unwrap(), data.len() as u64);
+                let mut src = Source::new(File::open(&path).unwrap(), data.len() as u64, Vec::new());
                 src.readers = readers;
                 src.seek(start as u64);
                 let mut got = Vec::new();
