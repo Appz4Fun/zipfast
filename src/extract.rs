@@ -1445,15 +1445,21 @@ pub(crate) fn create_sparse_target(place: Place, size: Option<u64>) -> Result<Ou
     create_target_with(place, size, true).map_err(crate::error::RarFault::into_legacy)
 }
 
-/// A broken file kept ([`Options::keep_broken`]): cut to what was written (a preallocated file is longer), then its
+/// A broken file kept ([`Options::keep_broken`]): cut to what was written (a preallocated file is longer), and to
+/// `declared` (the member's declared size, when known: UnRAR 7.30 `x -kb` and 7-Zip 26.06 `x` keep no more), then its
 /// times and mode set.
-pub(crate) fn keep_written(file: &File, meta: &Meta) {
+pub(crate) fn keep_written(file: &File, meta: &Meta, declared: Option<u64>) {
     use std::io::Seek;
     let mut handle = file;
     if let Ok(written) = handle.stream_position() {
-        let _ = file.set_len(written);
+        let _ = file.set_len(declared.map_or(written, |size| written.min(size)));
     }
     finish_file(file, meta);
+}
+
+/// `len` cut to `size`.
+pub(crate) fn clamp_len(size: u64, len: usize) -> usize {
+    usize::try_from(size).map_or(len, |size| size.min(len))
 }
 
 pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::error::RarResult<Output> {
@@ -2769,6 +2775,7 @@ impl SelectedEntry {
                 let selection = RarSelection {
                     sink: &mut checked_sink,
                     emit: false,
+                    unverified: emit,
                     packed_left: self.limit,
                     decoded_left: self.limit,
                     cancel: &self.cancel,
@@ -3481,6 +3488,10 @@ pub(crate) struct Pending {
     orphan: bool,
     /// [`UnsupportedFilters::WriteUnfiltered`]: a block was written unfiltered, so it is kept unchecked and fails
     unfiltered: bool,
+    /// its declared size, None when unknown: nothing past it is written (a member carrying more fails its size
+    /// check; kept with [`Options::keep_broken`], or handed over under [`UnverifiedOutput::Emit`], it stops there,
+    /// as UnRAR 7.30 and 7-Zip 26.06 write it)
+    declared: Option<u64>,
 }
 
 /// A symbolic link being extracted: created once its target is decoded and checked.
@@ -3524,6 +3535,15 @@ impl Pending {
             keep: None,
             orphan: false,
             unfiltered: false,
+            declared: (!h.size_unknown()).then_some(h.unpacked_size),
+        }
+    }
+
+    /// How much of `len` more bytes still lies within the declared size (all of them when it is unknown).
+    pub(crate) fn within_declared(&self, len: usize) -> usize {
+        match self.declared {
+            Some(size) => usize::try_from(size.saturating_sub(self.checks.bytes)).map_or(len, |room| room.min(len)),
+            None => len,
         }
     }
 
@@ -3562,11 +3582,12 @@ impl Pending {
         };
         let Some(mut out) = out else { return };
         if let Some(mem) = self.mem.take()
-            && out.write_detailed(&mem).is_err()
+            && out.write_detailed(&mem[..self.declared.map_or(mem.len(), |size| clamp_len(size, mem.len()))]).is_err()
         {
             return;
         }
-        let _ = out.finish_detailed(|file| keep_written(file, meta));
+        let declared = self.declared;
+        let _ = out.finish_detailed(|file| keep_written(file, meta, declared));
     }
 
     pub(crate) fn hash_key(&self, keyed: bool) -> Option<&[u8; 32]> {
@@ -3599,6 +3620,7 @@ impl Pending {
             }
         }
         let new_size = self.bytes.checked_add(chunk.len() as u64).ok_or_else(RarFault::counter_limit)?;
+        let written = self.within_declared(chunk.len());
         admit(chunk)?;
         if let Some(mem) = self.mem.as_mut() {
             mem.extend_from_slice(chunk);
@@ -3612,7 +3634,8 @@ impl Pending {
             b.update(chunk);
         }
         if let Some(out) = self.out.as_mut()
-            && let Err(error) = out.write_detailed(chunk)
+            && written != 0
+            && let Err(error) = out.write_detailed(&chunk[..written])
         {
             // a failure writing the output stops the run: what was written is never kept (Options::keep_broken)
             self.keep = None;
@@ -3834,6 +3857,9 @@ fn with_member_sink(
 struct RarSelection<'a> {
     sink: &'a mut dyn FnMut(&[u8]) -> Result<()>,
     emit: bool,
+    /// [`SelectOptions::unverified_output`] is `Emit`: nothing past the member's declared size goes to the sink, and
+    /// a RAR 5.0 member running past it hands over its output up to it, as 7-Zip 26.06 `x -so` streams it
+    unverified: bool,
     packed_left: u64,
     decoded_left: u64,
     cancel: &'a Cancellation,
@@ -3848,15 +3874,17 @@ impl Sink for SelectedSink<'_, '_> {
     fn put(&mut self, chunk: &[u8]) -> Result<()> {
         self.selection.cancel.check_io()?;
         let before = self.pending.bytes;
+        let within = self.pending.within_declared(chunk.len()) as u64;
         self.pending.take(chunk)?;
         let count = self.pending.bytes - before;
+        let shown = if self.selection.unverified { count.min(within) } else { count };
         self.selection.decoded_left = self
             .selection
             .decoded_left
             .checked_sub(count)
             .ok_or_else(|| Error::Unsupported("RAR5 decoding exceeds the decoded byte limit".into()))?;
-        if self.selection.emit && count > 0 {
-            (self.selection.sink)(&chunk[..count as usize])?;
+        if self.selection.emit && shown > 0 {
+            (self.selection.sink)(&chunk[..shown as usize])?;
         }
         Ok(())
     }
@@ -5351,7 +5379,7 @@ impl Run<'_, '_, '_> {
             if let Some(place) = place.take().filter(|_| self.opts.keep_broken && !link) {
                 let meta = self.opts.meta(Meta::from(h));
                 if let Ok(out) = create_target_detailed(place, None) {
-                    let _ = out.finish_detailed(|file| keep_written(file, &meta));
+                    let _ = out.finish_detailed(|file| keep_written(file, &meta, None));
                 }
             }
             let failure = ctx.integrity(RarIntegrityReason::Decoder("its start is in an earlier volume"), false);
@@ -5508,6 +5536,14 @@ impl Run<'_, '_, '_> {
                     Err(e) => Err(e),
                 }
             };
+            if ready.is_ok()
+                && let Some(u) = self.stream.as_mut()
+            {
+                // a member running past its declared size is written to it first, for a file kept with
+                // Options::keep_broken or a SelectedEntry under UnverifiedOutput::Emit (what UnRAR 7.30 `x -kb` and
+                // 7-Zip 26.06 `x` / `x -so` hand over); otherwise nothing of it is kept or shown, as before
+                u.write_to_size(self.opts.keep_broken || self.selection.as_ref().is_some_and(|s| s.unverified));
+            }
             if let Err(e) = ready {
                 p.discard();
                 let (failure, legacy) = e.detailed(p.context.scope()).into_parts();
@@ -6336,7 +6372,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("member");
         std::fs::write(&path, b"").unwrap();
-        let mut p = Pending::new(&FileHeader::default(), empty_context());
+        // declaring room for the bytes, so they are written (nothing past a declared size is)
+        let header = FileHeader { unpacked_size: 4, ..FileHeader::default() };
+        let mut p = Pending::new(&header, empty_context());
         p.keep = Some(Meta::default());
         // a read-only handle: every write to it fails
         p.out = Some(crate::output::Output::created(File::open(&path).unwrap(), Some(4), path.clone()));
@@ -6396,7 +6434,8 @@ mod tests {
             let mut held = crate::rar5::unpack::rar4::Rar4Decoder::new_with_cancel(65536, 1, 1, 4 << 20, None).unwrap();
             std::mem::swap(&mut held, &mut decoder);
             run.rar4 = Some(held);
-            let mut p = Pending::new(&FileHeader::default(), empty_context());
+            let header = FileHeader { unpacked_size: 1 << 20, ..FileHeader::default() };
+            let mut p = Pending::new(&header, empty_context());
             p.compressed = true;
             p.keep = Some(Meta::default());
             // a read-only handle: every write to it fails
@@ -6469,7 +6508,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("readonly");
         fs::write(&path, b"keep").unwrap();
-        let mut pending = Pending::new(&FileHeader::default(), empty_context());
+        let header = FileHeader { unpacked_size: 2, ..FileHeader::default() };
+        let mut pending = Pending::new(&header, empty_context());
         pending.out = Some(Output::new(File::open(&path).unwrap(), Some(1)));
         let result = with_member_sink(&mut pending, None, |sink| {
             let _ = sink.put(b"x");

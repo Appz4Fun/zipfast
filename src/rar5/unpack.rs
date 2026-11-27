@@ -686,6 +686,9 @@ pub struct Unpacker {
     /// the current file's declared size, None when unknown
     size: Option<u64>,
     size_failure: Option<(u64, u64)>,
+    /// [`Self::write_to_size`]: a file found running past its declared size first has its output up to that size
+    /// emitted
+    write_to_size: bool,
     tables_ready: bool,
     /// the code lengths the next block without tables is read with, which a worker may still be reading, and the
     /// lengths `tables` was last built from
@@ -893,6 +896,7 @@ impl Unpacker {
             emitted: 0,
             size: None,
             size_failure: None,
+            write_to_size: false,
             tables_ready: false,
             slot: Slot::filled(None),
             built: None,
@@ -1023,7 +1027,7 @@ impl Unpacker {
         }
         let r = self.settle(u64::MAX, sink);
         self.files_goal = 0;
-        r
+        self.flush_to_size(r, sink)
     }
 
     /// Starts the next file of a solid stream: the window, tables and history carry on.
@@ -1447,6 +1451,7 @@ impl Unpacker {
                                     self.size_failure = self
                                         .size
                                         .map(|size| (size, (sp - self.file_base).saturating_add(u64::from(len))));
+                                    sp = copy_to_end::<SPILLS>(win, sp, d, size_end);
                                 }
                                 break 'apply Err(e.into_legacy());
                             }
@@ -1464,7 +1469,8 @@ impl Unpacker {
     /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted. Blocks
     /// that arrive whole are decoded where they lie; only a block split across calls is gathered first.
     pub fn feed(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<()> {
-        self.feed_from(data, None, sink)
+        let r = self.feed_from(data, None, sink);
+        self.flush_to_size(r, sink)
     }
 
     /// [`Self::feed`] with the bytes in `range` of `piece`. Blocks that lie whole in it, with their padding, go to the
@@ -1476,7 +1482,8 @@ impl Unpacker {
         sink: &mut dyn Sink,
     ) -> Result<()> {
         let from = range.start;
-        self.feed_from(&piece.bytes()[range], Some((piece, from)), sink)
+        let r = self.feed_from(&piece.bytes()[range], Some((piece, from)), sink);
+        self.flush_to_size(r, sink)
     }
 
     /// `data` is at `base` in `piece`, given one.
@@ -1560,16 +1567,36 @@ impl Unpacker {
 
     /// Applies everything handed to the workers so far, leaving a block still coming in as it is.
     pub fn wait(&mut self, sink: &mut dyn Sink) -> Result<()> {
-        self.settle(0, sink)
+        let r = self.settle(0, sink);
+        self.flush_to_size(r, sink)
     }
 
     /// The file's packed bytes are all in. Emits what is left and checks the stream ended where it should.
     pub fn finish(&mut self, sink: &mut dyn Sink) -> Result<()> {
-        self.settle(0, sink)?;
-        if !self.input.is_empty() {
-            return Err(Error::Truncated);
+        let r = self.settle(0, sink).and_then(|()| {
+            if !self.input.is_empty() {
+                return Err(Error::Truncated);
+            }
+            self.check_end(sink)
+        });
+        self.flush_to_size(r, sink)
+    }
+
+    /// Off by default. On, a file found running past its declared size (a "more data than the header says"
+    /// failure) first has its output up to that size emitted, as UnRAR 7.30 (`x -kb`, `p`) and 7-Zip 26.06 (`x`,
+    /// `x -so`) write it, for a caller keeping or handing over a failing member's bytes; the failure is returned all
+    /// the same.
+    pub(crate) fn write_to_size(&mut self, on: bool) {
+        self.write_to_size = on;
+    }
+
+    /// [`Self::write_to_size`] after `result`.
+    fn flush_to_size(&mut self, result: Result<()>, sink: &mut dyn Sink) -> Result<()> {
+        if result.is_err() && self.write_to_size && self.size_failure.is_some() {
+            // the window holds the file up to its declared end; a pending filter may still hold some of it back
+            self.flush(sink)?;
         }
-        self.check_end(sink)
+        result
     }
 
     /// A whole block, `buf` being its payload and padding; `shared` says where it lies in a piece the workers may
@@ -1804,6 +1831,7 @@ impl Unpacker {
             if let Err(e) = copied {
                 if matches!(e, MatchCopyError::Size) {
                     *size_failure = size.map(|size| (size, (sp - file_base).saturating_add(u64::from(len))));
+                    sp = copy_to_end::<SPILLS>(window, sp, d, size_end);
                 }
                 break Err(e.into_legacy());
             }
@@ -2456,6 +2484,18 @@ impl MatchCopyError {
                     .into(),
             ),
         }
+    }
+}
+
+/// A match running past the file's declared end: the part before it goes into the window (UnRAR 7.30 and 7-Zip
+/// 26.06 write a file to its declared size and no further). Returns the stream position after it.
+#[cold]
+fn copy_to_end<const SPILLS: bool>(window: Win<'_>, sp: u64, dist: u64, size_end: u64) -> u64 {
+    let room = size_end.saturating_sub(sp);
+    // the whole match didn't fit, so what does is shorter than it (a u32)
+    match u32::try_from(room) {
+        Ok(room) if room != 0 && copy::<SPILLS>(window, sp, room, dist, size_end).is_ok() => sp + u64::from(room),
+        _ => sp,
     }
 }
 

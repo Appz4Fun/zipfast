@@ -478,6 +478,26 @@ one to the end of the data (55,084 bytes for `r5-partial`), and a `SelectedEntry
 | a wrong password, LZMA folder (`-pwrong enc.7z`) | nothing, "Data Error in encrypted file. Wrong password?" | nothing |
 | a wrong password, Copy folder (`-pwrong enc_copy.7z`) | the decrypted garbage, "CRC Failed in encrypted file. Wrong password?" | the same bytes |
 
+### A member carrying more than its declared size
+
+A member whose data gives more bytes than its header declares fails its size check, and every reference mode stops
+at the declared size: UnRAR 7.30 `x -kb` and `p` (exit 3, checksum error) and 7-Zip 26.06 `x` and `x -so` (exit 2,
+"CRC Failed" or "Data Error") write exactly the declared bytes, for RAR 5.0 and RAR 4.x (stored, LZ, PPMd), 7z (Copy,
+LZMA, LZMA2) and ZIP (stored, Deflate). zipfast does the same in every route: a file kept with `keep_broken` (RAR,
+ZIP on both routes, 7z), `RarSession` extraction and printing under `Emit`, `sevenzip::print_selected_with_options`
+and `SelectedEntry` under `Emit` (whose `UnverifiedWritten::bytes` is then the declared size). Without `keep_broken`
+the file is removed as before; a `SelectedEntry` under `Withhold` streams as before.
+
+| `tests/fixtures/declared-size` | member | declared | carried | every mode writes |
+| --- | --- | --- | --- | --- |
+| `r5-stored.rar`, `r4-stored.rar`, `zip-stored.zip` | stored | 1 | 60,000 | 1 byte |
+| `r5-lz.rar` (`-m3`), `zip-deflate.zip` | compressed | 1,000 | 211,990 | 1,000 bytes |
+| `r4-lz.rar` (RAR 2.9 LZ), `r4-ppmd.rar` (PPMd) | compressed | 100, 1,000 | 787, 98,304 | 100, 1,000 bytes |
+| `7z-copy.7z`, `7z-lzma.7z`, `7z-lzma2.7z` | folder unpack size | 1,000 | 12,000 | 1,000 bytes |
+
+`tests/declared_size.rs` checks each point, on the calling thread and on decode workers, and a stored RAR 5.0 member
+declaring 1 byte and carrying 5,000,000.
+
 Not covered: a Copy folder whose header gives fewer packed than unpacked bytes is refused as malformed headers
 (7-Zip streams the packed bytes and reports "Data Error"); an LZMA2 folder big enough to be decoded on several threads
 hands over only what its threads finished before the error. `tests/unverified_output.rs` checks each point against the
