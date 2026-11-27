@@ -143,6 +143,20 @@ fn decoder_threads() -> Option<usize> {
     )
 }
 
+/// Waits (a few seconds at most) for the decoder threads to be gone. The workers are joined when the run ends, but
+/// Linux may still list an exited thread under /proc for a moment after its join returns, so a count taken right
+/// away can see one. A worker that is really still running stays and fails the wait.
+fn decoder_threads_after_run() -> Option<usize> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let now = decoder_threads()?;
+        if now == 0 || std::time::Instant::now() >= deadline {
+            return Some(now);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
@@ -208,7 +222,7 @@ fn session_threads_decide_the_decoder_workers() {
         eprintln!("decoder threads can't be counted here");
         return;
     }
-    assert_eq!(decoder_threads(), Some(0), "none before");
+    assert_eq!(decoder_threads_after_run(), Some(0), "none before");
     let first = fixture("rar5-threads/solid.rar");
     for (threads, most) in [(None, (cores() - 1).min(16)), (Some(1), 0), (Some(3), 2)] {
         let mut session = RarSession::open(&first, None, session_options(threads, None)).unwrap();
@@ -222,7 +236,7 @@ fn session_threads_decide_the_decoder_workers() {
         } else {
             assert!((1..=most).contains(seen), "{threads:?}: {seen} workers, at most {most}");
         }
-        assert_eq!(decoder_threads(), Some(0), "{threads:?}: the workers stop with the run");
+        assert_eq!(decoder_threads_after_run(), Some(0), "{threads:?}: the workers stop with the run");
     }
 }
 
@@ -263,7 +277,7 @@ fn cancelling_with_blocks_on_the_workers_stops_the_run() {
         let result = session.extract_selected(&all, &options(&out, None, None), RarDecodeLimits::default(), |_| {});
         done.store(true, Ordering::Relaxed);
         let written = watcher.join().unwrap();
-        if let Some(threads) = decoder_threads() {
+        if let Some(threads) = decoder_threads_after_run() {
             assert_eq!(threads, 0, "the workers stop with the run");
         }
         match result {
