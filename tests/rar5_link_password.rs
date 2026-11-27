@@ -60,6 +60,7 @@ fn options(dest: &Path, mode: Mode) -> Options {
         encrypted_links: Default::default(),
         damaged_input: Default::default(),
         unsupported_filters: Default::default(),
+        unverified_output: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
@@ -230,6 +231,7 @@ fn progressive_options_with(
             Poll::Ready(Ok(None)) => return Ok(outcomes),
             Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(match outcome {
                 MemberOutcome::Verified(_) | MemberOutcome::Tested(_) => "ok".into(),
+                MemberOutcome::Skipped(extract::RarSkipReason::ExistingTarget) => "skipped".into(),
                 _ => "other".into(),
             }),
             Poll::Ready(Ok(Some(ProgressiveEvent::SessionTerminated { failure, .. }))) => {
@@ -876,4 +878,167 @@ fn verify_first_derives_a_link_key_once_on_a_progressive_session() {
     let budget =
         (1..=4096).find(|&b| run(EncryptedLinks::Verify, b).is_ok()).expect("a budget that fits one derivation");
     assert_eq!(run(EncryptedLinks::VerifyFirst, budget), Ok(vec!["ok".to_string(); 2]));
+}
+
+/// An unencrypted redirection member.
+fn clear_link<'a>(name: &'a str, kind: u64, target: &str) -> FileSpec<'a> {
+    FileSpec { extra: redirection(kind, target), unix_mode: Some(0o120777), no_crc: true, ..FileSpec::new(name, b"") }
+}
+
+/// Prybar's r5enclinks.rar shape: a file, then a symbolic link to it and a hard link and a copy of it, in a folder.
+fn write_linked(dir: &Path, encrypted: bool) -> std::path::PathBuf {
+    let path = dir.join(format!("linked-{encrypted}.rar"));
+    let link =
+        |name, kind, target| if encrypted { link(name, kind, target, true) } else { clear_link(name, kind, target) };
+    let files = [
+        FileSpec::new("t/plain", b"plain"),
+        link("t/lnk", 1, "plain"),
+        link("t/f", 4, "t/plain"),
+        link("t/c", 5, "t/plain"),
+    ];
+    fs::write(&path, archive(&files)).unwrap();
+    path
+}
+
+/// Each member's outcome on the whole-archive runner, a RarSession and a progressive session into `dest/<route>`.
+fn three_routes(arc: &Path, dest: &Path, opts: impl Fn(&Path) -> Options, password: Option<&str>) -> [Outcomes; 3] {
+    let [whole, session] = routes(arc, dest, &opts, password);
+    let progressive = progressive_with(arc, opts(&dest.join("progressive")), password).unwrap_or_else(|e| vec![e]);
+    [whole, session, progressive]
+}
+
+fn assert_linked(dest: &Path) {
+    for route in ["whole", "session", "progressive"] {
+        let dir = dest.join(route).join("t");
+        assert_eq!(fs::read_link(dir.join("lnk")).unwrap(), Path::new("plain"), "{route}");
+        assert_eq!(fs::read(dir.join("f")).unwrap(), b"plain", "{route}");
+        assert_eq!(fs::read(dir.join("c")).unwrap(), b"plain", "{route}");
+    }
+}
+
+/// Prybar's UnRAR mode: `unrar x -o- -ppw r5enclinks.rar` over the outputs of an earlier run is "All OK": `-o-` skips
+/// every existing target, the symbolic link placed before and the hard link whose target this run skipped too. Under
+/// Overwrite::Skip every route skips each one as an existing target, before its link target or the folder it would
+/// be placed through is looked at, encrypted (the right password, under each EncryptedLinks) or not.
+#[test]
+fn a_second_run_under_skip_skips_every_existing_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    for encrypted in [false, true] {
+        let arc = write_linked(tmp.path(), encrypted);
+        let all = [EncryptedLinks::Verify, EncryptedLinks::VerifyFirst, EncryptedLinks::PlaceUnverified];
+        for links in if encrypted { &all[..] } else { &all[..1] } {
+            let dest = tmp.path().join(format!("{encrypted}-{links:?}"));
+            let skip = |dest: &Path| Options { overwrite: Overwrite::Skip, ..with_links(dest, Mode::Extract, *links) };
+            for outcomes in three_routes(&arc, &dest, skip, Some(PASSWORD)) {
+                assert_eq!(outcomes, vec!["ok"; 4], "first run, encrypted {encrypted} {links:?}");
+            }
+            assert_linked(&dest);
+            for (route, outcomes) in
+                ["whole", "session", "progressive"].into_iter().zip(three_routes(&arc, &dest, skip, Some(PASSWORD)))
+            {
+                assert_eq!(outcomes, vec!["skipped"; 4], "second run, {route}, encrypted {encrypted} {links:?}");
+            }
+            assert_linked(&dest);
+        }
+    }
+}
+
+/// The skip is for an existing target only: under Overwrite::Skip a link that would be placed (nothing at its name)
+/// is still refused for a target leaving the destination or a hard link to a file this run didn't extract.
+#[test]
+fn a_link_placed_under_skip_is_still_checked() {
+    let tmp = tempfile::tempdir().unwrap();
+    for encrypted in [false, true] {
+        let arc = tmp.path().join(format!("unsafe-{encrypted}.rar"));
+        let link = |name, kind, target| {
+            if encrypted { link(name, kind, target, true) } else { clear_link(name, kind, target) }
+        };
+        let files = [link("esc", 1, "../../outside"), link("hard", 4, "missing"), FileSpec::new("plain", b"plain")];
+        fs::write(&arc, archive(&files)).unwrap();
+        let dest = tmp.path().join(format!("out-{encrypted}"));
+        let skip = |dest: &Path| Options { overwrite: Overwrite::Skip, ..options(dest, Mode::Extract) };
+        let [whole, session, progressive] = three_routes(&arc, &dest, skip, Some(PASSWORD));
+        assert_eq!(whole, ["target", "target", "ok"], "encrypted {encrypted}");
+        assert_eq!(session, ["target", "target", "ok"], "encrypted {encrypted}");
+        assert_eq!(progressive, ["UnsafePath"], "encrypted {encrypted}");
+        for route in ["whole", "session", "progressive"] {
+            for name in ["esc", "hard"] {
+                assert!(fs::symlink_metadata(dest.join(route).join(name)).is_err(), "{route} {name} was placed");
+            }
+        }
+    }
+}
+
+/// A plain file whose target is a symbolic link (one an earlier run placed, say) is skipped under Overwrite::Skip on
+/// every route, as UnRAR's `-o-` skips it, with nothing written through the link or over it.
+#[test]
+fn a_file_over_an_existing_symlink_is_skipped_under_skip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = tmp.path().join("file.rar");
+    fs::write(&arc, archive(&[FileSpec::new("t/lnk", b"new"), FileSpec::new("t/plain", b"plain")])).unwrap();
+    let dest = tmp.path().join("out");
+    for route in ["whole", "session", "progressive"] {
+        let dir = dest.join(route).join("t");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("elsewhere", dir.join("lnk")).unwrap();
+    }
+    let skip = |dest: &Path| Options { overwrite: Overwrite::Skip, ..options(dest, Mode::Extract) };
+    for (route, outcomes) in ["whole", "session", "progressive"].into_iter().zip(three_routes(&arc, &dest, skip, None))
+    {
+        assert_eq!(outcomes, ["skipped", "ok"], "{route}");
+        let dir = dest.join(route).join("t");
+        assert_eq!(fs::read_link(dir.join("lnk")).unwrap(), Path::new("elsewhere"), "{route}");
+        assert!(fs::symlink_metadata(dir.join("elsewhere")).is_err(), "{route}: written through the link");
+    }
+}
+
+/// The controlled RarSession route skips the same way under RarOverwriteMode::Skip: a second run reports every
+/// existing link Skipped(ExistingTarget) and asks the observer nothing.
+#[test]
+fn a_second_controlled_run_under_skip_skips_every_existing_link() {
+    use zipfast::extract::RarSkipReason;
+    use zipfast::rar5::session::*;
+    struct Collect(Vec<(u64, String)>);
+    impl RarExtractObserver for Collect {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("Skip asks nothing")
+        }
+        fn entry(&mut self, entry: &extract::RarEntryOutcome, _: RarDiagnostic<'_>) {
+            let label = match &entry.outcome {
+                RarOutcome::Skipped(RarSkipReason::ExistingTarget) => "skipped".to_string(),
+                other => classify(other),
+            };
+            self.0.push((entry.entry.order, label));
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    for encrypted in [false, true] {
+        let arc = write_linked(tmp.path(), encrypted);
+        let dest = tmp.path().join(format!("out-{encrypted}"));
+        for expected in ["ok", "skipped"] {
+            let mut session = RarSession::open(&arc, Some(PASSWORD), RarSessionOptions::default()).unwrap();
+            let all = session.select(|_| true).unwrap();
+            let mut control = RarExtractControl::new(None, RarOverwriteMode::Skip, RarExtractControlLimits::default());
+            let mut observer = Collect(Vec::new());
+            let opts = Options { overwrite: Overwrite::Skip, ..options(&dest, Mode::Extract) };
+            let report = session.extract_selected_controlled(
+                &all,
+                &opts,
+                RarDecodeLimits::default(),
+                &mut control,
+                &mut observer,
+            );
+            report.outcome().as_ref().unwrap();
+            drop(report);
+            observer.0.sort();
+            let outcomes: Outcomes = observer.0.into_iter().map(|e| e.1).collect();
+            assert_eq!(outcomes, vec![expected; 4], "encrypted {encrypted}");
+            assert_eq!(fs::read_link(dest.join("t/lnk")).unwrap(), Path::new("plain"));
+            assert_eq!(fs::read(dest.join("t/f")).unwrap(), b"plain");
+        }
+    }
 }

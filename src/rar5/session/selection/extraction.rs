@@ -120,6 +120,9 @@ impl<'a> Extraction<'a> {
     ) -> Result<RarOutcome, SelectedStop> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
         run.write_unfiltered = self.options.unsupported_filters == crate::extract::UnsupportedFilters::WriteUnfiltered;
+        // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume keeps what was decoded
+        run.emit_unverified =
+            self.options.keep_broken && self.options.unverified_output == crate::extract::UnverifiedOutput::Emit;
         let member = &session.model.members[index];
         let header = &member.header;
         if let Some(version) = header.version.filter(|_| !self.versions) {
@@ -134,7 +137,10 @@ impl<'a> Extraction<'a> {
             ),
             _ => None,
         };
-        if link.is_none() && (member.issue.is_some() || header.redirection.is_some()) {
+        // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume is written from what is there
+        let blocked =
+            member.issue.is_some_and(|issue| !(run.emit_unverified && super::cut_off(&session.issues[issue])));
+        if link.is_none() && (blocked || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
         // Options::encrypted_links: VerifyFirst checks an encrypted link's password before any target decision
@@ -199,6 +205,17 @@ impl<'a> Extraction<'a> {
         let parent = relative.parent().expect("sanitized relative path");
         let target = hooks.target(self.options, &relative, self.options.flatten)?;
         let parent = if self.options.flatten { Path::new("") } else { parent };
+        // Overwrite::Skip: a target that is already there is skipped before anything else about it is checked, as
+        // UnRAR's `-o-` skips it, a symbolic link there (one an earlier run placed) too, and for a link member before
+        // its link target is: a skipped member places and touches nothing. One that will be placed is checked below.
+        if hooks.skips_existing(self.options.overwrite) {
+            if let Some(above) = target.parent() {
+                self.inspect_parents(above)?;
+            }
+            if fs::symlink_metadata(&target).is_ok_and(|meta| link.is_some() || meta.file_type().is_symlink()) {
+                return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
+            }
+        }
         // a RAR 5.0 redirection's target is checked before anything is touched
         let link = match link {
             Some(Ok(kind)) => {
@@ -855,6 +872,11 @@ pub(super) trait ExtractionHooks {
         owned_link: bool,
         legacy: Overwrite,
     ) -> Result<bool, SelectedStop>;
+    /// Whether [`Self::replace`] skips any existing target without asking: what is already there is then skipped
+    /// before its other checks.
+    fn skips_existing(&self, legacy: Overwrite) -> bool {
+        legacy == Overwrite::Skip
+    }
     /// `sources`: the volumes the member's published bytes depend on, just checked by the native route.
     fn recheck(
         &mut self,
@@ -1024,6 +1046,7 @@ mod tests {
             encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),

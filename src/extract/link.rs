@@ -197,6 +197,7 @@ pub(crate) fn from_rar5(
 ///
 /// [`RarIntegrityReason::UnverifiableLinkPassword`]: crate::error::RarIntegrityReason::UnverifiableLinkPassword
 pub(crate) fn rar5_password(
+    keys: &mut crate::crypto::Rar5KeyCache,
     header: &crate::rar5::FileHeader,
     password: Option<&str>,
     scope: crate::error::RarScope,
@@ -222,10 +223,7 @@ pub(crate) fn rar5_password(
             verifier,
         });
     }
-    match crate::crypto::derive_rar5_keys(password, params.kdf_count, &params.salt, params.check) {
-        Ok(keys) => Ok(keys.evidence),
-        Err(error) => Err(RarFailure::crypt(error, scope)),
-    }
+    super::rar5_keys(keys, password, &params, scope).map(|keys| keys.evidence)
 }
 
 /// [`rar5_password`] under [`crate::extract::Options::encrypted_links`]: with
@@ -233,6 +231,7 @@ pub(crate) fn rar5_password(
 /// 7-Zip 26.06 doesn't check it, and an encrypted link passes with the evidence
 /// [`crate::error::RarPasswordEvidence::Unverified`]. Only the password is let go: every other link check applies.
 pub(crate) fn rar5_link_password(
+    keys: &mut crate::crypto::Rar5KeyCache,
     header: &crate::rar5::FileHeader,
     password: Option<&str>,
     scope: crate::error::RarScope,
@@ -242,7 +241,7 @@ pub(crate) fn rar5_link_password(
         crate::extract::EncryptedLinks::PlaceUnverified if header.encrypted => {
             Ok(crate::error::RarPasswordEvidence::Unverified)
         }
-        _ => rar5_password(header, password, scope),
+        _ => rar5_password(keys, header, password, scope),
     }
 }
 
@@ -533,6 +532,27 @@ pub(crate) fn refusal(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Opt
         LinkKind::Hard(target) | LinkKind::Copy(target) if !extracted.contains(target) => Some(HARD_TARGET),
         _ => None,
     }
+}
+
+/// Whether something is already at `rel` under `dest` (a file, a folder or a link, a dangling one too), reached
+/// through real folders only. Under `Overwrite::Skip` a link member found there is skipped before its target is
+/// checked: a skipped member places and touches nothing, so it needs none of the checks a placed link does.
+pub(crate) fn existing_target(dest: &Path, rel: &Path) -> bool {
+    let mut at = dest.to_path_buf();
+    let mut parts = rel.components().peekable();
+    while let Some(part) = parts.next() {
+        at.push(part);
+        let Ok(meta) = std::fs::symlink_metadata(&at) else {
+            return false;
+        };
+        if parts.peek().is_none() {
+            return true;
+        }
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return false;
+        }
+    }
+    false
 }
 
 /// [`refusal`] for a writer that goes on to place the link with [`publish`] (or [`make_or_stand_in`]): with

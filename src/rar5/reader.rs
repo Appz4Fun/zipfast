@@ -433,6 +433,8 @@ pub struct Volume {
     pub main: MainHeader,
     password: Option<String>,
     header_key: Option<crate::crypto::Rar5Keys>,
+    /// RAR 5.0 keys by salt, shared with the other volumes of the set when they were opened sharing it
+    rar5_keys: crate::crypto::SharedRar5Keys,
     /// RAR 3.x encrypted headers (`-hp`): each header carries its own salt, the keys derived once per salt.
     legacy_keys: Option<crate::crypto::Rar4KeyCache>,
     parser: Option<super::framing::HeaderParser>,
@@ -509,7 +511,7 @@ impl Volume {
         damaged: DamagedInput,
     ) -> Result<Self> {
         let HeldSignature { file, len, next, format, head } = signature;
-        Self::initialize_held(path, file, len, password, (head, next, format), false, None, damaged)
+        Self::initialize_held(path, file, len, password, (head, next, format), false, None, damaged, Default::default())
             .map_err(RarFault::into_legacy)
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -520,7 +522,7 @@ impl Volume {
         damaged: DamagedInput,
     ) -> RarResult<Self> {
         let HeldSignature { file, len, next, format, head } = signature;
-        Self::initialize_held(path, file, len, password, (head, next, format), true, None, damaged)
+        Self::initialize_held(path, file, len, password, (head, next, format), true, None, damaged, Default::default())
     }
     /// Opens the volume in `file` (at `path`), whose first bytes `head` were read already (to tell its format): they
     /// are kept rather than read again, and only what the signature search needs past them is read.
@@ -554,7 +556,7 @@ impl Volume {
         VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
         let len = volume_length(path, || file.metadata())?;
         let found = Self::probe_head(path, &file, len, head)?;
-        Self::initialize_held(path, file, len, password, found, detailed, None, damaged)
+        Self::initialize_held(path, file, len, password, found, detailed, None, damaged, Default::default())
     }
     pub fn open(path: &Path) -> Result<Volume> {
         Self::open_with_password(path, None)
@@ -567,7 +569,7 @@ impl Volume {
     /// [`Self::open_with_password`], reading damaged headers as `damaged` says
     /// ([`crate::extract::Options::damaged_input`]); [`Self::take_damage`] hands out what was read past.
     pub fn open_damaged(path: &Path, password: Option<&str>, damaged: DamagedInput) -> Result<Volume> {
-        Self::open_impl(path, password, false, damaged).map_err(RarFault::into_legacy)
+        Self::open_impl(path, password, false, damaged, Default::default()).map_err(RarFault::into_legacy)
     }
 
     pub(crate) fn open_detailed_damaged(
@@ -575,17 +577,49 @@ impl Volume {
         password: Option<&str>,
         damaged: DamagedInput,
     ) -> RarResult<Volume> {
-        Self::open_impl(path, password, true, damaged)
+        Self::open_impl(path, password, true, damaged, Default::default())
     }
 
-    fn open_impl(path: &Path, password: Option<&str>, detailed: bool, damaged: DamagedInput) -> RarResult<Volume> {
+    /// [`Self::open_detailed_damaged`] for a later volume of a set: its encrypted headers' key comes from `keys`
+    /// when an earlier volume derived it for the same salt.
+    pub(crate) fn open_detailed_sharing(
+        path: &Path,
+        password: Option<&str>,
+        damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
+    ) -> RarResult<Volume> {
+        Self::open_impl(path, password, true, damaged, keys)
+    }
+
+    /// [`Self::open_damaged`] sharing `keys` ([`Self::open_detailed_sharing`]).
+    pub(crate) fn open_damaged_sharing(
+        path: &Path,
+        password: Option<&str>,
+        damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
+    ) -> Result<Volume> {
+        Self::open_impl(path, password, false, damaged, keys).map_err(RarFault::into_legacy)
+    }
+
+    /// The RAR 5.0 key cache this volume uses, for the volumes after it and the run reading them.
+    pub(crate) fn rar5_keys(&self) -> &crate::crypto::SharedRar5Keys {
+        &self.rar5_keys
+    }
+
+    fn open_impl(
+        path: &Path,
+        password: Option<&str>,
+        detailed: bool,
+        damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
+    ) -> RarResult<Volume> {
         let file =
             File::open(path).map_err(|e| RarFault::input(IoOperation::Open, Some(path.to_path_buf()), None, e))?;
         #[cfg(all(test, unix))]
         VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
         let len = volume_length(path, || file.metadata())?;
         let found = Self::probe_head(path, &file, len, Vec::new())?;
-        Self::initialize_held(path, file, len, password, found, detailed, None, damaged)
+        Self::initialize_held(path, file, len, password, found, detailed, None, damaged, keys)
     }
 
     /// Opens a volume for the catalogue, whose reads are counted by `budget`: it reads the signature's bytes, and
@@ -597,6 +631,7 @@ impl Volume {
         password: Option<&str>,
         budget: &mut ScanBudget<'_>,
         damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
     ) -> RarResult<Self> {
         let mut first = [0; SIGNATURE.len()];
         let used = len.min(SIGNATURE.len() as u64) as usize;
@@ -608,7 +643,7 @@ impl Volume {
         } else {
             Self::probe_signature(path, &file, len, (first, used), budget)?
         };
-        Self::initialize_held(path, file, len, password, (Vec::new(), next, format), true, Some(budget), damaged)
+        Self::initialize_held(path, file, len, password, (Vec::new(), next, format), true, Some(budget), damaged, keys)
     }
 
     /// The signature's end and the format, searched for in the volume's first bytes: `head` (read already, from the
@@ -641,6 +676,7 @@ impl Volume {
         detailed: bool,
         budget: Option<&mut ScanBudget<'_>>,
         damaged: DamagedInput,
+        rar5_keys: crate::crypto::SharedRar5Keys,
     ) -> RarResult<Volume> {
         let mut vol = Volume {
             path: path.to_path_buf(),
@@ -650,6 +686,7 @@ impl Volume {
             main: MainHeader::default(),
             password: password.filter(|s| !s.is_empty()).map(str::to_owned),
             header_key: None,
+            rar5_keys,
             legacy_keys: None,
             parser: None,
             format,
@@ -1057,8 +1094,8 @@ impl Volume {
                     if let Some(budget) = budget.as_deref_mut() {
                         budget.check()?;
                     }
-                    let keys = crate::crypto::derive_rar5_keys(pw, params.kdf_count, &params.salt, params.check)
-                        .map_err(crypt_fault)?;
+                    let keys = crate::extract::rar5_keys(&mut self.rar5_keys.lock(), pw, &params, self.scope())
+                        .map_err(|failure| RarFault::new(failure, Error::Encrypted))?;
                     parser.set_encryption(&keys);
                     self.header_key = Some(keys);
                     continue;
@@ -1232,6 +1269,7 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            rar5_keys: Default::default(),
             legacy_keys: None,
             parser: None,
             format: RarFormat::Rar5,
@@ -1277,6 +1315,7 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            rar5_keys: Default::default(),
             legacy_keys: None,
             parser: None,
             format: RarFormat::Rar5,

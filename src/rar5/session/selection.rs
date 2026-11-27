@@ -212,7 +212,8 @@ impl RarSession {
                     return Err(DriverError::Native(run_error(summary, Some(entry), Arc::from(fault.failure))));
                 }
                 let link = run.link.take();
-                let event = RarEntryOutcome { entry, method, outcome, renamed, link };
+                let unverified_bytes = run.unverified.take();
+                let event = RarEntryOutcome { entry, method, outcome, renamed, link, unverified_bytes };
                 let callback = driver.entry(&event, self);
                 if let Some(failure) = terminal {
                     return Err(DriverError::Native(run_error(summary, Some(event.entry), failure)));
@@ -391,6 +392,21 @@ struct SelectedRun {
     /// [`crate::extract::UnsupportedFilters::WriteUnfiltered`], set by extraction: a RAR 3.x/4.x member using a VM
     /// filter zipfast doesn't run is written unfiltered and fails with [`unfiltered_written`]
     write_unfiltered: bool,
+    /// [`crate::extract::UnverifiedOutput::Emit`], set by extraction (with `keep_broken`) and printing: a member cut
+    /// off by a missing volume is decoded from the volumes there, its bytes handed to the output, and still fails
+    emit_unverified: bool,
+    /// the bytes of a failed member printed anyway ([`RarEntryOutcome::unverified_bytes`]), set by printing
+    unverified: Option<u64>,
+}
+
+/// A catalogue issue that is a member cut off by a missing volume: under
+/// [`crate::extract::UnverifiedOutput::Emit`] what the present volumes hold is decoded before it fails.
+pub(super) fn cut_off(failure: &RarFailure) -> bool {
+    matches!(
+        failure,
+        RarFailure::MissingVolume { .. }
+            | RarFailure::Integrity { reason: RarIntegrityReason::MissingSplitContinuation, .. }
+    )
 }
 
 /// The failure of a member written unfiltered ([`crate::extract::UnsupportedFilters::WriteUnfiltered`]): its data
@@ -425,6 +441,8 @@ impl SelectedRun {
             buffer,
             decrypted,
             write_unfiltered: false,
+            emit_unverified: false,
+            unverified: None,
         })
     }
 
@@ -576,7 +594,12 @@ impl SelectedRun {
         mut output: Option<DecodedOutput<'_>>,
     ) -> Result<(u64, RarVerification), RarFailure> {
         let member = &session.model.members[index];
-        if let Some(issue) = member.issue {
+        // UnverifiedOutput::Emit: a member cut off by a missing volume is decoded from what is there, then fails
+        let cut =
+            member.issue.map(|issue| &session.issues[issue]).filter(|issue| self.emit_unverified && cut_off(issue));
+        if let Some(issue) = member.issue
+            && cut.is_none()
+        {
             return Err(copy_catalogue_issue(&session.issues[issue]));
         }
         // Check known totals before key derivation or dictionary allocation.
@@ -614,7 +637,8 @@ impl SelectedRun {
                     .crypt
                     .and_then(Result::ok)
                     .ok_or_else(|| pending.context().integrity(RarIntegrityReason::MalformedEncryptionRecord, false))?;
-                pending.start_selected_cipher(params, password, member.unpacked_size)?;
+                let mut keys = session.rar5_keys();
+                pending.start_selected_cipher(&mut keys, params, password, member.unpacked_size)?;
             }
         }
         let compressed = header.method != 0;
@@ -625,16 +649,26 @@ impl SelectedRun {
                 .rar4_decoder(session, member, solid)
                 .map_err(|error| *error.detailed(pending.context().scope()).failure)?;
             decoder.set_write_unfiltered(self.write_unfiltered);
+            if cut.is_some() {
+                decoder.track_starts();
+            }
             Some(decoder)
         } else {
             None
         };
         if compressed && header.format == RarFormat::Rar5 {
             self.prepare_decoder(session, member, pending.context())?;
+            if cut.is_some()
+                && let Some(decoder) = self.decoder.as_mut()
+            {
+                decoder.track_tail();
+            }
         }
         for (part_index, part) in parts.iter().enumerate() {
             check_cancel(&session.options.cancel).map_err(|fault| *fault.failure)?;
+            // the last part there of a member cut off is not its last: it has no checks of its own to pass here
             let final_part = part_index + 1 == parts.len();
+            let checked_part = !final_part;
             self.packed =
                 charge(self.packed, part.packed_size, self.limits.packed_bytes, RarResource::SelectedPackedBytes)?;
             let volume = &session.volumes[part.volume];
@@ -660,7 +694,7 @@ impl SelectedRun {
                         source,
                     },
                 })?;
-                if !final_part {
+                if checked_part {
                     part_crc.update(chunk);
                     if let Some(hash) = &mut part_blake {
                         hash.update(chunk);
@@ -685,7 +719,17 @@ impl SelectedRun {
                 let decoder = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5);
                 if let Some(decoder) = rar4.as_mut() {
                     let result = decoder.feed(plaintext, &mut sink).map(|_| ());
-                    sink.finish_rar4(result)?;
+                    if let Err(failure) = sink.finish_rar4(result) {
+                        let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                        return Err(held.salvage(
+                            failure,
+                            self.emit_unverified,
+                            Some(decoder),
+                            None,
+                            &self.limits,
+                            session,
+                        ));
+                    }
                 } else {
                     match decoder {
                         Some(decoder) => {
@@ -693,7 +737,12 @@ impl SelectedRun {
                                 Some(blocks) => blocks.feed(plaintext, decoder, &mut sink),
                                 None => decoder.feed(plaintext, &mut sink),
                             };
-                            sink.finish(result, decoder.take_size_failure())?;
+                            if let Err(failure) = sink.finish(result, decoder.take_size_failure()) {
+                                let held =
+                                    Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                                let emit = self.emit_unverified;
+                                return Err(held.salvage(failure, emit, None, Some(decoder), &self.limits, session));
+                            }
                         }
                         None => {
                             let result = sink.put(plaintext);
@@ -707,9 +756,31 @@ impl SelectedRun {
                 left -= len as u64;
                 offset += len as u64;
             }
-            if !final_part {
-                verify_part(&pending, part.checks, part_crc, part_blake)?;
+            if checked_part && let Err(failure) = verify_part(&pending, part.checks, part_crc, part_blake) {
+                // a part failing its own checksum: what was decoded goes out as on any failure of the member's data
+                let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                let rar5 = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5);
+                return Err(held.salvage(failure, self.emit_unverified, rar4.as_mut(), rar5, &self.limits, session));
             }
+        }
+        if let Some(issue) = cut {
+            // what the decoder holds of the volumes there goes out, as UnRAR 7.30 `p` and `x -kb` write it
+            let mut sink = SelectedSink {
+                pending: &mut pending,
+                decoded: &mut self.decoded,
+                limit: self.limits.decoded_bytes,
+                cancel: &session.options.cancel,
+                failure: None,
+                output: &mut output,
+            };
+            if let Some(decoder) = rar4.as_mut() {
+                let result = decoder.flush_decoded(&mut sink);
+                sink.finish_rar4(result)?;
+            } else if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed) {
+                let result = decoder.flush_cut(&mut sink);
+                sink.finish(result, None)?;
+            }
+            return Err(copy_catalogue_issue(issue));
         }
         let context = pending.context().clone();
         if let Some(cipher) = pending.selected_cipher() {
@@ -725,7 +796,10 @@ impl SelectedRun {
                 output: &mut output,
             };
             let result = decoder.finish_logical(&mut sink).map(|_| ());
-            sink.finish_rar4(result)?;
+            if let Err(failure) = sink.finish_rar4(result) {
+                let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                return Err(held.salvage(failure, self.emit_unverified, Some(decoder), None, &self.limits, session));
+            }
         }
         if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5) {
             let mut sink = SelectedSink {
@@ -737,7 +811,10 @@ impl SelectedRun {
                 output: &mut output,
             };
             let result = decoder.finish(&mut sink);
-            sink.finish(result, decoder.take_size_failure())?;
+            if let Err(failure) = sink.finish(result, decoder.take_size_failure()) {
+                let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                return Err(held.salvage(failure, self.emit_unverified, None, Some(decoder), &self.limits, session));
+            }
         }
         let unfiltered = rar4.as_mut().is_some_and(Rar4Decoder::take_unfiltered);
         if let Some(decoder) = rar4.filter(Rar4Decoder::has_boundary) {
@@ -902,7 +979,7 @@ pub(super) fn link_password(
 ) -> Result<RarPasswordEvidence, RarFailure> {
     let header = &session.model.members[index].header;
     let scope = RarScope::Member { index: Some(index as u64) };
-    crate::extract::link::rar5_link_password(header, Some(&session.password), scope, links)
+    crate::extract::link::rar5_link_password(&mut session.rar5_keys(), header, Some(&session.password), scope, links)
 }
 
 fn is_terminal(failure: &RarFailure) -> bool {
@@ -947,6 +1024,55 @@ fn verify_part(
     blake: Option<Blake2sp>,
 ) -> Result<(), RarFailure> {
     super::super::member::verify_packed(pending.context(), checks, crc, blake, pending.hash_key(checks.keyed))
+}
+
+/// What a failing member's decoded bytes go to: [`Held::salvage`].
+struct Held<'a, 'out> {
+    pending: &'a mut Pending,
+    decoded: &'a mut u64,
+    output: &'a mut Option<DecodedOutput<'out>>,
+}
+
+impl Held<'_, '_> {
+    /// [`crate::extract::UnverifiedOutput::Emit`]: a member failing on its data hands over what its decoder still
+    /// buffers, so printing gets every byte decoded before the failure. The member's own failure is returned, or a
+    /// terminal one handing the bytes over met (an output or spool failure, a limit, cancellation).
+    fn salvage(
+        self,
+        failure: RarFailure,
+        emit: bool,
+        rar4: Option<&mut Rar4Decoder>,
+        rar5: Option<&mut Unpacker>,
+        limits: &RarDecodeLimits,
+        session: &RarSession,
+    ) -> RarFailure {
+        if !emit || is_terminal(&failure) {
+            return failure;
+        }
+        let mut sink = SelectedSink {
+            pending: self.pending,
+            decoded: self.decoded,
+            limit: limits.decoded_bytes,
+            cancel: &session.options.cancel,
+            failure: None,
+            output: self.output,
+        };
+        let flushed = match (rar4, rar5) {
+            (Some(decoder), _) => {
+                let result = decoder.flush_decoded(&mut sink);
+                sink.finish_rar4(result)
+            }
+            (None, Some(decoder)) => {
+                let result = decoder.flush_now(&mut sink);
+                sink.finish(result, None)
+            }
+            (None, None) => Ok(()),
+        };
+        match flushed {
+            Err(stop) if is_terminal(&stop) => stop,
+            _ => failure,
+        }
+    }
 }
 
 struct SelectedSink<'a, 'out> {

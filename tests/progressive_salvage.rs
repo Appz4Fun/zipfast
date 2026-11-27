@@ -67,6 +67,7 @@ fn extract_options(dest: &Path, mode: Mode, damaged: DamagedInput) -> extract::O
         encrypted_links: Default::default(),
         damaged_input: damaged,
         unsupported_filters: Default::default(),
+        unverified_output: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
