@@ -120,6 +120,9 @@ impl<'a> Extraction<'a> {
     ) -> Result<RarOutcome, SelectedStop> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
         run.write_unfiltered = self.options.unsupported_filters == crate::extract::UnsupportedFilters::WriteUnfiltered;
+        // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume keeps what was decoded
+        run.emit_unverified =
+            self.options.keep_broken && self.options.unverified_output == crate::extract::UnverifiedOutput::Emit;
         let member = &session.model.members[index];
         let header = &member.header;
         if let Some(version) = header.version.filter(|_| !self.versions) {
@@ -134,7 +137,10 @@ impl<'a> Extraction<'a> {
             ),
             _ => None,
         };
-        if link.is_none() && (member.issue.is_some() || header.redirection.is_some()) {
+        // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume is written from what is there
+        let blocked =
+            member.issue.is_some_and(|issue| !(run.emit_unverified && super::cut_off(&session.issues[issue])));
+        if link.is_none() && (blocked || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
         // Options::encrypted_links: VerifyFirst checks an encrypted link's password before any target decision
@@ -1040,6 +1046,7 @@ mod tests {
             encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
