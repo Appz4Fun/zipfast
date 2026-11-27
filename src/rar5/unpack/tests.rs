@@ -687,6 +687,51 @@ fn quick_literals_round_trip_with_mixed_lengths() {
     assert!(out == text);
 }
 
+/// Noise whose byte values below `fold` come in pairs (each odd one written as the even one below it): those get
+/// 7-bit codes and the rest 8-bit ones, the 8-bit literals taking `(256 - fold) / 256` of the code space.
+fn folded_noise(n: usize, fold: u8, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let b = (x >> 32) as u8;
+            if b < fold { b & !1 } else { b }
+        })
+        .collect()
+}
+
+#[test]
+fn quick_literals_only_where_one_length_takes_most_of_the_space() {
+    // (fold, common length): 8-bit literals in 7/8 of the space are worth the quick reads and their rounds; in 3/4
+    // of it, other codes come too often, so they are decoded one by one, though 192 literals share the length
+    for (fold, common) in [(32u8, 8u32), (64, 0), (8, 8)] {
+        let text = folded_noise(200_000, fold, u64::from(fold));
+        let ops = lits(&text);
+        let block = tuned_block(&ops, true);
+        for piece in [usize::MAX, 4_099] {
+            let mut u = Unpacker::new(Window::full(1 << 20)).unwrap();
+            u.set_threads(0, 0);
+            u.reset(Some(text.len() as u64));
+            let mut out = Vec::new();
+            let mut sink = |b: &[u8]| {
+                out.extend_from_slice(b);
+                Ok(())
+            };
+            for chunk in block.chunks(piece) {
+                u.feed(chunk, &mut sink).unwrap();
+            }
+            u.finish(&mut sink).unwrap();
+            assert_eq!(u.tables.main.common, common, "fold {fold}");
+            assert!(out == text, "fold {fold} piece {piece}");
+        }
+        // and on workers
+        let stream = tuned_stream(&ops, 30_000);
+        assert!(decode_with(&stream, text.len() as u64, 1 << 20, 10_000, 3, Hash::Off, false).unwrap() == text);
+    }
+}
+
 #[test]
 fn eight_bit_codes_of_other_symbols_end_a_quick_run() {
     // noise with one short match about as often as each byte value, so the match gets an 8-bit code too
