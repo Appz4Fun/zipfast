@@ -185,6 +185,64 @@ pub(crate) fn from_rar5(
     })
 }
 
+/// Whether an encrypted RAR 5.0 redirection member may be placed: only when `password` is verified for it by the
+/// check value in its encryption record. Its target is in the header, which `rar a -p` leaves in the clear, so a
+/// link would otherwise be placed whatever the password, where UnRAR reports a wrong password and creates nothing.
+///
+/// No password (or an empty one) fails as password required, a missing or malformed encryption record as a
+/// malformed one, a password the check value rejects as a wrong password, each as an encrypted data member fails.
+/// A record with no check value, or one whose checksum doesn't match, can't verify any password: a link has no data
+/// to check it against, so it is refused ([`RarIntegrityReason::UnverifiableLinkPassword`]) rather than placed.
+/// On success, the evidence the member reports. A member that isn't encrypted passes as it is.
+///
+/// [`RarIntegrityReason::UnverifiableLinkPassword`]: crate::error::RarIntegrityReason::UnverifiableLinkPassword
+pub(crate) fn rar5_password(
+    header: &crate::rar5::FileHeader,
+    password: Option<&str>,
+    scope: crate::error::RarScope,
+) -> Result<crate::error::RarPasswordEvidence, crate::error::RarFailure> {
+    use crate::error::{RarFailure, RarIntegrityReason, RarPasswordEvidence};
+    if !header.encrypted {
+        return Ok(RarPasswordEvidence::NotEncrypted);
+    }
+    let Some(password) = password.filter(|p| !p.is_empty()) else {
+        return Err(RarFailure::PasswordRequired { scope });
+    };
+    let Some(params) = header.crypt else {
+        return Err(RarFailure::Integrity {
+            scope,
+            reason: RarIntegrityReason::MalformedEncryptionRecord,
+            password: RarPasswordEvidence::NotEncrypted,
+        });
+    };
+    if let Some(verifier) = rar5_unverifiable(&params) {
+        return Err(RarFailure::EncryptedIntegrity {
+            scope,
+            reason: RarIntegrityReason::UnverifiableLinkPassword,
+            verifier,
+        });
+    }
+    match crate::crypto::derive_rar5_keys(password, params.kdf_count, &params.salt, params.check) {
+        Ok(keys) => Ok(keys.evidence),
+        Err(error) => Err(RarFailure::crypt(error, scope)),
+    }
+}
+
+/// Why these encryption parameters can't verify a password, or None when their check value can: there is one,
+/// and its checksum matches. Checked before any key is derived.
+pub(crate) fn rar5_unverifiable(
+    params: &crate::crypto::Rar5CryptParams,
+) -> Option<crate::error::RarVerifierUnavailable> {
+    use crate::error::RarVerifierUnavailable;
+    match params.check {
+        None => Some(RarVerifierUnavailable::Absent),
+        Some((check, sum)) if crate::crypto::sha256(&check)[..4] != sum => {
+            Some(RarVerifierUnavailable::CheckChecksumMismatch)
+        }
+        Some(_) => None,
+    }
+}
+
 /// A failure that stops only its own member: a hard link's or copy's earlier file is gone or changed, or links
 /// can't be created here. Any other error placing a link is the run's.
 pub(crate) fn member_failure(error: &io::Error) -> Option<&'static str> {

@@ -224,8 +224,17 @@ impl<'a> Extraction<'a> {
             return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
         }
         if let Some(kind) = link {
+            // an encrypted link is placed only on a password its check value verifies, once the overwrite decision
+            // lets it be placed (a skipped one stays skipped) and before anything is touched
+            // (a RAR 5.0 redirection only: a RAR 4.x symbolic link's target is its encrypted data, checked as it decrypts)
+            let evidence = match kind {
+                Some(_) => {
+                    super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?
+                }
+                None => crate::error::RarPasswordEvidence::NotEncrypted,
+            };
             let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
-            return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind);
+            return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind, evidence);
         }
         let mut output = None;
         let mut sink = |chunk: &[u8]| {
@@ -423,16 +432,13 @@ impl<'a> Extraction<'a> {
         initial: Option<SourceStamp>,
         hooks: &mut impl ExtractionHooks,
         kind: Option<crate::extract::link::LinkKind>,
+        password: crate::error::RarPasswordEvidence,
     ) -> Result<RarOutcome, SelectedStop> {
         use crate::extract::link;
         let (kind, bytes, checks) = match kind {
             Some(kind) => {
-                let checks = RarVerification {
-                    size_checked: false,
-                    crc32_checked: false,
-                    blake2sp_checked: false,
-                    password: crate::error::RarPasswordEvidence::NotEncrypted,
-                };
+                let checks =
+                    RarVerification { size_checked: false, crc32_checked: false, blake2sp_checked: false, password };
                 (kind, 0, checks)
             }
             None => {
