@@ -135,11 +135,13 @@ type Stream = Box<dyn Read>;
 pub(crate) struct LzmaReader {
     input: BufReader<Stream>,
     stream: liblzma::stream::Stream,
+    /// the data turned out bad after the bytes last returned: the next read says so
+    failed: bool,
 }
 
 impl LzmaReader {
     pub(crate) fn new(input: Stream, stream: liblzma::stream::Stream) -> Self {
-        Self { input: BufReader::with_capacity(BUF, input), stream }
+        Self { input: BufReader::with_capacity(BUF, input), stream, failed: false }
     }
 }
 
@@ -147,6 +149,9 @@ impl Read for LzmaReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
+        }
+        if self.failed {
+            return Err(data_error("LZMA data error"));
         }
         loop {
             let input = self.input.fill_buf()?;
@@ -160,6 +165,11 @@ impl Read for LzmaReader {
             match status {
                 Err(liblzma::stream::Error::Mem | liblzma::stream::Error::MemLimit) => {
                     return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+                // what decoded before the bad data goes out first (7-Zip's `x -so` streams it), the error after
+                Err(_) if made > 0 => {
+                    self.failed = true;
+                    return Ok(made);
                 }
                 Err(_) => return Err(data_error("LZMA data error")),
                 Ok(_) if made > 0 => return Ok(made),

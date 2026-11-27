@@ -56,6 +56,7 @@ fn options(dest: &Path, salvage: bool, keep: bool) -> Options {
         attempt_continued_members: false,
         damaged_input: Default::default(),
         unsupported_filters: Default::default(),
+        unverified_output: Default::default(),
         unix_modes: Default::default(),
         backslashes: Default::default(),
         salvage_truncated_zip: salvage,

@@ -212,7 +212,8 @@ impl RarSession {
                     return Err(DriverError::Native(run_error(summary, Some(entry), Arc::from(fault.failure))));
                 }
                 let link = run.link.take();
-                let event = RarEntryOutcome { entry, method, outcome, renamed, link };
+                let unverified_bytes = run.unverified.take();
+                let event = RarEntryOutcome { entry, method, outcome, renamed, link, unverified_bytes };
                 let callback = driver.entry(&event, self);
                 if let Some(failure) = terminal {
                     return Err(DriverError::Native(run_error(summary, Some(event.entry), failure)));
@@ -391,6 +392,21 @@ struct SelectedRun {
     /// [`crate::extract::UnsupportedFilters::WriteUnfiltered`], set by extraction: a RAR 3.x/4.x member using a VM
     /// filter zipfast doesn't run is written unfiltered and fails with [`unfiltered_written`]
     write_unfiltered: bool,
+    /// [`crate::extract::UnverifiedOutput::Emit`], set by extraction (with `keep_broken`) and printing: a member cut
+    /// off by a missing volume is decoded from the volumes there, its bytes handed to the output, and still fails
+    emit_unverified: bool,
+    /// the bytes of a failed member printed anyway ([`RarEntryOutcome::unverified_bytes`]), set by printing
+    unverified: Option<u64>,
+}
+
+/// A catalogue issue that is a member cut off by a missing volume: under
+/// [`crate::extract::UnverifiedOutput::Emit`] what the present volumes hold is decoded before it fails.
+pub(super) fn cut_off(failure: &RarFailure) -> bool {
+    matches!(
+        failure,
+        RarFailure::MissingVolume { .. }
+            | RarFailure::Integrity { reason: RarIntegrityReason::MissingSplitContinuation, .. }
+    )
 }
 
 /// The failure of a member written unfiltered ([`crate::extract::UnsupportedFilters::WriteUnfiltered`]): its data
@@ -425,6 +441,8 @@ impl SelectedRun {
             buffer,
             decrypted,
             write_unfiltered: false,
+            emit_unverified: false,
+            unverified: None,
         })
     }
 
@@ -578,7 +596,12 @@ impl SelectedRun {
         mut output: Option<DecodedOutput<'_>>,
     ) -> Result<(u64, RarVerification), RarFailure> {
         let member = &session.model.members[index];
-        if let Some(issue) = member.issue {
+        // UnverifiedOutput::Emit: a member cut off by a missing volume is decoded from what is there, then fails
+        let cut =
+            member.issue.map(|issue| &session.issues[issue]).filter(|issue| self.emit_unverified && cut_off(issue));
+        if let Some(issue) = member.issue
+            && cut.is_none()
+        {
             return Err(copy_catalogue_issue(&session.issues[issue]));
         }
         // Check known totals before key derivation or dictionary allocation.
@@ -627,16 +650,26 @@ impl SelectedRun {
                 .rar4_decoder(session, member, solid)
                 .map_err(|error| *error.detailed(pending.context().scope()).failure)?;
             decoder.set_write_unfiltered(self.write_unfiltered);
+            if cut.is_some() {
+                decoder.track_starts();
+            }
             Some(decoder)
         } else {
             None
         };
         if compressed && header.format == RarFormat::Rar5 {
             self.prepare_decoder(session, member, pending.context())?;
+            if cut.is_some()
+                && let Some(decoder) = self.decoder.as_mut()
+            {
+                decoder.track_tail();
+            }
         }
         for (part_index, part) in parts.iter().enumerate() {
             check_cancel(&session.options.cancel).map_err(|fault| *fault.failure)?;
+            // the last part there of a member cut off is not its last: it has no checks of its own to pass here
             let final_part = part_index + 1 == parts.len();
+            let checked_part = !final_part;
             self.packed =
                 charge(self.packed, part.packed_size, self.limits.packed_bytes, RarResource::SelectedPackedBytes)?;
             let volume = &session.volumes[part.volume];
@@ -662,7 +695,7 @@ impl SelectedRun {
                         source,
                     },
                 })?;
-                if !final_part {
+                if checked_part {
                     part_crc.update(chunk);
                     if let Some(hash) = &mut part_blake {
                         hash.update(chunk);
@@ -709,9 +742,28 @@ impl SelectedRun {
                 left -= len as u64;
                 offset += len as u64;
             }
-            if !final_part {
+            if checked_part {
                 verify_part(&pending, part.checks, part_crc, part_blake)?;
             }
+        }
+        if let Some(issue) = cut {
+            // what the decoder holds of the volumes there goes out, as UnRAR 7.30 `p` and `x -kb` write it
+            let mut sink = SelectedSink {
+                pending: &mut pending,
+                decoded: &mut self.decoded,
+                limit: self.limits.decoded_bytes,
+                cancel: &session.options.cancel,
+                failure: None,
+                output: &mut output,
+            };
+            if let Some(decoder) = rar4.as_mut() {
+                let result = decoder.flush_decoded(&mut sink);
+                sink.finish_rar4(result)?;
+            } else if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed) {
+                let result = decoder.flush_cut(&mut sink);
+                sink.finish(result, None)?;
+            }
+            return Err(copy_catalogue_issue(issue));
         }
         let context = pending.context().clone();
         if let Some(cipher) = pending.selected_cipher() {

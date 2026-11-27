@@ -245,6 +245,18 @@ pub struct Options {
     /// [`crate::rar5::session::RarSessionOptions::damaged_input`]. Progressive and persistent-partial sessions refuse a
     /// damaged header whatever this says. 7z and ZIP ignore it.
     pub damaged_input: DamagedInput,
+    /// What becomes of the bytes decoded of a member that then fails: withheld (the default) or handed over as UnRAR
+    /// and 7-Zip do. For these runners it is a RAR member cut off by a missing volume: with
+    /// [`UnverifiedOutput::Emit`] and [`Self::keep_broken`], its file keeps every byte decoded from the volumes
+    /// there, as UnRAR 7.30 `x -kb` keeps it (without `keep_broken` the file is removed either way, as UnRAR `x`
+    /// removes it). See [`UnverifiedOutput`].
+    ///
+    /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+    /// checked dispatchers) and [`crate::rar5::session::RarSession::extract_selected`] and
+    /// `extract_selected_controlled`. [`SelectedEntry`] takes it through [`SelectOptions::unverified_output`],
+    /// `RarSession::print_selected` through `RarPrintOptions::unverified_output`, and
+    /// [`crate::sevenzip::print_selected_with_options`] through `SevenZipPrintOptions::unverified_output`.
+    pub unverified_output: UnverifiedOutput,
 }
 
 /// What a damaged RAR header does to a run; see [`Options::damaged_input`].
@@ -359,9 +371,92 @@ pub enum UnsupportedFilters {
     ///
     /// Honoured by the whole-archive runners for RAR ([`run`], [`run_with_password`], [`run_rar_with_outcomes`])
     /// and by [`crate::rar5::session::RarSession::extract_selected`] and `extract_selected_controlled`. Progressive
-    /// and persistent-partial sessions, `RarSession` test and print runs, `SelectedEntry` and `FeedDecoder` fail
-    /// such a member as unsupported whatever this says.
+    /// and persistent-partial sessions, `RarSession` test and print runs and `FeedDecoder` fail such a member as
+    /// unsupported whatever this says; [`SelectedEntry`] writes it unfiltered under
+    /// [`SelectOptions::unverified_output`].
     WriteUnfiltered,
+}
+
+/// What becomes of the bytes decoded of a member that then fails on its own data (a missing volume, a CRC, a data
+/// error, a wrong password shown by its effect, an unsupported filter); see [`Options::unverified_output`] and
+/// `docs/compat-options.md`.
+///
+/// ```
+/// use zipfast::extract::{SelectOptions, UnverifiedOutput};
+///
+/// let select = SelectOptions::new().unverified_output(UnverifiedOutput::Emit);
+/// assert_eq!(select.unverified_output, UnverifiedOutput::Emit);
+/// assert_eq!(UnverifiedOutput::default(), UnverifiedOutput::Withhold);
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UnverifiedOutput {
+    /// Nothing that failed verification is handed over beyond what zipfast always did: a printed 7z or RAR member
+    /// shows only once verified, and a kept broken file ([`Options::keep_broken`]) of a RAR member cut off by a
+    /// missing volume holds only what was written before the volume was found missing (nothing, for a RAR 3.x/4.x
+    /// member under 32 KiB, as 7-Zip 26.06 `x` keeps it).
+    #[default]
+    Withhold,
+    /// The bytes decoded before the failure are written, printed or streamed as the reference tools do (UnRAR 7.30
+    /// `p` and `x -kb`, 7-Zip 26.06 `x -so`), and the member is still reported failed, with a sign that its bytes
+    /// went out unverified ([`UnverifiedWritten`], [`RarEntryOutcome::unverified_bytes`], [`Summary::unverified`]).
+    Emit,
+}
+
+/// A failed member whose bytes were printed anyway ([`UnverifiedOutput::Emit`]); see [`Summary::unverified`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UnverifiedMember {
+    /// Its listing index.
+    pub index: u64,
+    /// Its name, as listed.
+    pub name: String,
+    /// How many of its bytes went out.
+    pub bytes: u64,
+}
+
+impl UnverifiedMember {
+    pub(crate) fn new(index: u64, name: &str, bytes: u64) -> Self {
+        Self { index, name: name.to_owned(), bytes }
+    }
+}
+
+/// A member's bytes were handed over though it failed verification ([`UnverifiedOutput::Emit`]). It comes inside an
+/// [`Error::Io`] (kind `InvalidData`) from [`SelectedEntry::read`], wrapping the failure the member had;
+/// [`UnverifiedWritten::of`] finds it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct UnverifiedWritten {
+    /// How many bytes went to the sink.
+    pub bytes: u64,
+    /// Why the member failed, as it would have failed without [`UnverifiedOutput::Emit`].
+    pub cause: Error,
+}
+
+impl UnverifiedWritten {
+    /// The unverified-output sign inside `error`, if it carries one.
+    pub fn of(error: &Error) -> Option<&UnverifiedWritten> {
+        match error {
+            Error::Io(e) => e.get_ref().and_then(|inner| inner.downcast_ref::<UnverifiedWritten>()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_error(bytes: u64, cause: Error) -> Error {
+        Error::Io(io::Error::new(io::ErrorKind::InvalidData, UnverifiedWritten { bytes, cause }))
+    }
+}
+
+impl std::fmt::Display for UnverifiedWritten {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({} bytes written unverified)", self.cause, self.bytes)
+    }
+}
+
+impl std::error::Error for UnverifiedWritten {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
 }
 
 /// The permission bits a run gives what it writes; see [`Options::unix_modes`]. A member without stored Unix
@@ -496,6 +591,15 @@ pub struct SelectOptions {
     pub special_entries: SpecialEntries,
     /// As [`Options::compressed_tar`]; it also decides how entries are numbered.
     pub compressed_tar: CompressedTar,
+    /// What a read hands over of a member that fails, as 7-Zip 26.06 `x -so` streams it ([`UnverifiedOutput`]).
+    /// With [`UnverifiedOutput::Emit`], a 7z member that fails on its data gives the sink what was decoded of it (all
+    /// of it for a CRC failure, the bytes before the error for a data error or a folder cut short), and a RAR 3.x/4.x
+    /// member using a VM filter zipfast doesn't run is decoded with that block left unfiltered, as
+    /// [`UnsupportedFilters::WriteUnfiltered`] writes it. The read still fails, with an [`UnverifiedWritten`]
+    /// carrying the member's failure and how many bytes went to the sink. Other formats already hand the sink their
+    /// bytes as they decode, so for them it only adds that sign to the error. The default hands a 7z member over
+    /// only once it checks out and fails a RAR member using such a filter as unsupported.
+    pub unverified_output: UnverifiedOutput,
 }
 
 impl SelectOptions {
@@ -515,11 +619,21 @@ impl SelectOptions {
         self.compressed_tar = compressed_tar;
         self
     }
+
+    /// Sets [`Self::unverified_output`].
+    pub fn unverified_output(mut self, unverified_output: UnverifiedOutput) -> Self {
+        self.unverified_output = unverified_output;
+        self
+    }
 }
 
 impl From<&Options> for SelectOptions {
     fn from(options: &Options) -> Self {
-        Self { special_entries: options.special_entries, compressed_tar: options.compressed_tar }
+        Self {
+            special_entries: options.special_entries,
+            compressed_tar: options.compressed_tar,
+            unverified_output: options.unverified_output,
+        }
     }
 }
 
@@ -623,6 +737,7 @@ impl MemberRef<'_> {
 ///     attempt_continued_members: false,
 ///     damaged_input: Default::default(),
 ///     unsupported_filters: Default::default(),
+///     unverified_output: Default::default(),
 ///     salvage_truncated_zip: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
@@ -817,6 +932,10 @@ pub struct Summary {
     /// [`DamagedInput::Refuse`]. Non-empty means the archive's headers are damaged: UnRAR says "Corrupt header is
     /// found" (exit 3) and 7-Zip "Headers Error" (exit 2).
     pub damaged_headers: Vec<HeaderDamage>,
+    /// Members that failed but whose decoded bytes went out anyway under [`UnverifiedOutput::Emit`]
+    /// ([`crate::sevenzip::print_selected_with_options`]), in the order they were printed. Each is also a line in
+    /// [`Self::errors`].
+    pub unverified: Vec<UnverifiedMember>,
     /// the rename attempts this run has left
     pub(crate) rename_budget: RenameBudget,
     /// folders whose times and permissions are set once everything inside them is written
@@ -1647,6 +1766,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                         format_args!("missing volume {}", next.display()),
                     )?;
                 }
+                run.emit_unverified(&mut p);
                 p.discard();
                 run.stream = None;
                 run.rar4 = None;
@@ -2048,6 +2168,8 @@ pub struct SelectedEntry {
     limit: u64,
     windows_names: bool,
     meta: Meta,
+    /// [`SelectOptions::unverified_output`]
+    unverified: UnverifiedOutput,
     cancel: Cancellation,
 }
 
@@ -2168,6 +2290,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit,
+                    unverified: select.unverified_output,
                     source: SelectedSource::Tar(Box::new(selected)),
                     cancel,
                 });
@@ -2185,6 +2308,7 @@ impl SelectedEntry {
                         windows_names: !header.is_unix(),
                         index,
                         limit,
+                        unverified: select.unverified_output,
                         source: SelectedSource::Rar {
                             path: path.to_path_buf(),
                             chain_start,
@@ -2204,6 +2328,7 @@ impl SelectedEntry {
                     windows_names,
                     index,
                     limit,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SplitZip { path: path.to_path_buf(), archive },
                     cancel,
                 });
@@ -2220,6 +2345,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SevenZip { path: path.to_path_buf(), name },
                     cancel,
                 });
@@ -2235,6 +2361,7 @@ impl SelectedEntry {
             meta: Meta { mtime: entry.mtime, nanos: entry.nanos, mode: entry.unix_mode() },
             index,
             limit,
+            unverified: select.unverified_output,
             source: SelectedSource::Zip(archive),
             cancel,
         })
@@ -2291,6 +2418,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::Tar(Box::new(selected)),
                     cancel,
                 });
@@ -2327,6 +2455,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SevenZip { path: path.to_path_buf(), name },
                     cancel,
                 });
@@ -2339,6 +2468,7 @@ impl SelectedEntry {
                     windows_names,
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SplitZip { path: path.to_path_buf(), archive },
                     cancel,
                 });
@@ -2365,6 +2495,7 @@ impl SelectedEntry {
                     windows_names: !header.is_unix(),
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::Rar {
                         path: held_path,
                         chain_start,
@@ -2405,7 +2536,15 @@ impl SelectedEntry {
             Ok(selection) => selection,
             Err(error) => return Err(owner.reject(error)),
         };
-        Ok(Self { windows_names, meta, index, limit, source: SelectedSource::Zip(owner), cancel })
+        Ok(Self {
+            windows_names,
+            meta,
+            index,
+            limit,
+            unverified: select.unverified_output,
+            source: SelectedSource::Zip(owner),
+            cancel,
+        })
     }
     pub fn is_zip(&self) -> bool {
         matches!(self.source, SelectedSource::Zip(_))
@@ -2528,11 +2667,16 @@ impl SelectedEntry {
         observer: &mut SelectedReadObserver<'_>,
     ) -> Result<()> {
         self.cancel.check_io()?;
+        let emit = self.unverified == UnverifiedOutput::Emit;
+        // what went to the sink, and whether the sink itself failed (its error is returned as it is)
+        let (mut delivered, mut sink_failed) = (0u64, false);
         let mut checked_sink = |chunk: &[u8]| {
             self.cancel.check_io()?;
-            sink(chunk)
+            sink(chunk).inspect_err(|_| sink_failed = true)?;
+            delivered = delivered.saturating_add(chunk.len() as u64);
+            Ok(())
         };
-        match self.source {
+        let read = match self.source {
             SelectedSource::Zip(mut archive) => {
                 if observer.callback.is_some() {
                     let path = archive.source_path().map_err(|error| Error::Io(std::io::Error::other(error)))?;
@@ -2552,7 +2696,7 @@ impl SelectedEntry {
                     decoded_left: self.limit,
                     cancel: &self.cancel,
                 };
-                rar_read_at(&path, chain_start, self.index, &name, password, selection, observer)
+                rar_read_at(&path, chain_start, self.index, &name, password, selection, observer, emit)
             }
             SelectedSource::SplitZip { path, mut archive } => {
                 observer.notify(0, &path, SelectedReadRole::Selected, Some(&self.cancel))?;
@@ -2563,7 +2707,8 @@ impl SelectedEntry {
                 let limits = crate::sevenzip::SevenZipLimits::default();
                 let want = self.index as u64;
                 let mut failure = None;
-                let summary = crate::sevenzip::print_selected_with(
+                let options = crate::sevenzip::SevenZipPrintOptions::new().unverified_output(self.unverified);
+                let summary = crate::sevenzip::print_selected_with_options(
                     &path,
                     password,
                     &mut |ordinal, _| ordinal == want,
@@ -2576,6 +2721,7 @@ impl SelectedEntry {
                     },
                     &self.cancel,
                     &limits,
+                    &options,
                 );
                 match (summary, failure) {
                     // the sink's own error, as the other formats return it
@@ -2588,7 +2734,14 @@ impl SelectedEntry {
                     },
                 }
             }
-        }?;
+        };
+        match read {
+            // UnverifiedOutput::Emit: the member failed on its own, after bytes of it went to the sink
+            Err(cause) if emit && delivered != 0 && !sink_failed && !is_cancellation(&cause) => {
+                return Err(UnverifiedWritten::into_error(delivered, cause));
+            }
+            read => read?,
+        }
         self.cancel.check_io()?;
         Ok(())
     }
@@ -3719,6 +3872,9 @@ impl Books<'_, '_> {
 
 /// What a member written unfiltered ([`UnsupportedFilters::WriteUnfiltered`]) is reported with.
 const UNFILTERED_MESSAGE: &str = "unsupported method: VM filter, written unfiltered";
+/// The [`UnverifiedWritten::cause`] of a RAR member a [`SelectedEntry`] read wrote unfiltered: `Error::Unsupported`
+/// with this text.
+pub const UNFILTERED_SELECTED: &str = "VM filter, written unfiltered";
 
 /// A file's last part is in: checks it whole and finishes it, or hands it to a worker for that when its bytes were
 /// gathered.
@@ -4206,6 +4362,9 @@ fn rar_run_shared_open<'a>(
     }
     let result = if let Some(mut p) = run.pending.take() {
         let already_reported = p.failed || p.passive;
+        if walked.is_ok() {
+            run.emit_unverified(&mut p);
+        }
         p.discard();
         if walked.is_ok() && !p.hidden && (!run.reports.typed() || !already_reported) {
             let failure = p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false);
@@ -4220,6 +4379,7 @@ fn rar_run_shared_open<'a>(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rar_read_at(
     first: &Path,
     chain_start: usize,
@@ -4228,6 +4388,7 @@ fn rar_read_at(
     password: Option<&str>,
     selection: RarSelection<'_>,
     observer: &mut SelectedReadObserver<'_>,
+    unfiltered: bool,
 ) -> Result<()> {
     let opts = Options {
         mode: Mode::Test,
@@ -4250,7 +4411,9 @@ fn rar_read_at(
         keep_broken: false,
         attempt_continued_members: false,
         damaged_input: Default::default(),
-        unsupported_filters: Default::default(),
+        // SelectOptions::unverified_output: a VM filter zipfast doesn't run leaves its block unfiltered, as 7-Zip `x -so`
+        unsupported_filters: if unfiltered { UnsupportedFilters::WriteUnfiltered } else { UnsupportedFilters::Fail },
+        unverified_output: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
@@ -4311,6 +4474,10 @@ fn rar_read_at(
             run.file_block(volume, header, crypt).map_err(RunFault::into_legacy)?;
             let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
             if let Some(error) = summary.errors.first() {
+                if unfiltered && error.ends_with(UNFILTERED_MESSAGE) {
+                    // written whole with a block left unfiltered: 7-Zip's "Unsupported Method"
+                    return Err(Error::Unsupported(UNFILTERED_SELECTED.into()));
+                }
                 return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone())));
             }
             complete = selected && !split_after && summary.files > before && run.pending.is_none();
@@ -4407,6 +4574,21 @@ impl Run<'_, '_, '_> {
             dest: &self.opts.dest,
         }
         .terminal(ctx, fault)
+    }
+
+    /// [`UnverifiedOutput::Emit`]: a member cut off by a missing volume gets the bytes its decoder still holds (what
+    /// the present volumes decoded), so a file kept with [`Options::keep_broken`] has all of them, as UnRAR 7.30
+    /// `x -kb` keeps it. Best effort: a decoder that can't hand them over leaves the file as it was.
+    fn emit_unverified(&mut self, p: &mut Pending) {
+        if self.opts.unverified_output != UnverifiedOutput::Emit || p.failed || p.passive || p.hidden || !p.compressed {
+            return;
+        }
+        let mut sink = PendingSink { pending: p, fault: None };
+        if let Some(decoder) = self.rar4.as_mut() {
+            let _ = decoder.flush_decoded(&mut sink);
+        } else if let Some(stream) = self.stream.as_mut() {
+            let _ = stream.flush_cut(&mut sink);
+        }
     }
 
     fn pending_terminal(&mut self, pending: &Pending, fault: RarFault) -> RunFault {
@@ -4532,6 +4714,7 @@ impl Run<'_, '_, '_> {
         if !p.hidden && (!self.reports.typed() || (!p.failed && !p.passive)) {
             let failure = Arc::new(p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false));
             self.reports.failed(&p.context, Arc::clone(&failure), "next part is missing")?;
+            self.emit_unverified(&mut p);
             if p.compressed {
                 self.lost_history(&p.context, Some(failure));
             }
@@ -5416,6 +5599,11 @@ impl Run<'_, '_, '_> {
             return self.stored_parallel(vol, h, p);
         }
         let mut stream = if h.format == RarFormat::Rar5 && p.compressed { self.stream.take() } else { None };
+        if self.opts.unverified_output == UnverifiedOutput::Emit
+            && let Some(stream) = stream.as_mut()
+        {
+            stream.track_tail();
+        }
         let mut rar4_error = None;
         let mut rar4 = if h.format == RarFormat::Rar4 && p.compressed {
             let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
@@ -5423,6 +5611,9 @@ impl Run<'_, '_, '_> {
             match rar4_part_decoder(&mut self.rar4, h, vol.main.is_solid(), limit, cancel) {
                 Ok(mut decoder) => {
                     decoder.set_write_unfiltered(self.opts.unsupported_filters == UnsupportedFilters::WriteUnfiltered);
+                    if self.opts.unverified_output == UnverifiedOutput::Emit {
+                        decoder.track_starts();
+                    }
                     Some(decoder)
                 }
                 Err(error) => {

@@ -58,6 +58,7 @@ fn options(dest: &Path, mode: Mode, damaged: DamagedInput) -> Options {
         attempt_continued_members: false,
         damaged_input: damaged,
         unsupported_filters: Default::default(),
+        unverified_output: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),

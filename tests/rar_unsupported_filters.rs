@@ -57,6 +57,7 @@ fn options(dest: &Path, mode: Mode, filters: UnsupportedFilters) -> Options {
         keep_broken: false,
         attempt_continued_members: false,
         unsupported_filters: filters,
+        unverified_output: Default::default(),
         damaged_input: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),

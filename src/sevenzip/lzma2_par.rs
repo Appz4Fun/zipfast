@@ -1299,6 +1299,8 @@ struct Single {
     walker: Walker,
     /// what the last read made
     made: usize,
+    /// the data turned out bad after the bytes last made: the next read says so
+    failed: bool,
 }
 
 impl Single {
@@ -1324,12 +1326,16 @@ impl Single {
                 max_ratio: MAX_RATIO,
             },
             made: 0,
+            failed: false,
         })
     }
 
     /// Decodes into `out`: [`Self::BYTES`] with the count in `made`, or the offset in `buf` where the pipeline takes
     /// over.
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(data_error("LZMA data error"));
+        }
         loop {
             if self.at == self.len && !self.eof {
                 let n = loop {
@@ -1354,6 +1360,13 @@ impl Single {
             match status {
                 Err(liblzma::stream::Error::Mem | liblzma::stream::Error::MemLimit) => {
                     return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+                // what decoded before the bad data goes out first, the error after (as `LzmaReader` does)
+                Err(_) if made > 0 => {
+                    self.walker.produced += made as u64;
+                    self.made = made;
+                    self.failed = true;
+                    return Ok(Self::BYTES);
                 }
                 Err(_) => return Err(data_error("LZMA data error")),
                 Ok(_) if made > 0 => {
@@ -1523,8 +1536,8 @@ mod tests {
         }
     }
 
-    /// The one-thread failure, and its output a prefix of the threaded one's. The one-thread reader drops what the
-    /// decoder made in the call that failed; a worker hands it out, so the threaded output may run a little further.
+    /// The one-thread failure, and its output a prefix of the threaded one's (or, the bytes made in the call that
+    /// failed being handed out by both, the same); a worker may run a little further.
     fn same_failure(name: &str, got: &(Vec<u8>, Option<String>), want: &(Vec<u8>, Option<String>)) {
         assert_eq!(got.1, want.1, "{name}");
         assert!(got.0.starts_with(&want.0), "{name}: {} bytes vs {} one-thread", got.0.len(), want.0.len());

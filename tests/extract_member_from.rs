@@ -1193,6 +1193,7 @@ mod takeover {
                 attempt_continued_members: false,
                 damaged_input: Default::default(),
                 unsupported_filters: Default::default(),
+                unverified_output: Default::default(),
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),

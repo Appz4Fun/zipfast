@@ -19,6 +19,7 @@ keep_broken: false,
 attempt_continued_members: false,
 damaged_input: Default::default(),
 unsupported_filters: Default::default(),
+unverified_output: Default::default(),
 salvage_truncated_zip: false,
 unix_modes: Default::default(),
 backslashes: Default::default(),
@@ -305,7 +306,7 @@ standard filters in the same member still apply. With `UnsupportedFilters::Write
 | --- | --- | --- |
 | `7z x` / `7z e` | "ERROR: Unsupported Method : itanium_synthetic_bundles.bin", exit 2, the 1 MiB file written (SHA-256 `aff2543c…76c5`) with its time | the same file, with its time; the member reported failed with `RarFailure::Unsupported(RarUnsupported::FilterWrittenUnfiltered)` |
 | `7z t` | the same error, exit 2 | the same failure, nothing written |
-| `7z x -so` | the same error, exit 2, the same bytes streamed | not covered: `SelectedEntry` takes no `Options` |
+| `7z x -so` | the same error, exit 2, the same bytes streamed | `SelectedEntry` with `SelectOptions::unverified_output(UnverifiedOutput::Emit)`: the same bytes to the sink, then an `UnverifiedWritten` error (see `unverified_output` below) |
 
 The member's checksum is not checked (the unfiltered data can't match it), so the failure says the file is written
 but unverified: a caller imitating 7-Zip prints "Unsupported Method" and exits 2. It reaches every report a RAR run
@@ -323,6 +324,66 @@ corrupt data, writing nothing (by default it fails as unsupported, as before).
 Honoured by the whole-archive runners (`extract::run`, `run_with_password`, `run_rar_with_outcomes` and the
 dispatchers) and by `RarSession::extract_selected` and `extract_selected_controlled`, where the file is published as
 a verified one would be (every recheck and hook alike). `RarSession` test and print runs, progressive and
-persistent-partial sessions, `SelectedEntry` and `FeedDecoder` take no such choice (progressive sessions have no
-outcome for a member written but unverified) and fail the member as unsupported. `tests/rar_unsupported_filters.rs`
+persistent-partial sessions and `FeedDecoder` take no such choice (progressive sessions have no outcome for a member
+written but unverified) and fail the member as unsupported; `SelectedEntry` writes it unfiltered under
+`SelectOptions::unverified_output` (below). `tests/rar_unsupported_filters.rs`
 checks each point.
+
+## `unverified_output`: the bytes of a member that fails
+
+UnRAR and 7-Zip hand over what they decoded of a member before it failed; zipfast by default doesn't (a printed or
+streamed member shows only once verified, and `keep_broken` keeps a RAR member cut off by a missing volume empty, as
+7-Zip `x` does). `UnverifiedOutput::Emit` does as the tools do. The member is still reported failed with the failure
+it had (a missing volume, a checksum, a data error), and a sign says its bytes went out unverified, so a caller prints
+the tool's error and exits as it would (UnRAR: exit 3 or 6; 7-Zip: exit 2). `UnverifiedOutput::Withhold`, the
+default, changes nothing.
+
+| field | route | under `Emit` | sign |
+| --- | --- | --- | --- |
+| `Options::unverified_output` | `extract::run`, `run_with_password`, `run_rar_with_outcomes`, the dispatchers | with `keep_broken`, a RAR member cut off by a missing volume keeps every byte UnRAR 7.30 `x -kb` keeps (without `keep_broken` it is removed, as `unrar x` removes it) | the member's usual failure ("missing volume") |
+| `Options::unverified_output` | `RarSession::extract_selected`, `extract_selected_controlled` | with `keep_broken`, the same member is written and kept (by default a session doesn't write it at all) | `RarOutcome::Failed` with `RarFailure::MissingVolume` or `MissingSplitContinuation` |
+| `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume is decoded from the volumes there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
+| `SevenZipPrintOptions::unverified_output` | `sevenzip::print_selected_with_options` (`7z x -so`) | a 7z member failing on its data has what 7-Zip 26.06 streams of it printed | its line in `Summary::errors`, and an `UnverifiedMember { index, name, bytes }` in `Summary::unverified` |
+| `SelectOptions::unverified_output` | `SelectedEntry` (`open_cancelable_with_options`, `open_cancelable_with_zip_limit_and_options`), 7z and RAR | 7z: as `print_selected_with_options`; RAR 3.x/4.x: a VM filter zipfast doesn't run leaves its block unfiltered (as `UnsupportedFilters::WriteUnfiltered`); other formats already stream as they decode | `read` fails with an `Error::Io` carrying `UnverifiedWritten { bytes, cause }` (`UnverifiedWritten::of`); `cause` is the failure without `Emit`, `Error::Unsupported(UNFILTERED_SELECTED)` for a RAR member written unfiltered |
+
+`SelectOptions::from(&options)` copies `Options::unverified_output`.
+
+### A RAR member cut off by a missing volume
+
+UnRAR 7.30 decodes what the volumes there hold, but not to the last bit. From `multi_broken.part1.rar`, two RAR 3.00
+sets and `text.rar` made into a cut-off first volume at 47 places (`tests/fixtures/unverified-output/README.md`):
+
+- RAR 3.x/4.x (LZ): an LZ token whose first bit lies in the last 30 bytes of the data there is not decoded, nor
+  anything after it. In a PPMd block or a RAR 1.5/2.0 stream every byte decoded is handed over (not checked against
+  UnRAR).
+- RAR 5.0: a symbol starting in the last 128 bits of the data there is not decoded; a block of which fewer than 1,024
+  bytes (header included) are there is not decoded at all, and then the last symbols of the block before, within
+  128 bits of the data's end, are left out too (when that block was decoded on this thread: blocks of a big member
+  decoded on worker threads can't give back their last symbols, so a cut within 16 bytes past one of them may write
+  up to a few bytes more than UnRAR).
+
+| first volume alone | `unrar p` / `x -kb` | `Withhold` + `keep_broken` | `Emit` + `keep_broken`, `RarPrintOptions` `Emit` |
+| --- | --- | --- | --- |
+| `multi_broken.part1.rar` `file2.txt` | 6,198 bytes | empty (7-Zip `x`) | the same 6,198 bytes |
+| `multivol_newnaming_rar300.part01.rar` | 53,664 bytes | the 32 KiB flushed before the volume was missed | the same 53,664 bytes |
+| `r5-partial.part1.rar` (RAR 5.0) | 55,043 bytes | the whole blocks written | the same 55,043 bytes |
+
+`7z x -so` on such a member is not imitated: 7-Zip 26.06 streams nothing of a RAR 3.x/4.x one and decodes a RAR 5.0
+one to the end of the data (55,084 bytes for `r5-partial`), and a `SelectedEntry` keeps streaming what it did before.
+
+### 7z members under `7z x -so`
+
+| case | 7-Zip 26.06 `x -so` (exit 2) | `Emit` |
+| --- | --- | --- |
+| a member failing its CRC (`copy_crc.7z`) | every byte decoded, "CRC Failed" | the same bytes |
+| a data error in an LZMA stream (`lzma_bad.7z`, solid `solid_bad.7z`) | the bytes before the error, "Data Error" | the same bytes |
+| a later member of a solid block an earlier one broke | nothing | nothing |
+| a folder whose packed stream is cut short (`lzma_trunc.7z`) | the bytes decoded, "Data Error" | the same bytes |
+| a wrong password, LZMA folder (`-pwrong enc.7z`) | nothing, "Data Error in encrypted file. Wrong password?" | nothing |
+| a wrong password, Copy folder (`-pwrong enc_copy.7z`) | the decrypted garbage, "CRC Failed in encrypted file. Wrong password?" | the same bytes |
+
+Not covered: a Copy folder whose header gives fewer packed than unpacked bytes is refused as malformed headers
+(7-Zip streams the packed bytes and reports "Data Error"); an LZMA2 folder big enough to be decoded on several threads
+hands over only what its threads finished before the error. `tests/unverified_output.rs` checks each point against the
+reference tools' output.
+
