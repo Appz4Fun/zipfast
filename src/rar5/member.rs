@@ -1519,6 +1519,7 @@ mod tests {
                     unsupported_filters: Default::default(),
                     unverified_output: Default::default(),
                     salvage_truncated_zip: false,
+                    seven_zip_strict: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
                 },
@@ -1872,6 +1873,7 @@ mod tests {
                 unsupported_filters: Default::default(),
                 unverified_output: Default::default(),
                 salvage_truncated_zip: false,
+                seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
             };

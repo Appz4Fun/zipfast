@@ -685,6 +685,7 @@ fn file_binding_rejects_foreign_tuple_before_effects_and_borrows_operational_nam
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -1078,6 +1079,7 @@ fn original_file_stage_is_private_during_fill_and_finish_error_preserves_prior_t
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -1149,6 +1151,7 @@ fn original_file_publication_requires_completion_and_two_fresh_source_observatio
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -1244,6 +1247,7 @@ fn file_fixture_ready(overwrite: crate::extract::Overwrite, prior: Option<&[u8]>
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -1387,6 +1391,7 @@ fn actual_original_named_aes_pipeline_has_five_reserved_fds_and_one_under_refuse
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         };
@@ -1499,6 +1504,7 @@ fn actual_named_cipher_unresolved_pair_refuses_cleanup_reopen_and_retains_u_with
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -1913,6 +1919,7 @@ fn empty_move_after_real_effect_eintr_checks_both_names_and_cleans_without_retry
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -2080,6 +2087,7 @@ fn fullpath_ambiguous_birth_after_parent_retarget_cannot_retire_from_old_parent_
                 unsupported_filters: Default::default(),
                 unverified_output: Default::default(),
                 salvage_truncated_zip: false,
+                seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
             };
@@ -2226,6 +2234,7 @@ fn linux_actual_parent_access_default_acl_gid_and_mode_parity_survive_private_st
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         };
@@ -2326,6 +2335,7 @@ fn mac_native_inherited_acl_and_maximum_aces_match_incumbent_creation_after_publ
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         };
@@ -2409,6 +2419,7 @@ fn preparation_each_instrumented_boundary_retires_or_reports_unobserved_empty_di
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         };
@@ -2541,6 +2552,7 @@ fn retained_and_generic_receipts_release_borrows_before_real_read_and_publicatio
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
         };

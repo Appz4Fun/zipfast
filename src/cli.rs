@@ -124,6 +124,7 @@ pub(crate) fn main() -> ExitCode {
                 unsupported_filters: Default::default(),
                 unverified_output: Default::default(),
                 salvage_truncated_zip: false,
+                seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
             };
@@ -247,6 +248,7 @@ fn listing_options() -> Options {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }

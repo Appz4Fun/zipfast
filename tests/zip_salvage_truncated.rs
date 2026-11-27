@@ -61,6 +61,7 @@ fn options(dest: &Path, salvage: bool, keep: bool) -> Options {
         unix_modes: Default::default(),
         backslashes: Default::default(),
         salvage_truncated_zip: salvage,
+        seven_zip_strict: false,
     }
 }
 

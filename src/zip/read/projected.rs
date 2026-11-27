@@ -82,6 +82,9 @@ pub(super) struct Action {
     pub(super) scope: ProjectedReadScope,
     pub(super) active_ordinal: Option<usize>,
     pub(super) run_bound: bool,
+    /// [`crate::extract::Options::seven_zip_strict`] for the run bound to this action: each member's local header is
+    /// compared with its central record before it is decoded
+    pub(super) seven_zip_strict: bool,
     pub(super) active_record_charged: bool,
     pub(super) output: budget::PlannedOutput,
     pub(super) caller_max: Option<u64>,
@@ -933,6 +936,7 @@ pub(super) fn factory<'a>(
             scope,
             active_ordinal: None,
             run_bound: false,
+            seven_zip_strict: false,
             active_record_charged: false,
             output,
             caller_max,
@@ -1040,6 +1044,18 @@ struct HeldSource<'a> {
     binding: &'a mut SourceBinding,
     local_at: u64,
     prepared: bool,
+    /// [`crate::extract::Options::seven_zip_strict`]: the central record the local header must agree with
+    central: Option<Central<'a>>,
+}
+
+/// What [`HeldSource::prepare_member`] compares a local header with under strict checks.
+struct Central<'a> {
+    name: &'a str,
+    flags: u16,
+    method: u16,
+    crc32: u32,
+    packed: u64,
+    size: u64,
 }
 impl Read for HeldSource<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -1115,6 +1131,12 @@ impl cipher::CiphertextSource for HeldSource<'_> {
         }
         let header =
             zip::LocalHeader::parse(&head).map_err(|_| ReadFault::CheckedFormat { reason: "invalid local header" })?;
+        if let Some(c) = &self.central
+            && let Some(found) =
+                crate::extract::LocalHeaderMismatch::compare(&header, c.flags, c.method, c.crc32, c.packed, c.size)
+        {
+            return Err(ReadFault::LocalHeaderMismatch(Box::new(found.named(plan.ordinal, c.name))).into());
+        }
         let layout = zip::local_layout(header, self.local_at, len)
             .map_err(|_| ReadFault::CheckedFormat { reason: "invalid local layout" })?;
         let payload = layout
@@ -1237,6 +1259,7 @@ fn checked_read_inner(
         return Err(ReadFault::InvalidPlan.into());
     }
     action.consumed = true;
+    let strict = action.seven_zip_strict;
     if !(action.scope == ProjectedReadScope::AllRegular && action.active_record_charged) {
         context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1))?;
     }
@@ -1276,7 +1299,15 @@ fn checked_read_inner(
             && action.controlled_output
             && action.output == budget::PlannedOutput::StagedFiles,
     };
-    let mut source = HeldSource { file, binding, local_at: e.local_at, prepared: false };
+    let central = strict.then_some(Central {
+        name: e.name,
+        flags: e.flags,
+        method: e.method,
+        crc32: e.crc32,
+        packed: e.packed,
+        size: e.size,
+    });
+    let mut source = HeldSource { file, binding, local_at: e.local_at, prepared: false, central };
     if let Some(fault) = rejection {
         let fault = if cipher.is_some() {
             context.ledger.with_state(|s| s.encrypted.reject_member(e.packed, fault))
@@ -1603,7 +1634,8 @@ pub(super) fn test_original_all_member(
         streaming: false,
     };
     context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1))?;
-    let mut source = HeldSource { file: &mut owner.file, binding, local_at: e.local_at, prepared: false };
+    let mut source =
+        HeldSource { file: &mut owner.file, binding, local_at: e.local_at, prepared: false, central: None };
     let admission = cipher::Admission::new(&context.ledger, &mut source, plan, Some("pw"), kind)?.prepare(&cancel)?;
     let (admission, mut workspace) = admission.workspace()?;
     let pending = cipher::PendingAes::copy_admitted(admission, context.temp.as_ref(), &mut workspace.input, &cancel)?;

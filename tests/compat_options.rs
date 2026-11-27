@@ -76,6 +76,7 @@ fn options(mode: Mode, dest: &Path) -> Options {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }
@@ -467,6 +468,7 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
         ..options(Mode::Extract, dest)
@@ -509,6 +511,7 @@ fn r5extra_comes_out_as_7zip_writes_it() {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
         ..options(Mode::Extract, &out)

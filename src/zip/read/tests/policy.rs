@@ -430,6 +430,7 @@ fn frozen_policy_keeps_namespace_keys_after_inode_replacement_and_exact_configur
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -524,6 +525,7 @@ fn frozen_relative_destination_cwd_and_context_first_teardown_are_exact() {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };

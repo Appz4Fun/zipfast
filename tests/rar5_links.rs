@@ -54,6 +54,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite, threads: usize) -> Opt
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }
@@ -812,6 +813,7 @@ fn refused_links_leave_placeholders_on_every_writer() {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
         ..options(dest, Mode::Extract, Overwrite::Always, 1)

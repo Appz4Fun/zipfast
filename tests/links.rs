@@ -54,6 +54,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite) -> Options {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }
@@ -551,6 +552,7 @@ fn a_refused_link_leaves_a_placeholder_only_when_asked() {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
             ..options(&dest, Mode::Extract, Overwrite::Always)

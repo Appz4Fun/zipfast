@@ -26,8 +26,8 @@ use super::coders::{self, Fault, Keys};
 use super::source::VolumeSet;
 use super::{EncryptedFailure, SevenZipError, SevenZipLimits, check_bounds, member_name, open_map_keyed};
 use crate::extract::{
-    Cancellation, Checked, Dirs, LegacyMember, LegacyReport, Meta, Mode, Options, Overwrite, Place, RenameLog,
-    RenamedOutput, Summary,
+    Cancellation, Checked, Dirs, FolderDamage, FolderDamageKind, LegacyMember, LegacyReport, Meta, Mode, Options,
+    Overwrite, Place, RenameLog, RenamedOutput, Summary,
 };
 use crate::map::{MapFolder, MapMember, MemberMap};
 use crate::output::Output;
@@ -79,6 +79,8 @@ struct Active {
     /// the ones before them, so the output stays in archive order)
     unverified_held: Vec<u64>,
     defer: bool,
+    /// [`crate::extract::Options::seven_zip_strict`]: the coders' end checks, made once the folder is read to its end
+    checks: Vec<coders::EndCheck>,
 }
 
 /// Plaintext one member holds back until it checks out: in memory, or a range of the run's [`SpoolStore`] file.
@@ -300,6 +302,8 @@ struct Run<'a> {
     /// [`crate::extract::UnverifiedOutput::Emit`] when printing: a member that fails on its data prints what was
     /// decoded of it, as 7-Zip 26.06 `x -so` does
     unverified: bool,
+    /// [`crate::extract::Options::seven_zip_strict`]
+    strict: bool,
 }
 
 /// `threads` as asked for, None for one per core.
@@ -371,6 +375,7 @@ pub(super) fn run(
         store: SpoolStore::default(),
         threads: thread_count(options.threads),
         unverified: false,
+        strict: options.seven_zip_strict,
     };
     let result = run.members(&selected, &needed);
     crate::extract::finish_dirs(&mut run.summary);
@@ -393,8 +398,9 @@ pub(super) fn print(
     sink: PrintSink<'_>,
     cancel: &Cancellation,
     limits: &SevenZipLimits,
-    unverified: bool,
+    print_options: &super::SevenZipPrintOptions,
 ) -> Outcome<Summary> {
+    let unverified = print_options.unverified_output == crate::extract::UnverifiedOutput::Emit;
     let (map, header_key) = open_map_keyed(first, password, cancel, limits)?;
     let mut keys = Keys::new(password);
     if let Some((cycles, salt, key)) = header_key {
@@ -445,6 +451,7 @@ pub(super) fn print(
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     };
@@ -471,6 +478,7 @@ pub(super) fn print(
         store: SpoolStore::default(),
         threads: thread_count(limits.decode_threads),
         unverified,
+        strict: print_options.seven_zip_strict,
     };
     run.members(&selected, &needed)?;
     Ok(run.summary)
@@ -845,6 +853,11 @@ impl Run<'_> {
             self.pump(&mut active, left, None, None)?;
         }
         let complete = active.failed.is_none() && active.pos == folder.unpacked_size;
+        // Options::seven_zip_strict: a folder decoded to its end has its coders' ends checked, as 7-Zip checks them;
+        // what fails is the folder's damage, whatever its members' own checks said
+        if complete {
+            self.check_end(&mut active)?;
+        }
         let good = complete && folder.crc32.is_none_or(|crc| crc == active.crc.clone().finalize());
         // An encrypted folder whose own CRC fails before any data proved the password did not decrypt.
         // a folder that decoded to its end and fails only its own CRC shows it as a CRC failure
@@ -922,6 +935,39 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// [`crate::extract::Options::seven_zip_strict`]: runs the folder's end checks (each coder's, inner ones first);
+    /// the first that finds damage is the folder's [`FolderDamage`], reported as a line.
+    fn check_end(&mut self, active: &mut Active) -> Outcome<()> {
+        let mut found = None;
+        for check in &mut active.checks {
+            if self.cancel.is_canceled() {
+                return Err(SevenZipError::Canceled);
+            }
+            match check() {
+                Ok(None) => continue,
+                Ok(Some(damage)) => found = Some(damage),
+                Err(e) => match Fault::of(e) {
+                    Fault::Canceled => return Err(SevenZipError::Canceled),
+                    Fault::Missing(path) => return Err(SevenZipError::MissingVolume(path)),
+                    Fault::Input(e) => return Err(SevenZipError::Io(e)),
+                    Fault::Data(_) | Fault::Truncated => {
+                        found = Some((FolderDamageKind::DataError, "the folder's input does not decode to its end"))
+                    }
+                },
+            }
+            break;
+        }
+        active.checks.clear();
+        if let Some((kind, detail)) = found {
+            let damage = FolderDamage::new(active.index as u64, kind, detail);
+            let line = damage.to_string();
+            self.report.line(&line);
+            self.summary.errors.push(line);
+            self.summary.folder_damage.push(damage);
+        }
+        Ok(())
+    }
+
     fn open_folder(&mut self, index: usize) -> Outcome<()> {
         self.close_folder()?;
         let folder: &MapFolder = &self.map.folders[index];
@@ -933,8 +979,11 @@ impl Run<'_> {
             dictionaries: 0,
             threads: self.threads,
             spare: Default::default(),
+            strict: self.strict,
+            checks: Vec::new(),
         };
         let reader = coders::folder_reader(folder, &mut cx)?;
+        let checks = std::mem::take(&mut cx.checks);
         self.active = Some(Active {
             index,
             reader,
@@ -947,6 +996,7 @@ impl Run<'_> {
             held: Vec::new(),
             unverified_held: Vec::new(),
             defer: folder.crc32.is_some() && folder.members > 1,
+            checks,
         });
         Ok(())
     }

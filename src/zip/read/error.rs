@@ -213,6 +213,9 @@ pub enum ReadFault {
     CheckedFormat {
         reason: &'static str,
     },
+    /// [`crate::extract::Options::seven_zip_strict`]: the member's local header differs from its central directory
+    /// record (7-Zip's "Headers Error"); the member was not decoded.
+    LocalHeaderMismatch(Box<crate::extract::LocalHeaderMismatch>),
     InvalidPlan,
     CounterOverflow,
     Cancelled,

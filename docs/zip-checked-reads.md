@@ -174,3 +174,10 @@ find (`ReadFault::CheckedFormat { reason: "not a ZIP archive" }`, no cleanup fau
 with a local header is handed to the legacy reader, which walks its local headers as 7-Zip does. That run is a legacy
 run: its events are the legacy events above, and none of the checked guarantees apply to it. An archive whose end
 record is found never takes this path. See `docs/compat-options.md` (`salvage_truncated_zip`).
+
+## A local header that differs from the central directory (opt-in)
+
+With `Options::seven_zip_strict` (off by default), each member's local header is compared with its central record
+when the member is prepared: the CRC-32, the sizes and the method, as 7-Zip 26.06 compares them, plus the data
+descriptor flag. A member whose local header differs fails with `ReadFault::LocalHeaderMismatch` before anything is
+written, and `ZipRunReport::local_header_mismatches()` counts it. See `docs/compat-options.md` (`seven_zip_strict`).

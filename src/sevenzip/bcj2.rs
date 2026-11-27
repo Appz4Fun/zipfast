@@ -21,7 +21,8 @@
 //! `7zFormat.txt` and the LZMA SDK's description of the format.
 use std::io::{self, BufRead, Read};
 
-use super::coders::data_error;
+use super::coders::{Damage, data_error};
+use crate::extract::FolderDamageKind;
 
 /// Probabilities: one per previous byte for E8, one for E9, one for Jcc.
 const PROBS: usize = 258;
@@ -45,6 +46,9 @@ pub(crate) struct Bcj2Reader<R> {
     pending_len: usize,
     /// The last main byte was a candidate opcode whose bit has not been decoded yet.
     candidate: Option<u8>,
+    /// [`crate::extract::Options::seven_zip_strict`]: the range coder starts at the first read, and its first byte
+    /// must be 0, as 7-Zip requires
+    strict: bool,
 }
 
 impl<R: BufRead> Bcj2Reader<R> {
@@ -65,7 +69,63 @@ impl<R: BufRead> Bcj2Reader<R> {
             pending_at: 0,
             pending_len: 0,
             candidate: None,
+            strict: false,
         }
+    }
+
+    /// Checked as 7-Zip checks: see [`Self::finish`].
+    pub(crate) fn strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    fn start(&mut self) -> io::Result<()> {
+        if self.started {
+            return Ok(());
+        }
+        let first = self.rc_byte()?;
+        if self.strict && first != 0 {
+            return Err(data_error("the BCJ2 range coder's first byte is not 0"));
+        }
+        self.code = u32::from(first);
+        for _ in 0..4 {
+            self.code = (self.code << 8) | u32::from(self.rc_byte()?);
+        }
+        self.started = true;
+        Ok(())
+    }
+
+    /// Under strict checks, once the output is read to its size: every input stream used up, and the range coder at
+    /// 0, as 7-Zip's encoder leaves it.
+    pub(crate) fn finish(&mut self) -> io::Result<Option<Damage>> {
+        const LEFT: Damage = (FolderDamageKind::DataError, "a BCJ2 target is left after the output's end");
+        // A candidate opcode at the very end still has its bit coded.
+        if let Some(b) = self.candidate.take() {
+            self.start()?;
+            if self.settle(b).is_err() || self.pending_at < self.pending_len {
+                return Ok(Some(LEFT));
+            }
+        }
+        // the last bit's normalization, which 7-Zip's decoder makes as it decodes the bit
+        if self.started && self.range < TOP {
+            self.range <<= 8;
+            self.code = (self.code << 8) | u32::from(self.rc_byte()?);
+        }
+        let streams = [
+            (&mut self.main, "BCJ2 main stream bytes are left unused"),
+            (&mut self.call, "BCJ2 call stream bytes are left unused"),
+            (&mut self.jump, "BCJ2 jump stream bytes are left unused"),
+            (&mut self.rc, "BCJ2 range coder bytes are left unused"),
+        ];
+        for (input, what) in streams {
+            if !input.fill_buf()?.is_empty() {
+                return Ok(Some((FolderDamageKind::DataError, what)));
+            }
+        }
+        if !self.started {
+            self.start()?;
+        }
+        Ok((self.code != 0).then_some((FolderDamageKind::DataError, "the BCJ2 range coder does not end at 0")))
     }
 
     fn rc_byte(&mut self) -> io::Result<u8> {
@@ -77,12 +137,7 @@ impl<R: BufRead> Bcj2Reader<R> {
     }
 
     fn bit(&mut self, index: usize) -> io::Result<bool> {
-        if !self.started {
-            for _ in 0..5 {
-                self.code = (self.code << 8) | u32::from(self.rc_byte()?);
-            }
-            self.started = true;
-        }
+        self.start()?;
         if self.range < TOP {
             self.range <<= 8;
             self.code = (self.code << 8) | u32::from(self.rc_byte()?);
@@ -135,6 +190,9 @@ impl<R: BufRead> Read for Bcj2Reader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
+        }
+        if self.strict {
+            self.start()?;
         }
         if let Some(b) = self.candidate.take() {
             self.settle(b)?;
