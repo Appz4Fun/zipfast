@@ -285,12 +285,42 @@ Where it applies:
 - `RarSession`, through `RarSessionOptions::damaged_input`: the catalogue reads past the damage, its members list and
   extract (`extract_selected`, `extract_selected_controlled`, printing) as any other, and
   `RarArchiveMetadata::damaged_headers()` says what was read past;
-- `Volume::open_damaged` and `Volume::take_damage` for callers walking blocks themselves.
+- `Volume::open_damaged` and `Volume::take_damage` for callers walking blocks themselves;
+- progressive sessions (`ProgressiveSession::new`, `from_sealed_memory`), through `ProgressiveOptions::extract`: each
+  damaged header is a `ProgressiveEvent::HeaderDamaged { volume, damage }`, delivered before anything read from that
+  header (so just before the `MemberStarted` of a member whose header failed its checksum). See "Damaged headers in a
+  progressive session" below.
 
-Progressive and persistent-partial sessions still refuse a damaged header whatever `damaged_input` says; listings that
-take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
+Persistent-partial sessions (`ProgressiveSession::new_partial`) still refuse a damaged header whatever `damaged_input`
+says: their journal binds each member to the header bytes it was read from, and a header repaired later would no longer
+match. Listings that take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
 `--resync` (for `l`, `t`, `x`, `e`; a listing of anything but RAR stays as it is), prints each damaged header and a warning, and exits 1.
 `tests/rar_salvage.rs` checks each point.
+
+### Damaged headers in a progressive session
+
+A progressive session reads bytes as its source delivers them, and a range that is missing now may be filled later
+(an article fetched again, PAR2 repair, another copy). So only bytes the source has delivered are ever judged damaged:
+
+- A header the source has not delivered yet (`RangeRead::NotYet`, or a volume not there yet) is waited on, as under
+  `Refuse`; it is never damage. When it arrives it is read as any other header.
+- A header inside a range the source answers as a `Hole` is not damage either: the session stops with `HeaderHole`, as
+  under `Refuse`, since the bytes may yet be repaired. Run the session again once they are.
+- A resync never searches across a `Hole`: the next header may be inside it, so the search stops with `HeaderHole`.
+  On a source whose end isn't known yet (`GrowingFileVolumes`) a search that has not found a header waits for more
+  bytes, as reading a header does.
+- Only a header whose bytes were delivered and are wrong (a checksum that fails, fields that don't parse, a header or
+  data running past the volume's known end) is salvaged, exactly as the whole-archive runners do: the same members,
+  the same bytes and the same `HeaderDamage` records (`volume` is the volume's name as the session asked for it).
+
+Under salvage the session takes the volume's length from the source (`SourceInfo::length`, unless it is
+`Advertised(u64::MAX)`), so a header or data running past it is a volume cut short (`UnexpectedEnd`). The rest of a
+damaged volume is passed over as in the whole-archive runners: a volume set goes on with its next volume (a sealed set,
+or a declared last volume, may end there), anything else ends. A folder whose damaged header claims data is created and
+its data passed over. A resync's work is bounded as the whole-archive one's, by 16 times the furthest offset read in
+the volume plus 1 MiB, and it charges its window (at most a chunk and one candidate header) to `MetadataBytes`. Bytes
+passed over break a solid archive's history: the next solid member stops with `SolidHistoryUnavailable`.
+`tests/progressive_salvage.rs` checks each point.
 ## `unsupported_filters`: a RAR 3.x/4.x member using a VM filter zipfast doesn't run
 
 RAR 3.x/4.x carries filters as programs for its virtual machine. zipfast runs the standard ones (E8, E8E9, ITANIUM,

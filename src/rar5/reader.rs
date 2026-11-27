@@ -57,11 +57,11 @@ type ParsedBlock = (Block, MemberCrypt, Option<FileWire>);
 const MAX_DAMAGE_NAME: usize = 1024;
 
 /// [`Volume::resync`] reads the volume this many bytes at a time.
-const RESYNC_CHUNK: usize = 1 << 20;
+pub(crate) const RESYNC_CHUNK: usize = 1 << 20;
 /// The first chunk a resync reads: most land on a header within it, and a run of resyncs close together reads little.
-const RESYNC_FIRST_CHUNK: usize = 64;
+pub(crate) const RESYNC_FIRST_CHUNK: usize = 64;
 /// Bytes past each chunk a resync reads, so that every position in the chunk shows its header's fixed fields.
-const RESYNC_LOOKAHEAD: usize = 32;
+pub(crate) const RESYNC_LOOKAHEAD: usize = 32;
 /// The longest RAR 5.0 file or service header a resync checks: real ones, names and extra records included, are far
 /// shorter. An end header is at most [`RESYNC_END_MAX`].
 const RESYNC_HEADER_MAX: usize = 8 << 10;
@@ -71,13 +71,13 @@ const RESYNC_END_MAX: usize = 32;
 const RESYNC_RAR4_HEADER_MAX: usize = 32 + 2048 + 64;
 /// Work (bytes read and checksummed) all the resyncs in a volume may do per byte of the volume (plus 1 MiB), keeping
 /// them linear.
-const RESYNC_WORK_PER_BYTE: u64 = 16;
+pub(crate) const RESYNC_WORK_PER_BYTE: u64 = 16;
 
 /// The length of the header [`Volume::resync`] would check at the start of `b` (up to [`RESYNC_LOOKAHEAD`] bytes of
 /// it), from its fixed fields alone: a file, service or end header of a plausible size and with plausible fields. None
 /// when it is none. Random bytes pass about once in a few thousand positions, with a short header, so that checking
 /// what passes costs about a byte per byte scanned.
-fn resync_shape(b: &[u8], format: RarFormat) -> Option<usize> {
+pub(crate) fn resync_shape(b: &[u8], format: RarFormat) -> Option<usize> {
     if b.len() < 7 {
         return None;
     }
@@ -136,7 +136,7 @@ fn resync_shape(b: &[u8], format: RarFormat) -> Option<usize> {
 }
 
 /// Whether the whole header `h` (as long as [`resync_shape`] said) passes its checksum.
-fn resync_checks(h: &[u8], format: RarFormat) -> bool {
+pub(crate) fn resync_checks(h: &[u8], format: RarFormat) -> bool {
     match format {
         RarFormat::Rar5 => crate::crc32::hash(&h[4..]) == u32::from_le_bytes([h[0], h[1], h[2], h[3]]),
         RarFormat::Rar4 => crate::crc32::hash(&h[2..]) as u16 == u16::from_le_bytes([h[0], h[1]]),

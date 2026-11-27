@@ -230,6 +230,8 @@ impl ProgressiveSession {
             directories: Vec::new(),
             created: Vec::new(),
         });
+        // a persistent session refuses damaged headers whatever `damaged_input` says (see `damaged_input()`)
+        session.parser.set_salvage(crate::extract::DamagedInput::Refuse);
         Ok(session)
     }
     #[allow(clippy::result_large_err, reason = "preserve the public typed partial receipt API")]
