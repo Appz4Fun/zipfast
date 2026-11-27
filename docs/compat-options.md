@@ -458,9 +458,10 @@ sets and `text.rar` made into a cut-off first volume at 47 places (`tests/fixtur
 - RAR 5.0: a symbol starting in the last 128 bits of the data there is not decoded; a block of which fewer than 1,024
   bytes (header included) are there is not decoded at all, and then the last symbols of the block before, within
   128 bits of the data's end, are left out too. `RarSession` decodes a member it knows is cut off on the calling
-  thread whatever its thread settings, so this always holds there. The whole-archive run finds the cut only at the
-  missing volume: blocks of a big member it decoded on worker threads can't give back their last symbols, so a cut
-  within 16 bytes past one of them may write up to a few bytes more than UnRAR.
+  thread whatever its thread settings. The whole-archive run finds the cut only at the missing volume, so under
+  `Emit` its decode workers mark where the symbols in the last 128 bits of each block start, and the calling thread
+  notes the output before each as it applies their tokens: a big member (or any, with `parallel_min` 0) cut just
+  past a block gives UnRAR's bytes too.
 
 | first volume alone | `unrar p` / `x -kb` | `Withhold` + `keep_broken` | `Emit` + `keep_broken`, `RarPrintOptions` `Emit` |
 | --- | --- | --- | --- |
