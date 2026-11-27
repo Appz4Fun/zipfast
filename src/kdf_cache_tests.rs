@@ -135,9 +135,9 @@ fn block(kind: u64, fields: &[u8], extra: &[u8], data: Option<&[u8]>) -> Vec<u8>
 
 const KDF_COUNT: u8 = 4;
 
-/// A RAR 5.0 archive of stored members encrypted with [`PASSWORD`], member `i` keyed with salt `[salts[i]; 16]`
+/// A RAR 5.0 archive of stored members encrypted with `password`, member `i` keyed with salt `[salts[i]; 16]`
 /// and carrying its password check value, as `rar` writes members added in separate sessions.
-fn mixed_salts(salts: &[u8]) -> Vec<u8> {
+fn mixed_salts(password: &str, salts: &[u8]) -> Vec<u8> {
     let mut out = b"Rar!\x1a\x07\x01\x00".to_vec();
     out.extend(block(1, &[0], &[], None));
     for (i, &salt) in salts.iter().enumerate() {
@@ -145,7 +145,7 @@ fn mixed_salts(salts: &[u8]) -> Vec<u8> {
         let iv = [i as u8; 16];
         let name = format!("m{i}.txt");
         let plain = format!("member {i}\n").into_bytes();
-        let material = crate::crypto::rar5_material(PASSWORD.as_bytes(), KDF_COUNT, &salt, FOLD, &mut NoLimit).unwrap();
+        let material = crate::crypto::rar5_material(password.as_bytes(), KDF_COUNT, &salt, FOLD, &mut NoLimit).unwrap();
         let keys = material.keys(None).unwrap();
         let mut padded = plain.clone();
         padded.resize(plain.len().next_multiple_of(16), 0);
@@ -195,7 +195,7 @@ const MIXED: [u8; 6] = [1, 1, 2, 1, 2, 3];
 fn rar5_keys_are_derived_once_per_salt_on_every_route() {
     let dir = tempfile::tempdir().unwrap();
     let mixed = dir.path().join("mixed.rar");
-    fs::write(&mixed, mixed_salts(&MIXED)).unwrap();
+    fs::write(&mixed, mixed_salts(PASSWORD, &MIXED)).unwrap();
     let vols: Vec<PathBuf> = (1..=4).map(|n| fixture(&format!("vols.part{n}.rar"))).collect();
     for (name, paths, members, salts) in [
         ("hp3.rar", vec![fixture("hp3.rar")], 3, 1),
@@ -245,7 +245,8 @@ fn a_wrong_password_fails_every_member_on_one_derivation_per_salt() {
     const WRONG: &str = "kdfcache-wrong";
     let dir = tempfile::tempdir().unwrap();
     let mixed = dir.path().join("mixed.rar");
-    fs::write(&mixed, mixed_salts(&MIXED)).unwrap();
+    // made with a password of its own: building it derives nothing another test counts
+    fs::write(&mixed, mixed_salts("kdfcache-mixed", &MIXED)).unwrap();
     for (path, members, salts) in [(fixture("p3.rar"), 3, 1), (mixed, 6, 3)] {
         let before = rar5_derivations(WRONG);
         let out = dir.path().join("run");
