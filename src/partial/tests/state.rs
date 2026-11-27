@@ -183,6 +183,7 @@ impl Fixture {
                 bytes: bytes[frame.extent.start as usize..frame.extent.end as usize].to_vec(),
                 salvaged: false,
             }],
+            cut: Vec::new(),
             direct: None,
         };
         Self {
@@ -724,6 +725,7 @@ fn split_fixture() -> (Fixture, EvidenceUpdate) {
                 bytes: bytes[..frame.extent.end as usize].to_vec(),
                 salvaged: false,
             }],
+            cut: Vec::new(),
             direct: None,
         }
     };

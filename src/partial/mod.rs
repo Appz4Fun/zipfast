@@ -504,6 +504,7 @@ impl PartialCore {
                 .map(|h| h.bytes.len() + std::mem::size_of::<HeaderWitness>())
                 .sum::<usize>()
             + snapshot.evidence.parts.len() * std::mem::size_of::<PlainPart>()
+            + snapshot.evidence.cut.len() * std::mem::size_of::<u64>()
             + snapshot
                 .evidence
                 .admissions
@@ -2311,6 +2312,20 @@ impl PartialCore {
         let transaction = self.begin_transaction(&mut data, intent, valid, Vec::new())?;
         self.finish_transaction(&mut data, transaction)?;
         self.keep_part_results(&mut data, carried)
+    }
+    /// [`crate::extract::Options::keep_broken`] in a persistent session: gives a member kept unverified (`Bad`, or cut
+    /// off) the archive's modified time and permissions, as the whole-archive runners give a kept broken file, best
+    /// effort. The output stays resumable and repairable: the owner keeps read and write permission (`| 0o600`), and a
+    /// later `Verdict::Ok` applies the archive's metadata exactly. Commits nothing; the open group, if any, stays open.
+    pub(crate) fn apply_kept_metadata(&self) -> PartialResult<()> {
+        let mut data = self.operation()?;
+        self.check(&data)?;
+        let mut metadata = data.snapshot.evidence.metadata;
+        metadata.mode = metadata.mode.map(|mode| (mode & 0o777) | 0o600);
+        self.native.written();
+        drop(crate::extract::finish_file_checked(&self.native.output.file, &metadata));
+        data.stamp = stamp(&self.native)?;
+        self.check(&data)
     }
     /// Ends the member at its committed `produced`: `[produced, size)` becomes one `TailAbandoned` hole that
     /// plaintext fills may write, and the member counts as finished, with the archive's checks when the extraction

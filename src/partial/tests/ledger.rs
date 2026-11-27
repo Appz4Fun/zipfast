@@ -158,6 +158,7 @@ impl Fixture {
                 parts,
                 admissions,
                 headers,
+                cut: Vec::new(),
                 direct: None,
             },
             checks,
@@ -754,4 +755,124 @@ fn salvaged_witnesses_persist_in_their_own_section() {
     let last = stray.len() - 4;
     stray[last..].copy_from_slice(&7u32.to_le_bytes());
     assert!(decode(with(stray, &pages)).is_err(), "an index past the witnesses");
+}
+
+/// A part recorded cut short (its volume's final length ends inside its data: a set truncated inside a member's
+/// first part) is listed in a section only such states carry. Without the listing such a part is malformed, as
+/// before; states with no cut part are byte-identical to before; a section of an unknown version is `StateVersion`
+/// (as an older build reports for the section itself, an unknown trailing tag); a malformed section never decodes.
+#[test]
+fn cut_parts_persist_in_their_own_section() {
+    use crate::partial::state::{self, PageKind};
+    let f = Fixture::new(4096, true, true, false);
+    let file = f.create();
+    let op = file.core.operation().unwrap();
+    assert!(op.snapshot.evidence.parts.len() >= 2);
+    let witnesses = |pages: &[(PageKind, Vec<u8>)]| {
+        let (kind, bytes) = pages.iter().find(|(kind, _)| *kind == PageKind::HeaderWitnesses).unwrap();
+        state::page_payload(*kind, bytes).unwrap().to_vec()
+    };
+    let with = |witnesses: Vec<u8>, pages: &[(PageKind, Vec<u8>)]| -> Vec<(PageKind, Vec<u8>)> {
+        pages
+            .iter()
+            .map(|(kind, bytes)| match kind {
+                PageKind::HeaderWitnesses => (*kind, state::page_bytes(*kind, &witnesses).unwrap()),
+                _ => (*kind, bytes.clone()),
+            })
+            .collect()
+    };
+    let decode = |pages: Vec<(PageKind, Vec<u8>)>| {
+        state::decode_pages(op.snapshot.head.clone(), pages, &file.core.budget, &[]).map(|s| s.evidence.cut)
+    };
+    let (clean, _lease) = state::encode_pages(&op.snapshot, &file.core.budget).unwrap();
+    assert!(decode(clean.clone()).unwrap().is_empty());
+    let plain = witnesses(&clean);
+
+    // The first part's volume ends 10 bytes into its data.
+    let (mut cut, _copy) = file.core.clone_snapshot(&op.snapshot).unwrap();
+    let first = cut.evidence.parts[0].clone();
+    let admission = cut.evidence.admissions.iter_mut().find(|a| a.volume == first.packed.volume).unwrap();
+    let short = first.packed.range.start + 10;
+    admission.info.length = SourceLength::Final(short);
+    admission.info.extent = short;
+    let (unlisted, _lease) = state::encode_pages(&cut, &file.core.budget).unwrap();
+    assert!(
+        matches!(decode(unlisted).unwrap_err().kind, PartialErrorKind::StateMalformed),
+        "a part past its volume's final length is malformed unless listed cut"
+    );
+    cut.evidence.cut = vec![0];
+    let (pages, _lease) = state::encode_pages(&cut, &file.core.budget).unwrap();
+    let marked = witnesses(&pages);
+    assert_eq!(marked.len(), plain.len() + 14, "tag, version, count and one ordinal");
+    assert_eq!(&marked[..plain.len()], &plain[..], "the section follows the witnesses");
+    assert_eq!(&marked[plain.len()..plain.len() + 2], &[0xC7, 1]);
+    assert_eq!(decode(pages.clone()).unwrap(), vec![0]);
+
+    let section = |count: u32, ordinals: &[u64]| {
+        let mut bytes = plain.clone();
+        bytes.extend([0xC7, 1]);
+        bytes.extend(count.to_le_bytes());
+        for ordinal in ordinals {
+            bytes.extend(ordinal.to_le_bytes());
+        }
+        with(bytes, &pages)
+    };
+    let mut future = marked.clone();
+    future[plain.len() + 1] = 2;
+    assert!(matches!(decode(with(future, &pages)).unwrap_err().kind, PartialErrorKind::StateVersion));
+    let malformed = |pages| matches!(decode(pages).unwrap_err().kind, PartialErrorKind::StateMalformed);
+    assert!(malformed(section(0, &[])), "an empty listing");
+    assert!(malformed(section(2, &[0, 0])), "a part listed twice");
+    assert!(malformed(section(2, &[1, 0])), "ordinals out of order");
+    let mut within = plain.clone();
+    within.extend(&marked[plain.len()..]);
+    assert!(malformed(with(within, &clean)), "a listed part that lies within its volume");
+    assert!(malformed(section(2, &[0, u64::MAX])), "an ordinal past the parts");
+    assert!(malformed(section(1, &[u64::MAX])), "an ordinal past the parts");
+    assert!(malformed(section(u32::MAX, &[0])), "a count past the bytes");
+    assert!(malformed(section(1, &[])), "a section cut short");
+    let mut short_ordinal = marked.clone();
+    short_ordinal.truncate(short_ordinal.len() - 3);
+    assert!(decode(with(short_ordinal, &pages)).is_err(), "an ordinal cut short");
+
+    // With the other trailing sections: salvaged witnesses (0x5A) come first, the format tag last; any other order
+    // is refused.
+    let (mut both, _copy) = file.core.clone_snapshot(&cut).unwrap();
+    both.evidence.headers[0].salvaged = true;
+    let (both_pages, _lease) = state::encode_pages(&both, &file.core.budget).unwrap();
+    let decoded = state::decode_pages(op.snapshot.head.clone(), both_pages.clone(), &file.core.budget, &[]).unwrap();
+    assert_eq!(decoded.evidence.cut, vec![0]);
+    assert!(decoded.evidence.headers[0].salvaged);
+    let bytes = witnesses(&both_pages);
+    let salvaged_len = 6 + 4 * both.evidence.headers.iter().filter(|h| h.salvaged).count();
+    let (salvaged, cut_section) = bytes[plain.len()..].split_at(salvaged_len);
+    assert_eq!((salvaged[0], cut_section[0]), (0x5A, 0xC7));
+    let mut swapped = plain.clone();
+    swapped.extend(cut_section);
+    swapped.extend(salvaged);
+    assert!(decode(with(swapped, &both_pages)).is_err(), "the cut section before the salvaged one");
+    let mut twice = marked.clone();
+    twice.extend(&marked[plain.len()..]);
+    assert!(decode(with(twice, &pages)).is_err(), "the cut section twice");
+    // a format tag after the section is read as before (here a RAR4 tag on RAR 5.0 witnesses, refused as such
+    // by the witness parse, not as an unknown section)
+    let mut tagged = marked.clone();
+    tagged.push(4);
+    assert!(
+        !matches!(decode(with(tagged, &pages)).unwrap_err().kind, PartialErrorKind::StateVersion),
+        "the format tag follows the cut section"
+    );
+    let mut unknown = marked.clone();
+    unknown.push(0xEE);
+    assert!(matches!(decode(with(unknown, &pages)).unwrap_err().kind, PartialErrorKind::StateVersion));
+
+    // A listed part's volume must end inside its data: not before it, nor with an advertised length.
+    for length in [SourceLength::Final(first.packed.range.start - 1), SourceLength::Advertised(short)] {
+        let (mut odd, _copy) = file.core.clone_snapshot(&cut).unwrap();
+        let admission = odd.evidence.admissions.iter_mut().find(|a| a.volume == first.packed.volume).unwrap();
+        admission.info.length = length;
+        admission.info.extent = 0;
+        let (pages, _lease) = state::encode_pages(&odd, &file.core.budget).unwrap();
+        assert!(decode(pages).is_err(), "{length:?}");
+    }
 }
