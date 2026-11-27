@@ -253,6 +253,10 @@ pub enum PartialErrorKind {
     /// The member's tail was abandoned ([`PartialFile::abandon_tail`]): its extraction cannot go on, and a second
     /// abandon with different checks is refused.
     TailAbandoned,
+    /// [`PartialFile::refill_declared_from_packed`](super::PartialFile::refill_declared_from_packed) could not close
+    /// the hole from the repaired ranges; the hole is still there. Fall back to
+    /// [`refill_from_packed`](super::PartialFile::refill_from_packed) over the hole.
+    DeclaredRefill(DeclaredRefillFailure),
     Limit {
         resource: PartialResource,
         limit: u64,
@@ -262,6 +266,20 @@ pub enum PartialErrorKind {
         operation: OutputOperation,
         cause: io::Error,
     },
+}
+/// Why [`PartialFile::refill_declared_from_packed`](super::PartialFile::refill_declared_from_packed) left a hole.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DeclaredRefillFailure {
+    /// The bytes now in the output (the repaired ranges read from the volume, the rest as the extraction wrote it)
+    /// fail the own check of these parts (ordinals): a wrong byte lies outside the repaired ranges. The repaired
+    /// bytes were written and are kept, so a later call with more ranges reads only those.
+    CheckFailed { parts: Vec<u64> },
+    /// The hole cannot be closed by a part check from the repaired ranges alone: the member is encrypted or direct,
+    /// a part the hole touches has no check that can decide without reading more (no CRC-32 or BLAKE2sp; a final
+    /// part checked only by the member's BLAKE2sp), or output that check covers is unknown outside the hole.
+    /// Nothing was read or written.
+    Unprovable,
 }
 #[derive(Debug)]
 pub struct PartialError {
