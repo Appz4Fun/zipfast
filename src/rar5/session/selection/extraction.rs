@@ -228,9 +228,8 @@ impl<'a> Extraction<'a> {
             // lets it be placed (a skipped one stays skipped) and before anything is touched
             // (a RAR 5.0 redirection only: a RAR 4.x symbolic link's target is its encrypted data, checked as it decrypts)
             let evidence = match kind {
-                Some(_) => {
-                    super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?
-                }
+                Some(_) => super::link_password(session, index, self.options.encrypted_links)
+                    .map_err(|failure| SelectedStop::from(Arc::new(failure)))?,
                 None => crate::error::RarPasswordEvidence::NotEncrypted,
             };
             let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
@@ -1013,6 +1012,7 @@ mod tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
             salvage_truncated_zip: false,

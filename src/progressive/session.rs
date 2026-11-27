@@ -1187,7 +1187,11 @@ impl ProgressiveSession {
                     // no data to check a password against (`crate::extract::link::rar5_password`). The refusal waits
                     // for the disposition: a member that is skipped (an older revision, an existing target) is never
                     // placed or tested, so it is skipped as before.
-                    if header.encrypted && self.options.password().is_some_and(|p| !p.is_empty()) {
+                    // Options::encrypted_links set to PlaceUnverified lets the password go unchecked, as 7-Zip does.
+                    if header.encrypted
+                        && self.options.password().is_some_and(|p| !p.is_empty())
+                        && extract.encrypted_links != crate::extract::EncryptedLinks::PlaceUnverified
+                    {
                         unverified_link = header.crypt.as_ref().and_then(crate::extract::link::rar5_unverifiable);
                     }
                     self.link_kind = Some(kind);
@@ -1267,7 +1271,7 @@ impl ProgressiveSession {
                 },
             ))));
         }
-        let context = crate::extract::EntryContext {
+        let mut context = crate::extract::EntryContext {
             entry: crate::extract::RarEntryIdentity {
                 index: Some(member.ordinal),
                 order: member.ordinal,
@@ -1326,11 +1330,25 @@ impl ProgressiveSession {
         } else if decode && self.link_kind.is_some() && header.packed_size == 0 && !header.split_after() {
             // A RAR 5.0 redirection without data moves past the decoder as the complete route's `past_link` does:
             // a method it carries neither needs a solid predecessor nor resets the history the next file goes on from.
-            let stored = crate::rar5::FileHeader { method: 0, solid: false, ..header.clone() };
+            let mut stored = crate::rar5::FileHeader { method: 0, solid: false, ..header.clone() };
+            let mut password = self.options.password();
+            if header.encrypted
+                && self.options.extract.encrypted_links == crate::extract::EncryptedLinks::PlaceUnverified
+            {
+                // Options::encrypted_links: the password isn't checked for an encrypted link, as 7-Zip doesn't check
+                // it. With no data, nothing is decrypted, and a checksum of nothing (converted by a key the
+                // password may not give) is passed over: the link's target is all it carries.
+                stored.encrypted = false;
+                stored.crypt = None;
+                stored.crc32 = None;
+                stored.blake2sp = None;
+                password = None;
+                context.password = crate::error::RarPasswordEvidence::Unverified;
+            }
             Some(MemberMachine::new_with_history(
                 &stored,
                 context,
-                self.options.password(),
+                password,
                 &self.usage,
                 &self.control,
                 None,
@@ -1850,6 +1868,7 @@ mod tests {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                encrypted_links: Default::default(),
                 damaged_input: Default::default(),
                 unsupported_filters: Default::default(),
                 salvage_truncated_zip: false,
@@ -1985,6 +2004,7 @@ mod tests {
                     replace_placed_links: false,
                     keep_broken: false,
                     attempt_continued_members: false,
+                    encrypted_links: Default::default(),
                     damaged_input: Default::default(),
                     unsupported_filters: Default::default(),
                     salvage_truncated_zip: false,

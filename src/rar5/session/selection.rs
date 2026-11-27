@@ -439,7 +439,7 @@ impl SelectedRun {
         if member.header.is_dir() || member.header.redirection.is_some() {
             let outcome = match (member.issue, &member.header.redirection) {
                 (Some(issue), _) => RarOutcome::Failed(Arc::new(copy_catalogue_issue(&session.issues[issue]))),
-                (None, Some(link)) => match link_password(session, index) {
+                (None, Some(link)) => match link_password(session, index, session.options.encrypted_links) {
                     Ok(evidence) => self.test_link(&member.header, link, evidence),
                     Err(failure) => RarOutcome::Failed(Arc::new(failure)),
                 },
@@ -893,11 +893,16 @@ fn copy_catalogue_issue(failure: &RarFailure) -> RarFailure {
 }
 
 /// An encrypted RAR 5.0 redirection is placed or passed only on a password its check value verifies
-/// ([`crate::extract::link::rar5_password`]): its target is in the clear, so nothing else would stop it.
-pub(super) fn link_password(session: &RarSession, index: usize) -> Result<RarPasswordEvidence, RarFailure> {
+/// ([`crate::extract::link::rar5_password`]): its target is in the clear, so nothing else would stop it. Unless
+/// `links` is [`crate::extract::EncryptedLinks::PlaceUnverified`], which lets one be placed whatever the password.
+pub(super) fn link_password(
+    session: &RarSession,
+    index: usize,
+    links: crate::extract::EncryptedLinks,
+) -> Result<RarPasswordEvidence, RarFailure> {
     let header = &session.model.members[index].header;
     let scope = RarScope::Member { index: Some(index as u64) };
-    crate::extract::link::rar5_password(header, Some(&session.password), scope)
+    crate::extract::link::rar5_link_password(header, Some(&session.password), scope, links)
 }
 
 fn is_terminal(failure: &RarFailure) -> bool {

@@ -17,6 +17,7 @@ restart_from_first_volume: false,
 replace_placed_links: false,
 keep_broken: false,
 attempt_continued_members: false,
+encrypted_links: Default::default(),
 damaged_input: Default::default(),
 unsupported_filters: Default::default(),
 salvage_truncated_zip: false,
@@ -147,21 +148,44 @@ run writes nothing. The whole-archive runners for RAR, 7z, ZIP and tar, `RarSess
 sessions honour it (a progressive session still stops at the refused link, as without the option).
 `tests/links.rs` and `tests/rar5_links.rs` check these points.
 
-## Encrypted RAR 5.0 links and a wrong password (no option)
+## `encrypted_links`: encrypted RAR 5.0 links and a wrong password
 
 `rar a -p` encrypts file data but leaves headers in the clear, so a link member's target (its redirection record)
-is readable whatever the password. 7-Zip 26.06 creates such links with a wrong password; UnRAR 7.30 reports the
-wrong password for the member and creates nothing. zipfast does as UnRAR does, on every route (`extract::run*`,
-`RarSession` test and extraction, progressive sessions), and has no switch for 7-Zip's behaviour: a caller that
-wants it (Prybar's 7z mode) handles it itself.
+is readable whatever the password. UnRAR 7.30 reports the wrong password for the member and creates nothing;
+7-Zip 26.06 doesn't check the password for a link at all. `Options::encrypted_links` picks one:
+`EncryptedLinks::Verify` (the default, UnRAR's) or `EncryptedLinks::PlaceUnverified` (7-Zip's, for Prybar's 7z mode).
+It applies on every route: `extract::run*`, `RarSession::extract_selected` and `extract_selected_controlled` (from
+the `Options` they take), `RarSession::test_selected` (from `RarSessionOptions::encrypted_links`, as it takes no
+`Options`), and progressive sessions (from `ProgressiveOptions`' extract options).
 
-A redirection member whose header carries an encryption record (Unix or Windows symbolic link, junction, hard
-link, file copy) is placed, or passes a test, only when its password check value verifies the password. No
-password fails it as `RarFailure::PasswordRequired`, a wrong one as `RarFailure::WrongPassword`, as an encrypted
-data member fails; nothing is created. A record without a check value, or with a check value whose checksum doesn't
-match, can't verify any password, and a link has no data to check one against: the member is refused as
-`RarFailure::EncryptedIntegrity` with `RarIntegrityReason::UnverifiableLinkPassword`, even with the right password.
-A progressive session stops at such a member, as it does at a wrong password.
+With `Verify`, a redirection member whose header carries an encryption record (Unix or Windows symbolic link,
+junction, hard link, file copy) is placed, or passes a test, only when its password check value verifies the
+password. No password fails it as `RarFailure::PasswordRequired`, a wrong one as `RarFailure::WrongPassword`, as an
+encrypted data member fails; nothing is created. A record without a check value, or with a check value whose
+checksum doesn't match, can't verify any password, and a link has no data to check one against: the member is
+refused as `RarFailure::EncryptedIntegrity` with `RarIntegrityReason::UnverifiableLinkPassword`, even with the right
+password. A progressive session stops at such a member, as it does at a wrong password.
+
+With `PlaceUnverified`, the password isn't checked for such a member (no key is derived): with a wrong password,
+with none, or with no check value, the link is placed (or passes a test) and reported as any placed link is,
+`RarOutcome::Verified`, with the password evidence `RarPasswordEvidence::Unverified` in its checks, so a caller can
+tell it from a verified link (a progressive session reports `MemberOutcome::Verified`/`Tested`, which carries no
+password evidence; a caller that set the option knows an encrypted link there went unchecked). Every other link check
+still applies: a target that leaves the destination, a hard link or copy of a file the run didn't extract,
+protected paths, `replace_placed_links` and the overwrite decision. RAR 4.x symbolic links (whose target is their
+encrypted data) and members with data still need their password.
+
+What 7-Zip 26.06 (`7zz`, macOS arm64) does with such archives:
+
+| archive | `x -p<wrong>` | `x` (no `-p`) | `t -p<wrong>` |
+|---|---|---|---|
+| symlinks and a junction with a check value | links created, exit 0, "Everything is Ok" | same | "ERROR: Wrong password" per link, exit 2 |
+| the same without a check value | links created, exit 0 | same | exit 0 |
+| hard link and file copy | hard link created; copy "Unsupported Method", exit 2 | same | exit 0 |
+
+So `x` reports no error for an encrypted link under a wrong password or none, and `PlaceUnverified` matches it. `t`
+does check a check value it has (a wrong password is an error there, and with no `-p` it asks for one), which
+`PlaceUnverified` doesn't mirror: a test passes those links too, with `RarPasswordEvidence::Unverified`.
 
 ## 7z wrong passwords: how the member failed
 
