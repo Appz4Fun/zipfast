@@ -93,6 +93,8 @@ const HAND_OVER_MIN: usize = 64 << 10;
 const STAGE: usize = 1024;
 /// Bits of a code looked up in one step; longer codes take the slow path.
 const LUT_BITS: u32 = 11;
+/// The share of the main code's space (out of 1 << 16) the literals of one length must take for [`Huff::quick`].
+const QUICK_SPACE: u32 = 13 << 12;
 /// Codes [`Huff::run8`] reads in one round, and the bits from where a round starts to the end of the last byte it
 /// reads: a round's codes and one more byte.
 #[cfg(target_arch = "aarch64")]
@@ -276,7 +278,15 @@ impl Huff {
         // incompressible data comes out as literals nearly all of one length: worth guessing at
         by_len[0] = 0;
         let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
-        self.common = if !lits.is_empty() && *n >= 160 && len <= LUT_BITS as usize { len as u32 } else { 0 };
+        // and worth it only when that length's literals take most of the code space, so runs of them are long: the
+        // quick reads stop with a mispredicted branch at every other code, and below about four literals a run
+        // (13/16 of the space) decoding codes one by one is faster
+        let space = if len == 0 { 0 } else { *n << (16 - len) };
+        self.common = if !lits.is_empty() && *n >= 160 && len <= LUT_BITS as usize && space >= QUICK_SPACE {
+            len as u32
+        } else {
+            0
+        };
         // canonical codes up to the table's width fill it from the start, in order; the rest belongs to longer codes
         // or to none, and is marked for the slow path
         let mut covered = 0;
@@ -531,20 +541,27 @@ impl Huff {
         if self.common == 0 {
             return 0;
         }
+        let mut streak = 0u32;
         while k < room && bits.pos() + 128 <= end_bits {
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-            {
-                k += self.run8(bits, end_bits, &mut stage[k..], room - k);
-                if k >= room || bits.pos() + 128 > end_bits {
-                    break;
-                }
-            }
-            // SAFETY: 128 bits before the block's end (checked by the loop, and again after the rounds), and a
-            // block's bytes go on for PAD past it
+            // SAFETY: 128 bits before the block's end (checked by the loop), and a block's bytes go on for PAD past it
             unsafe { bits.refill_inside() };
             let (lits, n) = self.quick(bits);
             stage[k..k + 8].copy_from_slice(&lits);
             k += n;
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            if n == 7 {
+                streak += 1;
+                if streak < 2 {
+                    continue;
+                }
+                // fourteen literals of length 8 in a row, over two quick reads: a run likely long enough to be worth
+                // the rounds, which cost more to start than a few quick literals do. Data where other codes come
+                // every few literals loses more to rounds that end early than long runs gain.
+                k += self.run8(bits, end_bits, &mut stage[k..], room.saturating_sub(k));
+                streak = 0;
+                continue;
+            }
+            streak = 0;
             if n < 5 {
                 // a code of some other kind stopped them, with at least the table's width of bits still in the
                 // accumulator: a literal of another length joins them, anything else ends the run
