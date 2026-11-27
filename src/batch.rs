@@ -427,8 +427,13 @@ fn decode(
 
 /// Checks (and, given `out`, copies to `out` from `out_at` on) `len` stored bytes at `at` in the open `volume`, on
 /// `threads` threads (no more than [`STORED_THREADS`]). Returns the CRC32 of the bytes.
+///
+/// `head` is the range's first bytes, read already (no more than `len` of them count): they are checked and copied
+/// first, and only the rest is read.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stored_detailed(
     (volume, volume_path): (&File, Option<&Path>),
+    head: &[u8],
     at: u64,
     len: u64,
     out: Option<(&File, Option<&Path>)>,
@@ -436,6 +441,14 @@ pub(crate) fn stored_detailed(
     threads: usize,
     cancel: Option<&Cancellation>,
 ) -> RarResult<crate::crc32::Hasher> {
+    let head = &head[..usize::try_from(len).map_or(head.len(), |len| len.min(head.len()))];
+    let mut total = crate::crc32::Hasher::new();
+    total.update(head);
+    if let Some((out, path)) = out {
+        write_at(out, head, out_at, path)?;
+    }
+    let skip = head.len() as u64;
+    let (at, len, out_at) = (at.saturating_add(skip), len - skip, out_at.saturating_add(skip));
     let pieces = len.div_ceil(PIECE) as usize;
     let crcs: Vec<Mutex<Option<crate::crc32::Hasher>>> = (0..pieces).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
@@ -460,7 +473,7 @@ pub(crate) fn stored_detailed(
                         }
                         let off = i as u64 * PIECE;
                         let n = PIECE.min(len - off) as usize;
-                        read_at_detailed(volume, &mut buf[..n], at + off).map_err(|e| match e {
+                        crate::rar5::reader::read_volume(volume, &mut buf[..n], at + off).map_err(|e| match e {
                             PositionReadError::Eof => RarFault::new(
                                 RarFailure::integrity(
                                     RarScope::Header {
@@ -500,7 +513,6 @@ pub(crate) fn stored_detailed(
     if let Some(e) = first_error.into_inner().unwrap() {
         return Err(e);
     }
-    let mut total = crate::crc32::Hasher::new();
     for c in crcs {
         total.combine(&c.into_inner().unwrap().expect("every piece was done"));
     }
@@ -621,19 +633,44 @@ mod positional_tests {
         fs::write(&output, b"keep").unwrap();
         let write_only = OpenOptions::new().write(true).open(&input).unwrap();
         let read_only = File::open(&output).unwrap();
-        let fault = stored_detailed((&write_only, Some(&input)), 1, 1, None, 0, 2, None).err().unwrap();
+        let fault = stored_detailed((&write_only, Some(&input)), &[], 1, 1, None, 0, 2, None).err().unwrap();
         assert!(matches!(fault.failure.as_ref(), RarFailure::Input {
             operation: IoOperation::Read, path: Some(path), offset: Some(1), source, ..
         } if path == &input && source.raw_os_error() == Some(libc::EBADF)));
         let source_file = File::open(&input).unwrap();
-        let fault = stored_detailed((&source_file, Some(&input)), 1, 1, Some((&read_only, Some(&output))), 2, 2, None)
-            .err()
-            .unwrap();
+        let fault =
+            stored_detailed((&source_file, Some(&input)), &[], 1, 1, Some((&read_only, Some(&output))), 2, 2, None)
+                .err()
+                .unwrap();
         assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
             operation: IoOperation::Write, path: Some(path), offset: Some(2), source, ..
         } if path == &output && source.raw_os_error() == Some(libc::EBADF)));
         assert_eq!(fs::read(input).unwrap(), b"abcd");
         assert_eq!(fs::read(output).unwrap(), b"keep");
+    }
+
+    /// The bytes a volume read already with the headers are taken, not read again: only the rest comes from the file,
+    /// and the CRC covers both, in order.
+    #[test]
+    fn a_held_head_is_copied_and_only_the_rest_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        let data: Vec<u8> = (0..3 * PIECE + 17).map(|i| (i * 7) as u8).collect();
+        fs::write(&input, [b"head".as_slice(), &data].concat()).unwrap();
+        let source = File::open(&input).unwrap();
+        for held in [0, 1, 4096, PIECE as usize + 3, data.len(), data.len() + 9] {
+            // the held bytes differ from the file's, so they show where each byte came from
+            let head: Vec<u8> = (0..held).map(|i| !data.get(i).copied().unwrap_or(0)).collect();
+            let mut want = data.clone();
+            let taken = held.min(data.len());
+            want[..taken].copy_from_slice(&head[..taken]);
+            let output = dir.path().join(format!("out{held}"));
+            let out = OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&output).unwrap();
+            let crc =
+                stored_detailed((&source, None), &head, 4, data.len() as u64, Some((&out, None)), 0, 3, None).unwrap();
+            assert_eq!(fs::read(&output).unwrap(), want, "held {held}");
+            assert_eq!(crc.finalize(), crate::crc32::hash(&want), "held {held}");
+        }
     }
 }
 
