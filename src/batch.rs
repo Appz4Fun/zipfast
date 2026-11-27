@@ -336,7 +336,7 @@ fn run_job(
     let mut out = out;
     let keep_broken = |out: &mut Option<crate::output::Output>| {
         if let Some(o) = out.take().filter(|_| keep) {
-            let _ = o.finish_detailed(|file| crate::extract::keep_written(file, &meta));
+            let _ = o.finish_detailed(|file| crate::extract::keep_written(file, &meta, Some(size)));
         }
     };
     if let Err(fault) = decoded {
@@ -420,6 +420,9 @@ fn decode(
         }
     };
     u.restart(window, Some(size));
+    // a file running past its declared size is written to it first: kept (Options::keep_broken), it holds what UnRAR
+    // 7.30 `x -kb` and 7-Zip 26.06 `x` keep; otherwise it is removed as before
+    u.write_to_size(true);
     u.feed(packed, sink)
         .and_then(|()| u.finish(sink))
         .map_err(|e| decoder_failure_with_size(e, scope, RarPasswordEvidence::NotEncrypted, u.take_size_failure()))

@@ -672,8 +672,16 @@ fn read_entry(
     let mut crc = crate::crc32::Hasher::new();
     let mut size = 0u64;
     let mut emit = |chunk: &[u8]| -> Result<()> {
-        size += chunk.len() as u64;
+        let room = e.size.saturating_sub(size);
+        size = size.saturating_add(chunk.len() as u64);
         if size > e.size {
+            // the bytes up to the declared size go out first: a file kept with Options::keep_broken holds them, as
+            // 7-Zip 26.06 `x` writes it (the entry fails all the same)
+            let within = usize::try_from(room).map_or(chunk.len(), |room| room.min(chunk.len()));
+            if within != 0 {
+                check()?;
+                sink(&chunk[..within])?;
+            }
             return Err(Error::Corrupt("more data than the directory says"));
         }
         crc.update(chunk);
@@ -721,6 +729,12 @@ fn read_entry(
         match method {
             METHOD_STORED => {
                 if decrypted.len() as u64 != e.size {
+                    // the bytes up to the declared size go out first, as for an entry that isn't encrypted
+                    let within = usize::try_from(e.size).map_or(decrypted.len(), |size| size.min(decrypted.len()));
+                    if decrypted.len() as u64 > e.size && within != 0 {
+                        check()?;
+                        emit(&decrypted[..within])?;
+                    }
                     return Err(Error::Corrupt("stored entry's sizes differ"));
                 }
                 if cancel.is_some() {
@@ -781,8 +795,14 @@ fn read_entry(
     let mut left = e.packed;
     match e.method {
         METHOD_STORED => {
-            if e.packed != e.size {
+            // an entry carrying more than its declared size has the bytes up to it read out first: a file kept with
+            // Options::keep_broken holds them, as 7-Zip 26.06 `x` writes it; it fails all the same
+            let over = e.packed > e.size;
+            if e.packed != e.size && !over {
                 return Err(Error::Corrupt("stored entry's sizes differ"));
+            }
+            if over {
+                left = e.size;
             }
             while left > 0 {
                 check()?;
@@ -793,6 +813,9 @@ fn read_entry(
                     return Err(cut.into());
                 }
                 left -= n as u64;
+            }
+            if over {
+                return Err(Error::Corrupt("stored entry's sizes differ"));
             }
         }
         METHOD_DEFLATE => {
@@ -1542,7 +1565,7 @@ fn run_archive(
                     let canceled = cancel.is_some_and(Cancellation::is_canceled);
                     match target {
                         Some(out) if opts.keep_broken && !writing && !canceled => {
-                            let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta())));
+                            let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta()), None));
                         }
                         target => drop(target),
                     }
