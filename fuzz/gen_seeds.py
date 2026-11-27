@@ -41,4 +41,48 @@ for target, pre in (("progressive_rar", None), ("probe", None)):
                     (out / f"{p.name}.p").write_bytes(bytes([0x80, flags | 1]) + data)
                     (out / f"{p.name}.s").write_bytes(bytes([0x80, flags | 2]) + data)
                 n += 1
+
+# fuzz_map_feed / fuzz_feed_holes: byte 0 picks the format (head % 3: rar, 7z, zip) and the volume count
+# ((head >> 6) + 1), then the archive.
+FEED_MAGIC = [
+    (0, (MAGIC["extract_rar4"], MAGIC["extract_rar5"])),
+    (1, (MAGIC["extract_7z"],)),
+    (2, (MAGIC["extract_zip"],)),
+]
+
+
+def feed_head(fmt, nvol):
+    for low in range(64):
+        h = ((nvol - 1) << 6) | low
+        if h % 3 == fmt:
+            return h
+
+
+for target in ("fuzz_map_feed", "fuzz_feed_holes"):
+    out = ROOT / "seeds" / target
+    out.mkdir(parents=True, exist_ok=True)
+    for p in files:
+        data = p.read_bytes()
+        for fmt, magics in FEED_MAGIC:
+            if any(data.startswith(m) for m in magics):
+                for nvol in (1, 2):
+                    (out / f"{p.name}.{nvol}").write_bytes(bytes([feed_head(fmt, nvol)]) + data)
+                    n += 1
+
+# rar5_crypt_record: a RAR5 encryption record body (version vint 0, flags vint, KDF count byte, 16-byte salt, then an
+# optional 16-byte IV and a 12-byte password check). The target wraps the first 64 bytes in a HEAD_CRYPT block; the
+# rest follows as the archive body. Counts stay at lg2 <= 15 so each derivation is fast.
+out = ROOT / "seeds" / "rar5_crypt_record"
+out.mkdir(parents=True, exist_ok=True)
+salt = bytes(range(16))
+iv = bytes(range(0x40, 0x50))
+check = bytes(range(0x80, 0x8C))
+end_block = bytes.fromhex("0b0000000001050000")  # not a valid CRC; only a plausible trailing block
+for count in (0, 4, 10, 15):
+    for flags in (0, 1, 3):
+        rec = bytes([0, flags, count]) + salt
+        for name, body in (("bare", rec), ("iv", rec + iv), ("check", rec + check), ("iv_check", rec + iv + check)):
+            (out / f"{name}.c{count}.f{flags}").write_bytes(body)
+            (out / f"{name}.c{count}.f{flags}.tail").write_bytes(body.ljust(64, b"\0") + end_block)
+            n += 2
 print(n, "seeds")

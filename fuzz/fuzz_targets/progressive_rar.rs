@@ -59,5 +59,5 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    drive::remove_tree(&dir);
 });

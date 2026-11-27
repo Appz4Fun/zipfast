@@ -27,6 +27,34 @@ pub fn scratch() -> PathBuf {
     dir
 }
 
+/// Removes `path` and everything under it, first restoring the owner's rwx bits on directories and the write bit on
+/// files: extraction can leave read-only entries (and unreadable directories) that `remove_dir_all` cannot delete.
+/// Never follows symlinks, never panics; failures are ignored.
+pub fn remove_tree(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+            let ty = meta.file_type();
+            if ty.is_symlink() {
+                continue;
+            }
+            let mode = meta.permissions().mode();
+            if ty.is_dir() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode | 0o700));
+                if let Ok(rd) = std::fs::read_dir(&p) {
+                    stack.extend(rd.flatten().map(|e| e.path()));
+                }
+            } else {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode | 0o200));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
 pub fn options(dest: PathBuf, mode: Mode, bits: u8) -> Options {
     Options {
         mode,
@@ -90,7 +118,7 @@ pub fn drive(data: &[u8], magic: &[u8], names: (&str, &str)) {
     let mode = if bits & 128 != 0 { Mode::Extract } else { Mode::Test };
     let dest = dir.join("out");
     let _ = extract::run_with_password(&first, &options(dest.clone(), mode, bits), password, |_| {});
-    let _ = std::fs::remove_dir_all(&dest);
+    remove_tree(&dest);
     for (p, _) in &volumes {
         let _ = std::fs::remove_file(p);
     }
