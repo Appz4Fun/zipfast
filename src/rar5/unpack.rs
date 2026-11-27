@@ -215,6 +215,11 @@ struct Huff {
     lit8: Box<[u8; 256]>,
     first8: u8,
     nlit8: u16,
+    /// Set before [`Self::build`] for the end of a member the archive cuts short ([`Unpacker::set_lenient`]): the code
+    /// is built whatever its lengths, as UnRAR 7.30 builds it ([`LenientCode`]).
+    lenient: bool,
+    /// the code a lenient build made, which every code longer than the table is read with
+    loose: Option<Box<LenientCode>>,
 }
 
 impl Huff {
@@ -231,6 +236,8 @@ impl Huff {
             lit8: Box::new([0; 256]),
             first8: 0,
             nlit8: 0,
+            lenient: false,
+            loose: None,
         }
     }
 
@@ -251,6 +258,11 @@ impl Huff {
         for (l, &c) in count.iter().enumerate().skip(1) {
             kraft += c << (16 - l);
         }
+        if self.lenient {
+            self.build_lenient(lengths);
+            return Ok(());
+        }
+        self.loose = None;
         if kraft > 1 << 16 {
             return Err(corrupt("over-subscribed prefix code"));
         }
@@ -577,9 +589,26 @@ impl Huff {
         k
     }
 
+    /// [`Self::build`] for a lenient code: the short-code table agrees with [`LenientCode`], and the literal
+    /// shortcuts are off.
+    fn build_lenient(&mut self, lengths: &[u8]) {
+        let code = LenientCode::new(lengths.iter().map(|&l| l & 15), lengths.len());
+        for (i, slot) in self.lut.iter_mut().enumerate() {
+            let (sym, len) = code.decode((i << (15 - LUT_BITS)) as u32);
+            *slot = if len <= LUT_BITS { (sym << 4) | len as u16 } else { 0 };
+        }
+        self.dirty = 1 << LUT_BITS;
+        self.empty = false;
+        self.common = 0;
+        self.loose = Some(Box::new(code));
+    }
+
     /// A code longer than the table, from the next 16 bits: its symbol and length.
     #[cold]
     fn decode_slow(&self, peek: u32) -> Result<(u16, u32)> {
+        if let Some(code) = self.loose.as_deref() {
+            return Ok(code.decode(peek >> 1));
+        }
         for l in LUT_BITS as usize + 1..16 {
             if peek < self.limit[l] && peek >= self.first[l] {
                 let idx = self.start[l] as u32 + ((peek - self.first[l]) >> (16 - l));
@@ -588,6 +617,61 @@ impl Huff {
             }
         }
         Err(corrupt(if self.empty { "symbol from an empty prefix code" } else { "bit pattern matches no code" }))
+    }
+}
+
+/// A prefix code as UnRAR 7.30 reads one whatever its code lengths, observed on members an archive cuts short (whose
+/// last bytes decryption or the cut leaves meaningless): codes that overfill or underfill the code space still decode.
+/// The codes are canonical, counted from 0 for each length whether or not they fit; the next 15 bits `w` read the
+/// shortest length `n` whose codes (with every shorter one) reach past `w`, or 15 when none does, and the symbol at
+/// that code's place among the symbols sorted by length and value. A place past the alphabet reads the first place,
+/// and a place past the symbols there are reads symbol 0.
+#[derive(Clone)]
+pub(super) struct LenientCode {
+    /// for each length, the first 15-bit left-aligned value past every code of that length or shorter
+    limit: [u64; 16],
+    /// for each length, where its symbols start in `sorted`
+    start: [usize; 16],
+    /// the symbols in (length, symbol) order, then zeros up to the alphabet's size
+    sorted: Vec<u16>,
+}
+
+impl LenientCode {
+    /// The code for `lengths` (each at most 15; 0 for a symbol without a code) of an alphabet of `alphabet` symbols.
+    pub(super) fn new(lengths: impl Iterator<Item = u8> + Clone, alphabet: usize) -> Self {
+        let mut count = [0usize; 16];
+        for l in lengths.clone() {
+            count[usize::from(l & 15)] += 1;
+        }
+        let (mut limit, mut start) = ([0u64; 16], [0usize; 16]);
+        let (mut code, mut index) = (0u64, 0usize);
+        for n in 1..16 {
+            start[n] = index;
+            index += count[n];
+            code += count[n] as u64;
+            limit[n] = code << (15 - n);
+            code <<= 1;
+        }
+        let mut sorted = vec![0u16; alphabet.max(index).max(1)];
+        let mut next = start;
+        for (sym, l) in lengths.enumerate() {
+            let l = usize::from(l & 15);
+            if l != 0 {
+                sorted[next[l]] = sym as u16;
+                next[l] += 1;
+            }
+        }
+        sorted.truncate(alphabet.max(1));
+        LenientCode { limit, start, sorted }
+    }
+
+    /// The symbol and the length of the code the next 15 bits `w` start with.
+    pub(super) fn decode(&self, w: u32) -> (u16, u32) {
+        let w = u64::from(w & 0x7fff);
+        let n = (1..15).find(|&n| w < self.limit[n]).unwrap_or(15);
+        let place = self.start[n] as u64 + (w.saturating_sub(self.limit[n - 1]) >> (15 - n));
+        let place = usize::try_from(place).ok().filter(|&p| p < self.sorted.len()).unwrap_or(0);
+        (self.sorted[place], n as u32)
     }
 }
 
@@ -633,6 +717,14 @@ impl Tables {
     }
 
     fn build(&mut self, lens: &Lengths) -> Result<()> {
+        self.build_as(lens, false)
+    }
+
+    /// [`Self::build`], lenient as [`Huff::lenient`] says when `lenient`.
+    fn build_as(&mut self, lens: &Lengths, lenient: bool) -> Result<()> {
+        for huff in [&mut self.main, &mut self.dist, &mut self.low, &mut self.rep] {
+            huff.lenient = lenient;
+        }
         self.main.build(&lens[..NC])?;
         self.dist.build(&lens[NC..NC + DC])?;
         self.low.build(&lens[NC + DC..NC + DC + LDC])?;
@@ -766,6 +858,8 @@ pub struct Unpacker {
     /// block of which fewer bytes came is not decoded ([`TAIL_MARGIN_BITS`] and [`TAIL_BLOCK_MIN`], or none of either
     /// after [`Self::set_cut_short`])
     cut_rule: (usize, usize),
+    /// [`Self::set_lenient`]
+    lenient: bool,
 }
 
 /// See `Unpacker::tail`.
@@ -940,6 +1034,7 @@ impl Unpacker {
             seen: None,
             tail: None,
             cut_rule: (TAIL_MARGIN_BITS, TAIL_BLOCK_MIN),
+            lenient: false,
         })
     }
 
@@ -1662,6 +1757,7 @@ impl Unpacker {
     fn block_to(&mut self, buf: &[u8], end_bits: usize, flags: u8, sink: &mut dyn Sink) -> Result<()> {
         let mut bits = Bits::new(buf);
         if flags & 0x80 != 0 {
+            self.pre.lenient = self.lenient;
             let lens = read_lengths(&mut self.pre, &mut bits, end_bits)?;
             self.slot = Slot::filled(Some(lens));
             self.tables_ready = true;
@@ -1672,7 +1768,7 @@ impl Unpacker {
         if self.tables_ready && !self.built.as_ref().is_some_and(|b| Arc::ptr_eq(b, &self.slot)) {
             let lens = self.slot.wait().ok_or_else(|| corrupt("the tables before this block were damaged"))?;
             // blocks still decoding on the main thread's behalf keep the tables they were handed
-            Arc::make_mut(&mut self.tables).build(&lens)?;
+            Arc::make_mut(&mut self.tables).build_as(&lens, self.lenient)?;
             self.built = Some(Arc::clone(&self.slot));
         }
         let tables = Arc::clone(&self.tables);
@@ -1709,7 +1805,9 @@ impl Unpacker {
             }
             self.run(bits, at + 1, stop, tables)?;
         }
-        if bits.pos() > end_bits {
+        // the end of a member the archive cuts short decodes as UnRAR 7.30 decodes it: a block's last symbol may run
+        // past it
+        if bits.pos() > end_bits && !self.lenient {
             return Err(corrupt("a symbol runs past the end of its block"));
         }
         Ok(())
@@ -2094,6 +2192,18 @@ impl Unpacker {
     /// before the end, and the start of a block however little of it came.
     pub(crate) fn set_cut_short(&mut self, cut_short: bool) {
         self.cut_rule = if cut_short { (0, 0) } else { (TAIL_MARGIN_BITS, TAIL_BLOCK_MIN) };
+        self.lenient = false;
+    }
+
+    /// The rest of a member the archive cuts short (after [`Self::set_cut_short`]): the bytes past the last whole
+    /// cipher block, which UnRAR 7.30 hands on undecrypted, then zeros, or the zeros past the end of an unencrypted
+    /// member. They decode as UnRAR decodes them, without the checks real data meets: tables are read and built
+    /// whatever they hold (a run repeating the length before the first repeats 0, and a code that overfills or
+    /// underfills the code space still decodes, [`LenientCode`]), and a block's last symbol may run past its end.
+    pub(crate) fn set_lenient(&mut self) {
+        self.lenient = true;
+        // the tables in force, read from real data, go on as UnRAR's would: built again before the next block
+        self.built = None;
     }
 
     /// Notes where the last symbols of each block start, so that [`Self::flush_cut`] can leave out what UnRAR leaves
@@ -2267,11 +2377,11 @@ fn read_lengths(pre: &mut Huff, bits: &mut Bits<'_>, end: usize) -> Result<Lengt
                 i += 1;
             }
             16 | 17 => {
-                if i == 0 {
+                if i == 0 && !pre.lenient {
                     return Err(corrupt("table repeats a length before the first"));
                 }
                 let n = if sym == 16 { 3 + bits.get(3) } else { 11 + bits.get(7) } as usize;
-                let prev = lens[i - 1];
+                let prev = i.checked_sub(1).map_or(0, |prev| lens[prev]);
                 let run = n.min(TABLES - i);
                 lens[i..i + run].fill(prev);
                 i += run;

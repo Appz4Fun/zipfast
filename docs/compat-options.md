@@ -392,9 +392,18 @@ missing end header):
   RAR 3.x encryption, compressed or stored) decrypts the whole blocks and hands the bytes of the block cut short on
   undecrypted, to the decoder or, stored, to the file, then reads zeros; its checks decide, so it fails ("Checksum
   error in the encrypted file"), `keep_broken` keeping those bytes. The runner and a session do the same, rather
-  than failing an incomplete cipher block before decoding. Not matched, of 96 cuts tried (every cut of two 48-byte
-  members, `rar-long-password/a5-p-126.rar` and `short4-p-abc.rar`): 3 cuts with one whole block and 14 or 15
-  undecrypted bytes, where UnRAR prints one or a few more bytes of garbage than zipfast; both fail the member.
+  than failing an incomplete cipher block before decoding. What follows the last whole block (and the zeros after
+  the data of any member cut short) decodes as UnRAR decodes it, without the checks real data meets
+  (`Rar4Decoder::set_lenient`, `Unpacker::set_lenient`): a code-length run stops at the table's end and one
+  repeating the length before the first repeats 0; a prefix code that overfills or underfills the code space still
+  decodes (canonical codes counted from 0 for each length whether or not they fit; a window past every code takes
+  the longest length; a place past the alphabet reads the first place, one past the symbols there are reads symbol
+  0); a RAR 3.x match reaching before what was decoded (or with no distance yet) copies zeros and none runs past the
+  member's size; a RAR 5.0 block's last symbol may run past its end. Checked against `unrar p` at the last 60 cuts
+  of each of the 16 `rar-long-password/*-p-*` archives (960 cuts, RAR 5.0 and RAR 3.x, examples in
+  `tests/emit_cut_archive.rs`): all match but one, `u4-p-e.rar` cut 14 bytes into its data, where every byte is
+  undecrypted and reads as a PPMd block, and UnRAR prints one character more than zipfast (the PPMd stop rule
+  above). Both fail the member.
 - `HeaderCut::Header`: a RAR 4.x file header cut short, with at least the 7 bytes every header starts with. UnRAR
   lists it with the fields that are there and zeros for the rest, its name what of it is there up to a NUL (empty
   when none is), and fails it on extraction; zipfast does the same (`TruncatedHeader`; a `RarSession` member carries

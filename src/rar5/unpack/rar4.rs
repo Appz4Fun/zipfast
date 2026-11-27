@@ -19,7 +19,7 @@
 //! Original implementation from the SDD factual worksheet and independent vectors.
 //! No external decoder implementation was copied or translated.
 
-use super::Sink;
+use super::{LenientCode, Sink};
 use crate::extract::Cancellation;
 
 mod filters;
@@ -326,6 +326,11 @@ struct Huff {
     /// By the next [`QUICK_BITS`] bits: `symbol << 4 | length` of the code they start with when it is that short, else
     /// 0 (a longer code, or none)
     quick: [u16; 1 << QUICK_BITS],
+    /// Set before [`Self::build`] for a member the archive cuts short ([`Rar4Decoder::set_lenient`]): the table is
+    /// built whatever its code lengths, as UnRAR 7.30 builds it ([`LenientCode`]).
+    lenient: bool,
+    /// the code a lenient build made, which every code is read with
+    loose: Option<Box<LenientCode>>,
 }
 impl Huff {
     fn empty() -> Self {
@@ -336,12 +341,18 @@ impl Huff {
             symbols: [0; 299],
             used: 0,
             quick: [0; 1 << QUICK_BITS],
+            lenient: false,
+            loose: None,
         }
     }
     /// The symbol a code longer than [`QUICK_BITS`] at the start of `window` (the next 15 bits) stands for, and the
     /// code's length; `None` when no code starts it.
     #[inline]
     fn long(&self, window: u32) -> Option<(u16, u8)> {
+        if let Some(code) = self.loose.as_deref() {
+            let (symbol, length) = code.decode(window);
+            return Some((symbol, length as u8));
+        }
         for n in QUICK_BITS as usize + 1..16 {
             let prefix = window >> (15 - n);
             if let Some(relative) = prefix.checked_sub(self.first[n])
@@ -370,7 +381,7 @@ impl Huff {
         for n in 1..16 {
             work.tick(1)?;
             code = (code + u32::from(self.count[n - 1])) << 1;
-            if code + u32::from(self.count[n]) > 1 << n {
+            if code + u32::from(self.count[n]) > 1 << n && !self.lenient {
                 return Err(Rar4DecodeError::Malformed("oversubscribed Huffman table"));
             }
             self.first[n] = code;
@@ -385,6 +396,12 @@ impl Huff {
                 next[length as usize] += 1;
             }
         }
+        if self.lenient {
+            work.tick(1 << QUICK_BITS)?;
+            self.make_lenient(lengths.len());
+            return work.check();
+        }
+        self.loose = None;
         // Canonical codes of each length are consecutive and fit the code space (checked above), so a code of length
         // n <= QUICK_BITS owns the 2^(QUICK_BITS - n) entries its bits start.
         self.quick.fill(0);
@@ -397,6 +414,30 @@ impl Huff {
             }
         }
         work.check()
+    }
+}
+
+impl Huff {
+    /// Reads this table as UnRAR 7.30 reads one whatever its code lengths ([`LenientCode`]), from the symbols
+    /// [`Self::build`] sorted by length, of an alphabet of `alphabet` symbols.
+    fn make_lenient(&mut self, alphabet: usize) {
+        let mut lengths = [0u8; 299];
+        for n in 1..16 {
+            let from = self.offset[n];
+            for &symbol in self.symbols.get(from..from + usize::from(self.count[n])).unwrap_or(&[]) {
+                if let Some(length) = lengths.get_mut(usize::from(symbol)) {
+                    *length = n as u8;
+                }
+            }
+        }
+        let alphabet = alphabet.min(lengths.len());
+        let code = LenientCode::new(lengths[..alphabet].iter().copied(), alphabet);
+        for (q, slot) in self.quick.iter_mut().enumerate() {
+            let (symbol, length) = code.decode((q << (15 - QUICK_BITS)) as u32);
+            *slot = if length <= QUICK_BITS { (symbol << 4) | length as u16 } else { 0 };
+        }
+        self.lenient = true;
+        self.loose = Some(Box::new(code));
     }
 }
 
@@ -546,6 +587,8 @@ pub(crate) struct Rar4Decoder {
     starts: Option<Box<TokenStarts>>,
     /// [`Self::cut_short`]: the bytes of real data fed, and how far before their end a token is left out
     data_end: Option<(u64, u64)>,
+    /// [`Self::set_lenient`]
+    lenient: bool,
     /// [`Self::cut_short`]: a PPM or RAR 1.5/2.0 code starting at or past this bit of the member's data is not decoded
     stop_at: Option<u64>,
     hold_start: u64,
@@ -663,6 +706,7 @@ impl Rar4Decoder {
             unfiltered: false,
             starts: None,
             data_end: None,
+            lenient: false,
             stop_at: None,
             hold_start: 0,
             hold_plain: 0,
@@ -983,6 +1027,19 @@ impl Rar4Decoder {
         self.filled = (keep as usize).min(self.filled);
         self.flush(sink)
     }
+    /// The member is one the archive cuts short, decoded from here on as UnRAR 7.30 decodes the bytes past the end
+    /// that decryption or the cut leaves meaningless, without the checks real data meets: its tables are read and
+    /// built whatever they hold (a code-length run stops at the table's end, a run repeating the length before the
+    /// first repeats 0, and a code that overfills or underfills the code space still decodes, [`LenientCode`]); a
+    /// match is copied no further than the member's size, and one reaching before what was decoded (or with no
+    /// distance yet) copies zeros.
+    pub(crate) fn set_lenient(&mut self) {
+        self.lenient = true;
+        // the tables already built (from real data) go on as UnRAR's would
+        for (table, alphabet) in self.tables.iter_mut().zip([20, 299, 60, 17, 28]) {
+            table.make_lenient(alphabet);
+        }
+    }
     /// The output position [`Self::flush_decoded`] stops at: before the first LZ token starting within the margin
     /// of the data's end ([`TAIL_MARGIN`] before what was fed, or the end itself after [`Self::cut_short`]), or
     /// everything produced.
@@ -1279,7 +1336,7 @@ impl Rar4Decoder {
         self.phase = Phase::Align;
     }
     fn symbol(&mut self, table: usize, input: &mut &[u8]) -> DecodeResult<Option<u16>> {
-        if self.tables[table].used == 0 {
+        if self.tables[table].used == 0 && !self.lenient {
             return Err(Rar4DecodeError::Malformed("empty Huffman table"));
         }
         // With 15 bits at hand (the longest code), look the code up; take only its bits, so the input is consumed
@@ -1305,6 +1362,16 @@ impl Rar4Decoder {
             self.prefix = (self.prefix << 1) | bit;
             self.depth += 1;
             let h = &self.tables[table];
+            if let Some(code) = h.loose.as_deref() {
+                // a code of this many bits starts every window these bits start, or none does
+                let (symbol, length) = code.decode(self.prefix << (15 - self.depth));
+                if length as usize == self.depth {
+                    self.prefix = 0;
+                    self.depth = 0;
+                    return Ok(Some(symbol));
+                }
+                continue;
+            }
             if let Some(relative) = self.prefix.checked_sub(h.first[self.depth])
                 && relative < u32::from(h.count[self.depth])
             {
@@ -1330,6 +1397,9 @@ impl Rar4Decoder {
     }
     fn start_copy(&mut self, length: u64, distance: u64) -> DecodeResult<()> {
         let history = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+        if self.lenient {
+            return self.lenient_copy(length, distance);
+        }
         if distance == 0 || distance > self.binding.frame.dictionary || distance > history {
             return Err(Rar4DecodeError::Malformed("match distance outside initialized history"));
         }
@@ -1346,6 +1416,23 @@ impl Rar4Decoder {
         }
         self.last_length = length;
         self.phase = Phase::Copy { distance, left: length };
+        Ok(())
+    }
+    /// [`Self::start_copy`] for the end of a member the archive cuts short ([`Self::set_lenient`]), as UnRAR 7.30
+    /// copies there: no further than the member's size, and a match reaching before what was decoded (or with no
+    /// distance yet) copies zeros, the whole of it.
+    fn lenient_copy(&mut self, length: u64, distance: u64) -> DecodeResult<()> {
+        let length = length.min(self.expected.saturating_sub(self.produced));
+        self.last_length = length;
+        if length == 0 {
+            self.phase = Phase::Token;
+            return Ok(());
+        }
+        let history = self.chain_base.saturating_add(self.produced);
+        let reachable = distance != 0 && distance <= self.binding.frame.dictionary && distance <= history;
+        // a match reaching before what was decoded (or with no distance) copies zeros, the whole of it: distance 0
+        // marks that for copy_step
+        self.phase = Phase::Copy { distance: if reachable { distance } else { 0 }, left: length };
         Ok(())
     }
     fn length(index: usize) -> (u64, u8) {
@@ -1373,15 +1460,21 @@ impl Rar4Decoder {
     #[inline]
     fn copy_step(&mut self, distance: u64, left: u64, sink: &mut dyn Sink) -> DecodeResult<()> {
         let cursor = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
-        let from = cursor.checked_sub(distance).ok_or(Rar4DecodeError::CounterOverflow)?;
-        let copied = self.copy_plain(from, cursor, left)?;
-        if copied == 0 {
-            let index = (from & (self.dictionary.len() as u64 - 1)) as usize;
-            self.emit(self.dictionary[index], sink)?;
-        } else if self.filled >= OUTPUT {
-            self.flush(sink)?;
-        }
-        let done = copied.max(1);
+        let done = if distance == 0 && self.lenient {
+            // a member the archive cuts short: a match reaching before what was decoded copies zeros
+            self.emit(0, sink)?;
+            1
+        } else {
+            let from = cursor.checked_sub(distance).ok_or(Rar4DecodeError::CounterOverflow)?;
+            let copied = self.copy_plain(from, cursor, left)?;
+            if copied == 0 {
+                let index = (from & (self.dictionary.len() as u64 - 1)) as usize;
+                self.emit(self.dictionary[index], sink)?;
+            } else if self.filled >= OUTPUT {
+                self.flush(sink)?;
+            }
+            copied.max(1)
+        };
         self.phase = if left == done { Phase::Token } else { Phase::Copy { distance, left: left - done } };
         if self.produced == self.expected && left == done && self.lifecycle == Lifecycle::Active {
             self.flush(sink)?;
@@ -1426,7 +1519,7 @@ impl Rar4Decoder {
     #[inline(always)]
     fn fast_symbol(&mut self, table: usize, window: &mut Window<'_>) -> DecodeResult<u16> {
         let h = &self.tables[table];
-        if h.used == 0 {
+        if h.used == 0 && h.loose.is_none() {
             return Err(Rar4DecodeError::Malformed("empty Huffman table"));
         }
         window.fill();
@@ -1505,7 +1598,7 @@ impl Rar4Decoder {
                 }
                 256 | 257 => return Ok(Some(token)),
                 258 => {
-                    if self.last_length == 0 {
+                    if self.last_length == 0 && !self.lenient {
                         return Err(Rar4DecodeError::Malformed("repeat before a match"));
                     }
                     before_copy!(Phase::Token);
@@ -1513,7 +1606,7 @@ impl Rar4Decoder {
                 }
                 259..=262 => {
                     let slot = (token - 259) as usize;
-                    if self.recent[slot] == 0 {
+                    if self.recent[slot] == 0 && !self.lenient {
                         return Err(Rar4DecodeError::Malformed("recent distance unavailable"));
                     }
                     let (base, bits) = Self::length(self.fast_symbol(4, w)? as usize);
@@ -1659,6 +1752,7 @@ impl Rar4Decoder {
             Phase::BcRun { index } => {
                 let value = take!(4) as usize;
                 let count = if value == 0 { 1 } else { value + 2 };
+                let count = if self.lenient { count.min(20 - index) } else { count };
                 if index + count > 20 {
                     return Err(Rar4DecodeError::Malformed("BC run exceeds table"));
                 }
@@ -1666,8 +1760,9 @@ impl Rar4Decoder {
                 self.phase = if index + count == 20 { Phase::BuildBc } else { Phase::Bc { index: index + count } };
             }
             Phase::BuildBc => {
+                self.tables[0].lenient = self.lenient;
                 self.tables[0].build(&self.bc_lengths, &mut self.work)?;
-                if self.tables[0].used == 0 {
+                if self.tables[0].used == 0 && !self.lenient {
                     return Err(Rar4DecodeError::Malformed("empty code-length table"));
                 }
                 self.phase = Phase::Lengths { index: 0 };
@@ -1684,10 +1779,14 @@ impl Rar4Decoder {
             }
             Phase::LengthRun { index, kind } => {
                 let count = if kind == 16 || kind == 18 { take!(3) as usize + 3 } else { take!(7) as usize + 11 };
-                if index + count > 404 || (kind < 18 && index == 0) {
+                let count = if self.lenient { count.min(404 - index) } else { count };
+                if index + count > 404 || (kind < 18 && index == 0 && !self.lenient) {
                     return Err(Rar4DecodeError::Malformed("invalid code-length run"));
                 }
-                let value = if kind < 18 { self.lengths[index - 1] } else { 0 };
+                let value = match index.checked_sub(1) {
+                    Some(prev) if kind < 18 => self.lengths[prev],
+                    _ => 0,
+                };
                 self.lengths[index..index + count].fill(value);
                 self.work.tick(count as u64)?;
                 self.phase =
@@ -1695,9 +1794,10 @@ impl Rar4Decoder {
             }
             Phase::BuildTables => {
                 for (table, range) in [0..299, 299..359, 359..376, 376..404].into_iter().enumerate() {
+                    self.tables[table + 1].lenient = self.lenient;
                     self.tables[table + 1].build(&self.lengths[range], &mut self.work)?;
                 }
-                if self.tables[1].used == 0 {
+                if self.tables[1].used == 0 && !self.lenient {
                     return Err(Rar4DecodeError::Malformed("empty literal table"));
                 }
                 self.old = self.lengths;
@@ -1738,7 +1838,7 @@ impl Rar4Decoder {
                     256 => Phase::End,
                     257 => Phase::VmFirst,
                     258 => {
-                        if self.last_length == 0 {
+                        if self.last_length == 0 && !self.lenient {
                             return Err(Rar4DecodeError::Malformed("repeat before a match"));
                         }
                         self.start_copy(self.last_length, self.recent[0])?;
@@ -1787,7 +1887,7 @@ impl Rar4Decoder {
                 self.phase = Phase::LengthExtra { base, bits, recent };
             }
             Phase::RecentLength { slot } => {
-                if self.recent[slot] == 0 {
+                if self.recent[slot] == 0 && !self.lenient {
                     return Err(Rar4DecodeError::Malformed("recent distance unavailable"));
                 }
                 self.phase = Phase::Length { index: symbol!(4) as usize, recent: Some(slot) };
