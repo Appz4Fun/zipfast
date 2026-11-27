@@ -367,6 +367,7 @@ fn options(dest: &Path, first: OsString) -> ProgressiveOptions {
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         },
         first,
     );

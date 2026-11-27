@@ -1196,6 +1196,7 @@ fn direct_setup_output(
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     (file, session, options, context)
 }

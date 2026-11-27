@@ -46,6 +46,7 @@ fn additive_context_keeps_legacy_options() {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let _ = EncryptedReadContext::new(EncryptedReadOptions::default()).unwrap();
 }

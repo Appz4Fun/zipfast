@@ -141,6 +141,9 @@ pub(crate) struct HeaderParser {
     cut_header: Option<usize>,
     /// Set while that header is parsed: its name is what of it is there.
     cut_parse: bool,
+    /// [`crate::extract::DamagedInput::SevenZip`]: a RAR 4.x old-style block (0x75..=0x79) in clear headers is
+    /// passed over by its size without checking its checksum, as 7-Zip 26.06 does.
+    legacy_unchecked: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -175,12 +178,14 @@ impl HeaderParser {
             salvage_cut: false,
             cut_header: None,
             cut_parse: false,
+            legacy_unchecked: false,
         }
     }
     /// See [`Self::salvage`]. Encrypted headers are never salvaged: a checksum failure there is a wrong key.
     pub(crate) fn set_salvage(&mut self, damaged: crate::extract::DamagedInput) {
         self.salvage = damaged.salvages();
         self.resync = damaged == crate::extract::DamagedInput::Resync;
+        self.legacy_unchecked = damaged == crate::extract::DamagedInput::SevenZip;
     }
     /// A whole volume read under salvage ([`crate::rar5::reader::Volume`], never a progressive session, which waits
     /// for bytes still to come): a file header whose data runs past the end of the volume is read with the data that

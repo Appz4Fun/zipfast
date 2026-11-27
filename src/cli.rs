@@ -126,6 +126,7 @@ pub(crate) fn main() -> ExitCode {
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }
@@ -260,6 +261,7 @@ fn listing_options() -> Options {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 
