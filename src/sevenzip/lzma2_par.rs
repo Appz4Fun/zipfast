@@ -90,6 +90,10 @@ const FIND_BLOCKS: u64 = 4;
 const STORED_LOOKAHEAD: u64 = 256 << 10;
 /// Packed bytes read ahead at most before the caller's thread looks at its own work again.
 const BURST: u64 = 4 << 20;
+/// Room in flight each worker is planned with ([`plan`]), in halves of a 7-Zip block: the block's output, and half a
+/// block more for the packed bytes read ahead of its decoder (they leave the budget as it decodes them, so a piece's
+/// packed bytes waiting and its output so far together stay near one block).
+const FLIGHT_HALF_BLOCKS: u64 = 3;
 /// The smallest budget for bytes in flight.
 pub(crate) const MIN_MEMORY: u64 = 4 * MIN_PIECE;
 /// How long a waiting thread waits before it looks at the cancellation again.
@@ -1067,12 +1071,20 @@ pub(crate) struct Allowance {
 
 /// How many workers an LZMA2 coder with dictionary window `window` starts for `threads` and the parallel budget,
 /// and the budget left for bytes in flight. Each worker costs its window and its one output buffer; together they
-/// take at most a third of the budget, so the budget bounds all the memory the threads add, and the rest leaves
-/// each worker about a 7-Zip block (four windows) of room in flight.
+/// take at most a third of the budget, so the budget bounds all the memory the threads add. Each worker also gets
+/// room in flight for one and a half 7-Zip blocks (a block is four windows, at least a [`MIN_PIECE`]). More workers
+/// than that cost a lot: every idle one draws a later block's packed bytes into the budget, until the blocks already
+/// started have no room left to hand out their output and the run decodes about one block at a time (2.1 GB of
+/// 64 MiB blocks packing to four fifths took 8.9 s on 32 workers, 47 MiB of room each, and 5.8 to 6.1 s on 16 to
+/// 24). At least one worker starts while its cost fits, so a small budget still overlaps two blocks.
 pub(crate) fn plan(threads: usize, budget: u64, window: u64) -> (usize, u64) {
     let budget = budget.max(MIN_MEMORY);
     let cost = window + SEGMENT as u64;
-    let workers = usize::try_from(budget / 3 / cost).unwrap_or(usize::MAX).min(threads);
+    let block = window.saturating_mul(FIND_BLOCKS).max(MIN_PIECE);
+    let by_cost = budget / 3 / cost;
+    let room = block.saturating_mul(FLIGHT_HALF_BLOCKS) / 2;
+    let by_flight = (budget / cost.saturating_add(room)).max(1);
+    let workers = usize::try_from(by_cost.min(by_flight)).unwrap_or(usize::MAX).min(threads);
     (workers, budget - workers as u64 * cost)
 }
 
@@ -2008,5 +2020,37 @@ mod tests {
         reader.read_exact(&mut buf).unwrap();
         assert!(buf == plain[..buf.len()]);
         drop(reader);
+    }
+
+    /// The workers [`plan`] starts each keep one and a half 7-Zip blocks of the budget in flight, whatever the
+    /// thread count, and their own cost stays within a third of it.
+    #[test]
+    fn plan_leaves_each_worker_room_for_its_block() {
+        const MIB: u64 = 1 << 20;
+        // 32 cores and the default 2 GiB at -mx5 (16 MiB windows, 64 MiB blocks): 18 workers, not 32
+        assert_eq!(plan(32, 2048 * MIB, 16 * MIB).0, 18);
+        // -mx9 (64 MiB windows, 256 MiB blocks)
+        assert_eq!(plan(32, 2048 * MIB, 64 * MIB).0, 4);
+        // fewer threads than the budget pays for: the threads asked for
+        assert_eq!(plan(8, 2048 * MIB, 16 * MIB).0, 8);
+        // a budget too small for two blocks still starts one worker, while its cost fits
+        assert_eq!(plan(32, 256 * MIB, 64 * MIB).0, 1);
+        assert_eq!(plan(32, 4 * MIB, 64 * MIB).0, 0);
+        for threads in [1, 2, 8, 16, 32, 64, 1024] {
+            for budget in [4 * MIB, 64 * MIB, 256 * MIB, 1024 * MIB, 2048 * MIB, 1 << 40] {
+                for window in [4096, MIB, 16 * MIB, 64 * MIB, 1 << 30] {
+                    let (workers, memory) = plan(threads, budget, window);
+                    let cost = window + SEGMENT as u64;
+                    let block = (FIND_BLOCKS * window).max(MIN_PIECE);
+                    let workers = workers as u64;
+                    assert!(workers <= threads as u64);
+                    assert!(workers * cost <= budget / 3, "{threads} {budget} {window}");
+                    assert_eq!(memory, budget - workers * cost);
+                    if workers > 1 {
+                        assert!(memory / workers >= block * 3 / 2, "{threads} {budget} {window}: {workers} workers");
+                    }
+                }
+            }
+        }
     }
 }

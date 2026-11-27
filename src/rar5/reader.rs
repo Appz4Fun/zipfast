@@ -817,6 +817,18 @@ impl Volume {
         resumed_at: Option<u64>,
         passed_over: bool,
     ) {
+        self.record_damage_cut(offset, kind, name, resumed_at, passed_over, None);
+    }
+
+    fn record_damage_cut(
+        &mut self,
+        offset: u64,
+        kind: HeaderDamageKind,
+        name: Option<&str>,
+        resumed_at: Option<u64>,
+        passed_over: bool,
+        cut: Option<HeaderCut>,
+    ) {
         if self.damage.len() >= crate::extract::MAX_HEADER_DAMAGE {
             return;
         }
@@ -829,7 +841,15 @@ impl Volume {
             name[..end].to_owned()
         });
         {
-            self.damage.push(HeaderDamage { volume: self.path.clone(), offset, kind, name, resumed_at, passed_over });
+            self.damage.push(HeaderDamage {
+                volume: self.path.clone(),
+                offset,
+                kind,
+                name,
+                resumed_at,
+                passed_over,
+                cut,
+            });
         }
     }
 
@@ -1001,6 +1021,7 @@ impl Volume {
             let mut parser = HeaderParser::new(self.path.clone(), self.next, Some(self.len), budget.is_some());
             parser.set_format(self.format);
             parser.set_salvage(self.damaged_input);
+            parser.set_salvage_cut(self.damaged_input.salvages());
             parser
         });
         let result = (|| {
@@ -1080,6 +1101,22 @@ impl Volume {
                         _ => true,
                     };
                     self.record_damage_of(offset, kind, name, None, passed_over);
+                }
+                if let Block::File(header) = &frame.block
+                    && let Some(cut) = header.cut
+                {
+                    // the volume ends inside this header or its data: listed and read anyway, and the end reported
+                    // here rather than again at the end of the volume
+                    let (offset, name) = (frame.extent.start, header.name.clone());
+                    self.record_damage_cut(
+                        offset,
+                        HeaderDamageKind::UnexpectedEnd,
+                        Some(&name),
+                        None,
+                        false,
+                        Some(cut),
+                    );
+                    self.damage_closed = true;
                 }
                 if matches!(frame.block, Block::Crypt) {
                     if budget.is_some() && (!catalogue_main || self.header_key.is_some()) {

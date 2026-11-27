@@ -485,6 +485,27 @@ pub struct FileHeader {
     /// A service header's SubData: the stream name of an `STM` header, the `Protect+` tag of a RAR 4.x `RR`, and
     /// so on. Empty for file headers.
     pub sub_data: Vec<u8>,
+    /// Where the volume ends inside this file header or its data, when it was read anyway under
+    /// [`crate::extract::DamagedInput::Salvage`] or `Resync` (as UnRAR 7.30 and 7-Zip 26.06 list such a member).
+    /// None for a header and data that are whole. See [`HeaderCut`].
+    pub cut: Option<HeaderCut>,
+}
+
+/// How a volume cut short ends inside a file header or its data ([`FileHeader::cut`]); the read past is reported as
+/// [`crate::extract::HeaderDamageKind::UnexpectedEnd`] with the same `cut`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum HeaderCut {
+    /// The header is whole but only the first `present` bytes of its `packed_size` bytes of data are in the volume.
+    /// UnRAR 7.30 and 7-Zip 26.06 both list the member with its declared sizes. It is decoded from those bytes and
+    /// its checks decide, as UnRAR decodes it: one that passes them is good, as UnRAR reports it OK (7-Zip reports a
+    /// Data Error whatever they say).
+    Data { present: u64 },
+    /// A RAR 4.x file header cut short: its fields are read from the bytes there, the rest taken as zeros, and its
+    /// name is what of it is there (up to a NUL), possibly empty. UnRAR 7.30 lists it so ("NAME - the file header is
+    /// corrupt"); 7-Zip 26.06 lists nothing, so a caller showing 7-Zip's listing leaves it out. It has no data:
+    /// extracting it fails.
+    Header,
 }
 
 impl FileHeader {
@@ -695,6 +716,9 @@ pub(super) struct FileWire {
     pub(super) name: std::sync::Arc<Vec<u8>>,
     pub(super) compression: u64,
     pub(super) extent: std::ops::Range<u64>,
+    /// [`crate::extract::DamagedInput::Salvage`] in a catalogue: the volume ends inside this member's data, and this
+    /// many of its bytes are there (what UnRAR 7.30 reads of a member an archive cut short ends in)
+    pub(super) cut: Option<u64>,
 }
 
 fn parse_file_impl(
@@ -769,6 +793,7 @@ fn parse_file_impl(
             name: std::sync::Arc::new(encoded),
             compression: info,
             extent: head.data_at..head.data_at,
+            cut: None,
         })
     } else {
         None

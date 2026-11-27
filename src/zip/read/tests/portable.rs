@@ -93,8 +93,10 @@ fn run(archive: &Path, dest: &Path, overwrite: Overwrite, storage: StagedStorage
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let overrides = EncryptedReadOverrides { staged_storage: storage, ..Default::default() };
     crate::zip::run_with_policy(
@@ -298,8 +300,10 @@ fn run_with_context_restores_the_stream_setting() {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let mut context = EncryptedReadContext::new(Default::default()).unwrap();
     assert!(!context.options.stream_staged_aes);

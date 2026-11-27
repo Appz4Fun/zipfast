@@ -61,6 +61,8 @@ pub(super) struct Extraction<'a> {
     dirs: Vec<DirectoryOutput>,
     /// the files this run published, where each landed: the files a hard link or file copy may take
     extracted: crate::extract::link::Extracted,
+    /// the session's inputs are given to `extracted` ([`crate::extract::link::Extracted::protect_sources`])
+    sources_protected: bool,
 }
 
 pub(super) struct DirectoryOutput {
@@ -77,6 +79,7 @@ impl<'a> Extraction<'a> {
             versions: false,
             dirs: Vec::new(),
             extracted: crate::extract::link::Extracted::for_output(options),
+            sources_protected: false,
         }
     }
 
@@ -119,6 +122,20 @@ impl<'a> Extraction<'a> {
         hooks: &mut impl ExtractionHooks,
     ) -> Result<RarOutcome, SelectedStop> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
+        // the extraction's own thread settings, where it has any, over the session's
+        run.threads = self.options.threads.or(session.options.threads);
+        run.parallel_min = self.options.parallel_min.or(session.options.parallel_min);
+        // the extraction's hard link targets where it sets StoredName, else the session's
+        self.extracted.set_hard_link_targets(match self.options.hard_link_targets {
+            crate::extract::HardLinkTargets::Extracted => session.options.hard_link_targets,
+            set => set,
+        });
+        // the session's volumes and protected paths are never a stored-name hard link's file (found once per run)
+        if !self.sources_protected {
+            self.sources_protected = true;
+            let volumes = session.volumes.iter().map(|volume| (volume.stamp.device, volume.stamp.inode));
+            self.extracted.protect_sources(volumes.chain(crate::extract::link::protected_identities(self.options)));
+        }
         run.write_unfiltered = self.options.unsupported_filters == crate::extract::UnsupportedFilters::WriteUnfiltered;
         // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume keeps what was decoded
         run.emit_unverified =
@@ -155,11 +172,7 @@ impl<'a> Extraction<'a> {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
         let relative = hooks.project(header, self.options.version_naming)?;
-        let meta = if header.is_dir() {
-            self.options.dir_meta(Meta::from(header))
-        } else {
-            self.options.meta(Meta::from(header))
-        };
+        let meta = if header.is_dir() { self.options.rar_dir_meta(header) } else { self.options.rar_meta(header) };
         if header.is_dir() {
             let outcome = run.test(session, index, None)?;
             if !self.options.flatten && matches!(outcome, RarOutcome::Directory) {
@@ -519,6 +532,7 @@ impl<'a> Extraction<'a> {
                 Some(link::FOREIGN_LINK | link::LINK_LEAVES | link::UNSAFE_TARGET) => {
                     policy(RarPolicyReason::LinkTarget, path.to_path_buf())
                 }
+                Some(link::PROTECTED_SOURCE) => policy(RarPolicyReason::ProtectedInput, path.to_path_buf()),
                 Some(_) => policy(RarPolicyReason::HardLinkTarget, path.to_path_buf()),
                 None => output_fault(IoOperation::Publish, path, source),
             }
@@ -526,7 +540,10 @@ impl<'a> Extraction<'a> {
         // what is placed, so the diagnostic guard takes it as this run's own change
         let placed = match &kind {
             link::LinkKind::Symbolic(text) => PlacedLink::Symbolic { target: text },
-            link::LinkKind::Hard(source) => PlacedLink::Hard { source: self.extracted.landed_identity(source) },
+            link::LinkKind::Hard(source) => PlacedLink::Hard {
+                source: self.extracted.hard_link_source(dest, source),
+                timed: self.extracted.sets_hard_link_times(),
+            },
             link::LinkKind::Copy(_) => PlacedLink::Copy,
         };
         let rename = self.options.overwrite.rename().filter(|_| initial.is_some());
@@ -901,8 +918,10 @@ pub(super) trait ExtractionHooks {
 pub(super) enum PlacedLink<'a> {
     /// A symbolic link to these target bytes.
     Symbolic { target: &'a [u8] },
-    /// A hard link to the file this run extracted with this device and inode (a copy where linking fails).
-    Hard { source: Option<(u64, u64)> },
+    /// A hard link to the file with this device and inode (a copy where linking fails): the file this run extracted
+    /// or, under [`crate::extract::HardLinkTargets::StoredName`], the one at the target's stored name. With `timed`
+    /// the link member's own modification time was set on it ([`crate::extract::UnixModes::Masked`]).
+    Hard { source: Option<(u64, u64)>, timed: bool },
     /// A copy of a file this run extracted.
     Copy,
     /// The empty regular file a refused symbolic link leaves with
@@ -1048,8 +1067,10 @@ mod tests {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         }
     }
 

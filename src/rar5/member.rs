@@ -235,6 +235,9 @@ pub(crate) struct MemberMachine {
     part_missing: bool,
     /// Resumed after a restart: check mismatches mark the part or member missing instead of failing.
     resumed: bool,
+    /// A persistent session's member under `Options::keep_broken`: a final checksum mismatch the session does not
+    /// turn into a hole marks the member missing instead of failing, as for a resumed member.
+    keep_broken: bool,
 }
 impl MemberMachine {
     pub(crate) fn from_state(
@@ -260,6 +263,7 @@ impl MemberMachine {
             missing: false,
             part_missing: false,
             resumed: false,
+            keep_broken: false,
         }
     }
     /// Treats bytes already fed as missing after the fact (caller-declared damage), exactly as a hole fed in
@@ -356,6 +360,15 @@ impl MemberMachine {
     }
     pub(crate) fn part_missing(&self) -> bool {
         self.part_missing
+    }
+    /// `Options::keep_broken` in a persistent session: a member failing its final checksum is left to verification
+    /// (`Bad`, judged again from the output) and the session goes on, as for a resumed member. The checks a
+    /// persistent session turns into `DeclaredBad` holes (`part_checks_fail`, `member_checks_fail`) still do so. A
+    /// part's own check stays strict: a plain part failing it is already a hole, and an encrypted part's check
+    /// covers ciphertext that verification can't judge again, so marking it missing would lose the failure.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn keep_broken(&mut self) {
+        self.keep_broken = true;
     }
     /// Whether the current part, read whole and with no byte missing, fails its own packed check (CRC32 or
     /// BLAKE2sp). A persistent session turns such a part of a plain stored member into a `DeclaredBad` hole and
@@ -762,7 +775,10 @@ impl MemberMachine {
         })?;
         let bytes = inner.bytes;
         let result = inner.verify(&self.context, member.unpacked_size, checks.crc32, checks.blake2sp, key);
-        if result.is_err() && self.resumed && member.unpacked_size.is_none_or(|n| n == bytes) {
+        if result.is_err()
+            && (self.resumed || (self.keep_broken && final_checks_mismatch(&result)))
+            && member.unpacked_size.is_none_or(|n| n == bytes)
+        {
             self.missing = true;
             return Ok(());
         }
@@ -856,6 +872,15 @@ impl Sink for CheckingSink<'_> {
     fn crc(&mut self, crc: u32) {
         self.checks.crc = Some(crc);
     }
+}
+/// Whether `result` fails only the member's final checksums, the failure `Options::keep_broken` leaves to
+/// verification in a persistent session.
+fn final_checks_mismatch(result: &std::result::Result<(), RarFailure>) -> bool {
+    matches!(
+        result,
+        Err(RarFailure::Integrity { reason: RarIntegrityReason::FinalChecks { .. }, .. }
+            | RarFailure::EncryptedIntegrity { reason: RarIntegrityReason::FinalChecks { .. }, .. })
+    )
 }
 pub(crate) fn verify_packed(
     context: &EntryContext,
@@ -1065,6 +1090,16 @@ pub(crate) fn continue_decoder(stream: &mut Option<Unpacker>, dictionary: u64, s
         false
     }
 }
+/// [`crate::extract::Options::threads`] and [`crate::extract::Options::parallel_min`] on a new decoder: both None keep
+/// its default workers, `Some(n)` threads mean `n - 1` workers (`Some(1)` and `Some(0)` decode on the calling thread
+/// only), and a `parallel_min` sets the smallest file decoded on them.
+pub(crate) fn apply_threads(decoder: &mut Unpacker, threads: Option<usize>, parallel_min: Option<u64>) {
+    if threads.is_some() || parallel_min.is_some() {
+        let workers = threads.map_or_else(|| decoder.threads(), |n| n.saturating_sub(1));
+        decoder.set_threads(workers, parallel_min.unwrap_or(decoder.parallel_min()));
+    }
+}
+
 pub(crate) fn reset_decoder(
     stream: &mut Option<Unpacker>,
     window: super::unpack::Window,
@@ -1076,10 +1111,7 @@ pub(crate) fn reset_decoder(
         decoder.restart(window, size);
     } else {
         let mut decoder = Unpacker::new_detailed(window)?;
-        if threads.is_some() || parallel_min.is_some() {
-            let workers = threads.map_or_else(|| decoder.threads(), |n| n.saturating_sub(1));
-            decoder.set_threads(workers, parallel_min.unwrap_or(decoder.parallel_min()));
-        }
+        apply_threads(&mut decoder, threads, parallel_min);
         decoder.reset(size);
         *stream = Some(decoder);
     }
@@ -1365,6 +1397,7 @@ mod tests {
                     name: std::sync::Arc::new(b"f".to_vec()),
                     compression: 0,
                     extent: 0..0,
+                    cut: None,
                 };
                 let part = PhysicalPart::new(0, &header, header.crypt.map(Ok), &wire);
                 let mut member = PhysicalMember::new(header.clone(), wire, 0, &part).unwrap();
@@ -1512,8 +1545,10 @@ mod tests {
                     unsupported_filters: Default::default(),
                     unverified_output: Default::default(),
                     salvage_truncated_zip: false,
+                    seven_zip_strict: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
+                    hard_link_targets: Default::default(),
                 },
                 "a.rar".into(),
             );
@@ -1653,6 +1688,7 @@ mod tests {
                 name: std::sync::Arc::new(b"f".to_vec()),
                 compression: 0,
                 extent: 0..0,
+                cut: None,
             };
             // Part 0 declares no BLAKE2sp; part 1 does.
             let first = super::super::FileHeader {
@@ -1730,6 +1766,7 @@ mod tests {
                     name: std::sync::Arc::new(b"f".to_vec()),
                     compression: 0,
                     extent: 0..0,
+                    cut: None,
                 };
                 let part1 = PhysicalPart::new(0, &first, Some(Ok(params)), &wire);
                 let mut member = PhysicalMember::new(first.clone(), wire, 0, &part1).unwrap();
@@ -1865,8 +1902,10 @@ mod tests {
                 unsupported_filters: Default::default(),
                 unverified_output: Default::default(),
                 salvage_truncated_zip: false,
+                seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             let run = crate::extract::run_with_password(
                 &fixtures.join(format!("testfile5{set}.part01.rar")),

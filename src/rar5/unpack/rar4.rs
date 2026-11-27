@@ -56,6 +56,11 @@ pub(crate) enum Rar4DecodeError {
 
 const CHUNK: usize = 65536;
 const OUTPUT: usize = 32768;
+// Output not yet handed to the sink is read back from the window, which must not wrap onto it first.
+const _: () = assert!(2 * OUTPUT <= 65536, "the smallest RAR4 window holds two output buffers");
+/// Input [`Rar4Decoder::fast_tokens`] keeps in hand: the longest LZ token (a 15-bit code, 5 length bits, a 15-bit
+/// distance code, 14 distance bits and a 15-bit low distance code) takes 64 bits, past any buffered in `Bits`.
+const FAST_INPUT: usize = 16;
 /// PPM input decoded only while this much is buffered, until the member's data is all in: one character never
 /// reads more (a model of order 64 escapes at most 64 times, each normalizing at most 4 bytes).
 const PPM_LOOKAHEAD: usize = 4096;
@@ -195,10 +200,120 @@ impl Bits {
         }
         Some(value)
     }
+    /// The next 15 bits, MSB first, without taking them or any byte from `input`: `None` when fewer remain.
+    #[inline(always)]
+    fn peek15(&self, input: &[u8]) -> Option<u32> {
+        let (mut acc, mut count) = (self.acc, self.count);
+        let mut next = input.iter();
+        while count < 15 {
+            acc = (acc << 8) | u64::from(*next.next()?);
+            count += 8;
+        }
+        Some((acc >> (count - 15)) as u32 & 0x7fff)
+    }
     fn align(&mut self) {
         let discard = self.count % 8;
         self.count -= discard;
         self.acc &= (1u64 << self.count) - 1;
+    }
+}
+
+/// How many bits [`Huff::quick`] looks at.
+const QUICK_BITS: u32 = 10;
+
+/// [`Rar4Decoder::fast_tokens`]' bit reader: the bits [`Bits`] holds, then the input, read eight bytes at a time
+/// into a left-aligned register. Handing back ([`Window::store`]) returns every whole byte it read ahead and took
+/// no bit of, so the input is consumed as [`Bits::take`] consumes it, a byte only when a bit of it is taken.
+struct Window<'a> {
+    /// the next bits from the top down; past `count`, either zero or the stream's next bits
+    acc: u64,
+    count: u32,
+    input: &'a [u8],
+    /// how many bytes of `input` are in `acc` (or were and are taken)
+    next: usize,
+    #[cfg(test)]
+    read_bytes: u64,
+}
+impl<'a> Window<'a> {
+    fn new(bits: &Bits, input: &'a [u8]) -> Self {
+        let count = u32::from(bits.count);
+        debug_assert!(count <= 56);
+        Self {
+            acc: if count == 0 { 0 } else { bits.acc << (64 - count) },
+            count,
+            input,
+            next: 0,
+            #[cfg(test)]
+            read_bytes: bits.read_bytes,
+        }
+    }
+    /// Input bytes not read into the register yet.
+    #[inline(always)]
+    fn left(&self) -> usize {
+        self.input.len() - self.next
+    }
+    /// At least 57 bits in the register, unless the input runs out first (which the caller rules out).
+    #[inline(always)]
+    fn fill(&mut self) {
+        if self.count > 56 {
+            return;
+        }
+        if let Some(bytes) = self.input.get(self.next..self.next + 8) {
+            // whole bytes up to 57 bits or more, and the start of the next byte (bits it reads again later)
+            let ahead = u64::from_be_bytes(bytes.try_into().unwrap_or([0; 8]));
+            self.acc |= ahead >> self.count;
+            let whole = (63 - self.count) / 8;
+            self.next += whole as usize;
+            self.count += 8 * whole;
+        } else {
+            while self.count <= 56
+                && let Some(&byte) = self.input.get(self.next)
+            {
+                self.acc |= u64::from(byte) << (56 - self.count);
+                self.next += 1;
+                self.count += 8;
+            }
+        }
+    }
+    #[inline(always)]
+    fn peek15(&self) -> u32 {
+        (self.acc >> 49) as u32
+    }
+    #[inline(always)]
+    fn skip(&mut self, n: u8) {
+        let n = u32::from(n).min(self.count);
+        self.acc = self.acc.checked_shl(n).unwrap_or(0);
+        self.count -= n;
+    }
+    /// The next `n` (at most 18) bits.
+    #[inline(always)]
+    fn get(&mut self, n: u8) -> u32 {
+        let value = if n == 0 { 0 } else { (self.acc >> (64 - u32::from(n))) as u32 };
+        self.skip(n);
+        value
+    }
+    /// What [`Bits`] would hold after taking the same bits, and how many bytes of `input` it would have read.
+    fn settled(&self) -> (u64, u8, usize) {
+        let unread = (self.count as usize / 8).min(self.next);
+        let count = self.count - 8 * unread as u32;
+        let acc = if count == 0 { 0 } else { self.acc >> (64 - count) };
+        (acc, count as u8, self.next - unread)
+    }
+    /// Hands the bits back to `bits` and consumes what was read of `input`.
+    fn store(&self, bits: &mut Bits, input: &mut &[u8]) {
+        let (acc, count, read) = self.settled();
+        (bits.acc, bits.count) = (acc, count);
+        #[cfg(test)]
+        {
+            bits.read_bytes = self.read_bytes + read as u64;
+        }
+        *input = &input[read..];
+    }
+    /// Under test: `bits` as [`Window::store`] would leave it, for observers that read the bit position.
+    #[cfg(test)]
+    fn store_copy(&self, bits: &mut Bits) {
+        let (acc, count, read) = self.settled();
+        (bits.acc, bits.count, bits.read_bytes) = (acc, count, self.read_bytes + read as u64);
     }
 }
 
@@ -208,10 +323,34 @@ struct Huff {
     offset: [usize; 16],
     symbols: [u16; 299],
     used: usize,
+    /// By the next [`QUICK_BITS`] bits: `symbol << 4 | length` of the code they start with when it is that short, else
+    /// 0 (a longer code, or none)
+    quick: [u16; 1 << QUICK_BITS],
 }
 impl Huff {
     fn empty() -> Self {
-        Self { count: [0; 16], first: [0; 16], offset: [0; 16], symbols: [0; 299], used: 0 }
+        Self {
+            count: [0; 16],
+            first: [0; 16],
+            offset: [0; 16],
+            symbols: [0; 299],
+            used: 0,
+            quick: [0; 1 << QUICK_BITS],
+        }
+    }
+    /// The symbol a code longer than [`QUICK_BITS`] at the start of `window` (the next 15 bits) stands for, and the
+    /// code's length; `None` when no code starts it.
+    #[inline]
+    fn long(&self, window: u32) -> Option<(u16, u8)> {
+        for n in QUICK_BITS as usize + 1..16 {
+            let prefix = window >> (15 - n);
+            if let Some(relative) = prefix.checked_sub(self.first[n])
+                && relative < u32::from(self.count[n])
+            {
+                return Some((self.symbols[self.offset[n] + relative as usize], n as u8));
+            }
+        }
+        None
     }
     fn build(&mut self, lengths: &[u8], work: &mut Work) -> DecodeResult<()> {
         self.count = [0; 16];
@@ -244,6 +383,17 @@ impl Huff {
             if length != 0 {
                 self.symbols[next[length as usize]] = symbol as u16;
                 next[length as usize] += 1;
+            }
+        }
+        // Canonical codes of each length are consecutive and fit the code space (checked above), so a code of length
+        // n <= QUICK_BITS owns the 2^(QUICK_BITS - n) entries its bits start.
+        self.quick.fill(0);
+        for n in 1..=QUICK_BITS as usize {
+            let shift = QUICK_BITS as usize - n;
+            for k in 0..usize::from(self.count[n]) {
+                let code = self.first[n] as usize + k;
+                let entry = (self.symbols[self.offset[n] + k] << 4) | n as u16;
+                self.quick[code << shift..(code + 1) << shift].fill(entry);
             }
         }
         work.check()
@@ -360,7 +510,8 @@ pub(crate) struct Rar4Decoder {
     last_length: u64,
     low: u64,
     low_repeats: u8,
-    output: [u8; OUTPUT],
+    /// Decoded bytes not handed to the sink yet: `filled` of them in the window from cursor `out_start` on
+    out_start: u64,
     filled: usize,
     table_builds: u64,
     /// Solid chaining: past a member's last byte, read its end-of-file marker for the next member's start.
@@ -393,7 +544,13 @@ pub(crate) struct Rar4Decoder {
     unfiltered: bool,
     /// [`crate::extract::UnverifiedOutput::Emit`]: where the latest LZ tokens started, for [`Self::flush_decoded`]
     starts: Option<Box<TokenStarts>>,
+    /// [`Self::cut_short`]: the bytes of real data fed, and how far before their end a token is left out
+    data_end: Option<(u64, u64)>,
+    /// [`Self::cut_short`]: a PPM or RAR 1.5/2.0 code starting at or past this bit of the member's data is not decoded
+    stop_at: Option<u64>,
     hold_start: u64,
+    /// how many of the held bytes are plain output that was waiting when the first block's bytes began
+    hold_plain: usize,
     /// the member's unpack version, and the RAR 1.5 or 2.0 engine that decodes it
     version: u8,
     /// memory beyond the window a PPM model and a held filter block may take
@@ -487,7 +644,7 @@ impl Rar4Decoder {
             last_length: 0,
             low: 0,
             low_repeats: 0,
-            output: [0; OUTPUT],
+            out_start: 0,
             filled: 0,
             table_builds: 0,
             track_boundary: false,
@@ -505,7 +662,10 @@ impl Rar4Decoder {
             write_unfiltered: false,
             unfiltered: false,
             starts: None,
+            data_end: None,
+            stop_at: None,
             hold_start: 0,
+            hold_plain: 0,
             version: 29,
             memory_limit: PPM_MEMORY_MAX,
             legacy: None,
@@ -617,7 +777,13 @@ impl Rar4Decoder {
     fn flush(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
         self.work.check()?;
         if self.filled != 0 {
-            sink.put(&self.output[..self.filled]).map_err(Rar4DecodeError::Sink)?;
+            // the window is at least twice OUTPUT, so nothing has overwritten these bytes
+            let start = (self.out_start & (self.dictionary.len() as u64 - 1)) as usize;
+            let first = self.filled.min(self.dictionary.len() - start);
+            sink.put(&self.dictionary[start..start + first]).map_err(Rar4DecodeError::Sink)?;
+            if first < self.filled {
+                sink.put(&self.dictionary[..self.filled - first]).map_err(Rar4DecodeError::Sink)?;
+            }
             self.filled = 0;
         }
         self.work.check()
@@ -638,6 +804,16 @@ impl Rar4Decoder {
             // held until the block can be filtered
             if self.hold.is_empty() {
                 self.hold_start = cursor;
+                if self.filled != 0 {
+                    // Output still to go out lives in the window, which a long block would wrap onto: it waits
+                    // ahead of the block's bytes instead, and goes out first as it would have.
+                    debug_assert_eq!(self.out_start + self.filled as u64, cursor);
+                    let start = (self.out_start & (self.dictionary.len() as u64 - 1)) as usize;
+                    let first = self.filled.min(self.dictionary.len() - start);
+                    self.hold.extend_from_slice(&self.dictionary[start..start + first]);
+                    self.hold.extend_from_slice(&self.dictionary[..self.filled - first]);
+                    (self.hold_start, self.hold_plain, self.filled) = (self.out_start, self.filled, 0);
+                }
             }
             self.hold.push(byte);
             if cursor + 1 >= block.end() {
@@ -645,12 +821,60 @@ impl Rar4Decoder {
             }
             return Ok(());
         }
-        self.output[self.filled] = byte;
+        if self.filled == 0 {
+            self.out_start = cursor;
+        }
+        debug_assert_eq!(self.out_start + self.filled as u64, cursor);
         self.filled += 1;
-        if self.filled == OUTPUT {
+        if self.filled >= OUTPUT {
             self.flush(sink)?;
         }
         Ok(())
+    }
+    /// Copies as much of a match's next `left` bytes (from cursor `from` to cursor `to`) as can go straight to the
+    /// output buffer: as [`Self::emit`] would one by one, short of a waiting filter block's bytes and of a full
+    /// buffer. Copies nothing when fewer than two bytes could go, leaving those to `emit`. The work is one unit a
+    /// byte, as `emit` a byte at a time charges it (the step charged one already).
+    fn copy_plain(&mut self, from: u64, to: u64, left: u64) -> DecodeResult<u64> {
+        let mut n = left.min(OUTPUT.saturating_sub(self.filled) as u64);
+        if let Some(block) = self.filters.pending.front() {
+            n = n.min(block.start.saturating_sub(to));
+        }
+        let end = self.produced.checked_add(n).ok_or(Rar4DecodeError::CounterOverflow)?;
+        if n < 2 || end > self.expected {
+            return Ok(0);
+        }
+        to.checked_add(n).ok_or(Rar4DecodeError::CounterOverflow)?;
+        self.work.tick(n - 1)?;
+        let mask = self.dictionary.len() - 1;
+        let (src, dst, len) = (from as usize & mask, to as usize & mask, n as usize);
+        let window = self.dictionary.as_mut_slice();
+        if src + len <= window.len() && dst + len <= window.len() {
+            if len <= 32 {
+                // short: a byte at a time beats a call, and is right for overlapping copies too
+                for k in 0..len {
+                    window[dst + k] = window[src + k];
+                }
+            } else if src + len <= dst || dst + len <= src {
+                window.copy_within(src..src + len, dst);
+            } else {
+                // overlapping: each byte may be one this copy just wrote
+                for k in 0..len {
+                    window[dst + k] = window[src + k];
+                }
+            }
+        } else {
+            for k in 0..len {
+                window[(dst + k) & mask] = window[(src + k) & mask];
+            }
+        }
+        if self.filled == 0 {
+            self.out_start = to;
+        }
+        debug_assert_eq!(self.out_start + self.filled as u64, to);
+        self.filled += len;
+        self.produced = end;
+        Ok(n)
     }
     /// Filters every waiting block whose bytes are all decoded and writes it, with what lies between blocks.
     fn run_filters(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
@@ -687,6 +911,7 @@ impl Rar4Decoder {
             }
             sink.put(&data).map_err(Rar4DecodeError::Sink)?;
             self.hold.drain(..from + block.len);
+            self.hold_plain = 0;
             self.hold_start = block.end();
         }
         // what is held before the next block (or all of it, when none waits) goes out plain
@@ -699,6 +924,7 @@ impl Rar4Decoder {
             sink.put(&self.hold[..plain]).map_err(Rar4DecodeError::Sink)?;
             self.hold.drain(..plain);
             self.hold_start += plain as u64;
+            self.hold_plain = self.hold_plain.saturating_sub(plain);
         }
         Ok(())
     }
@@ -734,12 +960,19 @@ impl Rar4Decoder {
     /// taken: its bytes, and every later one, are left out. That needs [`Self::track_starts`] from the member's
     /// start; without it, or in a PPM block or a RAR 1.5/2.0 stream, every decoded byte is handed over.
     pub(crate) fn flush_decoded(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
-        let lz = !self.phase.ppm() && !matches!(self.phase, Phase::Legacy) && self.legacy.is_none();
-        let cut = match self.starts.as_deref().filter(|_| lz) {
-            Some(starts) => starts.cut(self.fetched, self.produced),
-            None => self.produced,
-        };
-        // the buffer holds the output just before the first held byte (or the newest, when nothing is held)
+        let cut = self.cut_point();
+        // the output waiting goes just before the first held byte (or is the newest, when nothing is held)
+        if self.hold_plain != 0 {
+            // it waits ahead of a held block (see emit)
+            let start = self.hold_start.saturating_sub(self.chain_base).min(self.produced);
+            let end = start.saturating_add(self.hold_plain as u64).min(self.produced);
+            let keep = ((cut.clamp(start, end) - start) as usize).min(self.hold_plain);
+            self.work.check()?;
+            if keep != 0 {
+                sink.put(&self.hold[..keep]).map_err(Rar4DecodeError::Sink)?;
+            }
+            return self.work.check();
+        }
         let end = if self.hold.is_empty() {
             self.produced
         } else {
@@ -749,6 +982,40 @@ impl Rar4Decoder {
         let keep = cut.clamp(start, end) - start;
         self.filled = (keep as usize).min(self.filled);
         self.flush(sink)
+    }
+    /// The output position [`Self::flush_decoded`] stops at: before the first LZ token starting within the margin
+    /// of the data's end ([`TAIL_MARGIN`] before what was fed, or the end itself after [`Self::cut_short`]), or
+    /// everything produced.
+    pub(crate) fn cut_point(&self) -> u64 {
+        let lz = !self.phase.ppm() && !matches!(self.phase, Phase::Legacy) && self.legacy.is_none();
+        let (end, margin) = self.data_end.unwrap_or((self.fetched, TAIL_MARGIN));
+        match self.starts.as_deref().filter(|_| lz) {
+            Some(starts) => starts.cut(end, margin, self.produced),
+            None => self.produced,
+        }
+    }
+    /// The archive is cut short at the end of the data fed so far, as UnRAR sees it: it reads zeros past the end, so a
+    /// code starting before the byte after the data decodes (one straddling the end over zeros) and a later one does
+    /// not. Up to [`CUT_PAD`] zero bytes are fed after this, then [`Self::drain`], and [`Self::cut_point`] says
+    /// where the output ends.
+    pub(crate) fn cut_short(&mut self) {
+        self.data_end = Some((self.fetched, 0));
+        self.stop_at = Some(self.fetched.saturating_add(1).saturating_mul(8));
+    }
+    /// Decodes what PPM or a RAR 1.5/2.0 engine held back for lookahead, as at the end of the member's data.
+    pub(crate) fn drain(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+        if self.poisoned || self.finished {
+            return Ok(());
+        }
+        self.drain_input(sink)
+    }
+    /// Where the next PPM or RAR 1.5/2.0 code starts, in bits from the member's first packed byte; whether it is at
+    /// or past where [`Self::cut_short`] stops.
+    fn stopped(&self, bit: u32) -> bool {
+        let Some(stop) = self.stop_at else { return false };
+        let waiting = (self.ppm_in.len() as u64).saturating_sub(self.ppm_pos as u64);
+        let at = self.fetched.saturating_sub(waiting).saturating_mul(8).saturating_add(u64::from(bit));
+        at >= stop
     }
     /// Records where each LZ token starts, so that [`Self::flush_decoded`] can leave out the tail UnRAR leaves out.
     pub(crate) fn track_starts(&mut self) {
@@ -826,7 +1093,7 @@ impl Rar4Decoder {
     /// One code of a RAR 1.5 or 2.0 engine.
     fn legacy_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
         let available = self.absorb(input)?;
-        if available < PPM_LOOKAHEAD && !self.finishing {
+        if available < PPM_LOOKAHEAD && !self.finishing || self.stopped(self.legacy_bit) {
             return Ok(false);
         }
         if self.ppm_pos > self.ppm_in.len() + 8 {
@@ -868,7 +1135,7 @@ impl Rar4Decoder {
     }
     fn ppm_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
         let available = self.absorb(input)?;
-        if available < PPM_LOOKAHEAD && !self.finishing {
+        if available < PPM_LOOKAHEAD && !self.finishing || self.stopped(0) {
             return Ok(false);
         }
         if self.ppm_pos > self.ppm_in.len() + 8 {
@@ -1015,6 +1282,23 @@ impl Rar4Decoder {
         if self.tables[table].used == 0 {
             return Err(Rar4DecodeError::Malformed("empty Huffman table"));
         }
+        // With 15 bits at hand (the longest code), look the code up; take only its bits, so the input is consumed
+        // exactly as reading it a bit at a time would. Near the end of the input, read it a bit at a time.
+        if self.depth == 0
+            && let Some(window) = self.bits.peek15(input)
+        {
+            let h = &self.tables[table];
+            let entry = h.quick[(window >> (15 - QUICK_BITS)) as usize];
+            let found = if entry != 0 { Some((entry >> 4, (entry & 15) as u8)) } else { h.long(window) };
+            let Some((symbol, length)) = found else {
+                // the bit-by-bit search gave up after 15 bits
+                self.bits.take(15, input);
+                return Err(Rar4DecodeError::Malformed("undefined Huffman code"));
+            };
+            self.bits.take(length, input);
+            self.work.tick(1)?;
+            return Ok(Some(symbol));
+        }
         while self.depth < 15 {
             let Some(bit) = self.bits.take(1, input) else { return Ok(None) };
             self.work.tick(1)?;
@@ -1083,6 +1367,218 @@ impl Rar4Decoder {
             48..=59 => (((index - 44) as u64) << 18, 18),
             _ => unreachable!(),
         }
+    }
+    /// The next bytes of a match (`Phase::Copy`): as many as go straight to the output, else one through
+    /// [`Self::emit`]. The caller charged one unit of work.
+    #[inline]
+    fn copy_step(&mut self, distance: u64, left: u64, sink: &mut dyn Sink) -> DecodeResult<()> {
+        let cursor = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
+        let from = cursor.checked_sub(distance).ok_or(Rar4DecodeError::CounterOverflow)?;
+        let copied = self.copy_plain(from, cursor, left)?;
+        if copied == 0 {
+            let index = (from & (self.dictionary.len() as u64 - 1)) as usize;
+            self.emit(self.dictionary[index], sink)?;
+        } else if self.filled >= OUTPUT {
+            self.flush(sink)?;
+        }
+        let done = copied.max(1);
+        self.phase = if left == done { Phase::Token } else { Phase::Copy { distance, left: left - done } };
+        if self.produced == self.expected && left == done && self.lifecycle == Lifecycle::Active {
+            self.flush(sink)?;
+            if self.track_boundary {
+                self.in_tail = true;
+            } else {
+                self.saved_phase = self.phase;
+                self.phase = Phase::Complete;
+            }
+        }
+        Ok(())
+    }
+    /// Decodes whole LZ tokens, each with its length and distance fields and its copy, while [`FAST_INPUT`] bytes of
+    /// input remain: more than the longest token takes, so no field runs out of bits half read. Each field is taken
+    /// in the order, and each failure raised at the point, that the one-phase-per-step path takes and raises them,
+    /// so the input is consumed and the output made exactly as there. Stops at any token that path handles with
+    /// more than a copy or a literal (end of block, filter record), having set the phase as it would.
+    ///
+    /// Only for a member's own data (not its end-of-file tail), and between symbols. With [`Self::track_starts`] it
+    /// records each token's start as [`Self::run`] does before each step.
+    fn fast_tokens(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<()> {
+        let data: &[u8] = input;
+        let mut window = Window::new(&self.bits, data);
+        let result = self.fast_loop(&mut window, sink);
+        window.store(&mut self.bits, input);
+        match result? {
+            Some(256) => {
+                #[cfg(test)]
+                self.observe(tests::TraceKind::EndSymbol);
+                self.phase = Phase::End;
+            }
+            Some(_) => {
+                #[cfg(test)]
+                self.observe(tests::TraceKind::VmFilter);
+                self.phase = Phase::VmFirst;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+    /// A code from `table` read through `window`, as [`Self::symbol`] reads it.
+    #[inline(always)]
+    fn fast_symbol(&mut self, table: usize, window: &mut Window<'_>) -> DecodeResult<u16> {
+        let h = &self.tables[table];
+        if h.used == 0 {
+            return Err(Rar4DecodeError::Malformed("empty Huffman table"));
+        }
+        window.fill();
+        let bits = window.peek15();
+        let entry = h.quick[(bits >> (15 - QUICK_BITS)) as usize];
+        let found = if entry != 0 { Some((entry >> 4, (entry & 15) as u8)) } else { h.long(bits) };
+        let Some((symbol, length)) = found else {
+            window.skip(15);
+            return Err(Rar4DecodeError::Malformed("undefined Huffman code"));
+        };
+        window.skip(length);
+        self.work.tick(1)?;
+        Ok(symbol)
+    }
+    /// [`Self::fast_tokens`]' loop: the end-of-block or filter token it stopped at, if any, read but not acted on.
+    fn fast_loop(&mut self, w: &mut Window<'_>, sink: &mut dyn Sink) -> DecodeResult<Option<u16>> {
+        macro_rules! take {
+            ($bits:expr) => {{
+                w.fill();
+                w.get($bits)
+            }};
+        }
+        // Under test, the bit position and the phase the stepped path would have are set before each copy starts,
+        // for the successor trace, which reads both.
+        macro_rules! before_copy {
+            ($phase:expr) => {
+                #[cfg(test)]
+                {
+                    w.store_copy(&mut self.bits);
+                    self.phase = $phase;
+                }
+            };
+        }
+        let mut first = true;
+        // (a copy that ends the member starts its end-of-file tail: the stepped path reads that)
+        while w.left() >= FAST_INPUT && matches!(self.phase, Phase::Token) && !self.in_tail {
+            // (run recorded the first token's start)
+            if !first && let Some(starts) = self.starts.as_mut() {
+                let at =
+                    self.fetched.saturating_add(w.next as u64).saturating_mul(8).saturating_sub(u64::from(w.count));
+                starts.push(at, self.produced);
+            }
+            first = false;
+            let token = self.fast_symbol(1, w)?;
+            match token {
+                0..=255 => {
+                    // what emit does for a byte that goes to a started, not yet full output buffer
+                    let cursor = self.out_start + self.filled as u64;
+                    if self.filled != 0
+                        && self.filled < OUTPUT
+                        && self.produced < self.expected
+                        && cursor < u64::MAX
+                        && self.filters.pending.front().is_none_or(|block| cursor < block.start)
+                    {
+                        debug_assert_eq!(cursor, self.chain_base + self.produced);
+                        let mask = self.dictionary.len() - 1;
+                        self.dictionary[cursor as usize & mask] = token as u8;
+                        self.filled += 1;
+                        self.produced += 1;
+                        if self.filled >= OUTPUT {
+                            self.flush(sink)?;
+                        }
+                    } else {
+                        self.emit(token as u8, sink)?;
+                    }
+                    if self.produced == self.expected && self.lifecycle == Lifecycle::Active {
+                        self.flush(sink)?;
+                        if self.track_boundary {
+                            self.in_tail = true;
+                            return Ok(None);
+                        }
+                        self.saved_phase = self.phase;
+                        self.phase = Phase::Complete;
+                    }
+                    continue;
+                }
+                256 | 257 => return Ok(Some(token)),
+                258 => {
+                    if self.last_length == 0 {
+                        return Err(Rar4DecodeError::Malformed("repeat before a match"));
+                    }
+                    before_copy!(Phase::Token);
+                    self.start_copy(self.last_length, self.recent[0])?;
+                }
+                259..=262 => {
+                    let slot = (token - 259) as usize;
+                    if self.recent[slot] == 0 {
+                        return Err(Rar4DecodeError::Malformed("recent distance unavailable"));
+                    }
+                    let (base, bits) = Self::length(self.fast_symbol(4, w)? as usize);
+                    let length = base + u64::from(take!(bits)) + 2;
+                    let distance = self.recent[slot];
+                    self.recent.copy_within(0..slot, 1);
+                    self.recent[0] = distance;
+                    before_copy!(Phase::LengthExtra { base, bits, recent: Some(slot) });
+                    self.start_copy(length, distance)?;
+                }
+                263..=270 => {
+                    let (base, bits) = match token - 263 {
+                        0 => (0, 2),
+                        1 => (4, 2),
+                        2 => (8, 3),
+                        3 => (16, 4),
+                        4 => (32, 5),
+                        5 => (64, 6),
+                        6 => (128, 6),
+                        _ => (192, 6),
+                    };
+                    let distance = base + 1 + u64::from(take!(bits));
+                    self.insert(distance);
+                    before_copy!(Phase::Short { index: (token - 263) as usize });
+                    self.start_copy(2, distance)?;
+                }
+                271..=298 => {
+                    let (base, bits) = Self::length((token - 271) as usize);
+                    let length = base + u64::from(take!(bits)) + 3;
+                    let index = self.fast_symbol(2, w)? as usize;
+                    let (base, bits) = Self::distance(index);
+                    if index <= 9 {
+                        let distance = base + 1 + u64::from(take!(bits));
+                        self.insert(distance);
+                        before_copy!(Phase::DistanceBits { length, index });
+                        self.start_copy(length, distance)?;
+                    } else {
+                        let base = base + 1 + (u64::from(take!(bits - 4)) << 4);
+                        let low = if self.low_repeats != 0 {
+                            self.low_repeats -= 1;
+                            self.low
+                        } else {
+                            let value = self.fast_symbol(3, w)?;
+                            if value == 16 {
+                                self.low_repeats = 15;
+                            } else {
+                                self.low = u64::from(value);
+                            }
+                            self.low
+                        };
+                        let distance = base + low;
+                        before_copy!(Phase::Low { length, base });
+                        let length = length + u64::from(distance >= 0x2000) + u64::from(distance >= 0x40000);
+                        self.insert(distance);
+                        self.start_copy(length, distance)?;
+                    }
+                }
+                _ => return Err(Rar4DecodeError::Malformed("literal alphabet")),
+            }
+            while let Phase::Copy { distance, left } = self.phase {
+                self.work.tick(1)?;
+                self.copy_step(distance, left, sink)?;
+            }
+        }
+        Ok(None)
     }
     fn step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
         if self.phase.ppm() {
@@ -1213,6 +1709,10 @@ impl Rar4Decoder {
                 self.phase = Phase::Token;
             }
             Phase::Token => {
+                if input.len() >= FAST_INPUT && self.depth == 0 && !self.in_tail {
+                    self.fast_tokens(input, sink)?;
+                    return Ok(true);
+                }
                 let token = symbol!(1);
                 if self.in_tail {
                     // Past the member's output only the end-of-file marker belongs to it. Anything else is
@@ -1352,22 +1852,7 @@ impl Rar4Decoder {
                 self.insert(distance);
                 self.start_copy(2, distance)?;
             }
-            Phase::Copy { distance, left } => {
-                let cursor = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
-                let index = (cursor.checked_sub(distance).ok_or(Rar4DecodeError::CounterOverflow)?
-                    & (self.dictionary.len() as u64 - 1)) as usize;
-                self.emit(self.dictionary[index], sink)?;
-                self.phase = if left == 1 { Phase::Token } else { Phase::Copy { distance, left: left - 1 } };
-                if self.produced == self.expected && left == 1 && self.lifecycle == Lifecycle::Active {
-                    self.flush(sink)?;
-                    if self.track_boundary {
-                        self.in_tail = true;
-                    } else {
-                        self.saved_phase = self.phase;
-                        self.phase = Phase::Complete;
-                    }
-                }
-            }
+            Phase::Copy { distance, left } => self.copy_step(distance, left, sink)?,
             Phase::VmFirst => {
                 let first = take!(8);
                 self.phase = match (first & 7) + 1 {
@@ -1406,6 +1891,10 @@ mod tests;
 /// [`Rar4Decoder::flush_decoded`]).
 pub(crate) const TAIL_MARGIN: u64 = 30;
 
+/// How many zero bytes go after the data of a member cut by the archive's end ([`Rar4Decoder::cut_short`]): enough for
+/// the longest LZ token or legacy code straddling the end to decode, as UnRAR's zero fill lets it.
+pub(crate) const CUT_PAD: usize = 16;
+
 /// The start (in bits from the member's first packed byte) and the bytes produced before each of the latest LZ tokens:
 /// enough of them to reach [`TAIL_MARGIN`] bytes back, since a token takes at least one bit.
 struct TokenStarts {
@@ -1433,11 +1922,11 @@ impl TokenStarts {
 
     /// The bytes produced before the first token that starts within [`TAIL_MARGIN`] bytes of `fetched`, the bytes fed
     /// so far; `produced` when there is none.
-    fn cut(&self, fetched: u64, produced: u64) -> u64 {
+    fn cut(&self, fetched: u64, margin: u64, produced: u64) -> u64 {
         let size = self.ring.len();
         (0..self.len)
             .map(|back| self.ring[(self.next + size - self.len + back) % size])
-            .find(|&(at, _)| (at / 8).saturating_add(TAIL_MARGIN) > fetched)
+            .find(|&(at, _)| (at / 8).saturating_add(margin) > fetched)
             .map_or(produced, |(_, before)| before.min(produced))
     }
 }
@@ -1511,3 +2000,7 @@ pub(crate) fn fixed_fixture() -> Vec<u8> {
 #[cfg(test)]
 #[path = "rar4/deferred_tests.rs"]
 mod deferred_tests;
+
+#[cfg(test)]
+#[path = "rar4/golden_tests.rs"]
+mod golden_tests;

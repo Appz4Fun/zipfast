@@ -30,7 +30,7 @@ use super::bcj2::Bcj2Reader;
 use super::lzma2_par::{self, Lzma2Blocks};
 use super::source::{PackReader, VolumeSet};
 use super::{SevenZipError, SevenZipLimit, SevenZipLimits};
-use crate::extract::Cancellation;
+use crate::extract::{Cancellation, FolderDamageKind};
 use crate::map::{CipherParams, CoderKind, MapCoder, MapFolder};
 
 const BUF: usize = 64 << 10;
@@ -131,17 +131,141 @@ impl<R: Read> Read for Exact<R> {
 
 type Stream = Box<dyn Read>;
 
-/// LZMA or LZMA2 through liblzma's raw decoder.
+/// What a coder found wrong once its folder was decoded to its end ([`crate::extract::Options::seven_zip_strict`]).
+pub(crate) type Damage = (FolderDamageKind, &'static str);
+
+/// A check made once the folder's output has been read to its end: `Ok(Some)` names what didn't end cleanly; an
+/// error is reading the archive failing (or bad data met while looking, which the caller counts as damage).
+pub(crate) type EndCheck = Box<dyn FnMut() -> io::Result<Option<Damage>>>;
+
+/// A reader the chain reads while its folder's end check keeps a handle on it.
+struct Shared<R>(Rc<RefCell<R>>);
+
+impl<R: Read> Read for Shared<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.borrow_mut().read(buf)
+    }
+}
+
+/// `reader` in the chain, with `check` run on it once the folder is decoded to its end.
+fn checked<R: Read + 'static>(
+    reader: R,
+    cx: &mut Context<'_>,
+    mut check: impl FnMut(&mut R) -> io::Result<Option<Damage>> + 'static,
+) -> Stream {
+    let shared = Rc::new(RefCell::new(reader));
+    let probe = Rc::clone(&shared);
+    cx.checks.push(Box::new(move || check(&mut probe.borrow_mut())));
+    Box::new(Shared(shared))
+}
+
+/// Whether `reader` has nothing left: one more read gives no bytes.
+fn drained(reader: &mut (impl Read + ?Sized)) -> io::Result<bool> {
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(n) => return Ok(n == 0),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A decoder that must end exactly at its output size, with nothing after its end in its input: more output (or bad
+/// data) once the size is reached is a data error, input left over is data after the end (as 7-Zip reports
+/// Deflate, Deflate64 and BZip2).
+fn stream_end<D: Read, I: Read>(
+    decoder: &mut D,
+    input: impl FnOnce(&mut D) -> &mut I,
+    what: (&'static str, &'static str),
+) -> io::Result<Option<Damage>> {
+    match drained(decoder) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Some((FolderDamageKind::DataError, what.0))),
+        Err(e) if is_bad_data(&e) => return Ok(Some((FolderDamageKind::DataError, what.0))),
+        Err(e) => return Err(e),
+    }
+    Ok((!drained(input(decoder))?).then_some((FolderDamageKind::DataAfterEnd, what.1)))
+}
+
+/// An error that is the data's fault (not reading the archive failing, nor cancellation).
+pub(crate) fn is_bad_data(error: &io::Error) -> bool {
+    match error.get_ref().and_then(|inner| inner.downcast_ref::<Fault>()) {
+        Some(fault) => matches!(fault, Fault::Data(_) | Fault::Truncated),
+        None => true,
+    }
+}
+
+/// LZMA or LZMA2 through liblzma's raw decoder (under strict checks, LZMA through its `.lzma` decoder, which knows
+/// the output size and checks the range coder's end).
 pub(crate) struct LzmaReader {
     input: BufReader<Stream>,
     stream: liblzma::stream::Stream,
     /// the data turned out bad after the bytes last returned: the next read says so
     failed: bool,
+    /// liblzma reported the stream's end
+    ended: bool,
+    /// [`crate::extract::Options::seven_zip_strict`]: a data error found with the last bytes of the output still
+    /// hands them out (the folder's end check reports it), and [`Self::finish`] is the end check
+    strict: Option<LzmaEnd>,
+}
+
+/// Which end [`LzmaReader::finish`] checks.
+#[derive(Clone, Copy)]
+enum LzmaEnd {
+    /// LZMA through the `.lzma` decoder given the output size: it must end there (range coder at 0, or an end
+    /// marker), with no input left.
+    Lzma,
+    /// LZMA2: nothing may follow the end marker, which may be absent.
+    Lzma2,
 }
 
 impl LzmaReader {
     pub(crate) fn new(input: Stream, stream: liblzma::stream::Stream) -> Self {
-        Self { input: BufReader::with_capacity(BUF, input), stream, failed: false }
+        Self { input: BufReader::with_capacity(BUF, input), stream, failed: false, ended: false, strict: None }
+    }
+
+    /// Under strict checks, once the output is read to its size: whether the stream ended cleanly.
+    fn finish(&mut self) -> io::Result<Option<Damage>> {
+        const BAD: Damage = (FolderDamageKind::DataError, "the LZMA data does not end cleanly at its size");
+        if self.failed {
+            return Ok(Some((FolderDamageKind::DataError, "the LZMA data fails to decode with its last bytes")));
+        }
+        const LEFT: Damage = (FolderDamageKind::DataError, "LZMA input is left unused");
+        let Some(end) = self.strict else { return Ok(None) };
+        // What decodes past the size must be nothing: the rest of the input goes through the decoder, and at its end
+        // LZMA must be finished (its range coder at 0, or an end marker read), and LZMA2 must be at a chunk boundary,
+        // which a lone end marker shows (7-Zip allows an LZMA2 stream without one, but nothing else after its data).
+        let damage = match end {
+            LzmaEnd::Lzma => BAD,
+            LzmaEnd::Lzma2 => LEFT,
+        };
+        let mut spare = [0u8; 16];
+        while !self.ended {
+            let input = self.input.fill_buf()?;
+            let eof = input.is_empty();
+            let data = if eof && matches!(end, LzmaEnd::Lzma2) { &[0u8][..] } else { input };
+            let action = if eof { liblzma::stream::Action::Finish } else { liblzma::stream::Action::Run };
+            let (i, o) = (self.stream.total_in(), self.stream.total_out());
+            let status = self.stream.process(data, &mut spare, action);
+            let used = (self.stream.total_in() - i) as usize;
+            let made = self.stream.total_out() - o;
+            if !eof {
+                self.input.consume(used);
+            }
+            match status {
+                Ok(liblzma::stream::Status::StreamEnd) if made == 0 => self.ended = true,
+                Err(liblzma::stream::Error::Mem | liblzma::stream::Error::MemLimit) => {
+                    return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+                Err(_) => return Ok(Some(damage)),
+                Ok(_) if made > 0 || eof => return Ok(Some(damage)),
+                // no progress with input left: don't count on liblzma to make some
+                Ok(_) if used == 0 => return Ok(Some(damage)),
+                Ok(_) => {}
+            }
+        }
+        Ok((!drained(&mut self.input)?).then_some(LEFT))
     }
 }
 
@@ -162,9 +286,17 @@ impl Read for LzmaReader {
             let used = (self.stream.total_in() - i) as usize;
             let made = (self.stream.total_out() - o) as usize;
             self.input.consume(used);
+            if matches!(status, Ok(liblzma::stream::Status::StreamEnd)) {
+                self.ended = true;
+            }
             match status {
                 Err(liblzma::stream::Error::Mem | liblzma::stream::Error::MemLimit) => {
                     return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+                // strict checks: the error may be the end not checking out; the folder's end check says so
+                Err(_) if made > 0 && self.strict.is_some() => {
+                    self.failed = true;
+                    return Ok(made);
                 }
                 // what decoded before the bad data goes out first (7-Zip's `x -so` streams it), the error after
                 // (only when the caller still wants more: one asking for exactly the bytes made would never ask
@@ -216,7 +348,7 @@ fn lzma(kind: CoderKind, properties: &[u8], input: Stream, size: u64, cx: &mut C
         });
     }
     *dictionaries = total;
-    if kind == CoderKind::Lzma2 && cx.threads > 1 && size >= 2 * lzma2_par::MIN_PIECE {
+    if kind == CoderKind::Lzma2 && cx.threads > 1 && !cx.strict && size >= 2 * lzma2_par::MIN_PIECE {
         // The caller's thread reads the stream, hands out the output and decodes the head piece in the window
         // counted above; up to `threads` workers decode the pieces after it, as many as the parallel budget pays
         // for, dictionaries and buffers included ([`lzma2_par::plan`]). Their windows also come out of what
@@ -235,13 +367,31 @@ fn lzma(kind: CoderKind, properties: &[u8], input: Stream, size: u64, cx: &mut C
             return Ok(Box::new(blocks.with_allowance(cx.spare.clone(), window)));
         }
     }
-    let stream = liblzma::stream::Stream::new_raw_decoder(&filters).map_err(|e| match e {
+    let map_err = |e| match e {
         liblzma::stream::Error::Mem | liblzma::stream::Error::MemLimit => {
             SevenZipError::Io(io::Error::from(io::ErrorKind::OutOfMemory))
         }
         _ => SevenZipError::Corrupt("7z LZMA properties"),
-    })?;
-    Ok(Box::new(LzmaReader::new(input, stream)))
+    };
+    if !cx.strict {
+        let stream = liblzma::stream::Stream::new_raw_decoder(&filters).map_err(map_err)?;
+        return Ok(Box::new(LzmaReader::new(input, stream)));
+    }
+    let (stream, input, end) = if kind == CoderKind::Lzma {
+        // The `.lzma` decoder, told the output size, checks how the stream ends there as 7-Zip does: the range coder
+        // at 0, or an end marker. Its 13-byte header: the properties byte, the dictionary size and the output size.
+        let mut header = [0u8; 13];
+        header[0] = properties[0];
+        header[1..5].copy_from_slice(&(window as u32).to_le_bytes());
+        header[5..].copy_from_slice(&size.to_le_bytes());
+        let stream = liblzma::stream::Stream::new_lzma_decoder(u64::MAX).map_err(map_err)?;
+        (stream, Box::new(io::Cursor::new(header).chain(input)) as Stream, LzmaEnd::Lzma)
+    } else {
+        (liblzma::stream::Stream::new_raw_decoder(&filters).map_err(map_err)?, input, LzmaEnd::Lzma2)
+    };
+    let mut reader = LzmaReader::new(input, stream);
+    reader.strict = Some(end);
+    Ok(checked(reader, cx, LzmaReader::finish))
 }
 
 /// 7zAES: AES-256-CBC over whole blocks.
@@ -381,7 +531,7 @@ fn ppmd(props: &[u8], input: Stream, size: u64, cx: &mut Context<'_>) -> Built {
         });
     }
     cx.dictionaries = total;
-    Ok(Box::new(PpmdReader {
+    let reader = PpmdReader {
         input,
         buf: Vec::with_capacity(PPMD_LOOKAHEAD * 2),
         pos: 0,
@@ -390,7 +540,9 @@ fn ppmd(props: &[u8], input: Stream, size: u64, cx: &mut Context<'_>) -> Built {
         order,
         memory,
         left: size,
-    }))
+        strict: cx.strict,
+    };
+    if cx.strict { Ok(checked(reader, cx, PpmdReader::finish)) } else { Ok(Box::new(reader)) }
 }
 
 /// One PPMd character never reads more than this much input.
@@ -406,9 +558,22 @@ struct PpmdReader {
     order: u8,
     memory: u32,
     left: u64,
+    /// [`crate::extract::Options::seven_zip_strict`]: the range coder's first byte must be 0
+    strict: bool,
 }
 
 impl PpmdReader {
+    /// Under strict checks, once the output is read to its size: the range coder ends at 0 having used all its input.
+    fn finish(&mut self) -> io::Result<Option<Damage>> {
+        let Some(model) = &self.model else { return Ok(None) };
+        let code = model.range_code();
+        self.fill()?;
+        if self.pos != self.buf.len() || !self.eof {
+            return Ok(Some((FolderDamageKind::DataError, "PPMd input is left unused")));
+        }
+        Ok((code != 0).then_some((FolderDamageKind::DataError, "the PPMd range coder does not end at 0")))
+    }
+
     /// Buffers at least the lookahead, unless the input ends first.
     fn fill(&mut self) -> io::Result<()> {
         while !self.eof && self.buf.len() - self.pos < PPMD_LOOKAHEAD {
@@ -437,6 +602,10 @@ impl Read for PpmdReader {
             let model = match &mut self.model {
                 Some(model) => model,
                 None => {
+                    // 7-Zip refuses a range coder whose first byte isn't 0 before decoding anything
+                    if self.strict && self.buf.get(self.pos).is_some_and(|&b| b != 0) {
+                        return Err(data_error("the PPMd range coder's first byte is not 0"));
+                    }
                     let mut model = Box::<Ppm>::default();
                     if !model.init_7z(&mut bits, self.order, self.memory) {
                         return Err(bad());
@@ -444,17 +613,80 @@ impl Read for PpmdReader {
                     self.model.insert(model)
                 }
             };
-            let byte = model.decode_char(&mut bits).ok_or_else(bad)?;
-            // past the input's end the decoder reads zeros; more than a few is damage
-            if bits.addr > self.buf.len() + 8 {
-                return Err(bad());
+            // decode while a whole character's lookahead is buffered, or the input has ended: true at first, as
+            // `fill` buffered it
+            let want = out.len().min(n.saturating_add(usize::try_from(self.left).unwrap_or(usize::MAX)));
+            let start = n;
+            while n < want && (self.eof || self.buf.len().saturating_sub(bits.addr) >= PPMD_LOOKAHEAD) {
+                out[n] = model.decode_char(&mut bits).ok_or_else(bad)?;
+                // past the input's end the decoder reads zeros; more than a few is damage (under strict checks any,
+                // as 7-Zip's decoder fails on input that ends before it does)
+                if bits.addr > self.buf.len() + if self.strict { 0 } else { 8 } {
+                    return Err(bad());
+                }
+                n += 1;
             }
             self.pos = bits.addr;
-            out[n] = byte;
-            n += 1;
-            self.left -= 1;
+            self.left -= (n - start) as u64;
         }
         Ok(n)
+    }
+}
+
+/// One BZip2 stream, for strict checks: unlike `bzip2::bufread::BzDecoder` it hands out what decoded before an
+/// error found with the last bytes (a stream checksum that fails at the end), so the member is judged by its own CRC
+/// and the folder's end check reports the error, as 7-Zip reports it.
+struct Bzip2Reader {
+    input: BufReader<Stream>,
+    raw: bzip2::Decompress,
+    ended: bool,
+    failed: bool,
+}
+
+impl Bzip2Reader {
+    fn new(input: Stream) -> Self {
+        Self {
+            input: BufReader::with_capacity(BUF, input),
+            raw: bzip2::Decompress::new(false),
+            ended: false,
+            failed: false,
+        }
+    }
+}
+
+impl Read for Bzip2Reader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.ended {
+            return Ok(0);
+        }
+        if self.failed {
+            return Err(data_error("BZip2 data error"));
+        }
+        loop {
+            let input = self.input.fill_buf()?;
+            let eof = input.is_empty();
+            let (i, o) = (self.raw.total_in(), self.raw.total_out());
+            let status = self.raw.decompress(input, out);
+            let used = (self.raw.total_in() - i) as usize;
+            let made = (self.raw.total_out() - o) as usize;
+            self.input.consume(used);
+            match status {
+                Ok(bzip2::Status::StreamEnd) => {
+                    self.ended = true;
+                    return Ok(made);
+                }
+                Err(_) if made > 0 => {
+                    self.failed = true;
+                    return Ok(made);
+                }
+                Err(_) => return Err(data_error("BZip2 data error")),
+                Ok(_) if made > 0 => return Ok(made),
+                Ok(_) if eof => return Err(Fault::Truncated.into()),
+                // the decoder always takes input it is given while it has room to write
+                Ok(_) if used == 0 => return Err(data_error("BZip2 data error")),
+                Ok(_) => {}
+            }
+        }
     }
 }
 
@@ -470,6 +702,11 @@ pub(crate) struct Context<'a> {
     pub(crate) threads: usize,
     /// What `dictionary_bytes` leaves for LZMA2 workers once the folder is built, shared by its coders.
     pub(crate) spare: Rc<Cell<u64>>,
+    /// [`crate::extract::Options::seven_zip_strict`]: the coders 7-Zip checks at a folder's end are built to be
+    /// checked, each adding its check to `checks`, and LZMA2 decodes on one thread.
+    pub(crate) strict: bool,
+    /// The end checks of the folder being built, inner coders first.
+    pub(crate) checks: Vec<EndCheck>,
 }
 
 /// The folder's output stream, exactly `folder.unpacked_size` bytes.
@@ -556,7 +793,42 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
         Ok(Box::new(BranchReader::new(one(inputs)?, arch, branch_start(props)?)))
     };
     match coder.kind {
+        CoderKind::Copy if cx.strict => Ok(checked(one(inputs)?, cx, |input| {
+            Ok((!drained(input)?)
+                .then_some((FolderDamageKind::DataAfterEnd, "data after what the Copy coder passes on")))
+        })),
         CoderKind::Copy => one(inputs),
+        CoderKind::Deflate if cx.strict => {
+            let decoder = flate2::bufread::DeflateDecoder::new(BufReader::with_capacity(BUF, one(inputs)?));
+            Ok(checked(decoder, cx, |d| {
+                stream_end(
+                    d,
+                    flate2::bufread::DeflateDecoder::get_mut,
+                    ("the Deflate stream does not end at its size", "data after the end of the Deflate stream"),
+                )
+            }))
+        }
+        CoderKind::Deflate64 if cx.strict => {
+            let decoder = crate::inflate64::Inflate64Reader::new(BufReader::with_capacity(BUF, one(inputs)?));
+            Ok(checked(decoder, cx, |d| {
+                stream_end(
+                    d,
+                    crate::inflate64::Inflate64Reader::get_mut,
+                    ("the Deflate64 stream does not end at its size", "data after the end of the Deflate64 stream"),
+                )
+            }))
+        }
+        // 7-Zip's BZip2 coder decodes one stream: a second one is data after the end
+        CoderKind::Bzip2 if cx.strict => {
+            let decoder = Bzip2Reader::new(one(inputs)?);
+            Ok(checked(decoder, cx, |d| {
+                stream_end(
+                    d,
+                    |d| &mut d.input,
+                    ("the BZip2 stream does not end cleanly at its size", "data after the end of the BZip2 stream"),
+                )
+            }))
+        }
         kind @ (CoderKind::Lzma | CoderKind::Lzma2) => lzma(kind, props, one(inputs)?, size, cx),
         CoderKind::Deflate => {
             Ok(Box::new(flate2::bufread::DeflateDecoder::new(BufReader::with_capacity(BUF, one(inputs)?))))
@@ -596,7 +868,8 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
             let [main, call, jump, rc]: [Stream; 4] =
                 inputs.try_into().map_err(|_| SevenZipError::Corrupt("7z BCJ2 stream count"))?;
             let buffered = |s: Stream| BufReader::with_capacity(BUF, s);
-            Ok(Box::new(Bcj2Reader::new(buffered(main), buffered(call), buffered(jump), buffered(rc))))
+            let reader = Bcj2Reader::new(buffered(main), buffered(call), buffered(jump), buffered(rc));
+            if cx.strict { Ok(checked(reader.strict(), cx, Bcj2Reader::finish)) } else { Ok(Box::new(reader)) }
         }
         CoderKind::Other(SWAP2) => Ok(Box::new(SwapReader::new(one(inputs)?, 2))),
         CoderKind::Other(SWAP4) => Ok(Box::new(SwapReader::new(one(inputs)?, 4))),

@@ -134,6 +134,18 @@ pub(crate) struct HeaderParser {
     /// [`crate::extract::DamagedInput::Resync`]: a damaged header of an unknown type is unreadable (the search for
     /// the next header goes on from it) rather than passed over by the size it claims.
     resync: bool,
+    /// Whole volumes under salvage only ([`Self::set_salvage_cut`]): a file header the volume ends inside of (RAR 4.x)
+    /// or inside whose data is read anyway, as [`FileHeader::cut`] says.
+    salvage_cut: bool,
+    /// The declared size of the RAR 4.x file header being read when the volume ends inside it ([`HeaderCut::Header`]).
+    cut_header: Option<usize>,
+    /// Set while that header is parsed: its fields past `cut_held` are zeros, its name what of it is there.
+    cut_parse: bool,
+    /// How many bytes of that header the volume holds.
+    cut_held: usize,
+    /// [`crate::extract::DamagedInput::SevenZip`]: a RAR 4.x old-style block (0x75..=0x79) in clear headers is
+    /// passed over by its size without checking its checksum, as 7-Zip 26.06 does.
+    legacy_unchecked: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -165,12 +177,25 @@ impl HeaderParser {
             rar4_unknown_part_crc: false,
             salvage: false,
             resync: false,
+            salvage_cut: false,
+            cut_header: None,
+            cut_parse: false,
+            cut_held: 0,
+            legacy_unchecked: false,
         }
     }
     /// See [`Self::salvage`]. Encrypted headers are never salvaged: a checksum failure there is a wrong key.
     pub(crate) fn set_salvage(&mut self, damaged: crate::extract::DamagedInput) {
         self.salvage = damaged.salvages();
         self.resync = damaged == crate::extract::DamagedInput::Resync;
+        self.legacy_unchecked = damaged == crate::extract::DamagedInput::SevenZip;
+    }
+    /// A whole volume read under salvage ([`crate::rar5::reader::Volume`], never a progressive session, which waits
+    /// for bytes still to come): a file header whose data runs past the end of the volume is read with the data that
+    /// is there, and a RAR 4.x file header the end cuts short with its fields that are there, as UnRAR 7.30 lists
+    /// both ([`FileHeader::cut`]). Without it, or for any other block, either is a volume cut short.
+    pub(crate) fn set_salvage_cut(&mut self, on: bool) {
+        self.salvage_cut = on;
     }
     pub(crate) fn format(&self) -> RarFormat {
         self.format
@@ -510,18 +535,29 @@ impl HeaderParser {
                     let kind = self.buffer[2];
                     let flags = u16::from_le_bytes([self.buffer[3], self.buffer[4]]);
                     let size = usize::from(u16::from_le_bytes([self.buffer[5], self.buffer[6]]));
+                    // the bytes of the header the volume holds, when it ends inside it
+                    let mut held = None;
                     if self.salvage
                         && size >= 7
-                        && self.complete_len.is_some_and(|len| self.at.saturating_add(size as u64) > len)
+                        && let Some(len) = self.complete_len.filter(|&len| self.at.saturating_add(size as u64) > len)
                     {
-                        // salvage tells a volume cut short from a header that can't be read
-                        return Err(self.fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false).into());
+                        // a file header is read with what of it is there, as UnRAR lists it (HeaderCut::Header);
+                        // not under Resync, where a header size damaged past the end is searched past instead
+                        if !(self.salvage_cut && !self.resync && kind == 0x74 && flags & 0x8000 != 0) {
+                            // salvage tells a volume cut short from a header that can't be read
+                            return Err(self
+                                .fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false)
+                                .into());
+                        }
+                        // at least the 7 bytes read so far, and less than the u16 size
+                        held = Some(len.saturating_sub(self.at) as usize);
                     }
                     if size < 7
-                        || self
-                            .at
-                            .checked_add(size as u64)
-                            .is_none_or(|end| self.complete_len.is_some_and(|len| end > len))
+                        || (held.is_none()
+                            && self
+                                .at
+                                .checked_add(size as u64)
+                                .is_none_or(|end| self.complete_len.is_some_and(|len| end > len)))
                     {
                         return Err(self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")).into());
                     }
@@ -536,10 +572,32 @@ impl HeaderParser {
                         usage.check(crate::progressive::Resource::HeaderAllocation, size as u64 * 12)?;
                     }
                     self.phase = Phase::Rar4Body;
-                    self.resized_need(size)?;
+                    match held {
+                        Some(held) => {
+                            self.cut_header = Some(size);
+                            self.resized_need(held)?;
+                        }
+                        None => self.resized_need(size)?,
+                    }
                 }
                 Phase::Rar4Body => {
-                    let frame = self.parse_rar4(budget)?;
+                    if let Some(size) = self.cut_header.take() {
+                        // the rest of the header is taken as zeros, as UnRAR reads it; `size` is a u16
+                        self.buffer
+                            .try_reserve_exact(size - self.buffer.len())
+                            .map_err(|_| super::session::allocation())?;
+                        self.cut_held = self.buffer.len();
+                        self.buffer.resize(size, 0);
+                        self.need = size;
+                        self.cut_parse = true;
+                    }
+                    let parsed = self.parse_rar4(budget);
+                    let cut = std::mem::take(&mut self.cut_parse);
+                    let mut frame = parsed?;
+                    if cut {
+                        // reported as the volume ending here, not as a checksum the zeros fail
+                        frame.damaged = false;
+                    }
                     self.ended = matches!(frame.block, Block::End { .. });
                     self.at = frame.data_end;
                     self.reset();
@@ -615,7 +673,8 @@ impl HeaderParser {
                         });
                     }
                     let header_end = self.at + self.need as u64;
-                    let mut frame = self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end)?;
+                    let mut frame =
+                        self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end, damaged)?;
                     if damaged && self.resync && matches!(frame.block, Block::Unknown) {
                         return Err(self.framing("damaged header", Error::Corrupt("damaged header")).into());
                     }
@@ -628,7 +687,7 @@ impl HeaderParser {
             }
         }
     }
-    fn parse(&self, body: &[u8], header_end: u64) -> std::result::Result<PhysicalFrame, FramingError> {
+    fn parse(&self, body: &[u8], header_end: u64, damaged: bool) -> std::result::Result<PhysicalFrame, FramingError> {
         let mut c = Cursor::new(body);
         let kind = c.vint().map_err(|e| self.parse_fault(e))?;
         let flags = c.vint().map_err(|e| self.parse_fault(e))?;
@@ -641,10 +700,18 @@ impl HeaderParser {
             .ok_or_else(|| self.framing("extra area size", Error::Corrupt("extra area size")))?;
         let fields = &body[c.pos()..fields_end];
         let extra = &body[fields_end..];
-        let data_end =
+        let mut data_end =
             header_end.checked_add(data_size).ok_or_else(|| self.framing("data size", Error::Corrupt("data size")))?;
-        if self.complete_len.is_some_and(|len| data_end > len) {
-            return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+        // a file header whose data the volume cuts short is read with the data there (HeaderCut::Data, and
+        // FileWire::cut for a catalogue); not one that fails its checksum, whose data size is as likely the damage
+        // (Resync searches past it instead)
+        let mut cut = None;
+        if let Some(len) = self.complete_len.filter(|&len| data_end > len) {
+            if !(self.salvage_cut && kind == HEAD_FILE && !self.encrypted() && !damaged) {
+                return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+            }
+            cut = Some(len.saturating_sub(header_end));
+            data_end = len;
         }
         let head = BlockHead { kind, flags, data_size, data_at: header_end };
         let mut frame = PhysicalFrame {
@@ -687,6 +754,7 @@ impl HeaderParser {
                 frame.wire = wire;
                 if let Some(wire) = &mut frame.wire {
                     wire.extent = frame.extent.clone();
+                    wire.cut = cut;
                 }
                 if kind == HEAD_FILE { Block::File(h) } else { Block::Service(h) }
             }
@@ -705,6 +773,9 @@ impl HeaderParser {
             }
             _ => Block::Unknown,
         };
+        if let (Some(present), Block::File(header)) = (cut, &mut frame.block) {
+            header.cut = Some(HeaderCut::Data { present });
+        }
         Ok(frame)
     }
 }

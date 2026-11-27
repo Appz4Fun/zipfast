@@ -83,7 +83,6 @@ struct State {
     succ: u32,
 }
 
-#[derive(Clone)]
 pub(crate) struct Ppm {
     heap: Heap,
     /// the model's memory in bytes; 0 before the first start
@@ -118,6 +117,10 @@ pub(crate) struct Ppm {
     prev_success: u8,
     hi_bits_flag: u8,
     bin_summ: [[u16; 64]; 128],
+    /// scratch for the states an escape leaves unmasked, and for the contexts a successor chain passes: kept to
+    /// spare an allocation per symbol
+    unmasked: Vec<u32>,
+    chain: Vec<u32>,
     /// a step that needed memory found none, even after a restart
     broken: bool,
     seven_z: bool,
@@ -177,6 +180,8 @@ impl Default for Ppm {
             prev_success: 0,
             hi_bits_flag: 0,
             bin_summ: [[0; 64]; 128],
+            unmasked: Vec::new(),
+            chain: Vec::new(),
             broken: false,
             seven_z: false,
             bin_decoded: false,
@@ -197,37 +202,38 @@ impl Default for Ppm {
 impl Ppm {
     // ---- the heap: out of range reads give 0 and writes go nowhere, which only damaged data reaches
 
+    #[inline]
     fn b(&self, at: u32) -> u32 {
-        u32::from(self.heap.get(at as usize))
+        self.heap.get(at)
     }
 
+    #[inline]
     fn set_b(&mut self, at: u32, v: u32) {
-        self.heap.set(at as usize, v as u8);
+        self.heap.set(at, v);
     }
 
+    #[inline]
     fn w(&self, at: u32) -> u32 {
-        self.b(at) | (self.b(at.wrapping_add(1)) << 8)
+        self.heap.get16(at)
     }
 
+    #[inline]
     fn set_w(&mut self, at: u32, v: u32) {
-        self.set_b(at, v);
-        self.set_b(at.wrapping_add(1), v >> 8);
+        self.heap.set16(at, v);
     }
 
+    #[inline]
     fn d(&self, at: u32) -> u32 {
-        self.w(at) | (self.w(at.wrapping_add(2)) << 16)
+        self.heap.get32(at)
     }
 
+    #[inline]
     fn set_d(&mut self, at: u32, v: u32) {
-        self.set_w(at, v);
-        self.set_w(at.wrapping_add(2), v >> 16);
+        self.heap.set32(at, v);
     }
 
     fn copy(&mut self, to: u32, from: u32, n: u32) {
-        for i in 0..n {
-            let v = self.b(from.wrapping_add(i));
-            self.set_b(to.wrapping_add(i), v);
-        }
+        self.heap.copy(to, from, n);
     }
 
     // a context: NumStats, then SummFreq and Stats or one State, then Suffix
@@ -324,7 +330,13 @@ impl Ppm {
             return;
         }
         let alloc = t / UNIT * UNIT + 2 * UNIT;
-        self.heap = Heap::new((self.heap_start + alloc) as usize);
+        self.heap = Heap::default();
+        let Some(heap) = Heap::new((self.heap_start + alloc) as usize) else {
+            self.size = 0;
+            self.broken = true;
+            return;
+        };
+        self.heap = heap;
         self.heap_end = self.heap_start + alloc - UNIT;
         self.size = t;
     }
@@ -536,6 +548,10 @@ impl Ppm {
     }
 
     // ---- the range coder
+    /// The range decoder's code: 7-Zip's PPMd encoder ends a stream where its decoder reaches 0.
+    pub(crate) fn range_code(&self) -> u32 {
+        self.code
+    }
 
     fn coder_init(&mut self, bits: &mut Bits<'_>) {
         self.low = 0;
@@ -789,15 +805,33 @@ impl Ppm {
 
     /// The state for `sym` among a context's stats, or None when it isn't there.
     fn find(&self, ctx: u32, sym: u32) -> Option<u32> {
-        let stats = self.stats(ctx);
-        (0..self.ns(ctx)).map(|i| stats + 6 * i).find(|p| self.sym(*p) == sym)
+        let (stats, ns) = (self.stats(ctx), self.ns(ctx));
+        if let Some(st) = self.heap.slice(stats, 6 * ns) {
+            return st.as_chunks::<6>().0.iter().position(|s| u32::from(s[0]) == sym).map(|k| stats + 6 * k as u32);
+        }
+        (0..ns).map(|i| stats + 6 * i).find(|p| self.sym(*p) == sym)
     }
 
     fn create_successors(&mut self, skip: bool, p1: u32) -> u32 {
-        let mut pc = self.min_ctx;
+        let pc = self.min_ctx;
         let up_branch = self.succ(self.found);
         let fsym = self.sym(self.found);
-        let mut ps: Vec<u32> = Vec::with_capacity(MAX_O);
+        let mut ps = std::mem::take(&mut self.chain);
+        ps.clear();
+        let pc = self.create_successors_in(skip, p1, pc, up_branch, fsym, &mut ps);
+        self.chain = ps;
+        pc
+    }
+
+    fn create_successors_in(
+        &mut self,
+        skip: bool,
+        p1: u32,
+        mut pc: u32,
+        up_branch: u32,
+        fsym: u32,
+        ps: &mut Vec<u32>,
+    ) -> u32 {
         let mut walk = true;
         if !skip {
             ps.push(self.found);
@@ -1084,11 +1118,33 @@ impl Ppm {
         self.prev_success = 0;
         let ns = self.ns(ctx);
         let mut i = ns.checked_sub(1).filter(|i| *i > 0)?;
+        // the states after the first, as one slice when the heap holds them all
+        let rest = self.heap.slice(p + 6, 6 * i).map(|st| {
+            let at = st.as_chunks::<6>().0.iter().position(|s| {
+                hi += u32::from(s[1]);
+                hi > count
+            });
+            (at, st.len() as u32 - 6)
+        });
         loop {
-            p += 6;
-            hi += self.freq(p);
-            if hi > count {
-                break;
+            if let Some((at, last)) = rest {
+                // the found state, or else the last one, as the loop below leaves `p`
+                match at {
+                    Some(k) => {
+                        p += 6 + 6 * k as u32;
+                        break;
+                    }
+                    None => {
+                        p += 6 + last;
+                        i = 1;
+                    }
+                }
+            } else {
+                p += 6;
+                hi += self.freq(p);
+                if hi > count {
+                    break;
+                }
             }
             i -= 1;
             if i == 0 {
@@ -1141,9 +1197,53 @@ impl Ppm {
             self.scale = 1;
             None
         };
+        let mut ps = std::mem::take(&mut self.unmasked);
+        ps.clear();
+        let r = self.decode_symbol2_in(ctx, ns, diff, see, &mut ps);
+        self.unmasked = ps;
+        r
+    }
+
+    fn decode_symbol2_in(
+        &mut self,
+        ctx: u32,
+        ns: u32,
+        diff: u32,
+        see: Option<(usize, usize)>,
+        ps: &mut Vec<u32>,
+    ) -> Option<()> {
         let stats = self.stats(ctx);
+        let hi = match self.heap.slice(stats, 6 * ns).filter(|_| ns <= 256) {
+            Some(st) => {
+                // every state, branch-free: the unmasked ones' addresses are packed at the front
+                let mut buf = [0u32; 256];
+                let ps = &mut buf[..];
+                let (mut len, mut hi) = (0usize, 0u32);
+                for (k, s) in st.as_chunks::<6>().0.iter().enumerate() {
+                    let keep = self.char_mask[usize::from(s[0])] != self.esc_count;
+                    ps[len] = stats + 6 * k as u32;
+                    hi += u32::from(s[1]) * u32::from(keep);
+                    len += usize::from(keep);
+                }
+                let diff = diff as usize;
+                if len < diff {
+                    return None;
+                }
+                let ps = &ps[..diff];
+                if len > diff {
+                    // only damaged data masks fewer than it counted: take the first `diff`, as the walk below does
+                    hi = ps.iter().map(|&p| self.freq(p)).sum();
+                }
+                return self.decode_symbol2_count(ctx, ns, hi, see, ps);
+            }
+            None => self.unmasked_walk(stats, ns, diff, ps)?,
+        };
+        self.decode_symbol2_count(ctx, ns, hi, see, ps)
+    }
+
+    /// The first `diff` unmasked states of the `ns` at `stats` into `ps`, and their total frequency.
+    fn unmasked_walk(&self, stats: u32, ns: u32, diff: u32, ps: &mut Vec<u32>) -> Option<u32> {
         let end = stats + 6 * ns;
-        let mut ps = Vec::with_capacity(diff as usize);
         let mut p = stats;
         let mut hi = 0u32;
         while ps.len() < diff as usize {
@@ -1160,6 +1260,17 @@ impl Ppm {
                 return None;
             }
         }
+        Some(hi)
+    }
+
+    fn decode_symbol2_count(
+        &mut self,
+        ctx: u32,
+        ns: u32,
+        hi: u32,
+        see: Option<(usize, usize)>,
+        ps: &[u32],
+    ) -> Option<()> {
         self.scale = self.scale.wrapping_add(hi);
         let count = match self.fake_root_count(ctx, 0, 0).map(|_| self.fake_count(hi)) {
             Some(c) => c?,
@@ -1188,7 +1299,7 @@ impl Ppm {
         } else {
             self.lo_count = hi;
             self.hi_count = self.scale;
-            for p in ps {
+            for &p in ps.iter() {
                 self.char_mask[self.sym(p) as usize] = self.esc_count;
             }
             if let Some((i, j)) = see {
@@ -1332,5 +1443,48 @@ mod tests {
             assert!(n == 300_000, "order {order}: {n} bytes");
             assert!(ppm.seen.0 > 2 && ppm.seen.1 > 0, "order {order}: restarts and glues {:?}", ppm.seen);
         }
+    }
+
+    /// What a run of fake counts decodes, hashed: models of several orders and sizes, which run out of memory and
+    /// start over, in RAR's and 7-Zip's coding. The digests are the decoder's output before its heap was flattened
+    /// and its scans were sped up; any change to the model's choices changes them.
+    #[test]
+    fn fake_runs_decode_what_they_always_did() {
+        fn run(seven_z: Option<(u8, u32)>, header: [u8; 2], seed: u32, n: usize) -> (u64, u32, (u32, u32)) {
+            let data = [header[0], header[1], 0, 0, 0, 0, 0, 0];
+            let mut bits = Bits { data: &data, addr: 0, bit: 0 };
+            let mut ppm = Ppm::default();
+            let ok = match seven_z {
+                Some((order, mem)) => ppm.init_7z(&mut bits, order, mem),
+                None => ppm.init(&mut bits, &mut 2),
+            };
+            assert!(ok);
+            ppm.fake = Some(seed);
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            let mut count = 0;
+            while (count as usize) < n {
+                let Some(b) = ppm.decode_char(&mut bits) else { break };
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+                count += 1;
+            }
+            (hash, count, ppm.seen)
+        }
+        let got = [
+            run(None, [0x20 | 1, 0], 1, 200_000),
+            run(None, [0x20 | 5, 0], 2, 300_000),
+            run(None, [0x20 | 15, 0], 3, 300_000),
+            run(None, [0x20 | 31, 0], 4, 300_000),
+            run(Some((6, 1 << 16)), [0, 0], 5, 200_000),
+            run(Some((32, 1 << 20)), [0, 0], 6, 200_000),
+        ];
+        let want = [
+            (10774010879018610099, 200_000, (1, 0)),
+            (14802757498947938259, 300_000, (4, 49)),
+            (910030016882616564, 300_000, (9, 229)),
+            (18446201423786171636, 300_000, (12, 329)),
+            (14857780315238285827, 200_000, (43, 42)),
+            (11591143091669852641, 200_000, (3, 13)),
+        ];
+        assert_eq!(got, want);
     }
 }

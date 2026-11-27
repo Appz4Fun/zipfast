@@ -1260,12 +1260,17 @@ fn r1_output_observation_precedes_work_refusal_and_declared_overshoot() {
             }
         };
         let before = checks.get();
-        let error = codecs::decode(input, &mut workspace, 0, 0, &Default::default(), &Default::default(), &mut |_| {
-            panic!("U+1 output must not reach sink")
+        // the U declared bytes reach the sink before the overshoot fails (what 7-Zip 26.06 keeps of such a member);
+        // byte U+1 never does
+        let mut delivered = Vec::new();
+        let error = codecs::decode(input, &mut workspace, 0, 0, &Default::default(), &Default::default(), &mut |b| {
+            delivered.extend_from_slice(b);
+            Ok(())
         })
         .unwrap_err();
+        assert_eq!(delivered, data[..declared.len()], "U bytes, never U+1");
         assert_eq!(checks.get(), before + 1);
-        assert_eq!(error.accepted_output_bytes(), 0);
+        assert_eq!(error.accepted_output_bytes(), declared.len() as u64);
         let evidence = match mode {
             0 => PasswordEvidence::NotEncrypted,
             1 => PasswordEvidence::HeaderMatched,

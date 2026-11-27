@@ -69,8 +69,10 @@ fn extract_options(dest: &Path, mode: Mode, damaged: DamagedInput) -> extract::O
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 
@@ -378,7 +380,10 @@ fn whole(volumes: &[(&str, Vec<u8>)], damaged: DamagedInput) -> Option<Outcome> 
     for damage in &summary.damaged_headers {
         let name = damage.volume.file_name().unwrap();
         let volume = volumes.iter().position(|(v, _)| name == *v).unwrap() as u32;
-        out.damage.push((volume, damage.offset, damage.kind, damage.name.clone(), damage.resumed_at));
+        // A whole volume lists a member it ends inside of (HeaderCut), naming it; a progressive session waits for
+        // the bytes still to come, and once the source is sealed reports the cut without reading the member.
+        let member = if damage.cut.is_some() { None } else { damage.name.clone() };
+        out.damage.push((volume, damage.offset, damage.kind, member, damage.resumed_at));
     }
     Some(out)
 }

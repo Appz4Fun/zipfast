@@ -65,10 +65,14 @@ impl HeaderParser {
         let mut cursor = Fields::new(header, 7);
         // Map walks follow unrar's ReadHeader15 on which blocks have data after the header: the old subblock (0x77)
         // and old recovery record (0x78) always start with its size, the main, old comment and end headers never
-        // have any, and every other block has it exactly when LONG_BLOCK is set.
+        // have any, and every other block has it exactly when LONG_BLOCK is set. A salvaging run sizes the old-style
+        // blocks the same way, as UnRAR 7.30 was seen to pass them over; 7-Zip 26.06 (and everything else) goes by
+        // LONG_BLOCK alone.
+        let unrar_sizes = self.map_lenient || self.salvage;
         let sized = match kind {
-            0x77 | 0x78 if self.map_lenient => true,
-            0x73 | 0x75 | 0x7b if self.map_lenient => false,
+            0x77 | 0x78 if unrar_sizes => true,
+            0x75 if unrar_sizes => false,
+            0x73 | 0x7b if self.map_lenient => false,
             _ => flags & 0x8000 != 0,
         };
         let packed = if sized { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
@@ -199,12 +203,30 @@ impl HeaderParser {
                 return Err(self.framing("damaged RAR4 header", Error::Corrupt("damaged RAR4 header")).into());
             }
             _ if damaged && !matches!(kind, 0x73 | 0x74 | 0x7a | 0x7b) => Block::Unknown,
+            // UnRAR 7.30 and 7-Zip 26.06 pass a sound old-style block over too.
+            0x75..=0x79 if self.salvage || self.legacy_unchecked => Block::Unknown,
             0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
             _ if flags & 0x4000 != 0 => Block::Unknown,
             _ => return Err(self.rar4_unsupported("header type").into()),
         };
-        if self.complete_len.is_some_and(|len| frame.data_end > len) {
-            return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+        if let Some(len) = self.complete_len.filter(|&len| frame.data_end > len) {
+            // a file header cut short (its zero padding fails the checksum), or whose data the volume cuts short, is
+            // read anyway (FileHeader::cut, and FileWire::cut for a catalogue); not a whole one that fails its
+            // checksum, whose packed size is as likely the damage (Resync searches past it)
+            let data_at = frame.extent.end;
+            match &mut frame.block {
+                Block::File(file) if self.salvage_cut && !self.legacy_headers && (!damaged || self.cut_parse) => {
+                    if file.cut.is_none() {
+                        let present = len.saturating_sub(data_at);
+                        file.cut = Some(HeaderCut::Data { present });
+                        if let Some(wire) = frame.wire.as_mut() {
+                            wire.cut = Some(present);
+                        }
+                    }
+                    frame.data_end = len;
+                }
+                _ => return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into()),
+            }
         }
         Ok(frame)
     }
@@ -219,7 +241,15 @@ impl HeaderParser {
             // As RAR 2.x writes it and UnRAR checks it, the CRC covers the fixed fields before the comment.
             return Some(header.len().min(13));
         }
-        if !self.map_lenient || self.legacy_headers {
+        if self.legacy_headers {
+            return Some(header.len());
+        }
+        // The old-style blocks, as observed: 7-Zip 26.06 checks none of them (DamagedInput::SevenZip), UnRAR 7.30
+        // (salvaging runs) not the AV (0x76) and sign (0x79) blocks.
+        if ((0x75..=0x79).contains(&kind) && self.legacy_unchecked) || (matches!(kind, 0x76 | 0x79) && self.salvage) {
+            return None;
+        }
+        if !self.map_lenient {
             return Some(header.len());
         }
         match kind {
@@ -283,21 +313,28 @@ impl HeaderParser {
             // As UnRAR reads it: all ones (both halves with the large-file flag) means the size is unknown.
             let size_unknown = if flags & 0x100 != 0 { unpacked == u64::MAX } else { unpacked == 0xffff_ffff };
             let encoded = fields.take(name_len)?;
-            let name = match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
-                // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
-                // name, which no decoded name can be (see below).
-                // Also a Unicode-flagged field that fell back to its legacy part (the bytes before the NUL).
-                Err(FileParseError::Format(Error::Unsupported(_)))
-                    if self.map_lenient && encoded.split(|&byte| byte == 0).next().is_some_and(|l| !l.is_empty()) =>
-                {
-                    String::new()
-                }
-                result => {
-                    let name = result?;
-                    if name.is_empty() || name.contains('\0') {
-                        return Err(Error::Corrupt("RAR4 member name").into());
+            let name = if self.cut_parse && fields.at > self.cut_held {
+                // a header cut short inside its name (HeaderCut::Header): what of the name is there, up to the zeros,
+                // as UnRAR lists it; a whole name is decoded as any other
+                String::from_utf8_lossy(encoded.split(|&byte| byte == 0).next().unwrap_or_default()).into_owned()
+            } else {
+                match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
+                    // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
+                    // name, which no decoded name can be (see below).
+                    // Also a Unicode-flagged field that fell back to its legacy part (the bytes before the NUL).
+                    Err(FileParseError::Format(Error::Unsupported(_)))
+                        if self.map_lenient
+                            && encoded.split(|&byte| byte == 0).next().is_some_and(|l| !l.is_empty()) =>
+                    {
+                        String::new()
                     }
-                    name
+                    result => {
+                        let name = result?;
+                        if name.is_empty() || name.contains('\0') {
+                            return Err(Error::Corrupt("RAR4 member name").into());
+                        }
+                        name
+                    }
                 }
             };
             let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
@@ -348,7 +385,8 @@ impl HeaderParser {
             // Bytes past the parsed fields of a service header are its SubData (the recovery record's "Protect+"
             // tag, the Unix owner names), which unrar keeps beside the header and this parser has no use for; the
             // header CRC above still covers them. A file header has no such field, so only a map walk ignores them.
-            if fields.at != bytes.len() && !self.map_lenient && bytes[2] != 0x7a {
+            // (A header cut short has zeros past the cut, which say less than the fields they stand in for did.)
+            if fields.at != bytes.len() && !self.map_lenient && !self.cut_parse && bytes[2] != 0x7a {
                 return Err(Error::Unsupported("RAR4 trailing header fields".into()).into());
             }
             let mut sub_data = Vec::new();
@@ -403,6 +441,7 @@ impl HeaderParser {
                 // As UnRAR: a member goes on from the history before it when its own flag says so. The first member of a
                 // solid archive starts the stream.
                 solid: flags & 0x10 != 0,
+                cut: self.cut_parse.then_some(HeaderCut::Header),
                 ..FileHeader::default()
             };
             Ok((header, encoded, salt))
@@ -448,6 +487,7 @@ impl HeaderParser {
                 name: std::sync::Arc::new(name),
                 compression: 0,
                 extent: self.at..data_at,
+                cut: None,
             },
         ))
     }

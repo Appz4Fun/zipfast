@@ -765,8 +765,10 @@ mod tests {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         }
     }
     struct Fault {
@@ -1028,8 +1030,10 @@ mod directory_fault_tests {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
         let report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Deny);
@@ -1118,8 +1122,10 @@ mod trailing_directory_tests {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
         let result =

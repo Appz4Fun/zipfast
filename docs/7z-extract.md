@@ -150,7 +150,14 @@ Memory is bounded by `SevenZipLimits::lzma2_parallel_bytes`: by default an eight
 allocation: memory is taken only as blocks are decoded ahead of the one being written. Each worker costs its dictionary (the coder's, shrunk to the folder's output) and its one 1 MiB
 output buffer, which it makes only when it has output to make (a short last segment goes out in a buffer of its own
 size, and every queued buffer counts by what it allocates); the workers take at most a third of the budget, and
-fewer start when they would take more (none: one thread). Their dictionaries also come out of what
+fewer start when they would take more (none: one thread). Fewer also start when the rest of the budget would leave
+each less than one and a half 7-Zip blocks (six dictionary windows, at least 1.5 MiB) in flight, so the default
+2 GiB starts at most 18 workers on `-mx5`'s 64 MiB blocks and 4 on `-mx9`'s 256 MiB ones, whatever the thread count
+(at least one starts while its cost fits). A worker with less room than its block stalls the run: idle workers draw
+later blocks' packed bytes into the budget until the blocks already started cannot hand out their output, and the
+run decodes about one block at a time. On a 32-core host, 2.1 GB of 64 MiB blocks packing to four fifths took 8.9 s
+with 32 workers (47 MiB of room each) and 5.8 to 6.1 s with 16 to 24, so the default (one thread per core) was
+slower than `-mt16`. Their dictionaries also come out of what
 `dictionary_bytes` leaves once the folder's coders are built, shared by all its LZMA2 coders and taken when a coder
 starts its workers. At most two pieces per thread are in the pipeline, and the packed bytes waiting for decoders and
 the decoded bytes waiting for the run together stay within the rest of the budget: a worker waits while it is
@@ -210,6 +217,8 @@ A folder of several members that stores its own CRC (7-Zip stores per-file CRCs 
 it) holds its verified files back until the whole folder has been read and its CRC matches; then they are
 published together, or all reported as failed. `Mode::Test` does the same: the members count as tested only once
 the folder's CRC matches.
+
+With `Options::seven_zip_strict` (off by default), a folder decoded to its end is also checked the way 7-Zip checks it: every coder must end where its stream ends (a range coder ending at 0, no bytes left unused, nothing after an end marker). A folder that fails is reported in `Summary::folder_damage` and `Summary::errors` as `#N: ...`; its verified members are still published. See `docs/compat-options.md` (`seven_zip_strict`).
 
 A member with no CRC of its own and no folder CRC behind it cannot be checked:
 

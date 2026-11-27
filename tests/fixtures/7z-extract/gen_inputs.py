@@ -101,3 +101,26 @@ put("big/two.txt", text(50_000, 4))
 os.makedirs(os.path.join(out, "tree/emptydir"), exist_ok=True)
 put("tree/sub/file.txt", text(500, 5))
 put("tree/empty.txt", b"")
+
+
+def mixed(n, seed):
+    """Text of a big made-up vocabulary, noise, branchy code and repeats, in turns: in a small PPMd model it runs
+    the memory out again and again (restarts and allocator glues), and escapes through every order."""
+    r = random.Random(seed)
+    vocab = [bytes(r.choice(b"etaoinshrdlucmfwypvbgkjqxz") for _ in range(r.randint(1, 12))) for _ in range(3000)]
+    b = bytearray()
+    while len(b) < n:
+        pick = r.random()
+        if pick < 0.5:
+            b += b" ".join(r.choice(vocab) for _ in range(r.randint(20, 400))) + b".\n"
+        elif pick < 0.6:
+            b += bytes(r.getrandbits(8) for _ in range(r.randint(16, 1000)))
+        elif pick < 0.9:
+            b += code("x86", r.randint(64, 4000), r.random())
+        else:
+            start = r.randint(0, max(0, len(b) - 1))
+            b += b[start : start + r.randint(1, 3000)]
+    return bytes(b[:n])
+
+
+put("ppmd/mixed.bin", mixed(300_000, 8))

@@ -1632,8 +1632,10 @@ fn rar4_leniency_stays_out_of_sessions_and_extraction() {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     // written under its private-use mapping
     let summary = zipfast::extract::run(&path, &options, |_| {}).unwrap();

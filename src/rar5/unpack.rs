@@ -686,6 +686,9 @@ pub struct Unpacker {
     /// the current file's declared size, None when unknown
     size: Option<u64>,
     size_failure: Option<(u64, u64)>,
+    /// [`Self::write_to_size`]: a file found running past its declared size first has its output up to that size
+    /// emitted
+    write_to_size: bool,
     tables_ready: bool,
     /// the code lengths the next block without tables is read with, which a worker may still be reading, and the
     /// lengths `tables` was last built from
@@ -755,9 +758,14 @@ pub struct Unpacker {
     /// ([`Self::record_filters`]): stream offsets
     seen: Option<Vec<SeenFilterRec>>,
     /// [`crate::extract::UnverifiedOutput::Emit`] ([`Self::track_tail`]): the symbols in the last
-    /// [`TAIL_MARGIN_BITS`] of the latest block decoded on this thread, as (bits from the symbol's start to the end of
-    /// the block's payload, output position before it), and that block's payload bits
+    /// [`TAIL_MARGIN_BITS`] of the latest block decoded (on this thread, or marked by a worker: `Job::marks`), as
+    /// (bits from the symbol's start to the end of the block's payload, output position before it), and that block's
+    /// payload bits
     tail: Option<Box<TailSymbols>>,
+    /// [`Self::flush_cut`]'s rule: symbols starting within this many bits of the data's end are left out, and a
+    /// block of which fewer bytes came is not decoded ([`TAIL_MARGIN_BITS`] and [`TAIL_BLOCK_MIN`], or none of either
+    /// after [`Self::set_cut_short`])
+    cut_rule: (usize, usize),
 }
 
 /// See `Unpacker::tail`.
@@ -893,6 +901,7 @@ impl Unpacker {
             emitted: 0,
             size: None,
             size_failure: None,
+            write_to_size: false,
             tables_ready: false,
             slot: Slot::filled(None),
             built: None,
@@ -930,6 +939,7 @@ impl Unpacker {
             hand_over_min: HAND_OVER_MIN,
             seen: None,
             tail: None,
+            cut_rule: (TAIL_MARGIN_BITS, TAIL_BLOCK_MIN),
         })
     }
 
@@ -984,6 +994,13 @@ impl Unpacker {
         self.parallel = self.threads > 0;
     }
 
+    /// Decodes the current file on the calling thread whatever its size: for a file whose blocks
+    /// [`Self::track_tail`] must follow. Call it before the file's first byte is fed ([`Self::reset`],
+    /// [`Self::restart`] and [`Self::next_file`] leave nothing with the workers); the next file decides again.
+    pub(crate) fn serial_file(&mut self) {
+        self.parallel = false;
+    }
+
     /// Starts the next file of a solid stream without waiting for the one before: its blocks may still be with the
     /// workers. Where the files meet, the earlier one is checked as [`Self::finish`] would, then the sink is called
     /// with an empty slice; the sink is never called with one otherwise. The earlier file's errors come out of later
@@ -1016,7 +1033,7 @@ impl Unpacker {
         }
         let r = self.settle(u64::MAX, sink);
         self.files_goal = 0;
-        r
+        self.flush_to_size(r, sink)
     }
 
     /// Starts the next file of a solid stream: the window, tables and history carry on.
@@ -1150,6 +1167,7 @@ impl Unpacker {
         let mut job = std::mem::replace(&mut self.batch, self.spare.pop().unwrap_or_default());
         self.batch.clear();
         job.seq = self.submitted;
+        job.tails = self.tail.is_some();
         self.queued += job.packed;
         pool.submit(job);
         self.submitted += 1;
@@ -1221,6 +1239,12 @@ impl Unpacker {
             }
             let buf = block_bytes(&job.buf, &job.shared, p);
             let mut bits = if i == part { Bits::at(buf, bit) } else { Bits::new(buf) };
+            if let Some(tail) = self.tail.as_mut().filter(|_| i > part) {
+                // a block the worker didn't reach: its last symbols are noted here (the one it stopped in keeps the
+                // marks it made, see apply_job)
+                tail.0.clear();
+                tail.1 = p.end_bits.div_ceil(8) * 8;
+            }
             if i > part && p.read_tables {
                 let lens = read_lengths(&mut self.pre, &mut bits, p.end_bits)?;
                 let mut t = Tables::empty();
@@ -1266,9 +1290,29 @@ impl Unpacker {
     /// A job's tokens, part by part, with the file boundaries between them, as far as the worker got.
     fn apply_job(&mut self, job: &Job, sink: &mut dyn Sink) -> Result<()> {
         let mut from = (0, 0);
-        for (p, &to) in job.parts.iter().zip(&job.ends) {
+        let mut marks = job.marks.iter().peekable();
+        for (i, (p, &to)) in job.parts.iter().zip(&job.ends).enumerate() {
             if let Some(b) = p.boundary {
                 self.end_file(b, sink)?;
+            }
+            if let Some(tail) = self.tail.as_mut()
+                && p.boundary.is_none()
+            {
+                // Self::track_tail: the symbols the worker marked near the block's end, with the output before each
+                tail.0.clear();
+                tail.1 = p.end_bits.div_ceil(8) * 8;
+                while let Some(&&(_, (left, tok, lit))) = marks.peek().filter(|&&&(part, _)| part == i) {
+                    marks.next();
+                    // a mark lies within the part's tokens; a damaged job's marks are only checked, not trusted
+                    if !(from.0 <= tok && tok <= to.0 && from.1 <= lit && lit <= to.1) {
+                        continue;
+                    }
+                    self.apply(&job.toks[from.0..tok], &job.filters, &job.lits[from.1..lit], sink)?;
+                    from = (tok, lit);
+                    if let Some(tail) = self.tail.as_mut() {
+                        tail.0.push((left, self.sp));
+                    }
+                }
             }
             self.apply(&job.toks[from.0..to.0], &job.filters, &job.lits[from.1..to.1], sink)?;
             from = to;
@@ -1440,6 +1484,7 @@ impl Unpacker {
                                     self.size_failure = self
                                         .size
                                         .map(|size| (size, (sp - self.file_base).saturating_add(u64::from(len))));
+                                    sp = copy_to_end::<SPILLS>(win, sp, d, size_end);
                                 }
                                 break 'apply Err(e.into_legacy());
                             }
@@ -1457,7 +1502,8 @@ impl Unpacker {
     /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted. Blocks
     /// that arrive whole are decoded where they lie; only a block split across calls is gathered first.
     pub fn feed(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<()> {
-        self.feed_from(data, None, sink)
+        let r = self.feed_from(data, None, sink);
+        self.flush_to_size(r, sink)
     }
 
     /// [`Self::feed`] with the bytes in `range` of `piece`. Blocks that lie whole in it, with their padding, go to the
@@ -1469,7 +1515,8 @@ impl Unpacker {
         sink: &mut dyn Sink,
     ) -> Result<()> {
         let from = range.start;
-        self.feed_from(&piece.bytes()[range], Some((piece, from)), sink)
+        let r = self.feed_from(&piece.bytes()[range], Some((piece, from)), sink);
+        self.flush_to_size(r, sink)
     }
 
     /// `data` is at `base` in `piece`, given one.
@@ -1553,16 +1600,36 @@ impl Unpacker {
 
     /// Applies everything handed to the workers so far, leaving a block still coming in as it is.
     pub fn wait(&mut self, sink: &mut dyn Sink) -> Result<()> {
-        self.settle(0, sink)
+        let r = self.settle(0, sink);
+        self.flush_to_size(r, sink)
     }
 
     /// The file's packed bytes are all in. Emits what is left and checks the stream ended where it should.
     pub fn finish(&mut self, sink: &mut dyn Sink) -> Result<()> {
-        self.settle(0, sink)?;
-        if !self.input.is_empty() {
-            return Err(Error::Truncated);
+        let r = self.settle(0, sink).and_then(|()| {
+            if !self.input.is_empty() {
+                return Err(Error::Truncated);
+            }
+            self.check_end(sink)
+        });
+        self.flush_to_size(r, sink)
+    }
+
+    /// Off by default. On, a file found running past its declared size (a "more data than the header says"
+    /// failure) first has its output up to that size emitted, as UnRAR 7.30 (`x -kb`, `p`) and 7-Zip 26.06 (`x`,
+    /// `x -so`) write it, for a caller keeping or handing over a failing member's bytes; the failure is returned all
+    /// the same.
+    pub(crate) fn write_to_size(&mut self, on: bool) {
+        self.write_to_size = on;
+    }
+
+    /// [`Self::write_to_size`] after `result`.
+    fn flush_to_size(&mut self, result: Result<()>, sink: &mut dyn Sink) -> Result<()> {
+        if result.is_err() && self.write_to_size && self.size_failure.is_some() {
+            // the window holds the file up to its declared end; a pending filter may still hold some of it back
+            self.flush(sink)?;
         }
-        self.check_end(sink)
+        result
     }
 
     /// A whole block, `buf` being its payload and padding; `shared` says where it lies in a piece the workers may
@@ -1797,6 +1864,7 @@ impl Unpacker {
             if let Err(e) = copied {
                 if matches!(e, MatchCopyError::Size) {
                     *size_failure = size.map(|size| (size, (sp - file_base).saturating_add(u64::from(len))));
+                    sp = copy_to_end::<SPILLS>(window, sp, d, size_end);
                 }
                 break Err(e.into_legacy());
             }
@@ -1989,14 +2057,14 @@ impl Unpacker {
         self.settle(0, sink)?;
         if !self.ended
             && let Ok(Some((header_len, payload, flags))) = block_header(&self.input)
-            && self.input.len() >= TAIL_BLOCK_MIN
+            && self.input.len() >= self.cut_rule.1
             && self.input.len() - header_len < payload
         {
             let have = self.input.len() - header_len;
             let mut block = std::mem::take(&mut self.input);
             block.drain(..header_len);
             block.resize(have + PAD, 0);
-            let end_bits = (have * 8).saturating_sub(TAIL_MARGIN_BITS);
+            let end_bits = (have * 8).saturating_sub(self.cut_rule.0);
             let parallel = std::mem::replace(&mut self.parallel, false);
             // what decodes before a damaged or cut symbol stands: the member fails anyway
             let _ = self.block_to(&block, end_bits, flags, sink);
@@ -2004,7 +2072,7 @@ impl Unpacker {
         } else if let Some(tail) = self.tail.take() {
             // the block before ends within the margin of the data's end: its last symbols are left out too
             let after = self.input.len().saturating_mul(8);
-            if let Some(&(_, before)) = tail.0.iter().find(|&&(left, _)| left + after <= TAIL_MARGIN_BITS)
+            if let Some(&(_, before)) = tail.0.iter().find(|&&(left, _)| left + after <= self.cut_rule.0)
                 && before >= self.emitted.max(self.file_base)
                 && before <= self.sp
             {
@@ -2015,8 +2083,16 @@ impl Unpacker {
         self.flush(sink)
     }
 
+    /// The data ends because the archive is cut short there, not at a missing volume: UnRAR reads on past the end
+    /// (zeros, as far as the length of what it prints shows), so [`Self::flush_cut`] decodes every symbol starting
+    /// before the end, and the start of a block however little of it came.
+    pub(crate) fn set_cut_short(&mut self, cut_short: bool) {
+        self.cut_rule = if cut_short { (0, 0) } else { (TAIL_MARGIN_BITS, TAIL_BLOCK_MIN) };
+    }
+
     /// Notes where the last symbols of each block start, so that [`Self::flush_cut`] can leave out what UnRAR leaves
-    /// out when the data ends just past a block. Blocks decoded on worker threads are not followed.
+    /// out when the data ends just past a block. Workers mark them in the blocks they decode, and the calling thread
+    /// notes the output before each as it applies their tokens.
     pub(crate) fn track_tail(&mut self) {
         self.tail.get_or_insert_with(Default::default);
     }
@@ -2449,6 +2525,18 @@ impl MatchCopyError {
                     .into(),
             ),
         }
+    }
+}
+
+/// A match running past the file's declared end: the part before it goes into the window (UnRAR 7.30 and 7-Zip
+/// 26.06 write a file to its declared size and no further). Returns the stream position after it.
+#[cold]
+fn copy_to_end<const SPILLS: bool>(window: Win<'_>, sp: u64, dist: u64, size_end: u64) -> u64 {
+    let room = size_end.saturating_sub(sp);
+    // the whole match didn't fit, so what does is shorter than it (a u32)
+    match u32::try_from(room) {
+        Ok(room) if room != 0 && copy::<SPILLS>(window, sp, room, dist, size_end).is_ok() => sp + u64::from(room),
+        _ => sp,
     }
 }
 

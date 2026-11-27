@@ -1160,8 +1160,10 @@ fn verify(config: &Config, map: &MemberMap, outputs: &[(usize, u64, PathBuf)]) -
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     zipfast::extract::run_with_password(&config.volumes[0], &options, config.password.as_deref(), |_| {})
         .map_err(|e| format!("straight extraction: {e}"))?;

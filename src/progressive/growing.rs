@@ -597,8 +597,10 @@ impl RangeSource for GrowingFileSource {
 ///     unsupported_filters: Default::default(),
 ///     unverified_output: Default::default(),
 ///     salvage_truncated_zip: false,
+///     seven_zip_strict: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
+///     hard_link_targets: Default::default(),
 /// };
 /// let options = ProgressiveOptions::new(extract, volumes.first_name().to_owned());
 /// let mut session = ProgressiveSession::new(Box::new(volumes), options)?;

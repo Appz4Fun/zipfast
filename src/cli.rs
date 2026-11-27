@@ -124,8 +124,10 @@ pub(crate) fn main() -> ExitCode {
                 unsupported_filters: Default::default(),
                 unverified_output: Default::default(),
                 salvage_truncated_zip: false,
+                seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             run(&archive, &opts, password.as_deref(), quiet)
         }
@@ -214,7 +216,18 @@ fn salvage_list(archive: &Path, password: Option<&str>, damaged: extract::Damage
         Ok(listing) => {
             let code = legacy_list_result(archive, Ok(listing.entries.clone()));
             damage_warning(&listing.damaged_headers, listing.damaged_headers.len() as u64);
-            if listing.headers_damaged() { ExitCode::from(1) } else { code }
+            for comment in &listing.damaged_comments {
+                eprintln!("warning: the archive comment in {} is corrupt", comment.display());
+            }
+            // A missing volume still fails the listing (exit 2, as 7-Zip does), after showing what was listed.
+            if let Some(missing) = &listing.missing_volume {
+                eprintln!("{}: missing volume {}", archive.display(), missing.display());
+                ExitCode::from(2)
+            } else if listing.headers_damaged() || listing.comment_damaged() {
+                ExitCode::from(1)
+            } else {
+                code
+            }
         }
         Err(e) => legacy_list_result(archive, Err(e)),
     }
@@ -247,8 +260,10 @@ fn listing_options() -> Options {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

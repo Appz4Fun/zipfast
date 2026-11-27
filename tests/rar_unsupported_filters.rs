@@ -61,8 +61,10 @@ fn options(dest: &Path, mode: Mode, filters: UnsupportedFilters) -> Options {
         unverified_output: Default::default(),
         damaged_input: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

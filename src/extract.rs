@@ -229,6 +229,10 @@ pub struct Options {
     /// it (the default), or a character of the name in every format but RAR 4.x, as 7-Zip 26.06 on Unix reads it.
     /// See [`Backslashes`].
     pub backslashes: Backslashes,
+    /// Which file a hard link member is made to: the file this run extracted for its target member, wherever a rename
+    /// mode put it (the default), or the regular file found at the target's stored name, whether this run wrote it or
+    /// not, as UnRAR 7.30 and 7-Zip 26.06 `x` make it. See [`HardLinkTargets`].
+    pub hard_link_targets: HardLinkTargets,
     /// What becomes of a RAR 3.x/4.x member whose data a VM program other than the standard filters (E8, E8E9,
     /// ITANIUM, DELTA, RGB, AUDIO) filters: it fails (the default), or it is written with the block that program
     /// filters left as decoded, as 7-Zip 26.06 writes it. See [`UnsupportedFilters`].
@@ -270,6 +274,146 @@ pub struct Options {
     /// and by progressive sessions through [`crate::progressive::ProgressiveOptions`]' extract options. A RarSession
     /// test run, which takes no `Options`, reads [`crate::rar5::session::RarSessionOptions::encrypted_links`].
     pub encrypted_links: EncryptedLinks,
+    /// Make the extra consistency checks 7-Zip 26.06 makes, and report what fails them, even where every member's
+    /// own CRC passes. Off (the default) none of this is checked; `docs/compat-options.md` ("`seven_zip_strict`")
+    /// has what 7-Zip reports for each case.
+    ///
+    /// - 7z: once a folder has been decoded to its end, each coder that 7-Zip checks must have ended cleanly and used
+    ///   up its input: an LZMA or PPMd range coder must end at 0 (or, for LZMA, at an end marker), and an LZMA, LZMA2,
+    ///   PPMd or BCJ2 coder must leave none of its input unused (LZMA2: nothing after its end marker, which may be
+    ///   absent, as 7-Zip allows). A folder that fails is a [`FolderDamage`] in [`Summary::folder_damage`] and a line
+    ///   `#N: data error: ...` in [`Summary::errors`] (7-Zip's "Data Error : #N", exit 2). Bytes left after the end of
+    ///   a Deflate, Deflate64 or BZip2 stream, or after what a Copy coder passes on, are
+    ///   [`FolderDamageKind::DataAfterEnd`] (7-Zip's "There are some data after the end of the payload data : #N").
+    ///   The folder's members are written and reported as their own checks say, as 7-Zip writes them. A folder not
+    ///   decoded to its end (no member after the last one selected is decoded) isn't checked, as 7-Zip doesn't check
+    ///   it. A BCJ2 or PPMd range coder whose first byte isn't 0 fails the folder's members as a data error before
+    ///   any of them is written, as 7-Zip fails them. LZMA2 decodes on one thread under this option.
+    /// - ZIP: each member's local header is compared with its central directory record: the CRC-32 and both sizes
+    ///   (unless the local header sets the data descriptor flag, as 7-Zip doesn't compare them then; a ZIP64 sentinel
+    ///   in the local header isn't compared), the compression method and the data descriptor flag. A member whose
+    ///   local header differs fails without being decoded (7-Zip's "Headers Error : NAME"; with [`Self::keep_broken`]
+    ///   its file stays empty, as 7-Zip leaves it) and is a [`LocalHeaderMismatch`] in
+    ///   [`Summary::local_header_mismatches`]; on the checked route it fails as
+    ///   [`crate::zip::ReadFault::LocalHeaderMismatch`].
+    ///
+    /// Honoured by the 7z runners ([`crate::sevenzip::run`], the dispatchers, the checked dispatchers'
+    /// 7z route, and [`crate::sevenzip::print_selected_with_options`] through
+    /// `SevenZipPrintOptions::seven_zip_strict`), and by the ZIP runners, legacy ([`crate::zip::run`] and the
+    /// dispatchers) and checked ([`run_with_policy`], [`crate::zip::run_with_policy`]). Progressive and
+    /// persistent-partial sessions decode neither 7z nor ZIP, and the other formats ignore it.
+    pub seven_zip_strict: bool,
+}
+
+/// A 7z folder that decoded to its end but whose coders didn't end cleanly, under [`Options::seven_zip_strict`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct FolderDamage {
+    /// The folder's index in the archive, 7-Zip's `#N`.
+    pub folder: u64,
+    pub kind: FolderDamageKind,
+    /// What did not end cleanly, for a message.
+    pub detail: &'static str,
+}
+
+impl FolderDamage {
+    pub(crate) fn new(folder: u64, kind: FolderDamageKind, detail: &'static str) -> Self {
+        Self { folder, kind, detail }
+    }
+}
+
+impl std::fmt::Display for FolderDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.kind {
+            FolderDamageKind::DataError => "data error",
+            FolderDamageKind::DataAfterEnd => "there are some data after the end of the payload data",
+        };
+        write!(f, "#{}: {what}: {}", self.folder, self.detail)
+    }
+}
+
+/// How 7-Zip 26.06 reports a [`FolderDamage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FolderDamageKind {
+    /// "Data Error": an LZMA, LZMA2, PPMd or BCJ2 coder that doesn't end cleanly or leaves input unused.
+    DataError,
+    /// "There are some data after the end of the payload data": bytes after the end of a Deflate, Deflate64 or
+    /// BZip2 stream, or after what a Copy coder passes on.
+    DataAfterEnd,
+}
+
+/// A ZIP member whose local header differs from its central directory record, under
+/// [`Options::seven_zip_strict`]. Each flag says whether that field differs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LocalHeaderMismatch {
+    /// The member's listing index.
+    pub ordinal: u64,
+    pub name: String,
+    /// The CRC-32.
+    pub crc32: bool,
+    /// The compressed size.
+    pub packed_size: bool,
+    /// The uncompressed size.
+    pub size: bool,
+    /// The compression method.
+    pub method: bool,
+    /// The data descriptor flag (general purpose bit 3).
+    pub descriptor_flag: bool,
+}
+
+impl LocalHeaderMismatch {
+    /// Compares a local header with the central record's values; `None` when 7-Zip would find nothing to report.
+    pub(crate) fn compare(
+        local: &zip_container::LocalHeader,
+        flags: u16,
+        method: u16,
+        crc32: u32,
+        packed: u64,
+        size: u64,
+    ) -> Option<Self> {
+        const DESCRIPTOR: u16 = 0x0008;
+        let streamed = local.flags & DESCRIPTOR != 0;
+        let differs = |wire: u32, value: u64| !streamed && wire != u32::MAX && u64::from(wire) != value;
+        let found = Self {
+            crc32: !streamed && local.crc32 != crc32,
+            packed_size: differs(local.packed_size, packed),
+            size: differs(local.unpacked_size, size),
+            method: local.method != method,
+            descriptor_flag: (local.flags ^ flags) & DESCRIPTOR != 0,
+            ..Self::default()
+        };
+        (found.crc32 || found.packed_size || found.size || found.method || found.descriptor_flag).then_some(found)
+    }
+
+    pub(crate) fn named(mut self, ordinal: u64, name: &str) -> Self {
+        self.ordinal = ordinal;
+        self.name = name.to_owned();
+        self
+    }
+}
+
+impl std::fmt::Display for LocalHeaderMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fields = [
+            (self.crc32, "CRC-32"),
+            (self.packed_size, "compressed size"),
+            (self.size, "size"),
+            (self.method, "method"),
+            (self.descriptor_flag, "data descriptor flag"),
+        ];
+        f.write_str("headers error: the local header differs from the central directory (")?;
+        let mut first = true;
+        for (_, what) in fields.iter().filter(|(on, _)| *on) {
+            if !first {
+                f.write_str(", ")?;
+            }
+            f.write_str(what)?;
+            first = false;
+        }
+        f.write_str(")")
+    }
 }
 
 /// What an encrypted RAR 5.0 redirection member needs before it is placed or tested; see
@@ -318,20 +462,34 @@ pub enum DamagedInput {
     /// data checksum still decides whether the member is good) and reported ([`HeaderDamageKind::ChecksumMismatch`]);
     /// a RAR 4.x block of an unknown type whose checksum fails is passed over by its size; a header that can't be
     /// read, or a volume cut short, ends that volume without failing the run, what came before standing
-    /// ([`HeaderDamageKind::Unreadable`], [`HeaderDamageKind::UnexpectedEnd`]). A RAR 5.0 volume without its end of
-    /// archive header is reported as ending unexpectedly, as 7-Zip 26.06 does. Encrypted headers are never salvaged:
-    /// there a checksum failure is how a wrong password shows.
+    /// ([`HeaderDamageKind::Unreadable`], [`HeaderDamageKind::UnexpectedEnd`]); a file header whose data the cut
+    /// leaves short, or a RAR 4.x file header it cuts short, is listed and read anyway, as UnRAR lists it
+    /// ([`crate::rar5::FileHeader::cut`], [`HeaderDamage::cut`]). A RAR 5.0 volume without its end of archive header
+    /// is reported as ending unexpectedly, as 7-Zip 26.06 does. A RAR 4.x old-style block (0x75..=0x79)
+    /// is passed over as UnRAR passes it over: an old comment (0x75) by its header alone, an old subblock (0x77) or
+    /// recovery record (0x78) with the data size it starts with, the others with their `LONG_BLOCK` data; the AV
+    /// (0x76) and sign (0x79) blocks' checksums are not checked. Encrypted headers are never salvaged: there a
+    /// checksum failure is how a wrong password shows.
     Salvage,
-    /// [`Self::Salvage`], and where a header can't be read the rest of the volume is searched, in one bounded
+    /// [`Self::Salvage`] (except that a RAR 4.x file header the volume seems to cut short is searched past, as
+    /// one whose size is damaged, not listed as [`crate::rar5::HeaderCut::Header`]), and where a header can't be read
+    /// the rest of the volume is searched, in one bounded
     /// linear pass, for the next header that passes its checksum, and reading goes on from there. Neither UnRAR
     /// 7.30 nor 7-Zip 26.06 does this: it recovers the members after a damaged stretch (a hole a downloader is
     /// still to repair, garbage between blocks).
     Resync,
+    /// As 7-Zip 26.06: [`Self::Refuse`], except that a RAR 4.x old-style block (old comment 0x75, AV 0x76, old
+    /// subblock 0x77, old recovery record 0x78, sign 0x79) in clear headers is passed over by its size (its
+    /// `LONG_BLOCK` data included) without checking its checksum, as 7-Zip passes them over. So a header whose type
+    /// byte was changed into one of these is passed over, with what it covered, and nothing is reported. A sound
+    /// old-style block is passed over under [`Self::Salvage`] and [`Self::Resync`] too, as UnRAR 7.30 does, but is
+    /// refused as unsupported under [`Self::Refuse`].
+    SevenZip,
 }
 
 impl DamagedInput {
     pub(crate) fn salvages(self) -> bool {
-        !matches!(self, Self::Refuse)
+        matches!(self, Self::Salvage | Self::Resync)
     }
 }
 
@@ -349,6 +507,10 @@ pub struct HeaderDamage {
     /// Where reading went on in the same volume after the damage ([`DamagedInput::Resync`]); `None` when the rest of
     /// the volume was passed over (or, for [`HeaderDamageKind::ChecksumMismatch`], nothing was).
     pub resumed_at: Option<u64>,
+    /// For [`HeaderDamageKind::UnexpectedEnd`] at a file header the volume ends inside of, or inside whose data,
+    /// how: the member is listed (and read) anyway, as its header's [`crate::rar5::FileHeader::cut`] says. `None` for
+    /// any other damage, which lists nothing.
+    pub cut: Option<crate::rar5::HeaderCut>,
     /// Whether bytes that may belong to a member were passed over here unread: the damage was unreadable or cut
     /// short, or the damaged header read as something other than a file header (a file header whose type byte was
     /// hit can read as a service header, whose data is skipped). A solid archive's history is lost past it.
@@ -518,7 +680,9 @@ pub enum UnixModes {
     Stored,
     /// The stored bits narrowed by `umask`, the caller's file-creation mask, as 7-Zip 26.06 on Unix sets them:
     /// `mode & 0o777 & !umask` for a file, and `(mode | 0o700) & 0o777 & !umask` for a folder (7-Zip must be able
-    /// to write into it). Never setuid, setgid or sticky.
+    /// to write into it). Never setuid, setgid or sticky. A hard link member's own modification time is set on the
+    /// file it links (so on every name of it), as 7-Zip sets it; under [`Self::Stored`] the file keeps its own, as
+    /// UnRAR 7.30 and GNU tar leave it.
     Masked { umask: u32 },
 }
 
@@ -538,6 +702,31 @@ impl UnixModes {
             Self::Masked { umask } => (mode | 0o700) & 0o777 & !umask,
         }
     }
+}
+
+/// Which file a hard link member is made to; see [`Options::hard_link_targets`].
+///
+/// The two differ when the target member did not land at its stored name, or was not written by this run: under a
+/// rename mode (`Overwrite::Rename`, UnRAR's `-or`, 7-Zip's `-aou`) with a file already at the target's name, under
+/// [`Overwrite::Skip`], or with the target member left out of the run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HardLinkTargets {
+    /// The file this run extracted for the target member, wherever it landed (a rename mode's new name included),
+    /// and only while it is still that file. A target this run didn't extract fails the link: a hard link never
+    /// reaches a file that was in the destination before the run.
+    #[default]
+    Extracted,
+    /// The regular file at the target member's stored name in the destination (with [`Options::flatten`], its last
+    /// component, as UnRAR `e` names it), whether this run wrote it or not: a file that was there before the run (left
+    /// by a rename mode or `Overwrite::Skip`, or a target member not taken) is linked to, as UnRAR 7.30 `x`/`e` and
+    /// 7-Zip 26.06 `x` link to it. It is reached from the destination without following any link; a symbolic link, a
+    /// folder or nothing at that name fails the link (UnRAR hard-links a symbolic link found there; zipfast never does,
+    /// so no link it makes leads out of the destination). Honoured by the whole-archive runners for RAR and tar and
+    /// by progressive sessions, and by [`crate::rar5::session::RarSession`] extraction (from these options or
+    /// [`crate::rar5::session::RarSessionOptions::hard_link_targets`]); test runs keep [`Self::Extracted`]. File
+    /// copies (RAR 5.0) are unaffected.
+    StoredName,
 }
 
 /// What a `\` in a member name is; see [`Options::backslashes`].
@@ -788,8 +977,10 @@ impl MemberRef<'_> {
 ///     unsupported_filters: Default::default(),
 ///     unverified_output: Default::default(),
 ///     salvage_truncated_zip: false,
+///     seven_zip_strict: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
+///     hard_link_targets: Default::default(),
 /// };
 /// assert!(format!("{opts:?}").contains("MemberFilter(..)"));
 /// ```
@@ -926,6 +1117,27 @@ impl Options {
         meta
     }
 
+    /// A RAR member's `meta` with the mode a run restores: under [`UnixModes::Masked`] a Unix-host member whose mode
+    /// has no file-type bits (`S_IFMT`, as a RAR 4.x attribute of `0x20` has none) is given `0o666` (a folder `0o777`)
+    /// less the umask, what file creation gives, as 7-Zip 26.06 leaves it (it sets no mode then). [`UnixModes::Stored`]
+    /// keeps the stored bits, as UnRAR 7.30 sets them.
+    pub(crate) fn rar_mode(&self, mut meta: Meta, dir: bool) -> Meta {
+        if matches!(self.unix_modes, UnixModes::Masked { .. }) && meta.mode.is_some_and(|mode| mode & 0o170000 == 0) {
+            meta.mode = Some(if dir { 0o777 } else { 0o666 });
+        }
+        meta
+    }
+
+    /// [`Self::meta`] for a RAR file member, its mode as [`Self::rar_mode`] gives it.
+    pub(crate) fn rar_meta(&self, h: &FileHeader) -> Meta {
+        self.meta(self.rar_mode(Meta::from(h), false))
+    }
+
+    /// [`Self::dir_meta`] for a RAR folder member, its mode as [`Self::rar_mode`] gives it.
+    pub(crate) fn rar_dir_meta(&self, h: &FileHeader) -> Meta {
+        self.dir_meta(self.rar_mode(Meta::from(h), true))
+    }
+
     /// [`Self::meta`] for a folder.
     pub(crate) fn dir_meta(&self, meta: Meta) -> Meta {
         let mut meta = meta.or_time(self.fallback_mtime);
@@ -985,6 +1197,14 @@ pub struct Summary {
     /// ([`crate::sevenzip::print_selected_with_options`]), in the order they were printed. Each is also a line in
     /// [`Self::errors`].
     pub unverified: Vec<UnverifiedMember>,
+    /// 7z folders that decoded to their end but whose coders didn't end cleanly, in archive order; empty unless
+    /// [`Options::seven_zip_strict`] is on. Each is also a line in [`Self::errors`]: 7-Zip 26.06 reports "Data Error :
+    /// #N" (or "There are some data after the end of the payload data : #N") and exits 2.
+    pub folder_damage: Vec<FolderDamage>,
+    /// ZIP members whose local header differs from their central directory record, in archive order; empty unless
+    /// [`Options::seven_zip_strict`] is on. Each member also failed (a line in [`Self::errors`]): 7-Zip 26.06 reports
+    /// "Headers Error : NAME" and exits 2.
+    pub local_header_mismatches: Vec<LocalHeaderMismatch>,
     /// the rename attempts this run has left
     pub(crate) rename_budget: RenameBudget,
     /// folders whose times and permissions are set once everything inside them is written
@@ -1445,15 +1665,21 @@ pub(crate) fn create_sparse_target(place: Place, size: Option<u64>) -> Result<Ou
     create_target_with(place, size, true).map_err(crate::error::RarFault::into_legacy)
 }
 
-/// A broken file kept ([`Options::keep_broken`]): cut to what was written (a preallocated file is longer), then its
+/// A broken file kept ([`Options::keep_broken`]): cut to what was written (a preallocated file is longer), and to
+/// `declared` (the member's declared size, when known: UnRAR 7.30 `x -kb` and 7-Zip 26.06 `x` keep no more), then its
 /// times and mode set.
-pub(crate) fn keep_written(file: &File, meta: &Meta) {
+pub(crate) fn keep_written(file: &File, meta: &Meta, declared: Option<u64>) {
     use std::io::Seek;
     let mut handle = file;
     if let Ok(written) = handle.stream_position() {
-        let _ = file.set_len(written);
+        let _ = file.set_len(declared.map_or(written, |size| written.min(size)));
     }
     finish_file(file, meta);
+}
+
+/// `len` cut to `size`.
+pub(crate) fn clamp_len(size: u64, len: usize) -> usize {
+    usize::try_from(size).map_or(len, |size| size.min(len))
 }
 
 pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::error::RarResult<Output> {
@@ -1781,9 +2007,16 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                     saw_end = true;
                     break;
                 }
-                Block::File(h) => {
+                Block::File(mut h) => {
                     if run.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
                         return Err(RarFault::new(RarFailure::Canceled, canceled_error()).into());
+                    }
+                    // DamagedInput::Salvage: a member the volume cuts short is read from the bytes that are there
+                    // (its checks decide, as UnRAR decides), and one whose header is cut short has none
+                    match h.cut {
+                        Some(crate::rar5::HeaderCut::Data { present }) => h.packed_size = present,
+                        Some(_) => h.packed_size = 0,
+                        None => {}
                     }
                     run.file_block(&mut vol, h, crypt)?
                 }
@@ -2051,7 +2284,7 @@ impl LegacyRoute {
                 Volume::from_held_signature(first, signature, password, DamagedInput::Refuse)?,
                 password,
                 DamagedInput::Refuse,
-                &mut Vec::new(),
+                &mut RarListSignals::default(),
             ),
         }
     }
@@ -2769,6 +3002,7 @@ impl SelectedEntry {
                 let selection = RarSelection {
                     sink: &mut checked_sink,
                     emit: false,
+                    unverified: emit,
                     packed_left: self.limit,
                     decoded_left: self.limit,
                     cancel: &self.cancel,
@@ -3017,6 +3251,12 @@ pub struct Listing {
     /// RAR headers the listing read past under [`Options::damaged_input`] ([`list_detailed_with_options`]), at most
     /// 4096 kept: `entries` holds the members listed past them. Empty otherwise.
     pub damaged_headers: Vec<HeaderDamage>,
+    /// RAR volumes whose archive comment (a `CMT` service header) fails its CRC or doesn't decode, under
+    /// [`Options::damaged_input`] ([`list_detailed_with_options`]), at most 4096 kept. UnRAR 7.30 says "The archive
+    /// comment is corrupt" (exit code 3) and lists the archive; 7-Zip 26.06 doesn't read RAR 4.x comments. A comment
+    /// zipfast doesn't decode (encrypted, split, over 1 MiB, compressed RAR 5.0) isn't judged. Empty otherwise, and
+    /// for a comment embedded in a RAR 2.x main header, which [`crate::rar5::session::RarSession::comment`] reads.
+    pub damaged_comments: Vec<PathBuf>,
 }
 
 impl Listing {
@@ -3033,11 +3273,22 @@ impl Listing {
     pub fn headers_damaged(&self) -> bool {
         !self.damaged_headers.is_empty()
     }
+
+    /// Whether an archive comment is damaged ([`Self::damaged_comments`]): UnRAR's "The archive comment is corrupt".
+    pub fn comment_damaged(&self) -> bool {
+        !self.damaged_comments.is_empty()
+    }
 }
 
 /// [`list_with_password`], with the listing's warnings.
 pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
-    let whole = |entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers: Vec::new() };
+    let whole = |entries| Listing {
+        entries,
+        missing_volume: None,
+        truncated: false,
+        damaged_headers: Vec::new(),
+        damaged_comments: Vec::new(),
+    };
     let held = match sniff_held(first)? {
         (Format::Zip, _) => return crate::zip::list_detailed(first),
         (Format::Tar, _) => return crate::tar::list(first).map(whole),
@@ -3053,16 +3304,30 @@ pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
 /// [`list_detailed`] under `options`: a RAR archive's damaged headers are read past as
 /// [`Options::damaged_input`] says ([`Listing::damaged_headers`] says what was), and a ZIP cut short is listed from
 /// its local headers with [`Options::salvage_truncated_zip`]. The other options don't change a listing.
+///
+/// Under [`DamagedInput::Salvage`] or `Resync` a RAR listing also reports, without failing:
+/// - a missing volume ([`Listing::missing_volume`]): the set names a next volume that isn't there, and `entries`
+///   holds the members up to it, one split into it with its declared sizes (7-Zip 26.06: "ERROR = Missing volume",
+///   exit 2; UnRAR 7.30 `l -v`: "Cannot find volume"). Under `Refuse` that is an error, as before.
+/// - a damaged archive comment ([`Listing::damaged_comments`]).
+/// - a member the volume ends inside of ([`crate::rar5::FileHeader::cut`]), listed with its declared sizes and
+///   reported as [`HeaderDamageKind::UnexpectedEnd`] with its [`HeaderDamage::cut`].
 pub fn list_detailed_with_options(first: &Path, password: Option<&str>, options: &Options) -> Result<Listing> {
     let held = match sniff_held(first)? {
         (Format::Zip, _) => return crate::zip::list_detailed_with_options(first, options),
         (Format::Tar | Format::SevenZip, _) => return list_detailed(first, password),
         (Format::Other, held) => held,
     };
-    let mut damaged_headers = Vec::new();
-    match rar_list_damaged(first, held, password, options.damaged_input, &mut damaged_headers) {
+    let mut signals = RarListSignals::default();
+    match rar_list_damaged(first, held, password, options.damaged_input, &mut signals) {
         Err(Error::NotAnArchive) => crate::zip::list_detailed_with_options(first, options),
-        other => other.map(|entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers }),
+        other => other.map(|entries| Listing {
+            entries,
+            missing_volume: signals.missing_volume,
+            truncated: false,
+            damaged_headers: signals.damaged_headers,
+            damaged_comments: signals.damaged_comments,
+        }),
     }
 }
 
@@ -3382,7 +3647,15 @@ fn zip_run(
 /// The entries of a RAR set from its first volume: the file [`sniff_held`] kept open when it did, else opened by
 /// path.
 fn rar_list_held(first: &Path, held: Option<Sniffed>, password: Option<&str>) -> Result<Vec<Entry>> {
-    rar_list_damaged(first, held, password, DamagedInput::Refuse, &mut Vec::new())
+    rar_list_damaged(first, held, password, DamagedInput::Refuse, &mut RarListSignals::default())
+}
+
+/// What a RAR listing under [`Options::damaged_input`] reports besides its entries ([`Listing`]).
+#[derive(Default)]
+struct RarListSignals {
+    damaged_headers: Vec<HeaderDamage>,
+    missing_volume: Option<PathBuf>,
+    damaged_comments: Vec<PathBuf>,
 }
 
 fn rar_list_damaged(
@@ -3390,25 +3663,60 @@ fn rar_list_damaged(
     held: Option<Sniffed>,
     password: Option<&str>,
     damaged: DamagedInput,
-    damage: &mut Vec<HeaderDamage>,
+    signals: &mut RarListSignals,
 ) -> Result<Vec<Entry>> {
     let volume = match held {
         Some(held) => held.open_rar(first, password, damaged)?,
         None => Volume::open_damaged(first, password, damaged)?,
     };
-    rar_list_from_volume(volume, password, damaged, damage)
+    rar_list_from_volume(volume, password, damaged, signals)
+}
+
+/// Whether the `CMT` service header `h` holds a comment that fails its CRC or doesn't decode, reading its data from
+/// `vol`. A comment zipfast doesn't read (encrypted, split, too big, compressed RAR 5.0) is not judged.
+fn comment_damaged(vol: &mut Volume, h: &FileHeader) -> Result<bool> {
+    if crate::rar5::session::service_comment_readable(h).is_err() {
+        return Ok(false);
+    }
+    let mut packed = Vec::new();
+    match vol.read_data_into(h.data_at, h.packed_size, &mut packed) {
+        Ok(()) => {}
+        // cut short with the volume, which the listing reports as it is
+        Err(Error::Truncated) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    let path = vol.path.clone();
+    match crate::rar5::session::decode_service_comment(&path, h, packed, &Cancellation::default()) {
+        Ok(_) => Ok(false),
+        Err(failure) => match failure.as_ref() {
+            RarFailure::Unsupported(_) | RarFailure::Limit { .. } => Ok(false),
+            RarFailure::Canceled => Err(canceled_error()),
+            _ => Ok(true),
+        },
+    }
 }
 
 fn rar_list_from_volume(
     volume: Volume,
     password: Option<&str>,
     damaged: DamagedInput,
-    damage: &mut Vec<HeaderDamage>,
+    signals: &mut RarListSignals,
 ) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut budget = ListingBudget::default();
-    walk(volume, password, damaged, damage, |_, block| {
-        let Block::File(h) = block else { return Ok(()) };
+    let comments = &mut signals.damaged_comments;
+    let walked = walk(volume, password, damaged, &mut signals.damaged_headers, |vol, block| {
+        let h = match block {
+            Block::File(h) => h,
+            // UnRAR 7.30 reads the comment of each volume it lists: "The archive comment is corrupt"
+            Block::Service(h) if damaged.salvages() && h.name == "CMT" => {
+                if comments.len() < MAX_HEADER_DAMAGE && !comments.contains(&vol.path) && comment_damaged(vol, &h)? {
+                    comments.push(vol.path.clone());
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
                 last.packed = last.packed.checked_add(h.packed_size).ok_or(Error::Corrupt("split packed size"))?;
@@ -3444,7 +3752,13 @@ fn rar_list_from_volume(
             version: h.version,
         });
         Ok(())
-    })?;
+    });
+    match walked {
+        Ok(_) => {}
+        // as 7-Zip lists it ("Missing volume"): the members up to the missing volume stand
+        Err(Error::MissingVolume(path)) if damaged.salvages() => signals.missing_volume = Some(path),
+        Err(error) => return Err(error),
+    }
     Ok(out)
 }
 
@@ -3481,6 +3795,10 @@ pub(crate) struct Pending {
     orphan: bool,
     /// [`UnsupportedFilters::WriteUnfiltered`]: a block was written unfiltered, so it is kept unchecked and fails
     unfiltered: bool,
+    /// its declared size, None when unknown: nothing past it is written (a member carrying more fails its size
+    /// check; kept with [`Options::keep_broken`], or handed over under [`UnverifiedOutput::Emit`], it stops there,
+    /// as UnRAR 7.30 and 7-Zip 26.06 write it)
+    declared: Option<u64>,
 }
 
 /// A symbolic link being extracted: created once its target is decoded and checked.
@@ -3524,6 +3842,15 @@ impl Pending {
             keep: None,
             orphan: false,
             unfiltered: false,
+            declared: (!h.size_unknown()).then_some(h.unpacked_size),
+        }
+    }
+
+    /// How much of `len` more bytes still lies within the declared size (all of them when it is unknown).
+    pub(crate) fn within_declared(&self, len: usize) -> usize {
+        match self.declared {
+            Some(size) => usize::try_from(size.saturating_sub(self.checks.bytes)).map_or(len, |room| room.min(len)),
+            None => len,
         }
     }
 
@@ -3562,11 +3889,12 @@ impl Pending {
         };
         let Some(mut out) = out else { return };
         if let Some(mem) = self.mem.take()
-            && out.write_detailed(&mem).is_err()
+            && out.write_detailed(&mem[..self.declared.map_or(mem.len(), |size| clamp_len(size, mem.len()))]).is_err()
         {
             return;
         }
-        let _ = out.finish_detailed(|file| keep_written(file, meta));
+        let declared = self.declared;
+        let _ = out.finish_detailed(|file| keep_written(file, meta, declared));
     }
 
     pub(crate) fn hash_key(&self, keyed: bool) -> Option<&[u8; 32]> {
@@ -3599,6 +3927,7 @@ impl Pending {
             }
         }
         let new_size = self.bytes.checked_add(chunk.len() as u64).ok_or_else(RarFault::counter_limit)?;
+        let written = self.within_declared(chunk.len());
         admit(chunk)?;
         if let Some(mem) = self.mem.as_mut() {
             mem.extend_from_slice(chunk);
@@ -3612,7 +3941,8 @@ impl Pending {
             b.update(chunk);
         }
         if let Some(out) = self.out.as_mut()
-            && let Err(error) = out.write_detailed(chunk)
+            && written != 0
+            && let Err(error) = out.write_detailed(&chunk[..written])
         {
             // a failure writing the output stops the run: what was written is never kept (Options::keep_broken)
             self.keep = None;
@@ -3834,6 +4164,9 @@ fn with_member_sink(
 struct RarSelection<'a> {
     sink: &'a mut dyn FnMut(&[u8]) -> Result<()>,
     emit: bool,
+    /// [`SelectOptions::unverified_output`] is `Emit`: nothing past the member's declared size goes to the sink, and
+    /// a RAR 5.0 member running past it hands over its output up to it, as 7-Zip 26.06 `x -so` streams it
+    unverified: bool,
     packed_left: u64,
     decoded_left: u64,
     cancel: &'a Cancellation,
@@ -3848,15 +4181,17 @@ impl Sink for SelectedSink<'_, '_> {
     fn put(&mut self, chunk: &[u8]) -> Result<()> {
         self.selection.cancel.check_io()?;
         let before = self.pending.bytes;
+        let within = self.pending.within_declared(chunk.len()) as u64;
         self.pending.take(chunk)?;
         let count = self.pending.bytes - before;
+        let shown = if self.selection.unverified { count.min(within) } else { count };
         self.selection.decoded_left = self
             .selection
             .decoded_left
             .checked_sub(count)
             .ok_or_else(|| Error::Unsupported("RAR5 decoding exceeds the decoded byte limit".into()))?;
-        if self.selection.emit && count > 0 {
-            (self.selection.sink)(&chunk[..count as usize])?;
+        if self.selection.emit && shown > 0 {
+            (self.selection.sink)(&chunk[..shown as usize])?;
         }
         Ok(())
     }
@@ -3895,7 +4230,7 @@ impl Checks {
     /// [`Checks::from`], with the time and mode `opts` restore ([`Options::meta`]).
     fn with_options(h: &FileHeader, opts: &Options) -> Self {
         let mut checks = Checks::from(h);
-        checks.meta = opts.meta(checks.meta);
+        checks.meta = opts.meta(opts.rar_mode(checks.meta, false));
         checks
     }
 }
@@ -4534,8 +4869,10 @@ fn rar_read_at(
         unsupported_filters: if unfiltered { UnsupportedFilters::WriteUnfiltered } else { UnsupportedFilters::Fail },
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let cancel = selection.cancel;
     let mut callback = |_: &str| {};
@@ -4781,7 +5118,7 @@ impl Run<'_, '_, '_> {
                 crc32: h.crc32,
                 blake2sp: h.blake2sp,
                 out,
-                meta: self.opts.meta(Meta::from(h)),
+                meta: self.opts.rar_meta(h),
                 keep: self.opts.keep_broken,
             },
         };
@@ -4820,6 +5157,16 @@ impl Run<'_, '_, '_> {
             return self.unselected_block(vol, h, name, continuation);
         }
         let ctx = self.reports.encounter(!continuation, &mut self.order, name, h.method)?;
+        if h.cut == Some(crate::rar5::HeaderCut::Header) {
+            // listed as UnRAR lists it (DamagedInput::Salvage), but nothing of it can be extracted
+            // (in a solid stream the members after it lose their history, as after any member not decoded)
+            let failure = ctx.integrity(RarIntegrityReason::TruncatedHeader, false);
+            let cause = self.fail_in_order(&ctx, failure, "the file header is cut short")?;
+            if vol.main.is_solid() && h.method != 0 && !h.is_dir() {
+                self.lost_history(&ctx, Some(cause));
+            }
+            return Ok(());
+        }
         if let Some(reason) = h.rar4_unsupported() {
             let cause =
                 self.fail_in_order(&ctx, RarFailure::Unsupported(reason), "unsupported RAR4 payload feature")?;
@@ -4880,6 +5227,16 @@ impl Run<'_, '_, '_> {
             if vol.main.is_solid() && h.method != 0 && !h.is_dir() {
                 self.drain()?;
                 self.lost_history(&ctx, Some(Arc::new(RarFailure::Unsupported(reason))));
+            }
+            return Ok(());
+        }
+        if h.cut == Some(crate::rar5::HeaderCut::Header) {
+            // DamagedInput::Salvage: a header the volume cuts short has no data to pass over; in a solid stream the
+            // members after it lose their history
+            if vol.main.is_solid() && h.method != 0 && !h.is_dir() {
+                self.drain()?;
+                let failure = Arc::new(ctx.integrity(RarIntegrityReason::TruncatedHeader, false));
+                self.lost_history(&ctx, Some(failure));
             }
             return Ok(());
         }
@@ -5015,7 +5372,7 @@ impl Run<'_, '_, '_> {
                 rel,
                 place,
                 &kind,
-                self.opts.meta(Meta::from(h)).modified(),
+                self.opts.rar_meta(h).modified(),
                 &mut self.landing.extracted,
             ) {
                 if let Some(why) = link::member_failure(&e) {
@@ -5176,7 +5533,7 @@ impl Run<'_, '_, '_> {
                     self.fail_in_order(&ctx, failure, why)?;
                     return Ok(());
                 }
-                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.dir_meta(Meta::from(h))));
+                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.rar_dir_meta(h)));
             }
             return self.reports.directory(&ctx);
         }
@@ -5349,9 +5706,9 @@ impl Run<'_, '_, '_> {
         // (its decoder state is there too): it fails as 7-Zip's "Data Error", kept empty with Options::keep_broken
         if h.split_before() && h.method != 0 && self.opts.attempt_continued_members {
             if let Some(place) = place.take().filter(|_| self.opts.keep_broken && !link) {
-                let meta = self.opts.meta(Meta::from(h));
+                let meta = self.opts.rar_meta(h);
                 if let Ok(out) = create_target_detailed(place, None) {
-                    let _ = out.finish_detailed(|file| keep_written(file, &meta));
+                    let _ = out.finish_detailed(|file| keep_written(file, &meta, None));
                 }
             }
             let failure = ctx.integrity(RarIntegrityReason::Decoder("its start is in an earlier volume"), false);
@@ -5375,7 +5732,7 @@ impl Run<'_, '_, '_> {
         p.cipher = cipher;
         p.cancel = self.cancel.clone();
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
-        p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.meta(Meta::from(h)));
+        p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.rar_meta(h));
         p.orphan = h.split_before() && self.opts.attempt_continued_members;
         p.place = place;
         if link && let Some(place) = p.place.take() {
@@ -5508,6 +5865,14 @@ impl Run<'_, '_, '_> {
                     Err(e) => Err(e),
                 }
             };
+            if ready.is_ok()
+                && let Some(u) = self.stream.as_mut()
+            {
+                // a member running past its declared size is written to it first, for a file kept with
+                // Options::keep_broken or a SelectedEntry under UnverifiedOutput::Emit (what UnRAR 7.30 `x -kb` and
+                // 7-Zip 26.06 `x` / `x -so` hand over); otherwise nothing of it is kept or shown, as before
+                u.write_to_size(self.opts.keep_broken || self.selection.as_ref().is_some_and(|s| s.unverified));
+            }
             if let Err(e) = ready {
                 p.discard();
                 let (failure, legacy) = e.detailed(p.context.scope()).into_parts();
@@ -5732,12 +6097,17 @@ impl Run<'_, '_, '_> {
             }
             return Ok(());
         }
+        // DamagedInput::Salvage: a continuation header the volume cuts short has no data to read
+        let cut_header = h.cut == Some(crate::rar5::HeaderCut::Header);
         let changed = (h.method != 0) != p.compressed
             || h.encrypted != p.encrypted
             || (h.split_before()
                 && p.rar4_identity != h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)));
-        if changed || matches!(crypt, Some(Err(_))) {
+        if cut_header || changed || matches!(crypt, Some(Err(_))) {
             let (failure, legacy) = match crypt {
+                _ if cut_header => {
+                    (p.context.integrity(RarIntegrityReason::TruncatedHeader, false), "the file header is cut short")
+                }
                 Some(Err(e)) if !changed => (RarFailure::crypt(e, p.context.scope()), "encrypted (password required)"),
                 _ => (
                     p.context.integrity(RarIntegrityReason::ChangedContinuationEncoding, false),
@@ -6336,7 +6706,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("member");
         std::fs::write(&path, b"").unwrap();
-        let mut p = Pending::new(&FileHeader::default(), empty_context());
+        // declaring room for the bytes, so they are written (nothing past a declared size is)
+        let header = FileHeader { unpacked_size: 4, ..FileHeader::default() };
+        let mut p = Pending::new(&header, empty_context());
         p.keep = Some(Meta::default());
         // a read-only handle: every write to it fails
         p.out = Some(crate::output::Output::created(File::open(&path).unwrap(), Some(4), path.clone()));
@@ -6385,8 +6757,10 @@ mod tests {
             unsupported_filters: Default::default(),
             unverified_output: UnverifiedOutput::Emit,
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         };
         for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
             opts.unverified_output = unverified;
@@ -6396,7 +6770,8 @@ mod tests {
             let mut held = crate::rar5::unpack::rar4::Rar4Decoder::new_with_cancel(65536, 1, 1, 4 << 20, None).unwrap();
             std::mem::swap(&mut held, &mut decoder);
             run.rar4 = Some(held);
-            let mut p = Pending::new(&FileHeader::default(), empty_context());
+            let header = FileHeader { unpacked_size: 1 << 20, ..FileHeader::default() };
+            let mut p = Pending::new(&header, empty_context());
             p.compressed = true;
             p.keep = Some(Meta::default());
             // a read-only handle: every write to it fails
@@ -6469,7 +6844,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("readonly");
         fs::write(&path, b"keep").unwrap();
-        let mut pending = Pending::new(&FileHeader::default(), empty_context());
+        let header = FileHeader { unpacked_size: 2, ..FileHeader::default() };
+        let mut pending = Pending::new(&header, empty_context());
         pending.out = Some(Output::new(File::open(&path).unwrap(), Some(1)));
         let result = with_member_sink(&mut pending, None, |sink| {
             let _ = sink.put(b"x");
@@ -6724,8 +7100,10 @@ mod read_once {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
             damaged_input: Default::default(),
         }
     }

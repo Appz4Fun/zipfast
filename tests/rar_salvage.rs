@@ -61,8 +61,10 @@ fn options(dest: &Path, mode: Mode, damaged: DamagedInput) -> Options {
         unsupported_filters: Default::default(),
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 
@@ -303,6 +305,66 @@ fn resync_recovers_the_members_after_a_hole() {
     }
 }
 
+/// b.txt's packed size damaged past the end of the archive, its header checksum left failing: the size is the
+/// damage, not a cut volume, so `Resync` still searches past b.txt and recovers c.txt (and `Salvage` ends the volume
+/// there, as before), rather than reading the rest of the volume as b.txt's data.
+#[test]
+fn a_damaged_packed_size_past_the_end_is_not_a_cut() {
+    let (mut bytes, at) = rar4();
+    bytes[at[1] + 7..at[1] + 11].copy_from_slice(&0x7fff_0000u32.to_le_bytes());
+    let case = case(&bytes);
+    let listing = listed(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(names(&listing), ["a.txt", "c.txt"]);
+    assert!(listing.damaged_headers.iter().all(|damage| damage.cut.is_none()), "{:?}", listing.damaged_headers);
+    extract(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(written(&case), ["a.txt", "c.txt"]);
+    assert_bytes(&case, "c.txt", C);
+    let listing = listed(&case, DamagedInput::Salvage).unwrap();
+    assert_eq!(names(&listing), ["a.txt"]);
+}
+
+/// b.txt's header size damaged to 65535, its checksum left failing: under `Resync` that is not taken as a header the
+/// volume cuts short (which `Salvage` lists as UnRAR does), and the search past it recovers c.txt.
+#[test]
+fn a_damaged_header_size_past_the_end_is_searched_past_under_resync() {
+    let (mut bytes, at) = rar4();
+    bytes[at[1] + 5..at[1] + 7].copy_from_slice(&u16::MAX.to_le_bytes());
+    let case = case(&bytes);
+    let listing = listed(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(names(&listing), ["a.txt", "c.txt"]);
+    extract(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(written(&case), ["a.txt", "c.txt"]);
+    assert_bytes(&case, "c.txt", C);
+}
+
+/// A Unicode-named RAR 4.x file header cut inside its extended time, after its whole name field: `Salvage` decodes
+/// the name as any other (é.txt), not only its legacy part before the NUL.
+#[test]
+fn salvage_decodes_the_whole_unicode_name_of_a_cut_rar4_header() {
+    let name = b"?.txt\0\0\xaa\xe9\0.\0t\0x\0\x80t\0";
+    let mut body = Vec::new();
+    body.extend((A.len() as u32).to_le_bytes());
+    body.extend((A.len() as u32).to_le_bytes());
+    body.push(3);
+    body.extend(hash(A).to_le_bytes());
+    body.extend(0x50221884u32.to_le_bytes());
+    body.extend([20, 0x30]);
+    body.extend((name.len() as u16).to_le_bytes());
+    body.extend(0o100644u32.to_le_bytes());
+    body.extend(name);
+    // extended time: the modification time with 3 more bytes
+    body.extend(0xb000u16.to_le_bytes());
+    body.extend([0; 3]);
+    let mut out = b"Rar!\x1a\x07\0".to_vec();
+    out.extend(rar4_block(0x73, 0, &[0; 6]));
+    out.extend(rar4_block(0x74, 0x8000 | 0x200 | 0x1000, &body));
+    let case = case(&out[..out.len() - 2]);
+    let listing = listed(&case, DamagedInput::Salvage).unwrap();
+    assert_eq!(names(&listing), ["é.txt"]);
+    assert_eq!(listing.damaged_headers[0].name.as_deref(), Some("é.txt"));
+    assert_eq!(listing.damaged_headers[0].cut, Some(zipfast::rar5::HeaderCut::Header));
+}
+
 /// A header cut short by the end of the file: UnRAR and 7-Zip say "Unexpected end of archive"; what came before
 /// stands.
 #[test]
@@ -314,7 +376,9 @@ fn salvage_reports_a_volume_cut_inside_a_header() {
         assert_eq!(written(&case), ["a.txt"], "{format}");
         assert_eq!(kinds(&summary.damaged_headers), [HeaderDamageKind::UnexpectedEnd], "{format}");
         let listing = listed(&case, DamagedInput::Salvage).unwrap();
-        assert_eq!(names(&listing), ["a.txt"], "{format}");
+        // UnRAR lists a RAR 4.x file header cut short with what of it is there: here no name (HeaderCut::Header)
+        let expected: &[&str] = if format == "rar4" { &["a.txt", ""] } else { &["a.txt"] };
+        assert_eq!(names(&listing), expected, "{format}");
         assert!(listing.unexpected_end(), "{format}");
     }
 }
@@ -443,11 +507,13 @@ fn fixture_unrar_salvage_creates_the_folder_whose_header_is_corrupt() {
 /// "Unexpected end of archive" for one cut inside a file header or (RAR 5.0) without its end header.
 #[test]
 fn fixtures_cut_short_open_empty_with_an_unexpected_end() {
-    for (file, format, refused) in [
-        ("list-rar4-cut-in-main.rar", zipfast::rar5::RarFormat::Rar4, true),
-        ("list-rar4-cut-at-main.rar", zipfast::rar5::RarFormat::Rar4, true),
-        ("hdrerr-rar4-cut-in-file.rar", zipfast::rar5::RarFormat::Rar4, true),
-        ("hdrerr-rar5-no-end.rar", zipfast::rar5::RarFormat::Rar5, false),
+    // hdrerr-rar4-cut-in-file.rar holds 11 bytes of a file header: listed as UnRAR lists it, with an empty name
+    // (7-Zip lists nothing; a caller showing its listing leaves out a HeaderCut::Header member)
+    for (file, format, refused, listed) in [
+        ("list-rar4-cut-in-main.rar", zipfast::rar5::RarFormat::Rar4, true, 0),
+        ("list-rar4-cut-at-main.rar", zipfast::rar5::RarFormat::Rar4, true, 0),
+        ("hdrerr-rar4-cut-in-file.rar", zipfast::rar5::RarFormat::Rar4, true, 1),
+        ("hdrerr-rar5-no-end.rar", zipfast::rar5::RarFormat::Rar5, false, 0),
     ] {
         let archive = Path::new(FIXTURES).join(file);
         let dir = tempfile::tempdir().unwrap();
@@ -456,7 +522,7 @@ fn fixtures_cut_short_open_empty_with_an_unexpected_end() {
         assert_eq!(RarSession::open(&archive, None, RarSessionOptions::default()).is_err(), refused, "{file}");
         let salvage = options(dir.path(), Mode::Test, DamagedInput::Salvage);
         let listing = extract::list_detailed_with_options(&archive, None, &salvage).unwrap();
-        assert!(listing.entries.is_empty(), "{file}");
+        assert_eq!(listing.entries.len(), listed, "{file}");
         assert!(listing.unexpected_end() && listing.headers_damaged(), "{file}");
         let session = RarSession::open(
             &archive,
@@ -465,7 +531,7 @@ fn fixtures_cut_short_open_empty_with_an_unexpected_end() {
         )
         .unwrap();
         assert_eq!(session.archive().format(), format, "{file}");
-        assert_eq!(session.entries().len(), 0, "{file}");
+        assert_eq!(session.entries().len(), listed, "{file}");
         assert_eq!(kinds(session.archive().damaged_headers()), [HeaderDamageKind::UnexpectedEnd], "{file}");
         let summary = extract::run(&archive, &salvage, |_| {}).unwrap();
         assert_eq!(kinds(&summary.damaged_headers), [HeaderDamageKind::UnexpectedEnd], "{file}");

@@ -636,6 +636,20 @@ fn read_projected_legacy(
     Ok((entries, usage))
 }
 
+/// [`Options::seven_zip_strict`]: how the entry's local header differs from its central record, if it does. A local
+/// header that can't be read is left for the read to report.
+fn local_mismatch(
+    file: &mut (impl Read + Seek),
+    len: u64,
+    e: &ZipEntry,
+) -> Option<crate::extract::LocalHeaderMismatch> {
+    if e.local_at.checked_add(LOCAL_HEADER_LEN as u64).is_none_or(|end| end > len) {
+        return None;
+    }
+    let header = LocalHeader::parse(&read_local_header(file, e.local_at).ok()?).ok()?;
+    crate::extract::LocalHeaderMismatch::compare(&header, e.flags, e.method, e.crc32, e.packed, e.size)
+}
+
 /// Where an entry's data starts, from its local header.
 fn data_at(file: &mut (impl Read + Seek), len: u64, e: &ReadDescription<'_>) -> Result<u64> {
     if e.local_at.checked_add(LOCAL_HEADER_LEN as u64).is_none_or(|end| end > len) {
@@ -672,8 +686,16 @@ fn read_entry(
     let mut crc = crate::crc32::Hasher::new();
     let mut size = 0u64;
     let mut emit = |chunk: &[u8]| -> Result<()> {
-        size += chunk.len() as u64;
+        let room = e.size.saturating_sub(size);
+        size = size.saturating_add(chunk.len() as u64);
         if size > e.size {
+            // the bytes up to the declared size go out first: a file kept with Options::keep_broken holds them, as
+            // 7-Zip 26.06 `x` writes it (the entry fails all the same)
+            let within = usize::try_from(room).map_or(chunk.len(), |room| room.min(chunk.len()));
+            if within != 0 {
+                check()?;
+                sink(&chunk[..within])?;
+            }
             return Err(Error::Corrupt("more data than the directory says"));
         }
         crc.update(chunk);
@@ -721,6 +743,12 @@ fn read_entry(
         match method {
             METHOD_STORED => {
                 if decrypted.len() as u64 != e.size {
+                    // the bytes up to the declared size go out first, as for an entry that isn't encrypted
+                    let within = usize::try_from(e.size).map_or(decrypted.len(), |size| size.min(decrypted.len()));
+                    if decrypted.len() as u64 > e.size && within != 0 {
+                        check()?;
+                        emit(&decrypted[..within])?;
+                    }
                     return Err(Error::Corrupt("stored entry's sizes differ"));
                 }
                 if cancel.is_some() {
@@ -781,8 +809,14 @@ fn read_entry(
     let mut left = e.packed;
     match e.method {
         METHOD_STORED => {
-            if e.packed != e.size {
+            // an entry carrying more than its declared size has the bytes up to it read out first: a file kept with
+            // Options::keep_broken holds them, as 7-Zip 26.06 `x` writes it; it fails all the same
+            let over = e.packed > e.size;
+            if e.packed != e.size && !over {
                 return Err(Error::Corrupt("stored entry's sizes differ"));
+            }
+            if over {
+                left = e.size;
             }
             while left > 0 {
                 check()?;
@@ -793,6 +827,9 @@ fn read_entry(
                     return Err(cut.into());
                 }
                 left -= n as u64;
+            }
+            if over {
+                return Err(Error::Corrupt("stored entry's sizes differ"));
             }
         }
         METHOD_DEFLATE => {
@@ -1221,7 +1258,13 @@ fn list_archive(mut archive: Archive) -> Result<crate::extract::Listing> {
             }
         })
         .collect();
-    Ok(crate::extract::Listing { entries, missing_volume, truncated, damaged_headers: Vec::new() })
+    Ok(crate::extract::Listing {
+        entries,
+        missing_volume,
+        truncated,
+        damaged_headers: Vec::new(),
+        damaged_comments: Vec::new(),
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1383,6 +1426,15 @@ fn run_archive(
                 continue;
             }
             if e.is_link() {
+                // Options::seven_zip_strict: as for a file, a local header that differs fails the link unread
+                if opts.seven_zip_strict
+                    && let Some(found) = local_mismatch(&mut archive.file, archive.len, e)
+                {
+                    let found = found.named(member.0, member.1);
+                    fail(&mut summary, report, member, &found.to_string());
+                    summary.local_header_mismatches.push(found);
+                    continue;
+                }
                 // The target is the member's data: read and checked whole before anything is placed.
                 let mut text = Vec::new();
                 let entry = e.read_description();
@@ -1493,6 +1545,22 @@ fn run_archive(
                     }
                 }
             }
+            // Options::seven_zip_strict: a local header that differs from the central record fails the member before
+            // it is decoded, as 7-Zip's "Headers Error" (with keep_broken its file stays empty, as 7-Zip leaves it)
+            if opts.seven_zip_strict
+                && let Some(found) = local_mismatch(&mut archive.file, archive.len, e)
+            {
+                let found = found.named(member.0, member.1);
+                match target {
+                    Some(out) if opts.keep_broken => {
+                        let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta()), None));
+                    }
+                    target => drop(target),
+                }
+                fail(&mut summary, report, member, &found.to_string());
+                summary.local_header_mismatches.push(found);
+                continue;
+            }
             let mut entry = e.read_description();
             entry.keep_cut = opts.keep_broken;
             // The last member of a walk cut off before its descriptor has no known size: what is there of it is
@@ -1542,7 +1610,7 @@ fn run_archive(
                     let canceled = cancel.is_some_and(Cancellation::is_canceled);
                     match target {
                         Some(out) if opts.keep_broken && !writing && !canceled => {
-                            let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta())));
+                            let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta()), None));
                         }
                         target => drop(target),
                     }

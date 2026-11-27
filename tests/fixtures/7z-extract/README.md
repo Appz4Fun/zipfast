@@ -19,6 +19,8 @@ The password of the encrypted ones is `password`.
 | `delta.7z` | `delta/samples.raw`, Delta:4 over LZMA2 |
 | `ppmd.7z` | `text/a.txt`, PPMd (order 6, 16 MiB) |
 | `ppmd_solid.7z` | `text` and `big` in one solid PPMd folder, order 32 with a 2 MiB model |
+| `ppmd_restart_o32.7z` | `ppmd/mixed.bin` (text, noise, code and repeats), order 32 with a 1 MiB model that starts over many times |
+| `ppmd_restart_o4.7z` | `ppmd/mixed.bin`, order 4 with a 64 KiB model |
 | `solid.7z` | the folders `big` and `text` and their six files in one solid LZMA2 block |
 | `tree.7z` | directories (one empty), an empty file, a file in a subfolder and the executable `text/run.sh` (mode 0755) |
 | `aes.7z` | `text/a.txt`, `text/b.txt`, 7zAES over LZMA2, plain header |
