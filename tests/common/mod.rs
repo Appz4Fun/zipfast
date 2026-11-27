@@ -17,6 +17,11 @@
 //! A tiny RAR 5.0 writer for tests, written from the published archive layout.
 #![allow(dead_code)]
 
+// The library's own tests also load this file (as `crate::test_stamps`, and this module through partial's tests).
+#[allow(clippy::duplicate_mod)]
+#[path = "../../src/test_stamps.rs"]
+pub mod stamps;
+
 pub fn vint(mut v: u64, out: &mut Vec<u8>) {
     loop {
         let b = (v & 0x7f) as u8;

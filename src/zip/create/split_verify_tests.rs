@@ -270,6 +270,8 @@ fn split_verifier_rejects_changed_held_stamps_and_preserves_file_cursors() {
     observer.seek(SeekFrom::Start(19)).unwrap();
     run(&f).unwrap();
     assert_eq!(observer.stream_position().unwrap(), 19);
+    // A same-size rewrite shows only in mtime and ctime, so it must land in a later tick.
+    crate::test_stamps::await_file_stamp_tick(f._root.path(), &f.files[1]);
     f.files[1].write_all_at(b"X", 0).unwrap();
     assert!(matches!(run(&f), Err(Error::Native(CreateError::StageChanged))));
 }

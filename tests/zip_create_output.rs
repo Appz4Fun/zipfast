@@ -16,6 +16,8 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+mod common;
+
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::symlink;
@@ -116,6 +118,9 @@ fn create_output_checks_path_and_held_tracked_directories() {
             matches!(plan.check_output_file(&output), Err(CreateError::OutputAliasesInput(found)) if found.ordinal() == id.ordinal())
         );
         plan.check_output_file(&tempfile::tempfile().unwrap()).unwrap();
+        // A new name may leave the directory's size alone: then only its mtime and ctime show it, so it must land in a
+        // later tick.
+        common::stamps::await_stamp_tick(&source);
         fs::write(source.join("changed"), b"change").unwrap();
         assert!(matches!(plan.check_output_file(&tempfile::tempfile().unwrap()), Err(CreateError::SourceChanged(_))));
     }
