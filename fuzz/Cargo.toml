@@ -12,7 +12,6 @@
 # HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
 # WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
 # ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
-# rights and limitations under the RPL.
 
 [package]
 name = "zipfast-fuzz"
@@ -28,6 +27,54 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 zipfast = { path = ".." }
+
+[profile.release]
+debug = 1
+panic = "abort"
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "extract_rar4"
+path = "fuzz_targets/extract_rar4.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extract_rar5"
+path = "fuzz_targets/extract_rar5.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extract_zip"
+path = "fuzz_targets/extract_zip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extract_7z"
+path = "fuzz_targets/extract_7z.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rar5_crypt_record"
+path = "fuzz_targets/rar5_crypt_record.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "progressive_rar"
+path = "fuzz_targets/progressive_rar.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "probe"
+path = "fuzz_targets/probe.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "fuzz_map_feed"
