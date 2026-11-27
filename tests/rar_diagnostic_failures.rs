@@ -52,6 +52,9 @@ fn options(dest: &Path, keep_broken: bool) -> Options {
         unix_modes: Default::default(),
         backslashes: Default::default(),
         unsupported_filters: Default::default(),
+        damaged_input: Default::default(),
+        encrypted_links: Default::default(),
+        unverified_output: Default::default(),
     }
 }
 
