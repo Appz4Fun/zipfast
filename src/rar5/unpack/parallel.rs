@@ -100,7 +100,20 @@ pub(super) struct Job {
     pub lits: Vec<u8>,
     /// for each part the worker got to, where its tokens and literals end
     pub ends: Vec<(usize, usize)>,
+    /// [`Unpacker::track_tail`]: note where the last symbols of each block start ([`Self::marks`])
+    pub tails: bool,
+    /// with [`Self::tails`], each symbol starting in the last [`TAIL_MARGIN_BITS`] of a block's payload: the part,
+    /// then a [`Mark`]
+    pub marks: Vec<(usize, Mark)>,
 }
+
+/// A symbol near the end of a block: the bits from its start to the end of the block's payload bytes, and where its
+/// tokens and literals start (a token boundary: literals before it end their run there).
+pub(super) type Mark = (usize, usize, usize);
+
+/// With marks wanted, [`tokenize`] reads one symbol at a time from this many bits before a block's end: farther than
+/// one pass of its quick loop can take it past [`TAIL_MARGIN_BITS`] before the end.
+const MARKED_SLOW: usize = TAIL_MARGIN_BITS + 512;
 
 impl Job {
     /// Empty for reuse, letting go of the pieces it shares.
@@ -267,6 +280,7 @@ fn work(
     job.filters.clear();
     job.lits.clear();
     job.ends.clear();
+    job.marks.clear();
     let budget = job.packed * BUDGET + SLACK;
     let mut result = Ok(None);
     let mut last = None;
@@ -315,8 +329,11 @@ fn work(
         };
         let start = bits.pos();
         let out = (&mut job.toks, &mut job.filters, &mut job.lits);
-        result = tokenize(block_bytes(&job.buf, &job.shared, p), start, p.end_bits, &tables, out, budget)
+        let mut marks = Vec::new();
+        let buf = block_bytes(&job.buf, &job.shared, p);
+        result = tokenize_marked(buf, start, p.end_bits, &tables, out, budget, job.tails.then_some(&mut marks))
             .map(|stop| stop.map(|bit| (i, bit)));
+        job.marks.extend(marks.into_iter().map(|mark| (i, mark)));
         job.ends.push((job.toks.len(), job.lits.len()));
         last = Some(tables);
     }
@@ -331,9 +348,28 @@ pub(super) fn tokenize(
     start_bit: usize,
     end_bits: usize,
     t: &Tables,
-    (toks, filters, lits): Out<'_>,
+    out: Out<'_>,
     budget: usize,
 ) -> Result<Option<usize>> {
+    tokenize_marked(buf, start_bit, end_bits, t, out, budget, None)
+}
+
+/// [`tokenize`], noting in `marks` each symbol that starts in the last [`TAIL_MARGIN_BITS`] of the block's payload
+/// bytes (see [`Job::marks`]).
+#[inline(always)]
+pub(super) fn tokenize_marked(
+    buf: &[u8],
+    start_bit: usize,
+    end_bits: usize,
+    t: &Tables,
+    (toks, filters, lits): Out<'_>,
+    budget: usize,
+    mut marks: Option<&mut Vec<Mark>>,
+) -> Result<Option<usize>> {
+    // the quick loop stops 128 bits before this; with marks wanted, far enough before the end that it can't decode
+    // a symbol that needs one
+    let quick_end = if marks.is_some() { end_bits.saturating_sub(MARKED_SLOW) } else { end_bits };
+    let payload_bits = end_bits.div_ceil(8) * 8;
     let mut bits = Bits::at(buf, start_bit);
     lits.reserve((end_bits - start_bit) / 8);
     let mut run = 0u32;
@@ -352,11 +388,11 @@ pub(super) fn tokenize(
             break Ok(Some(bits.pos()));
         }
         let sym;
-        if bits.pos() + 128 <= end_bits {
+        if bits.pos() + 128 <= quick_end {
             // three codes of at most 15 bits fit in one refill
             // SAFETY: 128 bits before the block's end, and a block's bytes go on for PAD past it
             unsafe { bits.refill_inside() };
-            let k = if t.main.common == 0 { 0 } else { t.main.quick_run(&mut bits, end_bits, &mut stage, STAGE) };
+            let k = if t.main.common == 0 { 0 } else { t.main.quick_run(&mut bits, quick_end, &mut stage, STAGE) };
             if k > 0 {
                 lits.extend_from_slice(&stage[..k]);
                 run += k as u32;
@@ -389,6 +425,15 @@ pub(super) fn tokenize(
         } else {
             if bits.pos() >= end_bits {
                 break Ok(None);
+            }
+            if let Some(marks) = marks.as_deref_mut()
+                && payload_bits - bits.pos() <= TAIL_MARGIN_BITS
+            {
+                if run > 0 {
+                    toks.push(Packed::lits(run));
+                    run = 0;
+                }
+                marks.push((payload_bits - bits.pos(), toks.len(), lits.len()));
             }
             bits.refill();
             let s = decode!(t.main);

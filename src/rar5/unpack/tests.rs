@@ -1242,3 +1242,52 @@ fn filter_records_count_against_a_workers_budget() {
     assert!(matches!(stop, Ok(Some(_))), "{:?} with {} filters read", stop.map(|_| ()), filters.len());
     assert!(filters.len() < ops.len());
 }
+
+/// `UnverifiedOutput::Emit` ([`Unpacker::track_tail`]): workers mark the last symbols of the blocks they decode, so a
+/// cut up to 20 bytes past a block's end leaves out the same output on workers as on the calling thread, after quick
+/// literal runs too.
+#[test]
+fn workers_note_the_last_symbols_of_their_blocks_as_the_calling_thread_does() {
+    let mut text = Vec::new();
+    let mut x = 5u32;
+    for i in 0..12_000u32 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        text.extend_from_slice(format!("{} {} ", i % 31, (x >> 22) % 7).as_bytes());
+    }
+    let mut trimmed = 0;
+    for ops in [mostly_noise(60_000, 4), lz(&text, 1 << 16, 4)] {
+        let size = model(&ops).len() as u64;
+        let chunks: Vec<&[Op]> = ops.chunks(4000).collect();
+        let mut stream = Vec::new();
+        let mut ends = Vec::new();
+        for (i, c) in chunks.iter().enumerate() {
+            stream.extend(tuned_block(c, i + 1 == chunks.len()));
+            ends.push(stream.len());
+        }
+        let cut_off = |cut: usize, threads: usize, tail: bool| {
+            let mut u = Unpacker::new(Window::full(1 << 20)).unwrap();
+            u.set_threads(threads, 0);
+            if tail {
+                u.track_tail();
+            }
+            u.reset(Some(size));
+            let mut out = Vec::new();
+            let mut sink = |b: &[u8]| {
+                out.extend_from_slice(b);
+                Ok(())
+            };
+            u.feed(&stream[..cut], &mut sink).unwrap();
+            u.flush_cut(&mut sink).unwrap();
+            out
+        };
+        for &end in &ends[..ends.len() - 1] {
+            for cut in end..end + 20 {
+                let serial = cut_off(cut, 0, true);
+                assert!(cut_off(cut, 3, true) == serial, "cut at {cut}, {} past a block", cut - end);
+                trimmed += usize::from(cut_off(cut, 0, false).len() > serial.len());
+            }
+        }
+    }
+    // the cuts do leave out the block's last symbols
+    assert!(trimmed > 0);
+}

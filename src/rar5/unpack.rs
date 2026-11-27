@@ -758,8 +758,9 @@ pub struct Unpacker {
     /// ([`Self::record_filters`]): stream offsets
     seen: Option<Vec<SeenFilterRec>>,
     /// [`crate::extract::UnverifiedOutput::Emit`] ([`Self::track_tail`]): the symbols in the last
-    /// [`TAIL_MARGIN_BITS`] of the latest block decoded on this thread, as (bits from the symbol's start to the end of
-    /// the block's payload, output position before it), and that block's payload bits
+    /// [`TAIL_MARGIN_BITS`] of the latest block decoded (on this thread, or marked by a worker: `Job::marks`), as
+    /// (bits from the symbol's start to the end of the block's payload, output position before it), and that block's
+    /// payload bits
     tail: Option<Box<TailSymbols>>,
 }
 
@@ -1161,6 +1162,7 @@ impl Unpacker {
         let mut job = std::mem::replace(&mut self.batch, self.spare.pop().unwrap_or_default());
         self.batch.clear();
         job.seq = self.submitted;
+        job.tails = self.tail.is_some();
         self.queued += job.packed;
         pool.submit(job);
         self.submitted += 1;
@@ -1232,6 +1234,12 @@ impl Unpacker {
             }
             let buf = block_bytes(&job.buf, &job.shared, p);
             let mut bits = if i == part { Bits::at(buf, bit) } else { Bits::new(buf) };
+            if let Some(tail) = self.tail.as_mut().filter(|_| i > part) {
+                // a block the worker didn't reach: its last symbols are noted here (the one it stopped in keeps the
+                // marks it made, see apply_job)
+                tail.0.clear();
+                tail.1 = p.end_bits.div_ceil(8) * 8;
+            }
             if i > part && p.read_tables {
                 let lens = read_lengths(&mut self.pre, &mut bits, p.end_bits)?;
                 let mut t = Tables::empty();
@@ -1277,9 +1285,29 @@ impl Unpacker {
     /// A job's tokens, part by part, with the file boundaries between them, as far as the worker got.
     fn apply_job(&mut self, job: &Job, sink: &mut dyn Sink) -> Result<()> {
         let mut from = (0, 0);
-        for (p, &to) in job.parts.iter().zip(&job.ends) {
+        let mut marks = job.marks.iter().peekable();
+        for (i, (p, &to)) in job.parts.iter().zip(&job.ends).enumerate() {
             if let Some(b) = p.boundary {
                 self.end_file(b, sink)?;
+            }
+            if let Some(tail) = self.tail.as_mut()
+                && p.boundary.is_none()
+            {
+                // Self::track_tail: the symbols the worker marked near the block's end, with the output before each
+                tail.0.clear();
+                tail.1 = p.end_bits.div_ceil(8) * 8;
+                while let Some(&&(_, (left, tok, lit))) = marks.peek().filter(|&&&(part, _)| part == i) {
+                    marks.next();
+                    // a mark lies within the part's tokens; a damaged job's marks are only checked, not trusted
+                    if !(from.0 <= tok && tok <= to.0 && from.1 <= lit && lit <= to.1) {
+                        continue;
+                    }
+                    self.apply(&job.toks[from.0..tok], &job.filters, &job.lits[from.1..lit], sink)?;
+                    from = (tok, lit);
+                    if let Some(tail) = self.tail.as_mut() {
+                        tail.0.push((left, self.sp));
+                    }
+                }
             }
             self.apply(&job.toks[from.0..to.0], &job.filters, &job.lits[from.1..to.1], sink)?;
             from = to;
@@ -2051,7 +2079,8 @@ impl Unpacker {
     }
 
     /// Notes where the last symbols of each block start, so that [`Self::flush_cut`] can leave out what UnRAR leaves
-    /// out when the data ends just past a block. Blocks decoded on worker threads are not followed.
+    /// out when the data ends just past a block. Workers mark them in the blocks they decode, and the calling thread
+    /// notes the output before each as it applies their tokens.
     pub(crate) fn track_tail(&mut self) {
         self.tail.get_or_insert_with(Default::default);
     }
