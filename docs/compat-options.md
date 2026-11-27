@@ -566,7 +566,7 @@ Differences from 7-Zip:
   instead. zipfast reports just that member.
 - When only the data descriptor flag differs, 7-Zip still writes the member's data. zipfast fails the member before
   writing it.
-- Links are not compared.
+- A link is compared too and fails unread. 7-Zip `x` leaves an empty regular file in its place; zipfast places nothing, even with `keep_broken`.
 
 ### Routes
 

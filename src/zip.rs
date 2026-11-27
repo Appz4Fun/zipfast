@@ -1420,6 +1420,15 @@ fn run_archive(
                 continue;
             }
             if e.is_link() {
+                // Options::seven_zip_strict: as for a file, a local header that differs fails the link unread
+                if opts.seven_zip_strict
+                    && let Some(found) = local_mismatch(&mut archive.file, archive.len, e)
+                {
+                    let found = found.named(member.0, member.1);
+                    fail(&mut summary, report, member, &found.to_string());
+                    summary.local_header_mismatches.push(found);
+                    continue;
+                }
                 // The target is the member's data: read and checked whole before anything is placed.
                 let mut text = Vec::new();
                 let entry = e.read_description();

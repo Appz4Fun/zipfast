@@ -40,3 +40,4 @@ folders.
 | `local-size.zip` | `f1.txt`'s local size | Headers Error : f1.txt |
 | `local-method.zip` | `f1.txt`'s local method | Headers Error : f1.txt |
 | `local-descriptor-flag.zip` | `f1.txt`'s local data descriptor flag | Headers Error : f1.txt |
+| `local-link-crc.zip` | the symbolic link `l1` (to `f0.txt`) with its local CRC-32 changed | Headers Error : l1 (`x` leaves an empty regular file) |

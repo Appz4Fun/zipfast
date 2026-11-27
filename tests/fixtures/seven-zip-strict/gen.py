@@ -254,6 +254,19 @@ at = local_header(streamed, 1)
 streamed[at + 14 : at + 18] = (0x12345678).to_bytes(4, "little")
 fixtures["local-streamed-crc.zip"] = bytes(streamed)
 
+# a symbolic link `l1` -> `f0.txt` whose local CRC-32 differs: 7-Zip compares links too ("Headers Error : l1"; `7z x`
+# leaves an empty regular file)
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, "w") as z:
+    for name, data, mode in (("f0.txt", text(500), 0o100644), ("l1", b"f0.txt", 0o120777), ("f2.txt", text(500), 0o100644)):
+        info = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+        info.create_system, info.external_attr = 3, mode << 16
+        z.writestr(info, data)
+link = bytearray(buf.getvalue())
+at = local_header(link, 1) + 14
+link[at : at + 4] = (int.from_bytes(link[at : at + 4], "little") ^ 1).to_bytes(4, "little")
+fixtures["local-link-crc.zip"] = bytes(link)
+
 os.makedirs(OUT, exist_ok=True)
 for name, data in sorted(fixtures.items()):
     with open(os.path.join(OUT, name), "wb") as f:

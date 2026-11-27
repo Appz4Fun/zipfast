@@ -281,6 +281,35 @@ fn a_zip_local_header_that_differs_fails_its_member_on_the_checked_route() {
     }
 }
 
+/// 7-Zip compares a link's local header too ("Headers Error : l1").
+#[test]
+fn a_link_whose_local_header_differs_fails() {
+    let summary = test_run("local-link-crc.zip", true);
+    assert_eq!(summary.local_header_mismatches.len(), 1);
+    let found = &summary.local_header_mismatches[0];
+    assert_eq!((found.ordinal, found.name.as_str(), found.crc32), (1, "l1", true));
+    assert_eq!(summary.errors, [format!("l1: {found}")]);
+    assert!(test_run("local-link-crc.zip", false).errors.is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    let mut failed = Vec::new();
+    let report = extract::run_with_zip_policy(
+        &fixture("local-link-crc.zip"),
+        &options(Mode::Test, dir.path(), true),
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |event: ZipRunEvent<'_>| {
+            if let ZipRunEvent::MemberFailed { name, error, .. } = event {
+                failed.push((name.to_owned(), matches!(error.operation(), Some(ReadFault::LocalHeaderMismatch(_)))));
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(failed, [("l1".to_owned(), true)]);
+    assert_eq!(report.local_header_mismatches(), 1);
+}
+
 /// 7-Zip `x` leaves the member's file empty: with `keep_broken`, so does zipfast, on both routes.
 #[test]
 fn keep_broken_leaves_the_member_empty() {
