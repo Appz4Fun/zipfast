@@ -338,6 +338,14 @@ impl HeaderParser {
     pub(crate) fn set_complete_len(&mut self, len: u64) {
         self.complete_len = Some(len);
     }
+    /// Where the parser's next byte comes from, once the signature is found.
+    pub(crate) fn next_offset(&self) -> Option<u64> {
+        self.signature.is_none().then(|| self.at.saturating_add(self.buffer.len() as u64))
+    }
+    /// Whether the parser stopped at a failure ([`Self::resume_at`] starts it again).
+    pub(crate) fn stopped(&self) -> bool {
+        self.failed
+    }
     pub(crate) fn complete_len(&self) -> Option<u64> {
         self.complete_len
     }

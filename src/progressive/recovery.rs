@@ -57,6 +57,9 @@ pub(crate) struct Record {
     wires: Vec<WireSnapshot>,
     epoch: Arc<AtomicU64>,
     part_evidence: Vec<PackedEvidence>,
+    /// The damaged-input choice the headers were read under: a replay reads the same damaged headers as they stand
+    /// and resumes where a resync did.
+    damaged_input: crate::extract::DamagedInput,
 }
 impl Record {
     pub(crate) fn required_volumes(&self) -> impl Iterator<Item = u32> + '_ {
@@ -75,6 +78,7 @@ impl Record {
         part_evidence: Vec<PackedEvidence>,
     ) -> Self {
         Self {
+            damaged_input: crate::extract::DamagedInput::Refuse,
             model,
             target,
             key: machine.cipher.as_ref().and_then(|c| c.checksum_key().copied()),
@@ -129,7 +133,7 @@ impl ProgressiveSession {
                 wires.push(WireSnapshot { volume: volume.volume, witnesses: volume.witnesses.clone(), count });
             }
         }
-        Ok(Record::new(
+        let mut record = Record::new(
             std::mem::take(&mut self.model),
             self.target.take().ok_or_else(invalid)?,
             machine,
@@ -137,7 +141,9 @@ impl ProgressiveSession {
             wires,
             self.replacement_epoch.clone(),
             std::mem::take(&mut self.part_evidence),
-        ))
+        );
+        record.damaged_input = self.damaged_input();
+        Ok(record)
     }
     /// Admit an explicit verification generation (a replacement lane) for `volume`.
     ///
@@ -903,12 +909,20 @@ impl Replay {
                 return Ok(Poll::Pending);
             }
             if self.parser.is_none() {
-                self.parser = Some(HeaderParser::from_start(
-                    format!("verification-volume-{}", volume.volume).into(),
-                    usage.clone(),
-                ));
+                let mut parser =
+                    HeaderParser::from_start(format!("verification-volume-{}", volume.volume).into(), usage.clone());
+                parser.set_salvage(record.damaged_input);
+                self.parser = Some(parser);
             }
             let witness = volume.witnesses.lock().unwrap()[self.witness];
+            if self.witness_offset == 0 && record.damaged_input.salvages() {
+                // Extraction read past damage here: a header it gave up on (the rest of its witness bytes are
+                // still compared) or one it searched past, so the next witness starts elsewhere. Read on from it.
+                let parser = self.parser.as_mut().unwrap();
+                if parser.stopped() || parser.next_offset().is_some_and(|next| next != witness.offset) {
+                    parser.resume_at(witness.offset);
+                }
+            }
             let n = (witness.len - self.witness_offset).min(buffer.len() as u64) as usize;
             let offset = witness.offset + self.witness_offset;
             let count = match driver.poll_replacement(volume.volume, offset, cx, &mut buffer[..n]) {
@@ -926,10 +940,17 @@ impl Replay {
                 return Err(ProgressiveFailure::new(FailureKind::SourceChanged));
             }
             let parser = self.parser.as_mut().unwrap();
-            let (used, step) = parser.advance(&buffer[..count]).map_err(|e| match e.kind {
-                FailureKind::Limit { .. } | FailureKind::Canceled => e,
-                _ => ProgressiveFailure::new(FailureKind::SourceChanged),
-            })?;
+            let advanced = if parser.stopped() && record.damaged_input.salvages() {
+                // the rest of a witness extraction read past as damage
+                Err(crate::extract::HeaderDamageKind::Unreadable)
+            } else {
+                parser.advance_salvaging(&buffer[..count]).map_err(|e| match e.kind {
+                    FailureKind::Limit { .. } | FailureKind::Canceled => e,
+                    _ => ProgressiveFailure::new(FailureKind::SourceChanged),
+                })?
+            };
+            // a header extraction read past as damage: its bytes are checked against the witness all the same
+            let (used, step) = advanced.unwrap_or((count, ParserStep::Need { offset: 0, len: 0 }));
             if used != count {
                 return Err(ProgressiveFailure::new(FailureKind::SourceChanged));
             }

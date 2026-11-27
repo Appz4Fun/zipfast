@@ -453,6 +453,10 @@ impl ProgressiveSession {
         if self.verify_job.is_some() {
             return Poll::Ready(Err(ProgressiveFailure::new(FailureKind::InvalidCapability)));
         }
+        // damage found by the last read is delivered even when that read ended the session
+        if let Some((volume, damage)) = self.damage.pop_front() {
+            return Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage })));
+        }
         if matches!(self.phase, Phase::Done) {
             return Poll::Ready(Ok(None));
         }
@@ -539,6 +543,9 @@ impl ProgressiveSession {
             if self.control.is_canceled() {
                 return Err(ProgressiveFailure::new(FailureKind::Canceled));
             }
+            if let Some((volume, damage)) = self.damage.pop_front() {
+                return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage }))));
+            }
             if work >= self.options.limits.packed_work_per_poll.min(1 << 20) {
                 cx.waker().wake_by_ref();
                 return Ok(Poll::Pending);
@@ -563,9 +570,6 @@ impl ProgressiveSession {
             #[cfg(feature = "persistent-partials")]
             if let Some(event) = self.partial.as_mut().and_then(|p| p.written.take()) {
                 return Ok(Poll::Ready(Ok(Some(event))));
-            }
-            if let Some((volume, damage)) = self.damage.pop_front() {
-                return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage }))));
             }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),

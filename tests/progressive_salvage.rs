@@ -229,6 +229,8 @@ struct Run<'a> {
     /// Called on every `Pending` with the outcome so far; returns whether to open the gate.
     on_pending: &'a mut dyn FnMut(&Outcome) -> bool,
     password: Option<&'a str>,
+    /// `ProgressiveLimits::packed_work_per_poll`, when not the default.
+    work: Option<u64>,
 }
 
 fn progressive(run: Run<'_>) -> Outcome {
@@ -239,6 +241,9 @@ fn progressive(run: Run<'_>) -> Outcome {
         ProgressiveOptions::new(extract_options(&dest, Mode::Extract, run.damaged), OsString::from(run.volumes[0].0));
     options.artifact_aftermath = ArtifactAftermath::RetainProvisional;
     options.set_password(run.password.map(str::to_owned)).unwrap();
+    if let Some(work) = run.work {
+        options.limits.packed_work_per_poll = work;
+    }
     let revealed = Arc::new(AtomicU64::new(0));
     let open = Arc::new(AtomicBool::new(run.gate.is_empty()));
     let session = match run.route {
@@ -334,7 +339,16 @@ fn progressive(run: Run<'_>) -> Outcome {
 }
 
 fn run_simple(volumes: &[(&str, Vec<u8>)], damaged: DamagedInput, route: Route) -> Outcome {
-    progressive(Run { volumes, damaged, route, gate: 0..0, hole: false, on_pending: &mut |_| false, password: None })
+    progressive(Run {
+        volumes,
+        damaged,
+        route,
+        gate: 0..0,
+        hole: false,
+        on_pending: &mut |_| false,
+        password: None,
+        work: None,
+    })
 }
 
 /// What `extract::run` makes of the same volumes: files and bytes, folders, and the damage list.
@@ -496,6 +510,7 @@ fn a_header_still_to_come_is_waited_for_and_one_in_a_hole_is_not_damage() {
                     waits > 400
                 },
                 password: None,
+                work: None,
             });
             assert!(waits > 400, "{format} {damaged:?}: the session did not wait for the header");
             assert_eq!(out.failure, None, "{format} {damaged:?}");
@@ -512,6 +527,7 @@ fn a_header_still_to_come_is_waited_for_and_one_in_a_hole_is_not_damage() {
                 hole: true,
                 on_pending: &mut |_| false,
                 password: None,
+                work: None,
             });
             assert_eq!(out.failure.as_deref(), Some("HeaderHole"), "{format} {damaged:?}");
             assert!(out.damage.is_empty(), "{format} {damaged:?}: {:?}", out.damage);
@@ -536,6 +552,7 @@ fn a_resync_never_searches_across_a_hole() {
         hole: true,
         on_pending: &mut |_| false,
         password: None,
+        work: None,
     });
     assert_eq!(out.failure.as_deref(), Some("HeaderHole"));
     assert!(out.damage.is_empty(), "{:?}", out.damage);
@@ -726,6 +743,7 @@ fn no_signature_and_encrypted_headers_are_not_salvaged() {
                     hole: false,
                     on_pending: &mut |_| false,
                     password,
+                    work: None,
                 });
                 assert!(out.failure.is_some(), "{what} {damaged:?} {route:?}: {out:?}");
                 assert!(out.damage.is_empty(), "{what} {damaged:?} {route:?}: {:?}", out.damage);
@@ -835,4 +853,28 @@ fn a_persistent_session_still_refuses_damaged_headers() {
         }
     }
     assert!(failed, "the damaged header did not stop the persistent session");
+}
+
+/// The read that finds damage may also use up the poll's work and end the session (a damaged end header read one
+/// byte a poll): its `HeaderDamaged` is still delivered before the end.
+#[test]
+fn damage_found_by_the_last_read_is_delivered() {
+    let (mut bytes, at) = rar5();
+    bytes[at[3]] ^= 0x5a;
+    for route in [Route::Sealed, Route::Pieces] {
+        let volumes = [("a.rar", bytes.clone())];
+        let out = progressive(Run {
+            volumes: &volumes,
+            damaged: DamagedInput::Salvage,
+            route,
+            gate: 0..0,
+            hole: false,
+            on_pending: &mut |_| false,
+            password: None,
+            work: Some(1),
+        });
+        assert_eq!(out.failure, None, "{route:?}: {out:?}");
+        assert_eq!(out.files.len(), 3, "{route:?}");
+        assert_eq!(out.damage, [(0, at[3] as u64, HeaderDamageKind::ChecksumMismatch, None, None)], "{route:?}");
+    }
 }
