@@ -1311,6 +1311,8 @@ impl PartialCore {
         if !intent.kept.is_empty() {
             let (mut written, _written_lease) = self.budget.leased_vector(plan.unknown.len() + corrected.len())?;
             written.extend(plan.unknown.iter().chain(&corrected).cloned());
+            // Unknown and corrected (alt) ranges never overlap: sorted, they are disjoint.
+            written.sort_by_key(|r| r.start);
             state::prune_kept(&mut intent, &written);
             state::prune_kept(&mut commit, &written);
         }

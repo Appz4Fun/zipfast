@@ -516,3 +516,76 @@ fn a_refill_the_checks_cannot_decide_reads_nothing() {
     assert_eq!(reader.total(), (SLICE.end - SLICE.start) as u64);
     assert_eq!(run.file().remaining().unwrap(), vec![PART as u64 + 10_000..PART as u64 + 20_000]);
 }
+
+#[test]
+fn a_write_over_kept_output_is_never_trusted_by_a_later_declared_refill() {
+    // After the declaration, bytes inside the hole are written by another path: wrong alt bytes, wrong packed bytes
+    // (a bad twin), or the right alt bytes. The kept CRC of what was there before must not vouch for them.
+    for (case, right) in [("fill", false), ("fill_packed", false), ("fill", true)] {
+        let label = format!("{case} right={right}");
+        let mut fixture = Fixture::new();
+        fixture.damage(0, BAD);
+        let mut run = run(&fixture);
+        let (volume, hole) = declared(&run);
+        let at = 180_000usize;
+        let mut bytes = fixture.data[at..at + 1000].to_vec();
+        if !right {
+            bytes[500] ^= 0xFF;
+        }
+        match case {
+            "fill" => {
+                run.file().fill(at as u64, &bytes).unwrap();
+            }
+            _ => {
+                run.file().fill_packed(volume, fixture.packed(0, at..at + 1000).start, &bytes).unwrap();
+            }
+        }
+        let repaired = fixture.packed(0, SLICE);
+        let mut reader = CountingVolume::new(fixture.good[0].clone());
+        let result =
+            run.file().refill_declared_from_packed(volume, hole.clone(), std::slice::from_ref(&repaired), &mut reader);
+        if right {
+            result.unwrap();
+            // The write dropped the whole kept leaf it landed in (131072..196608): the rest of that leaf outside the
+            // slice and the alt bytes is read as well.
+            let leaf = 131_072..196_608;
+            let extra = (leaf.end - SLICE.end) - 1000;
+            assert_eq!(reader.total(), (SLICE.end - SLICE.start + extra) as u64, "{label}");
+            assert!(matches!(verify(run.file()), Verdict::Ok { .. }), "{label}");
+            assert_eq!(run.output(), fixture.data, "{label}");
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(check_failed(&error), Some(&[0u64][..]), "{label}: {error:?}");
+            assert!(!run.file().remaining().unwrap().is_empty(), "{label}");
+        }
+    }
+}
+
+#[test]
+fn a_kept_leaf_whose_bytes_changed_while_closed_is_read_again() {
+    let mut fixture = Fixture::new();
+    fixture.damage(0, BAD);
+    let mut run = run(&fixture);
+    let (volume, hole) = declared(&run);
+    drop(run.file.take());
+    // A byte under a kept leaf outside the slice changes while no handle is open.
+    let path = run.dest.join("big.bin");
+    let mut output = std::fs::read(&path).unwrap();
+    output[10_000] ^= 0xFF;
+    std::fs::write(&path, &output).unwrap();
+    let anchor = run.anchors.current(&run.key).unwrap().unwrap();
+    let state = PartialState::load(&run.state_root, &anchor, &PartialLimits::default()).unwrap();
+    match PartialFile::open(state, run.context(anchor)) {
+        // The reopen refuses a changed output outright, or drops that kept leaf and the refill reads it again.
+        Err(error) => assert!(matches!(error.kind, PartialErrorKind::OutputChanged), "{error:?}"),
+        Ok(file) => {
+            run.file = Some(file);
+            let repaired = fixture.packed(0, SLICE);
+            let mut reader = CountingVolume::new(fixture.good[0].clone());
+            run.file().refill_declared_from_packed(volume, hole, std::slice::from_ref(&repaired), &mut reader).unwrap();
+            assert_eq!(reader.total(), (SLICE.end - SLICE.start) as u64 + 65_536);
+            assert!(matches!(verify(run.file()), Verdict::Ok { .. }));
+            assert_eq!(run.output(), fixture.data);
+        }
+    }
+}

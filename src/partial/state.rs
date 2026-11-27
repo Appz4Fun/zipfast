@@ -49,7 +49,8 @@ const CUT_PARTS: u8 = 0xC7;
 /// version, a count and each leaf's output range and CRC-32. Written only when some leaf is kept, after the hole
 /// cause section (which it forces) and in place of the ciphertext block section (kept leaves are plain-only, kept
 /// ciphertext encrypted-only), so every other state stays byte-identical and a build that predates it refuses such
-/// a state with `StateVersion` (it reads the tag as an unknown ciphertext section version).
+/// a state: with `StateVersion` if it knows the ciphertext block section (it reads the tag as an unknown version of
+/// it), as malformed if it predates that.
 const KEPT_LEAVES: u8 = 0x4B;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageKind {
@@ -117,7 +118,7 @@ impl CipherBlock {
         self.have == (0..16)
     }
 }
-/// Drops the kept leaves of `snapshot` that a later write (`written`) touches or that no longer fit it: each must lie
+/// Drops the kept leaves of `snapshot` that a later write (`written`, sorted and disjoint) touches or that no longer fit it: each must lie
 /// inside one part, inside a `DeclaredBad` hole, and off every known leaf. The leaves are sorted, so is `known`.
 pub(super) fn prune_kept(snapshot: &mut Snapshot, written: &[Range<u64>]) {
     if snapshot.kept.is_empty() {
@@ -144,7 +145,9 @@ pub(super) fn prune_kept(snapshot: &mut Snapshot, written: &[Range<u64>]) {
         // Hole outputs are disjoint: only the last one starting at or before the leaf can hold it.
         let upto = declared.partition_point(|h| h.start <= leaf.range.start);
         let inside = upto > 0 && leaf.range.end <= declared[upto - 1].end;
-        !on_known && in_part && inside && !written.iter().any(|w| overlaps(w, &leaf.range))
+        let at = written.partition_point(|w| w.end <= leaf.range.start);
+        let rewritten = written.get(at).is_some_and(|w| overlaps(w, &leaf.range));
+        !on_known && in_part && inside && !rewritten
     });
     snapshot.kept = kept;
 }

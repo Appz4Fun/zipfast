@@ -395,85 +395,97 @@ impl PartialCore {
             return Err(error);
         }
 
-        // The state if the checks pass: the kept leaves inside the checked ranges and the rebuilt leaves become
-        // known output, and the hole closes as far as they reach.
-        let (intent, valid, _snapshots) = self.next_snapshots(&op)?;
-        let (mut passed, _passed_lease) = self.clone_snapshot(&valid)?;
-        let mut restored: Vec<KnownLeaf> = Vec::new();
-        restored.try_reserve_exact(passed.kept.len() + leaves.len()).map_err(|_| malformed())?;
-        let mut rest = Vec::new();
-        rest.try_reserve_exact(passed.kept.len()).map_err(|_| malformed())?;
-        for leaf in passed.kept.drain(..) {
-            let first = plan.checks.partition_point(|c| c.end <= leaf.range.start);
-            if plan.checks.get(first).is_some_and(|c| c.start <= leaf.range.start && leaf.range.end <= c.end) {
-                restored.push(leaf);
-            } else {
-                rest.push(leaf);
+        // Errors from here on leave the state as it is after the writes (the hole open, the read ranges not kept):
+        // the caller learns that it changed.
+        let anchor = op.state.anchor.clone();
+        let finish = (|| -> PartialResult<PackedFillResult> {
+            // The state if the checks pass: the kept leaves inside the checked ranges and the rebuilt leaves become
+            // known output, and the hole closes as far as they reach.
+            let (intent, valid, _snapshots) = self.next_snapshots(&op)?;
+            let (mut passed, _passed_lease) = self.clone_snapshot(&valid)?;
+            let mut restored: Vec<KnownLeaf> = Vec::new();
+            restored.try_reserve_exact(passed.kept.len() + leaves.len()).map_err(|_| malformed())?;
+            let mut rest = Vec::new();
+            rest.try_reserve_exact(passed.kept.len()).map_err(|_| malformed())?;
+            for leaf in passed.kept.drain(..) {
+                let first = plan.checks.partition_point(|c| c.end <= leaf.range.start);
+                if plan.checks.get(first).is_some_and(|c| c.start <= leaf.range.start && leaf.range.end <= c.end) {
+                    restored.push(leaf);
+                } else {
+                    rest.push(leaf);
+                }
             }
-        }
-        passed.kept = rest;
-        restored.extend(leaves.iter().cloned());
-        restored.sort_by_key(|leaf| leaf.range.start);
-        let mut applied: Vec<Range<u64>> = Vec::new();
-        applied.try_reserve_exact(restored.len()).map_err(|_| malformed())?;
-        applied.extend(restored.iter().map(|leaf| leaf.range.clone()));
-        merge(&mut applied);
-        self.budget.metadata((restored.len() * std::mem::size_of::<KnownLeaf>()) as u64)?;
-        passed.known.try_reserve_exact(restored.len()).map_err(|_| malformed())?;
-        passed.known.extend(restored);
-        passed.known.sort_by_key(|leaf| leaf.range.start);
-        if passed.known.windows(2).any(|w| w[0].range.end > w[1].range.start) {
-            return Err(malformed());
-        }
-        ledger::Ledger { known: &mut passed.known, size: passed.head.size, budget: &self.budget }.check_intervals()?;
-        passed.holes = self.remaining_reports(&mut passed)?;
-        let verification = verify::Verification::after(Vec::new(), &[], &passed, &self.budget, self.hash_key())?;
-        let mut failed = Vec::new();
-        for &index in &plan.targets {
-            let part = &passed.evidence.parts[index];
-            let check = verification.parts.get(index).ok_or_else(malformed)?;
-            let ok = match &check.crc32 {
-                CheckResult::Passed => true,
-                CheckResult::Missing if !part.final_part => match part.blake2sp {
-                    Some(expected) => self.local_blake(&part.out, &mut buffer)? == expected,
-                    None => false,
-                },
-                _ => false,
-            };
-            if !ok {
-                failed.try_reserve(1).map_err(|_| malformed())?;
-                failed.push(part.ordinal);
+            passed.kept = rest;
+            restored.extend(leaves.iter().cloned());
+            restored.sort_by_key(|leaf| leaf.range.start);
+            let mut applied: Vec<Range<u64>> = Vec::new();
+            applied.try_reserve_exact(restored.len()).map_err(|_| malformed())?;
+            applied.extend(restored.iter().map(|leaf| leaf.range.clone()));
+            merge(&mut applied);
+            self.budget.metadata((restored.len() * std::mem::size_of::<KnownLeaf>()) as u64)?;
+            passed.known.try_reserve_exact(restored.len()).map_err(|_| malformed())?;
+            passed.known.extend(restored);
+            passed.known.sort_by_key(|leaf| leaf.range.start);
+            if passed.known.windows(2).any(|w| w[0].range.end > w[1].range.start) {
+                return Err(malformed());
             }
-        }
-        drop(verification);
-        if failed.is_empty() {
-            self.commit_snapshots(&mut op, intent, passed)?;
+            ledger::Ledger { known: &mut passed.known, size: passed.head.size, budget: &self.budget }
+                .check_intervals()?;
+            passed.holes = self.remaining_reports(&mut passed)?;
+            let verification = verify::Verification::after(Vec::new(), &[], &passed, &self.budget, self.hash_key())?;
+            let mut failed = Vec::new();
+            for &index in &plan.targets {
+                let part = &passed.evidence.parts[index];
+                let check = verification.parts.get(index).ok_or_else(malformed)?;
+                let ok = match &check.crc32 {
+                    CheckResult::Passed => true,
+                    CheckResult::Missing if !part.final_part => match part.blake2sp {
+                        Some(expected) => self.local_blake(&part.out, &mut buffer)? == expected,
+                        None => false,
+                    },
+                    _ => false,
+                };
+                if !ok {
+                    failed.try_reserve(1).map_err(|_| malformed())?;
+                    failed.push(part.ordinal);
+                }
+            }
+            drop(verification);
+            if failed.is_empty() {
+                self.commit_snapshots(&mut op, intent, passed)?;
+                op.verification = None;
+                let fill = self.fill_result(&mut op, applied)?;
+                return Ok(PackedFillResult {
+                    revision: fill.revision,
+                    applied: fill.applied,
+                    corrected: Vec::new(),
+                    unmapped: plan.unmapped,
+                    undecryptable: Vec::new(),
+                    state: fill.state,
+                    part_checks: fill.part_checks,
+                    needs_verification: fill.needs_verification,
+                });
+            }
+            drop(passed);
+            // The checks failed: the hole stays, and the bytes written (repaired archive bytes) are kept in place of the
+            // ones they replaced, so a later call with more ranges reads only those.
+            let mut valid = valid;
+            self.budget.metadata((leaves.len() * std::mem::size_of::<KnownLeaf>()) as u64)?;
+            valid.kept.try_reserve_exact(leaves.len()).map_err(|_| malformed())?;
+            valid.kept.extend(leaves.iter().cloned());
+            valid.kept.sort_by_key(|leaf| leaf.range.start);
+            state::prune_kept(&mut valid, &[]);
+            self.commit_snapshots(&mut op, intent, valid)?;
             op.verification = None;
-            let fill = self.fill_result(&mut op, applied)?;
-            return Ok(PackedFillResult {
-                revision: fill.revision,
-                applied: fill.applied,
-                corrected: Vec::new(),
-                unmapped: plan.unmapped,
-                undecryptable: Vec::new(),
-                state: fill.state,
-                part_checks: fill.part_checks,
-                needs_verification: fill.needs_verification,
-            });
-        }
-        drop(passed);
-        // The checks failed: the hole stays, and the bytes written (repaired archive bytes) are kept in place of the
-        // ones they replaced, so a later call with more ranges reads only those.
-        let mut valid = valid;
-        self.budget.metadata((leaves.len() * std::mem::size_of::<KnownLeaf>()) as u64)?;
-        valid.kept.try_reserve_exact(leaves.len()).map_err(|_| malformed())?;
-        valid.kept.extend(leaves.iter().cloned());
-        valid.kept.sort_by_key(|leaf| leaf.range.start);
-        state::prune_kept(&mut valid, &[]);
-        self.commit_snapshots(&mut op, intent, valid)?;
-        op.verification = None;
-        let mut error = err(PartialErrorKind::DeclaredRefill(DeclaredRefillFailure::CheckFailed { parts: failed }));
-        error.committed = Some(op.state.anchor.clone());
-        Err(error)
+            let mut error = err(PartialErrorKind::DeclaredRefill(DeclaredRefillFailure::CheckFailed { parts: failed }));
+            error.committed = Some(op.state.anchor.clone());
+            Err(error)
+        })();
+        finish.map_err(|mut error| {
+            if error.committed.is_none() {
+                error.committed = Some(anchor);
+            }
+            error
+        })
     }
 }
