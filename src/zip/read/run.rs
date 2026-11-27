@@ -44,6 +44,12 @@ fn continued(error: &ZipReadError) -> bool {
             )
         )
 }
+/// [`Options::seven_zip_strict`]: the active member's local header differed only in the data descriptor flag, as the
+/// failure it gets once read and placed.
+fn written_mismatch(context: &mut EncryptedReadContext) -> Option<ReadFault> {
+    let found = context.action.as_mut()?.written_mismatch.take()?;
+    Some(ReadFault::LocalHeaderMismatch(found))
+}
 fn add(counter: &mut u64) -> Result<(), ReadFault> {
     *counter = counter.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
     Ok(())
@@ -591,6 +597,7 @@ impl ProjectedReadSession {
         action.output_descriptor = None;
         action.renamed = None;
         action.backend = None;
+        action.written_mismatch = None;
         action.active_record_charged = false;
         if let Err(fault) = context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1)) {
             return (Err(fault.into()), false, false);
@@ -619,7 +626,11 @@ impl ProjectedReadSession {
                     && (e.packed > context.options.limits.member_packed_bytes
                         || e.size > context.options.limits.member_decoded_bytes)
             {
-                return self.read_at_with_context(ordinal, password, max, cancel, context, |_| Ok(())).map(|()| false);
+                self.read_at_with_context(ordinal, password, max, cancel, context, |_| Ok(()))?;
+                return match written_mismatch(context) {
+                    Some(fault) => Err(fault.into()),
+                    None => Ok(false),
+                };
             }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
@@ -647,9 +658,14 @@ impl ProjectedReadSession {
                 // what was staged, published as a verified file would be (the same directory sync and rename
                 // handling), and is reported failed all the same; a canceled run publishes nothing
                 let mut broken = None;
-                if let Err(error) =
-                    self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel))
-                {
+                let read =
+                    self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel));
+                // Options::seven_zip_strict: a member whose local header differs only in the data descriptor flag was
+                // read and checked whole; it is published as any verified file, then fails, as 7-Zip writes it and
+                // still reports "Headers Error"
+                let flagged = if read.is_ok() { written_mismatch(context) } else { None };
+                let written = stage.written();
+                if let Err(error) = read {
                     if continued(&error) && options.keep_broken && !cancel.is_canceled() {
                         // boxed: the error is large (kilobytes), and it waits across publication
                         broken = Some((Box::new(error), stage.written()));
@@ -697,6 +713,9 @@ impl ProjectedReadSession {
                     }
                     (Some((error, _)), Ok(false)) => Err(*error),
                     (_, Err(error)) => Err(error),
+                    (None, Ok(true)) if let Some(fault) = flagged => {
+                        Err(ZipReadError::from(fault).with_publication(PublicationState::Published, written))
+                    }
                     (None, Ok(published)) => Ok(!published),
                 }
             }
@@ -753,14 +772,31 @@ impl ProjectedReadSession {
             text.extend_from_slice(chunk);
             Ok(())
         });
+        let rel = crate::path::sanitize_with(&name, options.zip_windows_names(host), options.windows_safe_names)
+            .map(|rel| if options.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel });
         if let Err(error) = read {
+            // Options::seven_zip_strict with keep_broken: a link failed unread for its local header leaves an empty
+            // regular file at its path, as 7-Zip `x` does ("Unknown reparse stream")
+            if options.keep_broken
+                && options.mode == Mode::Extract
+                && matches!(error.operation(), Some(ReadFault::LocalHeaderMismatch(_)))
+                && let Ok(rel) = &rel
+                && let Err(fault) = self.link_stand_in(rel, options, context, extracted)
+            {
+                return (Err(fault.into()), false, false);
+            }
             return (Err(error), false, false);
         }
-        let Ok(rel) = crate::path::sanitize_with(&name, options.zip_windows_names(host), options.windows_safe_names)
-        else {
+        let Ok(rel) = rel else {
             return refuse("invalid ZIP target name");
         };
-        let rel = if options.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+        // Options::seven_zip_strict: a link whose local header differs only in the data descriptor flag is placed,
+        // then fails, as 7-Zip places it and reports "Headers Error"
+        let flagged = written_mismatch(context);
+        let flag = |placed: (ZipReadResult<()>, bool, bool)| match (placed, flagged) {
+            ((Ok(()), false, _), Some(fault)) => (Err(fault.into()), false, false),
+            (placed, _) => placed,
+        };
         let kind = link::LinkKind::Symbolic(text);
         // ZIP holds no hard links, so the run records only the symbolic links it placed
         // testing checks the target as extracting would
@@ -768,7 +804,7 @@ impl ProjectedReadSession {
             return refuse(why);
         }
         if options.mode != Mode::Extract {
-            return (Ok(()), false, false);
+            return flag((Ok(()), false, false));
         }
         // the destination root is made as for a file (following a root alias, as `create_dir_all` does) when a link,
         // or a refused link's placeholder, is the first output of the run
@@ -795,7 +831,7 @@ impl ProjectedReadSession {
             Err(error) => return (Err(ReadFault::Legacy(error).into()), false, false),
         };
         match link::publish(&options.dest, &rel, place, &kind, modified, extracted) {
-            Ok(()) => (Ok(()), false, false),
+            Ok(()) => flag((Ok(()), false, false)),
             Err(error) if let Some(why) = link::member_failure(&error) => refuse(why),
             Err(error) => (
                 Err(ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Publish, offset: 0, error }
@@ -803,6 +839,38 @@ impl ProjectedReadSession {
                 false,
                 false,
             ),
+        }
+    }
+    /// The empty regular file 7-Zip `x` leaves at the path of a link it failed unread: placed under the overwrite
+    /// choice as the link would be (an existing or declined target is left alone), and recorded as a file this run
+    /// wrote.
+    fn link_stand_in(
+        &mut self,
+        rel: &std::path::Path,
+        options: &Options,
+        context: &mut EncryptedReadContext,
+        extracted: &mut crate::extract::link::Extracted,
+    ) -> Result<(), ReadFault> {
+        let io_fault = |operation, error| ReadFault::Io { stage: IoStage::Output, operation, offset: 0, error };
+        std::fs::create_dir_all(&options.dest).map_err(|error| io_fault(ReadIoOperation::Directory, error))?;
+        let mut renamed = None;
+        let mut budget = crate::extract::RenameBudget::default();
+        let mut log = crate::extract::RenameLog {
+            budget: &mut budget,
+            record: &mut |r| renamed = Some(r),
+            placed: options.replace_placed_links.then_some(extracted),
+        };
+        let checked = crate::extract::check_target(options, rel, None, &mut log);
+        if let Some(action) = context.action.as_mut() {
+            action.renamed = renamed;
+        }
+        match checked {
+            Ok(crate::extract::Checked::Write(place)) => {
+                crate::extract::link::publish_empty(&options.dest, rel, place, extracted)
+                    .map_err(|error| io_fault(ReadIoOperation::Publish, error))
+            }
+            Ok(_) => Ok(()),
+            Err(error) => Err(ReadFault::Legacy(error)),
         }
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]

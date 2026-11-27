@@ -222,6 +222,7 @@ const LOCAL_MISMATCH: &[(&str, Fields)] = &[
     ("local-size.zip", |m| m.size && !m.crc32),
     ("local-method.zip", |m| m.method && !m.crc32),
     ("local-descriptor-flag.zip", |m| m.descriptor_flag && !m.crc32 && !m.size),
+    ("central-descriptor-flag.zip", |m| m.descriptor_flag && !m.crc32 && !m.size && !m.method),
 ];
 
 #[test]
@@ -336,5 +337,109 @@ fn keep_broken_leaves_the_member_empty() {
         }
         assert_eq!(fs::metadata(out.join("f1.txt")).unwrap().len(), 0, "checked: {checked}");
         assert_eq!(fs::metadata(out.join("f0.txt")).unwrap().len(), 1200, "checked: {checked}");
+    }
+}
+
+/// Extracts `name` on the legacy or the checked route: the local header mismatches reported and the files written.
+fn extract_route(name: &str, out: &Path, checked: bool, keep_broken: bool) -> (Vec<extract::LocalHeaderMismatch>, u64) {
+    let mut opts = options(Mode::Extract, out, true);
+    opts.keep_broken = keep_broken;
+    if !checked {
+        let summary = extract::run(&fixture(name), &opts, |_| {}).unwrap();
+        let lines: Vec<_> = summary.local_header_mismatches.iter().map(|m| format!("{}: {m}", m.name)).collect();
+        assert_eq!(summary.errors, lines, "{name}: one line per mismatch");
+        return (summary.local_header_mismatches, summary.files);
+    }
+    let mut found = Vec::new();
+    let report = extract::run_with_zip_policy(
+        &fixture(name),
+        &opts,
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |event: ZipRunEvent<'_>| {
+            if let ZipRunEvent::MemberFailed { error, .. } = event {
+                match error.operation() {
+                    Some(ReadFault::LocalHeaderMismatch(m)) => found.push((**m).clone()),
+                    other => panic!("{name}: {other:?}"),
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!((report.failed(), report.local_header_mismatches()), (found.len() as u64, found.len() as u64), "{name}");
+    (found, report.files())
+}
+
+/// 7-Zip 26.06 `x` writes `f1.txt`'s data when only the data descriptor flag differs (either header setting it), and
+/// still reports "Headers Error : f1.txt" and exits 2: zipfast writes it whole and fails it, on both routes, without
+/// `keep_broken`. A differing CRC-32, size or method still fails it unread.
+#[test]
+fn only_the_descriptor_flag_differing_still_writes_the_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain");
+    extract::run(&fixture("local.zip"), &options(Mode::Extract, &plain, false), |_| {}).unwrap();
+    let f1 = fs::read(plain.join("f1.txt")).unwrap();
+    assert_eq!(f1.len(), 1200);
+    for name in ["local-descriptor-flag.zip", "central-descriptor-flag.zip", "local-crc.zip"] {
+        for checked in [false, true] {
+            let out = dir.path().join(format!("{name}-{checked}"));
+            let (found, files) = extract_route(name, &out, checked, false);
+            let [found] = found.as_slice() else { panic!("{name} checked {checked}: {found:?}") };
+            assert_eq!((found.ordinal, found.name.as_str()), (1, "f1.txt"), "{name}");
+            assert_eq!(files, 2, "{name} checked {checked}: the failed member isn't counted");
+            assert_eq!(fs::read(out.join("f0.txt")).unwrap().len(), 1200);
+            if found.fails_unread() {
+                assert!(fs::symlink_metadata(out.join("f1.txt")).is_err(), "{name} checked {checked}");
+            } else {
+                assert!(found.descriptor_flag, "{name}");
+                assert_eq!(fs::read(out.join("f1.txt")).unwrap(), f1, "{name} checked {checked}");
+            }
+        }
+    }
+}
+
+/// 7-Zip 26.06 `x` places a link whose local header differs only in the data descriptor flag, and reports
+/// "Headers Error : l1": zipfast places it and fails it, on both routes.
+#[cfg(unix)]
+#[test]
+fn a_link_differing_only_in_its_descriptor_flag_is_placed_then_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    for checked in [false, true] {
+        let out = dir.path().join(format!("{checked}"));
+        let (found, files) = extract_route("local-link-flag.zip", &out, checked, false);
+        let [found] = found.as_slice() else { panic!("checked {checked}: {found:?}") };
+        assert_eq!((found.ordinal, found.name.as_str()), (1, "l1"));
+        assert!(found.descriptor_flag && !found.fails_unread(), "{found:?}");
+        assert_eq!(files, 2, "checked {checked}");
+        assert_eq!(fs::read_link(out.join("l1")).unwrap(), Path::new("f0.txt"), "checked {checked}");
+    }
+    assert!(test_run("local-link-flag.zip", false).errors.is_empty());
+}
+
+/// 7-Zip 26.06 `x` fails a link whose local CRC-32 differs unread and leaves an empty regular file at its path
+/// ("Unknown reparse stream : l1", "Headers Error : l1"): with `keep_broken`, so does zipfast, on both routes; without
+/// it, nothing is placed, as for a file.
+#[cfg(unix)]
+#[test]
+fn keep_broken_leaves_an_empty_file_for_a_link_failed_unread() {
+    let dir = tempfile::tempdir().unwrap();
+    for checked in [false, true] {
+        for keep_broken in [false, true] {
+            let out = dir.path().join(format!("{checked}-{keep_broken}"));
+            let (found, files) = extract_route("local-link-crc.zip", &out, checked, keep_broken);
+            let [found] = found.as_slice() else { panic!("checked {checked}: {found:?}") };
+            assert_eq!((found.name.as_str(), found.crc32), ("l1", true));
+            assert_eq!(files, 2, "checked {checked}");
+            let l1 = fs::symlink_metadata(out.join("l1"));
+            if keep_broken {
+                let l1 = l1.unwrap();
+                assert!(l1.file_type().is_file() && l1.len() == 0, "checked {checked}: {l1:?}");
+            } else {
+                assert!(l1.is_err(), "checked {checked}");
+            }
+            assert_eq!(fs::read(out.join("f2.txt")).unwrap().len(), 500);
+        }
     }
 }

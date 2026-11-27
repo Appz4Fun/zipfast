@@ -267,6 +267,21 @@ at = local_header(link, 1) + 14
 link[at : at + 4] = (int.from_bytes(link[at : at + 4], "little") ^ 1).to_bytes(4, "little")
 fixtures["local-link-crc.zip"] = bytes(link)
 
+# the same link with only its local data descriptor flag set: 7-Zip places the link, then reports "Headers Error : l1"
+link = bytearray(buf.getvalue())
+at = local_header(link, 1) + 6
+link[at : at + 2] = (int.from_bytes(link[at : at + 2], "little") | 8).to_bytes(2, "little")
+fixtures["local-link-flag.zip"] = bytes(link)
+
+# `f1.txt` flagged for a data descriptor in its central record only: 7-Zip writes its data, then "Headers Error"
+central = bytearray(plain)
+cd = central.find(b"PK\x01\x02", 0)
+while cd != -1:
+    if struct.unpack_from("<I", central, cd + 42)[0] == local_header(plain, 1):
+        central[cd + 8 : cd + 10] = (struct.unpack_from("<H", central, cd + 8)[0] | 8).to_bytes(2, "little")
+    cd = central.find(b"PK\x01\x02", cd + 4)
+fixtures["central-descriptor-flag.zip"] = bytes(central)
+
 os.makedirs(OUT, exist_ok=True)
 for name, data in sorted(fixtures.items()):
     with open(os.path.join(OUT, name), "wb") as f:

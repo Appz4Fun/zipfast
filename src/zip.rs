@@ -1426,14 +1426,39 @@ fn run_archive(
                 continue;
             }
             if e.is_link() {
-                // Options::seven_zip_strict: as for a file, a local header that differs fails the link unread
+                // Options::seven_zip_strict: as for a file, a local header whose CRC-32, sizes or method differ fails
+                // the link unread (with keep_broken an empty regular file takes its path, as 7-Zip `x` leaves one:
+                // "Unknown reparse stream"); one differing only in the data descriptor flag is placed, then fails
+                let mut written_mismatch = None;
                 if opts.seven_zip_strict
                     && let Some(found) = local_mismatch(&mut archive.file, archive.len, e)
                 {
                     let found = found.named(member.0, member.1);
-                    fail(&mut summary, report, member, &found.to_string());
-                    summary.local_header_mismatches.push(found);
-                    continue;
+                    if !found.fails_unread() {
+                        written_mismatch = Some(found);
+                    } else {
+                        if opts.keep_broken && opts.mode == Mode::Extract {
+                            let mut log = RenameLog {
+                                placed: opts.replace_placed_links.then_some(&extracted),
+                                budget: &mut summary.rename_budget,
+                                record: &mut |renamed| {
+                                    report.renamed_member(member.0, &renamed);
+                                    summary.renames.push(renamed);
+                                },
+                            };
+                            if let crate::extract::Checked::Write(place) =
+                                crate::extract::check_target(opts, &rel, None, &mut log)?
+                                && let Err(io) =
+                                    crate::extract::link::publish_empty(&opts.dest, &rel, place, &mut extracted)
+                            {
+                                finish_dirs(&mut summary);
+                                return Err(Error::Io(io));
+                            }
+                        }
+                        fail(&mut summary, report, member, &found.to_string());
+                        summary.local_header_mismatches.push(found);
+                        continue;
+                    }
                 }
                 // The target is the member's data: read and checked whole before anything is placed.
                 let mut text = Vec::new();
@@ -1515,6 +1540,11 @@ fn run_archive(
                         return Err(Error::Io(io));
                     }
                 }
+                if let Some(found) = written_mismatch {
+                    fail(&mut summary, report, member, &found.to_string());
+                    summary.local_header_mismatches.push(found);
+                    continue;
+                }
                 summary.files += 1;
                 report.member(LegacyMember::Succeeded { ordinal: member.0, name: member.1, bytes: 0 });
                 continue;
@@ -1545,12 +1575,17 @@ fn run_archive(
                     }
                 }
             }
-            // Options::seven_zip_strict: a local header that differs from the central record fails the member before
-            // it is decoded, as 7-Zip's "Headers Error" (with keep_broken its file stays empty, as 7-Zip leaves it)
-            if opts.seven_zip_strict
-                && let Some(found) = local_mismatch(&mut archive.file, archive.len, e)
-            {
-                let found = found.named(member.0, member.1);
+            // Options::seven_zip_strict: a local header whose CRC-32, sizes or method differ from the central record
+            // fails the member before it is decoded, as 7-Zip's "Headers Error" (with keep_broken its file stays
+            // empty, as 7-Zip leaves it). One differing only in the data descriptor flag is decoded and written as
+            // usual, and then fails, as 7-Zip writes its data and still reports the headers error.
+            let mut mismatch = if opts.seven_zip_strict {
+                local_mismatch(&mut archive.file, archive.len, e).map(|m| m.named(member.0, member.1))
+            } else {
+                None
+            };
+            let written_mismatch = mismatch.take_if(|found| !found.fails_unread());
+            if let Some(found) = mismatch {
                 match target {
                     Some(out) if opts.keep_broken => {
                         let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta()), None));
@@ -1594,6 +1629,11 @@ fn run_archive(
                     {
                         finish_dirs(&mut summary);
                         return Err(Error::Io(io));
+                    }
+                    if let Some(found) = written_mismatch {
+                        fail(&mut summary, report, member, &found.to_string());
+                        summary.local_header_mismatches.push(found);
+                        continue;
                     }
                     summary.files += 1;
                     summary.bytes += e.size;

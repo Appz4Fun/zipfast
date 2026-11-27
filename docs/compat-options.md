@@ -643,10 +643,17 @@ that member's CRC failure and the folder. Both tools exit 2 and write the same b
 7-Zip 26.06 compares each local header with its central directory record: the CRC-32, the compressed size, the size,
 the method and the data descriptor flag. When the local header sets the data descriptor flag, 7-Zip doesn't compare
 its CRC-32 or sizes. It also skips a size of `0xFFFFFFFF` (ZIP64), and it never compares the time, the version or the
-name. If any compared field differs, 7-Zip reports `Headers Error : name`, fails the member and exits 2. `7z x` leaves
-that member's file empty.
+name. If any compared field differs, 7-Zip reports `Headers Error : name`, fails the member and exits 2. What it
+writes depends on the field:
 
-With `seven_zip_strict`, zipfast fails such a member without decoding it. The failure is a `LocalHeaderMismatch {
+| what differs | 7-Zip 26.06 `x` / `e` / `-so` | zipfast with `seven_zip_strict` |
+| --- | --- | --- |
+| the CRC-32, a size or the method (with or without the flag) | leaves the file empty; prints nothing of it | fails it unread; with `keep_broken` its file is left empty |
+| only the data descriptor flag, set in either header (`local-descriptor-flag.zip`, `central-descriptor-flag.zip`) | writes and prints the data whole | decodes, checks and writes it as usual, then fails it |
+| a symbolic link's CRC-32, size or method (`local-link-crc.zip`) | leaves an empty regular file at the link's path, also reporting `Unknown reparse stream : l1` | fails it unread; with `keep_broken` an empty regular file takes its path |
+| only a symbolic link's data descriptor flag (`local-link-flag.zip`) | places the link | places the link, then fails it |
+
+`LocalHeaderMismatch::fails_unread()` tells the two kinds apart. The failure is a `LocalHeaderMismatch {
 ordinal, name, crc32, packed_size, size, method, descriptor_flag }`, where each flag names a field that differs:
 
 - The legacy route (`extract::run` and friends) puts it in `Summary::local_header_mismatches` and gives it a line in
@@ -654,15 +661,15 @@ ordinal, name, crc32, packed_size, size, method, descriptor_flag }`, where each 
 - The checked route (`run_with_zip_policy`) fails the member with `ReadFault::LocalHeaderMismatch` and counts it in
   `ZipRunReport::local_header_mismatches()`.
 
-With `keep_broken`, the member's file is left empty, as 7-Zip `x` leaves it.
+A member written before it fails is counted as failed, not in `Summary::files` or `ZipRunReport::files()`; on the
+checked route its failure says the output was published. If its data fails too, only the data failure is reported.
 
 Differences from 7-Zip:
 
 - A mismatch on the first member makes 7-Zip report a headers error for the whole archive and walk the local headers
   instead. zipfast reports just that member.
-- When only the data descriptor flag differs, 7-Zip still writes the member's data. zipfast fails the member before
-  writing it.
-- A link is compared too and fails unread. 7-Zip `x` leaves an empty regular file in its place; zipfast places nothing, even with `keep_broken`.
+- 7-Zip `x` always leaves the empty file (or, for a link, the empty regular file) of a member failed unread. zipfast
+  leaves it only with `keep_broken`, and doesn't report `Unknown reparse stream` separately.
 
 ### Routes
 

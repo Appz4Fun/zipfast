@@ -36,8 +36,10 @@ folders.
 | `two-folders-last-tail.7z` | a byte after the second folder's LZMA data | Data Error : #1 |
 | `local.zip` | none (`f0.txt`, `f1.txt`, `f2.txt`) | OK |
 | `local-streamed-crc.zip` | `f1.txt` flagged for a data descriptor in both headers, its local CRC-32 changed | OK (not compared) |
-| `local-crc.zip` | `f1.txt`'s local CRC-32 | Headers Error : f1.txt |
-| `local-size.zip` | `f1.txt`'s local size | Headers Error : f1.txt |
-| `local-method.zip` | `f1.txt`'s local method | Headers Error : f1.txt |
-| `local-descriptor-flag.zip` | `f1.txt`'s local data descriptor flag | Headers Error : f1.txt |
-| `local-link-crc.zip` | the symbolic link `l1` (to `f0.txt`) with its local CRC-32 changed | Headers Error : l1 (`x` leaves an empty regular file) |
+| `local-crc.zip` | `f1.txt`'s local CRC-32 | Headers Error : f1.txt (`x` leaves it empty) |
+| `local-size.zip` | `f1.txt`'s local size | Headers Error : f1.txt (`x` leaves it empty) |
+| `local-method.zip` | `f1.txt`'s local method | Headers Error : f1.txt (`x` leaves it empty) |
+| `local-descriptor-flag.zip` | `f1.txt`'s local data descriptor flag | Headers Error : f1.txt (`x` writes its data) |
+| `local-link-crc.zip` | the symbolic link `l1` (to `f0.txt`) with its local CRC-32 changed | Headers Error : l1 (`x` leaves an empty regular file and also reports Unknown reparse stream : l1) |
+| `local-link-flag.zip` | the same link with only its local data descriptor flag set | Headers Error : l1 (`x` places the link) |
+| `central-descriptor-flag.zip` | `f1.txt` flagged for a data descriptor in its central record only | Headers Error : f1.txt (`x` writes its data) |

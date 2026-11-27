@@ -85,6 +85,10 @@ pub(super) struct Action {
     /// [`crate::extract::Options::seven_zip_strict`] for the run bound to this action: each member's local header is
     /// compared with its central record before it is decoded
     pub(super) seven_zip_strict: bool,
+    /// Under strict checks, the active member's local header differed from its central record only in the data
+    /// descriptor flag: it was decoded to its end and checked, and the run fails it after its output is placed, as
+    /// 7-Zip 26.06 writes its data and reports "Headers Error"
+    pub(super) written_mismatch: Option<Box<crate::extract::LocalHeaderMismatch>>,
     pub(super) active_record_charged: bool,
     pub(super) output: budget::PlannedOutput,
     pub(super) caller_max: Option<u64>,
@@ -937,6 +941,7 @@ pub(super) fn factory<'a>(
             active_ordinal: None,
             run_bound: false,
             seven_zip_strict: false,
+            written_mismatch: None,
             active_record_charged: false,
             output,
             caller_max,
@@ -1046,6 +1051,9 @@ struct HeldSource<'a> {
     prepared: bool,
     /// [`crate::extract::Options::seven_zip_strict`]: the central record the local header must agree with
     central: Option<Central<'a>>,
+    /// A local header that differs from [`Self::central`] only in the data descriptor flag: the member is read all
+    /// the same, and fails once read
+    written_mismatch: Option<crate::extract::LocalHeaderMismatch>,
 }
 
 /// What [`HeldSource::prepare_member`] compares a local header with under strict checks.
@@ -1135,7 +1143,12 @@ impl cipher::CiphertextSource for HeldSource<'_> {
             && let Some(found) =
                 crate::extract::LocalHeaderMismatch::compare(&header, c.flags, c.method, c.crc32, c.packed, c.size)
         {
-            return Err(ReadFault::LocalHeaderMismatch(Box::new(found.named(plan.ordinal, c.name))).into());
+            let found = found.named(plan.ordinal, c.name);
+            if !found.fails_unread() {
+                self.written_mismatch = Some(found);
+            } else {
+                return Err(ReadFault::LocalHeaderMismatch(Box::new(found)).into());
+            }
         }
         let layout = zip::local_layout(header, self.local_at, len)
             .map_err(|_| ReadFault::CheckedFormat { reason: "invalid local layout" })?;
@@ -1307,7 +1320,8 @@ fn checked_read_inner(
         packed: e.packed,
         size: e.size,
     });
-    let mut source = HeldSource { file, binding, local_at: e.local_at, prepared: false, central };
+    let mut source =
+        HeldSource { file, binding, local_at: e.local_at, prepared: false, central, written_mismatch: None };
     if let Some(fault) = rejection {
         let fault = if cipher.is_some() {
             context.ledger.with_state(|s| s.encrypted.reject_member(e.packed, fault))
@@ -1336,7 +1350,9 @@ fn checked_read_inner(
     if receipt.consumed != ciphertext || receipt.decoded != e.size {
         return Err(ReadFault::InvalidPlan.into());
     }
-    context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.completed = true;
+    let action = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?;
+    action.completed = true;
+    action.written_mismatch = source.written_mismatch.take().map(Box::new);
     Ok(())
 }
 
@@ -1634,8 +1650,14 @@ pub(super) fn test_original_all_member(
         streaming: false,
     };
     context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1))?;
-    let mut source =
-        HeldSource { file: &mut owner.file, binding, local_at: e.local_at, prepared: false, central: None };
+    let mut source = HeldSource {
+        file: &mut owner.file,
+        binding,
+        local_at: e.local_at,
+        prepared: false,
+        central: None,
+        written_mismatch: None,
+    };
     let admission = cipher::Admission::new(&context.ledger, &mut source, plan, Some("pw"), kind)?.prepare(&cancel)?;
     let (admission, mut workspace) = admission.workspace()?;
     let pending = cipher::PendingAes::copy_admitted(admission, context.temp.as_ref(), &mut workspace.input, &cancel)?;
