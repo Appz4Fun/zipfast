@@ -543,7 +543,7 @@ impl ProgressiveSession {
         let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         let relative = crate::path::sanitize_fallible(&name, !header.is_unix())
             .map_err(|_| error(PartialErrorKind::UnsafePath))?;
-        let meta = self.options.extract.rar_meta(header);
+        let meta = self.options.extract.rar_dir_meta(header);
         let persistent = self.partial.as_mut().unwrap();
         self.usage.charge(
             Resource::MetadataBytes,
