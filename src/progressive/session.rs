@@ -21,6 +21,7 @@ mod partial;
 mod rar4;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
+mod salvage;
 use super::{
     output::{Capacity, DirectoryVerdict, OutputContext, Publication, Stage, Target},
     source::{SourceDriver, SourceStep},
@@ -72,6 +73,16 @@ pub enum ProgressiveEvent {
     VolumeOpened {
         index: u32,
         id: SourceId,
+    },
+    /// A damaged header of zero-based `volume` was read past under
+    /// [`crate::extract::Options::damaged_input`] (`Salvage` or `Resync`; never under the default `Refuse`, which
+    /// fails the session as before). Delivered before anything read from the header, so a member whose header
+    /// failed its checksum but parsed has this event just before its `MemberStarted`. Only bytes the source
+    /// delivered are judged: a header still to come is waited on and one in a `Hole` answer is `HeaderHole`. Non-empty
+    /// means the headers are damaged, as [`crate::extract::Summary::damaged_headers`] does for a whole archive.
+    HeaderDamaged {
+        volume: u32,
+        damage: crate::extract::HeaderDamage,
     },
     MemberStarted {
         member: MemberId,
@@ -197,6 +208,8 @@ enum Phase {
     Finish,
     Verdict,
     NextVolume,
+    /// A [`crate::extract::DamagedInput::Resync`] search past an unreadable header.
+    Resync(Box<salvage::Resync>),
     Done,
 }
 /// The longest `Hole` answer a persistent session accepts in one read (see `SourceDriver::allow_long_hole`):
@@ -231,9 +244,16 @@ pub struct ProgressiveSession {
     rar4_history: Option<crate::rar5::member::Rar4Owner>,
     /// every member so far was written by an archiver older than RAR 2.9, which writes no end-of-archive block
     pre_29: bool,
-    /// A pre-2.9 volume that names itself part of a set ended between members: the next volume is asked for, and
-    /// only a sealed in-memory set (every volume given up front) may end there when it has no next volume.
+    /// A pre-2.9 volume that names itself part of a set ended between members (or the rest of a damaged one was
+    /// passed over under [`crate::extract::Options::damaged_input`]): the next volume is asked for, and only a sealed
+    /// in-memory set (every volume given up front) or a declared last volume may end there with no next volume.
     pre_29_open_end: bool,
+    /// Damaged headers read past, each delivered as a [`ProgressiveEvent::HeaderDamaged`].
+    damage: std::collections::VecDeque<(u32, crate::extract::HeaderDamage)>,
+    /// The bytes a resync searched, kept for the next one.
+    resync_window: Vec<u8>,
+    /// The resync work done in the current volume.
+    resync_work: salvage::ResyncWork,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -342,6 +362,7 @@ impl ProgressiveSession {
         let expected = options.first_name.clone();
         let mut parser = HeaderParser::from_start(expected.clone().into(), usage.clone());
         parser.set_rar4_unknown_part_crc(options.rar4_unknown_part_crc);
+        parser.set_salvage(options.extract.damaged_input);
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(chunk as usize)
@@ -374,6 +395,9 @@ impl ProgressiveSession {
             rar4_history: None,
             pre_29: true,
             pre_29_open_end: false,
+            damage: Default::default(),
+            resync_window: Vec::new(),
+            resync_work: Default::default(),
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -429,7 +453,12 @@ impl ProgressiveSession {
         if self.verify_job.is_some() {
             return Poll::Ready(Err(ProgressiveFailure::new(FailureKind::InvalidCapability)));
         }
+        // damage found by the last read is delivered even when that read ended the session
+        if let Some((volume, damage)) = self.damage.pop_front() {
+            return Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage })));
+        }
         if matches!(self.phase, Phase::Done) {
+            self.extraction_active = false;
             return Poll::Ready(Ok(None));
         }
         self.control.register(cx.waker());
@@ -445,7 +474,10 @@ impl ProgressiveSession {
                     | Ok(None
                         | Some(ProgressiveEvent::MemberFinished { .. } | ProgressiveEvent::SessionTerminated { .. }))
             )
-        ) {
+        ) || matches!(self.phase, Phase::Done)
+        {
+            // a session that reached its end is no longer extracting, whatever its last event (a damaged end
+            // header's HeaderDamaged, say)
             self.extraction_active = false;
         }
         result
@@ -515,6 +547,9 @@ impl ProgressiveSession {
             if self.control.is_canceled() {
                 return Err(ProgressiveFailure::new(FailureKind::Canceled));
             }
+            if let Some((volume, damage)) = self.damage.pop_front() {
+                return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage }))));
+            }
             if work >= self.options.limits.packed_work_per_poll.min(1 << 20) {
                 cx.waker().wake_by_ref();
                 return Ok(Poll::Pending);
@@ -542,6 +577,11 @@ impl ProgressiveSession {
             }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
+                Phase::Resync(_) => {
+                    if let Some(poll) = self.poll_resync(cx, &mut work)? {
+                        return Ok(poll);
+                    }
+                }
                 Phase::NextVolume
                     if self.pre_29_open_end
                         && (self.driver.sealed_volume_count().is_some_and(|n| n <= self.volume as usize + 1)
@@ -570,6 +610,8 @@ impl ProgressiveSession {
                     self.usage.charge(Resource::MetadataBytes, self.expected.capacity() as u64)?;
                     self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone());
                     self.parser.set_rar4_unknown_part_crc(self.options.rar4_unknown_part_crc);
+                    self.parser.set_salvage(self.damaged_input());
+                    self.resync_work = Default::default();
                     self.cursor = 0;
                     self.main_seen = false;
                     self.phase = Phase::Header;
@@ -671,7 +713,13 @@ impl ProgressiveSession {
                     return self.finish().map(|e| Poll::Ready(Ok(Some(e))));
                 }
                 Phase::Header => {
-                    let (_, step) = self.parser.advance(&[])?;
+                    let (_, step) = match self.parser.advance_salvaging(&[])? {
+                        Ok(step) => step,
+                        Err(kind) => {
+                            self.salvage_header(kind)?;
+                            continue;
+                        }
+                    };
                     let (offset, len) = match step {
                         ParserStep::LegacyKeyRequired { salt } => {
                             let password = self
@@ -689,6 +737,11 @@ impl ProgressiveSession {
                             continue;
                         }
                         ParserStep::Need { offset, len } => (offset, len),
+                        // only a salvaging parser knows the volume's length: it ends here without its end header
+                        ParserStep::End if self.parser.salvages() => {
+                            self.salvage_volume_end()?;
+                            continue;
+                        }
                         ParserStep::End => return Err(self.parser.truncated()),
                         ParserStep::Frame(_) => unreachable!("frames require input"),
                     };
@@ -707,6 +760,14 @@ impl ProgressiveSession {
                         Poll::Ready(Err(e)) => return Err(e),
                         Poll::Ready(Ok(SourceStep::VolumeOpened { index, id })) => {
                             self.driver.validate_step()?;
+                            // Under salvage a header or data running past a volume's known end is a volume cut
+                            // short, as for a whole volume. An open-ended source (a growing file) has no known end.
+                            if self.parser.salvages()
+                                && let Some(info) = self.driver.observed_info(index)
+                                && info.length.value() != u64::MAX
+                            {
+                                self.parser.set_complete_len(info.length.value());
+                            }
                             return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index, id }))));
                         }
                         Poll::Ready(Ok(SourceStep::EndOfVolume))
@@ -733,6 +794,9 @@ impl ProgressiveSession {
                                 self.phase = Phase::Done;
                             }
                         }
+                        Poll::Ready(Ok(SourceStep::EndOfVolume)) if self.parser.salvages() => {
+                            self.salvage_volume_end()?;
+                        }
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
                             return Err(self.parser.truncated());
                         }
@@ -753,12 +817,21 @@ impl ProgressiveSession {
                             if let Some(partial) = &mut self.partial {
                                 partial.record_header(offset, &self.buffer[..count], &self.usage)?;
                             }
-                            let (used, step) = self.parser.advance(&self.buffer[..count])?;
+                            let (used, step) = match self.parser.advance_salvaging(&self.buffer[..count])? {
+                                Ok(step) => step,
+                                Err(kind) => {
+                                    self.driver.validate_step()?;
+                                    self.salvage_header(kind)?;
+                                    continue;
+                                }
+                            };
                             if used != count {
                                 return Err(ProgressiveFailure::new(FailureKind::SourceContract));
                             }
                             self.driver.validate_step()?;
-                            if let ParserStep::Frame(frame) = step {
+                            if let ParserStep::Frame(frame) = step
+                                && (!frame.damaged || self.damaged_frame(&frame)?)
+                            {
                                 #[cfg(feature = "persistent-partials")]
                                 if let Some(partial) = &mut self.partial {
                                     partial.frame_header(self.volume, &frame, &self.usage)?;
@@ -1115,6 +1188,8 @@ impl ProgressiveSession {
         Ok(())
     }
     fn start(&mut self, frame: PhysicalFrame) -> ProgressiveResult<ProgressiveEvent> {
+        // a folder whose damaged header claims data is created and its data passed over, as UnRAR 7.30 does
+        let damaged = frame.damaged;
         let Block::File(header) = frame.block else { unreachable!() };
         #[cfg(feature = "persistent-partials")]
         let refusal = self.partial.as_ref().and_then(|_| partial::refusal(&header));
@@ -1244,7 +1319,9 @@ impl ProgressiveSession {
             }
             Disposition::Skip(crate::extract::RarSkipReason::OlderVersion(version))
         } else if header.is_dir() {
-            if header.split_after() || header.packed_size != 0 || header.size_unknown() || header.unpacked_size != 0 {
+            if header.split_after()
+                || (!damaged && (header.packed_size != 0 || header.size_unknown() || header.unpacked_size != 0))
+            {
                 return Err(ProgressiveFailure::new(FailureKind::Malformed("directory payload or continuation")));
             }
             Disposition::Directory
