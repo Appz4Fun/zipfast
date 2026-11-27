@@ -538,8 +538,9 @@ impl HeaderParser {
                         && size >= 7
                         && let Some(len) = self.complete_len.filter(|&len| self.at.saturating_add(size as u64) > len)
                     {
-                        // a file header is read with what of it is there, as UnRAR lists it (HeaderCut::Header)
-                        if !(self.salvage_cut && kind == 0x74 && flags & 0x8000 != 0) {
+                        // a file header is read with what of it is there, as UnRAR lists it (HeaderCut::Header);
+                        // not under Resync, where a header size damaged past the end is searched past instead
+                        if !(self.salvage_cut && !self.resync && kind == 0x74 && flags & 0x8000 != 0) {
                             // salvage tells a volume cut short from a header that can't be read
                             return Err(self
                                 .fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false)

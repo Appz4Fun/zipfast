@@ -323,6 +323,20 @@ fn a_damaged_packed_size_past_the_end_is_not_a_cut() {
     assert_eq!(names(&listing), ["a.txt"]);
 }
 
+/// b.txt's header size damaged to 65535, its checksum left failing: under `Resync` that is not taken as a header the
+/// volume cuts short (which `Salvage` lists as UnRAR does), and the search past it recovers c.txt.
+#[test]
+fn a_damaged_header_size_past_the_end_is_searched_past_under_resync() {
+    let (mut bytes, at) = rar4();
+    bytes[at[1] + 5..at[1] + 7].copy_from_slice(&u16::MAX.to_le_bytes());
+    let case = case(&bytes);
+    let listing = listed(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(names(&listing), ["a.txt", "c.txt"]);
+    extract(&case, DamagedInput::Resync).unwrap();
+    assert_eq!(written(&case), ["a.txt", "c.txt"]);
+    assert_bytes(&case, "c.txt", C);
+}
+
 /// A header cut short by the end of the file: UnRAR and 7-Zip say "Unexpected end of archive"; what came before
 /// stands.
 #[test]

@@ -388,7 +388,9 @@ missing end header):
   when none is), and fails it on extraction; zipfast does the same (`TruncatedHeader`; a `RarSession` member carries
   it as its `payload_issue`). 7-Zip lists nothing: a caller showing 7-Zip's listing leaves out a `Header` cut, which
   is always the last member of its volume. Not matched: when the cut falls inside the attributes field, UnRAR 7.30
-  shows the name as one space.
+  shows the name as one space. `Salvage` only: under `Resync` a header the end seems to cut short is as likely one
+  whose size field is damaged, and the rest of the volume is searched past it instead (a header truly cut short ends
+  the volume there, as before).
 
 Every other header the end cuts short (a RAR 5.0 header, a service header or its data, fewer than 7 bytes of a RAR 4.x
 header) ends the volume as before. Progressive sessions don't read a cut member: they wait for bytes still to come,

@@ -471,7 +471,9 @@ pub enum DamagedInput {
     /// (0x76) and sign (0x79) blocks' checksums are not checked. Encrypted headers are never salvaged: there a
     /// checksum failure is how a wrong password shows.
     Salvage,
-    /// [`Self::Salvage`], and where a header can't be read the rest of the volume is searched, in one bounded
+    /// [`Self::Salvage`] (except that a RAR 4.x file header the volume seems to cut short is searched past, as
+    /// one whose size is damaged, not listed as [`crate::rar5::HeaderCut::Header`]), and where a header can't be read
+    /// the rest of the volume is searched, in one bounded
     /// linear pass, for the next header that passes its checksum, and reading goes on from there. Neither UnRAR
     /// 7.30 nor 7-Zip 26.06 does this: it recovers the members after a damaged stretch (a hole a downloader is
     /// still to repair, garbage between blocks).
