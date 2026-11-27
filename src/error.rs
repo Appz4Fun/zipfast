@@ -142,6 +142,10 @@ pub enum RarIntegrityReason {
         actual: u64,
     },
     DeclaredHashUnavailable,
+    /// An encrypted RAR 5.0 redirection (a link member) whose encryption record keeps no usable password check
+    /// value. A link has no data to check a password against, so without the check value the password can't be
+    /// verified for it, and the link is refused rather than placed on a possibly wrong password.
+    UnverifiableLinkPassword,
     InvalidDictionary {
         requested: u64,
     },

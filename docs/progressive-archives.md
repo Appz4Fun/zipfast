@@ -358,7 +358,9 @@ checks are not authenticated encryption.
 
 Limits retain the documented finite defaults in `ProgressiveLimits`, including
 1 MiB read/packed-work chunks, 16 retained artifacts, 128 MiB metadata, 256 MiB
-decoder windows and 64 GiB source/output/verification budgets. Test and passive
+decoder windows and 1 TiB (`DEFAULT_BYTE_TOTAL`) source/output/temp/write/verification budgets, sized
+above real sets such as 70-100 GB UHD remux posts: hostile archives are stopped by declared sizes, the decoder
+window and per-poll work, not by byte totals. Test and passive
 solid decoding charge decoded bytes to cumulative `LogicalOutputBytes`, but do
 not charge nonexistent temporary extent, output writes or physical verification
 reads. Extracted stages continue to charge logical extent and temporary bytes
@@ -366,7 +368,7 @@ together. Test permits zero output/artifact/temp/write capacities. Optional
 artifact reads still charge `VerifyBytes`; reporting a Hole does not. Verification
 charges attempted stage/replacement read spans, including failed attempts and
 provider retries. In-memory hashing is not a physical read. `VerifyWorkBytes`
-(default 64 GiB) separately bounds byte-span processing passes, not exact CPU
+(default 1 TiB) separately bounds byte-span processing passes, not exact CPU
 instructions or time. Combined fixed hash/decrypt/compare work may charge a span
 once; distinct rescans/replays charge again. SourceBytes counts source spans
 (including reported holes), SourceRequests counts callbacks, and these counters
