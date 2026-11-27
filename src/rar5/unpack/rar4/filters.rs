@@ -69,6 +69,13 @@ impl Block {
     pub(super) fn end(&self) -> u64 {
         self.start + self.len as u64
     }
+    /// Under test: a block of a standard filter with no register set, as a record would define it.
+    #[cfg(test)]
+    pub(super) fn standard(kind: Kind, start: u64, len: usize) -> Self {
+        let mut regs = [0; 7];
+        regs[4] = len as u32;
+        Self { kind, start, len, regs }
+    }
 }
 
 /// The filters a stream has defined, which a solid stream keeps from member to member, and the blocks waiting.
