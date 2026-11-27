@@ -33,6 +33,11 @@ pub struct MemberKey {
     pub(super) identity: [u8; 32],
 }
 impl MemberKey {
+    /// The ordinal of a member bound by its header's position rather than its place in the set: a persistent session
+    /// that honours [`crate::extract::Options::damaged_input`] binds so a member whose first header was read past as
+    /// damage, and every member after damage in the session, because damage can hide or invent members and so move
+    /// the ordinals of those after it (see `docs/persistent-partials.md`).
+    pub const POSITIONAL: u64 = u64::MAX;
     pub fn new(binding: ArchiveBinding, ordinal: u64, identity: [u8; 32]) -> Self {
         Self { binding, ordinal, identity }
     }
@@ -331,6 +336,9 @@ pub(crate) struct HeaderWitness {
     pub volume: u32,
     pub packed: Range<u64>,
     pub bytes: Vec<u8>,
+    /// The header failed its checksum and was read as it stands
+    /// ([`crate::extract::DamagedInput::Salvage`] or `Resync`): it is parsed again the same way.
+    pub salvaged: bool,
 }
 #[derive(Clone)]
 pub(crate) struct InitialEvidence {

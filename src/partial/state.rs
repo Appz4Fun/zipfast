@@ -34,6 +34,11 @@ const FORMAT_RAR4: u8 = 4;
 /// Header witness page tag of a direct member (created from a member map): no witnesses follow the count, and the
 /// tag is followed by the [`DirectFacts`]. Its validity ledger lists only known leaves; unknown output is implicit.
 const FORMAT_DIRECT: u8 = 0xD1;
+/// Header witness page section listing the witnesses read past as damage ([`HeaderWitness::salvaged`]), version 1:
+/// the tag, the version, a count and the ascending witness indices. Written only when some witness is salvaged, and
+/// before the format tag, so every other state stays byte-identical and a build that predates it refuses such a
+/// state with `StateVersion` (an unknown tag) instead of reading a damaged witness strictly.
+const SALVAGED_WITNESSES: u8 = 0x5A;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageKind {
     Geometry = 1,
@@ -722,6 +727,16 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         headers.range(&h.packed)?;
         headers.blob(&h.bytes)?;
     }
+    let salvaged = snapshot.evidence.headers.iter().filter(|h| h.salvaged).count();
+    if salvaged > 0 {
+        headers.reserve(6 + 4 * salvaged)?;
+        headers.u8(SALVAGED_WITNESSES)?;
+        headers.u8(1)?;
+        headers.u32(salvaged.try_into().map_err(|_| malformed())?)?;
+        for (index, _) in snapshot.evidence.headers.iter().enumerate().filter(|(_, h)| h.salvaged) {
+            headers.u32(index.try_into().map_err(|_| malformed())?)?;
+        }
+    }
     // Trailing format tag, written only for RAR4 members so that RAR5 states stay byte-identical and readable by
     // builds that predate RAR4 support. States without it are RAR5.
     if let Some(direct) = &snapshot.evidence.direct {
@@ -906,7 +921,26 @@ pub(super) fn decode_pages(
         if packed.end - packed.start != bytes.len() as u64 {
             return Err(malformed());
         }
-        headers.push(HeaderWitness { volume, packed, bytes });
+        headers.push(HeaderWitness { volume, packed, bytes, salvaged: false });
+    }
+    if d.bytes.get(d.at) == Some(&SALVAGED_WITNESSES) {
+        d.u8()?;
+        if d.u8()? != 1 {
+            return Err(err(PartialErrorKind::StateVersion));
+        }
+        let count = d.count(headers.len(), 4)?;
+        if count == 0 {
+            return Err(malformed());
+        }
+        let mut next = 0;
+        for _ in 0..count {
+            let index = d.u32()? as usize;
+            if index < next || index >= headers.len() {
+                return Err(malformed());
+            }
+            headers[index].salvaged = true;
+            next = index + 1;
+        }
     }
     let mut format = crate::rar5::RarFormat::Rar5;
     let mut direct = None;
@@ -1067,10 +1101,6 @@ pub(super) fn validate_evidence(
     evidence: &InitialEvidence,
     budget: &PartialBudget,
 ) -> PartialResult<Option<crate::crypto::Rar5CryptParams>> {
-    use crate::rar5::{
-        framing::{HeaderParser, ParserStep},
-        reader::Block,
-    };
     if evidence.direct.is_some() {
         // One synthetic part over the whole output, no packed bytes behind it, no part checks (the member checks
         // are in the head), and nothing parsed from an archive.
@@ -1120,25 +1150,7 @@ pub(super) fn validate_evidence(
         if witness.packed.end.checked_sub(witness.packed.start) != Some(witness.bytes.len() as u64) {
             return Err(malformed());
         }
-        let mut parser =
-            HeaderParser::progressive(PathBuf::from(&admission.expected), witness.packed.start, budget.usage.clone());
-        if evidence.format == crate::rar5::RarFormat::Rar4 {
-            parser.set_format(crate::rar5::RarFormat::Rar4);
-        }
-        let mut step = parser.advance(&[])?.1;
-        let frame = loop {
-            match step {
-                ParserStep::Need { offset, len } => {
-                    let at = offset.checked_sub(witness.packed.start).ok_or_else(malformed)? as usize;
-                    let bytes =
-                        witness.bytes.get(at..at.checked_add(len).ok_or_else(malformed)?).ok_or_else(malformed)?;
-                    step = parser.advance(bytes)?.1;
-                }
-                ParserStep::Frame(frame) => break frame,
-                _ => return Err(malformed()),
-            }
-        };
-        let Block::File(header) = frame.block else { return Err(malformed()) };
+        let header = witness_header(witness, evidence.format, &admission.expected, budget)?;
         if index == 0 {
             let actual = crate::extract::Meta::from(&header);
             if actual.mtime != evidence.metadata.mtime
@@ -1208,6 +1220,65 @@ pub(super) fn validate_evidence(
 /// count, salt and password check. The parts are one CBC stream, so only the first part's IV is used (a later part
 /// restating another is accepted, as member maps accept it), and the tweaked-checksum flag may appear on the final
 /// part only (rar 7.00 writes it there), so neither is compared.
+/// Parses a header witness again: strictly, or as it stands when it was read past as damage
+/// ([`HeaderWitness::salvaged`]), as the session read it. Only a file header is a witness.
+pub(super) fn witness_header(
+    witness: &HeaderWitness,
+    format: crate::rar5::RarFormat,
+    expected: &std::ffi::OsStr,
+    budget: &PartialBudget,
+) -> PartialResult<crate::rar5::FileHeader> {
+    use crate::rar5::{
+        framing::{HeaderParser, ParserStep},
+        reader::Block,
+    };
+    let mut parser = HeaderParser::progressive(PathBuf::from(expected), witness.packed.start, budget.usage.clone());
+    if format == crate::rar5::RarFormat::Rar4 {
+        parser.set_format(crate::rar5::RarFormat::Rar4);
+    }
+    if witness.salvaged {
+        parser.set_salvage(crate::extract::DamagedInput::Salvage);
+    }
+    let mut step = parser.advance(&[])?.1;
+    let frame = loop {
+        match step {
+            ParserStep::Need { offset, len } => {
+                let at = offset.checked_sub(witness.packed.start).ok_or_else(malformed)? as usize;
+                let bytes = witness.bytes.get(at..at.checked_add(len).ok_or_else(malformed)?).ok_or_else(malformed)?;
+                step = parser.advance(bytes)?.1;
+            }
+            ParserStep::Frame(frame) => break frame,
+            _ => return Err(malformed()),
+        }
+    };
+    let Block::File(header) = frame.block else { return Err(malformed()) };
+    Ok(header)
+}
+/// Whether two readings of the header at one archive position describe the same member as far as its output is
+/// concerned: name, sizes, where its data starts, method, checks, splitting, encryption and the host system (which
+/// decides how the name is made a path). Times and attributes are left out: they change no output byte. Used when one
+/// of the readings was damaged, to rebind a member to its header once the header is repaired.
+pub(crate) fn same_member_header(a: &crate::rar5::FileHeader, b: &crate::rar5::FileHeader) -> bool {
+    let legacy = |h: &crate::rar5::FileHeader| h.rar4.map(|raw| (raw.unpack_version, raw.salt, raw.method));
+    a.format == b.format
+        && a.name == b.name
+        && a.packed_size == b.packed_size
+        && a.data_at == b.data_at
+        && a.unpacked_size == b.unpacked_size
+        && a.size_unknown() == b.size_unknown()
+        && a.crc32 == b.crc32
+        && a.blake2sp == b.blake2sp
+        && a.method == b.method
+        && a.is_dir() == b.is_dir()
+        && a.redirection.is_none()
+        && b.redirection.is_none()
+        && a.split_before() == b.split_before()
+        && a.split_after() == b.split_after()
+        && a.encrypted == b.encrypted
+        && a.crypt == b.crypt
+        && legacy(a) == legacy(b)
+        && a.is_unix() == b.is_unix()
+}
 pub(crate) fn same_member_crypt(
     part: Option<&crate::crypto::Rar5CryptParams>,
     first: Option<&crate::crypto::Rar5CryptParams>,

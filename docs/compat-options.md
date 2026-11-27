@@ -307,9 +307,10 @@ Where it applies:
   header (so just before the `MemberStarted` of a member whose header failed its checksum). See "Damaged headers in a
   progressive session" below.
 
-Persistent-partial sessions (`ProgressiveSession::new_partial`) still refuse a damaged header whatever `damaged_input`
-says: their journal binds each member to the header bytes it was read from, and a header repaired later would no longer
-match. Listings that take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
+Persistent-partial sessions (`ProgressiveSession::new_partial`) honour it too, with the same events and hole rules; a
+member read from a damaged header, or after one, is bound to its header's position so that a restart over the same
+bytes, or over a header repaired since, finds it again (`docs/persistent-partials.md`, "Damaged headers"). Listings
+that take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
 `--resync` (for `l`, `t`, `x`, `e`; a listing of anything but RAR stays as it is), prints each damaged header and a warning, and exits 1.
 `tests/rar_salvage.rs` checks each point.
 
