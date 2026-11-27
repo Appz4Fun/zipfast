@@ -226,8 +226,13 @@ impl<'a> Extraction<'a> {
         if let Some(kind) = link {
             // an encrypted link is placed only on a password its check value verifies, once the overwrite decision
             // lets it be placed (a skipped one stays skipped) and before anything is touched
-            let evidence =
-                super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?;
+            // (a RAR 5.0 redirection only: a RAR 4.x symbolic link's target is its encrypted data, checked as it decrypts)
+            let evidence = match kind {
+                Some(_) => {
+                    super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?
+                }
+                None => crate::error::RarPasswordEvidence::NotEncrypted,
+            };
             let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
             return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind, evidence);
         }

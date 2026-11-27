@@ -445,3 +445,25 @@ fn an_unverifiable_link_over_an_existing_target_is_skipped_on_every_route() {
         assert_eq!(fs::read(dest.join("plain")).unwrap(), b"plain", "{route}");
     }
 }
+
+/// Codex on #307: the password gate is for RAR 5.0 redirections only. A RAR 4.x symbolic link stores its target as
+/// encrypted data, verified as it decrypts, so RarSession still places one under the right password. The fixture is
+/// `rar4-rar300/per_file_rar300_password.rar` with its file header turned into a Unix symlink (host OS 3, attributes
+/// `0o120777`, header CRC fixed).
+#[test]
+fn an_encrypted_rar4_symlink_is_placed_on_the_right_password_by_a_rar_session() {
+    use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4/enc_symlink_rar4.rar");
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let mut session = RarSession::open(&path, Some("password"), RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let mut outcomes = Vec::new();
+    session
+        .extract_selected(&all, &options(&dest, Mode::Extract), RarDecodeLimits::default(), |e| {
+            outcomes.push(classify(&e.outcome))
+        })
+        .unwrap();
+    assert_eq!(outcomes, ["ok"], "{outcomes:?}");
+    assert!(fs::symlink_metadata(dest.join("hello.txt")).unwrap().file_type().is_symlink());
+}
