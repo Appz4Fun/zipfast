@@ -253,6 +253,7 @@ impl DirectPartials {
                 }],
                 admissions: Vec::new(),
                 headers: Vec::new(),
+                cut: Vec::new(),
                 direct: Some(facts),
             },
         };

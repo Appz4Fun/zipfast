@@ -39,6 +39,12 @@ const FORMAT_DIRECT: u8 = 0xD1;
 /// before the format tag, so every other state stays byte-identical and a build that predates it refuses such a
 /// state with `StateVersion` (an unknown tag) instead of reading a damaged witness strictly.
 const SALVAGED_WITNESSES: u8 = 0x5A;
+/// Header witness page section listing the parts recorded cut short ([`InitialEvidence::cut`]: their volume's final
+/// length ends inside their data), version 1: the tag, the version, a count and the ascending part ordinals. Written
+/// only when some part is cut, after the salvaged section and before the format tag, so every other state stays
+/// byte-identical and a build that predates it refuses such a state with `StateVersion` (an unknown tag) instead of
+/// reading it as malformed.
+const CUT_PARTS: u8 = 0xC7;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageKind {
     Geometry = 1,
@@ -737,6 +743,15 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             headers.u32(index.try_into().map_err(|_| malformed())?)?;
         }
     }
+    if !snapshot.evidence.cut.is_empty() {
+        headers.reserve(6 + 8 * snapshot.evidence.cut.len())?;
+        headers.u8(CUT_PARTS)?;
+        headers.u8(1)?;
+        headers.u32(snapshot.evidence.cut.len().try_into().map_err(|_| malformed())?)?;
+        for ordinal in &snapshot.evidence.cut {
+            headers.u64(*ordinal)?;
+        }
+    }
     // Trailing format tag, written only for RAR4 members so that RAR5 states stay byte-identical and readable by
     // builds that predate RAR4 support. States without it are RAR5.
     if let Some(direct) = &snapshot.evidence.direct {
@@ -942,6 +957,26 @@ pub(super) fn decode_pages(
             next = index + 1;
         }
     }
+    let mut cut = Vec::new();
+    if d.bytes.get(d.at) == Some(&CUT_PARTS) {
+        d.u8()?;
+        if d.u8()? != 1 {
+            return Err(err(PartialErrorKind::StateVersion));
+        }
+        // Each listed ordinal names a distinct part (checked against the parts by `validate_evidence`).
+        let count = d.count(parts.len(), 8)?;
+        if count == 0 {
+            return Err(malformed());
+        }
+        cut = budget.vector(count)?;
+        for _ in 0..count {
+            let ordinal = d.u64()?;
+            if cut.last().is_some_and(|&last| last >= ordinal) {
+                return Err(malformed());
+            }
+            cut.push(ordinal);
+        }
+    }
     let mut format = crate::rar5::RarFormat::Rar5;
     let mut direct = None;
     if d.at < d.bytes.len() {
@@ -1079,7 +1114,7 @@ pub(super) fn decode_pages(
         }
     }
     d.end()?;
-    let evidence = InitialEvidence { format, metadata: head.metadata, parts, admissions, headers, direct };
+    let evidence = InitialEvidence { format, metadata: head.metadata, parts, admissions, headers, cut, direct };
     if has_cursor && evidence.direct.is_none() {
         return Err(malformed());
     }
@@ -1114,6 +1149,7 @@ pub(super) fn validate_evidence(
         };
         if evidence.parts != [whole]
             || !evidence.headers.is_empty()
+            || !evidence.cut.is_empty()
             || !evidence.admissions.is_empty()
             || evidence.format != crate::rar5::RarFormat::Rar5
             || name.is_empty()
@@ -1126,6 +1162,12 @@ pub(super) fn validate_evidence(
         return Err(malformed());
     }
     budget.usage.check(crate::progressive::Resource::Parts, evidence.parts.len() as u64)?;
+    // Cut parts are listed once each, ascending, and each names a recorded part.
+    if evidence.cut.windows(2).any(|w| w[0] >= w[1])
+        || evidence.cut.last().is_some_and(|&last| last >= evidence.parts.len() as u64)
+    {
+        return Err(malformed());
+    }
     let mut end = 0;
     let mut stream = 0u64;
     let mut crypt = None;
@@ -1137,9 +1179,15 @@ pub(super) fn validate_evidence(
         }
         end = part.out.end;
         let admission = evidence.admissions.iter().find(|a| a.volume == part.packed.volume).ok_or_else(malformed)?;
-        if admission.info.extent > admission.info.length.value()
-            || part.packed.range.end > admission.info.length.value()
-        {
+        // A part lies within its volume, except a part recorded cut short: its volume's final length ends inside
+        // its data (after its header, which the witness below must still match).
+        let within = if evidence.cut.contains(&part.ordinal) {
+            matches!(admission.info.length, SourceLength::Final(n)
+                if part.packed.range.start <= n && n < part.packed.range.end)
+        } else {
+            part.packed.range.end <= admission.info.length.value()
+        };
+        if admission.info.extent > admission.info.length.value() || !within {
             return Err(malformed());
         }
         let witness = evidence

@@ -348,6 +348,12 @@ pub(crate) struct InitialEvidence {
     pub parts: Vec<PlainPart>,
     pub admissions: Vec<SourceAdmission>,
     pub headers: Vec<HeaderWitness>,
+    /// Ordinals (ascending) of the parts whose volume was admitted with a final length ending inside the part's
+    /// data: a set truncated inside the member's first part, which a session reporting cut-off members still
+    /// creates ([`crate::extract::Options::keep_broken`] with [`crate::extract::UnverifiedOutput::Emit`]). Such a part
+    /// keeps the geometry its header gives, and only its bytes before that length can have been extracted. It is the
+    /// observation made when the part was recorded: a repaired volume later supplies the rest, and the mark stays.
+    pub cut: Vec<u64>,
     /// Set for a member created from a member map ([`super::DirectPartials`]): its output is plaintext written at
     /// output offsets, with no packed mapping, header witnesses or source admissions; `parts` is one synthetic part
     /// covering the whole output.

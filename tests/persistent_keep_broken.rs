@@ -250,9 +250,19 @@ struct Report {
 }
 
 /// Runs a persistent session over `volumes` (a `None` volume is missing) to its end.
-fn run(job: &Job, volumes: &[(&str, Option<Vec<u8>>)], (keep_broken, unverified): (bool, UnverifiedOutput)) -> Report {
+fn run(job: &Job, volumes: &[(&str, Option<Vec<u8>>)], setting: (bool, UnverifiedOutput)) -> Report {
+    run_with(job, volumes, setting, None)
+}
+/// [`run`] with the password of an encrypted set.
+fn run_with(
+    job: &Job,
+    volumes: &[(&str, Option<Vec<u8>>)],
+    (keep_broken, unverified): (bool, UnverifiedOutput),
+    password: Option<&str>,
+) -> Report {
     let mut options =
         ProgressiveOptions::new(extract_options(&job.out, keep_broken, unverified), OsString::from(volumes[0].0));
+    options.set_password(password.map(str::to_string)).unwrap();
     options.hole_policy = HolePolicy::PartialStored { fill: HoleFill::Sparse };
     let provider = Provider {
         names: volumes.iter().map(|(name, _)| OsString::from(*name)).collect(),
@@ -329,6 +339,15 @@ fn run(job: &Job, volumes: &[(&str, Option<Vec<u8>>)], (keep_broken, unverified)
     report
 }
 
+fn mtime(job: &Job, name: &str) -> std::time::SystemTime {
+    fs::metadata(job.out.join(name)).unwrap().modified().unwrap()
+}
+fn mode(job: &Job, name: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(job.out.join(name)).unwrap().permissions().mode() & 0o7777
+}
+const ARCHIVE_TIME: Duration = Duration::from_secs(1_700_000_000);
+
 fn bad_crc(label: &str) -> bool {
     label.starts_with("Bad") && label.contains("Crc32")
 }
@@ -366,10 +385,13 @@ fn a_member_failing_its_checksum_is_kept_and_the_session_goes_on() {
             assert_eq!(job.read("a.bin"), damaged, "{format}: every byte written is kept");
             assert_eq!(job.read("b.bin"), b);
             assert!(!kept.after_failure);
-            // Unverified output gets no archive metadata (mtime 1_700_000_000 for RAR 5.0).
-            let mtime = fs::metadata(job.out.join("a.bin")).unwrap().modified().unwrap();
-            let archive_time = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-            assert_ne!(mtime, archive_time, "{format}: metadata applied to a Bad member");
+            // The kept member gets the archive's metadata, as the whole-archive runners give a kept broken file: the
+            // same modified time as b.bin (verified Ok), mode 0644 from the RAR 5.0 header.
+            assert_eq!(mtime(&job, "a.bin"), mtime(&job, "b.bin"), "{format}: metadata of a kept Bad member");
+            if format == "rar5" {
+                assert_eq!(mtime(&job, "a.bin"), std::time::UNIX_EPOCH + ARCHIVE_TIME);
+                assert_eq!(mode(&job, "a.bin"), 0o644);
+            }
 
             // A restart adopts both members finished and reports them as they stand, reading nothing again; with
             // or without the option, since the member's finish is committed.
@@ -475,8 +497,11 @@ fn a_member_cut_short_by_a_truncated_set_is_reported_unverified() {
         for setting in [OFF, KEEP] {
             let job = Job::new();
             let report = run(&job, &cut, setting);
-            assert!(report.failure.is_some(), "{case}: {report:?}");
+            // `Truncated` under every setting (until #330's follow-up a part cut in its data was
+            // `Partial(StateMalformed)` by default)
+            assert_eq!(report.failure.as_deref(), Some("Truncated"), "{case}: {report:?}");
             assert!(report.outcomes.is_empty(), "{case}: {report:?}");
+            assert_eq!(&job.read("a.bin")[..known as usize], &a[..known as usize], "{case}");
         }
         let job = Job::new();
         let report = run(&job, &cut, EMIT);
@@ -486,6 +511,8 @@ fn a_member_cut_short_by_a_truncated_set_is_reported_unverified() {
         assert_eq!(report.missing["a.bin"], vec![known..a.len() as u64], "{case}");
         assert_eq!(&job.read("a.bin")[..known as usize], &a[..known as usize], "{case}");
         assert!(!report.after_failure);
+        // kept with the archive's metadata, as the whole-archive runners keep a cut-off file
+        assert_eq!(mtime(&job, "a.bin"), std::time::UNIX_EPOCH + ARCHIVE_TIME, "{case}");
 
         let repaired = run(&job, &whole, EMIT);
         assert_eq!(repaired.failure, None, "{case}: {repaired:?}");
@@ -495,23 +522,222 @@ fn a_member_cut_short_by_a_truncated_set_is_reported_unverified() {
     }
 }
 
-/// A volume whose final length ends inside the first part of a member: the member can't be created, under every
-/// setting, so nothing is written and nothing is reported (the earlier members stand as they finished).
+/// A volume whose final length ends inside the first part of a member. By default (and with `keep_broken` alone)
+/// the session ends `Truncated` before creating the member, so nothing is written for it (until #330's follow-up
+/// this was `Partial(StateMalformed)`). With `keep_broken` and `Emit` the member is created with its part recorded
+/// cut short, the bytes the volume has are extracted, and it is reported `PersistentUnverified` before the
+/// `Truncated` failure, the rest listed missing. A restart with the volume still cut adopts it and reports the
+/// same; one with the whole volume finishes it `Ok`. RAR 5.0 and RAR 4.x.
 #[test]
-fn a_member_whose_first_part_is_cut_is_not_created() {
+fn a_member_whose_first_part_is_cut_is_reported_unverified() {
     let a = data(2000, 2);
     let b = data(5000, 6);
-    let archive = common::archive(&[FileSpec::new("a.bin", &a), FileSpec::new("b.bin", &b)]);
-    let at = archive.windows(64).position(|w| w == &b[..64]).unwrap();
-    let volumes = [("a.rar", Some(archive[..at + 1000].to_vec()))];
-    for setting in [OFF, KEEP, EMIT] {
+    for format in ["rar5", "rar4"] {
+        let archive = if format == "rar5" {
+            common::archive(&[FileSpec::new("a.bin", &a), FileSpec::new("b.bin", &b)])
+        } else {
+            rar4(&[("a.bin", &a), ("b.bin", &b)])
+        };
+        let at = archive.windows(64).position(|w| w == &b[..64]).unwrap();
+        let whole = [("a.rar", Some(archive.clone()))];
+        let cut = [("a.rar", Some(archive[..at + 1000].to_vec()))];
+        for setting in [OFF, KEEP] {
+            let job = Job::new();
+            let report = run(&job, &cut, setting);
+            assert_eq!(report.failure.as_deref(), Some("Truncated"), "{format}: {report:?}");
+            assert_eq!(report.outcomes.len(), 1, "{format}: {report:?}");
+            assert_eq!(report.outcomes["a.bin"], "Ok");
+            assert!(!job.out.join("b.bin").exists(), "{format}");
+            assert!(!report.after_failure);
+        }
+
         let job = Job::new();
-        let report = run(&job, &volumes, setting);
-        assert!(report.failure.is_some(), "{report:?}");
-        assert_eq!(report.outcomes.len(), 1, "{report:?}");
-        assert_eq!(report.outcomes["a.bin"], "Ok");
-        assert!(!job.out.join("b.bin").exists());
+        let report = run(&job, &cut, EMIT);
+        assert_eq!(report.failure.as_deref(), Some("Truncated"), "{format}: {report:?}");
+        assert_eq!(report.outcomes["a.bin"], "Ok", "{format}: {report:?}");
+        assert_eq!(report.outcomes["b.bin"], "unverified", "{format}: {report:?}");
+        assert_eq!(report.missing["b.bin"], vec![1000..b.len() as u64], "{format}");
+        assert_eq!(report.events.last().unwrap(), "finished b.bin unverified", "{format}");
+        assert!(!report.after_failure, "{format}: the failure ends the session");
+        let kept = job.read("b.bin");
+        assert_eq!(kept.len(), b.len(), "{format}");
+        assert_eq!(&kept[..1000], &b[..1000], "{format}");
+        assert_eq!(mtime(&job, "b.bin"), mtime(&job, "a.bin"), "{format}: kept with the archive's metadata");
+
+        // The state written for it reopens on its own, the cut part included.
+        let held = load_held(&job.state, &job.out, &HeldOptions::default()).unwrap();
+        assert!(held.skipped.is_empty(), "{format}: {:?}", held.skipped);
+        let b_held = held.held.iter().find(|h| h.name.as_ref() == b"b.bin").unwrap();
+        assert_eq!(b_held.good, vec![0..1000], "{format}");
+        assert!(!b_held.finished, "{format}");
+
+        // Restart, the volume still cut: adopted unfinished, resumed, cut off again (under every setting it ends
+        // `Truncated`; only the opt-in reports it).
+        for (setting, reported) in [(OFF, false), (EMIT, true)] {
+            let again = run(&job, &cut, setting);
+            assert_eq!(again.failure.as_deref(), Some("Truncated"), "{format}: {again:?}");
+            assert_eq!(again.adopted, [("a.bin".to_string(), true), ("b.bin".to_string(), false)], "{format}");
+            assert_eq!(again.missing.contains_key("b.bin"), reported, "{format}: {again:?}");
+            if reported {
+                assert_eq!(again.missing["b.bin"], vec![1000..b.len() as u64], "{format}");
+            }
+        }
+
+        // Restart with the whole volume (a repair, a late download): the member resumes and verifies.
+        let repaired = run(&job, &whole, EMIT);
+        assert_eq!(repaired.failure, None, "{format}: {repaired:?}");
+        assert_eq!(repaired.adopted, [("a.bin".to_string(), true), ("b.bin".to_string(), false)], "{format}");
+        assert_eq!(repaired.outcomes["b.bin"], "Ok", "{format}");
+        assert_eq!(job.read("b.bin"), b, "{format}");
+        // and a later session adopts it finished
+        let later = run(&job, &whole, OFF);
+        assert_eq!(later.failure, None, "{format}: {later:?}");
+        assert_eq!(later.outcomes["b.bin"], "Ok", "{format}");
     }
+}
+
+/// The first part of a member split over three volumes, cut inside the first volume: reported unverified with the
+/// rest of the member missing; with the set repaired, the restart continues into the later volumes and verifies.
+#[test]
+fn a_split_member_cut_in_its_first_volume_resumes_into_the_later_ones() {
+    let chunk = 4000;
+    let a = data(3 * chunk - 500, 11);
+    let whole = split_set(&a, chunk);
+    let mut cut = whole.clone();
+    let first = cut[0].1.as_mut().unwrap();
+    let at = first.windows(64).position(|w| w == &a[..64]).unwrap();
+    first.truncate(at + 1500);
+    // only the first volume is offered: the cut ends the walk there
+    let cut = &cut[..1];
+
+    let job = Job::new();
+    let off = run(&job, cut, OFF);
+    assert_eq!(off.failure.as_deref(), Some("Truncated"), "{off:?}");
+    assert!(!job.out.join("a.bin").exists());
+
+    let report = run(&job, cut, EMIT);
+    assert_eq!(report.failure.as_deref(), Some("Truncated"), "{report:?}");
+    assert_eq!(report.outcomes["a.bin"], "unverified");
+    assert_eq!(report.missing["a.bin"], vec![1500..a.len() as u64]);
+    assert_eq!(&job.read("a.bin")[..1500], &a[..1500]);
+
+    let repaired = run(&job, &whole, OFF);
+    assert_eq!(repaired.failure, None, "{repaired:?}");
+    assert_eq!(repaired.adopted, [("a.bin".to_string(), false)]);
+    assert_eq!(repaired.outcomes["a.bin"], "Ok");
+    assert_eq!(repaired.outcomes["b.bin"], "Ok");
+    assert_eq!(job.read("a.bin"), a);
+}
+
+/// An encrypted (AES-256) member whose first part is cut: what the volume holds is decrypted up to the last whole
+/// cipher block, reported unverified, resumed on that block boundary after a restart, and verified once the volume
+/// is whole.
+#[test]
+fn an_encrypted_member_whose_first_part_is_cut_resumes_on_a_block_boundary() {
+    const SALT: [u8; 16] = [3; 16];
+    const IV: [u8; 16] = [9; 16];
+    let plain = data(5000, 8);
+    let (key, hash_key) = zipfast::crypto::derive_rar5_key_and_hash_key("pw", 1, &SALT, None).unwrap();
+    let mut padded = plain.clone();
+    padded.resize(plain.len().div_ceil(16) * 16, 0);
+    let cipher = zipfast::crypto::encrypt_cbc(&key, &IV, &padded).unwrap();
+    let mut extra = vec![36, 1, 0, 2, 1];
+    extra.extend(SALT);
+    extra.extend(IV);
+    let mut spec = FileSpec::new("a.bin", &cipher);
+    spec.size = Some(plain.len() as u64);
+    spec.extra = extra;
+    let crc = zipfast::crypto::rar5_tweak_crc32(hash(&plain), &hash_key);
+    let mut archive = SIG.to_vec();
+    archive.extend(main_block(false, None));
+    archive.extend(file_block(&spec, &cipher, crc, false, false));
+    archive.extend(end_block(false));
+    let at = archive.windows(64).position(|w| w == &cipher[..64]).unwrap();
+    let whole = [("a.rar", Some(archive.clone()))];
+    let cut = [("a.rar", Some(archive[..at + 1000].to_vec()))];
+    let pw = Some("pw");
+
+    let job = Job::new();
+    let off = run_with(&job, &cut, OFF, pw);
+    assert_eq!(off.failure.as_deref(), Some("Truncated"), "{off:?}");
+    assert!(!job.out.join("a.bin").exists());
+
+    let report = run_with(&job, &cut, EMIT, pw);
+    assert_eq!(report.failure.as_deref(), Some("Truncated"), "{report:?}");
+    assert_eq!(report.outcomes["a.bin"], "unverified", "{report:?}");
+    let known = report.missing["a.bin"][0].start;
+    assert_eq!(report.missing["a.bin"], vec![known..plain.len() as u64]);
+    assert!(known.is_multiple_of(16) && known <= 1000 && known + 32 >= 1000, "decrypted to a block boundary: {known}");
+    assert_eq!(&job.read("a.bin")[..known as usize], &plain[..known as usize]);
+
+    let again = run_with(&job, &cut, EMIT, pw);
+    assert_eq!(again.adopted, [("a.bin".to_string(), false)], "{again:?}");
+    assert_eq!(again.failure.as_deref(), Some("Truncated"), "{again:?}");
+    assert_eq!(again.missing["a.bin"], vec![known..plain.len() as u64]);
+
+    let repaired = run_with(&job, &whole, OFF, pw);
+    assert_eq!(repaired.failure, None, "{repaired:?}");
+    assert_eq!(repaired.adopted, [("a.bin".to_string(), false)]);
+    assert_eq!(repaired.outcomes["a.bin"], "Ok");
+    assert_eq!(job.read("a.bin"), plain);
+}
+
+/// `keep_broken` sets the archive's permissions on a kept member with the owner's read and write kept, so the
+/// output stays resumable and repairable; once it verifies `Ok` the archive's mode is applied exactly.
+#[test]
+fn a_kept_member_stays_writable_by_its_owner() {
+    let a = data(3000, 4);
+    let mut spec = FileSpec::new("a.bin", &a);
+    spec.unix_mode = Some(0o444);
+    let mut archive = common::archive(&[spec]);
+    let clean = archive.clone();
+    hit(&mut archive, &a, 100);
+    let job = Job::new();
+    let kept = run(&job, &[("a.rar", Some(archive.clone()))], KEEP);
+    assert!(bad_crc(&kept.outcomes["a.bin"]), "{kept:?}");
+    assert_eq!(mode(&job, "a.bin"), 0o644, "0444 with the owner's read and write");
+    assert_eq!(mtime(&job, "a.bin"), std::time::UNIX_EPOCH + ARCHIVE_TIME);
+
+    // A reopen reads (and could write) it: the handle opens and verification judges it `Bad` again. Kept with the
+    // archive's 0444, it could not be opened for writing.
+    let anchor = job.anchors.0.lock().unwrap().first().cloned().unwrap();
+    let key = anchor.member().clone();
+    let state = PartialState::load(&job.state, &anchor, &PartialLimits::default()).unwrap();
+    let mut file = PartialFile::open(
+        state,
+        PartialOpenContext {
+            output_root: job.out.clone(),
+            state_root: job.state.clone(),
+            expected_member: key,
+            expected_anchor: anchor,
+            protection: ProtectionDeclaration::Complete {
+                epoch: 1,
+                inventory: ProtectionInventory {
+                    volumes: vec![ProtectedVolume { index: 0, name: "a.rar".into(), backing: VolumeBacking::NonFile }],
+                    auxiliary_paths: Vec::new(),
+                },
+            },
+            limits: PartialLimits::default(),
+            progressive_limits: ProgressiveLimits::default(),
+            anchors: job.anchors.clone(),
+            control: SessionControl::default(),
+            password: None,
+        },
+    )
+    .unwrap();
+    let verdict = loop {
+        if let Poll::Ready(verdict) = file.poll_verify(&mut Context::from_waker(Waker::noop())) {
+            break verdict.unwrap();
+        }
+    };
+    assert!(matches!(verdict, Verdict::Bad { .. }), "{verdict:?}");
+    drop(file);
+
+    // Without keep_broken nothing is kept, and a clean member verifying Ok gets the archive's mode exactly.
+    let job = Job::new();
+    let ok = run(&job, &[("a.rar", Some(clean))], OFF);
+    assert_eq!(ok.outcomes["a.bin"], "Ok", "{ok:?}");
+    assert_eq!(mode(&job, "a.bin"), 0o444);
 }
 
 /// A set cut between two members ends with the same failure under every setting, and nothing is reported

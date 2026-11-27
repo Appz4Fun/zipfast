@@ -705,6 +705,14 @@ impl ProgressiveSession {
                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?,
             expected: self.expected.clone(),
         };
+        // A volume whose final length ends inside the first part's data is a set cut short inside this member. By
+        // default the session ends with `Truncated` before creating anything; a session reporting cut-off members
+        // creates the member with the part marked cut (`InitialEvidence::cut`), extracts the bytes the volume has,
+        // and reports it `PersistentUnverified` when the read reaches the cut (`partial_cut_off`).
+        let cut = cut_short(&admission, &plain);
+        if cut && !reports_cut_off(&self.options.extract) {
+            return Err(ProgressiveFailure::new(FailureKind::Truncated));
+        }
         let mut spec = CreateSpec {
             member: key.clone(),
             name: Arc::from(header.name.as_bytes()),
@@ -719,6 +727,7 @@ impl ProgressiveSession {
                 parts: vec![plain],
                 admissions: vec![admission],
                 headers: vec![witness],
+                cut: if cut { vec![0] } else { Vec::new() },
                 direct: None,
             },
         };
@@ -1082,12 +1091,9 @@ impl ProgressiveSession {
                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?,
             expected: self.expected.clone(),
         };
-        // A part running past its volume's final length is a set cut short. The state can't record it (by default
-        // the session ends with `StateMalformed` here, as before); a session reporting cut-off members ends with
-        // `Truncated`, which reports this one (`partial_cut_off`).
-        if reports_cut_off(&self.options.extract)
-            && matches!(admission.info.length, crate::progressive::SourceLength::Final(n) if plain.packed.range.end > n)
-        {
+        // A part running past its volume's final length is a set cut short: the session ends with `Truncated`
+        // before recording the part (a session reporting cut-off members reports this one first, `partial_cut_off`).
+        if cut_short(&admission, &plain) {
             return Err(ProgressiveFailure::new(FailureKind::Truncated));
         }
         persistent
@@ -1268,6 +1274,8 @@ impl ProgressiveSession {
         let (key, core) = persistent.active();
         let file = PartialFile::from_core(core.clone());
         let (Ok(state), Ok(missing)) = (core.state(), file.remaining()) else { return Err(failure) };
+        // kept with the archive's metadata, as the whole-archive runners keep a cut-off file (best effort)
+        let _ = core.apply_kept_metadata();
         let outcome = MemberOutcome::PersistentUnverified {
             member: key.clone(),
             state,
@@ -1321,6 +1329,11 @@ impl ProgressiveSession {
         let adopted_finished = persistent.resume.as_ref().is_some_and(|resume| resume.finished);
         if !adopted_finished {
             core.compact().map_err(failure)?;
+            // Options::keep_broken: a member kept Bad gets the archive's metadata, as the whole-archive runners give
+            // a kept broken file (best effort; the owner keeps read and write, so it stays repairable).
+            if self.options.extract.keep_broken && matches!(verdict, Verdict::Bad { .. } | Verdict::PartBad { .. }) {
+                let _ = core.apply_kept_metadata();
+            }
         }
         let state = core.state().map_err(failure)?;
         let outcome = if matches!(verdict, Verdict::Incomplete { .. }) {
@@ -1403,6 +1416,10 @@ fn ancestor_identities(
 /// or a truncated set cuts off is reported `PersistentUnverified` before the session's failure.
 fn reports_cut_off(options: &crate::extract::Options) -> bool {
     options.keep_broken && options.unverified_output == crate::extract::UnverifiedOutput::Emit
+}
+/// Whether `part` runs past the final length its volume was admitted with: the set is cut short inside it.
+fn cut_short(admission: &SourceAdmission, part: &PlainPart) -> bool {
+    matches!(admission.info.length, crate::progressive::SourceLength::Final(n) if part.packed.range.end > n)
 }
 fn member_checks(member: &PhysicalMember) -> MemberChecks {
     let checks = member.final_checks;

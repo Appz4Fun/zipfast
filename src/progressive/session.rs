@@ -157,8 +157,9 @@ pub enum MemberOutcome {
     },
     /// Under [`crate::extract::Options::keep_broken`] with [`crate::extract::UnverifiedOutput::Emit`] only: a
     /// persistent session's member cut off by the failure that ends the session (a missing volume, a set truncated
-    /// inside the member). Its output keeps every byte extracted so far, unverified: no check judged it, and no
-    /// archive metadata was applied. `missing` lists the output ranges still unknown (holes and the part never
+    /// inside the member, its first part included). Its output keeps every byte extracted so far, unverified: no
+    /// check judged it. It has the archive's modified time and permissions, as a kept broken file has, except that
+    /// the owner keeps read and write so it stays resumable (best effort). `missing` lists the output ranges still unknown (holes and the part never
     /// reached), as [`crate::partial::PartialFile::remaining`] does; `state` is the committed state. The session's
     /// failure follows as the next `poll_event` error. Nothing else is committed: a later session over the same
     /// roots and anchor store adopts the member and resumes it from its committed `produced`.
