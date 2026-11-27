@@ -1238,6 +1238,7 @@ impl ProgressiveSession {
         // An encrypted link whose password needs no checking by its cipher: let go (PlaceUnverified) or already
         // verified (VerifyFirst), with the evidence it reports
         let mut checked_link = None;
+        let mut link_rel = None;
         if let Some(redirection) = header.redirection.as_ref().filter(|_| refusal.is_none()) {
             let unsupported = || {
                 ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
@@ -1266,11 +1267,8 @@ impl ProgressiveSession {
                 Some(Err(_)) => return Err(ProgressiveFailure::new(FailureKind::UnsafePath)),
                 Some(Ok(_)) if !cfg!(unix) && extract.mode != crate::extract::Mode::Test => return Err(unsupported()),
                 Some(Ok(kind)) => {
-                    let rel = self.link_rel(&header)?;
-                    let extracted = self.output.as_ref().map_or(&self.tested, |output| &output.extracted);
-                    if crate::extract::link::refusal_before_place(&rel, &kind, extracted).is_some() {
-                        return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
-                    }
+                    // its target is checked once the disposition says it is placed or tested (below)
+                    link_rel = Some(self.link_rel(&header)?);
                     // An encrypted link is placed only on a password its check value verifies: the member's cipher
                     // refuses no password or a wrong one, and one with no usable check value is refused, as a link has
                     // no data to check a password against (`crate::extract::link::rar5_password`). The refusal waits
@@ -1350,6 +1348,18 @@ impl ProgressiveSession {
             }
             self.link_text.clear();
             self.disposition = Disposition::Link;
+        }
+        // A RAR 5.0 redirection placed or tested: a symbolic link's target must stay inside the destination, and a
+        // hard link or file copy must take a file this session published or tested. One that is skipped (an older
+        // revision, an existing target under Overwrite::Skip, as UnRAR's `-o-` skips it) places and touches nothing,
+        // so it is skipped without them.
+        if let (Some(rel), Some(kind)) = (&link_rel, &self.link_kind)
+            && matches!(self.disposition, Disposition::Link | Disposition::Test)
+        {
+            let extracted = self.output.as_ref().map_or(&self.tested, |output| &output.extracted);
+            if crate::extract::link::refusal_before_place(rel, kind, extracted).is_some() {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
         }
         if let Some(verifier) = unverified_link
             && matches!(self.disposition, Disposition::Link | Disposition::Test)
@@ -1575,6 +1585,14 @@ impl ProgressiveSession {
     ) -> ProgressiveResult<Disposition> {
         let output = self.output.as_ref().expect("output");
         let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        // Overwrite::Skip: a symbolic link already at the target (one an earlier run placed, say) is skipped, as
+        // UnRAR's `-o-` skips it; nothing is written through it or over it
+        if self.options.extract.overwrite == crate::extract::Overwrite::Skip
+            && output.symlink_at(&name, !header.is_unix())?
+        {
+            self.target = None;
+            return Ok(Disposition::Skip(crate::extract::RarSkipReason::ExistingTarget));
+        }
         let target = output.prepare_target(member, &name, !header.is_unix())?;
         let skip = self.options.extract.overwrite == crate::extract::Overwrite::Skip && target.exists();
         if skip {

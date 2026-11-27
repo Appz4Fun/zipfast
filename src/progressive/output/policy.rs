@@ -77,6 +77,22 @@ impl Policy<'_> {
             stage_identity: None,
         })
     }
+    /// Whether a symbolic link is at the member's target, reached through checked parents.
+    pub(super) fn symlink_at(&self, name: &str, windows_names: bool) -> ProgressiveResult<bool> {
+        self.root.check()?;
+        self.usage.charge(Resource::MetadataBytes, (name.len() as u64).saturating_mul(2))?;
+        let relative = crate::path::sanitize_fallible(name, windows_names)
+            .map_err(|_| ProgressiveFailure::new(FailureKind::UnsafePath))?;
+        let relative =
+            if self.root.flatten { Path::new(relative.file_name().ok_or_else(invalid)?) } else { relative.as_path() };
+        let path = self.root.path.join(relative);
+        self.parents(&path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => Ok(meta.file_type().is_symlink()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(out(OutputOperation::Metadata, e, 0)),
+        }
+    }
     pub(super) fn parents(&self, path: &Path) -> ProgressiveResult<()> {
         self.root.check()?;
         guard::check_parents(&self.root.path, path, self.usage)
@@ -212,6 +228,10 @@ impl OutputContext {
         source: &mut crate::progressive::source::SourceDriver,
     ) -> ProgressiveResult<bool> {
         Policy { root: &self.root, usage: &self.usage }.check_target(target, source)
+    }
+    /// Whether a symbolic link is at the member's target (a skip under `Overwrite::Skip`).
+    pub(crate) fn symlink_at(&self, name: &str, windows_names: bool) -> ProgressiveResult<bool> {
+        Policy { root: &self.root, usage: &self.usage }.symlink_at(name, windows_names)
     }
     /// Creates a link at `target` once it is checked ([`crate::extract::link`]): a symbolic link, or a hard link or
     /// copy of a file this session published, with the same parent and target checks a file's publication makes.

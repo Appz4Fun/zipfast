@@ -178,6 +178,18 @@ and the target checks; one that verifies goes on to them as usual. Nothing is pl
 changes only what is reported. An older file revision is still skipped before anything, on every route. A
 `RarSession` test run checks the password first under every mode.
 
+The order on every route (`extract::run*`, `RarSession::extract_selected` and `extract_selected_controlled`, a
+progressive session) is: (1) under `VerifyFirst` only, the password; (2) the overwrite decision: under
+`Overwrite::Skip` (and `RarOverwriteMode::Skip` on the controlled route) a link member whose target already exists,
+whatever is there (a file, a folder, a symbolic link an earlier run placed), is reported `Skipped(ExistingTarget)`
+and nothing else about it is checked, as UnRAR 7.30's `unrar x -o- -ppw` over an earlier run's output is "All OK";
+(3) for a link that will be placed, every link check (a target that leaves the destination, a hard link or copy of a
+file the run didn't extract, the path checks, protected paths, `replace_placed_links`), then under `Verify` the
+password, then the placing. A skipped member places and touches nothing, so it needs none of the checks in (3).
+Under `Overwrite::Skip` a symbolic link at a member's target (any member's, not just a link's) is skipped as an
+existing target the same way, rather than refused as `RarPolicyReason::Symlink`: nothing is written through it or
+over it. A symbolic link in a folder above the target is still refused.
+
 With `PlaceUnverified`, the password isn't checked for such a member (no key is derived): with a wrong password,
 with none, or with no check value, the link is placed (or passes a test) and reported as any placed link is,
 `RarOutcome::Verified`, with the password evidence `RarPasswordEvidence::Unverified` in its checks, so a caller can

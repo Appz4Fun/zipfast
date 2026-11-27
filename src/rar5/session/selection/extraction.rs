@@ -199,6 +199,17 @@ impl<'a> Extraction<'a> {
         let parent = relative.parent().expect("sanitized relative path");
         let target = hooks.target(self.options, &relative, self.options.flatten)?;
         let parent = if self.options.flatten { Path::new("") } else { parent };
+        // Overwrite::Skip: a target that is already there is skipped before anything else about it is checked, as
+        // UnRAR's `-o-` skips it, a symbolic link there (one an earlier run placed) too, and for a link member before
+        // its link target is: a skipped member places and touches nothing. One that will be placed is checked below.
+        if hooks.skips_existing(self.options.overwrite) {
+            if let Some(above) = target.parent() {
+                self.inspect_parents(above)?;
+            }
+            if fs::symlink_metadata(&target).is_ok_and(|meta| link.is_some() || meta.file_type().is_symlink()) {
+                return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
+            }
+        }
         // a RAR 5.0 redirection's target is checked before anything is touched
         let link = match link {
             Some(Ok(kind)) => {
@@ -855,6 +866,11 @@ pub(super) trait ExtractionHooks {
         owned_link: bool,
         legacy: Overwrite,
     ) -> Result<bool, SelectedStop>;
+    /// Whether [`Self::replace`] skips any existing target without asking: what is already there is then skipped
+    /// before its other checks.
+    fn skips_existing(&self, legacy: Overwrite) -> bool {
+        legacy == Overwrite::Skip
+    }
     /// `sources`: the volumes the member's published bytes depend on, just checked by the native route.
     fn recheck(
         &mut self,
