@@ -141,7 +141,8 @@ fn first_header(session: &RarSession) -> RarHeader<'_> {
 fn a_cut_rar4_header_reads_its_fields_as_unrar_does() {
     let bytes = fixture("rar4/latest_winrar.rar");
     // (cut, packed, unpacked, host, CRC, version, method, name), as `unrar lt` lists them
-    let cases: &[(usize, u64, u64, u8, u32, u8, u8, &str)] = &[
+    type Case = (usize, u64, u64, u8, u32, u8, u8, &'static str);
+    let cases: &[Case] = &[
         (28, 0, 0, 17, 0, 0, 0, ""),
         (31, 17, 0, 0, 0, 0, 0, ""),
         (33, 17, 0, 5, 0, 0, 0, ""),
