@@ -650,8 +650,10 @@ impl ProjectedReadSession {
                     && (e.packed > context.options.limits.member_packed_bytes
                         || e.size > context.options.limits.member_decoded_bytes)
             {
-                self.read_at_with_context(ordinal, password, max, cancel, context, |_| Ok(()))?;
-                return mismatch_result(written_mismatch(context));
+                // chained rather than `?`: the temporaries `?` makes would sit in this frame under the read
+                return self
+                    .read_at_with_context(ordinal, password, max, cancel, context, |_| Ok(()))
+                    .and_then(|()| mismatch_result(written_mismatch(context)));
             }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {

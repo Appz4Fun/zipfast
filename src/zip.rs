@@ -1362,6 +1362,18 @@ fn run_archive(
         report.member(LegacyMember::Failed { ordinal, name, error: Error::Io(std::io::Error::other(why.to_owned())) });
         summary.errors.push(line);
     }
+    /// [`Options::seven_zip_strict`]: a member failed for its local header (out of line, to keep the strings it
+    /// makes out of the run's frame)
+    #[inline(never)]
+    fn mismatched(
+        summary: &mut Summary,
+        report: &mut impl crate::extract::LegacyReport,
+        member: (u64, &str),
+        found: crate::extract::LocalHeaderMismatch,
+    ) {
+        fail(summary, report, member, &found.to_string());
+        summary.local_header_mismatches.push(found);
+    }
     /// A member passed over: a line, and as its outcome a skip.
     fn skipped(
         summary: &mut Summary,
@@ -1455,8 +1467,7 @@ fn run_archive(
                                 return Err(Error::Io(io));
                             }
                         }
-                        fail(&mut summary, report, member, &found.to_string());
-                        summary.local_header_mismatches.push(found);
+                        mismatched(&mut summary, report, member, found);
                         continue;
                     }
                 }
@@ -1541,8 +1552,7 @@ fn run_archive(
                     }
                 }
                 if let Some(found) = written_mismatch {
-                    fail(&mut summary, report, member, &found.to_string());
-                    summary.local_header_mismatches.push(found);
+                    mismatched(&mut summary, report, member, found);
                     continue;
                 }
                 summary.files += 1;
@@ -1592,8 +1602,7 @@ fn run_archive(
                     }
                     target => drop(target),
                 }
-                fail(&mut summary, report, member, &found.to_string());
-                summary.local_header_mismatches.push(found);
+                mismatched(&mut summary, report, member, found);
                 continue;
             }
             let mut entry = e.read_description();
@@ -1631,8 +1640,7 @@ fn run_archive(
                         return Err(Error::Io(io));
                     }
                     if let Some(found) = written_mismatch {
-                        fail(&mut summary, report, member, &found.to_string());
-                        summary.local_header_mismatches.push(found);
+                        mismatched(&mut summary, report, member, found);
                         continue;
                     }
                     summary.files += 1;
