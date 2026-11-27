@@ -24,6 +24,7 @@ unverified_output: Default::default(),
 salvage_truncated_zip: false,
 unix_modes: Default::default(),
 backslashes: Default::default(),
+hard_link_targets: Default::default(),
 ```
 
 The reference behaviour below is 7-Zip 26.06 and UnRAR 7.30 beta 1 for Linux x86-64, run in Docker with
@@ -505,3 +506,63 @@ Not covered: a Copy folder whose header gives fewer packed than unpacked bytes i
 hands over only what its threads finished before the error. `tests/unverified_output.rs` checks each point against the
 reference tools' output.
 
+
+## `hard_link_targets`: what a hard link is made to
+
+`HardLinkTargets::Extracted` (the default) makes a hard link member to the file this run extracted for its target
+member, wherever it landed, and fails it when the run extracted no such file: no hard link reaches a file that was in
+the destination before the run. `HardLinkTargets::StoredName` makes it to the regular file at the target's stored name,
+whoever wrote it, as both tools do. `hl.rar` holds `t/hard66` and the hard link `t/9iv20ci0cx -> t/hard66`; `t/hard66`
+(`OLD`) is in the destination before the run:
+
+| run | UnRAR 7.30 | 7-Zip 26.06 | `Extracted` | `StoredName` |
+|---|---|---|---|---|
+| rename on conflict (`x -or` / `x -aou`) | `t/hard66(1)` new, `t/9iv20ci0cx` linked to the old `t/hard66` | the same (`t/hard66_1`) | `t/9iv20ci0cx` linked to the renamed new file | as UnRAR |
+| the same with `t/9iv20ci0cx` there too | the link lands as `t/9iv20ci0cx(1)`, linked to the old `t/hard66` | | linked to the renamed new file | as UnRAR |
+| skip existing (`x -o-` / `x -aos`) | `t/9iv20ci0cx` linked to the old `t/hard66` | the same | the link fails (its target wasn't extracted) | as UnRAR |
+| only the link (`x hl.rar t/9iv20ci0cx`) | linked to the old `t/hard66`; with nothing there, "You need to unpack the link target first" | linked; with nothing there, "Cannot create hard link" | fails | as the tools |
+| `e -or` (flattened) | `9iv20ci0cx` linked to `hard66` | 7-Zip `e` looks for `t/hard66`, which isn't there: "Cannot create hard link" | linked to the renamed new file | as UnRAR |
+| a folder at `t/hard66` | "Cannot create hard link", exit 9 | "Cannot create hard link", exit 2 | linked to `t/hard66(1)` | fails |
+| a symbolic link at `t/hard66` (to `/etc/hostname`) | hard-links the symbolic link | "Dangerous link via another link was ignored" | linked to `t/hard66(1)` | fails |
+
+The file is reached from the destination without following a link, and linked only while it is still that file. A
+symbolic link there is never linked to, so no link zipfast makes leads out of the destination, and neither is the
+file at the link's own path (a rename mode's reservation, or what the link replaces). Honoured by the
+whole-archive RAR and tar runners and by progressive sessions; `RarSession` and test runs keep `Extracted`, and RAR 5.0
+file copies are unaffected.
+
+## Unix modes without a file type
+
+A Unix-host RAR member stores the whole `st_mode`. A mode without file-type bits (`S_IFMT` 0, such as a RAR 4.x member
+with Unix host and attribute `0x20`) is a mode 7-Zip doesn't set. Under `UnixModes::Masked` (7-Zip's choice) such a
+member is given what file creation gives with the umask passed, `0o666 & !umask` (a folder `0o777 & !umask`), as
+7-Zip leaves it; under `UnixModes::Stored` (the default) its permission bits are set, as UnRAR does. With umask 022:
+
+| stored mode (RAR 4.x attribute or RAR 5.0 mode) | UnRAR 7.30 | 7-Zip 26.06 | `Stored` | `Masked { umask: 0o022 }` |
+|---|---|---|---|---|
+| file `0x20` (`0o040`) | `0o040` | `0o644` | `0o040` | `0o644` |
+| file `0o100040` | `0o040` | `0o040` | `0o040` | `0o040` |
+| file `0o644` (RAR 5.0) | `0o644` | `0o644` | `0o644` | `0o644` |
+| RAR 5.0 folder `0o500` | `0o500` | `0o755` | `0o500` | `0o755` |
+| RAR 5.0 folder `0o40500` | `0o500` | `0o700` | `0o500` | `0o700` |
+
+UnRAR reads a RAR 1.5-format member with attribute bit `0x10` as a folder even from a Unix host; zipfast goes by the
+header's directory flags.
+
+## RAR 4.x old-style blocks
+
+The old comment (0x75), AV (0x76), old subblock (0x77), old recovery record (0x78) and sign (0x79) blocks hold no
+members. Under `DamagedInput::Refuse` (the default) one is refused as unsupported, and one that fails its checksum as
+a damaged header. The tools pass them over, each its own way; a header whose type byte was changed into one of these
+(`0x74` to `0x75`, say) is passed over with them:
+
+| | UnRAR 7.30 | 7-Zip 26.06 | zipfast |
+|---|---|---|---|
+| a sound block | passed over | passed over | `Salvage`, `Resync` and `SevenZip` pass it over |
+| its checksum fails | 0x75, 0x77, 0x78: reported, passed over, exit 3; 0x76, 0x79: not checked | not checked | `Salvage`: as UnRAR (a `ChecksumMismatch` record); `SevenZip`: not checked |
+| data after the header | 0x75: none; 0x77, 0x78: the size the block starts with; 0x76, 0x79: with `LONG_BLOCK` | with `LONG_BLOCK` | `Salvage`, `Resync`: as UnRAR; `SevenZip`: as 7-Zip |
+
+So 7-Zip passes over a file header whose type became 0x75 together with its data: `7z l`, `t` and `x -so` find no
+member and exit 0, as zipfast does under `DamagedInput::SevenZip`. UnRAR passes over only its header and fails on the
+data behind it ("Unexpected end of archive", exit 3); `Salvage` reads it as unreadable too. `DamagedInput::SevenZip`
+is otherwise `Refuse`, and encrypted headers are always checked.
