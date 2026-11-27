@@ -24,7 +24,7 @@ use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 use super::*;
 use crate::rar5::RarFormat;
-use crate::rar5::unpack::rar4::{Rar4DecodeError, Rar4Decoder};
+use crate::rar5::unpack::rar4::{CUT_PAD, Rar4DecodeError, Rar4Decoder};
 
 #[cfg(unix)]
 pub(super) mod control;
@@ -404,13 +404,17 @@ struct SelectedRun {
     unverified: Option<u64>,
 }
 
-/// A catalogue issue that is a member cut off by a missing volume: under
+/// A catalogue issue that is a member cut off by a missing volume, or by the end of an archive cut short (catalogued
+/// under [`crate::extract::DamagedInput::Salvage`]): under
 /// [`crate::extract::UnverifiedOutput::Emit`] what the present volumes hold is decoded before it fails.
 pub(super) fn cut_off(failure: &RarFailure) -> bool {
     matches!(
         failure,
         RarFailure::MissingVolume { .. }
-            | RarFailure::Integrity { reason: RarIntegrityReason::MissingSplitContinuation, .. }
+            | RarFailure::Integrity {
+                reason: RarIntegrityReason::MissingSplitContinuation | RarIntegrityReason::TruncatedData,
+                ..
+            }
     )
 }
 
@@ -648,12 +652,16 @@ impl SelectedRun {
                 pending.start_selected_cipher(&mut keys, params, password, member.unpacked_size)?;
             }
         }
+        // the archive ends inside this member's data (rather than a volume being missing)
+        let cut_short = cut.is_some_and(|issue| {
+            matches!(issue, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
+        });
         let compressed = header.method != 0;
         let mut rar4 = if compressed && header.format == RarFormat::Rar4 {
             let first = &session.model.parts[member.parts.start];
             let solid = member.has_successor || session.volumes[first.volume].metadata.main.is_solid();
             let mut decoder = self
-                .rar4_decoder(session, member, solid)
+                .rar4_decoder(session, member, solid, if cut_short { CUT_PAD as u64 } else { 0 })
                 .map_err(|error| *error.detailed(pending.context().scope()).failure)?;
             decoder.set_write_unfiltered(self.write_unfiltered);
             if cut.is_some() {
@@ -668,6 +676,9 @@ impl SelectedRun {
             if cut.is_some()
                 && let Some(decoder) = self.decoder.as_mut()
             {
+                if cut_short {
+                    decoder.cut_short();
+                }
                 decoder.track_tail();
                 // UnRAR's cut at the data's end needs the last symbols of each block, which workers don't note
                 decoder.serial_file();
@@ -783,6 +794,25 @@ impl SelectedRun {
                 output: &mut output,
             };
             if let Some(decoder) = rar4.as_mut() {
+                if cut_short {
+                    // UnRAR reads zeros past the end: what decodes from them is held until the cut is known
+                    decoder.cut_short();
+                    let before = sink.pending.bytes;
+                    let mut held = Vec::new();
+                    let mut keep = |bytes: &[u8]| -> crate::Result<()> {
+                        held.extend_from_slice(bytes);
+                        Ok(())
+                    };
+                    // what decodes before a damaged code stands: the member fails anyway
+                    let _ = decoder.feed(&[0; CUT_PAD], &mut keep);
+                    let _ = decoder.drain(&mut keep);
+                    let end = decoder.cut_point();
+                    let take = usize::try_from(end.saturating_sub(before)).unwrap_or(usize::MAX).min(held.len());
+                    if let Err(error) = sink.put(&held[..take]) {
+                        sink.finish(Err(error), None)?;
+                        return Err(copy_catalogue_issue(issue));
+                    }
+                }
                 let result = decoder.flush_decoded(&mut sink);
                 sink.finish_rar4(result)?;
             } else if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed) {
@@ -850,14 +880,16 @@ impl SelectedRun {
         session: &RarSession,
         member: &Member,
         solid: bool,
+        extra: u64,
     ) -> Result<Rar4Decoder, Rar4DecodeError> {
         let header = &member.header;
+        let packed = member.packed_size.saturating_add(extra);
         let raw = header.rar4.ok_or(Rar4DecodeError::Binding)?;
         if header.solid {
             let mut decoder = self.rar4.take().ok_or(Rar4DecodeError::State)?;
             decoder.next_solid_member(crate::rar5::unpack::rar4::CoreFrame {
                 ordinal: 0,
-                packed: member.packed_size,
+                packed,
                 unpacked: header.unpacked_size,
                 unpack_version: raw.unpack_version,
                 method: raw.method,
@@ -868,7 +900,7 @@ impl SelectedRun {
         self.rar4 = None;
         let mut decoder = Rar4Decoder::new(
             header.dictionary,
-            member.packed_size,
+            packed,
             header.unpacked_size,
             self.limits.window_bytes.min(WINDOW_MAX),
             session.options.cancel.clone(),

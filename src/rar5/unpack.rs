@@ -761,6 +761,10 @@ pub struct Unpacker {
     /// [`TAIL_MARGIN_BITS`] of the latest block decoded on this thread, as (bits from the symbol's start to the end of
     /// the block's payload, output position before it), and that block's payload bits
     tail: Option<Box<TailSymbols>>,
+    /// [`Self::flush_cut`]'s rule: symbols starting within this many bits of the data's end are left out, and a
+    /// block of which fewer bytes came is not decoded ([`TAIL_MARGIN_BITS`] and [`TAIL_BLOCK_MIN`], or none of either
+    /// after [`Self::cut_short`])
+    cut_rule: (usize, usize),
 }
 
 /// See `Unpacker::tail`.
@@ -934,6 +938,7 @@ impl Unpacker {
             hand_over_min: HAND_OVER_MIN,
             seen: None,
             tail: None,
+            cut_rule: (TAIL_MARGIN_BITS, TAIL_BLOCK_MIN),
         })
     }
 
@@ -2024,14 +2029,14 @@ impl Unpacker {
         self.settle(0, sink)?;
         if !self.ended
             && let Ok(Some((header_len, payload, flags))) = block_header(&self.input)
-            && self.input.len() >= TAIL_BLOCK_MIN
+            && self.input.len() >= self.cut_rule.1
             && self.input.len() - header_len < payload
         {
             let have = self.input.len() - header_len;
             let mut block = std::mem::take(&mut self.input);
             block.drain(..header_len);
             block.resize(have + PAD, 0);
-            let end_bits = (have * 8).saturating_sub(TAIL_MARGIN_BITS);
+            let end_bits = (have * 8).saturating_sub(self.cut_rule.0);
             let parallel = std::mem::replace(&mut self.parallel, false);
             // what decodes before a damaged or cut symbol stands: the member fails anyway
             let _ = self.block_to(&block, end_bits, flags, sink);
@@ -2039,7 +2044,7 @@ impl Unpacker {
         } else if let Some(tail) = self.tail.take() {
             // the block before ends within the margin of the data's end: its last symbols are left out too
             let after = self.input.len().saturating_mul(8);
-            if let Some(&(_, before)) = tail.0.iter().find(|&&(left, _)| left + after <= TAIL_MARGIN_BITS)
+            if let Some(&(_, before)) = tail.0.iter().find(|&&(left, _)| left + after <= self.cut_rule.0)
                 && before >= self.emitted.max(self.file_base)
                 && before <= self.sp
             {
@@ -2048,6 +2053,13 @@ impl Unpacker {
         }
         self.ended = true;
         self.flush(sink)
+    }
+
+    /// The data ends because the archive is cut short there, not at a missing volume: UnRAR reads on past the end
+    /// (zeros, as far as the length of what it prints shows), so [`Self::flush_cut`] decodes every symbol starting
+    /// before the end, and the start of a block however little of it came.
+    pub(crate) fn cut_short(&mut self) {
+        self.cut_rule = (0, 0);
     }
 
     /// Notes where the last symbols of each block start, so that [`Self::flush_cut`] can leave out what UnRAR leaves

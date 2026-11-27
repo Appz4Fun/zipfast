@@ -544,6 +544,10 @@ pub(crate) struct Rar4Decoder {
     unfiltered: bool,
     /// [`crate::extract::UnverifiedOutput::Emit`]: where the latest LZ tokens started, for [`Self::flush_decoded`]
     starts: Option<Box<TokenStarts>>,
+    /// [`Self::cut_short`]: the bytes of real data fed, and how far before their end a token is left out
+    data_end: Option<(u64, u64)>,
+    /// [`Self::cut_short`]: a PPM or RAR 1.5/2.0 code starting at or past this bit of the member's data is not decoded
+    stop_at: Option<u64>,
     hold_start: u64,
     /// how many of the held bytes are plain output that was waiting when the first block's bytes began
     hold_plain: usize,
@@ -658,6 +662,8 @@ impl Rar4Decoder {
             write_unfiltered: false,
             unfiltered: false,
             starts: None,
+            data_end: None,
+            stop_at: None,
             hold_start: 0,
             hold_plain: 0,
             version: 29,
@@ -954,11 +960,7 @@ impl Rar4Decoder {
     /// taken: its bytes, and every later one, are left out. That needs [`Self::track_starts`] from the member's
     /// start; without it, or in a PPM block or a RAR 1.5/2.0 stream, every decoded byte is handed over.
     pub(crate) fn flush_decoded(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
-        let lz = !self.phase.ppm() && !matches!(self.phase, Phase::Legacy) && self.legacy.is_none();
-        let cut = match self.starts.as_deref().filter(|_| lz) {
-            Some(starts) => starts.cut(self.fetched, self.produced),
-            None => self.produced,
-        };
+        let cut = self.cut_point();
         // the output waiting goes just before the first held byte (or is the newest, when nothing is held)
         if self.hold_plain != 0 {
             // it waits ahead of a held block (see emit)
@@ -980,6 +982,37 @@ impl Rar4Decoder {
         let keep = cut.clamp(start, end) - start;
         self.filled = (keep as usize).min(self.filled);
         self.flush(sink)
+    }
+    /// The output position [`Self::flush_decoded`] stops at: before the first LZ token starting within the margin
+    /// of the data's end ([`TAIL_MARGIN`] before what was fed, or the end itself after [`Self::cut_short`]), or
+    /// everything produced.
+    pub(crate) fn cut_point(&self) -> u64 {
+        let lz = !self.phase.ppm() && !matches!(self.phase, Phase::Legacy) && self.legacy.is_none();
+        let (end, margin) = self.data_end.unwrap_or((self.fetched, TAIL_MARGIN));
+        match self.starts.as_deref().filter(|_| lz) {
+            Some(starts) => starts.cut(end, margin, self.produced),
+            None => self.produced,
+        }
+    }
+    /// The archive is cut short at the end of the data fed so far, as UnRAR sees it: it reads zeros past the end, so a
+    /// code starting before the byte after the data decodes (one straddling the end over zeros) and a later one does
+    /// not. Up to [`CUT_PAD`] zero bytes are fed after this, then [`Self::drain`], and [`Self::cut_point`] says
+    /// where the output ends.
+    pub(crate) fn cut_short(&mut self) {
+        self.data_end = Some((self.fetched, 0));
+        self.stop_at = Some(self.fetched.saturating_add(1).saturating_mul(8));
+    }
+    /// Decodes what PPM or a RAR 1.5/2.0 engine held back for lookahead, as at the end of the member's data.
+    pub(crate) fn drain(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+        self.drain_input(sink)
+    }
+    /// Where the next PPM or RAR 1.5/2.0 code starts, in bits from the member's first packed byte; whether it is at
+    /// or past where [`Self::cut_short`] stops.
+    fn stopped(&self, bit: u32) -> bool {
+        let Some(stop) = self.stop_at else { return false };
+        let waiting = (self.ppm_in.len() as u64).saturating_sub(self.ppm_pos as u64);
+        let at = self.fetched.saturating_sub(waiting).saturating_mul(8).saturating_add(u64::from(bit));
+        at >= stop
     }
     /// Records where each LZ token starts, so that [`Self::flush_decoded`] can leave out the tail UnRAR leaves out.
     pub(crate) fn track_starts(&mut self) {
@@ -1057,7 +1090,7 @@ impl Rar4Decoder {
     /// One code of a RAR 1.5 or 2.0 engine.
     fn legacy_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
         let available = self.absorb(input)?;
-        if available < PPM_LOOKAHEAD && !self.finishing {
+        if available < PPM_LOOKAHEAD && !self.finishing || self.stopped(self.legacy_bit) {
             return Ok(false);
         }
         if self.ppm_pos > self.ppm_in.len() + 8 {
@@ -1099,7 +1132,7 @@ impl Rar4Decoder {
     }
     fn ppm_step(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<bool> {
         let available = self.absorb(input)?;
-        if available < PPM_LOOKAHEAD && !self.finishing {
+        if available < PPM_LOOKAHEAD && !self.finishing || self.stopped(0) {
             return Ok(false);
         }
         if self.ppm_pos > self.ppm_in.len() + 8 {
@@ -1855,6 +1888,10 @@ mod tests;
 /// [`Rar4Decoder::flush_decoded`]).
 pub(crate) const TAIL_MARGIN: u64 = 30;
 
+/// How many zero bytes go after the data of a member cut by the archive's end ([`Rar4Decoder::cut_short`]): enough for
+/// the longest LZ token or legacy code straddling the end to decode, as UnRAR's zero fill lets it.
+pub(crate) const CUT_PAD: usize = 16;
+
 /// The start (in bits from the member's first packed byte) and the bytes produced before each of the latest LZ tokens:
 /// enough of them to reach [`TAIL_MARGIN`] bytes back, since a token takes at least one bit.
 struct TokenStarts {
@@ -1882,11 +1919,11 @@ impl TokenStarts {
 
     /// The bytes produced before the first token that starts within [`TAIL_MARGIN`] bytes of `fetched`, the bytes fed
     /// so far; `produced` when there is none.
-    fn cut(&self, fetched: u64, produced: u64) -> u64 {
+    fn cut(&self, fetched: u64, margin: u64, produced: u64) -> u64 {
         let size = self.ring.len();
         (0..self.len)
             .map(|back| self.ring[(self.next + size - self.len + back) % size])
-            .find(|&(at, _)| (at / 8).saturating_add(TAIL_MARGIN) > fetched)
+            .find(|&(at, _)| (at / 8).saturating_add(margin) > fetched)
             .map_or(produced, |(_, before)| before.min(produced))
     }
 }

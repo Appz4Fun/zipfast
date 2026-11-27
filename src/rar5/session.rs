@@ -1469,8 +1469,13 @@ impl Catalogue {
                 return Ok(owned(header));
             }
         }
-        let final_part = !header.split_after();
-        let part = Part::new(volume, &header, crypt, &wire);
+        // a member the volume's end cuts short (FileWire::cut) has only the bytes there, and no part after them
+        let final_part = !header.split_after() && wire.cut.is_none();
+        let mut part = Part::new(volume, &header, crypt, &wire);
+        if let Some(there) = wire.cut {
+            part.packed_size = there;
+            part.final_part = false;
+        }
         let ordinal =
             if associated { self.session.model.members.len() - 1 } else { self.session.model.members.len() } as u64;
         let issue = if associated {
@@ -1487,6 +1492,16 @@ impl Catalogue {
             }
         } else {
             payload_issue(&header, crypt, ordinal)
+        };
+        // cut short, it fails as truncated (and under UnverifiedOutput::Emit what is there is decoded first, as for a
+        // member a missing volume cuts off), unless it already fails for something else
+        let issue = match issue {
+            None if wire.cut.is_some()
+                && !(associated && self.session.model.members.last().is_some_and(|member| member.issue.is_some())) =>
+            {
+                Some(member_integrity(ordinal, RarIntegrityReason::TruncatedData))
+            }
+            issue => issue,
         };
         let issue_minimum = u64::from(issue.is_some() && self.session.issues.len() == self.session.issues.capacity())
             * size_of::<RarFailure>() as u64;

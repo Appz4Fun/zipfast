@@ -1,0 +1,195 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+//! An archive cut short inside a member's data ("Unexpected end of archive"), catalogued under
+//! `DamagedInput::Salvage`: with `UnverifiedOutput::Emit`, `RarSession` prints (`unrar p`) and keeps (`unrar x -kb`)
+//! the members before the cut and what UnRAR 7.30 decodes of the member cut short, which is reported failed as
+//! truncated. See `tests/fixtures/emit-cut-archive/README.md`.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use zipfast::error::{RarFailure, RarIntegrityReason};
+use zipfast::extract::{DamagedInput, Mode, Options, Overwrite, RarOutcome, UnverifiedOutput};
+use zipfast::rar5::session::{RarDecodeLimits, RarPrintOptions, RarSession, RarSessionOptions};
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+fn sha256(bytes: &[u8]) -> String {
+    zipfast::crypto::sha256(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An archive, where it is cut, and what `unrar p` prints of the cut archive (length and SHA-256).
+struct Cut {
+    archive: &'static str,
+    at: usize,
+    unrar: (usize, &'static str),
+}
+
+const fn cut(archive: &'static str, at: usize, len: usize, sha: &'static str) -> Cut {
+    Cut { archive, at, unrar: (len, sha) }
+}
+
+const PPMD: &str = "rar4-rar300/ppmd_solid_rar300.rar";
+const R4_STORED: &str = "emit-cut-archive/r4-stored.rar";
+const R5_STORED: &str = "emit-cut-archive/r5-stored.rar";
+const R5_LZ: &str = "emit-cut-archive/r5-lz.rar";
+
+const CUTS: &[Cut] = &[
+    // RAR 2.9 LZ, solid: the second member is cut short
+    cut("rar4/solid.rar", 1518, 3357, "a547aa308e6c44eba5a36ed01d31c88ef52f1969995e5e431ca7fe9a2435c049"),
+    cut("rar4/solid.rar", 1530, 3379, "1e606cbc3098b49d2c3c1e6de4b21c3b57cd89eb5badd29ccebcb20fe60d1eb5"),
+    cut("rar4/solid.rar", 1545, 3488, "0991c60379ca3468df1fb4e4f8afe75622be577fec9ffa74943d9d525dc3a3b2"),
+    cut("rar4/solid.rar", 3036, 10494, "559bb42632a27116c413469e7f69b836e64392fbfac81974f87fda5a8a876ce5"),
+    cut("rar4/solid.rar", 4554, 17499, "17dd9eb56b181800dbb4f5398b2bb35413fceca80908642d7b2c3b3c9b97fe1d"),
+    // RAR 2.9 PPMd, solid
+    cut(PPMD, 5977, 55716, "0721bbace134903d9a786b3fc74a2d5c4fe20ce31d66d0eb13fc5280c58095ef"),
+    cut(PPMD, 5985, 55796, "9b0b01e4e6a810876d3d136a5e2a860715ba11372f2192d172f9234a2cf8b172"),
+    cut(PPMD, 11955, 116192, "d2ea62452ab70337995d11b004ab3e9c8664ed2a6f16d1d4f8b0302111003b10"),
+    cut(PPMD, 17932, 176566, "72fb2f3808636c69e6fa95358e8f74c667708d709befd03371ef43d1ea959681"),
+    // RAR 2.0 LZ
+    cut("rar4-legacy/BIGLZ.RAR", 1337, 9466, "71ba67ca0c5f1c547a3e4669e030dd920c07059ea5bf2eefb04f6fd92dd2b136"),
+    cut("rar4-legacy/BIGLZ.RAR", 2675, 74207, "27308609d986acb27d2df8a8ce080d7af13eb521578a5d79fcd1c183729eb275"),
+    cut("rar4-legacy/BIGLZ.RAR", 4013, 144399, "a6561e8a2e2ece668991c7f2fbb2c41900015ff72d4d1e18c8f461ae2b95b9b0"),
+    // stored
+    cut(R4_STORED, 18019, 17960, "a30930b94adfe93811c4074f7ce2daf1f39743ebec98978ca77b7e59433293cc"),
+    cut(R5_STORED, 18015, 17970, "f3ed3905d782815302a69e76e31c66acebb084e37eb01bd17c33157c715b9511"),
+    cut(R5_STORED, 36031, 35986, "7847bd188f6a6ea20a3faf8743a3de3b9582a4f81db114c87574afb73318144e"),
+    // RAR 5.0 LZ: the first three end inside the first block, short of 1,024 bytes of it
+    cut(R5_LZ, 200, 72, "3e4deb303b762b0b4489a6f01fdc9f19351bff7a69287d3d4b17fca59661af08"),
+    cut(R5_LZ, 400, 861, "5d57284ca2ff2bab94bc48780d86f9bbe2d915860f8b85fb0683b612d1600914"),
+    cut(R5_LZ, 700, 2483, "a471565bf8bda58e93f8811c7eb05990b2c5d15c6cbf34f28aea4069bd9ebdd3"),
+    cut(R5_LZ, 10002, 63402, "eed72168af4b8582609bb62a3c27505b4635cf2501f82e9e5cab91ddf726a58b"),
+    cut(R5_LZ, 10018, 63501, "3d58f3c8fbcb35944116d624b58687bef0a078dbf75ba5be27629dacf9096727"),
+    cut(R5_LZ, 20003, 129516, "42f96607a014771d88b46c60f25170a2d68627c2ad1e091e247b8713f337e380"),
+];
+
+/// The first `at` bytes of the archive, in a directory of their own.
+fn cut_archive(dir: &Path, case: &Cut) -> PathBuf {
+    let bytes = fs::read(Path::new(FIXTURES).join(case.archive)).unwrap();
+    let path = dir.join(format!("{}-{}", case.at, Path::new(case.archive).file_name().unwrap().to_string_lossy()));
+    fs::write(&path, &bytes[..case.at]).unwrap();
+    path
+}
+
+fn salvaging() -> RarSessionOptions {
+    RarSessionOptions { damaged_input: DamagedInput::Salvage, ..RarSessionOptions::default() }
+}
+
+fn truncated(failure: &RarFailure) -> bool {
+    matches!(failure, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
+}
+
+fn options(dest: &Path, unverified: UnverifiedOutput) -> Options {
+    Options {
+        mode: Mode::Extract,
+        dest: dest.to_path_buf(),
+        overwrite: Overwrite::Always,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+        select: None,
+        windows_safe_names: false,
+        special_entries: Default::default(),
+        fallback_mtime: None,
+        compressed_tar: Default::default(),
+        version_naming: Default::default(),
+        preexisting_links: Default::default(),
+        refused_link_placeholder: false,
+        restart_from_first_volume: false,
+        replace_placed_links: false,
+        keep_broken: true,
+        attempt_continued_members: false,
+        encrypted_links: Default::default(),
+        damaged_input: DamagedInput::Salvage,
+        unsupported_filters: Default::default(),
+        unverified_output: unverified,
+        salvage_truncated_zip: false,
+        unix_modes: Default::default(),
+        backslashes: Default::default(),
+    }
+}
+
+/// `unrar p`: the members before the cut, then what UnRAR prints of the one cut short, reported failed as truncated
+/// with its bytes counted unverified. `Withhold` prints only the members before it. By default the archive doesn't
+/// open, as before.
+#[test]
+fn rar_session_print_prints_what_unrar_prints_of_an_archive_cut_short() {
+    let dir = tempfile::tempdir().unwrap();
+    for case in CUTS {
+        let archive = cut_archive(dir.path(), case);
+        assert!(RarSession::open(&archive, None, RarSessionOptions::default()).is_err(), "{}", case.archive);
+        let mut whole = (Vec::new(), None);
+        for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+            let what = format!("{}@{} {unverified:?}", case.archive, case.at);
+            let mut session = RarSession::open(&archive, None, salvaging()).unwrap();
+            let all = session.select(|_| true).unwrap();
+            let options = RarPrintOptions { unverified_output: unverified, ..RarPrintOptions::default() };
+            let mut output = Vec::new();
+            let mut failed = Vec::new();
+            session
+                .print_selected(&all, &mut output, &options, |event| match &event.outcome {
+                    RarOutcome::Failed(failure) => failed.push((truncated(failure), event.unverified_bytes)),
+                    _ => {}
+                })
+                .unwrap();
+            let [(truncated, unverified_bytes)] = failed[..] else { panic!("{what}: {failed:?}") };
+            assert!(truncated, "{what}");
+            if unverified == UnverifiedOutput::Emit {
+                assert_eq!(output.len(), case.unrar.0, "{what}: length");
+                assert_eq!(sha256(&output), case.unrar.1, "{what}: bytes");
+                whole = (output, unverified_bytes);
+            } else {
+                // the members before it, and the rest went out unverified with Emit
+                assert!(whole.0.starts_with(&output), "{what}: the members before it");
+                assert_eq!(whole.1, Some((whole.0.len() - output.len()) as u64), "{what}: unverified with Emit");
+                assert_eq!(unverified_bytes, None, "{what}");
+            }
+        }
+    }
+}
+
+/// `unrar x -kb` through `RarSession::extract_selected` with `keep_broken`: the members' files, in the archive's
+/// order, hold what `unrar p` prints. With `Withhold` the member cut short isn't written.
+#[test]
+fn rar_session_extraction_keeps_what_unrar_decodes_of_an_archive_cut_short() {
+    let dir = tempfile::tempdir().unwrap();
+    for case in CUTS {
+        let archive = cut_archive(dir.path(), case);
+        for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+            let what = format!("{}@{} {unverified:?}", case.archive, case.at);
+            let out = dir.path().join(format!("out-{}-{unverified:?}", archive.file_name().unwrap().to_string_lossy()));
+            fs::create_dir_all(&out).unwrap();
+            let mut session = RarSession::open(&archive, None, salvaging()).unwrap();
+            let names: Vec<String> = session.entries().map(|member| member.name().to_owned()).collect();
+            let all = session.select(|_| true).unwrap();
+            let summary =
+                session.extract_selected(&all, &options(&out, unverified), RarDecodeLimits::default(), |_| {}).unwrap();
+            assert_eq!(summary.failed, 1, "{what}");
+            let (cut_short, before) = names.split_last().unwrap();
+            let mut kept: Vec<u8> = before.iter().flat_map(|name| fs::read(out.join(name)).unwrap()).collect();
+            let last = fs::read(out.join(cut_short));
+            if unverified == UnverifiedOutput::Emit {
+                kept.extend(last.unwrap_or_else(|e| panic!("{what}: {e}")));
+                assert_eq!(kept.len(), case.unrar.0, "{what}: length");
+                assert_eq!(sha256(&kept), case.unrar.1, "{what}: bytes");
+            } else {
+                assert!(last.is_err(), "{what}: not written");
+            }
+        }
+    }
+}
