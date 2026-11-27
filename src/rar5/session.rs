@@ -129,6 +129,11 @@ pub struct RarSessionOptions {
     /// The smallest RAR 5.0 member decoded on workers, as [`crate::extract::Options::parallel_min`] (None for the
     /// default, 4 MiB). [`RarSession::extract_selected`] takes its options' setting over this one when it has one.
     pub parallel_min: Option<u64>,
+    /// Which file a hard link member is made to, as [`crate::extract::Options::hard_link_targets`]: the file this
+    /// run extracted for its target (the default) or the regular file at the target's stored name, whoever wrote it.
+    /// [`RarSession::extract_selected`] and [`RarSession::extract_selected_controlled`] take their options'
+    /// setting over this one when it is [`crate::extract::HardLinkTargets::StoredName`]. Test runs ignore it.
+    pub hard_link_targets: crate::extract::HardLinkTargets,
 }
 
 impl Default for RarSessionOptions {
@@ -142,6 +147,7 @@ impl Default for RarSessionOptions {
             encrypted_links: Default::default(),
             threads: None,
             parallel_min: None,
+            hard_link_targets: Default::default(),
         }
     }
 }

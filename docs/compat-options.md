@@ -674,9 +674,29 @@ whoever wrote it, as both tools do. `hl.rar` holds `t/hard66` and the hard link 
 
 The file is reached from the destination without following a link, and linked only while it is still that file. A
 symbolic link there is never linked to, so no link zipfast makes leads out of the destination, and neither is the
-file at the link's own path (a rename mode's reservation, or what the link replaces). Honoured by the
-whole-archive RAR and tar runners and by progressive sessions; `RarSession` and test runs keep `Extracted`, and RAR 5.0
-file copies are unaffected.
+file at the link's own path (a rename mode's reservation, or what the link replaces), nor an input of the run (an
+archive volume or a protected path, which linking would change under the run). Honoured by the
+whole-archive RAR and tar runners, by progressive sessions, and by `RarSession::extract_selected` and
+`extract_selected_controlled`, which take it from their `Options` or, when those keep `Extracted`, from
+`RarSessionOptions::hard_link_targets`. Test runs keep `Extracted`, and RAR 5.0 file copies are unaffected.
+
+## The time of a hard-linked file
+
+A hard link and its target share one inode, so one modification time. UnRAR 7.30 and GNU tar never set a hard link
+member's own time: the file keeps the time its target member was given, or the time of a file that was already
+there. 7-Zip 26.06 sets the link member's time on the file once it is linked, a file that was there before the run
+too, for RAR 5.0 and tar alike. zipfast keeps UnRAR's under `UnixModes::Stored` (the default) and takes 7-Zip's under
+`UnixModes::Masked`, 7-Zip's metadata. `hl.rar` holds `t/hard66` (time 1600000000) and the hard link
+`t/9iv20ci0cx -> t/hard66` (time 1700000000, mode 0600); a `t/hard66` already there has time 1577865600, mode 0640:
+
+| run | UnRAR 7.30 | 7-Zip 26.06 | `Stored` | `Masked` |
+|---|---|---|---|---|
+| `x` (both names) | 1600000000, mode 0600 | 1700000000, mode 0644 | 1600000000, 0644 | 1700000000, 0644 |
+| `x -o-` / `x -aos`, `t/hard66` there (both names) | 1577865600, mode 0600 | 1700000000, mode 0640 | 1577865600, 0640 | 1700000000, 0640 |
+
+UnRAR sets the link member's mode on the shared file, 7-Zip doesn't; zipfast never does. Honoured wherever a hard
+link is placed (the whole-archive RAR and tar runners, `RarSession` extraction, progressive sessions);
+`tests/hard_link_times.rs` checks both rows.
 
 ## Unix modes without a file type
 

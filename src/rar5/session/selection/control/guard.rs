@@ -1633,9 +1633,9 @@ impl Guard {
             }
         }
         let symbolic = matches!(placed, PlacedLink::Symbolic { .. });
-        let source = match placed {
-            PlacedLink::Hard { source } => source,
-            _ => None,
+        let (source, timed) = match placed {
+            PlacedLink::Hard { source, timed } => (source, timed),
+            _ => (None, false),
         };
         let generation = self.next_generation()?;
         if let Some(stamp) = stamp {
@@ -1711,7 +1711,7 @@ impl Guard {
         }
         if let Some(source) = source {
             // A hard link (or its stage, removed again) adds a name to the earlier file: only its link count,
-            // by at most one, and its ctime may change.
+            // by at most one, and its ctime may change, and its mtime when the link member's time was set on it.
             let mut i = self.same_head(c, source)?;
             while i != NONE {
                 c.proof_work(1)?;
@@ -1725,7 +1725,8 @@ impl Guard {
                     let now = self
                         .observe(c, &r.path, attempts, r.follow)?
                         .ok_or(RarDiagnosticFailure::BindingChanged { ordinal: Some(r.ordinal) })?;
-                    let permitted = Stamp { ctime: now.ctime, links: now.links, ..old };
+                    let mtime = if timed { now.mtime } else { old.mtime };
+                    let permitted = Stamp { ctime: now.ctime, links: now.links, mtime, ..old };
                     let counted = now.links == old.links || Some(now.links) == old.links.checked_add(1);
                     if now != permitted || !counted {
                         return Err(RarDiagnosticFailure::BindingChanged { ordinal: Some(r.ordinal) });
