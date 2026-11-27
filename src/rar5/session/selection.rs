@@ -439,7 +439,10 @@ impl SelectedRun {
         if member.header.is_dir() || member.header.redirection.is_some() {
             let outcome = match (member.issue, &member.header.redirection) {
                 (Some(issue), _) => RarOutcome::Failed(Arc::new(copy_catalogue_issue(&session.issues[issue]))),
-                (None, Some(link)) => self.test_link(&member.header, link),
+                (None, Some(link)) => match link_password(session, index) {
+                    Ok(evidence) => self.test_link(&member.header, link, evidence),
+                    Err(failure) => RarOutcome::Failed(Arc::new(failure)),
+                },
                 (None, None) => RarOutcome::Directory,
             };
             let mut volumes = [0; VOLUME_WORDS];
@@ -502,7 +505,7 @@ impl SelectedRun {
 
     /// A RAR 5.0 redirection, tested: a symbolic link's target must stay inside the destination, and a hard link or
     /// file copy must take a member this run found whole, as extracting checks them ([`crate::extract::link`]).
-    fn test_link(&mut self, header: &FileHeader, link: &Redirection) -> RarOutcome {
+    fn test_link(&mut self, header: &FileHeader, link: &Redirection, password: RarPasswordEvidence) -> RarOutcome {
         use crate::extract::link::{self, LinkKind};
         let windows = !header.is_unix();
         let Some(kind) = link::from_rar5(link, windows, false, false) else {
@@ -526,12 +529,7 @@ impl SelectedRun {
             return RarOutcome::Failed(Arc::new(RarFailure::Policy { reason, path: rel }));
         }
         link::tested(&rel, &kind.expect("refused above"), &mut self.tested);
-        let checks = RarVerification {
-            size_checked: false,
-            crc32_checked: false,
-            blake2sp_checked: false,
-            password: RarPasswordEvidence::NotEncrypted,
-        };
+        let checks = RarVerification { size_checked: false, crc32_checked: false, blake2sp_checked: false, password };
         RarOutcome::Verified { bytes: 0, checks, output: RarOutput::Tested }
     }
 
@@ -892,6 +890,14 @@ fn copy_catalogue_issue(failure: &RarFailure) -> RarFailure {
         }
         _ => RarFailure::Internal(RarInternal::Invariant("unexpected retained catalogue issue")),
     }
+}
+
+/// An encrypted RAR 5.0 redirection is placed or passed only on a password its check value verifies
+/// ([`crate::extract::link::rar5_password`]): its target is in the clear, so nothing else would stop it.
+pub(super) fn link_password(session: &RarSession, index: usize) -> Result<RarPasswordEvidence, RarFailure> {
+    let header = &session.model.members[index].header;
+    let scope = RarScope::Member { index: Some(index as u64) };
+    crate::extract::link::rar5_password(header, Some(&session.password), scope)
 }
 
 fn is_terminal(failure: &RarFailure) -> bool {

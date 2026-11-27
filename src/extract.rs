@@ -4610,6 +4610,7 @@ impl Run<'_, '_, '_> {
         mut ctx: EntryContext,
         rel: &Path,
         kind: std::result::Result<link::LinkKind, Error>,
+        password: std::result::Result<RarPasswordEvidence, RarFailure>,
     ) -> RunResult<()> {
         self.drain()?;
         let refusal = match &kind {
@@ -4661,6 +4662,14 @@ impl Run<'_, '_, '_> {
                     return self.past_link(vol, h, ctx, Some(cause));
                 }
             };
+            match password {
+                Ok(evidence) => ctx.password = evidence,
+                Err(failure) => {
+                    let why = link_password_message(&failure);
+                    let cause = self.fail_in_order(&ctx, failure, why)?;
+                    return self.past_link(vol, h, ctx, Some(cause));
+                }
+            }
             let path = place.path.clone();
             // the folders known so far are looked at again past a link
             self.dirs.forget();
@@ -4686,6 +4695,14 @@ impl Run<'_, '_, '_> {
                 return Err(self.terminal(&ctx, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false)));
             }
         } else {
+            match password {
+                Ok(evidence) => ctx.password = evidence,
+                Err(failure) => {
+                    let why = link_password_message(&failure);
+                    let cause = self.fail_in_order(&ctx, failure, why)?;
+                    return self.past_link(vol, h, ctx, Some(cause));
+                }
+            }
             link::tested(rel, &kind, &mut self.landing.extracted);
         }
         self.reports.verified(&ctx, 0, ctx.checks(false, false, false), self.opts.mode)?;
@@ -4858,7 +4875,10 @@ impl Run<'_, '_, '_> {
                     self.opts.flatten,
                 )
         {
-            return self.rar5_link(vol, h, ctx, &rel, kind);
+            // its target is in the clear: an encrypted link is placed only on a password its check value verifies (applied
+            // once the link is known to be placed or tested: a skipped one stays skipped)
+            let password = link::rar5_password(h, self.password, ctx.scope());
+            return self.rar5_link(vol, h, ctx, &rel, kind, password);
         }
         if let Some(link) = &h.redirection {
             let kind = link.kind();
@@ -6171,5 +6191,15 @@ mod seven_zip_selected_tests {
                 "{archive}: {error}"
             );
         }
+    }
+}
+
+/// How a link whose password isn't verified is reported.
+fn link_password_message(failure: &RarFailure) -> &'static str {
+    match failure {
+        RarFailure::PasswordRequired { .. } => "encrypted (password required)",
+        RarFailure::WrongPassword { .. } => "wrong password",
+        RarFailure::EncryptedIntegrity { .. } => "the password can't be verified for a link",
+        _ => "invalid encryption record",
     }
 }
