@@ -45,6 +45,13 @@ const SALVAGED_WITNESSES: u8 = 0x5A;
 /// byte-identical and a build that predates it refuses such a state with `StateVersion` (an unknown tag) instead of
 /// reading it as malformed.
 const CUT_PARTS: u8 = 0xC7;
+/// Validity page section listing the kept leaves of a plain member ([`Snapshot::kept`]), version 1: the tag, the
+/// version, a count and each leaf's output range and CRC-32. Written only when some leaf is kept, after the hole
+/// cause section (which it forces) and in place of the ciphertext block section (kept leaves are plain-only, kept
+/// ciphertext encrypted-only), so every other state stays byte-identical and a build that predates it refuses such
+/// a state: with `StateVersion` if it knows the ciphertext block section (it reads the tag as an unknown version of
+/// it), as malformed if it predates that.
+const KEPT_LEAVES: u8 = 0x4B;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageKind {
     Geometry = 1,
@@ -111,6 +118,39 @@ impl CipherBlock {
         self.have == (0..16)
     }
 }
+/// Drops the kept leaves of `snapshot` that a later write (`written`, sorted and disjoint) touches or that no longer fit it: each must lie
+/// inside one part, inside a `DeclaredBad` hole, and off every known leaf. The leaves are sorted, so is `known`.
+pub(super) fn prune_kept(snapshot: &mut Snapshot, written: &[Range<u64>]) {
+    if snapshot.kept.is_empty() {
+        return;
+    }
+    let overlaps = |a: &Range<u64>, b: &Range<u64>| a.start < b.end && b.start < a.end;
+    let mut kept = std::mem::take(&mut snapshot.kept);
+    if snapshot.crypt.is_some() || snapshot.evidence.direct.is_some() {
+        return;
+    }
+    // The DeclaredBad hole outputs, sorted, so each leaf finds its hole by a binary search. A list that cannot be
+    // allocated keeps no leaf (they only save reads).
+    let mut declared: Vec<Range<u64>> = Vec::new();
+    let count = snapshot.holes.iter().filter(|h| h.cause == HoleCause::DeclaredBad).count();
+    if declared.try_reserve_exact(count).is_err() {
+        return;
+    }
+    declared.extend(snapshot.holes.iter().filter(|h| h.cause == HoleCause::DeclaredBad).map(|h| h.out.clone()));
+    declared.sort_by_key(|r| r.start);
+    kept.retain(|leaf| {
+        let first = snapshot.known.partition_point(|k| k.range.end <= leaf.range.start);
+        let on_known = snapshot.known.get(first).is_some_and(|k| k.range.start < leaf.range.end);
+        let in_part = snapshot.part_end(leaf.range.start).is_some_and(|end| leaf.range.end <= end);
+        // Hole outputs are disjoint: only the last one starting at or before the leaf can hold it.
+        let upto = declared.partition_point(|h| h.start <= leaf.range.start);
+        let inside = upto > 0 && leaf.range.end <= declared[upto - 1].end;
+        let at = written.partition_point(|w| w.end <= leaf.range.start);
+        let rewritten = written.get(at).is_some_and(|w| overlaps(w, &leaf.range));
+        !on_known && in_part && inside && !rewritten
+    });
+    snapshot.kept = kept;
+}
 impl Snapshot {
     /// End of the output a write may reach: the last recorded part's, or the size once the tail is abandoned.
     pub(super) fn writable_end(&self) -> Option<u64> {
@@ -138,6 +178,12 @@ pub(super) struct Snapshot {
     pub crypt: Option<crate::crypto::Rar5CryptParams>,
     /// Ciphertext blocks next to holes of an encrypted member, sorted by offset.
     pub cipher: Vec<CipherBlock>,
+    /// Leaves of a plain member's output that a part check later found wrong somewhere (a `DeclaredBad` hole the
+    /// session declared over a whole part, or the caller with `declare_hole`): the bytes are still in the output and
+    /// these are their CRC-32s, so `refill_declared_from_packed` can re-read only the repaired ranges and let the
+    /// part's own check decide. Sorted, disjoint, each inside a `DeclaredBad` hole and disjoint from `known`; a write
+    /// over one drops it in the write's intent, before any byte changes.
+    pub kept: Vec<KnownLeaf>,
     /// A direct member's cursor, as last set (committed with the next commit) or as the loaded state holds it.
     pub cursor: Option<Arc<[u8]>>,
 }
@@ -652,7 +698,8 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
         (extent_count.saturating_mul(21) as usize)
             .saturating_add(13)
             .saturating_add(snapshot.holes.iter().map(|h| 37 + 20 * h.packed.len()).sum::<usize>())
-            .saturating_add(snapshot.cipher.iter().map(|b| 10 + b.bytes.len()).sum::<usize>()),
+            .saturating_add(snapshot.cipher.iter().map(|b| 10 + b.bytes.len()).sum::<usize>())
+            .saturating_add(snapshot.kept.len().saturating_mul(20).saturating_add(6)),
     )?;
     // Byte offsets in `validity` where a page must start: after the extent count, at the first extent of each
     // window, and before the hole section. Only the windowed layout uses them.
@@ -704,7 +751,12 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
     // Trailing cause section, written only when some hole is not Missing so that states without declared
     // damage stay readable by builds that predate it. States without it decode every hole as Missing. The
     // ciphertext block section follows it, so it forces the cause section.
-    let causes = snapshot.holes.iter().any(|h| h.cause != HoleCause::Missing) || !snapshot.cipher.is_empty();
+    if !snapshot.kept.is_empty() && !snapshot.cipher.is_empty() {
+        return Err(malformed());
+    }
+    let causes = snapshot.holes.iter().any(|h| h.cause != HoleCause::Missing)
+        || !snapshot.cipher.is_empty()
+        || !snapshot.kept.is_empty();
     for h in snapshot.holes.iter().filter(|_| causes) {
         validity.u8(match h.cause {
             HoleCause::Missing => 0,
@@ -723,6 +775,15 @@ pub(super) fn encode_pages(snapshot: &Snapshot, budget: &PartialBudget) -> Parti
             validity.u8(block.have.start)?;
             validity.u8(block.have.end)?;
             validity.raw(&block.bytes)?;
+        }
+    }
+    if !snapshot.kept.is_empty() {
+        validity.u8(KEPT_LEAVES)?;
+        validity.u8(1)?;
+        validity.u32(snapshot.kept.len().try_into().map_err(|_| malformed())?)?;
+        for leaf in &snapshot.kept {
+            validity.range(&leaf.range)?;
+            validity.u32(leaf.crc)?;
         }
     }
     let mut headers = Encoder::budgeted(budget.limits.ledger_bytes as usize, budget);
@@ -1091,7 +1152,7 @@ pub(super) fn decode_pages(
         }
     }
     let mut cipher = Vec::new();
-    if d.at < d.bytes.len() {
+    if d.at < d.bytes.len() && d.bytes.get(d.at) != Some(&KEPT_LEAVES) {
         if d.u8()? != 1 {
             return Err(err(PartialErrorKind::StateVersion));
         }
@@ -1113,17 +1174,47 @@ pub(super) fn decode_pages(
             cipher.push(CipherBlock { offset, have, bytes });
         }
     }
+    let mut kept = Vec::new();
+    if d.at < d.bytes.len() {
+        if d.u8()? != KEPT_LEAVES || d.u8()? != 1 {
+            return Err(err(PartialErrorKind::StateVersion));
+        }
+        let count = d.count(budget.limits.crc_leaves as usize, 20)?;
+        if count == 0 || !cipher.is_empty() || sparse {
+            return Err(malformed());
+        }
+        budget.limits.check(PartialResource::CrcLeaves, (known.len() + count) as u64)?;
+        budget.metadata((count * std::mem::size_of::<KnownLeaf>()) as u64)?;
+        kept = budget.vector(count)?;
+        let mut end = 0;
+        for _ in 0..count {
+            let range = d.range()?;
+            let crc = d.u32()?;
+            if range.start < end || range.is_empty() || range.end > head.produced || range.end - range.start > 65_536 {
+                return Err(malformed());
+            }
+            end = range.end;
+            let hasher = crate::crc32::Hasher::from_parts(crc, range.end - range.start);
+            let lease = Arc::new(budget.reserve(PartialResource::CrcLeaves, 1)?);
+            kept.push(KnownLeaf { range, crc, hasher, provenance: Provenance::Original, _lease: lease });
+        }
+    }
     d.end()?;
     let evidence = InitialEvidence { format, metadata: head.metadata, parts, admissions, headers, cut, direct };
     if has_cursor && evidence.direct.is_none() {
         return Err(malformed());
     }
     let cursor = has_cursor.then(|| Arc::from(std::mem::take(&mut buffers[3]).into_boxed_slice()));
-    let mut snapshot = Snapshot { head, name, evidence, known, holes, crypt: None, cipher, cursor };
+    let mut snapshot = Snapshot { head, name, evidence, known, holes, crypt: None, cipher, cursor, kept };
     snapshot.crypt = validate_evidence(&snapshot.name, snapshot.head.size, &snapshot.evidence, budget)?;
-    if !snapshot.cipher.is_empty() && snapshot.crypt.is_none() {
+    if (!snapshot.cipher.is_empty() && snapshot.crypt.is_none())
+        || (!snapshot.kept.is_empty() && snapshot.crypt.is_some())
+    {
         return Err(malformed());
     }
+    // Kept leaves only lower what a refill must read, so ones that no longer fit the state (across a part boundary,
+    // over known output, outside every DeclaredBad hole) are dropped rather than refusing the state.
+    prune_kept(&mut snapshot, &[]);
     Ok(snapshot)
 }
 /// Checks every part against its header witness and returns the member's encryption parameters (`None` when the

@@ -19,6 +19,7 @@
 #![doc = include_str!("../../docs/persistent-partials.md")]
 mod anchor;
 mod cipher;
+mod declared;
 mod held;
 pub use held::{HeldOptions, HeldOutput, HeldScan, HeldSkip, load_held};
 mod journal;
@@ -255,6 +256,11 @@ fn write_output(file: &std::fs::File, offset: u64, bytes: &[u8]) -> std::io::Res
         crate::output::range::write_at(file, offset, bytes)
     }
 }
+/// Whether output `range` overlaps a kept leaf of `snapshot` ([`state::Snapshot::kept`]).
+fn kept_overlaps(snapshot: &Snapshot, range: &Range<u64>) -> bool {
+    let first = snapshot.kept.partition_point(|leaf| leaf.range.end <= range.start);
+    snapshot.kept.get(first).is_some_and(|leaf| leaf.range.start < range.end)
+}
 fn rehash_known(
     native: &PersistentNative,
     budget: &PartialBudget,
@@ -262,11 +268,13 @@ fn rehash_known(
     chunk: usize,
     snapshot: &mut Snapshot,
 ) -> PartialResult<()> {
-    if chunk == 0 && !snapshot.known.is_empty() {
+    if chunk == 0 && !(snapshot.known.is_empty() && snapshot.kept.is_empty()) {
         return Err(err(PartialErrorKind::InvalidOptions));
     }
     let before = stamp(native)?;
-    let max_leaf = snapshot.known.iter().map(|leaf| leaf.range.end - leaf.range.start).max().unwrap_or(0) as usize;
+    let max_leaf =
+        snapshot.known.iter().chain(&snapshot.kept).map(|leaf| leaf.range.end - leaf.range.start).max().unwrap_or(0)
+            as usize;
     let mut buffer = budget.vector(chunk.min(max_leaf))?;
     buffer.resize(chunk.min(max_leaf), 0);
     for leaf in &mut snapshot.known {
@@ -290,6 +298,45 @@ fn rehash_known(
         }
         leaf.hasher = hasher;
     }
+    // Kept leaves are bytes a part check found wrong somewhere; one whose bytes changed since only stops saving a
+    // read, so it is dropped rather than failing the reopen.
+    let mut kept = std::mem::take(&mut snapshot.kept);
+    let mut result = Ok(());
+    kept.retain_mut(|leaf| {
+        if result.is_err() {
+            return false;
+        }
+        let mut at = leaf.range.start;
+        let mut hasher = crate::crc32::Hasher::new();
+        while at < leaf.range.end {
+            let n = (leaf.range.end - at).min(buffer.len() as u64) as usize;
+            let read = canceled(control)
+                .and_then(|()| budget.usage.charge(Resource::VerifyBytes, n as u64).map_err(Into::into))
+                .and_then(|()| budget.usage.charge(Resource::VerifyWorkBytes, n as u64).map_err(Into::into))
+                .and_then(|()| {
+                    crate::output::range::read_at(&native.output.file, at, &mut buffer[..n])
+                        .map_err(|e| io_error(OutputOperation::Read, e))
+                });
+            match read {
+                Ok(0) => return false,
+                Ok(count) => {
+                    hasher.update(&buffer[..count]);
+                    at += count as u64;
+                }
+                Err(error) => {
+                    result = Err(error);
+                    return false;
+                }
+            }
+        }
+        if hasher.clone().finalize() != leaf.crc {
+            return false;
+        }
+        leaf.hasher = hasher;
+        true
+    });
+    result?;
+    snapshot.kept = kept;
     native.check(snapshot.head.size)?;
     if stamp(native)? != before {
         return Err(err(PartialErrorKind::OutputChanged));
@@ -386,6 +433,7 @@ impl PartialCore {
             crypt,
             cipher: Vec::new(),
             cursor: None,
+            kept: Vec::new(),
         };
         // The genesis pages stay with the prepared core until it is created.
         let (pages, encoded) = state::encode_pages(&initial, &budget)?;
@@ -496,7 +544,7 @@ impl PartialCore {
         let bytes = std::mem::size_of::<Snapshot>()
             + snapshot.name.len()
             + snapshot.head.relative_output.as_os_str().len()
-            + snapshot.known.len() * std::mem::size_of::<state::KnownLeaf>()
+            + (snapshot.known.len() + snapshot.kept.len()) * std::mem::size_of::<state::KnownLeaf>()
             + snapshot
                 .evidence
                 .headers
@@ -555,6 +603,15 @@ impl PartialCore {
         if !self.grouping() {
             self.reconcile(&mut op)?;
             // The result's copy of the state lives as long as the call does.
+            let _result_lease =
+                self.budget.metadata_lease(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
+            return Ok((self.write_data(&mut op, offset, bytes, FillMode::Alt)?.applied, true));
+        }
+        if kept_overlaps(&op.snapshot, &(offset..offset.saturating_add(bytes.len() as u64))) {
+            // Output kept under a DeclaredBad hole: a transaction drops the kept leaves before writing (a group's
+            // writes are durable only at its commit).
+            self.flush_group(&mut op)?;
+            self.reconcile(&mut op)?;
             let _result_lease =
                 self.budget.metadata_lease(op.state.wire.len() as u64 + std::mem::size_of::<Range<u64>>() as u64)?;
             return Ok((self.write_data(&mut op, offset, bytes, FillMode::Alt)?.applied, true));
@@ -874,7 +931,11 @@ impl PartialCore {
         for (packed, out) in &segments {
             let out = *out..*out + (packed.end - packed.start);
             let first = op.snapshot.known.partition_point(|leaf| leaf.range.end <= out.start);
-            if op.snapshot.known.get(first).is_some_and(|leaf| leaf.range.start < out.end) {
+            // Kept leaves too: a group's writes are not durable before its commit, so a write over kept output takes
+            // a transaction whose intent drops them first.
+            if op.snapshot.known.get(first).is_some_and(|leaf| leaf.range.start < out.end)
+                || kept_overlaps(&op.snapshot, &out)
+            {
                 drop(op);
                 return self.fill_packed(volume, offset, bytes);
             }
@@ -1246,6 +1307,15 @@ impl PartialCore {
         if !alternate {
             commit.head.produced = commit.head.produced.max(end);
         }
+        // Kept leaves under this write stop describing the output before any byte changes: the intent drops them.
+        if !intent.kept.is_empty() {
+            let (mut written, _written_lease) = self.budget.leased_vector(plan.unknown.len() + corrected.len())?;
+            written.extend(plan.unknown.iter().chain(&corrected).cloned());
+            // Unknown and corrected (alt) ranges never overlap: sorted, they are disjoint.
+            written.sort_by_key(|r| r.start);
+            state::prune_kept(&mut intent, &written);
+            state::prune_kept(&mut commit, &written);
+        }
         if !corrected.is_empty() {
             // Until the rewrite commits, the differing alt bytes are known bad: a crash leaves them as holes.
             intent.known = base.clone();
@@ -1407,6 +1477,10 @@ impl PartialCore {
             _ => {}
         }
         let range = offset..end;
+        // Callers send writes over kept output to a transaction (`write_data`), whose intent drops the kept leaves.
+        if kept_overlaps(&op.snapshot, &range) {
+            return Err(malformed());
+        }
         // Alt bytes over known output must match it (packed corrections never group: `fill_packed_grouped` sends
         // only output that is all holes).
         self.compare_known(op, offset, bytes, if mode == FillMode::Packed { FillMode::Alt } else { mode })?;
@@ -1812,6 +1886,10 @@ impl PartialCore {
         affected: Vec<Range<u64>>,
     ) -> PartialResult<Transaction> {
         let prior_sequence = data.state.anchor().sequence();
+        // Kept leaves must still fit each state (inside a DeclaredBad hole, off known output); writers drop the ones
+        // they overwrite themselves, before this.
+        state::prune_kept(&mut intent, &[]);
+        state::prune_kept(&mut valid, &[]);
         let result = (|| {
             // These copies live until the transaction finishes (or, on failure,
             // until the uncertain record is resolved); charge them that long.
@@ -2024,6 +2102,38 @@ impl PartialCore {
         valid.known = intent.known.clone();
         valid.head.produced = valid.head.produced.max(report.out.end);
         intent.head.produced = valid.head.produced;
+        // A plain member's output under a DeclaredBad hole stays as written: its whole leaves are kept with their
+        // CRC-32s, so a refill of only the repaired ranges can let the part's own check decide
+        // (`refill_declared_from_packed`). The bytes do not change here, so the intent keeps them too.
+        if report.cause == HoleCause::DeclaredBad
+            && data.snapshot.crypt.is_none()
+            && data.snapshot.evidence.direct.is_none()
+        {
+            let first = data.snapshot.known.partition_point(|leaf| leaf.range.end <= report.out.start);
+            let inside = data.snapshot.known[first..]
+                .iter()
+                .take_while(|leaf| leaf.range.start < report.out.end)
+                .filter(|leaf| report.out.start <= leaf.range.start && leaf.range.end <= report.out.end);
+            let count = inside.clone().count();
+            if count > 0 {
+                self.budget
+                    .limits
+                    .check(PartialResource::CrcLeaves, (intent.known.len() + valid.kept.len() + count) as u64)?;
+                self.budget.metadata((count * std::mem::size_of::<state::KnownLeaf>()) as u64)?;
+                lease.absorb(
+                    self.budget.metadata_lease(
+                        ((valid.kept.len() + count) * std::mem::size_of::<state::KnownLeaf>()) as u64,
+                    )?,
+                );
+                valid.kept.try_reserve_exact(count).map_err(|_| malformed())?;
+                valid.kept.extend(inside.cloned().map(|mut leaf| {
+                    leaf.provenance = state::Provenance::Original;
+                    leaf
+                }));
+                valid.kept.sort_by_key(|leaf| leaf.range.start);
+                intent.kept = valid.kept.clone();
+            }
+        }
         ledger::Ledger { known: &mut intent.known, size: intent.head.size, budget: &self.budget }.check_intervals()?;
         let affected = report.out.clone();
         // A source answers at most one read buffer per Hole, so one unread range arrives as many holes in a row.
@@ -3108,6 +3218,36 @@ impl PartialFile {
             Some(total) => Ok(total),
             None => self.core.fill_packed_grouped(volume, range.start, &[]),
         }
+    }
+    /// Closes a `DeclaredBad` hole of a plain member by re-reading only the `repaired` packed ranges of `volume`
+    /// from `reader` (positioned anywhere; it is sought), for a volume repaired in place after a part's own check
+    /// failed (the session declares the whole part then). `hole` is the hole's packed range on `volume` (as in its
+    /// [`HoleReport`]) and `repaired` are the sub-ranges of it the repair rewrote. The rest of the hole keeps the
+    /// output the extraction wrote, which the session keeps under a `DeclaredBad` hole, and the own check of every
+    /// part the hole touches decides (CRC-32 combined from leaf CRCs, so nothing else is read; for a part checked
+    /// only by BLAKE2sp, a local read of that part's output; a final part's check is the member CRC-32 over all of
+    /// the member's output). Hole output that is no longer kept (a crash during an earlier call, a write over it) is
+    /// read as well, still only inside `hole`.
+    ///
+    /// On success the whole hole is known output and the result lists it in [`PackedFillResult::applied`]. If a
+    /// check fails, the hole stays and the call returns [`PartialErrorKind::DeclaredRefill`] with
+    /// [`DeclaredRefillFailure::CheckFailed`]; the repaired bytes stay written and kept, so another call with more
+    /// ranges reads only those. If the hole cannot be decided from `repaired` alone (encrypted or direct member, no
+    /// usable check, output the check covers unknown outside the hole), it returns
+    /// [`DeclaredRefillFailure::Unprovable`] having read and written nothing. Fall back to
+    /// [`refill_from_packed`](Self::refill_from_packed) on either.
+    ///
+    /// Crash-safe: the kept leaves under the bytes to rewrite are dropped durably before any byte changes, and the
+    /// hole closes only in the transaction that records the rebuilt leaves, so a crash at any point leaves the hole
+    /// as it was (with fewer kept leaves) or closed. `repaired` ranges must be non-empty and inside `hole`.
+    pub fn refill_declared_from_packed<R: std::io::Read + std::io::Seek>(
+        &mut self,
+        volume: u32,
+        hole: Range<u64>,
+        repaired: &[Range<u64>],
+        reader: &mut R,
+    ) -> PartialResult<PackedFillResult> {
+        self.core.refill_declared(volume, &hole, repaired, reader)
     }
     /// The absolute path of the output file this partial writes to: the output root (made absolute when the
     /// session opened it) joined with [`relative_output_path`](Self::relative_output_path). Its parents were
