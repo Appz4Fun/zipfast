@@ -139,6 +139,7 @@ impl Fixture {
                 volume: index as u32,
                 packed: frame.extent.clone(),
                 bytes: bytes[frame.extent.start as usize..frame.extent.end as usize].to_vec(),
+                salvaged: false,
             });
         }
         let checks = MemberChecks {
@@ -695,4 +696,62 @@ fn a_scattered_hole_costs_the_same_however_many_holes_came_before() {
     let late = costs[HOLES - 10..].iter().sum::<i64>() / 10;
     assert!(late <= early + 64, "a hole cost {early} bytes after 10 holes and {late} after {}", HOLES - 10);
     assert_eq!(file.core.operation().unwrap().snapshot.holes.len(), HOLES, "separate holes stay separate");
+}
+
+/// A header witness read past as damage (`salvaged`) is stored in a section only such states carry, and parsed
+/// again as it stands: a damaged witness decodes when marked salvaged and is refused when not. States with no
+/// salvaged witness are byte-identical to before, and a section of an unknown version is `StateVersion`, as an older
+/// build reports for the section itself (an unknown trailing tag).
+#[test]
+fn salvaged_witnesses_persist_in_their_own_section() {
+    use crate::partial::state::{self, PageKind};
+    let f = Fixture::new(4096, false, true, false);
+    let file = f.create();
+    let op = file.core.operation().unwrap();
+    let witnesses = |pages: &[(PageKind, Vec<u8>)]| {
+        let (kind, bytes) = pages.iter().find(|(kind, _)| *kind == PageKind::HeaderWitnesses).unwrap();
+        state::page_payload(*kind, bytes).unwrap().to_vec()
+    };
+    let with = |witnesses: Vec<u8>, pages: &[(PageKind, Vec<u8>)]| -> Vec<(PageKind, Vec<u8>)> {
+        pages
+            .iter()
+            .map(|(kind, bytes)| match kind {
+                PageKind::HeaderWitnesses => (*kind, state::page_bytes(*kind, &witnesses).unwrap()),
+                _ => (*kind, bytes.clone()),
+            })
+            .collect()
+    };
+    let decode = |pages: Vec<(PageKind, Vec<u8>)>| {
+        state::decode_pages(op.snapshot.head.clone(), pages, &file.core.budget, &[]).map(|s| s.evidence.headers)
+    };
+    let (clean, _lease) = state::encode_pages(&op.snapshot, &file.core.budget).unwrap();
+    assert!(decode(clean.clone()).unwrap().iter().all(|h| !h.salvaged));
+
+    let (mut salvaged, _copy) = file.core.clone_snapshot(&op.snapshot).unwrap();
+    salvaged.evidence.headers[0].salvaged = true;
+    let (pages, _lease) = state::encode_pages(&salvaged, &file.core.budget).unwrap();
+    let marked = witnesses(&pages);
+    let plain = witnesses(&clean);
+    assert_eq!(marked.len(), plain.len() + 10, "tag, version, count and one index");
+    assert_eq!(&marked[..plain.len()], &plain[..], "the section follows the witnesses");
+    assert_eq!(marked[plain.len()], 0x5A);
+    assert!(decode(pages.clone()).unwrap()[0].salvaged);
+
+    // the witness's header CRC hit (its first byte, after the count, volume, range and length): read as it stands
+    // only when marked so
+    let header_crc = 4 + 4 + 16 + 4;
+    let damage = |mut bytes: Vec<u8>| {
+        bytes[header_crc] ^= 0x5a;
+        bytes
+    };
+    assert!(decode(with(damage(marked.clone()), &pages)).unwrap()[0].salvaged);
+    assert!(decode(with(damage(plain.clone()), &clean)).is_err(), "a damaged witness is not read strictly");
+
+    let mut future = marked.clone();
+    future[plain.len() + 1] = 2;
+    assert!(matches!(decode(with(future, &pages)).unwrap_err().kind, PartialErrorKind::StateVersion));
+    let mut stray = marked;
+    let last = stray.len() - 4;
+    stray[last..].copy_from_slice(&7u32.to_le_bytes());
+    assert!(decode(with(stray, &pages)).is_err(), "an index past the witnesses");
 }
