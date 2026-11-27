@@ -311,6 +311,7 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             salvage_truncated_zip: false,
                             unix_modes: Default::default(),
                             backslashes: Default::default(),
+                            hard_link_targets: Default::default(),
                         },
                         Some("password"),
                         |_| {},

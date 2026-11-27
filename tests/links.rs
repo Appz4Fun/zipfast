@@ -56,6 +56,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite) -> Options {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 
@@ -553,6 +554,7 @@ fn a_refused_link_leaves_a_placeholder_only_when_asked() {
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
             ..options(&dest, Mode::Extract, Overwrite::Always)
         };
         let s = extract::run(&archive, &opts, |_| {}).unwrap();

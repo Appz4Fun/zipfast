@@ -139,6 +139,10 @@ pub(crate) const UNSAFE_TARGET: &str = "the link's target is absolute or leads o
 /// The message for a hard link whose target is not a file this run extracted.
 pub(crate) const HARD_TARGET: &str = "the hard link's target is not a file extracted earlier in this run";
 
+/// The message for a hard link, under [`crate::extract::HardLinkTargets::StoredName`], whose target's name holds no
+/// regular file reached without following a link.
+pub(crate) const STORED_TARGET: &str = "the hard link's target is not a regular file in the destination";
+
 /// The message for a hard link or file copy whose earlier file was changed or replaced since it was extracted.
 pub(crate) const TARGET_CHANGED: &str = "the hard link's target is no longer the file extracted earlier";
 /// The message for a link on a platform where links aren't created.
@@ -319,6 +323,9 @@ pub(crate) struct Extracted {
     /// where each extracted file landed, and the members that landed there
     landed: BTreeMap<PathBuf, Vec<PathBuf>>,
     bytes: usize,
+    /// a hard link takes the regular file at its target's stored name, whoever wrote it
+    /// ([`crate::extract::HardLinkTargets::StoredName`])
+    stored_name_targets: bool,
 }
 
 /// The most bytes of paths [`Extracted`] holds, as much as a listing may.
@@ -348,16 +355,19 @@ fn normalised(rel: &Path) -> bool {
 impl Extracted {
     /// No records yet, with the link settings of `options`. A test run never writes a placeholder.
     pub(crate) fn new(options: &crate::extract::Options) -> Self {
+        let extracting = options.mode == crate::extract::Mode::Extract;
         Self {
             preexisting: options.preexisting_links,
-            placeholder: options.refused_link_placeholder && options.mode == crate::extract::Mode::Extract,
+            placeholder: options.refused_link_placeholder && extracting,
+            stored_name_targets: options.hard_link_targets == crate::extract::HardLinkTargets::StoredName && extracting,
             ..Self::default()
         }
     }
 
-    /// As [`Extracted::new`], for a writer that always extracts whatever `options.mode` says.
+    /// As [`Extracted::new`], for a writer that always extracts whatever `options.mode` says
+    /// ([`crate::rar5::session::RarSession`]), which links only to files it extracted itself.
     pub(crate) fn for_output(options: &crate::extract::Options) -> Self {
-        Self { placeholder: options.refused_link_placeholder, ..Self::new(options) }
+        Self { placeholder: options.refused_link_placeholder, stored_name_targets: false, ..Self::new(options) }
     }
 
     /// Whether a refused symbolic link leaves an empty regular file at its path: its lexical target check then
@@ -529,6 +539,8 @@ pub(crate) fn foreign_link(dest: &Path, path: &Path, target: &[u8], extracted: &
 pub(crate) fn refusal(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Option<&'static str> {
     match kind {
         LinkKind::Symbolic(target) if !contained(rel, target) => Some(UNSAFE_TARGET),
+        // under HardLinkTargets::StoredName what is at the target's name is found when the link is made
+        LinkKind::Hard(_) if extracted.stored_name_targets => None,
         LinkKind::Hard(target) | LinkKind::Copy(target) if !extracted.contains(target) => Some(HARD_TARGET),
         _ => None,
     }
@@ -701,11 +713,38 @@ fn make_charging(
         #[cfg(unix)]
         LinkKind::Symbolic(target) if let Some(why) = foreign_link(dest, path, target, extracted) => Err(refused(why)),
         LinkKind::Symbolic(target) => create(path, target, replace, modified),
+        LinkKind::Hard(source) if extracted.stored_name_targets => {
+            let found = stored_file(dest, source).ok_or_else(|| refused(STORED_TARGET))?;
+            hard(dest, &found, path, replace, false, charge)
+        }
         LinkKind::Hard(source) | LinkKind::Copy(source) => {
             let landed = extracted.records.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
             hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)), charge)
         }
     }
+}
+
+/// The regular file at `rel` under `dest`, reached through real folders only (no symbolic link on the way or at
+/// `rel`), as a hard link under [`crate::extract::HardLinkTargets::StoredName`] takes it. [`hard`] reaches it again
+/// the same way and links it only while it is still this file (device and inode).
+fn stored_file(dest: &Path, rel: &Path) -> Option<Landed> {
+    if !normalised(rel) {
+        return None;
+    }
+    let mut at = dest.to_path_buf();
+    let mut parts = rel.components().peekable();
+    while let Some(part) = parts.next() {
+        at.push(part);
+        let meta = std::fs::symlink_metadata(&at).ok()?;
+        if parts.peek().is_none() {
+            let (dev, ino) = identity(&meta);
+            return meta.file_type().is_file().then(|| Landed { rel: rel.to_path_buf(), dev, ino });
+        }
+        if !meta.file_type().is_dir() {
+            return None;
+        }
+    }
+    None
 }
 
 /// Records a link member placed at `path` (an absolute path under `dest`) for the member at `rel`: a symbolic link

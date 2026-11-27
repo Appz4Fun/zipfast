@@ -2566,6 +2566,7 @@ mod tests {
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);
@@ -2638,6 +2639,7 @@ mod tests {
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);

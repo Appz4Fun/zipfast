@@ -52,6 +52,7 @@ pub(super) fn setup(
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let context = EncryptedReadContext::for_projected(
         &mut s,

@@ -63,6 +63,7 @@ fn options(dest: &Path, mode: Mode, filters: UnsupportedFilters) -> Options {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

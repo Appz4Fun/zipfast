@@ -159,9 +159,9 @@ impl<'a> Extraction<'a> {
         }
         let relative = hooks.project(header, self.options.version_naming)?;
         let meta = if header.is_dir() {
-            self.options.dir_meta(Meta::from(header))
+            self.options.dir_meta(self.options.rar_mode(Meta::from(header)))
         } else {
-            self.options.meta(Meta::from(header))
+            self.options.rar_meta(header)
         };
         if header.is_dir() {
             let outcome = run.test(session, index, None)?;
@@ -1053,6 +1053,7 @@ mod tests {
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
+            hard_link_targets: Default::default(),
         }
     }
 
