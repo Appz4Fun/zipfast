@@ -1397,6 +1397,7 @@ mod tests {
                     name: std::sync::Arc::new(b"f".to_vec()),
                     compression: 0,
                     extent: 0..0,
+                    cut: None,
                 };
                 let part = PhysicalPart::new(0, &header, header.crypt.map(Ok), &wire);
                 let mut member = PhysicalMember::new(header.clone(), wire, 0, &part).unwrap();
@@ -1544,6 +1545,7 @@ mod tests {
                     unsupported_filters: Default::default(),
                     unverified_output: Default::default(),
                     salvage_truncated_zip: false,
+                    seven_zip_strict: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
                     hard_link_targets: Default::default(),
@@ -1686,6 +1688,7 @@ mod tests {
                 name: std::sync::Arc::new(b"f".to_vec()),
                 compression: 0,
                 extent: 0..0,
+                cut: None,
             };
             // Part 0 declares no BLAKE2sp; part 1 does.
             let first = super::super::FileHeader {
@@ -1763,6 +1766,7 @@ mod tests {
                     name: std::sync::Arc::new(b"f".to_vec()),
                     compression: 0,
                     extent: 0..0,
+                    cut: None,
                 };
                 let part1 = PhysicalPart::new(0, &first, Some(Ok(params)), &wire);
                 let mut member = PhysicalMember::new(first.clone(), wire, 0, &part1).unwrap();
@@ -1898,6 +1902,7 @@ mod tests {
                 unsupported_filters: Default::default(),
                 unverified_output: Default::default(),
                 salvage_truncated_zip: false,
+                seven_zip_strict: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
                 hard_link_targets: Default::default(),

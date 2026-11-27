@@ -218,6 +218,8 @@ it) holds its verified files back until the whole folder has been read and its C
 published together, or all reported as failed. `Mode::Test` does the same: the members count as tested only once
 the folder's CRC matches.
 
+With `Options::seven_zip_strict` (off by default), a folder decoded to its end is also checked the way 7-Zip checks it: every coder must end where its stream ends (a range coder ending at 0, no bytes left unused, nothing after an end marker). A folder that fails is reported in `Summary::folder_damage` and `Summary::errors` as `#N: ...`; its verified members are still published. See `docs/compat-options.md` (`seven_zip_strict`).
+
 A member with no CRC of its own and no folder CRC behind it cannot be checked:
 
 - **Unencrypted, it is published unverified**, as 7-Zip extracts it: only a decoding error can catch damage.

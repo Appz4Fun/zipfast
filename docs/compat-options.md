@@ -22,6 +22,7 @@ damaged_input: Default::default(),
 unsupported_filters: Default::default(),
 unverified_output: Default::default(),
 salvage_truncated_zip: false,
+seven_zip_strict: false,
 unix_modes: Default::default(),
 backslashes: Default::default(),
 hard_link_targets: Default::default(),
@@ -313,7 +314,7 @@ What UnRAR 7.30 (`x`, `t`, `l`) does, from archives with one byte changed, cut s
 | the main header fails its checksum | "Main archive header is corrupt", reads on | "Headers Error" | `ChecksumMismatch`, reads on |
 | a RAR 4.x block's type byte changed (checksum fails, type unknown) | the block is passed over by its size, the rest extracted | "Headers Error" | `ChecksumMismatch`, passed over by its size |
 | a header that can't be read (size field changed, garbage inserted before it) | "Corrupt header is found" or "Unexpected end of archive", nothing after it is read, exit 3 | "Headers Error", stops | `Unreadable` (or `UnexpectedEnd`), the rest of the volume passed over, what came before stands |
-| the volume ends inside a header or its data | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there |
+| the volume ends inside a header or its data | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there; a `RarSession` catalogue lists a file whose data the end cuts short, failing as `TruncatedData` (see `unverified_output`) |
 | a RAR 5.0 volume without its end header | no message | "Unexpected end of archive", exit 2 | `UnexpectedEnd` at the volume's length |
 | only a member's data damaged | "checksum error", the rest extracted | "CRC Failed" | as before, with any `damaged_input`: the member fails, nothing is recorded as header damage |
 | a RAR 4.x archive cut inside its main header | "Main archive header is corrupt", lists "0 files" (`Details: RAR 1.5`) | | opens with no members, `UnexpectedEnd` |
@@ -438,9 +439,9 @@ default, changes nothing.
 | field | route | under `Emit` | sign |
 | --- | --- | --- | --- |
 | `Options::unverified_output` | `extract::run`, `run_with_password`, `run_rar_with_outcomes`, the dispatchers | with `keep_broken`, a RAR member cut off by a missing volume keeps every byte UnRAR 7.30 `x -kb` keeps (without `keep_broken` it is removed, as `unrar x` removes it) | the member's usual failure ("missing volume") |
-| `Options::unverified_output` | `RarSession::extract_selected`, `extract_selected_controlled` | with `keep_broken`, the same member is written and kept (by default a session doesn't write it at all) | `RarOutcome::Failed` with `RarFailure::MissingVolume` or `MissingSplitContinuation` |
+| `Options::unverified_output` | `RarSession::extract_selected`, `extract_selected_controlled` | with `keep_broken`, the same member is written and kept (by default a session doesn't write it at all), and so is one an archive cut short ends inside (under `DamagedInput::Salvage`) | `RarOutcome::Failed` with `RarFailure::MissingVolume` or `MissingSplitContinuation` (`TruncatedData` for the archive cut short) |
 | `Options::unverified_output` | persistent-partial sessions (`ProgressiveSession::new_partial`) | with `keep_broken`, a stored member cut off by a missing volume or a set truncated inside it keeps the bytes already written (as ever) and is reported before the session's failure | `MemberFinished` with `MemberOutcome::PersistentUnverified { missing, .. }`, then the session's `MissingVolume` or `Truncated` |
-| `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume is decoded from the volumes there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
+| `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume, or by the end of an archive cut short (under `DamagedInput::Salvage`), is decoded from the data there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
 | `SevenZipPrintOptions::unverified_output` | `sevenzip::print_selected_with_options` (`7z x -so`) | a 7z member failing on its data has what 7-Zip 26.06 streams of it printed | its line in `Summary::errors`, and an `UnverifiedMember { index, name, bytes }` in `Summary::unverified` |
 | `SelectOptions::unverified_output` | `SelectedEntry` (`open_cancelable_with_options`, `open_cancelable_with_zip_limit_and_options`), 7z and RAR | 7z: as `print_selected_with_options`; RAR 3.x/4.x: a VM filter zipfast doesn't run leaves its block unfiltered (as `UnsupportedFilters::WriteUnfiltered`); other formats already stream as they decode | `read` fails with an `Error::Io` carrying `UnverifiedWritten { bytes, cause }` (`UnverifiedWritten::of`); `cause` is the failure without `Emit`, `Error::Unsupported(UNFILTERED_SELECTED)` for a RAR member written unfiltered |
 
@@ -470,6 +471,30 @@ sets and `text.rar` made into a cut-off first volume at 47 places (`tests/fixtur
 
 `7z x -so` on such a member is not imitated: 7-Zip 26.06 streams nothing of a RAR 3.x/4.x one and decodes a RAR 5.0
 one to the end of the data (55,084 bytes for `r5-partial`), and a `SelectedEntry` keeps streaming what it did before.
+
+### A RAR archive cut short inside a member's data
+
+UnRAR 7.30 `p` and `x -kb` ("Unexpected end of archive", exit 3) hand over the members before the cut and then what
+they decode of the member cut short. Unlike at a missing volume, they read on past the end as though zeros followed:
+every code starting before the byte after the data decodes, one straddling the end over that fill, whatever the
+codec (RAR 2.9 LZ and PPMd, RAR 1.5/2.0, RAR 5.0, a RAR 5.0 block however little of it is there). Under
+`DamagedInput::Salvage` a `RarSession` catalogue lists that member, with the data there, failing as
+`RarIntegrityReason::TruncatedData`; with `Emit`, `print_selected` prints and `extract_selected` (with `keep_broken`)
+keeps exactly those bytes. RAR 3.x/4.x decoding feeds zeros after the data, and a PPMd or RAR 1.5/2.0 code starting
+past the byte after it is not decoded. For RAR 5.0 the length matches, but a symbol straddling the end gives UnRAR
+bytes zeros don't, so the last few bytes can differ there. In a volume set UnRAR then goes on to the members of the
+later volumes, and so does the session; the cut member's continuation there is not joined to it. By default (`DamagedInput::Refuse`) such an archive still
+fails to open, and under `Withhold` the member prints nothing and isn't written. The whole-archive runner still passes
+over it.
+
+Checked against `unrar p` at consecutive cuts (`tests/fixtures/emit-cut-archive/README.md`): all 116 RAR 3.x/4.x
+cuts (2.9 LZ, PPMd, 2.0 LZ) and the stored RAR 4.x and 5.0 cuts give UnRAR's bytes exactly; of 108 RAR 5.0 LZ cuts
+(16 of them just past a block's start), 21 give its bytes, 72 more its length, and 15 are 1 to 3 bytes off.
+`tests/emit_cut_archive.rs` checks 21 cuts.
+
+7-Zip 26.06 `x` and `x -so` keep or print the stored data there and what they decode of a RAR 5.0 member (UnRAR's
+length, different last bytes), and nothing of a compressed RAR 3.x/4.x member. Neither `7z x -so` (`SelectedEntry`)
+nor `7z x` is imitated for this case.
 
 ### 7z members under `7z x -so`
 
@@ -507,6 +532,77 @@ Not covered: a Copy folder whose header gives fewer packed than unpacked bytes i
 hands over only what its threads finished before the error. `tests/unverified_output.rs` checks each point against the
 reference tools' output.
 
+
+## `seven_zip_strict`: 7-Zip's end checks on a 7z folder and a ZIP local header
+
+7-Zip checks more than each member's CRC. Once it has decoded a 7z folder to its end, it also checks that every coder
+in the folder ended where its stream ends. Separately, it compares each ZIP member's local header with the member's
+central directory record. zipfast by default checks the CRC only. `seven_zip_strict: true` makes these checks too. It
+defaults to `false`, and with `false` nothing changes.
+
+### 7z folders
+
+These checks run only when a folder is decoded to its end. Selecting only a solid block's earlier members skips them,
+as `7z t archive.7z a.txt` does. Whatever the checks find, every member that passes its CRC is still written or
+printed. A folder that fails gets one line in `Summary::errors` and a `FolderDamage { folder, kind, detail }` in
+`Summary::folder_damage`. The line looks like 7-Zip's (`#N: data error: ...` or `#N: there are some data after the end
+of the payload data: ...`). 7-Zip 26.06 reports such a folder as `Data Error : #N` or `There are some data after the
+end of the payload data : #N` and exits 2, even though every member's CRC passes.
+
+| coder | 7-Zip 26.06 reports it (zipfast does too) | 7-Zip 26.06 passes it |
+| --- | --- | --- |
+| LZMA | the range coder's final code is not 0; bytes after the data (`Data Error : #N`) | an end marker after the data |
+| LZMA2 | bytes after the end marker; a chunk starting after the folder's size (`Data Error`) | **a missing end marker** |
+| PPMd | the range coder's final code is not 0; bytes left over (`Data Error`); a first byte that isn't 0 fails every member (`Data Error : name`) | |
+| BCJ2 | main, call or jump stream bytes, or range coder bytes, left unused; the range coder's final code is not 0 (`Data Error`); a first range coder byte that isn't 0 fails every member (`Data Error : name`) | |
+| Deflate, Deflate64 | more output past the folder's size (`Data Error`); input after the end block (`data after the end`) | |
+| BZip2 | a second stream after the first (`data after the end`); 7-Zip's coder decodes one stream, so members held in a second one fail (`Data Error : name`) | |
+| Copy | packed bytes beyond the unpacked size (`data after the end`) | |
+
+A coder feeding another one is stopped at the folder's end. A Deflate or Deflate64 coder behind a Copy coder must already be at its last block's end by then; otherwise it is a `Data Error`, although the same stream on its own may have empty blocks after the output. zipfast checks each coder before the coders feeding it, so every coder can first read what it still needs.
+
+The LZMA2 missing end marker is not an error in 7-Zip 26.06, so zipfast doesn't flag it either. In strict mode an LZMA2
+folder is decoded on one thread, because the end checks need the whole stream in order. A folder whose input fails to
+decode before its end gets the usual member failures, and a `FolderDamage` when every member had already passed.
+
+7-Zip sometimes reports a damaged last range coder byte as `Data Error : name` for the last member. zipfast then reports
+that member's CRC failure and the folder. Both tools exit 2 and write the same bytes.
+
+### ZIP local headers
+
+7-Zip 26.06 compares each local header with its central directory record: the CRC-32, the compressed size, the size,
+the method and the data descriptor flag. When the local header sets the data descriptor flag, 7-Zip doesn't compare
+its CRC-32 or sizes. It also skips a size of `0xFFFFFFFF` (ZIP64), and it never compares the time, the version or the
+name. If any compared field differs, 7-Zip reports `Headers Error : name`, fails the member and exits 2. `7z x` leaves
+that member's file empty.
+
+With `seven_zip_strict`, zipfast fails such a member without decoding it. The failure is a `LocalHeaderMismatch {
+ordinal, name, crc32, packed_size, size, method, descriptor_flag }`, where each flag names a field that differs:
+
+- The legacy route (`extract::run` and friends) puts it in `Summary::local_header_mismatches` and gives it a line in
+  `Summary::errors`.
+- The checked route (`run_with_zip_policy`) fails the member with `ReadFault::LocalHeaderMismatch` and counts it in
+  `ZipRunReport::local_header_mismatches()`.
+
+With `keep_broken`, the member's file is left empty, as 7-Zip `x` leaves it.
+
+Differences from 7-Zip:
+
+- A mismatch on the first member makes 7-Zip report a headers error for the whole archive and walk the local headers
+  instead. zipfast reports just that member.
+- When only the data descriptor flag differs, 7-Zip still writes the member's data. zipfast fails the member before
+  writing it.
+- A link is compared too and fails unread. 7-Zip `x` leaves an empty regular file in its place; zipfast places nothing, even with `keep_broken`.
+
+### Routes
+
+The whole-archive runners and the dispatchers honour the option for 7z, both on the checked ZIP route and on the legacy
+ZIP route. `sevenzip::print_selected_with_options` honours it too, through `SevenZipPrintOptions::seven_zip_strict`.
+`ZipReadSession`, `SelectedEntry`, and progressive and persistent sessions ignore it. The progressive and persistent
+sessions decode neither 7z nor ZIP.
+
+`tests/seven_zip_strict.rs` checks each point against the fixtures in `tests/fixtures/seven-zip-strict`, whose
+README gives 7-Zip 26.06's verdict on each.
 
 ## `hard_link_targets`: what a hard link is made to
 

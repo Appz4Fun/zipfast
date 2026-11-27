@@ -864,6 +864,11 @@ impl<R: BufRead> Inflate64Reader<R> {
     pub fn into_inner(self) -> R {
         self.inner
     }
+
+    /// The inner reader, borrowed: what it holds is the input after the stream's end, once the stream ended.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
 }
 
 impl<R: BufRead> Read for Inflate64Reader<R> {

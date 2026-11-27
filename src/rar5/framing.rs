@@ -177,6 +177,12 @@ impl HeaderParser {
         self.resync = damaged == crate::extract::DamagedInput::Resync;
         self.legacy_unchecked = damaged == crate::extract::DamagedInput::SevenZip;
     }
+    /// A salvaging catalogue takes a file header whose data runs past the end of the volume, as UnRAR 7.30 does
+    /// ("Unexpected end of archive"): the frame ends at the volume's end and its wire says how much of the data is
+    /// there ([`super::FileWire::cut`]). Otherwise such a header fails as truncated data.
+    pub(super) fn cut_short(&self) -> bool {
+        self.salvage && self.catalogue
+    }
     pub(crate) fn format(&self) -> RarFormat {
         self.format
     }
@@ -646,10 +652,16 @@ impl HeaderParser {
             .ok_or_else(|| self.framing("extra area size", Error::Corrupt("extra area size")))?;
         let fields = &body[c.pos()..fields_end];
         let extra = &body[fields_end..];
-        let data_end =
+        let mut data_end =
             header_end.checked_add(data_size).ok_or_else(|| self.framing("data size", Error::Corrupt("data size")))?;
-        if self.complete_len.is_some_and(|len| data_end > len) {
-            return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+        // the bytes of a file's data that are there when the volume ends inside it (see `cut_short`)
+        let mut cut = None;
+        if let Some(len) = self.complete_len.filter(|&len| data_end > len) {
+            if !self.cut_short() || kind != HEAD_FILE {
+                return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+            }
+            cut = Some(len.saturating_sub(header_end));
+            data_end = len;
         }
         let head = BlockHead { kind, flags, data_size, data_at: header_end };
         let mut frame = PhysicalFrame {
@@ -692,6 +704,7 @@ impl HeaderParser {
                 frame.wire = wire;
                 if let Some(wire) = &mut frame.wire {
                     wire.extent = frame.extent.clone();
+                    wire.cut = cut;
                 }
                 if kind == HEAD_FILE { Block::File(h) } else { Block::Service(h) }
             }
