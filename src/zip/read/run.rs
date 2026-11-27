@@ -34,6 +34,7 @@ fn continued(error: &ZipReadError) -> bool {
                     | ReadFault::AuthenticationFailed
                     | ReadFault::Integrity { .. }
                     | ReadFault::UnsupportedMethod { .. }
+                    | ReadFault::LocalHeaderMismatch(_)
                     | ReadFault::Limit {
                         resource: ReadResource::MemberPackedBytes
                             | ReadResource::MemberDecodedBytes
@@ -329,8 +330,11 @@ impl ProjectedReadSession {
                             && !context.ledger.with_state(|s| s.poisoned);
                         error.with_member_local(local)
                     });
-                    if fault.is_some() {
+                    if let Some(error) = &fault {
                         add(&mut report.failed)?;
+                        if matches!(error.operation(), Some(ReadFault::LocalHeaderMismatch(_))) {
+                            report.local_header_mismatches = report.local_header_mismatches.saturating_add(1);
+                        }
                     } else if skipped {
                         add(&mut report.skipped)?;
                     } else {
@@ -561,7 +565,9 @@ impl ProjectedReadSession {
                     );
             }
         }
-        context.action.as_mut().ok_or(ReadFault::InvalidPlan)?.run_bound = true;
+        let action = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?;
+        action.run_bound = true;
+        action.seven_zip_strict = options.seven_zip_strict;
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
