@@ -507,6 +507,12 @@ impl<'a> RarHeader<'a> {
         self.header.data_at
     }
 
+    /// Where the volume ends inside this file header or its data, read anyway under
+    /// [`RarSessionOptions::damaged_input`]: see [`super::FileHeader::cut`].
+    pub fn cut(&self) -> Option<super::HeaderCut> {
+        self.header.cut
+    }
+
     pub fn attributes(&self) -> u64 {
         self.header.attributes
     }
@@ -650,6 +656,7 @@ pub struct RarMember<'a> {
     member: &'a Member,
     parts: &'a [Part],
     issue: Option<&'a RarFailure>,
+    cut: Option<super::HeaderCut>,
 }
 
 impl<'a> RarMember<'a> {
@@ -694,6 +701,14 @@ impl<'a> RarMember<'a> {
 
     pub fn packed_size(&self) -> u64 {
         self.member.packed_size
+    }
+
+    /// Where the volume ends inside one of this member's headers or its data, read anyway under
+    /// [`RarSessionOptions::damaged_input`] ([`super::FileHeader::cut`]): it is listed with its declared sizes, and
+    /// fails as truncated data ([`super::HeaderCut::Data`]; under [`crate::extract::UnverifiedOutput::Emit`] what
+    /// UnRAR 7.30 decodes of it is handed over first) or a truncated header ([`super::HeaderCut::Header`]). A caller showing 7-Zip 26.06's listing leaves out a `Header` cut.
+    pub fn cut(&self) -> Option<super::HeaderCut> {
+        self.cut
     }
 
     pub fn is_directory(&self) -> bool {
@@ -849,6 +864,11 @@ pub struct RarSession {
     invalid_binding: Option<Arc<RarFailure>>,
     restarted_from: Option<PathBuf>,
     members_before_named: u64,
+    /// `DamagedInput::Salvage`: the members a volume ends inside one of the headers or the data of, by member index,
+    /// in order, with where (whichever part it was; a member's `header` keeps its first part's physical header).
+    /// Kept apart from the members so an intact catalogue pays nothing for it; each cut ends a volume, so there are
+    /// no more of these than volumes.
+    cuts: Vec<(usize, super::HeaderCut)>,
 }
 
 impl RarSession {
@@ -867,6 +887,11 @@ impl RarSession {
     /// listing positions, which count from the volume named, are the catalogue's positions minus this.
     pub fn members_before_named(&self) -> u64 {
         self.members_before_named
+    }
+
+    /// Where a volume ends inside member `index`'s headers or data ([`RarMember::cut`]).
+    fn cut(&self, index: usize) -> Option<super::HeaderCut> {
+        self.cuts.binary_search_by_key(&index, |&(member, _)| member).ok().map(|at| self.cuts[at].1)
     }
 
     /// Read the volume headers and check their source binding. Member
@@ -918,6 +943,7 @@ impl RarSession {
                 invalid_binding: None,
                 restarted_from: None,
                 members_before_named: 0,
+                cuts: Vec::new(),
             },
             options,
             owned_capacity: 0,
@@ -993,6 +1019,7 @@ impl RarSession {
             member,
             parts: &self.model.parts[member.parts.clone()],
             issue: member.issue.map(|index| &self.issues[index]),
+            cut: self.cut(index),
         })
     }
 
@@ -1038,8 +1065,8 @@ const MAX_COMMENT: u64 = 1 << 20;
 const COMMENT_WINDOW: u64 = 4 << 20;
 const COMMENT_MEMORY: u64 = 16 << 20;
 
-fn comment_scope(held: &HeldVolume) -> RarScope {
-    RarScope::Header { volume: held.path.clone() }
+fn comment_scope(path: &Path) -> RarScope {
+    RarScope::Header { volume: path.to_path_buf() }
 }
 
 fn comment_unsupported(what: &str) -> Arc<RarFailure> {
@@ -1054,8 +1081,8 @@ fn comment_limit(requested: u64) -> Arc<RarFailure> {
     })
 }
 
-fn comment_integrity(held: &HeldVolume, reason: RarIntegrityReason) -> Arc<RarFailure> {
-    Arc::new(RarFailure::integrity(comment_scope(held), reason, RarPasswordEvidence::NotEncrypted, false))
+fn comment_integrity(path: &Path, reason: RarIntegrityReason) -> Arc<RarFailure> {
+    Arc::new(RarFailure::integrity(comment_scope(path), reason, RarPasswordEvidence::NotEncrypted, false))
 }
 
 fn read_comment(held: &HeldVolume, at: u64, len: u64) -> Result<Vec<u8>, Arc<RarFailure>> {
@@ -1070,6 +1097,14 @@ fn read_comment(held: &HeldVolume, at: u64, len: u64) -> Result<Vec<u8>, Arc<Rar
 }
 
 fn service_comment(held: &HeldVolume, header: &FileHeader, cancel: &Cancellation) -> Result<Vec<u8>, Arc<RarFailure>> {
+    service_comment_readable(header)?;
+    let packed = read_comment(held, header.data_at, header.packed_size)?;
+    decode_service_comment(&held.path, header, packed, cancel)
+}
+
+/// Whether a `CMT` service header's comment is one [`decode_service_comment`] reads: not encrypted, not split, and
+/// at most [`MAX_COMMENT`] bytes packed.
+pub(crate) fn service_comment_readable(header: &FileHeader) -> Result<(), Arc<RarFailure>> {
     if header.encrypted {
         return Err(comment_unsupported("encrypted"));
     }
@@ -1079,7 +1114,17 @@ fn service_comment(held: &HeldVolume, header: &FileHeader, cancel: &Cancellation
     if header.packed_size > MAX_COMMENT {
         return Err(comment_limit(header.packed_size));
     }
-    let packed = read_comment(held, header.data_at, header.packed_size)?;
+    Ok(())
+}
+
+/// The comment a `CMT` service header in the volume at `path` holds, from its `packed` data
+/// ([`service_comment_readable`]): decoded when compressed, and checked against its stored CRC.
+pub(crate) fn decode_service_comment(
+    path: &Path,
+    header: &FileHeader,
+    packed: Vec<u8>,
+    cancel: &Cancellation,
+) -> Result<Vec<u8>, Arc<RarFailure>> {
     let bytes = match (header.method, header.rar4) {
         (0, _) => packed,
         (_, Some(rar4)) => {
@@ -1089,14 +1134,14 @@ fn service_comment(held: &HeldVolume, header: &FileHeader, cancel: &Cancellation
             if header.unpacked_size > MAX_COMMENT {
                 return Err(comment_limit(header.unpacked_size));
             }
-            decode_rar4_comment(held, &packed, rar4.unpack_version, header.dictionary, header.unpacked_size, cancel)?
+            decode_rar4_comment(path, &packed, rar4.unpack_version, header.dictionary, header.unpacked_size, cancel)?
         }
         _ => return Err(comment_unsupported("compressed RAR 5.0")),
     };
     if let Some(expected) = header.crc32
         && crate::crc32::hash(&bytes) != expected
     {
-        return Err(comment_integrity(held, RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false }));
+        return Err(comment_integrity(path, RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false }));
     }
     Ok(bytes)
 }
@@ -1105,7 +1150,7 @@ fn service_comment(held: &HeldVolume, header: &FileHeader, cancel: &Cancellation
 /// unpack version, method and the comment's 16-bit CRC) followed by the packed comment, as UnRAR's `DoGetComment`
 /// reads it.
 fn rar2_comment(held: &HeldVolume, block: &[u8], cancel: &Cancellation) -> Result<Vec<u8>, Arc<RarFailure>> {
-    let framing = |reason| comment_integrity(held, RarIntegrityReason::HeaderFraming(reason));
+    let framing = |reason| comment_integrity(&held.path, RarIntegrityReason::HeaderFraming(reason));
     let field = |at: usize| block.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let (Some(size), Some(unpacked), Some(&version), Some(&method), Some(crc)) =
         (field(5), field(7), block.get(9), block.get(10), field(11))
@@ -1118,7 +1163,7 @@ fn rar2_comment(held: &HeldVolume, block: &[u8], cancel: &Cancellation) -> Resul
     }
     // The main header's CRC covers only its own 13 bytes: the comment header carries its own, over its fields.
     if field(0) != Some(crate::crc32::hash(&block[2..13]) as u16) {
-        return Err(comment_integrity(held, RarIntegrityReason::HeaderCrc));
+        return Err(comment_integrity(&held.path, RarIntegrityReason::HeaderCrc));
     }
     let Some(packed) = block.get(13..size) else { return Err(framing("RAR 2.x comment size")) };
     let bytes = if method == 0x30 {
@@ -1127,18 +1172,18 @@ fn rar2_comment(held: &HeldVolume, block: &[u8], cancel: &Cancellation) -> Resul
         stored.extend_from_slice(packed);
         stored
     } else if (0x31..=0x35).contains(&method) {
-        decode_rar4_comment(held, packed, version, 65_536, u64::from(unpacked), cancel)?
+        decode_rar4_comment(&held.path, packed, version, 65_536, u64::from(unpacked), cancel)?
     } else {
         return Err(comment_unsupported("RAR 2.x method"));
     };
     if crate::crc32::hash(&bytes) as u16 != crc {
-        return Err(comment_integrity(held, RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false }));
+        return Err(comment_integrity(&held.path, RarIntegrityReason::FinalChecks { crc32: true, blake2sp: false }));
     }
     Ok(bytes)
 }
 
 fn decode_rar4_comment(
-    held: &HeldVolume,
+    path: &Path,
     packed: &[u8],
     version: u8,
     dictionary: u64,
@@ -1149,7 +1194,7 @@ fn decode_rar4_comment(
     if !matches!(version, 15 | 20 | 26 | 29) {
         return Err(comment_unsupported("RAR 4.x unpack version"));
     }
-    let failed = |error: super::unpack::rar4::Rar4DecodeError| Arc::from(error.detailed(comment_scope(held)).failure);
+    let failed = |error: super::unpack::rar4::Rar4DecodeError| Arc::from(error.detailed(comment_scope(path)).failure);
     let mut out = Vec::new();
     out.try_reserve_exact(unpacked as usize).map_err(|_| Arc::from(allocation().failure))?;
     let mut decoder =
@@ -1168,7 +1213,7 @@ fn decode_rar4_comment(
     decoder.finish(&mut sink).map_err(failed)?;
     if out.len() as u64 != unpacked {
         return Err(comment_integrity(
-            held,
+            path,
             RarIntegrityReason::DecodedSize { expected: unpacked, actual: out.len() as u64 },
         ));
     }
@@ -1475,14 +1520,21 @@ impl Catalogue {
                 return Ok(owned(header));
             }
         }
-        // a member the volume's end cuts short (FileWire::cut) has only the bytes there, and no part after them
-        let final_part = !header.split_after() && wire.cut.is_none();
-        let cut_short = wire.cut.is_some();
+        // DamagedInput::Salvage: a member the volume's end cuts short (FileHeader::cut) has only the bytes there
+        // (FileWire::cut), none when its header is cut short, and no part after them; it keeps its declared size
+        let cut_short = header.cut.is_some();
+        let final_part = !header.split_after() && !cut_short;
         let mut part = Part::new(volume, &header, crypt, &wire);
-        if let Some(there) = wire.cut {
-            part.packed_size = there;
+        let declared = part.packed_size;
+        match header.cut {
+            Some(super::HeaderCut::Data { present }) => part.packed_size = present.min(declared),
+            Some(_) => part.packed_size = 0,
+            None => {}
+        }
+        if cut_short {
             part.final_part = false;
         }
+        let unread = declared - part.packed_size;
         let ordinal =
             if associated { self.session.model.members.len() - 1 } else { self.session.model.members.len() } as u64;
         let issue = if associated {
@@ -1518,8 +1570,13 @@ impl Catalogue {
             let allowed = self.allowed();
             reserve_one(&mut self.session.model.parts, base, allowed)?;
             let issue = self.retain_issue(issue)?;
+            if let Some(cut) = header.cut {
+                // `ordinal` is the index of the member this part continues
+                self.record_cut(ordinal as usize, cut)?;
+            }
             let member = self.session.model.members.last_mut().unwrap();
             member.append(&header, &part)?;
+            member.packed_size = add(member.packed_size, unread)?;
             if issue.is_some() {
                 member.issue = issue;
             }
@@ -1578,7 +1635,11 @@ impl Catalogue {
             } else {
                 None
             };
+            if let Some(cut) = header.cut {
+                self.record_cut(self.session.model.members.len(), cut)?;
+            }
             let mut member = Member::new(header, wire, part_index, &part)?;
+            member.packed_size = add(member.packed_size, unread)?;
             member.issue = issue;
             member.chain = chain;
             self.session.model.members.push(member);
@@ -1654,8 +1715,25 @@ impl Catalogue {
             vector_bytes::<Member>(self.session.model.members.capacity())?,
             vector_bytes::<Part>(self.session.model.parts.capacity())?,
         )?;
-        let headers = vector_bytes::<HeaderRecord>(self.session.headers.capacity())?;
+        let headers = add(
+            vector_bytes::<HeaderRecord>(self.session.headers.capacity())?,
+            vector_bytes::<(usize, super::HeaderCut)>(self.session.cuts.capacity())?,
+        )?;
         add(add(self.owned_capacity, volumes)?, add(model, headers)?)
+    }
+
+    /// Note where a volume ends inside member `index` ([`RarSession::cuts`]), within the catalogue's capacity: a later
+    /// part's cut replaces its member's earlier one.
+    fn record_cut(&mut self, index: usize, cut: super::HeaderCut) -> RarResult<()> {
+        if let Some(last) = self.session.cuts.last_mut().filter(|last| last.0 == index) {
+            last.1 = cut;
+            return Ok(());
+        }
+        let base = self.capacity_without::<(usize, super::HeaderCut)>(self.session.cuts.capacity())?;
+        let allowed = self.allowed();
+        reserve_one(&mut self.session.cuts, base, allowed)?;
+        self.session.cuts.push((index, cut));
+        Ok(())
     }
 
     fn capacity_without<T>(&self, count: usize) -> RarResult<u64> {
@@ -1681,6 +1759,7 @@ impl Catalogue {
         self.session.headers.shrink_to_fit();
         self.session.issues.shrink_to_fit();
         self.session.volumes.shrink_to_fit();
+        self.session.cuts.shrink_to_fit();
         self.update_capacity()
     }
 }
@@ -1709,6 +1788,10 @@ fn target_name(header: &FileHeader) -> Option<&String> {
 }
 
 fn payload_issue(header: &FileHeader, crypt: MemberCrypt, ordinal: u64) -> Option<RarFailure> {
+    if header.cut == Some(super::HeaderCut::Header) {
+        // listed as UnRAR lists it (DamagedInput::Salvage), but nothing of it can be extracted
+        return Some(member_integrity(ordinal, RarIntegrityReason::TruncatedHeader));
+    }
     if let Some(reason) = header.rar4_unsupported() {
         return Some(RarFailure::Unsupported(reason));
     }

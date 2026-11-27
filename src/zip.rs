@@ -1258,7 +1258,13 @@ fn list_archive(mut archive: Archive) -> Result<crate::extract::Listing> {
             }
         })
         .collect();
-    Ok(crate::extract::Listing { entries, missing_volume, truncated, damaged_headers: Vec::new() })
+    Ok(crate::extract::Listing {
+        entries,
+        missing_volume,
+        truncated,
+        damaged_headers: Vec::new(),
+        damaged_comments: Vec::new(),
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

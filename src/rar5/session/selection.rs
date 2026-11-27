@@ -615,7 +615,12 @@ impl SelectedRun {
         }
         // Check known totals before key derivation or dictionary allocation.
         // Actual work is still charged at each part and decoded chunk.
-        charge(self.packed, member.packed_size, self.limits.packed_bytes, RarResource::SelectedPackedBytes)?;
+        charge(
+            self.packed,
+            available_packed(session, member),
+            self.limits.packed_bytes,
+            RarResource::SelectedPackedBytes,
+        )?;
         if let Some(size) = member.unpacked_size {
             charge(self.decoded, size, self.limits.decoded_bytes, RarResource::SelectedDecodedBytes)?;
         }
@@ -891,7 +896,8 @@ impl SelectedRun {
         extra: u64,
     ) -> Result<Rar4Decoder, Rar4DecodeError> {
         let header = &member.header;
-        let packed = member.packed_size.saturating_add(extra);
+        // the bytes there (a member cut short lists its declared size), and the zeros a cut is read on with
+        let packed = available_packed(session, member).saturating_add(extra);
         let raw = header.rar4.ok_or(Rar4DecodeError::Binding)?;
         if header.solid {
             let mut decoder = self.rar4.take().ok_or(Rar4DecodeError::State)?;
@@ -1253,4 +1259,14 @@ mod tests {
         assert_eq!(failure.partial.files, 0);
         assert!(stdout.is_empty());
     }
+}
+
+/// The packed bytes there are to read of `member`: its parts' own sizes, without what a volume cut short
+/// (`DamagedInput::Salvage`), which its `packed_size` still counts as declared.
+fn available_packed(session: &RarSession, member: &Member) -> u64 {
+    session
+        .model
+        .parts
+        .get(member.parts.clone())
+        .map_or(0, |parts| parts.iter().fold(0u64, |sum, part| sum.saturating_add(part.packed_size)))
 }
