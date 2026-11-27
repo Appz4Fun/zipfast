@@ -333,7 +333,7 @@ impl ProjectedReadSession {
                     if let Some(error) = &fault {
                         add(&mut report.failed)?;
                         if matches!(error.operation(), Some(ReadFault::LocalHeaderMismatch(_))) {
-                            add(&mut report.local_header_mismatches)?;
+                            report.local_header_mismatches = report.local_header_mismatches.saturating_add(1);
                         }
                     } else if skipped {
                         add(&mut report.skipped)?;

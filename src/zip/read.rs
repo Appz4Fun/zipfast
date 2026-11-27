@@ -799,28 +799,30 @@ pub struct ZipRunReport {
     run_usage: RunUsage,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     diagnostic_usage: ZipDiagnosticUsage,
-    damaged_headers: u64,
-    folder_damage: u64,
-    local_header_mismatches: u64,
+    // Every ZipReadError carries a report, so these three share the 8 bytes `damaged_headers` had alone (it counts up
+    // to 4096; the others saturate).
+    damaged_headers: u16,
+    folder_damage: u16,
+    local_header_mismatches: u32,
 }
 impl ZipRunReport {
     /// 7z folders whose coders didn't end cleanly under [`crate::extract::Options::seven_zip_strict`] (each also a
-    /// failure, sent as a `LegacyDiagnostic` line): 7-Zip's "Data Error : #N".
+    /// failure, sent as a `LegacyDiagnostic` line; counted up to 65535): 7-Zip's "Data Error : #N".
     pub fn folder_damage(&self) -> u64 {
-        self.folder_damage
+        u64::from(self.folder_damage)
     }
 
     /// ZIP members that failed under [`crate::extract::Options::seven_zip_strict`] because their local header
     /// differs from their central record ([`ReadFault::LocalHeaderMismatch`]): 7-Zip's "Headers Error".
     pub fn local_header_mismatches(&self) -> u64 {
-        self.local_header_mismatches
+        u64::from(self.local_header_mismatches)
     }
 
     /// RAR headers the run read past under [`crate::extract::Options::damaged_input`] (counted up to 4096; each was
     /// also sent as a `LegacyDiagnostic` line). Non-zero means the archive's headers are damaged: UnRAR's "Corrupt
     /// header is found", 7-Zip's "Headers Error".
     pub fn damaged_headers(&self) -> u64 {
-        self.damaged_headers
+        u64::from(self.damaged_headers)
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -833,9 +835,9 @@ impl ZipRunReport {
             failed: summary.errors.len() as u64,
             volumes: summary.volumes,
             decoded_bytes: summary.bytes as u128,
-            damaged_headers: summary.damaged_headers.len() as u64,
-            folder_damage: summary.folder_damage.len() as u64,
-            local_header_mismatches: summary.local_header_mismatches.len() as u64,
+            damaged_headers: u16::try_from(summary.damaged_headers.len()).unwrap_or(u16::MAX),
+            folder_damage: u16::try_from(summary.folder_damage.len()).unwrap_or(u16::MAX),
+            local_header_mismatches: u32::try_from(summary.local_header_mismatches.len()).unwrap_or(u32::MAX),
             ..Default::default()
         }
     }
