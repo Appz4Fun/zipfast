@@ -1511,3 +1511,7 @@ pub(crate) fn fixed_fixture() -> Vec<u8> {
 #[cfg(test)]
 #[path = "rar4/deferred_tests.rs"]
 mod deferred_tests;
+
+#[cfg(test)]
+#[path = "rar4/golden_tests.rs"]
+mod golden_tests;
