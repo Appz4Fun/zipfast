@@ -650,6 +650,7 @@ pub struct RarMember<'a> {
     member: &'a Member,
     parts: &'a [Part],
     issue: Option<&'a RarFailure>,
+    cut: Option<super::HeaderCut>,
 }
 
 impl<'a> RarMember<'a> {
@@ -701,7 +702,7 @@ impl<'a> RarMember<'a> {
     /// extracting it decodes the bytes there ([`super::HeaderCut::Data`], its checks decide) or fails
     /// ([`super::HeaderCut::Header`]). A caller showing 7-Zip 26.06's listing leaves out a `Header` cut.
     pub fn cut(&self) -> Option<super::HeaderCut> {
-        self.member.cut
+        self.cut
     }
 
     pub fn is_directory(&self) -> bool {
@@ -857,6 +858,11 @@ pub struct RarSession {
     invalid_binding: Option<Arc<RarFailure>>,
     restarted_from: Option<PathBuf>,
     members_before_named: u64,
+    /// `DamagedInput::Salvage`: the members a volume ends inside one of the headers or the data of, by member index,
+    /// in order, with where (whichever part it was; a member's `header` keeps its first part's physical header).
+    /// Kept apart from the members so an intact catalogue pays nothing for it; each cut ends a volume, so there are
+    /// no more of these than volumes.
+    cuts: Vec<(usize, super::HeaderCut)>,
 }
 
 impl RarSession {
@@ -875,6 +881,11 @@ impl RarSession {
     /// listing positions, which count from the volume named, are the catalogue's positions minus this.
     pub fn members_before_named(&self) -> u64 {
         self.members_before_named
+    }
+
+    /// Where a volume ends inside member `index`'s headers or data ([`RarMember::cut`]).
+    fn cut(&self, index: usize) -> Option<super::HeaderCut> {
+        self.cuts.binary_search_by_key(&index, |&(member, _)| member).ok().map(|at| self.cuts[at].1)
     }
 
     /// Read the volume headers and check their source binding. Member
@@ -926,6 +937,7 @@ impl RarSession {
                 invalid_binding: None,
                 restarted_from: None,
                 members_before_named: 0,
+                cuts: Vec::new(),
             },
             options,
             owned_capacity: 0,
@@ -1001,6 +1013,7 @@ impl RarSession {
             member,
             parts: &self.model.parts[member.parts.clone()],
             issue: member.issue.map(|index| &self.issues[index]),
+            cut: self.cut(index),
         })
     }
 
@@ -1540,9 +1553,13 @@ impl Catalogue {
             let member = self.session.model.members.last_mut().unwrap();
             member.append(&header, &part)?;
             member.packed_size = add(member.packed_size, unread)?;
-            member.unread = add(member.unread, unread)?;
-            if header.cut.is_some() {
-                member.cut = header.cut;
+            if let Some(cut) = header.cut {
+                // `ordinal` is the index of the member this part continues
+                let index = ordinal as usize;
+                match self.session.cuts.last_mut() {
+                    Some(last) if last.0 == index => last.1 = cut,
+                    _ => self.session.cuts.push((index, cut)),
+                }
             }
             if issue.is_some() {
                 member.issue = issue;
@@ -1604,7 +1621,9 @@ impl Catalogue {
             };
             let mut member = Member::new(header, wire, part_index, &part)?;
             member.packed_size = add(member.packed_size, unread)?;
-            member.unread = unread;
+            if let Some(cut) = member.header.cut {
+                self.session.cuts.push((self.session.model.members.len(), cut));
+            }
             member.issue = issue;
             member.chain = chain;
             self.session.model.members.push(member);

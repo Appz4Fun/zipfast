@@ -52,11 +52,6 @@ pub(crate) struct PhysicalMember {
     pub(crate) issue: Option<usize>,
     pub(crate) chain: Option<usize>,
     pub(crate) has_successor: bool,
-    /// Declared packed bytes a volume ends before (`DamagedInput::Salvage`): counted in `packed_size`, never read.
-    pub(crate) unread: u64,
-    /// Where a volume ends inside one of this member's headers or its data, whichever part it was. `header` keeps
-    /// the first part's own physical header.
-    pub(crate) cut: Option<super::HeaderCut>,
 }
 
 /// The same continuation encoding and size checks serve catalogue and progressive adapters.
@@ -118,7 +113,6 @@ impl PhysicalMember {
         part: &PhysicalPart,
     ) -> crate::error::RarResult<Self> {
         let unpacked_size = (!header.size_unknown()).then_some(header.unpacked_size);
-        let header_cut = header.cut;
         Ok(Self {
             header,
             wire,
@@ -130,14 +124,7 @@ impl PhysicalMember {
             issue: None,
             chain: None,
             has_successor: false,
-            unread: 0,
-            cut: header_cut,
         })
-    }
-
-    /// The packed bytes there are to read: `packed_size` without what a volume cut short.
-    pub(crate) fn available_packed(&self) -> u64 {
-        self.packed_size.saturating_sub(self.unread)
     }
     pub(crate) fn matches_continuation(&self, header: &FileHeader, wire: &FileWire) -> bool {
         header.split_before() && self.wire.name == wire.name
