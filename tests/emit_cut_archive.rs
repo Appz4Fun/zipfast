@@ -484,3 +484,77 @@ fn a_stored_encrypted_member_cut_short_keeps_its_last_block_as_unrar_does() {
         assert_eq!((kept.len(), sha256(&kept).as_str()), (len, sha), "{what}: the session");
     }
 }
+
+/// Encrypted members cut short where what follows the last whole cipher block (handed on undecrypted, then zeros)
+/// decodes to tables or codes real data never holds, and what `unrar p -p<password>` 7.30 prints of each (hex). UnRAR
+/// reads them without the checks real data meets: a code-length run stops at the table's end and a run repeating the
+/// length before the first repeats 0; a code that overfills or underfills the code space still decodes (canonical
+/// codes counted from 0 for each length; past the last code, the longest length; a place past the alphabet reads the
+/// first); a RAR 3.x match reaching before what was decoded copies zeros, and none runs past the member's size; a RAR
+/// 5.0 code may run past the end of its block.
+const UNCHECKED_CUTS: &[(&str, &str, usize, &str)] = &[
+    // RAR 5.0: codes that underfill or overfill the code space
+    ("a5-p-126", "pw126.txt", 143, "6100"),
+    ("a5-p-127", "pw127.txt", 143, "61f76cf720"),
+    ("a5-p-128", "pw128.txt", 142, "2020202020c1bc20"),
+    ("a5-p-200", "pw200.txt", 143, "64747320"),
+    // RAR 5.0: the block's last code runs past its end
+    ("a5-p-129", "pw129.txt", 149, "68656c6c6f206c6f6e672070617373776f7264206f7764736c6f656c6164"),
+    ("u5-p-j", "pwj.txt", 150, "68656c6c6f206c6f6e672070617373776f7264202073746568706f736165"),
+    // RAR 3.x: a code-length run past the table's end, then a table that overfills the code space
+    ("short4-p-abc", "", 100, "a92020"),
+    ("short4-p-abc", "", 101, "aba97f202020"),
+    ("a4-p-126", "pw126.txt", 95, "202020"),
+    ("a4-p-126", "pw126.txt", 96, "73c3202020"),
+    ("a4-p-126", "pw126.txt", 97, "73c36474652020"),
+    ("a4-p-126", "pw126.txt", 98, "73c364747268202020"),
+    ("a4-p-126", "pw126.txt", 99, "73c3647472687020202020"),
+    ("a4-p-126", "pw126.txt", 100, "73c36474726870207365202020"),
+    ("a4-p-126", "pw126.txt", 101, "73c364747268702073650a20202020"),
+    ("a4-p-127", "pw127.txt", 100, "6474e4e164e320e474e3202020"),
+    ("u4-p-j", "pwj.txt", 96, "73670a70776e6e7770652020"),
+    // RAR 3.x: matches reaching before what was decoded copy zeros (one with no distance yet, one far past the
+    // dictionary)
+    ("a4-p-128", "pw128.txt", 100, "74000000000000000000730000000000000020"),
+    ("mid4-p-40", "pw40.txt", 101, "7300000000000000000000000000"),
+    // RAR 3.x: a match running past the member's size is copied up to it
+    ("a4-p-129", "pw129.txt", 105, "68656c6c6f206c6f6e672070617373776f72642074657374206c73676767"),
+];
+
+/// [`UNCHECKED_CUTS`]: `RarSession::print_selected` prints, and the whole-archive runner keeps with `keep_broken`,
+/// what UnRAR 7.30 prints, and both fail the member (its checksum fails, as UnRAR's does).
+#[test]
+fn an_encrypted_member_cut_short_decodes_unchecked_as_unrar_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(FIXTURES).join("rar-long-password");
+    for &(archive, pw, at, unrar) in UNCHECKED_CUTS {
+        let what = format!("{archive}@{at}");
+        let password = if pw.is_empty() { "abc".to_string() } else { fs::read_to_string(fixtures.join(pw)).unwrap() };
+        let bytes = fs::read(fixtures.join(format!("{archive}.rar"))).unwrap();
+        let path = dir.path().join(format!("{archive}-{at}.rar"));
+        fs::write(&path, &bytes[..at]).unwrap();
+        let mut session = RarSession::open(&path, Some(&password), salvaging()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let print = RarPrintOptions { unverified_output: UnverifiedOutput::Emit, ..RarPrintOptions::default() };
+        let mut printed = Vec::new();
+        let mut failed = Vec::new();
+        session
+            .print_selected(&all, &mut printed, &print, |event| {
+                failed.push(matches!(event.outcome, RarOutcome::Failed(_)));
+            })
+            .unwrap();
+        assert_eq!(failed, [true], "{what}: the session fails it");
+        assert_eq!(hex(&printed), unrar, "{what}: the session prints UnRAR's bytes");
+        let out = dir.path().join(format!("run-{archive}-{at}"));
+        let summary = zipfast::extract::run_with_password(
+            &path,
+            &options(&out, UnverifiedOutput::Withhold),
+            Some(&password),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(summary.errors.len(), 1, "{what}: {:?}", summary.errors);
+        let kept = fs::read(out.join("f.txt")).unwrap();
+        assert_eq!(hex(&kept), unrar, "{what}: the runner keeps UnRAR's bytes");
+    }
+}

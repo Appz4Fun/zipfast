@@ -858,6 +858,7 @@ impl SelectedRun {
                     // the data ends after the cipher block cut short; UnRAR reads zeros past it: what decodes from
                     // them is held until the cut is known. What decodes before a damaged code stands: the member fails
                     // anyway
+                    decoder.set_lenient();
                     let fed = decoder.feed(&raw, &mut keep).is_ok();
                     decoder.cut_short();
                     if fed && decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
@@ -873,6 +874,9 @@ impl SelectedRun {
                 let result = decoder.flush_decoded(&mut sink);
                 sink.finish_rar4(result)?;
             } else if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed) {
+                if cut_short {
+                    decoder.set_lenient();
+                }
                 let fed = match blocks.as_mut() {
                     Some(blocks) => blocks.feed(&raw, decoder, &mut sink),
                     None => decoder.feed(&raw, &mut sink),

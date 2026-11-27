@@ -4130,7 +4130,9 @@ pub(crate) fn rar4_part_decoder(
 /// is fed zeros past the end, every code starting before the byte after the data decoding; a RAR 5.0 one decodes
 /// every symbol starting before the end. An encrypted member's last cipher block cut short isn't decrypted: UnRAR
 /// hands its bytes on as they are (to the decoder, or to the file if stored), so no incomplete block fails it here.
-/// What decodes before a damaged code stands; only a failure writing it (the sink's) is returned.
+/// What follows the last whole cipher block (or the data's end) decodes as UnRAR decodes it, without the checks real
+/// data meets ([`Rar4Decoder::set_lenient`], [`Unpacker::set_lenient`]). What decodes before a damaged code stands;
+/// only a failure writing it (the sink's) is returned.
 fn emit_cut_short(
     p: &mut Pending,
     rar4: Option<&mut Rar4Decoder>,
@@ -4156,6 +4158,7 @@ fn emit_cut_short(
             held.extend_from_slice(bytes);
             Ok(())
         };
+        decoder.set_lenient();
         let fed = decoder.feed(&raw, &mut keep).is_ok();
         decoder.cut_short();
         if fed && decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
@@ -4166,6 +4169,7 @@ fn emit_cut_short(
             let _ = decoder.flush_decoded(&mut sink);
         }
     } else if let Some(stream) = stream {
+        stream.set_lenient();
         let fed = match blocks.as_mut() {
             Some(blocks) => blocks.feed(&raw, stream, &mut sink),
             None => stream.feed(&raw, &mut sink),
