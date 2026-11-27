@@ -1231,6 +1231,7 @@ mod tests {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                damaged_input: Default::default(),
                 unsupported_filters: Default::default(),
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
@@ -1470,7 +1471,9 @@ mod tests {
         while !s.verify_job.as_ref().is_some_and(|job| job.offset == 10 && job.part == 1) {
             assert!(s.poll_verify(&mut a, &mut cx).is_pending());
         }
-        // One start-of-poll info check, then the final validation callback.
+        // One start-of-poll info check, then the final validation callback. The attack is a same-size rewrite, which
+        // shows only in mtime and ctime, so it must land in a later tick.
+        crate::test_stamps::await_file_stamp_tick(dir.path(), a.stage.as_ref().unwrap().native.file());
         *attack.lock().unwrap() = Some((2, a.stage.as_ref().unwrap().native.file().try_clone().unwrap()));
         assert!(matches!(
             s.poll_verify(&mut a, &mut cx),

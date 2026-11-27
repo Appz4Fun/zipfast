@@ -536,6 +536,8 @@ fn split_create_same_size_stage_change_before_permissions_is_rejected() {
     let r = with_hook(
         move |event, path| {
             if event == Event::AfterVerify {
+                // Same size and the old mtime: only ctime shows the change, so it must land in a later tick.
+                crate::test_stamps::await_stamp_tick(path.unwrap());
                 let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path.unwrap())?;
                 let old = f.metadata()?.modified()?;
                 f.seek(std::io::SeekFrom::Start(50))?;
