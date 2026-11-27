@@ -672,7 +672,9 @@ pub enum UnixModes {
     Stored,
     /// The stored bits narrowed by `umask`, the caller's file-creation mask, as 7-Zip 26.06 on Unix sets them:
     /// `mode & 0o777 & !umask` for a file, and `(mode | 0o700) & 0o777 & !umask` for a folder (7-Zip must be able
-    /// to write into it). Never setuid, setgid or sticky.
+    /// to write into it). Never setuid, setgid or sticky. A hard link member's own modification time is set on the
+    /// file it links (so on every name of it), as 7-Zip sets it; under [`Self::Stored`] the file keeps its own, as
+    /// UnRAR 7.30 and GNU tar leave it.
     Masked { umask: u32 },
 }
 
@@ -713,7 +715,8 @@ pub enum HardLinkTargets {
     /// 7-Zip 26.06 `x` link to it. It is reached from the destination without following any link; a symbolic link, a
     /// folder or nothing at that name fails the link (UnRAR hard-links a symbolic link found there; zipfast never does,
     /// so no link it makes leads out of the destination). Honoured by the whole-archive runners for RAR and tar and
-    /// by progressive sessions; [`crate::rar5::session::RarSession`] and test runs keep [`Self::Extracted`]. File
+    /// by progressive sessions, and by [`crate::rar5::session::RarSession`] extraction (from these options or
+    /// [`crate::rar5::session::RarSessionOptions::hard_link_targets`]); test runs keep [`Self::Extracted`]. File
     /// copies (RAR 5.0) are unaffected.
     StoredName,
 }
