@@ -29,3 +29,12 @@ hand-specified codebooks and token topologies from the worksheet. Exact
 bytes, expected output lengths/hashes, and pinned independent replay are
 recorded in `branch-vectors.json` and `branch-reference.json`.
 No general compression API or third-party decoder code is included.
+
+`zipf-m3.rar` is a RARLAB 6.24 archive made with
+`rar a -ma4 -m3 -s- -mt1 -tsm- -tsc- -tsa- zipf-m3.rar zipf.txt code.exe` from the two inputs
+`zipf-m3.gen.py` writes (Zipf-distributed words, so the literal table has codes up to 15 bits, and
+x86-like bytes; both deterministic, mtime 2026-01-01). Members: `zipf.txt` 98,304 bytes
+(sha256 d2a80a5fb0675d25d7ad22f1a3ca621cddc709fb842ed7f9492f276e135a5db2) and `code.exe` 49,152 bytes
+(cab01a0827e8359dfb02aecbe9f8c3dce50283d85aa78d18c9884f8a6fbaa114), both LZ. Archive SHA-256 is
+53c0b3eef8919f422875e58417966104630fb7ed1175afb85ff197b9c7682fe2. The RAR4 decoder's golden tests
+(`src/rar5/unpack/rar4/golden_tests.rs`) decode its two packed streams as is and mutated.
