@@ -72,3 +72,5 @@ Refused: a tail not ending in a RAR 5.0 end header (`NotAnArchive`); no quick op
 Compared with RustyGet's `head_from_tail`, this also rebuilds sets whose locator field has another width (rar pads it to two bytes more than the volume size takes, so 5 bytes in 100 KB volumes and 6 in 5 MB ones), keeps the sibling's archive flags and extra records instead of refusing solid archives, lists every cached header, and reports why a result is uncertain instead of returning nothing.
 
 Tested (`tests/rar5_volume_head.rs`) on rar 7.30 volumes kept as vectors (one file, two files, `-p` last volume, small pieces in both quick open modes, no quick open data), and, when present, on every volume of the rar-made sets of `ZIPFAST_RAR5_TAIL_SETS` and RustyGet's `ZIPFAST_Z_FIXTURES` sets: 113 of 157 volumes rebuild exactly; the rest are `-hp`, `-qo-`, `-rr` or default-mode volumes that are refused or doubted, and no result claimed exact differs from the volume.
+
+To rebuild a whole lost volume around borrowed packed data (signature, main and file headers, quick open data, end header), see [volume headers from a sibling](rar5-volume-headers.md).
