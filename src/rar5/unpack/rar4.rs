@@ -56,6 +56,8 @@ pub(crate) enum Rar4DecodeError {
 
 const CHUNK: usize = 65536;
 const OUTPUT: usize = 32768;
+// Output not yet handed to the sink is read back from the window, which must not wrap onto it first.
+const _: () = assert!(2 * OUTPUT <= 65536, "the smallest RAR4 window holds two output buffers");
 /// Input [`Rar4Decoder::fast_tokens`] keeps in hand: the longest LZ token (a 15-bit code, 5 length bits, a 15-bit
 /// distance code, 14 distance bits and a 15-bit low distance code) takes 64 bits, past any buffered in `Bits`.
 const FAST_INPUT: usize = 16;
@@ -805,7 +807,7 @@ impl Rar4Decoder {
         }
         debug_assert_eq!(self.out_start + self.filled as u64, cursor);
         self.filled += 1;
-        if self.filled == OUTPUT {
+        if self.filled >= OUTPUT {
             self.flush(sink)?;
         }
         Ok(())
@@ -815,7 +817,7 @@ impl Rar4Decoder {
     /// buffer. Copies nothing when fewer than two bytes could go, leaving those to `emit`. The work is one unit a
     /// byte, as `emit` a byte at a time charges it (the step charged one already).
     fn copy_plain(&mut self, from: u64, to: u64, left: u64) -> DecodeResult<u64> {
-        let mut n = left.min((OUTPUT - self.filled) as u64);
+        let mut n = left.min(OUTPUT.saturating_sub(self.filled) as u64);
         if let Some(block) = self.filters.pending.front() {
             n = n.min(block.start.saturating_sub(to));
         }
@@ -1314,7 +1316,7 @@ impl Rar4Decoder {
         if copied == 0 {
             let index = (from & (self.dictionary.len() as u64 - 1)) as usize;
             self.emit(self.dictionary[index], sink)?;
-        } else if self.filled == OUTPUT {
+        } else if self.filled >= OUTPUT {
             self.flush(sink)?;
         }
         let done = copied.max(1);
@@ -1339,7 +1341,8 @@ impl Rar4Decoder {
     /// Only for a member's own data (not its end-of-file tail), and between symbols. With [`Self::track_starts`] it
     /// records each token's start as [`Self::run`] does before each step.
     fn fast_tokens(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<()> {
-        let mut window = Window::new(&self.bits, *input);
+        let data: &[u8] = input;
+        let mut window = Window::new(&self.bits, data);
         let result = self.fast_loop(&mut window, sink);
         window.store(&mut self.bits, input);
         match result? {
@@ -1399,7 +1402,8 @@ impl Rar4Decoder {
         while w.left() >= FAST_INPUT && matches!(self.phase, Phase::Token) {
             // (run recorded the first token's start)
             if !first && let Some(starts) = self.starts.as_mut() {
-                let at = self.fetched.saturating_add(w.next as u64).saturating_mul(8).saturating_sub(u64::from(w.count));
+                let at =
+                    self.fetched.saturating_add(w.next as u64).saturating_mul(8).saturating_sub(u64::from(w.count));
                 starts.push(at, self.produced);
             }
             first = false;
@@ -1419,7 +1423,7 @@ impl Rar4Decoder {
                         self.dictionary[cursor as usize & mask] = token as u8;
                         self.filled += 1;
                         self.produced += 1;
-                        if self.filled == OUTPUT {
+                        if self.filled >= OUTPUT {
                             self.flush(sink)?;
                         }
                     } else {

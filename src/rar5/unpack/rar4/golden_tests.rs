@@ -82,7 +82,7 @@ impl BitWriter {
     }
     fn put(&mut self, value: u32, n: u32) {
         for k in (0..n).rev() {
-            if self.used % 8 == 0 {
+            if self.used.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             if (value >> k) & 1 != 0 {
@@ -220,7 +220,13 @@ fn digest(name: &str, packed: &[u8], unpacked: usize) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     // big outputs take long to decode a byte of input at a time: fewer mutations, fed in 5-byte pieces
     let big = unpacked > 1 << 16;
-    let mutations = if unpacked > 1 << 20 { 8 } else if big { 40 } else { 150 };
+    let mutations = if unpacked > 1 << 20 {
+        8
+    } else if big {
+        40
+    } else {
+        150
+    };
     for case in 0..=mutations {
         let bytes = if case == 0 { packed.to_vec() } else { mutate(packed, &mut rng) };
         let chunks: &[usize] = if big && case != 0 { &[usize::MAX, 5] } else { &[usize::MAX, 1, 5] };
@@ -315,7 +321,11 @@ fn table_lookup_matches_the_bitwise_search_for_every_window() {
                 space -= 1;
             }
         }
-        if space == 0 { complete += 1 } else { incomplete += 1 }
+        if space == 0 {
+            complete += 1
+        } else {
+            incomplete += 1
+        }
         h.build(&lengths, &mut work).unwrap();
         for window in 0..1u32 << 15 {
             let entry = h.quick[(window >> (15 - QUICK_BITS)) as usize];
