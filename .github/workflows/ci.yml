@@ -40,8 +40,12 @@ jobs:
     name: Test (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runs_on: [self-hosted, Linux, X64, ubuntu-latest]
+          - os: macos-latest
+            runs_on: [self-hosted, macOS, ARM64, macos-latest]
+    runs-on: ${{ matrix.runs_on }}
     # Two full test runs (without and with persistent-partials) take 25-45 minutes on the hosted runners
     # (tests/persistent_partials.rs alone ran 21 minutes in one); at 30 the second was cancelled on main and on most
     # PRs, and once at 45.
@@ -80,7 +84,7 @@ jobs:
     # GitHub's x86 runners vary. Intel's Software Development Emulator runs the SHA-256 tests on emulated CPUs with
     # known features, so the SHA-NI rounds and the portable fallback are both checked, as in par-rs and Rust's
     # stdarch CI. Sapphire Rapids has SHA-NI; Skylake client (the Coffee Lake instruction set) does not.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, ubuntu-latest]
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -121,7 +125,7 @@ jobs:
 
   zipview-msrv:
     name: Zipview on Rust 1.100.0
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, ubuntu-latest]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -133,7 +137,7 @@ jobs:
 
   audit:
     name: Audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, ubuntu-latest]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -149,7 +153,7 @@ jobs:
     name: Zipview fuzz (smoke)
     env:
       RUSTUP_TOOLCHAIN: nightly
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, ubuntu-latest]
     timeout-minutes: 25
     defaults:
       run:
