@@ -153,7 +153,8 @@ sessions honour it (a progressive session still stops at the refused link, as wi
 `rar a -p` encrypts file data but leaves headers in the clear, so a link member's target (its redirection record)
 is readable whatever the password. UnRAR 7.30 reports the wrong password for the member and creates nothing;
 7-Zip 26.06 doesn't check the password for a link at all. `Options::encrypted_links` picks one:
-`EncryptedLinks::Verify` (the default, UnRAR's) or `EncryptedLinks::PlaceUnverified` (7-Zip's, for Prybar's 7z mode).
+`EncryptedLinks::Verify` (the default), `EncryptedLinks::VerifyFirst` (UnRAR's reporting order, for Prybar's unrar
+mode) or `EncryptedLinks::PlaceUnverified` (7-Zip's, for Prybar's 7z mode).
 It applies on every route: `extract::run*`, `RarSession::extract_selected` and `extract_selected_controlled` (from
 the `Options` they take), `RarSession::test_selected` (from `RarSessionOptions::encrypted_links`, as it takes no
 `Options`), and progressive sessions (from `ProgressiveOptions`' extract options).
@@ -165,6 +166,17 @@ encrypted data member fails; nothing is created. A record without a check value,
 checksum doesn't match, can't verify any password, and a link has no data to check one against: the member is
 refused as `RarFailure::EncryptedIntegrity` with `RarIntegrityReason::UnverifiableLinkPassword`, even with the right
 password. A progressive session stops at such a member, as it does at a wrong password.
+
+`Verify` checks the password once the member is known to be placed or tested: a member skipped for an existing
+target under `Overwrite::Skip` is reported `Skipped(ExistingTarget)`, and a hard link or copy whose target the run
+didn't extract fails on its target (`RarPolicyReason::HardLinkTarget`; a progressive session stops with
+`UnsafePath`), whatever the password. `VerifyFirst` checks it first, as UnRAR 7.30 does: `unrar x -o- -pwrong` over
+links that already exist prints "Incorrect password" and exits 11, and a hard link with a missing target is reported
+as the wrong password. Under `VerifyFirst` a password that doesn't verify fails such a member as above
+(`WrongPassword`, `PasswordRequired`, `EncryptedIntegrity`/`UnverifiableLinkPassword`) before the overwrite decision
+and the target checks; one that verifies goes on to them as usual. Nothing is placed or replaced either way, so this
+changes only what is reported. An older file revision is still skipped before anything, on every route. A
+`RarSession` test run checks the password first under every mode.
 
 With `PlaceUnverified`, the password isn't checked for such a member (no key is derived): with a wrong password,
 with none, or with no check value, the link is placed (or passes a test) and reported as any placed link is,

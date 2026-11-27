@@ -1167,12 +1167,23 @@ impl ProgressiveSession {
                 ))))
             };
             let extract = &self.options.extract;
-            match crate::extract::link::from_rar5(
+            let kind = crate::extract::link::from_rar5(
                 redirection,
                 !header.is_unix(),
                 extract.windows_safe_names,
                 extract.flatten,
-            ) {
+            );
+            // Options::encrypted_links: VerifyFirst reports a password that doesn't verify before the link's target
+            // and the overwrite decision are looked at (an older revision is still skipped first, as it is below)
+            if kind.is_some()
+                && header.encrypted
+                && extract.encrypted_links == crate::extract::EncryptedLinks::VerifyFirst
+                && (header.version.is_none() || extract.mode == crate::extract::Mode::Test)
+            {
+                self.link_password_first(&header, member.ordinal)?;
+            }
+            let extract = &self.options.extract;
+            match kind {
                 None => return Err(unsupported()),
                 Some(Err(_)) => return Err(ProgressiveFailure::new(FailureKind::UnsafePath)),
                 Some(Ok(_)) if !cfg!(unix) && extract.mode != crate::extract::Mode::Test => return Err(unsupported()),
@@ -1429,6 +1440,29 @@ impl ProgressiveSession {
     }
     /// Where a link member goes, relative to the destination, as its target is checked: a flattened output drops
     /// the member's folders.
+    /// [`crate::extract::EncryptedLinks::VerifyFirst`]: an encrypted RAR 5.0 link's password is checked as its header
+    /// is read, as the member's cipher would check it, and one its check value can't verify is refused, as below.
+    fn link_password_first(&self, header: &crate::rar5::FileHeader, ordinal: u64) -> ProgressiveResult<()> {
+        let scope = crate::error::RarScope::Member { index: Some(ordinal) };
+        let password = self
+            .options
+            .password()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+        let params =
+            header.crypt.ok_or_else(|| ProgressiveFailure::new(FailureKind::Malformed("member encryption record")))?;
+        if let Some(verifier) = crate::extract::link::rar5_unverifiable(&params) {
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                crate::error::RarFailure::EncryptedIntegrity {
+                    scope,
+                    reason: crate::error::RarIntegrityReason::UnverifiableLinkPassword,
+                    verifier,
+                },
+            ))));
+        }
+        crate::rar5::member::controlled_keys(password, params, &self.usage, &self.control, scope).map(|_| ())
+    }
+
     fn link_rel(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<std::path::PathBuf> {
         let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         let rel = crate::path::sanitize(&name, !header.is_unix())

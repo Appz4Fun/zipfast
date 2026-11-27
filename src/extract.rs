@@ -246,8 +246,9 @@ pub struct Options {
     /// damaged header whatever this says. 7z and ZIP ignore it.
     pub damaged_input: DamagedInput,
     /// Whether an encrypted RAR 5.0 redirection member (a symbolic link, junction, hard link or file copy) is placed
-    /// or tested only when its password check value verifies the password, as UnRAR 7.30 does (the default), or
-    /// whatever the password, as 7-Zip 26.06 `x`/`e` does. See [`EncryptedLinks`].
+    /// or tested only when its password check value verifies the password (the default; [`EncryptedLinks::VerifyFirst`]
+    /// checks it before the overwrite and target decisions, in UnRAR 7.30's order), or whatever the password, as
+    /// 7-Zip 26.06 `x`/`e` does. See [`EncryptedLinks`].
     ///
     /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
     /// checked dispatchers), by [`crate::rar5::session::RarSession::extract_selected`] (and its controlled route),
@@ -264,12 +265,22 @@ pub struct Options {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum EncryptedLinks {
-    /// As UnRAR 7.30: placed only when the member's check value verifies the password. No password fails the member
+    /// Placed only when the member's check value verifies the password, checked once the member is known to be placed
+    /// or tested (a member skipped for an existing target, or refused for its target, is reported so whatever the
+    /// password). No password fails the member
     /// as [`RarFailure::PasswordRequired`], a wrong one as [`RarFailure::WrongPassword`], and a record with no usable
     /// check value as [`RarFailure::EncryptedIntegrity`] with
     /// [`crate::error::RarIntegrityReason::UnverifiableLinkPassword`].
     #[default]
     Verify,
+    /// As [`Self::Verify`], in UnRAR 7.30's reporting order: the password is checked as soon as the member is reached,
+    /// before the overwrite decision (an existing target under [`Overwrite::Skip`]) and before a hard link's or copy's
+    /// target is checked, so a password that doesn't verify is reported as the failure above even for a member that
+    /// would otherwise be skipped or refused (UnRAR's "Incorrect password", exit 11, where `Verify` reports
+    /// [`RarSkipReason::ExistingTarget`] or the link target). A password that verifies goes on to those decisions as
+    /// usual. Nothing is placed or touched either way: only the reported outcome differs. An older file revision is
+    /// still skipped first, as every route skips one before reading it.
+    VerifyFirst,
     /// As 7-Zip 26.06 `x`/`e` (exit 0, "Everything is Ok"): the password isn't checked for a redirection, so one is
     /// placed (or passes a test) with a wrong password, with none, or with no check value to verify it by. It is
     /// reported as any placed link is ([`RarOutcome::Verified`]), with the password evidence
@@ -4688,6 +4699,15 @@ impl Run<'_, '_, '_> {
         password: std::result::Result<RarPasswordEvidence, RarFailure>,
     ) -> RunResult<()> {
         self.drain()?;
+        // Options::encrypted_links: VerifyFirst reports a password that doesn't verify before any target decision
+        let password = match password {
+            Err(failure) if self.opts.encrypted_links == EncryptedLinks::VerifyFirst => {
+                let why = link_password_message(&failure);
+                let cause = self.fail_in_order(&ctx, failure, why)?;
+                return self.past_link(vol, h, ctx, Some(cause));
+            }
+            password => password,
+        };
         let refusal = match &kind {
             Ok(kind) => link::refusal_before_place(rel, kind, &self.landing.extracted),
             Err(_) => Some(link::HARD_TARGET),

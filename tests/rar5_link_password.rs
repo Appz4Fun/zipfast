@@ -667,3 +667,115 @@ impl TapDir for std::path::PathBuf {
         self
     }
 }
+
+/// Each member's outcome on the whole-archive runner and on RarSession::extract_selected, with a skip told apart.
+fn routes(arc: &Path, dest: &Path, opts: impl Fn(&Path) -> Options, password: Option<&str>) -> [Outcomes; 2] {
+    use zipfast::extract::RarSkipReason;
+    use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
+    let label = |o: &RarOutcome| match o {
+        RarOutcome::Skipped(RarSkipReason::ExistingTarget) => "skipped".to_string(),
+        RarOutcome::Failed(f) if matches!(f.as_ref(), RarFailure::Policy { .. }) => "target".to_string(),
+        other => classify(other),
+    };
+    let mut whole = Vec::new();
+    let whole_dest = dest.join("whole");
+    extract::run_rar_with_outcomes(arc, &opts(&whole_dest), password, |e| {
+        whole.push((e.entry.order, label(&e.outcome)))
+    })
+    .unwrap();
+    let mut session_events = Vec::new();
+    let session_dest = dest.join("session");
+    let mut session = RarSession::open(arc, password, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    session
+        .extract_selected(&all, &opts(&session_dest), RarDecodeLimits::default(), |e| {
+            session_events.push((e.entry.order, label(&e.outcome)))
+        })
+        .unwrap();
+    whole.sort();
+    session_events.sort();
+    [whole.into_iter().map(|e| e.1).collect(), session_events.into_iter().map(|e| e.1).collect()]
+}
+
+/// Links already on disk, to be kept under Overwrite::Skip.
+fn existing(dest: &Path) {
+    for route in ["whole", "session", "progressive"] {
+        let dir = dest.join(route);
+        fs::create_dir_all(&dir).unwrap();
+        for name in LINKS {
+            fs::write(dir.join(name), b"kept").unwrap();
+        }
+    }
+}
+
+fn assert_kept(dest: &Path) {
+    for route in ["whole", "session", "progressive"] {
+        for name in LINKS {
+            assert_eq!(fs::read(dest.join(route).join(name)).unwrap(), b"kept", "{route} {name}");
+        }
+    }
+}
+
+/// Prybar's UnRAR mode, case 1: `unrar x -o- -pwrong` over links that already exist reports "Incorrect password"
+/// (exit 11). VerifyFirst checks the password before the overwrite decision and reports WrongPassword; Verify skips
+/// the existing target, as before. Nothing is replaced either way.
+#[test]
+fn verify_first_reports_a_wrong_password_before_skipping_an_existing_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = write(tmp.path(), true);
+    let skip =
+        |links| move |dest: &Path| Options { overwrite: Overwrite::Skip, ..with_links(dest, Mode::Extract, links) };
+    for (links, password, expected, progressive_expected) in [
+        (EncryptedLinks::Verify, Some("not the password"), "skipped", Ok(())),
+        (EncryptedLinks::VerifyFirst, Some("not the password"), "wrong", Err("WrongPassword")),
+        (EncryptedLinks::VerifyFirst, Some(PASSWORD), "skipped", Ok(())),
+    ] {
+        let dest = tmp.path().join(format!("{links:?}-{}", password.unwrap()));
+        existing(&dest);
+        for (route, outcomes) in ["whole", "session"].into_iter().zip(routes(&arc, &dest, skip(links), password)) {
+            assert_eq!(outcomes, expect(expected), "{route} {links:?} {password:?}");
+        }
+        let progressive = progressive_with(&arc, skip(links)(&dest.join("progressive")), password);
+        match progressive_expected {
+            Ok(()) => assert_eq!(progressive.unwrap().last().map(String::as_str), Some("ok"), "{links:?}"),
+            Err(kind) => assert_eq!(progressive, Err(kind.to_string()), "{links:?}"),
+        }
+        assert_kept(&dest);
+    }
+    // a link with no check value is refused before the skip too
+    let arc = write(&tmp.path().join("nocheck").tap_dir(), false);
+    let dest = tmp.path().join("nocheck-out");
+    existing(&dest);
+    for outcomes in routes(&arc, &dest, skip(EncryptedLinks::VerifyFirst), Some(PASSWORD)) {
+        assert_eq!(outcomes, expect("unverified"));
+    }
+    let failure = progressive_with(&arc, skip(EncryptedLinks::VerifyFirst)(&dest.join("progressive")), Some(PASSWORD));
+    assert!(failure.unwrap_err().contains("UnverifiableLinkPassword"));
+    assert_kept(&dest);
+}
+
+/// Prybar's UnRAR mode, case 2: a hard link whose target this run didn't extract. UnRAR reports the wrong password;
+/// VerifyFirst does too, where Verify reports the link target. With the right password VerifyFirst goes on to the
+/// target check and refuses the link as Verify does.
+#[test]
+fn verify_first_reports_a_wrong_password_before_a_missing_hard_link_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = tmp.path().join("lonely.rar");
+    fs::write(&arc, archive(&[link("hard", 4, "plain", true), FileSpec::new("other", b"other")])).unwrap();
+    for (links, password, expected, progressive_expected) in [
+        (EncryptedLinks::Verify, Some("not the password"), "target", "UnsafePath"),
+        (EncryptedLinks::VerifyFirst, Some("not the password"), "wrong", "WrongPassword"),
+        (EncryptedLinks::VerifyFirst, None, "required", "PasswordRequired"),
+        (EncryptedLinks::VerifyFirst, Some(PASSWORD), "target", "UnsafePath"),
+    ] {
+        let dest = tmp.path().join(format!("{links:?}-{}", password.unwrap_or("none")));
+        let opts = |dest: &Path| with_links(dest, Mode::Extract, links);
+        for (route, outcomes) in ["whole", "session"].into_iter().zip(routes(&arc, &dest, opts, password)) {
+            assert_eq!(outcomes, [expected, "ok"], "{route} {links:?} {password:?}");
+            assert!(fs::symlink_metadata(dest.join(route).join("hard")).is_err(), "{route}");
+        }
+        let progressive = progressive_with(&arc, opts(&dest.join("progressive")), password);
+        assert_eq!(progressive, Err(progressive_expected.to_string()), "{links:?} {password:?}");
+        assert!(fs::symlink_metadata(dest.join("progressive").join("hard")).is_err());
+    }
+}
