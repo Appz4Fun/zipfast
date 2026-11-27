@@ -133,6 +133,9 @@ fn every_coder_extracts() {
         None,
         &["big/one.txt", "big/two.txt", "text/a.txt", "text/b.txt", "text/run.sh", "text/tiny.txt"],
     );
+    // models far smaller than their input, which run out of memory and start over again and again
+    extracts_to("ppmd_restart_o32.7z", None, &["ppmd/mixed.bin"]);
+    extracts_to("ppmd_restart_o4.7z", None, &["ppmd/mixed.bin"]);
 }
 
 #[test]
@@ -154,6 +157,8 @@ fn the_branch_fixtures_use_the_coders_they_are_named_for() {
         ("lzma2.7z", CoderKind::Lzma2),
         ("ppmd.7z", CoderKind::Ppmd),
         ("ppmd_solid.7z", CoderKind::Ppmd),
+        ("ppmd_restart_o32.7z", CoderKind::Ppmd),
+        ("ppmd_restart_o4.7z", CoderKind::Ppmd),
     ] {
         let bytes = fs::read(fixture(name)).unwrap();
         let map = MemberMap::from_memory(&[&bytes], name, None).unwrap();
