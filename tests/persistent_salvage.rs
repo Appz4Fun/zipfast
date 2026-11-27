@@ -166,6 +166,10 @@ fn cases() -> Vec<(&'static str, Volumes)> {
     renamed[name + 1] = b't';
     cases.push(("rar5 damaged name", one(renamed)));
     cases.push(("rar5 without end", one(bytes[..at[3]].to_vec())));
+    // b.txt's type byte hit so that it reads as a second main header, its data passed over
+    let mut as_main = bytes.clone();
+    as_main[at[1] + 5] = 1;
+    cases.push(("rar5 file read as main", one(as_main)));
     let (mut typed, at4) = rar4();
     typed[at4[1] + 2] ^= 0x5a;
     cases.push(("rar4 damaged type", one(typed)));

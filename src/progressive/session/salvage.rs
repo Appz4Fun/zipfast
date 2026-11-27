@@ -146,6 +146,8 @@ impl ProgressiveSession {
         self.header_damage(frame.extent.start, HeaderDamageKind::ChecksumMismatch, name, None, passed_over)?;
         if matches!(frame.block, Block::Main(_)) && (self.main_seen || self.volume > 0) {
             self.main_seen = true;
+            // its bytes are recorded but no frame follows them: reading goes on past its data
+            self.drop_partial_header();
             return Ok(false);
         }
         if !self.main_seen && !matches!(frame.block, Block::Main(_)) {
