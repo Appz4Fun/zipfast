@@ -534,6 +534,27 @@ pub(crate) fn refusal(rel: &Path, kind: &LinkKind, extracted: &Extracted) -> Opt
     }
 }
 
+/// Whether something is already at `rel` under `dest` (a file, a folder or a link, a dangling one too), reached
+/// through real folders only. Under `Overwrite::Skip` a link member found there is skipped before its target is
+/// checked: a skipped member places and touches nothing, so it needs none of the checks a placed link does.
+pub(crate) fn existing_target(dest: &Path, rel: &Path) -> bool {
+    let mut at = dest.to_path_buf();
+    let mut parts = rel.components().peekable();
+    while let Some(part) = parts.next() {
+        at.push(part);
+        let Ok(meta) = std::fs::symlink_metadata(&at) else {
+            return false;
+        };
+        if parts.peek().is_none() {
+            return true;
+        }
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return false;
+        }
+    }
+    false
+}
+
 /// [`refusal`] for a writer that goes on to place the link with [`publish`] (or [`make_or_stand_in`]): with
 /// placeholders on, a symbolic link whose target leaves the destination is not refused yet, so its path is checked
 /// as any output's and the placeholder takes it; the placing refuses it then.

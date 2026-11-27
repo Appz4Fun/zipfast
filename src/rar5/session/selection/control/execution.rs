@@ -669,6 +669,9 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
         self.binding(target, Some(initial))?;
         Ok(decision == RarOverwriteDecision::Replace)
     }
+    fn skips_existing(&self, legacy: Overwrite) -> bool {
+        legacy.rename().is_none() && self.control.overwrite == RarOverwriteMode::Skip
+    }
     fn recheck(
         &mut self,
         session: &mut RarSession,

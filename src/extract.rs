@@ -1296,10 +1296,11 @@ fn place_target(
     let metadata = |e| RarFault::output(IoOperation::Metadata, Some(target.clone()), None, e, false);
     Ok(match fs::symlink_metadata(&target) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            if !log.placed.is_some_and(|p| p.owns_link(&meta)) {
-                DetailedChecked::Blocked(RarPolicyReason::Symlink)
-            } else if opts.overwrite == Overwrite::Skip {
+            // skipped under Overwrite::Skip, as UnRAR's `-o-` skips it: nothing is written through it or over it
+            if opts.overwrite == Overwrite::Skip {
                 DetailedChecked::Exists
+            } else if !log.placed.is_some_and(|p| p.owns_link(&meta)) {
+                DetailedChecked::Blocked(RarPolicyReason::Symlink)
             } else {
                 // a link this run made: replaced by rename, which never follows it
                 let mut place = Place::new(target, true);
@@ -4939,6 +4940,16 @@ impl Run<'_, '_, '_> {
             }
             password => password,
         };
+        // Overwrite::Skip: a link whose target is already there (one an earlier run placed, say) is skipped before its
+        // link target is checked, as UnRAR's `-o-` skips it: a skipped member places and touches nothing. A link that
+        // will be placed still passes every check below.
+        if self.opts.mode == Mode::Extract
+            && self.opts.overwrite == Overwrite::Skip
+            && link::existing_target(&self.opts.dest, rel)
+        {
+            self.reports.skipped(&ctx, RarSkipReason::ExistingTarget)?;
+            return self.past_link(vol, h, ctx, None);
+        }
         let refusal = match &kind {
             Ok(kind) => link::refusal_before_place(rel, kind, &self.landing.extracted),
             Err(_) => Some(link::HARD_TARGET),
