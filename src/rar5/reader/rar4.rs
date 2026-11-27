@@ -62,7 +62,7 @@ impl HeaderParser {
         if self.embedded_comment(kind, flags) {
             return Err(self.rar4_unsupported("embedded comment").into());
         }
-        let mut cursor = Fields::new(header, 7);
+        let mut cursor = self.fields(header, 7);
         // Map walks follow unrar's ReadHeader15 on which blocks have data after the header: the old subblock (0x77)
         // and old recovery record (0x78) always start with its size, the main, old comment and end headers never
         // have any, and every other block has it exactly when LONG_BLOCK is set. A salvaging run sizes the old-style
@@ -156,7 +156,8 @@ impl HeaderParser {
                 {
                     budget.names(u64::from(u16::from_le_bytes([size[0], size[1]])))?;
                 }
-                let (file, wire) = self.rar4_file(header, flags, packed, data_at, budget)?;
+                // the fields after the packed size start where it left the reading (a header cut short)
+                let (file, wire) = self.rar4_file(header, cursor.at, flags, packed, data_at, budget)?;
                 frame.data_end = file
                     .data_at
                     .checked_add(file.packed_size)
@@ -288,16 +289,22 @@ impl HeaderParser {
         )
     }
 
+    /// The fields of `bytes` from `at`: those of a header cut short (HeaderCut::Header) as UnRAR reads them.
+    fn fields<'a>(&self, bytes: &'a [u8], at: usize) -> Fields<'a> {
+        if self.cut_parse { Fields::cut(bytes, at, self.cut_held) } else { Fields::new(bytes, at) }
+    }
+
     fn rar4_file(
         &self,
         bytes: &[u8],
+        at: usize,
         flags: u16,
         mut packed: u64,
         data_at: u64,
         budget: Option<&ScanBudget<'_>>,
     ) -> std::result::Result<(FileHeader, FileWire), FramingError> {
         let result: std::result::Result<_, FileParseError> = (|| {
-            let mut fields = Fields::new(bytes, 11);
+            let mut fields = self.fields(bytes, at);
             let mut unpacked = u64::from(fields.u32()?);
             let host = fields.byte()?;
             let crc = fields.u32()?;
@@ -313,10 +320,18 @@ impl HeaderParser {
             // As UnRAR reads it: all ones (both halves with the large-file flag) means the size is unknown.
             let size_unknown = if flags & 0x100 != 0 { unpacked == u64::MAX } else { unpacked == 0xffff_ffff };
             let encoded = fields.take(name_len)?;
-            let name = if self.cut_parse && fields.at > self.cut_held {
-                // a header cut short inside its name (HeaderCut::Header): what of the name is there, up to the zeros,
-                // as UnRAR lists it; a whole name is decoded as any other
-                String::from_utf8_lossy(encoded.split(|&byte| byte == 0).next().unwrap_or_default()).into_owned()
+            // a header cut short (HeaderCut::Header): a name cut short, or one that does not decode (taken from where
+            // a field not there left the reading), is what of it is there up to a NUL, as UnRAR lists it; a whole
+            // name is decoded as any other
+            let cut_name = || String::from_utf8_lossy(encoded.split(|&byte| byte == 0).next().unwrap_or_default());
+            let name = if self.cut_parse && encoded.len() < name_len {
+                cut_name().into_owned()
+            } else if self.cut_parse {
+                match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
+                    Ok(name) if !name.is_empty() && !name.contains('\0') => name,
+                    Err(error @ (FileParseError::Allocation | FileParseError::Progressive(_))) => return Err(error),
+                    _ => cut_name().into_owned(),
+                }
             } else {
                 match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
                     // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
@@ -337,7 +352,15 @@ impl HeaderParser {
                     }
                 }
             };
-            let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
+            let salt = if flags & 0x400 != 0 {
+                // all 8 bytes, but for a header cut short inside them
+                let mut salt = [0; 8];
+                let there = fields.take(8)?;
+                salt[..there.len()].copy_from_slice(there);
+                Some(salt)
+            } else {
+                None
+            };
             let mut mtime = dos_timestamp(dos);
             let mut nanos = 0;
             let mut resolution = 2_000_000_000;
@@ -493,29 +516,61 @@ impl HeaderParser {
     }
 }
 
+/// A header's fields, read in order.
+///
+/// A RAR 4.x file header the volume cuts short ([`HeaderCut::Header`]) holds only its first `held` bytes, and is read
+/// as UnRAR 7.30 was seen to read one: a number (1, 2 or 4 bytes) not wholly there reads as 0 and is not stepped
+/// over, so the next field starts where it did; a byte string (the name, the salt, a time's fraction bytes) takes
+/// what of it is there, the rest zeros, and the bytes there end with it.
 struct Fields<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// The bytes there, for a header cut short.
+    held: Option<usize>,
 }
 
 impl<'a> Fields<'a> {
     fn new(bytes: &'a [u8], at: usize) -> Self {
-        Self { bytes, at }
+        Self { bytes, at, held: None }
     }
+    /// The fields of a header of which only the first `held` bytes are there (see above).
+    fn cut(bytes: &'a [u8], at: usize, held: usize) -> Self {
+        Self { bytes, at, held: Some(held.min(bytes.len())) }
+    }
+    /// A byte string of `len` bytes: shorter, when the header is cut short inside it.
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
         let end = self.at.checked_add(len).ok_or(Error::Corrupt("RAR4 field size"))?;
+        match self.held {
+            Some(held) if end > held => {
+                let bytes = self.bytes.get(self.at.min(held)..held).unwrap_or_default();
+                self.at = self.at.max(held);
+                Ok(bytes)
+            }
+            _ => {
+                let bytes = self.bytes.get(self.at..end).ok_or(Error::Truncated)?;
+                self.at = end;
+                Ok(bytes)
+            }
+        }
+    }
+    /// A number of `N` bytes: 0, and not stepped over, when a header cut short does not hold all of it.
+    fn number<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let end = self.at.checked_add(N).ok_or(Error::Corrupt("RAR4 field size"))?;
+        if self.held.is_some_and(|held| end > held) {
+            return Ok([0; N]);
+        }
         let bytes = self.bytes.get(self.at..end).ok_or(Error::Truncated)?;
         self.at = end;
-        Ok(bytes)
+        Ok(bytes.try_into().unwrap())
     }
     fn byte(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        Ok(self.number::<1>()?[0])
     }
     fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(self.number()?))
     }
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.number()?))
     }
 }
 

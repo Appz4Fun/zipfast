@@ -548,6 +548,9 @@ pub(crate) struct Rar4Decoder {
     data_end: Option<(u64, u64)>,
     /// [`Self::cut_short`]: a PPM or RAR 1.5/2.0 code starting at or past this bit of the member's data is not decoded
     stop_at: Option<u64>,
+    /// [`Self::cut_short`]: a match reaching before the history copies the zeros there, as UnRAR 7.30's window holds
+    /// (seen as the zeros UnRAR writes at the end of a member cut short), instead of failing the member
+    zero_window: bool,
     hold_start: u64,
     /// how many of the held bytes are plain output that was waiting when the first block's bytes began
     hold_plain: usize,
@@ -664,6 +667,7 @@ impl Rar4Decoder {
             starts: None,
             data_end: None,
             stop_at: None,
+            zero_window: false,
             hold_start: 0,
             hold_plain: 0,
             version: 29,
@@ -999,6 +1003,7 @@ impl Rar4Decoder {
     /// not. Up to [`CUT_PAD`] zero bytes are fed after this, then [`Self::drain`], and [`Self::cut_point`] says
     /// where the output ends.
     pub(crate) fn cut_short(&mut self) {
+        self.zero_window = true;
         self.data_end = Some((self.fetched, 0));
         self.stop_at = Some(self.fetched.saturating_add(1).saturating_mul(8));
     }
@@ -1330,7 +1335,8 @@ impl Rar4Decoder {
     }
     fn start_copy(&mut self, length: u64, distance: u64) -> DecodeResult<()> {
         let history = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
-        if distance == 0 || distance > self.binding.frame.dictionary || distance > history {
+        // past a cut (zero_window): a match reaching before the history copies the zeros there
+        if distance == 0 || distance > self.binding.frame.dictionary || (distance > history && !self.zero_window) {
             return Err(Rar4DecodeError::Malformed("match distance outside initialized history"));
         }
         let end = self.produced.checked_add(length).ok_or(Rar4DecodeError::CounterOverflow)?;
@@ -1373,11 +1379,15 @@ impl Rar4Decoder {
     #[inline]
     fn copy_step(&mut self, distance: u64, left: u64, sink: &mut dyn Sink) -> DecodeResult<()> {
         let cursor = self.chain_base.checked_add(self.produced).ok_or(Rar4DecodeError::CounterOverflow)?;
-        let from = cursor.checked_sub(distance).ok_or(Rar4DecodeError::CounterOverflow)?;
-        let copied = self.copy_plain(from, cursor, left)?;
+        // before the history, past a cut (zero_window): a zero
+        let from = cursor.checked_sub(distance);
+        let copied = match from {
+            Some(from) => self.copy_plain(from, cursor, left)?,
+            None => 0,
+        };
         if copied == 0 {
-            let index = (from & (self.dictionary.len() as u64 - 1)) as usize;
-            self.emit(self.dictionary[index], sink)?;
+            let byte = from.map_or(0, |from| self.dictionary[(from & (self.dictionary.len() as u64 - 1)) as usize]);
+            self.emit(byte, sink)?;
         } else if self.filled >= OUTPUT {
             self.flush(sink)?;
         }

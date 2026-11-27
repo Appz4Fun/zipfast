@@ -409,8 +409,20 @@ struct SelectedRun {
 /// [`crate::extract::UnverifiedOutput`] says, as UnRAR 7.30 decodes it (reading on past the end as zeros), and its own
 /// checks decide, as UnRAR's do: one whose checksum passes (a compressed stream whose last bytes it didn't need) is
 /// good, and the archive still ends unexpectedly; the rest fail as this issue.
+///
+/// So is a RAR 4.x file header the archive's end cuts short ([`crate::rar5::HeaderCut::Header`], the only member
+/// issue a session catalogues as a truncated header): UnRAR 7.30 decodes it from no data (zeros), and what comes of
+/// that is what `unrar p` prints and `unrar x -kb` keeps (an empty file, mostly); it never passes.
 pub(super) fn cut_short(failure: &RarFailure) -> bool {
-    matches!(failure, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
+    matches!(
+        failure,
+        RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData | RarIntegrityReason::TruncatedHeader, .. }
+    )
+}
+
+/// A [`cut_short`] issue that is a file header cut short, which fails whatever its checks say.
+fn header_cut(failure: &RarFailure) -> bool {
+    matches!(failure, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedHeader, .. })
 }
 
 /// A catalogue issue that is a member cut off by a missing volume, or by the end of an archive cut short (catalogued
@@ -622,6 +634,13 @@ impl SelectedRun {
         // a member an archive cut short ends inside of (`cut_short`): what fails its checks or its decoding there
         // fails as the cut, which is why
         match session.model.members[index].issue.map(|issue| &session.issues[issue]).filter(|issue| cut_short(issue)) {
+            Some(issue) if header_cut(issue) => match result {
+                // whatever it decoded to, a header cut short fails
+                Ok(_) | Err(RarFailure::Integrity { .. } | RarFailure::EncryptedIntegrity { .. }) => {
+                    Err(copy_catalogue_issue(issue))
+                }
+                Err(failure) => Err(failure),
+            },
             Some(issue) => result.map_err(|failure| match failure {
                 RarFailure::Integrity { .. } | RarFailure::EncryptedIntegrity { .. } => copy_catalogue_issue(issue),
                 failure => failure,
@@ -642,7 +661,10 @@ impl SelectedRun {
         let cut = member
             .issue
             .map(|issue| &session.issues[issue])
-            .filter(|issue| cut_short(issue) || (self.emit_unverified && cut_off(issue)));
+            .filter(|issue| cut_short(issue) || (self.emit_unverified && cut_off(issue)))
+            // a header cut short decodes only as a member that is whole could (UnRAR decodes nothing of one whose
+            // fields, zeros or not, name what it can't unpack)
+            .filter(|issue| !header_cut(issue) || member.header.rar4_unsupported().is_none());
         if let Some(issue) = member.issue
             && cut.is_none()
         {
