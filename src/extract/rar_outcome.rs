@@ -125,6 +125,9 @@ pub struct RarRunSummary {
     /// names were claimed. A terminal error's `partial` keeps the renames made before it, including an existing file
     /// moved aside for a member that then failed.
     pub renames: Vec<RenamedOutput>,
+    /// Headers read past under [`super::Options::damaged_input`] (at most 4096 kept): non-empty means the headers
+    /// are damaged ([`super::Summary::damaged_headers`]).
+    pub damaged_headers: Vec<super::HeaderDamage>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -259,6 +262,19 @@ impl<'a> Reports<'a> {
                 summary.renames.push(renamed);
             }
             Self::Typed { summary, .. } => summary.renames.push(renamed),
+        }
+    }
+
+    /// Headers a salvaging run read past, as it met them: kept in the summary, and told as a diagnostic line.
+    pub(super) fn damaged(&mut self, damage: Vec<super::HeaderDamage>) {
+        match self {
+            Self::Legacy { summary, callback, .. } => {
+                for d in &damage {
+                    callback.line(&d.to_string());
+                }
+                super::keep_damage(&mut summary.damaged_headers, damage);
+            }
+            Self::Typed { summary, .. } => super::keep_damage(&mut summary.damaged_headers, damage),
         }
     }
 
