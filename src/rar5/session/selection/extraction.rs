@@ -137,6 +137,14 @@ impl<'a> Extraction<'a> {
         if link.is_none() && (member.issue.is_some() || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
+        // Options::encrypted_links: VerifyFirst checks an encrypted link's password before any target decision
+        let checked_first = match link {
+            Some(_) if self.options.encrypted_links == crate::extract::EncryptedLinks::VerifyFirst => Some(
+                super::link_password(session, index, self.options.encrypted_links)
+                    .map_err(|failure| SelectedStop::from(Arc::new(failure)))?,
+            ),
+            _ => None,
+        };
         if !projectable_name(header, &member.wire.name) {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
@@ -227,11 +235,11 @@ impl<'a> Extraction<'a> {
             // an encrypted link is placed only on a password its check value verifies, once the overwrite decision
             // lets it be placed (a skipped one stays skipped) and before anything is touched
             // (a RAR 5.0 redirection only: a RAR 4.x symbolic link's target is its encrypted data, checked as it decrypts)
-            let evidence = match kind {
-                Some(_) => {
-                    super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?
-                }
-                None => crate::error::RarPasswordEvidence::NotEncrypted,
+            let evidence = match (kind.as_ref(), checked_first) {
+                (Some(_), Some(evidence)) => evidence,
+                (Some(_), None) => super::link_password(session, index, self.options.encrypted_links)
+                    .map_err(|failure| SelectedStop::from(Arc::new(failure)))?,
+                (None, _) => crate::error::RarPasswordEvidence::NotEncrypted,
             };
             let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
             return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind, evidence);
@@ -1013,6 +1021,7 @@ mod tests {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
             salvage_truncated_zip: false,

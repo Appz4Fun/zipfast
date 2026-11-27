@@ -86,6 +86,7 @@ fn options(dest: &std::path::Path) -> ProgressiveOptions {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
             salvage_truncated_zip: false,
@@ -582,6 +583,15 @@ impl VolumeSource for NativeProvider {
     }
 }
 fn native_session(dir: &std::path::Path, data: Vec<u8>, holes: Vec<Range<u64>>, encrypted: bool) -> ProgressiveSession {
+    native_session_with(dir, data, holes, encrypted, Default::default())
+}
+fn native_session_with(
+    dir: &std::path::Path,
+    data: Vec<u8>,
+    holes: Vec<Range<u64>>,
+    encrypted: bool,
+    damaged: zipfast::extract::DamagedInput,
+) -> ProgressiveSession {
     let path = dir.join("source.rar");
     std::fs::write(&path, &data).unwrap();
     let file = File::open(&path).unwrap();
@@ -600,6 +610,7 @@ fn native_session(dir: &std::path::Path, data: Vec<u8>, holes: Vec<Range<u64>>, 
         },
     };
     let mut opts = options(&dir.join("out"));
+    opts.extract.damaged_input = damaged;
     opts.recovery_publication = RecoveryPublication::VerifiedInner;
     if encrypted {
         opts.set_password(Some("pw".into())).unwrap();
@@ -632,6 +643,35 @@ fn recovered_inner_keeps_missing_cipher_evidence() {
     assert!(a.discard().is_err());
     drop(a);
     assert!(dir.path().join("out/inner").exists());
+}
+/// A member read past damaged headers (`damaged_input`: a main header failing its checksum under `Salvage`, garbage
+/// before the member searched past under `Resync`) still verifies Strict from a replacement holding the same bytes:
+/// the replay reads the damaged headers as extraction did.
+#[test]
+fn strict_replacement_replays_headers_read_past_as_damage() {
+    let plain: Vec<u8> = (0..79).collect();
+    let (data, start) = encrypted(&plain);
+    let member = common::SIG.len() + common::main_block(false, None).len();
+    let mut main_crc = data.clone();
+    main_crc[common::SIG.len()] ^= 0x5a;
+    let mut garbage = data[..member].to_vec();
+    garbage.extend([0; 5]);
+    garbage.extend(&data[member..]);
+    for (what, data, start, damaged) in [
+        ("main crc", main_crc, start, zipfast::extract::DamagedInput::Salvage),
+        ("resync", garbage, start + 5, zipfast::extract::DamagedInput::Resync),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = native_session_with(dir.path(), data.clone(), one(start + 17..start + 18), true, damaged);
+        let mut a = artifact(&mut s);
+        s.patch(&mut a, 16, &plain[16..48]).unwrap();
+        let replacement = dir.path().join("replacement.rar");
+        std::fs::write(&replacement, &data).unwrap();
+        s.supply_verification_source(0, Box::new(ImmutableFileSource::open(&replacement).unwrap())).unwrap();
+        let v = verify(&mut s, &mut a).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(v.level(), VerificationLevel::Strict, "{what}");
+        assert_eq!(std::fs::read(dir.path().join("out/inner")).unwrap(), plain, "{what}");
+    }
 }
 #[test]
 fn strict_native_replacement_publishes_and_custom_replacement_cannot() {

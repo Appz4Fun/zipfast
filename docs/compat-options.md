@@ -17,6 +17,7 @@ restart_from_first_volume: false,
 replace_placed_links: false,
 keep_broken: false,
 attempt_continued_members: false,
+encrypted_links: Default::default(),
 damaged_input: Default::default(),
 unsupported_filters: Default::default(),
 salvage_truncated_zip: false,
@@ -147,21 +148,56 @@ run writes nothing. The whole-archive runners for RAR, 7z, ZIP and tar, `RarSess
 sessions honour it (a progressive session still stops at the refused link, as without the option).
 `tests/links.rs` and `tests/rar5_links.rs` check these points.
 
-## Encrypted RAR 5.0 links and a wrong password (no option)
+## `encrypted_links`: encrypted RAR 5.0 links and a wrong password
 
 `rar a -p` encrypts file data but leaves headers in the clear, so a link member's target (its redirection record)
-is readable whatever the password. 7-Zip 26.06 creates such links with a wrong password; UnRAR 7.30 reports the
-wrong password for the member and creates nothing. zipfast does as UnRAR does, on every route (`extract::run*`,
-`RarSession` test and extraction, progressive sessions), and has no switch for 7-Zip's behaviour: a caller that
-wants it (Prybar's 7z mode) handles it itself.
+is readable whatever the password. UnRAR 7.30 reports the wrong password for the member and creates nothing;
+7-Zip 26.06 doesn't check the password for a link at all. `Options::encrypted_links` picks one:
+`EncryptedLinks::Verify` (the default), `EncryptedLinks::VerifyFirst` (UnRAR's reporting order, for Prybar's unrar
+mode) or `EncryptedLinks::PlaceUnverified` (7-Zip's, for Prybar's 7z mode).
+It applies on every route: `extract::run*`, `RarSession::extract_selected` and `extract_selected_controlled` (from
+the `Options` they take), `RarSession::test_selected` (from `RarSessionOptions::encrypted_links`, as it takes no
+`Options`), and progressive sessions (from `ProgressiveOptions`' extract options).
 
-A redirection member whose header carries an encryption record (Unix or Windows symbolic link, junction, hard
-link, file copy) is placed, or passes a test, only when its password check value verifies the password. No
-password fails it as `RarFailure::PasswordRequired`, a wrong one as `RarFailure::WrongPassword`, as an encrypted
-data member fails; nothing is created. A record without a check value, or with a check value whose checksum doesn't
-match, can't verify any password, and a link has no data to check one against: the member is refused as
-`RarFailure::EncryptedIntegrity` with `RarIntegrityReason::UnverifiableLinkPassword`, even with the right password.
-A progressive session stops at such a member, as it does at a wrong password.
+With `Verify`, a redirection member whose header carries an encryption record (Unix or Windows symbolic link,
+junction, hard link, file copy) is placed, or passes a test, only when its password check value verifies the
+password. No password fails it as `RarFailure::PasswordRequired`, a wrong one as `RarFailure::WrongPassword`, as an
+encrypted data member fails; nothing is created. A record without a check value, or with a check value whose
+checksum doesn't match, can't verify any password, and a link has no data to check one against: the member is
+refused as `RarFailure::EncryptedIntegrity` with `RarIntegrityReason::UnverifiableLinkPassword`, even with the right
+password. A progressive session stops at such a member, as it does at a wrong password.
+
+`Verify` checks the password once the member is known to be placed or tested: a member skipped for an existing
+target under `Overwrite::Skip` is reported `Skipped(ExistingTarget)`, and a hard link or copy whose target the run
+didn't extract fails on its target (`RarPolicyReason::HardLinkTarget`; a progressive session stops with
+`UnsafePath`), whatever the password. `VerifyFirst` checks it first, as UnRAR 7.30 does: `unrar x -o- -pwrong` over
+links that already exist prints "Incorrect password" and exits 11, and a hard link with a missing target is reported
+as the wrong password. Under `VerifyFirst` a password that doesn't verify fails such a member as above
+(`WrongPassword`, `PasswordRequired`, `EncryptedIntegrity`/`UnverifiableLinkPassword`) before the overwrite decision
+and the target checks; one that verifies goes on to them as usual. Nothing is placed or replaced either way, so this
+changes only what is reported. An older file revision is still skipped before anything, on every route. A
+`RarSession` test run checks the password first under every mode.
+
+With `PlaceUnverified`, the password isn't checked for such a member (no key is derived): with a wrong password,
+with none, or with no check value, the link is placed (or passes a test) and reported as any placed link is,
+`RarOutcome::Verified`, with the password evidence `RarPasswordEvidence::Unverified` in its checks, so a caller can
+tell it from a verified link (a progressive session reports `MemberOutcome::Verified`/`Tested`, which carries no
+password evidence; a caller that set the option knows an encrypted link there went unchecked). Every other link check
+still applies: a target that leaves the destination, a hard link or copy of a file the run didn't extract,
+protected paths, `replace_placed_links` and the overwrite decision. RAR 4.x symbolic links (whose target is their
+encrypted data) and members with data still need their password.
+
+What 7-Zip 26.06 (`7zz`, macOS arm64) does with such archives:
+
+| archive | `x -p<wrong>` | `x` (no `-p`) | `t -p<wrong>` |
+|---|---|---|---|
+| symlinks and a junction with a check value | links created, exit 0, "Everything is Ok" | same | "ERROR: Wrong password" per link, exit 2 |
+| the same without a check value | links created, exit 0 | same | exit 0 |
+| hard link and file copy | hard link created; copy "Unsupported Method", exit 2 | same | exit 0 |
+
+So `x` reports no error for an encrypted link under a wrong password or none, and `PlaceUnverified` matches it. `t`
+does check a check value it has (a wrong password is an error there, and with no `-p` it asks for one), which
+`PlaceUnverified` doesn't mirror: a test passes those links too, with `RarPasswordEvidence::Unverified`.
 
 ## 7z wrong passwords: how the member failed
 
@@ -301,12 +337,42 @@ Where it applies:
 - `RarSession`, through `RarSessionOptions::damaged_input`: the catalogue reads past the damage, its members list and
   extract (`extract_selected`, `extract_selected_controlled`, printing) as any other, and
   `RarArchiveMetadata::damaged_headers()` says what was read past;
-- `Volume::open_damaged` and `Volume::take_damage` for callers walking blocks themselves.
+- `Volume::open_damaged` and `Volume::take_damage` for callers walking blocks themselves;
+- progressive sessions (`ProgressiveSession::new`, `from_sealed_memory`), through `ProgressiveOptions::extract`: each
+  damaged header is a `ProgressiveEvent::HeaderDamaged { volume, damage }`, delivered before anything read from that
+  header (so just before the `MemberStarted` of a member whose header failed its checksum). See "Damaged headers in a
+  progressive session" below.
 
-Progressive and persistent-partial sessions still refuse a damaged header whatever `damaged_input` says; listings that
-take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
+Persistent-partial sessions (`ProgressiveSession::new_partial`) still refuse a damaged header whatever `damaged_input`
+says: their journal binds each member to the header bytes it was read from, and a header repaired later would no longer
+match. Listings that take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
 `--resync` (for `l`, `t`, `x`, `e`; a listing of anything but RAR stays as it is), prints each damaged header and a warning, and exits 1.
 `tests/rar_salvage.rs` checks each point.
+
+### Damaged headers in a progressive session
+
+A progressive session reads bytes as its source delivers them, and a range that is missing now may be filled later
+(an article fetched again, PAR2 repair, another copy). So only bytes the source has delivered are ever judged damaged:
+
+- A header the source has not delivered yet (`RangeRead::NotYet`, or a volume not there yet) is waited on, as under
+  `Refuse`; it is never damage. When it arrives it is read as any other header.
+- A header inside a range the source answers as a `Hole` is not damage either: the session stops with `HeaderHole`, as
+  under `Refuse`, since the bytes may yet be repaired. Run the session again once they are.
+- A resync never searches across a `Hole`: the next header may be inside it, so the search stops with `HeaderHole`.
+  On a source whose end isn't known yet (`GrowingFileVolumes`) a search that has not found a header waits for more
+  bytes, as reading a header does.
+- Only a header whose bytes were delivered and are wrong (a checksum that fails, fields that don't parse, a header or
+  data running past the volume's known end) is salvaged, exactly as the whole-archive runners do: the same members,
+  the same bytes and the same `HeaderDamage` records (`volume` is the volume's name as the session asked for it).
+
+Under salvage the session takes the volume's length from the source (`SourceInfo::length`, unless it is
+`Advertised(u64::MAX)`), so a header or data running past it is a volume cut short (`UnexpectedEnd`). The rest of a
+damaged volume is passed over as in the whole-archive runners: a volume set goes on with its next volume (a sealed set,
+or a declared last volume, may end there), anything else ends. A folder whose damaged header claims data is created and
+its data passed over. A resync's work is bounded as the whole-archive one's, by 16 times the furthest offset read in
+the volume plus 1 MiB, and it charges its window (at most a chunk and one candidate header) to `MetadataBytes`. Bytes
+passed over break a solid archive's history: the next solid member stops with `SolidHistoryUnavailable`.
+`tests/progressive_salvage.rs` checks each point.
 ## `unsupported_filters`: a RAR 3.x/4.x member using a VM filter zipfast doesn't run
 
 RAR 3.x/4.x carries filters as programs for its virtual machine. zipfast runs the standard ones (E8, E8E9, ITANIUM,

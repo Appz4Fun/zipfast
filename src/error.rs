@@ -80,6 +80,10 @@ pub enum RarPasswordEvidence {
     NotEncrypted,
     VerifierMatched,
     VerifierUnavailable(RarVerifierUnavailable),
+    /// An encrypted RAR 5.0 redirection placed or tested without its password verifying, as
+    /// [`crate::extract::EncryptedLinks::PlaceUnverified`] allows: no password was given, its check value rejected
+    /// the one given, or it has no usable check value.
+    Unverified,
 }
 
 /// Why the encryption record could not verify a password independently.
