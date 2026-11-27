@@ -615,6 +615,52 @@ fn declared_damage_and_refill_from_a_repaired_volume() {
 }
 
 #[test]
+fn a_part_failing_its_header_crc_becomes_a_declared_hole_and_the_member_finishes() {
+    // A wrong byte in part 2 (output 2000..3000), from an article whose transport check passed: the part's header
+    // CRC fails. The part's output becomes a DeclaredBad hole instead of ending the session, and refilling it from
+    // the repaired volume reads that part and nothing else.
+    for naming in [Naming::Old, Naming::Parts] {
+        let gold = gold(4000);
+        let mut set = Set::split(naming, &gold, &[1000, 2000, 3000]);
+        let p2 = set.payloads[2].clone();
+        let good = set.volumes[2].clone();
+        set.volumes[2][p2.start as usize + 500] ^= 0x40;
+        let mut run = extract(&set);
+        assert_eq!(reports(&run.holes), vec![(2000..3000, vec![(2, p2.clone())], HoleCause::DeclaredBad)]);
+        // The clean non-final parts are checked as before; the bad one is not reported verified.
+        assert_eq!(run.parts, vec![(0, 0), (1, 1)]);
+        assert_eq!(run.outcomes.len(), 1);
+        assert!(matches!(run.outcomes[0], MemberOutcome::PersistentPartial { .. }));
+        // Every volume is read forward: no source read goes back to an offset already passed.
+        let reads = set.reads.lock().unwrap().clone();
+        for volume in 0..set.volumes.len() as u32 {
+            let offsets: Vec<u64> = reads.iter().filter(|r| r.0 == volume).map(|r| r.1).collect();
+            assert!(offsets.windows(2).all(|w| w[0] < w[1]), "volume {volume} read again: {offsets:?}");
+        }
+        let file = &mut run.files[0].1;
+        assert_eq!(file.remaining().unwrap(), vec![2000..3000]);
+        struct Counting(std::io::Cursor<Vec<u8>>, u64);
+        impl std::io::Read for Counting {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                self.1 += n as u64;
+                Ok(n)
+            }
+        }
+        impl std::io::Seek for Counting {
+            fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+        let mut reader = Counting(std::io::Cursor::new(good.clone()), 0);
+        file.refill_from_packed(2, 0..good.len() as u64, &mut reader).unwrap();
+        assert_eq!(reader.1, 1000, "refill reads only the declared part");
+        assert!(matches!(verify(file), Verdict::Ok { .. }));
+        assert_eq!(fs::read(run.out().join("big.bin")).unwrap(), gold);
+    }
+}
+
+#[test]
 fn two_member_set_only_the_damaged_member_is_partial() {
     let (a, b) = (gold(1500), gold(900).into_iter().rev().collect::<Vec<_>>());
     let mut set = Set::single(&[(b"a.bin", &a), (b"b.bin", &b)]);
@@ -1317,11 +1363,18 @@ fn without_opting_in_a_zero_part_crc_is_a_part_crc_mismatch() {
     let gold = gold(3000);
     let mut set = Set::split(Naming::Old, &gold, &[1000, 2000]);
     zero_part_crc(&mut set, 1);
-    let (run, failure) = events_with(&set, false);
-    let failure = failure.expect("the default is unchanged: the part CRC is checked");
-    assert!(failure.contains("volume_index: Some(1)"), "{failure}");
-    assert!(failure.contains("PackedPiece { crc32: true"), "{failure}");
-    assert!(run.outcomes.is_empty(), "{:?}", described(&run.outcomes));
+    let (mut run, failure) = events_with(&set, false);
+    // The default is unchanged: the part CRC is checked. A part failing it is damage the session places on that
+    // part (a DeclaredBad hole over its output), and the member finishes with it.
+    assert_eq!(failure, None);
+    let p1 = set.payloads[1].clone();
+    assert_eq!(reports(&run.holes), vec![(1000..2000, vec![(1, p1)], HoleCause::DeclaredBad)]);
+    assert_eq!(described(&run.outcomes), ["partial"]);
+    // Its bytes are right, so a refill from the volume writes them back, and the stored 0 still fails the part.
+    let file = &mut run.files[0].1;
+    refill_volume(file, &set, 1);
+    assert!(file.remaining().unwrap().is_empty());
+    assert!(matches!(verify(file), Verdict::PartBad { volume: 1, .. }));
 }
 
 #[test]
@@ -1329,11 +1382,17 @@ fn opting_in_never_skips_the_member_check_in_the_final_part() {
     let gold = gold(3000);
     let mut set = Set::split(Naming::Old, &gold, &[1000, 2000]);
     zero_part_crc(&mut set, 2);
-    let (run, failure) = events_with(&set, true);
-    let failure = failure.expect("the final part's CRC is the member check");
-    assert!(failure.contains("volume_index: Some(2)"), "{failure}");
-    assert!(failure.contains("FinalChecks { crc32: true"), "{failure}");
-    assert!(run.outcomes.is_empty(), "{:?}", described(&run.outcomes));
+    let (mut run, failure) = events_with(&set, true);
+    // The final part's CRC is the member check, and it fails. Both parts before it passed their own CRCs, so the
+    // session places the damage on the final part (a DeclaredBad hole) instead of ending.
+    assert_eq!(failure, None);
+    assert_eq!(run.parts, vec![(0, 0), (1, 1)]);
+    let p2 = set.payloads[2].clone();
+    assert_eq!(reports(&run.holes), vec![(2000..3000, vec![(2, p2)], HoleCause::DeclaredBad)]);
+    assert_eq!(described(&run.outcomes), ["partial"]);
+    let file = &mut run.files[0].1;
+    refill_volume(file, &set, 2);
+    assert!(matches!(verify(file), Verdict::Bad { which: ChecksumAlgorithm::Crc32, .. }), "member CRC still judged");
 }
 
 /// [`session`] with [`ProgressiveOptions::rar4_unknown_part_crc`] set.
