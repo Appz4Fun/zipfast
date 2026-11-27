@@ -82,7 +82,7 @@ fn main() {
                 (summary.files, summary.errors.len() as u64)
             }
             "session" | "test" => {
-                let mut session = RarSession::open(first, None, RarSessionOptions::default()).unwrap();
+                let mut session = RarSession::open(first, None, RarSessionOptions { threads, ..RarSessionOptions::default() }).unwrap();
                 let all = session.select(|_| true).unwrap();
                 let summary = if mode == "session" {
                     session.extract_selected(&all, &opts, RarDecodeLimits::default(), |_| {}).unwrap()
