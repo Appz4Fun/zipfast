@@ -143,6 +143,10 @@ pub(crate) const HARD_TARGET: &str = "the hard link's target is not a file extra
 /// regular file reached without following a link.
 pub(crate) const STORED_TARGET: &str = "the hard link's target is not a regular file in the destination";
 
+/// The message for a hard link, under [`crate::extract::HardLinkTargets::StoredName`], whose target's name holds an
+/// input of the run (an archive volume or a protected path).
+pub(crate) const PROTECTED_SOURCE: &str = "the hard link's target is an input of this run";
+
 /// The message for a hard link or file copy whose earlier file was changed or replaced since it was extracted.
 pub(crate) const TARGET_CHANGED: &str = "the hard link's target is no longer the file extracted earlier";
 /// The message for a link on a platform where links aren't created.
@@ -330,6 +334,8 @@ pub(crate) struct Extracted {
     /// ([`crate::extract::UnixModes::Masked`], 7-Zip's metadata); otherwise the file keeps its own, as UnRAR 7.30
     /// and GNU tar leave it
     hard_link_times: bool,
+    /// device and inode of the run's inputs (archive volumes, protected paths): never a stored-name hard link's file
+    protected_sources: Vec<(u64, u64)>,
 }
 
 /// The most bytes of paths [`Extracted`] holds, as much as a listing may.
@@ -360,23 +366,24 @@ impl Extracted {
     /// No records yet, with the link settings of `options`. A test run never writes a placeholder.
     pub(crate) fn new(options: &crate::extract::Options) -> Self {
         let extracting = options.mode == crate::extract::Mode::Extract;
-        Self {
+        let mut extracted = Self {
             preexisting: options.preexisting_links,
             placeholder: options.refused_link_placeholder && extracting,
             stored_name_targets: options.hard_link_targets == crate::extract::HardLinkTargets::StoredName && extracting,
             hard_link_times: matches!(options.unix_modes, crate::extract::UnixModes::Masked { .. }),
             ..Self::default()
+        };
+        if extracting && options.hard_link_targets == crate::extract::HardLinkTargets::StoredName {
+            extracted.protect_sources(protected_identities(options));
         }
+        extracted
     }
 
     /// As [`Extracted::new`], for a writer that always extracts whatever `options.mode` says
-    /// ([`crate::rar5::session::RarSession`]).
+    /// ([`crate::rar5::session::RarSession`]), which sets its hard link targets and inputs itself
+    /// ([`Extracted::set_hard_link_targets`], [`Extracted::protect_sources`]).
     pub(crate) fn for_output(options: &crate::extract::Options) -> Self {
-        Self {
-            placeholder: options.refused_link_placeholder,
-            stored_name_targets: options.hard_link_targets == crate::extract::HardLinkTargets::StoredName,
-            ..Self::new(options)
-        }
+        Self { placeholder: options.refused_link_placeholder, stored_name_targets: false, ..Self::new(options) }
     }
 
     /// Sets which file a hard link takes ([`crate::extract::HardLinkTargets`]), for a writer whose setting comes
@@ -460,6 +467,13 @@ impl Extracted {
     /// The device and inode of the file the member at `rel` landed as, when it was extracted (not only tested).
     pub(crate) fn landed_identity(&self, rel: &Path) -> Option<(u64, u64)> {
         self.records.get(rel).and_then(|landed| landed.as_ref()).map(|landed| (landed.dev, landed.ino))
+    }
+
+    /// The run's inputs by device and inode (archive volumes, protected paths), which a hard link under
+    /// [`crate::extract::HardLinkTargets::StoredName`] never takes: linking one would change it under the run.
+    pub(crate) fn protect_sources(&mut self, identities: impl IntoIterator<Item = (u64, u64)>) {
+        self.protected_sources.clear();
+        self.protected_sources.extend(identities);
     }
 
     /// Whether a hard link member's own modification time is set on the file it links
@@ -754,6 +768,9 @@ fn make_charging(
                 .then(|| stored_file(dest, source))
                 .flatten()
                 .ok_or_else(|| refused(STORED_TARGET))?;
+            if extracted.protected_sources.contains(&(found.dev, found.ino)) {
+                return Err(refused(PROTECTED_SOURCE));
+            }
             hard(dest, &found, path, replace, false, charge)?;
             hard_link_time(extracted, path, modified);
             Ok(())
@@ -780,6 +797,12 @@ fn hard_link_time(extracted: &Extracted, path: &Path, modified: Option<SystemTim
     }
     #[cfg(not(unix))]
     let _ = (extracted, path, modified);
+}
+
+/// Device and inode of each of `options.protected_paths` there is (a whole-archive run's archive and volumes among
+/// them), for [`Extracted::protect_sources`].
+pub(crate) fn protected_identities(options: &crate::extract::Options) -> impl Iterator<Item = (u64, u64)> + '_ {
+    options.protected_paths.iter().filter_map(|path| std::fs::metadata(path).ok()).map(|meta| identity(&meta))
 }
 
 /// The regular file at `rel` under `dest`, reached through real folders only (no symbolic link on the way or at

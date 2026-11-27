@@ -599,7 +599,8 @@ whoever wrote it, as both tools do. `hl.rar` holds `t/hard66` and the hard link 
 
 The file is reached from the destination without following a link, and linked only while it is still that file. A
 symbolic link there is never linked to, so no link zipfast makes leads out of the destination, and neither is the
-file at the link's own path (a rename mode's reservation, or what the link replaces). Honoured by the
+file at the link's own path (a rename mode's reservation, or what the link replaces), nor an input of the run (an
+archive volume or a protected path, which linking would change under the run). Honoured by the
 whole-archive RAR and tar runners, by progressive sessions, and by `RarSession::extract_selected` and
 `extract_selected_controlled`, which take it from their `Options` or, when those keep `Extracted`, from
 `RarSessionOptions::hard_link_targets`. Test runs keep `Extracted`, and RAR 5.0 file copies are unaffected.

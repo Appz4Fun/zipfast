@@ -61,6 +61,8 @@ pub(super) struct Extraction<'a> {
     dirs: Vec<DirectoryOutput>,
     /// the files this run published, where each landed: the files a hard link or file copy may take
     extracted: crate::extract::link::Extracted,
+    /// the session's inputs are given to `extracted` ([`crate::extract::link::Extracted::protect_sources`])
+    sources_protected: bool,
 }
 
 pub(super) struct DirectoryOutput {
@@ -77,6 +79,7 @@ impl<'a> Extraction<'a> {
             versions: false,
             dirs: Vec::new(),
             extracted: crate::extract::link::Extracted::for_output(options),
+            sources_protected: false,
         }
     }
 
@@ -127,6 +130,12 @@ impl<'a> Extraction<'a> {
             crate::extract::HardLinkTargets::Extracted => session.options.hard_link_targets,
             set => set,
         });
+        // the session's volumes and protected paths are never a stored-name hard link's file (found once per run)
+        if !self.sources_protected {
+            self.sources_protected = true;
+            let volumes = session.volumes.iter().map(|volume| (volume.stamp.device, volume.stamp.inode));
+            self.extracted.protect_sources(volumes.chain(crate::extract::link::protected_identities(self.options)));
+        }
         run.write_unfiltered = self.options.unsupported_filters == crate::extract::UnsupportedFilters::WriteUnfiltered;
         // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume keeps what was decoded
         run.emit_unverified =
@@ -523,6 +532,7 @@ impl<'a> Extraction<'a> {
                 Some(link::FOREIGN_LINK | link::LINK_LEAVES | link::UNSAFE_TARGET) => {
                     policy(RarPolicyReason::LinkTarget, path.to_path_buf())
                 }
+                Some(link::PROTECTED_SOURCE) => policy(RarPolicyReason::ProtectedInput, path.to_path_buf()),
                 Some(_) => policy(RarPolicyReason::HardLinkTarget, path.to_path_buf()),
                 None => output_fault(IoOperation::Publish, path, source),
             }
