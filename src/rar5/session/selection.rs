@@ -24,7 +24,7 @@ use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 use super::*;
 use crate::rar5::RarFormat;
-use crate::rar5::unpack::rar4::{CUT_PAD, Rar4DecodeError, Rar4Decoder};
+use crate::rar5::unpack::rar4::{CUT_HELD_MAX, CUT_PAD, Rar4DecodeError, Rar4Decoder};
 
 #[cfg(unix)]
 pub(super) mod control;
@@ -404,6 +404,15 @@ struct SelectedRun {
     unverified: Option<u64>,
 }
 
+/// A catalogue issue that is a member the end of an archive cut short ends inside the data of (catalogued under
+/// [`crate::extract::DamagedInput::Salvage`]). Unlike one a missing volume cuts off, it is decoded whatever
+/// [`crate::extract::UnverifiedOutput`] says, as UnRAR 7.30 decodes it (reading on past the end as zeros), and its own
+/// checks decide, as UnRAR's do: one whose checksum passes (a compressed stream whose last bytes it didn't need) is
+/// good, and the archive still ends unexpectedly; the rest fail as this issue.
+pub(super) fn cut_short(failure: &RarFailure) -> bool {
+    matches!(failure, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
+}
+
 /// A catalogue issue that is a member cut off by a missing volume, or by the end of an archive cut short (catalogued
 /// under [`crate::extract::DamagedInput::Salvage`]): under
 /// [`crate::extract::UnverifiedOutput::Emit`] what the present volumes hold is decoded before it fails.
@@ -509,6 +518,11 @@ impl SelectedRun {
                     self.failed = Some((predecessor, failure));
                     return Ok(RarOutcome::Failed(history_failure(self.failed.as_ref())));
                 }
+                // a predecessor that passed may still end the chain's history (one an archive cut short)
+                if self.failed.is_some() {
+                    self.next = predecessor + 1;
+                    return Ok(RarOutcome::Failed(history_failure(self.failed.as_ref())));
+                }
             }
             self.next = index + 1;
         }
@@ -602,12 +616,33 @@ impl SelectedRun {
         &mut self,
         session: &RarSession,
         index: usize,
+        output: Option<DecodedOutput<'_>>,
+    ) -> Result<(u64, RarVerification), RarFailure> {
+        let result = self.decode_member(session, index, output);
+        // a member an archive cut short ends inside of (`cut_short`): what fails its checks or its decoding there
+        // fails as the cut, which is why
+        match session.model.members[index].issue.map(|issue| &session.issues[issue]).filter(|issue| cut_short(issue)) {
+            Some(issue) => result.map_err(|failure| match failure {
+                RarFailure::Integrity { .. } | RarFailure::EncryptedIntegrity { .. } => copy_catalogue_issue(issue),
+                failure => failure,
+            }),
+            None => result,
+        }
+    }
+
+    fn decode_member(
+        &mut self,
+        session: &RarSession,
+        index: usize,
         mut output: Option<DecodedOutput<'_>>,
     ) -> Result<(u64, RarVerification), RarFailure> {
         let member = &session.model.members[index];
-        // UnverifiedOutput::Emit: a member cut off by a missing volume is decoded from what is there, then fails
-        let cut =
-            member.issue.map(|issue| &session.issues[issue]).filter(|issue| self.emit_unverified && cut_off(issue));
+        // UnverifiedOutput::Emit: a member cut off by a missing volume is decoded from what is there, then fails; one
+        // an archive cut short ends inside of is always decoded as UnRAR decodes it, and its checks decide
+        let cut = member
+            .issue
+            .map(|issue| &session.issues[issue])
+            .filter(|issue| cut_short(issue) || (self.emit_unverified && cut_off(issue)));
         if let Some(issue) = member.issue
             && cut.is_none()
         {
@@ -658,9 +693,7 @@ impl SelectedRun {
             }
         }
         // the archive ends inside this member's data (rather than a volume being missing)
-        let cut_short = cut.is_some_and(|issue| {
-            matches!(issue, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
-        });
+        let cut_short = cut.is_some_and(cut_short);
         let compressed = header.method != 0;
         let mut rar4 = if compressed && header.format == RarFormat::Rar4 {
             let first = &session.model.parts[member.parts.start];
@@ -790,6 +823,12 @@ impl SelectedRun {
             }
         }
         if let Some(issue) = cut {
+            // the archive cut short inside a cipher block: UnRAR 7.30 decrypts only whole blocks and hands the bytes of
+            // the one cut short on undecrypted (to the decoder, or to the file if stored), then reads zeros
+            let (raw, mut blocks) = match pending.selected_cipher().filter(|_| cut_short) {
+                Some(cipher) => (std::mem::take(&mut cipher.rem), cipher.take_blocks()),
+                None => (Vec::new(), None),
+            };
             // what the decoder holds of the volumes there goes out, as UnRAR 7.30 `p` and `x -kb` write it
             let mut sink = SelectedSink {
                 pending: &mut pending,
@@ -801,11 +840,12 @@ impl SelectedRun {
             };
             if let Some(decoder) = rar4.as_mut() {
                 if cut_short {
-                    // UnRAR reads zeros past the end: what decodes from them is held until the cut is known
-                    decoder.cut_short();
                     let before = sink.pending.bytes;
+                    // held as the runner holds it (no more than the member may still produce, nor CUT_HELD_MAX), and
                     // no more than the decoded bytes the selection may still take: the sink refuses the rest anyway
-                    let room = usize::try_from(sink.limit.saturating_sub(*sink.decoded)).unwrap_or(usize::MAX);
+                    let declared = member.unpacked_size.map_or(CUT_HELD_MAX, |size| size.saturating_sub(before));
+                    let budget = sink.limit.saturating_sub(*sink.decoded);
+                    let room = usize::try_from(declared.min(CUT_HELD_MAX).min(budget)).unwrap_or(usize::MAX);
                     let mut held = Vec::new();
                     let mut keep = |bytes: &[u8]| -> crate::Result<()> {
                         if bytes.len() > room - held.len() {
@@ -815,8 +855,12 @@ impl SelectedRun {
                         held.extend_from_slice(bytes);
                         Ok(())
                     };
-                    // what decodes before a damaged code stands: the member fails anyway
-                    if decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
+                    // the data ends after the cipher block cut short; UnRAR reads zeros past it: what decodes from
+                    // them is held until the cut is known. What decodes before a damaged code stands: the member fails
+                    // anyway
+                    let fed = decoder.feed(&raw, &mut keep).is_ok();
+                    decoder.cut_short();
+                    if fed && decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
                         let _ = decoder.drain(&mut keep);
                     }
                     let end = decoder.cut_point();
@@ -829,10 +873,41 @@ impl SelectedRun {
                 let result = decoder.flush_decoded(&mut sink);
                 sink.finish_rar4(result)?;
             } else if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed) {
-                let result = decoder.flush_cut(&mut sink);
+                let fed = match blocks.as_mut() {
+                    Some(blocks) => blocks.feed(&raw, decoder, &mut sink),
+                    None => decoder.feed(&raw, &mut sink),
+                };
+                // what decodes before a damaged code stands
+                if fed.is_ok() {
+                    let result = decoder.flush_cut(&mut sink);
+                    sink.finish(result, None)?;
+                } else if let Some(failure) = sink.failure.take() {
+                    return Err(failure);
+                }
+            } else if !compressed && !raw.is_empty() {
+                // stored: written as they are (no further than the declared size, as the sink takes no more)
+                let result = sink.put(&raw);
                 sink.finish(result, None)?;
             }
-            return Err(copy_catalogue_issue(issue));
+            if !cut_short {
+                return Err(copy_catalogue_issue(issue));
+            }
+            // the archive cut short: what UnRAR decodes of the member is checked as UnRAR checks it (`decode_bound`
+            // fails it as the cut when that fails); no history goes on from what was decoded past the end, so a solid
+            // member after it fails as one whose history is lost, whatever these checks say
+            if compressed {
+                self.decoder = None;
+                self.rar4 = None;
+                self.failed = Some((index, Arc::new(copy_catalogue_issue(issue))));
+            }
+            let final_checks = parts.last().expect("catalogue members have a part").checks;
+            let checks = pending.verify_selected(
+                member.unpacked_size,
+                final_checks.crc32,
+                final_checks.blake2sp,
+                final_checks.keyed,
+            )?;
+            return Ok((pending.verified_size(), checks));
         }
         let context = pending.context().clone();
         if let Some(cipher) = pending.selected_cipher() {
@@ -935,7 +1010,10 @@ impl SelectedRun {
     ) -> Result<(), RarFailure> {
         let header = &member.header;
         if header.solid {
-            let decoder = self.decoder.as_mut().expect("solid predecessors decoded");
+            // a chain whose history ended (at a member an archive cut short, say) has no decoder to go on with
+            let Some(decoder) = self.decoder.as_mut() else {
+                return Err(copy_history_failure(&history_failure(self.failed.as_ref())));
+            };
             if header.dictionary > decoder.reach() {
                 return Err(RarFailure::Limit {
                     resource: RarResource::DictionarySize,
@@ -1066,6 +1144,16 @@ fn is_terminal(failure: &RarFailure) -> bool {
                 ..
             }
     )
+}
+
+/// [`history_failure`], owned.
+fn copy_history_failure(failure: &RarFailure) -> RarFailure {
+    match failure {
+        RarFailure::SolidHistoryUnavailable { predecessor, cause } => {
+            RarFailure::SolidHistoryUnavailable { predecessor: *predecessor, cause: cause.clone() }
+        }
+        _ => RarFailure::Internal(RarInternal::Invariant("unexpected history failure")),
+    }
 }
 
 fn history_failure(failed: Option<&(usize, Arc<RarFailure>)>) -> Arc<RarFailure> {

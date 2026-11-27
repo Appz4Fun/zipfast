@@ -1895,6 +1895,11 @@ pub(crate) const TAIL_MARGIN: u64 = 30;
 /// the longest LZ token or legacy code straddling the end to decode, as UnRAR's zero fill lets it.
 pub(crate) const CUT_PAD: usize = 16;
 
+/// The most a member cut short may decode from the zeros it is read on with ([`CUT_PAD`]) before what came of them is
+/// cut where UnRAR stops: past it the rest is left out. Both the whole-archive runner and a `RarSession` hold no more
+/// than this, nor more than the member's declared size still allows.
+pub(crate) const CUT_HELD_MAX: u64 = 64 << 20;
+
 /// The start (in bits from the member's first packed byte) and the bytes produced before each of the latest LZ tokens:
 /// enough of them to reach [`TAIL_MARGIN`] bytes back, since a token takes at least one bit.
 struct TokenStarts {

@@ -154,9 +154,13 @@ impl<'a> Extraction<'a> {
             ),
             _ => None,
         };
-        // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume is written from what is there
-        let blocked =
-            member.issue.is_some_and(|issue| !(run.emit_unverified && super::cut_off(&session.issues[issue])));
+        // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume is written from what is there;
+        // one an archive cut short ends inside of always is, as UnRAR decodes it, its checks deciding (kept failed
+        // with keep_broken, as `unrar x -kb` keeps it)
+        let blocked = member.issue.is_some_and(|issue| {
+            let issue = &session.issues[issue];
+            !((run.emit_unverified && super::cut_off(issue)) || super::cut_short(issue))
+        });
         if link.is_none() && (blocked || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
