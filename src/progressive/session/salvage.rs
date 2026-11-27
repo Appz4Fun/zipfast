@@ -68,13 +68,9 @@ impl ResyncWork {
 }
 
 impl ProgressiveSession {
-    /// The damaged-input choice the parsers of this session take. A persistent session refuses damaged headers
-    /// whatever the options say (its journal binds a member to the header bytes it was read from).
+    /// The damaged-input choice the parsers of this session take. A persistent session takes it too: a member read
+    /// after damage, or from a damaged header, is bound by its header's position (see `docs/persistent-partials.md`).
     pub(super) fn damaged_input(&self) -> crate::extract::DamagedInput {
-        #[cfg(feature = "persistent-partials")]
-        if self.partial.is_some() {
-            return crate::extract::DamagedInput::Refuse;
-        }
         self.options.extract.damaged_input
     }
     /// Queues the event for one damaged header of the current volume.
@@ -116,7 +112,18 @@ impl ProgressiveSession {
             self.history_failure = None;
         }
         self.damage.push_back((self.volume, damage));
+        #[cfg(feature = "persistent-partials")]
+        if let Some(partial) = &mut self.partial {
+            partial.damaged = true;
+        }
         Ok(())
+    }
+    /// A persistent session drops the bytes of a header read past: reading goes on elsewhere.
+    fn drop_partial_header(&mut self) {
+        #[cfg(feature = "persistent-partials")]
+        if let Some(partial) = &mut self.partial {
+            partial.drop_header();
+        }
     }
     /// A header that failed its checksum but parsed, read as it stands. False when the frame is to be dropped: a
     /// damaged main header past the first volume's (or a second one in a volume, which only damage produces), which
@@ -139,6 +146,8 @@ impl ProgressiveSession {
         self.header_damage(frame.extent.start, HeaderDamageKind::ChecksumMismatch, name, None, passed_over)?;
         if matches!(frame.block, Block::Main(_)) && (self.main_seen || self.volume > 0) {
             self.main_seen = true;
+            // its bytes are recorded but no frame follows them: reading goes on past its data
+            self.drop_partial_header();
             return Ok(false);
         }
         if !self.main_seen && !matches!(frame.block, Block::Main(_)) {
@@ -151,6 +160,7 @@ impl ProgressiveSession {
     /// The header at the parser's offset is damage of `kind`: searched past under `Resync`, else the rest of the
     /// volume is passed over.
     pub(super) fn salvage_header(&mut self, kind: HeaderDamageKind) -> ProgressiveResult<()> {
+        self.drop_partial_header();
         let at = self.parser.header_offset();
         if self.parser.resyncs() {
             let mut window = std::mem::take(&mut self.resync_window);
@@ -187,6 +197,7 @@ impl ProgressiveSession {
     /// The rest of the volume is passed over: a set goes on with its next volume, as the whole-archive runners do, and
     /// may end there when no next volume follows; otherwise the session is done.
     fn end_damaged_volume(&mut self) -> ProgressiveResult<()> {
+        self.drop_partial_header();
         if self.volume_set == Some(true) {
             // a member split into the next volume needs it; between members the set may end here
             self.pre_29_open_end = self.member.is_none();
@@ -199,6 +210,8 @@ impl ProgressiveSession {
         if let Some(output) = &mut self.output {
             output.finish_directories(&mut self.driver)?;
         }
+        #[cfg(feature = "persistent-partials")]
+        self.partial_finish_directories()?;
         self.phase = Phase::Done;
         Ok(())
     }

@@ -143,7 +143,7 @@ runners do, and reports each as `ProgressiveEvent::HeaderDamaged { volume, damag
 before. The rule with holes: only delivered bytes are judged. A header the source has not delivered yet is waited on,
 one inside a `Hole` answer stops the session with `HeaderHole` (repair may still fill it), and a resync never searches
 across a hole. See `docs/compat-options.md` ("Damaged headers in a progressive session"). Persistent-partial sessions
-keep refusing damaged headers.
+follow the same rules; see `docs/persistent-partials.md` ("Damaged headers") for how their members are bound.
 
 ## RAR4 capability boundary
 

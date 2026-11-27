@@ -2837,13 +2837,32 @@ impl PartialCore {
         Ok(())
     }
     /// Whether part `part` (with its header witness) is already recorded. A recorded part, or a witness at the same
-    /// archive position, that differs is a `BindingMismatch`: the archive is not the one the member came from.
+    /// archive position, that differs is a `BindingMismatch`: the archive is not the one the member came from. When
+    /// either witness was read past as damage, the two may differ in bytes as long as both describe the same member
+    /// ([`state::same_member_header`]): the header was repaired since, or damaged since; otherwise the member is
+    /// another one (`BindingMismatch(Member)`). The recorded witness is kept.
     pub(crate) fn recorded_part(&self, part: &PlainPart, witness: &HeaderWitness) -> PartialResult<bool> {
         let op = self.operation()?;
         let evidence = &op.snapshot.evidence;
         let old = evidence.headers.iter().find(|old| old.volume == witness.volume && old.packed == witness.packed);
-        if old.is_some_and(|old| old != witness) {
-            return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
+        if let Some(old) = old.filter(|old| *old != witness) {
+            // A header one of the readings took as damage (a run under `damaged_input` Salvage or Resync) may be
+            // read whole by the other, once repaired, or damaged by it: the same member only if both readings
+            // describe the same output. Any other difference is another archive.
+            if !(old.salvaged || witness.salvaged) {
+                return Err(err(PartialErrorKind::BindingMismatch(BindingField::Source)));
+            }
+            let expected = evidence
+                .admissions
+                .iter()
+                .find(|a| a.volume == witness.volume)
+                .map_or(std::ffi::OsStr::new(""), |a| a.expected.as_os_str());
+            let recorded = state::witness_header(old, evidence.format, expected, &self.budget)?;
+            let read = state::witness_header(witness, evidence.format, expected, &self.budget)
+                .map_err(|_| err(PartialErrorKind::BindingMismatch(BindingField::Member)))?;
+            if !state::same_member_header(&recorded, &read) {
+                return Err(err(PartialErrorKind::BindingMismatch(BindingField::Member)));
+            }
         }
         match evidence.parts.iter().find(|old| old.ordinal == part.ordinal) {
             Some(recorded) if recorded == part && old.is_some() => Ok(true),
