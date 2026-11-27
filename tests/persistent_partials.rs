@@ -43,6 +43,8 @@ struct Source {
     hook: ReadHook,
     wait: Option<(u64, Arc<WaitGate>)>,
     reads: Arc<Mutex<Vec<(u32, u64, usize)>>>,
+    /// Each read the source answered with data: (volume, offset, bytes given).
+    served: Arc<Mutex<Vec<(u32, u64, usize)>>>,
     /// Answers each hole whole, from the read offset to its end, rather than capped at the buffer; and, when
     /// `slow`, every other read `NotYet` first.
     long_holes: bool,
@@ -93,6 +95,7 @@ impl RangeSource for Source {
         }
         let n = (end - at) as usize;
         buf[..n].copy_from_slice(&self.bytes[at as usize..end as usize]);
+        self.served.lock().unwrap().push((self.index, at, n));
         Ok(RangeRead::Filled { count: n })
     }
 }
@@ -129,6 +132,7 @@ struct Fixture {
     data: [Vec<u8>; 2],
     volumes: Vec<Option<Source>>,
     reads: Arc<Mutex<Vec<(u32, u64, usize)>>>,
+    served: Arc<Mutex<Vec<(u32, u64, usize)>>>,
     payloads: Vec<Range<u64>>,
 }
 impl Fixture {
@@ -142,6 +146,7 @@ impl Fixture {
             (0..7000).map(|i| ((i * 31 + member * 19 + 7) % 251) as u8).collect::<Vec<_>>()
         });
         let reads = Arc::new(Mutex::new(Vec::new()));
+        let served = Arc::new(Mutex::new(Vec::new()));
         let mut volumes = Vec::new();
         let mut payloads = Vec::new();
         for index in 0..10 {
@@ -179,12 +184,13 @@ impl Fixture {
                 bytes,
                 holes,
                 reads: reads.clone(),
+                served: served.clone(),
                 backing: Vec::new(),
                 hook: Arc::new(Mutex::new(None)),
                 wait: None,
             }));
         }
-        Self { data, volumes, reads, payloads }
+        Self { data, volumes, reads, served, payloads }
     }
     fn provider(&mut self) -> Provider {
         let protection = ProtectionDeclaration::Complete {
@@ -2155,6 +2161,142 @@ fn declare_hole_on_bytes_just_streamed_skips_their_checks_and_member_still_finis
     assert_eq!(fs::read(dest.join("b.bin")).unwrap(), fixture.data[1]);
 }
 
+/// Asserts the source gave every volume's bytes forward only: each data answer starts at or after the end of the one
+/// before it on that volume, so no packed byte was read twice.
+fn assert_read_once(reads: &[(u32, u64, usize)]) {
+    let mut next: std::collections::HashMap<u32, u64> = Default::default();
+    for &(volume, at, len) in reads {
+        let end = next.entry(volume).or_default();
+        assert!(at >= *end, "volume {volume} read again at {at} (already read to {end})");
+        *end = at + len as u64;
+    }
+}
+
+/// A `Read + Seek` over volume bytes that counts the bytes read, as a repaired volume file.
+struct CountingVolume {
+    inner: std::io::Cursor<Vec<u8>>,
+    read: u64,
+}
+impl std::io::Read for CountingVolume {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+impl std::io::Seek for CountingVolume {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// Drives a session to its end like [`run_to_end`], also returning each member's outcome.
+fn run_with_outcomes(session: &mut ProgressiveSession) -> (Vec<HoleReport>, Vec<PartialFile>, Vec<MemberOutcome>) {
+    let (mut holes, mut files, mut outcomes) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..100_000 {
+        match session.poll_event(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(Some(ProgressiveEvent::PartialReady { member, .. }))) => {
+                files.push(session.partial_file(&member).unwrap())
+            }
+            Poll::Ready(Ok(Some(ProgressiveEvent::Hole(report)))) => holes.push(report),
+            Poll::Ready(Ok(Some(ProgressiveEvent::MemberFinished { outcome, .. }))) => outcomes.push(outcome),
+            Poll::Ready(Ok(None)) => return (holes, files, outcomes),
+            Poll::Ready(Err(e)) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    panic!("session did not finish")
+}
+
+#[test]
+fn a_part_failing_its_own_check_becomes_a_declared_hole_and_the_session_goes_on() {
+    // A wrong byte in b.bin's first part (volume 5), from an article whose transport check passed: the part's
+    // CRC fails. The session used to end there, so a caller extracted the set again from its first volume. Now
+    // the part's output becomes a DeclaredBad hole, the session finishes every member, and refilling the part from
+    // the repaired volume reads that part again and nothing else.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    let mut fixture = Fixture::new();
+    let p5 = fixture.payloads[5].clone();
+    let good = fixture.volumes[5].as_ref().unwrap().bytes.clone();
+    fixture.volumes[5].as_mut().unwrap().bytes[p5.start as usize + 10] ^= 0x55;
+    let mut session = ProgressiveSession::new_partial(
+        Box::new(fixture.provider()),
+        options(&dest),
+        partial_options(&dir.path().join("state")),
+    )
+    .unwrap();
+    let (holes, mut files, outcomes) = run_with_outcomes(&mut session);
+    assert_read_once(&fixture.served.lock().unwrap());
+    let declared: Vec<_> = holes.iter().filter(|h| matches!(h.cause, HoleCause::DeclaredBad)).collect();
+    assert_eq!(declared.len(), 1, "one declared hole: the bad part");
+    assert_eq!(declared[0].member.ordinal(), 1);
+    assert_eq!(declared[0].out, 0..1400);
+    assert_eq!(
+        declared[0].packed.iter().map(|s| (s.volume, s.range.clone())).collect::<Vec<_>>(),
+        vec![(5, p5.clone())]
+    );
+    assert_eq!(outcomes.len(), 2, "both members finish");
+    assert!(matches!(outcomes[1], MemberOutcome::PersistentPartial { .. }));
+    drop(session);
+    let b = &mut files[1];
+    assert_eq!(b.remaining().unwrap(), vec![0..1400, 3500..4200]);
+    // The repaired volume: only the declared part is read back.
+    let mut repaired = CountingVolume { inner: std::io::Cursor::new(good), read: 0 };
+    b.refill_from_packed(5, p5.clone(), &mut repaired).unwrap();
+    assert_eq!(repaired.read, 1400);
+    b.fill(3500, &fixture.data[1][3500..4200]).unwrap();
+    assert!(matches!(verify(b), Verdict::Ok { .. }));
+    assert_eq!(fs::read(dest.join("b.bin")).unwrap(), fixture.data[1]);
+}
+
+#[test]
+fn a_member_failing_its_final_check_with_every_earlier_part_passed_declares_its_last_part() {
+    // b.bin with no missing article and a wrong byte in its last part (volume 9): the parts before it passed
+    // their own CRCs, so the wrong byte is in the last part, whose header carries only the member CRC.
+    for missing_earlier in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let mut fixture = Fixture::new();
+        if !missing_earlier {
+            fixture.volumes[7].as_mut().unwrap().holes.clear();
+        }
+        let p9 = fixture.payloads[9].clone();
+        fixture.volumes[9].as_mut().unwrap().bytes[p9.start as usize + 700] ^= 0x01;
+        let mut session = ProgressiveSession::new_partial(
+            Box::new(fixture.provider()),
+            options(&dest),
+            partial_options(&dir.path().join("state")),
+        )
+        .unwrap();
+        let (holes, mut files, outcomes) = run_with_outcomes(&mut session);
+        assert_read_once(&fixture.served.lock().unwrap());
+        assert_eq!(outcomes.len(), 2);
+        let declared: Vec<_> = holes.iter().filter(|h| matches!(h.cause, HoleCause::DeclaredBad)).collect();
+        drop(session);
+        let b = &mut files[1];
+        if missing_earlier {
+            // A part before the last was not checked (it had a hole): the wrong byte cannot be placed, nothing is
+            // declared, and verification judges the member once its hole is filled.
+            assert!(declared.is_empty());
+            b.fill(3500, &fixture.data[1][3500..4200]).unwrap();
+            assert!(matches!(verify(b), Verdict::Bad { .. }));
+            continue;
+        }
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].out, 5600..7000);
+        assert_eq!(
+            declared[0].packed.iter().map(|s| (s.volume, s.range.clone())).collect::<Vec<_>>(),
+            vec![(9, p9.clone())]
+        );
+        assert!(matches!(outcomes[1], MemberOutcome::PersistentPartial { .. }));
+        assert_eq!(b.remaining().unwrap(), vec![5600..7000]);
+        b.fill(5600, &fixture.data[1][5600..7000]).unwrap();
+        assert!(matches!(verify(b), Verdict::Ok { .. }));
+        assert_eq!(fs::read(dest.join("b.bin")).unwrap(), fixture.data[1]);
+    }
+}
+
 #[test]
 fn declare_hole_releases_a_read_parked_on_the_declared_bytes() {
     let dir = tempfile::tempdir().unwrap();
@@ -2527,6 +2669,7 @@ impl Encrypted {
                     bytes: self.volumes[index].clone(),
                     holes,
                     reads: reads.clone(),
+                    served: Default::default(),
                     backing: Vec::new(),
                     hook: Arc::new(Mutex::new(None)),
                     wait: None,
@@ -4452,6 +4595,7 @@ fn a_rar5_volume_answered_entirely_as_holes_stays_within_default_limits_and_refi
             bytes,
             holes: if index == 1 { vec![payloads[1].clone()] } else { Vec::new() },
             reads: reads.clone(),
+            served: Default::default(),
             backing: Vec::new(),
             hook: Arc::new(Mutex::new(None)),
             wait: None,
@@ -4548,6 +4692,7 @@ fn long_hole_rar5(
             bytes,
             holes: if index == 1 { vec![payloads[1].clone()] } else { Vec::new() },
             reads: reads.clone(),
+            served: Default::default(),
             backing: Vec::new(),
             hook: Arc::new(Mutex::new(None)),
             wait: None,

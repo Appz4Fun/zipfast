@@ -27,6 +27,11 @@
 //! answered as holes (volume index, offset in that volume file, length) in place of the generated ones. Every hole
 //! is refilled on every member's handle. The summary also gives the session's extra time per hole (against a run
 //! without holes) and the time per refill.
+//!
+//! Each run also prints the packed bytes the session read and the refills read back, against the volumes' size.
+//! `ZF_CORRUPT=v:offset:len` flips those bytes of volume `v` as the session reads them (an article whose transport
+//! check passed but whose bytes are wrong); the refills read the volume files, which stand for the repaired volumes.
+//! `ZF_NO_CLEAN=1` skips the run without holes.
 
 use std::{
     ffi::OsString,
@@ -102,6 +107,23 @@ fn generate(dir: &Path, size: u64, volumes: u32) -> u64 {
     File::create(done).unwrap();
     size
 }
+/// Packed bytes the sessions read from the volume files, and the refills read back.
+static SESSION_READ: AtomicU64 = AtomicU64::new(0);
+static REFILL_READ: AtomicU64 = AtomicU64::new(0);
+/// A volume file read by a refill, counting the bytes it gives.
+struct CountingFile(File);
+impl std::io::Read for CountingFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        REFILL_READ.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+impl std::io::Seek for CountingFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
 struct DiskSource {
     index: u32,
     file: File,
@@ -129,6 +151,21 @@ impl RangeSource for DiskSource {
         let next = self.holes.iter().filter(|h| h.start > at).map(|h| h.start).min().unwrap_or(self.len);
         let n = (next.min(self.len) - at).min(buf.len() as u64) as usize;
         let count = self.file.read_at(&mut buf[..n], at).unwrap();
+        SESSION_READ.fetch_add(count as u64, Ordering::Relaxed);
+        // ZF_CORRUPT=v:offset:len flips the bits of those bytes as served (an article whose yEnc CRC passed).
+        if let Ok(spec) = std::env::var("ZF_CORRUPT")
+            && !spec.is_empty()
+        {
+            let f: Vec<u64> = spec.split(':').map(|x| x.parse().unwrap()).collect();
+            if f[0] as u32 == self.index {
+                for (i, b) in buf[..count].iter_mut().enumerate() {
+                    let o = at + i as u64;
+                    if o >= f[1] && o < f[1] + f[2] {
+                        *b ^= 0xff;
+                    }
+                }
+            }
+        }
         Ok(RangeRead::Filled { count })
     }
 }
@@ -265,7 +302,7 @@ fn main() {
         for i in 0..3 {
             best[i] = best[i].min(t[i]);
         }
-        if !ranges.is_empty() {
+        if !ranges.is_empty() && std::env::var_os("ZF_NO_CLEAN").is_none() {
             best_clean = best_clean.min(run(&set, &work, &names, &[]).0[0]);
         }
     }
@@ -371,14 +408,14 @@ fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Ran
     let c1 = anchors.cas.load(Ordering::Relaxed);
     assert!(!handles.is_empty(), "a partial handle");
     // As RustyGet does after a repair: one refill per packed span of each reported hole, on the hole's member.
-    let mut readers: Vec<Option<File>> = names.iter().map(|_| None).collect();
+    let mut readers: Vec<Option<CountingFile>> = names.iter().map(|_| None).collect();
     let start = Instant::now();
     let mut refills = 0u64;
     for report in &reports {
         let (file, _) = handles.iter_mut().find(|(_, key)| *key == report.member).expect("the hole's member");
         for span in &report.packed {
             let reader = readers[span.volume as usize]
-                .get_or_insert_with(|| File::open(set.join(&names[span.volume as usize])).unwrap());
+                .get_or_insert_with(|| CountingFile(File::open(set.join(&names[span.volume as usize])).unwrap()));
             file.refill_from_packed(span.volume, span.range.clone(), reader).unwrap();
             refills += 1;
         }
@@ -395,12 +432,23 @@ fn run(set: &Path, work: &Path, names: &[OsString], holes: &[(u32, std::ops::Ran
         loop {
             match file.poll_verify(&mut cx) {
                 Poll::Ready(Ok(Verdict::Ok { .. })) => break,
+                Poll::Ready(Ok(other)) if std::env::var("ZF_CORRUPT").is_ok_and(|s| !s.is_empty()) => {
+                    eprintln!("verify {other:?}");
+                    break;
+                }
                 Poll::Ready(other) => panic!("verify {other:?}"),
                 Poll::Pending => {}
             }
         }
     }
     let verify_time = start.elapsed().as_secs_f64();
+    let volume_bytes: u64 = names.iter().map(|n| fs::metadata(set.join(n)).unwrap().len()).sum();
+    eprintln!(
+        "packed bytes read: session {}, refills {} (volumes hold {volume_bytes}); hole events {}",
+        SESSION_READ.swap(0, Ordering::Relaxed),
+        REFILL_READ.swap(0, Ordering::Relaxed),
+        reports.len()
+    );
     if !holes.is_empty() {
         eprintln!(
             "syncs: session {}, refill {}, verify {}; anchor CAS session {} refill {}; hole events {}, refills {refills}; \
