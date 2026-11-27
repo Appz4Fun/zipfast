@@ -21,7 +21,7 @@
 //! `7zFormat.txt` and the LZMA SDK's description of the format.
 use std::io::{self, BufRead, Read};
 
-use super::coders::{Damage, data_error};
+use super::coders::{Damage, data_error, is_bad_data};
 use crate::extract::FolderDamageKind;
 
 /// Probabilities: one per previous byte for E8, one for E9, one for Jcc.
@@ -102,14 +102,22 @@ impl<R: BufRead> Bcj2Reader<R> {
         // A candidate opcode at the very end still has its bit coded.
         if let Some(b) = self.candidate.take() {
             self.start()?;
-            if self.settle(b).is_err() || self.pending_at < self.pending_len {
-                return Ok(Some(LEFT));
+            match self.settle(b) {
+                // a missing volume, cancellation or a read error is not damage
+                Err(e) if !is_bad_data(&e) => return Err(e),
+                Err(_) => return Ok(Some(LEFT)),
+                Ok(_) if self.pending_at < self.pending_len => return Ok(Some(LEFT)),
+                Ok(_) => {}
             }
         }
         // the last bit's normalization, which 7-Zip's decoder makes as it decodes the bit
         if self.started && self.range < TOP {
             self.range <<= 8;
             self.code = (self.code << 8) | u32::from(self.rc_byte()?);
+        }
+        // a folder with no output never read its range coder's first bytes
+        if !self.started {
+            self.start()?;
         }
         let streams = [
             (&mut self.main, "BCJ2 main stream bytes are left unused"),
@@ -121,9 +129,6 @@ impl<R: BufRead> Bcj2Reader<R> {
             if !input.fill_buf()?.is_empty() {
                 return Ok(Some((FolderDamageKind::DataError, what)));
             }
-        }
-        if !self.started {
-            self.start()?;
         }
         Ok((self.code != 0).then_some((FolderDamageKind::DataError, "the BCJ2 range coder does not end at 0")))
     }

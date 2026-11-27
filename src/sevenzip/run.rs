@@ -946,6 +946,8 @@ impl Run<'_> {
             match check() {
                 Ok(None) => continue,
                 Ok(Some(damage)) => found = Some(damage),
+                // a decoder that ran out of memory says nothing about the data
+                Err(e) if e.kind() == std::io::ErrorKind::OutOfMemory => return Err(SevenZipError::Io(e)),
                 Err(e) => match Fault::of(e) {
                     Fault::Canceled => return Err(SevenZipError::Canceled),
                     Fault::Missing(path) => return Err(SevenZipError::MissingVolume(path)),

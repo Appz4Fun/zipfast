@@ -189,7 +189,7 @@ fn stream_end<D: Read, I: Read>(
 }
 
 /// An error that is the data's fault (not reading the archive failing, nor cancellation).
-fn is_bad_data(error: &io::Error) -> bool {
+pub(crate) fn is_bad_data(error: &io::Error) -> bool {
     match error.get_ref().and_then(|inner| inner.downcast_ref::<Fault>()) {
         Some(fault) => matches!(fault, Fault::Data(_) | Fault::Truncated),
         None => true,
@@ -260,6 +260,8 @@ impl LzmaReader {
                 }
                 Err(_) => return Ok(Some(damage)),
                 Ok(_) if made > 0 || eof => return Ok(Some(damage)),
+                // no progress with input left: don't count on liblzma to make some
+                Ok(_) if used == 0 => return Ok(Some(damage)),
                 Ok(_) => {}
             }
         }
