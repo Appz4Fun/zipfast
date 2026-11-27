@@ -197,6 +197,7 @@ pub(crate) fn from_rar5(
 ///
 /// [`RarIntegrityReason::UnverifiableLinkPassword`]: crate::error::RarIntegrityReason::UnverifiableLinkPassword
 pub(crate) fn rar5_password(
+    keys: &mut crate::crypto::Rar5KeyCache,
     header: &crate::rar5::FileHeader,
     password: Option<&str>,
     scope: crate::error::RarScope,
@@ -222,10 +223,7 @@ pub(crate) fn rar5_password(
             verifier,
         });
     }
-    match crate::crypto::derive_rar5_keys(password, params.kdf_count, &params.salt, params.check) {
-        Ok(keys) => Ok(keys.evidence),
-        Err(error) => Err(RarFailure::crypt(error, scope)),
-    }
+    super::rar5_keys(keys, password, &params, scope).map(|keys| keys.evidence)
 }
 
 /// Why these encryption parameters can't verify a password, or None when their check value can: there is one,

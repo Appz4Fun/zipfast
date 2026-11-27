@@ -821,6 +821,8 @@ pub struct RarSession {
     password: String,
     /// Whether a password was given at all: an empty one is still tried on RAR 3.x members.
     password_given: bool,
+    /// RAR 5.0 keys derived for the password, by salt and count: every selection of the session shares them.
+    rar5_keys: crate::crypto::SharedRar5Keys,
     options: RarSessionOptions,
     token: Arc<selection::SessionToken>,
     invalid_binding: Option<Arc<RarFailure>>,
@@ -829,6 +831,11 @@ pub struct RarSession {
 }
 
 impl RarSession {
+    /// The session's RAR 5.0 key cache.
+    pub(crate) fn rar5_keys(&self) -> std::sync::MutexGuard<'_, crate::crypto::Rar5KeyCache> {
+        self.rar5_keys.lock()
+    }
+
     /// The earlier volume the catalogue started at instead of the one named, with
     /// [`RarSessionOptions::restart_from_first_volume`]; None when it started at the named volume.
     pub fn restarted_from(&self) -> Option<&Path> {
@@ -884,6 +891,7 @@ impl RarSession {
                 usage: RarCatalogueUsage::default(),
                 password: String::new(),
                 password_given: false,
+                rar5_keys: Default::default(),
                 options: options.clone(),
                 token: Arc::new(selection::SessionToken { _private: 0 }),
                 invalid_binding: None,
@@ -1197,11 +1205,12 @@ impl Catalogue {
             Err(fault) => return soft(fault),
         };
         let damaged = self.options.damaged_input;
-        let mut volume = match Volume::open_catalogue(path, file, stamp.len, password, &mut self.scan_budget(), damaged)
-        {
-            Ok(volume) => volume,
-            Err(fault) => return soft(fault),
-        };
+        let keys = self.session.rar5_keys.clone();
+        let mut volume =
+            match Volume::open_catalogue(path, file, stamp.len, password, &mut self.scan_budget(), damaged, keys) {
+                Ok(volume) => volume,
+                Err(fault) => return soft(fault),
+            };
         loop {
             match volume.next_catalogue(&mut self.scan_budget()) {
                 Ok(Some((Block::File(header), _, _))) => return Ok(Some(header.split_before())),
@@ -1272,8 +1281,9 @@ impl Catalogue {
             }
             self.owned_capacity = add(self.owned_capacity, path_bytes)?;
             let damaged = self.options.damaged_input;
+            let keys = self.session.rar5_keys.clone();
             let mut volume =
-                Volume::open_catalogue(&path, file, stamp.len, password, &mut self.scan_budget(), damaged)?;
+                Volume::open_catalogue(&path, file, stamp.len, password, &mut self.scan_budget(), damaged, keys)?;
             let format = volume.format();
             if self.session.volumes.is_empty() {
                 self.session.archive.format = format;

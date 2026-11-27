@@ -1573,7 +1573,8 @@ fn walk_until_observed(
             return Ok(volumes);
         }
         observer.notify(observer.volume_index(volumes)?, &next, SelectedReadRole::Header, cancel)?;
-        vol = Volume::open_damaged(&next, password, damaged)?;
+        let keys = vol.rar5_keys().clone();
+        vol = Volume::open_damaged_sharing(&next, password, damaged, keys)?;
         if vol.format() != format {
             return Err(Error::Corrupt("RAR volume format changed"));
         }
@@ -1659,7 +1660,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                 RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into()
             );
         }
-        vol = Volume::open_detailed_damaged(&next, run.password, run.opts.damaged_input)?;
+        vol = Volume::open_detailed_sharing(&next, run.password, run.opts.damaged_input, run.rar5_keys.clone())?;
         if vol.format() != format {
             return Err(RarFault::new(
                 RarFailure::integrity(
@@ -3441,6 +3442,21 @@ impl Sink for Pending {
     }
 }
 
+/// RAR 5.0 keys for `params` through the run's or session's cache (no cancellation: a derivation runs to its end,
+/// as it did before the cache).
+pub(crate) fn rar5_keys(
+    keys: &mut crate::crypto::Rar5KeyCache,
+    password: &str,
+    params: &crate::crypto::Rar5CryptParams,
+    scope: crate::error::RarScope,
+) -> std::result::Result<crate::crypto::Rar5Keys, RarFailure> {
+    keys.keys(password, params, None).map_err(|error| match error {
+        crate::crypto::ControlledKdfError::Crypt(error) => RarFailure::crypt(error, scope),
+        // an uncanceled derivation has no limits; were one to stop, it would have been canceled
+        crate::crypto::ControlledKdfError::Control(_) => RarFailure::Canceled,
+    })
+}
+
 impl Pending {
     pub(crate) fn verified_size(&self) -> u64 {
         self.bytes
@@ -3450,26 +3466,29 @@ impl Pending {
         &self.context
     }
 
+    /// The member's cipher, its keys derived once per salt for the run's password (`keys`); its own check value
+    /// is still compared.
     fn start_cipher(
         context: &mut EntryContext,
+        keys: &mut crate::crypto::Rar5KeyCache,
         compressed: bool,
         params: crate::crypto::Rar5CryptParams,
         password: &str,
         size: Option<u64>,
     ) -> std::result::Result<PendingCipher, RarFailure> {
-        let keys = crate::crypto::derive_rar5_keys(password, params.kdf_count, &params.salt, params.check)
-            .map_err(|error| RarFailure::crypt(error, context.scope()))?;
+        let keys = rar5_keys(keys, password, &params, context.scope())?;
         context.password = keys.evidence;
         Ok(PendingCipher::from_keys(params, keys, compressed, size))
     }
 
     pub(crate) fn start_selected_cipher(
         &mut self,
+        keys: &mut crate::crypto::Rar5KeyCache,
         params: crate::crypto::Rar5CryptParams,
         password: &str,
         size: Option<u64>,
     ) -> std::result::Result<(), RarFailure> {
-        self.cipher = Some(Self::start_cipher(&mut self.context, self.compressed, params, password, size)?);
+        self.cipher = Some(Self::start_cipher(&mut self.context, keys, self.compressed, params, password, size)?);
         Ok(())
     }
 
@@ -4012,6 +4031,8 @@ struct Run<'a, 'r, 'c> {
     rar4: Option<Rar4Decoder>,
     /// RAR 3.x keys already derived for the run's password, by salt
     rar4_keys: crate::crypto::Rar4KeyCache,
+    /// RAR 5.0 keys already derived for the run's password, by salt and count, shared with the volumes it opens
+    rar5_keys: crate::crypto::SharedRar5Keys,
     /// threads for work spread over files; 1 for none
     threads: usize,
     /// small files being decoded and written on other threads
@@ -4232,6 +4253,8 @@ fn rar_run_shared_open<'a>(
     run.cancel = cancel.cloned();
     // not countable: the members before the volume given are left alone
     run.members_before = skipped.unwrap_or(u64::MAX);
+    // the first volume's header key serves the members and the later volumes
+    run.rar5_keys = first_volume.rar5_keys().clone();
     let walked = walk_rar(first_volume, &mut run).and_then(|()| run.drain());
     let canceled = cancel.is_some_and(Cancellation::is_canceled);
     if canceled {
@@ -4309,6 +4332,7 @@ fn rar_read_at(
     let mut complete = false;
     observer.notify(0, first, SelectedReadRole::Header, Some(cancel))?;
     let volume = Volume::open_with_password(first, run.password)?;
+    run.rar5_keys = volume.rar5_keys().clone();
     walk_until_observed(
         volume,
         run.password,
@@ -4382,6 +4406,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             stream: None,
             rar4: None,
             rar4_keys: Default::default(),
+            rar5_keys: Default::default(),
             threads,
             batch: None,
             batch_paths: HashSet::new(),
@@ -4627,7 +4652,8 @@ impl Run<'_, '_, '_> {
             },
             (Some(params), Some(password)) => {
                 let size = (!h.size_unknown()).then_some(h.unpacked_size);
-                match Pending::start_cipher(&mut ctx, true, params, password, size) {
+                let started = Pending::start_cipher(&mut ctx, &mut self.rar5_keys.lock(), true, params, password, size);
+                match started {
                     Ok(cipher) => (Some(cipher), None),
                     // a wrong password is why the members after it lose their history
                     Err(failure) => (None, Some(Arc::new(failure))),
@@ -4920,7 +4946,7 @@ impl Run<'_, '_, '_> {
         {
             // its target is in the clear: an encrypted link is placed only on a password its check value verifies (applied
             // once the link is known to be placed or tested: a skipped one stays skipped)
-            let password = link::rar5_password(h, self.password, ctx.scope());
+            let password = link::rar5_password(&mut self.rar5_keys.lock(), h, self.password, ctx.scope());
             return self.rar5_link(vol, h, ctx, &rel, kind, password);
         }
         if let Some(link) = &h.redirection {
@@ -4936,8 +4962,9 @@ impl Run<'_, '_, '_> {
                 None => None,
             }
         } else if let (Some(cp), Some(pw)) = (h.crypt, self.password) {
-            match Pending::start_cipher(&mut ctx, h.method != 0, cp, pw, (!h.size_unknown()).then_some(h.unpacked_size))
-            {
+            let size = (!h.size_unknown()).then_some(h.unpacked_size);
+            let started = Pending::start_cipher(&mut ctx, &mut self.rar5_keys.lock(), h.method != 0, cp, pw, size);
+            match started {
                 Ok(cipher) => Some(cipher),
                 Err(failure) => {
                     let why = if matches!(failure, RarFailure::Internal(_)) {

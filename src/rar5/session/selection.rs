@@ -614,7 +614,8 @@ impl SelectedRun {
                     .crypt
                     .and_then(Result::ok)
                     .ok_or_else(|| pending.context().integrity(RarIntegrityReason::MalformedEncryptionRecord, false))?;
-                pending.start_selected_cipher(params, password, member.unpacked_size)?;
+                let mut keys = session.rar5_keys();
+                pending.start_selected_cipher(&mut keys, params, password, member.unpacked_size)?;
             }
         }
         let compressed = header.method != 0;
@@ -897,7 +898,7 @@ fn copy_catalogue_issue(failure: &RarFailure) -> RarFailure {
 pub(super) fn link_password(session: &RarSession, index: usize) -> Result<RarPasswordEvidence, RarFailure> {
     let header = &session.model.members[index].header;
     let scope = RarScope::Member { index: Some(index as u64) };
-    crate::extract::link::rar5_password(header, Some(&session.password), scope)
+    crate::extract::link::rar5_password(&mut session.rar5_keys(), header, Some(&session.password), scope)
 }
 
 fn is_terminal(failure: &RarFailure) -> bool {

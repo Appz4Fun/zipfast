@@ -1237,8 +1237,7 @@ impl SevenZipWalker {
         usage.check(Resource::PasswordUtf8Bytes, password.len() as u64).map_err(fail)?;
         usage.check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2).map_err(fail)?;
         options.limits.check_seven_zip_kdf(num_cycles_power).map_err(fail)?;
-        let mut meter = crate::rar5::member::KdfMeter::new(usage, &options.control);
-        match crate::crypto::derive_7z_key_controlled(password, salt, num_cycles_power, &mut meter) {
+        match crate::rar5::member::session_7z_key(password, salt, num_cycles_power, usage, &options.control) {
             None => Err(unsupported(volume, "7zAES cycle count")),
             Some(Ok(key)) => Ok(key),
             Some(Err(crate::crypto::KdfControlError::Canceled)) => {
