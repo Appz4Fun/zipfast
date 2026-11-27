@@ -763,7 +763,7 @@ pub struct Unpacker {
     tail: Option<Box<TailSymbols>>,
     /// [`Self::flush_cut`]'s rule: symbols starting within this many bits of the data's end are left out, and a
     /// block of which fewer bytes came is not decoded ([`TAIL_MARGIN_BITS`] and [`TAIL_BLOCK_MIN`], or none of either
-    /// after [`Self::cut_short`])
+    /// after [`Self::set_cut_short`])
     cut_rule: (usize, usize),
 }
 
@@ -2058,8 +2058,8 @@ impl Unpacker {
     /// The data ends because the archive is cut short there, not at a missing volume: UnRAR reads on past the end
     /// (zeros, as far as the length of what it prints shows), so [`Self::flush_cut`] decodes every symbol starting
     /// before the end, and the start of a block however little of it came.
-    pub(crate) fn cut_short(&mut self) {
-        self.cut_rule = (0, 0);
+    pub(crate) fn set_cut_short(&mut self, cut_short: bool) {
+        self.cut_rule = if cut_short { (0, 0) } else { (TAIL_MARGIN_BITS, TAIL_BLOCK_MIN) };
     }
 
     /// Notes where the last symbols of each block start, so that [`Self::flush_cut`] can leave out what UnRAR leaves

@@ -1004,6 +1004,9 @@ impl Rar4Decoder {
     }
     /// Decodes what PPM or a RAR 1.5/2.0 engine held back for lookahead, as at the end of the member's data.
     pub(crate) fn drain(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+        if self.poisoned || self.finished {
+            return Ok(());
+        }
         self.drain_input(sink)
     }
     /// Where the next PPM or RAR 1.5/2.0 code starts, in bits from the member's first packed byte; whether it is at

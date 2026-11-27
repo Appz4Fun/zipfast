@@ -479,7 +479,8 @@ codec (RAR 2.9 LZ and PPMd, RAR 1.5/2.0, RAR 5.0, a RAR 5.0 block however little
 `RarIntegrityReason::TruncatedData`; with `Emit`, `print_selected` prints and `extract_selected` (with `keep_broken`)
 keeps exactly those bytes. RAR 3.x/4.x decoding feeds zeros after the data, and a PPMd or RAR 1.5/2.0 code starting
 past the byte after it is not decoded. For RAR 5.0 the length matches, but a symbol straddling the end gives UnRAR
-bytes zeros don't, so the last few bytes can differ there. By default (`DamagedInput::Refuse`) such an archive still
+bytes zeros don't, so the last few bytes can differ there. In a volume set UnRAR then goes on to the members of the
+later volumes, and so does the session; the cut member's continuation there is not joined to it. By default (`DamagedInput::Refuse`) such an archive still
 fails to open, and under `Withhold` the member prints nothing and isn't written. The whole-archive runner still passes
 over it.
 

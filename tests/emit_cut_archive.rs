@@ -142,9 +142,10 @@ fn rar_session_print_prints_what_unrar_prints_of_an_archive_cut_short() {
             let mut output = Vec::new();
             let mut failed = Vec::new();
             session
-                .print_selected(&all, &mut output, &options, |event| match &event.outcome {
-                    RarOutcome::Failed(failure) => failed.push((truncated(failure), event.unverified_bytes)),
-                    _ => {}
+                .print_selected(&all, &mut output, &options, |event| {
+                    if let RarOutcome::Failed(failure) = &event.outcome {
+                        failed.push((truncated(failure), event.unverified_bytes));
+                    }
                 })
                 .unwrap();
             let [(truncated, unverified_bytes)] = failed[..] else { panic!("{what}: {failed:?}") };
@@ -192,4 +193,34 @@ fn rar_session_extraction_keeps_what_unrar_decodes_of_an_archive_cut_short() {
             }
         }
     }
+}
+
+/// A first volume cut short inside a member split into the next volume, with the later volumes there: UnRAR 7.30
+/// prints what it decodes of `a.txt` up to the cut and goes on to the members of the later volumes (`unrar p`: 930,716
+/// bytes, `s.txt` the last 6), and so does the session. The continuation of `a.txt` in the second volume isn't joined
+/// to the member cut short (that would give the bytes after a gap as the ones after the cut).
+#[test]
+fn a_member_cut_short_is_not_continued_from_the_next_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = Path::new(FIXTURES).join("rar5-threads");
+    let first = dir.path().join("big.part01.rar");
+    fs::write(&first, &fs::read(set.join("big.part01.rar")).unwrap()[..70_000]).unwrap();
+    for later in ["big.part02.rar", "big.part03.rar"] {
+        fs::copy(set.join(later), dir.path().join(later)).unwrap();
+    }
+    let mut session = RarSession::open(&first, None, salvaging()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    let options = RarPrintOptions { unverified_output: UnverifiedOutput::Emit, ..RarPrintOptions::default() };
+    let mut output = Vec::new();
+    let mut failures = Vec::new();
+    session
+        .print_selected(&all, &mut output, &options, |event| {
+            if let RarOutcome::Failed(failure) = &event.outcome {
+                failures.push(truncated(failure));
+            }
+        })
+        .unwrap();
+    assert!(failures.first() == Some(&true), "a.txt fails as truncated: {failures:?}");
+    assert_eq!(output.len(), 930_716);
+    assert_eq!(sha256(&output), "41cf0cc0b9c6a62ca032a319c7eb30115240e95775c4bbe4ddf858b628cee6ae");
 }

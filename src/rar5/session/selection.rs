@@ -673,12 +673,13 @@ impl SelectedRun {
         };
         if compressed && header.format == RarFormat::Rar5 {
             self.prepare_decoder(session, member, pending.context())?;
+            if let Some(decoder) = self.decoder.as_mut() {
+                // a decoder kept from the member before gets this one's rule
+                decoder.set_cut_short(cut_short);
+            }
             if cut.is_some()
                 && let Some(decoder) = self.decoder.as_mut()
             {
-                if cut_short {
-                    decoder.cut_short();
-                }
                 decoder.track_tail();
                 // UnRAR's cut at the data's end needs the last symbols of each block, which workers don't note
                 decoder.serial_file();
@@ -798,14 +799,21 @@ impl SelectedRun {
                     // UnRAR reads zeros past the end: what decodes from them is held until the cut is known
                     decoder.cut_short();
                     let before = sink.pending.bytes;
+                    // no more than the decoded bytes the selection may still take: the sink refuses the rest anyway
+                    let room = usize::try_from(sink.limit.saturating_sub(*sink.decoded)).unwrap_or(usize::MAX);
                     let mut held = Vec::new();
                     let mut keep = |bytes: &[u8]| -> crate::Result<()> {
+                        if bytes.len() > room - held.len() {
+                            return Err(crate::Error::Corrupt("more output than the selection may decode"));
+                        }
+                        held.try_reserve(bytes.len()).map_err(|_| crate::Error::Corrupt("output too large to hold"))?;
                         held.extend_from_slice(bytes);
                         Ok(())
                     };
                     // what decodes before a damaged code stands: the member fails anyway
-                    let _ = decoder.feed(&[0; CUT_PAD], &mut keep);
-                    let _ = decoder.drain(&mut keep);
+                    if decoder.feed(&[0; CUT_PAD], &mut keep).is_ok() {
+                        let _ = decoder.drain(&mut keep);
+                    }
                     let end = decoder.cut_point();
                     let take = usize::try_from(end.saturating_sub(before)).unwrap_or(usize::MAX).min(held.len());
                     if let Err(error) = sink.put(&held[..take]) {

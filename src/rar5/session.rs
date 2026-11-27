@@ -1471,6 +1471,7 @@ impl Catalogue {
         }
         // a member the volume's end cuts short (FileWire::cut) has only the bytes there, and no part after them
         let final_part = !header.split_after() && wire.cut.is_none();
+        let cut_short = wire.cut.is_some();
         let mut part = Part::new(volume, &header, crypt, &wire);
         if let Some(there) = wire.cut {
             part.packed_size = there;
@@ -1517,7 +1518,7 @@ impl Catalogue {
                 member.issue = issue;
             }
             self.session.model.parts.push(part);
-            self.pending = !final_part;
+            self.pending = !final_part && !cut_short;
             self.update_capacity()?;
             return Ok(owned(header));
         } else {
@@ -1577,7 +1578,8 @@ impl Catalogue {
             self.session.model.members.push(member);
         }
         self.session.model.parts.push(part);
-        self.pending = !final_part;
+        // nothing continues a member cut short: a continuation in a later volume is an orphan
+        self.pending = !final_part && !cut_short;
         self.update_capacity()?;
         Ok(StoredHeader::Member(self.session.model.members.len() - 1))
     }
