@@ -407,3 +407,6 @@ final key padding, before the primitive. The independent ceilings are 2^22 block
 per derivation and a default 2^26 per session; a permitted long password can still
 reach a work limit. Such exhaustion is a resource failure, not a password verdict.
 The existing public unrestricted crypto helper retains its previous behavior.
+A session derives each (password, salt, count) once: the keys of a repeated input
+(RAR 5.0, RAR 3.x or 7zAES) come from the session's `Usage` and charge nothing, a
+member's own RAR 5.0 check value is still compared (see `docs/rar-passwords.md`).
