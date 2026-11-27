@@ -253,6 +253,7 @@ length) and its times set, and the member is still reported failed:
 | ZIP (checked route: a single-file `.zip` through `run_with_policy`) | a member failing on its own data (a wrong password, a CRC, a cut), published under every check a verified file passes except the read's completion, at the length written | `-pwrong aes.zip` / `crypto.zip` (every file empty) |
 | RAR (`RarSession::extract_selected` and `extract_selected_controlled`) | a member failing on its own data, published as a verified one would be (every recheck, hook and overwrite decision alike) | UnRAR `-kb` |
 | 7z | a member CRC failure, including a wrong password shown by the CRC; a decode failure ("Data Error") is not kept, as 7-Zip keeps none | `-pwrong encrypted_files.7z`: `baz.txt` kept, `foo.txt` not |
+| RAR (persistent-partial sessions, `ProgressiveSession::new_partial`) | a stored member failing its final CRC32 or BLAKE2sp that the session doesn't turn into a `DeclaredBad` hole (a member in one part, say; an encrypted part failing its own check still ends the session): its finish is committed with every byte written, `MemberFinished` reports `PersistentComplete` with `Verdict::Bad` (no archive metadata applied), and the session goes on with the next member instead of ending | (no reference tool has persistent output; `docs/persistent-partials.md`, "Damaged members") |
 
 Not kept: links, and a failure writing the output (that stops the run). Whatever the option, a 7z member that fails
 before anything of it is kept no longer leaves the folders its placing created (`-pwrong aes.7z` leaves no empty
@@ -484,6 +485,7 @@ default, changes nothing.
 | --- | --- | --- | --- |
 | `Options::unverified_output` | `extract::run`, `run_with_password`, `run_rar_with_outcomes`, the dispatchers | with `keep_broken`, a RAR member cut off by a missing volume keeps every byte UnRAR 7.30 `x -kb` keeps (without `keep_broken` it is removed, as `unrar x` removes it) | the member's usual failure ("missing volume") |
 | `Options::unverified_output` | `RarSession::extract_selected`, `extract_selected_controlled` | with `keep_broken`, the same member is written and kept (by default a session doesn't write it at all) | `RarOutcome::Failed` with `RarFailure::MissingVolume` or `MissingSplitContinuation` |
+| `Options::unverified_output` | persistent-partial sessions (`ProgressiveSession::new_partial`) | with `keep_broken`, a stored member cut off by a missing volume or a set truncated inside it keeps the bytes already written (as ever) and is reported before the session's failure | `MemberFinished` with `MemberOutcome::PersistentUnverified { missing, .. }`, then the session's `MissingVolume` or `Truncated` |
 | `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume is decoded from the volumes there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
 | `SevenZipPrintOptions::unverified_output` | `sevenzip::print_selected_with_options` (`7z x -so`) | a 7z member failing on its data has what 7-Zip 26.06 streams of it printed | its line in `Summary::errors`, and an `UnverifiedMember { index, name, bytes }` in `Summary::unverified` |
 | `SelectOptions::unverified_output` | `SelectedEntry` (`open_cancelable_with_options`, `open_cancelable_with_zip_limit_and_options`), 7z and RAR | 7z: as `print_selected_with_options`; RAR 3.x/4.x: a VM filter zipfast doesn't run leaves its block unfiltered (as `UnsupportedFilters::WriteUnfiltered`); other formats already stream as they decode | `read` fails with an `Error::Io` carrying `UnverifiedWritten { bytes, cause }` (`UnverifiedWritten::of`); `cause` is the failure without `Emit`, `Error::Unsupported(UNFILTERED_SELECTED)` for a RAR member written unfiltered |
@@ -524,6 +526,26 @@ one to the end of the data (55,084 bytes for `r5-partial`), and a `SelectedEntry
 | a folder whose packed stream is cut short (`lzma_trunc.7z`) | the bytes decoded, "Data Error" | the same bytes |
 | a wrong password, LZMA folder (`-pwrong enc.7z`) | nothing, "Data Error in encrypted file. Wrong password?" | nothing |
 | a wrong password, Copy folder (`-pwrong enc_copy.7z`) | the decrypted garbage, "CRC Failed in encrypted file. Wrong password?" | the same bytes |
+
+### A member carrying more than its declared size
+
+A member whose data gives more bytes than its header declares fails its size check, and every reference mode stops
+at the declared size: UnRAR 7.30 `x -kb` and `p` (exit 3, checksum error) and 7-Zip 26.06 `x` and `x -so` (exit 2,
+"CRC Failed" or "Data Error") write exactly the declared bytes, for RAR 5.0 and RAR 4.x (stored, LZ, PPMd), 7z (Copy,
+LZMA, LZMA2) and ZIP (stored, Deflate). zipfast does the same in every route: a file kept with `keep_broken` (RAR,
+ZIP on both routes, 7z), `RarSession` extraction and printing under `Emit`, `sevenzip::print_selected_with_options`
+and `SelectedEntry` under `Emit` (whose `UnverifiedWritten::bytes` is then the declared size). Without `keep_broken`
+the file is removed as before; a `SelectedEntry` under `Withhold` streams as before.
+
+| `tests/fixtures/declared-size` | member | declared | carried | every mode writes |
+| --- | --- | --- | --- | --- |
+| `r5-stored.rar`, `r4-stored.rar`, `zip-stored.zip` | stored | 1 | 60,000 | 1 byte |
+| `r5-lz.rar` (`-m3`), `zip-deflate.zip` | compressed | 1,000 | 211,990 | 1,000 bytes |
+| `r4-lz.rar` (RAR 2.9 LZ), `r4-ppmd.rar` (PPMd) | compressed | 100, 1,000 | 787, 98,304 | 100, 1,000 bytes |
+| `7z-copy.7z`, `7z-lzma.7z`, `7z-lzma2.7z` | folder unpack size | 1,000 | 12,000 | 1,000 bytes |
+
+`tests/declared_size.rs` checks each point, on the calling thread and on decode workers, and a stored RAR 5.0 member
+declaring 1 byte and carrying 5,000,000.
 
 Not covered: a Copy folder whose header gives fewer packed than unpacked bytes is refused as malformed headers
 (7-Zip streams the packed bytes and reports "Data Error"); an LZMA2 folder big enough to be decoded on several threads

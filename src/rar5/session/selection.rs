@@ -919,6 +919,9 @@ impl SelectedRun {
             let mut decoder =
                 Unpacker::new_detailed(window).map_err(|error| *error.detailed(context.scope()).failure)?;
             crate::rar5::member::apply_threads(&mut decoder, self.threads, self.parallel_min);
+            // a member running past its declared size hands over its output up to it, as UnRAR 7.30 `p` and `x -kb`
+            // do: printed or kept only under UnverifiedOutput::Emit or Options::keep_broken, discarded otherwise
+            decoder.write_to_size(true);
             decoder.reset(member.unpacked_size);
             self.decoder = Some(decoder);
         }
@@ -1113,13 +1116,16 @@ impl SelectedSink<'_, '_> {
 
     fn take(&mut self, bytes: &[u8]) -> Result<(), RarFailure> {
         check_cancel(self.cancel).map_err(|fault| *fault.failure)?;
+        // nothing past the declared size is printed or written: a member carrying more fails its size check, and
+        // what UnRAR 7.30 `p` and `x -kb` hand over of it stops there
+        let within = self.pending.within_declared(bytes.len());
         self.pending
             .take_with(bytes, |chunk| {
                 *self.decoded =
                     charge(*self.decoded, chunk.len() as u64, self.limit, RarResource::SelectedDecodedBytes)
                         .map_err(|failure| RarFault::new(failure, Error::Corrupt("selected RAR decoded work limit")))?;
                 if let Some(output) = &mut self.output {
-                    output(chunk)?;
+                    output(&chunk[..within.min(chunk.len())])?;
                 }
                 Ok(())
             })
