@@ -374,6 +374,9 @@ impl Rar4Decoder {
         self.fed = 0;
         self.fetched = 0;
         self.produced = 0;
+        if let Some(starts) = self.starts.as_mut() {
+            starts.clear();
+        }
         self.bits = Bits::default();
         self.prefix = 0;
         self.depth = 0;

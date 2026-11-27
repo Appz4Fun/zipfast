@@ -391,6 +391,8 @@ pub(crate) struct Rar4Decoder {
     write_unfiltered: bool,
     /// a block of this member was written unfiltered
     unfiltered: bool,
+    /// [`crate::extract::UnverifiedOutput::Emit`]: where the latest LZ tokens started, for [`Self::flush_decoded`]
+    starts: Option<Box<TokenStarts>>,
     hold_start: u64,
     /// the member's unpack version, and the RAR 1.5 or 2.0 engine that decodes it
     version: u8,
@@ -502,6 +504,7 @@ impl Rar4Decoder {
             hold: Vec::new(),
             write_unfiltered: false,
             unfiltered: false,
+            starts: None,
             hold_start: 0,
             version: 29,
             memory_limit: PPM_MEMORY_MAX,
@@ -575,6 +578,13 @@ impl Rar4Decoder {
     }
     fn run(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<()> {
         loop {
+            if let Some(starts) = self.starts.as_mut()
+                && matches!(self.phase, Phase::Token)
+            {
+                // the bits fetched so far, less those still buffered: where this token's first bit is
+                let at = self.fetched.saturating_mul(8).saturating_sub(u64::from(self.bits.count));
+                starts.push(at, self.produced);
+            }
             match self.step_counted(input, sink) {
                 Ok(true) => {}
                 Ok(false) => return Ok(()),
@@ -714,6 +724,35 @@ impl Rar4Decoder {
     /// the member fails (`false`, the default), or the block is written as decoded, as 7-Zip writes it.
     pub(crate) fn set_write_unfiltered(&mut self, on: bool) {
         self.write_unfiltered = on;
+    }
+    /// Hands `sink` every decoded byte still buffered, short of the bytes a filter block holds until it is whole: a
+    /// member cut off by a missing volume ([`crate::extract::UnverifiedOutput::Emit`]) gets what its present
+    /// volumes decoded. The decoder is not to be fed again after this.
+    ///
+    /// As UnRAR 7.30 does when the data ends (observed on `multi_broken.part1.rar` and two RAR 3.00 sets cut after
+    /// their first volume), an LZ token whose first bit lies in the last [`TAIL_MARGIN`] bytes of what was fed is not
+    /// taken: its bytes, and every later one, are left out. That needs [`Self::track_starts`] from the member's
+    /// start; without it, or in a PPM block or a RAR 1.5/2.0 stream, every decoded byte is handed over.
+    pub(crate) fn flush_decoded(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+        let lz = !self.phase.ppm() && !matches!(self.phase, Phase::Legacy) && self.legacy.is_none();
+        let cut = match self.starts.as_deref().filter(|_| lz) {
+            Some(starts) => starts.cut(self.fetched, self.produced),
+            None => self.produced,
+        };
+        // the buffer holds the output just before the first held byte (or the newest, when nothing is held)
+        let end = if self.hold.is_empty() {
+            self.produced
+        } else {
+            self.hold_start.saturating_sub(self.chain_base).min(self.produced)
+        };
+        let start = end.saturating_sub(self.filled as u64);
+        let keep = cut.clamp(start, end) - start;
+        self.filled = (keep as usize).min(self.filled);
+        self.flush(sink)
+    }
+    /// Records where each LZ token starts, so that [`Self::flush_decoded`] can leave out the tail UnRAR leaves out.
+    pub(crate) fn track_starts(&mut self) {
+        self.starts.get_or_insert_with(Default::default);
     }
     /// Whether a block of the member just decoded was written unfiltered, clearing it for the next member.
     pub(crate) fn take_unfiltered(&mut self) -> bool {
@@ -1361,6 +1400,47 @@ impl Rar4Decoder {
 
 #[cfg(test)]
 mod tests;
+
+/// How far before the end of the data UnRAR 7.30 stops taking LZ tokens when a RAR 3.x/4.x member's data ends early
+/// (a missing volume): a token starting in the last 30 bytes is not decoded. Found by observation (see
+/// [`Rar4Decoder::flush_decoded`]).
+pub(crate) const TAIL_MARGIN: u64 = 30;
+
+/// The start (in bits from the member's first packed byte) and the bytes produced before each of the latest LZ tokens:
+/// enough of them to reach [`TAIL_MARGIN`] bytes back, since a token takes at least one bit.
+struct TokenStarts {
+    ring: [(u64, u64); 256],
+    next: usize,
+    len: usize,
+}
+
+impl Default for TokenStarts {
+    fn default() -> Self {
+        Self { ring: [(0, 0); 256], next: 0, len: 0 }
+    }
+}
+
+impl TokenStarts {
+    fn push(&mut self, at: u64, produced: u64) {
+        self.ring[self.next] = (at, produced);
+        self.next = (self.next + 1) % self.ring.len();
+        self.len = (self.len + 1).min(self.ring.len());
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The bytes produced before the first token that starts within [`TAIL_MARGIN`] bytes of `fetched`, the bytes fed
+    /// so far; `produced` when there is none.
+    fn cut(&self, fetched: u64, produced: u64) -> u64 {
+        let size = self.ring.len();
+        (0..self.len)
+            .map(|back| self.ring[(self.next + size - self.len + back) % size])
+            .find(|&(at, _)| (at / 8).saturating_add(TAIL_MARGIN) > fetched)
+            .map_or(produced, |(_, before)| before.min(produced))
+    }
+}
 
 /// A legacy engine's output: the decoder's window and sink, up to the member's end.
 struct LegacyOut<'a> {

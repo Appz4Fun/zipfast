@@ -30,6 +30,12 @@ pub struct RarPrintOptions {
     pub io_attempts: u64,
     /// Parent for the private temporary file. Defaults to the system temp directory.
     pub temp_dir: Option<PathBuf>,
+    /// [`crate::extract::UnverifiedOutput::Emit`]: a member that fails on its own data (a checksum, a decoder error,
+    /// a missing volume, a wrong RAR 3.x password shown by its checksum) has the bytes decoded of it printed anyway,
+    /// as UnRAR 7.30 `p` prints them, and is still reported failed, with
+    /// [`crate::extract::RarEntryOutcome::unverified_bytes`] saying how many went out. A member cut off by a missing
+    /// volume is decoded from the volumes there. The default, `Withhold`, prints only verified members.
+    pub unverified_output: crate::extract::UnverifiedOutput,
 }
 
 impl Default for RarPrintOptions {
@@ -40,6 +46,7 @@ impl Default for RarPrintOptions {
             live_spool_bytes: 8 << 30,
             io_attempts: 1 << 32,
             temp_dir: None,
+            unverified_output: Default::default(),
         }
     }
 }
@@ -82,7 +89,8 @@ impl RarSession {
     /// then copy that member to the caller's writer in archive order.
     ///
     /// The writer must be distinct from every archive input. A failed member
-    /// emits no data until verified. A terminal copy error leaves any bytes
+    /// emits no data until verified, unless `options.unverified_output` says
+    /// to print what was decoded of it. A terminal copy error leaves any bytes
     /// already accepted by the writer visible. The returned partial summary
     /// counts completed members, and the error records current-member bytes.
     /// An entry without a checksum reports that evidence in its outcome.
@@ -97,11 +105,13 @@ impl RarSession {
         let cancel = self.options.cancel.clone();
         let mut attempts = PrintAttempts { used: 0, limit: options.io_attempts, cancel: &cancel };
         let mut accepted = 0;
+        let emit = options.unverified_output == crate::extract::UnverifiedOutput::Emit;
         self.execute_selected(
             selection,
             options.decode,
             |run, session, index| {
                 accepted = 0;
+                run.emit_unverified = emit;
                 let mut spool = Spool::default();
                 let result = run.test(
                     session,
@@ -125,6 +135,23 @@ impl RarSession {
                     }
                     RarOutcome::Directory => {
                         Ok(RarOutcome::Failed(Arc::new(RarFailure::Unsupported(RarUnsupported::PrintDirectory))))
+                    }
+                    // UnverifiedOutput::Emit: what was decoded of a member failing on its own data, as UnRAR prints it
+                    RarOutcome::Failed(failure)
+                        if emit
+                            && spool.size != 0
+                            && matches!(
+                                failure.as_ref(),
+                                RarFailure::Integrity { .. }
+                                    | RarFailure::EncryptedIntegrity { .. }
+                                    | RarFailure::MissingVolume { .. }
+                            ) =>
+                    {
+                        let size = spool.size;
+                        spool.prepare_copy(size, &mut attempts).map_err(Arc::new)?;
+                        spool.copy_to(output, &mut accepted, &mut run.buffer, &mut attempts).map_err(Arc::new)?;
+                        run.unverified = Some(accepted);
+                        Ok(RarOutcome::Failed(failure))
                     }
                     outcome => Ok(outcome),
                 }

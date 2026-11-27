@@ -351,7 +351,54 @@ pub fn print_selected_with(
     cancel: &Cancellation,
     limits: &SevenZipLimits,
 ) -> Result<Summary> {
-    run::print(first, password, select, on_bytes, cancel, limits).map_err(Error::from)
+    print_selected_with_options(first, password, select, on_bytes, cancel, limits, &SevenZipPrintOptions::default())
+}
+
+/// The choices [`print_selected_with_options`] takes beyond [`print_selected_with`]'s.
+///
+/// ```
+/// use zipfast::extract::UnverifiedOutput;
+/// use zipfast::sevenzip::SevenZipPrintOptions;
+///
+/// let options = SevenZipPrintOptions::new().unverified_output(UnverifiedOutput::Emit);
+/// assert_eq!(options.unverified_output, UnverifiedOutput::Emit);
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SevenZipPrintOptions {
+    /// [`crate::extract::UnverifiedOutput::Emit`]: a member that fails on its data has what was decoded of it
+    /// printed, as 7-Zip 26.06 `x -so` streams it: everything for a CRC failure (a wrong password's garbage too, in a
+    /// Copy folder), the bytes before the error for a data error or a folder cut short, nothing for a member of a
+    /// solid block an earlier member broke. It is still a line in [`Summary::errors`], and an entry in
+    /// [`Summary::unverified`] says how many of its bytes went out. The default prints only members that check out.
+    pub unverified_output: crate::extract::UnverifiedOutput,
+}
+
+impl SevenZipPrintOptions {
+    /// The defaults: only members that check out are printed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets [`Self::unverified_output`].
+    pub fn unverified_output(mut self, unverified_output: crate::extract::UnverifiedOutput) -> Self {
+        self.unverified_output = unverified_output;
+        self
+    }
+}
+
+/// [`print_selected_with`] with [`SevenZipPrintOptions`].
+pub fn print_selected_with_options(
+    first: &Path,
+    password: Option<&str>,
+    select: &mut dyn FnMut(u64, &str) -> bool,
+    on_bytes: &mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>,
+    cancel: &Cancellation,
+    limits: &SevenZipLimits,
+    options: &SevenZipPrintOptions,
+) -> Result<Summary> {
+    let unverified = options.unverified_output == crate::extract::UnverifiedOutput::Emit;
+    run::print(first, password, select, on_bytes, cancel, limits, unverified).map_err(Error::from)
 }
 
 /// [`run`], reporting a rename mode's renames to `report` as they happen; a terminal error keeps them too.
@@ -746,6 +793,7 @@ mod header_key_tests {
             encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
