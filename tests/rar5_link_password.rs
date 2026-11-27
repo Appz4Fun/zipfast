@@ -209,10 +209,18 @@ fn progressive(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>) -> R
 }
 
 fn progressive_with(arc: &Path, extract: Options, password: Option<&str>) -> Result<Outcomes, String> {
+    let opts = zipfast::progressive::ProgressiveOptions::new(extract, arc.file_name().unwrap().to_owned());
+    progressive_options_with(arc, opts, password)
+}
+
+fn progressive_options_with(
+    arc: &Path,
+    mut opts: zipfast::progressive::ProgressiveOptions,
+    password: Option<&str>,
+) -> Result<Outcomes, String> {
     use std::task::{Context, Poll};
     use zipfast::progressive::*;
     let volume = (arc.file_name().unwrap().to_owned(), fs::read(arc).unwrap().into_boxed_slice());
-    let mut opts = ProgressiveOptions::new(extract, arc.file_name().unwrap().to_owned());
     opts.set_password(password.map(str::to_owned)).unwrap();
     let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
     let mut outcomes = Vec::new();
@@ -778,4 +786,94 @@ fn verify_first_reports_a_wrong_password_before_a_missing_hard_link_target() {
         assert_eq!(progressive, Err(progressive_expected.to_string()), "{links:?} {password:?}");
         assert!(fs::symlink_metadata(dest.join("progressive").join("hard")).is_err());
     }
+}
+
+/// Codex on #320: an encrypted link carrying a checksum keyed by the password (encryption flag 0x02) or a BLAKE2sp
+/// hash is placed under PlaceUnverified on every route too: with no key derived, its checksum of nothing isn't
+/// checked, at the final verdict either.
+#[test]
+fn place_unverified_places_encrypted_links_carrying_checksums() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keyed = |name: &'static str, blake: bool| {
+        let mut body = vec![1, 0, 3, KDF_COUNT]; // type, version, flags (check value, keyed checksums), exponent
+        body.extend(SALT);
+        body.extend(IV);
+        body.extend(CHECK);
+        let mut extra = record(body);
+        if blake {
+            extra.extend(common::blake_record(common::blake(b"")));
+        }
+        extra.extend(redirection(1, "plain"));
+        FileSpec { extra, unix_mode: Some(0o120777), no_crc: blake, ..FileSpec::new(name, b"") }
+    };
+    let arc = tmp.path().join("sums.rar");
+    let files = [keyed("crc", false), keyed("blake", true), FileSpec::new("plain", b"plain")];
+    fs::write(&arc, archive(&files)).unwrap();
+    for password in [Some("not the password"), None] {
+        for mode in [Mode::Test, Mode::Extract] {
+            let tag = format!("{}-{mode:?}", password.unwrap_or("none"));
+            let ok = vec!["ok".to_string(); 3];
+            let dest = tmp.path().join(format!("whole-{tag}"));
+            assert_eq!(whole_with(&arc, &dest, mode, password, EncryptedLinks::PlaceUnverified), ok, "whole {tag}");
+            let dest2 = tmp.path().join(format!("session-{tag}"));
+            assert_eq!(
+                session_with(&arc, &dest2, mode, password, EncryptedLinks::PlaceUnverified),
+                ok,
+                "session {tag}"
+            );
+            let dest3 = tmp.path().join(format!("progressive-{tag}"));
+            let extract = with_links(&dest3, mode, EncryptedLinks::PlaceUnverified);
+            assert_eq!(progressive_with(&arc, extract, password), Ok(ok), "progressive {tag}");
+            if mode == Mode::Extract {
+                for dest in [dest, dest2, dest3] {
+                    for name in ["crc", "blake"] {
+                        assert_eq!(fs::read_link(dest.join(name)).unwrap(), Path::new("plain"), "{tag} {name}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// VerifyFirst with the right password places links as Verify does, on every route (a progressive session reuses
+/// the early check rather than deriving the key a second time for the link).
+#[test]
+fn verify_first_places_links_on_the_right_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = write(tmp.path(), true);
+    for mode in [Mode::Test, Mode::Extract] {
+        let dest = tmp.path().join(format!("whole-{mode:?}"));
+        assert_eq!(whole_with(&arc, &dest, mode, Some(PASSWORD), EncryptedLinks::VerifyFirst), expect("ok"));
+        let dest2 = tmp.path().join(format!("session-{mode:?}"));
+        assert_eq!(session_with(&arc, &dest2, mode, Some(PASSWORD), EncryptedLinks::VerifyFirst), expect("ok"));
+        let dest3 = tmp.path().join(format!("progressive-{mode:?}"));
+        let extract = with_links(&dest3, mode, EncryptedLinks::VerifyFirst);
+        assert_eq!(progressive_with(&arc, extract, Some(PASSWORD)), Ok(expect("ok")), "{mode:?}");
+        if mode == Mode::Extract {
+            for dest in [dest, dest2, dest3] {
+                assert_links(&dest);
+            }
+        }
+    }
+}
+
+/// Codex on #320: under VerifyFirst a progressive session derives an encrypted link's key once (at its header), not a
+/// second time for the link's data-less member: a session KDF budget that fits exactly one link's derivation under
+/// Verify fits VerifyFirst too.
+#[test]
+fn verify_first_derives_a_link_key_once_on_a_progressive_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = tmp.path().join("one.rar");
+    fs::write(&arc, archive(&[FileSpec::new("plain", b"plain"), link("unix", 1, "plain", true)])).unwrap();
+    let run = |links: EncryptedLinks, budget: u64| {
+        let mut extract = with_links(&tmp.path().join(format!("out-{links:?}-{budget}")), Mode::Extract, links);
+        extract.overwrite = Overwrite::Always;
+        let mut session_options = zipfast::progressive::ProgressiveOptions::new(extract, "one.rar".into());
+        session_options.limits.kdf_session_blocks = budget;
+        progressive_options_with(&arc, session_options, Some(PASSWORD))
+    };
+    // the least budget Verify needs for its one derivation
+    let budget =
+        (1..=4096).find(|&b| run(EncryptedLinks::Verify, b).is_ok()).expect("a budget that fits one derivation");
+    assert_eq!(run(EncryptedLinks::VerifyFirst, budget), Ok(vec!["ok".to_string(); 2]));
 }

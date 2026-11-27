@@ -1235,6 +1235,9 @@ impl ProgressiveSession {
         // the destination, and a hard link or file copy must take a file this session published or tested.
         self.link_kind = None;
         let mut unverified_link = None;
+        // An encrypted link whose password needs no checking by its cipher: let go (PlaceUnverified) or already
+        // verified (VerifyFirst), with the evidence it reports
+        let mut checked_link = None;
         if let Some(redirection) = header.redirection.as_ref().filter(|_| refusal.is_none()) {
             let unsupported = || {
                 ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
@@ -1255,7 +1258,7 @@ impl ProgressiveSession {
                 && extract.encrypted_links == crate::extract::EncryptedLinks::VerifyFirst
                 && (header.version.is_none() || extract.mode == crate::extract::Mode::Test)
             {
-                self.link_password_first(&header, member.ordinal)?;
+                checked_link = Some(self.link_password_first(&header, member.ordinal)?);
             }
             let extract = &self.options.extract;
             match kind {
@@ -1380,6 +1383,7 @@ impl ProgressiveSession {
         } else {
             None
         };
+        let mut unchecked_sums = false;
         let mut machine = if decode && header.format == crate::rar5::RarFormat::Rar4 && header.method != 0 {
             self.history.take();
             let source = self
@@ -1423,15 +1427,20 @@ impl ProgressiveSession {
             if header.encrypted
                 && self.options.extract.encrypted_links == crate::extract::EncryptedLinks::PlaceUnverified
             {
-                // Options::encrypted_links: the password isn't checked for an encrypted link, as 7-Zip doesn't check
-                // it. With no data, nothing is decrypted, and a checksum of nothing (converted by a key the
-                // password may not give) is passed over: the link's target is all it carries.
+                checked_link = Some(crate::error::RarPasswordEvidence::Unverified);
+            }
+            if let Some(evidence) = checked_link.filter(|_| header.encrypted) {
+                // Options::encrypted_links: the password isn't checked for an encrypted link (PlaceUnverified, as
+                // 7-Zip doesn't check it), or was checked as its header was read (VerifyFirst: no second key
+                // derivation). With no data nothing is decrypted, and a checksum of nothing (converted by a key the
+                // password may not give) is passed over, here and at the final verdict: the target is all it carries.
                 stored.encrypted = false;
                 stored.crypt = None;
                 stored.crc32 = None;
                 stored.blake2sp = None;
                 password = None;
-                context.password = crate::error::RarPasswordEvidence::Unverified;
+                context.password = evidence;
+                unchecked_sums = true;
             }
             Some(MemberMachine::new_with_history(
                 &stored,
@@ -1492,7 +1501,10 @@ impl ProgressiveSession {
         } else {
             None
         };
-        let part = PhysicalPart::new(self.volume as usize, &header, frame.crypt, &wire);
+        let mut part = PhysicalPart::new(self.volume as usize, &header, frame.crypt, &wire);
+        if unchecked_sums {
+            part.checks = crate::rar5::session::RarChecks { crc32: None, blake2sp: None, keyed: false };
+        }
         if let Some(machine) = &mut machine {
             machine.begin_part(&part);
         }
@@ -1515,11 +1527,14 @@ impl ProgressiveSession {
         }
         Ok(ProgressiveEvent::MemberStarted { member, name, size })
     }
-    /// Where a link member goes, relative to the destination, as its target is checked: a flattened output drops
-    /// the member's folders.
     /// [`crate::extract::EncryptedLinks::VerifyFirst`]: an encrypted RAR 5.0 link's password is checked as its header
-    /// is read, as the member's cipher would check it, and one its check value can't verify is refused, as below.
-    fn link_password_first(&self, header: &crate::rar5::FileHeader, ordinal: u64) -> ProgressiveResult<()> {
+    /// is read, as the member's cipher would check it, and one its check value can't verify is refused, as below. On
+    /// success, the evidence the member reports (its data-less machine then needs no second derivation).
+    fn link_password_first(
+        &self,
+        header: &crate::rar5::FileHeader,
+        ordinal: u64,
+    ) -> ProgressiveResult<crate::error::RarPasswordEvidence> {
         let scope = crate::error::RarScope::Member { index: Some(ordinal) };
         let password = self
             .options
@@ -1537,9 +1552,12 @@ impl ProgressiveSession {
                 },
             ))));
         }
-        crate::rar5::member::controlled_keys(password, params, &self.usage, &self.control, scope).map(|_| ())
+        crate::rar5::member::controlled_keys(password, params, &self.usage, &self.control, scope)
+            .map(|keys| keys.evidence)
     }
 
+    /// Where a link member goes, relative to the destination, as its target is checked: a flattened output drops
+    /// the member's folders.
     fn link_rel(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<std::path::PathBuf> {
         let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         let rel = crate::path::sanitize(&name, !header.is_unix())
