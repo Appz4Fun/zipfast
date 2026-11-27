@@ -209,8 +209,13 @@ impl HeaderParser {
             _ if flags & 0x4000 != 0 => Block::Unknown,
             _ => return Err(self.rar4_unsupported("header type").into()),
         };
-        if self.complete_len.is_some_and(|len| frame.data_end > len) {
-            return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+        if let Some(len) = self.complete_len.filter(|&len| frame.data_end > len) {
+            // a salvaging catalogue takes a file whose data the volume's end cuts short (`HeaderParser::cut_short`)
+            let Some(wire) = frame.wire.as_mut().filter(|_| self.cut_short() && kind == 0x74) else {
+                return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+            };
+            wire.cut = Some(len.saturating_sub(frame.extent.end));
+            frame.data_end = len;
         }
         Ok(frame)
     }
@@ -462,6 +467,7 @@ impl HeaderParser {
                 name: std::sync::Arc::new(name),
                 compression: 0,
                 extent: self.at..data_at,
+                cut: None,
             },
         ))
     }

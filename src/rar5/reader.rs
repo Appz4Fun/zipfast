@@ -1063,6 +1063,13 @@ impl Volume {
                     }
                 };
                 self.next = frame.data_end;
+                if frame.wire.as_ref().is_some_and(|wire| wire.cut.is_some()) {
+                    // a file the volume's end cuts short (DamagedInput::Salvage, catalogue): catalogued with what is
+                    // there, and the volume ends with it, as UnRAR 7.30 reads it ("Unexpected end of archive")
+                    // (nothing is passed over: a solid member cut short still decodes on from the one before)
+                    self.damage_closed = true;
+                    self.record_damage_of(self.len, HeaderDamageKind::UnexpectedEnd, None, None, false);
+                }
                 if frame.damaged {
                     let name = match &frame.block {
                         Block::File(h) | Block::Service(h) => Some(h.name.as_str()),
