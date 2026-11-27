@@ -6316,8 +6316,10 @@ impl Run<'_, '_, '_> {
             return Ok(());
         }
         let seven_zip_cut = cut_short && self.opts.damaged_input == DamagedInput::SevenZip;
-        if seven_zip_cut && p.compressed && h.format == RarFormat::Rar4 {
-            // 7-Zip 26.06 writes nothing of a compressed RAR 3.x/4.x member cut short: it isn't decoded
+        let withheld = self.selection.as_ref().is_some_and(|selection| !selection.unverified);
+        if seven_zip_cut && (p.compressed && h.format == RarFormat::Rar4 || withheld) {
+            // 7-Zip 26.06 writes nothing of a compressed RAR 3.x/4.x member cut short: it isn't decoded; and a
+            // selected read under UnverifiedOutput::Withhold hands over nothing of a member it knows fails
             self.lost_history(&p.context, None);
             return self.fail_seven_zip_cut(h, p);
         }

@@ -629,7 +629,7 @@ of it and report it ("ERROR: Data Error : NAME" and the like), say "Unexpected e
   `UnverifiedWritten { bytes, cause }`, `cause` being `archive is truncated`; under `Withhold` it fails with nothing
   of the cut member.
 
-What 7-Zip 26.06 hands over of the member cut short (`tests/seven_zip_cut_member.rs` checks 48 cut archives and 3
+What 7-Zip 26.06 hands over of the member cut short (`tests/seven_zip_cut_member.rs` checks 50 cut archives and 3
 volume sets against its output; fixtures and commands in `tests/fixtures/seven-zip-cut-member/README.md`):
 
 | member | 7-Zip's error | what it keeps or prints | zipfast under 7z mode |
@@ -644,6 +644,7 @@ volume sets against its output; fixtures and commands in `tests/fixtures/seven-z
 | ZIP, ZipCrypto, Deflate / Store | Data Error / CRC Failed "in encrypted file. Wrong password?" | the decrypted bytes decoded / the decrypted bytes past the header | the same |
 | ZIP, WinZip AES, salt and verifier not all there | E_FAIL : Unspecified error | 0 bytes | the same |
 | ZIP, WinZip AES, Deflate / Store | Data Error in encrypted file. Wrong password? / Unexpected end of data | the decrypted bytes decoded (no authentication code) / the decrypted bytes past salt and verifier | the same |
+| ZIP, a streamed member cut before its data descriptor | Unexpected end of data (Store), Data Error (Deflate) | what is there, listed with no size | the same |
 | ZIP, a later member's local header cut | (none for a member) | that member isn't listed | the same |
 | RAR 3.x/4.x, compressed (2.9 LZ, PPMd, 2.0 LZ), solid or not | Data Error | 0 bytes | the same; it isn't decoded |
 | RAR 3.x/4.x, stored | CRC Failed | the bytes there | the same |

@@ -613,13 +613,31 @@ impl Archive {
         mut sink: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
         self.selected_entry(index, limit)?;
+        // without `seven_zip_cut` nothing of a member the cut reaches is handed over: it fails before it is read
+        if !seven_zip_cut {
+            let e = self.entries[index].clone();
+            if let Some(cause) = self.gap_crossed(&e) {
+                return Err(cause);
+            }
+        }
         let mut entry = self.entries[index].read_description();
         entry.keep_cut = seven_zip_cut;
         entry.seven_zip_cut = seven_zip_cut;
+        // the last member of a walk cut off before its descriptor has no known size: what is there of it is read,
+        // as the whole-archive run reads it
+        if self.last_size_unknown && index + 1 == self.entries.len() {
+            entry.size = if self.entries[index].effective_method() == METHOD_STORED { entry.packed } else { u64::MAX };
+        }
         let mut buffer = vec![0; BUF];
-        let read = read_entry(&mut self.file, self.len, &entry, password, &mut buffer, &mut sink, cancel);
+        // the sink's own failure is returned as it is, never taken for the cut
+        let mut sink_failed = false;
+        let mut checked_sink = |chunk: &[u8]| sink(chunk).inspect_err(|_| sink_failed = true);
+        let read = read_entry(&mut self.file, self.len, &entry, password, &mut buffer, &mut checked_sink, cancel);
         match read {
-            Err(error) if !matches!(&error, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof) => {
+            Err(error)
+                if !sink_failed
+                    && !matches!(&error, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof) =>
+            {
                 let e = self.entries[index].clone();
                 Err(self.gap_crossed(&e).unwrap_or(error))
             }
@@ -952,6 +970,11 @@ fn read_entry(
                             return Err(cut.into());
                         }
                         if left == 0 {
+                            // a streamed member cut before its descriptor ends where the cut does: 7-Zip reads on
+                            // past it as past any cut
+                            if e.keep_cut && e.seven_zip_cut {
+                                inflate_past_end(&mut z, &mut out, &mut emit)?;
+                            }
                             return Err(Error::Corrupt("deflate data ends early"));
                         }
                         break;

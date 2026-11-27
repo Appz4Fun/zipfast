@@ -479,6 +479,28 @@ const CUTS: &[Cut] = &[
             ("b.bin", 20000, "f5d2817d5839c91e66cf80c225aa89677956115fb0b69f8e8011444a049feef5"),
         ],
     },
+    // streamed members (data descriptors), the first cut 5,000 bytes into its data: its size is unknown
+    // 7z: ERROR: Unexpected end of data : s.txt
+    Cut {
+        label: "zs-streamed-s5k",
+        fixture: "seven-zip-cut-member/streamed.cut.zip",
+        at: 5035,
+        password: None,
+        failed: Some("s.txt"),
+        files: &[("s.txt", 5000, "e389b48fe49d89bdbdbefad9e960bafa3adbe4c3b86a2a52977e868862dacd13")],
+    },
+    // 7z: ERROR: Data Error : d.txt (the second, deflated, cut 2,000 bytes into its data)
+    Cut {
+        label: "zs-streamed-d2k",
+        fixture: "seven-zip-cut-member/streamed.cut.zip",
+        at: 22086,
+        password: None,
+        failed: Some("d.txt"),
+        files: &[
+            ("s.txt", 20000, "d6cd7c26e08e068d8262824134e66be5c87aea04a08c826e7b8fda6eec618071"),
+            ("d.txt", 5612, "607e7d309307a3e0414397de08bdeeaecc6c978975f3231fc4716bf8b8764ca8"),
+        ],
+    },
     // 7z: ERROR: Data Error : unrardll.txt
     Cut {
         label: "solid-1518",
@@ -859,6 +881,9 @@ fn selected_entry_reads_what_7z_prints() {
                     assert_eq!(read.is_err(), fails, "{what}: {read:?}");
                     if unverified == UnverifiedOutput::Emit || !fails {
                         assert_eq!((out.len(), sha256(&out)), (size, sha.to_string()), "{what}");
+                    } else if !case.label.contains("miss") {
+                        // a member cut off by a missing volume streams what it decodes, as before
+                        assert!(out.is_empty(), "{what}: {} bytes withheld", out.len());
                     }
                     if fails && unverified == UnverifiedOutput::Emit && size != 0 {
                         let error = read.unwrap_err();
@@ -982,4 +1007,21 @@ fn an_encrypted_member_declaring_more_than_the_file_holds_fails_with_what_is_the
         assert!(result.is_err() || !result.as_ref().unwrap().errors.is_empty(), "{unverified:?}: {result:?}");
         assert!(written(&dest).values().all(|(size, _)| *size <= 20), "{unverified:?}");
     }
+}
+
+/// A sink that stops a read of a member cut short has its own error returned, never taken for the cut.
+#[test]
+fn a_sink_error_on_a_cut_zip_member_is_returned_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = fs::read(Path::new(FIXTURES).join("seven-zip-cut-member/zs-deflate.cut.zip")).unwrap();
+    let archive = dir.path().join("zs-deflate.zip");
+    fs::write(&archive, &bytes[..40236]).unwrap();
+    let select = SelectOptions::new().damaged_input(DamagedInput::SevenZip).unverified_output(UnverifiedOutput::Emit);
+    // c.txt, the member cut short
+    let error =
+        SelectedEntry::open_cancelable_with_options(&archive, 2, None, u64::MAX, Cancellation::default(), select)
+            .unwrap()
+            .read(None, |_| Err(zipfast::error::Error::Unsupported("sink stopped".into())))
+            .unwrap_err();
+    assert!(matches!(&error, zipfast::error::Error::Unsupported(why) if why == "sink stopped"), "{error:?}");
 }

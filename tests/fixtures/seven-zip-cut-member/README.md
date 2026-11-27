@@ -22,6 +22,11 @@ Each `zs-<method>.cut.zip` is an archive made by 7-Zip 26.06 for Linux x86-64, c
 test's cut points are named for where they fall: `a0` just past `a.txt`'s local header, `a4k` 4,000 bytes into its
 data, `b100` 100 bytes into `b.bin`'s, `c3k` 3,000 bytes into `c.txt`'s, `chdr` 20 bytes into `c.txt`'s local header.
 
+`streamed.cut.zip` holds two members written to a stream by Python's `zipfile` (each with a data descriptor, so its
+local header has no sizes): `s.txt`, stored, and `d.txt`, deflated, each the first 20,000 bytes of `a.txt`; it is cut
+2,000 bytes into `d.txt`'s data, and the test cuts it 5,000 bytes into `s.txt`'s too. 7-Zip lists a member cut before
+its descriptor with no size and hands over what is there ("Unexpected end of data" for the stored one).
+
 The expected output is 7-Zip 26.06's, from `docker run --platform linux/amd64 --network none` with the cut files
 mounted read-only:
 
