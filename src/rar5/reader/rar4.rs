@@ -313,8 +313,9 @@ impl HeaderParser {
             // As UnRAR reads it: all ones (both halves with the large-file flag) means the size is unknown.
             let size_unknown = if flags & 0x100 != 0 { unpacked == u64::MAX } else { unpacked == 0xffff_ffff };
             let encoded = fields.take(name_len)?;
-            let name = if self.cut_parse {
-                // a header cut short (HeaderCut::Header): what of the name is there, up to the zeros, as UnRAR lists it
+            let name = if self.cut_parse && fields.at > self.cut_held {
+                // a header cut short inside its name (HeaderCut::Header): what of the name is there, up to the zeros,
+                // as UnRAR lists it; a whole name is decoded as any other
                 String::from_utf8_lossy(encoded.split(|&byte| byte == 0).next().unwrap_or_default()).into_owned()
             } else {
                 match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {

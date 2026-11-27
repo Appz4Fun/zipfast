@@ -139,8 +139,10 @@ pub(crate) struct HeaderParser {
     salvage_cut: bool,
     /// The declared size of the RAR 4.x file header being read when the volume ends inside it ([`HeaderCut::Header`]).
     cut_header: Option<usize>,
-    /// Set while that header is parsed: its name is what of it is there.
+    /// Set while that header is parsed: its fields past `cut_held` are zeros, its name what of it is there.
     cut_parse: bool,
+    /// How many bytes of that header the volume holds.
+    cut_held: usize,
     /// [`crate::extract::DamagedInput::SevenZip`]: a RAR 4.x old-style block (0x75..=0x79) in clear headers is
     /// passed over by its size without checking its checksum, as 7-Zip 26.06 does.
     legacy_unchecked: bool,
@@ -178,6 +180,7 @@ impl HeaderParser {
             salvage_cut: false,
             cut_header: None,
             cut_parse: false,
+            cut_held: 0,
             legacy_unchecked: false,
         }
     }
@@ -583,6 +586,7 @@ impl HeaderParser {
                         self.buffer
                             .try_reserve_exact(size - self.buffer.len())
                             .map_err(|_| super::session::allocation())?;
+                        self.cut_held = self.buffer.len();
                         self.buffer.resize(size, 0);
                         self.need = size;
                         self.cut_parse = true;

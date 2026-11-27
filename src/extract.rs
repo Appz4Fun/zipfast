@@ -5159,8 +5159,12 @@ impl Run<'_, '_, '_> {
         let ctx = self.reports.encounter(!continuation, &mut self.order, name, h.method)?;
         if h.cut == Some(crate::rar5::HeaderCut::Header) {
             // listed as UnRAR lists it (DamagedInput::Salvage), but nothing of it can be extracted
+            // (in a solid stream the members after it lose their history, as after any member not decoded)
             let failure = ctx.integrity(RarIntegrityReason::TruncatedHeader, false);
-            self.fail_in_order(&ctx, failure, "the file header is cut short")?;
+            let cause = self.fail_in_order(&ctx, failure, "the file header is cut short")?;
+            if vol.main.is_solid() && h.method != 0 && !h.is_dir() {
+                self.lost_history(&ctx, Some(cause));
+            }
             return Ok(());
         }
         if let Some(reason) = h.rar4_unsupported() {

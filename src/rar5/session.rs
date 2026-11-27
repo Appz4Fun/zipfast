@@ -1570,17 +1570,13 @@ impl Catalogue {
             let allowed = self.allowed();
             reserve_one(&mut self.session.model.parts, base, allowed)?;
             let issue = self.retain_issue(issue)?;
+            if let Some(cut) = header.cut {
+                // `ordinal` is the index of the member this part continues
+                self.record_cut(ordinal as usize, cut)?;
+            }
             let member = self.session.model.members.last_mut().unwrap();
             member.append(&header, &part)?;
             member.packed_size = add(member.packed_size, unread)?;
-            if let Some(cut) = header.cut {
-                // `ordinal` is the index of the member this part continues
-                let index = ordinal as usize;
-                match self.session.cuts.last_mut() {
-                    Some(last) if last.0 == index => last.1 = cut,
-                    _ => self.session.cuts.push((index, cut)),
-                }
-            }
             if issue.is_some() {
                 member.issue = issue;
             }
@@ -1639,11 +1635,11 @@ impl Catalogue {
             } else {
                 None
             };
+            if let Some(cut) = header.cut {
+                self.record_cut(self.session.model.members.len(), cut)?;
+            }
             let mut member = Member::new(header, wire, part_index, &part)?;
             member.packed_size = add(member.packed_size, unread)?;
-            if let Some(cut) = member.header.cut {
-                self.session.cuts.push((self.session.model.members.len(), cut));
-            }
             member.issue = issue;
             member.chain = chain;
             self.session.model.members.push(member);
@@ -1719,8 +1715,25 @@ impl Catalogue {
             vector_bytes::<Member>(self.session.model.members.capacity())?,
             vector_bytes::<Part>(self.session.model.parts.capacity())?,
         )?;
-        let headers = vector_bytes::<HeaderRecord>(self.session.headers.capacity())?;
+        let headers = add(
+            vector_bytes::<HeaderRecord>(self.session.headers.capacity())?,
+            vector_bytes::<(usize, super::HeaderCut)>(self.session.cuts.capacity())?,
+        )?;
         add(add(self.owned_capacity, volumes)?, add(model, headers)?)
+    }
+
+    /// Note where a volume ends inside member `index` ([`RarSession::cuts`]), within the catalogue's capacity: a later
+    /// part's cut replaces its member's earlier one.
+    fn record_cut(&mut self, index: usize, cut: super::HeaderCut) -> RarResult<()> {
+        if let Some(last) = self.session.cuts.last_mut().filter(|last| last.0 == index) {
+            last.1 = cut;
+            return Ok(());
+        }
+        let base = self.capacity_without::<(usize, super::HeaderCut)>(self.session.cuts.capacity())?;
+        let allowed = self.allowed();
+        reserve_one(&mut self.session.cuts, base, allowed)?;
+        self.session.cuts.push((index, cut));
+        Ok(())
     }
 
     fn capacity_without<T>(&self, count: usize) -> RarResult<u64> {
@@ -1746,6 +1759,7 @@ impl Catalogue {
         self.session.headers.shrink_to_fit();
         self.session.issues.shrink_to_fit();
         self.session.volumes.shrink_to_fit();
+        self.session.cuts.shrink_to_fit();
         self.update_capacity()
     }
 }

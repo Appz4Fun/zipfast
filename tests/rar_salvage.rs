@@ -337,6 +337,34 @@ fn a_damaged_header_size_past_the_end_is_searched_past_under_resync() {
     assert_bytes(&case, "c.txt", C);
 }
 
+/// A Unicode-named RAR 4.x file header cut inside its extended time, after its whole name field: `Salvage` decodes
+/// the name as any other (é.txt), not only its legacy part before the NUL.
+#[test]
+fn salvage_decodes_the_whole_unicode_name_of_a_cut_rar4_header() {
+    let name = b"?.txt\0\0\xaa\xe9\0.\0t\0x\0\x80t\0";
+    let mut body = Vec::new();
+    body.extend((A.len() as u32).to_le_bytes());
+    body.extend((A.len() as u32).to_le_bytes());
+    body.push(3);
+    body.extend(hash(A).to_le_bytes());
+    body.extend(0x50221884u32.to_le_bytes());
+    body.extend([20, 0x30]);
+    body.extend((name.len() as u16).to_le_bytes());
+    body.extend(0o100644u32.to_le_bytes());
+    body.extend(name);
+    // extended time: the modification time with 3 more bytes
+    body.extend(0xb000u16.to_le_bytes());
+    body.extend([0; 3]);
+    let mut out = b"Rar!\x1a\x07\0".to_vec();
+    out.extend(rar4_block(0x73, 0, &[0; 6]));
+    out.extend(rar4_block(0x74, 0x8000 | 0x200 | 0x1000, &body));
+    let case = case(&out[..out.len() - 2]);
+    let listing = listed(&case, DamagedInput::Salvage).unwrap();
+    assert_eq!(names(&listing), ["é.txt"]);
+    assert_eq!(listing.damaged_headers[0].name.as_deref(), Some("é.txt"));
+    assert_eq!(listing.damaged_headers[0].cut, Some(zipfast::rar5::HeaderCut::Header));
+}
+
 /// A header cut short by the end of the file: UnRAR and 7-Zip say "Unexpected end of archive"; what came before
 /// stands.
 #[test]
