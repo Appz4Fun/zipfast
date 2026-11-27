@@ -167,6 +167,10 @@ impl ProgressiveSession {
     /// The volume ended at a block boundary without its end header. A RAR 5.0 volume is cut short there (7-Zip 26.06:
     /// "Unexpected end of archive"); a RAR 4.x one may end so (archives older than RAR 2.9 write no end block).
     pub(super) fn salvage_volume_end(&mut self) -> ProgressiveResult<()> {
+        // a source that ends before a RAR signature was found is not a RAR volume, damaged or not
+        if self.parser.scanning() {
+            return Err(self.parser.truncated());
+        }
         if !self.parser.at_block_start() {
             return self.salvage_header(HeaderDamageKind::UnexpectedEnd);
         }
@@ -268,12 +272,6 @@ impl ProgressiveSession {
             Some(parked) if parked <= full.min(self.buffer.len()) => parked,
             _ => full.min(self.buffer.len()).min(budget).max(1),
         };
-        if !self.resync_work.charge(n as u64) {
-            let Phase::Resync(scan) = &mut self.phase else { unreachable!() };
-            scan.eof = true;
-            scan.window.truncate((scan.pos - scan.start) as usize);
-            return Ok(None);
-        }
         if at != self.cursor {
             self.driver.seek(at)?;
             self.cursor = at;
@@ -305,6 +303,12 @@ impl ProgressiveSession {
                 let Phase::Resync(scan) = &mut self.phase else { unreachable!() };
                 if offset != scan.start + scan.window.len() as u64 {
                     return Err(ProgressiveFailure::new(FailureKind::SourceContract));
+                }
+                // only the bytes delivered count as work: a short read or a wait costs nothing
+                if !self.resync_work.charge(count as u64) {
+                    scan.eof = true;
+                    self.driver.validate_step()?;
+                    return Ok(None);
                 }
                 // the window holds at most a candidate's bytes and one chunk: its capacity is charged as it grows
                 let before = scan.window.capacity();

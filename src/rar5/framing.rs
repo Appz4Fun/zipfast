@@ -323,9 +323,10 @@ impl HeaderParser {
             },
         }
     }
-    /// Whether damaged headers are read past ([`Self::set_salvage`]).
+    /// Whether damaged headers are read past ([`Self::set_salvage`]): never once the archive is recognised as having
+    /// encrypted headers, where a failed checksum or a cut header is how a wrong password or a truncation shows.
     pub(crate) fn salvages(&self) -> bool {
-        self.salvage
+        self.salvage && !self.encrypted()
     }
     /// Whether an unreadable header is searched past ([`crate::extract::DamagedInput::Resync`]).
     pub(crate) fn resyncs(&self) -> bool {

@@ -228,6 +228,7 @@ struct Run<'a> {
     hole: bool,
     /// Called on every `Pending` with the outcome so far; returns whether to open the gate.
     on_pending: &'a mut dyn FnMut(&Outcome) -> bool,
+    password: Option<&'a str>,
 }
 
 fn progressive(run: Run<'_>) -> Outcome {
@@ -237,6 +238,7 @@ fn progressive(run: Run<'_>) -> Outcome {
     let mut options =
         ProgressiveOptions::new(extract_options(&dest, Mode::Extract, run.damaged), OsString::from(run.volumes[0].0));
     options.artifact_aftermath = ArtifactAftermath::RetainProvisional;
+    options.set_password(run.password.map(str::to_owned)).unwrap();
     let revealed = Arc::new(AtomicU64::new(0));
     let open = Arc::new(AtomicBool::new(run.gate.is_empty()));
     let session = match run.route {
@@ -332,7 +334,7 @@ fn progressive(run: Run<'_>) -> Outcome {
 }
 
 fn run_simple(volumes: &[(&str, Vec<u8>)], damaged: DamagedInput, route: Route) -> Outcome {
-    progressive(Run { volumes, damaged, route, gate: 0..0, hole: false, on_pending: &mut |_| false })
+    progressive(Run { volumes, damaged, route, gate: 0..0, hole: false, on_pending: &mut |_| false, password: None })
 }
 
 /// What `extract::run` makes of the same volumes: files and bytes, folders, and the damage list.
@@ -489,6 +491,7 @@ fn a_header_still_to_come_is_waited_for_and_one_in_a_hole_is_not_damage() {
                     waits += 1;
                     waits > 400
                 },
+                password: None,
             });
             assert!(waits > 400, "{format} {damaged:?}: the session did not wait for the header");
             assert_eq!(out.failure, None, "{format} {damaged:?}");
@@ -504,6 +507,7 @@ fn a_header_still_to_come_is_waited_for_and_one_in_a_hole_is_not_damage() {
                 gate: gate.clone(),
                 hole: true,
                 on_pending: &mut |_| false,
+                password: None,
             });
             assert_eq!(out.failure.as_deref(), Some("HeaderHole"), "{format} {damaged:?}");
             assert!(out.damage.is_empty(), "{format} {damaged:?}: {:?}", out.damage);
@@ -527,6 +531,7 @@ fn a_resync_never_searches_across_a_hole() {
         gate,
         hole: true,
         on_pending: &mut |_| false,
+        password: None,
     });
     assert_eq!(out.failure.as_deref(), Some("HeaderHole"));
     assert!(out.damage.is_empty(), "{:?}", out.damage);
@@ -671,6 +676,57 @@ fn resync_crosses_random_data_and_false_headers_in_bounded_work() {
         assert_eq!(out.files.keys().collect::<Vec<_>>(), ["a.txt", "b.txt", "c.txt"], "{what}");
         assert_eq!(out.damage.len(), 1, "{what}: {:?}", out.damage);
         assert_eq!(out.damage[0].4, Some((at[1] + 5 + filler.len()) as u64), "{what}");
+    }
+}
+
+/// A source that delivers a few bytes a call and waits in between: a resync charges only the bytes delivered, so
+/// crossing a long garbage stretch in tiny pieces (and many waits) never runs out of its allowance.
+#[test]
+fn a_resync_fed_in_pieces_charges_only_the_bytes_delivered() {
+    let (bytes, at) = rar5();
+    let filler = noise(256 << 10, 0x2545_f491_4f6c_dd1d);
+    let mut damaged = bytes[..at[1]].to_vec();
+    damaged.extend([0; 5]);
+    damaged.extend(&filler);
+    damaged.extend(&bytes[at[1]..]);
+    let out = run_simple(&[("a.rar", damaged)], DamagedInput::Resync, Route::Pieces);
+    assert_eq!(out.failure, None, "{out:?}");
+    assert_eq!(out.files.keys().collect::<Vec<_>>(), ["a.txt", "b.txt", "c.txt"]);
+    assert_eq!(out.damage.len(), 1, "{:?}", out.damage);
+    assert_eq!(out.damage[0].4, Some((at[1] + 5 + filler.len()) as u64));
+}
+
+/// What isn't salvage: a source that ends before any RAR signature (empty, or a few bytes of something else) is
+/// refused as before, and an archive with encrypted headers cut at a header boundary is a truncation, not damage
+/// (encrypted headers are never salvaged).
+#[test]
+fn no_signature_and_encrypted_headers_are_not_salvaged() {
+    let mut fields = Vec::new();
+    common::vint(0, &mut fields); // encryption version
+    common::vint(0, &mut fields); // flags: no password check
+    fields.push(15); // KDF count
+    fields.extend([7; 16]); // salt
+    let mut encrypted = SIG.to_vec();
+    encrypted.extend(common::block(4, 0, &fields, &[], &[], false));
+    for (what, bytes, password) in
+        [("empty", Vec::new(), None), ("not rar", b"hello".to_vec(), None), ("encrypted", encrypted, Some("pw"))]
+    {
+        for damaged in [DamagedInput::Refuse, DamagedInput::Salvage, DamagedInput::Resync] {
+            for route in [Route::Sealed, Route::Pieces] {
+                let volumes = [("a.rar", bytes.clone())];
+                let out = progressive(Run {
+                    volumes: &volumes,
+                    damaged,
+                    route,
+                    gate: 0..0,
+                    hole: false,
+                    on_pending: &mut |_| false,
+                    password,
+                });
+                assert!(out.failure.is_some(), "{what} {damaged:?} {route:?}: {out:?}");
+                assert!(out.damage.is_empty(), "{what} {damaged:?} {route:?}: {:?}", out.damage);
+            }
+        }
     }
 }
 
