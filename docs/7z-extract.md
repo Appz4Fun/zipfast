@@ -145,8 +145,9 @@ core), an LZMA2 coder whose output is at least 2 MiB decodes such blocks side by
 - Worker threads start only with a second piece: an LZMA-coded stream of one block (one-thread 7-Zip, `-mmt1`,
   liblzma) is decoded on the run's thread alone, with a short lookahead.
 
-Memory is bounded by `SevenZipLimits::lzma2_parallel_bytes` (256 MiB, at least 4 MiB), so several extractions at
-once stay modest. Each worker costs its dictionary (the coder's, shrunk to the folder's output) and its one 1 MiB
+Memory is bounded by `SevenZipLimits::lzma2_parallel_bytes`: by default an eighth of the machine's memory, at least
+256 MiB and at most 2 GiB (1 GiB where the memory can't be read; at least 4 MiB is used). It is a cap, not an
+allocation: memory is taken only as blocks are decoded ahead of the one being written. Each worker costs its dictionary (the coder's, shrunk to the folder's output) and its one 1 MiB
 output buffer, which it makes only when it has output to make (a short last segment goes out in a buffer of its own
 size, and every queued buffer counts by what it allocates); the workers take at most a third of the budget, and
 fewer start when they would take more (none: one thread). Their dictionaries also come out of what
@@ -160,7 +161,13 @@ run is waiting for those: the run always moves, and a run that stops reading (wr
 consumer) stops the head too, so a block of zeros cannot pile up decoded output. Reading ahead also stops once the
 packed bytes waiting in the piece being read pass the larger of 8 MiB and the output handed out so far, capped by
 the budget (256 KiB in a piece that is nine tenths stored chunks, which cost only a copy to decode), so a one-block stream holds little more
-than the one-thread decoder does. All told, the threads hold at most the budget and two segments at any moment.
+than the one-thread decoder does. Two exceptions, so that the blocks reach the threads early: before the workers
+start (the first piece, which may be the only one) that lookahead may reach four dictionary windows, one 7-Zip
+block's packed bytes, so the second piece is found while the first is still decoding; and while a worker waits with
+no piece to decode, only the budget bounds reading ahead, since every piece found then puts a thread to work. (On
+the 1.28 GB archive below, the second piece used to be found only half way through the first, and the stored
+pieces of its random files were read 256 KiB at a time, so the text blocks after them reached the workers a second
+late.) All told, the threads hold at most the budget and two segments at any moment.
 Peak resident memory can read higher: each piece's decoder allocates its dictionary afresh (liblzma offers no way to
 reuse one), and on Linux glibc keeps freed blocks of that size in its per-thread arenas instead of returning them.
 So on glibc a worker asks it to trim its arenas (`malloc_trim`) after finishing pieces, at most once per 4 MiB of
@@ -169,12 +176,15 @@ dictionaries freed. With 12 threads on the 16 MiB-block archive below that broug
 back by itself) gave 287 MiB, and 8 threads 296 MiB without either.
 
 7-Zip's blocks are four times its dictionary: 4 MiB at `-md=1m`, 64 MiB at `-mx5`'s 16 MiB, 256 MiB at `-mx9`'s
-64 MiB (7-Zip 26 at `-mx5 -mmt8` wrote 134 MiB blocks with a 32 MiB dictionary for the measured archive). With the
-256 MiB default such a stream gets two workers (a 32 MiB dictionary and a 1 MiB buffer each) and 190 MiB for bytes
-in flight, about one and a half blocks, so it decodes only partly side by side: about 1.6 times one thread on that
-archive, whatever the thread count. Streams of smaller blocks (16 MiB at `-md=4m`) get every thread. A caller that
-wants the most speed on large blocks and has the memory raises `lzma2_parallel_bytes` (1 GiB lets the six 134 MiB
-blocks overlap: about 3.4 times one thread at 8 threads, with peak memory near 1 GiB).
+64 MiB (7-Zip 26 at `-mx5 -mmt8` wrote 134 MiB blocks with a 32 MiB dictionary for one archive). Blocks decoded
+ahead of the one being written are held whole, so how many decode side by side is about the bytes in flight over
+the block size. With the old 256 MiB default a stream of 64 MiB blocks got about one and a half blocks in flight and
+decoded only partly side by side, whatever the thread count; the memory-scaled default lets a dozen or more 64 MiB
+blocks overlap. A caller running several extractions at once may lower it.
+
+Measured on 1.28 GB of mixed data (600 MB of text, 600 MB of random bytes, 80 MB of short runs; `7z a -m0=lzma2
+-mx5 -mmt`), median of 3 runs, extracting to local disk: see the pull request that made the default scale with
+memory for the table against `7zz`.
 
 Failures keep their place. A piece that does not decode, ends early, or whose packed bytes cannot be read gives the
 output it decoded before the failure and then the failure, in stream order, so the failure lands on the member it
