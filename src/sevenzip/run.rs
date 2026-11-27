@@ -75,6 +75,9 @@ struct Active {
     tested: Vec<(String, u64, u64)>,
     /// Printed members held back for the folder's CRC in the same case: listing index and spooled data.
     held: Vec<(u64, Spool)>,
+    /// [`crate::extract::UnverifiedOutput::Emit`]: those of `held` that failed and print unverified (queued behind
+    /// the ones before them, so the output stays in archive order)
+    unverified_held: Vec<u64>,
     defer: bool,
 }
 
@@ -294,6 +297,9 @@ struct Run<'a> {
     store: SpoolStore,
     /// threads an LZMA2 coder may decode its blocks on
     threads: usize,
+    /// [`crate::extract::UnverifiedOutput::Emit`] when printing: a member that fails on its data prints what was
+    /// decoded of it, as 7-Zip 26.06 `x -so` does
+    unverified: bool,
 }
 
 /// `threads` as asked for, None for one per core.
@@ -364,6 +370,7 @@ pub(super) fn run(
         print: None,
         store: SpoolStore::default(),
         threads: thread_count(options.threads),
+        unverified: false,
     };
     let result = run.members(&selected, &needed);
     crate::extract::finish_dirs(&mut run.summary);
@@ -386,6 +393,7 @@ pub(super) fn print(
     sink: PrintSink<'_>,
     cancel: &Cancellation,
     limits: &SevenZipLimits,
+    unverified: bool,
 ) -> Outcome<Summary> {
     let (map, header_key) = open_map_keyed(first, password, cancel, limits)?;
     let mut keys = Keys::new(password);
@@ -432,8 +440,10 @@ pub(super) fn print(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        encrypted_links: Default::default(),
         damaged_input: Default::default(),
         unsupported_filters: Default::default(),
+        unverified_output: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
@@ -460,6 +470,7 @@ pub(super) fn print(
         print: Some(sink),
         store: SpoolStore::default(),
         threads: thread_count(limits.decode_threads),
+        unverified,
     };
     run.members(&selected, &needed)?;
     Ok(run.summary)
@@ -527,7 +538,13 @@ impl Run<'_> {
 
     /// Marks the active folder as not decrypting under the password (shown by `failure`), and fails this member if it
     /// is taken.
-    fn wrong_password(&mut self, active: &mut Active, name: &str, take: bool, failure: EncryptedFailure) {
+    fn wrong_password(
+        &mut self,
+        active: &mut Active,
+        name: &str,
+        take: bool,
+        failure: EncryptedFailure,
+    ) -> Outcome<()> {
         // the first sign decides: the rest of the folder fails the same way
         let failure = *active.wrong_password.get_or_insert(failure);
         if active.failed.is_none() {
@@ -541,9 +558,23 @@ impl Run<'_> {
             .chain(std::mem::take(&mut active.tested).into_iter().map(|(n, _, o)| (o, n)))
             .collect();
         held.sort_by_key(|(o, _)| *o);
-        // printed members held for the same CRC print nothing: let their plaintext go now
-        for (_, mut spool) in active.held.drain(..) {
-            let _ = self.store.release(&mut spool);
+        // printed members held for the same CRC print nothing (UnverifiedOutput::Emit: what they hold): let their
+        // plaintext go now
+        active.unverified_held.clear();
+        let mut spools = std::mem::take(&mut active.held).into_iter();
+        while let Some((ordinal, mut spool)) = spools.next() {
+            if self.unverified {
+                let name = member_name(&self.map.members[ordinal as usize]);
+                if let Err(error) = self.print_unverified(ordinal, &name, spool) {
+                    // a failure writing the output ends the run: what is still held goes
+                    for (_, mut spool) in spools {
+                        let _ = self.store.release(&mut spool);
+                    }
+                    return Err(error);
+                }
+            } else {
+                let _ = self.store.release(&mut spool);
+            }
         }
         for (ordinal, held) in held {
             self.fail_wrong_password(ordinal, &held, failure);
@@ -551,6 +582,7 @@ impl Run<'_> {
         if take {
             self.fail_wrong_password(self.current, name, failure);
         }
+        Ok(())
     }
 
     fn skipped(&mut self, ordinal: u64, name: &str) {
@@ -848,6 +880,15 @@ impl Run<'_> {
                 .chain(tested.iter().map(|(n, _, o)| (*o, n.as_str())))
                 .collect();
             failed.sort_by_key(|(o, _)| *o);
+            // UnverifiedOutput::Emit: the printed members held for the folder's CRC print what they hold
+            if self.unverified {
+                for (ordinal, spool) in held {
+                    let name = member_name(&self.map.members[ordinal as usize]);
+                    self.print_unverified(ordinal, &name, spool)?;
+                }
+            } else {
+                drop(held);
+            }
             for (ordinal, name) in failed {
                 if let Some(failure) = wrong_password {
                     self.fail_wrong_password(ordinal, name, failure);
@@ -855,14 +896,19 @@ impl Run<'_> {
                     self.fail_at(ordinal, name, &why);
                 }
             }
-            drop(held);
             return self.store.reset().map_err(SevenZipError::Io);
         }
         // A cancellation from an earlier member's outcome stops the deferred members still to come.
         let canceled = |run: &Self| if run.cancel.is_canceled() { Err(SevenZipError::Canceled) } else { Ok(()) };
+        let unverified_held = std::mem::take(&mut active.unverified_held);
         for (ordinal, spool) in held {
             canceled(self)?;
-            self.print_spooled(ordinal, spool)?;
+            if unverified_held.contains(&ordinal) {
+                let name = member_name(&self.map.members[ordinal as usize]);
+                self.print_unverified(ordinal, &name, spool)?;
+            } else {
+                self.print_spooled(ordinal, spool)?;
+            }
         }
         self.store.reset().map_err(SevenZipError::Io)?;
         for (name, size, ordinal) in tested {
@@ -899,6 +945,7 @@ impl Run<'_> {
             staged: Vec::new(),
             tested: Vec::new(),
             held: Vec::new(),
+            unverified_held: Vec::new(),
             defer: folder.crc32.is_some() && folder.members > 1,
         });
         Ok(())
@@ -1037,8 +1084,13 @@ impl Run<'_> {
         };
         let outcome = self.pump(active, size, dest, Some(&mut crc))?;
         if let Some(why) = outcome {
-            if let Some(spool) = spool.as_mut() {
-                self.store.release(spool).map_err(SevenZipError::Io)?;
+            if let Some(mut spool) = spool.take() {
+                if self.unverified && !spool.over {
+                    // UnverifiedOutput::Emit: what decoded before the failure, as 7-Zip streams it
+                    self.emit_failed(active, name, spool)?;
+                } else {
+                    self.store.release(&mut spool).map_err(SevenZipError::Io)?;
+                }
             }
             return self.data_failure(active, name, &why, encrypted, take);
         }
@@ -1054,8 +1106,13 @@ impl Run<'_> {
         }
         let crc_ok = member.checks.and_then(|c| c.crc32).is_none_or(|want| want == crc.finalize());
         if !crc_ok {
-            if let Some(spool) = spool.as_mut() {
-                self.store.release(spool).map_err(SevenZipError::Io)?;
+            if let Some(mut spool) = spool.take() {
+                if self.unverified && !spool.over {
+                    // UnverifiedOutput::Emit: everything decoded, as 7-Zip streams a member failing its CRC
+                    self.emit_failed(active, name, spool)?;
+                } else {
+                    self.store.release(&mut spool).map_err(SevenZipError::Io)?;
+                }
             }
             // Options::keep_broken: what was decoded stays, as 7-Zip keeps a file that fails its CRC (a wrong
             // password's garbage included); reported failed all the same
@@ -1068,8 +1125,7 @@ impl Run<'_> {
             if encrypted && !self.password_proven {
                 // Decrypted garbage: the password does not open this folder. The rest of the folder fails the same
                 // way; the run goes on with the other folders.
-                self.wrong_password(active, name, take, EncryptedFailure::CrcFailed);
-                return Ok(());
+                return self.wrong_password(active, name, take, EncryptedFailure::CrcFailed);
             }
             if take {
                 self.fail(name, &crate::Error::BadChecksum(name.to_owned()).to_string());
@@ -1159,6 +1215,28 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// [`crate::extract::UnverifiedOutput::Emit`]: a failing member's data, printed now, or behind the members of its
+    /// folder still held for the folder's CRC, so that the output stays in archive order.
+    fn emit_failed(&mut self, active: &mut Active, name: &str, spool: Spool) -> Outcome<()> {
+        if active.held.is_empty() {
+            return self.print_unverified(self.current, name, spool);
+        }
+        active.held.push((self.current, spool));
+        active.unverified_held.push(self.current);
+        Ok(())
+    }
+
+    /// [`crate::extract::UnverifiedOutput::Emit`]: copies a failing member's held-back data to the print sink and
+    /// notes it in [`Summary::unverified`] (the member's failure is reported as without it).
+    fn print_unverified(&mut self, ordinal: u64, name: &str, spool: Spool) -> Outcome<()> {
+        let bytes = spool.len;
+        self.print_spooled(ordinal, spool)?;
+        if bytes != 0 {
+            self.summary.unverified.push(crate::extract::UnverifiedMember::new(ordinal, name, bytes));
+        }
+        Ok(())
+    }
+
     /// Copies a checked member's held-back data to the print sink.
     fn print_spooled(&mut self, ordinal: u64, mut spool: Spool) -> Outcome<()> {
         let Run { print, store, cancel, .. } = self;
@@ -1172,8 +1250,7 @@ impl Run<'_> {
 
     fn data_failure(&mut self, active: &mut Active, name: &str, why: &str, encrypted: bool, take: bool) -> Outcome<()> {
         if encrypted && !self.password_proven {
-            self.wrong_password(active, name, take, EncryptedFailure::DataError);
-            return Ok(());
+            return self.wrong_password(active, name, take, EncryptedFailure::DataError);
         }
         if active.failed.is_none() {
             active.failed = Some("cannot be decoded: an earlier member of its solid block failed".to_owned());

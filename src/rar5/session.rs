@@ -117,6 +117,10 @@ pub struct RarSessionOptions {
     /// default), or read past as UnRAR 7.30 does (`Salvage`), or also searched past (`Resync`). What was read past
     /// is in [`RarArchiveMetadata::damaged_headers`]; the members catalogued past it list and extract as any other.
     pub damaged_input: crate::extract::DamagedInput,
+    /// Whether a test run ([`RarSession::test_selected`]) passes an encrypted RAR 5.0 redirection only when its
+    /// password verifies (the default) or whatever the password ([`crate::extract::Options::encrypted_links`], which
+    /// [`RarSession::extract_selected`] reads instead).
+    pub encrypted_links: crate::extract::EncryptedLinks,
 }
 
 impl Default for RarSessionOptions {
@@ -127,6 +131,7 @@ impl Default for RarSessionOptions {
             follow_volumes: true,
             restart_from_first_volume: false,
             damaged_input: Default::default(),
+            encrypted_links: Default::default(),
         }
     }
 }

@@ -226,6 +226,25 @@ pub(crate) fn rar5_password(
     super::rar5_keys(keys, password, &params, scope).map(|keys| keys.evidence)
 }
 
+/// [`rar5_password`] under [`crate::extract::Options::encrypted_links`]: with
+/// [`crate::extract::EncryptedLinks::PlaceUnverified`] the password isn't checked at all (no key is derived), as
+/// 7-Zip 26.06 doesn't check it, and an encrypted link passes with the evidence
+/// [`crate::error::RarPasswordEvidence::Unverified`]. Only the password is let go: every other link check applies.
+pub(crate) fn rar5_link_password(
+    keys: &mut crate::crypto::Rar5KeyCache,
+    header: &crate::rar5::FileHeader,
+    password: Option<&str>,
+    scope: crate::error::RarScope,
+    links: crate::extract::EncryptedLinks,
+) -> Result<crate::error::RarPasswordEvidence, crate::error::RarFailure> {
+    match links {
+        crate::extract::EncryptedLinks::PlaceUnverified if header.encrypted => {
+            Ok(crate::error::RarPasswordEvidence::Unverified)
+        }
+        _ => rar5_password(keys, header, password, scope),
+    }
+}
+
 /// Why these encryption parameters can't verify a password, or None when their check value can: there is one,
 /// and its checksum matches. Checked before any key is derived.
 pub(crate) fn rar5_unverifiable(

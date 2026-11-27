@@ -58,6 +58,8 @@ fn options(dest: &Path) -> Options {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        unverified_output: Default::default(),
+        encrypted_links: Default::default(),
     }
 }
 
