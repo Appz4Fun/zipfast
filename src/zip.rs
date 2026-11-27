@@ -1538,7 +1538,7 @@ fn run_archive(
                 let found = found.named(member.0, member.1);
                 match target {
                     Some(out) if opts.keep_broken => {
-                        let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta())));
+                        let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta()), None));
                     }
                     target => drop(target),
                 }

@@ -65,6 +65,7 @@ fn extract_options(dest: &Path, keep_broken: bool, unverified: UnverifiedOutput)
         unsupported_filters: Default::default(),
         encrypted_links: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }
