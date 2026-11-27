@@ -121,6 +121,14 @@ pub struct RarSessionOptions {
     /// password verifies (the default) or whatever the password ([`crate::extract::Options::encrypted_links`], which
     /// [`RarSession::extract_selected`] reads instead).
     pub encrypted_links: crate::extract::EncryptedLinks,
+    /// The threads a big RAR 5.0 member is decoded on, as [`crate::extract::Options::threads`]: None for the default
+    /// (one worker fewer than the cores, up to 16), `Some(n)` for `n - 1` workers beside the calling thread, and
+    /// `Some(1)` to decode on the calling thread only. [`RarSession::extract_selected`] takes its options' setting
+    /// over this one when it has one. Output and events stay on the calling thread either way.
+    pub threads: Option<usize>,
+    /// The smallest RAR 5.0 member decoded on workers, as [`crate::extract::Options::parallel_min`] (None for the
+    /// default, 4 MiB). [`RarSession::extract_selected`] takes its options' setting over this one when it has one.
+    pub parallel_min: Option<u64>,
 }
 
 impl Default for RarSessionOptions {
@@ -132,6 +140,8 @@ impl Default for RarSessionOptions {
             restart_from_first_volume: false,
             damaged_input: Default::default(),
             encrypted_links: Default::default(),
+            threads: None,
+            parallel_min: None,
         }
     }
 }
