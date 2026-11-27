@@ -119,6 +119,9 @@ impl<'a> Extraction<'a> {
         hooks: &mut impl ExtractionHooks,
     ) -> Result<RarOutcome, SelectedStop> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
+        // the extraction's own thread settings, where it has any, over the session's
+        run.threads = self.options.threads.or(session.options.threads);
+        run.parallel_min = self.options.parallel_min.or(session.options.parallel_min);
         run.write_unfiltered = self.options.unsupported_filters == crate::extract::UnsupportedFilters::WriteUnfiltered;
         // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume keeps what was decoded
         run.emit_unverified =

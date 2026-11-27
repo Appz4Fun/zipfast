@@ -188,6 +188,7 @@ impl RarSession {
             DriverError::Native(run_error(std::mem::take(&mut summary), None, Arc::from(fault.failure)))
         })?;
         run.versions = selection.versions;
+        (run.threads, run.parallel_min) = (self.options.threads, self.options.parallel_min);
         for (word, mut bits) in selection.bits.iter().copied().enumerate() {
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
@@ -378,6 +379,10 @@ struct SelectedRun {
     next: usize,
     failed: Option<(usize, Arc<RarFailure>)>,
     decoder: Option<Unpacker>,
+    /// [`crate::extract::Options::threads`] and [`crate::extract::Options::parallel_min`] for the RAR 5.0 decoder,
+    /// from [`RarSessionOptions`] or, extracting, the extraction's options
+    threads: Option<usize>,
+    parallel_min: Option<u64>,
     /// the RAR4 decoder, kept between the members of a solid stream
     rar4: Option<Rar4Decoder>,
     /// RAR 3.x keys already derived for the session's password, by salt
@@ -433,6 +438,8 @@ impl SelectedRun {
             next: 0,
             failed: None,
             decoder: None,
+            threads: None,
+            parallel_min: None,
             rar4: None,
             rar4_keys: Default::default(),
             tested: Default::default(),
@@ -662,6 +669,8 @@ impl SelectedRun {
                 && let Some(decoder) = self.decoder.as_mut()
             {
                 decoder.track_tail();
+                // UnRAR's cut at the data's end needs the last symbols of each block, which workers don't note
+                decoder.serial_file();
             }
         }
         for (part_index, part) in parts.iter().enumerate() {
@@ -909,7 +918,7 @@ impl SelectedRun {
             self.decoder = None;
             let mut decoder =
                 Unpacker::new_detailed(window).map_err(|error| *error.detailed(context.scope()).failure)?;
-            decoder.set_threads(0, decoder.parallel_min());
+            crate::rar5::member::apply_threads(&mut decoder, self.threads, self.parallel_min);
             decoder.reset(member.unpacked_size);
             self.decoder = Some(decoder);
         }

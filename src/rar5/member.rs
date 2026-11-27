@@ -1065,6 +1065,16 @@ pub(crate) fn continue_decoder(stream: &mut Option<Unpacker>, dictionary: u64, s
         false
     }
 }
+/// [`crate::extract::Options::threads`] and [`crate::extract::Options::parallel_min`] on a new decoder: both None keep
+/// its default workers, `Some(n)` threads mean `n - 1` workers (`Some(1)` and `Some(0)` decode on the calling thread
+/// only), and a `parallel_min` sets the smallest file decoded on them.
+pub(crate) fn apply_threads(decoder: &mut Unpacker, threads: Option<usize>, parallel_min: Option<u64>) {
+    if threads.is_some() || parallel_min.is_some() {
+        let workers = threads.map_or_else(|| decoder.threads(), |n| n.saturating_sub(1));
+        decoder.set_threads(workers, parallel_min.unwrap_or(decoder.parallel_min()));
+    }
+}
+
 pub(crate) fn reset_decoder(
     stream: &mut Option<Unpacker>,
     window: super::unpack::Window,
@@ -1076,10 +1086,7 @@ pub(crate) fn reset_decoder(
         decoder.restart(window, size);
     } else {
         let mut decoder = Unpacker::new_detailed(window)?;
-        if threads.is_some() || parallel_min.is_some() {
-            let workers = threads.map_or_else(|| decoder.threads(), |n| n.saturating_sub(1));
-            decoder.set_threads(workers, parallel_min.unwrap_or(decoder.parallel_min()));
-        }
+        apply_threads(&mut decoder, threads, parallel_min);
         decoder.reset(size);
         *stream = Some(decoder);
     }

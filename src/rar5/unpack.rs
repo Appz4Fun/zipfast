@@ -984,6 +984,13 @@ impl Unpacker {
         self.parallel = self.threads > 0;
     }
 
+    /// Decodes the current file on the calling thread whatever its size: for a file whose blocks
+    /// [`Self::track_tail`] must follow. Call it before the file's first byte is fed ([`Self::reset`],
+    /// [`Self::restart`] and [`Self::next_file`] leave nothing with the workers); the next file decides again.
+    pub(crate) fn serial_file(&mut self) {
+        self.parallel = false;
+    }
+
     /// Starts the next file of a solid stream without waiting for the one before: its blocks may still be with the
     /// workers. Where the files meet, the earlier one is checked as [`Self::finish`] would, then the sink is called
     /// with an empty slice; the sink is never called with one otherwise. The earlier file's errors come out of later
