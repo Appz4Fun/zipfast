@@ -966,18 +966,24 @@ impl Options {
     }
 
     /// A RAR member's `meta` with the mode a run restores: under [`UnixModes::Masked`] a Unix-host member whose mode
-    /// has no file-type bits (`S_IFMT`, as a RAR 4.x attribute of `0x20` has none) is left with the mode file creation
-    /// gives, as 7-Zip 26.06 leaves it (it sets no mode then). [`UnixModes::Stored`] keeps it, as UnRAR 7.30 sets it.
-    pub(crate) fn rar_mode(&self, mut meta: Meta) -> Meta {
+    /// has no file-type bits (`S_IFMT`, as a RAR 4.x attribute of `0x20` has none) is given `0o666` (a folder `0o777`)
+    /// less the umask, what file creation gives, as 7-Zip 26.06 leaves it (it sets no mode then). [`UnixModes::Stored`]
+    /// keeps the stored bits, as UnRAR 7.30 sets them.
+    pub(crate) fn rar_mode(&self, mut meta: Meta, dir: bool) -> Meta {
         if matches!(self.unix_modes, UnixModes::Masked { .. }) && meta.mode.is_some_and(|mode| mode & 0o170000 == 0) {
-            meta.mode = None;
+            meta.mode = Some(if dir { 0o777 } else { 0o666 });
         }
         meta
     }
 
     /// [`Self::meta`] for a RAR file member, its mode as [`Self::rar_mode`] gives it.
     pub(crate) fn rar_meta(&self, h: &FileHeader) -> Meta {
-        self.meta(self.rar_mode(Meta::from(h)))
+        self.meta(self.rar_mode(Meta::from(h), false))
+    }
+
+    /// [`Self::dir_meta`] for a RAR folder member, its mode as [`Self::rar_mode`] gives it.
+    pub(crate) fn rar_dir_meta(&self, h: &FileHeader) -> Meta {
+        self.dir_meta(self.rar_mode(Meta::from(h), true))
     }
 
     /// [`Self::meta`] for a folder.
@@ -3949,7 +3955,7 @@ impl Checks {
     /// [`Checks::from`], with the time and mode `opts` restore ([`Options::meta`]).
     fn with_options(h: &FileHeader, opts: &Options) -> Self {
         let mut checks = Checks::from(h);
-        checks.meta = opts.meta(opts.rar_mode(checks.meta));
+        checks.meta = opts.meta(opts.rar_mode(checks.meta, false));
         checks
     }
 }
@@ -5231,7 +5237,7 @@ impl Run<'_, '_, '_> {
                     self.fail_in_order(&ctx, failure, why)?;
                     return Ok(());
                 }
-                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.dir_meta(self.opts.rar_mode(Meta::from(h)))));
+                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.rar_dir_meta(h)));
             }
             return self.reports.directory(&ctx);
         }

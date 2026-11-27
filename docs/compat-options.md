@@ -504,7 +504,8 @@ whoever wrote it, as both tools do. `hl.rar` holds `t/hard66` and the hard link 
 | a symbolic link at `t/hard66` (to `/etc/hostname`) | hard-links the symbolic link | "Dangerous link via another link was ignored" | linked to `t/hard66(1)` | fails |
 
 The file is reached from the destination without following a link, and linked only while it is still that file. A
-symbolic link there is never linked to, so no link zipfast makes leads out of the destination. Honoured by the
+symbolic link there is never linked to, so no link zipfast makes leads out of the destination, and neither is the
+file at the link's own path (a rename mode's reservation, or what the link replaces). Honoured by the
 whole-archive RAR and tar runners and by progressive sessions; `RarSession` and test runs keep `Extracted`, and RAR 5.0
 file copies are unaffected.
 
@@ -512,8 +513,8 @@ file copies are unaffected.
 
 A Unix-host RAR member stores the whole `st_mode`. A mode without file-type bits (`S_IFMT` 0, such as a RAR 4.x member
 with Unix host and attribute `0x20`) is a mode 7-Zip doesn't set. Under `UnixModes::Masked` (7-Zip's choice) such a
-member, file or folder, is left with the mode file creation gives; under `UnixModes::Stored` (the default) its
-permission bits are set, as UnRAR does. With umask 022:
+member is given what file creation gives with the umask passed, `0o666 & !umask` (a folder `0o777 & !umask`), as
+7-Zip leaves it; under `UnixModes::Stored` (the default) its permission bits are set, as UnRAR does. With umask 022:
 
 | stored mode (RAR 4.x attribute or RAR 5.0 mode) | UnRAR 7.30 | 7-Zip 26.06 | `Stored` | `Masked { umask: 0o022 }` |
 |---|---|---|---|---|

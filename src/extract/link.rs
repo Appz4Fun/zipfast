@@ -714,7 +714,11 @@ fn make_charging(
         LinkKind::Symbolic(target) if let Some(why) = foreign_link(dest, path, target, extracted) => Err(refused(why)),
         LinkKind::Symbolic(target) => create(path, target, replace, modified),
         LinkKind::Hard(source) if extracted.stored_name_targets => {
-            let found = stored_file(dest, source).ok_or_else(|| refused(STORED_TARGET))?;
+            // never the file at the link's own path (a rename mode's reservation, or what the link replaces)
+            let own = std::fs::symlink_metadata(path).ok().map(|m| identity(&m));
+            let found = stored_file(dest, source)
+                .filter(|found| !(cfg!(unix) && own == Some((found.dev, found.ino))))
+                .ok_or_else(|| refused(STORED_TARGET))?;
             hard(dest, &found, path, replace, false, charge)
         }
         LinkKind::Hard(source) | LinkKind::Copy(source) => {

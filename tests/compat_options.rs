@@ -983,21 +983,30 @@ fn stored_name_hard_links_take_the_file_at_the_targets_name() {
     assert_eq!(fs::read(tmp.path().join("folder/t/hard66(1)")).unwrap(), b"new");
     assert_eq!(fs::read(&outside).unwrap(), b"secret");
 
+    // Codex on #329: a link whose target is its own name finds nothing there, not its own rename reservation
+    let selfish = tmp.path().join("self.rar");
+    let link_only = [FileSpec { extra: redirection_record(4, "t/self"), ..FileSpec::new("t/self", b"") }];
+    fs::write(&selfish, archive(&link_only)).unwrap();
+    for flatten in [false, true] {
+        let out = tmp.path().join(format!("self-{flatten}"));
+        let opts = Options {
+            overwrite: rename,
+            flatten,
+            hard_link_targets: HardLinkTargets::StoredName,
+            ..options(Mode::Extract, &out)
+        };
+        let summary = extract::run_with_password(&selfish, &opts, None, |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        let landed = if flatten { out.join("self") } else { out.join("t/self") };
+        assert!(fs::symlink_metadata(&landed).is_err(), "{landed:?}");
+    }
+
     // nothing in the way: both choices make the same link
     let none = |_: &Path| {};
     let (out, summary) = run("plain-stored", Overwrite::Always, HardLinkTargets::StoredName, false, &none);
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);
     assert_eq!(inode(&out.join("t/9iv20ci0cx")), inode(&out.join("t/hard66")));
     assert_eq!(fs::read(out.join("t/9iv20ci0cx")).unwrap(), b"new");
-}
-
-/// The mode a new file and a new folder get here (what file creation gives, less the process's umask).
-#[cfg(unix)]
-fn creation_modes(dir: &Path) -> (u32, u32) {
-    fs::create_dir_all(dir).unwrap();
-    fs::write(dir.join("probe-file"), b"").unwrap();
-    fs::create_dir(dir.join("probe-dir")).unwrap();
-    (mode_of(&dir.join("probe-file")), mode_of(&dir.join("probe-dir")))
 }
 
 /// A RAR 4.x header block of `kind` with its CRC set.
@@ -1027,13 +1036,12 @@ fn rars_compressed_attr(attr: u32) -> Vec<u8> {
 }
 
 /// prybar fuzz2 (N-UMASK): a Unix-host RAR member whose mode has no file-type bits (a RAR 4.x attribute of 0x20) is
-/// set as stored by UnRAR 7.30 (0o040) and left alone by 7-Zip 26.06 (0o666 less the umask); with file-type bits both
+/// set as stored by UnRAR 7.30 (0o040) and left alone by 7-Zip 26.06 (0o666 less the umask, 0o644 here); with file-type bits both
 /// set it. RAR 5.0 members and folders likewise.
 #[cfg(unix)]
 #[test]
 fn masked_unix_modes_leave_modes_without_a_file_type() {
     let tmp = tempfile::tempdir().unwrap();
-    let (file_mode, dir_mode) = creation_modes(&tmp.path().join("probe"));
     let masked =
         |out: &Path| Options { unix_modes: extract::UnixModes::Masked { umask: 0o022 }, ..options(Mode::Extract, out) };
     let extract = |name: &str, bytes: &[u8], masked_run: bool| {
@@ -1049,7 +1057,7 @@ fn masked_unix_modes_leave_modes_without_a_file_type() {
     let out = extract("r4-20-stored", &rars_compressed(), false);
     assert_eq!(mode_of(&out.join("payload.txt")), 0o040);
     let out = extract("r4-20-masked", &rars_compressed(), true);
-    assert_eq!(mode_of(&out.join("payload.txt")), file_mode & !0o022);
+    assert_eq!(mode_of(&out.join("payload.txt")), 0o644);
     let out = extract("r4-8020-masked", &rars_compressed_attr(0x8020), true);
     assert_eq!(mode_of(&out.join("payload.txt")), 0o040);
     let out = extract("r4-81ff-masked", &rars_compressed_attr(0x81ff), true);
@@ -1073,7 +1081,7 @@ fn masked_unix_modes_leave_modes_without_a_file_type() {
     let rar5 = archive(&files);
     let out = extract("r5-masked", &rar5, true);
     let found = ["f40", "f100040", "d500", "d40500"].map(|name| mode_of(&out.join(name)));
-    assert_eq!(found, [file_mode & !0o022, 0o040, dir_mode & !0o022, 0o700]);
+    assert_eq!(found, [0o644, 0o040, 0o755, 0o700]);
     let out = extract("r5-stored", &rar5, false);
     let found = ["f40", "f100040", "d500", "d40500"].map(|name| mode_of(&out.join(name)));
     assert_eq!(found, [0o040, 0o040, 0o500, 0o500]);
