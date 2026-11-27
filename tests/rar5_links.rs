@@ -56,6 +56,7 @@ fn options(dest: &Path, mode: Mode, overwrite: Overwrite, threads: usize) -> Opt
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 
@@ -814,6 +815,7 @@ fn refused_links_leave_placeholders_on_every_writer() {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
         ..options(dest, Mode::Extract, Overwrite::Always, 1)
     };
     let check = |dest: &Path, placeholder: bool, failed: &[u64], writer: &str| {

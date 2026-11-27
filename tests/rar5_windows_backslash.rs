@@ -37,6 +37,7 @@ fn extract_to(bytes: &[u8], dir: &std::path::Path) -> Vec<String> {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     extract::run_with_password(&rar, &options, None, |_| {}).unwrap();
     let mut names: Vec<String> =

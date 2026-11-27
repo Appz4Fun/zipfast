@@ -78,6 +78,7 @@ fn options(mode: Mode, dest: &Path) -> Options {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 
@@ -469,6 +470,7 @@ fn rar5_revisions_are_named_as_7zip_names_them_on_request() {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
         ..options(Mode::Extract, dest)
     };
     let out = tmp.path().join("seven");
@@ -511,6 +513,7 @@ fn r5extra_comes_out_as_7zip_writes_it() {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
         ..options(Mode::Extract, &out)
     };
     extract::run(&fixture("rar5-compat", "r5extra.rar"), &opts, |_| {}).unwrap();
@@ -883,4 +886,309 @@ fn literal_backslashes_map_rar5_link_targets_as_names() {
     assert_eq!(fs::read(out.join("d\\x.txt")).unwrap(), b"target");
     assert_eq!(fs::read(out.join("hard.txt")).unwrap(), b"target");
     assert_eq!(fs::read(out.join("copy.txt")).unwrap(), b"target");
+}
+
+/// A RAR 5.0 redirection extra record of `kind` (4 hard link, 5 file copy) to `target`.
+fn redirection_record(kind: u64, target: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    for v in [5, kind, 0, target.len() as u64] {
+        common::vint(v, &mut body);
+    }
+    body.extend(target.as_bytes());
+    let mut extra = Vec::new();
+    common::vint(body.len() as u64, &mut extra);
+    extra.extend(body);
+    extra
+}
+
+#[cfg(unix)]
+fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).unwrap().ino()
+}
+
+/// prybar fuzz2 (N-UNRAR-OR-HARDLINK): with `t/hard66` already in the destination, UnRAR 7.30 `x -or` and 7-Zip
+/// 26.06 `x -aou` write the new `t/hard66` under another name and make the hard link `t/9iv20ci0cx` to the old file at
+/// the target's stored name. `HardLinkTargets::StoredName` does the same; the default links to the renamed new file.
+#[cfg(unix)]
+#[test]
+fn stored_name_hard_links_take_the_file_at_the_targets_name() {
+    use extract::{HardLinkTargets, RenameStyle};
+    let tmp = tempfile::tempdir().unwrap();
+    let rar = tmp.path().join("hl.rar");
+    let files = [
+        FileSpec::new("t/hard66", b"new"),
+        FileSpec { extra: redirection_record(4, "t/hard66"), ..FileSpec::new("t/9iv20ci0cx", b"") },
+    ];
+    fs::write(&rar, archive(&files)).unwrap();
+    let run = |name: &str, overwrite: Overwrite, targets: HardLinkTargets, flatten: bool, before: &dyn Fn(&Path)| {
+        let out = tmp.path().join(name);
+        fs::create_dir_all(out.join("t")).unwrap();
+        before(&out);
+        let opts = Options { overwrite, flatten, hard_link_targets: targets, ..options(Mode::Extract, &out) };
+        let summary = extract::run_with_password(&rar, &opts, None, |_| {}).unwrap();
+        (out, summary)
+    };
+    let old = |out: &Path| fs::write(out.join("t/hard66"), b"OLD").unwrap();
+    let none_before = |_: &Path| {};
+    let rename = Overwrite::RenameNew(RenameStyle::Parenthesized);
+
+    // -or: the default links to the renamed new file, StoredName to the old one, as both tools do
+    let (out, summary) = run("or-default", rename, HardLinkTargets::Extracted, false, &old);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("t/9iv20ci0cx")).unwrap(), b"new");
+    assert_eq!(inode(&out.join("t/9iv20ci0cx")), inode(&out.join("t/hard66(1)")));
+    let (out, summary) = run("or-stored", rename, HardLinkTargets::StoredName, false, &old);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("t/hard66(1)")).unwrap(), b"new");
+    assert_eq!(fs::read(out.join("t/9iv20ci0cx")).unwrap(), b"OLD");
+    assert_eq!(inode(&out.join("t/9iv20ci0cx")), inode(&out.join("t/hard66")));
+
+    // the link's own name taken too: it lands renamed, still linked to the old file
+    let both = |out: &Path| {
+        old(out);
+        fs::write(out.join("t/9iv20ci0cx"), b"OLD2").unwrap();
+    };
+    let (out, summary) = run("or-both", rename, HardLinkTargets::StoredName, false, &both);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("t/9iv20ci0cx")).unwrap(), b"OLD2");
+    assert_eq!(inode(&out.join("t/9iv20ci0cx(1)")), inode(&out.join("t/hard66")));
+
+    // -o-: the target member is skipped; UnRAR and 7-Zip link to what is there, the default refuses the link
+    let (out, summary) = run("skip-default", Overwrite::Skip, HardLinkTargets::Extracted, false, &old);
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(!out.join("t/9iv20ci0cx").exists());
+    let (out, summary) = run("skip-stored", Overwrite::Skip, HardLinkTargets::StoredName, false, &old);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(inode(&out.join("t/9iv20ci0cx")), inode(&out.join("t/hard66")));
+
+    // e -or: the flattened name, as UnRAR `e` takes it
+    let flat_old = |out: &Path| fs::write(out.join("hard66"), b"OLD").unwrap();
+    let (out, summary) = run("e-stored", rename, HardLinkTargets::StoredName, true, &flat_old);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join("hard66(1)")).unwrap(), b"new");
+    assert_eq!(inode(&out.join("9iv20ci0cx")), inode(&out.join("hard66")));
+
+    // a symbolic link or a folder at the target's name is never linked to (UnRAR hard-links a symbolic link)
+    let outside = tmp.path().join("outside.txt");
+    fs::write(&outside, b"secret").unwrap();
+    let symlink = |out: &Path| std::os::unix::fs::symlink(&outside, out.join("t/hard66")).unwrap();
+    let folder = |out: &Path| fs::create_dir(out.join("t/hard66")).unwrap();
+    for (name, before) in [("symlink", &symlink as &dyn Fn(&Path)), ("folder", &folder)] {
+        let (out, summary) = run(name, rename, HardLinkTargets::StoredName, false, before);
+        let refused = summary.errors.iter().filter(|e| e.starts_with("t/9iv20ci0cx: ")).count();
+        assert_eq!(refused, 1, "{name}: {:?}", summary.errors);
+        assert!(fs::symlink_metadata(out.join("t/9iv20ci0cx")).is_err(), "{name}");
+    }
+    // (a symbolic link in the way of `t/hard66` itself fails that member, whatever the rename mode)
+    assert_eq!(fs::read(tmp.path().join("folder/t/hard66(1)")).unwrap(), b"new");
+    assert_eq!(fs::read(&outside).unwrap(), b"secret");
+
+    // Codex on #329: a link whose target is its own name finds nothing there, not its own rename reservation
+    let selfish = tmp.path().join("self.rar");
+    let link_only = [FileSpec { extra: redirection_record(4, "t/self"), ..FileSpec::new("t/self", b"") }];
+    fs::write(&selfish, archive(&link_only)).unwrap();
+    for flatten in [false, true] {
+        let out = tmp.path().join(format!("self-{flatten}"));
+        let opts = Options {
+            overwrite: rename,
+            flatten,
+            hard_link_targets: HardLinkTargets::StoredName,
+            ..options(Mode::Extract, &out)
+        };
+        let summary = extract::run_with_password(&selfish, &opts, None, |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        let landed = if flatten { out.join("self") } else { out.join("t/self") };
+        assert!(fs::symlink_metadata(&landed).is_err(), "{landed:?}");
+    }
+
+    // Codex on #329: a link whose path is already another hard link to the target is made again
+    let (out, summary) = run("relink", Overwrite::Always, HardLinkTargets::StoredName, false, &none_before);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    let opts = Options {
+        overwrite: Overwrite::Always,
+        hard_link_targets: HardLinkTargets::StoredName,
+        select: Some(MemberFilter::new(|m| m.name == "t/9iv20ci0cx")),
+        ..options(Mode::Extract, &out)
+    };
+    let summary = extract::run_with_password(&rar, &opts, None, |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(inode(&out.join("t/9iv20ci0cx")), inode(&out.join("t/hard66")));
+
+    // nothing in the way: both choices make the same link
+    let none = |_: &Path| {};
+    let (out, summary) = run("plain-stored", Overwrite::Always, HardLinkTargets::StoredName, false, &none);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(inode(&out.join("t/9iv20ci0cx")), inode(&out.join("t/hard66")));
+    assert_eq!(fs::read(out.join("t/9iv20ci0cx")).unwrap(), b"new");
+}
+
+/// A RAR 4.x header block of `kind` with its CRC set.
+fn rar4_block(kind: u8, flags: u16, fields: &[u8]) -> Vec<u8> {
+    let mut h = vec![0, 0, kind];
+    h.extend(flags.to_le_bytes());
+    h.extend(u16::try_from(7 + fields.len()).unwrap().to_le_bytes());
+    h.extend(fields);
+    let crc = crc32fast::hash(&h[2..]) as u16;
+    h[..2].copy_from_slice(&crc.to_le_bytes());
+    h
+}
+
+/// `rars-compressed.rar`: marker and main header (20 bytes), then `payload.txt`'s 43-byte file header (Unix host,
+/// attribute 0x20) and its 24 bytes of data, no end header.
+fn rars_compressed() -> Vec<u8> {
+    fs::read(fixture("rar4-legacy", "rars-compressed.rar")).unwrap()
+}
+
+/// `rars-compressed.rar` with `payload.txt`'s attribute set to `attr` (its header CRC fixed).
+fn rars_compressed_attr(attr: u32) -> Vec<u8> {
+    let mut b = rars_compressed();
+    b[0x30..0x34].copy_from_slice(&attr.to_le_bytes());
+    let crc = crc32fast::hash(&b[0x16..0x14 + 43]) as u16;
+    b[0x14..0x16].copy_from_slice(&crc.to_le_bytes());
+    b
+}
+
+/// prybar fuzz2 (N-UMASK): a Unix-host RAR member whose mode has no file-type bits (a RAR 4.x attribute of 0x20) is
+/// set as stored by UnRAR 7.30 (0o040) and left alone by 7-Zip 26.06 (0o666 less the umask, 0o644 here); with file-type bits both
+/// set it. RAR 5.0 members and folders likewise.
+#[cfg(unix)]
+#[test]
+fn masked_unix_modes_leave_modes_without_a_file_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let masked =
+        |out: &Path| Options { unix_modes: extract::UnixModes::Masked { umask: 0o022 }, ..options(Mode::Extract, out) };
+    let extract = |name: &str, bytes: &[u8], masked_run: bool| {
+        let rar = tmp.path().join(format!("{name}.rar"));
+        fs::write(&rar, bytes).unwrap();
+        let out = tmp.path().join(name);
+        let opts = if masked_run { masked(&out) } else { options(Mode::Extract, &out) };
+        let summary = extract::run_with_password(&rar, &opts, None, |_| {}).unwrap();
+        assert!(summary.errors.is_empty(), "{name}: {:?}", summary.errors);
+        out
+    };
+    // RAR 4.x
+    let out = extract("r4-20-stored", &rars_compressed(), false);
+    assert_eq!(mode_of(&out.join("payload.txt")), 0o040);
+    let out = extract("r4-20-masked", &rars_compressed(), true);
+    assert_eq!(mode_of(&out.join("payload.txt")), 0o644);
+    let out = extract("r4-8020-masked", &rars_compressed_attr(0x8020), true);
+    assert_eq!(mode_of(&out.join("payload.txt")), 0o040);
+    let out = extract("r4-81ff-masked", &rars_compressed_attr(0x81ff), true);
+    assert_eq!(mode_of(&out.join("payload.txt")), 0o755);
+    // RAR 5.0 files and folders
+    let spec = |name: &'static str, dir: bool, mode: u64| {
+        let mut spec = FileSpec::new(name, b"x");
+        spec.dir = dir;
+        spec.unix_mode = Some(mode);
+        if dir {
+            spec.data = b"";
+        }
+        spec
+    };
+    let files = [
+        spec("f40", false, 0o40),
+        spec("f100040", false, 0o100040),
+        spec("d500", true, 0o500),
+        spec("d40500", true, 0o40500),
+    ];
+    let rar5 = archive(&files);
+    let out = extract("r5-masked", &rar5, true);
+    let found = ["f40", "f100040", "d500", "d40500"].map(|name| mode_of(&out.join(name)));
+    assert_eq!(found, [0o644, 0o040, 0o755, 0o700]);
+    let out = extract("r5-stored", &rar5, false);
+    let found = ["f40", "f100040", "d500", "d40500"].map(|name| mode_of(&out.join(name)));
+    assert_eq!(found, [0o040, 0o040, 0o500, 0o500]);
+}
+
+/// `rars-compressed.rar` with `block` inserted before its file header.
+fn with_block_before_file(block: &[u8]) -> Vec<u8> {
+    let b = rars_compressed();
+    [&b[..0x14], block, &b[0x14..]].concat()
+}
+
+fn run_damaged(
+    name: &str,
+    tmp: &Path,
+    bytes: &[u8],
+    damaged: extract::DamagedInput,
+) -> zipfast::Result<extract::Summary> {
+    let rar = tmp.join(format!("{name}.rar"));
+    fs::write(&rar, bytes).unwrap();
+    let opts = Options { damaged_input: damaged, ..options(Mode::Extract, &tmp.join(name)) };
+    extract::run_with_password(&rar, &opts, None, |_| {})
+}
+
+/// prybar fuzz2: `rars-compressed.rar` with its file header's type byte changed from 0x74 to 0x75 (an old comment
+/// block; checksum not fixed). 7-Zip 26.06 passes old-style blocks over unchecked, by `LONG_BLOCK`: the header goes
+/// with its data, `7z l`/`t`/`x -so` find no member and exit 0. UnRAR 7.30 passes over the old comment's header alone
+/// and then fails: "Unexpected end of archive", exit 3.
+#[test]
+fn seven_zip_passes_over_a_header_turned_into_an_old_comment() {
+    use extract::{DamagedInput, HeaderDamageKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut flipped = rars_compressed();
+    flipped[0x16] = 0x75;
+    assert!(run_damaged("refuse", tmp.path(), &flipped, DamagedInput::Refuse).is_err());
+    let summary = run_damaged("seven", tmp.path(), &flipped, DamagedInput::SevenZip).unwrap();
+    assert_eq!((summary.files, summary.errors.len(), summary.damaged_headers.len()), (0, 0, 0), "{summary:?}");
+    let rar = tmp.path().join("seven.rar");
+    let listing = extract::list_detailed_with_options(
+        &rar,
+        None,
+        &Options { damaged_input: DamagedInput::SevenZip, ..options(Mode::Test, tmp.path()) },
+    )
+    .unwrap();
+    assert!(listing.entries.is_empty());
+    // Salvage, as UnRAR: the old comment's header alone is passed over, and what follows can't be read
+    let summary = run_damaged("salvage", tmp.path(), &flipped, DamagedInput::Salvage).unwrap();
+    assert_eq!(summary.files, 0);
+    let kinds: Vec<_> = summary.damaged_headers.iter().map(|d| d.kind).collect();
+    assert_eq!(kinds.first(), Some(&HeaderDamageKind::ChecksumMismatch), "{kinds:?}");
+    assert!(kinds.len() == 2 && kinds[1] != HeaderDamageKind::ChecksumMismatch, "{kinds:?}");
+}
+
+/// Sound and damaged old-style RAR 4.x blocks before a member, as UnRAR 7.30 and 7-Zip 26.06 pass them over.
+#[test]
+fn old_style_rar4_blocks_are_passed_over_as_the_tools_do() {
+    use extract::DamagedInput::{self, Refuse, Salvage, SevenZip};
+    let tmp = tempfile::tempdir().unwrap();
+    let fields = |size: u32| [size.to_le_bytes().as_slice(), &[0, 0]].concat();
+    let mut n = 0;
+    let mut check = |bytes: &[u8], damaged: DamagedInput, extracted: Option<bool>, damage: usize| {
+        n += 1;
+        let result = run_damaged(&format!("case{n}"), tmp.path(), bytes, damaged);
+        match extracted {
+            None => assert!(result.is_err(), "case {n}: {result:?}"),
+            Some(extracted) => {
+                let summary = result.unwrap();
+                assert_eq!(summary.files, u64::from(extracted), "case {n}: {summary:?}");
+                assert_eq!(summary.damaged_headers.len(), damage, "case {n}: {summary:?}");
+            }
+        }
+    };
+    // a sound AV block with 5 bytes of LONG_BLOCK data: refused by default, passed over by both tools
+    let av = with_block_before_file(&[rar4_block(0x76, 0x8000, &fields(5)), b"JUNKJ".to_vec()].concat());
+    check(&av, Refuse, None, 0);
+    check(&av, SevenZip, Some(true), 0);
+    check(&av, Salvage, Some(true), 0);
+    // the same with its checksum broken: neither tool checks it
+    let mut bad_av = av.clone();
+    bad_av[0x14] ^= 0xff;
+    check(&bad_av, Refuse, None, 0);
+    check(&bad_av, SevenZip, Some(true), 0);
+    check(&bad_av, Salvage, Some(true), 0);
+    // an old comment with LONG_BLOCK data: 7-Zip passes the data over too, UnRAR doesn't (and can't read on)
+    let comment = with_block_before_file(&[rar4_block(0x75, 0x8000, &fields(5)), b"JUNKJ".to_vec()].concat());
+    check(&comment, SevenZip, Some(true), 0);
+    check(&comment, Salvage, Some(false), 1);
+    // an old comment without data whose checksum fails: UnRAR reports it and reads on, 7-Zip doesn't check it
+    let mut bad_comment = with_block_before_file(&rar4_block(0x75, 0, &[0, 0, 0x0f, 0x30, 0, 0]));
+    bad_comment[0x14] ^= 0xff;
+    check(&bad_comment, Refuse, None, 0);
+    check(&bad_comment, SevenZip, Some(true), 0);
+    check(&bad_comment, Salvage, Some(true), 1);
+    // an old subblock starts with its data size even without LONG_BLOCK, as UnRAR reads it
+    let subblock = with_block_before_file(&[rar4_block(0x77, 0, &fields(5)), b"JUNKJ".to_vec()].concat());
+    check(&subblock, Salvage, Some(true), 0);
 }
