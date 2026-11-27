@@ -157,6 +157,23 @@ fn whole_archive_runs_keep_what_unrar_decodes_of_a_member_cut_off_by_a_missing_v
     }
 }
 
+/// The same with every block decoded on the workers (`parallel_min` 0): the last symbols of the block before the cut,
+/// which UnRAR leaves out when fewer than 16 bytes of the next block are there (`r5-edge`), are noted by the workers.
+#[test]
+fn whole_archive_runs_on_decode_workers_keep_what_unrar_decodes_of_a_member_cut_off() {
+    let dir = tempfile::tempdir().unwrap();
+    for cut in CUTS {
+        let volume = alone(dir.path(), cut.volume);
+        let what = format!("{} on workers", cut.volume);
+        let out = dir.path().join(format!("workers-{}", cut.member));
+        let mut options = options(&out, true, UnverifiedOutput::Emit, 4);
+        options.parallel_min = Some(0);
+        let summary = extract::run(&volume, &options, |_| {}).unwrap();
+        assert!(summary.errors.iter().any(|e| e.starts_with(cut.member) && e.contains("missing volume")), "{what}");
+        assert_reference(&fs::read(out.join(cut.member)).unwrap(), cut.unrar, &what);
+    }
+}
+
 /// `unrar p`: `RarSession::print_selected` prints what UnRAR prints of a member cut off by a missing volume, reports it
 /// failed with the missing volume, and says how many bytes went out unverified; by default it prints nothing of it.
 #[test]
