@@ -545,6 +545,8 @@ pub(crate) struct Rar4Decoder {
     /// [`crate::extract::UnverifiedOutput::Emit`]: where the latest LZ tokens started, for [`Self::flush_decoded`]
     starts: Option<Box<TokenStarts>>,
     hold_start: u64,
+    /// how many of the held bytes are plain output that was waiting when the first block's bytes began
+    hold_plain: usize,
     /// the member's unpack version, and the RAR 1.5 or 2.0 engine that decodes it
     version: u8,
     /// memory beyond the window a PPM model and a held filter block may take
@@ -657,6 +659,7 @@ impl Rar4Decoder {
             unfiltered: false,
             starts: None,
             hold_start: 0,
+            hold_plain: 0,
             version: 29,
             memory_limit: PPM_MEMORY_MAX,
             legacy: None,
@@ -795,6 +798,16 @@ impl Rar4Decoder {
             // held until the block can be filtered
             if self.hold.is_empty() {
                 self.hold_start = cursor;
+                if self.filled != 0 {
+                    // Output still to go out lives in the window, which a long block would wrap onto: it waits
+                    // ahead of the block's bytes instead, and goes out first as it would have.
+                    debug_assert_eq!(self.out_start + self.filled as u64, cursor);
+                    let start = (self.out_start & (self.dictionary.len() as u64 - 1)) as usize;
+                    let first = self.filled.min(self.dictionary.len() - start);
+                    self.hold.extend_from_slice(&self.dictionary[start..start + first]);
+                    self.hold.extend_from_slice(&self.dictionary[..self.filled - first]);
+                    (self.hold_start, self.hold_plain, self.filled) = (self.out_start, self.filled, 0);
+                }
             }
             self.hold.push(byte);
             if cursor + 1 >= block.end() {
@@ -892,6 +905,7 @@ impl Rar4Decoder {
             }
             sink.put(&data).map_err(Rar4DecodeError::Sink)?;
             self.hold.drain(..from + block.len);
+            self.hold_plain = 0;
             self.hold_start = block.end();
         }
         // what is held before the next block (or all of it, when none waits) goes out plain
@@ -904,6 +918,7 @@ impl Rar4Decoder {
             sink.put(&self.hold[..plain]).map_err(Rar4DecodeError::Sink)?;
             self.hold.drain(..plain);
             self.hold_start += plain as u64;
+            self.hold_plain = self.hold_plain.saturating_sub(plain);
         }
         Ok(())
     }
@@ -944,7 +959,18 @@ impl Rar4Decoder {
             Some(starts) => starts.cut(self.fetched, self.produced),
             None => self.produced,
         };
-        // the buffer holds the output just before the first held byte (or the newest, when nothing is held)
+        // the output waiting goes just before the first held byte (or is the newest, when nothing is held)
+        if self.hold_plain != 0 {
+            // it waits ahead of a held block (see emit)
+            let start = self.hold_start.saturating_sub(self.chain_base).min(self.produced);
+            let end = start.saturating_add(self.hold_plain as u64).min(self.produced);
+            let keep = ((cut.clamp(start, end) - start) as usize).min(self.hold_plain);
+            self.work.check()?;
+            if keep != 0 {
+                sink.put(&self.hold[..keep]).map_err(Rar4DecodeError::Sink)?;
+            }
+            return self.work.check();
+        }
         let end = if self.hold.is_empty() {
             self.produced
         } else {
@@ -1399,7 +1425,8 @@ impl Rar4Decoder {
             };
         }
         let mut first = true;
-        while w.left() >= FAST_INPUT && matches!(self.phase, Phase::Token) {
+        // (a copy that ends the member starts its end-of-file tail: the stepped path reads that)
+        while w.left() >= FAST_INPUT && matches!(self.phase, Phase::Token) && !self.in_tail {
             // (run recorded the first token's start)
             if !first && let Some(starts) = self.starts.as_mut() {
                 let at =

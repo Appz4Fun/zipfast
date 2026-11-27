@@ -404,3 +404,82 @@ fn cut_short_members_hand_over_what_they_did() {
     let table: String = computed.iter().map(|(name, hash)| format!("    (\"{name}\", 0x{hash:016x}),\n")).collect();
     assert_eq!(computed.as_slice(), CUT_GOLDEN, "computed goldens:\n{table}");
 }
+
+/// Output still to hand to the sink lives in the window: a filter block held back must not let the window wrap onto
+/// it. In the smallest window, plain bytes waiting ahead of a block as long as the window come out as in a window
+/// that can't wrap.
+#[test]
+fn plain_output_waiting_ahead_of_a_window_long_filter_block_survives() {
+    let run = |dictionary: u64| {
+        let mut d = Rar4Decoder::new(dictionary, 1, 1 << 20, 4 << 20, Cancellation::default()).unwrap();
+        let mut out = Vec::new();
+        let mut sink = |bytes: &[u8]| {
+            out.extend_from_slice(bytes);
+            Ok(())
+        };
+        let byte = |i: usize| if i % 97 == 5 { 0xe8 } else { (i * 31 % 251) as u8 };
+        for i in 0..100 {
+            d.emit(byte(i), &mut sink).unwrap();
+        }
+        d.filters.pending.push_back(filters::Block::standard(filters::Kind::E8, 100, 65536));
+        for i in 100..100 + 65536 + 300 {
+            d.emit(byte(i), &mut sink).unwrap();
+        }
+        d.flush(&mut sink).unwrap();
+        assert!(d.hold.is_empty() && d.filters.pending.is_empty());
+        out
+    };
+    let wide = run(4 << 20);
+    assert_eq!(wide.len(), 100 + 65536 + 300);
+    assert_eq!(run(65536), wide);
+}
+
+/// Where a member ends (boundary tracking on, the member shorter than the stream) must not depend on how the input
+/// is fed: whole, it goes through the whole-token path, a byte at a time through the stepped one.
+#[test]
+fn member_ends_the_same_however_the_input_is_fed() {
+    let state = |packed: &[u8], unpacked: usize, chunk: usize| {
+        let mut d =
+            Rar4Decoder::new(4 << 20, packed.len() as u64, unpacked as u64, 4 << 20, Cancellation::default()).unwrap();
+        d.track_boundary();
+        let mut out = Vec::new();
+        let mut sink = |bytes: &[u8]| {
+            out.extend_from_slice(bytes);
+            Ok(())
+        };
+        let mut status = String::from("fed");
+        for piece in packed.chunks(chunk) {
+            if let Err(error) = d.feed(piece, &mut sink) {
+                status = format!("{error:?}");
+                break;
+            }
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325;
+        fnv(&mut hash, &out);
+        format!(
+            "{} {hash:016x} {status} recent={:?} last={} low={}/{} tail={} boundary={:?} fetched={}",
+            out.len(),
+            d.recent,
+            d.last_length,
+            d.low,
+            d.low_repeats,
+            d.in_tail,
+            d.boundary.map(|phase| matches!(phase, Phase::Token)),
+            d.fetched,
+        )
+    };
+    let mut checked = 0;
+    for (name, packed, unpacked) in bases() {
+        if unpacked < 64 {
+            continue;
+        }
+        for fifth in 1..5 {
+            let cut = unpacked * fifth / 5;
+            let whole = state(&packed, cut, usize::MAX);
+            assert_eq!(state(&packed, cut, 1), whole, "{name} cut at {cut}");
+            assert_eq!(state(&packed, cut, 7), whole, "{name} cut at {cut}");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 30);
+}
