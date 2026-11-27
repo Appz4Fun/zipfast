@@ -701,7 +701,7 @@ impl<'a> RarMember<'a> {
     /// extracting it decodes the bytes there ([`super::HeaderCut::Data`], its checks decide) or fails
     /// ([`super::HeaderCut::Header`]). A caller showing 7-Zip 26.06's listing leaves out a `Header` cut.
     pub fn cut(&self) -> Option<super::HeaderCut> {
-        self.member.header.cut
+        self.member.cut
     }
 
     pub fn is_directory(&self) -> bool {
@@ -1540,8 +1540,9 @@ impl Catalogue {
             let member = self.session.model.members.last_mut().unwrap();
             member.append(&header, &part)?;
             member.packed_size = add(member.packed_size, unread)?;
+            member.unread = add(member.unread, unread)?;
             if header.cut.is_some() {
-                member.header.cut = header.cut;
+                member.cut = header.cut;
             }
             if issue.is_some() {
                 member.issue = issue;
@@ -1603,6 +1604,7 @@ impl Catalogue {
             };
             let mut member = Member::new(header, wire, part_index, &part)?;
             member.packed_size = add(member.packed_size, unread)?;
+            member.unread = unread;
             member.issue = issue;
             member.chain = chain;
             self.session.model.members.push(member);

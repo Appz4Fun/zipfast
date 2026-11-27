@@ -173,6 +173,14 @@ fn salvage_reports_a_rar4_comment_that_fails_its_crc() {
         }
         let session = session(&case, DamagedInput::Refuse).unwrap();
         assert_eq!(session.comment(0).is_err(), damaged_comment);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_zipfast"))
+            .args(["l", "--salvage"])
+            .arg(&case.archive)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(if damaged_comment { 1 } else { 0 }), "{stderr}");
+        assert_eq!(stderr.contains("comment"), damaged_comment, "{stderr}");
     }
 }
 
@@ -227,6 +235,14 @@ fn salvage_extracts_a_cut_member_whose_checks_pass_as_unrar_does() {
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);
     assert_eq!(fs::read(case.out.join("1.txt")).unwrap().len(), 5);
     assert_eq!(summary.damaged_headers[0].cut, Some(HeaderCut::Data { present: 8 }));
+    // the session decodes it from the bytes there too, not the declared packed size
+    let mut session = session(&case, DamagedInput::Salvage).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let out = case.dir.path().join("session");
+    let opts = options(&out, Mode::Extract, DamagedInput::Salvage);
+    let summary = session.extract_selected(&selected, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (1, 0));
+    assert_eq!(fs::read(out.join("1.txt")).unwrap().len(), 5);
     // with no data bytes at all it fails
     let case = self::case(&bytes[..62]);
     let opts = options(&case.out, Mode::Extract, DamagedInput::Salvage);
@@ -329,5 +345,65 @@ fn every_cut_is_read_without_panicking() {
                 let _ = extract::run(&case.archive, &options(&case.out, Mode::Test, damaged), |_| {});
             }
         }
+    }
+}
+
+/// multi.part2.rar (its continuation header at 20, 46 bytes, then 4914 data bytes) written cut at `len` beside the
+/// whole first and third volumes.
+fn cut_second_volume(len: usize) -> Case {
+    let case = case_named("multi.part1.rar", &fixture("rar4-volumes/multi.part1.rar"));
+    fs::write(case.dir.path().join("multi.part2.rar"), &fixture("rar4-volumes/multi.part2.rar")[..len]).unwrap();
+    fs::write(case.dir.path().join("multi.part3.rar"), fixture("rar4-volumes/multi.part3.rar")).unwrap();
+    case
+}
+
+/// A split member's continuation header cut short in the second volume: `Salvage` finishes the run at every cut
+/// inside the header. Once file2.txt's name is whole (61 bytes on) the cut header continues it, and file2.txt fails
+/// because the header is cut short; before that the partial name continues nothing.
+#[test]
+fn salvage_fails_a_split_member_whose_continuation_header_is_cut() {
+    for len in 27..66 {
+        let case = cut_second_volume(len);
+        let opts = options(&case.out, Mode::Extract, DamagedInput::Salvage);
+        let summary = extract::run(&case.archive, &opts, |_| {}).unwrap_or_else(|e| panic!("cut at {len}: {e}"));
+        if len >= 61 {
+            assert_eq!(summary.errors.len(), 1, "cut at {len}: {:?}", summary.errors);
+            assert!(summary.errors[0].contains("file2.txt") && summary.errors[0].contains("cut short"), "{len}");
+        } else {
+            assert!(!summary.errors.is_empty(), "cut at {len}");
+        }
+        assert!(!case.out.join("file2.txt").exists(), "cut at {len}");
+    }
+}
+
+/// The second volume cut inside a split member's data: the member is marked cut, but the first volume's own header
+/// for it is not.
+#[test]
+fn salvage_marks_only_the_cut_part_of_a_split_member() {
+    let case = cut_second_volume(1000);
+    let session = session(&case, DamagedInput::Salvage).unwrap();
+    let cut: Vec<_> = session.entries().filter_map(|m| m.cut().map(|cut| (m.name().to_owned(), cut))).collect();
+    assert_eq!(cut, [("file2.txt".to_owned(), HeaderCut::Data { present: 1000 - 66 })]);
+    let first = session.volume_headers(0).last().unwrap();
+    assert_eq!((first.name(), first.cut()), ("file2.txt", None));
+    let second = session.volume_headers(1).next().unwrap();
+    assert_eq!((second.name(), second.cut()), ("file2.txt", Some(HeaderCut::Data { present: 1000 - 66 })));
+}
+
+/// `zipfast l --salvage` / `--resync` on a set missing its second volume shows what was listed, names the missing
+/// volume and exits 2, as 7-Zip does; a damaged comment exits 1.
+#[test]
+fn salvage_cli_reports_a_missing_volume_and_a_damaged_comment() {
+    let case = case_named("multi.part1.rar", &fixture("rar4-volumes/multi.part1.rar"));
+    for flag in ["--salvage", "--resync"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_zipfast"))
+            .args(["l", flag])
+            .arg(&case.archive)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag}: {stderr}");
+        assert!(stderr.contains("missing volume") && stderr.contains("multi.part2.rar"), "{flag}: {stderr}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("name"), "{flag}");
     }
 }

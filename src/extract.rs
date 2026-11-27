@@ -5831,12 +5831,17 @@ impl Run<'_, '_, '_> {
             }
             return Ok(());
         }
+        // DamagedInput::Salvage: a continuation header the volume cuts short has no data to read
+        let cut_header = h.cut == Some(crate::rar5::HeaderCut::Header);
         let changed = (h.method != 0) != p.compressed
             || h.encrypted != p.encrypted
             || (h.split_before()
                 && p.rar4_identity != h.rar4.map(|raw| (h.dictionary, raw.unpack_version, raw.method, raw.salt)));
-        if changed || matches!(crypt, Some(Err(_))) {
+        if cut_header || changed || matches!(crypt, Some(Err(_))) {
             let (failure, legacy) = match crypt {
+                _ if cut_header => {
+                    (p.context.integrity(RarIntegrityReason::TruncatedHeader, false), "the file header is cut short")
+                }
                 Some(Err(e)) if !changed => (RarFailure::crypt(e, p.context.scope()), "encrypted (password required)"),
                 _ => (
                     p.context.integrity(RarIntegrityReason::ChangedContinuationEncoding, false),

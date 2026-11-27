@@ -611,7 +611,7 @@ impl SelectedRun {
         }
         // Check known totals before key derivation or dictionary allocation.
         // Actual work is still charged at each part and decoded chunk.
-        charge(self.packed, member.packed_size, self.limits.packed_bytes, RarResource::SelectedPackedBytes)?;
+        charge(self.packed, member.available_packed(), self.limits.packed_bytes, RarResource::SelectedPackedBytes)?;
         if let Some(size) = member.unpacked_size {
             charge(self.decoded, size, self.limits.decoded_bytes, RarResource::SelectedDecodedBytes)?;
         }
@@ -857,7 +857,7 @@ impl SelectedRun {
             let mut decoder = self.rar4.take().ok_or(Rar4DecodeError::State)?;
             decoder.next_solid_member(crate::rar5::unpack::rar4::CoreFrame {
                 ordinal: 0,
-                packed: member.packed_size,
+                packed: member.available_packed(),
                 unpacked: header.unpacked_size,
                 unpack_version: raw.unpack_version,
                 method: raw.method,
@@ -868,7 +868,7 @@ impl SelectedRun {
         self.rar4 = None;
         let mut decoder = Rar4Decoder::new(
             header.dictionary,
-            member.packed_size,
+            member.available_packed(),
             header.unpacked_size,
             self.limits.window_bytes.min(WINDOW_MAX),
             session.options.cancel.clone(),
