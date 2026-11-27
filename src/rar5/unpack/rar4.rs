@@ -1336,8 +1336,8 @@ impl Rar4Decoder {
     /// so the input is consumed and the output made exactly as there. Stops at any token that path handles with
     /// more than a copy or a literal (end of block, filter record), having set the phase as it would.
     ///
-    /// Only for a member's own data (not its end-of-file tail), between symbols, and without
-    /// [`Self::track_starts`], which wants a step per token.
+    /// Only for a member's own data (not its end-of-file tail), and between symbols. With [`Self::track_starts`] it
+    /// records each token's start as [`Self::run`] does before each step.
     fn fast_tokens(&mut self, input: &mut &[u8], sink: &mut dyn Sink) -> DecodeResult<()> {
         let mut window = Window::new(&self.bits, *input);
         let result = self.fast_loop(&mut window, sink);
@@ -1395,7 +1395,14 @@ impl Rar4Decoder {
                 }
             };
         }
+        let mut first = true;
         while w.left() >= FAST_INPUT && matches!(self.phase, Phase::Token) {
+            // (run recorded the first token's start)
+            if !first && let Some(starts) = self.starts.as_mut() {
+                let at = self.fetched.saturating_add(w.next as u64).saturating_mul(8).saturating_sub(u64::from(w.count));
+                starts.push(at, self.produced);
+            }
+            first = false;
             let token = self.fast_symbol(1, w)?;
             match token {
                 0..=255 => {
@@ -1635,7 +1642,7 @@ impl Rar4Decoder {
                 self.phase = Phase::Token;
             }
             Phase::Token => {
-                if input.len() >= FAST_INPUT && self.depth == 0 && !self.in_tail && self.starts.is_none() {
+                if input.len() >= FAST_INPUT && self.depth == 0 && !self.in_tail {
                     self.fast_tokens(input, sink)?;
                     return Ok(true);
                 }

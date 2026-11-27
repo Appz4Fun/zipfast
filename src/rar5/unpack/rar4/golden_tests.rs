@@ -328,3 +328,69 @@ fn table_lookup_matches_the_bitwise_search_for_every_window() {
     assert!(matches!(h.build(&[1, 1, 1], &mut work), Err(Rar4DecodeError::Malformed("oversubscribed Huffman table"))));
     assert!(matches!(h.build(&[16], &mut work), Err(Rar4DecodeError::Malformed("code length"))));
 }
+
+/// A member cut short and handed over as far as UnRAR would ([`Rar4Decoder::flush_decoded`] with token starts
+/// tracked): what comes out, fed whole and in 7-byte pieces.
+fn cut_short(packed: &[u8], unpacked: usize, chunk: usize) -> String {
+    let mut d = Rar4Decoder::new(4 << 20, packed.len() as u64 + 1, unpacked as u64, 4 << 20, Cancellation::default())
+        .expect("decoder");
+    d.track_starts();
+    let mut out = Vec::new();
+    let mut sink = |bytes: &[u8]| {
+        out.extend_from_slice(bytes);
+        Ok(())
+    };
+    let mut status = "fed".to_string();
+    for piece in packed.chunks(chunk.max(1)) {
+        if let Err(error) = d.feed(piece, &mut sink) {
+            status = format!("feed {error:?}");
+            break;
+        }
+    }
+    let flushed = d.flush_decoded(&mut sink);
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    fnv(&mut hash, &out);
+    format!("{}:{hash:016x}:{status}:{flushed:?}", out.len())
+}
+
+/// Recorded with the bit-by-bit decoder (zipfast 56819cd7).
+const CUT_GOLDEN: &[(&str, u64)] = &[
+    ("all-recent-slots", 0xcbde13e49b52b447),
+    ("code-length-nibble-zero-run", 0xcbde13e49b52b447),
+    ("dd10-low", 0xcbde13e49b52b447),
+    ("dd59-reach4m", 0xb2895b522050a33d),
+    ("low-repeat16", 0xcbde13e49b52b447),
+    ("low-reset-table", 0x9169e1fd15ed90b1),
+    ("new-match-repeat-last", 0xcbde13e49b52b447),
+    ("official-lz-m1", 0x7e0223de9c57a051),
+    ("official-lz-m3", 0xfefb80ef80668391),
+    ("previous-length-runs", 0xcbde13e49b52b447),
+    ("table-reuse-delta", 0x1c53ed001d9c5421),
+    ("threshold262144", 0xae3103337b6c921b),
+    ("threshold8192", 0x9914e5366eaffecf),
+    ("vm-marker-after-prefix", 0xcbde13e49b52b447),
+    ("zipf-text", 0x84668f0575a62621),
+    ("zipf-code", 0x6346113b4a24c2cb),
+    ("bc-oversubscribed", 0xcbde13e49b52b447),
+    ("bc-incomplete-undefined", 0xed934a713a299cc1),
+    ("bc-fifteen-bit-codes", 0xcbde13e49b52b447),
+];
+
+#[test]
+fn cut_short_members_hand_over_what_they_did() {
+    let computed: Vec<(&str, u64)> = bases()
+        .iter()
+        .map(|(name, packed, unpacked)| {
+            let mut hash = 0xcbf2_9ce4_8422_2325;
+            for quarter in 1..4 {
+                for chunk in [usize::MAX, 7] {
+                    let record = cut_short(&packed[..packed.len() * quarter / 4], *unpacked, chunk);
+                    fnv(&mut hash, record.as_bytes());
+                }
+            }
+            (*name, hash)
+        })
+        .collect();
+    let table: String = computed.iter().map(|(name, hash)| format!("    (\"{name}\", 0x{hash:016x}),\n")).collect();
+    assert_eq!(computed.as_slice(), CUT_GOLDEN, "computed goldens:\n{table}");
+}
