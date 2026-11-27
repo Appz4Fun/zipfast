@@ -848,6 +848,10 @@ impl ProgressiveSession {
                         continue;
                     }
                     if self.remaining == 0 {
+                        #[cfg(feature = "persistent-partials")]
+                        if self.partial_active() {
+                            self.partial_part_damage()?;
+                        }
                         let part = self.model.parts.last().expect("active part");
                         if let Some(machine) = &mut self.machine {
                             machine.finish_part(part)?;

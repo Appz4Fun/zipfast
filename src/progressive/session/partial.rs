@@ -1060,6 +1060,53 @@ impl ProgressiveSession {
         self.driver.validate_current()?;
         Ok(written)
     }
+    /// A plain stored part read whole that fails its own check (an article whose transport check passed but whose
+    /// bytes are wrong) holds a wrong byte somewhere in its output. Rather than ending the session, which would
+    /// leave every member after it to be read again, the part's output becomes a `DeclaredBad` hole, as if the
+    /// caller had declared the part's packed bytes with `declare_hole`, and is delivered as a `Hole` event (after
+    /// the `BytesWritten` events of that output). The caller refills it once the volume is repaired, reading that
+    /// part again and nothing else. Called at the end of each part of a persistent member.
+    pub(super) fn partial_part_damage(&mut self) -> ProgressiveResult<()> {
+        let part = self.model.parts.last().expect("active part");
+        let plain = !self.model.members.last().is_some_and(|m| m.header.encrypted);
+        if !plain || part.packed_size == 0 || !self.machine.as_ref().is_some_and(|m| m.part_checks_fail(part)) {
+            return Ok(());
+        }
+        let span = plain_part(part, 0)?.packed;
+        self.declare_bad_part(span)
+    }
+    /// The final part's counterpart of [`Self::partial_part_damage`]: a plain stored member whose final checks
+    /// fail while every part before the last passed a check of its own has its wrong bytes in the last part, so
+    /// that part's output becomes a `DeclaredBad` hole and the member finishes with it. A member in one part, or
+    /// with a part before the last that was not checked (a hole, no check recorded), keeps the strict failure.
+    fn partial_final_part_damage(&mut self) -> ProgressiveResult<()> {
+        let member = self.model.members.last().expect("active member");
+        let Some(part) = self.model.parts.last().filter(|p| p.final_part && p.packed_size > 0) else { return Ok(()) };
+        let before = self.model.parts.len() - 1;
+        let checked = before > 0
+            && self.part_evidence.len() == self.model.parts.len()
+            && self.model.parts[..before].iter().zip(&self.part_evidence).all(|(part, evidence)| {
+                *evidence == PackedEvidence::Passed && (part.checks.crc32.is_some() || part.checks.blake2sp.is_some())
+            });
+        if member.header.encrypted || !checked || !self.finalizer.as_ref().is_some_and(|m| m.member_checks_fail(member))
+        {
+            return Ok(());
+        }
+        let span = plain_part(part, 0)?.packed;
+        self.declare_bad_part(span)
+    }
+    /// Declares `span` (a part's packed data) damaged on the active member and queues the resulting holes as
+    /// events. The member machine stops judging the part and the member (`declare_missing`).
+    fn declare_bad_part(&mut self, span: PackedSpan) -> ProgressiveResult<()> {
+        let receipt = self.declare_hole(span.volume, span.range)?;
+        let persistent = self.partial.as_mut().unwrap();
+        for report in receipt.holes {
+            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<HoleReport>() as u64)?;
+            persistent.holes.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+            persistent.holes.push_back(report);
+        }
+        Ok(())
+    }
     pub(super) fn partial_part_event(&self) -> ProgressiveResult<Option<ProgressiveEvent>> {
         if !self.partial_active() {
             return Ok(None);
@@ -1117,6 +1164,9 @@ impl ProgressiveSession {
         &mut self,
         cx: &mut Context<'_>,
     ) -> ProgressiveResult<Poll<ProgressiveResult<Option<ProgressiveEvent>>>> {
+        if self.finalizer.is_some() {
+            self.partial_final_part_damage()?;
+        }
         if let Some(mut machine) = self.finalizer.take() {
             machine.finish_member(self.model.members.last().unwrap())?;
             self.partial.as_ref().unwrap().active().1.finish_member().map_err(failure)?;
