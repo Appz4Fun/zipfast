@@ -56,6 +56,7 @@ fn options(dest: &Path, overwrite: Overwrite, select: MemberFilter) -> Options {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

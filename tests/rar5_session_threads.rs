@@ -101,6 +101,7 @@ fn options(dest: &Path, threads: Option<usize>, parallel_min: Option<u64>) -> Op
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     }
 }
 

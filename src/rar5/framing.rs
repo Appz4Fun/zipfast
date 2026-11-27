@@ -134,6 +134,9 @@ pub(crate) struct HeaderParser {
     /// [`crate::extract::DamagedInput::Resync`]: a damaged header of an unknown type is unreadable (the search for
     /// the next header goes on from it) rather than passed over by the size it claims.
     resync: bool,
+    /// [`crate::extract::DamagedInput::SevenZip`]: a RAR 4.x old-style block (0x75..=0x79) in clear headers is
+    /// passed over by its size without checking its checksum, as 7-Zip 26.06 does.
+    legacy_unchecked: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -165,12 +168,14 @@ impl HeaderParser {
             rar4_unknown_part_crc: false,
             salvage: false,
             resync: false,
+            legacy_unchecked: false,
         }
     }
     /// See [`Self::salvage`]. Encrypted headers are never salvaged: a checksum failure there is a wrong key.
     pub(crate) fn set_salvage(&mut self, damaged: crate::extract::DamagedInput) {
         self.salvage = damaged.salvages();
         self.resync = damaged == crate::extract::DamagedInput::Resync;
+        self.legacy_unchecked = damaged == crate::extract::DamagedInput::SevenZip;
     }
     /// A salvaging catalogue takes a file header whose data runs past the end of the volume, as UnRAR 7.30 does
     /// ("Unexpected end of archive"): the frame ends at the volume's end and its wire says how much of the data is

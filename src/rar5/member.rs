@@ -1547,6 +1547,7 @@ mod tests {
                     salvage_truncated_zip: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
+                    hard_link_targets: Default::default(),
                 },
                 "a.rar".into(),
             );
@@ -1902,6 +1903,7 @@ mod tests {
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             let run = crate::extract::run_with_password(
                 &fixtures.join(format!("testfile5{set}.part01.rar")),

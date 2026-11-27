@@ -65,10 +65,14 @@ impl HeaderParser {
         let mut cursor = Fields::new(header, 7);
         // Map walks follow unrar's ReadHeader15 on which blocks have data after the header: the old subblock (0x77)
         // and old recovery record (0x78) always start with its size, the main, old comment and end headers never
-        // have any, and every other block has it exactly when LONG_BLOCK is set.
+        // have any, and every other block has it exactly when LONG_BLOCK is set. A salvaging run sizes the old-style
+        // blocks the same way, as UnRAR 7.30 was seen to pass them over; 7-Zip 26.06 (and everything else) goes by
+        // LONG_BLOCK alone.
+        let unrar_sizes = self.map_lenient || self.salvage;
         let sized = match kind {
-            0x77 | 0x78 if self.map_lenient => true,
-            0x73 | 0x75 | 0x7b if self.map_lenient => false,
+            0x77 | 0x78 if unrar_sizes => true,
+            0x75 if unrar_sizes => false,
+            0x73 | 0x7b if self.map_lenient => false,
             _ => flags & 0x8000 != 0,
         };
         let packed = if sized { u64::from(cursor.u32().map_err(|e| self.parse_fault(e))?) } else { 0 };
@@ -199,6 +203,8 @@ impl HeaderParser {
                 return Err(self.framing("damaged RAR4 header", Error::Corrupt("damaged RAR4 header")).into());
             }
             _ if damaged && !matches!(kind, 0x73 | 0x74 | 0x7a | 0x7b) => Block::Unknown,
+            // UnRAR 7.30 and 7-Zip 26.06 pass a sound old-style block over too.
+            0x75..=0x79 if self.salvage || self.legacy_unchecked => Block::Unknown,
             0x75..=0x79 => return Err(self.rar4_unsupported("legacy service block").into()),
             _ if flags & 0x4000 != 0 => Block::Unknown,
             _ => return Err(self.rar4_unsupported("header type").into()),
@@ -224,7 +230,15 @@ impl HeaderParser {
             // As RAR 2.x writes it and UnRAR checks it, the CRC covers the fixed fields before the comment.
             return Some(header.len().min(13));
         }
-        if !self.map_lenient || self.legacy_headers {
+        if self.legacy_headers {
+            return Some(header.len());
+        }
+        // The old-style blocks, as observed: 7-Zip 26.06 checks none of them (DamagedInput::SevenZip), UnRAR 7.30
+        // (salvaging runs) not the AV (0x76) and sign (0x79) blocks.
+        if ((0x75..=0x79).contains(&kind) && self.legacy_unchecked) || (matches!(kind, 0x76 | 0x79) && self.salvage) {
+            return None;
+        }
+        if !self.map_lenient {
             return Some(header.len());
         }
         match kind {

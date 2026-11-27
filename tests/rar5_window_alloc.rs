@@ -117,6 +117,7 @@ fn check_archive(archive: &Path, refuse: bool) {
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
+        hard_link_targets: Default::default(),
     };
     let mut seen = 0;
     REFUSE_WINDOW.store(refuse, Ordering::Relaxed);

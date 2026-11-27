@@ -1713,8 +1713,12 @@ impl HoleBudget {
 
     /// Charges a copy of the file at `target` (a hard link that couldn't be made) for its holes.
     fn copy(&mut self, target: &Path) -> io::Result<()> {
-        let holes = self.extracted.get(target).copied().unwrap_or(0);
-        match self.left.checked_sub(holes) {
+        self.charge(self.extracted.get(target).copied().unwrap_or(0))
+    }
+
+    /// Charges `bytes` of a copy the archive's data doesn't account for.
+    fn charge(&mut self, bytes: u64) -> io::Result<()> {
+        match self.left.checked_sub(bytes) {
             Some(left) => {
                 self.left = left;
                 Ok(())
@@ -1840,7 +1844,12 @@ fn link_member(
         let Some(place) = checked_place(opts, rel, (ordinal, name), Some(extracted), summary, report)? else {
             return Ok(());
         };
-        let mut copy = |_| match kind {
+        // Under HardLinkTargets::StoredName the file copied may be one this run didn't write (a file system that
+        // takes no hard link, or another one mounted below the destination): its whole length is charged, as the
+        // archive's own data accounts for none of it.
+        let stored = opts.hard_link_targets == crate::extract::HardLinkTargets::StoredName;
+        let mut copy = |len: u64| match kind {
+            LinkKind::Hard(_) if stored => holes.charge(len),
             LinkKind::Hard(target) | LinkKind::Copy(target) => holes.copy(target),
             LinkKind::Symbolic(_) => Ok(()),
         };
@@ -2566,6 +2575,7 @@ mod tests {
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert_eq!(s.errors.len(), 4, "{name} chained {chained}: {:?}", s.errors);
@@ -2590,6 +2600,66 @@ mod tests {
             assert_eq!(std::fs::read(dest.join("after.txt")).unwrap(), b"after", "{name}");
         }
         link::NO_HARD_LINKS.with(|n| n.set(false));
+    }
+
+    /// Codex on #329: under `HardLinkTargets::StoredName` a link to a file this run didn't write, copied where no
+    /// hard link can be made, is charged its whole length: links to a big preexisting (sparse) file can't
+    /// materialise more than the budget, while one to a small file is copied.
+    #[cfg(unix)]
+    #[test]
+    fn stored_name_copies_of_preexisting_files_are_charged_their_length() {
+        let mut tar = Vec::new();
+        for i in 0..3 {
+            tar.extend(test_header(&format!("big{i}"), b'1', 0, "big"));
+        }
+        tar.extend(test_header("small-copy", b'1', 0, "small"));
+        tar.extend([0u8; 2 * BLOCK]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.tar");
+        std::fs::write(&path, tar).unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        // 600 MiB, all holes: one copy fits the 1 GiB budget, two don't
+        std::fs::File::create(dest.join("big")).unwrap().set_len(600 << 20).unwrap();
+        std::fs::write(dest.join("small"), b"small").unwrap();
+        let opts = Options {
+            mode: Mode::Extract,
+            dest: dest.clone(),
+            overwrite: Overwrite::Skip,
+            flatten: false,
+            threads: Some(1),
+            protected_paths: Default::default(),
+            parallel_min: None,
+            select: None,
+            windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
+            preexisting_links: Default::default(),
+            refused_link_placeholder: false,
+            restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
+            encrypted_links: Default::default(),
+            damaged_input: Default::default(),
+            unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
+            hard_link_targets: crate::extract::HardLinkTargets::StoredName,
+        };
+        link::NO_HARD_LINKS.with(|n| n.set(true));
+        let s = run(&path, &opts, |_| {});
+        link::NO_HARD_LINKS.with(|n| n.set(false));
+        let s = s.unwrap();
+        assert_eq!(s.errors.len(), 2, "{:?}", s.errors);
+        assert!(s.errors.iter().all(|e| e.contains("would have to copy")), "{:?}", s.errors);
+        assert_eq!(std::fs::metadata(dest.join("big0")).unwrap().len(), 600 << 20);
+        assert!(!dest.join("big1").exists() && !dest.join("big2").exists());
+        assert_eq!(std::fs::read(dest.join("small-copy")).unwrap(), b"small");
     }
 
     /// A sparse member skipped because its file exists makes no holes, so it takes nothing from the run's budget:
@@ -2638,6 +2708,7 @@ mod tests {
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             };
             let s = run(&path, &opts, |_| {}).unwrap();
             assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);

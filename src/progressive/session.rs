@@ -674,7 +674,7 @@ impl ProgressiveSession {
                         // A growing declaration must never name this file as an input.
                         self.driver.record_output(identity)?;
                     }
-                    stage.set_metadata(self.options.extract.meta(crate::extract::Meta::from(&member.header)));
+                    stage.set_metadata(self.options.extract.rar_meta(&member.header));
                     self.stage = Some(stage);
                     self.phase = Phase::Part;
                     return Ok(Poll::Ready(Ok(self.start_event.take())));
@@ -2052,6 +2052,7 @@ mod tests {
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
+                hard_link_targets: Default::default(),
             },
             "a.rar".into(),
         );
@@ -2189,6 +2190,7 @@ mod tests {
                     salvage_truncated_zip: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
+                    hard_link_targets: Default::default(),
                 },
                 "a.rar".into(),
             );
