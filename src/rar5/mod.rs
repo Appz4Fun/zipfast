@@ -31,10 +31,15 @@ pub mod tail;
 pub mod testenc;
 pub mod unpack;
 mod unrar_name;
+pub mod volume_headers;
 
 pub use head::{CachedHeader, HeadDoubt, HeadOptions, RebuiltHead, rebuild_volume_head};
 pub use tail::{QuickOpenMode, RebuiltTail, TailDoubt, quick_open_mode, rebuild_volume_tail, rebuild_volume_tail_with};
 pub use unrar_name::{unrar_name, unrar_name_to_string};
+pub use volume_headers::{
+    HashKind, PartHashes, TargetVolume, VolumeFrame, VolumeHeadersError, rebuild_volume_headers,
+    rebuild_volume_headers_from,
+};
 
 use crate::error::{Error, Result};
 
