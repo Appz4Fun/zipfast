@@ -126,6 +126,8 @@ fn options(dest: &Path, overwrite: Overwrite, unix_modes: UnixModes) -> Options 
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
         seven_zip_strict: false,
+        rar4_raw_names: false,
+        folder_times: Default::default(),
         unix_modes,
         backslashes: Default::default(),
         hard_link_targets: HardLinkTargets::StoredName,

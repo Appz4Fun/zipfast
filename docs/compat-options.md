@@ -23,6 +23,8 @@ unsupported_filters: Default::default(),
 unverified_output: Default::default(),
 salvage_truncated_zip: false,
 seven_zip_strict: false,
+rar4_raw_names: false,
+folder_times: Default::default(),
 unix_modes: Default::default(),
 backslashes: Default::default(),
 hard_link_targets: Default::default(),
@@ -753,3 +755,47 @@ So 7-Zip passes over a file header whose type became 0x75 together with its data
 member and exit 0, as zipfast does under `DamagedInput::SevenZip`. UnRAR passes over only its header and fails on the
 data behind it ("Unexpected end of archive", exit 3); `Salvage` reads it as unreadable too. `DamagedInput::SevenZip`
 is otherwise `Refuse`, and encrypted headers are always checked.
+
+## `rar4_raw_names`: RAR 4.x names stored as raw bytes
+
+A RAR 4.x legacy name holding bytes that aren't UTF-8 decodes with U+FFFE marking it and each such byte as U+E000 plus
+its value (U+E080..U+E0FF). By default zipfast writes those private-use characters, valid UTF-8 everywhere.
+UnRAR 7.30 and 7-Zip 26.06 on Unix create the file under the raw bytes. `Options::rar4_raw_names: true` does the
+same: after the name has been checked as usual, each U+E080..U+E0FF character goes back to its byte 0x80..0xFF. Those
+bytes are never a `/`, a NUL or a `.`, so no new component, `..` or absolute path can appear; the mapped path is
+checked again to have the same plain components, and is left private-use otherwise.
+
+| `rar4/corrupted.rar` (Prybar's `seven-list/rar4-rawname.rar`), first file | written as |
+|---|---|
+| UnRAR 7.30 `x -y`, 7-Zip 26.06 `x -y` (Linux, ext4) | `test/C\x85:5\xe5\xcbB'` (82 bytes, sha256 `60603e05...`) |
+| zipfast, default | `test/C\u{E085}:5\u{E0E5}\u{E0CB}B'` |
+| zipfast, `rar4_raw_names` on Linux | `test/C\x85:5\xe5\xcbB'` |
+| zipfast, `rar4_raw_names` on macOS (APFS refuses the bytes with EILSEQ) | `test/C\u{E085}:5\u{E0E5}\u{E0CB}B'` |
+
+Whether the file system takes such a name is found once per run, at the first name that needs it, by creating and
+removing a probe file (`.zipfast-raw-name-probe-<pid>-\xff`) in the destination. Honoured by the whole-archive RAR
+runners (`extract::run`, `run_with_password`, `run_rar_with_outcomes`, the dispatchers); `SelectedEntry`, `RarSession`
+and progressive sessions keep the private-use name. Unix only.
+
+## `folder_times`: when a folder's time is set
+
+`FolderTimes::AtEnd` (the default) sets every RAR folder member's time after the run, deepest first, as 7-Zip 26.06
+does: folders keep their archived times whatever is written in them. `FolderTimes::AtEntry` sets it when the run
+reaches the folder's entry and never again, as UnRAR 7.30 does: a file or folder created in it later, or a file that
+fails its checksum and is created and removed (the default without `keep_broken`), leaves it at the time that
+happened. Permission bits are set at the end under both, so a read-only folder never blocks its own files.
+
+`rar4/corrupted.rar` stores its folders' entries among its files and breaks after its first file, so every later
+file fails. Run with `x -y` (UnRAR) and `x -y` (7-Zip):
+
+| folder | 7-Zip 26.06, `AtEnd` | UnRAR 7.30, `AtEntry` | why |
+|---|---|---|---|
+| `test/a` | 2006-09-28 11:11:03 | extraction time | `test/a/oe`, `test/a/a.a.a`, ... after its entry |
+| `test/a.a` | 11:11:14 | extraction time | `test/a.a/j.ngmccgooauqn.cl.m` after its entry |
+| `test/a.a.a` | 11:07:44 | extraction time | folder `test/a.a.a/a.a.a.a` made after its entry |
+| `test/a.a.a/a.a` | 11:09:36 | extraction time | `test/a.a.a/a.a/qv.yb` after its entry |
+| `test/a.a/a.a.a` | 11:10:51 | extraction time | `test/a.a/a.a.a/oyo:nwnlh.uhy` after its entry |
+| `test` and the 15 other folders | archived time | archived time | nothing made in them after their entry |
+
+Honoured by the whole-archive RAR runners; other formats, `RarSession` and progressive sessions always set folder
+times at the end. `tests/rar4_raw_names_folder_times.rs` checks both options.

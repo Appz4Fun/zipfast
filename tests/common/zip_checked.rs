@@ -82,6 +82,8 @@ pub fn options(dest: &Path, extract: bool) -> zipfast::extract::Options {
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
         seven_zip_strict: false,
+        rar4_raw_names: false,
+        folder_times: Default::default(),
         unix_modes: Default::default(),
         backslashes: Default::default(),
         hard_link_targets: Default::default(),

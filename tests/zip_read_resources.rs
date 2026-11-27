@@ -310,6 +310,8 @@ fn encrypted_stored_and_deflate_preserve_password_authentication_and_crc_rules()
                             unverified_output: Default::default(),
                             salvage_truncated_zip: false,
                             seven_zip_strict: false,
+                            rar4_raw_names: false,
+                            folder_times: Default::default(),
                             unix_modes: Default::default(),
                             backslashes: Default::default(),
                             hard_link_targets: Default::default(),

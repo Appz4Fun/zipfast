@@ -45,6 +45,34 @@ pub(crate) fn rar_output_name(name: &str, rar4: bool) -> Option<std::borrow::Cow
     }
 }
 
+/// `Options::rar4_raw_names`: `rel`, a RAR 4.x member's checked output path (from [`rar_output_name`] and
+/// [`sanitize`]), with each U+E080..U+E0FF character turned back into the byte 0x80..0xFF it stands for, as UnRAR
+/// and 7-Zip write such a name on Unix. None when `rel` holds no such character.
+///
+/// The bytes are all 0x80 or above, never a `/`, a NUL or a `.`, so every component stays the one that was checked;
+/// that is verified again here, and a path that would change shape is refused (None, keep `rel`).
+#[cfg(unix)]
+pub(crate) fn rar4_raw_path(rel: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let text = rel.to_str()?;
+    if !text.chars().any(|c| ('\u{E080}'..='\u{E0FF}').contains(&c)) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        match u32::from(c).checked_sub(0xE000).filter(|b| (0x80..=0xFF).contains(b)) {
+            Some(byte) => bytes.push(u8::try_from(byte).ok()?),
+            None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    if bytes.contains(&0) {
+        return None;
+    }
+    let raw = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    let normal = |path: &Path| path.components().all(|part| matches!(part, Component::Normal(_)));
+    (normal(rel) && normal(&raw) && raw.components().count() == rel.components().count()).then_some(raw)
+}
+
 /// Whether a folder member's name is only `.` and separators, as in the `./` that bsdtar and Windows `tar.exe`
 /// write first when archiving the current directory: it stands for the destination itself, so it is passed over.
 #[cfg(test)]
@@ -176,6 +204,21 @@ mod tests {
         assert_eq!(sanitize("a/b/c.mkv", false).unwrap(), Path::new("a/b/c.mkv"));
         assert_eq!(sanitize("./a//b", false).unwrap(), Path::new("a/b"));
         assert_eq!(sanitize("a\\b.txt", true).unwrap(), Path::new("a/b.txt"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rar4_raw_paths_map_private_use_back_to_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = |name: &str| rar4_raw_path(Path::new(name)).map(|p| p.as_os_str().as_bytes().to_vec());
+        assert_eq!(raw("test/C\u{E085}:5\u{E0E5}\u{E0CB}B'").as_deref(), Some(&b"test/C\x85:5\xe5\xcbB'"[..]));
+        assert_eq!(raw("d\u{E0FF}/\u{E080}").as_deref(), Some(&b"d\xff/\x80"[..]));
+        // nothing mapped: the path stays as it is
+        assert_eq!(raw("test/caf\u{E9}.txt"), None);
+        assert_eq!(raw("test/\u{E07F}\u{E100}"), None);
+        // never a separator, NUL or dot component out of a mapped byte; a path that isn't plain is left alone
+        assert_eq!(raw("../\u{E085}"), None);
+        assert_eq!(raw("/abs/\u{E085}"), None);
     }
 
     #[test]

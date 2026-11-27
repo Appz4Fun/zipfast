@@ -57,6 +57,8 @@ fn options(dest: &Path, keep_broken: bool) -> Options {
         unverified_output: Default::default(),
         hard_link_targets: Default::default(),
         seven_zip_strict: Default::default(),
+        rar4_raw_names: false,
+        folder_times: Default::default(),
     }
 }
 
