@@ -64,6 +64,7 @@ fn extract_options(dest: &Path, mode: Mode, damaged: DamagedInput) -> extract::O
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        encrypted_links: Default::default(),
         damaged_input: damaged,
         unsupported_filters: Default::default(),
         salvage_truncated_zip: false,
