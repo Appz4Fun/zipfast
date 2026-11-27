@@ -92,7 +92,8 @@ pub struct SevenZipLimits {
     /// `dictionary_bytes` too), and the packed and decoded bytes in flight the rest: a worker waits while that is
     /// spent. Blocks decoded ahead of the one being written are held whole, so how many decode side by side is about
     /// this budget over the block size (7-Zip's blocks are four times the dictionary: 64 MiB to 256 MiB at `-mx5` to
-    /// `-mx9`). The memory is taken only as blocks need it; a caller running several extractions at once may lower
+    /// `-mx9`), and fewer workers start than the threads asked for when the rest would leave each less than one and
+    /// a half blocks in flight (18 at most for 64 MiB blocks in 2 GiB). The memory is taken only as blocks need it; a caller running several extractions at once may lower
     /// it. See `docs/7z-extract.md`.
     pub lzma2_parallel_bytes: u64,
     /// Threads [`print_selected`] (and reading one member through `extract::SelectedEntry`) decode a folder's
