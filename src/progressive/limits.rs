@@ -143,6 +143,9 @@ pub struct ProgressiveLimits {
     pub protection_paths: u64,
     pub protection_path_bytes: u64,
 }
+/// The default of every byte-total limit (source, logical output, temp, output writes, verify): 1 TiB.
+pub const DEFAULT_BYTE_TOTAL: u64 = 1 << 40;
+
 impl Default for ProgressiveLimits {
     fn default() -> Self {
         Self {
@@ -162,12 +165,14 @@ impl Default for ProgressiveLimits {
             source_requests: 4194304,
             source_bookkeeping: 64 * 1024 * 1024,
             provider_wakes: 1048576,
-            source_bytes: 68719476736,
-            logical_output_bytes: 68719476736,
-            temp_bytes: 68719476736,
-            output_write_bytes: 68719476736,
-            verify_bytes: 68719476736,
-            verify_work_bytes: 68719476736,
+            // Byte totals are not where a hostile archive is stopped (declared sizes, the decoder window and the
+            // per-poll work are): they only have to exceed real sets, such as 70-100 GB UHD remux posts. 1 TiB each.
+            source_bytes: DEFAULT_BYTE_TOTAL,
+            logical_output_bytes: DEFAULT_BYTE_TOTAL,
+            temp_bytes: DEFAULT_BYTE_TOTAL,
+            output_write_bytes: DEFAULT_BYTE_TOTAL,
+            verify_bytes: DEFAULT_BYTE_TOTAL,
+            verify_work_bytes: DEFAULT_BYTE_TOTAL,
             decoder_window: 268435456,
             packed_work_per_poll: 1048576,
             kdf_exponent: 20,
