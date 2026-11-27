@@ -274,6 +274,146 @@ pub struct Options {
     /// and by progressive sessions through [`crate::progressive::ProgressiveOptions`]' extract options. A RarSession
     /// test run, which takes no `Options`, reads [`crate::rar5::session::RarSessionOptions::encrypted_links`].
     pub encrypted_links: EncryptedLinks,
+    /// Make the extra consistency checks 7-Zip 26.06 makes, and report what fails them, even where every member's
+    /// own CRC passes. Off (the default) none of this is checked; `docs/compat-options.md` ("`seven_zip_strict`")
+    /// has what 7-Zip reports for each case.
+    ///
+    /// - 7z: once a folder has been decoded to its end, each coder that 7-Zip checks must have ended cleanly and used
+    ///   up its input: an LZMA or PPMd range coder must end at 0 (or, for LZMA, at an end marker), and an LZMA, LZMA2,
+    ///   PPMd or BCJ2 coder must leave none of its input unused (LZMA2: nothing after its end marker, which may be
+    ///   absent, as 7-Zip allows). A folder that fails is a [`FolderDamage`] in [`Summary::folder_damage`] and a line
+    ///   `#N: data error: ...` in [`Summary::errors`] (7-Zip's "Data Error : #N", exit 2). Bytes left after the end of
+    ///   a Deflate, Deflate64 or BZip2 stream, or after what a Copy coder passes on, are
+    ///   [`FolderDamageKind::DataAfterEnd`] (7-Zip's "There are some data after the end of the payload data : #N").
+    ///   The folder's members are written and reported as their own checks say, as 7-Zip writes them. A folder not
+    ///   decoded to its end (no member after the last one selected is decoded) isn't checked, as 7-Zip doesn't check
+    ///   it. A BCJ2 or PPMd range coder whose first byte isn't 0 fails the folder's members as a data error before
+    ///   any of them is written, as 7-Zip fails them. LZMA2 decodes on one thread under this option.
+    /// - ZIP: each member's local header is compared with its central directory record: the CRC-32 and both sizes
+    ///   (unless the local header sets the data descriptor flag, as 7-Zip doesn't compare them then; a ZIP64 sentinel
+    ///   in the local header isn't compared), the compression method and the data descriptor flag. A member whose
+    ///   local header differs fails without being decoded (7-Zip's "Headers Error : NAME"; with [`Self::keep_broken`]
+    ///   its file stays empty, as 7-Zip leaves it) and is a [`LocalHeaderMismatch`] in
+    ///   [`Summary::local_header_mismatches`]; on the checked route it fails as
+    ///   [`crate::zip::ReadFault::LocalHeaderMismatch`].
+    ///
+    /// Honoured by the 7z runners ([`crate::sevenzip::run`], the dispatchers, the checked dispatchers'
+    /// 7z route, and [`crate::sevenzip::print_selected_with_options`] through
+    /// `SevenZipPrintOptions::seven_zip_strict`), and by the ZIP runners, legacy ([`crate::zip::run`] and the
+    /// dispatchers) and checked ([`run_with_policy`], [`crate::zip::run_with_policy`]). Progressive and
+    /// persistent-partial sessions decode neither 7z nor ZIP, and the other formats ignore it.
+    pub seven_zip_strict: bool,
+}
+
+/// A 7z folder that decoded to its end but whose coders didn't end cleanly, under [`Options::seven_zip_strict`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct FolderDamage {
+    /// The folder's index in the archive, 7-Zip's `#N`.
+    pub folder: u64,
+    pub kind: FolderDamageKind,
+    /// What did not end cleanly, for a message.
+    pub detail: &'static str,
+}
+
+impl FolderDamage {
+    pub(crate) fn new(folder: u64, kind: FolderDamageKind, detail: &'static str) -> Self {
+        Self { folder, kind, detail }
+    }
+}
+
+impl std::fmt::Display for FolderDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.kind {
+            FolderDamageKind::DataError => "data error",
+            FolderDamageKind::DataAfterEnd => "there are some data after the end of the payload data",
+        };
+        write!(f, "#{}: {what}: {}", self.folder, self.detail)
+    }
+}
+
+/// How 7-Zip 26.06 reports a [`FolderDamage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FolderDamageKind {
+    /// "Data Error": an LZMA, LZMA2, PPMd or BCJ2 coder that doesn't end cleanly or leaves input unused.
+    DataError,
+    /// "There are some data after the end of the payload data": bytes after the end of a Deflate, Deflate64 or
+    /// BZip2 stream, or after what a Copy coder passes on.
+    DataAfterEnd,
+}
+
+/// A ZIP member whose local header differs from its central directory record, under
+/// [`Options::seven_zip_strict`]. Each flag says whether that field differs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LocalHeaderMismatch {
+    /// The member's listing index.
+    pub ordinal: u64,
+    pub name: String,
+    /// The CRC-32.
+    pub crc32: bool,
+    /// The compressed size.
+    pub packed_size: bool,
+    /// The uncompressed size.
+    pub size: bool,
+    /// The compression method.
+    pub method: bool,
+    /// The data descriptor flag (general purpose bit 3).
+    pub descriptor_flag: bool,
+}
+
+impl LocalHeaderMismatch {
+    /// Compares a local header with the central record's values; `None` when 7-Zip would find nothing to report.
+    pub(crate) fn compare(
+        local: &zip_container::LocalHeader,
+        flags: u16,
+        method: u16,
+        crc32: u32,
+        packed: u64,
+        size: u64,
+    ) -> Option<Self> {
+        const DESCRIPTOR: u16 = 0x0008;
+        let streamed = local.flags & DESCRIPTOR != 0;
+        let differs = |wire: u32, value: u64| !streamed && wire != u32::MAX && u64::from(wire) != value;
+        let found = Self {
+            crc32: !streamed && local.crc32 != crc32,
+            packed_size: differs(local.packed_size, packed),
+            size: differs(local.unpacked_size, size),
+            method: local.method != method,
+            descriptor_flag: (local.flags ^ flags) & DESCRIPTOR != 0,
+            ..Self::default()
+        };
+        (found.crc32 || found.packed_size || found.size || found.method || found.descriptor_flag).then_some(found)
+    }
+
+    pub(crate) fn named(mut self, ordinal: u64, name: &str) -> Self {
+        self.ordinal = ordinal;
+        self.name = name.to_owned();
+        self
+    }
+}
+
+impl std::fmt::Display for LocalHeaderMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fields = [
+            (self.crc32, "CRC-32"),
+            (self.packed_size, "compressed size"),
+            (self.size, "size"),
+            (self.method, "method"),
+            (self.descriptor_flag, "data descriptor flag"),
+        ];
+        f.write_str("headers error: the local header differs from the central directory (")?;
+        let mut first = true;
+        for (_, what) in fields.iter().filter(|(on, _)| *on) {
+            if !first {
+                f.write_str(", ")?;
+            }
+            f.write_str(what)?;
+            first = false;
+        }
+        f.write_str(")")
+    }
 }
 
 /// What an encrypted RAR 5.0 redirection member needs before it is placed or tested; see
@@ -832,6 +972,7 @@ impl MemberRef<'_> {
 ///     unsupported_filters: Default::default(),
 ///     unverified_output: Default::default(),
 ///     salvage_truncated_zip: false,
+///     seven_zip_strict: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
 ///     hard_link_targets: Default::default(),
@@ -1051,6 +1192,14 @@ pub struct Summary {
     /// ([`crate::sevenzip::print_selected_with_options`]), in the order they were printed. Each is also a line in
     /// [`Self::errors`].
     pub unverified: Vec<UnverifiedMember>,
+    /// 7z folders that decoded to their end but whose coders didn't end cleanly, in archive order; empty unless
+    /// [`Options::seven_zip_strict`] is on. Each is also a line in [`Self::errors`]: 7-Zip 26.06 reports "Data Error :
+    /// #N" (or "There are some data after the end of the payload data : #N") and exits 2.
+    pub folder_damage: Vec<FolderDamage>,
+    /// ZIP members whose local header differs from their central directory record, in archive order; empty unless
+    /// [`Options::seven_zip_strict`] is on. Each member also failed (a line in [`Self::errors`]): 7-Zip 26.06 reports
+    /// "Headers Error : NAME" and exits 2.
+    pub local_header_mismatches: Vec<LocalHeaderMismatch>,
     /// the rename attempts this run has left
     pub(crate) rename_budget: RenameBudget,
     /// folders whose times and permissions are set once everything inside them is written
@@ -4715,6 +4864,7 @@ fn rar_read_at(
         unsupported_filters: if unfiltered { UnsupportedFilters::WriteUnfiltered } else { UnsupportedFilters::Fail },
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
+        seven_zip_strict: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
         hard_link_targets: Default::default(),
@@ -6598,6 +6748,7 @@ mod tests {
             unsupported_filters: Default::default(),
             unverified_output: UnverifiedOutput::Emit,
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
             hard_link_targets: Default::default(),
@@ -6940,6 +7091,7 @@ mod read_once {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
             hard_link_targets: Default::default(),

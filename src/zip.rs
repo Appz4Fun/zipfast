@@ -636,6 +636,20 @@ fn read_projected_legacy(
     Ok((entries, usage))
 }
 
+/// [`Options::seven_zip_strict`]: how the entry's local header differs from its central record, if it does. A local
+/// header that can't be read is left for the read to report.
+fn local_mismatch(
+    file: &mut (impl Read + Seek),
+    len: u64,
+    e: &ZipEntry,
+) -> Option<crate::extract::LocalHeaderMismatch> {
+    if e.local_at.checked_add(LOCAL_HEADER_LEN as u64).is_none_or(|end| end > len) {
+        return None;
+    }
+    let header = LocalHeader::parse(&read_local_header(file, e.local_at).ok()?).ok()?;
+    crate::extract::LocalHeaderMismatch::compare(&header, e.flags, e.method, e.crc32, e.packed, e.size)
+}
+
 /// Where an entry's data starts, from its local header.
 fn data_at(file: &mut (impl Read + Seek), len: u64, e: &ReadDescription<'_>) -> Result<u64> {
     if e.local_at.checked_add(LOCAL_HEADER_LEN as u64).is_none_or(|end| end > len) {
@@ -1412,6 +1426,15 @@ fn run_archive(
                 continue;
             }
             if e.is_link() {
+                // Options::seven_zip_strict: as for a file, a local header that differs fails the link unread
+                if opts.seven_zip_strict
+                    && let Some(found) = local_mismatch(&mut archive.file, archive.len, e)
+                {
+                    let found = found.named(member.0, member.1);
+                    fail(&mut summary, report, member, &found.to_string());
+                    summary.local_header_mismatches.push(found);
+                    continue;
+                }
                 // The target is the member's data: read and checked whole before anything is placed.
                 let mut text = Vec::new();
                 let entry = e.read_description();
@@ -1521,6 +1544,22 @@ fn run_archive(
                         continue;
                     }
                 }
+            }
+            // Options::seven_zip_strict: a local header that differs from the central record fails the member before
+            // it is decoded, as 7-Zip's "Headers Error" (with keep_broken its file stays empty, as 7-Zip leaves it)
+            if opts.seven_zip_strict
+                && let Some(found) = local_mismatch(&mut archive.file, archive.len, e)
+            {
+                let found = found.named(member.0, member.1);
+                match target {
+                    Some(out) if opts.keep_broken => {
+                        let _ = out.finish(|file| crate::extract::keep_written(file, &opts.meta(e.meta()), None));
+                    }
+                    target => drop(target),
+                }
+                fail(&mut summary, report, member, &found.to_string());
+                summary.local_header_mismatches.push(found);
+                continue;
             }
             let mut entry = e.read_description();
             entry.keep_cut = opts.keep_broken;

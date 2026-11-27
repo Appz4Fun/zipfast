@@ -372,6 +372,10 @@ pub struct SevenZipPrintOptions {
     /// solid block an earlier member broke. It is still a line in [`Summary::errors`], and an entry in
     /// [`Summary::unverified`] says how many of its bytes went out. The default prints only members that check out.
     pub unverified_output: crate::extract::UnverifiedOutput,
+    /// [`crate::extract::Options::seven_zip_strict`]: each folder decoded to its end has its coders' ends checked as
+    /// 7-Zip 26.06 checks them; a folder that fails is a [`crate::extract::FolderDamage`] in
+    /// [`Summary::folder_damage`] and a line in [`Summary::errors`], and its members print as their own checks say.
+    pub seven_zip_strict: bool,
 }
 
 impl SevenZipPrintOptions {
@@ -383,6 +387,12 @@ impl SevenZipPrintOptions {
     /// Sets [`Self::unverified_output`].
     pub fn unverified_output(mut self, unverified_output: crate::extract::UnverifiedOutput) -> Self {
         self.unverified_output = unverified_output;
+        self
+    }
+
+    /// Sets [`Self::seven_zip_strict`].
+    pub fn seven_zip_strict(mut self, seven_zip_strict: bool) -> Self {
+        self.seven_zip_strict = seven_zip_strict;
         self
     }
 }
@@ -397,8 +407,7 @@ pub fn print_selected_with_options(
     limits: &SevenZipLimits,
     options: &SevenZipPrintOptions,
 ) -> Result<Summary> {
-    let unverified = options.unverified_output == crate::extract::UnverifiedOutput::Emit;
-    run::print(first, password, select, on_bytes, cancel, limits, unverified).map_err(Error::from)
+    run::print(first, password, select, on_bytes, cancel, limits, options).map_err(Error::from)
 }
 
 /// [`run`], reporting a rename mode's renames to `report` as they happen; a terminal error keeps them too.
@@ -795,6 +804,7 @@ mod header_key_tests {
             unsupported_filters: Default::default(),
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
+            seven_zip_strict: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
             hard_link_targets: Default::default(),
