@@ -50,6 +50,12 @@ pub struct RarEntryOutcome {
     /// or a log. Only the first 4096 bytes are kept, so a longer target comes cut off there (and such a link is never
     /// placed).
     pub link: Option<crate::rar5::Redirection>,
+    /// The bytes of a failed member that went to the caller's writer anyway, under
+    /// [`crate::extract::UnverifiedOutput::Emit`] (`RarPrintOptions::unverified_output` for
+    /// [`crate::rar5::session::RarSession::print_selected`]), as UnRAR 7.30 `p` prints them. `Some` only with
+    /// [`RarOutcome::Failed`], whose failure is the member's own (a checksum, a missing volume, a decoder error):
+    /// a caller imitating UnRAR prints its error and exits as it would without the bytes. `None` otherwise.
+    pub unverified_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,6 +198,7 @@ impl EntryContext {
             outcome,
             renamed: self.renamed.clone(),
             link: self.link.clone(),
+            unverified_bytes: None,
         }
     }
 
