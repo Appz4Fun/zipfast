@@ -434,8 +434,7 @@ pub(super) fn derive_keys(
             usage.check(Resource::PasswordUtf8Bytes, password.len() as u64).map_err(fail)?;
             usage.check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2).map_err(fail)?;
             limits.check_seven_zip_kdf(*num_cycles_power).map_err(fail)?;
-            let mut meter = crate::rar5::member::KdfMeter::new(usage, control);
-            let key = match crate::crypto::derive_7z_key_controlled(password, salt, *num_cycles_power, &mut meter) {
+            let key = match crate::rar5::member::session_7z_key(password, salt, *num_cycles_power, usage, control) {
                 None => return Err(ExtractFromError::Unsupported(UnsupportedRead::UnmappedCipher)),
                 Some(Ok(key)) => key,
                 Some(Err(crate::crypto::KdfControlError::Canceled)) => {

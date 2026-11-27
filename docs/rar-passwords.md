@@ -50,8 +50,26 @@ RAR5 hashes the UTF-8 bytes of the first 127 characters.
 
 ## zipfast
 
-`crypto::RAR_MAX_PASSWORD_CHARS` (127) is applied where keys are derived: RAR5 (`derive_rar5_keys_impl`,
+`crypto::RAR_MAX_PASSWORD_CHARS` (127) is applied where keys are derived: RAR5 (`rar5_pbkdf2`,
 `Rar5PasswordCheck::accepts_bytes`; UTF-8, characters are counted, invalid UTF-8 is cut at 127 bytes) and RAR4
 (`derive_rar4_key_iv_impl`; UTF-16 units, a pair counts as one character). Every public and controlled derive
 function passes through them, so data and header encryption, listing, extraction, mapping and the progressive
 and partial sessions all agree.
+
+## Derived keys are cached per run and session
+
+`rar` gives every encrypted header and file record of an archive (and of every volume of a set) the same salt, so
+deriving per member or per volume repeats the same PBKDF2 run: ~3 ms each at the usual count of 15, which made a
+1000-member `-hp` archive take seconds. UnRAR and 7-Zip keep the keys of recent inputs, and so does zipfast:
+
+* `crypto::KdfCache` keeps key material by (password, salt, count), at most `KdfCache::KEPT` (16) inputs, least
+  recently used dropped first, in memory only, for the life of one run or session. An archive with a new salt in
+  every header derives as it would without a cache. Nothing is kept across runs or process-wide.
+* RAR 5.0 keeps the key, the `HashKey` and the derived password check value (`crypto::Rar5Derived`), not a verdict:
+  every member's own check value is still compared, so a wrong password fails each member as before. Material
+  derived for a record without a usable check value is derived again for a later record that has one.
+* The whole-archive runner shares one `crypto::SharedRar5Keys` with every volume it opens (header keys) and its
+  members (data keys, link password checks); listing shares it between volumes; `RarSession` shares it between the
+  catalogue and every selection. Progressive and partial sessions, member maps and feed decoders cache through
+  their `progressive::Usage`, for RAR 5.0, RAR 3.x and 7zAES: a repeated input charges no KDF work to the session
+  budget, a new one is charged in full.
