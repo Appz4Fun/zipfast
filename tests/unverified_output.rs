@@ -390,3 +390,152 @@ fn selected_entry_streams_a_rar_member_with_an_unsupported_filter_unfiltered() {
         }
     }
 }
+
+fn num(out: &mut Vec<u8>, value: u64) {
+    let bytes = value.to_le_bytes();
+    let extra = (0..=8).find(|&n| n == 8 || value < 1u64 << (7 * (n + 1))).unwrap();
+    if extra == 8 {
+        out.push(0xFF);
+        out.extend_from_slice(&bytes);
+        return;
+    }
+    let first = (0xFFu16 << (8 - extra)) as u8 | (value >> (8 * extra)) as u8;
+    out.push(first);
+    out.extend_from_slice(&bytes[..extra]);
+}
+
+/// One folder holding `files` (name, contents, the CRC stored for it if any) with the folder's own CRC, so a member
+/// without a CRC of its own is held back for it: Copy, or 7zAES over the data when `password` is given (the "no
+/// hashing" key derivation, power 0x3F: the key is the password). 7-Zip always writes member CRCs, so this is built
+/// by hand.
+fn folder_with_a_crc(path: &Path, password: Option<&str>, files: &[(&str, &[u8], Option<u32>)]) {
+    let plain: Vec<u8> = files.iter().flat_map(|(_, data, _)| data.iter().copied()).collect();
+    let iv = [9u8; 16];
+    let packed = match password {
+        Some(password) => {
+            let mut key = [0u8; 32];
+            for (slot, byte) in key.iter_mut().zip(password.encode_utf16().flat_map(u16::to_le_bytes)) {
+                *slot = byte;
+            }
+            let mut padded = plain.clone();
+            padded.resize(plain.len().next_multiple_of(16), 0);
+            zipfast::crypto::encrypt_cbc(&key, &iv, &padded).unwrap()
+        }
+        None => plain.clone(),
+    };
+    let mut h = vec![0x01, 0x04, 0x06, 0x00, 0x01, 0x09];
+    num(&mut h, packed.len() as u64);
+    h.extend([0x00, 0x07, 0x0B, 0x01, 0x00, 0x01]);
+    if password.is_some() {
+        h.extend([0x24, 0x06, 0xF1, 0x07, 0x01]);
+        let mut props = vec![0x7F, 0x0F];
+        props.extend(iv);
+        num(&mut h, props.len() as u64);
+        h.extend(props);
+    } else {
+        h.extend([0x01, 0x00]);
+    }
+    h.push(0x0C);
+    num(&mut h, plain.len() as u64);
+    h.extend([0x0A, 0x01]);
+    h.extend(zipfast::crc32::hash(&plain).to_le_bytes());
+    h.push(0x00);
+    h.extend([0x08, 0x0D]);
+    num(&mut h, files.len() as u64);
+    h.push(0x09);
+    for (_, data, _) in &files[..files.len() - 1] {
+        num(&mut h, data.len() as u64);
+    }
+    h.extend([0x0A, 0x00]);
+    let mut bits = vec![0u8; files.len().div_ceil(8)];
+    for (i, (_, _, crc)) in files.iter().enumerate() {
+        if crc.is_some() {
+            bits[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    h.extend(bits);
+    for (_, _, crc) in files {
+        if let Some(crc) = crc {
+            h.extend(crc.to_le_bytes());
+        }
+    }
+    h.extend([0x00, 0x00, 0x05]);
+    num(&mut h, files.len() as u64);
+    let mut names = vec![0u8];
+    for (name, _, _) in files {
+        names.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+        names.extend([0, 0]);
+    }
+    h.push(0x11);
+    num(&mut h, names.len() as u64);
+    h.extend(names);
+    h.extend([0x00, 0x00]);
+    let mut start = [0u8; 20];
+    start[..8].copy_from_slice(&(packed.len() as u64).to_le_bytes());
+    start[8..16].copy_from_slice(&(h.len() as u64).to_le_bytes());
+    start[16..].copy_from_slice(&zipfast::crc32::hash(&h).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend(zipfast::crc32::hash(&start).to_le_bytes());
+    out.extend(start);
+    out.extend(packed);
+    out.extend(h);
+    fs::write(path, out).unwrap();
+}
+
+/// Codex on #317: a member failing its own CRC behind one held for the folder's CRC prints after it, in archive order.
+#[test]
+fn seven_zip_print_keeps_archive_order_behind_a_member_held_for_the_folder_crc() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("held.7z");
+    let (first, second, third): (&[u8], &[u8], &[u8]) = (b"no crc of its own, ", b"a wrong stored crc, ", b"fine");
+    let files = [
+        ("first.txt", first, None),
+        ("second.txt", second, Some(zipfast::crc32::hash(second) ^ 1)),
+        ("third.txt", third, Some(zipfast::crc32::hash(third))),
+    ];
+    folder_with_a_crc(&path, None, &files);
+    let mut output = Vec::new();
+    let summary = sevenzip::print_selected_with_options(
+        &path,
+        None,
+        &mut |_, _| true,
+        &mut |_, bytes| {
+            output.extend_from_slice(bytes);
+            Ok(())
+        },
+        &Cancellation::default(),
+        &SevenZipLimits::default(),
+        &SevenZipPrintOptions::new().unverified_output(UnverifiedOutput::Emit),
+    )
+    .unwrap();
+    assert_eq!(output, [first, second, third].concat(), "archive order");
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].starts_with("second.txt"), "{:?}", summary.errors);
+    let unverified: Vec<_> = summary.unverified.iter().map(|m| (m.index, m.bytes)).collect();
+    assert_eq!(unverified, [(1, second.len() as u64)]);
+}
+
+/// Codex on #317: a member held for the folder's CRC, printed when a later member shows the wrong password, fails the
+/// run when writing it fails.
+#[test]
+fn seven_zip_print_fails_on_an_output_error_printing_held_members_for_a_wrong_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aes-held.7z");
+    let (first, second): (&[u8], &[u8]) = (b"no crc of its own", b"checked by its crc");
+    folder_with_a_crc(
+        &path,
+        Some("right"),
+        &[("first.txt", first, None), ("second.txt", second, Some(zipfast::crc32::hash(second)))],
+    );
+    let result = sevenzip::print_selected_with_options(
+        &path,
+        Some("wrong"),
+        &mut |_, _| true,
+        &mut |_, _| Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed")),
+        &Cancellation::default(),
+        &SevenZipLimits::default(),
+        &SevenZipPrintOptions::new().unverified_output(UnverifiedOutput::Emit),
+    );
+    let error = result.expect_err("the output error ends the run");
+    assert!(error.to_string().contains("closed"), "{error}");
+}

@@ -1362,7 +1362,8 @@ impl Single {
                     return Err(io::Error::from(io::ErrorKind::OutOfMemory));
                 }
                 // what decoded before the bad data goes out first, the error after (as `LzmaReader` does)
-                Err(_) if made > 0 => {
+                // (only when the caller still wants more, as there)
+                Err(_) if made > 0 && made < out.len() => {
                     self.walker.produced += made as u64;
                     self.made = made;
                     self.failed = true;

@@ -167,7 +167,9 @@ impl Read for LzmaReader {
                     return Err(io::Error::from(io::ErrorKind::OutOfMemory));
                 }
                 // what decoded before the bad data goes out first (7-Zip's `x -so` streams it), the error after
-                Err(_) if made > 0 => {
+                // (only when the caller still wants more: one asking for exactly the bytes made would never ask
+                // again, and the failure would be lost)
+                Err(_) if made > 0 && made < out.len() => {
                     self.failed = true;
                     return Ok(made);
                 }
@@ -611,6 +613,41 @@ fn coder_reader(coder: &MapCoder, inputs: Vec<Stream>, size: u64, cx: &mut Conte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex on #317: a data error liblzma reports in the call that also made the last bytes the caller asked for is
+    /// not put off to a later read (a caller asking for exactly what is left never reads again): the read fails.
+    #[test]
+    fn a_data_error_with_the_last_bytes_asked_for_fails_the_read() {
+        let data: Vec<u8> =
+            (0..10_000u32).map(|i| b"lzma end marker test "[(i % 21) as usize] ^ (i / 997) as u8).collect();
+        let options = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
+        let mut filters = liblzma::stream::Filters::new();
+        filters.lzma1(&options);
+        let mut encoder = liblzma::stream::Stream::new_raw_encoder(&filters).unwrap();
+        let mut packed = Vec::with_capacity(data.len() + 1024);
+        encoder.process_vec(&data, &mut packed, liblzma::stream::Action::Finish).unwrap();
+        let mut cases = 0;
+        for back in 1..=8.min(packed.len()) {
+            for bit in 0..8 {
+                let mut bad = packed.clone();
+                let at = bad.len() - back;
+                bad[at] ^= 1 << bit;
+                // what liblzma does with an output buffer of exactly the data's length
+                let mut direct = liblzma::stream::Stream::new_raw_decoder(&filters).unwrap();
+                let mut out = vec![0u8; data.len()];
+                let status = direct.process(&bad, &mut out, liblzma::stream::Action::Finish);
+                if status.is_ok() || direct.total_out() != data.len() as u64 {
+                    continue;
+                }
+                cases += 1;
+                let stream = liblzma::stream::Stream::new_raw_decoder(&filters).unwrap();
+                let mut reader = LzmaReader::new(Box::new(io::Cursor::new(bad)), stream);
+                let mut out = vec![0u8; data.len()];
+                assert!(reader.read(&mut out).is_err(), "byte {back} from the end, bit {bit}");
+            }
+        }
+        assert!(cases > 0, "no damage made the decoder fail with the last byte");
+    }
 
     /// Empty stored Deflate blocks, forever.
     struct EmptyBlocks;
