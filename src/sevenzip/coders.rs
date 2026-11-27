@@ -444,15 +444,20 @@ impl Read for PpmdReader {
                     self.model.insert(model)
                 }
             };
-            let byte = model.decode_char(&mut bits).ok_or_else(bad)?;
-            // past the input's end the decoder reads zeros; more than a few is damage
-            if bits.addr > self.buf.len() + 8 {
-                return Err(bad());
+            // decode while a whole character's lookahead is buffered, or the input has ended: true at first, as
+            // `fill` buffered it
+            let want = out.len().min(n.saturating_add(usize::try_from(self.left).unwrap_or(usize::MAX)));
+            let start = n;
+            while n < want && (self.eof || self.buf.len().saturating_sub(bits.addr) >= PPMD_LOOKAHEAD) {
+                out[n] = model.decode_char(&mut bits).ok_or_else(bad)?;
+                // past the input's end the decoder reads zeros; more than a few is damage
+                if bits.addr > self.buf.len() + 8 {
+                    return Err(bad());
+                }
+                n += 1;
             }
             self.pos = bits.addr;
-            out[n] = byte;
-            n += 1;
-            self.left -= 1;
+            self.left -= (n - start) as u64;
         }
         Ok(n)
     }

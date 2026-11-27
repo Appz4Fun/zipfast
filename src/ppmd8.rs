@@ -98,7 +98,7 @@ fn hi_flag_4(sym: u32) -> u8 {
 /// `size` zero bytes, or None when the allocator can't supply them. The allocator hands over zeroed pages
 /// without the decoder touching each one, so a header that asks for 256 MiB in front of a few bytes of garbage costs
 /// address space, not resident memory.
-fn zeroed_heap(size: usize) -> Option<Vec<u8>> {
+pub(crate) fn zeroed_heap(size: usize) -> Option<Vec<u8>> {
     if size == 0 {
         return Some(Vec::new());
     }
