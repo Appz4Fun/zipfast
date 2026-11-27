@@ -1807,17 +1807,37 @@ enum Format {
 const HEAD_PROBE_BYTES: usize = 1024;
 
 fn sniff(path: &Path) -> Result<Format> {
+    sniff_held(path).map(|(format, _)| format)
+}
+
+/// The file at `path` and the first bytes [`sniff_held`] read of it, which a RAR volume opened from it keeps rather
+/// than reading them again.
+struct Sniffed {
+    file: File,
+    head: Vec<u8>,
+}
+
+impl Sniffed {
+    fn open_rar(self, path: &Path, password: Option<&str>, damaged: DamagedInput) -> Result<Volume> {
+        Volume::open_head(path, self.file, self.head, password, damaged)
+    }
+}
+
+/// [`sniff`], keeping the file open and its head, for a RAR read of [`Format::Other`].
+fn sniff_held(path: &Path) -> Result<(Format, Option<Sniffed>)> {
     // a spanned set's `.zip` (or `.z01`) starts where the disk before it stopped, often mid-member
     if crate::zip::is_spanned(path) {
-        return Ok(Format::Zip);
+        return Ok((Format::Zip, None));
     }
-    let mut head = [0u8; HEAD_PROBE_BYTES];
+    let mut head = vec![0u8; HEAD_PROBE_BYTES];
     let mut file = File::open(path)?;
     let n = crate::tar::read_full(&mut file, &mut head)?;
-    match classify_head(&head[..n]) {
+    head.truncate(n);
+    match classify_head(&head) {
         // an ISO 9660 image says so 32 KiB in, past the probe
-        Format::Other if crate::tar::sniff_iso(&file) => Ok(Format::Tar),
-        format => Ok(format),
+        Format::Other if crate::tar::sniff_iso(&file) => Ok((Format::Tar, None)),
+        Format::Other => Ok((Format::Other, Some(Sniffed { file, head }))),
+        format => Ok((format, None)),
     }
 }
 
@@ -1905,8 +1925,14 @@ pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::Z
             Ok(CheckedRoute::Legacy(LegacyRoute::Tar))
         }
         Format::Other => {
-            let (opened, probe) = opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?;
-            match opened.recognize_rar(&probe) {
+            // A RAR that starts within the head is recognized from it; a later signature (behind a self-extractor)
+            // takes the whole window.
+            let (opened, probe) = if signature_end(&head).is_ok() {
+                (opened, head)
+            } else {
+                opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?
+            };
+            match opened.recognize_rar(probe) {
                 Ok((signature, path)) => Ok(CheckedRoute::Legacy(LegacyRoute::Rar { signature, path })),
                 // A byte-split ZIP whose first piece doesn't start with a ZIP signature (a self-extractor, or a
                 // first piece of under four bytes) is still read as the pieces concatenated.
@@ -2898,13 +2924,17 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
             crate::sevenzip::list(first, password)?
         }
         Format::Other => {
-            let signature = signature_end(&source.probe_prefix(SIGNATURE_PROBE_BYTES, cancel)?);
+            // a RAR that starts within the head is recognized from it; a later one takes the whole window
+            let probe = if signature_end(&head[..n]).is_ok() {
+                head[..n].to_vec()
+            } else {
+                source.probe_prefix(SIGNATURE_PROBE_BYTES, cancel)?
+            };
+            let signature = signature_end(&probe);
             cancel.check_io().map_err(Error::from)?;
             match signature {
-                Ok(_) => {
-                    drop(source);
-                    rar_list(first, password)?
-                }
+                // the volume keeps the bytes read to find the signature rather than reading them again
+                Ok(_) => rar_list_held(first, Some(Sniffed { file: source.into_file(), head: probe }), password)?,
                 // a byte-split ZIP whose first piece has no ZIP signature at its start, as above
                 Err(Error::NotAnArchive) if crate::zip::is_byte_split(first) => {
                     drop(source);
@@ -2957,13 +2987,13 @@ impl Listing {
 /// [`list_with_password`], with the listing's warnings.
 pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
     let whole = |entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers: Vec::new() };
-    match sniff(first)? {
-        Format::Zip => return crate::zip::list_detailed(first),
-        Format::Tar => return crate::tar::list(first).map(whole),
-        Format::SevenZip => return crate::sevenzip::list(first, password).map(whole),
-        Format::Other => {}
-    }
-    match rar_list(first, password) {
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return crate::zip::list_detailed(first),
+        (Format::Tar, _) => return crate::tar::list(first).map(whole),
+        (Format::SevenZip, _) => return crate::sevenzip::list(first, password).map(whole),
+        (Format::Other, held) => held,
+    };
+    match rar_list_held(first, held, password) {
         Err(Error::NotAnArchive) => crate::zip::list_detailed(first),
         other => other.map(whole),
     }
@@ -2973,13 +3003,13 @@ pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
 /// [`Options::damaged_input`] says ([`Listing::damaged_headers`] says what was), and a ZIP cut short is listed from
 /// its local headers with [`Options::salvage_truncated_zip`]. The other options don't change a listing.
 pub fn list_detailed_with_options(first: &Path, password: Option<&str>, options: &Options) -> Result<Listing> {
-    match sniff(first)? {
-        Format::Zip => return crate::zip::list_detailed_with_options(first, options),
-        Format::Tar | Format::SevenZip => return list_detailed(first, password),
-        Format::Other => {}
-    }
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return crate::zip::list_detailed_with_options(first, options),
+        (Format::Tar | Format::SevenZip, _) => return list_detailed(first, password),
+        (Format::Other, held) => held,
+    };
     let mut damaged_headers = Vec::new();
-    match rar_list_damaged(first, password, options.damaged_input, &mut damaged_headers) {
+    match rar_list_damaged(first, held, password, options.damaged_input, &mut damaged_headers) {
         Err(Error::NotAnArchive) => crate::zip::list_detailed_with_options(first, options),
         other => other.map(|entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers }),
     }
@@ -2992,13 +3022,13 @@ pub fn list(first: &Path) -> Result<Vec<Entry>> {
 
 /// The entries of an archive, decrypting encrypted headers when `password` is given.
 pub fn list_with_password(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
-    match sniff(first)? {
-        Format::Zip => return crate::zip::list(first),
-        Format::Tar => return crate::tar::list(first),
-        Format::SevenZip => return crate::sevenzip::list(first, password),
-        Format::Other => {}
-    }
-    match rar_list(first, password) {
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return crate::zip::list(first),
+        (Format::Tar, _) => return crate::tar::list(first),
+        (Format::SevenZip, _) => return crate::sevenzip::list(first, password),
+        (Format::Other, held) => held,
+    };
+    match rar_list_held(first, held, password) {
         Err(Error::NotAnArchive) => crate::zip::list(first),
         other => other,
     }
@@ -3264,10 +3294,10 @@ pub fn run_with_renames(
     password: Option<&str>,
     mut report: impl FnMut(&str),
 ) -> std::result::Result<Summary, RunError> {
-    match sniff(first)? {
-        Format::Zip => return zip_run(first, opts, password, &mut report),
-        Format::Tar => return crate::tar::run_reporting(first, opts, &mut report),
-        Format::SevenZip => {
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return zip_run(first, opts, password, &mut report),
+        (Format::Tar, _) => return crate::tar::run_reporting(first, opts, &mut report),
+        (Format::SevenZip, _) => {
             let limits = crate::sevenzip::SevenZipLimits::default();
             return crate::sevenzip::run_reporting(
                 first,
@@ -3278,9 +3308,9 @@ pub fn run_with_renames(
                 &mut report,
             );
         }
-        Format::Other => {}
-    }
-    match rar_run(first, opts, password, &mut report) {
+        (Format::Other, held) => held,
+    };
+    match rar_run(first, held, opts, password, &mut report) {
         Err(RunError { error: Error::NotAnArchive, .. }) => zip_run(first, opts, password, &mut report),
         other => other,
     }
@@ -3298,17 +3328,23 @@ fn zip_run(
     crate::zip::run_renaming(path, opts, password, None, report)
 }
 
-fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
-    rar_list_damaged(first, password, DamagedInput::Refuse, &mut Vec::new())
+/// The entries of a RAR set from its first volume: the file [`sniff_held`] kept open when it did, else opened by
+/// path.
+fn rar_list_held(first: &Path, held: Option<Sniffed>, password: Option<&str>) -> Result<Vec<Entry>> {
+    rar_list_damaged(first, held, password, DamagedInput::Refuse, &mut Vec::new())
 }
 
 fn rar_list_damaged(
     first: &Path,
+    held: Option<Sniffed>,
     password: Option<&str>,
     damaged: DamagedInput,
     damage: &mut Vec<HeaderDamage>,
 ) -> Result<Vec<Entry>> {
-    let volume = Volume::open_damaged(first, password, damaged)?;
+    let volume = match held {
+        Some(held) => held.open_rar(first, password, damaged)?,
+        None => Volume::open_damaged(first, password, damaged)?,
+    };
     rar_list_from_volume(volume, password, damaged, damage)
 }
 
@@ -4179,12 +4215,16 @@ fn invariant(reason: &'static str, legacy: Error) -> RarFault {
 
 fn rar_run(
     first: &Path,
+    held: Option<Sniffed>,
     opts: &Options,
     password: Option<&str>,
     mut report: impl FnMut(&str),
 ) -> std::result::Result<Summary, RunError> {
     let mut reports = Reports::legacy(&mut report);
-    let result = rar_run_shared(first, opts, password, &mut reports);
+    let result = rar_run_shared_open(first, opts, password, None, &mut reports, || match held {
+        Some(Sniffed { file, head }) => Volume::open_head_detailed(first, file, head, password, opts.damaged_input),
+        None => Volume::open_detailed_damaged(first, password, opts.damaged_input),
+    });
     let Reports::Legacy { summary, .. } = reports else { unreachable!() };
     legacy_result(result, summary)
 }
@@ -5850,8 +5890,10 @@ impl Run<'_, '_, '_> {
             }
         };
         let volume_path = vol.path.clone();
+        // what the volume read already with the headers is taken from it, not read again
         let part = batch::stored_detailed(
             (vol.file(), Some(&volume_path)),
+            vol.held_at(h.data_at, h.packed_size),
             h.data_at,
             h.packed_size,
             file.as_ref().map(|f| (&f.file, f.target())),
@@ -6469,5 +6511,270 @@ fn link_password_message(failure: &RarFailure) -> &'static str {
         RarFailure::WrongPassword { .. } => "wrong password",
         RarFailure::EncryptedIntegrity { .. } => "the password can't be verified for a link",
         _ => "invalid encryption record",
+    }
+}
+
+/// Every byte of a RAR volume is read once on the plain paths: the head read to tell the format and find the
+/// signature is the volume's first piece, not read again (Prybar's strace of a 10-volume RAR5 set).
+#[cfg(all(test, unix))]
+mod read_once {
+    use super::*;
+    use crate::rar5::reader::VOLUME_READS;
+
+    fn vint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn block(kind: u64, mut flags: u64, fields: &[u8], data: Option<&[u8]>) -> Vec<u8> {
+        if data.is_some() {
+            flags |= 2;
+        }
+        let mut body = Vec::new();
+        vint(kind, &mut body);
+        vint(flags, &mut body);
+        if let Some(data) = data {
+            vint(data.len() as u64, &mut body);
+        }
+        body.extend_from_slice(fields);
+        let mut sized = Vec::new();
+        vint(body.len() as u64, &mut sized);
+        sized.extend_from_slice(&body);
+        let mut out = crate::crc32::hash(&sized).to_le_bytes().to_vec();
+        out.extend_from_slice(&sized);
+        out.extend_from_slice(data.unwrap_or_default());
+        out
+    }
+
+    /// A RAR 5.0 set of one stored file split into volumes of `chunk` data bytes, each volume after `prefix`es.
+    fn volumes(data: &[u8], chunk: usize, prefix: &[u8]) -> Vec<Vec<u8>> {
+        let parts: Vec<&[u8]> = data.chunks(chunk).collect();
+        let n = parts.len();
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let last = i + 1 == n;
+                let mut out = if i == 0 { prefix.to_vec() } else { Vec::new() };
+                out.extend_from_slice(b"Rar!\x1a\x07\x01\x00");
+                let mut main = Vec::new();
+                vint(if i == 0 { 1 } else { 3 }, &mut main);
+                if i > 0 {
+                    vint(i as u64, &mut main);
+                }
+                out.extend(block(1, 0, &main, None));
+                let mut file = Vec::new();
+                vint(0x4, &mut file);
+                vint(data.len() as u64, &mut file);
+                vint(0o644, &mut file);
+                let crc = if last { crate::crc32::hash(data) } else { crate::crc32::hash(part) };
+                file.extend_from_slice(&crc.to_le_bytes());
+                vint(0, &mut file);
+                vint(1, &mut file);
+                vint(4, &mut file);
+                file.extend_from_slice(b"data");
+                let split = if i > 0 { 0x8 } else { 0 } | if last { 0 } else { 0x10 };
+                out.extend(block(2, split, &file, Some(part)));
+                let mut end = Vec::new();
+                vint(u64::from(!last), &mut end);
+                out.extend(block(5, 0, &end, None));
+                out
+            })
+            .collect()
+    }
+
+    fn options(dest: &Path, threads: usize) -> Options {
+        Options {
+            mode: Mode::Extract,
+            dest: dest.to_path_buf(),
+            overwrite: Overwrite::Always,
+            flatten: false,
+            threads: Some(threads),
+            protected_paths: Default::default(),
+            parallel_min: None,
+            select: None,
+            windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
+            preexisting_links: Default::default(),
+            refused_link_placeholder: false,
+            restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
+            unsupported_filters: Default::default(),
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
+            damaged_input: Default::default(),
+        }
+    }
+
+    fn identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    /// Where the volume reads recorded from `since` on went, for each of `paths`: every byte of each volume read
+    /// once, in reads that follow on from each other, the first volume's from `head` on (its first bytes, read to
+    /// tell its format before any volume opened).
+    fn assert_read_once(paths: &[PathBuf], since: usize, head: u64) {
+        let reads = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner())[since..].to_vec();
+        for (i, path) in paths.iter().enumerate() {
+            let id = identity(path);
+            let mut ranges: Vec<(u64, u64)> =
+                reads.iter().filter(|(of, _, _)| *of == id).map(|&(_, at, len)| (at, at + len)).collect();
+            ranges.sort();
+            let mut at = if i == 0 { head } else { 0 };
+            for range in ranges {
+                assert_eq!(range.0, at, "{}: read {range:?} with {at} read so far", path.display());
+                at = range.1;
+            }
+            assert_eq!(at, fs::metadata(path).unwrap().len(), "{}: bytes read", path.display());
+        }
+    }
+
+    fn write_set(dir: &Path, set: &[Vec<u8>]) -> Vec<PathBuf> {
+        set.iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let path = dir.join(format!("set.part{}.rar", i + 1));
+                fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect()
+    }
+
+    #[test]
+    fn a_rar5_set_reads_each_volume_once() {
+        let data = data(7 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            for threads in [1, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = write_set(dir.path(), &volumes(&data, 5 << 19, prefix));
+                let dest = dir.path().join("out");
+                let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let summary = run(&paths[0], &options(&dest, threads), |_| {}).unwrap();
+                assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+                assert_eq!(fs::read(dest.join("data")).unwrap(), data, "prefix {} threads {threads}", prefix.len());
+                assert_read_once(&paths, since, HEAD_PROBE_BYTES as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn the_checked_route_reads_each_volume_once() {
+        let data = data(5 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = write_set(dir.path(), &volumes(&data, 3 << 19, prefix));
+            let dest = dir.path().join("out");
+            let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+            run_with_policy(
+                &paths[0],
+                &options(&dest, 2),
+                None,
+                &Cancellation::default(),
+                &crate::zip::EncryptedReadOverrides::default(),
+                |_: crate::zip::ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(fs::read(dest.join("data")).unwrap(), data, "prefix {}", prefix.len());
+            // a signature behind a self-extractor is searched for in the whole window, read on the checked route
+            let head = if prefix.is_empty() { HEAD_PROBE_BYTES as u64 } else { SIGNATURE_PROBE_BYTES };
+            assert_read_once(&paths, since, head);
+        }
+    }
+
+    #[test]
+    fn a_rar5_listing_reads_the_first_volume_head_once() {
+        let data = data(3 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = write_set(dir.path(), &volumes(&data, 1 << 20, prefix));
+            for lister in
+                [&(|p: &Path| list(p).unwrap().len()) as &dyn Fn(&Path) -> usize, &|p: &Path| match inspect(p).unwrap()
+                {
+                    Inspection::Other(entries) => entries.len(),
+                    Inspection::Zip(_) => panic!("a RAR set"),
+                }]
+            {
+                let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+                assert_eq!(lister(&paths[0]), 1);
+                let reads = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner())[since..].to_vec();
+                let id = identity(&paths[0]);
+                let mut ranges: Vec<(u64, u64)> =
+                    reads.iter().filter(|(of, _, _)| *of == id).map(|&(_, at, len)| (at, at + len)).collect();
+                ranges.sort();
+                for pair in ranges.windows(2) {
+                    assert!(pair[0].1 <= pair[1].0, "read twice: {:?} and {:?}", pair[0], pair[1]);
+                }
+            }
+        }
+    }
+
+    /// A big stored part is copied on several threads, by position: the part of it the volume read with the headers
+    /// is taken from there, not read again.
+    #[test]
+    fn a_big_stored_part_reads_its_volume_once() {
+        let data = data(batch::STORED_PARALLEL_MIN as usize + (3 << 19));
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_set(dir.path(), &volumes(&data, data.len() - 1000, &[]));
+        let dest = dir.path().join("out");
+        let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let summary = run(&paths[0], &options(&dest, 4), |_| {}).unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert!(fs::read(dest.join("data")).unwrap() == data);
+        assert_read_once(&paths, since, HEAD_PROBE_BYTES as u64);
+    }
+
+    #[test]
+    fn a_rar4_set_reads_each_volume_once() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-volumes");
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (1..=3)
+            .map(|i| {
+                let name = format!("multi.part{i}.rar");
+                let path = dir.path().join(&name);
+                fs::copy(fixtures.join(&name), &path).unwrap();
+                path
+            })
+            .collect();
+        let dest = dir.path().join("out");
+        let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let summary = run(&paths[0], &options(&dest, 1), |_| {}).unwrap();
+        assert!(summary.errors.is_empty() && summary.files > 0, "{summary:?}");
+        assert_read_once(&paths, since, HEAD_PROBE_BYTES as u64);
+    }
+
+    /// A self-extractor longer than the signature window is still no RAR, as before.
+    #[test]
+    fn a_signature_past_the_window_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = vec![0x4d; crate::rar5::MAX_SFX as usize + 1];
+        let paths = write_set(dir.path(), &volumes(b"small", 8, &prefix));
+        assert!(Volume::open(&paths[0]).is_err());
+        let file = File::open(&paths[0]).unwrap();
+        assert!(Volume::open_head(&paths[0], file, prefix[..1024].to_vec(), None, DamagedInput::Refuse).is_err());
+        let mut at_edge = vec![0x4d; crate::rar5::MAX_SFX as usize];
+        at_edge.extend_from_slice(&volumes(b"small", 8, &[])[0]);
+        fs::write(&paths[0], &at_edge).unwrap();
+        assert!(Volume::open(&paths[0]).is_ok(), "a signature right at the window's end is found");
+        let file = File::open(&paths[0]).unwrap();
+        assert!(Volume::open_head(&paths[0], file, at_edge[..1024].to_vec(), None, DamagedInput::Refuse).is_ok());
     }
 }
