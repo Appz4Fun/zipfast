@@ -357,6 +357,47 @@ impl MemberMachine {
     pub(crate) fn part_missing(&self) -> bool {
         self.part_missing
     }
+    /// Whether the current part, read whole and with no byte missing, fails its own packed check (CRC32 or
+    /// BLAKE2sp). A persistent session turns such a part of a plain stored member into a `DeclaredBad` hole and
+    /// goes on, instead of failing as `finish_part` would: see `ProgressiveSession`'s part checks.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn part_checks_fail(&self, part: &super::physical::PhysicalPart) -> bool {
+        if part.final_part || self.part_missing || self.resumed || self.failed || self.part_bytes != part.packed_size {
+            return false;
+        }
+        let key = self.cipher.as_ref().filter(|_| part.checks.keyed).and_then(PendingCipher::checksum_key);
+        let result = verify_packed(&self.context, part.checks, self.part_crc.clone(), self.part_blake.clone(), key);
+        matches!(
+            result,
+            Err(RarFailure::Integrity { reason: RarIntegrityReason::PackedPiece { .. }, .. }
+                | RarFailure::EncryptedIntegrity { reason: RarIntegrityReason::PackedPiece { .. }, .. })
+        )
+    }
+    /// Whether the member, decoded whole with no byte missing and its full size written, fails its final checks
+    /// (CRC32 or BLAKE2sp), as `finish_member` would judge them. Judges nothing and changes nothing.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn member_checks_fail(&self, member: &super::physical::PhysicalMember) -> bool {
+        if self.failed || self.resumed || self.missing || !self.decoded_finished || !member.complete {
+            return false;
+        }
+        let (Some(checks), Some(inner)) = (member.final_checks, self.inner.as_ref()) else { return false };
+        if member.unpacked_size.is_none_or(|n| n != inner.bytes) {
+            return false;
+        }
+        let key = self.cipher.as_ref().filter(|_| checks.keyed).and_then(PendingCipher::checksum_key);
+        let mut probe = InnerChecks {
+            hasher: inner.hasher.clone(),
+            decoder_crc: inner.decoder_crc,
+            crc: inner.crc,
+            blake: inner.blake.clone(),
+            bytes: inner.bytes,
+        };
+        matches!(
+            probe.verify(&self.context, member.unpacked_size, checks.crc32, checks.blake2sp, key),
+            Err(RarFailure::Integrity { reason: RarIntegrityReason::FinalChecks { .. }, .. }
+                | RarFailure::EncryptedIntegrity { reason: RarIntegrityReason::FinalChecks { .. }, .. })
+        )
+    }
     pub(crate) fn reserve_progressive_scratch(
         &mut self,
         count: usize,

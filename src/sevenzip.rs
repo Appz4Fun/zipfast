@@ -84,13 +84,16 @@ pub struct SevenZipLimits {
     /// nothing is left behind however the process ends, and the run uses one descriptor however many members it
     /// holds back.
     pub spool_dir: Option<std::path::PathBuf>,
-    /// Memory an LZMA2 coder decoding its blocks on several threads may add: 256 MiB (at least 4 MiB is used). A
-    /// stream 7-Zip wrote with `-mmt` is a run of independent blocks; with more than one thread they are decoded
-    /// side by side. Each worker thread costs its dictionary and a 1 MiB output buffer; the workers take at most a
-    /// third of this (fewer start when they would take more; their dictionaries count against `dictionary_bytes`
-    /// too), and the packed and decoded bytes in flight the rest: a worker waits while that is spent. Large blocks
-    /// (7-Zip's are four times the dictionary: 64 MiB to 256 MiB at `-mx5` to `-mx9`) then decode only partly side
-    /// by side; a caller that wants the most speed and has the memory raises it. See `docs/7z-extract.md`.
+    /// Memory an LZMA2 coder decoding its blocks on several threads may add: by default an eighth of the machine's
+    /// memory, at least 256 MiB and at most 2 GiB (1 GiB where the machine's memory can't be read); at least 4 MiB
+    /// is used. A stream 7-Zip wrote with `-mmt` is a run of independent blocks; with more than one thread they are
+    /// decoded side by side. Each worker thread costs its dictionary and a 1 MiB output buffer; the workers take at
+    /// most a third of this (fewer start when they would take more; their dictionaries count against
+    /// `dictionary_bytes` too), and the packed and decoded bytes in flight the rest: a worker waits while that is
+    /// spent. Blocks decoded ahead of the one being written are held whole, so how many decode side by side is about
+    /// this budget over the block size (7-Zip's blocks are four times the dictionary: 64 MiB to 256 MiB at `-mx5` to
+    /// `-mx9`). The memory is taken only as blocks need it; a caller running several extractions at once may lower
+    /// it. See `docs/7z-extract.md`.
     pub lzma2_parallel_bytes: u64,
     /// Threads [`print_selected`] (and reading one member through `extract::SelectedEntry`) decode a folder's
     /// LZMA2 blocks on: None for one per core, `Some(1)` for the calling thread alone. [`run`] takes
@@ -111,10 +114,30 @@ impl Default for SevenZipLimits {
             spool_member_bytes: 8 << 30,
             spool_memory_bytes: 1 << 20,
             spool_dir: None,
-            lzma2_parallel_bytes: 256 << 20,
+            lzma2_parallel_bytes: default_lzma2_parallel_bytes(),
             decode_threads: None,
         }
     }
+}
+
+/// [`SevenZipLimits::lzma2_parallel_bytes`] by default: an eighth of the machine's memory, from 256 MiB to 2 GiB.
+fn default_lzma2_parallel_bytes() -> u64 {
+    physical_memory().map_or(1 << 30, |bytes| (bytes / 8).clamp(256 << 20, 2 << 30))
+}
+
+/// The machine's physical memory, where it can be read.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+fn physical_memory() -> Option<u64> {
+    // SAFETY: sysconf only reads a system setting; it has no preconditions and touches no memory of ours.
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    let pages = u64::try_from(pages).ok().filter(|&n| n > 0)?;
+    let page = u64::try_from(page).ok().filter(|&n| n > 0)?;
+    pages.checked_mul(page)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+fn physical_memory() -> Option<u64> {
+    None
 }
 
 /// Which of [`SevenZipLimits`] an archive went past.

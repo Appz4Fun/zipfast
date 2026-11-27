@@ -198,11 +198,39 @@ fn num(out: &mut Vec<u8>, value: u64) {
 /// A 7z archive of one solid LZMA2 folder (dictionary property 16, 1 MiB) holding `files`, each with its CRC, whose
 /// packed stream is `packed`.
 fn solid_lzma2(files: &[(String, Vec<u8>)], packed: &[u8]) -> Vec<u8> {
+    solid(files, packed, None, true)
+}
+
+/// A filter coder after the LZMA2 coder: its method id and properties.
+type Filter<'a> = (&'a [u8], &'a [u8]);
+
+/// x86 BCJ, after LZMA2.
+const BCJ: Filter = (&[0x03, 0x03, 0x01, 0x03], &[]);
+
+/// A 7z archive of one solid folder holding `files` whose packed stream is `packed`: LZMA2 (dictionary property 16),
+/// then `filter` on its output if given. Each file carries its CRC when `crcs` is set.
+fn solid(files: &[(String, Vec<u8>)], packed: &[u8], filter: Option<Filter>, crcs: bool) -> Vec<u8> {
     let total: u64 = files.iter().map(|(_, d)| d.len() as u64).sum();
     let mut h = vec![0x01, 0x04, 0x06, 0x00, 0x01, 0x09];
     num(&mut h, packed.len() as u64);
-    // one folder: one LZMA2 coder, property byte 16
-    h.extend([0x00, 0x07, 0x0B, 0x01, 0x00, 0x01, 0x21, 0x21, 0x01, 16, 0x0C]);
+    h.extend([0x00, 0x07, 0x0B, 0x01, 0x00]);
+    match filter {
+        // one folder: one LZMA2 coder, property byte 16
+        None => h.extend([0x01, 0x21, 0x21, 0x01, 16, 0x0C]),
+        // the filter (coder 0) reads the LZMA2 coder's output (coder 1), which reads the packed stream
+        Some((id, props)) => {
+            h.push(0x02);
+            h.push(id.len() as u8 | if props.is_empty() { 0 } else { 0x20 });
+            h.extend_from_slice(id);
+            if !props.is_empty() {
+                num(&mut h, props.len() as u64);
+                h.extend_from_slice(props);
+            }
+            h.extend([0x21, 0x21, 0x01, 16]);
+            h.extend([0x00, 0x01, 0x0C]);
+            num(&mut h, total);
+        }
+    }
     num(&mut h, total);
     h.push(0x00);
     // substreams: the files' sizes (all but the last) and all their CRCs
@@ -212,9 +240,11 @@ fn solid_lzma2(files: &[(String, Vec<u8>)], packed: &[u8]) -> Vec<u8> {
     for (_, data) in &files[..files.len() - 1] {
         num(&mut h, data.len() as u64);
     }
-    h.extend([0x0A, 0x01]);
-    for (_, data) in files {
-        h.extend(crc32fast::hash(data).to_le_bytes());
+    if crcs {
+        h.extend([0x0A, 0x01]);
+        for (_, data) in files {
+            h.extend(crc32fast::hash(data).to_le_bytes());
+        }
     }
     h.extend([0x00, 0x00]);
     h.push(0x05);
@@ -387,4 +417,149 @@ fn a_canceled_multi_block_folder_stops_promptly() {
         assert!(matches!(SevenZipError::of(&error), Some(SevenZipError::Canceled)), "{threads}: {error}");
         assert!(seen < plain.len(), "{threads} threads printed everything");
     }
+}
+
+/// Each extracted member's bytes, in archive order, for `threads`; or the run's error.
+fn extracted(archive: &Path, files: &[(String, Vec<u8>)], threads: usize) -> Result<Vec<Vec<u8>>, String> {
+    let dir = tempfile::tempdir().unwrap();
+    let summary =
+        extract::run(archive, &opts(Mode::Extract, dir.path(), threads), |_| {}).map_err(|e| e.to_string())?;
+    if !summary.errors.is_empty() {
+        return Err(format!("{:?}", summary.errors));
+    }
+    Ok(files.iter().map(|(name, _)| fs::read(dir.path().join(name)).unwrap()).collect())
+}
+
+/// Delta (which the test can encode, so the members' CRCs check) and x86 BCJ (whose output the test compares with
+/// one thread's) after a multi-block LZMA2 coder: the filter runs over the reassembled stream, in order, so the
+/// output is one thread's at every thread count, and damage fails alike.
+#[test]
+fn a_filter_after_a_multi_block_lzma2_coder_decodes_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut files = members();
+    // x86 call and jump opcodes all through the text, so BCJ has addresses to convert
+    for (i, (_, data)) in files.iter_mut().enumerate() {
+        for at in (i * 7..data.len()).step_by(997) {
+            data[at] = if at % 2 == 0 { 0xE8 } else { 0xE9 };
+        }
+    }
+    let plain: Vec<u8> = files.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+
+    // Delta, distance 4: each byte is stored less the byte four before it
+    let encoded: Vec<u8> =
+        (0..plain.len()).map(|i| plain[i].wrapping_sub(if i >= 4 { plain[i - 4] } else { 0 })).collect();
+    let delta =
+        write(dir.path(), "delta.7z", &solid(&files, &blocks(&encoded, 1_000_000), Some((&[0x03], &[3])), true));
+    let want: Vec<(u64, Vec<u8>)> = files.iter().enumerate().map(|(i, (_, d))| (i as u64, d.clone())).collect();
+    for threads in [1, 2, 4, 8] {
+        let printed = print(&delta, None, &limits(threads, None)).unwrap();
+        assert!(printed.1.errors.is_empty(), "delta, {threads} threads: {:?}", printed.1.errors);
+        assert!(printed.0 == want, "delta, {threads} threads: printed members");
+        let out = extracted(&delta, &files, threads).unwrap();
+        assert!(out.iter().zip(&files).all(|(a, (_, b))| a == b), "delta, {threads} threads: extracted members");
+    }
+
+    // BCJ over the same blocks, without CRCs: every thread count gives one thread's bytes
+    let packed = blocks(&plain, 1_000_000);
+    let bcj = write(dir.path(), "bcj.7z", &solid(&files, &packed, Some(BCJ), false));
+    let one = print(&bcj, None, &limits(1, None)).unwrap();
+    assert!(one.1.errors.is_empty(), "{:?}", one.1.errors);
+    assert!(one.0 != want, "BCJ converted no address");
+    let one_extracted = extracted(&bcj, &files, 1).unwrap();
+    for threads in [2, 4, 8] {
+        for memory in [None, Some(0), Some(8 << 20)] {
+            same_print(&bcj, None, threads, memory);
+        }
+        assert!(extracted(&bcj, &files, threads).unwrap() == one_extracted, "BCJ, {threads} threads");
+        assert_eq!(tested(&bcj, None, threads), tested(&bcj, None, 1), "BCJ, {threads} threads");
+    }
+
+    // a damaged block in the middle fails as on one thread
+    let mut damaged = packed.clone();
+    let starts: Vec<usize> = plain
+        .chunks(1_000_000)
+        .scan(0, |at, piece| {
+            let start = *at;
+            *at += lzma2_block(piece).len();
+            Some(start)
+        })
+        .collect();
+    // a control byte LZMA2 has no meaning for, at the start of a block in the middle
+    damaged[starts[starts.len() / 2]] = 0x05;
+    let bcj = write(dir.path(), "bcj-damaged.7z", &solid(&files, &damaged, Some(BCJ), false));
+    let one = tested(&bcj, None, 1);
+    assert!(!matches!(&one, Ok(t) if t.0.is_empty()), "the damage went unnoticed");
+    for threads in [2, 4, 8] {
+        assert_eq!(tested(&bcj, None, threads), one, "damaged BCJ, {threads} threads");
+        same_print(&bcj, None, threads, None);
+        assert_eq!(extracted(&bcj, &files, threads).err(), extracted(&bcj, &files, 1).err(), "{threads} threads");
+    }
+}
+
+/// A tiny deterministic generator for the stress test.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+/// Folders of shuffled blocks (stored noise and LZMA text of many sizes, as `7z -mmt` writes for mixed data),
+/// members cut at random places, whole and with one damaged block: every thread count and budget decodes what one
+/// thread does.
+#[test]
+fn shuffled_block_layouts_decode_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    for seed in 1..=4u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let (mut plain, mut packed, mut starts) = (Vec::new(), Vec::new(), Vec::new());
+        for piece in 0..(4 + rng.below(6)) {
+            let len = 64 << 10 | rng.below(5 << 19) as usize;
+            let data = bytes(len, seed * 100 + piece, rng.below(3) != 0);
+            starts.push(packed.len());
+            packed.extend(lzma2_block(&data));
+            plain.extend(data);
+        }
+        packed.push(0);
+        let mut cuts: Vec<usize> = (0..rng.below(6)).map(|_| rng.below(plain.len() as u64) as usize).collect();
+        cuts.extend([0, plain.len()]);
+        cuts.sort_unstable();
+        cuts.dedup();
+        let files: Vec<(String, Vec<u8>)> =
+            cuts.windows(2).enumerate().map(|(i, w)| (format!("s{i}.bin"), plain[w[0]..w[1]].to_vec())).collect();
+        let archive = write(dir.path(), &format!("shuffled{seed}.7z"), &solid_lzma2(&files, &packed));
+        let want: Vec<(u64, Vec<u8>)> = files.iter().enumerate().map(|(i, (_, d))| (i as u64, d.clone())).collect();
+        for threads in [2, 3, 4, 8] {
+            let printed = print(&archive, None, &limits(threads, None)).unwrap();
+            assert!(printed.1.errors.is_empty(), "seed {seed}, {threads} threads: {:?}", printed.1.errors);
+            assert!(printed.0 == want, "seed {seed}, {threads} threads: printed members");
+            same_print(&archive, None, threads, Some(0));
+            same_print(&archive, None, threads, Some(8 << 20));
+        }
+        assert_eq!(tested(&archive, None, 4), tested(&archive, None, 1), "seed {seed}");
+
+        // one block damaged somewhere past the first
+        let block = 1 + rng.below(starts.len() as u64 - 1) as usize;
+        let end = starts.get(block + 1).copied().unwrap_or(packed.len() - 1);
+        let mut damaged = packed.clone();
+        damaged[starts[block] + (end - starts[block]) / 2] ^= 0xA5;
+        let archive = write(dir.path(), &format!("shuffled{seed}-damaged.7z"), &solid_lzma2(&files, &damaged));
+        let one = tested(&archive, None, 1);
+        for threads in [2, 4, 8] {
+            assert_eq!(tested(&archive, None, threads), one, "seed {seed}, damaged block {block}, {threads} threads");
+            same_print(&archive, None, threads, None);
+            same_print(&archive, None, threads, Some(0));
+        }
+    }
+}
+
+/// The default parallel budget scales with the machine's memory, within 256 MiB and 2 GiB.
+#[test]
+fn the_default_parallel_budget_is_bounded() {
+    let budget = SevenZipLimits::default().lzma2_parallel_bytes;
+    assert!((256 << 20..=2 << 30).contains(&budget), "{budget}");
 }
