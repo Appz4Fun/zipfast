@@ -203,8 +203,17 @@ impl HeaderParser {
             _ if flags & 0x4000 != 0 => Block::Unknown,
             _ => return Err(self.rar4_unsupported("header type").into()),
         };
-        if self.complete_len.is_some_and(|len| frame.data_end > len) {
-            return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+        if let Some(len) = self.complete_len.filter(|&len| frame.data_end > len) {
+            // a file header cut short, or whose data the volume cuts short, is read anyway (FileHeader::cut)
+            match &mut frame.block {
+                Block::File(file) if self.salvage_cut && !self.legacy_headers => {
+                    if file.cut.is_none() {
+                        file.cut = Some(HeaderCut::Data { present: len.saturating_sub(file.data_at) });
+                    }
+                    frame.data_end = len;
+                }
+                _ => return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into()),
+            }
         }
         Ok(frame)
     }
@@ -283,21 +292,27 @@ impl HeaderParser {
             // As UnRAR reads it: all ones (both halves with the large-file flag) means the size is unknown.
             let size_unknown = if flags & 0x100 != 0 { unpacked == u64::MAX } else { unpacked == 0xffff_ffff };
             let encoded = fields.take(name_len)?;
-            let name = match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
-                // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
-                // name, which no decoded name can be (see below).
-                // Also a Unicode-flagged field that fell back to its legacy part (the bytes before the NUL).
-                Err(FileParseError::Format(Error::Unsupported(_)))
-                    if self.map_lenient && encoded.split(|&byte| byte == 0).next().is_some_and(|l| !l.is_empty()) =>
-                {
-                    String::new()
-                }
-                result => {
-                    let name = result?;
-                    if name.is_empty() || name.contains('\0') {
-                        return Err(Error::Corrupt("RAR4 member name").into());
+            let name = if self.cut_parse {
+                // a header cut short (HeaderCut::Header): what of the name is there, up to the zeros, as UnRAR lists it
+                String::from_utf8_lossy(encoded.split(|&byte| byte == 0).next().unwrap_or_default()).into_owned()
+            } else {
+                match decode_name(encoded, flags & 0x200 != 0, self.map_lenient, self.usage.as_ref()) {
+                    // A legacy (OEM) name that is not UTF-8: a map walk lists it by its raw bytes, with an empty decoded
+                    // name, which no decoded name can be (see below).
+                    // Also a Unicode-flagged field that fell back to its legacy part (the bytes before the NUL).
+                    Err(FileParseError::Format(Error::Unsupported(_)))
+                        if self.map_lenient
+                            && encoded.split(|&byte| byte == 0).next().is_some_and(|l| !l.is_empty()) =>
+                    {
+                        String::new()
                     }
-                    name
+                    result => {
+                        let name = result?;
+                        if name.is_empty() || name.contains('\0') {
+                            return Err(Error::Corrupt("RAR4 member name").into());
+                        }
+                        name
+                    }
                 }
             };
             let salt = if flags & 0x400 != 0 { Some(fields.take(8)?.try_into().unwrap()) } else { None };
@@ -348,7 +363,8 @@ impl HeaderParser {
             // Bytes past the parsed fields of a service header are its SubData (the recovery record's "Protect+"
             // tag, the Unix owner names), which unrar keeps beside the header and this parser has no use for; the
             // header CRC above still covers them. A file header has no such field, so only a map walk ignores them.
-            if fields.at != bytes.len() && !self.map_lenient && bytes[2] != 0x7a {
+            // (A header cut short has zeros past the cut, which say less than the fields they stand in for did.)
+            if fields.at != bytes.len() && !self.map_lenient && !self.cut_parse && bytes[2] != 0x7a {
                 return Err(Error::Unsupported("RAR4 trailing header fields".into()).into());
             }
             let mut sub_data = Vec::new();
@@ -403,6 +419,7 @@ impl HeaderParser {
                 // As UnRAR: a member goes on from the history before it when its own flag says so. The first member of a
                 // solid archive starts the stream.
                 solid: flags & 0x10 != 0,
+                cut: self.cut_parse.then_some(HeaderCut::Header),
                 ..FileHeader::default()
             };
             Ok((header, encoded, salt))

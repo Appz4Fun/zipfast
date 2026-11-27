@@ -311,7 +311,9 @@ What UnRAR 7.30 (`x`, `t`, `l`) does, from archives with one byte changed, cut s
 | the main header fails its checksum | "Main archive header is corrupt", reads on | "Headers Error" | `ChecksumMismatch`, reads on |
 | a RAR 4.x block's type byte changed (checksum fails, type unknown) | the block is passed over by its size, the rest extracted | "Headers Error" | `ChecksumMismatch`, passed over by its size |
 | a header that can't be read (size field changed, garbage inserted before it) | "Corrupt header is found" or "Unexpected end of archive", nothing after it is read, exit 3 | "Headers Error", stops | `Unreadable` (or `UnexpectedEnd`), the rest of the volume passed over, what came before stands |
-| the volume ends inside a header or its data | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there |
+| the volume ends inside a file header's data (the header whole) | lists the member with its declared sizes; extracts it from the bytes there, reporting it OK when its checksum passes and "checksum error" (file removed, kept with `-kb`) when not; "Unexpected end of archive", exit 1 or 3 | lists it; "Data Error", a 0-byte file (stored data: the bytes there), exit 2 | as UnRAR: listed with its declared sizes, `UnexpectedEnd` with the name and `cut: Some(HeaderCut::Data { present })`; decoded from the bytes there, its checks deciding (`keep_broken` keeps a failed one's bytes) |
+| the volume ends inside a RAR 4.x file header (at least its 7 base bytes there) | lists an entry with the fields that are there, the rest zeros, and what of the name is there (possibly empty); "NAME - the file header is corrupt", exit 3; extracting it fails | lists nothing | as UnRAR: listed so, `UnexpectedEnd` with `cut: Some(HeaderCut::Header)`; extracting it fails (`TruncatedHeader`), nothing written |
+| the volume ends inside any other header, a service header's data, or a RAR 5.0 file header | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there |
 | a RAR 5.0 volume without its end header | no message | "Unexpected end of archive", exit 2 | `UnexpectedEnd` at the volume's length |
 | only a member's data damaged | "checksum error", the rest extracted | "CRC Failed" | as before, with any `damaged_input`: the member fails, nothing is recorded as header damage |
 | a RAR 4.x archive cut inside its main header | "Main archive header is corrupt", lists "0 files" (`Details: RAR 1.5`) | | opens with no members, `UnexpectedEnd` |
@@ -346,7 +348,7 @@ Where it applies:
   / `run_with_zip_policy` through the legacy route): `Summary::damaged_headers`, `RarRunSummary::damaged_headers`, and
   `ZipRunReport::damaged_headers()` (a count; each record is also sent as a `LegacyDiagnostic` line);
 - listing: `extract::list_detailed_with_options` (`Listing::damaged_headers`, `Listing::headers_damaged()`, and
-  `Listing::unexpected_end()` for `UnexpectedEnd`);
+  `Listing::unexpected_end()` for `UnexpectedEnd`), with the listing signals below;
 - `RarSession`, through `RarSessionOptions::damaged_input`: the catalogue reads past the damage, its members list and
   extract (`extract_selected`, `extract_selected_controlled`, printing) as any other, and
   `RarArchiveMetadata::damaged_headers()` says what was read past;
@@ -362,6 +364,51 @@ bytes, or over a header repaired since, finds it again (`docs/persistent-partial
 that take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
 `--resync` (for `l`, `t`, `x`, `e`; a listing of anything but RAR stays as it is), prints each damaged header and a warning, and exits 1.
 `tests/rar_salvage.rs` checks each point.
+
+### Members the volume ends inside of, and listing signals
+
+A member whose header or data the end of the volume cuts short is listed under `Salvage` and `Resync` as the tools
+list it. Its header says how (`FileHeader::cut`, `RarHeader::cut()`, `RarMember::cut()`), and so does its
+`UnexpectedEnd` record (`HeaderDamage::cut`), reported once (a RAR 5.0 volume cut so has no second record for its
+missing end header):
+
+- `HeaderCut::Data { present }`: the header is whole, only `present` bytes of its data are there. UnRAR 7.30 and
+  7-Zip 26.06 both list it with its declared sizes, and so does zipfast (`Entry::packed`, `RarMember::packed_size()`;
+  a `RarPart` holds the bytes there). Extracting it decodes those bytes and the member's checks decide, as UnRAR
+  decides: one whose checksum passes (a compressed stream whose last bytes it didn't need) is good, the rest fail as
+  any damaged member does, `keep_broken` keeping what was decoded as `unrar x -kb` does. 7-Zip reports a Data Error
+  and leaves a 0-byte file whatever the checksum says (for stored data, the bytes there); a caller showing 7-Zip's
+  outcome maps the member's `UnexpectedEnd` record to that. A member split into the next volume goes on there, as
+  both tools go on, and fails its checks.
+- `HeaderCut::Header`: a RAR 4.x file header cut short, with at least the 7 bytes every header starts with. UnRAR
+  lists it with the fields that are there and zeros for the rest, its name what of it is there up to a NUL (empty
+  when none is), and fails it on extraction; zipfast does the same (`TruncatedHeader`; a `RarSession` member carries
+  it as its `payload_issue`). 7-Zip lists nothing: a caller showing 7-Zip's listing leaves out a `Header` cut, which
+  is always the last member of its volume. Not matched: when the cut falls inside the attributes field, UnRAR 7.30
+  shows the name as one space.
+
+Every other header the end cuts short (a RAR 5.0 header, a service header or its data, fewer than 7 bytes of a RAR 4.x
+header) ends the volume as before. Progressive sessions don't read a cut member: they wait for bytes still to come,
+and once the source is sealed report the cut as `UnexpectedEnd` without its name. Sweeps over every cut of RAR 4.x
+and RAR 5.0 archives (compressed, solid, with links, quick open and recovery records) list the same members as UnRAR
+7.30 and 7-Zip 26.06 under `Salvage`, the RAR 4.x header cut aside for 7-Zip; no cut RAR 5.0 archive was found where
+7-Zip lists fewer members than zipfast.
+
+`extract::list_detailed_with_options` under `Salvage` and `Resync` also reports, without failing the listing:
+
+- a missing volume: `Listing::missing_volume` names the volume the set says comes next, and `entries` holds the
+  members up to it, one split into it listed with its declared sizes (7-Zip 26.06: "ERROR = Missing volume : NAME",
+  exit 2; UnRAR 7.30 `l -v` / `lt -v`: "Cannot find volume NAME"; `unrar l` lists one volume and says nothing).
+  `Listing::unexpected_end()` is true. Under `Refuse` the listing fails with `Error::MissingVolume`, as before.
+  `RarSession` reports it with any choice (`RarArchiveMetadata::missing_volume()`).
+- a damaged archive comment: `Listing::damaged_comments` lists each volume whose `CMT` comment fails its CRC or
+  doesn't decode (`Listing::comment_damaged()`). UnRAR 7.30 prints "ERROR: Corrupt CMT data block" and "The archive
+  comment is corrupt" and exits 3, still listing the archive; `unrar t` counts it as an error. 7-Zip 26.06 doesn't
+  read RAR 4.x comments. A comment zipfast doesn't read (encrypted, split, over 1 MiB, compressed RAR 5.0) isn't
+  judged, and a RAR 2.x comment embedded in the main header is read only by `RarSession::comment`, which fails with
+  `RarFailure::Integrity` for any damaged comment, with any choice.
+
+`tests/rar_listing_signals.rs` checks each point.
 
 ### Damaged headers in a progressive session
 

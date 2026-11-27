@@ -314,7 +314,9 @@ fn salvage_reports_a_volume_cut_inside_a_header() {
         assert_eq!(written(&case), ["a.txt"], "{format}");
         assert_eq!(kinds(&summary.damaged_headers), [HeaderDamageKind::UnexpectedEnd], "{format}");
         let listing = listed(&case, DamagedInput::Salvage).unwrap();
-        assert_eq!(names(&listing), ["a.txt"], "{format}");
+        // UnRAR lists a RAR 4.x file header cut short with what of it is there: here no name (HeaderCut::Header)
+        let expected: &[&str] = if format == "rar4" { &["a.txt", ""] } else { &["a.txt"] };
+        assert_eq!(names(&listing), expected, "{format}");
         assert!(listing.unexpected_end(), "{format}");
     }
 }
@@ -443,11 +445,13 @@ fn fixture_unrar_salvage_creates_the_folder_whose_header_is_corrupt() {
 /// "Unexpected end of archive" for one cut inside a file header or (RAR 5.0) without its end header.
 #[test]
 fn fixtures_cut_short_open_empty_with_an_unexpected_end() {
-    for (file, format, refused) in [
-        ("list-rar4-cut-in-main.rar", zipfast::rar5::RarFormat::Rar4, true),
-        ("list-rar4-cut-at-main.rar", zipfast::rar5::RarFormat::Rar4, true),
-        ("hdrerr-rar4-cut-in-file.rar", zipfast::rar5::RarFormat::Rar4, true),
-        ("hdrerr-rar5-no-end.rar", zipfast::rar5::RarFormat::Rar5, false),
+    // hdrerr-rar4-cut-in-file.rar holds 11 bytes of a file header: listed as UnRAR lists it, with an empty name
+    // (7-Zip lists nothing; a caller showing its listing leaves out a HeaderCut::Header member)
+    for (file, format, refused, listed) in [
+        ("list-rar4-cut-in-main.rar", zipfast::rar5::RarFormat::Rar4, true, 0),
+        ("list-rar4-cut-at-main.rar", zipfast::rar5::RarFormat::Rar4, true, 0),
+        ("hdrerr-rar4-cut-in-file.rar", zipfast::rar5::RarFormat::Rar4, true, 1),
+        ("hdrerr-rar5-no-end.rar", zipfast::rar5::RarFormat::Rar5, false, 0),
     ] {
         let archive = Path::new(FIXTURES).join(file);
         let dir = tempfile::tempdir().unwrap();
@@ -456,7 +460,7 @@ fn fixtures_cut_short_open_empty_with_an_unexpected_end() {
         assert_eq!(RarSession::open(&archive, None, RarSessionOptions::default()).is_err(), refused, "{file}");
         let salvage = options(dir.path(), Mode::Test, DamagedInput::Salvage);
         let listing = extract::list_detailed_with_options(&archive, None, &salvage).unwrap();
-        assert!(listing.entries.is_empty(), "{file}");
+        assert_eq!(listing.entries.len(), listed, "{file}");
         assert!(listing.unexpected_end() && listing.headers_damaged(), "{file}");
         let session = RarSession::open(
             &archive,
@@ -465,7 +469,7 @@ fn fixtures_cut_short_open_empty_with_an_unexpected_end() {
         )
         .unwrap();
         assert_eq!(session.archive().format(), format, "{file}");
-        assert_eq!(session.entries().len(), 0, "{file}");
+        assert_eq!(session.entries().len(), listed, "{file}");
         assert_eq!(kinds(session.archive().damaged_headers()), [HeaderDamageKind::UnexpectedEnd], "{file}");
         let summary = extract::run(&archive, &salvage, |_| {}).unwrap();
         assert_eq!(kinds(&summary.damaged_headers), [HeaderDamageKind::UnexpectedEnd], "{file}");

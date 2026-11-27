@@ -318,8 +318,10 @@ pub enum DamagedInput {
     /// data checksum still decides whether the member is good) and reported ([`HeaderDamageKind::ChecksumMismatch`]);
     /// a RAR 4.x block of an unknown type whose checksum fails is passed over by its size; a header that can't be
     /// read, or a volume cut short, ends that volume without failing the run, what came before standing
-    /// ([`HeaderDamageKind::Unreadable`], [`HeaderDamageKind::UnexpectedEnd`]). A RAR 5.0 volume without its end of
-    /// archive header is reported as ending unexpectedly, as 7-Zip 26.06 does. Encrypted headers are never salvaged:
+    /// ([`HeaderDamageKind::Unreadable`], [`HeaderDamageKind::UnexpectedEnd`]); a file header whose data the cut
+    /// leaves short, or a RAR 4.x file header it cuts short, is listed and read anyway, as UnRAR lists it
+    /// ([`crate::rar5::FileHeader::cut`], [`HeaderDamage::cut`]). A RAR 5.0 volume without its end of archive header
+    /// is reported as ending unexpectedly, as 7-Zip 26.06 does. Encrypted headers are never salvaged:
     /// there a checksum failure is how a wrong password shows.
     Salvage,
     /// [`Self::Salvage`], and where a header can't be read the rest of the volume is searched, in one bounded
@@ -349,6 +351,10 @@ pub struct HeaderDamage {
     /// Where reading went on in the same volume after the damage ([`DamagedInput::Resync`]); `None` when the rest of
     /// the volume was passed over (or, for [`HeaderDamageKind::ChecksumMismatch`], nothing was).
     pub resumed_at: Option<u64>,
+    /// For [`HeaderDamageKind::UnexpectedEnd`] at a file header the volume ends inside of, or inside whose data,
+    /// how: the member is listed (and read) anyway, as its header's [`crate::rar5::FileHeader::cut`] says. `None` for
+    /// any other damage, which lists nothing.
+    pub cut: Option<crate::rar5::HeaderCut>,
     /// Whether bytes that may belong to a member were passed over here unread: the damage was unreadable or cut
     /// short, or the damaged header read as something other than a file header (a file header whose type byte was
     /// hit can read as a service header, whose data is skipped). A solid archive's history is lost past it.
@@ -1781,9 +1787,16 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                     saw_end = true;
                     break;
                 }
-                Block::File(h) => {
+                Block::File(mut h) => {
                     if run.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
                         return Err(RarFault::new(RarFailure::Canceled, canceled_error()).into());
+                    }
+                    // DamagedInput::Salvage: a member the volume cuts short is read from the bytes that are there
+                    // (its checks decide, as UnRAR decides), and one whose header is cut short has none
+                    match h.cut {
+                        Some(crate::rar5::HeaderCut::Data { present }) => h.packed_size = present,
+                        Some(_) => h.packed_size = 0,
+                        None => {}
                     }
                     run.file_block(&mut vol, h, crypt)?
                 }
@@ -2051,7 +2064,7 @@ impl LegacyRoute {
                 Volume::from_held_signature(first, signature, password, DamagedInput::Refuse)?,
                 password,
                 DamagedInput::Refuse,
-                &mut Vec::new(),
+                &mut RarListSignals::default(),
             ),
         }
     }
@@ -3017,6 +3030,12 @@ pub struct Listing {
     /// RAR headers the listing read past under [`Options::damaged_input`] ([`list_detailed_with_options`]), at most
     /// 4096 kept: `entries` holds the members listed past them. Empty otherwise.
     pub damaged_headers: Vec<HeaderDamage>,
+    /// RAR volumes whose archive comment (a `CMT` service header) fails its CRC or doesn't decode, under
+    /// [`Options::damaged_input`] ([`list_detailed_with_options`]), at most 4096 kept. UnRAR 7.30 says "The archive
+    /// comment is corrupt" (exit code 3) and lists the archive; 7-Zip 26.06 doesn't read RAR 4.x comments. A comment
+    /// zipfast doesn't decode (encrypted, split, over 1 MiB, compressed RAR 5.0) isn't judged. Empty otherwise, and
+    /// for a comment embedded in a RAR 2.x main header, which [`crate::rar5::session::RarSession::comment`] reads.
+    pub damaged_comments: Vec<PathBuf>,
 }
 
 impl Listing {
@@ -3033,11 +3052,22 @@ impl Listing {
     pub fn headers_damaged(&self) -> bool {
         !self.damaged_headers.is_empty()
     }
+
+    /// Whether an archive comment is damaged ([`Self::damaged_comments`]): UnRAR's "The archive comment is corrupt".
+    pub fn comment_damaged(&self) -> bool {
+        !self.damaged_comments.is_empty()
+    }
 }
 
 /// [`list_with_password`], with the listing's warnings.
 pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
-    let whole = |entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers: Vec::new() };
+    let whole = |entries| Listing {
+        entries,
+        missing_volume: None,
+        truncated: false,
+        damaged_headers: Vec::new(),
+        damaged_comments: Vec::new(),
+    };
     let held = match sniff_held(first)? {
         (Format::Zip, _) => return crate::zip::list_detailed(first),
         (Format::Tar, _) => return crate::tar::list(first).map(whole),
@@ -3053,16 +3083,30 @@ pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
 /// [`list_detailed`] under `options`: a RAR archive's damaged headers are read past as
 /// [`Options::damaged_input`] says ([`Listing::damaged_headers`] says what was), and a ZIP cut short is listed from
 /// its local headers with [`Options::salvage_truncated_zip`]. The other options don't change a listing.
+///
+/// Under [`DamagedInput::Salvage`] or `Resync` a RAR listing also reports, without failing:
+/// - a missing volume ([`Listing::missing_volume`]): the set names a next volume that isn't there, and `entries`
+///   holds the members up to it, one split into it with its declared sizes (7-Zip 26.06: "ERROR = Missing volume",
+///   exit 2; UnRAR 7.30 `l -v`: "Cannot find volume"). Under `Refuse` that is an error, as before.
+/// - a damaged archive comment ([`Listing::damaged_comments`]).
+/// - a member the volume ends inside of ([`crate::rar5::FileHeader::cut`]), listed with its declared sizes and
+///   reported as [`HeaderDamageKind::UnexpectedEnd`] with its [`HeaderDamage::cut`].
 pub fn list_detailed_with_options(first: &Path, password: Option<&str>, options: &Options) -> Result<Listing> {
     let held = match sniff_held(first)? {
         (Format::Zip, _) => return crate::zip::list_detailed_with_options(first, options),
         (Format::Tar | Format::SevenZip, _) => return list_detailed(first, password),
         (Format::Other, held) => held,
     };
-    let mut damaged_headers = Vec::new();
-    match rar_list_damaged(first, held, password, options.damaged_input, &mut damaged_headers) {
+    let mut signals = RarListSignals::default();
+    match rar_list_damaged(first, held, password, options.damaged_input, &mut signals) {
         Err(Error::NotAnArchive) => crate::zip::list_detailed_with_options(first, options),
-        other => other.map(|entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers }),
+        other => other.map(|entries| Listing {
+            entries,
+            missing_volume: signals.missing_volume,
+            truncated: false,
+            damaged_headers: signals.damaged_headers,
+            damaged_comments: signals.damaged_comments,
+        }),
     }
 }
 
@@ -3382,7 +3426,15 @@ fn zip_run(
 /// The entries of a RAR set from its first volume: the file [`sniff_held`] kept open when it did, else opened by
 /// path.
 fn rar_list_held(first: &Path, held: Option<Sniffed>, password: Option<&str>) -> Result<Vec<Entry>> {
-    rar_list_damaged(first, held, password, DamagedInput::Refuse, &mut Vec::new())
+    rar_list_damaged(first, held, password, DamagedInput::Refuse, &mut RarListSignals::default())
+}
+
+/// What a RAR listing under [`Options::damaged_input`] reports besides its entries ([`Listing`]).
+#[derive(Default)]
+struct RarListSignals {
+    damaged_headers: Vec<HeaderDamage>,
+    missing_volume: Option<PathBuf>,
+    damaged_comments: Vec<PathBuf>,
 }
 
 fn rar_list_damaged(
@@ -3390,25 +3442,60 @@ fn rar_list_damaged(
     held: Option<Sniffed>,
     password: Option<&str>,
     damaged: DamagedInput,
-    damage: &mut Vec<HeaderDamage>,
+    signals: &mut RarListSignals,
 ) -> Result<Vec<Entry>> {
     let volume = match held {
         Some(held) => held.open_rar(first, password, damaged)?,
         None => Volume::open_damaged(first, password, damaged)?,
     };
-    rar_list_from_volume(volume, password, damaged, damage)
+    rar_list_from_volume(volume, password, damaged, signals)
+}
+
+/// Whether the `CMT` service header `h` holds a comment that fails its CRC or doesn't decode, reading its data from
+/// `vol`. A comment zipfast doesn't read (encrypted, split, too big, compressed RAR 5.0) is not judged.
+fn comment_damaged(vol: &mut Volume, h: &FileHeader) -> Result<bool> {
+    if crate::rar5::session::service_comment_readable(h).is_err() {
+        return Ok(false);
+    }
+    let mut packed = Vec::new();
+    match vol.read_data_into(h.data_at, h.packed_size, &mut packed) {
+        Ok(()) => {}
+        // cut short with the volume, which the listing reports as it is
+        Err(Error::Truncated) => return Ok(true),
+        Err(error) => return Err(error),
+    }
+    let path = vol.path.clone();
+    match crate::rar5::session::decode_service_comment(&path, h, packed, &Cancellation::default()) {
+        Ok(_) => Ok(false),
+        Err(failure) => match failure.as_ref() {
+            RarFailure::Unsupported(_) | RarFailure::Limit { .. } => Ok(false),
+            RarFailure::Canceled => Err(canceled_error()),
+            _ => Ok(true),
+        },
+    }
 }
 
 fn rar_list_from_volume(
     volume: Volume,
     password: Option<&str>,
     damaged: DamagedInput,
-    damage: &mut Vec<HeaderDamage>,
+    signals: &mut RarListSignals,
 ) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut budget = ListingBudget::default();
-    walk(volume, password, damaged, damage, |_, block| {
-        let Block::File(h) = block else { return Ok(()) };
+    let comments = &mut signals.damaged_comments;
+    let walked = walk(volume, password, damaged, &mut signals.damaged_headers, |vol, block| {
+        let h = match block {
+            Block::File(h) => h,
+            // UnRAR 7.30 reads the comment of each volume it lists: "The archive comment is corrupt"
+            Block::Service(h) if damaged.salvages() && h.name == "CMT" => {
+                if comments.len() < MAX_HEADER_DAMAGE && !comments.contains(&vol.path) && comment_damaged(vol, &h)? {
+                    comments.push(vol.path.clone());
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
                 last.packed = last.packed.checked_add(h.packed_size).ok_or(Error::Corrupt("split packed size"))?;
@@ -3444,7 +3531,13 @@ fn rar_list_from_volume(
             version: h.version,
         });
         Ok(())
-    })?;
+    });
+    match walked {
+        Ok(_) => {}
+        // as 7-Zip lists it ("Missing volume"): the members up to the missing volume stand
+        Err(Error::MissingVolume(path)) if damaged.salvages() => signals.missing_volume = Some(path),
+        Err(error) => return Err(error),
+    }
     Ok(out)
 }
 
@@ -4820,6 +4913,12 @@ impl Run<'_, '_, '_> {
             return self.unselected_block(vol, h, name, continuation);
         }
         let ctx = self.reports.encounter(!continuation, &mut self.order, name, h.method)?;
+        if h.cut == Some(crate::rar5::HeaderCut::Header) {
+            // listed as UnRAR lists it (DamagedInput::Salvage), but nothing of it can be extracted
+            let failure = ctx.integrity(RarIntegrityReason::TruncatedHeader, false);
+            self.fail_in_order(&ctx, failure, "the file header is cut short")?;
+            return Ok(());
+        }
         if let Some(reason) = h.rar4_unsupported() {
             let cause =
                 self.fail_in_order(&ctx, RarFailure::Unsupported(reason), "unsupported RAR4 payload feature")?;

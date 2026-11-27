@@ -102,6 +102,7 @@ impl ProgressiveSession {
             name: name.map(str::to_owned),
             resumed_at,
             passed_over,
+            cut: None,
         };
         if passed_over && self.member.is_none() {
             // Bytes that may hold a member's compressed stream were passed over: a solid member after the gap fails as
