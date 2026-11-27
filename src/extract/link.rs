@@ -698,6 +698,24 @@ fn stand_in(path: &Path, replace: bool) -> io::Result<()> {
     Err(io::ErrorKind::AlreadyExists.into())
 }
 
+/// Leaves an empty regular file where the link member at `rel` would go, at the `place` the run's target check gave
+/// (the overwrite choice and a rename mode already settled), and records it as a file this run wrote. This is what
+/// 7-Zip 26.06 `x` leaves for a ZIP link it failed unread ("Unknown reparse stream"), under
+/// [`crate::extract::Options::seven_zip_strict`] with [`crate::extract::Options::keep_broken`].
+pub(crate) fn publish_empty(dest: &Path, rel: &Path, place: super::Place, extracted: &mut Extracted) -> io::Result<()> {
+    let (path, replace) = match &place.reserved {
+        Some(reserved) => (reserved.path().to_path_buf(), true),
+        None => (place.path.clone(), place.replace),
+    };
+    // on failure the reservation is dropped, which removes the empty file while it is still the one created
+    stand_in(&path, replace)?;
+    if let Some(reserved) = place.reserved {
+        let _ = reserved.into_parts();
+    }
+    stood_in(dest, rel, &path, extracted);
+    Ok(())
+}
+
 /// Places a checked link member: a symbolic link, or a hard link to the earlier member (a copy where the file
 /// system takes no hard link), or a copy of it. `place` comes from the run's target check, so the overwrite choice,
 /// a rename mode and the refusal to write through a link in the way are already settled. A rename mode's reserved

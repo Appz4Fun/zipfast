@@ -292,10 +292,12 @@ pub struct Options {
     /// - ZIP: each member's local header is compared with its central directory record: the CRC-32 and both sizes
     ///   (unless the local header sets the data descriptor flag, as 7-Zip doesn't compare them then; a ZIP64 sentinel
     ///   in the local header isn't compared), the compression method and the data descriptor flag. A member whose
-    ///   local header differs fails without being decoded (7-Zip's "Headers Error : NAME"; with [`Self::keep_broken`]
-    ///   its file stays empty, as 7-Zip leaves it) and is a [`LocalHeaderMismatch`] in
+    ///   local header differs fails (7-Zip's "Headers Error : NAME") and is a [`LocalHeaderMismatch`] in
     ///   [`Summary::local_header_mismatches`]; on the checked route it fails as
-    ///   [`crate::zip::ReadFault::LocalHeaderMismatch`].
+    ///   [`crate::zip::ReadFault::LocalHeaderMismatch`]. When the CRC-32, a size or the method differs
+    ///   ([`LocalHeaderMismatch::fails_unread`]) it fails without being decoded (with [`Self::keep_broken`] its file,
+    ///   or a link's path, is left an empty regular file, as 7-Zip leaves it); when only the data descriptor flag
+    ///   differs, its data is still decoded, checked and written (a link is placed) before it fails, as 7-Zip does.
     ///
     /// Honoured by the 7z runners ([`crate::sevenzip::run`], the dispatchers, the checked dispatchers'
     /// 7z route, and [`crate::sevenzip::print_selected_with_options`] through
@@ -385,6 +387,13 @@ impl LocalHeaderMismatch {
             ..Self::default()
         };
         (found.crc32 || found.packed_size || found.size || found.method || found.descriptor_flag).then_some(found)
+    }
+
+    /// Whether a field that locates or checks the data differs (the CRC-32, a size or the method): 7-Zip 26.06 then
+    /// fails the member unread. When only the data descriptor flag differs, it still writes the member's data (and
+    /// reports the headers error all the same).
+    pub fn fails_unread(&self) -> bool {
+        self.crc32 || self.packed_size || self.size || self.method
     }
 
     pub(crate) fn named(mut self, ordinal: u64, name: &str) -> Self {

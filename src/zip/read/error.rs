@@ -214,7 +214,9 @@ pub enum ReadFault {
         reason: &'static str,
     },
     /// [`crate::extract::Options::seven_zip_strict`]: the member's local header differs from its central directory
-    /// record (7-Zip's "Headers Error"); the member was not decoded.
+    /// record (7-Zip's "Headers Error"). The member was not decoded when
+    /// [`crate::extract::LocalHeaderMismatch::fails_unread`]; when only the data descriptor flag differs, it was
+    /// decoded, checked and published (a link placed) first, as 7-Zip writes it.
     LocalHeaderMismatch(Box<crate::extract::LocalHeaderMismatch>),
     InvalidPlan,
     CounterOverflow,
