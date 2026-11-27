@@ -1181,7 +1181,7 @@ pub(super) fn validate_evidence(
         let admission = evidence.admissions.iter().find(|a| a.volume == part.packed.volume).ok_or_else(malformed)?;
         // A part lies within its volume, except a part recorded cut short: its volume's final length ends inside
         // its data (after its header, which the witness below must still match).
-        let within = if evidence.cut.contains(&part.ordinal) {
+        let within = if evidence.cut.binary_search(&part.ordinal).is_ok() {
             matches!(admission.info.length, SourceLength::Final(n)
                 if part.packed.range.start <= n && n < part.packed.range.end)
         } else {

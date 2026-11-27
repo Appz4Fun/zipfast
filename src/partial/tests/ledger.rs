@@ -835,6 +835,37 @@ fn cut_parts_persist_in_their_own_section() {
     short_ordinal.truncate(short_ordinal.len() - 3);
     assert!(decode(with(short_ordinal, &pages)).is_err(), "an ordinal cut short");
 
+    // With the other trailing sections: salvaged witnesses (0x5A) come first, the format tag last; any other order
+    // is refused.
+    let (mut both, _copy) = file.core.clone_snapshot(&cut).unwrap();
+    both.evidence.headers[0].salvaged = true;
+    let (both_pages, _lease) = state::encode_pages(&both, &file.core.budget).unwrap();
+    let decoded = state::decode_pages(op.snapshot.head.clone(), both_pages.clone(), &file.core.budget, &[]).unwrap();
+    assert_eq!(decoded.evidence.cut, vec![0]);
+    assert!(decoded.evidence.headers[0].salvaged);
+    let bytes = witnesses(&both_pages);
+    let salvaged_len = 6 + 4 * both.evidence.headers.iter().filter(|h| h.salvaged).count();
+    let (salvaged, cut_section) = bytes[plain.len()..].split_at(salvaged_len);
+    assert_eq!((salvaged[0], cut_section[0]), (0x5A, 0xC7));
+    let mut swapped = plain.clone();
+    swapped.extend(cut_section);
+    swapped.extend(salvaged);
+    assert!(decode(with(swapped, &both_pages)).is_err(), "the cut section before the salvaged one");
+    let mut twice = marked.clone();
+    twice.extend(&marked[plain.len()..]);
+    assert!(decode(with(twice, &pages)).is_err(), "the cut section twice");
+    // a format tag after the section is read as before (here a RAR4 tag on RAR 5.0 witnesses, refused as such
+    // by the witness parse, not as an unknown section)
+    let mut tagged = marked.clone();
+    tagged.push(4);
+    assert!(
+        !matches!(decode(with(tagged, &pages)).unwrap_err().kind, PartialErrorKind::StateVersion),
+        "the format tag follows the cut section"
+    );
+    let mut unknown = marked.clone();
+    unknown.push(0xEE);
+    assert!(matches!(decode(with(unknown, &pages)).unwrap_err().kind, PartialErrorKind::StateVersion));
+
     // A listed part's volume must end inside its data: not before it, nor with an advertised length.
     for length in [SourceLength::Final(first.packed.range.start - 1), SourceLength::Advertised(short)] {
         let (mut odd, _copy) = file.core.clone_snapshot(&cut).unwrap();

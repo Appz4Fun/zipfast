@@ -710,7 +710,7 @@ impl ProgressiveSession {
         // creates the member with the part marked cut (`InitialEvidence::cut`), extracts the bytes the volume has,
         // and reports it `PersistentUnverified` when the read reaches the cut (`partial_cut_off`).
         let cut = cut_short(&admission, &plain);
-        if cut && !reports_cut_off(&self.options.extract) {
+        if cut && (!reports_cut_off(&self.options.extract) || !cut_in_data(&admission, &plain)) {
             return Err(ProgressiveFailure::new(FailureKind::Truncated));
         }
         let mut spec = CreateSpec {
@@ -1417,9 +1417,14 @@ fn ancestor_identities(
 fn reports_cut_off(options: &crate::extract::Options) -> bool {
     options.keep_broken && options.unverified_output == crate::extract::UnverifiedOutput::Emit
 }
-/// Whether `part` runs past the final length its volume was admitted with: the set is cut short inside it.
+/// Whether `part` runs past the final length its volume was admitted with: the set is cut short inside it (or
+/// before its data, which no state records: the session then ends `Truncated` without creating anything).
 fn cut_short(admission: &SourceAdmission, part: &PlainPart) -> bool {
     matches!(admission.info.length, crate::progressive::SourceLength::Final(n) if part.packed.range.end > n)
+}
+/// Whether a cut-short `part` can be recorded: its volume ends inside its data, after its header.
+fn cut_in_data(admission: &SourceAdmission, part: &PlainPart) -> bool {
+    matches!(admission.info.length, crate::progressive::SourceLength::Final(n) if part.packed.range.start <= n)
 }
 fn member_checks(member: &PhysicalMember) -> MemberChecks {
     let checks = member.final_checks;
