@@ -358,6 +358,15 @@ pub(super) fn decode(
             consumed = consumed.checked_add(p.consumed as u64).ok_or(ReadFault::CounterOverflow)?;
             let next = u128::from(decoded).checked_add(p.produced as u128).ok_or(ReadFault::CounterOverflow)?;
             if next > u128::from(plan.decoded) {
+                // the bytes up to the declared size go out first: a member kept with Options::keep_broken, or handed
+                // over under UnverifiedOutput::Emit, holds them, as 7-Zip 26.06 `x` and `x -so` write it (the
+                // allowance is one byte past the declared size, so this is less than what was produced)
+                let within = usize::try_from(plan.decoded - decoded).map_err(|_| ReadFault::CounterOverflow)?;
+                if within != 0 && within < p.produced {
+                    io::canceled(Some(cancel))?;
+                    sink(&workspace.output[..within]).map_err(ZipReadError::from)?;
+                    accepted = plan.decoded;
+                }
                 return Err(integrity(IntegrityReason::DecodedSize));
             }
             if let Some(reason) = p.fault {
