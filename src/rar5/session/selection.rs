@@ -718,7 +718,17 @@ impl SelectedRun {
                 let decoder = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5);
                 if let Some(decoder) = rar4.as_mut() {
                     let result = decoder.feed(plaintext, &mut sink).map(|_| ());
-                    sink.finish_rar4(result)?;
+                    if let Err(failure) = sink.finish_rar4(result) {
+                        let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                        return Err(held.salvage(
+                            failure,
+                            self.emit_unverified,
+                            Some(decoder),
+                            None,
+                            &self.limits,
+                            session,
+                        ));
+                    }
                 } else {
                     match decoder {
                         Some(decoder) => {
@@ -726,7 +736,12 @@ impl SelectedRun {
                                 Some(blocks) => blocks.feed(plaintext, decoder, &mut sink),
                                 None => decoder.feed(plaintext, &mut sink),
                             };
-                            sink.finish(result, decoder.take_size_failure())?;
+                            if let Err(failure) = sink.finish(result, decoder.take_size_failure()) {
+                                let held =
+                                    Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                                let emit = self.emit_unverified;
+                                return Err(held.salvage(failure, emit, None, Some(decoder), &self.limits, session));
+                            }
                         }
                         None => {
                             let result = sink.put(plaintext);
@@ -777,7 +792,10 @@ impl SelectedRun {
                 output: &mut output,
             };
             let result = decoder.finish_logical(&mut sink).map(|_| ());
-            sink.finish_rar4(result)?;
+            if let Err(failure) = sink.finish_rar4(result) {
+                let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                return Err(held.salvage(failure, self.emit_unverified, Some(decoder), None, &self.limits, session));
+            }
         }
         if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5) {
             let mut sink = SelectedSink {
@@ -789,7 +807,10 @@ impl SelectedRun {
                 output: &mut output,
             };
             let result = decoder.finish(&mut sink);
-            sink.finish(result, decoder.take_size_failure())?;
+            if let Err(failure) = sink.finish(result, decoder.take_size_failure()) {
+                let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                return Err(held.salvage(failure, self.emit_unverified, None, Some(decoder), &self.limits, session));
+            }
         }
         let unfiltered = rar4.as_mut().is_some_and(Rar4Decoder::take_unfiltered);
         if let Some(decoder) = rar4.filter(Rar4Decoder::has_boundary) {
@@ -994,6 +1015,55 @@ fn verify_part(
     blake: Option<Blake2sp>,
 ) -> Result<(), RarFailure> {
     super::super::member::verify_packed(pending.context(), checks, crc, blake, pending.hash_key(checks.keyed))
+}
+
+/// What a failing member's decoded bytes go to: [`Held::salvage`].
+struct Held<'a, 'out> {
+    pending: &'a mut Pending,
+    decoded: &'a mut u64,
+    output: &'a mut Option<DecodedOutput<'out>>,
+}
+
+impl Held<'_, '_> {
+    /// [`crate::extract::UnverifiedOutput::Emit`]: a member failing on its data hands over what its decoder still
+    /// buffers, so printing gets every byte decoded before the failure. The member's own failure is returned, or a
+    /// terminal one handing the bytes over met (an output or spool failure, a limit, cancellation).
+    fn salvage(
+        self,
+        failure: RarFailure,
+        emit: bool,
+        rar4: Option<&mut Rar4Decoder>,
+        rar5: Option<&mut Unpacker>,
+        limits: &RarDecodeLimits,
+        session: &RarSession,
+    ) -> RarFailure {
+        if !emit || is_terminal(&failure) {
+            return failure;
+        }
+        let mut sink = SelectedSink {
+            pending: self.pending,
+            decoded: self.decoded,
+            limit: limits.decoded_bytes,
+            cancel: &session.options.cancel,
+            failure: None,
+            output: self.output,
+        };
+        let flushed = match (rar4, rar5) {
+            (Some(decoder), _) => {
+                let result = decoder.flush_decoded(&mut sink);
+                sink.finish_rar4(result)
+            }
+            (None, Some(decoder)) => {
+                let result = decoder.flush_now(&mut sink);
+                sink.finish(result, None)
+            }
+            (None, None) => Ok(()),
+        };
+        match flushed {
+            Err(stop) if is_terminal(&stop) => stop,
+            _ => failure,
+        }
+    }
 }
 
 struct SelectedSink<'a, 'out> {

@@ -1766,7 +1766,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                         format_args!("missing volume {}", next.display()),
                     )?;
                 }
-                run.emit_unverified(&mut p);
+                run.emit_unverified(&mut p)?;
                 p.discard();
                 run.stream = None;
                 run.rar4 = None;
@@ -4362,10 +4362,12 @@ fn rar_run_shared_open<'a>(
     }
     let result = if let Some(mut p) = run.pending.take() {
         let already_reported = p.failed || p.passive;
-        if walked.is_ok() {
-            run.emit_unverified(&mut p);
-        }
+        let emitted = if walked.is_ok() { run.emit_unverified(&mut p) } else { Ok(()) };
         p.discard();
+        if let Err(fault) = emitted {
+            finish_dir_meta(&mut run.dir_meta);
+            return Err(fault);
+        }
         if walked.is_ok() && !p.hidden && (!run.reports.typed() || !already_reported) {
             let failure = p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false);
             run.reports.failed(&p.context, Arc::new(failure), "archive ends before this file does")
@@ -4472,7 +4474,12 @@ fn rar_read_at(
             let crypt = header.crypt.map(Ok);
             let split_after = header.split_after();
             run.file_block(volume, header, crypt).map_err(RunFault::into_legacy)?;
-            let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
+            let Reports::Legacy { summary, .. } = &mut run.reports else { unreachable!() };
+            if !selected && unfiltered && summary.errors.len() == 1 && summary.errors[0].ends_with(UNFILTERED_MESSAGE) {
+                // a solid prerequisite written unfiltered: its filters act on its output only, so the history the
+                // selected member goes on from is whole
+                summary.errors.clear();
+            }
             if let Some(error) = summary.errors.first() {
                 if unfiltered && error.ends_with(UNFILTERED_MESSAGE) {
                     // written whole with a block left unfiltered: 7-Zip's "Unsupported Method"
@@ -4578,16 +4585,24 @@ impl Run<'_, '_, '_> {
 
     /// [`UnverifiedOutput::Emit`]: a member cut off by a missing volume gets the bytes its decoder still holds (what
     /// the present volumes decoded), so a file kept with [`Options::keep_broken`] has all of them, as UnRAR 7.30
-    /// `x -kb` keeps it. Best effort: a decoder that can't hand them over leaves the file as it was.
-    fn emit_unverified(&mut self, p: &mut Pending) {
+    /// `x -kb` keeps it. A decoder that can't hand them over leaves the file as it was; a failure writing them (the
+    /// sink's) ends the run, as any output failure does.
+    fn emit_unverified(&mut self, p: &mut Pending) -> RunResult<()> {
         if self.opts.unverified_output != UnverifiedOutput::Emit || p.failed || p.passive || p.hidden || !p.compressed {
-            return;
+            return Ok(());
         }
         let mut sink = PendingSink { pending: p, fault: None };
         if let Some(decoder) = self.rar4.as_mut() {
             let _ = decoder.flush_decoded(&mut sink);
         } else if let Some(stream) = self.stream.as_mut() {
             let _ = stream.flush_cut(&mut sink);
+        }
+        match sink.fault {
+            Some(fault) => {
+                p.discard();
+                Err(self.terminal(&p.context, fault))
+            }
+            None => Ok(()),
         }
     }
 
@@ -4714,7 +4729,7 @@ impl Run<'_, '_, '_> {
         if !p.hidden && (!self.reports.typed() || (!p.failed && !p.passive)) {
             let failure = Arc::new(p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false));
             self.reports.failed(&p.context, Arc::clone(&failure), "next part is missing")?;
-            self.emit_unverified(&mut p);
+            self.emit_unverified(&mut p)?;
             if p.compressed {
                 self.lost_history(&p.context, Some(failure));
             }
@@ -6178,6 +6193,68 @@ mod tests {
         assert!(p.take(b"data").is_err(), "the write fails");
         p.discard();
         assert!(!path.exists(), "a member whose output failed is removed, not kept");
+    }
+
+    /// Codex on #317: under `UnverifiedOutput::Emit`, a failure writing the bytes a cut-off member's decoder still
+    /// holds ends the run, as any output failure does, instead of leaving only the missing-volume failure.
+    #[test]
+    fn an_output_failure_handing_over_a_cut_members_bytes_ends_the_run() {
+        let packed = include_bytes!("../tests/fixtures/rar4-lz/literal-a.packed");
+        let mut decoder =
+            crate::rar5::unpack::rar4::Rar4Decoder::new_with_cancel(65536, packed.len() as u64 + 1, 2, 4 << 20, None)
+                .unwrap();
+        decoder.set_version(29).unwrap();
+        let mut scratch = Pending::new(&FileHeader::default(), empty_context());
+        // it ends early (the member says two bytes): what it decoded stays in its buffer
+        let _ = decoder.feed(packed, &mut scratch);
+        assert_eq!(scratch.bytes, 0, "the decoded byte is still buffered");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member");
+        let mut opts = Options {
+            mode: Mode::Extract,
+            dest: dir.path().to_path_buf(),
+            overwrite: Overwrite::Always,
+            flatten: false,
+            threads: Some(1),
+            protected_paths: Default::default(),
+            parallel_min: None,
+            select: None,
+            windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
+            preexisting_links: Default::default(),
+            refused_link_placeholder: false,
+            restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: true,
+            attempt_continued_members: false,
+            damaged_input: Default::default(),
+            unsupported_filters: Default::default(),
+            unverified_output: UnverifiedOutput::Emit,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
+        };
+        for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+            opts.unverified_output = unverified;
+            let mut callback = |_: &str| {};
+            let mut reports = Reports::legacy(&mut callback);
+            let mut run = Run::new(&opts, None, &mut reports, 1);
+            let mut held = crate::rar5::unpack::rar4::Rar4Decoder::new_with_cancel(65536, 1, 1, 4 << 20, None).unwrap();
+            std::mem::swap(&mut held, &mut decoder);
+            run.rar4 = Some(held);
+            let mut p = Pending::new(&FileHeader::default(), empty_context());
+            p.compressed = true;
+            p.keep = Some(Meta::default());
+            // a read-only handle: every write to it fails
+            std::fs::write(&path, b"").unwrap();
+            p.out = Some(crate::output::Output::created(File::open(&path).unwrap(), Some(4), path.clone()));
+            let result = run.emit_unverified(&mut p);
+            assert_eq!(result.is_err(), unverified == UnverifiedOutput::Emit, "{unverified:?}");
+            decoder = run.rar4.take().unwrap();
+        }
     }
 
     #[cfg(unix)]

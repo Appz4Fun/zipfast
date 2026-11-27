@@ -258,3 +258,40 @@ fn a_program_failing_its_check_byte_is_never_written_unfiltered() {
         assert!(!out.join("tiny_e8e9.exe").exists() && !out.join("lead2.txt").exists());
     }
 }
+
+/// Codex on #317: a `SelectedEntry` read with `UnverifiedOutput::Emit` goes on past a solid prerequisite written
+/// unfiltered (its filters act on its output, never on the history), so a later member reads whole; the member
+/// itself reads unfiltered and fails as written so.
+#[test]
+fn a_selected_read_goes_on_past_a_prerequisite_written_unfiltered() {
+    use zipfast::extract::{Cancellation, SelectOptions, SelectedEntry, UnverifiedOutput, UnverifiedWritten};
+    const LEAD: (usize, u32) = (800, 0x93b3_7d98);
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("solid.rar");
+    fs::write(&archive, solid_case(0, &[8, 16])).unwrap();
+    let read = |index: usize| {
+        let select = SelectOptions::new().unverified_output(UnverifiedOutput::Emit);
+        let entry = SelectedEntry::open_cancelable_with_options(
+            &archive,
+            index,
+            None,
+            1 << 20,
+            Cancellation::default(),
+            select,
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        let result = entry.read(None, |chunk| {
+            got.extend_from_slice(chunk);
+            Ok(())
+        });
+        (got, result)
+    };
+    let (lead2, result) = read(2);
+    result.expect("lead2.txt reads whole");
+    assert_eq!((lead2.len(), zipfast::crc32::hash(&lead2)), LEAD);
+    let (exe, result) = read(1);
+    let error = result.unwrap_err();
+    assert_eq!(UnverifiedWritten::of(&error).map(|s| s.bytes), Some(exe.len() as u64), "{error}");
+    assert_eq!((exe.len(), zipfast::crc32::hash(&exe)), (5884, 0x507a_ca8a));
+}

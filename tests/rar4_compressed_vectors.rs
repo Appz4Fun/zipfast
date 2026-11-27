@@ -515,3 +515,34 @@ fn compressed_and_stored_rar4_links_report_their_decoded_targets() {
     assert_eq!(verified(&events), expected, "typed");
     assert_eq!(fs::read_link(dest.join("packed")).unwrap(), Path::new("A"));
 }
+
+/// Codex on #317: with `RarPrintOptions::unverified_output = Emit`, a member failing on its data prints what its
+/// decoder still buffered too (`literal-a` declared as two bytes fails its decoded size with the `A` buffered).
+#[test]
+fn printing_unverified_hands_over_what_the_decoder_buffered() {
+    use zipfast::extract::UnverifiedOutput;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.rar");
+    let packed = include_bytes!("fixtures/rar4-lz/literal-a.packed");
+    fs::write(&path, archive(&[member(b"short", packed, b"AA", 29, 0x33, 0)])).unwrap();
+    for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let options = RarPrintOptions { unverified_output: unverified, ..RarPrintOptions::default() };
+        let mut stdout = Vec::new();
+        let mut events = Vec::new();
+        let summary = session
+            .print_selected(&all, &mut stdout, &options, |event| {
+                events.push((matches!(event.outcome, RarOutcome::Failed(_)), event.unverified_bytes))
+            })
+            .unwrap();
+        assert_eq!(summary.failed, 1, "{unverified:?}");
+        if unverified == UnverifiedOutput::Emit {
+            assert_eq!(stdout, b"A");
+            assert_eq!(events, [(true, Some(1))]);
+        } else {
+            assert!(stdout.is_empty());
+            assert_eq!(events, [(true, None)]);
+        }
+    }
+}
