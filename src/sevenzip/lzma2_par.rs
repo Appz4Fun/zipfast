@@ -45,7 +45,9 @@
 //! Reading ahead also stops once the packed bytes waiting in the piece being read pass the larger of [`LOOKAHEAD`]
 //! and the output handed out so far (at most the budget), or [`STORED_LOOKAHEAD`] in a piece of stored
 //! chunks (which cost a copy to decode, so finding the next piece early gains little), so a one-block stream holds
-//! little more than the one-thread reader does.
+//! little more than the one-thread reader does. Two exceptions put blocks on threads early: before the workers start,
+//! the lookahead may reach [`FIND_BLOCKS`] dictionary windows (one 7-Zip block), so the second piece is found while
+//! the first decodes; and while a worker waits with no piece to decode, the budget alone bounds reading ahead.
 //!
 //! A piece that fails gives the output it decoded before the failure and then the failure, in order, so the failure
 //! lands on the member it lands on in one-thread decoding. Workers check the [`Cancellation`] every [`SEGMENT`] bytes
@@ -82,6 +84,8 @@ const SPARE: usize = 64;
 const READ: usize = 64 << 10;
 /// Packed bytes that may wait for decoders before any output is handed out (see the module documentation).
 const LOOKAHEAD: u64 = 8 << 20;
+/// Before the workers start, the lookahead may reach this many dictionary windows: 7-Zip's blocks are four windows.
+const FIND_BLOCKS: u64 = 4;
 /// The lookahead in a piece of stored chunks (nine tenths or more of its output so far).
 const STORED_LOOKAHEAD: u64 = 256 << 10;
 /// Packed bytes read ahead at most before the caller's thread looks at its own work again.
@@ -325,10 +329,18 @@ struct State {
     buffers: u64,
     /// the most `held` and `buffers` have been together, for the tests
     peak_total: u64,
+    /// pieces started, and how many had been when the first was handed out in full, for the tests
+    #[cfg(test)]
+    opened: u64,
+    #[cfg(test)]
+    opened_at_first_pop: Option<u64>,
     /// dictionary bytes freed since the arenas were last trimmed
     freed: u64,
     /// workers waiting for room in the budget
     budget_waiters: usize,
+    /// workers waiting for a piece: while there are more of them than pieces waiting for a thread, reading ahead to
+    /// the next piece pays, so it is bounded by the budget alone ([`Parallel::room`])
+    idle: usize,
     /// packed blocks the decoders are done with, for the reader to read into again
     spare: Vec<Vec<u8>>,
     stop: bool,
@@ -358,6 +370,10 @@ impl State {
     /// Drops the head piece, once it is handed out; the bytes it never read leave the budget.
     fn pop(&mut self) -> Option<Piece> {
         let piece = self.pieces.pop_front()?;
+        #[cfg(test)]
+        if self.head == 0 {
+            self.opened_at_first_pop = Some(self.opened);
+        }
         self.head += 1;
         self.held -= piece.queued;
         Some(piece)
@@ -549,7 +565,9 @@ fn work(shared: &Shared) {
                     guard.number = Some(number);
                     break number;
                 }
+                state.idle += 1;
                 state = shared.wait(&shared.jobs, state);
+                state.idle -= 1;
             }
         };
         let fault = match Decoder::new(number, shared.dict) {
@@ -811,6 +829,10 @@ impl Parallel {
             }
         }
         let mut state = self.shared.lock();
+        #[cfg(test)]
+        {
+            state.opened = state.opened.max(number + 1);
+        }
         state.pieces.push_back(Piece::default());
         if number > 0 {
             state.jobs.push_back(number);
@@ -879,11 +901,20 @@ impl Parallel {
             Some(Feeding { number, decoded, stored }) => {
                 // Stored chunks cost a copy to decode: finding the next piece early gains little, and a long
                 // lookahead would leave the cache. Otherwise the lookahead grows with the output, up to the budget.
-                let limit = if stored * 10 >= decoded * 9 {
+                // But a worker with nothing to do gains from every piece found: while one waits, the budget alone
+                // bounds reading ahead. Before the workers start (the first piece, which may be the only one) the
+                // lookahead may reach one 7-Zip block's packed bytes (four windows), so that a second piece is found
+                // while the first is still decoding, without reading a one-block stream far ahead.
+                let mut limit = if stored * 10 >= decoded * 9 {
                     STORED_LOOKAHEAD
                 } else {
-                    LOOKAHEAD.max(self.produced).min(self.shared.memory.max(HEAD_INPUT))
+                    let first = if self.threads.is_empty() { FIND_BLOCKS * dict_size(self.shared.dict) } else { 0 };
+                    LOOKAHEAD.max(self.produced).max(first)
                 };
+                if !self.threads.is_empty() && state.idle > state.jobs.len() {
+                    limit = limit.max(self.shared.memory);
+                }
+                let limit = limit.min(self.shared.memory.max(HEAD_INPUT));
                 (state.piece(number).map_or(0, |p| p.queued), limit, number == state.head)
             }
             None => (0, LOOKAHEAD, true),
@@ -1104,8 +1135,13 @@ impl Lzma2Blocks {
                 peak: 0,
                 buffers: 0,
                 peak_total: 0,
+                #[cfg(test)]
+                opened: 1,
+                #[cfg(test)]
+                opened_at_first_pop: None,
                 freed: 0,
                 budget_waiters: 0,
+                idle: 0,
                 spare: Vec::new(),
                 stop: false,
             }),
@@ -1674,6 +1710,14 @@ mod tests {
             }
         }
 
+        /// The pieces started when the first was handed out in full.
+        fn opened_at_first_pop(&self) -> Option<u64> {
+            match &self.mode {
+                Mode::Parallel(parallel) => parallel.shared.lock().opened_at_first_pop,
+                _ => None,
+            }
+        }
+
         /// The most bytes the pipeline has held, once it runs.
         fn peak(&self) -> Option<u64> {
             match &self.mode {
@@ -1834,6 +1878,23 @@ mod tests {
             let bound = memory.max(HEAD_INPUT) + 2 * READ as u64 + (HEAD_SEGMENTS as u64 + 1) * SEGMENT as u64;
             assert!(peak <= bound, "{memory}: peak {peak}, bound {bound}");
         }
+    }
+
+    /// A slow first piece, then stored ones (which decode at once and leave their workers idle), then LZMA ones:
+    /// with workers idle the reader reads on past the stored pieces within the budget, so every piece has reached
+    /// a thread before the first is handed out, instead of the stored pieces being read a little at a time as the
+    /// first one decodes.
+    #[test]
+    fn idle_workers_get_the_pieces_after_stored_ones_early() {
+        let mut blocks = vec![(6 << 20, 40, true)];
+        blocks.extend((0..4).map(|i| (4 << 20, 41 + i, false)));
+        blocks.extend([(2 << 20, 50, true), (2 << 20, 51, true)]);
+        let (packed, plain) = stream(&blocks);
+        let mut reader =
+            Lzma2Blocks::new(cursor(&packed), plain.len() as u64, DICT, 4, 1 << 30, &Cancellation::default()).unwrap();
+        let got = drain(&mut reader, plain.len() as u64);
+        assert!(got.1.is_none() && got.0 == plain, "{:?}", got.1);
+        assert_eq!(reader.opened_at_first_pop(), Some(blocks.len() as u64));
     }
 
     /// Blocks of zeros 1 MiB and one byte long: each ends in a one-byte segment. With the reader paused the queued
