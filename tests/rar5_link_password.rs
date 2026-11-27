@@ -401,3 +401,46 @@ fn an_unverifiable_link_over_an_existing_target_is_skipped_on_a_progressive_sess
     assert_eq!(fs::read(dest.join("plain")).unwrap(), b"plain");
     assert_eq!(fs::read(dest.join("old")).unwrap(), b"kept", "the existing target is left alone");
 }
+
+/// Codex on #307: on the whole-archive runner and RarSession too, an encrypted link with no check value over an
+/// existing target under Overwrite::Skip is reported Skipped(ExistingTarget), not failed for its missing check value.
+#[test]
+fn an_unverifiable_link_over_an_existing_target_is_skipped_on_every_route() {
+    use zipfast::extract::{Overwrite, RarSkipReason};
+    use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("skip.rar");
+    fs::write(&path, archive(&[link("old", 1, "plain", false), FileSpec::new("plain", b"plain")])).unwrap();
+    let skipped_first = |outcomes: &[(u64, String)], route: &str| {
+        let old = outcomes.iter().find(|(order, _)| *order == 0).map(|(_, o)| o.as_str());
+        assert_eq!(old, Some("skipped existing"), "{route}");
+    };
+    let label = |o: &RarOutcome| match o {
+        RarOutcome::Skipped(RarSkipReason::ExistingTarget) => "skipped existing".to_string(),
+        other => classify(other),
+    };
+    for route in ["whole", "session"] {
+        let dest = dir.path().join(route);
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("old"), b"kept").unwrap();
+        let opts = Options { overwrite: Overwrite::Skip, ..options(&dest, Mode::Extract) };
+        let mut outcomes = Vec::new();
+        if route == "whole" {
+            extract::run_rar_with_outcomes(&path, &opts, Some(PASSWORD), |e| {
+                outcomes.push((e.entry.order, label(&e.outcome)))
+            })
+            .unwrap();
+        } else {
+            let mut session = RarSession::open(&path, Some(PASSWORD), RarSessionOptions::default()).unwrap();
+            let all = session.select(|_| true).unwrap();
+            session
+                .extract_selected(&all, &opts, RarDecodeLimits::default(), |e| {
+                    outcomes.push((e.entry.order, label(&e.outcome)))
+                })
+                .unwrap();
+        }
+        skipped_first(&outcomes, route);
+        assert_eq!(fs::read(dest.join("old")).unwrap(), b"kept", "{route}");
+        assert_eq!(fs::read(dest.join("plain")).unwrap(), b"plain", "{route}");
+    }
+}

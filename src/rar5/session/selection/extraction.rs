@@ -137,11 +137,6 @@ impl<'a> Extraction<'a> {
         if link.is_none() && (member.issue.is_some() || header.redirection.is_some()) {
             return run.test(session, index, None).map_err(SelectedStop::Native);
         }
-        // an encrypted link is placed only on a password its check value verifies, before anything is touched
-        let evidence = match link {
-            Some(_) => super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?,
-            None => crate::error::RarPasswordEvidence::NotEncrypted,
-        };
         if !projectable_name(header, &member.wire.name) {
             return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
@@ -229,6 +224,10 @@ impl<'a> Extraction<'a> {
             return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
         }
         if let Some(kind) = link {
+            // an encrypted link is placed only on a password its check value verifies, once the overwrite decision
+            // lets it be placed (a skipped one stays skipped) and before anything is touched
+            let evidence =
+                super::link_password(session, index).map_err(|failure| SelectedStop::from(Arc::new(failure)))?;
             let relative = selected_relative(&relative, self.options.flatten).to_path_buf();
             return self.link(run, session, index, &relative, parent, &target, initial, hooks, kind, evidence);
         }
