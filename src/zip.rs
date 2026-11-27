@@ -747,7 +747,13 @@ fn read_entry(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
         let packed_len = usize::try_from(e.packed).map_err(|_| Error::Corrupt("encrypted entry too large"))?;
-        let mut raw = vec![0u8; packed_len];
+        // a payload a cut runs past (keep_cut) holds no more than the file has after `at`: the buffer is sized by
+        // that, not by what a header cut a few bytes on declares
+        let there = usize::try_from(len.saturating_sub(at)).unwrap_or(usize::MAX);
+        if packed_len > there && !(e.keep_cut && e.seven_zip_cut) {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+        let mut raw = vec![0u8; packed_len.min(there)];
         // Options::salvage_truncated_zip with keep_broken: the bytes there of an entry a cut reaches are read, and
         // what 7-Zip decrypts and decodes of them goes out before it fails (nothing when its encryption header isn't
         // all there, as 7-Zip writes nothing then)
@@ -762,6 +768,9 @@ fn read_entry(
                     cut = c;
                     break;
                 }
+            }
+            if cut.is_none() && got < packed_len {
+                cut = Some(std::io::ErrorKind::UnexpectedEof.into());
             }
             if let Some(cut) = cut {
                 raw.truncate(got);

@@ -936,3 +936,50 @@ fn defaults_are_unchanged() {
         }
     }
 }
+
+/// A cut a few bytes past an encrypted member's local header that declares 128 MiB of packed data: the read fails
+/// with no more than the bytes there, its buffer sized by what the file holds (not by the declared size).
+#[test]
+fn an_encrypted_member_declaring_more_than_the_file_holds_fails_with_what_is_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let declared: u32 = 128 << 20;
+    let mut zip = Vec::new();
+    zip.extend_from_slice(b"PK\x03\x04");
+    zip.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    zip.extend_from_slice(&1u16.to_le_bytes()); // flags: encrypted (ZipCrypto)
+    zip.extend_from_slice(&0u16.to_le_bytes()); // stored
+    zip.extend_from_slice(&[0; 4]); // time, date
+    zip.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // CRC-32
+    zip.extend_from_slice(&declared.to_le_bytes()); // compressed size
+    zip.extend_from_slice(&(declared - 12).to_le_bytes()); // uncompressed size
+    zip.extend_from_slice(&1u16.to_le_bytes()); // name length
+    zip.extend_from_slice(&0u16.to_le_bytes()); // extra length
+    zip.push(b'a');
+    zip.extend_from_slice(&[0x5a; 20]);
+    let archive = dir.path().join("declared.zip");
+    fs::write(&archive, &zip).unwrap();
+    for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+        let select = SelectOptions::new().damaged_input(DamagedInput::SevenZip).unverified_output(unverified);
+        let mut out = Vec::new();
+        let read = SelectedEntry::open_cancelable_with_options(
+            &archive,
+            0,
+            Some("pw"),
+            u64::MAX,
+            Cancellation::default(),
+            select,
+        )
+        .and_then(|entry| {
+            entry.read(Some("pw"), |chunk| {
+                out.extend_from_slice(chunk);
+                Ok(())
+            })
+        });
+        assert!(read.is_err(), "{unverified:?}");
+        assert!(out.len() <= 20, "{unverified:?}: {} bytes", out.len());
+        let dest = dir.path().join(format!("out-{unverified:?}"));
+        let result = extract::run_with_password(&archive, &seven_zip_mode(&dest, unverified), Some("pw"), |_| {});
+        assert!(result.is_err() || !result.as_ref().unwrap().errors.is_empty(), "{unverified:?}: {result:?}");
+        assert!(written(&dest).values().all(|(size, _)| *size <= 20), "{unverified:?}");
+    }
+}
