@@ -241,9 +241,12 @@ pub struct Options {
     /// 7-Zip would ("Corrupt header is found", "Headers Error").
     ///
     /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
-    /// checked dispatchers), by [`list_detailed_with_options`], and by [`crate::rar5::session::RarSession`] through
-    /// [`crate::rar5::session::RarSessionOptions::damaged_input`]. Progressive and persistent-partial sessions refuse a
-    /// damaged header whatever this says. 7z and ZIP ignore it.
+    /// checked dispatchers), by [`list_detailed_with_options`], by [`crate::rar5::session::RarSession`] through
+    /// [`crate::rar5::session::RarSessionOptions::damaged_input`], and by progressive sessions through
+    /// [`crate::progressive::ProgressiveOptions::extract`] (reported as
+    /// [`crate::progressive::ProgressiveEvent::HeaderDamaged`]; only bytes the source delivered are judged, a header
+    /// still to come is waited on and one in a hole is `HeaderHole`). Persistent-partial sessions refuse a damaged
+    /// header whatever this says. 7z and ZIP ignore it.
     pub damaged_input: DamagedInput,
     /// What becomes of the bytes decoded of a member that then fails: withheld (the default) or handed over as UnRAR
     /// and 7-Zip do. For these runners it is a RAR member cut off by a missing volume: with

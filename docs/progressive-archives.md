@@ -136,6 +136,15 @@ the complete extractor; this entrypoint creates no links. Stored recovery is
 available for the admitted RAR4 and RAR5 subsets below. Full original
 compatibility remains open.
 
+## Damaged headers
+
+`ProgressiveOptions::extract.damaged_input` (`Salvage`, `Resync`) reads past damaged RAR headers as the whole-archive
+runners do, and reports each as `ProgressiveEvent::HeaderDamaged { volume, damage }`. The default `Refuse` fails as
+before. The rule with holes: only delivered bytes are judged. A header the source has not delivered yet is waited on,
+one inside a `Hole` answer stops the session with `HeaderHole` (repair may still fill it), and a resync never searches
+across a hole. See `docs/compat-options.md` ("Damaged headers in a progressive session"). Persistent-partial sessions
+keep refusing damaged headers.
+
 ## RAR4 capability boundary
 
 | Progressive RAR4 case | Current admission |
