@@ -6372,7 +6372,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("member");
         std::fs::write(&path, b"").unwrap();
-        let mut p = Pending::new(&FileHeader::default(), empty_context());
+        // declaring room for the bytes, so they are written (nothing past a declared size is)
+        let header = FileHeader { unpacked_size: 4, ..FileHeader::default() };
+        let mut p = Pending::new(&header, empty_context());
         p.keep = Some(Meta::default());
         // a read-only handle: every write to it fails
         p.out = Some(crate::output::Output::created(File::open(&path).unwrap(), Some(4), path.clone()));
@@ -6432,7 +6434,8 @@ mod tests {
             let mut held = crate::rar5::unpack::rar4::Rar4Decoder::new_with_cancel(65536, 1, 1, 4 << 20, None).unwrap();
             std::mem::swap(&mut held, &mut decoder);
             run.rar4 = Some(held);
-            let mut p = Pending::new(&FileHeader::default(), empty_context());
+            let header = FileHeader { unpacked_size: 1 << 20, ..FileHeader::default() };
+            let mut p = Pending::new(&header, empty_context());
             p.compressed = true;
             p.keep = Some(Meta::default());
             // a read-only handle: every write to it fails
@@ -6505,7 +6508,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("readonly");
         fs::write(&path, b"keep").unwrap();
-        let mut pending = Pending::new(&FileHeader::default(), empty_context());
+        let header = FileHeader { unpacked_size: 2, ..FileHeader::default() };
+        let mut pending = Pending::new(&header, empty_context());
         pending.out = Some(Output::new(File::open(&path).unwrap(), Some(1)));
         let result = with_member_sink(&mut pending, None, |sink| {
             let _ = sink.put(b"x");
