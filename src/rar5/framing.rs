@@ -668,7 +668,8 @@ impl HeaderParser {
                         });
                     }
                     let header_end = self.at + self.need as u64;
-                    let mut frame = self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end)?;
+                    let mut frame =
+                        self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end, damaged)?;
                     if damaged && self.resync && matches!(frame.block, Block::Unknown) {
                         return Err(self.framing("damaged header", Error::Corrupt("damaged header")).into());
                     }
@@ -681,7 +682,7 @@ impl HeaderParser {
             }
         }
     }
-    fn parse(&self, body: &[u8], header_end: u64) -> std::result::Result<PhysicalFrame, FramingError> {
+    fn parse(&self, body: &[u8], header_end: u64, damaged: bool) -> std::result::Result<PhysicalFrame, FramingError> {
         let mut c = Cursor::new(body);
         let kind = c.vint().map_err(|e| self.parse_fault(e))?;
         let flags = c.vint().map_err(|e| self.parse_fault(e))?;
@@ -696,9 +697,10 @@ impl HeaderParser {
         let extra = &body[fields_end..];
         let data_end =
             header_end.checked_add(data_size).ok_or_else(|| self.framing("data size", Error::Corrupt("data size")))?;
-        // a file header whose data the volume cuts short is read with the data there (HeaderCut::Data)
+        // a file header whose data the volume cuts short is read with the data there (HeaderCut::Data); not one
+        // that fails its checksum, whose data size is as likely the damage (Resync searches past it instead)
         let cut = self.complete_len.filter(|&len| data_end > len);
-        if cut.is_some() && !(self.salvage_cut && kind == HEAD_FILE && !self.encrypted()) {
+        if cut.is_some() && !(self.salvage_cut && kind == HEAD_FILE && !self.encrypted() && !damaged) {
             return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
         }
         let head = BlockHead { kind, flags, data_size, data_at: header_end };

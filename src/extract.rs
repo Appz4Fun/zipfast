@@ -5071,6 +5071,16 @@ impl Run<'_, '_, '_> {
             }
             return Ok(());
         }
+        if h.cut == Some(crate::rar5::HeaderCut::Header) {
+            // DamagedInput::Salvage: a header the volume cuts short has no data to pass over; in a solid stream the
+            // members after it lose their history
+            if vol.main.is_solid() && h.method != 0 && !h.is_dir() {
+                self.drain()?;
+                let failure = Arc::new(ctx.integrity(RarIntegrityReason::TruncatedHeader, false));
+                self.lost_history(&ctx, Some(failure));
+            }
+            return Ok(());
+        }
         if !(vol.main.is_solid() && h.method != 0 && !h.is_dir()) {
             if h.split_after() {
                 // its later parts are passed over too

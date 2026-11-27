@@ -408,3 +408,22 @@ fn salvage_cli_reports_a_missing_volume_and_a_damaged_comment() {
         assert!(String::from_utf8_lossy(&out.stdout).contains("name"), "{flag}");
     }
 }
+
+/// solid_simple_rar300.rar (one.txt, then compressed two.txt's header at 101, 39 bytes) cut at every byte of two.txt's
+/// header, extracting only one.txt: the unselected cut header is passed over without reading its data (and the solid
+/// stream's history marked lost after it), and the run finishes. A regression guard: the run passes a trailing
+/// unselected member over without decoding it either way.
+#[test]
+fn salvage_passes_over_an_unselected_cut_header_in_a_solid_archive() {
+    let bytes = fixture("rar4-rar300/solid_simple_rar300.rar");
+    for len in 108..140 {
+        let case = case(&bytes[..len]);
+        let mut opts = options(&case.out, Mode::Extract, DamagedInput::Salvage);
+        opts.select = Some(extract::MemberFilter::new(|m| m.name == "one.txt"));
+        let summary = extract::run(&case.archive, &opts, |_| {}).unwrap_or_else(|e| panic!("cut at {len}: {e}"));
+        assert!(summary.errors.is_empty(), "cut at {len}: {:?}", summary.errors);
+        assert_eq!(written(&case), ["one.txt"], "cut at {len}");
+        assert_eq!(summary.damaged_headers.len(), 1, "cut at {len}: {:?}", summary.damaged_headers);
+        assert_eq!(summary.damaged_headers[0].cut, Some(HeaderCut::Header), "cut at {len}");
+    }
+}

@@ -210,9 +210,11 @@ impl HeaderParser {
             _ => return Err(self.rar4_unsupported("header type").into()),
         };
         if let Some(len) = self.complete_len.filter(|&len| frame.data_end > len) {
-            // a file header cut short, or whose data the volume cuts short, is read anyway (FileHeader::cut)
+            // a file header cut short (its zero padding fails the checksum), or whose data the volume cuts short, is
+            // read anyway (FileHeader::cut); not a whole one that fails its checksum, whose packed size is as likely
+            // the damage (Resync searches past it)
             match &mut frame.block {
-                Block::File(file) if self.salvage_cut && !self.legacy_headers => {
+                Block::File(file) if self.salvage_cut && !self.legacy_headers && (!damaged || self.cut_parse) => {
                     if file.cut.is_none() {
                         file.cut = Some(HeaderCut::Data { present: len.saturating_sub(file.data_at) });
                     }
