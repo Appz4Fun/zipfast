@@ -696,13 +696,18 @@ impl HeaderParser {
             .ok_or_else(|| self.framing("extra area size", Error::Corrupt("extra area size")))?;
         let fields = &body[c.pos()..fields_end];
         let extra = &body[fields_end..];
-        let data_end =
+        let mut data_end =
             header_end.checked_add(data_size).ok_or_else(|| self.framing("data size", Error::Corrupt("data size")))?;
-        // a file header whose data the volume cuts short is read with the data there (HeaderCut::Data); not one
-        // that fails its checksum, whose data size is as likely the damage (Resync searches past it instead)
-        let cut = self.complete_len.filter(|&len| data_end > len);
-        if cut.is_some() && !(self.salvage_cut && kind == HEAD_FILE && !self.encrypted() && !damaged) {
-            return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+        // a file header whose data the volume cuts short is read with the data there (HeaderCut::Data, and
+        // FileWire::cut for a catalogue); not one that fails its checksum, whose data size is as likely the damage
+        // (Resync searches past it instead)
+        let mut cut = None;
+        if let Some(len) = self.complete_len.filter(|&len| data_end > len) {
+            if !(self.salvage_cut && kind == HEAD_FILE && !self.encrypted() && !damaged) {
+                return Err(self.fault(RarIntegrityReason::TruncatedData, Error::Truncated, false).into());
+            }
+            cut = Some(len.saturating_sub(header_end));
+            data_end = len;
         }
         let head = BlockHead { kind, flags, data_size, data_at: header_end };
         let mut frame = PhysicalFrame {
@@ -745,6 +750,7 @@ impl HeaderParser {
                 frame.wire = wire;
                 if let Some(wire) = &mut frame.wire {
                     wire.extent = frame.extent.clone();
+                    wire.cut = cut;
                 }
                 if kind == HEAD_FILE { Block::File(h) } else { Block::Service(h) }
             }
@@ -763,9 +769,8 @@ impl HeaderParser {
             }
             _ => Block::Unknown,
         };
-        if let (Some(len), Block::File(header)) = (cut, &mut frame.block) {
-            header.cut = Some(HeaderCut::Data { present: len.saturating_sub(header_end) });
-            frame.data_end = len;
+        if let (Some(present), Block::File(header)) = (cut, &mut frame.block) {
+            header.cut = Some(HeaderCut::Data { present });
         }
         Ok(frame)
     }

@@ -314,7 +314,7 @@ What UnRAR 7.30 (`x`, `t`, `l`) does, from archives with one byte changed, cut s
 | the main header fails its checksum | "Main archive header is corrupt", reads on | "Headers Error" | `ChecksumMismatch`, reads on |
 | a RAR 4.x block's type byte changed (checksum fails, type unknown) | the block is passed over by its size, the rest extracted | "Headers Error" | `ChecksumMismatch`, passed over by its size |
 | a header that can't be read (size field changed, garbage inserted before it) | "Corrupt header is found" or "Unexpected end of archive", nothing after it is read, exit 3 | "Headers Error", stops | `Unreadable` (or `UnexpectedEnd`), the rest of the volume passed over, what came before stands |
-| the volume ends inside a file header's data (the header whole) | lists the member with its declared sizes; extracts it from the bytes there, reporting it OK when its checksum passes and "checksum error" (file removed, kept with `-kb`) when not; "Unexpected end of archive", exit 1 or 3 | lists it; "Data Error", a 0-byte file (stored data: the bytes there), exit 2 | as UnRAR: listed with its declared sizes, `UnexpectedEnd` with the name and `cut: Some(HeaderCut::Data { present })`; decoded from the bytes there, its checks deciding (`keep_broken` keeps a failed one's bytes) |
+| the volume ends inside a file header's data (the header whole) | lists the member with its declared sizes; extracts it from the bytes there, reporting it OK when its checksum passes and "checksum error" (file removed, kept with `-kb`) when not; "Unexpected end of archive", exit 1 or 3 | lists it; "Data Error", a 0-byte file (stored data: the bytes there), exit 2 | as UnRAR: listed with its declared sizes, `UnexpectedEnd` with the name and `cut: Some(HeaderCut::Data { present })`; decoded from the bytes there, its checks deciding (`keep_broken` keeps a failed one's bytes); a `RarSession` member fails as `TruncatedData` (see `unverified_output`) |
 | the volume ends inside a RAR 4.x file header (at least its 7 base bytes there) | lists an entry with the fields that are there, the rest zeros, and what of the name is there (possibly empty); "NAME - the file header is corrupt", exit 3; extracting it fails | lists nothing | as UnRAR: listed so, `UnexpectedEnd` with `cut: Some(HeaderCut::Header)`; extracting it fails (`TruncatedHeader`), nothing written |
 | the volume ends inside any other header, a service header's data, or a RAR 5.0 file header | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there |
 | a RAR 5.0 volume without its end header | no message | "Unexpected end of archive", exit 2 | `UnexpectedEnd` at the volume's length |
@@ -381,8 +381,10 @@ missing end header):
   decides: one whose checksum passes (a compressed stream whose last bytes it didn't need) is good, the rest fail as
   any damaged member does, `keep_broken` keeping what was decoded as `unrar x -kb` does. 7-Zip reports a Data Error
   and leaves a 0-byte file whatever the checksum says (for stored data, the bytes there); a caller showing 7-Zip's
-  outcome maps the member's `UnexpectedEnd` record to that. A member split into the next volume goes on there, as
-  both tools go on, and fails its checks.
+  outcome maps the member's `UnexpectedEnd` record to that. A `RarSession` lists it the same way but fails it as
+  `TruncatedData` whatever its checks, and under `UnverifiedOutput::Emit` hands over what UnRAR decodes of it (reading
+  on past the end as zeros); nothing continues it from a later volume there. The whole-archive runner goes on into
+  the next volume with a member split there, as both tools go on, and it fails its checks.
 - `HeaderCut::Header`: a RAR 4.x file header cut short, with at least the 7 bytes every header starts with. UnRAR
   lists it with the fields that are there and zeros for the rest, its name what of it is there up to a NUL (empty
   when none is), and fails it on extraction; zipfast does the same (`TruncatedHeader`; a `RarSession` member carries
@@ -488,9 +490,9 @@ default, changes nothing.
 | field | route | under `Emit` | sign |
 | --- | --- | --- | --- |
 | `Options::unverified_output` | `extract::run`, `run_with_password`, `run_rar_with_outcomes`, the dispatchers | with `keep_broken`, a RAR member cut off by a missing volume keeps every byte UnRAR 7.30 `x -kb` keeps (without `keep_broken` it is removed, as `unrar x` removes it) | the member's usual failure ("missing volume") |
-| `Options::unverified_output` | `RarSession::extract_selected`, `extract_selected_controlled` | with `keep_broken`, the same member is written and kept (by default a session doesn't write it at all) | `RarOutcome::Failed` with `RarFailure::MissingVolume` or `MissingSplitContinuation` |
+| `Options::unverified_output` | `RarSession::extract_selected`, `extract_selected_controlled` | with `keep_broken`, the same member is written and kept (by default a session doesn't write it at all), and so is one an archive cut short ends inside (under `DamagedInput::Salvage`) | `RarOutcome::Failed` with `RarFailure::MissingVolume` or `MissingSplitContinuation` (`TruncatedData` for the archive cut short) |
 | `Options::unverified_output` | persistent-partial sessions (`ProgressiveSession::new_partial`) | with `keep_broken`, a stored member cut off by a missing volume or a set truncated inside it keeps the bytes already written (as ever) and is reported before the session's failure | `MemberFinished` with `MemberOutcome::PersistentUnverified { missing, .. }`, then the session's `MissingVolume` or `Truncated` |
-| `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume is decoded from the volumes there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
+| `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume, or by the end of an archive cut short (under `DamagedInput::Salvage`), is decoded from the data there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
 | `SevenZipPrintOptions::unverified_output` | `sevenzip::print_selected_with_options` (`7z x -so`) | a 7z member failing on its data has what 7-Zip 26.06 streams of it printed | its line in `Summary::errors`, and an `UnverifiedMember { index, name, bytes }` in `Summary::unverified` |
 | `SelectOptions::unverified_output` | `SelectedEntry` (`open_cancelable_with_options`, `open_cancelable_with_zip_limit_and_options`), 7z and RAR | 7z: as `print_selected_with_options`; RAR 3.x/4.x: a VM filter zipfast doesn't run leaves its block unfiltered (as `UnsupportedFilters::WriteUnfiltered`); other formats already stream as they decode | `read` fails with an `Error::Io` carrying `UnverifiedWritten { bytes, cause }` (`UnverifiedWritten::of`); `cause` is the failure without `Emit`, `Error::Unsupported(UNFILTERED_SELECTED)` for a RAR member written unfiltered |
 
@@ -519,6 +521,30 @@ sets and `text.rar` made into a cut-off first volume at 47 places (`tests/fixtur
 
 `7z x -so` on such a member is not imitated: 7-Zip 26.06 streams nothing of a RAR 3.x/4.x one and decodes a RAR 5.0
 one to the end of the data (55,084 bytes for `r5-partial`), and a `SelectedEntry` keeps streaming what it did before.
+
+### A RAR archive cut short inside a member's data
+
+UnRAR 7.30 `p` and `x -kb` ("Unexpected end of archive", exit 3) hand over the members before the cut and then what
+they decode of the member cut short. Unlike at a missing volume, they read on past the end as though zeros followed:
+every code starting before the byte after the data decodes, one straddling the end over that fill, whatever the
+codec (RAR 2.9 LZ and PPMd, RAR 1.5/2.0, RAR 5.0, a RAR 5.0 block however little of it is there). Under
+`DamagedInput::Salvage` a `RarSession` catalogue lists that member, with the data there, failing as
+`RarIntegrityReason::TruncatedData`; with `Emit`, `print_selected` prints and `extract_selected` (with `keep_broken`)
+keeps exactly those bytes. RAR 3.x/4.x decoding feeds zeros after the data, and a PPMd or RAR 1.5/2.0 code starting
+past the byte after it is not decoded. For RAR 5.0 the length matches, but a symbol straddling the end gives UnRAR
+bytes zeros don't, so the last few bytes can differ there. In a volume set UnRAR then goes on to the members of the
+later volumes, and so does the session; the cut member's continuation there is not joined to it. By default (`DamagedInput::Refuse`) such an archive still
+fails to open, and under `Withhold` the member prints nothing and isn't written. The whole-archive runner still passes
+over it.
+
+Checked against `unrar p` at consecutive cuts (`tests/fixtures/emit-cut-archive/README.md`): all 116 RAR 3.x/4.x
+cuts (2.9 LZ, PPMd, 2.0 LZ) and the stored RAR 4.x and 5.0 cuts give UnRAR's bytes exactly; of 108 RAR 5.0 LZ cuts
+(16 of them just past a block's start), 21 give its bytes, 72 more its length, and 15 are 1 to 3 bytes off.
+`tests/emit_cut_archive.rs` checks 21 cuts.
+
+7-Zip 26.06 `x` and `x -so` keep or print the stored data there and what they decode of a RAR 5.0 member (UnRAR's
+length, different last bytes), and nothing of a compressed RAR 3.x/4.x member. Neither `7z x -so` (`SelectedEntry`)
+nor `7z x` is imitated for this case.
 
 ### 7z members under `7z x -so`
 

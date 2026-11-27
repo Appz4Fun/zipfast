@@ -237,14 +237,16 @@ fn salvage_extracts_a_cut_member_whose_checks_pass_as_unrar_does() {
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);
     assert_eq!(fs::read(case.out.join("1.txt")).unwrap().len(), 5);
     assert_eq!(summary.damaged_headers[0].cut, Some(HeaderCut::Data { present: 8 }));
-    // the session decodes it from the bytes there too, not the declared packed size
+    // a RarSession lists it with its declared size but fails it as truncated whatever its checks (its
+    // UnverifiedOutput::Emit hands over what UnRAR decodes: tests/emit_cut_archive.rs)
     let mut session = session(&case, DamagedInput::Salvage).unwrap();
+    let member = session.entries().next().unwrap();
+    assert_eq!((member.name(), member.cut()), ("1.txt", Some(HeaderCut::Data { present: 8 })));
     let selected = session.select(|_| true).unwrap();
     let out = case.dir.path().join("session");
     let opts = options(&out, Mode::Extract, DamagedInput::Salvage);
     let summary = session.extract_selected(&selected, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
-    assert_eq!((summary.files, summary.failed), (1, 0));
-    assert_eq!(fs::read(out.join("1.txt")).unwrap().len(), 5);
+    assert_eq!((summary.files, summary.failed), (0, 1));
     // with no data bytes at all it fails
     let case = self::case(&bytes[..62]);
     let opts = options(&case.out, Mode::Extract, DamagedInput::Salvage);

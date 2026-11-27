@@ -211,12 +211,17 @@ impl HeaderParser {
         };
         if let Some(len) = self.complete_len.filter(|&len| frame.data_end > len) {
             // a file header cut short (its zero padding fails the checksum), or whose data the volume cuts short, is
-            // read anyway (FileHeader::cut); not a whole one that fails its checksum, whose packed size is as likely
-            // the damage (Resync searches past it)
+            // read anyway (FileHeader::cut, and FileWire::cut for a catalogue); not a whole one that fails its
+            // checksum, whose packed size is as likely the damage (Resync searches past it)
+            let data_at = frame.extent.end;
             match &mut frame.block {
                 Block::File(file) if self.salvage_cut && !self.legacy_headers && (!damaged || self.cut_parse) => {
                     if file.cut.is_none() {
-                        file.cut = Some(HeaderCut::Data { present: len.saturating_sub(file.data_at) });
+                        let present = len.saturating_sub(data_at);
+                        file.cut = Some(HeaderCut::Data { present });
+                        if let Some(wire) = frame.wire.as_mut() {
+                            wire.cut = Some(present);
+                        }
                     }
                     frame.data_end = len;
                 }
@@ -481,6 +486,7 @@ impl HeaderParser {
                 name: std::sync::Arc::new(name),
                 compression: 0,
                 extent: self.at..data_at,
+                cut: None,
             },
         ))
     }

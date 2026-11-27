@@ -699,8 +699,8 @@ impl<'a> RarMember<'a> {
 
     /// Where the volume ends inside one of this member's headers or its data, read anyway under
     /// [`RarSessionOptions::damaged_input`] ([`super::FileHeader::cut`]): it is listed with its declared sizes, and
-    /// extracting it decodes the bytes there ([`super::HeaderCut::Data`], its checks decide) or fails
-    /// ([`super::HeaderCut::Header`]). A caller showing 7-Zip 26.06's listing leaves out a `Header` cut.
+    /// fails as truncated data ([`super::HeaderCut::Data`]; under [`crate::extract::UnverifiedOutput::Emit`] what
+    /// UnRAR 7.30 decodes of it is handed over first) or a truncated header ([`super::HeaderCut::Header`]). A caller showing 7-Zip 26.06's listing leaves out a `Header` cut.
     pub fn cut(&self) -> Option<super::HeaderCut> {
         self.cut
     }
@@ -1514,15 +1514,19 @@ impl Catalogue {
                 return Ok(owned(header));
             }
         }
-        let final_part = !header.split_after();
+        // DamagedInput::Salvage: a member the volume's end cuts short (FileHeader::cut) has only the bytes there
+        // (FileWire::cut), none when its header is cut short, and no part after them; it keeps its declared size
+        let cut_short = header.cut.is_some();
+        let final_part = !header.split_after() && !cut_short;
         let mut part = Part::new(volume, &header, crypt, &wire);
-        // DamagedInput::Salvage: only the bytes of a member the volume cuts short are there to read, and none of one
-        // whose header it cuts short; the member keeps its declared size
         let declared = part.packed_size;
         match header.cut {
             Some(super::HeaderCut::Data { present }) => part.packed_size = present.min(declared),
             Some(_) => part.packed_size = 0,
             None => {}
+        }
+        if cut_short {
+            part.final_part = false;
         }
         let unread = declared - part.packed_size;
         let ordinal =
@@ -1541,6 +1545,16 @@ impl Catalogue {
             }
         } else {
             payload_issue(&header, crypt, ordinal)
+        };
+        // cut short, it fails as truncated (and under UnverifiedOutput::Emit what is there is decoded first, as for a
+        // member a missing volume cuts off), unless it already fails for something else
+        let issue = match issue {
+            None if wire.cut.is_some()
+                && !(associated && self.session.model.members.last().is_some_and(|member| member.issue.is_some())) =>
+            {
+                Some(member_integrity(ordinal, RarIntegrityReason::TruncatedData))
+            }
+            issue => issue,
         };
         let issue_minimum = u64::from(issue.is_some() && self.session.issues.len() == self.session.issues.capacity())
             * size_of::<RarFailure>() as u64;
@@ -1565,7 +1579,7 @@ impl Catalogue {
                 member.issue = issue;
             }
             self.session.model.parts.push(part);
-            self.pending = !final_part;
+            self.pending = !final_part && !cut_short;
             self.update_capacity()?;
             return Ok(owned(header));
         } else {
@@ -1629,7 +1643,8 @@ impl Catalogue {
             self.session.model.members.push(member);
         }
         self.session.model.parts.push(part);
-        self.pending = !final_part;
+        // nothing continues a member cut short: a continuation in a later volume is an orphan
+        self.pending = !final_part && !cut_short;
         self.update_capacity()?;
         Ok(StoredHeader::Member(self.session.model.members.len() - 1))
     }

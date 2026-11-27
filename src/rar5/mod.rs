@@ -716,6 +716,9 @@ pub(super) struct FileWire {
     pub(super) name: std::sync::Arc<Vec<u8>>,
     pub(super) compression: u64,
     pub(super) extent: std::ops::Range<u64>,
+    /// [`crate::extract::DamagedInput::Salvage`] in a catalogue: the volume ends inside this member's data, and this
+    /// many of its bytes are there (what UnRAR 7.30 reads of a member an archive cut short ends in)
+    pub(super) cut: Option<u64>,
 }
 
 fn parse_file_impl(
@@ -790,6 +793,7 @@ fn parse_file_impl(
             name: std::sync::Arc::new(encoded),
             compression: info,
             extent: head.data_at..head.data_at,
+            cut: None,
         })
     } else {
         None
