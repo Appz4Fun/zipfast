@@ -1021,7 +1021,8 @@ impl Volume {
             let mut parser = HeaderParser::new(self.path.clone(), self.next, Some(self.len), budget.is_some());
             parser.set_format(self.format);
             parser.set_salvage(self.damaged_input);
-            parser.set_salvage_cut(self.damaged_input.salvages());
+            // DamagedInput::SevenZip reads a member whose data the volume cuts short too, as 7-Zip 26.06 lists it
+            parser.set_salvage_cut(self.damaged_input.salvages() || self.damaged_input == DamagedInput::SevenZip);
             parser
         });
         let result = (|| {

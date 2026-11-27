@@ -181,6 +181,7 @@ impl ZipEntry {
             local_at: self.local_at,
             aes_info: self.aes_info,
             keep_cut: false,
+            seven_zip_cut: false,
         }
     }
 
@@ -222,7 +223,16 @@ struct ReadDescription<'a> {
     /// the bytes before a cut (a missing volume, a truncated file) are passed on before the read fails, for
     /// [`crate::extract::Options::keep_broken`]; otherwise only whole reads are
     keep_cut: bool,
+    /// With `keep_cut`, [`crate::extract::Options::salvage_truncated_zip`] under
+    /// [`crate::extract::DamagedInput::SevenZip`]: what is there of an entry a cut reaches is
+    /// decoded as 7-Zip 26.06 decodes it ([`SEVEN_ZIP_PAST_END`] after a Deflate stream; an encrypted entry's bytes
+    /// decrypted without its authentication code), so a kept file holds what 7-Zip's does
+    seven_zip_cut: bool,
 }
+
+/// What 7-Zip 26.06 reads past the end of a Deflate stream a cut ends: bytes 0xFF, of which a code may use the first
+/// four (observed: `7z x` of a ZIP cut inside a Deflate entry keeps every code that ends within them).
+const SEVEN_ZIP_PAST_END: [u8; 4] = [0xFF; 4];
 
 impl ReadDescription<'_> {
     fn encrypted(&self) -> bool {
@@ -589,6 +599,51 @@ impl Archive {
         let mut buffer = vec![0; BUF];
         read_entry(&mut self.file, self.len, &entry, password, &mut buffer, &mut sink, cancel)
     }
+
+    /// [`Self::read_at_cancelable`] of one file cut short ([`Self::open_truncated`]) as 7-Zip 26.06 reads an entry
+    /// the cut reaches (`seven_zip_cut`: what is there of it is decoded and passed on, see
+    /// [`ReadDescription::seven_zip_cut`]); such an entry then fails as truncated.
+    pub(crate) fn read_truncated_at(
+        &mut self,
+        index: usize,
+        password: Option<&str>,
+        limit: u64,
+        cancel: Option<&Cancellation>,
+        seven_zip_cut: bool,
+        mut sink: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.selected_entry(index, limit)?;
+        // without `seven_zip_cut` nothing of a member the cut reaches is handed over: it fails before it is read
+        if !seven_zip_cut {
+            let e = self.entries[index].clone();
+            if let Some(cause) = self.gap_crossed(&e) {
+                return Err(cause);
+            }
+        }
+        let mut entry = self.entries[index].read_description();
+        entry.keep_cut = seven_zip_cut;
+        entry.seven_zip_cut = seven_zip_cut;
+        // the last member of a walk cut off before its descriptor has no known size: what is there of it is read,
+        // as the whole-archive run reads it
+        if self.last_size_unknown && index + 1 == self.entries.len() {
+            entry.size = if self.entries[index].effective_method() == METHOD_STORED { entry.packed } else { u64::MAX };
+        }
+        let mut buffer = vec![0; BUF];
+        // the sink's own failure is returned as it is, never taken for the cut
+        let mut sink_failed = false;
+        let mut checked_sink = |chunk: &[u8]| sink(chunk).inspect_err(|_| sink_failed = true);
+        let read = read_entry(&mut self.file, self.len, &entry, password, &mut buffer, &mut checked_sink, cancel);
+        match read {
+            Err(error)
+                if !sink_failed
+                    && !matches!(&error, Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof) =>
+            {
+                let e = self.entries[index].clone();
+                Err(self.gap_crossed(&e).unwrap_or(error))
+            }
+            read => read,
+        }
+    }
 }
 
 pub(crate) fn projected_parser(
@@ -710,8 +765,56 @@ fn read_entry(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
         let packed_len = usize::try_from(e.packed).map_err(|_| Error::Corrupt("encrypted entry too large"))?;
-        let mut raw = vec![0u8; packed_len];
-        if cancel.is_some() {
+        // a payload a cut runs past (keep_cut) holds no more than the file has after `at`: the buffer is sized by
+        // that, not by what a header cut a few bytes on declares
+        let there = usize::try_from(len.saturating_sub(at)).unwrap_or(usize::MAX);
+        if packed_len > there && !(e.keep_cut && e.seven_zip_cut) {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+        let mut raw = vec![0u8; packed_len.min(there)];
+        // Options::salvage_truncated_zip with keep_broken: the bytes there of an entry a cut reaches are read, and
+        // what 7-Zip decrypts and decodes of them goes out before it fails (nothing when its encryption header isn't
+        // all there, as 7-Zip writes nothing then)
+        if e.keep_cut && e.seven_zip_cut {
+            let mut got = 0;
+            let mut cut = None;
+            for chunk in raw.chunks_mut(buf.len()) {
+                check()?;
+                let (n, c) = fill(file, chunk, true)?;
+                got += n;
+                if c.is_some() {
+                    cut = c;
+                    break;
+                }
+            }
+            if cut.is_none() && got < packed_len {
+                cut = Some(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            if let Some(cut) = cut {
+                raw.truncate(got);
+                let payload = if e.method == 99 || e.aes_info.is_some() {
+                    let (strength, _, _) = e.aes_info.ok_or(Error::Corrupt("missing WinZip AES extra field"))?;
+                    if crate::crypto::winzip_aes_header_len(strength).is_none_or(|header| got < header) {
+                        return Err(cut.into());
+                    }
+                    crate::crypto::decrypt_winzip_aes_cut_in_place(pw, strength, &mut raw, e.packed, check)?
+                        .ok_or(Error::Corrupt("wrong password or damaged AES stream"))?
+                } else {
+                    if got < 12 {
+                        return Err(cut.into());
+                    }
+                    let password_check = if e.flags & 0x0008 != 0 {
+                        read_local_header(file, e.local_at)?[11]
+                    } else {
+                        (e.crc32 >> 24) as u8
+                    };
+                    crate::crypto::decrypt_zipcrypto_in_place(pw, password_check, &mut raw, check)?
+                        .ok_or(Error::Corrupt("wrong password"))?
+                };
+                decode_cut(e, e.effective_method(), &raw[payload], buf, &mut emit)?;
+                return Err(cut.into());
+            }
+        } else if cancel.is_some() {
             for chunk in raw.chunks_mut(buf.len()) {
                 check()?;
                 file.read_exact(chunk)?;
@@ -861,9 +964,17 @@ fn read_entry(
                     }
                     if input.is_empty() {
                         if let Some(cut) = cut.take() {
+                            if e.seven_zip_cut {
+                                inflate_past_end(&mut z, &mut out, &mut emit)?;
+                            }
                             return Err(cut.into());
                         }
                         if left == 0 {
+                            // a streamed member cut before its descriptor ends where the cut does: 7-Zip reads on
+                            // past it as past any cut
+                            if e.keep_cut && e.seven_zip_cut {
+                                inflate_past_end(&mut z, &mut out, &mut emit)?;
+                            }
                             return Err(Error::Corrupt("deflate data ends early"));
                         }
                         break;
@@ -902,6 +1013,71 @@ fn read_entry(
         return Err(Error::BadChecksum(e.name.to_owned()));
     }
     Ok(())
+}
+
+/// [`ReadDescription::seven_zip_cut`]: a Deflate stream that a cut ended (all its bytes there given to `z`) is read on
+/// over [`SEVEN_ZIP_PAST_END`], as 7-Zip 26.06 reads it, and what decodes goes out. A code that doesn't decode ends it
+/// quietly: the entry fails as cut short anyway. Only `emit`'s own failure is returned.
+fn inflate_past_end(z: &mut Decompress, out: &mut [u8], emit: &mut impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let mut input = &SEVEN_ZIP_PAST_END[..];
+    loop {
+        let (before_in, before_out) = (z.total_in(), z.total_out());
+        let Ok(status) = z.decompress(input, out, FlushDecompress::None) else { return Ok(()) };
+        let used = (z.total_in() - before_in) as usize;
+        let made = (z.total_out() - before_out) as usize;
+        input = &input[used..];
+        emit(&out[..made])?;
+        if status == Status::StreamEnd || made < out.len() && (input.is_empty() || used == 0) {
+            return Ok(());
+        }
+    }
+}
+
+/// [`ReadDescription::seven_zip_cut`]: what 7-Zip 26.06 decodes of the decrypted bytes there of an encrypted entry a
+/// cut reaches: stored, all of them (to the declared size); Deflate, as [`inflate_past_end`] reads it; any other
+/// method, what its decoder gives before it fails. Only `emit`'s own failure is returned.
+fn decode_cut(
+    e: &ReadDescription<'_>,
+    method: u16,
+    data: &[u8],
+    buf: &mut [u8],
+    emit: &mut impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    match method {
+        METHOD_STORED => emit(&data[..crate::extract::clamp_len(e.size, data.len())]),
+        METHOD_DEFLATE => {
+            let mut z = Decompress::new(false);
+            let mut out = vec![0u8; BUF];
+            let mut input = data;
+            loop {
+                let (before_in, before_out) = (z.total_in(), z.total_out());
+                let Ok(status) = z.decompress(input, &mut out, FlushDecompress::None) else { return Ok(()) };
+                let used = (z.total_in() - before_in) as usize;
+                let made = (z.total_out() - before_out) as usize;
+                input = &input[used..];
+                emit(&out[..made])?;
+                if status == Status::StreamEnd {
+                    return Ok(());
+                }
+                if made == out.len() {
+                    continue;
+                }
+                if input.is_empty() {
+                    return inflate_past_end(&mut z, &mut out, emit);
+                }
+                if used == 0 {
+                    return Ok(());
+                }
+            }
+        }
+        _ => {
+            let Ok(mut dec) = stream_decoder(e, method, BufReader::new(Cursor::new(data))) else { return Ok(()) };
+            while let Ok(n @ 1..) = dec.read(buf) {
+                emit(&buf[..n])?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Fills `buf`: whole (an error otherwise), or with `keep_cut` as much as is there before a cut, with what cut it
@@ -1563,6 +1739,9 @@ fn run_archive(
             }
             let mut entry = e.read_description();
             entry.keep_cut = opts.keep_broken;
+            // 7z mode (Options::salvage_truncated_zip under DamagedInput::SevenZip): decoded as 7-Zip decodes it
+            entry.seven_zip_cut =
+                opts.salvage_truncated_zip && opts.damaged_input == crate::extract::DamagedInput::SevenZip;
             // The last member of a walk cut off before its descriptor has no known size: what is there of it is
             // read (it then fails at the gap), so a kept file (Options::keep_broken) holds it, as 7-Zip's does.
             if archive.last_size_unknown && ordinal + 1 == entries.len() {

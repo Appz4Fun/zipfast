@@ -639,10 +639,19 @@ impl SelectedRun {
         let member = &session.model.members[index];
         // UnverifiedOutput::Emit: a member cut off by a missing volume is decoded from what is there, then fails; one
         // an archive cut short ends inside of is always decoded as UnRAR decodes it, and its checks decide
-        let cut = member
-            .issue
-            .map(|issue| &session.issues[issue])
-            .filter(|issue| cut_short(issue) || (self.emit_unverified && cut_off(issue)));
+        //
+        // DamagedInput::SevenZip: a member an archive cut short ends inside of is decoded only under Emit, as one a
+        // missing volume cuts off is, and fails as the cut whatever its checks say (7-Zip 26.06's "Data Error");
+        // nothing of a compressed RAR 3.x/4.x member cut either way goes out, as 7-Zip writes none of it
+        let seven_zip = session.options.damaged_input == crate::extract::DamagedInput::SevenZip;
+        let rar4_compressed = member.header.method != 0 && member.header.format == RarFormat::Rar4;
+        let cut = member.issue.map(|issue| &session.issues[issue]).filter(|issue| {
+            if seven_zip {
+                self.emit_unverified && !rar4_compressed && cut_off(issue)
+            } else {
+                cut_short(issue) || (self.emit_unverified && cut_off(issue))
+            }
+        });
         if let Some(issue) = member.issue
             && cut.is_none()
         {
@@ -692,8 +701,10 @@ impl SelectedRun {
                 pending.start_selected_cipher(&mut keys, params, password, member.unpacked_size)?;
             }
         }
-        // the archive ends inside this member's data (rather than a volume being missing)
-        let cut_short = cut.is_some_and(cut_short);
+        // the archive ends inside this member's data (rather than a volume being missing), decoded as UnRAR decodes
+        // it (and checked); under DamagedInput::SevenZip only its RAR 5.0 symbols are read to the end that way
+        let seven_zip_cut = seven_zip && cut.is_some_and(cut_short);
+        let cut_short = cut.is_some_and(cut_short) && !seven_zip;
         let compressed = header.method != 0;
         let mut rar4 = if compressed && header.format == RarFormat::Rar4 {
             let first = &session.model.parts[member.parts.start];
@@ -713,7 +724,7 @@ impl SelectedRun {
             self.prepare_decoder(session, member, pending.context())?;
             if let Some(decoder) = self.decoder.as_mut() {
                 // a decoder kept from the member before gets this one's rule
-                decoder.set_cut_short(cut_short);
+                decoder.set_cut_short(cut_short || seven_zip_cut);
             }
             if cut.is_some()
                 && let Some(decoder) = self.decoder.as_mut()

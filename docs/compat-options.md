@@ -293,7 +293,9 @@ is read by walking its local headers (`LegacyRoute::TruncatedZip`, the walk byte
 Events come as for other legacy runs (`LegacyDiagnostic`, `LegacyError`). An archive whose end record is found is read
 on the checked route as ever, option or not. `extract::run` honours the option too, and
 `zip::list_detailed_with_options` lists such a file (`Listing::truncated`, `Listing::unexpected_end`). The other
-listings (`inspect_projected_cancelable`, `zipfast l`) and `SelectedEntry` take no `Options` and still refuse it.
+listings (`inspect_projected_cancelable`, `zipfast l`) take no `Options` and still refuse it; a `SelectedEntry` reads
+it under `SelectOptions::damaged_input` `DamagedInput::SevenZip` ([Cut members in 7z mode](#cut-members-in-7z-mode)).
+Under `DamagedInput::SevenZip` with `keep_broken`, the member the cut reaches is kept as 7-Zip keeps it (see there).
 `tests/zip_salvage_truncated.rs` checks each point.
 
 ## `damaged_input`: RAR archives with damaged headers
@@ -504,7 +506,7 @@ default, changes nothing.
 | `Options::unverified_output` | persistent-partial sessions (`ProgressiveSession::new_partial`) | with `keep_broken`, a stored member cut off by a missing volume or a set truncated inside it keeps the bytes already written (as ever) and is reported before the session's failure | `MemberFinished` with `MemberOutcome::PersistentUnverified { missing, .. }`, then the session's `MissingVolume` or `Truncated` |
 | `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume, or by the end of an archive cut short (under `DamagedInput::Salvage`), is decoded from the data there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
 | `SevenZipPrintOptions::unverified_output` | `sevenzip::print_selected_with_options` (`7z x -so`) | a 7z member failing on its data has what 7-Zip 26.06 streams of it printed | its line in `Summary::errors`, and an `UnverifiedMember { index, name, bytes }` in `Summary::unverified` |
-| `SelectOptions::unverified_output` | `SelectedEntry` (`open_cancelable_with_options`, `open_cancelable_with_zip_limit_and_options`), 7z and RAR | 7z: as `print_selected_with_options`; RAR 3.x/4.x: a VM filter zipfast doesn't run leaves its block unfiltered (as `UnsupportedFilters::WriteUnfiltered`); other formats already stream as they decode | `read` fails with an `Error::Io` carrying `UnverifiedWritten { bytes, cause }` (`UnverifiedWritten::of`); `cause` is the failure without `Emit`, `Error::Unsupported(UNFILTERED_SELECTED)` for a RAR member written unfiltered |
+| `SelectOptions::unverified_output` | `SelectedEntry` (`open_cancelable_with_options`, `open_cancelable_with_zip_limit_and_options`), 7z and RAR | 7z: as `print_selected_with_options`; a member cut short under `SelectOptions::damaged_input` `SevenZip`: what 7-Zip streams of it ([Cut members in 7z mode](#cut-members-in-7z-mode)); RAR 3.x/4.x: a VM filter zipfast doesn't run leaves its block unfiltered (as `UnsupportedFilters::WriteUnfiltered`); other formats already stream as they decode | `read` fails with an `Error::Io` carrying `UnverifiedWritten { bytes, cause }` (`UnverifiedWritten::of`); `cause` is the failure without `Emit`, `Error::Unsupported(UNFILTERED_SELECTED)` for a RAR member written unfiltered |
 
 `SelectOptions::from(&options)` copies `Options::unverified_output`.
 
@@ -530,8 +532,10 @@ sets and `text.rar` made into a cut-off first volume at 47 places (`tests/fixtur
 | `multivol_newnaming_rar300.part01.rar` | 53,664 bytes | the 32 KiB flushed before the volume was missed | the same 53,664 bytes |
 | `r5-partial.part1.rar` (RAR 5.0) | 55,043 bytes | the whole blocks written | the same 55,043 bytes |
 
-`7z x -so` on such a member is not imitated: 7-Zip 26.06 streams nothing of a RAR 3.x/4.x one and decodes a RAR 5.0
-one to the end of the data (55,084 bytes for `r5-partial`), and a `SelectedEntry` keeps streaming what it did before.
+`7z x -so` on such a member: 7-Zip 26.06 streams nothing of a compressed RAR 3.x/4.x one and decodes a RAR 5.0 one to
+the end of the data (55,084 bytes for `r5-partial`). Under `DamagedInput::SevenZip` with `Emit` the runner keeps
+nothing of a compressed RAR 3.x/4.x member either, as `7z x`; a RAR 5.0 one keeps UnRAR's bytes
+([Cut members in 7z mode](#cut-members-in-7z-mode)).
 
 ### A RAR archive cut short inside a member's data
 
@@ -563,8 +567,8 @@ cuts (2.9 LZ, PPMd, 2.0 LZ) and the stored RAR 4.x and 5.0 cuts give UnRAR's byt
 `tests/rar_listing_signals.rs` checks UnRAR's verdict at each cut of `latest_winrar.rar`'s member.
 
 7-Zip 26.06 `x` and `x -so` keep or print the stored data there and what they decode of a RAR 5.0 member (UnRAR's
-length, different last bytes), and nothing of a compressed RAR 3.x/4.x member. Neither `7z x -so` (`SelectedEntry`)
-nor `7z x` is imitated for this case.
+length, different last bytes), and nothing of a compressed RAR 3.x/4.x member: `DamagedInput::SevenZip` does that
+([Cut members in 7z mode](#cut-members-in-7z-mode)).
 
 ### 7z members under `7z x -so`
 
@@ -602,6 +606,56 @@ Not covered: a Copy folder whose header gives fewer packed than unpacked bytes i
 hands over only what its threads finished before the error. `tests/unverified_output.rs` checks each point against the
 reference tools' output.
 
+
+## Cut members in 7z mode
+
+A member whose packed data an archive's end cuts short (a truncated file, a volume set missing a later volume) in
+Prybar's 7z mode: `Options { keep_broken: true, damaged_input: DamagedInput::SevenZip, salvage_truncated_zip: true,
+unverified_output: UnverifiedOutput::Emit, .. }`. 7-Zip 26.06 `7z x`, `7z e` and `7z x -so` hand over the same bytes
+of it and report it ("ERROR: Data Error : NAME" and the like), say "Unexpected end of archive" and exit 2; `7z x` and
+`e` leave a file, 0 bytes where nothing of it decodes. zipfast now does the same:
+
+- `extract::run` (and the routes sharing it): under `DamagedInput::SevenZip` a RAR member the volume's end cuts short is
+  listed with the data there (as under `Salvage`; a cut inside a header is not), and the members before it come out
+  whole. The cut member is kept with what 7-Zip keeps and fails as `archive is truncated`. A ZIP member the cut
+  reaches, under `salvage_truncated_zip` with `keep_broken` (and `DamagedInput::SevenZip`), is decoded as 7-Zip
+  decodes it; without `SevenZip` it keeps the verified prefix it kept before.
+- `RarSession::print_selected` with a session under `DamagedInput::SevenZip`: the same bytes under
+  `RarPrintOptions::unverified_output` `Emit`, the member reported failed (`RarIntegrityReason::TruncatedData`);
+  `Withhold` prints only the members before it.
+- `SelectedEntry` with `SelectOptions::damaged_input(DamagedInput::SevenZip)` (`SelectOptions::from(&options)` copies
+  it): a RAR member cut short opens, and a ZIP file whose end record is gone is read from its local headers (both
+  opens). Under `SelectOptions::unverified_output` `Emit` the read streams 7-Zip's bytes and fails with
+  `UnverifiedWritten { bytes, cause }`, `cause` being `archive is truncated`; under `Withhold` it fails with nothing
+  of the cut member.
+
+What 7-Zip 26.06 hands over of the member cut short (`tests/seven_zip_cut_member.rs` checks 50 cut archives and 3
+volume sets against its output; fixtures and commands in `tests/fixtures/seven-zip-cut-member/README.md`):
+
+| member | 7-Zip's error | what it keeps or prints | zipfast under 7z mode |
+| --- | --- | --- | --- |
+| a `.7z` cut short, or a split `.7z.00N` set missing a part | "Cannot open the file as [7z] archive", "Unexpected end of archive" | nothing (the headers are at the end) | the same: the archive doesn't open |
+| ZIP, Store | CRC Failed | the bytes there | the same |
+| ZIP, Deflate | Data Error | what decodes as though four 0xFF bytes followed the data | the same |
+| ZIP, LZMA | Data Error | what decodes | the same, but a cut deep in the stream can be some bytes off (9,341 for 9,333) |
+| ZIP, BZip2 | Data Error | nothing (0 bytes) | the same |
+| ZIP, cut right after the local header | Data Error (Deflate), CRC Failed (Store) | 0 bytes | the same |
+| ZIP, ZipCrypto, the 12-byte header not all there | E_FAIL : Unspecified error | 0 bytes | the same |
+| ZIP, ZipCrypto, Deflate / Store | Data Error / CRC Failed "in encrypted file. Wrong password?" | the decrypted bytes decoded / the decrypted bytes past the header | the same |
+| ZIP, WinZip AES, salt and verifier not all there | E_FAIL : Unspecified error | 0 bytes | the same |
+| ZIP, WinZip AES, Deflate / Store | Data Error in encrypted file. Wrong password? / Unexpected end of data | the decrypted bytes decoded (no authentication code) / the decrypted bytes past salt and verifier | the same |
+| ZIP, a streamed member cut before its data descriptor | Unexpected end of data (Store), Data Error (Deflate) | what is there, listed with no size | the same |
+| ZIP, a later member's local header cut | (none for a member) | that member isn't listed | the same |
+| RAR 3.x/4.x, compressed (2.9 LZ, PPMd, 2.0 LZ), solid or not | Data Error | 0 bytes | the same; it isn't decoded |
+| RAR 3.x/4.x, stored | CRC Failed | the bytes there | the same |
+| RAR 5.0, stored | Data Error | the bytes there | the same |
+| RAR 5.0, compressed, encrypted or not | Data Error (encrypted: "in encrypted file. Wrong password?") | UnRAR's length, most of its bytes (+11 bytes at one cut) | UnRAR's bytes (as under `Salvage`): the last 10 to 20 bytes can differ from 7-Zip's |
+| RAR, a later volume missing (`7z x first.rar`) | "ERROR = Missing volume", then Data Error | RAR 3.x/4.x compressed: 0 bytes; stored, encrypted: the whole AES blocks; RAR 5.0: decoded to the data's end | the same for RAR 3.x/4.x; RAR 5.0 keeps UnRAR's (some hundred bytes short) |
+
+7-Zip prints "There are data after the end of archive" too for a cut RAR 3.x/4.x, and a cut header only "Unexpected
+end of archive". Prybar maps the failure to 7-Zip's wording itself; note RAR 5.0 stored is "Data Error" where RAR
+3.x/4.x stored is "CRC Failed". By default (every opt-in off) nothing changes: such a ZIP doesn't open, such a RAR
+doesn't open in a session, and the member cut short is never written.
 
 ## `seven_zip_strict`: 7-Zip's end checks on a 7z folder and a ZIP local header
 
