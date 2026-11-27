@@ -404,6 +404,15 @@ struct SelectedRun {
     unverified: Option<u64>,
 }
 
+/// A catalogue issue that is a member the end of an archive cut short ends inside the data of (catalogued under
+/// [`crate::extract::DamagedInput::Salvage`]). Unlike one a missing volume cuts off, it is decoded whatever
+/// [`crate::extract::UnverifiedOutput`] says, as UnRAR 7.30 decodes it (reading on past the end as zeros), and its own
+/// checks decide, as UnRAR's do: one whose checksum passes (a compressed stream whose last bytes it didn't need) is
+/// good, and the archive still ends unexpectedly; the rest fail as this issue.
+pub(super) fn cut_short(failure: &RarFailure) -> bool {
+    matches!(failure, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
+}
+
 /// A catalogue issue that is a member cut off by a missing volume, or by the end of an archive cut short (catalogued
 /// under [`crate::extract::DamagedInput::Salvage`]): under
 /// [`crate::extract::UnverifiedOutput::Emit`] what the present volumes hold is decoded before it fails.
@@ -602,12 +611,33 @@ impl SelectedRun {
         &mut self,
         session: &RarSession,
         index: usize,
+        output: Option<DecodedOutput<'_>>,
+    ) -> Result<(u64, RarVerification), RarFailure> {
+        let result = self.decode_member(session, index, output);
+        // a member an archive cut short ends inside of (`cut_short`): what fails its checks or its decoding there
+        // fails as the cut, which is why
+        match session.model.members[index].issue.map(|issue| &session.issues[issue]).filter(|issue| cut_short(issue)) {
+            Some(issue) => result.map_err(|failure| match failure {
+                RarFailure::Integrity { .. } | RarFailure::EncryptedIntegrity { .. } => copy_catalogue_issue(issue),
+                failure => failure,
+            }),
+            None => result,
+        }
+    }
+
+    fn decode_member(
+        &mut self,
+        session: &RarSession,
+        index: usize,
         mut output: Option<DecodedOutput<'_>>,
     ) -> Result<(u64, RarVerification), RarFailure> {
         let member = &session.model.members[index];
-        // UnverifiedOutput::Emit: a member cut off by a missing volume is decoded from what is there, then fails
-        let cut =
-            member.issue.map(|issue| &session.issues[issue]).filter(|issue| self.emit_unverified && cut_off(issue));
+        // UnverifiedOutput::Emit: a member cut off by a missing volume is decoded from what is there, then fails; one
+        // an archive cut short ends inside of is always decoded as UnRAR decodes it, and its checks decide
+        let cut = member
+            .issue
+            .map(|issue| &session.issues[issue])
+            .filter(|issue| cut_short(issue) || (self.emit_unverified && cut_off(issue)));
         if let Some(issue) = member.issue
             && cut.is_none()
         {
@@ -658,9 +688,7 @@ impl SelectedRun {
             }
         }
         // the archive ends inside this member's data (rather than a volume being missing)
-        let cut_short = cut.is_some_and(|issue| {
-            matches!(issue, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
-        });
+        let cut_short = cut.is_some_and(cut_short);
         let compressed = header.method != 0;
         let mut rar4 = if compressed && header.format == RarFormat::Rar4 {
             let first = &session.model.parts[member.parts.start];
@@ -832,7 +860,22 @@ impl SelectedRun {
                 let result = decoder.flush_cut(&mut sink);
                 sink.finish(result, None)?;
             }
-            return Err(copy_catalogue_issue(issue));
+            if !cut_short {
+                return Err(copy_catalogue_issue(issue));
+            }
+            // the archive cut short: what UnRAR decodes of the member is checked as UnRAR checks it (`decode_bound`
+            // fails it as the cut when that fails); its decoder goes no further
+            if compressed {
+                self.decoder = None;
+            }
+            let final_checks = parts.last().expect("catalogue members have a part").checks;
+            let checks = pending.verify_selected(
+                member.unpacked_size,
+                final_checks.crc32,
+                final_checks.blake2sp,
+                final_checks.keyed,
+            )?;
+            return Ok((pending.verified_size(), checks));
         }
         let context = pending.context().clone();
         if let Some(cipher) = pending.selected_cipher() {

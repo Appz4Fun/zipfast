@@ -704,9 +704,12 @@ impl<'a> RarMember<'a> {
     }
 
     /// Where the volume ends inside one of this member's headers or its data, read anyway under
-    /// [`RarSessionOptions::damaged_input`] ([`super::FileHeader::cut`]): it is listed with its declared sizes, and
-    /// fails as truncated data ([`super::HeaderCut::Data`]; under [`crate::extract::UnverifiedOutput::Emit`] what
-    /// UnRAR 7.30 decodes of it is handed over first) or a truncated header ([`super::HeaderCut::Header`]). A caller showing 7-Zip 26.06's listing leaves out a `Header` cut.
+    /// [`RarSessionOptions::damaged_input`] ([`super::FileHeader::cut`]): it is listed with its declared sizes. With
+    /// its data cut ([`super::HeaderCut::Data`]) it is decoded as UnRAR 7.30 decodes it, reading on past the end as
+    /// zeros, and its checks decide, as UnRAR's do: good when they pass (the archive still ends unexpectedly, as
+    /// [`RarArchiveMetadata::damaged_headers`] says), else failed as truncated data. With its header cut
+    /// ([`super::HeaderCut::Header`]) it fails as a truncated header. A caller showing 7-Zip 26.06's listing leaves
+    /// out a `Header` cut.
     pub fn cut(&self) -> Option<super::HeaderCut> {
         self.cut
     }

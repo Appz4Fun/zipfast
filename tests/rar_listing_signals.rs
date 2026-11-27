@@ -28,9 +28,10 @@ use std::path::{Path, PathBuf};
 
 use common::{FileSpec, SIG, end_block, file_block, main_block};
 use zipfast::crc32::hash;
-use zipfast::extract::{self, DamagedInput, HeaderDamageKind, Mode, Options, Overwrite};
+use zipfast::error::{RarFailure, RarIntegrityReason};
+use zipfast::extract::{self, DamagedInput, HeaderDamageKind, Mode, Options, Overwrite, RarOutcome, UnverifiedOutput};
 use zipfast::rar5::HeaderCut;
-use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
+use zipfast::rar5::session::{RarDecodeLimits, RarPrintOptions, RarSession, RarSessionOptions};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 const A: &[u8] = b"alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha";
@@ -103,6 +104,14 @@ fn names(listing: &extract::Listing) -> Vec<&str> {
 #[allow(clippy::result_large_err)]
 fn session(case: &Case, damaged: DamagedInput) -> Result<RarSession, extract::RarRunError> {
     RarSession::open(&case.archive, None, RarSessionOptions { damaged_input: damaged, ..Default::default() })
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    zipfast::crypto::sha256(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn kinds(damage: &[extract::HeaderDamage]) -> Vec<HeaderDamageKind> {
+    damage.iter().map(|d| d.kind).collect()
 }
 
 fn written(case: &Case) -> Vec<String> {
@@ -218,16 +227,45 @@ fn salvage_lists_a_rar4_member_whose_data_is_cut_off() {
     assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
     assert!(written(&case).is_empty());
     assert_eq!(summary.damaged_headers.len(), 1);
-    // kept with keep_broken, as UnRAR -kb keeps what it decoded
+    // kept with keep_broken: the 1,774 bytes `unrar x -kb` keeps (and `unrar p` prints), under Withhold and Emit
+    // alike, decoded as UnRAR decodes a member cut short
+    const UNRAR_KB: &str = "9088570bd395f56c88ab726efae3c7a024309fd449c9e84bf22bf9eee9fe4e29";
     let opts = Options { keep_broken: true, ..options(&case.out, Mode::Extract, DamagedInput::Salvage) };
-    let summary = extract::run(&case.archive, &opts, |_| {}).unwrap();
-    assert_eq!(summary.errors.len(), 1);
-    assert_eq!(written(&case), ["README.md"]);
+    let emit = Options { unverified_output: UnverifiedOutput::Emit, ..opts.clone() };
+    for opts in [&opts, &emit] {
+        let summary = extract::run(&case.archive, opts, |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), 1);
+        assert_eq!(written(&case), ["README.md"]);
+        assert_eq!(sha256(&fs::read(case.out.join("README.md")).unwrap()), UNRAR_KB);
+    }
+
+    // a RarSession fails it as truncated (UnRAR: "checksum error", exit 3), in a test and an extraction alike, and
+    // keeps the same bytes with keep_broken
+    let mut session = self::session(&case, DamagedInput::Salvage).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let mut failures = Vec::new();
+    session
+        .test_selected(&selected, RarDecodeLimits::default(), |event| {
+            if let RarOutcome::Failed(failure) = &event.outcome {
+                failures.push(failure.clone());
+            }
+        })
+        .unwrap();
+    assert!(
+        matches!(failures[..], [ref f] if matches!(f.as_ref(), RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })),
+        "{failures:?}"
+    );
+    let out = case.dir.path().join("session");
+    let opts = Options { dest: out.clone(), ..opts };
+    let summary = session.extract_selected(&selected, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (0, 1));
+    assert_eq!(sha256(&fs::read(out.join("README.md")).unwrap()), UNRAR_KB);
 }
 
 /// latest_winrar.rar cut 50 bytes into 1.txt's 17 packed bytes... at 70, 8 bytes in: UnRAR 7.30 decodes 1.txt from
-/// them, its CRC passes, and it reports it OK (with "Unexpected end of archive"). So does `Salvage`: the member's own
-/// checks decide.
+/// them, its CRC passes, and it reports it OK (`t` and `x`: "Unexpected end of archive", exit 1). So does `Salvage`,
+/// through the runner and a `RarSession` alike: the member's own checks decide, and the archive still ends
+/// unexpectedly (its `UnexpectedEnd` record).
 #[test]
 fn salvage_extracts_a_cut_member_whose_checks_pass_as_unrar_does() {
     let bytes = fixture("rar4/latest_winrar.rar");
@@ -237,22 +275,55 @@ fn salvage_extracts_a_cut_member_whose_checks_pass_as_unrar_does() {
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);
     assert_eq!(fs::read(case.out.join("1.txt")).unwrap().len(), 5);
     assert_eq!(summary.damaged_headers[0].cut, Some(HeaderCut::Data { present: 8 }));
-    // a RarSession lists it with its declared size but fails it as truncated whatever its checks (its
-    // UnverifiedOutput::Emit hands over what UnRAR decodes: tests/emit_cut_archive.rs)
+    // a RarSession lists it with its declared size, reports the cut, and tests, prints and extracts it as good
     let mut session = session(&case, DamagedInput::Salvage).unwrap();
+    assert_eq!(kinds(session.archive().damaged_headers()), [HeaderDamageKind::UnexpectedEnd]);
     let member = session.entries().next().unwrap();
     assert_eq!((member.name(), member.cut()), ("1.txt", Some(HeaderCut::Data { present: 8 })));
     let selected = session.select(|_| true).unwrap();
     let out = case.dir.path().join("session");
     let opts = options(&out, Mode::Extract, DamagedInput::Salvage);
     let summary = session.extract_selected(&selected, &opts, RarDecodeLimits::default(), |_| {}).unwrap();
-    assert_eq!((summary.files, summary.failed), (0, 1));
+    assert_eq!((summary.files, summary.failed), (1, 0));
+    assert_eq!(fs::read(out.join("1.txt")).unwrap(), fs::read(case.out.join("1.txt")).unwrap());
+    let summary = session.test_selected(&selected, RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed), (1, 0));
+    let mut printed = Vec::new();
+    let summary = session.print_selected(&selected, &mut printed, &RarPrintOptions::default(), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.failed, printed.len()), (1, 0, 5));
     // with no data bytes at all it fails
     let case = self::case(&bytes[..62]);
     let opts = options(&case.out, Mode::Extract, DamagedInput::Salvage);
     let summary = extract::run(&case.archive, &opts, |_| {}).unwrap();
     assert_eq!(summary.errors.len(), 1);
     assert!(written(&case).is_empty());
+}
+
+/// latest_winrar.rar cut at every byte of 1.txt's 17 packed bytes (62 to 78): `unrar t` 7.30 reports 1.txt OK from
+/// 68 on (six bytes of data there) and a checksum error before ("Unexpected end of archive" either way). The runner and
+/// a `RarSession` give the same verdicts, under `Withhold` and `Emit` alike.
+#[test]
+fn a_cut_member_passes_or_fails_where_unrar_does() {
+    let bytes = fixture("rar4/latest_winrar.rar");
+    for at in 62..79 {
+        let unrar_ok = at >= 68;
+        let case = case(&bytes[..at]);
+        for unverified in [UnverifiedOutput::Withhold, UnverifiedOutput::Emit] {
+            let what = format!("cut at {at} {unverified:?}");
+            let opts =
+                Options { unverified_output: unverified, ..options(&case.out, Mode::Test, DamagedInput::Salvage) };
+            let summary = extract::run(&case.archive, &opts, |_| {}).unwrap();
+            assert_eq!(summary.errors.is_empty(), unrar_ok, "{what}: runner {:?}", summary.errors);
+            assert_eq!(kinds(&summary.damaged_headers), [HeaderDamageKind::UnexpectedEnd], "{what}");
+            let mut session = self::session(&case, DamagedInput::Salvage).unwrap();
+            let selected = session.select(|_| true).unwrap();
+            let summary = session.test_selected(&selected, RarDecodeLimits::default(), |_| {}).unwrap();
+            assert_eq!((summary.files, summary.failed), if unrar_ok { (1, 0) } else { (0, 1) }, "{what}: session");
+            let print = RarPrintOptions { unverified_output: unverified, ..RarPrintOptions::default() };
+            let summary = session.print_selected(&selected, &mut Vec::new(), &print, |_| {}).unwrap();
+            assert_eq!(summary.failed, u64::from(!unrar_ok), "{what}: session print");
+        }
+    }
 }
 
 /// A RAR 5.0 archive cut inside b.txt's data: both tools list a.txt and b.txt. `Salvage` lists both, through the

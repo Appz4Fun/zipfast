@@ -17,7 +17,8 @@
 //! An archive cut short inside a member's data ("Unexpected end of archive"), catalogued under
 //! `DamagedInput::Salvage`: with `UnverifiedOutput::Emit`, `RarSession` prints (`unrar p`) and keeps (`unrar x -kb`)
 //! the members before the cut and what UnRAR 7.30 decodes of the member cut short, which is reported failed as
-//! truncated. See `tests/fixtures/emit-cut-archive/README.md`.
+//! truncated, and so does the whole-archive runner (`extract::run`, `unrar x -kb`). See
+//! `tests/fixtures/emit-cut-archive/README.md`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -167,7 +168,8 @@ fn rar_session_print_prints_what_unrar_prints_of_an_archive_cut_short() {
 }
 
 /// `unrar x -kb` through `RarSession::extract_selected` with `keep_broken`: the members' files, in the archive's
-/// order, hold what `unrar p` prints. With `Withhold` the member cut short isn't written.
+/// order, hold what `unrar p` prints. With `Withhold` too: a member an archive cut short ends inside of is always
+/// decoded as UnRAR decodes it (its checks decide on those bytes), and `keep_broken` keeps it as written.
 #[test]
 fn rar_session_extraction_keeps_what_unrar_decodes_of_an_archive_cut_short() {
     let dir = tempfile::tempdir().unwrap();
@@ -186,13 +188,92 @@ fn rar_session_extraction_keeps_what_unrar_decodes_of_an_archive_cut_short() {
             let (cut_short, before) = names.split_last().unwrap();
             let mut kept: Vec<u8> = before.iter().flat_map(|name| fs::read(out.join(name)).unwrap()).collect();
             let last = fs::read(out.join(cut_short));
-            if unverified == UnverifiedOutput::Emit {
-                kept.extend(last.unwrap_or_else(|e| panic!("{what}: {e}")));
+            kept.extend(last.unwrap_or_else(|e| panic!("{what}: {e}")));
+            assert_eq!(kept.len(), case.unrar.0, "{what}: length");
+            assert_eq!(sha256(&kept), case.unrar.1, "{what}: bytes");
+        }
+    }
+}
+
+/// The member files `extract::run` leaves in `out`, in the order `names` gives, joined.
+fn joined(out: &Path, names: &[String]) -> Vec<u8> {
+    names.iter().flat_map(|name| fs::read(out.join(name)).unwrap_or_default()).collect()
+}
+
+/// `unrar x -kb` through the whole-archive runner (`extract::run`, `Salvage`, `keep_broken`, `Emit`), on one thread
+/// and on several: the member cut short fails, and the files hold what `unrar p` prints, as the session keeps them.
+/// `Withhold` keeps the same: the member is decoded as UnRAR decodes it whatever, its checks deciding on that.
+#[test]
+fn whole_archive_run_keeps_what_unrar_decodes_of_an_archive_cut_short() {
+    let dir = tempfile::tempdir().unwrap();
+    for case in CUTS {
+        let archive = cut_archive(dir.path(), case);
+        let names: Vec<String> = RarSession::open(&archive, None, salvaging())
+            .unwrap()
+            .entries()
+            .map(|member| member.name().to_owned())
+            .collect();
+        for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+            for threads in [1, 4] {
+                let what = format!("{}@{} {unverified:?} threads {threads}", case.archive, case.at);
+                let out = dir.path().join(format!("run-{}-{unverified:?}-{threads}", case.at));
+                let options = Options { threads: Some(threads), ..options(&out, unverified) };
+                let summary = zipfast::extract::run(&archive, &options, |_| {}).unwrap();
+                assert_eq!(summary.errors.len(), 1, "{what}: {:?}", summary.errors);
+                assert!(summary.errors[0].contains(names.last().unwrap().as_str()), "{what}: {:?}", summary.errors);
+                let kept = joined(&out, &names);
                 assert_eq!(kept.len(), case.unrar.0, "{what}: length");
                 assert_eq!(sha256(&kept), case.unrar.1, "{what}: bytes");
-            } else {
-                assert!(last.is_err(), "{what}: not written");
+                if threads == 1 {
+                    // the session keeps the same
+                    let session_out = dir.path().join(format!("session-{}-{threads}", case.at));
+                    let mut session = RarSession::open(&archive, None, salvaging()).unwrap();
+                    let all = session.select(|_| true).unwrap();
+                    session
+                        .extract_selected(&all, &options_at(&session_out, &options), Default::default(), |_| {})
+                        .unwrap();
+                    assert_eq!(joined(&session_out, &names), kept, "{what}: the session keeps the same");
+                }
             }
+        }
+        // without keep_broken the member cut short is removed, as `unrar x` removes it
+        let out = dir.path().join(format!("plain-{}", case.at));
+        let options = Options { keep_broken: false, ..options(&out, UnverifiedOutput::Emit) };
+        let summary = zipfast::extract::run(&archive, &options, |_| {}).unwrap();
+        assert_eq!(summary.errors.len(), 1, "{}@{}", case.archive, case.at);
+        assert!(!out.join(names.last().unwrap()).exists(), "{}@{}", case.archive, case.at);
+    }
+}
+
+fn options_at(dest: &Path, options: &Options) -> Options {
+    Options { dest: dest.to_path_buf(), ..options.clone() }
+}
+
+/// The first volume of `rar5-threads/big` cut 70,000 bytes in, inside `a.txt`, its later volumes there: `unrar x -kb`
+/// keeps 930,710 bytes of `a.txt` (what `unrar p` prints of it) and extracts `s.txt` from the last volume; the part of
+/// `a.txt` in the second volume continues nothing. So does the runner, under `Emit` and `Withhold` alike.
+#[test]
+fn whole_archive_run_does_not_continue_a_member_cut_short_from_the_next_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = Path::new(FIXTURES).join("rar5-threads");
+    let first = dir.path().join("big.part01.rar");
+    fs::write(&first, &fs::read(set.join("big.part01.rar")).unwrap()[..70_000]).unwrap();
+    for later in ["big.part02.rar", "big.part03.rar"] {
+        fs::copy(set.join(later), dir.path().join(later)).unwrap();
+    }
+    for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+        for threads in [1, 4] {
+            let what = format!("{unverified:?} threads {threads}");
+            let out = dir.path().join(format!("out-{unverified:?}-{threads}"));
+            let options = Options { threads: Some(threads), ..options(&out, unverified) };
+            let summary = zipfast::extract::run(&first, &options, |_| {}).unwrap();
+            assert!(summary.errors.iter().any(|error| error.contains("a.txt")), "{what}: {:?}", summary.errors);
+            assert_eq!(fs::read(out.join("s.txt")).unwrap(), b"small\n", "{what}");
+            let a = fs::read(out.join("a.txt")).unwrap();
+            let mut printed = a.clone();
+            printed.extend_from_slice(b"small\n");
+            assert_eq!(a.len(), 930_710, "{what}");
+            assert_eq!(sha256(&printed), "41cf0cc0b9c6a62ca032a319c7eb30115240e95775c4bbe4ddf858b628cee6ae", "{what}");
         }
     }
 }
