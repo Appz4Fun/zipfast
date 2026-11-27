@@ -303,6 +303,40 @@ pub struct Options {
     /// dispatchers) and checked ([`run_with_policy`], [`crate::zip::run_with_policy`]). Progressive and
     /// persistent-partial sessions decode neither 7z nor ZIP, and the other formats ignore it.
     pub seven_zip_strict: bool,
+    /// A RAR 4.x name stored as bytes that aren't UTF-8 is written under those bytes, as UnRAR 7.30 and 7-Zip 26.06
+    /// write it on Unix (`test/C\x85:5\xe5\xcbB'`), instead of the private-use characters U+E080..U+E0FF that stand
+    /// for them (the default, valid UTF-8 everywhere; see `docs/compat-options.md`, "`rar4_raw_names`"). Each mapped
+    /// character becomes its byte 0x80..0xFF, after the name has been checked, so it never yields a `/`, a NUL or a
+    /// `..` component. A file system that refuses such a name (APFS and HFS+ on macOS, which take only UTF-8) keeps
+    /// the private-use name: the run checks once, at its first such name, by creating and removing a probe file in
+    /// the destination. Unix only; elsewhere this does nothing.
+    ///
+    /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+    /// dispatchers). [`SelectedEntry::relative_path`], `RarSession` and progressive sessions keep the private-use
+    /// name.
+    pub rar4_raw_names: bool,
+    /// When a RAR folder member's modification time is set: after the run, deepest first, as 7-Zip 26.06 sets it (the
+    /// default), or as soon as the run reaches the folder's entry, as UnRAR 7.30 does, so that whatever is created
+    /// or removed in it later leaves it at that later time. See [`FolderTimes`].
+    pub folder_times: FolderTimes,
+}
+
+/// When a RAR folder member's modification time is set; see [`Options::folder_times`].
+///
+/// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+/// dispatchers). Other formats, `RarSession` and progressive sessions always set folder times at the end. Permission
+/// bits are set at the end either way, so a read-only folder never stops its own files from being written.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FolderTimes {
+    /// Every folder's time is set once the run is done, deepest first, so the folder keeps its archived time
+    /// whatever was written in it, as 7-Zip 26.06 sets it.
+    #[default]
+    AtEnd,
+    /// A folder's time is set when the run reaches its entry and never again, as UnRAR 7.30 sets it: a file or folder
+    /// created in it afterwards, or a failed file created and then removed (as UnRAR removes a file whose checksum
+    /// fails), leaves it at the time that happened.
+    AtEntry,
 }
 
 /// A 7z folder that decoded to its end but whose coders didn't end cleanly, under [`Options::seven_zip_strict`].
@@ -3799,6 +3833,9 @@ pub(crate) struct Pending {
     /// check; kept with [`Options::keep_broken`], or handed over under [`UnverifiedOutput::Emit`], it stops there,
     /// as UnRAR 7.30 and 7-Zip 26.06 write it)
     declared: Option<u64>,
+    /// [`FolderTimes::AtEntry`]: given up on before its file was created, it still moves its folder's time, as UnRAR
+    /// moves it by creating the file and removing it again
+    touch_folder: bool,
 }
 
 /// A symbolic link being extracted: created once its target is decoded and checked.
@@ -3807,6 +3844,8 @@ struct LinkOut {
     /// where it goes, relative to the destination
     rel: PathBuf,
     target: Vec<u8>,
+    /// [`Options::rar4_raw_names`], taken by the destination: the target names members by their raw bytes too
+    raw_names: bool,
 }
 
 impl std::ops::Deref for Pending {
@@ -3843,6 +3882,7 @@ impl Pending {
             orphan: false,
             unfiltered: false,
             declared: (!h.size_unknown()).then_some(h.unpacked_size),
+            touch_folder: false,
         }
     }
 
@@ -3865,6 +3905,14 @@ impl Pending {
     /// Gives up on this file: what was written of it is removed, so a later run doesn't take it for finished (kept
     /// with [`Options::keep_broken`]).
     fn discard(&mut self) {
+        if self.touch_folder
+            && !self.passive
+            && !self.hidden
+            && self.keep.is_none()
+            && let Some(parent) = self.place.as_ref().and_then(|place| place.path.parent())
+        {
+            touch_dir(parent);
+        }
         self.failed = true;
         // a canceled run publishes nothing of the member in progress, kept or not
         let canceled = self.cancel.as_ref().is_some_and(Cancellation::is_canceled);
@@ -4457,11 +4505,13 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
     {
         return Err(books.terminal(&p.context, e.detailed(false)));
     }
-    if let Some(LinkOut { place, rel, target }) = p.link.take() {
+    if let Some(LinkOut { place, rel, target, raw_names }) = p.link.take() {
         // the target is the decoded data: reported with the outcome, refused or not
         p.context.link = Some(crate::rar5::Redirection::UnixSymlink(String::from_utf8_lossy(&target).into_owned()));
         // written mapped as the member names it may point at
         let target = link::rar4_target(&target).unwrap_or_default();
+        // Options::rar4_raw_names: as the members it may point at are written, under their raw bytes
+        let target = if raw_names { crate::path::rar4_raw_bytes(target) } else { target };
         let placeholder = books.landing.extracted.placeholder();
         if !placeholder && !link::contained(&rel, &target) {
             let failure = RarFailure::Policy { reason: RarPolicyReason::LinkTarget, path: place.path };
@@ -4651,6 +4701,8 @@ struct Run<'a, 'r, 'c> {
     landing: Landing,
     /// checked before each member and as each member's data is decoded
     cancel: Option<Cancellation>,
+    /// `Options::rar4_raw_names`: whether the destination takes a name that isn't UTF-8, once a member needed one
+    raw_names: Option<bool>,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -4927,6 +4979,8 @@ fn rar_read_at(
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
         seven_zip_strict: false,
+        rar4_raw_names: false,
+        folder_times: Default::default(),
         unix_modes: Default::default(),
         backslashes: Default::default(),
         hard_link_targets: Default::default(),
@@ -5037,12 +5091,38 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             members_before: 0,
             landing: Landing { placed: HashMap::new(), extracted: link::Extracted::new(opts) },
             cancel: None,
+            raw_names: None,
         }
     }
 }
 
 impl Run<'_, '_, '_> {
     /// Finishes everything still on other threads.
+    /// `Options::rar4_raw_names`: `rel` with its mapped characters back to raw bytes, when there are some and the
+    /// destination takes such a name (asked once, at the first one).
+    #[cfg(unix)]
+    fn raw_path(&mut self, rel: &Path) -> Option<PathBuf> {
+        let raw = crate::path::rar4_raw_path(rel)?;
+        self.takes_raw_names().then_some(raw)
+    }
+
+    #[cfg(not(unix))]
+    fn raw_path(&mut self, _rel: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// Whether the destination takes a name that isn't UTF-8, asked once.
+    #[cfg(unix)]
+    fn takes_raw_names(&mut self) -> bool {
+        let dest = &self.opts.dest;
+        *self.raw_names.get_or_insert_with(|| takes_raw_names(dest))
+    }
+
+    #[cfg(not(unix))]
+    fn takes_raw_names(&mut self) -> bool {
+        false
+    }
+
     fn drain(&mut self) -> RunResult<()> {
         self.drain_solid()?;
         self.drain_batch()
@@ -5578,6 +5658,17 @@ impl Run<'_, '_, '_> {
             }
         };
         let rel = if self.opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+        // Options::rar4_raw_names: a name mapped from bytes that aren't UTF-8 goes back to those bytes, checked as it is
+        let rel = if self.opts.rar4_raw_names
+            && self.opts.mode == Mode::Extract
+            && self.selection.is_none()
+            && h.format == RarFormat::Rar4
+            && ctx.entry.name.contains('\u{FFFE}')
+        {
+            self.raw_path(&rel).unwrap_or(rel)
+        } else {
+            rel
+        };
         let key = rel.to_string_lossy().to_lowercase();
         if self.opts.mode == Mode::Extract
             && rel.ancestors().any(|a| {
@@ -5600,7 +5691,16 @@ impl Run<'_, '_, '_> {
                     self.fail_in_order(&ctx, failure, why)?;
                     return Ok(());
                 }
-                self.dir_meta.push((self.opts.dest.join(&rel), self.opts.rar_dir_meta(h)));
+                let path = self.opts.dest.join(&rel);
+                let mut meta = self.opts.rar_dir_meta(h);
+                if self.opts.folder_times == FolderTimes::AtEntry {
+                    // as UnRAR: the time is set now, once what was handed to other threads has landed, and what is
+                    // created or removed in the folder later moves it on; the mode still waits for the end
+                    self.drain()?;
+                    set_dir_time(&path, &meta);
+                    meta.mtime = None;
+                }
+                self.dir_meta.push((path, meta));
             }
             return self.reports.directory(&ctx);
         }
@@ -5801,10 +5901,12 @@ impl Run<'_, '_, '_> {
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.keep = (self.opts.keep_broken && place.is_some()).then(|| self.opts.rar_meta(h));
         p.orphan = h.split_before() && self.opts.attempt_continued_members;
+        p.touch_folder = self.opts.folder_times == FolderTimes::AtEntry && !link;
         p.place = place;
         if link && let Some(place) = p.place.take() {
             self.dirs.forget();
-            p.link = Some(LinkOut { place, rel, target: Vec::new() });
+            let raw_names = self.opts.rar4_raw_names && h.format == RarFormat::Rar4 && self.takes_raw_names();
+            p.link = Some(LinkOut { place, rel, target: Vec::new(), raw_names });
         }
         self.begin_decoding(vol, h, p)
     }
@@ -6606,6 +6708,50 @@ pub(crate) fn finish_file(out: &File, h: &Meta) {
     drop((modified, permissions));
 }
 
+/// Whether a file under `dest` may be named with bytes that aren't UTF-8 (APFS and HFS+ refuse such names with
+/// EILSEQ): a probe file is created with one and removed again.
+#[cfg(unix)]
+fn takes_raw_names(dest: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut name = format!("{}raw-name-probe-{}-", crate::output::STAGED_PREFIX, std::process::id()).into_bytes();
+    name.push(0xFF);
+    let probe = dest.join(std::ffi::OsStr::from_bytes(&name));
+    match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        // someone else's file already has such a name: the file system takes it
+        Err(e) => e.kind() == io::ErrorKind::AlreadyExists,
+    }
+}
+
+/// `Options::folder_times` `AtEntry`: a folder's time moved to now, as creating and removing a file in it moves it,
+/// if it is still a real folder.
+fn touch_dir(path: &Path) {
+    #[cfg(unix)]
+    if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && let Ok(dir) = File::open(path)
+    {
+        let _ = dir.set_modified(SystemTime::now());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// `Options::folder_times` `AtEntry`: a folder's time set now, if it is still a real folder.
+fn set_dir_time(path: &Path, h: &Meta) {
+    #[cfg(unix)]
+    if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && let Ok(dir) = File::open(path)
+    {
+        set_time(&dir, h);
+    }
+    #[cfg(not(unix))]
+    let _ = (path, h);
+}
+
 fn set_time(out: &File, h: &Meta) {
     if let Some(at) = h.mtime.and_then(|seconds| archive_time(seconds, h.nanos)) {
         let _ = out.set_modified(at);
@@ -6857,6 +7003,8 @@ mod tests {
             unverified_output: UnverifiedOutput::Emit,
             salvage_truncated_zip: false,
             seven_zip_strict: false,
+            rar4_raw_names: false,
+            folder_times: Default::default(),
             unix_modes: Default::default(),
             backslashes: Default::default(),
             hard_link_targets: Default::default(),
@@ -7200,6 +7348,8 @@ mod read_once {
             unverified_output: Default::default(),
             salvage_truncated_zip: false,
             seven_zip_strict: false,
+            rar4_raw_names: false,
+            folder_times: Default::default(),
             unix_modes: Default::default(),
             backslashes: Default::default(),
             hard_link_targets: Default::default(),

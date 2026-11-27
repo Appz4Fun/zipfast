@@ -67,6 +67,8 @@ fn options(dest: &Path, mode: Mode, damaged: DamagedInput) -> Options {
         backslashes: Default::default(),
         hard_link_targets: Default::default(),
         seven_zip_strict: false,
+        rar4_raw_names: false,
+        folder_times: Default::default(),
     }
 }
 

@@ -60,6 +60,8 @@ fn options(dest: &Path) -> Options {
         unverified_output: Default::default(),
         salvage_truncated_zip: false,
         seven_zip_strict: false,
+        rar4_raw_names: false,
+        folder_times: Default::default(),
         unix_modes: Default::default(),
         backslashes: Default::default(),
         hard_link_targets: Default::default(),
@@ -730,6 +732,25 @@ fn link_targets_are_mapped_like_raw_member_names() {
     let outcomes = progressive(&path, &out).unwrap();
     assert_eq!(outcomes.iter().filter(|o| *o == "verified").count(), 2, "{outcomes:?}");
     check("progressive", &out);
+}
+
+/// `Options::rar4_raw_names` on a file system that takes the bytes: the member is written under `caf\xe9`, and the
+/// link's target names it the same way, so the link still resolves, as UnRAR 7.30 and 7-Zip 26.06 make it on Linux.
+#[test]
+#[cfg(target_os = "linux")]
+fn link_targets_follow_raw_member_names_when_asked() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.rar");
+    fs::write(&path, archive(&[header(0x74, 3, b"caf\xe9", b"data", 0o100644, &[]), link_member(b"link", b"caf\xe9")]))
+        .unwrap();
+    let raw = std::ffi::OsStr::from_bytes(b"caf\xe9");
+    let out = dir.path().join("run");
+    let summary = extract::run(&path, &Options { rar4_raw_names: true, ..options(&out) }, |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(fs::read(out.join(raw)).unwrap(), b"data");
+    assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(raw));
+    assert_eq!(fs::read(out.join("link")).unwrap(), b"data", "the link resolves to the member");
 }
 
 /// A link already in the destination that leads out (`alias -> ../outside`): an archive link whose target passes

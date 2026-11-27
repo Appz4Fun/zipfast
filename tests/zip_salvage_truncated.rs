@@ -63,6 +63,8 @@ fn options(dest: &Path, salvage: bool, keep: bool) -> Options {
         hard_link_targets: Default::default(),
         salvage_truncated_zip: salvage,
         seven_zip_strict: false,
+        rar4_raw_names: false,
+        folder_times: Default::default(),
     }
 }
 
