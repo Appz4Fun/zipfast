@@ -548,6 +548,10 @@ impl Ppm {
     }
 
     // ---- the range coder
+    /// The range decoder's code: 7-Zip's PPMd encoder ends a stream where its decoder reaches 0.
+    pub(crate) fn range_code(&self) -> u32 {
+        self.code
+    }
 
     fn coder_init(&mut self, bits: &mut Bits<'_>) {
         self.low = 0;

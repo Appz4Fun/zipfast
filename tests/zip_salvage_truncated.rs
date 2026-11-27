@@ -62,6 +62,7 @@ fn options(dest: &Path, salvage: bool, keep: bool) -> Options {
         backslashes: Default::default(),
         hard_link_targets: Default::default(),
         salvage_truncated_zip: salvage,
+        seven_zip_strict: false,
     }
 }
 
