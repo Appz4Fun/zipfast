@@ -23,6 +23,8 @@
 extern crate self as zipfast;
 
 #[cfg(test)]
+mod kdf_cache_tests;
+#[cfg(test)]
 mod test_alloc;
 #[cfg(all(test, unix))]
 mod test_stamps;
