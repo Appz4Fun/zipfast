@@ -1467,7 +1467,7 @@ impl CheckedOpen {
             .map_err(|report| ZipReadError::from(report).with_bootstrap(self.bootstrap.usage()))
     }
 
-    pub(crate) fn recognize_rar(self, head: &[u8]) -> Result<(crate::rar5::reader::HeldSignature, PathBuf), Self> {
+    pub(crate) fn recognize_rar(self, head: Vec<u8>) -> Result<(crate::rar5::reader::HeldSignature, PathBuf), Self> {
         let Self { file, path, len, source, bootstrap } = self;
         match crate::rar5::reader::HeldSignature::recognize(file, len, head) {
             Ok(signature) => Ok((signature, path)),
