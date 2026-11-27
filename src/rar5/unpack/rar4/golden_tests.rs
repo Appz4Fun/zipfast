@@ -273,3 +273,58 @@ fn unmutated_streams_report_as_before() {
         eprintln!("{name}: {whole}");
     }
 }
+
+/// The code at the start of `window` found as the old decoder did: a bit at a time, against each length's codes.
+fn bitwise(h: &Huff, window: u32) -> Option<(u16, u8)> {
+    let mut prefix = 0;
+    for depth in 1..16 {
+        prefix = (prefix << 1) | ((window >> (15 - depth)) & 1);
+        if let Some(relative) = prefix.checked_sub(h.first[depth])
+            && relative < u32::from(h.count[depth])
+        {
+            return Some((h.symbols[h.offset[depth] + relative as usize], depth as u8));
+        }
+    }
+    None
+}
+
+#[test]
+fn table_lookup_matches_the_bitwise_search_for_every_window() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut work = Work { operations: 0, cancel: None, cancel_at: None };
+    let mut h = Huff::empty();
+    let (mut complete, mut incomplete) = (0, 0);
+    for round in 0..240 {
+        let n = [20, 299, 60, 17, 28][round % 5];
+        // lengths that fit the code space, in random symbol order: often incomplete, sometimes complete
+        let mut lengths = vec![0u8; n];
+        let mut space = 1u32 << 15;
+        let longest = 1 + rng.below(15) as u32;
+        for _ in 0..n * 2 {
+            let symbol = rng.below(n);
+            let length = 1 + rng.below(longest as usize) as u32;
+            if lengths[symbol] == 0 && space >= 1 << (15 - length) {
+                lengths[symbol] = length as u8;
+                space -= 1 << (15 - length);
+            }
+        }
+        // fill what is left with the longest codes when there are symbols for them
+        for length in lengths.iter_mut().filter(|l| **l == 0) {
+            if round % 2 == 0 && space != 0 {
+                *length = 15;
+                space -= 1;
+            }
+        }
+        if space == 0 { complete += 1 } else { incomplete += 1 }
+        h.build(&lengths, &mut work).unwrap();
+        for window in 0..1u32 << 15 {
+            let entry = h.quick[(window >> (15 - QUICK_BITS)) as usize];
+            let table = if entry != 0 { Some((entry >> 4, (entry & 15) as u8)) } else { h.long(window) };
+            assert_eq!(table, bitwise(&h, window), "round {round} window {window:#06x} lengths {lengths:?}");
+        }
+    }
+    assert!(complete > 10 && incomplete > 10, "{complete} complete, {incomplete} incomplete");
+    // oversubscribed lengths still fail the build as before
+    assert!(matches!(h.build(&[1, 1, 1], &mut work), Err(Rar4DecodeError::Malformed("oversubscribed Huffman table"))));
+    assert!(matches!(h.build(&[16], &mut work), Err(Rar4DecodeError::Malformed("code length"))));
+}
