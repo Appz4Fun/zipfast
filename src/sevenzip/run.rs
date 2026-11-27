@@ -774,7 +774,7 @@ impl Run<'_> {
     /// was decoded, as a verified one would. Best effort: when that fails, it is removed as without the option.
     fn keep_broken(&mut self, (temporary, output): (tempfile::TempPath, Output), place: Place, member: &MapMember) {
         let meta = self.opts.meta(meta(member));
-        if output.finish(|file| crate::extract::keep_written(file, &meta)).is_err() {
+        if output.finish(|file| crate::extract::keep_written(file, &meta, None)).is_err() {
             return;
         }
         Self::put_kept(temporary, place);

@@ -54,6 +54,10 @@ pub(super) struct Persistent {
     /// A header was read past as damage earlier in this session ([`crate::extract::Options::damaged_input`]): the
     /// members after it are bound by position (see [`Self::member_keys`]).
     pub(super) damaged: bool,
+    /// [`crate::extract::Options::keep_broken`] with [`crate::extract::UnverifiedOutput::Emit`]: the session ended
+    /// cut off (a missing volume, a truncated set) inside a member. Its `MemberFinished` (`PersistentUnverified`)
+    /// is delivered after the events still queued, then the failure.
+    ending: Option<(Option<ProgressiveEvent>, ProgressiveFailure)>,
 }
 /// A member this session created or adopted. Its core (state pages, descriptors, `open_partials` lease) is held
 /// until the member has finished and the caller has taken its handle with `partial_file`; then the session keeps
@@ -301,6 +305,7 @@ impl ProgressiveSession {
             directories: Vec::new(),
             created: Vec::new(),
             damaged: false,
+            ending: None,
         });
         Ok(session)
     }
@@ -1077,6 +1082,14 @@ impl ProgressiveSession {
                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?,
             expected: self.expected.clone(),
         };
+        // A part running past its volume's final length is a set cut short. The state can't record it (by default
+        // the session ends with `StateMalformed` here, as before); a session reporting cut-off members ends with
+        // `Truncated`, which reports this one (`partial_cut_off`).
+        if reports_cut_off(&self.options.extract)
+            && matches!(admission.info.length, crate::progressive::SourceLength::Final(n) if plain.packed.range.end > n)
+        {
+            return Err(ProgressiveFailure::new(FailureKind::Truncated));
+        }
         persistent
             .active()
             .1
@@ -1233,6 +1246,55 @@ impl ProgressiveSession {
         self.phase = Phase::Verdict;
         Ok(())
     }
+    /// [`crate::extract::Options::keep_broken`] with [`crate::extract::UnverifiedOutput::Emit`]: a failure that cuts
+    /// the active member off (a missing volume, a set truncated inside it) first delivers that member's
+    /// `MemberFinished` with `PersistentUnverified`, its output kept as extracted so far, unverified, with the ranges
+    /// still unknown. Commits the open group (the state then covers every byte written) and nothing else: a restart
+    /// resumes the member from its committed `produced`. Returns the failure back when there is nothing to report
+    /// (no active member, another failure, the option off, an adopted member already finished) or when the state
+    /// can't be read; the session then ends with it as before.
+    pub(super) fn partial_cut_off(&mut self, failure: ProgressiveFailure) -> Result<(), ProgressiveFailure> {
+        if !reports_cut_off(&self.options.extract)
+            || !matches!(failure.kind, FailureKind::MissingVolume | FailureKind::Truncated)
+            || !self.partial_active()
+            || self.member.is_none()
+        {
+            return Err(failure);
+        }
+        let persistent = self.partial.as_mut().unwrap();
+        if persistent.resume.as_ref().is_some_and(|resume| resume.finished) {
+            return Err(failure);
+        }
+        let (key, core) = persistent.active();
+        let file = PartialFile::from_core(core.clone());
+        let (Ok(state), Ok(missing)) = (core.state(), file.remaining()) else { return Err(failure) };
+        let outcome = MemberOutcome::PersistentUnverified {
+            member: key.clone(),
+            state,
+            expected: member_checks(self.model.members.last().unwrap()),
+            missing,
+        };
+        let event = ProgressiveEvent::MemberFinished { member: self.member.take().unwrap(), outcome };
+        persistent.ending = Some((Some(event), failure));
+        Ok(())
+    }
+    /// What a session [`Self::partial_cut_off`] ended still delivers: the queued `Hole` and `BytesWritten` events, the
+    /// member's `MemberFinished`, then the failure. `None` once all of it was delivered (or there was none).
+    pub(super) fn partial_ending(&mut self) -> Option<ProgressiveResult<Option<ProgressiveEvent>>> {
+        let persistent = self.partial.as_mut()?;
+        persistent.ending.as_ref()?;
+        if let Some(report) = persistent.holes.pop_front() {
+            return Some(Ok(Some(ProgressiveEvent::Hole(report))));
+        }
+        if let Some(event) = persistent.written.take() {
+            return Some(Ok(Some(event)));
+        }
+        if let Some(event) = persistent.ending.as_mut().and_then(|(event, _)| event.take()) {
+            return Some(Ok(Some(event)));
+        }
+        let (_, failure) = persistent.ending.take().unwrap();
+        Some(Err(failure))
+    }
     pub(super) fn partial_finish(
         &mut self,
         cx: &mut Context<'_>,
@@ -1336,6 +1398,11 @@ fn ancestor_identities(
         }
     }
     Ok(())
+}
+/// [`crate::extract::Options::keep_broken`] with [`crate::extract::UnverifiedOutput::Emit`]: a member a missing volume
+/// or a truncated set cuts off is reported `PersistentUnverified` before the session's failure.
+fn reports_cut_off(options: &crate::extract::Options) -> bool {
+    options.keep_broken && options.unverified_output == crate::extract::UnverifiedOutput::Emit
 }
 fn member_checks(member: &PhysicalMember) -> MemberChecks {
     let checks = member.final_checks;

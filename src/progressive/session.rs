@@ -155,6 +155,20 @@ pub enum MemberOutcome {
         state: crate::partial::PartialState,
         verdict: crate::partial::Verdict,
     },
+    /// Under [`crate::extract::Options::keep_broken`] with [`crate::extract::UnverifiedOutput::Emit`] only: a
+    /// persistent session's member cut off by the failure that ends the session (a missing volume, a set truncated
+    /// inside the member). Its output keeps every byte extracted so far, unverified: no check judged it, and no
+    /// archive metadata was applied. `missing` lists the output ranges still unknown (holes and the part never
+    /// reached), as [`crate::partial::PartialFile::remaining`] does; `state` is the committed state. The session's
+    /// failure follows as the next `poll_event` error. Nothing else is committed: a later session over the same
+    /// roots and anchor store adopts the member and resumes it from its committed `produced`.
+    #[cfg(feature = "persistent-partials")]
+    PersistentUnverified {
+        member: crate::partial::MemberKey,
+        state: crate::partial::PartialState,
+        expected: crate::partial::MemberChecks,
+        missing: Vec<std::ops::Range<u64>>,
+    },
     Tested(TestEvidence),
     Skipped(crate::extract::RarSkipReason),
     /// A persistent session refused the member before creating any output or state for it, skipped its data
@@ -457,6 +471,11 @@ impl ProgressiveSession {
         if let Some((volume, damage)) = self.damage.pop_front() {
             return Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage })));
         }
+        // a persistent member a cut-off ended is reported before the failure (Options::keep_broken, Emit)
+        #[cfg(feature = "persistent-partials")]
+        if let Some(result) = self.partial_ending() {
+            return Poll::Ready(result);
+        }
         if matches!(self.phase, Phase::Done) {
             self.extraction_active = false;
             return Poll::Ready(Ok(None));
@@ -502,6 +521,12 @@ impl ProgressiveSession {
         self.target.take();
         self.history.take();
         self.rar4_history.take();
+        // Options::keep_broken with Emit: a persistent member cut off is reported first, then the failure.
+        #[cfg(feature = "persistent-partials")]
+        let failure = match self.partial_cut_off(failure) {
+            Ok(()) => return self.partial_ending().unwrap_or(Ok(None)),
+            Err(failure) => failure,
+        };
         if let Some(stage) = self.stage.take() {
             let output = self.output.as_mut().expect("output");
             let mut termination = output.terminate(stage, failure);
@@ -1517,6 +1542,11 @@ impl ProgressiveSession {
         }
         if let Some(machine) = &mut machine {
             machine.begin_part(&part);
+            // Options::keep_broken: a persistent member failing its checksum is kept, judged Bad by verification.
+            #[cfg(feature = "persistent-partials")]
+            if self.partial.is_some() && self.options.extract.keep_broken {
+                machine.keep_broken();
+            }
         }
         self.remaining = part.packed_size;
         self.model.members.clear();
