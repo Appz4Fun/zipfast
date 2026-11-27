@@ -357,6 +357,47 @@ impl MemberMachine {
     pub(crate) fn part_missing(&self) -> bool {
         self.part_missing
     }
+    /// Whether the current part, read whole and with no byte missing, fails its own packed check (CRC32 or
+    /// BLAKE2sp). A persistent session turns such a part of a plain stored member into a `DeclaredBad` hole and
+    /// goes on, instead of failing as `finish_part` would: see `ProgressiveSession`'s part checks.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn part_checks_fail(&self, part: &super::physical::PhysicalPart) -> bool {
+        if part.final_part || self.part_missing || self.resumed || self.failed || self.part_bytes != part.packed_size {
+            return false;
+        }
+        let key = self.cipher.as_ref().filter(|_| part.checks.keyed).and_then(PendingCipher::checksum_key);
+        let result = verify_packed(&self.context, part.checks, self.part_crc.clone(), self.part_blake.clone(), key);
+        matches!(
+            result,
+            Err(RarFailure::Integrity { reason: RarIntegrityReason::PackedPiece { .. }, .. }
+                | RarFailure::EncryptedIntegrity { reason: RarIntegrityReason::PackedPiece { .. }, .. })
+        )
+    }
+    /// Whether the member, decoded whole with no byte missing and its full size written, fails its final checks
+    /// (CRC32 or BLAKE2sp), as `finish_member` would judge them. Judges nothing and changes nothing.
+    #[cfg(feature = "persistent-partials")]
+    pub(crate) fn member_checks_fail(&self, member: &super::physical::PhysicalMember) -> bool {
+        if self.failed || self.resumed || self.missing || !self.decoded_finished || !member.complete {
+            return false;
+        }
+        let (Some(checks), Some(inner)) = (member.final_checks, self.inner.as_ref()) else { return false };
+        if member.unpacked_size.is_none_or(|n| n != inner.bytes) {
+            return false;
+        }
+        let key = self.cipher.as_ref().filter(|_| checks.keyed).and_then(PendingCipher::checksum_key);
+        let mut probe = InnerChecks {
+            hasher: inner.hasher.clone(),
+            decoder_crc: inner.decoder_crc,
+            crc: inner.crc,
+            blake: inner.blake.clone(),
+            bytes: inner.bytes,
+        };
+        matches!(
+            probe.verify(&self.context, member.unpacked_size, checks.crc32, checks.blake2sp, key),
+            Err(RarFailure::Integrity { reason: RarIntegrityReason::FinalChecks { .. }, .. }
+                | RarFailure::EncryptedIntegrity { reason: RarIntegrityReason::FinalChecks { .. }, .. })
+        )
+    }
     pub(crate) fn reserve_progressive_scratch(
         &mut self,
         count: usize,
@@ -879,6 +920,51 @@ impl crate::crypto::KdfControl for KdfMeter<'_> {
         Ok(())
     }
 }
+/// RAR 5.0 keys for `params`, derived under `usage` and `control` once per salt and count for the session `usage`
+/// accounts for (`rar` gives every header of an archive the same salt). A member's own check value is still
+/// compared; one whose input was derived before costs no derivation work.
+pub(crate) fn session_rar5_keys(
+    password: &str,
+    params: &crate::crypto::Rar5CryptParams,
+    usage: &crate::progressive::Usage,
+    control: &crate::progressive::SessionControl,
+) -> std::result::Result<crate::crypto::Rar5Keys, crate::crypto::ControlledKdfError> {
+    let bytes = password.as_bytes();
+    let derived = match usage.rar5_cached(bytes, params.kdf_count, &params.salt, params.check) {
+        Some(derived) => derived,
+        None => {
+            let derived = crate::crypto::rar5_material_controlled(
+                password,
+                params.kdf_count,
+                &params.salt,
+                params.check,
+                &mut KdfMeter { usage, control, blocks: 0 },
+            )?;
+            usage.rar5_remember(bytes, params.kdf_count, &params.salt, derived.clone());
+            derived
+        }
+    };
+    derived.keys(params.check).map_err(crate::crypto::ControlledKdfError::Crypt)
+}
+/// The 7zAES key for `password`, `salt` and `cycles`, derived under `usage` and `control` once per input for the
+/// session `usage` accounts for ([`crate::crypto::derive_7z_key_controlled`]: None for an unsupported input).
+pub(crate) fn session_7z_key(
+    password: &str,
+    salt: &[u8],
+    cycles: u8,
+    usage: &crate::progressive::Usage,
+    control: &crate::progressive::SessionControl,
+) -> Option<std::result::Result<[u8; 32], crate::crypto::KdfControlError>> {
+    if let Some(key) = usage.seven_zip_cached(password.as_bytes(), cycles, salt) {
+        return Some(Ok(key));
+    }
+    let key =
+        crate::crypto::derive_7z_key_controlled(password, salt, cycles, &mut KdfMeter { usage, control, blocks: 0 });
+    if let Some(Ok(key)) = key {
+        usage.seven_zip_remember(password.as_bytes(), cycles, salt, key);
+    }
+    key
+}
 pub(crate) fn controlled_keys(
     password: &str,
     params: crate::crypto::Rar5CryptParams,
@@ -893,14 +979,7 @@ pub(crate) fn controlled_keys(
     usage.check(Resource::PasswordUtf8Bytes, password.len() as u64)?;
     usage.check(Resource::PasswordEncodedBytes, password.len() as u64)?;
     usage.check(Resource::KdfExponent, u64::from(params.kdf_count))?;
-    crate::crypto::derive_rar5_keys_controlled(
-        password,
-        params.kdf_count,
-        &params.salt,
-        params.check,
-        &mut KdfMeter { usage, control, blocks: 0 },
-    )
-    .map_err(|error| match error {
+    session_rar5_keys(password, &params, usage, control).map_err(|error| match error {
         crate::crypto::ControlledKdfError::Crypt(error) => super::framing::progressive_fault(
             crate::error::RarFault::new(RarFailure::crypt(error, scope), Error::Encrypted),
         ),
@@ -926,16 +1005,22 @@ pub(crate) fn controlled_legacy_keys(
     }
     usage.check(Resource::PasswordUtf8Bytes, password.len() as u64)?;
     usage.check(Resource::PasswordEncodedBytes, password.encode_utf16().count() as u64 * 2)?;
-    crate::crypto::derive_rar4_key_iv_controlled(password, salt, &mut KdfMeter { usage, control, blocks: 0 }).map_err(
-        |error| {
-            ProgressiveFailure::new(match error {
-                crate::crypto::KdfControlError::Canceled => FailureKind::Canceled,
-                crate::crypto::KdfControlError::Limit { resource, limit, attempted } => {
-                    FailureKind::Limit { resource, limit, attempted }
-                }
-            })
-        },
-    )
+    // `rar -hp` repeats one salt in every header: the session derives it once.
+    if let Some(keys) = usage.rar4_cached(password.as_bytes(), salt) {
+        return Ok(keys);
+    }
+    let keys =
+        crate::crypto::derive_rar4_key_iv_controlled(password, salt, &mut KdfMeter { usage, control, blocks: 0 })
+            .map_err(|error| {
+                ProgressiveFailure::new(match error {
+                    crate::crypto::KdfControlError::Canceled => FailureKind::Canceled,
+                    crate::crypto::KdfControlError::Limit { resource, limit, attempted } => {
+                        FailureKind::Limit { resource, limit, attempted }
+                    }
+                })
+            })?;
+    usage.rar4_remember(password.as_bytes(), salt, keys);
+    Ok(keys)
 }
 impl PendingCipher {
     pub(crate) fn checksum_key(&self) -> Option<&[u8; 32]> {
@@ -1422,7 +1507,10 @@ mod tests {
                     replace_placed_links: false,
                     keep_broken: false,
                     attempt_continued_members: false,
+                    encrypted_links: Default::default(),
+                    damaged_input: Default::default(),
                     unsupported_filters: Default::default(),
+                    unverified_output: Default::default(),
                     salvage_truncated_zip: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),
@@ -1532,6 +1620,11 @@ mod tests {
         let usage = Usage::new(ProgressiveLimits { kdf_session_blocks: 50, ..ProgressiveLimits::default() });
         let control = SessionControl::default();
         controlled_keys("secret", params, &usage, &control, context().scope()).unwrap();
+        // the same input again is the session's derived keys: no more work
+        let used = usage.used(Resource::KdfSessionBlocks);
+        controlled_keys("secret", params, &usage, &control, context().scope()).unwrap();
+        assert_eq!(usage.used(Resource::KdfSessionBlocks), used);
+        let params = crate::crypto::Rar5CryptParams { salt: [8; 16], ..params };
         assert!(matches!(
             controlled_keys("secret", params, &usage, &control, context().scope()),
             Err(crate::progressive::ProgressiveFailure {
@@ -1767,7 +1860,10 @@ mod tests {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                encrypted_links: Default::default(),
+                damaged_input: Default::default(),
                 unsupported_filters: Default::default(),
+                unverified_output: Default::default(),
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),

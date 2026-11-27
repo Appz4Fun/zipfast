@@ -30,6 +30,7 @@ use crate::error::{
     Error, IoOperation, RarFailure, RarFault, RarIntegrityReason, RarInternal, RarPasswordEvidence, RarResult,
     RarScope, RarUnsupported, Result,
 };
+use crate::extract::{DamagedInput, HeaderDamage, HeaderDamageKind};
 
 pub enum Block {
     Main(MainHeader),
@@ -51,6 +52,96 @@ pub(crate) enum ReadDataError<E> {
 }
 
 type ParsedBlock = (Block, MemberCrypt, Option<FileWire>);
+
+/// The longest member name a [`HeaderDamage`] keeps.
+const MAX_DAMAGE_NAME: usize = 1024;
+
+/// [`Volume::resync`] reads the volume this many bytes at a time.
+pub(crate) const RESYNC_CHUNK: usize = 1 << 20;
+/// The first chunk a resync reads: most land on a header within it, and a run of resyncs close together reads little.
+pub(crate) const RESYNC_FIRST_CHUNK: usize = 64;
+/// Bytes past each chunk a resync reads, so that every position in the chunk shows its header's fixed fields.
+pub(crate) const RESYNC_LOOKAHEAD: usize = 32;
+/// The longest RAR 5.0 file or service header a resync checks: real ones, names and extra records included, are far
+/// shorter. An end header is at most [`RESYNC_END_MAX`].
+const RESYNC_HEADER_MAX: usize = 8 << 10;
+const RESYNC_END_MAX: usize = 32;
+/// The longest RAR 4.x file or service header a resync checks: 32 fixed bytes, a name of at most 2 KiB, and room for
+/// the high sizes, salt and extended times.
+const RESYNC_RAR4_HEADER_MAX: usize = 32 + 2048 + 64;
+/// Work (bytes read and checksummed) all the resyncs in a volume may do per byte of the volume (plus 1 MiB), keeping
+/// them linear.
+pub(crate) const RESYNC_WORK_PER_BYTE: u64 = 16;
+
+/// The length of the header [`Volume::resync`] would check at the start of `b` (up to [`RESYNC_LOOKAHEAD`] bytes of
+/// it), from its fixed fields alone: a file, service or end header of a plausible size and with plausible fields. None
+/// when it is none. Random bytes pass about once in a few thousand positions, with a short header, so that checking
+/// what passes costs about a byte per byte scanned.
+pub(crate) fn resync_shape(b: &[u8], format: RarFormat) -> Option<usize> {
+    if b.len() < 7 {
+        return None;
+    }
+    match format {
+        RarFormat::Rar5 => {
+            let mut size = 0usize;
+            let mut size_len = 0;
+            loop {
+                let byte = b[4 + size_len];
+                size |= usize::from(byte & 0x7f) << (7 * size_len);
+                size_len += 1;
+                if byte & 0x80 == 0 {
+                    // RAR writes the shortest form: a last byte of 0 after a continued one is not a size it wrote
+                    if byte == 0 && size_len > 1 {
+                        return None;
+                    }
+                    break;
+                }
+                if size_len == 3 {
+                    return None;
+                }
+            }
+            let kind = *b.get(4 + size_len)?;
+            // header flags: one byte, with only the defined bits (extra, data, skip, split before and after, child,
+            // inherited)
+            let flags = *b.get(5 + size_len)?;
+            let most = match kind {
+                2 | 3 => RESYNC_HEADER_MAX,
+                5 => RESYNC_END_MAX,
+                _ => return None,
+            };
+            ((3..=most).contains(&size) && flags < 0x80).then_some(4 + size_len + size)
+        }
+        RarFormat::Rar4 => {
+            let size = usize::from(u16::from_le_bytes([b[5], b[6]]));
+            match b[2] {
+                0x74 | 0x7a => {
+                    // LONG_BLOCK; host OS 0..=5; unpack version 15..=36 (RAR 1.5 to 3.6 formats); method 0x30..=0x35;
+                    // a name that fits in the header
+                    let fields = b.get(..28)?;
+                    let name = usize::from(u16::from_le_bytes([fields[26], fields[27]]));
+                    let plausible = fields[4] & 0x80 != 0
+                        && fields[15] <= 5
+                        && (15..=36).contains(&fields[24])
+                        && (0x30..=0x35).contains(&fields[25])
+                        && name > 0
+                        && 32 + name <= size
+                        && size <= RESYNC_RAR4_HEADER_MAX;
+                    plausible.then_some(size)
+                }
+                0x7b => (7..=20).contains(&size).then_some(size),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Whether the whole header `h` (as long as [`resync_shape`] said) passes its checksum.
+pub(crate) fn resync_checks(h: &[u8], format: RarFormat) -> bool {
+    match format {
+        RarFormat::Rar5 => crate::crc32::hash(&h[4..]) == u32::from_le_bytes([h[0], h[1], h[2], h[3]]),
+        RarFormat::Rar4 => crate::crc32::hash(&h[2..]) as u16 == u16::from_le_bytes([h[0], h[1]]),
+    }
+}
 
 fn header_buffer(size: usize) -> RarResult<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -90,6 +181,30 @@ impl SourceError {
             Self::Spawn(e) => RarFault::new(RarFailure::Internal(RarInternal::WorkerStopped), e.into()),
             Self::Stopped => RarFault::new(RarFailure::Internal(RarInternal::WorkerStopped), Error::Truncated),
         }
+    }
+}
+
+/// Reads `buf.len()` bytes of a volume at `at`. Every read of a volume's bytes goes through this (here and in
+/// [`crate::batch::stored_detailed`]), so a test can check that each byte is read once.
+pub(crate) fn read_volume(file: &File, buf: &mut [u8], at: u64) -> std::result::Result<(), PositionReadError> {
+    #[cfg(all(test, unix))]
+    count_read(file, at, buf.len());
+    read_at_detailed(file, buf, at)
+}
+
+/// A volume read in tests: the file's (device, inode), where, and how many bytes.
+#[cfg(all(test, unix))]
+pub(crate) type VolumeRead = ((u64, u64), u64, u64);
+
+/// Every volume read in tests.
+#[cfg(all(test, unix))]
+pub(crate) static VOLUME_READS: std::sync::Mutex<Vec<VolumeRead>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, unix))]
+fn count_read(file: &File, at: u64, len: usize) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = file.metadata() {
+        VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).push(((meta.dev(), meta.ino()), at, len as u64));
     }
 }
 
@@ -207,7 +322,7 @@ fn read_ahead(
         let n = (len - at).min(READ as u64) as usize;
         let mut buf = spares.lock().ok().and_then(|s| s.try_recv().ok()).unwrap_or_default();
         buf.resize(n, 0);
-        let read = read_at_detailed(file, &mut buf, at).map(|()| buf);
+        let read = read_volume(file, &mut buf, at).map(|()| buf);
         let failed = read.is_err();
         if send.send(read).is_err() || failed {
             return;
@@ -217,17 +332,11 @@ fn read_ahead(
 }
 
 impl Source {
-    fn new(file: File, len: u64) -> Source {
-        Source {
-            file,
-            len,
-            piece: Piece::new(Vec::new(), None),
-            at: 0,
-            off: 0,
-            sequential: false,
-            ahead: None,
-            readers: 1,
-        }
+    /// A source whose first piece is `head`, the volume's first bytes as they were read to find its signature, so
+    /// they aren't read again. At most `len` of them are kept.
+    fn new(file: File, len: u64, mut head: Vec<u8>) -> Source {
+        head.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+        Source { file, len, piece: Piece::new(head, None), at: 0, off: 0, sequential: false, ahead: None, readers: 1 }
     }
 
     /// What is left of the piece in use.
@@ -303,7 +412,7 @@ impl Source {
                     // the first piece after a move is read here; read on past it, and the thread takes over
                     let mut buf = used;
                     buf.resize((self.len - from).min(READ as u64) as usize, 0);
-                    read_at_detailed(&self.file, &mut buf, from).map_err(SourceError::Read)?;
+                    read_volume(&self.file, &mut buf, from).map_err(SourceError::Read)?;
                     self.sequential = true;
                     Piece::new(buf, None)
                 }
@@ -324,6 +433,8 @@ pub struct Volume {
     pub main: MainHeader,
     password: Option<String>,
     header_key: Option<crate::crypto::Rar5Keys>,
+    /// RAR 5.0 keys by salt, shared with the other volumes of the set when they were opened sharing it
+    rar5_keys: crate::crypto::SharedRar5Keys,
     /// RAR 3.x encrypted headers (`-hp`): each header carries its own salt, the keys derived once per salt.
     legacy_keys: Option<crate::crypto::Rar4KeyCache>,
     parser: Option<super::framing::HeaderParser>,
@@ -332,6 +443,18 @@ pub struct Volume {
     sfx: u64,
     /// The end of archive header's fields, once it is read.
     end_record: Option<super::RarEndRecord>,
+    /// What a damaged header does ([`crate::extract::Options::damaged_input`]).
+    damaged_input: DamagedInput,
+    /// Headers read past since [`Self::take_damage`] last ran.
+    damage: Vec<HeaderDamage>,
+    /// Whether this volume's damage is already accounted for to its end (no "unexpected end" on top).
+    damage_closed: bool,
+    /// A block found where the main header should be, under salvage: handed out first.
+    held_block: Option<ParsedBlock>,
+    /// Checksum work the resyncs in this volume have left, once one has run.
+    resync_work: Option<u64>,
+    /// The run's cancellation, for a resync's search.
+    cancel: Option<crate::extract::Cancellation>,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
@@ -350,123 +473,230 @@ fn signature_location(head: &[u8]) -> Result<(u64, RarFormat)> {
     super::framing::SignatureParser::default().advance(head).1.ok_or(Error::NotAnArchive)
 }
 
+fn signature_fault(e: Error) -> RarFault {
+    let failure = match e {
+        Error::NotAnArchive => RarFailure::NotRar,
+        _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
+    };
+    RarFault::new(failure, e)
+}
+
 #[cfg(all(test, unix))]
 thread_local! {
     pub(crate) static VOLUME_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Recognition and its initial held data handle cannot become separated.
+/// Recognition and its initial held data handle cannot become separated. The bytes read to recognize it (from the
+/// start of the file) are kept, so the volume doesn't read them again.
 pub(crate) struct HeldSignature {
     file: File,
     len: u64,
     next: u64,
     format: RarFormat,
+    head: Vec<u8>,
 }
 impl HeldSignature {
-    pub(crate) fn recognize(file: File, len: u64, head: &[u8]) -> std::result::Result<Self, File> {
-        match signature_location(head) {
-            Ok((next, format)) => Ok(Self { file, len, next, format }),
+    pub(crate) fn recognize(file: File, len: u64, head: Vec<u8>) -> std::result::Result<Self, File> {
+        match signature_location(&head) {
+            Ok((next, format)) => Ok(Self { file, len, next, format, head }),
             Err(_) => Err(file),
         }
     }
 }
 impl Volume {
-    pub(crate) fn from_held_signature(path: &Path, signature: HeldSignature, password: Option<&str>) -> Result<Self> {
-        let HeldSignature { file, len, next, format } = signature;
-        Self::initialize_held(path, file, len, password, next, format, false, None).map_err(RarFault::into_legacy)
+    pub(crate) fn from_held_signature(
+        path: &Path,
+        signature: HeldSignature,
+        password: Option<&str>,
+        damaged: DamagedInput,
+    ) -> Result<Self> {
+        let HeldSignature { file, len, next, format, head } = signature;
+        Self::initialize_held(path, file, len, password, (head, next, format), false, None, damaged, Default::default())
+            .map_err(RarFault::into_legacy)
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn from_held_signature_detailed(
         path: &Path,
         signature: HeldSignature,
         password: Option<&str>,
+        damaged: DamagedInput,
     ) -> RarResult<Self> {
-        let HeldSignature { file, len, next, format } = signature;
-        Self::initialize_held(path, file, len, password, next, format, true, None)
+        let HeldSignature { file, len, next, format, head } = signature;
+        Self::initialize_held(path, file, len, password, (head, next, format), true, None, damaged, Default::default())
+    }
+    /// Opens the volume in `file` (at `path`), whose first bytes `head` were read already (to tell its format): they
+    /// are kept rather than read again, and only what the signature search needs past them is read.
+    pub(crate) fn open_head(
+        path: &Path,
+        file: File,
+        head: Vec<u8>,
+        password: Option<&str>,
+        damaged: DamagedInput,
+    ) -> Result<Volume> {
+        Self::open_head_impl(path, file, head, password, false, damaged).map_err(RarFault::into_legacy)
+    }
+    pub(crate) fn open_head_detailed(
+        path: &Path,
+        file: File,
+        head: Vec<u8>,
+        password: Option<&str>,
+        damaged: DamagedInput,
+    ) -> RarResult<Volume> {
+        Self::open_head_impl(path, file, head, password, true, damaged)
+    }
+    fn open_head_impl(
+        path: &Path,
+        file: File,
+        head: Vec<u8>,
+        password: Option<&str>,
+        detailed: bool,
+        damaged: DamagedInput,
+    ) -> RarResult<Volume> {
+        #[cfg(all(test, unix))]
+        VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
+        let len = volume_length(path, || file.metadata())?;
+        let found = Self::probe_head(path, &file, len, head)?;
+        Self::initialize_held(path, file, len, password, found, detailed, None, damaged, Default::default())
     }
     pub fn open(path: &Path) -> Result<Volume> {
         Self::open_with_password(path, None)
     }
 
     pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Volume> {
-        Self::open_impl(path, password, false).map_err(RarFault::into_legacy)
+        Self::open_damaged(path, password, DamagedInput::Refuse)
     }
 
-    pub(crate) fn open_detailed(path: &Path, password: Option<&str>) -> RarResult<Volume> {
-        Self::open_impl(path, password, true)
+    /// [`Self::open_with_password`], reading damaged headers as `damaged` says
+    /// ([`crate::extract::Options::damaged_input`]); [`Self::take_damage`] hands out what was read past.
+    pub fn open_damaged(path: &Path, password: Option<&str>, damaged: DamagedInput) -> Result<Volume> {
+        Self::open_impl(path, password, false, damaged, Default::default()).map_err(RarFault::into_legacy)
     }
 
-    fn open_impl(path: &Path, password: Option<&str>, detailed: bool) -> RarResult<Volume> {
+    pub(crate) fn open_detailed_damaged(
+        path: &Path,
+        password: Option<&str>,
+        damaged: DamagedInput,
+    ) -> RarResult<Volume> {
+        Self::open_impl(path, password, true, damaged, Default::default())
+    }
+
+    /// [`Self::open_detailed_damaged`] for a later volume of a set: its encrypted headers' key comes from `keys`
+    /// when an earlier volume derived it for the same salt.
+    pub(crate) fn open_detailed_sharing(
+        path: &Path,
+        password: Option<&str>,
+        damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
+    ) -> RarResult<Volume> {
+        Self::open_impl(path, password, true, damaged, keys)
+    }
+
+    /// [`Self::open_damaged`] sharing `keys` ([`Self::open_detailed_sharing`]).
+    pub(crate) fn open_damaged_sharing(
+        path: &Path,
+        password: Option<&str>,
+        damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
+    ) -> Result<Volume> {
+        Self::open_impl(path, password, false, damaged, keys).map_err(RarFault::into_legacy)
+    }
+
+    /// The RAR 5.0 key cache this volume uses, for the volumes after it and the run reading them.
+    pub(crate) fn rar5_keys(&self) -> &crate::crypto::SharedRar5Keys {
+        &self.rar5_keys
+    }
+
+    fn open_impl(
+        path: &Path,
+        password: Option<&str>,
+        detailed: bool,
+        damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
+    ) -> RarResult<Volume> {
         let file =
             File::open(path).map_err(|e| RarFault::input(IoOperation::Open, Some(path.to_path_buf()), None, e))?;
         #[cfg(all(test, unix))]
         VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
         let len = volume_length(path, || file.metadata())?;
-        Self::open_file(path, file, len, password, detailed, None)
+        let found = Self::probe_head(path, &file, len, Vec::new())?;
+        Self::initialize_held(path, file, len, password, found, detailed, None, damaged, keys)
     }
 
+    /// Opens a volume for the catalogue, whose reads are counted by `budget`: it reads the signature's bytes, and
+    /// searches the rest of the window only when they aren't one.
     pub(super) fn open_catalogue(
         path: &Path,
         file: File,
         len: u64,
         password: Option<&str>,
         budget: &mut ScanBudget<'_>,
+        damaged: DamagedInput,
+        keys: crate::crypto::SharedRar5Keys,
     ) -> RarResult<Self> {
-        Self::open_file(path, file, len, password, true, Some(budget))
-    }
-
-    fn open_file(
-        path: &Path,
-        file: File,
-        len: u64,
-        password: Option<&str>,
-        detailed: bool,
-        mut budget: Option<&mut ScanBudget<'_>>,
-    ) -> RarResult<Volume> {
-        let first = if let Some(budget) = budget.as_deref_mut() {
-            let mut first = [0; SIGNATURE.len()];
-            let used = len.min(SIGNATURE.len() as u64) as usize;
-            budget.read(&file, path, &mut first[..used], 0)?;
-            Some((first, used))
-        } else {
-            None
-        };
-        let (next, format) = if let Some((first, _)) = first
-            && first == *SIGNATURE
-        {
+        let mut first = [0; SIGNATURE.len()];
+        let used = len.min(SIGNATURE.len() as u64) as usize;
+        budget.read(&file, path, &mut first[..used], 0)?;
+        let (next, format) = if first == *SIGNATURE {
             (SIGNATURE.len() as u64, RarFormat::Rar5)
-        } else if let Some((first, _)) = first
-            && first.starts_with(SIGNATURE_V4)
-        {
+        } else if first.starts_with(SIGNATURE_V4) {
             (SIGNATURE_V4.len() as u64, RarFormat::Rar4)
         } else {
-            Self::probe_signature(path, &file, len, first, budget.as_deref_mut())?
+            Self::probe_signature(path, &file, len, (first, used), budget)?
         };
-        Self::initialize_held(path, file, len, password, next, format, detailed, budget)
+        Self::initialize_held(path, file, len, password, (Vec::new(), next, format), true, Some(budget), damaged, keys)
     }
-    #[allow(clippy::too_many_arguments)] // Shared post-recognition legacy initialization.
+
+    /// The signature's end and the format, searched for in the volume's first bytes: `head` (read already, from the
+    /// start of the file), and as much more of the window as the search needs. The bytes read are returned with it,
+    /// for the volume's first piece, so nothing is read twice.
+    fn probe_head(path: &Path, file: &File, len: u64, mut head: Vec<u8>) -> RarResult<(Vec<u8>, u64, RarFormat)> {
+        head.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+        if let Ok((next, format)) = signature_location(&head) {
+            return Ok((head, next, format));
+        }
+        let want = len.min(SIGNATURE_PROBE_BYTES) as usize;
+        let have = head.len();
+        if have < want {
+            head.try_reserve_exact(want - have).map_err(|_| allocation())?;
+            head.resize(want, 0);
+            read_volume(file, &mut head[have..], have as u64)
+                .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
+        }
+        let (next, format) = signature_location(&head).map_err(signature_fault)?;
+        Ok((head, next, format))
+    }
+
+    #[allow(clippy::too_many_arguments)] // Shared post-recognition initialization.
     fn initialize_held(
         path: &Path,
         file: File,
         len: u64,
         password: Option<&str>,
-        next: u64,
-        format: RarFormat,
+        (head, next, format): (Vec<u8>, u64, RarFormat),
         detailed: bool,
         budget: Option<&mut ScanBudget<'_>>,
+        damaged: DamagedInput,
+        rar5_keys: crate::crypto::SharedRar5Keys,
     ) -> RarResult<Volume> {
         let mut vol = Volume {
             path: path.to_path_buf(),
-            src: Source::new(file, len),
+            src: Source::new(file, len, head),
             next,
             len,
             main: MainHeader::default(),
             password: password.filter(|s| !s.is_empty()).map(str::to_owned),
             header_key: None,
+            rar5_keys,
             legacy_keys: None,
             parser: None,
             format,
             end_record: None,
+            damaged_input: damaged,
+            damage: Vec::new(),
+            damage_closed: false,
+            held_block: None,
+            resync_work: None,
+            cancel: None,
             sfx: next.saturating_sub(match format {
                 RarFormat::Rar5 => SIGNATURE.len(),
                 RarFormat::Rar4 => SIGNATURE_V4.len(),
@@ -475,6 +705,14 @@ impl Volume {
         match vol.next_block_impl(detailed, budget, true)? {
             Some((Block::Main(m), _, _)) => vol.main = m,
             Some((Block::Crypt, _, _)) => return Err(vol.password_required()),
+            // Salvage: no readable main header. A RAR 4.x set reads on with an empty one (UnRAR lists such an
+            // archive as "RAR 1.5" with nothing in it); a block a resync found is handed out first.
+            other if damaged.salvages() && !vol.damage.is_empty() => {
+                if vol.format == RarFormat::Rar4 {
+                    vol.main.rar4_flags = Some(0);
+                }
+                vol.held_block = other;
+            }
             _ => {
                 return Err(vol.header_fault(
                     RarIntegrityReason::HeaderFraming("main archive header missing"),
@@ -486,33 +724,20 @@ impl Volume {
         Ok(vol)
     }
 
+    /// The catalogue's search of the rest of the signature window, past the `first` bytes it read.
     fn probe_signature(
         path: &Path,
         file: &File,
         len: u64,
-        first: Option<([u8; SIGNATURE.len()], usize)>,
-        budget: Option<&mut ScanBudget<'_>>,
+        (first, used): ([u8; SIGNATURE.len()], usize),
+        budget: &mut ScanBudget<'_>,
     ) -> RarResult<(u64, RarFormat)> {
         let len = len.min(SIGNATURE_PROBE_BYTES) as usize;
-        if let (Some(budget), Some((_, used))) = (&budget, first) {
-            budget.check_read(len - used)?;
-        }
+        budget.check_read(len - used)?;
         let mut head = header_buffer(len)?;
-        if let Some(budget) = budget {
-            let (first, used) = first.expect("catalogue probe reads the signature prefix");
-            head[..used].copy_from_slice(&first[..used]);
-            budget.read(file, path, &mut head[used..], used as u64)?;
-        } else {
-            read_at_detailed(file, &mut head, 0)
-                .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
-        }
-        signature_location(&head).map_err(|e| {
-            let failure = match e {
-                Error::NotAnArchive => RarFailure::NotRar,
-                _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
-            };
-            RarFault::new(failure, e)
-        })
+        head[..used].copy_from_slice(&first[..used]);
+        budget.read(file, path, &mut head[used..], used as u64)?;
+        signature_location(&head).map_err(signature_fault)
     }
 
     /// The next block, or None at the physical end of the volume.
@@ -575,7 +800,197 @@ impl Volume {
         self.header_fault(RarIntegrityReason::HeaderFraming(reason), legacy, true)
     }
 
+    /// Headers read past since this was last called ([`crate::extract::Options::damaged_input`]).
+    pub fn take_damage(&mut self) -> Vec<HeaderDamage> {
+        std::mem::take(&mut self.damage)
+    }
+
+    fn record_damage(&mut self, offset: u64, kind: HeaderDamageKind, name: Option<&str>, resumed_at: Option<u64>) {
+        self.record_damage_of(offset, kind, name, resumed_at, kind != HeaderDamageKind::ChecksumMismatch);
+    }
+
+    fn record_damage_of(
+        &mut self,
+        offset: u64,
+        kind: HeaderDamageKind,
+        name: Option<&str>,
+        resumed_at: Option<u64>,
+        passed_over: bool,
+    ) {
+        if self.damage.len() >= crate::extract::MAX_HEADER_DAMAGE {
+            return;
+        }
+        // a damaged header's name is kept for the message only: a copy of at most 1 KiB of it
+        let name = name.map(|name| {
+            let mut end = name.len().min(MAX_DAMAGE_NAME);
+            while !name.is_char_boundary(end) {
+                end -= 1;
+            }
+            name[..end].to_owned()
+        });
+        {
+            self.damage.push(HeaderDamage { volume: self.path.clone(), offset, kind, name, resumed_at, passed_over });
+        }
+    }
+
+    /// Whether a failure reading a header is damage [`DamagedInput::Salvage`] reads past: a header that fails its
+    /// checksum, doesn't frame or parse, or runs (or whose data runs) past the end of the volume. Never with
+    /// encrypted headers, where a failed checksum is how a wrong password shows.
+    fn salvageable(&self, fault: &RarFault) -> Option<HeaderDamageKind> {
+        if !self.damaged_input.salvages() || self.encrypted_headers() {
+            return None;
+        }
+        match fault.failure.as_ref() {
+            RarFailure::Integrity { scope: RarScope::Header { .. }, reason, .. } => match reason {
+                RarIntegrityReason::TruncatedHeader | RarIntegrityReason::TruncatedData => {
+                    Some(HeaderDamageKind::UnexpectedEnd)
+                }
+                RarIntegrityReason::HeaderCrc | RarIntegrityReason::HeaderFraming(_) => {
+                    Some(HeaderDamageKind::Unreadable)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn next_block_impl(
+        &mut self,
+        detailed: bool,
+        mut budget: Option<&mut ScanBudget<'_>>,
+        catalogue_main: bool,
+    ) -> RarResult<Option<ParsedBlock>> {
+        if let Some(block) = self.held_block.take() {
+            return Ok(Some(block));
+        }
+        loop {
+            match self.next_block_raw(detailed, budget.as_deref_mut(), catalogue_main) {
+                Ok(Some((Block::Main(_), ..))) if !catalogue_main && self.damaged_input.salvages() => {
+                    // only a resync lands on a second main header: there is nothing in it to read
+                    continue;
+                }
+                Ok(None) => {
+                    if self.damaged_input.salvages()
+                        && !self.damage_closed
+                        && self.format == RarFormat::Rar5
+                        && self.end_record.is_none()
+                        && !self.encrypted_headers()
+                    {
+                        // 7-Zip 26.06: "Unexpected end of archive" for a RAR 5.0 volume without its end header
+                        self.damage_closed = true;
+                        self.record_damage(self.len, HeaderDamageKind::UnexpectedEnd, None, None);
+                    }
+                    return Ok(None);
+                }
+                Ok(block) => return Ok(block),
+                Err(fault) => {
+                    let Some(kind) = self.salvageable(&fault) else { return Err(fault) };
+                    let at = self.parser.take().map_or(self.next, |parser| parser.header_offset());
+                    let resumed = if self.damaged_input == DamagedInput::Resync {
+                        self.resync(at.saturating_add(1), budget.as_deref_mut())?
+                    } else {
+                        None
+                    };
+                    self.record_damage(at, kind, None, resumed);
+                    match resumed {
+                        Some(next) => self.next = next,
+                        None => {
+                            self.next = self.len;
+                            self.damage_closed = true;
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`DamagedInput::Resync`]: the offset of the next header from `from` on that passes its checksum, found in one
+    /// pass over the rest of the volume. Candidates are file, service and end headers (never a main header) of at
+    /// most [`RESYNC_HEADER_MAX`] bytes. The checksum work of every resync in this volume together is bounded by
+    /// [`RESYNC_WORK_PER_BYTE`] times the volume's length (plus 1 MiB), and each resync reads its window in chunks
+    /// that start small, so the scan stays linear whatever the bytes are; past the bound it gives up.
+    fn resync(&mut self, from: u64, mut budget: Option<&mut ScanBudget<'_>>) -> RarResult<Option<u64>> {
+        let mut work =
+            self.resync_work.unwrap_or_else(|| self.len.saturating_mul(RESYNC_WORK_PER_BYTE).saturating_add(1 << 20));
+        let mut window = Vec::new();
+        let mut header = Vec::new();
+        let mut chunk = RESYNC_FIRST_CHUNK;
+        let mut pos = from;
+        let found = 'scan: loop {
+            if pos >= self.len {
+                break None;
+            }
+            let scan = (self.len - pos).min(chunk as u64) as usize;
+            let want = (self.len - pos).min((scan + RESYNC_LOOKAHEAD) as u64) as usize;
+            // the bytes read count as work too, so a run of resyncs close together stays linear
+            let Some(left) = work.checked_sub(want as u64) else { break None };
+            work = left;
+            if !self.resync_read(&mut budget, &mut window, want, pos)? {
+                break None;
+            }
+            for i in 0..scan {
+                let Some(total) = resync_shape(&window[i..], self.format) else { continue };
+                let at = pos + i as u64;
+                if at.checked_add(total as u64).is_none_or(|end| end > self.len) {
+                    continue;
+                }
+                let Some(left) = work.checked_sub(total as u64) else { break 'scan None };
+                work = left;
+                let checks = if let Some(h) = window.get(i..i + total) {
+                    resync_checks(h, self.format)
+                } else {
+                    if !self.resync_read(&mut budget, &mut header, total, at)? {
+                        break 'scan None;
+                    }
+                    resync_checks(&header, self.format)
+                };
+                if checks {
+                    break 'scan Some(at);
+                }
+            }
+            pos += scan as u64;
+            chunk = chunk.saturating_mul(2).min(RESYNC_CHUNK);
+        };
+        self.resync_work = Some(work);
+        Ok(found)
+    }
+
+    /// `len` bytes at `at` into `out`, for a resync; false when a catalogue's read budget has no room for them (the
+    /// resync then gives up rather than fail the catalogue). Cancellation is checked before every read.
+    fn resync_read(
+        &mut self,
+        budget: &mut Option<&mut ScanBudget<'_>>,
+        out: &mut Vec<u8>,
+        len: usize,
+        at: u64,
+    ) -> RarResult<bool> {
+        if self.cancel.as_ref().is_some_and(crate::extract::Cancellation::is_canceled) {
+            return Err(RarFault::new(RarFailure::Canceled, crate::extract::canceled_error()));
+        }
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+            if budget.check_read(len).is_err() {
+                return Ok(false);
+            }
+        }
+        out.clear();
+        out.try_reserve_exact(len).map_err(|_| allocation())?;
+        out.resize(len, 0);
+        match budget.as_deref_mut() {
+            Some(budget) => budget.read(&self.src.file, &self.path, out, at)?,
+            None => read_at_detailed(&self.src.file, out, at)
+                .map_err(|e| read_failure(e, Some(self.path.clone()), RarIntegrityReason::TruncatedHeader))?,
+        }
+        Ok(true)
+    }
+
+    /// The run's cancellation, checked while a resync searches ([`DamagedInput::Resync`]).
+    pub(crate) fn set_cancel(&mut self, cancel: Option<crate::extract::Cancellation>) {
+        self.cancel = cancel;
+    }
+
+    fn next_block_raw(
         &mut self,
         detailed: bool,
         mut budget: Option<&mut ScanBudget<'_>>,
@@ -585,6 +1000,7 @@ impl Volume {
         let mut parser = self.parser.take().unwrap_or_else(|| {
             let mut parser = HeaderParser::new(self.path.clone(), self.next, Some(self.len), budget.is_some());
             parser.set_format(self.format);
+            parser.set_salvage(self.damaged_input);
             parser
         });
         let result = (|| {
@@ -647,6 +1063,24 @@ impl Volume {
                     }
                 };
                 self.next = frame.data_end;
+                if frame.damaged {
+                    let name = match &frame.block {
+                        Block::File(h) | Block::Service(h) => Some(h.name.as_str()),
+                        _ => None,
+                    };
+                    let (offset, kind) = (frame.extent.start, HeaderDamageKind::ChecksumMismatch);
+                    // A damaged header keeps the solid history only when its data, if any, is decoded into it in turn:
+                    // it reads as a compressed file (not a folder, link or stored file). Read as anything else (a
+                    // service, an unknown block, a folder, a main or end header that claims data) its data, which
+                    // may be a member's compressed stream, is skipped unread.
+                    let carries_data = frame.data_end > frame.extent.end;
+                    let passed_over = match &frame.block {
+                        Block::File(h) => carries_data && (h.method == 0 || h.is_dir() || h.redirection.is_some()),
+                        Block::Main(_) | Block::End { .. } => carries_data,
+                        _ => true,
+                    };
+                    self.record_damage_of(offset, kind, name, None, passed_over);
+                }
                 if matches!(frame.block, Block::Crypt) {
                     if budget.is_some() && (!catalogue_main || self.header_key.is_some()) {
                         return Err(self.framing("unexpected RAR header encryption block", Error::Encrypted));
@@ -660,8 +1094,8 @@ impl Volume {
                     if let Some(budget) = budget.as_deref_mut() {
                         budget.check()?;
                     }
-                    let keys = crate::crypto::derive_rar5_keys(pw, params.kdf_count, &params.salt, params.check)
-                        .map_err(crypt_fault)?;
+                    let keys = crate::extract::rar5_keys(&mut self.rar5_keys.lock(), pw, &params, self.scope())
+                        .map_err(|failure| RarFault::new(failure, Error::Encrypted))?;
                     parser.set_encryption(&keys);
                     self.header_key = Some(keys);
                     continue;
@@ -680,8 +1114,21 @@ impl Volume {
         result
     }
 
+    /// The bytes from `at` on (no more than `len`) that the volume holds already from its last read: a caller that
+    /// reads the range itself can take these and start past them.
+    pub(crate) fn held_at(&self, at: u64, len: u64) -> &[u8] {
+        let bytes = self.src.piece.bytes();
+        match at.checked_sub(self.src.at).and_then(|skip| usize::try_from(skip).ok()) {
+            Some(skip) if skip < bytes.len() => {
+                let n = usize::try_from(len).unwrap_or(usize::MAX).min(bytes.len() - skip);
+                &bytes[skip..skip + n]
+            }
+            _ => &[],
+        }
+    }
+
     /// The open volume, for reads by position.
-    pub fn file(&mut self) -> &File {
+    pub fn file(&self) -> &File {
         &self.src.file
     }
 
@@ -816,17 +1263,24 @@ mod tests {
         let file = File::open(&path).unwrap();
         let mut volume = Volume {
             path: path.clone(),
-            src: Source::new(file, 1),
+            src: Source::new(file, 1, Vec::new()),
             next: 0,
             len: 1,
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            rar5_keys: Default::default(),
             legacy_keys: None,
             parser: None,
             format: RarFormat::Rar5,
             sfx: 0,
             end_record: None,
+            damaged_input: DamagedInput::Refuse,
+            damage: Vec::new(),
+            damage_closed: false,
+            held_block: None,
+            resync_work: None,
+            cancel: None,
         };
         let (send, recv) = sync_channel(1);
         let (spare, _) = channel();
@@ -855,17 +1309,24 @@ mod tests {
         std::fs::write(&path, b"one byte").unwrap();
         let mut volume = Volume {
             path: path.clone(),
-            src: Source::new(File::open(&path).unwrap(), 1),
+            src: Source::new(File::open(&path).unwrap(), 1, Vec::new()),
             next: 0,
             len: 1,
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            rar5_keys: Default::default(),
             legacy_keys: None,
             parser: None,
             format: RarFormat::Rar5,
             sfx: 0,
             end_record: None,
+            damaged_input: DamagedInput::Refuse,
+            damage: Vec::new(),
+            damage_closed: false,
+            held_block: None,
+            resync_work: None,
+            cancel: None,
         };
         let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
         else {
@@ -896,7 +1357,7 @@ mod tests {
         for readers in [1, 2, 3] {
             // from the start, from just past it (read on through), and from a far place (started again there)
             for start in [0, 13, 5 * READ + 77] {
-                let mut src = Source::new(File::open(&path).unwrap(), data.len() as u64);
+                let mut src = Source::new(File::open(&path).unwrap(), data.len() as u64, Vec::new());
                 src.readers = readers;
                 src.seek(start as u64);
                 let mut got = Vec::new();

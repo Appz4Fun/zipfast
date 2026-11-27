@@ -71,26 +71,22 @@ impl MemberKeys {
         budget.usage.check(Resource::PasswordUtf8Bytes, password.len() as u64)?;
         budget.usage.check(Resource::PasswordEncodedBytes, password.len() as u64)?;
         budget.usage.check(Resource::KdfExponent, u64::from(params.kdf_count))?;
-        let keys = crate::crypto::derive_rar5_keys_controlled(
-            password,
-            params.kdf_count,
-            &params.salt,
-            params.check,
-            &mut crate::rar5::member::KdfMeter::new(&budget.usage, control),
-        )
-        .map_err(|error| match error {
-            ControlledKdfError::Crypt(Rar5CryptError::WrongPassword) => err(PartialErrorKind::WrongPassword),
-            ControlledKdfError::Crypt(_) => err(PartialErrorKind::UnsupportedMethod),
-            ControlledKdfError::Control(KdfControlError::Canceled) => err(PartialErrorKind::Canceled),
-            ControlledKdfError::Control(KdfControlError::Limit { resource, limit, attempted }) => {
-                crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::Limit {
-                    resource,
-                    limit,
-                    attempted,
-                })
-                .into()
-            }
-        })?;
+        let keys =
+            crate::rar5::member::session_rar5_keys(password, params, &budget.usage, control).map_err(|error| {
+                match error {
+                    ControlledKdfError::Crypt(Rar5CryptError::WrongPassword) => err(PartialErrorKind::WrongPassword),
+                    ControlledKdfError::Crypt(_) => err(PartialErrorKind::UnsupportedMethod),
+                    ControlledKdfError::Control(KdfControlError::Canceled) => err(PartialErrorKind::Canceled),
+                    ControlledKdfError::Control(KdfControlError::Limit { resource, limit, attempted }) => {
+                        crate::progressive::ProgressiveFailure::new(crate::progressive::FailureKind::Limit {
+                            resource,
+                            limit,
+                            attempted,
+                        })
+                        .into()
+                    }
+                }
+            })?;
         let aes = crate::crypto::AesKey::new(&keys.key).ok_or_else(|| err(PartialErrorKind::UnsupportedMethod))?;
         Ok(Self::new(aes, keys.hash_key))
     }

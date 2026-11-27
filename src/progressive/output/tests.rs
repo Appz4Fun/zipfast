@@ -43,7 +43,10 @@ fn setup(dir: &Path) -> OutputContext {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            encrypted_links: Default::default(),
+            damaged_input: Default::default(),
             unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
@@ -1220,6 +1223,8 @@ fn recovery_publication_rechecks_stage_stamp_after_authorization_callback() {
     s.write_at(0, b"abc").unwrap();
     let permit = verify(&mut s);
     let mut target = s.target("final", false).unwrap();
+    // A same-size rewrite shows only in mtime and ctime, so it must land in a later tick.
+    crate::test_stamps::await_file_stamp_tick(d.path(), s.native.file());
     let mut driver = super::super::source::SourceDriver::new(
         Box::new(Mutating { file: Some(s.native.file().try_clone().unwrap()), declaration: native_complete(d.path()) }),
         "input.rar".into(),

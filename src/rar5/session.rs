@@ -113,6 +113,14 @@ pub struct RarSessionOptions {
     /// starts no continued member exists and opens (otherwise the named volume, as before).
     /// [`RarSession::restarted_from`] says where it started. Off by default.
     pub restart_from_first_volume: bool,
+    /// What a damaged header does to the catalogue ([`crate::extract::Options::damaged_input`]): refused (the
+    /// default), or read past as UnRAR 7.30 does (`Salvage`), or also searched past (`Resync`). What was read past
+    /// is in [`RarArchiveMetadata::damaged_headers`]; the members catalogued past it list and extract as any other.
+    pub damaged_input: crate::extract::DamagedInput,
+    /// Whether a test run ([`RarSession::test_selected`]) passes an encrypted RAR 5.0 redirection only when its
+    /// password verifies (the default) or whatever the password ([`crate::extract::Options::encrypted_links`], which
+    /// [`RarSession::extract_selected`] reads instead).
+    pub encrypted_links: crate::extract::EncryptedLinks,
 }
 
 impl Default for RarSessionOptions {
@@ -122,6 +130,8 @@ impl Default for RarSessionOptions {
             cancel: Cancellation::default(),
             follow_volumes: true,
             restart_from_first_volume: false,
+            damaged_input: Default::default(),
+            encrypted_links: Default::default(),
         }
     }
 }
@@ -145,9 +155,16 @@ pub struct RarArchiveMetadata {
     volumes: usize,
     orphan_continuations: u64,
     missing_volume: Option<PathBuf>,
+    damaged_headers: Vec<crate::extract::HeaderDamage>,
 }
 
 impl RarArchiveMetadata {
+    /// Headers the catalogue read past under [`RarSessionOptions::damaged_input`] (at most 4096 kept). Non-empty
+    /// means the headers are damaged: UnRAR says "Corrupt header is found" and 7-Zip "Headers Error".
+    pub fn damaged_headers(&self) -> &[crate::extract::HeaderDamage] {
+        &self.damaged_headers
+    }
+
     /// The next volume the set names when it wasn't found: the catalogue ends at the volume before it, and a member
     /// split into it fails on its own ([`RarFailure::MissingVolume`]).
     pub fn missing_volume(&self) -> Option<&Path> {
@@ -809,6 +826,8 @@ pub struct RarSession {
     password: String,
     /// Whether a password was given at all: an empty one is still tried on RAR 3.x members.
     password_given: bool,
+    /// RAR 5.0 keys derived for the password, by salt and count: every selection of the session shares them.
+    rar5_keys: crate::crypto::SharedRar5Keys,
     options: RarSessionOptions,
     token: Arc<selection::SessionToken>,
     invalid_binding: Option<Arc<RarFailure>>,
@@ -817,6 +836,11 @@ pub struct RarSession {
 }
 
 impl RarSession {
+    /// The session's RAR 5.0 key cache.
+    pub(crate) fn rar5_keys(&self) -> std::sync::MutexGuard<'_, crate::crypto::Rar5KeyCache> {
+        self.rar5_keys.lock()
+    }
+
     /// The earlier volume the catalogue started at instead of the one named, with
     /// [`RarSessionOptions::restart_from_first_volume`]; None when it started at the named volume.
     pub fn restarted_from(&self) -> Option<&Path> {
@@ -872,6 +896,7 @@ impl RarSession {
                 usage: RarCatalogueUsage::default(),
                 password: String::new(),
                 password_given: false,
+                rar5_keys: Default::default(),
                 options: options.clone(),
                 token: Arc::new(selection::SessionToken { _private: 0 }),
                 invalid_binding: None,
@@ -1184,10 +1209,13 @@ impl Catalogue {
             Ok(stamp) => stamp,
             Err(fault) => return soft(fault),
         };
-        let mut volume = match Volume::open_catalogue(path, file, stamp.len, password, &mut self.scan_budget()) {
-            Ok(volume) => volume,
-            Err(fault) => return soft(fault),
-        };
+        let damaged = self.options.damaged_input;
+        let keys = self.session.rar5_keys.clone();
+        let mut volume =
+            match Volume::open_catalogue(path, file, stamp.len, password, &mut self.scan_budget(), damaged, keys) {
+                Ok(volume) => volume,
+                Err(fault) => return soft(fault),
+            };
         loop {
             match volume.next_catalogue(&mut self.scan_budget()) {
                 Ok(Some((Block::File(header), _, _))) => return Ok(Some(header.split_before())),
@@ -1257,7 +1285,10 @@ impl Catalogue {
                 return Err(volume_framing(&path, "RAR volume identity repeats"));
             }
             self.owned_capacity = add(self.owned_capacity, path_bytes)?;
-            let mut volume = Volume::open_catalogue(&path, file, stamp.len, password, &mut self.scan_budget())?;
+            let damaged = self.options.damaged_input;
+            let keys = self.session.rar5_keys.clone();
+            let mut volume =
+                Volume::open_catalogue(&path, file, stamp.len, password, &mut self.scan_budget(), damaged, keys)?;
             let format = volume.format();
             if self.session.volumes.is_empty() {
                 self.session.archive.format = format;
@@ -1274,7 +1305,15 @@ impl Catalogue {
             let first_header = self.session.headers.len();
             let mut end = None;
             let mut comment = None;
-            while let Some((block, crypt, wire)) = volume.next_catalogue(&mut self.scan_budget())? {
+            loop {
+                let parsed = volume.next_catalogue(&mut self.scan_budget());
+                let damage = volume.take_damage();
+                // bytes passed over break the solid history: a solid member after them chains to nothing
+                if damage.iter().any(|d| d.passed_over) {
+                    self.history_barrier = true;
+                }
+                self.keep_damage(damage)?;
+                let Some((block, crypt, wire)) = parsed? else { break };
                 match block {
                     Block::File(header) => {
                         let wire = wire.expect("catalogue file metadata includes the wire name");
@@ -1367,6 +1406,30 @@ impl Catalogue {
         }
         check_cancel(&self.options.cancel)?;
         self.session.archive.volumes = self.session.volumes.len();
+        Ok(())
+    }
+
+    /// Keeps what a salvaging volume read past, its memory charged to the catalogue.
+    fn keep_damage(&mut self, damage: Vec<crate::extract::HeaderDamage>) -> RarResult<()> {
+        for d in damage {
+            if self.session.archive.damaged_headers.len() >= crate::extract::MAX_HEADER_DAMAGE {
+                break;
+            }
+            let kept = &mut self.session.archive.damaged_headers;
+            // the vector grows by doubling, up to the cap, and every slot it holds is charged
+            let grow = if kept.len() == kept.capacity() {
+                kept.capacity().saturating_mul(2).clamp(4, crate::extract::MAX_HEADER_DAMAGE) - kept.capacity()
+            } else {
+                0
+            };
+            let slots = (grow * size_of::<crate::extract::HeaderDamage>()) as u64;
+            let owned = (d.volume.capacity() + d.name.as_ref().map_or(0, String::capacity)) as u64;
+            self.owned_capacity = add(add(self.owned_capacity, slots)?, owned)?;
+            self.update_capacity()?;
+            let kept = &mut self.session.archive.damaged_headers;
+            kept.try_reserve_exact(grow).map_err(|_| allocation())?;
+            kept.push(d);
+        }
         Ok(())
     }
 
@@ -2022,6 +2085,8 @@ mod tests {
         let held = open_read_only(&path).unwrap();
         let stamp = SourceStamp::capture(&held, &path).unwrap();
         let original_time = held.metadata().unwrap().modified().unwrap();
+        // Same size and the old mtime: only ctime shows the change, so it must land in a later tick.
+        crate::test_stamps::await_stamp_tick(&path);
         let mut output = OpenOptions::new().write(true).open(&path).unwrap();
         output.write_all(b"new").unwrap();
         output.set_times(FileTimes::new().set_modified(original_time)).unwrap();

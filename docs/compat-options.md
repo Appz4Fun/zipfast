@@ -17,7 +17,10 @@ restart_from_first_volume: false,
 replace_placed_links: false,
 keep_broken: false,
 attempt_continued_members: false,
+encrypted_links: Default::default(),
+damaged_input: Default::default(),
 unsupported_filters: Default::default(),
+unverified_output: Default::default(),
 salvage_truncated_zip: false,
 unix_modes: Default::default(),
 backslashes: Default::default(),
@@ -146,6 +149,69 @@ run writes nothing. The whole-archive runners for RAR, 7z, ZIP and tar, `RarSess
 sessions honour it (a progressive session still stops at the refused link, as without the option).
 `tests/links.rs` and `tests/rar5_links.rs` check these points.
 
+## `encrypted_links`: encrypted RAR 5.0 links and a wrong password
+
+`rar a -p` encrypts file data but leaves headers in the clear, so a link member's target (its redirection record)
+is readable whatever the password. UnRAR 7.30 reports the wrong password for the member and creates nothing;
+7-Zip 26.06 doesn't check the password for a link at all. `Options::encrypted_links` picks one:
+`EncryptedLinks::Verify` (the default), `EncryptedLinks::VerifyFirst` (UnRAR's reporting order, for Prybar's unrar
+mode) or `EncryptedLinks::PlaceUnverified` (7-Zip's, for Prybar's 7z mode).
+It applies on every route: `extract::run*`, `RarSession::extract_selected` and `extract_selected_controlled` (from
+the `Options` they take), `RarSession::test_selected` (from `RarSessionOptions::encrypted_links`, as it takes no
+`Options`), and progressive sessions (from `ProgressiveOptions`' extract options).
+
+With `Verify`, a redirection member whose header carries an encryption record (Unix or Windows symbolic link,
+junction, hard link, file copy) is placed, or passes a test, only when its password check value verifies the
+password. No password fails it as `RarFailure::PasswordRequired`, a wrong one as `RarFailure::WrongPassword`, as an
+encrypted data member fails; nothing is created. A record without a check value, or with a check value whose
+checksum doesn't match, can't verify any password, and a link has no data to check one against: the member is
+refused as `RarFailure::EncryptedIntegrity` with `RarIntegrityReason::UnverifiableLinkPassword`, even with the right
+password. A progressive session stops at such a member, as it does at a wrong password.
+
+`Verify` checks the password once the member is known to be placed or tested: a member skipped for an existing
+target under `Overwrite::Skip` is reported `Skipped(ExistingTarget)`, and a hard link or copy whose target the run
+didn't extract fails on its target (`RarPolicyReason::HardLinkTarget`; a progressive session stops with
+`UnsafePath`), whatever the password. `VerifyFirst` checks it first, as UnRAR 7.30 does: `unrar x -o- -pwrong` over
+links that already exist prints "Incorrect password" and exits 11, and a hard link with a missing target is reported
+as the wrong password. Under `VerifyFirst` a password that doesn't verify fails such a member as above
+(`WrongPassword`, `PasswordRequired`, `EncryptedIntegrity`/`UnverifiableLinkPassword`) before the overwrite decision
+and the target checks; one that verifies goes on to them as usual. Nothing is placed or replaced either way, so this
+changes only what is reported. An older file revision is still skipped before anything, on every route. A
+`RarSession` test run checks the password first under every mode.
+
+The order on every route (`extract::run*`, `RarSession::extract_selected` and `extract_selected_controlled`, a
+progressive session) is: (1) under `VerifyFirst` only, the password; (2) the overwrite decision: under
+`Overwrite::Skip` (and `RarOverwriteMode::Skip` on the controlled route) a link member whose target already exists,
+whatever is there (a file, a folder, a symbolic link an earlier run placed), is reported `Skipped(ExistingTarget)`
+and nothing else about it is checked, as UnRAR 7.30's `unrar x -o- -ppw` over an earlier run's output is "All OK";
+(3) for a link that will be placed, every link check (a target that leaves the destination, a hard link or copy of a
+file the run didn't extract, the path checks, protected paths, `replace_placed_links`), then under `Verify` the
+password, then the placing. A skipped member places and touches nothing, so it needs none of the checks in (3).
+Under `Overwrite::Skip` a symbolic link at a member's target (any member's, not just a link's) is skipped as an
+existing target the same way, rather than refused as `RarPolicyReason::Symlink`: nothing is written through it or
+over it. A symbolic link in a folder above the target is still refused.
+
+With `PlaceUnverified`, the password isn't checked for such a member (no key is derived): with a wrong password,
+with none, or with no check value, the link is placed (or passes a test) and reported as any placed link is,
+`RarOutcome::Verified`, with the password evidence `RarPasswordEvidence::Unverified` in its checks, so a caller can
+tell it from a verified link (a progressive session reports `MemberOutcome::Verified`/`Tested`, which carries no
+password evidence; a caller that set the option knows an encrypted link there went unchecked). Every other link check
+still applies: a target that leaves the destination, a hard link or copy of a file the run didn't extract,
+protected paths, `replace_placed_links` and the overwrite decision. RAR 4.x symbolic links (whose target is their
+encrypted data) and members with data still need their password.
+
+What 7-Zip 26.06 (`7zz`, macOS arm64) does with such archives:
+
+| archive | `x -p<wrong>` | `x` (no `-p`) | `t -p<wrong>` |
+|---|---|---|---|
+| symlinks and a junction with a check value | links created, exit 0, "Everything is Ok" | same | "ERROR: Wrong password" per link, exit 2 |
+| the same without a check value | links created, exit 0 | same | exit 0 |
+| hard link and file copy | hard link created; copy "Unsupported Method", exit 2 | same | exit 0 |
+
+So `x` reports no error for an encrypted link under a wrong password or none, and `PlaceUnverified` matches it. `t`
+does check a check value it has (a wrong password is an error there, and with no `-p` it asks for one), which
+`PlaceUnverified` doesn't mirror: a test passes those links too, with `RarPasswordEvidence::Unverified`.
+
 ## 7z wrong passwords: how the member failed
 
 7z keeps no password check value, so a wrong password shows by its effect, and 7-Zip words the two effects
@@ -227,6 +293,100 @@ on the checked route as ever, option or not. `extract::run` honours the option t
 listings (`inspect_projected_cancelable`, `zipfast l`) and `SelectedEntry` take no `Options` and still refuse it.
 `tests/zip_salvage_truncated.rs` checks each point.
 
+## `damaged_input`: RAR archives with damaged headers
+
+`DamagedInput::Refuse` (the default) fails a RAR 4.x or RAR 5.0 run, listing or catalogue at the first header that
+fails its checksum or doesn't parse, as before. `DamagedInput::Salvage` reads on the way UnRAR 7.30 does, and
+`DamagedInput::Resync` also looks past an unreadable header. Whatever was read past comes back as `HeaderDamage`
+records (volume, offset, `HeaderDamageKind`, the member name when the header parsed, where reading resumed), so a
+caller can warn and exit as the tools do: UnRAR prints "Corrupt header is found" / "NAME - the file header is
+corrupt" and exits 3, 7-Zip prints "Headers Error" (or "Unexpected end of archive") and exits 2.
+
+What UnRAR 7.30 (`x`, `t`, `l`) does, from archives with one byte changed, cut short or with bytes inserted, and what
+`Salvage` does:
+
+| damage | UnRAR 7.30 | 7-Zip 26.06 | `Salvage` |
+|---|---|---|---|
+| a file header fails its checksum but parses (a CRC byte, or its name, changed) | "the file header is corrupt"; the member is listed and extracted as the header reads (a changed name is the name written), its data checksum deciding; the rest follows; exit 3 | "Headers Error", stops there, exit 2 | the same as UnRAR: `ChecksumMismatch` with the name, the member listed and extracted as read |
+| the main header fails its checksum | "Main archive header is corrupt", reads on | "Headers Error" | `ChecksumMismatch`, reads on |
+| a RAR 4.x block's type byte changed (checksum fails, type unknown) | the block is passed over by its size, the rest extracted | "Headers Error" | `ChecksumMismatch`, passed over by its size |
+| a header that can't be read (size field changed, garbage inserted before it) | "Corrupt header is found" or "Unexpected end of archive", nothing after it is read, exit 3 | "Headers Error", stops | `Unreadable` (or `UnexpectedEnd`), the rest of the volume passed over, what came before stands |
+| the volume ends inside a header or its data | "Unexpected end of archive" | "Unexpected end of archive" | `UnexpectedEnd`, the volume ends there |
+| a RAR 5.0 volume without its end header | no message | "Unexpected end of archive", exit 2 | `UnexpectedEnd` at the volume's length |
+| only a member's data damaged | "checksum error", the rest extracted | "CRC Failed" | as before, with any `damaged_input`: the member fails, nothing is recorded as header damage |
+| a RAR 4.x archive cut inside its main header | "Main archive header is corrupt", lists "0 files" (`Details: RAR 1.5`) | | opens with no members, `UnexpectedEnd` |
+
+Neither tool looks past an unreadable header for the next one. `Resync` does, for callers (RustyGet) that would rather
+recover the members after a damaged stretch, such as a hole still waiting for repair, garbage between blocks, or the
+rest of a member's compressed data after its header was hit: from the byte after the unreadable header it searches the
+rest of the volume for a file, service or end header (never a main header) whose fixed fields are plausible (RAR 5.0:
+a one-byte flags field, a file or service header of at most 8 KiB, an end header of at most 32 bytes; RAR 4.x: a
+known host, unpack version and method, and a name that fits) and whose checksum passes, and reads on from there
+(`HeaderDamage::resumed_at`). Under `Resync` a damaged header of an unknown type is unreadable too, rather than passed
+over by the size it claims, so the search starts from it. Each search is one forward pass, read in chunks from 64 bytes
+doubling to 1 MiB; all the searches in a volume together may read and checksum at most 16 times the volume's length
+plus 1 MiB, so a volume stays linear whatever its bytes are, and megabytes of random (compressed-looking) data are
+crossed well within that. Past the bound, or when a `RarSession` catalogue's read budget (`RarCatalogueLimits::
+read_bytes`) has no room left, the search gives up and passes over the rest of the volume rather than fail. A RAR 4.x
+header checksum is 16 bits, so in a long damaged stretch a resync can land on a false header: what it reads from it
+fails its own checks (a member's data checksum, the next header's framing) and the search goes on. A whole-archive
+run checks its `Cancellation` while it searches. Bytes passed over (an unreadable stretch, a resync) break a solid
+archive's history: a solid member after them fails as lacking it (`RarFailure::SolidHistoryUnavailable`) until a
+non-solid member starts a new history, in the whole-archive runners and in `RarSession` alike.
+
+Encrypted headers (`-hp`) are never salvaged, by either choice: there a failed checksum is how a wrong password shows.
+A RAR 5.0 encryption header that fails its checksum is never read as it stands either (its salt and KDF parameters
+would make every later header look like a wrong password): it is an unreadable header. A damage record keeps at most
+1 KiB of a member's name.
+A member whose data fails its checksum fails as before (`keep_broken` keeps what was written).
+
+Where it applies:
+
+- the whole-archive RAR runners (`extract::run`, `run_with_password`, `run_rar_with_outcomes`, and `run_with_policy`
+  / `run_with_zip_policy` through the legacy route): `Summary::damaged_headers`, `RarRunSummary::damaged_headers`, and
+  `ZipRunReport::damaged_headers()` (a count; each record is also sent as a `LegacyDiagnostic` line);
+- listing: `extract::list_detailed_with_options` (`Listing::damaged_headers`, `Listing::headers_damaged()`, and
+  `Listing::unexpected_end()` for `UnexpectedEnd`);
+- `RarSession`, through `RarSessionOptions::damaged_input`: the catalogue reads past the damage, its members list and
+  extract (`extract_selected`, `extract_selected_controlled`, printing) as any other, and
+  `RarArchiveMetadata::damaged_headers()` says what was read past;
+- `Volume::open_damaged` and `Volume::take_damage` for callers walking blocks themselves;
+- progressive sessions (`ProgressiveSession::new`, `from_sealed_memory`), through `ProgressiveOptions::extract`: each
+  damaged header is a `ProgressiveEvent::HeaderDamaged { volume, damage }`, delivered before anything read from that
+  header (so just before the `MemberStarted` of a member whose header failed its checksum). See "Damaged headers in a
+  progressive session" below.
+
+Persistent-partial sessions (`ProgressiveSession::new_partial`) honour it too, with the same events and hole rules; a
+member read from a damaged header, or after one, is bound to its header's position so that a restart over the same
+bytes, or over a header repaired since, finds it again (`docs/persistent-partials.md`, "Damaged headers"). Listings
+that take no `Options` (`extract::list`, `list_detailed`, `inspect*`) refuse it too. The CLI takes `--salvage` and
+`--resync` (for `l`, `t`, `x`, `e`; a listing of anything but RAR stays as it is), prints each damaged header and a warning, and exits 1.
+`tests/rar_salvage.rs` checks each point.
+
+### Damaged headers in a progressive session
+
+A progressive session reads bytes as its source delivers them, and a range that is missing now may be filled later
+(an article fetched again, PAR2 repair, another copy). So only bytes the source has delivered are ever judged damaged:
+
+- A header the source has not delivered yet (`RangeRead::NotYet`, or a volume not there yet) is waited on, as under
+  `Refuse`; it is never damage. When it arrives it is read as any other header.
+- A header inside a range the source answers as a `Hole` is not damage either: the session stops with `HeaderHole`, as
+  under `Refuse`, since the bytes may yet be repaired. Run the session again once they are.
+- A resync never searches across a `Hole`: the next header may be inside it, so the search stops with `HeaderHole`.
+  On a source whose end isn't known yet (`GrowingFileVolumes`) a search that has not found a header waits for more
+  bytes, as reading a header does.
+- Only a header whose bytes were delivered and are wrong (a checksum that fails, fields that don't parse, a header or
+  data running past the volume's known end) is salvaged, exactly as the whole-archive runners do: the same members,
+  the same bytes and the same `HeaderDamage` records (`volume` is the volume's name as the session asked for it).
+
+Under salvage the session takes the volume's length from the source (`SourceInfo::length`, unless it is
+`Advertised(u64::MAX)`), so a header or data running past it is a volume cut short (`UnexpectedEnd`). The rest of a
+damaged volume is passed over as in the whole-archive runners: a volume set goes on with its next volume (a sealed set,
+or a declared last volume, may end there), anything else ends. A folder whose damaged header claims data is created and
+its data passed over. A resync's work is bounded as the whole-archive one's, by 16 times the furthest offset read in
+the volume plus 1 MiB, and it charges its window (at most a chunk and one candidate header) to `MetadataBytes`. Bytes
+passed over break a solid archive's history: the next solid member stops with `SolidHistoryUnavailable`.
+`tests/progressive_salvage.rs` checks each point.
 ## `unsupported_filters`: a RAR 3.x/4.x member using a VM filter zipfast doesn't run
 
 RAR 3.x/4.x carries filters as programs for its virtual machine. zipfast runs the standard ones (E8, E8E9, ITANIUM,
@@ -241,7 +401,7 @@ standard filters in the same member still apply. With `UnsupportedFilters::Write
 | --- | --- | --- |
 | `7z x` / `7z e` | "ERROR: Unsupported Method : itanium_synthetic_bundles.bin", exit 2, the 1 MiB file written (SHA-256 `aff2543c…76c5`) with its time | the same file, with its time; the member reported failed with `RarFailure::Unsupported(RarUnsupported::FilterWrittenUnfiltered)` |
 | `7z t` | the same error, exit 2 | the same failure, nothing written |
-| `7z x -so` | the same error, exit 2, the same bytes streamed | not covered: `SelectedEntry` takes no `Options` |
+| `7z x -so` | the same error, exit 2, the same bytes streamed | `SelectedEntry` with `SelectOptions::unverified_output(UnverifiedOutput::Emit)`: the same bytes to the sink, then an `UnverifiedWritten` error (see `unverified_output` below) |
 
 The member's checksum is not checked (the unfiltered data can't match it), so the failure says the file is written
 but unverified: a caller imitating 7-Zip prints "Unsupported Method" and exits 2. It reaches every report a RAR run
@@ -259,6 +419,66 @@ corrupt data, writing nothing (by default it fails as unsupported, as before).
 Honoured by the whole-archive runners (`extract::run`, `run_with_password`, `run_rar_with_outcomes` and the
 dispatchers) and by `RarSession::extract_selected` and `extract_selected_controlled`, where the file is published as
 a verified one would be (every recheck and hook alike). `RarSession` test and print runs, progressive and
-persistent-partial sessions, `SelectedEntry` and `FeedDecoder` take no such choice (progressive sessions have no
-outcome for a member written but unverified) and fail the member as unsupported. `tests/rar_unsupported_filters.rs`
+persistent-partial sessions and `FeedDecoder` take no such choice (progressive sessions have no outcome for a member
+written but unverified) and fail the member as unsupported; `SelectedEntry` writes it unfiltered under
+`SelectOptions::unverified_output` (below). `tests/rar_unsupported_filters.rs`
 checks each point.
+
+## `unverified_output`: the bytes of a member that fails
+
+UnRAR and 7-Zip hand over what they decoded of a member before it failed; zipfast by default doesn't (a printed or
+streamed member shows only once verified, and `keep_broken` keeps a RAR member cut off by a missing volume empty, as
+7-Zip `x` does). `UnverifiedOutput::Emit` does as the tools do. The member is still reported failed with the failure
+it had (a missing volume, a checksum, a data error), and a sign says its bytes went out unverified, so a caller prints
+the tool's error and exits as it would (UnRAR: exit 3 or 6; 7-Zip: exit 2). `UnverifiedOutput::Withhold`, the
+default, changes nothing.
+
+| field | route | under `Emit` | sign |
+| --- | --- | --- | --- |
+| `Options::unverified_output` | `extract::run`, `run_with_password`, `run_rar_with_outcomes`, the dispatchers | with `keep_broken`, a RAR member cut off by a missing volume keeps every byte UnRAR 7.30 `x -kb` keeps (without `keep_broken` it is removed, as `unrar x` removes it) | the member's usual failure ("missing volume") |
+| `Options::unverified_output` | `RarSession::extract_selected`, `extract_selected_controlled` | with `keep_broken`, the same member is written and kept (by default a session doesn't write it at all) | `RarOutcome::Failed` with `RarFailure::MissingVolume` or `MissingSplitContinuation` |
+| `RarPrintOptions::unverified_output` | `RarSession::print_selected` (`unrar p`) | a member failing on its own data (checksum, decoder error, missing volume, a wrong RAR 3.x password shown by its checksum) has what was decoded of it printed; one cut off by a missing volume is decoded from the volumes there | `RarOutcome::Failed`, and `RarEntryOutcome::unverified_bytes = Some(n)` |
+| `SevenZipPrintOptions::unverified_output` | `sevenzip::print_selected_with_options` (`7z x -so`) | a 7z member failing on its data has what 7-Zip 26.06 streams of it printed | its line in `Summary::errors`, and an `UnverifiedMember { index, name, bytes }` in `Summary::unverified` |
+| `SelectOptions::unverified_output` | `SelectedEntry` (`open_cancelable_with_options`, `open_cancelable_with_zip_limit_and_options`), 7z and RAR | 7z: as `print_selected_with_options`; RAR 3.x/4.x: a VM filter zipfast doesn't run leaves its block unfiltered (as `UnsupportedFilters::WriteUnfiltered`); other formats already stream as they decode | `read` fails with an `Error::Io` carrying `UnverifiedWritten { bytes, cause }` (`UnverifiedWritten::of`); `cause` is the failure without `Emit`, `Error::Unsupported(UNFILTERED_SELECTED)` for a RAR member written unfiltered |
+
+`SelectOptions::from(&options)` copies `Options::unverified_output`.
+
+### A RAR member cut off by a missing volume
+
+UnRAR 7.30 decodes what the volumes there hold, but not to the last bit. From `multi_broken.part1.rar`, two RAR 3.00
+sets and `text.rar` made into a cut-off first volume at 47 places (`tests/fixtures/unverified-output/README.md`):
+
+- RAR 3.x/4.x (LZ): an LZ token whose first bit lies in the last 30 bytes of the data there is not decoded, nor
+  anything after it. In a PPMd block or a RAR 1.5/2.0 stream every byte decoded is handed over (not checked against
+  UnRAR).
+- RAR 5.0: a symbol starting in the last 128 bits of the data there is not decoded; a block of which fewer than 1,024
+  bytes (header included) are there is not decoded at all, and then the last symbols of the block before, within
+  128 bits of the data's end, are left out too (when that block was decoded on this thread: blocks of a big member
+  decoded on worker threads can't give back their last symbols, so a cut within 16 bytes past one of them may write
+  up to a few bytes more than UnRAR).
+
+| first volume alone | `unrar p` / `x -kb` | `Withhold` + `keep_broken` | `Emit` + `keep_broken`, `RarPrintOptions` `Emit` |
+| --- | --- | --- | --- |
+| `multi_broken.part1.rar` `file2.txt` | 6,198 bytes | empty (7-Zip `x`) | the same 6,198 bytes |
+| `multivol_newnaming_rar300.part01.rar` | 53,664 bytes | the 32 KiB flushed before the volume was missed | the same 53,664 bytes |
+| `r5-partial.part1.rar` (RAR 5.0) | 55,043 bytes | the whole blocks written | the same 55,043 bytes |
+
+`7z x -so` on such a member is not imitated: 7-Zip 26.06 streams nothing of a RAR 3.x/4.x one and decodes a RAR 5.0
+one to the end of the data (55,084 bytes for `r5-partial`), and a `SelectedEntry` keeps streaming what it did before.
+
+### 7z members under `7z x -so`
+
+| case | 7-Zip 26.06 `x -so` (exit 2) | `Emit` |
+| --- | --- | --- |
+| a member failing its CRC (`copy_crc.7z`) | every byte decoded, "CRC Failed" | the same bytes |
+| a data error in an LZMA stream (`lzma_bad.7z`, solid `solid_bad.7z`) | the bytes before the error, "Data Error" | the same bytes |
+| a later member of a solid block an earlier one broke | nothing | nothing |
+| a folder whose packed stream is cut short (`lzma_trunc.7z`) | the bytes decoded, "Data Error" | the same bytes |
+| a wrong password, LZMA folder (`-pwrong enc.7z`) | nothing, "Data Error in encrypted file. Wrong password?" | nothing |
+| a wrong password, Copy folder (`-pwrong enc_copy.7z`) | the decrypted garbage, "CRC Failed in encrypted file. Wrong password?" | the same bytes |
+
+Not covered: a Copy folder whose header gives fewer packed than unpacked bytes is refused as malformed headers
+(7-Zip streams the packed bytes and reports "Data Error"); an LZMA2 folder big enough to be decoded on several threads
+hands over only what its threads finished before the error. `tests/unverified_output.rs` checks each point against the
+reference tools' output.
+

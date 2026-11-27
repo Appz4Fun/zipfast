@@ -21,6 +21,7 @@ mod partial;
 mod rar4;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
+mod salvage;
 use super::{
     output::{Capacity, DirectoryVerdict, OutputContext, Publication, Stage, Target},
     source::{SourceDriver, SourceStep},
@@ -72,6 +73,16 @@ pub enum ProgressiveEvent {
     VolumeOpened {
         index: u32,
         id: SourceId,
+    },
+    /// A damaged header of zero-based `volume` was read past under
+    /// [`crate::extract::Options::damaged_input`] (`Salvage` or `Resync`; never under the default `Refuse`, which
+    /// fails the session as before). Delivered before anything read from the header, so a member whose header
+    /// failed its checksum but parsed has this event just before its `MemberStarted`. Only bytes the source
+    /// delivered are judged: a header still to come is waited on and one in a `Hole` answer is `HeaderHole`. Non-empty
+    /// means the headers are damaged, as [`crate::extract::Summary::damaged_headers`] does for a whole archive.
+    HeaderDamaged {
+        volume: u32,
+        damage: crate::extract::HeaderDamage,
     },
     MemberStarted {
         member: MemberId,
@@ -197,6 +208,8 @@ enum Phase {
     Finish,
     Verdict,
     NextVolume,
+    /// A [`crate::extract::DamagedInput::Resync`] search past an unreadable header.
+    Resync(Box<salvage::Resync>),
     Done,
 }
 /// The longest `Hole` answer a persistent session accepts in one read (see `SourceDriver::allow_long_hole`):
@@ -231,9 +244,16 @@ pub struct ProgressiveSession {
     rar4_history: Option<crate::rar5::member::Rar4Owner>,
     /// every member so far was written by an archiver older than RAR 2.9, which writes no end-of-archive block
     pre_29: bool,
-    /// A pre-2.9 volume that names itself part of a set ended between members: the next volume is asked for, and
-    /// only a sealed in-memory set (every volume given up front) may end there when it has no next volume.
+    /// A pre-2.9 volume that names itself part of a set ended between members (or the rest of a damaged one was
+    /// passed over under [`crate::extract::Options::damaged_input`]): the next volume is asked for, and only a sealed
+    /// in-memory set (every volume given up front) or a declared last volume may end there with no next volume.
     pre_29_open_end: bool,
+    /// Damaged headers read past, each delivered as a [`ProgressiveEvent::HeaderDamaged`].
+    damage: std::collections::VecDeque<(u32, crate::extract::HeaderDamage)>,
+    /// The bytes a resync searched, kept for the next one.
+    resync_window: Vec<u8>,
+    /// The resync work done in the current volume.
+    resync_work: salvage::ResyncWork,
     solid_archive: Option<bool>,
     archive_format: Option<crate::rar5::RarFormat>,
     disposition: Disposition,
@@ -342,6 +362,7 @@ impl ProgressiveSession {
         let expected = options.first_name.clone();
         let mut parser = HeaderParser::from_start(expected.clone().into(), usage.clone());
         parser.set_rar4_unknown_part_crc(options.rar4_unknown_part_crc);
+        parser.set_salvage(options.extract.damaged_input);
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(chunk as usize)
@@ -374,6 +395,9 @@ impl ProgressiveSession {
             rar4_history: None,
             pre_29: true,
             pre_29_open_end: false,
+            damage: Default::default(),
+            resync_window: Vec::new(),
+            resync_work: Default::default(),
             solid_archive: None,
             archive_format: None,
             disposition: Disposition::Write,
@@ -429,7 +453,12 @@ impl ProgressiveSession {
         if self.verify_job.is_some() {
             return Poll::Ready(Err(ProgressiveFailure::new(FailureKind::InvalidCapability)));
         }
+        // damage found by the last read is delivered even when that read ended the session
+        if let Some((volume, damage)) = self.damage.pop_front() {
+            return Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage })));
+        }
         if matches!(self.phase, Phase::Done) {
+            self.extraction_active = false;
             return Poll::Ready(Ok(None));
         }
         self.control.register(cx.waker());
@@ -445,7 +474,10 @@ impl ProgressiveSession {
                     | Ok(None
                         | Some(ProgressiveEvent::MemberFinished { .. } | ProgressiveEvent::SessionTerminated { .. }))
             )
-        ) {
+        ) || matches!(self.phase, Phase::Done)
+        {
+            // a session that reached its end is no longer extracting, whatever its last event (a damaged end
+            // header's HeaderDamaged, say)
             self.extraction_active = false;
         }
         result
@@ -515,6 +547,9 @@ impl ProgressiveSession {
             if self.control.is_canceled() {
                 return Err(ProgressiveFailure::new(FailureKind::Canceled));
             }
+            if let Some((volume, damage)) = self.damage.pop_front() {
+                return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::HeaderDamaged { volume, damage }))));
+            }
             if work >= self.options.limits.packed_work_per_poll.min(1 << 20) {
                 cx.waker().wake_by_ref();
                 return Ok(Poll::Pending);
@@ -542,6 +577,11 @@ impl ProgressiveSession {
             }
             match &self.phase {
                 Phase::Done => return Ok(Poll::Ready(Ok(None))),
+                Phase::Resync(_) => {
+                    if let Some(poll) = self.poll_resync(cx, &mut work)? {
+                        return Ok(poll);
+                    }
+                }
                 Phase::NextVolume
                     if self.pre_29_open_end
                         && (self.driver.sealed_volume_count().is_some_and(|n| n <= self.volume as usize + 1)
@@ -570,6 +610,8 @@ impl ProgressiveSession {
                     self.usage.charge(Resource::MetadataBytes, self.expected.capacity() as u64)?;
                     self.parser = HeaderParser::from_start(self.expected.clone().into(), self.usage.clone());
                     self.parser.set_rar4_unknown_part_crc(self.options.rar4_unknown_part_crc);
+                    self.parser.set_salvage(self.damaged_input());
+                    self.resync_work = Default::default();
                     self.cursor = 0;
                     self.main_seen = false;
                     self.phase = Phase::Header;
@@ -671,7 +713,13 @@ impl ProgressiveSession {
                     return self.finish().map(|e| Poll::Ready(Ok(Some(e))));
                 }
                 Phase::Header => {
-                    let (_, step) = self.parser.advance(&[])?;
+                    let (_, step) = match self.parser.advance_salvaging(&[])? {
+                        Ok(step) => step,
+                        Err(kind) => {
+                            self.salvage_header(kind)?;
+                            continue;
+                        }
+                    };
                     let (offset, len) = match step {
                         ParserStep::LegacyKeyRequired { salt } => {
                             let password = self
@@ -689,6 +737,11 @@ impl ProgressiveSession {
                             continue;
                         }
                         ParserStep::Need { offset, len } => (offset, len),
+                        // only a salvaging parser knows the volume's length: it ends here without its end header
+                        ParserStep::End if self.parser.salvages() => {
+                            self.salvage_volume_end()?;
+                            continue;
+                        }
                         ParserStep::End => return Err(self.parser.truncated()),
                         ParserStep::Frame(_) => unreachable!("frames require input"),
                     };
@@ -707,6 +760,14 @@ impl ProgressiveSession {
                         Poll::Ready(Err(e)) => return Err(e),
                         Poll::Ready(Ok(SourceStep::VolumeOpened { index, id })) => {
                             self.driver.validate_step()?;
+                            // Under salvage a header or data running past a volume's known end is a volume cut
+                            // short, as for a whole volume. An open-ended source (a growing file) has no known end.
+                            if self.parser.salvages()
+                                && let Some(info) = self.driver.observed_info(index)
+                                && info.length.value() != u64::MAX
+                            {
+                                self.parser.set_complete_len(info.length.value());
+                            }
                             return Ok(Poll::Ready(Ok(Some(ProgressiveEvent::VolumeOpened { index, id }))));
                         }
                         Poll::Ready(Ok(SourceStep::EndOfVolume))
@@ -733,6 +794,9 @@ impl ProgressiveSession {
                                 self.phase = Phase::Done;
                             }
                         }
+                        Poll::Ready(Ok(SourceStep::EndOfVolume)) if self.parser.salvages() => {
+                            self.salvage_volume_end()?;
+                        }
                         Poll::Ready(Ok(SourceStep::EndOfVolume)) => {
                             return Err(self.parser.truncated());
                         }
@@ -753,12 +817,21 @@ impl ProgressiveSession {
                             if let Some(partial) = &mut self.partial {
                                 partial.record_header(offset, &self.buffer[..count], &self.usage)?;
                             }
-                            let (used, step) = self.parser.advance(&self.buffer[..count])?;
+                            let (used, step) = match self.parser.advance_salvaging(&self.buffer[..count])? {
+                                Ok(step) => step,
+                                Err(kind) => {
+                                    self.driver.validate_step()?;
+                                    self.salvage_header(kind)?;
+                                    continue;
+                                }
+                            };
                             if used != count {
                                 return Err(ProgressiveFailure::new(FailureKind::SourceContract));
                             }
                             self.driver.validate_step()?;
-                            if let ParserStep::Frame(frame) = step {
+                            if let ParserStep::Frame(frame) = step
+                                && (!frame.damaged || self.damaged_frame(&frame)?)
+                            {
                                 #[cfg(feature = "persistent-partials")]
                                 if let Some(partial) = &mut self.partial {
                                     partial.frame_header(self.volume, &frame, &self.usage)?;
@@ -783,6 +856,10 @@ impl ProgressiveSession {
                         continue;
                     }
                     if self.remaining == 0 {
+                        #[cfg(feature = "persistent-partials")]
+                        if self.partial_active() {
+                            self.partial_part_damage()?;
+                        }
                         let part = self.model.parts.last().expect("active part");
                         if let Some(machine) = &mut self.machine {
                             machine.finish_part(part)?;
@@ -1111,6 +1188,8 @@ impl ProgressiveSession {
         Ok(())
     }
     fn start(&mut self, frame: PhysicalFrame) -> ProgressiveResult<ProgressiveEvent> {
+        // a folder whose damaged header claims data is created and its data passed over, as UnRAR 7.30 does
+        let damaged = frame.damaged;
         let Block::File(header) = frame.block else { unreachable!() };
         #[cfg(feature = "persistent-partials")]
         let refusal = self.partial.as_ref().and_then(|_| partial::refusal(&header));
@@ -1155,6 +1234,11 @@ impl ProgressiveSession {
         // A RAR 5.0 redirection is checked as soon as its header is in: a symbolic link's target must stay inside
         // the destination, and a hard link or file copy must take a file this session published or tested.
         self.link_kind = None;
+        let mut unverified_link = None;
+        // An encrypted link whose password needs no checking by its cipher: let go (PlaceUnverified) or already
+        // verified (VerifyFirst), with the evidence it reports
+        let mut checked_link = None;
+        let mut link_rel = None;
         if let Some(redirection) = header.redirection.as_ref().filter(|_| refusal.is_none()) {
             let unsupported = || {
                 ProgressiveFailure::new(FailureKind::Rar(Box::new(crate::error::RarFailure::Unsupported(
@@ -1162,20 +1246,40 @@ impl ProgressiveSession {
                 ))))
             };
             let extract = &self.options.extract;
-            match crate::extract::link::from_rar5(
+            let kind = crate::extract::link::from_rar5(
                 redirection,
                 !header.is_unix(),
                 extract.windows_safe_names,
                 extract.flatten,
-            ) {
+            );
+            // Options::encrypted_links: VerifyFirst reports a password that doesn't verify before the link's target
+            // and the overwrite decision are looked at (an older revision is still skipped first, as it is below)
+            if kind.is_some()
+                && header.encrypted
+                && extract.encrypted_links == crate::extract::EncryptedLinks::VerifyFirst
+                && (header.version.is_none() || extract.mode == crate::extract::Mode::Test)
+            {
+                checked_link = Some(self.link_password_first(&header, member.ordinal)?);
+            }
+            let extract = &self.options.extract;
+            match kind {
                 None => return Err(unsupported()),
                 Some(Err(_)) => return Err(ProgressiveFailure::new(FailureKind::UnsafePath)),
                 Some(Ok(_)) if !cfg!(unix) && extract.mode != crate::extract::Mode::Test => return Err(unsupported()),
                 Some(Ok(kind)) => {
-                    let rel = self.link_rel(&header)?;
-                    let extracted = self.output.as_ref().map_or(&self.tested, |output| &output.extracted);
-                    if crate::extract::link::refusal_before_place(&rel, &kind, extracted).is_some() {
-                        return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+                    // its target is checked once the disposition says it is placed or tested (below)
+                    link_rel = Some(self.link_rel(&header)?);
+                    // An encrypted link is placed only on a password its check value verifies: the member's cipher
+                    // refuses no password or a wrong one, and one with no usable check value is refused, as a link has
+                    // no data to check a password against (`crate::extract::link::rar5_password`). The refusal waits
+                    // for the disposition: a member that is skipped (an older revision, an existing target) is never
+                    // placed or tested, so it is skipped as before.
+                    // Options::encrypted_links set to PlaceUnverified lets the password go unchecked, as 7-Zip does.
+                    if header.encrypted
+                        && self.options.password().is_some_and(|p| !p.is_empty())
+                        && extract.encrypted_links != crate::extract::EncryptedLinks::PlaceUnverified
+                    {
+                        unverified_link = header.crypt.as_ref().and_then(crate::extract::link::rar5_unverifiable);
                     }
                     self.link_kind = Some(kind);
                 }
@@ -1216,7 +1320,9 @@ impl ProgressiveSession {
             }
             Disposition::Skip(crate::extract::RarSkipReason::OlderVersion(version))
         } else if header.is_dir() {
-            if header.split_after() || header.packed_size != 0 || header.size_unknown() || header.unpacked_size != 0 {
+            if header.split_after()
+                || (!damaged && (header.packed_size != 0 || header.size_unknown() || header.unpacked_size != 0))
+            {
                 return Err(ProgressiveFailure::new(FailureKind::Malformed("directory payload or continuation")));
             }
             Disposition::Directory
@@ -1243,7 +1349,30 @@ impl ProgressiveSession {
             self.link_text.clear();
             self.disposition = Disposition::Link;
         }
-        let context = crate::extract::EntryContext {
+        // A RAR 5.0 redirection placed or tested: a symbolic link's target must stay inside the destination, and a
+        // hard link or file copy must take a file this session published or tested. One that is skipped (an older
+        // revision, an existing target under Overwrite::Skip, as UnRAR's `-o-` skips it) places and touches nothing,
+        // so it is skipped without them.
+        if let (Some(rel), Some(kind)) = (&link_rel, &self.link_kind)
+            && matches!(self.disposition, Disposition::Link | Disposition::Test)
+        {
+            let extracted = self.output.as_ref().map_or(&self.tested, |output| &output.extracted);
+            if crate::extract::link::refusal_before_place(rel, kind, extracted).is_some() {
+                return Err(ProgressiveFailure::new(FailureKind::UnsafePath));
+            }
+        }
+        if let Some(verifier) = unverified_link
+            && matches!(self.disposition, Disposition::Link | Disposition::Test)
+        {
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                crate::error::RarFailure::EncryptedIntegrity {
+                    scope: crate::error::RarScope::Member { index: Some(member.ordinal) },
+                    reason: crate::error::RarIntegrityReason::UnverifiableLinkPassword,
+                    verifier,
+                },
+            ))));
+        }
+        let mut context = crate::extract::EntryContext {
             entry: crate::extract::RarEntryIdentity {
                 index: Some(member.ordinal),
                 order: member.ordinal,
@@ -1264,6 +1393,7 @@ impl ProgressiveSession {
         } else {
             None
         };
+        let mut unchecked_sums = false;
         let mut machine = if decode && header.format == crate::rar5::RarFormat::Rar4 && header.method != 0 {
             self.history.take();
             let source = self
@@ -1302,11 +1432,30 @@ impl ProgressiveSession {
         } else if decode && self.link_kind.is_some() && header.packed_size == 0 && !header.split_after() {
             // A RAR 5.0 redirection without data moves past the decoder as the complete route's `past_link` does:
             // a method it carries neither needs a solid predecessor nor resets the history the next file goes on from.
-            let stored = crate::rar5::FileHeader { method: 0, solid: false, ..header.clone() };
+            let mut stored = crate::rar5::FileHeader { method: 0, solid: false, ..header.clone() };
+            let mut password = self.options.password();
+            if header.encrypted
+                && self.options.extract.encrypted_links == crate::extract::EncryptedLinks::PlaceUnverified
+            {
+                checked_link = Some(crate::error::RarPasswordEvidence::Unverified);
+            }
+            if let Some(evidence) = checked_link.filter(|_| header.encrypted) {
+                // Options::encrypted_links: the password isn't checked for an encrypted link (PlaceUnverified, as
+                // 7-Zip doesn't check it), or was checked as its header was read (VerifyFirst: no second key
+                // derivation). With no data nothing is decrypted, and a checksum of nothing (converted by a key the
+                // password may not give) is passed over, here and at the final verdict: the target is all it carries.
+                stored.encrypted = false;
+                stored.crypt = None;
+                stored.crc32 = None;
+                stored.blake2sp = None;
+                password = None;
+                context.password = evidence;
+                unchecked_sums = true;
+            }
             Some(MemberMachine::new_with_history(
                 &stored,
                 context,
-                self.options.password(),
+                password,
                 &self.usage,
                 &self.control,
                 None,
@@ -1362,7 +1511,10 @@ impl ProgressiveSession {
         } else {
             None
         };
-        let part = PhysicalPart::new(self.volume as usize, &header, frame.crypt, &wire);
+        let mut part = PhysicalPart::new(self.volume as usize, &header, frame.crypt, &wire);
+        if unchecked_sums {
+            part.checks = crate::rar5::session::RarChecks { crc32: None, blake2sp: None, keyed: false };
+        }
         if let Some(machine) = &mut machine {
             machine.begin_part(&part);
         }
@@ -1385,6 +1537,35 @@ impl ProgressiveSession {
         }
         Ok(ProgressiveEvent::MemberStarted { member, name, size })
     }
+    /// [`crate::extract::EncryptedLinks::VerifyFirst`]: an encrypted RAR 5.0 link's password is checked as its header
+    /// is read, as the member's cipher would check it, and one its check value can't verify is refused, as below. On
+    /// success, the evidence the member reports (its data-less machine then needs no second derivation).
+    fn link_password_first(
+        &self,
+        header: &crate::rar5::FileHeader,
+        ordinal: u64,
+    ) -> ProgressiveResult<crate::error::RarPasswordEvidence> {
+        let scope = crate::error::RarScope::Member { index: Some(ordinal) };
+        let password = self
+            .options
+            .password()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| ProgressiveFailure::new(FailureKind::PasswordRequired))?;
+        let params =
+            header.crypt.ok_or_else(|| ProgressiveFailure::new(FailureKind::Malformed("member encryption record")))?;
+        if let Some(verifier) = crate::extract::link::rar5_unverifiable(&params) {
+            return Err(ProgressiveFailure::new(FailureKind::Rar(Box::new(
+                crate::error::RarFailure::EncryptedIntegrity {
+                    scope,
+                    reason: crate::error::RarIntegrityReason::UnverifiableLinkPassword,
+                    verifier,
+                },
+            ))));
+        }
+        crate::rar5::member::controlled_keys(password, params, &self.usage, &self.control, scope)
+            .map(|keys| keys.evidence)
+    }
+
     /// Where a link member goes, relative to the destination, as its target is checked: a flattened output drops
     /// the member's folders.
     fn link_rel(&self, header: &crate::rar5::FileHeader) -> ProgressiveResult<std::path::PathBuf> {
@@ -1404,6 +1585,14 @@ impl ProgressiveSession {
     ) -> ProgressiveResult<Disposition> {
         let output = self.output.as_ref().expect("output");
         let name = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
+        // Overwrite::Skip: a symbolic link already at the target (one an earlier run placed, say) is skipped, as
+        // UnRAR's `-o-` skips it; nothing is written through it or over it
+        if self.options.extract.overwrite == crate::extract::Overwrite::Skip
+            && output.symlink_at(&name, !header.is_unix())?
+        {
+            self.target = None;
+            return Ok(Disposition::Skip(crate::extract::RarSkipReason::ExistingTarget));
+        }
         let target = output.prepare_target(member, &name, !header.is_unix())?;
         let skip = self.options.extract.overwrite == crate::extract::Overwrite::Skip && target.exists();
         if skip {
@@ -1826,7 +2015,10 @@ mod tests {
                 replace_placed_links: false,
                 keep_broken: false,
                 attempt_continued_members: false,
+                encrypted_links: Default::default(),
+                damaged_input: Default::default(),
                 unsupported_filters: Default::default(),
+                unverified_output: Default::default(),
                 salvage_truncated_zip: false,
                 unix_modes: Default::default(),
                 backslashes: Default::default(),
@@ -1960,7 +2152,10 @@ mod tests {
                     replace_placed_links: false,
                     keep_broken: false,
                     attempt_continued_members: false,
+                    encrypted_links: Default::default(),
+                    damaged_input: Default::default(),
                     unsupported_filters: Default::default(),
+                    unverified_output: Default::default(),
                     salvage_truncated_zip: false,
                     unix_modes: Default::default(),
                     backslashes: Default::default(),

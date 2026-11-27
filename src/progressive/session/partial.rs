@@ -51,6 +51,9 @@ pub(super) struct Persistent {
     directories: Vec<PendingDirectory>,
     /// Identities of every directory this session created: parents of its outputs and directory entries.
     created: Vec<crate::progressive::native::Identity>,
+    /// A header was read past as damage earlier in this session ([`crate::extract::Options::damaged_input`]): the
+    /// members after it are bound by position (see [`Self::member_keys`]).
+    pub(super) damaged: bool,
 }
 /// A member this session created or adopted. Its core (state pages, descriptors, `open_partials` lease) is held
 /// until the member has finished and the caller has taken its handle with `partial_file`; then the session keeps
@@ -180,10 +183,78 @@ impl Persistent {
                 .get(start..start + len)
                 .ok_or_else(|| ProgressiveFailure::new(FailureKind::SourceContract))?;
             usage.charge(Resource::MetadataBytes, len as u64)?;
-            self.witness = Some(HeaderWitness { volume, packed: frame.extent.clone(), bytes: bytes.to_vec() });
+            self.witness = Some(HeaderWitness {
+                volume,
+                packed: frame.extent.clone(),
+                bytes: bytes.to_vec(),
+                salvaged: frame.damaged,
+            });
         }
         self.header.clear();
         Ok(())
+    }
+    /// Drops the header bytes recorded so far: reading goes on elsewhere (a resync, the next volume) after a header
+    /// read past as damage.
+    pub(super) fn drop_header(&mut self) {
+        self.header.clear();
+    }
+    /// The keys a member whose first header is `witness` may have in the anchor store, in the order they are looked
+    /// up, and the key it is created under when none has an anchor.
+    ///
+    /// - A member whose first header is whole, in a session that has read past no damage before it (or that does not
+    ///   honour `damaged_input`): the ordinal and a digest of its header bytes, as always.
+    /// - After damage, ordinals may have moved (damage can hide a member or turn a header into another block), so
+    ///   the member is bound by position: [`MemberKey::POSITIONAL`] and a digest of its volume, header offset and
+    ///   header bytes, which the same header at the same place gives whatever came before it.
+    /// - A member whose first header was itself read as damage is bound by its position only: a digest of the volume
+    ///   and header offset. A later run over the same damaged bytes finds it again; one over the repaired header
+    ///   finds it too, and adoption decides whether the repaired header describes the same member.
+    ///
+    /// A whole header in a session honouring `damaged_input` is looked up under each form, so a member created after
+    /// damage, or under a header since repaired, is found again by a run that reads no damage before it.
+    fn member_keys(
+        &self,
+        format: crate::rar5::RarFormat,
+        ordinal: u64,
+        witness: &HeaderWitness,
+        honours_damage: bool,
+    ) -> (Vec<MemberKey>, MemberKey) {
+        let rar4 = format == crate::rar5::RarFormat::Rar4;
+        let domain = |name: &str| {
+            let mut identity =
+                if rar4 { b"zipfast/rar4-stored/member/".to_vec() } else { b"zipfast/plain-stored/member/".to_vec() };
+            identity.extend_from_slice(name.as_bytes());
+            identity.push(0);
+            identity
+        };
+        let binding = self.options.binding.clone();
+        let positioned = |mut identity: Vec<u8>| {
+            identity.extend_from_slice(&witness.volume.to_le_bytes());
+            identity.extend_from_slice(&witness.packed.start.to_le_bytes());
+            identity
+        };
+        let salvaged = || {
+            MemberKey::new(
+                binding.clone(),
+                MemberKey::POSITIONAL,
+                crate::crypto::sha256(&positioned(domain("salvaged-at/v1"))),
+            )
+        };
+        if witness.salvaged {
+            let key = salvaged();
+            return (vec![key.clone()], key);
+        }
+        let mut identity = domain("v1");
+        identity.extend_from_slice(&witness.bytes);
+        let ordered = MemberKey::new(binding.clone(), ordinal, crate::crypto::sha256(&identity));
+        if !honours_damage {
+            return (vec![ordered.clone()], ordered);
+        }
+        let mut identity = positioned(domain("at/v1"));
+        identity.extend_from_slice(&witness.bytes);
+        let at = MemberKey::new(binding.clone(), MemberKey::POSITIONAL, crate::crypto::sha256(&identity));
+        let create = if self.damaged { at.clone() } else { ordered.clone() };
+        (vec![ordered, at, salvaged()], create)
     }
     fn active(&self) -> (&MemberKey, &Arc<PartialCore>) {
         let slot = &self.cores[self.current.expect("persistent member")];
@@ -229,6 +300,7 @@ impl ProgressiveSession {
             resume: None,
             directories: Vec::new(),
             created: Vec::new(),
+            damaged: false,
         });
         Ok(session)
     }
@@ -585,16 +657,9 @@ impl ProgressiveSession {
         self.usage.charge(Resource::MetadataBytes, (witness.bytes.len() + header.name.len() + 32) as u64)?;
         // Each format has its own identity domain, so a RAR4 and a RAR5 member never share a key or a bundle.
         let format = header.format;
-        let mut identity = match format {
-            crate::rar5::RarFormat::Rar5 => b"zipfast/plain-stored/member/v1\0".to_vec(),
-            crate::rar5::RarFormat::Rar4 => b"zipfast/rar4-stored/member/v1\0".to_vec(),
-        };
-        identity.extend_from_slice(&witness.bytes);
-        let key = MemberKey::new(
-            persistent.options.binding.clone(),
-            self.member.unwrap().ordinal,
-            crate::crypto::sha256(&identity),
-        );
+        let honours_damage = self.options.extract.damaged_input.salvages();
+        let (lookups, key) = persistent.member_keys(format, self.member.unwrap().ordinal, &witness, honours_damage);
+        self.usage.charge(Resource::MetadataBytes, (lookups.len() * std::mem::size_of::<MemberKey>()) as u64)?;
         let output = header.output_name().unwrap_or(std::borrow::Cow::Borrowed(&header.name));
         let mut relative = crate::path::sanitize_fallible(&output, !header.is_unix())
             .map_err(|_| error(PartialErrorKind::UnsafePath))?;
@@ -621,8 +686,10 @@ impl ProgressiveSession {
             None => None,
         };
         // A member an earlier session created has its anchor already: adopt it instead of creating it again.
-        if let Some(anchor) = persistent.options.anchors.current(&key).map_err(failure)? {
-            return self.partial_adopt(key, anchor, relative, plain, witness, keys);
+        for found in lookups {
+            if let Some(anchor) = persistent.options.anchors.current(&found).map_err(failure)? {
+                return self.partial_adopt(found, anchor, relative, plain, witness, keys);
+            }
         }
         let checks = member_checks(physical);
         let admission = SourceAdmission {
@@ -773,8 +840,16 @@ impl ProgressiveSession {
         )
         .map_err(failure)?;
         check(&mut self.driver)?;
-        core.check_adopted(&relative, header.name.as_bytes(), header.unpacked_size).map_err(failure)?;
-        if !core.recorded_part(&plain, &witness).map_err(failure)? {
+        // A mismatch names the header: a member bound by position whose header has been repaired into another
+        // member's is refused here, before anything is written.
+        let at = |error: PartialError| {
+            let mut failure = failure(error);
+            failure.context.volume_index = Some(witness.volume);
+            failure.context.packed_offset = Some(witness.packed.start);
+            failure
+        };
+        core.check_adopted(&relative, header.name.as_bytes(), header.unpacked_size).map_err(at)?;
+        if !core.recorded_part(&plain, &witness).map_err(at)? {
             return Err(error(PartialErrorKind::StateMalformed));
         }
         let (produced, finished, size) = core.resume_point().map_err(failure)?;
@@ -1058,6 +1133,53 @@ impl ProgressiveSession {
         self.driver.validate_current()?;
         Ok(written)
     }
+    /// A plain stored part read whole that fails its own check (an article whose transport check passed but whose
+    /// bytes are wrong) holds a wrong byte somewhere in its output. Rather than ending the session, which would
+    /// leave every member after it to be read again, the part's output becomes a `DeclaredBad` hole, as if the
+    /// caller had declared the part's packed bytes with `declare_hole`, and is delivered as a `Hole` event (after
+    /// the `BytesWritten` events of that output). The caller refills it once the volume is repaired, reading that
+    /// part again and nothing else. Called at the end of each part of a persistent member.
+    pub(super) fn partial_part_damage(&mut self) -> ProgressiveResult<()> {
+        let part = self.model.parts.last().expect("active part");
+        let plain = !self.model.members.last().is_some_and(|m| m.header.encrypted);
+        if !plain || part.packed_size == 0 || !self.machine.as_ref().is_some_and(|m| m.part_checks_fail(part)) {
+            return Ok(());
+        }
+        let span = plain_part(part, 0)?.packed;
+        self.declare_bad_part(span)
+    }
+    /// The final part's counterpart of [`Self::partial_part_damage`]: a plain stored member whose final checks
+    /// fail while every part before the last passed a check of its own has its wrong bytes in the last part, so
+    /// that part's output becomes a `DeclaredBad` hole and the member finishes with it. A member in one part, or
+    /// with a part before the last that was not checked (a hole, no check recorded), keeps the strict failure.
+    fn partial_final_part_damage(&mut self) -> ProgressiveResult<()> {
+        let member = self.model.members.last().expect("active member");
+        let Some(part) = self.model.parts.last().filter(|p| p.final_part && p.packed_size > 0) else { return Ok(()) };
+        let before = self.model.parts.len() - 1;
+        let checked = before > 0
+            && self.part_evidence.len() == self.model.parts.len()
+            && self.model.parts[..before].iter().zip(&self.part_evidence).all(|(part, evidence)| {
+                *evidence == PackedEvidence::Passed && (part.checks.crc32.is_some() || part.checks.blake2sp.is_some())
+            });
+        if member.header.encrypted || !checked || !self.finalizer.as_ref().is_some_and(|m| m.member_checks_fail(member))
+        {
+            return Ok(());
+        }
+        let span = plain_part(part, 0)?.packed;
+        self.declare_bad_part(span)
+    }
+    /// Declares `span` (a part's packed data) damaged on the active member and queues the resulting holes as
+    /// events. The member machine stops judging the part and the member (`declare_missing`).
+    fn declare_bad_part(&mut self, span: PackedSpan) -> ProgressiveResult<()> {
+        let receipt = self.declare_hole(span.volume, span.range)?;
+        let persistent = self.partial.as_mut().unwrap();
+        for report in receipt.holes {
+            self.usage.charge(Resource::MetadataBytes, std::mem::size_of::<HoleReport>() as u64)?;
+            persistent.holes.try_reserve(1).map_err(|_| error(PartialErrorKind::StateMalformed))?;
+            persistent.holes.push_back(report);
+        }
+        Ok(())
+    }
     pub(super) fn partial_part_event(&self) -> ProgressiveResult<Option<ProgressiveEvent>> {
         if !self.partial_active() {
             return Ok(None);
@@ -1115,6 +1237,9 @@ impl ProgressiveSession {
         &mut self,
         cx: &mut Context<'_>,
     ) -> ProgressiveResult<Poll<ProgressiveResult<Option<ProgressiveEvent>>>> {
+        if self.finalizer.is_some() {
+            self.partial_final_part_damage()?;
+        }
         if let Some(mut machine) = self.finalizer.take() {
             machine.finish_member(self.model.members.last().unwrap())?;
             self.partial.as_ref().unwrap().active().1.finish_member().map_err(failure)?;

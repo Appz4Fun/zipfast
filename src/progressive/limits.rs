@@ -143,6 +143,9 @@ pub struct ProgressiveLimits {
     pub protection_paths: u64,
     pub protection_path_bytes: u64,
 }
+/// The default of every byte-total limit (source, logical output, temp, output writes, verify): 1 TiB.
+pub const DEFAULT_BYTE_TOTAL: u64 = 1 << 40;
+
 impl Default for ProgressiveLimits {
     fn default() -> Self {
         Self {
@@ -162,12 +165,14 @@ impl Default for ProgressiveLimits {
             source_requests: 4194304,
             source_bookkeeping: 64 * 1024 * 1024,
             provider_wakes: 1048576,
-            source_bytes: 68719476736,
-            logical_output_bytes: 68719476736,
-            temp_bytes: 68719476736,
-            output_write_bytes: 68719476736,
-            verify_bytes: 68719476736,
-            verify_work_bytes: 68719476736,
+            // Byte totals are not where a hostile archive is stopped (declared sizes, the decoder window and the
+            // per-poll work are): they only have to exceed real sets, such as 70-100 GB UHD remux posts. 1 TiB each.
+            source_bytes: DEFAULT_BYTE_TOTAL,
+            logical_output_bytes: DEFAULT_BYTE_TOTAL,
+            temp_bytes: DEFAULT_BYTE_TOTAL,
+            output_write_bytes: DEFAULT_BYTE_TOTAL,
+            verify_bytes: DEFAULT_BYTE_TOTAL,
+            verify_work_bytes: DEFAULT_BYTE_TOTAL,
             decoder_window: 268435456,
             packed_work_per_poll: 1048576,
             kdf_exponent: 20,
@@ -240,10 +245,23 @@ impl ProgressiveLimits {
 struct UsageState {
     limits: ProgressiveLimits,
     used: [u64; 31],
+    /// RAR 5.0 key material the session derived, by password, salt and count: a later member with the same input
+    /// costs no derivation work.
+    rar5_keys: crate::crypto::Rar5KeyCache,
+    /// RAR 3.x keys the session derived, by password and salt.
+    rar4_keys: crate::crypto::Rar4Keys,
+    /// 7zAES keys the session derived, by password, cycle power and salt.
+    seven_zip_keys: crate::crypto::KdfCache<(u8, Vec<u8>), [u8; 32]>,
 }
 impl UsageState {
     pub(crate) fn new(limits: ProgressiveLimits) -> Self {
-        Self { limits, used: [0; 31] }
+        Self {
+            limits,
+            used: [0; 31],
+            rar5_keys: Default::default(),
+            rar4_keys: Default::default(),
+            seven_zip_keys: Default::default(),
+        }
     }
     pub(crate) fn check(&self, resource: Resource, attempted: u64) -> ProgressiveResult<()> {
         let limit = self.limits.limit(resource);
@@ -328,6 +346,43 @@ impl Usage {
         state.charge(Resource::LogicalOutputBytes, amount)
     }
 
+    /// RAR 5.0 key material this session derived before for the input, when it serves a member with `check`
+    /// ([`crate::crypto::Rar5Derived::serves`]).
+    pub(crate) fn rar5_cached(
+        &self,
+        password: &[u8],
+        kdf_count: u8,
+        salt: &[u8; 16],
+        check: Option<([u8; 8], [u8; 4])>,
+    ) -> Option<crate::crypto::Rar5Derived> {
+        self.0.lock().unwrap().rar5_keys.get(password, &(kdf_count, *salt)).filter(|derived| derived.serves(check))
+    }
+    /// Keeps RAR 5.0 key material derived for the input for the rest of the session.
+    pub(crate) fn rar5_remember(
+        &self,
+        password: &[u8],
+        kdf_count: u8,
+        salt: &[u8; 16],
+        derived: crate::crypto::Rar5Derived,
+    ) {
+        self.0.lock().unwrap().rar5_keys.insert(password, (kdf_count, *salt), derived);
+    }
+    /// The RAR 3.x key and IV this session derived before for the password and salt.
+    pub(crate) fn rar4_cached(&self, password: &[u8], salt: &[u8; 8]) -> Option<([u8; 16], [u8; 16])> {
+        self.0.lock().unwrap().rar4_keys.get(password, salt)
+    }
+    /// Keeps a RAR 3.x key and IV derived for the password and salt for the rest of the session.
+    pub(crate) fn rar4_remember(&self, password: &[u8], salt: &[u8; 8], keys: ([u8; 16], [u8; 16])) {
+        self.0.lock().unwrap().rar4_keys.insert(password, *salt, keys);
+    }
+    /// The 7zAES key this session derived before for the password, cycle power and salt.
+    pub(crate) fn seven_zip_cached(&self, password: &[u8], cycles: u8, salt: &[u8]) -> Option<[u8; 32]> {
+        self.0.lock().unwrap().seven_zip_keys.get(password, &(cycles, salt.to_vec()))
+    }
+    /// Keeps a 7zAES key derived for the password, cycle power and salt for the rest of the session.
+    pub(crate) fn seven_zip_remember(&self, password: &[u8], cycles: u8, salt: &[u8], key: [u8; 32]) {
+        self.0.lock().unwrap().seven_zip_keys.insert(password, (cycles, salt.to_vec()), key);
+    }
     pub(crate) fn charge(&self, resource: Resource, amount: u64) -> ProgressiveResult<()> {
         self.0.lock().unwrap().charge(resource, amount)?;
         self.record(resource, amount, true);

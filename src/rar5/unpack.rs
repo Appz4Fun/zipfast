@@ -65,6 +65,13 @@ pub(crate) const BC: usize = 20;
 const TABLES: usize = NC + DC + LDC + RC;
 /// Zero bytes after a block's payload, so reads near its end never need a bounds check.
 const PAD: usize = 32;
+/// How close to the end of the data UnRAR 7.30 stops decoding a RAR 5.0 block the data ends inside (see
+/// [`Unpacker::flush_cut`]); found by observation (`textvol.part1.rar`, and `text.rar` made into a first volume cut
+/// at a dozen places). 7-Zip 26.06 `x -so` decodes to the end: a margin of 0.
+const TAIL_MARGIN_BITS: usize = 128;
+/// The least of a block (header and payload) UnRAR 7.30 decodes anything of when the data ends inside it; observed
+/// as [`TAIL_MARGIN_BITS`] was.
+const TAIL_BLOCK_MIN: usize = 1024;
 const MAX_FILTERS: usize = 8192;
 const MAX_FILTER_LEN: u64 = 0x40_0000;
 
@@ -86,6 +93,8 @@ const HAND_OVER_MIN: usize = 64 << 10;
 const STAGE: usize = 1024;
 /// Bits of a code looked up in one step; longer codes take the slow path.
 const LUT_BITS: u32 = 11;
+/// The share of the main code's space (out of 1 << 16) the literals of one length must take for [`Huff::quick`].
+const QUICK_SPACE: u32 = 13 << 12;
 /// Codes [`Huff::run8`] reads in one round, and the bits from where a round starts to the end of the last byte it
 /// reads: a round's codes and one more byte.
 #[cfg(target_arch = "aarch64")]
@@ -269,7 +278,15 @@ impl Huff {
         // incompressible data comes out as literals nearly all of one length: worth guessing at
         by_len[0] = 0;
         let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
-        self.common = if !lits.is_empty() && *n >= 160 && len <= LUT_BITS as usize { len as u32 } else { 0 };
+        // and worth it only when that length's literals take most of the code space, so runs of them are long: the
+        // quick reads stop with a mispredicted branch at every other code, and below about four literals a run
+        // (13/16 of the space) decoding codes one by one is faster
+        let space = if len == 0 { 0 } else { *n << (16 - len) };
+        self.common = if !lits.is_empty() && *n >= 160 && len <= LUT_BITS as usize && space >= QUICK_SPACE {
+            len as u32
+        } else {
+            0
+        };
         // canonical codes up to the table's width fill it from the start, in order; the rest belongs to longer codes
         // or to none, and is marked for the slow path
         let mut covered = 0;
@@ -524,20 +541,27 @@ impl Huff {
         if self.common == 0 {
             return 0;
         }
+        let mut streak = 0u32;
         while k < room && bits.pos() + 128 <= end_bits {
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-            {
-                k += self.run8(bits, end_bits, &mut stage[k..], room - k);
-                if k >= room || bits.pos() + 128 > end_bits {
-                    break;
-                }
-            }
-            // SAFETY: 128 bits before the block's end (checked by the loop, and again after the rounds), and a
-            // block's bytes go on for PAD past it
+            // SAFETY: 128 bits before the block's end (checked by the loop), and a block's bytes go on for PAD past it
             unsafe { bits.refill_inside() };
             let (lits, n) = self.quick(bits);
             stage[k..k + 8].copy_from_slice(&lits);
             k += n;
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            if n == 7 {
+                streak += 1;
+                if streak < 2 {
+                    continue;
+                }
+                // fourteen literals of length 8 in a row, over two quick reads: a run likely long enough to be worth
+                // the rounds, which cost more to start than a few quick literals do. Data where other codes come
+                // every few literals loses more to rounds that end early than long runs gain.
+                k += self.run8(bits, end_bits, &mut stage[k..], room.saturating_sub(k));
+                streak = 0;
+                continue;
+            }
+            streak = 0;
             if n < 5 {
                 // a code of some other kind stopped them, with at least the table's width of bits still in the
                 // accumulator: a literal of another length joins them, anything else ends the run
@@ -730,7 +754,14 @@ pub struct Unpacker {
     /// filters run so far whose output the window may still hold, when a feed decoder wants checkpoints
     /// ([`Self::record_filters`]): stream offsets
     seen: Option<Vec<SeenFilterRec>>,
+    /// [`crate::extract::UnverifiedOutput::Emit`] ([`Self::track_tail`]): the symbols in the last
+    /// [`TAIL_MARGIN_BITS`] of the latest block decoded on this thread, as (bits from the symbol's start to the end of
+    /// the block's payload, output position before it), and that block's payload bits
+    tail: Option<Box<TailSymbols>>,
 }
+
+/// See `Unpacker::tail`.
+type TailSymbols = (Vec<(usize, u64)>, usize);
 
 impl Drop for Unpacker {
     fn drop(&mut self) {
@@ -898,6 +929,7 @@ impl Unpacker {
             hand_over_window: HAND_OVER_WINDOW,
             hand_over_min: HAND_OVER_MIN,
             seen: None,
+            tail: None,
         })
     }
 
@@ -1544,16 +1576,29 @@ impl Unpacker {
         sink: &mut dyn Sink,
     ) -> Result<()> {
         if self.parallel {
+            if let Some(tail) = self.tail.as_mut() {
+                // a block on the workers: no symbols noted for it
+                tail.0.clear();
+            }
             return self.submit(buf, shared, payload, flags, sink);
         }
         let valid_bits = usize::from(flags & 7) + 1;
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
+        if let Some(tail) = self.tail.as_mut() {
+            tail.0.clear();
+            tail.1 = payload * 8;
+        }
+        self.block_to(buf, end_bits, flags, sink)
+    }
+
+    /// A block's symbols on this thread, up to `end_bits` into `buf` (which goes on for [`PAD`] bytes past them).
+    fn block_to(&mut self, buf: &[u8], end_bits: usize, flags: u8, sink: &mut dyn Sink) -> Result<()> {
         let mut bits = Bits::new(buf);
         if flags & 0x80 != 0 {
             let lens = read_lengths(&mut self.pre, &mut bits, end_bits)?;
             self.slot = Slot::filled(Some(lens));
             self.tables_ready = true;
-        } else if !self.tables_ready && payload > 0 {
+        } else if !self.tables_ready && end_bits > 0 {
             return Err(corrupt("block without tables at the start of a stream"));
         }
         // after blocks on workers, the tables here may lag behind the lengths last read
@@ -1576,13 +1621,26 @@ impl Unpacker {
         sink: &mut dyn Sink,
     ) -> Result<()> {
         let flush_at = self.flush_at();
-        while bits.pos() < end_bits {
+        // Self::track_tail: the last symbols one by one, noting where each starts
+        let bulk_end = if self.tail.is_some() { end_bits.saturating_sub(TAIL_MARGIN_BITS) } else { end_bits };
+        while bits.pos() < bulk_end {
             if self.sp - self.file_base - self.emitted > flush_at {
                 self.flush(sink)?;
             }
             // decode until the block ends or the window holds as much unflushed output as it may
             let stop = self.file_base + self.emitted + flush_at + 1;
-            self.run(bits, end_bits, stop, tables)?;
+            self.run(bits, bulk_end, stop, tables)?;
+        }
+        while bits.pos() < end_bits {
+            if self.sp - self.file_base - self.emitted > flush_at {
+                self.flush(sink)?;
+            }
+            let stop = self.file_base + self.emitted + flush_at + 1;
+            let (at, sp) = (bits.pos(), self.sp);
+            if let Some(tail) = self.tail.as_mut() {
+                tail.0.push((tail.1.saturating_sub(at), sp));
+            }
+            self.run(bits, at + 1, stop, tables)?;
         }
         if bits.pos() > end_bits {
             return Err(corrupt("a symbol runs past the end of its block"));
@@ -1919,6 +1977,48 @@ impl Unpacker {
     /// Whether the block flagged last was decoded on a decoder that stops there.
     pub(crate) fn ended(&self) -> bool {
         self.ended
+    }
+
+    /// [`crate::extract::UnverifiedOutput::Emit`]: the member's data stopped inside a block (a missing volume). Decodes
+    /// what came of that block, then emits everything decoded that no pending filter holds back, as UnRAR 7.30 `p`
+    /// and `x -kb` write it: a block of which fewer than [`TAIL_BLOCK_MIN`] bytes (its header included) came is not
+    /// decoded at all, and in one that is, a symbol starting in the last [`TAIL_MARGIN_BITS`] bits of what came is
+    /// left out, with everything after it. (UnRAR also leaves out the symbols in the last bits of the block before
+    /// when fewer than 16 bytes of the next came; those stay here.) The decoder is not to be fed again after this.
+    pub(crate) fn flush_cut(&mut self, sink: &mut dyn Sink) -> Result<()> {
+        self.settle(0, sink)?;
+        if !self.ended
+            && let Ok(Some((header_len, payload, flags))) = block_header(&self.input)
+            && self.input.len() >= TAIL_BLOCK_MIN
+            && self.input.len() - header_len < payload
+        {
+            let have = self.input.len() - header_len;
+            let mut block = std::mem::take(&mut self.input);
+            block.drain(..header_len);
+            block.resize(have + PAD, 0);
+            let end_bits = (have * 8).saturating_sub(TAIL_MARGIN_BITS);
+            let parallel = std::mem::replace(&mut self.parallel, false);
+            // what decodes before a damaged or cut symbol stands: the member fails anyway
+            let _ = self.block_to(&block, end_bits, flags, sink);
+            self.parallel = parallel;
+        } else if let Some(tail) = self.tail.take() {
+            // the block before ends within the margin of the data's end: its last symbols are left out too
+            let after = self.input.len().saturating_mul(8);
+            if let Some(&(_, before)) = tail.0.iter().find(|&&(left, _)| left + after <= TAIL_MARGIN_BITS)
+                && before >= self.emitted.max(self.file_base)
+                && before <= self.sp
+            {
+                self.sp = before;
+            }
+        }
+        self.ended = true;
+        self.flush(sink)
+    }
+
+    /// Notes where the last symbols of each block start, so that [`Self::flush_cut`] can leave out what UnRAR leaves
+    /// out when the data ends just past a block. Blocks decoded on worker threads are not followed.
+    pub(crate) fn track_tail(&mut self) {
+        self.tail.get_or_insert_with(Default::default);
     }
 
     /// Emits everything decoded that no pending filter holds back.

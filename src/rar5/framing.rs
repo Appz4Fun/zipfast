@@ -71,6 +71,8 @@ pub(crate) struct PhysicalFrame {
     pub(crate) header_crypt: Option<std::result::Result<crate::crypto::Rar5CryptParams, crate::crypto::Rar5CryptError>>,
     /// The end of archive header's fields, for an end frame.
     pub(crate) end_record: Option<super::RarEndRecord>,
+    /// The header failed its checksum and was parsed anyway ([`HeaderParser::set_salvage`]).
+    pub(crate) damaged: bool,
 }
 #[allow(
     clippy::large_enum_variant,
@@ -126,6 +128,12 @@ pub(crate) struct HeaderParser {
     /// Progressive sessions that opted in through [`crate::progressive::ProgressiveOptions::rar4_unknown_part_crc`]:
     /// a RAR 4.x file part that continues into the next volume and stores 0 as its CRC has no part check.
     rar4_unknown_part_crc: bool,
+    /// [`crate::extract::DamagedInput::Salvage`]: a clear header that fails its checksum is parsed anyway, and its
+    /// frame says so ([`PhysicalFrame::damaged`]).
+    salvage: bool,
+    /// [`crate::extract::DamagedInput::Resync`]: a damaged header of an unknown type is unreadable (the search for
+    /// the next header goes on from it) rather than passed over by the size it claims.
+    resync: bool,
 }
 impl HeaderParser {
     pub(crate) fn new(path: PathBuf, at: u64, complete_len: Option<u64>, catalogue: bool) -> Self {
@@ -155,7 +163,14 @@ impl HeaderParser {
             legacy_headers: false,
             map_lenient: false,
             rar4_unknown_part_crc: false,
+            salvage: false,
+            resync: false,
         }
+    }
+    /// See [`Self::salvage`]. Encrypted headers are never salvaged: a checksum failure there is a wrong key.
+    pub(crate) fn set_salvage(&mut self, damaged: crate::extract::DamagedInput) {
+        self.salvage = damaged.salvages();
+        self.resync = damaged == crate::extract::DamagedInput::Resync;
     }
     pub(crate) fn format(&self) -> RarFormat {
         self.format
@@ -278,14 +293,73 @@ impl HeaderParser {
         };
     }
     pub(crate) fn advance(&mut self, bytes: &[u8]) -> ProgressiveResult<(usize, ParserStep)> {
-        self.advance_core(bytes).map_err(|error| {
-            let mut failure = error.progressive();
-            failure.context.packed_offset = Some(self.at);
-            if !self.path.as_os_str().is_empty() {
-                failure.context.expected = Some(std::mem::take(&mut self.path).into_os_string());
-            }
-            failure
-        })
+        self.advance_core(bytes).map_err(|error| self.progressive_error(error))
+    }
+    fn progressive_error(&mut self, error: FramingError) -> ProgressiveFailure {
+        let mut failure = error.progressive();
+        failure.context.packed_offset = Some(self.at);
+        if !self.path.as_os_str().is_empty() {
+            failure.context.expected = Some(std::mem::take(&mut self.path).into_os_string());
+        }
+        failure
+    }
+    /// [`Self::advance`] for a progressive session under [`crate::extract::DamagedInput::Salvage`] or `Resync`: a
+    /// failure that is header damage (a header that fails its checksum and doesn't parse, doesn't frame, or runs
+    /// past the end of the volume) is `Ok(Err(kind))`, the header starting at [`Self::header_offset`], and the
+    /// parser stays stopped until [`Self::resume_at`]. As [`crate::rar5::reader::Volume`] decides it; never with
+    /// encrypted headers, where a failed checksum is how a wrong password shows. Every other failure is `Err`.
+    pub(crate) fn advance_salvaging(
+        &mut self,
+        bytes: &[u8],
+    ) -> ProgressiveResult<std::result::Result<(usize, ParserStep), crate::extract::HeaderDamageKind>> {
+        if !self.salvage || self.encrypted() {
+            return self.advance(bytes).map(Ok);
+        }
+        match self.advance_core(bytes) {
+            Ok(step) => Ok(Ok(step)),
+            Err(error) => match salvage_kind(&error) {
+                Some(kind) => Ok(Err(kind)),
+                None => Err(self.progressive_error(error)),
+            },
+        }
+    }
+    /// Whether damaged headers are read past ([`Self::set_salvage`]): never once the archive is recognised as having
+    /// encrypted headers, where a failed checksum or a cut header is how a wrong password or a truncation shows.
+    pub(crate) fn salvages(&self) -> bool {
+        self.salvage && !self.encrypted()
+    }
+    /// Whether an unreadable header is searched past ([`crate::extract::DamagedInput::Resync`]).
+    pub(crate) fn resyncs(&self) -> bool {
+        self.resync
+    }
+    /// The volume's length, once a progressive session under salvage knows it: a header or data running past it is
+    /// a volume cut short ([`crate::extract::HeaderDamageKind::UnexpectedEnd`]) and reading stops there, as for a
+    /// whole volume.
+    pub(crate) fn set_complete_len(&mut self, len: u64) {
+        self.complete_len = Some(len);
+    }
+    /// Where the parser's next byte comes from, once the signature is found.
+    pub(crate) fn next_offset(&self) -> Option<u64> {
+        self.signature.is_none().then(|| self.at.saturating_add(self.buffer.len() as u64))
+    }
+    /// Whether the parser stopped at a failure ([`Self::resume_at`] starts it again).
+    pub(crate) fn stopped(&self) -> bool {
+        self.failed
+    }
+    pub(crate) fn complete_len(&self) -> Option<u64> {
+        self.complete_len
+    }
+    /// At a block boundary, with nothing of the next header read.
+    pub(crate) fn at_block_start(&self) -> bool {
+        self.signature.is_none() && self.buffer.is_empty() && matches!(self.phase, Phase::Prefix | Phase::Rar4Prefix)
+    }
+    /// Reading goes on at `at`, where a resync found a header whose checksum passes: a stopped parser starts again,
+    /// keeping its format and the volume's header byte count. Never used with encrypted headers.
+    pub(crate) fn resume_at(&mut self, at: u64) {
+        self.at = at;
+        self.failed = false;
+        self.ended = false;
+        self.reset();
     }
     fn scope(&self) -> RarScope {
         RarScope::Header { volume: self.path.clone() }
@@ -436,6 +510,13 @@ impl HeaderParser {
                     let kind = self.buffer[2];
                     let flags = u16::from_le_bytes([self.buffer[3], self.buffer[4]]);
                     let size = usize::from(u16::from_le_bytes([self.buffer[5], self.buffer[6]]));
+                    if self.salvage
+                        && size >= 7
+                        && self.complete_len.is_some_and(|len| self.at.saturating_add(size as u64) > len)
+                    {
+                        // salvage tells a volume cut short from a header that can't be read
+                        return Err(self.fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false).into());
+                    }
                     if size < 7
                         || self
                             .at
@@ -444,7 +525,8 @@ impl HeaderParser {
                     {
                         return Err(self.framing("RAR4 header size", Error::Corrupt("RAR4 header size")).into());
                     }
-                    if self.embedded_comment(kind, flags) {
+                    // under salvage the body decides, once its checksum is known: a damaged flag is damage
+                    if !self.salvage && self.embedded_comment(kind, flags) {
                         return Err(self.rar4_unsupported("embedded comment").into());
                     }
                     if let Some(budget) = budget {
@@ -514,7 +596,10 @@ impl HeaderParser {
                     let plain_end = base + 4 + self.size_len + self.size;
                     let stored = u32::from_le_bytes(self.buffer[base..base + 4].try_into().unwrap());
                     let actual = crate::crc32::hash(&self.buffer[base + 4..plain_end]);
-                    if actual != stored {
+                    // never an encryption header: its salt and KDF parameters are what every later header needs
+                    let crypt = self.buffer.get(base + 4 + self.size_len) == Some(&(HEAD_CRYPT as u8));
+                    let damaged = actual != stored && self.salvage && !self.encrypted() && !crypt;
+                    if actual != stored && !damaged {
                         return Err(FramingError::Checksum {
                             expected: stored,
                             actual,
@@ -530,7 +615,11 @@ impl HeaderParser {
                         });
                     }
                     let header_end = self.at + self.need as u64;
-                    let frame = self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end)?;
+                    let mut frame = self.parse(&self.buffer[base + 4 + self.size_len..plain_end], header_end)?;
+                    if damaged && self.resync && matches!(frame.block, Block::Unknown) {
+                        return Err(self.framing("damaged header", Error::Corrupt("damaged header")).into());
+                    }
+                    frame.damaged = damaged;
                     self.ended = matches!(frame.block, Block::End { .. });
                     self.at = frame.data_end;
                     self.reset();
@@ -566,6 +655,7 @@ impl HeaderParser {
             data_end,
             header_crypt: None,
             end_record: None,
+            damaged: false,
         };
         frame.block = match kind {
             HEAD_MAIN => {
@@ -616,6 +706,23 @@ impl HeaderParser {
             _ => Block::Unknown,
         };
         Ok(frame)
+    }
+}
+
+/// What a salvaging run reads past ([`crate::extract::DamagedInput::Salvage`]): a header failure that is damage, as
+/// [`crate::rar5::reader::Volume`] tells it apart.
+fn salvage_kind(error: &FramingError) -> Option<crate::extract::HeaderDamageKind> {
+    use crate::extract::HeaderDamageKind;
+    let (FramingError::Rar(fault) | FramingError::Checksum { fault, .. }) = error else { return None };
+    match fault.failure.as_ref() {
+        RarFailure::Integrity { scope: RarScope::Header { .. }, reason, .. } => match reason {
+            RarIntegrityReason::TruncatedHeader | RarIntegrityReason::TruncatedData => {
+                Some(HeaderDamageKind::UnexpectedEnd)
+            }
+            RarIntegrityReason::HeaderCrc | RarIntegrityReason::HeaderFraming(_) => Some(HeaderDamageKind::Unreadable),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

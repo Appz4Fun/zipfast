@@ -233,6 +233,173 @@ pub struct Options {
     /// ITANIUM, DELTA, RGB, AUDIO) filters: it fails (the default), or it is written with the block that program
     /// filters left as decoded, as 7-Zip 26.06 writes it. See [`UnsupportedFilters`].
     pub unsupported_filters: UnsupportedFilters,
+    /// What a RAR 4.x or RAR 5.0 header that fails its checksum or doesn't parse does to the run: refuse the archive
+    /// (the default, as before), or read on as UnRAR 7.30 does ([`DamagedInput::Salvage`]), or also look for the next
+    /// valid header past the damage ([`DamagedInput::Resync`]). Whatever was passed over or used despite its checksum
+    /// is reported in [`Summary::damaged_headers`] (and [`Listing::damaged_headers`],
+    /// [`crate::rar5::session::RarArchiveMetadata::damaged_headers`]), so a caller can warn and exit as UnRAR or
+    /// 7-Zip would ("Corrupt header is found", "Headers Error").
+    ///
+    /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+    /// checked dispatchers), by [`list_detailed_with_options`], by [`crate::rar5::session::RarSession`] through
+    /// [`crate::rar5::session::RarSessionOptions::damaged_input`], and by progressive sessions through
+    /// [`crate::progressive::ProgressiveOptions::extract`] (reported as
+    /// [`crate::progressive::ProgressiveEvent::HeaderDamaged`]; only bytes the source delivered are judged, a header
+    /// still to come is waited on and one in a hole is `HeaderHole`). Persistent-partial sessions refuse a damaged
+    /// header whatever this says. 7z and ZIP ignore it.
+    pub damaged_input: DamagedInput,
+    /// What becomes of the bytes decoded of a member that then fails: withheld (the default) or handed over as UnRAR
+    /// and 7-Zip do. For these runners it is a RAR member cut off by a missing volume: with
+    /// [`UnverifiedOutput::Emit`] and [`Self::keep_broken`], its file keeps every byte decoded from the volumes
+    /// there, as UnRAR 7.30 `x -kb` keeps it (without `keep_broken` the file is removed either way, as UnRAR `x`
+    /// removes it). See [`UnverifiedOutput`].
+    ///
+    /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+    /// checked dispatchers) and [`crate::rar5::session::RarSession::extract_selected`] and
+    /// `extract_selected_controlled`. [`SelectedEntry`] takes it through [`SelectOptions::unverified_output`],
+    /// `RarSession::print_selected` through `RarPrintOptions::unverified_output`, and
+    /// [`crate::sevenzip::print_selected_with_options`] through `SevenZipPrintOptions::unverified_output`.
+    pub unverified_output: UnverifiedOutput,
+    /// Whether an encrypted RAR 5.0 redirection member (a symbolic link, junction, hard link or file copy) is placed
+    /// or tested only when its password check value verifies the password (the default; [`EncryptedLinks::VerifyFirst`]
+    /// checks it before the overwrite and target decisions, in UnRAR 7.30's order), or whatever the password, as
+    /// 7-Zip 26.06 `x`/`e` does. See [`EncryptedLinks`].
+    ///
+    /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+    /// checked dispatchers), by [`crate::rar5::session::RarSession::extract_selected`] (and its controlled route),
+    /// and by progressive sessions through [`crate::progressive::ProgressiveOptions`]' extract options. A RarSession
+    /// test run, which takes no `Options`, reads [`crate::rar5::session::RarSessionOptions::encrypted_links`].
+    pub encrypted_links: EncryptedLinks,
+}
+
+/// What an encrypted RAR 5.0 redirection member needs before it is placed or tested; see
+/// [`Options::encrypted_links`].
+///
+/// `rar a -p` leaves file headers in the clear, so a redirection's target is readable with any password, and a link
+/// has no data a wrong password would fail to decrypt: only its encryption record's password check value can tell.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EncryptedLinks {
+    /// Placed only when the member's check value verifies the password, checked once the member is known to be placed
+    /// or tested (a member skipped for an existing target, or refused for its target, is reported so whatever the
+    /// password). No password fails the member
+    /// as [`RarFailure::PasswordRequired`], a wrong one as [`RarFailure::WrongPassword`], and a record with no usable
+    /// check value as [`RarFailure::EncryptedIntegrity`] with
+    /// [`crate::error::RarIntegrityReason::UnverifiableLinkPassword`].
+    #[default]
+    Verify,
+    /// As [`Self::Verify`], in UnRAR 7.30's reporting order: the password is checked as soon as the member is reached,
+    /// before the overwrite decision (an existing target under [`Overwrite::Skip`]) and before a hard link's or copy's
+    /// target is checked, so a password that doesn't verify is reported as the failure above even for a member that
+    /// would otherwise be skipped or refused (UnRAR's "Incorrect password", exit 11, where `Verify` reports
+    /// [`RarSkipReason::ExistingTarget`] or the link target). A password that verifies goes on to those decisions as
+    /// usual. Nothing is placed or touched either way: only the reported outcome differs. An older file revision is
+    /// still skipped first, as every route skips one before reading it.
+    VerifyFirst,
+    /// As 7-Zip 26.06 `x`/`e` (exit 0, "Everything is Ok"): the password isn't checked for a redirection, so one is
+    /// placed (or passes a test) with a wrong password, with none, or with no check value to verify it by. It is
+    /// reported as any placed link is ([`RarOutcome::Verified`]), with the password evidence
+    /// [`RarPasswordEvidence::Unverified`] (the password isn't checked at all, so a right one reports that too).
+    /// Every other link check applies as for any link: a target that leaves
+    /// the destination, a hard link or copy of a file this run didn't extract, protected paths and the overwrite
+    /// decision. Only RAR 5.0 redirections: a RAR 4.x symbolic link's target is its encrypted data, checked as it
+    /// decrypts, and members with data still need their password.
+    PlaceUnverified,
+}
+
+/// What a damaged RAR header does to a run; see [`Options::damaged_input`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DamagedInput {
+    /// A header that fails its checksum or doesn't parse fails the run, as before.
+    #[default]
+    Refuse,
+    /// As UnRAR 7.30 `x`/`t`/`l`: a header whose checksum fails but which parses is used as read (its member's own
+    /// data checksum still decides whether the member is good) and reported ([`HeaderDamageKind::ChecksumMismatch`]);
+    /// a RAR 4.x block of an unknown type whose checksum fails is passed over by its size; a header that can't be
+    /// read, or a volume cut short, ends that volume without failing the run, what came before standing
+    /// ([`HeaderDamageKind::Unreadable`], [`HeaderDamageKind::UnexpectedEnd`]). A RAR 5.0 volume without its end of
+    /// archive header is reported as ending unexpectedly, as 7-Zip 26.06 does. Encrypted headers are never salvaged:
+    /// there a checksum failure is how a wrong password shows.
+    Salvage,
+    /// [`Self::Salvage`], and where a header can't be read the rest of the volume is searched, in one bounded
+    /// linear pass, for the next header that passes its checksum, and reading goes on from there. Neither UnRAR
+    /// 7.30 nor 7-Zip 26.06 does this: it recovers the members after a damaged stretch (a hole a downloader is
+    /// still to repair, garbage between blocks).
+    Resync,
+}
+
+impl DamagedInput {
+    pub(crate) fn salvages(self) -> bool {
+        !matches!(self, Self::Refuse)
+    }
+}
+
+/// A RAR header a [`DamagedInput::Salvage`] or [`DamagedInput::Resync`] run read past.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct HeaderDamage {
+    /// The volume holding the header.
+    pub volume: PathBuf,
+    /// Where the header starts in that volume.
+    pub offset: u64,
+    pub kind: HeaderDamageKind,
+    /// The member the header names, when it parsed as a file header (UnRAR's "NAME - the file header is corrupt").
+    pub name: Option<String>,
+    /// Where reading went on in the same volume after the damage ([`DamagedInput::Resync`]); `None` when the rest of
+    /// the volume was passed over (or, for [`HeaderDamageKind::ChecksumMismatch`], nothing was).
+    pub resumed_at: Option<u64>,
+    /// Whether bytes that may belong to a member were passed over here unread: the damage was unreadable or cut
+    /// short, or the damaged header read as something other than a file header (a file header whose type byte was
+    /// hit can read as a service header, whose data is skipped). A solid archive's history is lost past it.
+    pub(crate) passed_over: bool,
+}
+
+/// What was wrong with a [`HeaderDamage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HeaderDamageKind {
+    /// The header failed its checksum but parsed, and was used as read (or, for a RAR 4.x block of an unknown type,
+    /// passed over by its size).
+    ChecksumMismatch,
+    /// The header could not be read: its framing or fields are invalid.
+    Unreadable,
+    /// The volume ends inside a header or its data, or (RAR 5.0) without its end of archive header.
+    UnexpectedEnd,
+}
+
+impl std::fmt::Display for HeaderDamage {
+    /// One line naming the volume, where and what: `a.rar: damaged header at 144 (b.txt): checksum mismatch, read as
+    /// it stands`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: damaged header at {}", self.volume.display(), self.offset)?;
+        if let Some(name) = &self.name {
+            write!(f, " ({})", name.escape_default())?;
+        }
+        f.write_str(match self.kind {
+            HeaderDamageKind::ChecksumMismatch => ": checksum mismatch, read as it stands",
+            HeaderDamageKind::Unreadable => ": unreadable",
+            HeaderDamageKind::UnexpectedEnd => ": unexpected end of archive",
+        })?;
+        match self.resumed_at {
+            Some(at) => write!(f, ", reading on at {at}"),
+            None if self.kind == HeaderDamageKind::Unreadable => f.write_str(", rest of the volume passed over"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// At most this many [`HeaderDamage`] records are kept per run or catalogue; [`Summary::damaged_headers`] says
+/// whether any were, so the flag holds even past the cap.
+pub(crate) const MAX_HEADER_DAMAGE: usize = 4096;
+
+pub(crate) fn keep_damage(into: &mut Vec<HeaderDamage>, from: impl IntoIterator<Item = HeaderDamage>) {
+    for damage in from {
+        if into.len() >= MAX_HEADER_DAMAGE {
+            return;
+        }
+        into.push(damage);
+    }
 }
 
 /// What becomes of a RAR 3.x/4.x member that uses a VM filter zipfast doesn't run; see
@@ -252,9 +419,92 @@ pub enum UnsupportedFilters {
     ///
     /// Honoured by the whole-archive runners for RAR ([`run`], [`run_with_password`], [`run_rar_with_outcomes`])
     /// and by [`crate::rar5::session::RarSession::extract_selected`] and `extract_selected_controlled`. Progressive
-    /// and persistent-partial sessions, `RarSession` test and print runs, `SelectedEntry` and `FeedDecoder` fail
-    /// such a member as unsupported whatever this says.
+    /// and persistent-partial sessions, `RarSession` test and print runs and `FeedDecoder` fail such a member as
+    /// unsupported whatever this says; [`SelectedEntry`] writes it unfiltered under
+    /// [`SelectOptions::unverified_output`].
     WriteUnfiltered,
+}
+
+/// What becomes of the bytes decoded of a member that then fails on its own data (a missing volume, a CRC, a data
+/// error, a wrong password shown by its effect, an unsupported filter); see [`Options::unverified_output`] and
+/// `docs/compat-options.md`.
+///
+/// ```
+/// use zipfast::extract::{SelectOptions, UnverifiedOutput};
+///
+/// let select = SelectOptions::new().unverified_output(UnverifiedOutput::Emit);
+/// assert_eq!(select.unverified_output, UnverifiedOutput::Emit);
+/// assert_eq!(UnverifiedOutput::default(), UnverifiedOutput::Withhold);
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UnverifiedOutput {
+    /// Nothing that failed verification is handed over beyond what zipfast always did: a printed 7z or RAR member
+    /// shows only once verified, and a kept broken file ([`Options::keep_broken`]) of a RAR member cut off by a
+    /// missing volume holds only what was written before the volume was found missing (nothing, for a RAR 3.x/4.x
+    /// member under 32 KiB, as 7-Zip 26.06 `x` keeps it).
+    #[default]
+    Withhold,
+    /// The bytes decoded before the failure are written, printed or streamed as the reference tools do (UnRAR 7.30
+    /// `p` and `x -kb`, 7-Zip 26.06 `x -so`), and the member is still reported failed, with a sign that its bytes
+    /// went out unverified ([`UnverifiedWritten`], [`RarEntryOutcome::unverified_bytes`], [`Summary::unverified`]).
+    Emit,
+}
+
+/// A failed member whose bytes were printed anyway ([`UnverifiedOutput::Emit`]); see [`Summary::unverified`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UnverifiedMember {
+    /// Its listing index.
+    pub index: u64,
+    /// Its name, as listed.
+    pub name: String,
+    /// How many of its bytes went out.
+    pub bytes: u64,
+}
+
+impl UnverifiedMember {
+    pub(crate) fn new(index: u64, name: &str, bytes: u64) -> Self {
+        Self { index, name: name.to_owned(), bytes }
+    }
+}
+
+/// A member's bytes were handed over though it failed verification ([`UnverifiedOutput::Emit`]). It comes inside an
+/// [`Error::Io`] (kind `InvalidData`) from [`SelectedEntry::read`], wrapping the failure the member had;
+/// [`UnverifiedWritten::of`] finds it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct UnverifiedWritten {
+    /// How many bytes went to the sink.
+    pub bytes: u64,
+    /// Why the member failed, as it would have failed without [`UnverifiedOutput::Emit`].
+    pub cause: Error,
+}
+
+impl UnverifiedWritten {
+    /// The unverified-output sign inside `error`, if it carries one.
+    pub fn of(error: &Error) -> Option<&UnverifiedWritten> {
+        match error {
+            Error::Io(e) => e.get_ref().and_then(|inner| inner.downcast_ref::<UnverifiedWritten>()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_error(bytes: u64, cause: Error) -> Error {
+        Error::Io(io::Error::new(io::ErrorKind::InvalidData, UnverifiedWritten { bytes, cause }))
+    }
+}
+
+impl std::fmt::Display for UnverifiedWritten {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({} bytes written unverified)", self.cause, self.bytes)
+    }
+}
+
+impl std::error::Error for UnverifiedWritten {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
 }
 
 /// The permission bits a run gives what it writes; see [`Options::unix_modes`]. A member without stored Unix
@@ -389,6 +639,15 @@ pub struct SelectOptions {
     pub special_entries: SpecialEntries,
     /// As [`Options::compressed_tar`]; it also decides how entries are numbered.
     pub compressed_tar: CompressedTar,
+    /// What a read hands over of a member that fails, as 7-Zip 26.06 `x -so` streams it ([`UnverifiedOutput`]).
+    /// With [`UnverifiedOutput::Emit`], a 7z member that fails on its data gives the sink what was decoded of it (all
+    /// of it for a CRC failure, the bytes before the error for a data error or a folder cut short), and a RAR 3.x/4.x
+    /// member using a VM filter zipfast doesn't run is decoded with that block left unfiltered, as
+    /// [`UnsupportedFilters::WriteUnfiltered`] writes it. The read still fails, with an [`UnverifiedWritten`]
+    /// carrying the member's failure and how many bytes went to the sink. Other formats already hand the sink their
+    /// bytes as they decode, so for them it only adds that sign to the error. The default hands a 7z member over
+    /// only once it checks out and fails a RAR member using such a filter as unsupported.
+    pub unverified_output: UnverifiedOutput,
 }
 
 impl SelectOptions {
@@ -408,11 +667,21 @@ impl SelectOptions {
         self.compressed_tar = compressed_tar;
         self
     }
+
+    /// Sets [`Self::unverified_output`].
+    pub fn unverified_output(mut self, unverified_output: UnverifiedOutput) -> Self {
+        self.unverified_output = unverified_output;
+        self
+    }
 }
 
 impl From<&Options> for SelectOptions {
     fn from(options: &Options) -> Self {
-        Self { special_entries: options.special_entries, compressed_tar: options.compressed_tar }
+        Self {
+            special_entries: options.special_entries,
+            compressed_tar: options.compressed_tar,
+            unverified_output: options.unverified_output,
+        }
     }
 }
 
@@ -514,7 +783,10 @@ impl MemberRef<'_> {
 ///     replace_placed_links: false,
 ///     keep_broken: false,
 ///     attempt_continued_members: false,
+///     encrypted_links: Default::default(),
+///     damaged_input: Default::default(),
 ///     unsupported_filters: Default::default(),
+///     unverified_output: Default::default(),
 ///     salvage_truncated_zip: false,
 ///     unix_modes: Default::default(),
 ///     backslashes: Default::default(),
@@ -705,6 +977,14 @@ pub struct Summary {
     /// Members renamed by [`Overwrite::RenameNew`] or [`Overwrite::RenameExisting`], in the order the names were
     /// claimed. Empty for the other modes.
     pub renames: Vec<RenamedOutput>,
+    /// RAR headers read past under [`Options::damaged_input`] (at most 4096 kept); empty under
+    /// [`DamagedInput::Refuse`]. Non-empty means the archive's headers are damaged: UnRAR says "Corrupt header is
+    /// found" (exit 3) and 7-Zip "Headers Error" (exit 2).
+    pub damaged_headers: Vec<HeaderDamage>,
+    /// Members that failed but whose decoded bytes went out anyway under [`UnverifiedOutput::Emit`]
+    /// ([`crate::sevenzip::print_selected_with_options`]), in the order they were printed. Each is also a line in
+    /// [`Self::errors`].
+    pub unverified: Vec<UnverifiedMember>,
     /// the rename attempts this run has left
     pub(crate) rename_budget: RenameBudget,
     /// folders whose times and permissions are set once everything inside them is written
@@ -1016,10 +1296,11 @@ fn place_target(
     let metadata = |e| RarFault::output(IoOperation::Metadata, Some(target.clone()), None, e, false);
     Ok(match fs::symlink_metadata(&target) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            if !log.placed.is_some_and(|p| p.owns_link(&meta)) {
-                DetailedChecked::Blocked(RarPolicyReason::Symlink)
-            } else if opts.overwrite == Overwrite::Skip {
+            // skipped under Overwrite::Skip, as UnRAR's `-o-` skips it: nothing is written through it or over it
+            if opts.overwrite == Overwrite::Skip {
                 DetailedChecked::Exists
+            } else if !log.placed.is_some_and(|p| p.owns_link(&meta)) {
+                DetailedChecked::Blocked(RarPolicyReason::Symlink)
             } else {
                 // a link this run made: replaced by rename, which never follows it
                 let mut place = Place::new(target, true);
@@ -1369,9 +1650,12 @@ impl ListingBudget {
 fn walk(
     vol: Volume,
     password: Option<&str>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>,
 ) -> Result<u64> {
-    walk_until(vol, password, None, |vol, block| {
+    let mut observer = SelectedReadObserver::default();
+    walk_until_observed(vol, password, None, &mut observer, damaged, damage, |vol, block, _, _| {
         on_block(vol, block)?;
         Ok(false)
     })
@@ -1384,14 +1668,25 @@ fn walk_until(
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<bool>,
 ) -> Result<u64> {
     let mut observer = SelectedReadObserver::default();
-    walk_until_observed(vol, password, cancel, &mut observer, |vol, block, _, _| on_block(vol, block))
+    walk_until_observed(
+        vol,
+        password,
+        cancel,
+        &mut observer,
+        DamagedInput::Refuse,
+        &mut Vec::new(),
+        |vol, block, _, _| on_block(vol, block),
+    )
 }
 
+#[allow(clippy::too_many_arguments)] // one walk for listing, selected reads and salvage
 fn walk_until_observed(
     mut vol: Volume,
     password: Option<&str>,
     cancel: Option<&Cancellation>,
     observer: &mut SelectedReadObserver<'_>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
     mut on_block: impl FnMut(&mut Volume, Block, u32, &mut SelectedReadObserver<'_>) -> Result<bool>,
 ) -> Result<u64> {
     let format = vol.format();
@@ -1406,7 +1701,9 @@ fn walk_until_observed(
                 cancel.check_io()?;
             }
             observer.notify(index, &vol.path, SelectedReadRole::Header, cancel)?;
-            let Some(block) = vol.next_block()? else { break };
+            let next = vol.next_block();
+            keep_damage(damage, vol.take_damage());
+            let Some(block) = next? else { break };
             match block {
                 Block::End { more_volumes, .. } => {
                     more = more_volumes;
@@ -1442,7 +1739,8 @@ fn walk_until_observed(
             return Ok(volumes);
         }
         observer.notify(observer.volume_index(volumes)?, &next, SelectedReadRole::Header, cancel)?;
-        vol = Volume::open_with_password(&next, password)?;
+        let keys = vol.rar5_keys().clone();
+        vol = Volume::open_damaged_sharing(&next, password, damaged, keys)?;
         if vol.format() != format {
             return Err(Error::Corrupt("RAR volume format changed"));
         }
@@ -1455,7 +1753,28 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
         run.reports.volume()?;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
-        while let Some((block, crypt)) = vol.next_block_detailed()? {
+        vol.set_cancel(run.cancel.clone());
+        loop {
+            // a resync (DamagedInput::Resync) may have searched a long way, at the open too
+            if run.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
+                return Err(RarFault::new(RarFailure::Canceled, canceled_error()).into());
+            }
+            let next = vol.next_block_detailed();
+            let damage = vol.take_damage();
+            if !damage.is_empty() {
+                // bytes were passed over: whatever solid history they held is lost, so a solid member after the
+                // gap fails as lacking it instead of decoding against the history from before the gap (a member
+                // still being continued keeps its decoder: its own checks decide)
+                let gap = damage.iter().any(|d| d.passed_over);
+                run.reports.damaged(damage);
+                if gap && run.pending.is_none() {
+                    run.drain()?;
+                    run.stream = None;
+                    run.rar4 = None;
+                    run.unavailable = Some((None, None));
+                }
+            }
+            let Some((block, crypt)) = next? else { break };
             match block {
                 Block::End { more_volumes, .. } => {
                     more = more_volumes;
@@ -1498,6 +1817,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                         format_args!("missing volume {}", next.display()),
                     )?;
                 }
+                run.emit_unverified(&mut p)?;
                 p.discard();
                 run.stream = None;
                 run.rar4 = None;
@@ -1507,7 +1827,7 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
                 RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into()
             );
         }
-        vol = Volume::open_detailed(&next, run.password)?;
+        vol = Volume::open_detailed_sharing(&next, run.password, run.opts.damaged_input, run.rar5_keys.clone())?;
         if vol.format() != format {
             return Err(RarFault::new(
                 RarFailure::integrity(
@@ -1538,17 +1858,37 @@ enum Format {
 const HEAD_PROBE_BYTES: usize = 1024;
 
 fn sniff(path: &Path) -> Result<Format> {
+    sniff_held(path).map(|(format, _)| format)
+}
+
+/// The file at `path` and the first bytes [`sniff_held`] read of it, which a RAR volume opened from it keeps rather
+/// than reading them again.
+struct Sniffed {
+    file: File,
+    head: Vec<u8>,
+}
+
+impl Sniffed {
+    fn open_rar(self, path: &Path, password: Option<&str>, damaged: DamagedInput) -> Result<Volume> {
+        Volume::open_head(path, self.file, self.head, password, damaged)
+    }
+}
+
+/// [`sniff`], keeping the file open and its head, for a RAR read of [`Format::Other`].
+fn sniff_held(path: &Path) -> Result<(Format, Option<Sniffed>)> {
     // a spanned set's `.zip` (or `.z01`) starts where the disk before it stopped, often mid-member
     if crate::zip::is_spanned(path) {
-        return Ok(Format::Zip);
+        return Ok((Format::Zip, None));
     }
-    let mut head = [0u8; HEAD_PROBE_BYTES];
+    let mut head = vec![0u8; HEAD_PROBE_BYTES];
     let mut file = File::open(path)?;
     let n = crate::tar::read_full(&mut file, &mut head)?;
-    match classify_head(&head[..n]) {
+    head.truncate(n);
+    match classify_head(&head) {
         // an ISO 9660 image says so 32 KiB in, past the probe
-        Format::Other if crate::tar::sniff_iso(&file) => Ok(Format::Tar),
-        format => Ok(format),
+        Format::Other if crate::tar::sniff_iso(&file) => Ok((Format::Tar, None)),
+        Format::Other => Ok((Format::Other, Some(Sniffed { file, head }))),
+        format => Ok((format, None)),
     }
 }
 
@@ -1636,8 +1976,14 @@ pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::Z
             Ok(CheckedRoute::Legacy(LegacyRoute::Tar))
         }
         Format::Other => {
-            let (opened, probe) = opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?;
-            match opened.recognize_rar(&probe) {
+            // A RAR that starts within the head is recognized from it; a later signature (behind a self-extractor)
+            // takes the whole window.
+            let (opened, probe) = if signature_end(&head).is_ok() {
+                (opened, head)
+            } else {
+                opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?
+            };
+            match opened.recognize_rar(probe) {
                 Ok((signature, path)) => Ok(CheckedRoute::Legacy(LegacyRoute::Rar { signature, path })),
                 // A byte-split ZIP whose first piece doesn't start with a ZIP signature (a self-extractor, or a
                 // first piece of under four bytes) is still read as the pieces concatenated.
@@ -1688,7 +2034,7 @@ impl LegacyRoute {
             Self::Rar { signature, .. } => {
                 let mut reports = Reports::legacy(report);
                 let result = rar_run_shared_open(first, options, password, Some(cancel), &mut reports, || {
-                    Volume::from_held_signature_detailed(first, signature, password)
+                    Volume::from_held_signature_detailed(first, signature, password, options.damaged_input)
                 });
                 let Reports::Legacy { summary, .. } = reports else { unreachable!() };
                 legacy_result(result, summary)
@@ -1701,9 +2047,12 @@ impl LegacyRoute {
             Self::SevenZip => crate::sevenzip::list(first, password),
             Self::SplitZip => crate::zip::list(first),
             Self::TruncatedZip => crate::zip::list_truncated(first),
-            Self::Rar { signature, .. } => {
-                rar_list_from_volume(Volume::from_held_signature(first, signature, password)?, password)
-            }
+            Self::Rar { signature, .. } => rar_list_from_volume(
+                Volume::from_held_signature(first, signature, password, DamagedInput::Refuse)?,
+                password,
+                DamagedInput::Refuse,
+                &mut Vec::new(),
+            ),
         }
     }
 }
@@ -1896,6 +2245,8 @@ pub struct SelectedEntry {
     limit: u64,
     windows_names: bool,
     meta: Meta,
+    /// [`SelectOptions::unverified_output`]
+    unverified: UnverifiedOutput,
     cancel: Cancellation,
 }
 
@@ -2016,6 +2367,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit,
+                    unverified: select.unverified_output,
                     source: SelectedSource::Tar(Box::new(selected)),
                     cancel,
                 });
@@ -2033,6 +2385,7 @@ impl SelectedEntry {
                         windows_names: !header.is_unix(),
                         index,
                         limit,
+                        unverified: select.unverified_output,
                         source: SelectedSource::Rar {
                             path: path.to_path_buf(),
                             chain_start,
@@ -2052,6 +2405,7 @@ impl SelectedEntry {
                     windows_names,
                     index,
                     limit,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SplitZip { path: path.to_path_buf(), archive },
                     cancel,
                 });
@@ -2068,6 +2422,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SevenZip { path: path.to_path_buf(), name },
                     cancel,
                 });
@@ -2083,6 +2438,7 @@ impl SelectedEntry {
             meta: Meta { mtime: entry.mtime, nanos: entry.nanos, mode: entry.unix_mode() },
             index,
             limit,
+            unverified: select.unverified_output,
             source: SelectedSource::Zip(archive),
             cancel,
         })
@@ -2139,6 +2495,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::Tar(Box::new(selected)),
                     cancel,
                 });
@@ -2175,6 +2532,7 @@ impl SelectedEntry {
                     windows_names: false,
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SevenZip { path: path.to_path_buf(), name },
                     cancel,
                 });
@@ -2187,12 +2545,14 @@ impl SelectedEntry {
                     windows_names,
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::SplitZip { path: path.to_path_buf(), archive },
                     cancel,
                 });
             }
             CheckedRoute::Legacy(LegacyRoute::Rar { signature, path: held_path }) => {
-                let volume = Volume::from_held_signature(&held_path, signature, password).map_err(ReadFault::Legacy)?;
+                let volume = Volume::from_held_signature(&held_path, signature, password, DamagedInput::Refuse)
+                    .map_err(ReadFault::Legacy)?;
                 let (header, chain_start) =
                     rar_selected_header_from_volume(volume, index, password, &cancel).map_err(ReadFault::Legacy)?;
                 if header.is_dir() || header.redirection.is_some() {
@@ -2212,6 +2572,7 @@ impl SelectedEntry {
                     windows_names: !header.is_unix(),
                     index,
                     limit: max_bytes,
+                    unverified: select.unverified_output,
                     source: SelectedSource::Rar {
                         path: held_path,
                         chain_start,
@@ -2252,7 +2613,15 @@ impl SelectedEntry {
             Ok(selection) => selection,
             Err(error) => return Err(owner.reject(error)),
         };
-        Ok(Self { windows_names, meta, index, limit, source: SelectedSource::Zip(owner), cancel })
+        Ok(Self {
+            windows_names,
+            meta,
+            index,
+            limit,
+            unverified: select.unverified_output,
+            source: SelectedSource::Zip(owner),
+            cancel,
+        })
     }
     pub fn is_zip(&self) -> bool {
         matches!(self.source, SelectedSource::Zip(_))
@@ -2375,11 +2744,16 @@ impl SelectedEntry {
         observer: &mut SelectedReadObserver<'_>,
     ) -> Result<()> {
         self.cancel.check_io()?;
+        let emit = self.unverified == UnverifiedOutput::Emit;
+        // what went to the sink, and whether the sink itself failed (its error is returned as it is)
+        let (mut delivered, mut sink_failed) = (0u64, false);
         let mut checked_sink = |chunk: &[u8]| {
             self.cancel.check_io()?;
-            sink(chunk)
+            sink(chunk).inspect_err(|_| sink_failed = true)?;
+            delivered = delivered.saturating_add(chunk.len() as u64);
+            Ok(())
         };
-        match self.source {
+        let read = match self.source {
             SelectedSource::Zip(mut archive) => {
                 if observer.callback.is_some() {
                     let path = archive.source_path().map_err(|error| Error::Io(std::io::Error::other(error)))?;
@@ -2399,7 +2773,7 @@ impl SelectedEntry {
                     decoded_left: self.limit,
                     cancel: &self.cancel,
                 };
-                rar_read_at(&path, chain_start, self.index, &name, password, selection, observer)
+                rar_read_at(&path, chain_start, self.index, &name, password, selection, observer, emit)
             }
             SelectedSource::SplitZip { path, mut archive } => {
                 observer.notify(0, &path, SelectedReadRole::Selected, Some(&self.cancel))?;
@@ -2410,7 +2784,8 @@ impl SelectedEntry {
                 let limits = crate::sevenzip::SevenZipLimits::default();
                 let want = self.index as u64;
                 let mut failure = None;
-                let summary = crate::sevenzip::print_selected_with(
+                let options = crate::sevenzip::SevenZipPrintOptions::new().unverified_output(self.unverified);
+                let summary = crate::sevenzip::print_selected_with_options(
                     &path,
                     password,
                     &mut |ordinal, _| ordinal == want,
@@ -2423,6 +2798,7 @@ impl SelectedEntry {
                     },
                     &self.cancel,
                     &limits,
+                    &options,
                 );
                 match (summary, failure) {
                     // the sink's own error, as the other formats return it
@@ -2435,7 +2811,14 @@ impl SelectedEntry {
                     },
                 }
             }
-        }?;
+        };
+        match read {
+            // UnverifiedOutput::Emit: the member failed on its own, after bytes of it went to the sink
+            Err(cause) if emit && delivered != 0 && !sink_failed && !is_cancellation(&cause) => {
+                return Err(UnverifiedWritten::into_error(delivered, cause));
+            }
+            read => read?,
+        }
         self.cancel.check_io()?;
         Ok(())
     }
@@ -2592,13 +2975,17 @@ pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancell
             crate::sevenzip::list(first, password)?
         }
         Format::Other => {
-            let signature = signature_end(&source.probe_prefix(SIGNATURE_PROBE_BYTES, cancel)?);
+            // a RAR that starts within the head is recognized from it; a later one takes the whole window
+            let probe = if signature_end(&head[..n]).is_ok() {
+                head[..n].to_vec()
+            } else {
+                source.probe_prefix(SIGNATURE_PROBE_BYTES, cancel)?
+            };
+            let signature = signature_end(&probe);
             cancel.check_io().map_err(Error::from)?;
             match signature {
-                Ok(_) => {
-                    drop(source);
-                    rar_list(first, password)?
-                }
+                // the volume keeps the bytes read to find the signature rather than reading them again
+                Ok(_) => rar_list_held(first, Some(Sniffed { file: source.into_file(), head: probe }), password)?,
                 // a byte-split ZIP whose first piece has no ZIP signature at its start, as above
                 Err(Error::NotAnArchive) if crate::zip::is_byte_split(first) => {
                     drop(source);
@@ -2627,27 +3014,55 @@ pub struct Listing {
     /// ([`crate::zip::list_detailed_with_options`] with [`Options::salvage_truncated_zip`]). 7-Zip prints "Unexpected
     /// end of archive" and exits nonzero here.
     pub truncated: bool,
+    /// RAR headers the listing read past under [`Options::damaged_input`] ([`list_detailed_with_options`]), at most
+    /// 4096 kept: `entries` holds the members listed past them. Empty otherwise.
+    pub damaged_headers: Vec<HeaderDamage>,
 }
 
 impl Listing {
-    /// Whether the archive ended before it should have (7-Zip's "Unexpected end of archive").
+    /// Whether the archive ended before it should have (7-Zip's "Unexpected end of archive"), a RAR volume cut short
+    /// or without its end header included.
     pub fn unexpected_end(&self) -> bool {
-        self.missing_volume.is_some() || self.truncated
+        self.missing_volume.is_some()
+            || self.truncated
+            || self.damaged_headers.iter().any(|d| d.kind == HeaderDamageKind::UnexpectedEnd)
+    }
+
+    /// Whether headers were read past ([`Self::damaged_headers`]): UnRAR's "Corrupt header is found", 7-Zip's
+    /// "Headers Error".
+    pub fn headers_damaged(&self) -> bool {
+        !self.damaged_headers.is_empty()
     }
 }
 
 /// [`list_with_password`], with the listing's warnings.
 pub fn list_detailed(first: &Path, password: Option<&str>) -> Result<Listing> {
-    let whole = |entries| Listing { entries, missing_volume: None, truncated: false };
-    match sniff(first)? {
-        Format::Zip => return crate::zip::list_detailed(first),
-        Format::Tar => return crate::tar::list(first).map(whole),
-        Format::SevenZip => return crate::sevenzip::list(first, password).map(whole),
-        Format::Other => {}
-    }
-    match rar_list(first, password) {
+    let whole = |entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers: Vec::new() };
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return crate::zip::list_detailed(first),
+        (Format::Tar, _) => return crate::tar::list(first).map(whole),
+        (Format::SevenZip, _) => return crate::sevenzip::list(first, password).map(whole),
+        (Format::Other, held) => held,
+    };
+    match rar_list_held(first, held, password) {
         Err(Error::NotAnArchive) => crate::zip::list_detailed(first),
         other => other.map(whole),
+    }
+}
+
+/// [`list_detailed`] under `options`: a RAR archive's damaged headers are read past as
+/// [`Options::damaged_input`] says ([`Listing::damaged_headers`] says what was), and a ZIP cut short is listed from
+/// its local headers with [`Options::salvage_truncated_zip`]. The other options don't change a listing.
+pub fn list_detailed_with_options(first: &Path, password: Option<&str>, options: &Options) -> Result<Listing> {
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return crate::zip::list_detailed_with_options(first, options),
+        (Format::Tar | Format::SevenZip, _) => return list_detailed(first, password),
+        (Format::Other, held) => held,
+    };
+    let mut damaged_headers = Vec::new();
+    match rar_list_damaged(first, held, password, options.damaged_input, &mut damaged_headers) {
+        Err(Error::NotAnArchive) => crate::zip::list_detailed_with_options(first, options),
+        other => other.map(|entries| Listing { entries, missing_volume: None, truncated: false, damaged_headers }),
     }
 }
 
@@ -2658,13 +3073,13 @@ pub fn list(first: &Path) -> Result<Vec<Entry>> {
 
 /// The entries of an archive, decrypting encrypted headers when `password` is given.
 pub fn list_with_password(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
-    match sniff(first)? {
-        Format::Zip => return crate::zip::list(first),
-        Format::Tar => return crate::tar::list(first),
-        Format::SevenZip => return crate::sevenzip::list(first, password),
-        Format::Other => {}
-    }
-    match rar_list(first, password) {
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return crate::zip::list(first),
+        (Format::Tar, _) => return crate::tar::list(first),
+        (Format::SevenZip, _) => return crate::sevenzip::list(first, password),
+        (Format::Other, held) => held,
+    };
+    match rar_list_held(first, held, password) {
         Err(Error::NotAnArchive) => crate::zip::list(first),
         other => other,
     }
@@ -2930,10 +3345,10 @@ pub fn run_with_renames(
     password: Option<&str>,
     mut report: impl FnMut(&str),
 ) -> std::result::Result<Summary, RunError> {
-    match sniff(first)? {
-        Format::Zip => return zip_run(first, opts, password, &mut report),
-        Format::Tar => return crate::tar::run_reporting(first, opts, &mut report),
-        Format::SevenZip => {
+    let held = match sniff_held(first)? {
+        (Format::Zip, _) => return zip_run(first, opts, password, &mut report),
+        (Format::Tar, _) => return crate::tar::run_reporting(first, opts, &mut report),
+        (Format::SevenZip, _) => {
             let limits = crate::sevenzip::SevenZipLimits::default();
             return crate::sevenzip::run_reporting(
                 first,
@@ -2944,9 +3359,9 @@ pub fn run_with_renames(
                 &mut report,
             );
         }
-        Format::Other => {}
-    }
-    match rar_run(first, opts, password, &mut report) {
+        (Format::Other, held) => held,
+    };
+    match rar_run(first, held, opts, password, &mut report) {
         Err(RunError { error: Error::NotAnArchive, .. }) => zip_run(first, opts, password, &mut report),
         other => other,
     }
@@ -2964,14 +3379,35 @@ fn zip_run(
     crate::zip::run_renaming(path, opts, password, None, report)
 }
 
-fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
-    rar_list_from_volume(Volume::open_with_password(first, password)?, password)
+/// The entries of a RAR set from its first volume: the file [`sniff_held`] kept open when it did, else opened by
+/// path.
+fn rar_list_held(first: &Path, held: Option<Sniffed>, password: Option<&str>) -> Result<Vec<Entry>> {
+    rar_list_damaged(first, held, password, DamagedInput::Refuse, &mut Vec::new())
 }
 
-fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<Entry>> {
+fn rar_list_damaged(
+    first: &Path,
+    held: Option<Sniffed>,
+    password: Option<&str>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
+) -> Result<Vec<Entry>> {
+    let volume = match held {
+        Some(held) => held.open_rar(first, password, damaged)?,
+        None => Volume::open_damaged(first, password, damaged)?,
+    };
+    rar_list_from_volume(volume, password, damaged, damage)
+}
+
+fn rar_list_from_volume(
+    volume: Volume,
+    password: Option<&str>,
+    damaged: DamagedInput,
+    damage: &mut Vec<HeaderDamage>,
+) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut budget = ListingBudget::default();
-    walk(volume, password, |_, block| {
+    walk(volume, password, damaged, damage, |_, block| {
         let Block::File(h) = block else { return Ok(()) };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
@@ -3206,6 +3642,21 @@ impl Sink for Pending {
     }
 }
 
+/// RAR 5.0 keys for `params` through the run's or session's cache (no cancellation: a derivation runs to its end,
+/// as it did before the cache).
+pub(crate) fn rar5_keys(
+    keys: &mut crate::crypto::Rar5KeyCache,
+    password: &str,
+    params: &crate::crypto::Rar5CryptParams,
+    scope: crate::error::RarScope,
+) -> std::result::Result<crate::crypto::Rar5Keys, RarFailure> {
+    keys.keys(password, params, None).map_err(|error| match error {
+        crate::crypto::ControlledKdfError::Crypt(error) => RarFailure::crypt(error, scope),
+        // an uncanceled derivation has no limits; were one to stop, it would have been canceled
+        crate::crypto::ControlledKdfError::Control(_) => RarFailure::Canceled,
+    })
+}
+
 impl Pending {
     pub(crate) fn verified_size(&self) -> u64 {
         self.bytes
@@ -3215,26 +3666,29 @@ impl Pending {
         &self.context
     }
 
+    /// The member's cipher, its keys derived once per salt for the run's password (`keys`); its own check value
+    /// is still compared.
     fn start_cipher(
         context: &mut EntryContext,
+        keys: &mut crate::crypto::Rar5KeyCache,
         compressed: bool,
         params: crate::crypto::Rar5CryptParams,
         password: &str,
         size: Option<u64>,
     ) -> std::result::Result<PendingCipher, RarFailure> {
-        let keys = crate::crypto::derive_rar5_keys(password, params.kdf_count, &params.salt, params.check)
-            .map_err(|error| RarFailure::crypt(error, context.scope()))?;
+        let keys = rar5_keys(keys, password, &params, context.scope())?;
         context.password = keys.evidence;
         Ok(PendingCipher::from_keys(params, keys, compressed, size))
     }
 
     pub(crate) fn start_selected_cipher(
         &mut self,
+        keys: &mut crate::crypto::Rar5KeyCache,
         params: crate::crypto::Rar5CryptParams,
         password: &str,
         size: Option<u64>,
     ) -> std::result::Result<(), RarFailure> {
-        self.cipher = Some(Self::start_cipher(&mut self.context, self.compressed, params, password, size)?);
+        self.cipher = Some(Self::start_cipher(&mut self.context, keys, self.compressed, params, password, size)?);
         Ok(())
     }
 
@@ -3523,6 +3977,9 @@ impl Books<'_, '_> {
 
 /// What a member written unfiltered ([`UnsupportedFilters::WriteUnfiltered`]) is reported with.
 const UNFILTERED_MESSAGE: &str = "unsupported method: VM filter, written unfiltered";
+/// The [`UnverifiedWritten::cause`] of a RAR member a [`SelectedEntry`] read wrote unfiltered: `Error::Unsupported`
+/// with this text.
+pub const UNFILTERED_SELECTED: &str = "VM filter, written unfiltered";
 
 /// A file's last part is in: checks it whole and finishes it, or hands it to a worker for that when its bytes were
 /// gathered.
@@ -3777,6 +4234,8 @@ struct Run<'a, 'r, 'c> {
     rar4: Option<Rar4Decoder>,
     /// RAR 3.x keys already derived for the run's password, by salt
     rar4_keys: crate::crypto::Rar4KeyCache,
+    /// RAR 5.0 keys already derived for the run's password, by salt and count, shared with the volumes it opens
+    rar5_keys: crate::crypto::SharedRar5Keys,
     /// threads for work spread over files; 1 for none
     threads: usize,
     /// small files being decoded and written on other threads
@@ -3827,12 +4286,16 @@ fn invariant(reason: &'static str, legacy: Error) -> RarFault {
 
 fn rar_run(
     first: &Path,
+    held: Option<Sniffed>,
     opts: &Options,
     password: Option<&str>,
     mut report: impl FnMut(&str),
 ) -> std::result::Result<Summary, RunError> {
     let mut reports = Reports::legacy(&mut report);
-    let result = rar_run_shared(first, opts, password, &mut reports);
+    let result = rar_run_shared_open(first, opts, password, None, &mut reports, || match held {
+        Some(Sniffed { file, head }) => Volume::open_head_detailed(first, file, head, password, opts.damaged_input),
+        None => Volume::open_detailed_damaged(first, password, opts.damaged_input),
+    });
     let Reports::Legacy { summary, .. } = reports else { unreachable!() };
     legacy_result(result, summary)
 }
@@ -3878,7 +4341,9 @@ fn rar_run_shared<'a>(
     password: Option<&str>,
     reports: &mut Reports<'a>,
 ) -> RunResult<()> {
-    rar_run_shared_open(first, opts, password, None, reports, || Volume::open_detailed(first, password))
+    rar_run_shared_open(first, opts, password, None, reports, || {
+        Volume::open_detailed_damaged(first, password, opts.damaged_input)
+    })
 }
 
 /// Whether the first member in the volume at `path` continues from an earlier volume.
@@ -3897,16 +4362,19 @@ fn starts_with_continuation(path: &Path, password: Option<&str>) -> Option<bool>
 /// volume, the volume before it (by name) back to one that doesn't, if each of them exists and opens. UnRAR then
 /// extracts the whole set; with a volume missing in between it extracts only what starts at `path`, and reports the
 /// continued member as lacking its start.
+///
+/// A volume with none before it by name (`part1`, an old-style set's `.rar`) never restarts, whatever its first member
+/// says, so it isn't opened again to look: the run has read its head already.
 pub(crate) fn restart_volume(path: &Path, password: Option<&str>) -> Option<PathBuf> {
-    let mut current = path.to_path_buf();
-    if !starts_with_continuation(&current, password)? {
+    let mut previous = crate::volume::previous_volume(path)?;
+    if !starts_with_continuation(path, password)? {
         return None;
     }
     for _ in 0..4096 {
-        current = crate::volume::previous_volume(&current)?;
-        if !starts_with_continuation(&current, password)? {
-            return Some(current);
+        if !starts_with_continuation(&previous, password)? {
+            return Some(previous);
         }
+        previous = crate::volume::previous_volume(&previous)?;
     }
     None
 }
@@ -3957,7 +4425,7 @@ fn rar_run_shared_open<'a>(
     };
     let first = restart.as_deref().unwrap_or(first);
     if restart.is_some() {
-        first_volume = Volume::open_detailed(first, password)?;
+        first_volume = Volume::open_detailed_damaged(first, password, opts.damaged_input)?;
     }
     let mut opts = match opts.protecting_detailed(first) {
         Ok(opts) => opts,
@@ -3991,6 +4459,8 @@ fn rar_run_shared_open<'a>(
     run.cancel = cancel.cloned();
     // not countable: the members before the volume given are left alone
     run.members_before = skipped.unwrap_or(u64::MAX);
+    // the first volume's header key serves the members and the later volumes
+    run.rar5_keys = first_volume.rar5_keys().clone();
     let walked = walk_rar(first_volume, &mut run).and_then(|()| run.drain());
     let canceled = cancel.is_some_and(Cancellation::is_canceled);
     if canceled {
@@ -4008,7 +4478,12 @@ fn rar_run_shared_open<'a>(
     }
     let result = if let Some(mut p) = run.pending.take() {
         let already_reported = p.failed || p.passive;
+        let emitted = if walked.is_ok() { run.emit_unverified(&mut p) } else { Ok(()) };
         p.discard();
+        if let Err(fault) = emitted {
+            finish_dir_meta(&mut run.dir_meta);
+            return Err(fault);
+        }
         if walked.is_ok() && !p.hidden && (!run.reports.typed() || !already_reported) {
             let failure = p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false);
             run.reports.failed(&p.context, Arc::new(failure), "archive ends before this file does")
@@ -4022,6 +4497,7 @@ fn rar_run_shared_open<'a>(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rar_read_at(
     first: &Path,
     chain_start: usize,
@@ -4030,6 +4506,7 @@ fn rar_read_at(
     password: Option<&str>,
     selection: RarSelection<'_>,
     observer: &mut SelectedReadObserver<'_>,
+    unfiltered: bool,
 ) -> Result<()> {
     let opts = Options {
         mode: Mode::Test,
@@ -4051,7 +4528,11 @@ fn rar_read_at(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
-        unsupported_filters: Default::default(),
+        encrypted_links: Default::default(),
+        damaged_input: Default::default(),
+        // SelectOptions::unverified_output: a VM filter zipfast doesn't run leaves its block unfiltered, as 7-Zip `x -so`
+        unsupported_filters: if unfiltered { UnsupportedFilters::WriteUnfiltered } else { UnsupportedFilters::Fail },
+        unverified_output: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
@@ -4067,49 +4548,67 @@ fn rar_read_at(
     let mut complete = false;
     observer.notify(0, first, SelectedReadRole::Header, Some(cancel))?;
     let volume = Volume::open_with_password(first, run.password)?;
-    walk_until_observed(volume, run.password, Some(cancel), observer, |volume, block, volume_index, observer| {
-        let Block::File(header) = block else { return Ok(false) };
-        if !header.split_before() {
-            if run.pending.is_some() {
+    run.rar5_keys = volume.rar5_keys().clone();
+    walk_until_observed(
+        volume,
+        run.password,
+        Some(cancel),
+        observer,
+        DamagedInput::Refuse,
+        &mut Vec::new(),
+        |volume, block, volume_index, observer| {
+            let Block::File(header) = block else { return Ok(false) };
+            if !header.split_before() {
+                if run.pending.is_some() {
+                    return Err(Error::Truncated);
+                }
+                selected = next == index;
+                prerequisite = (chain_start..index).contains(&next)
+                    && header.method != 0
+                    && !header.is_dir()
+                    && header.redirection.is_none();
+                next += 1;
+                if selected && (header.name != name || header.is_dir() || header.redirection.is_some()) {
+                    return Err(Error::Corrupt("RAR5 entry changed since it was selected"));
+                }
+            }
+            if !selected && !prerequisite {
+                return Ok(false);
+            }
+            if header.split_before() && run.pending.is_none() {
                 return Err(Error::Truncated);
             }
-            selected = next == index;
-            prerequisite = (chain_start..index).contains(&next)
-                && header.method != 0
-                && !header.is_dir()
-                && header.redirection.is_none();
-            next += 1;
-            if selected && (header.name != name || header.is_dir() || header.redirection.is_some()) {
-                return Err(Error::Corrupt("RAR5 entry changed since it was selected"));
+            if let Some(selection) = &mut run.selection {
+                selection.emit = selected;
             }
-        }
-        if !selected && !prerequisite {
-            return Ok(false);
-        }
-        if header.split_before() && run.pending.is_none() {
-            return Err(Error::Truncated);
-        }
-        if let Some(selection) = &mut run.selection {
-            selection.emit = selected;
-        }
-        observer.notify(
-            volume_index,
-            &volume.path,
-            if selected { SelectedReadRole::Selected } else { SelectedReadRole::Prerequisite },
-            Some(cancel),
-        )?;
-        let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
-        let before = summary.files;
-        let crypt = header.crypt.map(Ok);
-        let split_after = header.split_after();
-        run.file_block(volume, header, crypt).map_err(RunFault::into_legacy)?;
-        let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
-        if let Some(error) = summary.errors.first() {
-            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone())));
-        }
-        complete = selected && !split_after && summary.files > before && run.pending.is_none();
-        Ok(complete)
-    })?;
+            observer.notify(
+                volume_index,
+                &volume.path,
+                if selected { SelectedReadRole::Selected } else { SelectedReadRole::Prerequisite },
+                Some(cancel),
+            )?;
+            let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
+            let before = summary.files;
+            let crypt = header.crypt.map(Ok);
+            let split_after = header.split_after();
+            run.file_block(volume, header, crypt).map_err(RunFault::into_legacy)?;
+            let Reports::Legacy { summary, .. } = &mut run.reports else { unreachable!() };
+            if !selected && unfiltered && summary.errors.len() == 1 && summary.errors[0].ends_with(UNFILTERED_MESSAGE) {
+                // a solid prerequisite written unfiltered: its filters act on its output only, so the history the
+                // selected member goes on from is whole
+                summary.errors.clear();
+            }
+            if let Some(error) = summary.errors.first() {
+                if unfiltered && error.ends_with(UNFILTERED_MESSAGE) {
+                    // written whole with a block left unfiltered: 7-Zip's "Unsupported Method"
+                    return Err(Error::Unsupported(UNFILTERED_SELECTED.into()));
+                }
+                return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone())));
+            }
+            complete = selected && !split_after && summary.files > before && run.pending.is_none();
+            Ok(complete)
+        },
+    )?;
     if !complete {
         return Err(Error::Truncated);
     }
@@ -4132,6 +4631,7 @@ impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
             stream: None,
             rar4: None,
             rar4_keys: Default::default(),
+            rar5_keys: Default::default(),
             threads,
             batch: None,
             batch_paths: HashSet::new(),
@@ -4200,6 +4700,29 @@ impl Run<'_, '_, '_> {
             dest: &self.opts.dest,
         }
         .terminal(ctx, fault)
+    }
+
+    /// [`UnverifiedOutput::Emit`]: a member cut off by a missing volume gets the bytes its decoder still holds (what
+    /// the present volumes decoded), so a file kept with [`Options::keep_broken`] has all of them, as UnRAR 7.30
+    /// `x -kb` keeps it. A decoder that can't hand them over leaves the file as it was; a failure writing them (the
+    /// sink's) ends the run, as any output failure does.
+    fn emit_unverified(&mut self, p: &mut Pending) -> RunResult<()> {
+        if self.opts.unverified_output != UnverifiedOutput::Emit || p.failed || p.passive || p.hidden || !p.compressed {
+            return Ok(());
+        }
+        let mut sink = PendingSink { pending: p, fault: None };
+        if let Some(decoder) = self.rar4.as_mut() {
+            let _ = decoder.flush_decoded(&mut sink);
+        } else if let Some(stream) = self.stream.as_mut() {
+            let _ = stream.flush_cut(&mut sink);
+        }
+        match sink.fault {
+            Some(fault) => {
+                p.discard();
+                Err(self.terminal(&p.context, fault))
+            }
+            None => Ok(()),
+        }
     }
 
     fn pending_terminal(&mut self, pending: &Pending, fault: RarFault) -> RunFault {
@@ -4325,6 +4848,7 @@ impl Run<'_, '_, '_> {
         if !p.hidden && (!self.reports.typed() || (!p.failed && !p.passive)) {
             let failure = Arc::new(p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false));
             self.reports.failed(&p.context, Arc::clone(&failure), "next part is missing")?;
+            self.emit_unverified(&mut p)?;
             if p.compressed {
                 self.lost_history(&p.context, Some(failure));
             }
@@ -4377,7 +4901,8 @@ impl Run<'_, '_, '_> {
             },
             (Some(params), Some(password)) => {
                 let size = (!h.size_unknown()).then_some(h.unpacked_size);
-                match Pending::start_cipher(&mut ctx, true, params, password, size) {
+                let started = Pending::start_cipher(&mut ctx, &mut self.rar5_keys.lock(), true, params, password, size);
+                match started {
                     Ok(cipher) => (Some(cipher), None),
                     // a wrong password is why the members after it lose their history
                     Err(failure) => (None, Some(Arc::new(failure))),
@@ -4403,8 +4928,28 @@ impl Run<'_, '_, '_> {
         mut ctx: EntryContext,
         rel: &Path,
         kind: std::result::Result<link::LinkKind, Error>,
+        password: std::result::Result<RarPasswordEvidence, RarFailure>,
     ) -> RunResult<()> {
         self.drain()?;
+        // Options::encrypted_links: VerifyFirst reports a password that doesn't verify before any target decision
+        let password = match password {
+            Err(failure) if self.opts.encrypted_links == EncryptedLinks::VerifyFirst => {
+                let why = link_password_message(&failure);
+                let cause = self.fail_in_order(&ctx, failure, why)?;
+                return self.past_link(vol, h, ctx, Some(cause));
+            }
+            password => password,
+        };
+        // Overwrite::Skip: a link whose target is already there (one an earlier run placed, say) is skipped before its
+        // link target is checked, as UnRAR's `-o-` skips it: a skipped member places and touches nothing. A link that
+        // will be placed still passes every check below.
+        if self.opts.mode == Mode::Extract
+            && self.opts.overwrite == Overwrite::Skip
+            && link::existing_target(&self.opts.dest, rel)
+        {
+            self.reports.skipped(&ctx, RarSkipReason::ExistingTarget)?;
+            return self.past_link(vol, h, ctx, None);
+        }
         let refusal = match &kind {
             Ok(kind) => link::refusal_before_place(rel, kind, &self.landing.extracted),
             Err(_) => Some(link::HARD_TARGET),
@@ -4454,6 +4999,14 @@ impl Run<'_, '_, '_> {
                     return self.past_link(vol, h, ctx, Some(cause));
                 }
             };
+            match password {
+                Ok(evidence) => ctx.password = evidence,
+                Err(failure) => {
+                    let why = link_password_message(&failure);
+                    let cause = self.fail_in_order(&ctx, failure, why)?;
+                    return self.past_link(vol, h, ctx, Some(cause));
+                }
+            }
             let path = place.path.clone();
             // the folders known so far are looked at again past a link
             self.dirs.forget();
@@ -4479,6 +5032,14 @@ impl Run<'_, '_, '_> {
                 return Err(self.terminal(&ctx, RarFault::output(IoOperation::CreateFile, Some(path), None, e, false)));
             }
         } else {
+            match password {
+                Ok(evidence) => ctx.password = evidence,
+                Err(failure) => {
+                    let why = link_password_message(&failure);
+                    let cause = self.fail_in_order(&ctx, failure, why)?;
+                    return self.past_link(vol, h, ctx, Some(cause));
+                }
+            }
             link::tested(rel, &kind, &mut self.landing.extracted);
         }
         self.reports.verified(&ctx, 0, ctx.checks(false, false, false), self.opts.mode)?;
@@ -4619,11 +5180,18 @@ impl Run<'_, '_, '_> {
             }
             return self.reports.directory(&ctx);
         }
+        // Options::encrypted_links: a RAR 5.0 redirection placed or tested here needs no password to be given (it is
+        // checked, or let go, with the link)
+        let unverified_link = self.opts.encrypted_links == EncryptedLinks::PlaceUnverified
+            && h.format == RarFormat::Rar5
+            && h.redirection.is_some()
+            && self.selection.is_none();
         let refuse = if let Some(reason) = h.rar4_unsupported() {
             Some((RarFailure::Unsupported(reason), "unsupported RAR4 payload feature"))
         } else if let Some(Err(e)) = crypt {
             Some((RarFailure::crypt(e, ctx.scope()), "encrypted (password required)"))
         } else if h.encrypted
+            && !unverified_link
             && match h.format {
                 RarFormat::Rar4 => self.rar4_password.is_none(),
                 RarFormat::Rar5 => self.password.is_none() || h.crypt.is_none(),
@@ -4651,7 +5219,11 @@ impl Run<'_, '_, '_> {
                     self.opts.flatten,
                 )
         {
-            return self.rar5_link(vol, h, ctx, &rel, kind);
+            // its target is in the clear: an encrypted link is placed only on a password its check value verifies (applied
+            // once the link is known to be placed or tested: a skipped one stays skipped)
+            let links = self.opts.encrypted_links;
+            let password = link::rar5_link_password(&mut self.rar5_keys.lock(), h, self.password, ctx.scope(), links);
+            return self.rar5_link(vol, h, ctx, &rel, kind, password);
         }
         if let Some(link) = &h.redirection {
             let kind = link.kind();
@@ -4666,8 +5238,9 @@ impl Run<'_, '_, '_> {
                 None => None,
             }
         } else if let (Some(cp), Some(pw)) = (h.crypt, self.password) {
-            match Pending::start_cipher(&mut ctx, h.method != 0, cp, pw, (!h.size_unknown()).then_some(h.unpacked_size))
-            {
+            let size = (!h.size_unknown()).then_some(h.unpacked_size);
+            let started = Pending::start_cipher(&mut ctx, &mut self.rar5_keys.lock(), h.method != 0, cp, pw, size);
+            match started {
                 Ok(cipher) => Some(cipher),
                 Err(failure) => {
                     let why = if matches!(failure, RarFailure::Internal(_)) {
@@ -5209,6 +5782,11 @@ impl Run<'_, '_, '_> {
             return self.stored_parallel(vol, h, p);
         }
         let mut stream = if h.format == RarFormat::Rar5 && p.compressed { self.stream.take() } else { None };
+        if self.opts.unverified_output == UnverifiedOutput::Emit
+            && let Some(stream) = stream.as_mut()
+        {
+            stream.track_tail();
+        }
         let mut rar4_error = None;
         let mut rar4 = if h.format == RarFormat::Rar4 && p.compressed {
             let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
@@ -5216,6 +5794,9 @@ impl Run<'_, '_, '_> {
             match rar4_part_decoder(&mut self.rar4, h, vol.main.is_solid(), limit, cancel) {
                 Ok(mut decoder) => {
                     decoder.set_write_unfiltered(self.opts.unsupported_filters == UnsupportedFilters::WriteUnfiltered);
+                    if self.opts.unverified_output == UnverifiedOutput::Emit {
+                        decoder.track_starts();
+                    }
                     Some(decoder)
                 }
                 Err(error) => {
@@ -5417,8 +5998,10 @@ impl Run<'_, '_, '_> {
             }
         };
         let volume_path = vol.path.clone();
+        // what the volume read already with the headers is taken from it, not read again
         let part = batch::stored_detailed(
             (vol.file(), Some(&volume_path)),
+            vol.held_at(h.data_at, h.packed_size),
             h.data_at,
             h.packed_size,
             file.as_ref().map(|f| (&f.file, f.target())),
@@ -5762,6 +6345,69 @@ mod tests {
         assert!(!path.exists(), "a member whose output failed is removed, not kept");
     }
 
+    /// Codex on #317: under `UnverifiedOutput::Emit`, a failure writing the bytes a cut-off member's decoder still
+    /// holds ends the run, as any output failure does, instead of leaving only the missing-volume failure.
+    #[test]
+    fn an_output_failure_handing_over_a_cut_members_bytes_ends_the_run() {
+        let packed = include_bytes!("../tests/fixtures/rar4-lz/literal-a.packed");
+        let mut decoder =
+            crate::rar5::unpack::rar4::Rar4Decoder::new_with_cancel(65536, packed.len() as u64 + 1, 2, 4 << 20, None)
+                .unwrap();
+        decoder.set_version(29).unwrap();
+        let mut scratch = Pending::new(&FileHeader::default(), empty_context());
+        // it ends early (the member says two bytes): what it decoded stays in its buffer
+        let _ = decoder.feed(packed, &mut scratch);
+        assert_eq!(scratch.bytes, 0, "the decoded byte is still buffered");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member");
+        let mut opts = Options {
+            mode: Mode::Extract,
+            dest: dir.path().to_path_buf(),
+            overwrite: Overwrite::Always,
+            flatten: false,
+            threads: Some(1),
+            protected_paths: Default::default(),
+            parallel_min: None,
+            select: None,
+            windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
+            preexisting_links: Default::default(),
+            refused_link_placeholder: false,
+            restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: true,
+            attempt_continued_members: false,
+            encrypted_links: Default::default(),
+            damaged_input: Default::default(),
+            unsupported_filters: Default::default(),
+            unverified_output: UnverifiedOutput::Emit,
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
+        };
+        for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+            opts.unverified_output = unverified;
+            let mut callback = |_: &str| {};
+            let mut reports = Reports::legacy(&mut callback);
+            let mut run = Run::new(&opts, None, &mut reports, 1);
+            let mut held = crate::rar5::unpack::rar4::Rar4Decoder::new_with_cancel(65536, 1, 1, 4 << 20, None).unwrap();
+            std::mem::swap(&mut held, &mut decoder);
+            run.rar4 = Some(held);
+            let mut p = Pending::new(&FileHeader::default(), empty_context());
+            p.compressed = true;
+            p.keep = Some(Meta::default());
+            // a read-only handle: every write to it fails
+            std::fs::write(&path, b"").unwrap();
+            p.out = Some(crate::output::Output::created(File::open(&path).unwrap(), Some(4), path.clone()));
+            let result = run.emit_unverified(&mut p);
+            assert_eq!(result.is_err(), unverified == UnverifiedOutput::Emit, "{unverified:?}");
+            decoder = run.rar4.take().unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn persistent_metadata_attributes_are_independent() {
@@ -5964,5 +6610,353 @@ mod seven_zip_selected_tests {
                 "{archive}: {error}"
             );
         }
+    }
+}
+
+/// How a link whose password isn't verified is reported.
+fn link_password_message(failure: &RarFailure) -> &'static str {
+    match failure {
+        RarFailure::PasswordRequired { .. } => "encrypted (password required)",
+        RarFailure::WrongPassword { .. } => "wrong password",
+        RarFailure::EncryptedIntegrity { .. } => "the password can't be verified for a link",
+        _ => "invalid encryption record",
+    }
+}
+
+/// Every byte of a RAR volume is read once on the plain paths: the head read to tell the format and find the
+/// signature is the volume's first piece, not read again (Prybar's strace of a 10-volume RAR5 set).
+#[cfg(all(test, unix))]
+mod read_once {
+    use super::*;
+    use crate::rar5::reader::VOLUME_READS;
+
+    fn vint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn block(kind: u64, mut flags: u64, fields: &[u8], data: Option<&[u8]>) -> Vec<u8> {
+        if data.is_some() {
+            flags |= 2;
+        }
+        let mut body = Vec::new();
+        vint(kind, &mut body);
+        vint(flags, &mut body);
+        if let Some(data) = data {
+            vint(data.len() as u64, &mut body);
+        }
+        body.extend_from_slice(fields);
+        let mut sized = Vec::new();
+        vint(body.len() as u64, &mut sized);
+        sized.extend_from_slice(&body);
+        let mut out = crate::crc32::hash(&sized).to_le_bytes().to_vec();
+        out.extend_from_slice(&sized);
+        out.extend_from_slice(data.unwrap_or_default());
+        out
+    }
+
+    /// A RAR 5.0 set of one stored file split into volumes of `chunk` data bytes, each volume after `prefix`es.
+    fn volumes(data: &[u8], chunk: usize, prefix: &[u8]) -> Vec<Vec<u8>> {
+        let parts: Vec<&[u8]> = data.chunks(chunk).collect();
+        let n = parts.len();
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let last = i + 1 == n;
+                let mut out = if i == 0 { prefix.to_vec() } else { Vec::new() };
+                out.extend_from_slice(b"Rar!\x1a\x07\x01\x00");
+                let mut main = Vec::new();
+                vint(if i == 0 { 1 } else { 3 }, &mut main);
+                if i > 0 {
+                    vint(i as u64, &mut main);
+                }
+                out.extend(block(1, 0, &main, None));
+                let mut file = Vec::new();
+                vint(0x4, &mut file);
+                vint(data.len() as u64, &mut file);
+                vint(0o644, &mut file);
+                let crc = if last { crate::crc32::hash(data) } else { crate::crc32::hash(part) };
+                file.extend_from_slice(&crc.to_le_bytes());
+                vint(0, &mut file);
+                vint(1, &mut file);
+                vint(4, &mut file);
+                file.extend_from_slice(b"data");
+                let split = if i > 0 { 0x8 } else { 0 } | if last { 0 } else { 0x10 };
+                out.extend(block(2, split, &file, Some(part)));
+                let mut end = Vec::new();
+                vint(u64::from(!last), &mut end);
+                out.extend(block(5, 0, &end, None));
+                out
+            })
+            .collect()
+    }
+
+    fn options(dest: &Path, threads: usize) -> Options {
+        Options {
+            mode: Mode::Extract,
+            dest: dest.to_path_buf(),
+            overwrite: Overwrite::Always,
+            flatten: false,
+            threads: Some(threads),
+            protected_paths: Default::default(),
+            parallel_min: None,
+            select: None,
+            windows_safe_names: false,
+            special_entries: Default::default(),
+            fallback_mtime: None,
+            compressed_tar: Default::default(),
+            version_naming: Default::default(),
+            preexisting_links: Default::default(),
+            refused_link_placeholder: false,
+            restart_from_first_volume: false,
+            replace_placed_links: false,
+            keep_broken: false,
+            attempt_continued_members: false,
+            encrypted_links: Default::default(),
+            unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
+            salvage_truncated_zip: false,
+            unix_modes: Default::default(),
+            backslashes: Default::default(),
+            damaged_input: Default::default(),
+        }
+    }
+
+    fn identity(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    /// Where the volume reads recorded from `since` on went, for each of `paths`: every byte of each volume read
+    /// once, in reads that follow on from each other, the first volume's from `head` on (its first bytes, read to
+    /// tell its format before any volume opened).
+    fn assert_read_once(paths: &[PathBuf], since: usize, head: u64) {
+        let reads = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner())[since..].to_vec();
+        for (i, path) in paths.iter().enumerate() {
+            let id = identity(path);
+            let mut ranges: Vec<(u64, u64)> =
+                reads.iter().filter(|(of, _, _)| *of == id).map(|&(_, at, len)| (at, at + len)).collect();
+            ranges.sort();
+            let mut at = if i == 0 { head } else { 0 };
+            for range in ranges {
+                assert_eq!(range.0, at, "{}: read {range:?} with {at} read so far", path.display());
+                at = range.1;
+            }
+            assert_eq!(at, fs::metadata(path).unwrap().len(), "{}: bytes read", path.display());
+        }
+    }
+
+    fn write_set(dir: &Path, set: &[Vec<u8>]) -> Vec<PathBuf> {
+        set.iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let path = dir.join(format!("set.part{}.rar", i + 1));
+                fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect()
+    }
+
+    #[test]
+    fn a_rar5_set_reads_each_volume_once() {
+        let data = data(7 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            for threads in [1, 4] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = write_set(dir.path(), &volumes(&data, 5 << 19, prefix));
+                let dest = dir.path().join("out");
+                let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let summary = run(&paths[0], &options(&dest, threads), |_| {}).unwrap();
+                assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+                assert_eq!(fs::read(dest.join("data")).unwrap(), data, "prefix {} threads {threads}", prefix.len());
+                assert_read_once(&paths, since, HEAD_PROBE_BYTES as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn the_checked_route_reads_each_volume_once() {
+        let data = data(5 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = write_set(dir.path(), &volumes(&data, 3 << 19, prefix));
+            let dest = dir.path().join("out");
+            let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+            run_with_policy(
+                &paths[0],
+                &options(&dest, 2),
+                None,
+                &Cancellation::default(),
+                &crate::zip::EncryptedReadOverrides::default(),
+                |_: crate::zip::ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(fs::read(dest.join("data")).unwrap(), data, "prefix {}", prefix.len());
+            // a signature behind a self-extractor is searched for in the whole window, read on the checked route
+            let head = if prefix.is_empty() { HEAD_PROBE_BYTES as u64 } else { SIGNATURE_PROBE_BYTES };
+            assert_read_once(&paths, since, head);
+        }
+    }
+
+    /// Every dispatcher, run as `pry extract` runs it ([`Options::restart_from_first_volume`]): the first volume,
+    /// which has none before it by name, is not opened again to see whether its first member continues one.
+    #[test]
+    fn every_dispatcher_reads_each_volume_once_when_it_may_restart() {
+        type Runner = fn(&Path, &Options) -> u64;
+        let policy: Runner = |first, options| {
+            let report = run_with_zip_policy(
+                first,
+                options,
+                None,
+                &Cancellation::default(),
+                &crate::zip::EncryptedReadOverrides::default(),
+                |_: crate::zip::ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            report.files()
+        };
+        let password: Runner = |first, options| run_with_password(first, options, None, |_| {}).unwrap().files;
+        let outcomes: Runner = |first, options| run_rar_with_outcomes(first, options, None, |_| {}).unwrap().files;
+        let data = data(5 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            // the bytes of the first volume read before any volume opens: the checked route's probe searches the
+            // whole window for a signature behind a self-extractor; a plain RAR run opens the volume directly
+            let checked = if prefix.is_empty() { HEAD_PROBE_BYTES as u64 } else { SIGNATURE_PROBE_BYTES };
+            for (name, runner, head) in [
+                ("run_with_zip_policy", policy, checked),
+                ("run_with_password", password, HEAD_PROBE_BYTES as u64),
+                ("run_rar_with_outcomes", outcomes, 0),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = write_set(dir.path(), &volumes(&data, 3 << 19, prefix));
+                let dest = dir.path().join("out");
+                let options =
+                    Options { restart_from_first_volume: true, replace_placed_links: true, ..options(&dest, 2) };
+                let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+                assert_eq!(runner(&paths[0], &options), 1, "{name}");
+                assert_eq!(fs::read(dest.join("data")).unwrap(), data, "{name} prefix {}", prefix.len());
+                assert_read_once(&paths, since, head);
+            }
+            // a listing reads the headers, each once
+            let dir = tempfile::tempdir().unwrap();
+            let paths = write_set(dir.path(), &volumes(&data, 3 << 19, prefix));
+            let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let options = Options { restart_from_first_volume: true, ..options(dir.path(), 1) };
+            assert_eq!(list_detailed_with_options(&paths[0], None, &options).unwrap().entries.len(), 1);
+            let reads = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner())[since..].to_vec();
+            for path in &paths {
+                let id = identity(path);
+                let mut ranges: Vec<(u64, u64)> =
+                    reads.iter().filter(|(of, _, _)| *of == id).map(|&(_, at, len)| (at, at + len)).collect();
+                ranges.sort();
+                for pair in ranges.windows(2) {
+                    assert!(pair[0].1 <= pair[1].0, "{}: read twice: {:?} and {:?}", path.display(), pair[0], pair[1]);
+                }
+            }
+        }
+    }
+
+    /// A run given a later volume still starts over at the first, as UnRAR does.
+    #[test]
+    fn a_run_from_a_later_volume_still_restarts() {
+        let data = data(3 << 20);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_set(dir.path(), &volumes(&data, 1 << 20, &[]));
+        let dest = dir.path().join("out");
+        let options = Options { restart_from_first_volume: true, ..options(&dest, 1) };
+        let summary = run(&paths[1], &options, |_| {}).unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert_eq!(fs::read(dest.join("data")).unwrap(), data);
+    }
+
+    #[test]
+    fn a_rar5_listing_reads_the_first_volume_head_once() {
+        let data = data(3 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = write_set(dir.path(), &volumes(&data, 1 << 20, prefix));
+            for lister in
+                [&(|p: &Path| list(p).unwrap().len()) as &dyn Fn(&Path) -> usize, &|p: &Path| match inspect(p).unwrap()
+                {
+                    Inspection::Other(entries) => entries.len(),
+                    Inspection::Zip(_) => panic!("a RAR set"),
+                }]
+            {
+                let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+                assert_eq!(lister(&paths[0]), 1);
+                let reads = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner())[since..].to_vec();
+                let id = identity(&paths[0]);
+                let mut ranges: Vec<(u64, u64)> =
+                    reads.iter().filter(|(of, _, _)| *of == id).map(|&(_, at, len)| (at, at + len)).collect();
+                ranges.sort();
+                for pair in ranges.windows(2) {
+                    assert!(pair[0].1 <= pair[1].0, "read twice: {:?} and {:?}", pair[0], pair[1]);
+                }
+            }
+        }
+    }
+
+    /// A big stored part is copied on several threads, by position: the part of it the volume read with the headers
+    /// is taken from there, not read again.
+    #[test]
+    fn a_big_stored_part_reads_its_volume_once() {
+        let data = data(batch::STORED_PARALLEL_MIN as usize + (3 << 19));
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_set(dir.path(), &volumes(&data, data.len() - 1000, &[]));
+        let dest = dir.path().join("out");
+        let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let summary = run(&paths[0], &options(&dest, 4), |_| {}).unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert!(fs::read(dest.join("data")).unwrap() == data);
+        assert_read_once(&paths, since, HEAD_PROBE_BYTES as u64);
+    }
+
+    #[test]
+    fn a_rar4_set_reads_each_volume_once() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-volumes");
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (1..=3)
+            .map(|i| {
+                let name = format!("multi.part{i}.rar");
+                let path = dir.path().join(&name);
+                fs::copy(fixtures.join(&name), &path).unwrap();
+                path
+            })
+            .collect();
+        let dest = dir.path().join("out");
+        let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let summary = run(&paths[0], &options(&dest, 1), |_| {}).unwrap();
+        assert!(summary.errors.is_empty() && summary.files > 0, "{summary:?}");
+        assert_read_once(&paths, since, HEAD_PROBE_BYTES as u64);
+    }
+
+    /// A self-extractor longer than the signature window is still no RAR, as before.
+    #[test]
+    fn a_signature_past_the_window_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = vec![0x4d; crate::rar5::MAX_SFX as usize + 1];
+        let paths = write_set(dir.path(), &volumes(b"small", 8, &prefix));
+        assert!(Volume::open(&paths[0]).is_err());
+        let file = File::open(&paths[0]).unwrap();
+        assert!(Volume::open_head(&paths[0], file, prefix[..1024].to_vec(), None, DamagedInput::Refuse).is_err());
+        let mut at_edge = vec![0x4d; crate::rar5::MAX_SFX as usize];
+        at_edge.extend_from_slice(&volumes(b"small", 8, &[])[0]);
+        fs::write(&paths[0], &at_edge).unwrap();
+        assert!(Volume::open(&paths[0]).is_ok(), "a signature right at the window's end is found");
+        let file = File::open(&paths[0]).unwrap();
+        assert!(Volume::open_head(&paths[0], file, at_edge[..1024].to_vec(), None, DamagedInput::Refuse).is_ok());
     }
 }

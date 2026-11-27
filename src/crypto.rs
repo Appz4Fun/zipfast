@@ -988,6 +988,32 @@ pub(crate) fn derive_rar5_keys_controlled(
     check: Option<([u8; 8], [u8; 4])>,
     control: &mut dyn KdfControl,
 ) -> std::result::Result<Rar5Keys, ControlledKdfError> {
+    rar5_controlled(password, kdf_count, control, |control| {
+        derive_rar5_keys_impl(password.as_bytes(), kdf_count, salt, check, control)
+    })
+}
+
+/// [`rar5_material`] under the limits and metering of [`derive_rar5_keys_controlled`].
+pub(crate) fn rar5_material_controlled(
+    password: &str,
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+    control: &mut dyn KdfControl,
+) -> std::result::Result<Rar5Derived, ControlledKdfError> {
+    rar5_controlled(password, kdf_count, control, |control| {
+        rar5_material(password.as_bytes(), kdf_count, salt, check, control)
+    })
+}
+
+/// Refuses a password or exponent past the progressive limits before any hashing, then runs `derive` with every
+/// block charged to `control` and one derivation held to 2^22 blocks.
+fn rar5_controlled<T>(
+    password: &str,
+    kdf_count: u8,
+    control: &mut dyn KdfControl,
+    derive: impl FnOnce(&mut dyn KdfControl) -> std::result::Result<T, ControlledKdfError>,
+) -> std::result::Result<T, ControlledKdfError> {
     use crate::progressive::Resource;
     for (resource, attempted, limit) in [
         (Resource::KdfExponent, u64::from(kdf_count), 20),
@@ -1022,7 +1048,7 @@ pub(crate) fn derive_rar5_keys_controlled(
             Ok(())
         }
     }
-    derive_rar5_keys_impl(password.as_bytes(), kdf_count, salt, check, &mut Derivation { control, blocks: 0 })
+    derive(&mut Derivation { control, blocks: 0 })
 }
 
 fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
@@ -1032,9 +1058,89 @@ fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
     check: Option<([u8; 8], [u8; 4])>,
     control: &mut C,
 ) -> std::result::Result<Rar5Keys, ControlledKdfError> {
-    use crate::error::{RarPasswordEvidence, RarVerifierUnavailable};
+    let derived = rar5_pbkdf2(password, kdf_count, salt, check, control)?;
+    // The check value was derived exactly when the record's checksum holds: no second hash.
+    derived.keys_verified(check, derived.fold.is_some()).map_err(ControlledKdfError::Crypt)
+}
+
+/// What one RAR 5.0 PBKDF2-HMAC-SHA256 run gives: the AES key, the `HashKey`, and the folded password check value
+/// when it was computed. A member's own check value is compared with `fold` by [`Rar5Derived::keys`].
+#[derive(Clone)]
+pub(crate) struct Rar5Derived {
+    key: [u8; 32],
+    hash_key: [u8; 32],
+    fold: Option<[u8; 8]>,
+}
+
+impl Rar5Derived {
+    /// The folded password check value, when it was derived.
+    #[cfg(test)]
+    pub(crate) fn check_value(&self) -> Option<[u8; 8]> {
+        self.fold
+    }
+
+    /// The keys for a member whose encryption record carries `check`: its check value, when its checksum holds,
+    /// must equal the derived one, or the password is wrong.
+    /// Whether this material can give the keys for a member with `check`: material derived for a member without a
+    /// verifiable check value has none to compare a later member's with (that member derives again).
+    pub(crate) fn serves(&self, check: Option<([u8; 8], [u8; 4])>) -> bool {
+        self.fold.is_some() || !matches!(check, Some((chk, csum)) if sha256(&chk)[..4] == csum)
+    }
+
+    pub(crate) fn keys(&self, check: Option<([u8; 8], [u8; 4])>) -> std::result::Result<Rar5Keys, Rar5CryptError> {
+        let verifiable = matches!(check, Some((chk, csum)) if sha256(&chk)[..4] == csum);
+        self.keys_verified(check, verifiable)
+    }
+
+    /// [`Self::keys`] where `verifiable` says whether the check value's checksum holds.
+    fn keys_verified(
+        &self,
+        check: Option<([u8; 8], [u8; 4])>,
+        verifiable: bool,
+    ) -> std::result::Result<Rar5Keys, Rar5CryptError> {
+        use crate::error::{RarPasswordEvidence, RarVerifierUnavailable};
+        let evidence = match check {
+            Some((chk, _)) if verifiable => match self.fold {
+                Some(fold) if fold == chk => RarPasswordEvidence::VerifierMatched,
+                _ => return Err(Rar5CryptError::WrongPassword),
+            },
+            Some(_) => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::CheckChecksumMismatch),
+            None => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::Absent),
+        };
+        Ok(Rar5Keys { key: self.key, hash_key: self.hash_key, evidence })
+    }
+}
+
+/// RAR 5.0 PBKDF2 runs started so far, by password (tests only: a test counts the runs for a password only it uses).
+#[cfg(test)]
+static RAR5_DERIVATIONS: std::sync::Mutex<Vec<(Vec<u8>, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// RAR 5.0 key derivations started so far for `password` (tests only).
+#[cfg(test)]
+pub(crate) fn rar5_derivations(password: &str) -> u64 {
+    let counts = RAR5_DERIVATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    counts.iter().find(|(p, _)| p == password.as_bytes()).map_or(0, |(_, n)| *n)
+}
+
+/// The RAR 5.0 PBKDF2-HMAC-SHA256 run: `2^kdf_count` rounds for the key, 16 more for the `HashKey`, and 16 more for
+/// the password check value when `check` can be verified.
+fn rar5_pbkdf2<C: KdfControl + ?Sized>(
+    password: &[u8],
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+    control: &mut C,
+) -> std::result::Result<Rar5Derived, ControlledKdfError> {
     if kdf_count > 24 {
         return Err(ControlledKdfError::Crypt(Rar5CryptError::KdfLimit(kdf_count)));
+    }
+    #[cfg(test)]
+    {
+        let mut counts = RAR5_DERIVATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match counts.iter_mut().find(|(p, _)| p == password) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((password.to_vec(), 1)),
+        }
     }
     // Normalizing a long HMAC key hashes ceil((bytes + 9) / 64) blocks.
     // Setup always hashes the two ipad/opad blocks. No password buffer is allocated.
@@ -1068,28 +1174,131 @@ fn derive_rar5_keys_impl<C: KdfControl + ?Sized>(
     if check.is_some() {
         control.charge(1).map_err(ControlledKdfError::Control)?;
     }
-    let evidence = match check {
-        Some((chk, csum)) if sha256(&chk)[..4] == csum => {
-            for _ in 0..16 {
-                control.charge(2).map_err(ControlledKdfError::Control)?;
-                u = keyed.mac_32(&u);
-                for (slot, b) in fn_acc.iter_mut().zip(u) {
-                    *slot ^= b;
-                }
+    let verifiable = matches!(check, Some((chk, csum)) if sha256(&chk)[..4] == csum);
+    let fold = if verifiable {
+        for _ in 0..16 {
+            control.charge(2).map_err(ControlledKdfError::Control)?;
+            u = keyed.mac_32(&u);
+            for (slot, b) in fn_acc.iter_mut().zip(u) {
+                *slot ^= b;
             }
-            let mut folded = [0u8; 8];
-            for (i, b) in fn_acc.iter().enumerate() {
-                folded[i % 8] ^= *b;
-            }
-            if folded != chk {
-                return Err(ControlledKdfError::Crypt(Rar5CryptError::WrongPassword));
-            }
-            RarPasswordEvidence::VerifierMatched
         }
-        Some(_) => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::CheckChecksumMismatch),
-        None => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::Absent),
+        let mut folded = [0u8; 8];
+        for (i, b) in fn_acc.iter().enumerate() {
+            folded[i % 8] ^= *b;
+        }
+        Some(folded)
+    } else {
+        None
     };
-    Ok(Rar5Keys { key, hash_key, evidence })
+    Ok(Rar5Derived { key, hash_key, fold })
+}
+
+/// Key material by key-derivation input (password and `K`: salt, count), for one run or session. In memory only;
+/// at most [`KdfCache::KEPT`] inputs are kept, least recently used dropped first, so an archive with a new salt in
+/// every header derives as it would without a cache.
+pub(crate) struct KdfCache<K, V> {
+    entries: Vec<(Box<[u8]>, K, V)>,
+}
+
+impl<K, V> Default for KdfCache<K, V> {
+    fn default() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<K: PartialEq, V: Clone> KdfCache<K, V> {
+    /// Inputs kept at most.
+    pub(crate) const KEPT: usize = 16;
+
+    /// The material derived before for this input, now the most recently used.
+    pub(crate) fn get(&mut self, password: &[u8], input: &K) -> Option<V> {
+        let at = self.entries.iter().position(|(p, k, _)| k == input && **p == *password)?;
+        let entry = self.entries.remove(at);
+        let value = entry.2.clone();
+        self.entries.push(entry);
+        Some(value)
+    }
+
+    /// Keeps material derived for this input, dropping the least recently used past [`Self::KEPT`].
+    pub(crate) fn insert(&mut self, password: &[u8], input: K, value: V) {
+        self.entries.retain(|(p, k, _)| !(*k == input && **p == *password));
+        if self.entries.len() >= Self::KEPT {
+            self.entries.remove(0);
+        }
+        self.entries.push((password.into(), input, value));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// RAR 5.0 key material by (count, salt): PBKDF2 runs once per input, since `rar` gives every file header of an
+/// archive (and its encrypted headers) the same salt. Each member's password check value is still compared with
+/// the derived one ([`Rar5Derived::keys`]).
+pub(crate) type Rar5KeyCache = KdfCache<(u8, [u8; 16]), Rar5Derived>;
+
+/// A [`Rar5KeyCache`] shared by the volumes of a set and the run or session reading them, so each volume's
+/// encrypted headers and its members derive only inputs none of them derived before.
+#[derive(Clone, Default)]
+pub(crate) struct SharedRar5Keys(std::sync::Arc<std::sync::Mutex<Rar5KeyCache>>);
+
+impl SharedRar5Keys {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Rar5KeyCache> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// RAR 3.x key and IV by salt, for a progressive session ([`crate::progressive::Usage`]).
+pub(crate) type Rar4Keys = KdfCache<[u8; 8], ([u8; 16], [u8; 16])>;
+
+impl Rar5KeyCache {
+    /// [`derive_rar5_keys`] through the cache, stopping when `cancel` is set (only a derivation has work to stop).
+    pub(crate) fn keys(
+        &mut self,
+        password: &str,
+        params: &Rar5CryptParams,
+        cancel: Option<&crate::extract::Cancellation>,
+    ) -> std::result::Result<Rar5Keys, ControlledKdfError> {
+        let input = (params.kdf_count, params.salt);
+        let derived = match self.get(password.as_bytes(), &input).filter(|derived| derived.serves(params.check)) {
+            Some(derived) => derived,
+            None => {
+                let control = &mut Cancelable(cancel);
+                let derived =
+                    rar5_material(password.as_bytes(), params.kdf_count, &params.salt, params.check, control)?;
+                self.insert(password.as_bytes(), input, derived.clone());
+                derived
+            }
+        };
+        derived.keys(params.check).map_err(ControlledKdfError::Crypt)
+    }
+}
+
+/// Stops a derivation once `cancel` is set.
+struct Cancelable<'a>(Option<&'a crate::extract::Cancellation>);
+impl KdfControl for Cancelable<'_> {
+    fn charge(&mut self, _: u64) -> std::result::Result<(), KdfControlError> {
+        if self.0.is_some_and(crate::extract::Cancellation::is_canceled) {
+            Err(KdfControlError::Canceled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// RAR 5.0 key material for a [`Rar5KeyCache`], with the check value when `check` (the first member's) can be
+/// verified: what [`derive_rar5_keys`] derives for it, at the same cost.
+pub(crate) fn rar5_material(
+    password: &[u8],
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+    control: &mut dyn KdfControl,
+) -> std::result::Result<Rar5Derived, ControlledKdfError> {
+    rar5_pbkdf2(password, kdf_count, salt, check, control)
 }
 
 /// [`derive_rar5_key_and_hash_key`] for a password given as raw bytes, hashed exactly as given. RAR 5.0 keys
@@ -1372,16 +1581,6 @@ impl Rar4KeyCache {
     ) -> std::result::Result<([u8; 16], [u8; 16]), KdfControlError> {
         if let Some(&(_, key, iv)) = self.keys.iter().find(|(s, ..)| s == salt) {
             return Ok((key, iv));
-        }
-        struct Cancelable<'a>(Option<&'a crate::extract::Cancellation>);
-        impl KdfControl for Cancelable<'_> {
-            fn charge(&mut self, _: u64) -> std::result::Result<(), KdfControlError> {
-                if self.0.is_some_and(crate::extract::Cancellation::is_canceled) {
-                    Err(KdfControlError::Canceled)
-                } else {
-                    Ok(())
-                }
-            }
         }
         let units: Vec<u16> = password.encode_utf16().collect();
         let (key, iv) = derive_rar4_key_iv_impl(&units, salt, &mut Cancelable(cancel))?;

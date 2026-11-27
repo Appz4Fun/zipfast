@@ -314,9 +314,14 @@ fn a_failed_rar4_hand_off_keeps_the_decoder() {
 /// flag, and each member's packed data is padded to whole AES blocks and encrypted with the keys for `password` and
 /// that salt.
 fn encrypt_rar4(archive: &[u8], password: &str, salt: [u8; 8]) -> Vec<u8> {
-    let (key, iv) = zipfast::crypto::derive_rar4_key_iv(password, &salt);
+    encrypt_rar4_salted(archive, password, &[salt])
+}
+
+/// [`encrypt_rar4`] with file `i` salted `salts[i % salts.len()]`.
+fn encrypt_rar4_salted(archive: &[u8], password: &str, salts: &[[u8; 8]]) -> Vec<u8> {
     let mut out = archive[..7].to_vec();
     let mut at = 7;
+    let mut files = 0;
     while at + 7 <= archive.len() {
         let kind = archive[at + 2];
         let flags = u16::from_le_bytes([archive[at + 3], archive[at + 4]]);
@@ -329,6 +334,9 @@ fn encrypt_rar4(archive: &[u8], password: &str, salt: [u8; 8]) -> Vec<u8> {
         };
         let mut data = archive[at + size..at + size + data_len].to_vec();
         if kind == 0x74 {
+            let salt = salts[files % salts.len()];
+            files += 1;
+            let (key, iv) = zipfast::crypto::derive_rar4_key_iv(password, &salt);
             assert_eq!(flags & 0x100, 0, "no high sizes in these fixtures");
             let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
             header.splice(32 + name_len..32 + name_len, salt);
@@ -348,27 +356,35 @@ fn encrypt_rar4(archive: &[u8], password: &str, salt: [u8; 8]) -> Vec<u8> {
 }
 
 /// One key-derivation budget covers every key a decoder derives: a successor decoding two encrypted earlier members
-/// again derives three keys, which a session budget of two and a half refuses (each alone fits).
+/// with salts of their own derives three keys, which a session budget of two and a half refuses (each alone fits).
+/// Members sharing one salt, as `rar` writes them, derive it once and fit.
 #[test]
 fn a_successor_charges_every_key_it_derives_to_one_budget() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4-rar300");
     let plain = std::fs::read(root.join("solid_rar300.rar")).unwrap();
-    let bytes = encrypt_rar4(&plain, "secret", *b"saltsalt");
-    let map = MemberMap::from_memory(&[&bytes], "solid_rar300.rar", Some("secret")).unwrap();
-    let stream = streams(&map).into_iter().next().expect("a solid stream");
-    assert_eq!(stream.len(), 3);
-    assert!(stream.iter().all(|&i| map.members[i].encrypted));
-    let last = *stream.last().unwrap();
-    // decodes with the default budget
-    assert!(reference(&map, last, std::slice::from_ref(&bytes), Some("secret")).is_some());
-    // a RAR 3.x key ("secret", 8-byte salt) costs about 94,000 blocks
-    let limited = || {
-        let mut o = FeedOptions::new(Some("secret"));
-        o.limits.kdf_session_blocks = 250_000;
-        o
-    };
-    assert!(FeedDecoder::new(&map, stream[0], limited()).is_ok());
-    assert!(matches!(FeedDecoder::new(&map, last, limited()), Err(FeedError::Key(_))));
+    for (salts, fits) in [(&[*b"saltsalt", *b"pepper!!", *b"cuminxyz"][..], false), (&[*b"saltsalt"][..], true)] {
+        let bytes = encrypt_rar4_salted(&plain, "secret", salts);
+        let map = MemberMap::from_memory(&[&bytes], "solid_rar300.rar", Some("secret")).unwrap();
+        let stream = streams(&map).into_iter().next().expect("a solid stream");
+        assert_eq!(stream.len(), 3);
+        assert!(stream.iter().all(|&i| map.members[i].encrypted));
+        let last = *stream.last().unwrap();
+        // decodes with the default budget
+        assert!(reference(&map, last, std::slice::from_ref(&bytes), Some("secret")).is_some());
+        // a RAR 3.x key ("secret", 8-byte salt) costs about 94,000 blocks
+        let limited = || {
+            let mut o = FeedOptions::new(Some("secret"));
+            o.limits.kdf_session_blocks = 250_000;
+            o
+        };
+        assert!(FeedDecoder::new(&map, stream[0], limited()).is_ok());
+        let successor = FeedDecoder::new(&map, last, limited());
+        if fits {
+            assert!(successor.is_ok(), "one salt is derived once");
+        } else {
+            assert!(matches!(successor, Err(FeedError::Key(_))), "{} salts", salts.len());
+        }
+    }
 }
 
 /// A handed-over decoder answers to the new member's session control: canceling the earlier member's after the

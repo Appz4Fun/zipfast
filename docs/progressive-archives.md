@@ -136,6 +136,15 @@ the complete extractor; this entrypoint creates no links. Stored recovery is
 available for the admitted RAR4 and RAR5 subsets below. Full original
 compatibility remains open.
 
+## Damaged headers
+
+`ProgressiveOptions::extract.damaged_input` (`Salvage`, `Resync`) reads past damaged RAR headers as the whole-archive
+runners do, and reports each as `ProgressiveEvent::HeaderDamaged { volume, damage }`. The default `Refuse` fails as
+before. The rule with holes: only delivered bytes are judged. A header the source has not delivered yet is waited on,
+one inside a `Hole` answer stops the session with `HeaderHole` (repair may still fill it), and a resync never searches
+across a hole. See `docs/compat-options.md` ("Damaged headers in a progressive session"). Persistent-partial sessions
+follow the same rules; see `docs/persistent-partials.md` ("Damaged headers") for how their members are bound.
+
 ## RAR4 capability boundary
 
 | Progressive RAR4 case | Current admission |
@@ -349,7 +358,9 @@ checks are not authenticated encryption.
 
 Limits retain the documented finite defaults in `ProgressiveLimits`, including
 1 MiB read/packed-work chunks, 16 retained artifacts, 128 MiB metadata, 256 MiB
-decoder windows and 64 GiB source/output/verification budgets. Test and passive
+decoder windows and 1 TiB (`DEFAULT_BYTE_TOTAL`) source/output/temp/write/verification budgets, sized
+above real sets such as 70-100 GB UHD remux posts: hostile archives are stopped by declared sizes, the decoder
+window and per-poll work, not by byte totals. Test and passive
 solid decoding charge decoded bytes to cumulative `LogicalOutputBytes`, but do
 not charge nonexistent temporary extent, output writes or physical verification
 reads. Extracted stages continue to charge logical extent and temporary bytes
@@ -357,7 +368,7 @@ together. Test permits zero output/artifact/temp/write capacities. Optional
 artifact reads still charge `VerifyBytes`; reporting a Hole does not. Verification
 charges attempted stage/replacement read spans, including failed attempts and
 provider retries. In-memory hashing is not a physical read. `VerifyWorkBytes`
-(default 64 GiB) separately bounds byte-span processing passes, not exact CPU
+(default 1 TiB) separately bounds byte-span processing passes, not exact CPU
 instructions or time. Combined fixed hash/decrypt/compare work may charge a span
 once; distinct rescans/replays charge again. SourceBytes counts source spans
 (including reported holes), SourceRequests counts callbacks, and these counters
@@ -396,3 +407,6 @@ final key padding, before the primitive. The independent ceilings are 2^22 block
 per derivation and a default 2^26 per session; a permitted long password can still
 reach a work limit. Such exhaustion is a resource failure, not a password verdict.
 The existing public unrestricted crypto helper retains its previous behavior.
+A session derives each (password, salt, count) once: the keys of a repeated input
+(RAR 5.0, RAR 3.x or 7zAES) come from the session's `Usage` and charge nothing, a
+member's own RAR 5.0 check value is still compared (see `docs/rar-passwords.md`).

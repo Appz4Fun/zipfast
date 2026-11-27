@@ -304,6 +304,11 @@ impl InspectionSource {
         Ok(Self { file, source, dispatch_bytes: 0 })
     }
 
+    /// The data file, for a format other than ZIP to read.
+    pub(crate) fn into_file(self) -> File {
+        self.file
+    }
+
     pub(crate) fn probe_prefix(&mut self, max_len: u64, cancel: &Cancellation) -> Result<Vec<u8>> {
         check_cancel(Some(cancel))?;
         let len = self.file.metadata()?.len().min(max_len) as usize;

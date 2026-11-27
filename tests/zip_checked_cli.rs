@@ -144,6 +144,12 @@ fn listing_hardlink_source_alias_refuses() {
     alias_case(&["v"], true, true, false);
 }
 #[test]
+fn salvage_listing_source_alias_refuses() {
+    // `--salvage` / `--resync` change only how a RAR archive is listed: a ZIP keeps its checked listing
+    alias_case(&["l", "--salvage"], true, false, false);
+    alias_case(&["v", "--resync"], true, true, false);
+}
+#[test]
 fn unknown_arg_source_alias_refuses() {
     alias_case(&["t", "-unknown"], false, true, false);
 }
@@ -601,7 +607,10 @@ fn r2_prefixed_zip_public_policy_context_and_selected_caps() {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            encrypted_links: Default::default(),
+            damaged_input: Default::default(),
             unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
