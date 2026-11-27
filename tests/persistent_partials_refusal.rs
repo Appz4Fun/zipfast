@@ -184,6 +184,7 @@ fn extract_options(dest: &Path, first: OsString) -> ProgressiveOptions {
             encrypted_links: Default::default(),
             damaged_input: Default::default(),
             unsupported_filters: Default::default(),
+            unverified_output: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),
             backslashes: Default::default(),
