@@ -930,6 +930,7 @@ fn stored_name_hard_links_take_the_file_at_the_targets_name() {
         (out, summary)
     };
     let old = |out: &Path| fs::write(out.join("t/hard66"), b"OLD").unwrap();
+    let none_before = |_: &Path| {};
     let rename = Overwrite::RenameNew(RenameStyle::Parenthesized);
 
     // -or: the default links to the renamed new file, StoredName to the old one, as both tools do
@@ -1000,6 +1001,19 @@ fn stored_name_hard_links_take_the_file_at_the_targets_name() {
         let landed = if flatten { out.join("self") } else { out.join("t/self") };
         assert!(fs::symlink_metadata(&landed).is_err(), "{landed:?}");
     }
+
+    // Codex on #329: a link whose path is already another hard link to the target is made again
+    let (out, summary) = run("relink", Overwrite::Always, HardLinkTargets::StoredName, false, &none_before);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    let opts = Options {
+        overwrite: Overwrite::Always,
+        hard_link_targets: HardLinkTargets::StoredName,
+        select: Some(MemberFilter::new(|m| m.name == "t/9iv20ci0cx")),
+        ..options(Mode::Extract, &out)
+    };
+    let summary = extract::run_with_password(&rar, &opts, None, |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(inode(&out.join("t/9iv20ci0cx")), inode(&out.join("t/hard66")));
 
     // nothing in the way: both choices make the same link
     let none = |_: &Path| {};
