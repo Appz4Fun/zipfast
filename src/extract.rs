@@ -4361,16 +4361,19 @@ fn starts_with_continuation(path: &Path, password: Option<&str>) -> Option<bool>
 /// volume, the volume before it (by name) back to one that doesn't, if each of them exists and opens. UnRAR then
 /// extracts the whole set; with a volume missing in between it extracts only what starts at `path`, and reports the
 /// continued member as lacking its start.
+///
+/// A volume with none before it by name (`part1`, an old-style set's `.rar`) never restarts, whatever its first member
+/// says, so it isn't opened again to look: the run has read its head already.
 pub(crate) fn restart_volume(path: &Path, password: Option<&str>) -> Option<PathBuf> {
-    let mut current = path.to_path_buf();
-    if !starts_with_continuation(&current, password)? {
+    let mut previous = crate::volume::previous_volume(path)?;
+    if !starts_with_continuation(path, password)? {
         return None;
     }
     for _ in 0..4096 {
-        current = crate::volume::previous_volume(&current)?;
-        if !starts_with_continuation(&current, password)? {
-            return Some(current);
+        if !starts_with_continuation(&previous, password)? {
+            return Some(previous);
         }
+        previous = crate::volume::previous_volume(&previous)?;
     }
     None
 }
@@ -6795,6 +6798,77 @@ mod read_once {
             let head = if prefix.is_empty() { HEAD_PROBE_BYTES as u64 } else { SIGNATURE_PROBE_BYTES };
             assert_read_once(&paths, since, head);
         }
+    }
+
+    /// Every dispatcher, run as `pry extract` runs it ([`Options::restart_from_first_volume`]): the first volume,
+    /// which has none before it by name, is not opened again to see whether its first member continues one.
+    #[test]
+    fn every_dispatcher_reads_each_volume_once_when_it_may_restart() {
+        type Runner = fn(&Path, &Options) -> u64;
+        let policy: Runner = |first, options| {
+            let report = run_with_zip_policy(
+                first,
+                options,
+                None,
+                &Cancellation::default(),
+                &crate::zip::EncryptedReadOverrides::default(),
+                |_: crate::zip::ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            report.files()
+        };
+        let password: Runner = |first, options| run_with_password(first, options, None, |_| {}).unwrap().files;
+        let outcomes: Runner = |first, options| run_rar_with_outcomes(first, options, None, |_| {}).unwrap().files;
+        let data = data(5 << 20);
+        for prefix in [&[][..], &[0x4d; 100_000][..]] {
+            // the bytes of the first volume read before any volume opens: the checked route's probe searches the
+            // whole window for a signature behind a self-extractor; a plain RAR run opens the volume directly
+            let checked = if prefix.is_empty() { HEAD_PROBE_BYTES as u64 } else { SIGNATURE_PROBE_BYTES };
+            for (name, runner, head) in [
+                ("run_with_zip_policy", policy, checked),
+                ("run_with_password", password, HEAD_PROBE_BYTES as u64),
+                ("run_rar_with_outcomes", outcomes, 0),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = write_set(dir.path(), &volumes(&data, 3 << 19, prefix));
+                let dest = dir.path().join("out");
+                let options =
+                    Options { restart_from_first_volume: true, replace_placed_links: true, ..options(&dest, 2) };
+                let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+                assert_eq!(runner(&paths[0], &options), 1, "{name}");
+                assert_eq!(fs::read(dest.join("data")).unwrap(), data, "{name} prefix {}", prefix.len());
+                assert_read_once(&paths, since, head);
+            }
+            // a listing reads the headers, each once
+            let dir = tempfile::tempdir().unwrap();
+            let paths = write_set(dir.path(), &volumes(&data, 3 << 19, prefix));
+            let since = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let options = Options { restart_from_first_volume: true, ..options(dir.path(), 1) };
+            assert_eq!(list_detailed_with_options(&paths[0], None, &options).unwrap().entries.len(), 1);
+            let reads = VOLUME_READS.lock().unwrap_or_else(|e| e.into_inner())[since..].to_vec();
+            for path in &paths {
+                let id = identity(path);
+                let mut ranges: Vec<(u64, u64)> =
+                    reads.iter().filter(|(of, _, _)| *of == id).map(|&(_, at, len)| (at, at + len)).collect();
+                ranges.sort();
+                for pair in ranges.windows(2) {
+                    assert!(pair[0].1 <= pair[1].0, "{}: read twice: {:?} and {:?}", path.display(), pair[0], pair[1]);
+                }
+            }
+        }
+    }
+
+    /// A run given a later volume still starts over at the first, as UnRAR does.
+    #[test]
+    fn a_run_from_a_later_volume_still_restarts() {
+        let data = data(3 << 20);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = write_set(dir.path(), &volumes(&data, 1 << 20, &[]));
+        let dest = dir.path().join("out");
+        let options = Options { restart_from_first_volume: true, ..options(&dest, 1) };
+        let summary = run(&paths[1], &options, |_| {}).unwrap();
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+        assert_eq!(fs::read(dest.join("data")).unwrap(), data);
     }
 
     #[test]
