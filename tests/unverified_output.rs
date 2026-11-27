@@ -539,3 +539,50 @@ fn seven_zip_print_fails_on_an_output_error_printing_held_members_for_a_wrong_pa
     let error = result.expect_err("the output error ends the run");
     assert!(error.to_string().contains("closed"), "{error}");
 }
+
+/// Codex on #317: a compressed split member whose first part fails its own packed checksum prints what was decoded
+/// of it (the RAR 3.x decoder still buffering it) under `Emit`; nothing by default.
+#[test]
+fn rar_session_print_hands_over_a_member_whose_part_fails_its_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    for part in 1..=3 {
+        fs::copy(
+            fixture(&format!("rar4-volumes/multi.part{part}.rar")),
+            dir.path().join(format!("multi.part{part}.rar")),
+        )
+        .unwrap();
+    }
+    let first = dir.path().join("multi.part1.rar");
+    let mut bytes = fs::read(&first).unwrap();
+    // the last byte of file2.txt's data in this volume, before the end block: the part's CRC fails, nothing else
+    let at = bytes.len() - 21;
+    bytes[at] ^= 0x01;
+    fs::write(&first, bytes).unwrap();
+    for unverified in [UnverifiedOutput::Emit, UnverifiedOutput::Withhold] {
+        let mut session = RarSession::open(&first, None, RarSessionOptions::default()).unwrap();
+        let selection = session.select(|member| member.name() == "file2.txt").unwrap();
+        let options = RarPrintOptions { unverified_output: unverified, ..RarPrintOptions::default() };
+        let mut output = Vec::new();
+        let mut events = Vec::new();
+        session
+            .print_selected(&selection, &mut output, &options, |event| {
+                events.push((
+                    match &event.outcome {
+                        RarOutcome::Failed(failure) => Some(format!("{failure:?}")),
+                        _ => None,
+                    },
+                    event.unverified_bytes,
+                ))
+            })
+            .unwrap();
+        let [(Some(failure), unverified_bytes)] = events.as_slice() else { panic!("{unverified:?}: {events:?}") };
+        assert!(failure.contains("Integrity"), "{failure}");
+        if unverified == UnverifiedOutput::Emit {
+            assert!(!output.is_empty(), "{failure}");
+            assert_eq!(*unverified_bytes, Some(output.len() as u64));
+        } else {
+            assert!(output.is_empty());
+            assert_eq!(*unverified_bytes, None);
+        }
+    }
+}

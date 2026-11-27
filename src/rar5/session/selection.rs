@@ -755,8 +755,11 @@ impl SelectedRun {
                 left -= len as u64;
                 offset += len as u64;
             }
-            if checked_part {
-                verify_part(&pending, part.checks, part_crc, part_blake)?;
+            if checked_part && let Err(failure) = verify_part(&pending, part.checks, part_crc, part_blake) {
+                // a part failing its own checksum: what was decoded goes out as on any failure of the member's data
+                let held = Held { pending: &mut pending, decoded: &mut self.decoded, output: &mut output };
+                let rar5 = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5);
+                return Err(held.salvage(failure, self.emit_unverified, rar4.as_mut(), rar5, &self.limits, session));
             }
         }
         if let Some(issue) = cut {
