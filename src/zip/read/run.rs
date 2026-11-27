@@ -63,12 +63,16 @@ fn mismatch_result(found: Option<Box<crate::extract::LocalHeaderMismatch>>) -> Z
         None => Ok(false),
     }
 }
+/// `placed`: the link is in place, so its failure says it was published.
 #[inline(never)]
-fn mismatch_link(found: Option<Box<crate::extract::LocalHeaderMismatch>>) -> (ZipReadResult<()>, bool, bool) {
-    match found {
-        Some(found) => (Err(ReadFault::LocalHeaderMismatch(found).into()), false, false),
-        None => (Ok(()), false, false),
-    }
+fn mismatch_link(
+    found: Option<Box<crate::extract::LocalHeaderMismatch>>,
+    placed: bool,
+) -> (ZipReadResult<()>, bool, bool) {
+    let Some(found) = found else { return (Ok(()), false, false) };
+    let error = ZipReadError::from(ReadFault::LocalHeaderMismatch(found));
+    let error = if placed { error.with_publication(PublicationState::Published, 0) } else { error };
+    (Err(error), false, false)
 }
 #[inline(never)]
 fn fault_link(fault: ReadFault) -> (ZipReadResult<()>, bool, bool) {
@@ -798,14 +802,21 @@ impl ProjectedReadSession {
             .map(|rel| if options.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel });
         if let Err(error) = read {
             // Options::seven_zip_strict with keep_broken: a link failed unread for its local header leaves an empty
-            // regular file at its path, as 7-Zip `x` does ("Unknown reparse stream")
+            // regular file at its path, as 7-Zip `x` does ("Unknown reparse stream"); only for a failure of the member
+            // alone (no source change or cleanup evidence) in a run not canceled, as a kept file is published
             if options.keep_broken
                 && options.mode == Mode::Extract
                 && matches!(error.operation(), Some(ReadFault::LocalHeaderMismatch(_)))
+                && continued(&error)
+                && !cancel.is_canceled()
                 && let Ok(rel) = &rel
-                && let Err(fault) = self.link_stand_in(rel, options, context, extracted)
             {
-                return fault_link(fault);
+                match self.link_stand_in(rel, options, context, extracted) {
+                    Err(fault) => return fault_link(fault),
+                    // kept: the member still fails, but its path now holds the empty file
+                    Ok(true) => return (Err(error.with_publication(PublicationState::Published, 0)), false, false),
+                    Ok(false) => {}
+                }
             }
             return (Err(error), false, false);
         }
@@ -822,7 +833,7 @@ impl ProjectedReadSession {
             return refuse(why);
         }
         if options.mode != Mode::Extract {
-            return mismatch_link(flagged);
+            return mismatch_link(flagged, false);
         }
         // the destination root is made as for a file (following a root alias, as `create_dir_all` does) when a link,
         // or a refused link's placeholder, is the first output of the run
@@ -849,7 +860,7 @@ impl ProjectedReadSession {
             Err(error) => return (Err(ReadFault::Legacy(error).into()), false, false),
         };
         match link::publish(&options.dest, &rel, place, &kind, modified, extracted) {
-            Ok(()) => mismatch_link(flagged),
+            Ok(()) => mismatch_link(flagged, true),
             Err(error) if let Some(why) = link::member_failure(&error) => refuse(why),
             Err(error) => (
                 Err(ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Publish, offset: 0, error }
@@ -861,14 +872,14 @@ impl ProjectedReadSession {
     }
     /// The empty regular file 7-Zip `x` leaves at the path of a link it failed unread: placed under the overwrite
     /// choice as the link would be (an existing or declined target is left alone), and recorded as a file this run
-    /// wrote.
+    /// wrote. Whether it was placed.
     fn link_stand_in(
         &mut self,
         rel: &std::path::Path,
         options: &Options,
         context: &mut EncryptedReadContext,
         extracted: &mut crate::extract::link::Extracted,
-    ) -> Result<(), ReadFault> {
+    ) -> Result<bool, ReadFault> {
         let io_fault = |operation, error| ReadFault::Io { stage: IoStage::Output, operation, offset: 0, error };
         std::fs::create_dir_all(&options.dest).map_err(|error| io_fault(ReadIoOperation::Directory, error))?;
         let mut renamed = None;
@@ -885,9 +896,10 @@ impl ProjectedReadSession {
         match checked {
             Ok(crate::extract::Checked::Write(place)) => {
                 crate::extract::link::publish_empty(&options.dest, rel, place, extracted)
+                    .map(|()| true)
                     .map_err(|error| io_fault(ReadIoOperation::Publish, error))
             }
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(false),
             Err(error) => Err(ReadFault::Legacy(error)),
         }
     }

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use zipfast::extract::{self, Cancellation, FolderDamageKind, MemberFilter, Mode, Options, Overwrite};
 use zipfast::sevenzip::{self, SevenZipLimits, SevenZipPrintOptions};
-use zipfast::zip::{ReadFault, ZipRunEvent};
+use zipfast::zip::{PublicationState, ReadFault, ZipRunEvent};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/seven-zip-strict").join(name)
@@ -341,7 +341,14 @@ fn keep_broken_leaves_the_member_empty() {
 }
 
 /// Extracts `name` on the legacy or the checked route: the local header mismatches reported and the files written.
-fn extract_route(name: &str, out: &Path, checked: bool, keep_broken: bool) -> (Vec<extract::LocalHeaderMismatch>, u64) {
+/// On the checked route, each failure must say it was published exactly when `published` says so.
+fn extract_route(
+    name: &str,
+    out: &Path,
+    checked: bool,
+    keep_broken: bool,
+    published: bool,
+) -> (Vec<extract::LocalHeaderMismatch>, u64) {
     let mut opts = options(Mode::Extract, out, true);
     opts.keep_broken = keep_broken;
     if !checked {
@@ -363,6 +370,8 @@ fn extract_route(name: &str, out: &Path, checked: bool, keep_broken: bool) -> (V
                     Some(ReadFault::LocalHeaderMismatch(m)) => found.push((**m).clone()),
                     other => panic!("{name}: {other:?}"),
                 }
+                let state = if published { PublicationState::Published } else { PublicationState::NotPublished };
+                assert_eq!(error.publication_state(), state, "{name}");
             }
             Ok(())
         },
@@ -385,7 +394,8 @@ fn only_the_descriptor_flag_differing_still_writes_the_data() {
     for name in ["local-descriptor-flag.zip", "central-descriptor-flag.zip", "local-crc.zip"] {
         for checked in [false, true] {
             let out = dir.path().join(format!("{name}-{checked}"));
-            let (found, files) = extract_route(name, &out, checked, false);
+            let written = name != "local-crc.zip";
+            let (found, files) = extract_route(name, &out, checked, false, written);
             let [found] = found.as_slice() else { panic!("{name} checked {checked}: {found:?}") };
             assert_eq!((found.ordinal, found.name.as_str()), (1, "f1.txt"), "{name}");
             assert_eq!(files, 2, "{name} checked {checked}: the failed member isn't counted");
@@ -408,7 +418,7 @@ fn a_link_differing_only_in_its_descriptor_flag_is_placed_then_fails() {
     let dir = tempfile::tempdir().unwrap();
     for checked in [false, true] {
         let out = dir.path().join(format!("{checked}"));
-        let (found, files) = extract_route("local-link-flag.zip", &out, checked, false);
+        let (found, files) = extract_route("local-link-flag.zip", &out, checked, false, true);
         let [found] = found.as_slice() else { panic!("checked {checked}: {found:?}") };
         assert_eq!((found.ordinal, found.name.as_str()), (1, "l1"));
         assert!(found.descriptor_flag && !found.fails_unread(), "{found:?}");
@@ -428,7 +438,7 @@ fn keep_broken_leaves_an_empty_file_for_a_link_failed_unread() {
     for checked in [false, true] {
         for keep_broken in [false, true] {
             let out = dir.path().join(format!("{checked}-{keep_broken}"));
-            let (found, files) = extract_route("local-link-crc.zip", &out, checked, keep_broken);
+            let (found, files) = extract_route("local-link-crc.zip", &out, checked, keep_broken, keep_broken);
             let [found] = found.as_slice() else { panic!("checked {checked}: {found:?}") };
             assert_eq!((found.name.as_str(), found.crc32), ("l1", true));
             assert_eq!(files, 2, "checked {checked}");
