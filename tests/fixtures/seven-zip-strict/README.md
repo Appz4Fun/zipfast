@@ -29,6 +29,7 @@ folders.
 | `bcj2-rc-first-byte.7z` | the range coder's first byte is not 0 | Data Error : a.bin, b.bin |
 | `deflate-past-size.7z` | the Deflate stream goes on with more output past the folder's size | Data Error : #0 |
 | `deflate-tail.7z`, `deflate64-tail.7z` | a byte after the end block | There are some data after the end of the payload data : #0 |
+| `deflate64-copy-last-block-empty.7z` | Copy feeding Deflate64 (one folder, two coders); the output in a block that isn't the last, then an empty last block | Data Error : #0 |
 | `bzip2-second-stream.7z` | a second BZip2 stream after the first | There are some data after the end of the payload data : #0 |
 | `bzip2-two-streams.7z` | `a.txt` and `b.txt` written as two BZip2 streams | Data Error : b.txt |
 | `copy-tail.7z` | a packed byte beyond the unpacked size | There are some data after the end of the payload data : #0 |

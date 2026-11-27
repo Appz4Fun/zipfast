@@ -106,9 +106,12 @@ impl<R: BufRead> Bcj2Reader<R> {
                 // a missing volume, cancellation or a read error is not damage
                 Err(e) if !is_bad_data(&e) => return Err(e),
                 Err(_) => return Ok(Some(LEFT)),
-                Ok(_) if self.pending_at < self.pending_len => return Ok(Some(LEFT)),
                 Ok(_) => {}
             }
+        }
+        // a restored target the output's end cuts through
+        if self.pending_at < self.pending_len {
+            return Ok(Some(LEFT));
         }
         // the last bit's normalization, which 7-Zip's decoder makes as it decodes the bit
         if self.started && self.range < TOP {
@@ -235,5 +238,25 @@ impl<R: BufRead> Read for Bcj2Reader<R> {
         // stream may legitimately end there.
         self.candidate = found;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An output size that cuts through a restored call target leaves that target's last bytes: damage.
+    #[test]
+    fn a_target_cut_by_the_output_end_is_damage() {
+        let rc = [0x00, 0x7F, 0xFF, 0xFC, 0x00];
+        let decoder = |len: usize| {
+            let mut reader = Bcj2Reader::new(&[0xE8][..], &[0, 0, 0, 0][..], &[][..], &rc[..]).strict();
+            let mut out = vec![0u8; len];
+            reader.read_exact(&mut out).unwrap();
+            reader
+        };
+        let left = (FolderDamageKind::DataError, "a BCJ2 target is left after the output's end");
+        assert_eq!(decoder(2).finish().unwrap(), Some(left));
+        assert_ne!(decoder(5).finish().unwrap(), Some(left));
     }
 }

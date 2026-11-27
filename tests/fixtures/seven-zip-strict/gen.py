@@ -183,6 +183,12 @@ fixtures["deflate-past-size.7z"] = repack(
 deflate64 = seven(two, "-m0=Deflate64", "-ms=on")
 (p,) = packs(deflate64)
 fixtures["deflate64-tail.7z"] = repack(deflate64, [p + b"\x00\x01\x02"])
+# Copy feeding Deflate64, whose stream holds the output in a block that isn't the last, then an empty last block:
+# fine on its own, but 7-Zip stops a coder that feeds another at the output's end ("Data Error"), and zipfast checks
+# Deflate64 before the Copy coder feeding it, as a check of Copy first would find bytes left ("data after the end")
+chain = seven({"a.txt": b"x"}, "-m0=Deflate64", "-m1=Copy")
+stored = lambda last, data: bytes([last]) + struct.pack("<HH", len(data), len(data) ^ 0xFFFF) + data
+fixtures["deflate64-copy-last-block-empty.7z"] = repack(chain, [stored(0, b"x") + stored(1, b"")])
 
 bzip2 = seven(two, "-m0=BZip2", "-ms=on")
 (p,) = packs(bzip2)

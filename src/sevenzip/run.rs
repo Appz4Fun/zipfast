@@ -939,7 +939,9 @@ impl Run<'_> {
     /// the first that finds damage is the folder's [`FolderDamage`], reported as a line.
     fn check_end(&mut self, active: &mut Active) -> Outcome<()> {
         let mut found = None;
-        for check in &mut active.checks {
+        // A coder's check may still read its input (an end block, a trailer), so checks run downstream first: a
+        // coder's inputs were built, and their checks registered, before it.
+        for check in active.checks.iter_mut().rev() {
             if self.cancel.is_canceled() {
                 return Err(SevenZipError::Canceled);
             }

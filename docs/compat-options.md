@@ -511,6 +511,8 @@ end of the payload data : #N` and exits 2, even though every member's CRC passes
 | BZip2 | a second stream after the first (`data after the end`); 7-Zip's coder decodes one stream, so members held in a second one fail (`Data Error : name`) | |
 | Copy | packed bytes beyond the unpacked size (`data after the end`) | |
 
+A coder feeding another one is stopped at the folder's end. A Deflate or Deflate64 coder behind a Copy coder must already be at its last block's end by then; otherwise it is a `Data Error`, although the same stream on its own may have empty blocks after the output. zipfast checks each coder before the coders feeding it, so every coder can first read what it still needs.
+
 The LZMA2 missing end marker is not an error in 7-Zip 26.06, so zipfast doesn't flag it either. In strict mode an LZMA2
 folder is decoded on one thread, because the end checks need the whole stream in order. A folder whose input fails to
 decode before its end gets the usual member failures, and a `FolderDamage` when every member had already passed.

@@ -80,6 +80,7 @@ const FOLDER_DAMAGE: &[(&str, u64, FolderDamageKind)] = &[
     ("deflate-past-size.7z", 0, FolderDamageKind::DataError),
     ("deflate-tail.7z", 0, FolderDamageKind::DataAfterEnd),
     ("deflate64-tail.7z", 0, FolderDamageKind::DataAfterEnd),
+    ("deflate64-copy-last-block-empty.7z", 0, FolderDamageKind::DataError),
     ("bzip2-second-stream.7z", 0, FolderDamageKind::DataAfterEnd),
     ("copy-tail.7z", 0, FolderDamageKind::DataAfterEnd),
     ("two-folders-last-tail.7z", 1, FolderDamageKind::DataError),
