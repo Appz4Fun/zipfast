@@ -248,6 +248,51 @@ pub struct Options {
     /// still to come is waited on and one in a hole is `HeaderHole`). Persistent-partial sessions refuse a damaged
     /// header whatever this says. 7z and ZIP ignore it.
     pub damaged_input: DamagedInput,
+    /// Whether an encrypted RAR 5.0 redirection member (a symbolic link, junction, hard link or file copy) is placed
+    /// or tested only when its password check value verifies the password (the default; [`EncryptedLinks::VerifyFirst`]
+    /// checks it before the overwrite and target decisions, in UnRAR 7.30's order), or whatever the password, as
+    /// 7-Zip 26.06 `x`/`e` does. See [`EncryptedLinks`].
+    ///
+    /// Honoured by the whole-archive RAR runners ([`run`], [`run_with_password`], [`run_rar_with_outcomes`], the
+    /// checked dispatchers), by [`crate::rar5::session::RarSession::extract_selected`] (and its controlled route),
+    /// and by progressive sessions through [`crate::progressive::ProgressiveOptions`]' extract options. A RarSession
+    /// test run, which takes no `Options`, reads [`crate::rar5::session::RarSessionOptions::encrypted_links`].
+    pub encrypted_links: EncryptedLinks,
+}
+
+/// What an encrypted RAR 5.0 redirection member needs before it is placed or tested; see
+/// [`Options::encrypted_links`].
+///
+/// `rar a -p` leaves file headers in the clear, so a redirection's target is readable with any password, and a link
+/// has no data a wrong password would fail to decrypt: only its encryption record's password check value can tell.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EncryptedLinks {
+    /// Placed only when the member's check value verifies the password, checked once the member is known to be placed
+    /// or tested (a member skipped for an existing target, or refused for its target, is reported so whatever the
+    /// password). No password fails the member
+    /// as [`RarFailure::PasswordRequired`], a wrong one as [`RarFailure::WrongPassword`], and a record with no usable
+    /// check value as [`RarFailure::EncryptedIntegrity`] with
+    /// [`crate::error::RarIntegrityReason::UnverifiableLinkPassword`].
+    #[default]
+    Verify,
+    /// As [`Self::Verify`], in UnRAR 7.30's reporting order: the password is checked as soon as the member is reached,
+    /// before the overwrite decision (an existing target under [`Overwrite::Skip`]) and before a hard link's or copy's
+    /// target is checked, so a password that doesn't verify is reported as the failure above even for a member that
+    /// would otherwise be skipped or refused (UnRAR's "Incorrect password", exit 11, where `Verify` reports
+    /// [`RarSkipReason::ExistingTarget`] or the link target). A password that verifies goes on to those decisions as
+    /// usual. Nothing is placed or touched either way: only the reported outcome differs. An older file revision is
+    /// still skipped first, as every route skips one before reading it.
+    VerifyFirst,
+    /// As 7-Zip 26.06 `x`/`e` (exit 0, "Everything is Ok"): the password isn't checked for a redirection, so one is
+    /// placed (or passes a test) with a wrong password, with none, or with no check value to verify it by. It is
+    /// reported as any placed link is ([`RarOutcome::Verified`]), with the password evidence
+    /// [`RarPasswordEvidence::Unverified`] (the password isn't checked at all, so a right one reports that too).
+    /// Every other link check applies as for any link: a target that leaves
+    /// the destination, a hard link or copy of a file this run didn't extract, protected paths and the overwrite
+    /// decision. Only RAR 5.0 redirections: a RAR 4.x symbolic link's target is its encrypted data, checked as it
+    /// decrypts, and members with data still need their password.
+    PlaceUnverified,
 }
 
 /// What a damaged RAR header does to a run; see [`Options::damaged_input`].
@@ -624,6 +669,7 @@ impl MemberRef<'_> {
 ///     replace_placed_links: false,
 ///     keep_broken: false,
 ///     attempt_continued_members: false,
+///     encrypted_links: Default::default(),
 ///     damaged_input: Default::default(),
 ///     unsupported_filters: Default::default(),
 ///     salvage_truncated_zip: false,
@@ -4292,6 +4338,7 @@ fn rar_read_at(
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        encrypted_links: Default::default(),
         damaged_input: Default::default(),
         unsupported_filters: Default::default(),
         salvage_truncated_zip: false,
@@ -4656,6 +4703,15 @@ impl Run<'_, '_, '_> {
         password: std::result::Result<RarPasswordEvidence, RarFailure>,
     ) -> RunResult<()> {
         self.drain()?;
+        // Options::encrypted_links: VerifyFirst reports a password that doesn't verify before any target decision
+        let password = match password {
+            Err(failure) if self.opts.encrypted_links == EncryptedLinks::VerifyFirst => {
+                let why = link_password_message(&failure);
+                let cause = self.fail_in_order(&ctx, failure, why)?;
+                return self.past_link(vol, h, ctx, Some(cause));
+            }
+            password => password,
+        };
         let refusal = match &kind {
             Ok(kind) => link::refusal_before_place(rel, kind, &self.landing.extracted),
             Err(_) => Some(link::HARD_TARGET),
@@ -4886,11 +4942,18 @@ impl Run<'_, '_, '_> {
             }
             return self.reports.directory(&ctx);
         }
+        // Options::encrypted_links: a RAR 5.0 redirection placed or tested here needs no password to be given (it is
+        // checked, or let go, with the link)
+        let unverified_link = self.opts.encrypted_links == EncryptedLinks::PlaceUnverified
+            && h.format == RarFormat::Rar5
+            && h.redirection.is_some()
+            && self.selection.is_none();
         let refuse = if let Some(reason) = h.rar4_unsupported() {
             Some((RarFailure::Unsupported(reason), "unsupported RAR4 payload feature"))
         } else if let Some(Err(e)) = crypt {
             Some((RarFailure::crypt(e, ctx.scope()), "encrypted (password required)"))
         } else if h.encrypted
+            && !unverified_link
             && match h.format {
                 RarFormat::Rar4 => self.rar4_password.is_none(),
                 RarFormat::Rar5 => self.password.is_none() || h.crypt.is_none(),
@@ -4920,7 +4983,7 @@ impl Run<'_, '_, '_> {
         {
             // its target is in the clear: an encrypted link is placed only on a password its check value verifies (applied
             // once the link is known to be placed or tested: a skipped one stays skipped)
-            let password = link::rar5_password(h, self.password, ctx.scope());
+            let password = link::rar5_link_password(h, self.password, ctx.scope(), self.opts.encrypted_links);
             return self.rar5_link(vol, h, ctx, &rel, kind, password);
         }
         if let Some(link) = &h.redirection {
@@ -6346,6 +6409,7 @@ mod read_once {
             replace_placed_links: false,
             keep_broken: false,
             attempt_continued_members: false,
+            encrypted_links: Default::default(),
             unsupported_filters: Default::default(),
             salvage_truncated_zip: false,
             unix_modes: Default::default(),

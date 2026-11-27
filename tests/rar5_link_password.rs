@@ -27,7 +27,7 @@ use std::path::Path;
 
 use common::{FileSpec, archive};
 use zipfast::error::RarFailure;
-use zipfast::extract::{self, Mode, Options, Overwrite, RarOutcome};
+use zipfast::extract::{self, EncryptedLinks, Mode, Options, Overwrite, RarOutcome};
 
 const PASSWORD: &str = "zipfast-test-only";
 const SALT: [u8; 16] = [0x53; 16];
@@ -57,12 +57,17 @@ fn options(dest: &Path, mode: Mode) -> Options {
         replace_placed_links: false,
         keep_broken: false,
         attempt_continued_members: false,
+        encrypted_links: Default::default(),
         damaged_input: Default::default(),
         unsupported_filters: Default::default(),
         salvage_truncated_zip: false,
         unix_modes: Default::default(),
         backslashes: Default::default(),
     }
+}
+
+fn with_links(dest: &Path, mode: Mode, links: EncryptedLinks) -> Options {
+    Options { encrypted_links: links, ..options(dest, mode) }
 }
 
 fn record(body: Vec<u8>) -> Vec<u8> {
@@ -149,10 +154,14 @@ fn assert_links(dest: &Path) {
 
 /// The whole-archive runner, legacy summary and typed outcomes.
 fn whole(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>) -> Outcomes {
-    let summary = extract::run_with_password(arc, &options(dest, mode), password, |_| {}).unwrap();
+    whole_with(arc, dest, mode, password, EncryptedLinks::Verify)
+}
+
+fn whole_with(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>, links: EncryptedLinks) -> Outcomes {
+    let summary = extract::run_with_password(arc, &with_links(dest, mode, links), password, |_| {}).unwrap();
     let mut events = Vec::new();
     let typed = dest.with_extension("typed");
-    extract::run_rar_with_outcomes(arc, &options(&typed, mode), password, |e| {
+    extract::run_rar_with_outcomes(arc, &with_links(&typed, mode, links), password, |e| {
         events.push((e.entry.order, classify(&e.outcome)))
     })
     .unwrap();
@@ -173,14 +182,21 @@ fn whole(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>) -> Outcome
 }
 
 fn session(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>) -> Outcomes {
+    session_with(arc, dest, mode, password, EncryptedLinks::Verify)
+}
+
+/// A RarSession run: a test run reads `links` from RarSessionOptions, an extraction from extract::Options.
+fn session_with(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>, links: EncryptedLinks) -> Outcomes {
     use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
-    let mut session = RarSession::open(arc, password, RarSessionOptions::default()).unwrap();
+    let session_options = RarSessionOptions { encrypted_links: links, ..RarSessionOptions::default() };
+    let mut session = RarSession::open(arc, password, session_options).unwrap();
     let all = session.select(|_| true).unwrap();
     let mut events = Vec::new();
     let mut push = |e: &extract::RarEntryOutcome| events.push((e.entry.order, classify(&e.outcome)));
+    let opts = with_links(dest, mode, links);
     match mode {
         Mode::Test => session.test_selected(&all, RarDecodeLimits::default(), &mut push),
-        Mode::Extract => session.extract_selected(&all, &options(dest, mode), RarDecodeLimits::default(), &mut push),
+        Mode::Extract => session.extract_selected(&all, &opts, RarDecodeLimits::default(), &mut push),
     }
     .unwrap();
     events.sort();
@@ -193,10 +209,18 @@ fn progressive(arc: &Path, dest: &Path, mode: Mode, password: Option<&str>) -> R
 }
 
 fn progressive_with(arc: &Path, extract: Options, password: Option<&str>) -> Result<Outcomes, String> {
+    let opts = zipfast::progressive::ProgressiveOptions::new(extract, arc.file_name().unwrap().to_owned());
+    progressive_options_with(arc, opts, password)
+}
+
+fn progressive_options_with(
+    arc: &Path,
+    mut opts: zipfast::progressive::ProgressiveOptions,
+    password: Option<&str>,
+) -> Result<Outcomes, String> {
     use std::task::{Context, Poll};
     use zipfast::progressive::*;
     let volume = (arc.file_name().unwrap().to_owned(), fs::read(arc).unwrap().into_boxed_slice());
-    let mut opts = ProgressiveOptions::new(extract, arc.file_name().unwrap().to_owned());
     opts.set_password(password.map(str::to_owned)).unwrap();
     let mut session = ProgressiveSession::from_sealed_memory(vec![volume], opts).unwrap();
     let mut outcomes = Vec::new();
@@ -466,4 +490,390 @@ fn an_encrypted_rar4_symlink_is_placed_on_the_right_password_by_a_rar_session() 
         .unwrap();
     assert_eq!(outcomes, ["ok"], "{outcomes:?}");
     assert!(fs::symlink_metadata(dest.join("hello.txt")).unwrap().file_type().is_symlink());
+}
+
+/// The password cases EncryptedLinks::PlaceUnverified lets go, as 7-Zip 26.06 `x` does (exit 0, links created): a
+/// wrong password, none, and a link with no check value (with the right password and a wrong one).
+const UNVERIFIED: [(bool, Option<&str>); 4] =
+    [(true, Some("not the password")), (true, None), (false, Some(PASSWORD)), (false, Some("not the password"))];
+
+#[test]
+fn place_unverified_places_encrypted_links_on_the_whole_archive_runner() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (n, (check, password)) in UNVERIFIED.into_iter().enumerate() {
+        let arc = write(&tmp.path().join(format!("arc-{n}")).tap_dir(), check);
+        for mode in [Mode::Test, Mode::Extract] {
+            let dest = tmp.path().join(format!("out-{n}-{mode:?}"));
+            let outcomes = whole_with(&arc, &dest, mode, password, EncryptedLinks::PlaceUnverified);
+            assert_eq!(outcomes, expect("ok"), "{check} {password:?} {mode:?}");
+            if mode == Mode::Extract {
+                assert_links(&dest);
+                assert_links(&dest.with_extension("typed"));
+            }
+        }
+    }
+}
+
+#[test]
+fn place_unverified_places_encrypted_links_on_a_rar_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (n, (check, password)) in UNVERIFIED.into_iter().enumerate() {
+        let arc = write(&tmp.path().join(format!("arc-{n}")).tap_dir(), check);
+        for mode in [Mode::Test, Mode::Extract] {
+            let dest = tmp.path().join(format!("out-{n}-{mode:?}"));
+            let outcomes = session_with(&arc, &dest, mode, password, EncryptedLinks::PlaceUnverified);
+            assert_eq!(outcomes, expect("ok"), "{check} {password:?} {mode:?}");
+            if mode == Mode::Extract {
+                assert_links(&dest);
+            }
+        }
+    }
+}
+
+#[test]
+fn place_unverified_places_encrypted_links_on_a_progressive_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (n, (check, password)) in UNVERIFIED.into_iter().enumerate() {
+        let arc = write(&tmp.path().join(format!("arc-{n}")).tap_dir(), check);
+        for mode in [Mode::Test, Mode::Extract] {
+            let dest = tmp.path().join(format!("out-{n}-{mode:?}"));
+            let extract = with_links(&dest, mode, EncryptedLinks::PlaceUnverified);
+            let outcomes = progressive_with(&arc, extract, password);
+            assert_eq!(outcomes, Ok(expect("ok")), "{check} {password:?} {mode:?}");
+            if mode == Mode::Extract {
+                assert_links(&dest);
+            }
+        }
+    }
+}
+
+/// The controlled RarSession route (extract_selected_controlled) honours the option as extract_selected does.
+#[test]
+fn place_unverified_places_encrypted_links_on_the_controlled_route() {
+    use zipfast::rar5::session::*;
+    struct Collect(Vec<(u64, String)>);
+    impl RarExtractObserver for Collect {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            Ok(RarOverwriteDecision::Replace)
+        }
+        fn entry(&mut self, entry: &extract::RarEntryOutcome, _: RarDiagnostic<'_>) {
+            self.0.push((entry.entry.order, classify(&entry.outcome)));
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = write(tmp.path(), true);
+    for (links, expected) in [(EncryptedLinks::Verify, "wrong"), (EncryptedLinks::PlaceUnverified, "ok")] {
+        let dest = tmp.path().join(format!("out-{links:?}"));
+        let mut session = RarSession::open(&arc, Some("not the password"), RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let mut observer = Collect(Vec::new());
+        let opts = with_links(&dest, Mode::Extract, links);
+        let report =
+            session.extract_selected_controlled(&all, &opts, RarDecodeLimits::default(), &mut control, &mut observer);
+        report.outcome().as_ref().unwrap();
+        drop(report);
+        observer.0.sort();
+        let outcomes: Outcomes = observer.0.into_iter().map(|e| e.1).collect();
+        assert_eq!(outcomes, expect(expected), "{links:?}");
+        if expected == "ok" { assert_links(&dest) } else { assert_no_links(&dest) }
+    }
+}
+
+/// A link placed unverified reports the typed evidence RarPasswordEvidence::Unverified, so a caller can tell it
+/// from a verified one; a plain member reports NotEncrypted as before.
+#[test]
+fn a_link_placed_unverified_reports_unverified_evidence() {
+    use zipfast::error::RarPasswordEvidence;
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = write(tmp.path(), true);
+    for password in [Some("not the password"), None, Some(PASSWORD)] {
+        let dest = tmp.path().join(format!("out-{}", password.unwrap_or("none")));
+        let mut evidence = Vec::new();
+        let opts = with_links(&dest, Mode::Extract, EncryptedLinks::PlaceUnverified);
+        extract::run_rar_with_outcomes(&arc, &opts, password, |e| {
+            if let RarOutcome::Verified { checks, .. } = &e.outcome {
+                evidence.push((e.entry.order, checks.password));
+            }
+        })
+        .unwrap();
+        evidence.sort_by_key(|e| e.0);
+        let u = RarPasswordEvidence::Unverified;
+        let expected = [(0, u), (1, u), (2, u), (3, RarPasswordEvidence::NotEncrypted)];
+        assert_eq!(evidence, expected, "{password:?}");
+    }
+}
+
+/// PlaceUnverified lets only the password go: a link whose target leaves the destination is still refused on every
+/// route, and the plain file after it still extracts.
+#[test]
+fn place_unverified_still_refuses_a_link_that_escapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = tmp.path().join("escape.rar");
+    fs::write(&arc, archive(&[link("esc", 1, "../outside", true), FileSpec::new("plain", b"plain")])).unwrap();
+    let refused = |outcomes: &Outcomes, what: &str| {
+        assert_eq!(outcomes.len(), 2, "{what}: {outcomes:?}");
+        assert!(outcomes[0].contains("LinkTarget"), "{what}: {outcomes:?}");
+        assert_eq!(outcomes[1], "ok", "{what}");
+    };
+    for password in [Some("not the password"), None] {
+        for mode in [Mode::Test, Mode::Extract] {
+            let tag = format!("{}-{mode:?}", password.unwrap_or("none"));
+            let dest = tmp.path().join(format!("whole-{tag}"));
+            refused(&whole_with(&arc, &dest, mode, password, EncryptedLinks::PlaceUnverified), "whole");
+            assert!(fs::symlink_metadata(dest.join("esc")).is_err());
+            let dest = tmp.path().join(format!("session-{tag}"));
+            refused(&session_with(&arc, &dest, mode, password, EncryptedLinks::PlaceUnverified), "session");
+            assert!(fs::symlink_metadata(dest.join("esc")).is_err());
+            let dest = tmp.path().join(format!("progressive-{tag}"));
+            let extract = with_links(&dest, mode, EncryptedLinks::PlaceUnverified);
+            assert_eq!(progressive_with(&arc, extract, password), Err("UnsafePath".into()), "progressive {tag}");
+            assert!(fs::symlink_metadata(dest.join("esc")).is_err());
+        }
+    }
+}
+
+/// Hard links and file copies are let through the same way, and still take only a file this run extracted.
+#[test]
+fn place_unverified_places_encrypted_hard_links_and_copies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = tmp.path().join("hard.rar");
+    let files = [FileSpec::new("plain", b"plain"), link("hard", 4, "plain", true), link("copy", 5, "plain", true)];
+    fs::write(&arc, archive(&files)).unwrap();
+    for password in [Some("not the password"), None] {
+        let tag = password.unwrap_or("none");
+        let dest = tmp.path().join(format!("whole-{tag}"));
+        let ok = vec!["ok".to_string(); 3];
+        assert_eq!(whole_with(&arc, &dest, Mode::Extract, password, EncryptedLinks::PlaceUnverified), ok);
+        let dest2 = tmp.path().join(format!("session-{tag}"));
+        assert_eq!(session_with(&arc, &dest2, Mode::Extract, password, EncryptedLinks::PlaceUnverified), ok);
+        for dest in [dest, dest2] {
+            assert_eq!(fs::read(dest.join("hard")).unwrap(), b"plain");
+            assert_eq!(fs::read(dest.join("copy")).unwrap(), b"plain");
+        }
+    }
+    // without the plain file it would take, a hard link is refused whatever the password option
+    let lonely = tmp.path().join("lonely.rar");
+    fs::write(&lonely, archive(&[link("hard", 4, "plain", true)])).unwrap();
+    let dest = tmp.path().join("lonely");
+    let outcomes = whole_with(&lonely, &dest, Mode::Extract, None, EncryptedLinks::PlaceUnverified);
+    assert!(outcomes[0].contains("HardLinkTarget"), "{outcomes:?}");
+}
+
+trait TapDir {
+    fn tap_dir(self) -> Self;
+}
+
+impl TapDir for std::path::PathBuf {
+    /// Creates the folder and gives it back.
+    fn tap_dir(self) -> Self {
+        fs::create_dir_all(&self).unwrap();
+        self
+    }
+}
+
+/// Each member's outcome on the whole-archive runner and on RarSession::extract_selected, with a skip told apart.
+fn routes(arc: &Path, dest: &Path, opts: impl Fn(&Path) -> Options, password: Option<&str>) -> [Outcomes; 2] {
+    use zipfast::extract::RarSkipReason;
+    use zipfast::rar5::session::{RarDecodeLimits, RarSession, RarSessionOptions};
+    let label = |o: &RarOutcome| match o {
+        RarOutcome::Skipped(RarSkipReason::ExistingTarget) => "skipped".to_string(),
+        RarOutcome::Failed(f) if matches!(f.as_ref(), RarFailure::Policy { .. }) => "target".to_string(),
+        other => classify(other),
+    };
+    let mut whole = Vec::new();
+    let whole_dest = dest.join("whole");
+    extract::run_rar_with_outcomes(arc, &opts(&whole_dest), password, |e| {
+        whole.push((e.entry.order, label(&e.outcome)))
+    })
+    .unwrap();
+    let mut session_events = Vec::new();
+    let session_dest = dest.join("session");
+    let mut session = RarSession::open(arc, password, RarSessionOptions::default()).unwrap();
+    let all = session.select(|_| true).unwrap();
+    session
+        .extract_selected(&all, &opts(&session_dest), RarDecodeLimits::default(), |e| {
+            session_events.push((e.entry.order, label(&e.outcome)))
+        })
+        .unwrap();
+    whole.sort();
+    session_events.sort();
+    [whole.into_iter().map(|e| e.1).collect(), session_events.into_iter().map(|e| e.1).collect()]
+}
+
+/// Links already on disk, to be kept under Overwrite::Skip.
+fn existing(dest: &Path) {
+    for route in ["whole", "session", "progressive"] {
+        let dir = dest.join(route);
+        fs::create_dir_all(&dir).unwrap();
+        for name in LINKS {
+            fs::write(dir.join(name), b"kept").unwrap();
+        }
+    }
+}
+
+fn assert_kept(dest: &Path) {
+    for route in ["whole", "session", "progressive"] {
+        for name in LINKS {
+            assert_eq!(fs::read(dest.join(route).join(name)).unwrap(), b"kept", "{route} {name}");
+        }
+    }
+}
+
+/// Prybar's UnRAR mode, case 1: `unrar x -o- -pwrong` over links that already exist reports "Incorrect password"
+/// (exit 11). VerifyFirst checks the password before the overwrite decision and reports WrongPassword; Verify skips
+/// the existing target, as before. Nothing is replaced either way.
+#[test]
+fn verify_first_reports_a_wrong_password_before_skipping_an_existing_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = write(tmp.path(), true);
+    let skip =
+        |links| move |dest: &Path| Options { overwrite: Overwrite::Skip, ..with_links(dest, Mode::Extract, links) };
+    for (links, password, expected, progressive_expected) in [
+        (EncryptedLinks::Verify, Some("not the password"), "skipped", Ok(())),
+        (EncryptedLinks::VerifyFirst, Some("not the password"), "wrong", Err("WrongPassword")),
+        (EncryptedLinks::VerifyFirst, Some(PASSWORD), "skipped", Ok(())),
+    ] {
+        let dest = tmp.path().join(format!("{links:?}-{}", password.unwrap()));
+        existing(&dest);
+        for (route, outcomes) in ["whole", "session"].into_iter().zip(routes(&arc, &dest, skip(links), password)) {
+            assert_eq!(outcomes, expect(expected), "{route} {links:?} {password:?}");
+        }
+        let progressive = progressive_with(&arc, skip(links)(&dest.join("progressive")), password);
+        match progressive_expected {
+            Ok(()) => assert_eq!(progressive.unwrap().last().map(String::as_str), Some("ok"), "{links:?}"),
+            Err(kind) => assert_eq!(progressive, Err(kind.to_string()), "{links:?}"),
+        }
+        assert_kept(&dest);
+    }
+    // a link with no check value is refused before the skip too
+    let arc = write(&tmp.path().join("nocheck").tap_dir(), false);
+    let dest = tmp.path().join("nocheck-out");
+    existing(&dest);
+    for outcomes in routes(&arc, &dest, skip(EncryptedLinks::VerifyFirst), Some(PASSWORD)) {
+        assert_eq!(outcomes, expect("unverified"));
+    }
+    let failure = progressive_with(&arc, skip(EncryptedLinks::VerifyFirst)(&dest.join("progressive")), Some(PASSWORD));
+    assert!(failure.unwrap_err().contains("UnverifiableLinkPassword"));
+    assert_kept(&dest);
+}
+
+/// Prybar's UnRAR mode, case 2: a hard link whose target this run didn't extract. UnRAR reports the wrong password;
+/// VerifyFirst does too, where Verify reports the link target. With the right password VerifyFirst goes on to the
+/// target check and refuses the link as Verify does.
+#[test]
+fn verify_first_reports_a_wrong_password_before_a_missing_hard_link_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = tmp.path().join("lonely.rar");
+    fs::write(&arc, archive(&[link("hard", 4, "plain", true), FileSpec::new("other", b"other")])).unwrap();
+    for (links, password, expected, progressive_expected) in [
+        (EncryptedLinks::Verify, Some("not the password"), "target", "UnsafePath"),
+        (EncryptedLinks::VerifyFirst, Some("not the password"), "wrong", "WrongPassword"),
+        (EncryptedLinks::VerifyFirst, None, "required", "PasswordRequired"),
+        (EncryptedLinks::VerifyFirst, Some(PASSWORD), "target", "UnsafePath"),
+    ] {
+        let dest = tmp.path().join(format!("{links:?}-{}", password.unwrap_or("none")));
+        let opts = |dest: &Path| with_links(dest, Mode::Extract, links);
+        for (route, outcomes) in ["whole", "session"].into_iter().zip(routes(&arc, &dest, opts, password)) {
+            assert_eq!(outcomes, [expected, "ok"], "{route} {links:?} {password:?}");
+            assert!(fs::symlink_metadata(dest.join(route).join("hard")).is_err(), "{route}");
+        }
+        let progressive = progressive_with(&arc, opts(&dest.join("progressive")), password);
+        assert_eq!(progressive, Err(progressive_expected.to_string()), "{links:?} {password:?}");
+        assert!(fs::symlink_metadata(dest.join("progressive").join("hard")).is_err());
+    }
+}
+
+/// Codex on #320: an encrypted link carrying a checksum keyed by the password (encryption flag 0x02) or a BLAKE2sp
+/// hash is placed under PlaceUnverified on every route too: with no key derived, its checksum of nothing isn't
+/// checked, at the final verdict either.
+#[test]
+fn place_unverified_places_encrypted_links_carrying_checksums() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keyed = |name: &'static str, blake: bool| {
+        let mut body = vec![1, 0, 3, KDF_COUNT]; // type, version, flags (check value, keyed checksums), exponent
+        body.extend(SALT);
+        body.extend(IV);
+        body.extend(CHECK);
+        let mut extra = record(body);
+        if blake {
+            extra.extend(common::blake_record(common::blake(b"")));
+        }
+        extra.extend(redirection(1, "plain"));
+        FileSpec { extra, unix_mode: Some(0o120777), no_crc: blake, ..FileSpec::new(name, b"") }
+    };
+    let arc = tmp.path().join("sums.rar");
+    let files = [keyed("crc", false), keyed("blake", true), FileSpec::new("plain", b"plain")];
+    fs::write(&arc, archive(&files)).unwrap();
+    for password in [Some("not the password"), None] {
+        for mode in [Mode::Test, Mode::Extract] {
+            let tag = format!("{}-{mode:?}", password.unwrap_or("none"));
+            let ok = vec!["ok".to_string(); 3];
+            let dest = tmp.path().join(format!("whole-{tag}"));
+            assert_eq!(whole_with(&arc, &dest, mode, password, EncryptedLinks::PlaceUnverified), ok, "whole {tag}");
+            let dest2 = tmp.path().join(format!("session-{tag}"));
+            assert_eq!(
+                session_with(&arc, &dest2, mode, password, EncryptedLinks::PlaceUnverified),
+                ok,
+                "session {tag}"
+            );
+            let dest3 = tmp.path().join(format!("progressive-{tag}"));
+            let extract = with_links(&dest3, mode, EncryptedLinks::PlaceUnverified);
+            assert_eq!(progressive_with(&arc, extract, password), Ok(ok), "progressive {tag}");
+            if mode == Mode::Extract {
+                for dest in [dest, dest2, dest3] {
+                    for name in ["crc", "blake"] {
+                        assert_eq!(fs::read_link(dest.join(name)).unwrap(), Path::new("plain"), "{tag} {name}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// VerifyFirst with the right password places links as Verify does, on every route (a progressive session reuses
+/// the early check rather than deriving the key a second time for the link).
+#[test]
+fn verify_first_places_links_on_the_right_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = write(tmp.path(), true);
+    for mode in [Mode::Test, Mode::Extract] {
+        let dest = tmp.path().join(format!("whole-{mode:?}"));
+        assert_eq!(whole_with(&arc, &dest, mode, Some(PASSWORD), EncryptedLinks::VerifyFirst), expect("ok"));
+        let dest2 = tmp.path().join(format!("session-{mode:?}"));
+        assert_eq!(session_with(&arc, &dest2, mode, Some(PASSWORD), EncryptedLinks::VerifyFirst), expect("ok"));
+        let dest3 = tmp.path().join(format!("progressive-{mode:?}"));
+        let extract = with_links(&dest3, mode, EncryptedLinks::VerifyFirst);
+        assert_eq!(progressive_with(&arc, extract, Some(PASSWORD)), Ok(expect("ok")), "{mode:?}");
+        if mode == Mode::Extract {
+            for dest in [dest, dest2, dest3] {
+                assert_links(&dest);
+            }
+        }
+    }
+}
+
+/// Codex on #320: under VerifyFirst a progressive session derives an encrypted link's key once (at its header), not a
+/// second time for the link's data-less member: a session KDF budget that fits exactly one link's derivation under
+/// Verify fits VerifyFirst too.
+#[test]
+fn verify_first_derives_a_link_key_once_on_a_progressive_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let arc = tmp.path().join("one.rar");
+    fs::write(&arc, archive(&[FileSpec::new("plain", b"plain"), link("unix", 1, "plain", true)])).unwrap();
+    let run = |links: EncryptedLinks, budget: u64| {
+        let mut extract = with_links(&tmp.path().join(format!("out-{links:?}-{budget}")), Mode::Extract, links);
+        extract.overwrite = Overwrite::Always;
+        let mut session_options = zipfast::progressive::ProgressiveOptions::new(extract, "one.rar".into());
+        session_options.limits.kdf_session_blocks = budget;
+        progressive_options_with(&arc, session_options, Some(PASSWORD))
+    };
+    // the least budget Verify needs for its one derivation
+    let budget =
+        (1..=4096).find(|&b| run(EncryptedLinks::Verify, b).is_ok()).expect("a budget that fits one derivation");
+    assert_eq!(run(EncryptedLinks::VerifyFirst, budget), Ok(vec!["ok".to_string(); 2]));
 }
