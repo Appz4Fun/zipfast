@@ -1053,7 +1053,7 @@ struct HeldSource<'a> {
     central: Option<Central<'a>>,
     /// A local header that differs from [`Self::central`] only in the data descriptor flag: the member is read all
     /// the same, and fails once read
-    written_mismatch: Option<crate::extract::LocalHeaderMismatch>,
+    written_mismatch: Option<Box<crate::extract::LocalHeaderMismatch>>,
 }
 
 /// What [`HeldSource::prepare_member`] compares a local header with under strict checks.
@@ -1143,12 +1143,11 @@ impl cipher::CiphertextSource for HeldSource<'_> {
             && let Some(found) =
                 crate::extract::LocalHeaderMismatch::compare(&header, c.flags, c.method, c.crc32, c.packed, c.size)
         {
-            let found = found.named(plan.ordinal, c.name);
-            if !found.fails_unread() {
-                self.written_mismatch = Some(found);
-            } else {
-                return Err(ReadFault::LocalHeaderMismatch(Box::new(found)).into());
+            let found = Box::new(found.named(plan.ordinal, c.name));
+            if found.fails_unread() {
+                return Err(ReadFault::LocalHeaderMismatch(found).into());
             }
+            self.written_mismatch = Some(found);
         }
         let layout = zip::local_layout(header, self.local_at, len)
             .map_err(|_| ReadFault::CheckedFormat { reason: "invalid local layout" })?;
@@ -1352,7 +1351,7 @@ fn checked_read_inner(
     }
     let action = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?;
     action.completed = true;
-    action.written_mismatch = source.written_mismatch.take().map(Box::new);
+    action.written_mismatch = source.written_mismatch.take();
     Ok(())
 }
 

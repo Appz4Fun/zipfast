@@ -44,11 +44,35 @@ fn continued(error: &ZipReadError) -> bool {
             )
         )
 }
-/// [`Options::seven_zip_strict`]: the active member's local header differed only in the data descriptor flag, as the
-/// failure it gets once read and placed.
-fn written_mismatch(context: &mut EncryptedReadContext) -> Option<ReadFault> {
-    let found = context.action.as_mut()?.written_mismatch.take()?;
-    Some(ReadFault::LocalHeaderMismatch(found))
+/// [`Options::seven_zip_strict`]: whether the active member's local header differed only in the data descriptor
+/// flag, so that it fails once read and placed.
+fn written_mismatch(context: &mut EncryptedReadContext) -> Option<Box<crate::extract::LocalHeaderMismatch>> {
+    context.action.as_mut()?.written_mismatch.take()
+}
+// The failures below are built out of line and boxed, or straight into the caller's return value: a ZipReadError is
+// kilobytes, and the member frames sit under deep reads (a debug test thread has a 2 MiB stack).
+#[inline(never)]
+fn mismatch_boxed(found: Box<crate::extract::LocalHeaderMismatch>) -> Box<ZipReadError> {
+    Box::new(ReadFault::LocalHeaderMismatch(found).into())
+}
+#[inline(never)]
+#[allow(clippy::result_large_err)] // the member closure's own result type
+fn mismatch_result(found: Option<Box<crate::extract::LocalHeaderMismatch>>) -> ZipReadResult<bool> {
+    match found {
+        Some(found) => Err(ReadFault::LocalHeaderMismatch(found).into()),
+        None => Ok(false),
+    }
+}
+#[inline(never)]
+fn mismatch_link(found: Option<Box<crate::extract::LocalHeaderMismatch>>) -> (ZipReadResult<()>, bool, bool) {
+    match found {
+        Some(found) => (Err(ReadFault::LocalHeaderMismatch(found).into()), false, false),
+        None => (Ok(()), false, false),
+    }
+}
+#[inline(never)]
+fn fault_link(fault: ReadFault) -> (ZipReadResult<()>, bool, bool) {
+    (Err(fault.into()), false, false)
 }
 fn add(counter: &mut u64) -> Result<(), ReadFault> {
     *counter = counter.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
@@ -627,10 +651,7 @@ impl ProjectedReadSession {
                         || e.size > context.options.limits.member_decoded_bytes)
             {
                 self.read_at_with_context(ordinal, password, max, cancel, context, |_| Ok(()))?;
-                return match written_mismatch(context) {
-                    Some(fault) => Err(fault.into()),
-                    None => Ok(false),
-                };
+                return mismatch_result(written_mismatch(context));
             }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
@@ -658,14 +679,10 @@ impl ProjectedReadSession {
                 // what was staged, published as a verified file would be (the same directory sync and rename
                 // handling), and is reported failed all the same; a canceled run publishes nothing
                 let mut broken = None;
-                let read =
-                    self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel));
-                // Options::seven_zip_strict: a member whose local header differs only in the data descriptor flag was
-                // read and checked whole; it is published as any verified file, then fails, as 7-Zip writes it and
-                // still reports "Headers Error"
-                let flagged = if read.is_ok() { written_mismatch(context) } else { None };
-                let written = stage.written();
-                if let Err(error) = read {
+                let mut read_whole = false;
+                if let Err(error) =
+                    self.read_at_with_context(ordinal, password, max, cancel, context, |b| stage.write_all(b, cancel))
+                {
                     if continued(&error) && options.keep_broken && !cancel.is_canceled() {
                         // boxed: the error is large (kilobytes), and it waits across publication
                         broken = Some((Box::new(error), stage.written()));
@@ -676,10 +693,16 @@ impl ProjectedReadSession {
                             stage.finish_error(error, context)
                         });
                     }
+                } else if let Some(found) = written_mismatch(context) {
+                    // Options::seven_zip_strict: a member whose local header differs only in the data descriptor flag
+                    // was read and checked whole; it is published as any verified file, then fails, as 7-Zip writes
+                    // it and still reports "Headers Error"
+                    broken = Some((mismatch_boxed(found), stage.written()));
+                    read_whole = true;
                 }
                 let bulk =
                     context.options.publication == Publication::Bulk && stage.backend() == StagedBackend::Portable;
-                let published = if broken.is_some() {
+                let published = if broken.is_some() && !read_whole {
                     stage.publish_broken(mode, mtime, cancel, context, |cx| self.check_source(cx))
                 } else {
                     stage.publish(mode, mtime, cancel, context, |cx| self.check_source(cx))
@@ -713,9 +736,6 @@ impl ProjectedReadSession {
                     }
                     (Some((error, _)), Ok(false)) => Err(*error),
                     (_, Err(error)) => Err(error),
-                    (None, Ok(true)) if let Some(fault) = flagged => {
-                        Err(ZipReadError::from(fault).with_publication(PublicationState::Published, written))
-                    }
                     (None, Ok(published)) => Ok(!published),
                 }
             }
@@ -783,7 +803,7 @@ impl ProjectedReadSession {
                 && let Ok(rel) = &rel
                 && let Err(fault) = self.link_stand_in(rel, options, context, extracted)
             {
-                return (Err(fault.into()), false, false);
+                return fault_link(fault);
             }
             return (Err(error), false, false);
         }
@@ -793,10 +813,6 @@ impl ProjectedReadSession {
         // Options::seven_zip_strict: a link whose local header differs only in the data descriptor flag is placed,
         // then fails, as 7-Zip places it and reports "Headers Error"
         let flagged = written_mismatch(context);
-        let flag = |placed: (ZipReadResult<()>, bool, bool)| match (placed, flagged) {
-            ((Ok(()), false, _), Some(fault)) => (Err(fault.into()), false, false),
-            (placed, _) => placed,
-        };
         let kind = link::LinkKind::Symbolic(text);
         // ZIP holds no hard links, so the run records only the symbolic links it placed
         // testing checks the target as extracting would
@@ -804,7 +820,7 @@ impl ProjectedReadSession {
             return refuse(why);
         }
         if options.mode != Mode::Extract {
-            return flag((Ok(()), false, false));
+            return mismatch_link(flagged);
         }
         // the destination root is made as for a file (following a root alias, as `create_dir_all` does) when a link,
         // or a refused link's placeholder, is the first output of the run
@@ -831,7 +847,7 @@ impl ProjectedReadSession {
             Err(error) => return (Err(ReadFault::Legacy(error).into()), false, false),
         };
         match link::publish(&options.dest, &rel, place, &kind, modified, extracted) {
-            Ok(()) => flag((Ok(()), false, false)),
+            Ok(()) => mismatch_link(flagged),
             Err(error) if let Some(why) = link::member_failure(&error) => refuse(why),
             Err(error) => (
                 Err(ReadFault::Io { stage: IoStage::Output, operation: ReadIoOperation::Publish, offset: 0, error }
