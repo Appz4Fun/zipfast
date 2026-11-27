@@ -326,6 +326,10 @@ pub(crate) struct Extracted {
     /// a hard link takes the regular file at its target's stored name, whoever wrote it
     /// ([`crate::extract::HardLinkTargets::StoredName`])
     stored_name_targets: bool,
+    /// a hard link member's own modification time is set on the file it links, as 7-Zip 26.06 sets it
+    /// ([`crate::extract::UnixModes::Masked`], 7-Zip's metadata); otherwise the file keeps its own, as UnRAR 7.30
+    /// and GNU tar leave it
+    hard_link_times: bool,
 }
 
 /// The most bytes of paths [`Extracted`] holds, as much as a listing may.
@@ -360,14 +364,25 @@ impl Extracted {
             preexisting: options.preexisting_links,
             placeholder: options.refused_link_placeholder && extracting,
             stored_name_targets: options.hard_link_targets == crate::extract::HardLinkTargets::StoredName && extracting,
+            hard_link_times: matches!(options.unix_modes, crate::extract::UnixModes::Masked { .. }),
             ..Self::default()
         }
     }
 
     /// As [`Extracted::new`], for a writer that always extracts whatever `options.mode` says
-    /// ([`crate::rar5::session::RarSession`]), which links only to files it extracted itself.
+    /// ([`crate::rar5::session::RarSession`]).
     pub(crate) fn for_output(options: &crate::extract::Options) -> Self {
-        Self { placeholder: options.refused_link_placeholder, stored_name_targets: false, ..Self::new(options) }
+        Self {
+            placeholder: options.refused_link_placeholder,
+            stored_name_targets: options.hard_link_targets == crate::extract::HardLinkTargets::StoredName,
+            ..Self::new(options)
+        }
+    }
+
+    /// Sets which file a hard link takes ([`crate::extract::HardLinkTargets`]), for a writer whose setting comes
+    /// from elsewhere too ([`crate::rar5::session::RarSessionOptions::hard_link_targets`]).
+    pub(crate) fn set_hard_link_targets(&mut self, targets: crate::extract::HardLinkTargets) {
+        self.stored_name_targets = targets == crate::extract::HardLinkTargets::StoredName;
     }
 
     /// Whether a refused symbolic link leaves an empty regular file at its path: its lexical target check then
@@ -445,6 +460,23 @@ impl Extracted {
     /// The device and inode of the file the member at `rel` landed as, when it was extracted (not only tested).
     pub(crate) fn landed_identity(&self, rel: &Path) -> Option<(u64, u64)> {
         self.records.get(rel).and_then(|landed| landed.as_ref()).map(|landed| (landed.dev, landed.ino))
+    }
+
+    /// Whether a hard link member's own modification time is set on the file it links
+    /// ([`crate::extract::UnixModes::Masked`]).
+    pub(crate) fn sets_hard_link_times(&self) -> bool {
+        self.hard_link_times
+    }
+
+    /// The device and inode of the file a hard link to the member at `rel` would be made to now: the file this run
+    /// extracted for it or, under [`crate::extract::HardLinkTargets::StoredName`], the regular file at its stored
+    /// name under `dest` (found as [`make_charging`] finds it).
+    pub(crate) fn hard_link_source(&self, dest: &Path, rel: &Path) -> Option<(u64, u64)> {
+        if self.stored_name_targets {
+            stored_file(dest, rel).map(|landed| (landed.dev, landed.ino))
+        } else {
+            self.landed_identity(rel)
+        }
     }
 }
 
@@ -699,7 +731,9 @@ pub(crate) fn publish_charging(
 }
 
 /// Makes the link `kind` at `path`, replacing what is there only with `replace`. A symbolic link takes the archived
-/// `modified` time; a hard link is the earlier file, with its own time. Nothing is recorded: see [`placed`].
+/// `modified` time; a hard link is the earlier file, with its own time, or with `modified` under
+/// [`crate::extract::UnixModes::Masked`], as 7-Zip sets it on the file both names share. Nothing is recorded: see
+/// [`placed`].
 fn make_charging(
     dest: &Path,
     kind: &LinkKind,
@@ -720,13 +754,32 @@ fn make_charging(
                 .then(|| stored_file(dest, source))
                 .flatten()
                 .ok_or_else(|| refused(STORED_TARGET))?;
-            hard(dest, &found, path, replace, false, charge)
+            hard(dest, &found, path, replace, false, charge)?;
+            hard_link_time(extracted, path, modified);
+            Ok(())
         }
         LinkKind::Hard(source) | LinkKind::Copy(source) => {
             let landed = extracted.records.get(source).cloned().flatten().ok_or_else(|| refused(HARD_TARGET))?;
-            hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)), charge)
+            hard(dest, &landed, path, replace, matches!(kind, LinkKind::Copy(_)), charge)?;
+            if matches!(kind, LinkKind::Hard(_)) {
+                hard_link_time(extracted, path, modified);
+            }
+            Ok(())
         }
     }
+}
+
+/// Under [`crate::extract::UnixModes::Masked`], sets a hard link member's `modified` time on the file just placed at
+/// `path` (so on every name of it), never through a link at `path`. Best effort, as a file's times are.
+fn hard_link_time(extracted: &Extracted, path: &Path, modified: Option<SystemTime>) {
+    #[cfg(unix)]
+    if extracted.hard_link_times
+        && let Some(at) = modified
+    {
+        set_link_time(path, at);
+    }
+    #[cfg(not(unix))]
+    let _ = (extracted, path, modified);
 }
 
 /// The regular file at `rel` under `dest`, reached through real folders only (no symbolic link on the way or at

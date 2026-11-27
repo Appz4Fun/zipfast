@@ -122,6 +122,11 @@ impl<'a> Extraction<'a> {
         // the extraction's own thread settings, where it has any, over the session's
         run.threads = self.options.threads.or(session.options.threads);
         run.parallel_min = self.options.parallel_min.or(session.options.parallel_min);
+        // the extraction's hard link targets where it sets StoredName, else the session's
+        self.extracted.set_hard_link_targets(match self.options.hard_link_targets {
+            crate::extract::HardLinkTargets::Extracted => session.options.hard_link_targets,
+            set => set,
+        });
         run.write_unfiltered = self.options.unsupported_filters == crate::extract::UnsupportedFilters::WriteUnfiltered;
         // UnverifiedOutput::Emit with keep_broken: a member cut off by a missing volume keeps what was decoded
         run.emit_unverified =
@@ -525,7 +530,10 @@ impl<'a> Extraction<'a> {
         // what is placed, so the diagnostic guard takes it as this run's own change
         let placed = match &kind {
             link::LinkKind::Symbolic(text) => PlacedLink::Symbolic { target: text },
-            link::LinkKind::Hard(source) => PlacedLink::Hard { source: self.extracted.landed_identity(source) },
+            link::LinkKind::Hard(source) => PlacedLink::Hard {
+                source: self.extracted.hard_link_source(dest, source),
+                timed: self.extracted.sets_hard_link_times(),
+            },
             link::LinkKind::Copy(_) => PlacedLink::Copy,
         };
         let rename = self.options.overwrite.rename().filter(|_| initial.is_some());
@@ -900,8 +908,10 @@ pub(super) trait ExtractionHooks {
 pub(super) enum PlacedLink<'a> {
     /// A symbolic link to these target bytes.
     Symbolic { target: &'a [u8] },
-    /// A hard link to the file this run extracted with this device and inode (a copy where linking fails).
-    Hard { source: Option<(u64, u64)> },
+    /// A hard link to the file with this device and inode (a copy where linking fails): the file this run extracted
+    /// or, under [`crate::extract::HardLinkTargets::StoredName`], the one at the target's stored name. With `timed`
+    /// the link member's own modification time was set on it ([`crate::extract::UnixModes::Masked`]).
+    Hard { source: Option<(u64, u64)>, timed: bool },
     /// A copy of a file this run extracted.
     Copy,
     /// The empty regular file a refused symbolic link leaves with
