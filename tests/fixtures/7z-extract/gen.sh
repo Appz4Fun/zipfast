@@ -28,6 +28,9 @@ a deflate.7z -m0=Deflate text/a.txt text/b.txt
 a bzip2.7z -m0=BZip2 text/a.txt text/b.txt
 a ppmd.7z -m0=PPMd text/a.txt
 a ppmd_solid.7z -m0=PPMd:mem=2m:o=32 -ms=on text big
+# models far smaller than their input: they run out of memory and start over many times
+a ppmd_restart_o32.7z -m0=PPMd:o=32:mem=1m ppmd/mixed.bin
+a ppmd_restart_o4.7z -m0=PPMd:o=4:mem=64k ppmd/mixed.bin
 a aes.7z -m0=LZMA2:d=64k -ppassword text/a.txt text/b.txt
 a aes_hdr.7z -m0=LZMA2:d=64k -ppassword -mhe=on text/a.txt text/b.txt
 a aes_copy.7z -m0=Copy -ppassword text/tiny.txt
